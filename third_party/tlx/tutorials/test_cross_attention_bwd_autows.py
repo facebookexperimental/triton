@@ -148,8 +148,15 @@ def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
         )
 
 
-@pytest.mark.parametrize("ns", [1, 2])
-@pytest.mark.parametrize("Lq,Lkv,Z", _SHARED_SHAPES)
+# autows_2kv-only shapes: at BLOCK_N=64 the shared 256/384/512 are all even KV
+# block counts (4/6/8), so add Lkv=320 (5 blocks) to exercise the odd-tail
+# masked-b1 path. (Kept off _SHARED_SHAPES: the TLX_2KV kernel there assumes a
+# 128-multiple Lkv.)
+_AUTOWS_2KV_SHAPES = [(256, 256, 2), (256, 320, 2), (256, 384, 2), (256, 512, 2)]
+
+
+@pytest.mark.parametrize("ns", [1])
+@pytest.mark.parametrize("Lq,Lkv,Z", _AUTOWS_2KV_SHAPES)
 def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
     """MANUAL 2-KV-block data-partition reduce_dq (BwdVariant.TRITON_AUTOWS_2KV),
     shared-KV + compute fold, warp specialization ON (milestone 2). Two KV blocks
@@ -166,12 +173,12 @@ def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     _reset_captured_globals(xa)
 
-    # BLOCK_N=128 -> the manual 2-KV loop supplies parallelism, no compiler DP.
-    # BLOCK_M=32: WS on keeps qk/dp/dk disjoint per block (dq is a shared
-    # accumulator), so TMEM stays ~448 cols; BLOCK_M>=64 overflows the 512-col
-    # TMEM (the disjoint dp/qk tiles cost 2x). Recovering a larger BLOCK_M needs
-    # sharing dp/qk across blocks (TLX-style depth-1) -- deferred.
-    bb.force(ns, bm=32, bn=128)
+    # BLOCK_M=64, BLOCK_N=64: the manual 2-KV loop supplies parallelism (no
+    # compiler DP). At BLOCK_N=64 the two [BLOCK_N, DimQ] dk accumulators stack in
+    # TMEM's two 64-row groups at the same columns (128 cols for both, not 256),
+    # so with dq as a single shared accumulator the peak stays ~480 < 512 and
+    # BLOCK_M reaches 64. BLOCK_N=128 needs 256 dk cols -> 608 > 512 at BLOCK_M=64.
+    bb.force(ns, bm=64, bn=64)
     torch.manual_seed(0)
     q, k, v, do, so_kv, so_q, asc = bb.make(Lq, Lkv, Z, shared=True)
     # shared-KV: K and V are one leaf, so the returned dk = dk + dv (dv is None).

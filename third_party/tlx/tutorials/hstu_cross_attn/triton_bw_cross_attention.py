@@ -2068,9 +2068,8 @@ def _hstu_attn_bwd_redq(  # noqa C901
 
 
 def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
-    # BLOCK_N is pinned to 128 so a single BLOCK_N block never triggers the
-    # compiler DP pass (which fires at BLOCK_N >= 256); the manual 2-KV-block
-    # loop supplies the 2-way parallelism instead.
+    # The manual 2-KV-block loop supplies the 2-way parallelism, so BLOCK_N stays
+    # well below the compiler-DP trigger (BLOCK_N >= 256) and the pass never runs.
     configs = [
         triton.Config(
             {
@@ -2081,14 +2080,15 @@ def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
             num_warps=nw,
             pre_hook=_bwd_pre_hook_redq_v3,
         )
-        # BLOCK_M=32: the compute fold MMA-accumulates BOTH KV blocks' dk in
-        # TMEM (2 x DimQ=256 cols fixed). Even with warp specialization ON, the
-        # per-block disjoint qk/dp/dk tiles push BLOCK_M>=64 over the 512-col
-        # TMEM limit (dq is a single shared accumulator). Sharing dp/qk across
-        # blocks (TLX-style depth-1) to recover a larger BLOCK_M is deferred.
-        for M in [32]
-        for N in [128]
-        for ns in [2]
+        # BLOCK_M=64, BLOCK_N=64. The compute fold MMA-accumulates BOTH KV blocks'
+        # dk in TMEM (each [BLOCK_N, DimQ]); at BLOCK_N=64 the two dk tiles stack
+        # in TMEM's two 64-row groups at the SAME columns (128 cols for both, not
+        # 256), which -- with dq as a single shared accumulator -- keeps the peak
+        # at ~480 < 512 cols and lets BLOCK_M reach 64. BLOCK_N=128 would need 256
+        # dk cols and overflows at BLOCK_M=64 (608 > 512).
+        for M in [64]
+        for N in [64]
+        for ns in [1]
         for nw in [4]
     ]
     return configs
