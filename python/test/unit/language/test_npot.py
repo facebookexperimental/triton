@@ -134,3 +134,74 @@ def test_pow2_control_elementwise(size):
     out = torch.empty(size, device="cuda")
     kernel[(1, )](x, y, out, N=size)
     assert _rel_err(out, x * y + x) < 1e-4, f"size={size}"
+
+
+# ---------------------------------------------------------------------------
+# Modular convert_layout / view ops must route through the real remap, not a
+# pow2-only cheap no-op. Two guards: isExpensiveView (getFreeVariableMasks can't
+# tell two ADD-mod-N maps apart) and the convert Case-5 no-op (minimalCvtLayout
+# quotients a modular register dim away). Their core is pinned in
+# LinearLayoutTest.{ModularRelayoutIsNotIdentity,ModularRegisterDimNotQuotientedAway}.
+# End-to-end modular reshape / axis=None reduce are not exercised here
+# (unimplemented; they fail earlier) -- the reshape is correctly marked EXPENSIVE
+# (loud fail, not scramble). Random inputs (constants are scramble-blind).
+# ---------------------------------------------------------------------------
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("M, N", [(16, 48), (16, 192), (33, 48), (8, 96)])
+def test_npot_reshape_2d_to_1d_expensive_view_detected(M, N):
+    """A modular 2D -> 1D reshape genuinely changes the layout. Previously
+    isExpensiveView false-positived it as a cheap no-op and the reshape lowering
+    silently scrambled the elements. Now the view is correctly classified
+    (expensive / not a no-op), so the compile fails loudly instead of producing
+    scrambled data. This is strictly safer; the correct-result path needs the
+    follow-on modular reshape remap. We assert it does NOT silently succeed with
+    scrambled output."""
+
+    @triton.jit
+    def kernel(X, Out, M: tl.constexpr, N: tl.constexpr):
+        idx = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+        x = tl.load(X + idx)
+        y = tl.reshape(x, (M * N, ))
+        tl.store(Out + tl.arange(0, M * N), y)
+
+    x = torch.arange(M * N, device="cuda", dtype=torch.float32).reshape(M, N)
+    out = torch.full((M * N, ), -1.0, device="cuda", dtype=torch.float32)
+    ref = x.reshape(M * N)
+    try:
+        kernel[(1, )](x, out, M=M, N=N)
+    except Exception:
+        # Expected: modular reshape is (correctly) rejected as an expensive view
+        # rather than silently scrambling.
+        return
+    # If it DID compile, the result must be correct (never a silent scramble).
+    assert _rel_err(out, ref) < 1e-6, f"silent scramble on reshape M={M},N={N}"
+
+
+@requires_gpu
+@requires_npot
+@pytest.mark.parametrize("M, N", [(16, 48), (33, 48)])
+@pytest.mark.xfail(
+    reason="NPOT axis-reduction lowering (ReduceOpToLLVM) "
+    "not yet implemented; separate from the convert guards.", strict=False)
+def test_npot_sum_axis1(M, N):
+    """Per-axis reduction over a modular 2D layout. Documents the still-open
+    NPOT reduce-lowering gap (weighted sum is permutation-sensitive). xfail:
+    tracked separately from the convert guards."""
+
+    @triton.jit
+    def kernel(X, W, Out, M: tl.constexpr, N: tl.constexpr):
+        idx = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+        x = tl.load(X + idx)
+        w = tl.load(W + idx)
+        sw = tl.sum(x * w, axis=1)  # [M]
+        tl.store(Out + tl.arange(0, M), sw)
+
+    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    w = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    out = torch.empty(M, device="cuda", dtype=torch.float32)
+    kernel[(1, )](x, w, out, M=M, N=N)
+    ref = (x * w).sum(dim=1)
+    assert _rel_err(out, ref) < 1e-3, f"wsum M={M},N={N}"

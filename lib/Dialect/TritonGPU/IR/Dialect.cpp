@@ -120,6 +120,16 @@ bool isExpensiveView(Type srcType, Type dstType) {
   auto tensorDstType = cast<RankedTensorType>(dstType);
   auto llSrc = toLinearLayout(tensorSrcType);
   auto llDst = toLinearLayout(tensorDstType);
+  // NPOT: getFreeVariableMasks() cannot distinguish two different ADD-mod-N
+  // maps, so distinct modular layouts compare "cheap" and callers skip the
+  // relayout -> scramble. Treat a modular, non-identical view as expensive so
+  // it routes through the real remap. pow2 unaffected (isModular() is false).
+  if (llSrc.isModular() || llDst.isModular()) {
+    static const bool allowNpot =
+        mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+    if (allowNpot && llSrc != llDst)
+      return true;
+  }
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -3602,10 +3612,13 @@ struct TritonGPUVerifyTensorLayoutInterface
                          << " which is not a power of two.";
       }
       // Layouts whose modular (non-power-of-2) lowering is implemented.
-      bool npotLoweringImplemented =
-          isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr>(
-              layout);
-      if (!npotLoweringImplemented) {
+      // Dot-operand and MMA encodings (Nvidia WGMMA/MMAv5, AMD MFMA/WMMA) are
+      // admitted so an NPOT tl.dot's operand/result tensors pass verification
+      // under the flag; the modular LinearLayout they resolve to is lowered by
+      // the encoding-agnostic ADD+UREM path in applyLinearLayout.
+      if (!isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr,
+               DotOperandEncodingAttr, NvidiaMmaEncodingAttr,
+               AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout)) {
         return makeErr()
                << "NPOT layout not yet supported: tensor shape "
                << rankedTy.getShape()
