@@ -320,6 +320,23 @@ class CMakeBuild(build_ext):
                 "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",
             ]
 
+        # Build against the default prebuilt LLVM (compiled on a newer distro)
+        # on a host with older glibc / libstdc++. Two facets, both enabled by
+        # TRITON_GLIBC_COMPAT:
+        #   1. libtriton links the glibc 2.38+ -> older trampolines in
+        #      cmake/glibc_compat.c (redirects __isoc23_*@GLIBC_2.38).
+        #   2. the prebuilt LLVM build tools (mlir-tblgen, ...) that run during
+        #      the build dynamically need GLIBCXX_3.4.30 (GCC 12) symbols absent
+        #      from the host libstdc++, so we build a drop-in libstdc++.so.6 and
+        #      prepend it to LD_LIBRARY_PATH for the build subprocesses.
+        if check_env_flag("TRITON_GLIBC_COMPAT"):
+            cmake_args += ["-DTRITON_GLIBC_COMPAT=ON"]
+            compat_dir = os.path.join(self.build_temp, "glibcxx-compat")
+            subprocess.check_call(
+                [os.path.join(self.base_dir, "scripts", "build-glibcxx-compat.sh"), compat_dir])
+            old_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = compat_dir + (os.pathsep + old_ld if old_ld else "")
+
         if check_env_flag("TRITON_EXT_ENABLED"):
             cmake_args += ["-DTRITON_EXT_ENABLED=1"]
         else:

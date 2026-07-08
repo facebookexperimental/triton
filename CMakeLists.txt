@@ -422,6 +422,16 @@ if(TRITON_BUILD_PYTHON_MODULE)
                   ${PYTHON_SRC_PATH}/bitequiv.cc
                   ${PYTHON_SRC_PATH}/specialize.cc)
 
+  # glibc 2.38+ -> older compat trampolines. Enable when linking against an
+  # LLVM image compiled on a newer glibc than the build/run host (the prebuilt
+  # image references __isoc23_*@GLIBC_2.38 symbols absent on older glibc). See
+  # cmake/glibc_compat.c.
+  option(TRITON_GLIBC_COMPAT "Link glibc 2.38+ -> older compat trampolines into libtriton" OFF)
+  if(TRITON_GLIBC_COMPAT)
+    message(STATUS "TRITON_GLIBC_COMPAT enabled: adding glibc 2.38+ compat trampolines")
+    target_sources(triton PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/glibc_compat.c)
+  endif()
+
   # Link triton with its dependencies
   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
 
