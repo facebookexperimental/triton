@@ -295,6 +295,29 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let hasFolder = 1;
 }
 
+def TLX_DumpLayoutOp : TLX_Op<"dump_layout", []> {
+  let summary = "compile-time diagnostic that prints the layout of a value";
+
+  let description = [{
+    `tlx.dump_layout` prints the resolved layout/encoding of a register tensor
+    or a shared/tensor-memory buffer (memdesc) to the compiler log at compile
+    time. It emits no device code and produces no result.
+
+    The op is consumed by the `tlx-dump-layout` pass, which runs at the end of
+    the TTGIR pipeline so that the reported layout is final. The pass prints the
+    value type and its layout in CuTe Shape:Stride notation, then erases the op.
+
+    This is a static, host-side diagnostic and is distinct from the runtime,
+    device-side `tt.print` / `tl.device_print` family.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$src);
+
+  let results = (outs);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
                               [SameOperandAndResultMemorySpace,
                                Pure]> {

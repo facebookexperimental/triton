@@ -944,6 +944,43 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
   tlx.prefetch(desc_in, tensormap=True)
   ```
 
+- `tlx.dump_layout(x)` **[Hopper+, MI300+]**
+
+    Compile-time diagnostic that prints the resolved layout of a value to the
+    compiler log. `x` may be a register tensor or a shared/tensor-memory buffer
+    (memdesc). It emits **no** device code and returns nothing — this is a
+    static, host-side diagnostic, distinct from the runtime `tl.device_print` /
+    `tl.print`. The op is rendered at the end of the TTGIR pipeline, so the
+    printed layout reflects all compiler optimizations, then it is erased.
+
+    The layout is printed in CuTe (CUTLASS) `Shape:Stride` notation (`_N` marks
+    a static integer):
+    - Register tensors → a thread-value (TV) layout
+      `((thread...),(value...)):((thread...),(value...))`, where the thread
+      group comes from the hardware lane/warp/block dims and the value group
+      from the per-thread registers (stride `_0` denotes a broadcast).
+    - Shared/tensor-memory buffers → a single strided layout, e.g. `_64:_1`.
+    - Swizzled shared buffers → `Swizzle<B,M,S> o (base):(stride)`.
+
+    In all cases the layout maps a coordinate to the **logical tensor's
+    row-major element index** (its codomain): for a register tensor a
+    `(thread, value)` coordinate → the logical element index it holds, and for
+    a buffer an offset → the buffer element index. The strides are offsets in
+    that logical index space, not physical byte/bank addresses.
+
+    Layouts that are not representable as a CuTe layout fall back to the raw
+    linear-layout string.
+
+    Example:
+    ```python
+    x = tl.load(x_ptr + offs)          # register tensor
+    tlx.dump_layout(x)                  # -> // cute: ((_32,_2,_2),_1):((_1,_32,_0),_0)
+
+    buf = tlx.local_alloc((BLOCK,), tl.float32, 1)
+    v = tlx.local_view(buf, 0)
+    tlx.dump_layout(v)                  # -> // cute: _64:_1
+    ```
+
 
 ## Buffer Operations (AMD)
 
