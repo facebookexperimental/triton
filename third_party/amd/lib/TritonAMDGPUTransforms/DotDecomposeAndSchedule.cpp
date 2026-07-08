@@ -93,6 +93,22 @@ namespace {
 // Partition plan (Phase 1a)
 //===----------------------------------------------------------------------===//
 
+struct DotPartitionPlan {
+  triton::DotOp dotOp;
+  unsigned blockM;        // BLOCK_M; e.g. 256 for v8/v10.
+  unsigned instrM;        // MFMA instr M; e.g. 16 for [16,16,32].
+  unsigned ctaTileM;      // instrM * warpsPerCTA[0]; e.g. 32 for v8/v10.
+  unsigned numPartitions; // blockM / ctaTileM; e.g. 8 for v8/v10.
+  unsigned tileM;         // ctaTileM (i.e. M dim of each sub-dot result).
+  // Phase 2: N-split fields.
+  unsigned blockN;         // BLOCK_N; e.g. 128 for v8/v10's left/right half.
+  unsigned instrN;         // MFMA instr N; e.g. 16 for [16,16,32].
+  unsigned ctaTileN;       // instrN * warpsPerCTA[1]; e.g. 32 for v8/v10.
+  unsigned numPartitionsN; // blockN / ctaTileN; e.g. 4 for v8/v10. 0 = no
+                           //   N-split (numPartitions < 2 for N).
+  unsigned tileN;          // ctaTileN.
+};
+
 static triton::gpu::AMDMfmaEncodingAttr getMfmaEncoding(triton::DotOp dotOp) {
   auto resultType = dyn_cast<RankedTensorType>(dotOp.getResult().getType());
   if (!resultType)
@@ -100,6 +116,326 @@ static triton::gpu::AMDMfmaEncodingAttr getMfmaEncoding(triton::DotOp dotOp) {
   return dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(resultType.getEncoding());
 }
 
+static std::optional<DotPartitionPlan> planMSplit(triton::DotOp dotOp) {
+  auto mfmaEnc = getMfmaEncoding(dotOp);
+  if (!mfmaEnc)
+    return std::nullopt;
+  auto resultType = cast<RankedTensorType>(dotOp.getResult().getType());
+  auto resultShape = resultType.getShape();
+  if (resultShape.size() != 2)
+    return std::nullopt;
+  auto instrShape = mfmaEnc.getInstrShape();
+  if (instrShape.size() < 2)
+    return std::nullopt;
+  auto warpsPerCTA = mfmaEnc.getWarpsPerCTA();
+  if (warpsPerCTA.size() < 2)
+    return std::nullopt;
+  unsigned blockM = static_cast<unsigned>(resultShape[0]);
+  unsigned blockN = static_cast<unsigned>(resultShape[1]);
+  unsigned instrM = instrShape[0];
+  unsigned instrN = instrShape[1];
+  unsigned warpsM = warpsPerCTA[0];
+  unsigned warpsN = warpsPerCTA[1];
+  if (instrM == 0 || warpsM == 0 || instrN == 0 || warpsN == 0)
+    return std::nullopt;
+
+  // M split (required for the plan to be valid).
+  unsigned ctaTileM = instrM * warpsM;
+  if (blockM % ctaTileM != 0)
+    return std::nullopt;
+  unsigned numPartitions = blockM / ctaTileM;
+  if (numPartitions < 2)
+    return std::nullopt;
+
+  // N split (optional — falls back to 1 partition if it can't divide).
+  unsigned ctaTileN = instrN * warpsN;
+  unsigned numPartitionsN = 0;
+  if (blockN % ctaTileN == 0) {
+    unsigned candidate = blockN / ctaTileN;
+    if (candidate >= 2)
+      numPartitionsN = candidate;
+  }
+
+  return DotPartitionPlan{dotOp,         blockM,         instrM,  ctaTileM,
+                          numPartitions, ctaTileM,       blockN,  instrN,
+                          ctaTileN,      numPartitionsN, ctaTileN};
+}
+
+//===----------------------------------------------------------------------===//
+// Partition scheme + backward walker (Phase 1b)
+//===----------------------------------------------------------------------===//
+
+struct DataPartitionScheme {
+  unsigned numPartitions = 0;
+  llvm::SetVector<Operation *> ops;
+  llvm::DenseMap<Operation *, unsigned> opPartitionDims;
+};
+
+static bool needToSlice(Value v, unsigned dim, unsigned numPartitions) {
+  auto rtt = dyn_cast<RankedTensorType>(v.getType());
+  if (!rtt)
+    return false;
+  if (dim >= rtt.getRank())
+    return false;
+  int64_t extent = rtt.getShape()[dim];
+  return extent >= static_cast<int64_t>(numPartitions);
+}
+
+static bool isInsideRegion(Operation *op, Region *boundary) {
+  return op->getParentRegion() == boundary;
+}
+
+/// Forward-declared so backward and forward walkers can share the same
+/// scheme + op-classification helpers.
+static bool isAllowedProducerOp(Operation *op) {
+  return op->hasTrait<OpTrait::Elementwise>() ||
+         isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp,
+             triton::SplatOp, triton::AddPtrOp, triton::LoadOp,
+             triton::gpu::ConvertLayoutOp, triton::gpu::LocalAllocOp,
+             triton::gpu::LocalLoadOp, triton::amdgpu::BufferLoadToLocalOp>(op);
+}
+
+/// Adapted from `WSDataPartition::getBackwardSliceToPartition` (line 291).
+static bool getBackwardSliceToPartition(Value v, unsigned currentDim,
+                                        DataPartitionScheme &scheme,
+                                        Region *boundary) {
+  if (!needToSlice(v, currentDim, scheme.numPartitions))
+    return true;
+
+  Operation *defOp = v.getDefiningOp();
+  if (!defOp)
+    return true;
+
+  if (!isInsideRegion(defOp, boundary))
+    return true;
+
+  if (scheme.ops.contains(defOp)) {
+    auto it = scheme.opPartitionDims.find(defOp);
+    if (it != scheme.opPartitionDims.end() && it->second != currentDim)
+      return false;
+    return true;
+  }
+
+  if (!isAllowedProducerOp(defOp)) {
+    LLVM_DEBUG(llvm::dbgs() << "ttgir-sched: backward walker bailing on "
+                            << defOp->getName() << "\n");
+    return false;
+  }
+
+  scheme.ops.insert(defOp);
+  scheme.opPartitionDims[defOp] = currentDim;
+
+  for (Value operand : defOp->getOperands()) {
+    if (!getBackwardSliceToPartition(operand, currentDim, scheme, boundary))
+      return false;
+  }
+  return true;
+}
+
+static std::optional<DataPartitionScheme>
+backwardSliceForMSplit(const DotPartitionPlan &plan) {
+  DataPartitionScheme scheme;
+  scheme.numPartitions = plan.numPartitions;
+
+  triton::DotOp dot = plan.dotOp;
+  Region *boundary = dot->getParentRegion();
+
+  if (!getBackwardSliceToPartition(dot.getA(), /*dim=*/0, scheme, boundary))
+    return std::nullopt;
+  if (!getBackwardSliceToPartition(dot.getC(), /*dim=*/0, scheme, boundary))
+    return std::nullopt;
+  return scheme;
+}
+
+//===----------------------------------------------------------------------===//
+// Forward walker (Phase 1c)
+//===----------------------------------------------------------------------===//
+
+/// Op allow-list for forward walker. Producer-side ops are still allowed
+/// (some user-side chains pass through `ConvertLayoutOp` etc.), plus the
+/// extra user-side ops that don't appear as producers: truncating casts,
+/// stores. Mirrors WSDataPartition's forward-side allow-set sans Hopper
+/// branches.
+static bool isAllowedUserOp(Operation *op) {
+  if (isAllowedProducerOp(op))
+    return true;
+  return isa<arith::TruncFOp, arith::TruncIOp, arith::SIToFPOp, arith::UIToFPOp,
+             arith::FPToSIOp, arith::FPToUIOp, triton::StoreOp,
+             triton::gpu::LocalStoreOp, triton::amdgpu::BufferStoreOp,
+             scf::YieldOp>(op);
+}
+
+/// Adapted from `WSDataPartition::getForwardSliceToPartition` (line 441),
+/// stripped of:
+///   * AtomicRMWOp / DescriptorReduceOp `onlyUsedByAtomicStore` special case
+///   * AsyncTaskId tracking
+///   * BroadcastOp / ExpandDimsOp / TransOp dim-flipping (deferred to
+///     Phase 1c-ext if a v8/v10 user chain needs it)
+///   * MultiResult `scf.if` follow-through (not used by v8/v10 main loop)
+///
+/// Walks `v.getUsers()` recursively. Stops at:
+///   * `scf::YieldOp` — recorded in scheme, but no further recursion (the
+///     iter-arg back-edge is already covered by the backward walk on
+///     `dot.getC()` in the next iteration).
+///   * ops outside `boundary`
+///   * `tt.return` / `func.return` terminators (no results to follow)
+///   * unsupported op → bail with false.
+///
+/// `seen` guards against cyclic SSA (multi-use values) — same trick as the
+/// WSDataPartition walker.
+static bool getForwardSliceToPartition(Value v, unsigned currentDim,
+                                       DataPartitionScheme &scheme,
+                                       Region *boundary,
+                                       llvm::DenseSet<Value> &seen) {
+  if (!seen.insert(v).second)
+    return true;
+  if (!needToSlice(v, currentDim, scheme.numPartitions))
+    return true;
+
+  for (Operation *userOp : v.getUsers()) {
+    // Cross-region: don't walk into ops outside the current loop body. This
+    // catches the dot's result being captured by an op in a nested scf.if /
+    // scf.for region — handled in Phase 1c-ext if needed.
+    if (!isInsideRegion(userOp, boundary)) {
+      // It's safe to ignore; the value escapes the loop body, which means
+      // the cross-iteration users will be handled by the backward walk on
+      // the iter-arg / result.
+      continue;
+    }
+
+    // Already classified? Check compatibility.
+    if (scheme.ops.contains(userOp)) {
+      auto it = scheme.opPartitionDims.find(userOp);
+      if (it != scheme.opPartitionDims.end() && it->second != currentDim) {
+        return false;
+      }
+      // scf.yield is recorded but we don't recurse through it (see above).
+      if (isa<scf::YieldOp>(userOp))
+        continue;
+      // Compatible existing classification — recurse into its results.
+      for (Value res : userOp->getResults()) {
+        if (!getForwardSliceToPartition(res, currentDim, scheme, boundary,
+                                        seen))
+          return false;
+      }
+      continue;
+    }
+
+    if (!isAllowedUserOp(userOp)) {
+      LLVM_DEBUG(llvm::dbgs() << "ttgir-sched: forward walker bailing on "
+                              << userOp->getName() << "\n");
+      return false;
+    }
+
+    scheme.ops.insert(userOp);
+    scheme.opPartitionDims[userOp] = currentDim;
+
+    // scf.yield: stop here (the iter-arg cycle is closed by the backward
+    // walker hitting dot.getC() next iteration).
+    if (isa<scf::YieldOp>(userOp))
+      continue;
+
+    // Recurse into each result of the user op.
+    for (Value res : userOp->getResults()) {
+      if (!getForwardSliceToPartition(res, currentDim, scheme, boundary, seen))
+        return false;
+    }
+  }
+  return true;
+}
+
+/// Driver: extend an existing scheme by walking forward from the dot's
+/// result. Returns false on infeasibility (unsupported op or dim conflict).
+static bool extendSliceForwardFromDot(const DotPartitionPlan &plan,
+                                      DataPartitionScheme &scheme) {
+  triton::DotOp dot = plan.dotOp;
+  Region *boundary = dot->getParentRegion();
+  llvm::DenseSet<Value> seen;
+  return getForwardSliceToPartition(dot.getResult(), /*dim=*/0, scheme,
+                                    boundary, seen);
+}
+
+//===----------------------------------------------------------------------===//
+// Apply M-split (Phase 1d)
+//===----------------------------------------------------------------------===//
+
+/// Compute the sliced tensor type for `original` along `dim`, taking
+/// `tileExtent` elements out of the original `dim`. Preserves the encoding.
+static RankedTensorType sliceTensorType(RankedTensorType original, unsigned dim,
+                                        unsigned tileExtent) {
+  SmallVector<int64_t> shape(original.getShape().begin(),
+                             original.getShape().end());
+  shape[dim] = tileExtent;
+  return RankedTensorType::get(shape, original.getElementType(),
+                               original.getEncoding());
+}
+
+/// Build `amdgpu.extract_slice src[offsetsAlongDim, 0]` returning a tensor
+/// of the same rank with `tileExtent` along `dim`.
+static Value buildExtractSliceAlongDim(OpBuilder &builder, Location loc,
+                                       Value src, unsigned dim, int64_t offset,
+                                       unsigned tileExtent) {
+  auto srcType = cast<RankedTensorType>(src.getType());
+  auto sliceType = sliceTensorType(srcType, dim, tileExtent);
+  SmallVector<int64_t> offsets(srcType.getRank(), 0);
+  offsets[dim] = offset;
+  return triton::amdgpu::ExtractSliceOp::create(
+      builder, loc, sliceType, src, builder.getDenseI64ArrayAttr(offsets));
+}
+
+/// Parse `TRITON_TTGIR_SCHED_BARRIER_STRIDE` env var. Returns:
+///   * 0 → no SchedBarrier insertion (raw rewrite from Phase 2)
+///   * k > 0 → insert ROCDL::SchedBarrier(0) after every k-th sub-dot
+/// Default (env var unset): k = numPartitionsN (one barrier per M-row).
+static int getSchedBarrierStride(unsigned defaultStride) {
+  const char *env = std::getenv("TRITON_TTGIR_SCHED_BARRIER_STRIDE");
+  if (!env || !*env)
+    return static_cast<int>(defaultStride);
+  return std::atoi(env);
+}
+
+//===----------------------------------------------------------------------===//
+// Producer-chain slicing (opt-in: TRITON_TTGIR_SCHED_SLICE_LOADS)
+//
+// Instead of `extract_slice`-ing the dot's register operands (which leaves the
+// monolithic `local_load` whole), rebuild the producer chain the backward
+// walker recorded, PER PARTITION: slice the SMEM buffer at the `local_load`
+// leaf (memdesc_subslice + local_load) and CLONE interior ops (convert_layout,
+// casts) with sliced operands + sliced result types. This exposes per-tile load
+// nodes so a downstream modulo scheduler can overlap loads with the sub-dots.
+// See claude/ttgir_sched_modulo_plan.md.
+//===----------------------------------------------------------------------===//
+
+/// Leaf: slice the shared-memory buffer that `loadOp` reads, returning a
+/// memdesc_subslice + local_load of the [offset, tileExtent] sub-tile along
+/// `dim`. Mirrors `WGMMAPipeline.cpp::splitRhs`.
+static Value buildSlicedLocalLoad(OpBuilder &builder, Location loc,
+                                  triton::gpu::LocalLoadOp loadOp, unsigned dim,
+                                  int64_t offset, unsigned tileExtent) {
+  Value srcMem = loadOp.getSrc();
+  auto srcTy = cast<triton::gpu::MemDescType>(srcMem.getType());
+
+  SmallVector<int64_t> shape(srcTy.getShape().begin(), srcTy.getShape().end());
+  shape[dim] = tileExtent;
+  auto subTy = triton::gpu::MemDescType::get(
+      shape, srcTy.getElementType(), srcTy.getEncoding(),
+      srcTy.getMemorySpace(),
+      /*mutableMemory=*/srcTy.getMutableMemory(), srcTy.getAllocShape());
+
+  SmallVector<int32_t> offsets(srcTy.getRank(), 0);
+  offsets[dim] = static_cast<int32_t>(offset);
+  Value sub = triton::gpu::MemDescSubsliceOp::create(builder, loc, subTy,
+                                                     srcMem, offsets);
+
+  auto resTy = sliceTensorType(
+      cast<RankedTensorType>(loadOp.getResult().getType()), dim, tileExtent);
+  return triton::gpu::LocalLoadOp::create(builder, loc, resTy, sub,
+                                          loadOp.getToken());
+}
+
+/// Interior ops we are willing to clone per partition (safe to clone + reset
+/// the result shape along `dim`). Dim-flipping ops (broadcast/expand/trans/
+/// reshape) are intentionally excluded — same limitation as the walkers.
 static bool isCloneableInterior(Operation *op) {
   return isa<triton::gpu::ConvertLayoutOp>(op) ||
          op->hasTrait<mlir::OpTrait::Elementwise>() ||
@@ -108,6 +444,237 @@ static bool isCloneableInterior(Operation *op) {
              arith::FPToUIOp>(op);
 }
 
+/// Materialize the [partIdx*tile : +tile] slice (along `dim`) of `v`,
+/// rebuilding the producer chain recorded in `scheme`. Memoized per (value,
+/// partIdx).
+///   - local_load (in scheme)      -> memdesc_subslice + local_load (leaf)
+///   - cloneable interior (in scheme) -> clone with sliced operands/result
+///   - global tt.load (in scheme, sliceGlobalLoads) -> clone with sliced ptr
+///   - anything else               -> extract_slice fallback (phase-1d
+///   behavior)
+///
+/// `sliceGlobalLoads` (env TRITON_TTGIR_SCHED_SLICE_GLOBAL_LOADS) is an
+/// independent opt-in: a global `tt.load` is normally left whole (extract_slice
+/// fallback) so its wide/coalesced global access is preserved; when set, the
+/// load is cloned per partition with a sliced pointer (and mask/other) operand,
+/// giving per-sub-tile global loads at the cost of narrower access. See
+/// claude/amd_modulo_scheduling_plan.md (load-slicing is a scheduler-infra
+/// knob, measured -12% standalone on the pinned matmul).
+static Value
+materializeSlice(OpBuilder &builder, Location loc, Value v, unsigned dim,
+                 unsigned partIdx, unsigned tile,
+                 const DataPartitionScheme &scheme, bool sliceLoads,
+                 bool sliceGlobalLoads,
+                 llvm::DenseMap<std::pair<Value, unsigned>, Value> &memo) {
+  auto key = std::make_pair(v, partIdx);
+  if (auto it = memo.find(key); it != memo.end())
+    return it->second;
+
+  int64_t offset = static_cast<int64_t>(partIdx) * tile;
+  Operation *def = v.getDefiningOp();
+  Value result;
+
+  // A global load is cloneable (per-partition slice of its pointer operand)
+  // only when explicitly opted in; otherwise it stays whole and we
+  // extract_slice.
+  bool cloneGlobalLoad = sliceGlobalLoads && def && isa<triton::LoadOp>(def);
+
+  if (sliceLoads && def && scheme.ops.contains(def) &&
+      isa<triton::gpu::LocalLoadOp>(def)) {
+    result = buildSlicedLocalLoad(
+        builder, loc, cast<triton::gpu::LocalLoadOp>(def), dim, offset, tile);
+  } else if (sliceLoads && def && scheme.ops.contains(def) &&
+             (isCloneableInterior(def) || cloneGlobalLoad)) {
+    IRMapping map;
+    for (Value operand : def->getOperands()) {
+      Value newOperand =
+          needToSlice(operand, dim, scheme.numPartitions)
+              ? materializeSlice(builder, loc, operand, dim, partIdx, tile,
+                                 scheme, sliceLoads, sliceGlobalLoads, memo)
+              : operand;
+      map.map(operand, newOperand);
+    }
+    Operation *cloned = builder.clone(*def, map);
+    for (auto [oldR, newR] : llvm::zip(def->getResults(), cloned->getResults()))
+      if (auto t = dyn_cast<RankedTensorType>(oldR.getType()))
+        newR.setType(sliceTensorType(t, dim, tile));
+    result = cloned->getResult(0);
+  } else {
+    result = buildExtractSliceAlongDim(builder, loc, v, dim, offset, tile);
+  }
+
+  memo[key] = result;
+  return result;
+}
+
+/// Apply the M-(and optionally N-)split rewrite for one plan. Replaces
+///   %D = tt.dot %A, %B, %C
+/// with an M × N grid of small dots, where
+///   %A_i  = amdgpu.extract_slice %A [i*ctaTileM, 0]      (M dim only)
+///   %B_j  = amdgpu.extract_slice %B [0, j*ctaTileN]      (N dim only)
+///   %C_ij = amdgpu.extract_slice %C [i*ctaTileM, j*ctaTileN]
+///   %D_ij = tt.dot %A_i, %B_j, %C_ij
+/// then
+///   %D = amdgpu.concat %D_00, %D_01, ..., %D_{M-1,N-1}
+/// in row-major (M outer, N inner) order.
+///
+/// Phase 3: after every `stride` sub-dots (default = numPartitionsN, i.e.
+/// one per M-row) insert a `ROCDL::SchedBarrier(0)` so LLVM's misched can
+/// reorder within a region but not across it. `stride=0` disables barriers
+/// entirely (= Phase 2 behavior). Configurable via
+/// `TRITON_TTGIR_SCHED_BARRIER_STRIDE`.
+///
+/// If `plan.numPartitionsN < 2`, the N-split is skipped (degenerates to the
+/// pure-M case from Phase 1d). Producer chains are NOT modified — the
+/// extract_slices are CTA-tile no-ops upstream so the existing layouts are
+/// preserved.
+static LogicalResult applyMSplit(const DotPartitionPlan &plan,
+                                 DataPartitionScheme &scheme) {
+  triton::DotOp dot = plan.dotOp;
+  OpBuilder builder(dot);
+  Location loc = dot.getLoc();
+  unsigned nM = plan.numPartitions;
+  unsigned tileM = plan.tileM;
+  unsigned nN = plan.numPartitionsN >= 2 ? plan.numPartitionsN : 1;
+  unsigned tileN = nN > 1 ? plan.tileN : plan.blockN;
+
+  // Phase 3: barrier stride; default = one per M-row.
+  int stride = getSchedBarrierStride(/*defaultStride=*/nN);
+
+  // Opt-in producer-chain slicing (feeds the modulo pipeline). The driver's
+  // `scheme` covers the A (and C) backward slice; build a separate scheme for B
+  // (sliced along N) since backwardSliceForMSplit only walked A and C. Capture
+  // operands now so the dead originals can be erased after the rewrite.
+  bool sliceLoads = triton::tools::getBoolEnv("TRITON_TTGIR_SCHED_SLICE_LOADS");
+  // Independent opt-in: also slice the global tt.load (per-partition cloned
+  // load with a sliced pointer), instead of leaving it whole + extract_slice.
+  bool sliceGlobalLoads =
+      triton::tools::getBoolEnv("TRITON_TTGIR_SCHED_SLICE_GLOBAL_LOADS");
+  Value aOperand = dot.getA();
+  Value bOperand = dot.getB();
+  llvm::DenseMap<std::pair<Value, unsigned>, Value> sliceMemo;
+
+  DataPartitionScheme schemeB;
+  bool sliceB = false;
+  if (sliceLoads && nN > 1) {
+    schemeB.numPartitions = nN;
+    sliceB = getBackwardSliceToPartition(bOperand, /*dim=*/1, schemeB,
+                                         dot->getParentRegion());
+  }
+
+  SmallVector<Value> partialResults;
+  partialResults.reserve(nM * nN);
+
+  // Pre-build B slices (one per N partition), then reuse across all M-i.
+  SmallVector<Value> bSlices;
+  bSlices.reserve(nN);
+  if (nN > 1) {
+    for (unsigned j = 0; j < nN; ++j) {
+      bSlices.push_back(materializeSlice(builder, loc, bOperand, /*dim=*/1, j,
+                                         tileN, schemeB, sliceB,
+                                         sliceGlobalLoads, sliceMemo));
+    }
+  } else {
+    bSlices.push_back(bOperand);
+  }
+
+  unsigned dotIdx = 0;
+  for (unsigned i = 0; i < nM; ++i) {
+    int64_t offM = static_cast<int64_t>(i) * tileM;
+    Value aSlice =
+        materializeSlice(builder, loc, aOperand, /*dim=*/0, i, tileM, scheme,
+                         sliceLoads, sliceGlobalLoads, sliceMemo);
+    for (unsigned j = 0; j < nN; ++j) {
+      Value cSlice;
+      if (nN > 1) {
+        auto cType = cast<RankedTensorType>(dot.getC().getType());
+        auto smallCType = sliceTensorType(
+            sliceTensorType(cType, /*dim=*/0, tileM), /*dim=*/1, tileN);
+        SmallVector<int64_t> offsets = {offM, static_cast<int64_t>(j) * tileN};
+        cSlice = triton::amdgpu::ExtractSliceOp::create(
+            builder, loc, smallCType, dot.getC(),
+            builder.getDenseI64ArrayAttr(offsets));
+      } else {
+        cSlice = buildExtractSliceAlongDim(builder, loc, dot.getC(),
+                                           /*dim=*/0, offM, tileM);
+      }
+      auto smallResultType = cast<RankedTensorType>(cSlice.getType());
+      auto smallDot = triton::DotOp::create(
+          builder, loc, smallResultType, aSlice, bSlices[j], cSlice,
+          dot.getInputPrecisionAttr(), dot.getMaxNumImpreciseAccAttr());
+      partialResults.push_back(smallDot.getResult());
+      ++dotIdx;
+
+      // Phase 3: after every `stride` sub-dots, drop a SchedBarrier(0).
+      // Don't emit one after the last sub-dot (the concat itself is an
+      // implicit cap).
+      if (stride > 0 && dotIdx < nM * nN &&
+          (dotIdx % static_cast<unsigned>(stride)) == 0) {
+        ROCDL::SchedBarrier::create(builder, loc,
+                                    /*mask=*/0);
+      }
+    }
+  }
+
+  auto fullType = cast<RankedTensorType>(dot.getResult().getType());
+  auto concat =
+      triton::amdgpu::ConcatOp::create(builder, loc, fullType, partialResults);
+  dot.getResult().replaceAllUsesWith(concat.getResult());
+  dot.erase();
+
+  // The original monolithic loads (and any cloned interior convert/cast) are
+  // now dead — erase them so only the per-tile sliced producers remain in the
+  // DDG. Fixpoint on use_empty; null out erased entries to avoid dangling
+  // derefs.
+  if (sliceLoads) {
+    SmallVector<Operation *> chain(scheme.ops.begin(), scheme.ops.end());
+    chain.append(schemeB.ops.begin(), schemeB.ops.end());
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (Operation *&op : chain) {
+        if (op && op->use_empty() &&
+            isa<triton::gpu::LocalLoadOp, triton::gpu::ConvertLayoutOp,
+                triton::LoadOp, arith::ExtFOp, arith::ExtSIOp, arith::ExtUIOp,
+                arith::TruncFOp, arith::TruncIOp>(op)) {
+          op->erase();
+          op = nullptr;
+          changed = true;
+        }
+      }
+    }
+    // The ops just erased were members of `scheme.ops` / `schemeB.ops`; those
+    // SetVectors would now hold dangling pointers. Clear them so no later code
+    // can dereference freed memory — the schemes are fully consumed here.
+    scheme.ops.clear();
+    schemeB.ops.clear();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+
+static void collectPlans(scf::ForOp forOp,
+                         SmallVectorImpl<DotPartitionPlan> &plans,
+                         unsigned &numMfmaDotsSeen,
+                         unsigned &numMfmaDotsSkipped) {
+  forOp.getBody()->walk([&](triton::DotOp dotOp) {
+    if (!getMfmaEncoding(dotOp))
+      return;
+    ++numMfmaDotsSeen;
+    if (auto plan = planMSplit(dotOp))
+      plans.push_back(*plan);
+    else
+      ++numMfmaDotsSkipped;
+  });
+}
+
+// LDS-capacity stage cap (change #3 of amd_decomp_modulo_pipeline.md). Returns
+// the max pipeline depth (stageCap; numBuffers = stageCap+1) whose
+// multi-buffered operand tiles fit gfx950's 160KB LDS, replacing the hardcoded
+// cap. Computed from the dot's per-iteration operand tiles (A = BM×BK, B =
+// BK×BN). Gated by TRITON_USE_MODULO_SCHEDULE so the existing AMD_MODULO path
+// is unchanged by default.
 static int computeLDSStageCap(scf::ForOp forOp, int fallback) {
   constexpr int64_t kLDSBytes = 160 * 1024; // gfx950 LDS per CU
   int64_t perBufferBytes = 0;
@@ -541,17 +1108,154 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
       runModuloExpand(getOperation());
       return;
     }
-    // Legacy env-var dispatch: opt-in early load lowering / modulo scaffold.
-    if (triton::tools::getBoolEnv("TRITON_AMD_EARLY_LOWER")) {
-      runEarlyLowerLoads(getOperation());
-      return;
+    bool modeDecompose = (m == "decompose");
+
+    if (!modeDecompose) {
+      // Legacy env-var dispatch (mode unset).
+      // Change #1: opt-in early load lowering (tt.load -> single-buffer
+      // async_copy + local_load) so a later modulo pass sees the staged ops.
+      if (triton::tools::getBoolEnv("TRITON_AMD_EARLY_LOWER")) {
+        runEarlyLowerLoads(getOperation());
+        return;
+      }
+
+      // Phase E0: opt-in AMD modulo scaffold (DDG build + classification).
+      if (triton::tools::getBoolEnv("TRITON_ENABLE_AMD_MODULO")) {
+        runAMDModuloScaffold(getOperation());
+        return;
+      }
+
+      if (!triton::tools::getBoolEnv("TRITON_ENABLE_TTGIR_SCHED"))
+        return;
     }
-    if (triton::tools::getBoolEnv("TRITON_ENABLE_AMD_MODULO")) {
-      runAMDModuloScaffold(getOperation());
-      return;
+
+    // Phase 1d gate: when set, the pass mutates the IR (replaces each
+    // candidate dot with N sliced sub-dots + concat). Default off so the
+    // existing TRITON_ENABLE_TTGIR_SCHED=1 keeps planning-only behavior.
+    // mode=decompose forces apply (explicit request, independent of env).
+    bool apply =
+        modeDecompose || triton::tools::getBoolEnv("TRITON_TTGIR_SCHED_APPLY");
+    const char *modeSuffix = apply ? "phase 3: applied" : "phase 3: plan only";
+
+    ModuleOp module = getOperation();
+    unsigned numForOps = 0;
+    unsigned numCandidateLoops = 0;
+    unsigned totalMfmaDots = 0;
+    unsigned totalSkipped = 0;
+    unsigned totalPlans = 0;
+    unsigned totalBwdInfeasible = 0;
+    unsigned totalFwdInfeasible = 0;
+    unsigned totalApplied = 0;
+
+    // Collect plans first so we don't iterate while we mutate.
+    struct LoopWork {
+      scf::ForOp forOp;
+      SmallVector<DotPartitionPlan> plans;
+      unsigned mfmaDotsSeen = 0;
+      unsigned mfmaDotsSkipped = 0;
+    };
+    SmallVector<LoopWork> work;
+
+    module.walk([&](scf::ForOp forOp) {
+      ++numForOps;
+      LoopWork lw;
+      lw.forOp = forOp;
+      collectPlans(forOp, lw.plans, lw.mfmaDotsSeen, lw.mfmaDotsSkipped);
+      if (lw.mfmaDotsSeen == 0)
+        return;
+      ++numCandidateLoops;
+      totalMfmaDots += lw.mfmaDotsSeen;
+      totalSkipped += lw.mfmaDotsSkipped;
+      totalPlans += lw.plans.size();
+      work.push_back(std::move(lw));
+    });
+
+    for (auto &lw : work) {
+      unsigned loopBwdInfeasible = 0;
+      unsigned loopFwdInfeasible = 0;
+      unsigned loopApplied = 0;
+      unsigned loopTotalProducerOps = 0;
+      unsigned loopTotalUserOps = 0;
+
+      // Process plans in reverse program order so erasing the dot doesn't
+      // invalidate later plans' references. (Each plan is independent — the
+      // dot's operands are siblings, not children — but reverse-order is the
+      // safe pattern.)
+      for (auto it = lw.plans.rbegin(); it != lw.plans.rend(); ++it) {
+        const auto &plan = *it;
+        triton::DotOp dot = plan.dotOp;
+        auto schemeOpt = backwardSliceForMSplit(plan);
+        if (!schemeOpt) {
+          ++loopBwdInfeasible;
+          ++totalBwdInfeasible;
+          dot.emitRemark() << "ttgir-sched: would M-split this dot into "
+                           << plan.numPartitions << " (blockM=" << plan.blockM
+                           << " / ctaTileM=" << plan.ctaTileM
+                           << "), but backward walker bailed (" << modeSuffix
+                           << ")";
+          continue;
+        }
+        unsigned producerCount = schemeOpt->ops.size();
+        loopTotalProducerOps += producerCount;
+
+        if (!extendSliceForwardFromDot(plan, *schemeOpt)) {
+          ++loopFwdInfeasible;
+          ++totalFwdInfeasible;
+          dot.emitRemark() << "ttgir-sched: would M-split this dot into "
+                           << plan.numPartitions << " (blockM=" << plan.blockM
+                           << " / ctaTileM=" << plan.ctaTileM
+                           << "), backward found " << producerCount
+                           << " producer op(s), forward walker bailed ("
+                           << modeSuffix << ")";
+          continue;
+        }
+        unsigned totalOps = schemeOpt->ops.size();
+        unsigned userCount = totalOps - producerCount;
+        loopTotalUserOps += userCount;
+
+        if (!apply) {
+          dot.emitRemark() << "ttgir-sched: would M-split this dot into "
+                           << plan.numPartitions << " (blockM=" << plan.blockM
+                           << " / ctaTileM=" << plan.ctaTileM
+                           << "), co-partitioning " << producerCount
+                           << " producer op(s) + " << userCount
+                           << " user op(s) (" << modeSuffix << ")";
+          continue;
+        }
+
+        // APPLY path: mutate IR.
+        if (failed(applyMSplit(plan, *schemeOpt))) {
+          ++loopFwdInfeasible; // bookkeeping: treat apply failure as infeasible
+          ++totalFwdInfeasible;
+          continue;
+        }
+        ++loopApplied;
+        ++totalApplied;
+      }
+
+      // (modeSuffix declared at outer scope)
+      lw.forOp.emitRemark()
+          << "ttgir-sched: candidate inner loop with " << lw.mfmaDotsSeen
+          << " MFMA tt.dot op(s); plans " << lw.plans.size() << ", skipped "
+          << lw.mfmaDotsSkipped << ", bwd-infeasible " << loopBwdInfeasible
+          << ", fwd-infeasible " << loopFwdInfeasible << ", applied "
+          << loopApplied << ", co-partition producer-ops "
+          << loopTotalProducerOps << " + user-ops " << loopTotalUserOps << " ("
+          << modeSuffix << ")";
     }
+
+    module.emitRemark() << "ttgir-sched: visited " << numForOps
+                        << " scf.for op(s), " << numCandidateLoops
+                        << " candidate(s), " << totalMfmaDots
+                        << " MFMA tt.dot op(s), " << totalPlans
+                        << " planned M-split(s), " << totalSkipped
+                        << " skipped, " << totalBwdInfeasible
+                        << " bwd-infeasible, " << totalFwdInfeasible
+                        << " fwd-infeasible, " << totalApplied << " applied ("
+                        << modeSuffix << ")";
   }
 };
+
 } // namespace
 
 } // namespace mlir

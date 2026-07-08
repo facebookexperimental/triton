@@ -306,6 +306,12 @@ class HIPBackend(BaseBackend):
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
         amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
+        # Phase 0 — opt-in TTGIR-level scheduler scaffold. No-ops unless
+        # TRITON_ENABLE_TTGIR_SCHED=1 (also re-checked inside the pass).
+        # Subsequent phases (M/N split + scheduling) will land behind the
+        # same gate. See ~/AMD/triton/claude/llir_sched_at_ttgir_{design,plan}.md.
+        if os.environ.get("TRITON_ENABLE_TTGIR_SCHED"):
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
