@@ -5481,15 +5481,28 @@ static unsigned computeMemDescBytes(ttg::MemDescType ty) {
   return static_cast<unsigned>(numElems * ty.getElementTypeBitWidth() / 8);
 }
 
+// Prototype opt-in (T278685041 SMEM follow-up): neutral-backing reuse. See
+// areReuseEncodingsCompatible in WSMemoryPlanner.cpp.
+static bool neutralReuseEnabled() {
+  const char *e = std::getenv("TRITON_WS_NEUTRAL_REUSE");
+  return e && StringRef(e) == "1";
+}
 // Conservative check: only allow reuse when both the staging and host
 // memdescs share the exact same encoding Attribute. Different swizzle
 // patterns would make memdesc_reinterpret unsound because TMA reads
 // would interpret bytes differently.
+//
+// With neutral-backing reuse enabled, mismatched encodings are realized through
+// per-view memdesc_reinterpret over a shared backing, so only the memory space
+// must match (byte-fit is checked separately against hostBytes).
 static bool areEncodingsCompatibleForReuse(ttg::MemDescType host,
                                            ttg::MemDescType staging) {
-  return host.getEncoding() == staging.getEncoding() &&
-         host.getMemorySpace() == staging.getMemorySpace() &&
-         host.getElementType() == staging.getElementType();
+  if (host.getEncoding() == staging.getEncoding() &&
+      host.getMemorySpace() == staging.getMemorySpace() &&
+      host.getElementType() == staging.getElementType())
+    return true;
+  return neutralReuseEnabled() &&
+         host.getMemorySpace() == staging.getMemorySpace();
 }
 
 void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
@@ -5524,8 +5537,9 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
       return;
     auto stagingAttr =
         stagingAlloc->getAttrOfType<IntegerAttr>("buffer.tmaStaging");
-    if (!stagingAttr)
-      return; // only TMA stagings carry reuseTarget in practice
+    if (!stagingAttr && !neutralReuseEnabled())
+      return; // by default only TMA stagings carry reuseTarget in practice;
+              // neutral-backing reuse also realizes non-staging reusers
     stagingsByHostId[reuseAttr.getInt()].push_back(stagingAlloc);
   });
 

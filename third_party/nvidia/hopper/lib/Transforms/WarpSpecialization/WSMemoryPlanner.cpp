@@ -1690,6 +1690,15 @@ static int getLastConsumerOrder(const WSBuffer &buf,
 /// silently drops it and emits the buffer standalone — under-counting the real
 /// footprint and surfacing as an OutOfResources at codegen (T277224987, e.g. a
 /// 128x32 swizzle=64 dk/dv store-staging vs a 128x128 swizzle=128 operand).
+// Prototype opt-in (T278685041 SMEM follow-up): neutral-backing reuse allows a
+// candidate to alias a target of DIFFERENT encoding/element-type by realizing
+// the alias class through one memdesc_reinterpret per view over a shared backing
+// (mergeStagingReuseIntoHost). Off by default so existing behavior/tests are
+// unchanged.
+static bool neutralReuseEnabled() {
+  const char *e = std::getenv("TRITON_WS_NEUTRAL_REUSE");
+  return e && StringRef(e) == "1";
+}
 static bool areReuseEncodingsCompatible(const WSBuffer &candidate,
                                         const WSBuffer &target) {
   auto candAlloc = dyn_cast_or_null<ttg::LocalAllocOp>(candidate.allocOp);
@@ -1698,9 +1707,15 @@ static bool areReuseEncodingsCompatible(const WSBuffer &candidate,
     return true; // non-SMEM allocs: leave existing behavior unchanged
   auto candTy = candAlloc.getType();
   auto tgtTy = tgtAlloc.getType();
-  return candTy.getEncoding() == tgtTy.getEncoding() &&
-         candTy.getMemorySpace() == tgtTy.getMemorySpace() &&
-         candTy.getElementType() == tgtTy.getElementType();
+  if (candTy.getEncoding() == tgtTy.getEncoding() &&
+      candTy.getMemorySpace() == tgtTy.getMemorySpace() &&
+      candTy.getElementType() == tgtTy.getElementType())
+    return true;
+  // Neutral-backing reuse: tolerate mismatched encoding/element-type as long as
+  // both live in the same memory space. Byte-fit is enforced separately (the
+  // size*copies check in findReuseCandidate and mergeStagingReuseIntoHost).
+  return neutralReuseEnabled() &&
+         candTy.getMemorySpace() == tgtTy.getMemorySpace();
 }
 
 /// Find an allocated buffer that a non-innermost candidate can reuse.
@@ -1784,7 +1799,14 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     // Tiebreak: within the same linearOrder, prefer the target whose last
     // consumer appears earlier in program order (its SMEM is free sooner).
     bool isBetter = false;
-    if (effectiveOrder < bestOrder.linearOrder) {
+    if (neutralReuseEnabled() && !best) {
+      // Neutral-backing prototype: consumer order is often unknown at this
+      // point (loop.stage not yet assigned -> lastConsumerOrder=-1 ->
+      // effectiveOrder=INT_MAX), which would leave the strict-order heuristic
+      // unable to pick any target. Fall back to first-fit so a byte-fit,
+      // liveness-non-overlapping (already checked) target is selected.
+      isBetter = true;
+    } else if (effectiveOrder < bestOrder.linearOrder) {
       isBetter = true;
     } else if (effectiveOrder == bestOrder.linearOrder &&
                bestOrder.linearOrder != INT_MAX && order.lastOp &&
