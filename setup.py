@@ -327,7 +327,7 @@ class CMakeBuild(build_ext):
         # Build a drop-in libstdc++.so.6 and install it into the LLVM lib dir; the
         # tools have RUNPATH "$ORIGIN/../lib" so they pick it up with no env, for
         # any build invocation. See scripts/build-glibcxx-compat.sh.
-        if check_env_flag("TRITON_GLIBC_COMPAT"):
+        if check_env_flag("TRITON_LIBSTDCXX_COMPAT"):
             compat_dir = os.path.join(self.build_temp, "glibcxx-compat")
             # LLVM_SYSPATH is required by the build (CMake fatal-errors without it).
             llvm_lib = os.path.join(os.environ["LLVM_SYSPATH"], "lib")

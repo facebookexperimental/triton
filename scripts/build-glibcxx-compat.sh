@@ -26,19 +26,17 @@
 #   * DT_NEEDEDs the real lib (copied under the renamed soname
 #     "libstdc++_base.so.6") so every other symbol resolves against it.
 #
-# The two resulting .so files are installed into each <install_dir> (typically
-# the prebuilt LLVM's lib/ dir): the LLVM tools have RUNPATH "$ORIGIN/../lib", so
-# dropping the drop-in libstdc++.so.6 there makes clang++/mlir-tblgen/opt/... pick
-# it up with no LD_LIBRARY_PATH, robust to any build invocation. It is a
-# build-host workaround (writes only into the per-user LLVM cache) and is not
-# shipped.
+# The two resulting .so files are installed into <install_dir> (the prebuilt
+# LLVM's lib/ dir): the LLVM tools have RUNPATH "$ORIGIN/../lib", so dropping the
+# drop-in libstdc++.so.6 there makes clang++/mlir-tblgen/opt/... pick it up
+# automatically, robust to any build invocation. It is a build-host workaround
+# (writes only into the per-user LLVM cache) and is not shipped.
 #
-# Usage: build-glibcxx-compat.sh <output_dir> [install_dir ...]
+# Usage: build-glibcxx-compat.sh <output_dir> <install_dir>
 set -euo pipefail
 
-OUT_DIR="${1:?usage: build-glibcxx-compat.sh <output_dir> [install_dir ...]}"
-shift
-INSTALL_DIRS=("$@")
+OUT_DIR="${1:?usage: build-glibcxx-compat.sh <output_dir> <install_dir>}"
+INSTALL_DIR="${2:?usage: build-glibcxx-compat.sh <output_dir> <install_dir>}"
 mkdir -p "$OUT_DIR"
 
 # Locate the real system libstdc++.so.6.
@@ -56,14 +54,11 @@ BASE="$OUT_DIR/libstdc++_base.so.6"
 AUG="$OUT_DIR/libstdc++.so.6"
 STAMP="$OUT_DIR/.glibcxx-compat.stamp"
 
-# Install the drop-in + renamed base into each requested dir (e.g. LLVM/lib).
+# Install the drop-in + renamed base into the target dir (e.g. LLVM/lib).
 install_compat() {
-    for d in "${INSTALL_DIRS[@]}"; do
-        [ -n "$d" ] || continue
-        mkdir -p "$d"
-        cp -f "$AUG" "$BASE" "$d/"
-        echo "glibcxx-compat: installed into $d"
-    done
+    mkdir -p "$INSTALL_DIR"
+    cp -f "$AUG" "$BASE" "$INSTALL_DIR/"
+    echo "glibcxx-compat: installed into $INSTALL_DIR"
 }
 
 # Skip the (re)build if already built against the same base lib, but still
