@@ -152,9 +152,11 @@ def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
 @pytest.mark.parametrize("Lq,Lkv,Z", _SHARED_SHAPES)
 def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
     """MANUAL 2-KV-block data-partition reduce_dq (BwdVariant.TRITON_AUTOWS_2KV),
-    shared-KV + compute fold, warp specialization OFF (milestone 1). Two KV
-    blocks are processed per step explicitly in Triton so the compiler DP pass
-    never runs. Must match the torch-float reference."""
+    shared-KV + compute fold, warp specialization ON (milestone 2). Two KV blocks
+    are processed per step explicitly in Triton, with DISJOINT per-block
+    buffer.ids (_2KV for b0, _2KV_B1 for b1) so their concurrently-live tiles
+    never alias -- the manual equivalent of the compiler DP per-half id-remap.
+    The compiler DP pass never runs. Must match the torch-float reference."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
 
@@ -165,8 +167,10 @@ def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
     _reset_captured_globals(xa)
 
     # BLOCK_N=128 -> the manual 2-KV loop supplies parallelism, no compiler DP.
-    # BLOCK_M=32: the fold MMA-accumulates both blocks' dk in TMEM (256 cols
-    # fixed); with WS off, BLOCK_M>=64 overflows the 512-col TMEM (milestone 2).
+    # BLOCK_M=32: WS on keeps qk/dp/dk disjoint per block (dq is a shared
+    # accumulator), so TMEM stays ~448 cols; BLOCK_M>=64 overflows the 512-col
+    # TMEM (the disjoint dp/qk tiles cost 2x). Recovering a larger BLOCK_M needs
+    # sharing dp/qk across blocks (TLX-style depth-1) -- deferred.
     bb.force(ns, bm=32, bn=128)
     torch.manual_seed(0)
     q, k, v, do, so_kv, so_q, asc = bb.make(Lq, Lkv, Z, shared=True)
@@ -175,7 +179,9 @@ def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
 
     for t in (q, k, v):
         t.grad = None
-    bb._fwd(xa.BwdVariant.TRITON_AUTOWS_2KV, "0", q, k, v, so_kv, so_q, Lkv, Lq,
+    # ws="1" -> TRITON_USE_META_WS=1 (meta warp specialization enabled), required
+    # now that the kernel is dispatched with WS_ON=True.
+    bb._fwd(xa.BwdVariant.TRITON_AUTOWS_2KV, "1", q, k, v, so_kv, so_q, Lkv, Lq,
             asc, shared=True).backward(do)
     dq, dk = q.grad.clone(), k.grad.clone()
     for name, got, want in (("dq", dq, rq), ("dk", dk, rk)):

@@ -127,11 +127,16 @@ _HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs(
 # for SHARED_KV + DP and _HSTU_COMPUTE_FOLD
 # --> we can do dk += dot(...) dk += dot(...)
 # --> we use "dk_shared" instead of "dk"
+# Block b0 schedule. dq (opndD id 11) is a SINGLE accumulator SHARED with block
+# b1: both blocks MMA-accumulate dq^T into the same TMEM tile (dq is a reduction
+# over KV blocks -- like the hand-written attn_bwd_ws_2kv), then ONE store. So
+# dpT must NOT time-share id 11 with dq (as the single-KV _TLX schedule does); it
+# gets its own tile (id 5). Everything else (qkT/S+P id 2, dv/dk id 7) is b0's.
 _HSTU_BWD_DOT_ATTRS_2KV = FrozenDotAttrs(
     {
         "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
         "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
-        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,11"]},
+        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
         "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
         "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
         "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
@@ -167,6 +172,33 @@ _HSTU_ATTRS_DPT_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dpT"))
 _HSTU_ATTRS_DK_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dk"))
 _HSTU_ATTRS_DK_SHARED_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dk_shared"))
 _HSTU_ATTRS_DQ_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dq"))
+
+# MANUAL 2-KV DP (milestone 2): with warp specialization ON, the two KV blocks'
+# per-block MMAs run concurrently and their operand/accumulator tiles are
+# simultaneously live, so block b1 uses DISJOINT buffer.ids from b0 (which keeps
+# _2KV above) for qkT/S+P (2->12), dv/dk (7->17), dpT (5->15), and the smem
+# operands (8->9). This is the hand-written equivalent of the per-half id-remap
+# the compiler DP pass is supposed to synthesize. The ONE exception is dq's
+# accumulator (opndD id 11): it is INTENTIONALLY shared -- dq is a reduction over
+# both KV blocks, accumulated into one TMEM tile and stored once.
+_HSTU_BWD_DOT_ATTRS_2KV_B1 = FrozenDotAttrs(
+    {
+        "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,12"]},
+        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,12", "opndD,tmem,1,17"]},
+        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,15"]},
+        "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,20"]},
+        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,17"]},
+        # dq opndD id 11 is SHARED with b0 (single dq accumulator over both KV
+        # blocks); only its input operand (opndB smem) is b1's own (id 9).
+        "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,9", "opndD,tmem,1,11"]},
+    }
+)
+_HSTU_ATTRS_QKT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("qkT"))
+_HSTU_ATTRS_DV_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dv"))
+_HSTU_ATTRS_DPT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dpT"))
+_HSTU_ATTRS_DK_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dk"))
+_HSTU_ATTRS_DK_SHARED_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dk_shared"))
+_HSTU_ATTRS_DQ_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dq"))
 
 # "compute fold": fold dk_attn (dqk @ q) into the dv/dk accumulator (TLX 2kv
 # parity) instead of a separate dk_attn tile + register add. Kept behind a
@@ -2050,9 +2082,10 @@ def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
             pre_hook=_bwd_pre_hook_redq_v3,
         )
         # BLOCK_M=32: the compute fold MMA-accumulates BOTH KV blocks' dk in
-        # TMEM (2 x DimQ=256 cols fixed), so with warp-specialization OFF the
-        # per-Q-block transients must stay small to fit the 512-col TMEM limit.
-        # BLOCK_M>=64 overflows TMEM (milestone 2 recovers it via WS/TMEM reuse).
+        # TMEM (2 x DimQ=256 cols fixed). Even with warp specialization ON, the
+        # per-block disjoint qk/dp/dk tiles push BLOCK_M>=64 over the 512-col
+        # TMEM limit (dq is a single shared accumulator). Sharing dp/qk across
+        # blocks (TLX-style depth-1) to recover a larger BLOCK_M is deferred.
         for M in [32]
         for N in [128]
         for ns in [2]
@@ -2133,8 +2166,10 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
     """MANUAL 2-KV-block data-partition fork of `_hstu_attn_bwd_redq`.
 
     Steps the KV loop by 2*BLOCK_N and dispatches `_hstu_attn_bwd_inner_2kv`
-    (two KV blocks per call). An odd leftover BLOCK_N block is processed with
-    the single-KV `_hstu_attn_bwd_inner`. SHARED_KV + compute-fold only.
+    (two KV blocks per call), rounding the block count up so an odd leftover
+    block is handled by the same 2-KV inner with its second block fully masked
+    (no separate single-KV tail, whose buffer.ids would clash under WS).
+    SHARED_KV + compute-fold only.
     """
     tl.static_assert(SHARED_KV, "_hstu_attn_bwd_redq_2kv is SHARED_KV only")
     tl.static_assert(not PER_KV_HEAD, "_hstu_attn_bwd_redq_2kv requires G == 1")
@@ -2207,57 +2242,17 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
     )
 
     # Pair up BLOCK_N KV blocks: process two blocks per _hstu_attn_bwd_inner_2kv
-    # call. An odd leftover block is handled by the single-KV inner below.
+    # call, rounding the block count UP so an odd leftover block is handled by
+    # the SAME 2-KV inner with its second block (b1) fully masked -- b1's dq
+    # contribution is zero and its dk1 store lands past end_kv (dropped by the
+    # desc_dk TMA bounds). This avoids a separate single-KV tail inner, whose
+    # distinct TLX buffer.ids collide with the 2-KV ids and crash the WS pass.
     n_blocks = tl.cdiv(seq_len_kv, BLOCK_N)
-    paired_blocks = (n_blocks // 2) * 2
-    pair_end_n = paired_blocks * BLOCK_N
+    n_pairs = tl.cdiv(n_blocks, 2)
+    pair_end_n = n_pairs * 2 * BLOCK_N
     for start_n in tl.range(0, pair_end_n, 2 * BLOCK_N):
         _hstu_attn_bwd_inner_2kv(
             start_n,
-            seq_start_kv,
-            seq_len_kv,
-            seq_start_q,
-            seq_len_q,
-            desc_q,
-            desc_k,
-            desc_v,
-            desc_do,
-            desc_dk,
-            desc_dq,
-            DV,
-            stride_qh,
-            stride_kh,
-            stride_vh,
-            stride_doh,
-            stride_dvn,
-            stride_dvh,
-            alpha,
-            attn_scale,
-            M,
-            Delta,
-            stride_mm,
-            off_h,
-            off_h_kv,
-            H_kv,
-            uih_len_q,
-            num_softmax_heads,
-            DimQ,
-            DimV,
-            ALLOW_TF32,
-            BLOCK_M,
-            BLOCK_N,
-            ATTN_SCALE_TYPE,
-            G > 1,  # GQA_ATOMIC_ADD
-            SHARED_KV,
-            True,  # MASK_KV
-            HAS_CAUSAL,
-            AUTOWS,
-            WS_ON,
-        )
-    if n_blocks % 2 == 1:
-        tail_start_n = (n_blocks - 1) * BLOCK_N
-        _hstu_attn_bwd_inner(
-            tail_start_n,
             seq_start_kv,
             seq_len_kv,
             seq_start_q,
@@ -3812,8 +3807,19 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     else:
         low_q = 0
 
+    # merge_epilogue is intentionally OFF (unlike the single-KV inner). Folding
+    # the dq epilogue store into the computation partition duplicates/misplaces
+    # the store for the two-block shared dq accumulator, over-counting dq (norm
+    # ratio ~1.37) while dk stays correct. A separate epilogue partition stores
+    # dq once, correctly. warp_specialize stays ON.
+    #
+    # num_stages=1: warp specialization already supplies the parallelism; software
+    # pipelining the two-block loop (num_stages>=2) trips the pipeliner
+    # ("local_alloc can't predicate") on the doubled operand allocs, so the loop
+    # pipeline depth is pinned to 1 here regardless of the kernel num_stages.
     for start_m in tl.range(
-        low_q, seq_len_q, BLOCK_M, warp_specialize=WS_ON, merge_epilogue=WS_ON
+        low_q, seq_len_q, BLOCK_M, num_stages=1,
+        warp_specialize=WS_ON, merge_epilogue=False,
     ):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
@@ -3863,7 +3869,11 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             )
         # compute fold: pre-scale alpha into dqk so both dq and dk_attn carry it.
         dqk_trans0 = (dqk_trans0 * alpha).to(k0.dtype)
-        dq0_trans = tl.dot(
+        # dq is a SINGLE accumulator over both KV blocks: b0 fresh-writes it, b1
+        # accumulates into the same TMEM tile (opndD id 11) below. This avoids a
+        # cross-partition register sum (dq0 and dq1 land in different warp
+        # partitions under WS) and a two-store race, and needs one TMEM tile.
+        dq_trans = tl.dot(
             tl.trans(k0), dqk_trans0,
             attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
         )
@@ -3873,9 +3883,11 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         )
 
         # ---- KV block b1 (SHARED_KV + compute fold) ----
+        # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
+        # tiles never alias b0's (which stays on _2KV).
         qk_trans1 = tl.dot(
             k1, tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_QKT_2KV_B1 if WS_ON else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans1 = backward_valid_mask(
@@ -3896,11 +3908,11 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             )
         dact_qk_trans1 = tl.dot(
             v1, tl.trans(do), allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DPT_2KV_B1 if WS_ON else None,
         )
         dk1 = tl.dot(
             act_qk_trans1, do, dk1, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DV_2KV_B1 if WS_ON else None,
         )
         if num_softmax_heads > 0:
             dqk_trans1 = backward_d_softmax_activation(
@@ -3911,17 +3923,18 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
                 dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1
             )
         dqk_trans1 = (dqk_trans1 * alpha).to(k1.dtype)
-        dq1_trans = tl.dot(
-            tl.trans(k1), dqk_trans1,
-            attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
+        # Accumulate b1's dq into the SAME dq_trans TMEM tile (opndD id 11 via
+        # _B1), reducing both KV blocks' contributions in TMEM.
+        dq_trans = tl.dot(
+            tl.trans(k1), dqk_trans1, dq_trans,
+            attrs=_HSTU_ATTRS_DQ_2KV_B1 if WS_ON else None,
         )
         dk1 = tl.dot(
             dqk_trans1, q, dk1, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DK_SHARED_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DK_SHARED_2KV_B1 if WS_ON else None,
         )
 
-        # dq reduces the contributions from BOTH KV blocks; ONE store per Q.
-        dq_trans = dq0_trans + dq1_trans
+        # ONE store per Q: dq_trans already holds b0+b1.
         dq = tl.trans(dq_trans)
         desc_dq.store(
             [q_offset.to(tl.int32), DimQ * off_h],
@@ -4356,9 +4369,11 @@ def triton_hstu_cross_attn_v3_bwd(
             HAS_CAUSAL=HAS_CAUSAL,
             HAS_NUM_TARGETS=HAS_NUM_TARGETS,
             PER_KV_HEAD=False,
+            # AUTOWS=False keeps the compiler DP pass from ever running; the
+            # manual 2-KV loop + disjoint b0/b1 buffer.ids do the partitioning.
             AUTOWS=False,
-            # Milestone 1: warp specialization OFF (get numerics right first).
-            WS_ON=False,
+            # Milestone 2: warp specialization ON.
+            WS_ON=True,
         )
     else:
         grid = lambda meta: (Z * H, 1)  # noqa E731
