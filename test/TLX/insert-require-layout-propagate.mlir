@@ -301,7 +301,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #mma_7 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
 #shared_7 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 // CHECK-DAG: #[[$PADDED_A_SUB:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
-// CHECK-DAG: #[[$PADDED_B_SUB:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PADDED_B_SUB:.*]] = #ttg.padded_shared<[128:+16] {order = [1, 0], shape = [128, 32]}>
 #smem_7 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_full_tile_subslices_feed_dot
@@ -345,6 +345,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #shared_8 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #shared_8_trans = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 // CHECK-DAG: #[[$PADDED_A_TRANS:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
+// CHECK-DAG: #[[$PADDED_B_TRANS:.*]] = #ttg.padded_shared<[128:+16] {order = [1, 0], shape = [32, 128]}>
 #smem_8 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_transposed_b_subslice_trans_feed_dot
@@ -354,20 +355,20 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma_8>
     // CHECK: %[[ALLOC_A:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable>
     %alloc_a = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #shared_8, #smem_8, mutable>
-    // CHECK: %[[ALLOC_B:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable>
+    // CHECK: %[[ALLOC_B:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable>
     %alloc_b = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #shared_8, #smem_8, mutable>
     // CHECK: %[[BUF_A:.*]] = ttg.memdesc_index %[[ALLOC_A]][%{{.*}}] : !ttg.memdesc<2x32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable>
     %buf_a = ttg.memdesc_index %alloc_a[%c0] : !ttg.memdesc<2x32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
-    // CHECK: %[[BUF_B:.*]] = ttg.memdesc_index %[[ALLOC_B]][%{{.*}}] : !ttg.memdesc<2x32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable>
+    // CHECK: %[[BUF_B:.*]] = ttg.memdesc_index %[[ALLOC_B]][%{{.*}}] : !ttg.memdesc<2x32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable>
     %buf_b = ttg.memdesc_index %alloc_b[%c0] : !ttg.memdesc<2x32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
     %tok_a = amdg.async_tdm_copy_global_to_local %desc_a[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<tensor<32x128xf16>> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
     // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF_B]]
     %tok_b = amdg.async_tdm_copy_global_to_local %desc_b[%n, %k] into %buf_b, pred = %p : !tt.tensordesc<tensor<32x128xf16>> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
     // CHECK: %[[SUB_A:.*]] = ttg.memdesc_subslice %[[BUF_A]][0, 64] : !ttg.memdesc<32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_A_TRANS]], #smem, mutable, 32x128>
     %sub_a = ttg.memdesc_subslice %buf_a[0, 64] : !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x32xf16, #shared_8, #smem_8, mutable, 32x128>
-    // CHECK: %[[SUB_B:.*]] = ttg.memdesc_subslice %[[BUF_B]][0, 64] : !ttg.memdesc<32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_A_TRANS]], #smem, mutable, 32x128>
+    // CHECK: %[[SUB_B:.*]] = ttg.memdesc_subslice %[[BUF_B]][0, 64] : !ttg.memdesc<32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_B_TRANS]], #smem, mutable, 32x128>
     %sub_b = ttg.memdesc_subslice %buf_b[0, 64] : !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x32xf16, #shared_8, #smem_8, mutable, 32x128>
-    // CHECK: %[[TRANS_B:.*]] = ttg.memdesc_trans %[[SUB_B]] {order = array<i32: 1, 0>} : !ttg.memdesc<32x32xf16, #[[$PADDED_A_TRANS]], #smem, mutable, 32x128> -> !ttg.memdesc<32x32xf16, #{{.*}}, #smem, mutable, 128x32>
+    // CHECK: %[[TRANS_B:.*]] = ttg.memdesc_trans %[[SUB_B]] {order = array<i32: 1, 0>} : !ttg.memdesc<32x32xf16, #[[$PADDED_B_TRANS]], #smem, mutable, 32x128> -> !ttg.memdesc<32x32xf16, #{{.*}}, #smem, mutable, 128x32>
     %trans_b = ttg.memdesc_trans %sub_b {order = array<i32: 1, 0>} : !ttg.memdesc<32x32xf16, #shared_8, #smem_8, mutable, 32x128> -> !ttg.memdesc<32x32xf16, #shared_8_trans, #smem_8, mutable, 128x32>
     // CHECK: %[[A:.*]] = ttg.local_load %[[SUB_A]] : !ttg.memdesc<32x32xf16, #[[$PADDED_A_TRANS]], #smem, mutable, 32x128> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
     %a = ttg.local_load %sub_a : !ttg.memdesc<32x32xf16, #shared_8, #smem_8, mutable, 32x128> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_8, kWidth = 8}>>
@@ -390,7 +391,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 
 #mma_9 = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
 #shared_9 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
-// CHECK-DAG: #[[$PADDED_RESHAPE:.*]] = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-DAG: #[[$PADDED_RESHAPE:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
 #smem_9 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_full_tile_reshape_dot
