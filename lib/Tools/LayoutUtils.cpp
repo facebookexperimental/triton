@@ -245,7 +245,7 @@ std::optional<ColumnAction> regPermForDivide(const LinearLayout &A,
   llvm::DenseMap<StringAttr, unsigned> log2QuotSize;
   for (StringAttr out : A.getOutDimNames()) {
     log2QuotSize[out] =
-        A.getOutDimSizeLog2(out) - BBroadcast.getOutDimSizeLog2(out);
+        A.getOutDimSizeBits(out) - BBroadcast.getOutDimSizeBits(out);
     if (log2QuotSize[out] < 0)
       return std::nullopt;
   }
@@ -513,7 +513,7 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
   // Precompute tile out-dim bit-widths.
   llvm::SmallDenseMap<StringAttr, int> outBLog2;
   for (StringAttr od : cvt.getOutDimNames())
-    outBLog2[od] = tile.hasOutDim(od) ? tile.getOutDimSizeLog2(od) : 0;
+    outBLog2[od] = tile.hasOutDim(od) ? tile.getOutDimSizeBits(od) : 0;
 
   // Build a per-out-dimension mask by OR-ing all tile bases that touch it.
   llvm::SmallDenseMap<StringAttr, int32_t> tileMaskPerOutDim;

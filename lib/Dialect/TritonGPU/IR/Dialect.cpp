@@ -377,6 +377,16 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
     }
+    // Round NPOT tile dims up to pow2 so MMA reps don't read past the buffer
+    // (nvmmaSharedToLinearLayout rounds internally). Only the trailing dims the
+    // swizzle covers -- rounding a leading multi-buffer dim would bill 6 stages
+    // as 8 and waste SMEM. Pow2 shapes are unchanged (NextPowerOf2 is a no-op).
+    unsigned tileRank = sharedMMALayout.getCGALayout().getRank();
+    size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
+    for (size_t i = firstTileDim; i < shape.size(); ++i) {
+      if (!llvm::isPowerOf2_64(shape[i]))
+        shape[i] = llvm::NextPowerOf2(shape[i]);
+    }
   }
   return getShapePerCTA(layout, shape);
 }
@@ -3832,7 +3842,7 @@ std::string mlir::triton::gpu::getDistributedLayoutStr(LinearLayout &ll,
   StringAttr kWarp = StringAttr::get(ctx, "warp");
   StringAttr kBlock = StringAttr::get(ctx, "block");
 
-  int64_t tensorSize = ll.getTotalOutDimSize();
+  int64_t tensorSize = ll.getTotalOutDimSizeProduct();
   std::vector<std::string> elementMapping(tensorSize);
   std::vector<std::string> threadMapping;
   auto shape = convertType<int64_t>(llvm::to_vector(ll.getOutDimSizes()));
