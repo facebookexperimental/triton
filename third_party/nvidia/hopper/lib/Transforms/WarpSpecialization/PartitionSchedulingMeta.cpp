@@ -1265,7 +1265,18 @@ preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
     }
   }
 
-  if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule) {
+  // Shared ops (in >1 MMA backward slice) are centralized in the default
+  // partition. But when the default IS the reduction partition (bwd TMA-reduce
+  // kernels with no correction partition), sinking the shared softmax/ds
+  // compute chain into reduction forces cross-partition (reduction->computation)
+  // SMEM transports of its MMA operands. Mirror the Phase-4 load-user guard
+  // (getInitialSchedule: defaultPartition != reductionPartition): skip the
+  // reduction sink and let propagatePartitions place these ops in the
+  // computation partition(s) that actually consume them. See
+  // docs/PartitionSchedulingMeta.md (reduction holds only TMA-reduce + pre-loop
+  // tmem_stores).
+  if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule &&
+      layout.defaultPartition != layout.reductionPartition) {
     for (Operation *sharedOp : categorizer.getSharedOps()) {
       if (!isa<arith::ConstantOp>(sharedOp))
         tryScheduleOp(layout.defaultPartition, sharedOp);
