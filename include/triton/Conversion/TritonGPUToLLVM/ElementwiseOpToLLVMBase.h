@@ -7,6 +7,7 @@
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "llvm/Support/MathExtras.h" // Log2_64
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -89,8 +90,13 @@ public:
     auto invReg = inv.sublayout(dims, {kReg});
     auto bases_inv = invReg.getBases();
     for (auto [c, d] : llvm::zip(constancy, dims)) {
-      assert(llvm::isPowerOf2_32(c));
-      for (int i = 0; i < llvm::Log2_32(c); i++) {
+      // Clamp constancy to its largest pow2 divisor (c & -c) before Log2; NPOT
+      // constancy (e.g. 48) would mis-floor. c is a multiple of it, so the
+      // zeroed low bits never cross a constancy block boundary. Pow2 c: no-op.
+      if (c == 0)
+        continue; // Log2_64(0) is UB; nothing to dedup
+      int64_t pow2C = c & (-c);
+      for (int i = 0; i < llvm::Log2_64(pow2C); i++) {
         bases_inv[d][i] = {0};
       }
     }

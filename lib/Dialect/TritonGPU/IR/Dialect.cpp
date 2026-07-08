@@ -3601,13 +3601,19 @@ struct TritonGPUVerifyTensorLayoutInterface
                          << rankedTy.getShape()
                          << " which is not a power of two.";
       }
-      return makeErr()
-             << "NPOT layout not yet supported: tensor shape "
-             << rankedTy.getShape()
-             << " has a non-power-of-2 dimension that is not supported by this "
-                "distributed layout's lowering in this build yet "
-                "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
-                "NPOT slice).";
+      // Layouts whose modular (non-power-of-2) lowering is implemented.
+      bool npotLoweringImplemented =
+          isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr>(
+              layout);
+      if (!npotLoweringImplemented) {
+        return makeErr()
+               << "NPOT layout not yet supported: tensor shape "
+               << rankedTy.getShape()
+               << " has a non-power-of-2 dimension that is not supported by "
+                  "this distributed layout's lowering in this build yet "
+                  "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
+                  "NPOT slice).";
+      }
     }
     auto ll = toLinearLayout(rankedTy);
     ModuleOp module = op->getParentOfType<ModuleOp>();
