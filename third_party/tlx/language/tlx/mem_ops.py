@@ -25,6 +25,10 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
         assert mask is not None, "when other is set, mask must also be set"
 
 
+def _value_or_empty(value):
+    return value.handle if value is not None else ir.value()
+
+
 @tl.builtin
 def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
     """
@@ -55,8 +59,8 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         other = _semantic.cast(other, ptr.type.scalar.element_ty)
         offsets, other = _semantic.broadcast_impl_value(offsets, other)
 
-    mask_handle = mask.handle if mask is not None else None
-    other_handle = other.handle if other is not None else None
+    mask_handle = _value_or_empty(mask)
+    other_handle = _value_or_empty(other)
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
@@ -93,7 +97,7 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
         offsets, stored_value = _semantic.broadcast_impl_value(offsets, stored_value)
         offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
 
-    mask_handle = mask.handle if mask is not None else None
+    mask_handle = _value_or_empty(mask)
     cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     _semantic.builder.create_buffer_store(stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
@@ -138,8 +142,8 @@ def buffer_load_to_local(
         other = _semantic.cast(other, ptr.type.scalar.element_ty)
         offsets, other = _semantic.broadcast_impl_value(offsets, other)
 
-    mask_handle = mask.handle if mask is not None else None
-    other_handle = other.handle if other is not None else None
+    mask_handle = _value_or_empty(mask)
+    other_handle = _value_or_empty(other)
     cache_mod = _semantic._str_to_load_cache_modifier(cache_modifier) if cache_modifier else ir.CACHE_MODIFIER.NONE
 
     handle = _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask_handle,
@@ -352,8 +356,8 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
             raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
         layout_handle = layout.to_ir(_semantic.builder)
 
-    alias_handle = None
-    shared_buffer_handle = None
+    alias_handle = ir.value()
+    shared_buffer_handle = ir.value()
     if reuse:
         if isinstance(reuse, tlx.buffered_tensor):
             # Legacy behavior: reuse an existing buffer's memory
@@ -721,8 +725,8 @@ def async_load(
             _semantic.builder.create_async_load(
                 src.handle,
                 result.handle,
-                None,
-                None,
+                ir.value(),
+                ir.value(),
                 cache,
                 eviction,
                 is_volatile,
@@ -763,13 +767,13 @@ def async_load(
         _semantic.builder.create_async_load(
             src.handle,
             result.handle,
-            mask.handle if mask else None,
-            other.handle if other else None,
+            _value_or_empty(mask),
+            _value_or_empty(other),
             cache,
             eviction,
             is_volatile,
-            None,
-            None,
+            ir.value(),
+            ir.value(),
             False,
         ))
 
@@ -823,11 +827,11 @@ def local_load(
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
         tmem_compatible_layout_encoding = _create_tmem_compatible_tensor_layout_encoding(_semantic.builder, src)
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
-                                                         token.handle if token else None)
+                                                         _value_or_empty(token))
         output = _semantic.builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
     else:
-        output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
+        output = _semantic.builder.create_local_load(src.handle, _value_or_empty(token))
         result = tl.tensor(output, block_type)
         if relaxed:
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
@@ -1080,12 +1084,70 @@ def _layouts_match(actual, expected):
     return False
 
 
+def _updated_tensor_descriptor(desc, handle):
+    if isinstance(desc, tl.tensor_descriptor):
+        return tl.tensor_descriptor(handle, list(desc.shape.values), list(desc.strides.values), desc.block_type)
+    return tl.tensor_descriptor_base(handle, desc.block_type)
+
+
+@tl.builtin
+def update_tensor_descriptor(
+    desc: tl.tensor_descriptor_base,
+    add_offsets: Optional[list[tl.tensor]] = None,
+    set_bounds: Optional[list[tl.tensor]] = None,
+    pred: tl.tensor = None,
+    clamp_bounds: tl.constexpr = False,
+    _semantic=None,
+) -> tl.tensor_descriptor_base:
+    """Update selected fields of an AMD TDM tensor descriptor.
+
+    This mirrors Gluon's ``gl.amd.gfx1250.tdm.update_tensor_descriptor``:
+    ``add_offsets`` advances the descriptor tile position, ``set_bounds``
+    rewrites descriptor bounds, ``pred`` rewrites the descriptor predicate, and
+    ``clamp_bounds=True`` derives edge-tile bounds from ``add_offsets``.
+    """
+    assert isinstance(desc, tl.tensor_descriptor_base)
+    if add_offsets is None and set_bounds is None and pred is None:
+        raise ValueError("tlx.update_tensor_descriptor requires at least one of add_offsets, set_bounds, pred")
+    clamp_bounds = bool(tl._unwrap_if_constexpr(clamp_bounds))
+    if clamp_bounds:
+        if add_offsets is None:
+            raise ValueError("tlx.update_tensor_descriptor: clamp_bounds requires add_offsets")
+        if set_bounds is not None:
+            raise ValueError("tlx.update_tensor_descriptor: clamp_bounds and set_bounds are mutually exclusive")
+
+    rank = len(desc.block_shape)
+    add_offset_handles = []
+    if add_offsets is not None:
+        assert len(add_offsets) == rank, f"expected {rank} add_offsets, but got {len(add_offsets)}"
+        add_offset_handles = _semantic._convert_to_ir_values(add_offsets, require_i64=False)
+    set_bounds_handles = []
+    if set_bounds is not None:
+        assert len(set_bounds) == rank, f"expected {rank} set_bounds, but got {len(set_bounds)}"
+        set_bounds_handles = _semantic._convert_to_ir_values(set_bounds, require_i64=False)
+
+    pred_handle = ir.value()
+    if pred is not None:
+        pred = _semantic.to_tensor(pred)
+        pred_handle = pred.handle
+
+    handle = _semantic.builder.create_update_tensor_descriptor(
+        desc.handle,
+        add_offset_handles,
+        set_bounds_handles,
+        pred_handle,
+        clamp_bounds,
+    )
+    return _updated_tensor_descriptor(desc, handle)
+
+
 @tl.builtin
 def async_amd_descriptor_load(
     desc: tl.tensor_descriptor_base,
     result: tlx.buffered_tensor,
     offsets: list[tl.tensor],
     pred: tl.tensor = None,
+    clamp_bounds: tl.constexpr = False,
     _semantic=None,
 ) -> tlx.async_token:
     """Asynchronous descriptor load from global to a local buffer (AMD).
@@ -1136,7 +1198,8 @@ def async_amd_descriptor_load(
         offsets_handles,
         result.handle,
         pred_handle,
-        None,
+        ir.value(),
+        bool(tl._unwrap_if_constexpr(clamp_bounds)),
     )
     return tlx.async_token(token_handle)
 
@@ -1204,7 +1267,8 @@ def async_amd_descriptor_load_group(
 def async_amd_descriptor_store(
     desc: tl.tensor_descriptor_base,
     source: tlx.buffered_tensor,
-    offsets: list[tl.tensor],
+    offsets: Optional[list[tl.tensor]] = None,
+    clamp_bounds: tl.constexpr = False,
     _semantic=None,
 ) -> None:
     """Asynchronous descriptor store from a local buffer to global (AMD).
@@ -1236,7 +1300,8 @@ def async_amd_descriptor_store(
     assert is_amd_tdm_target(arch), (
         f"async_amd_descriptor_store is only available on AMD TDM-capable targets, got arch={arch}")
     ndim = len(desc.block_shape)
-    assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
+    if offsets is not None:
+        assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     # Auto-propagated layouts (no `layout=` passed to local_alloc) are silently
     # rewritten by TLXInsertRequireLayout. Explicit padded layouts are preserved
@@ -1256,12 +1321,13 @@ def async_amd_descriptor_store(
                 stacklevel=2,
             )
 
-    offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    offsets_handles = [] if offsets is None else _semantic._convert_to_ir_values(offsets, require_i64=False)
     _semantic.builder.create_async_tdm_copy_local_to_global(
         desc.handle,
         offsets_handles,
         source.handle,
-        None,
+        ir.value(),
+        bool(tl._unwrap_if_constexpr(clamp_bounds)),
     )
 
 

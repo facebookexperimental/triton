@@ -890,16 +890,17 @@ def test_async_amd_desc_load_pred_compiles_gfx1250(device):
         constexprs={"BLOCK_M": 16, "BLOCK_N": 32, "DO_LOAD": 1},
     )
     ttgir = compiled.asm["ttgir"]
-    # Capture the SSA name fed into the TDM op's pred operand and verify
-    # its definition is i32 — either an explicit i1->i32 extension, or
+    # Capture the SSA name fed into the descriptor update's pred operand and
+    # verify its definition is i32 — either an explicit i1->i32 extension, or
     # (after constant folding) a fresh `arith.constant N : i32`.
-    tdm_match = re.search(r"amdg\.async_tdm_copy_global_to_local\b.*pred = (%\S+)", ttgir)
-    assert tdm_match, ("expected amdg.async_tdm_copy_global_to_local with pred operand, got:\n" + ttgir)
-    pred_ssa = re.escape(tdm_match.group(1))
+    update_match = re.search(r"amdg\.update_tensor_descriptor\b.*pred = (%\S+)", ttgir)
+    assert update_match, ("expected amdg.update_tensor_descriptor with pred operand, got:\n" + ttgir)
+    pred_ssa = re.escape(update_match.group(1))
     has_extension = bool(re.search(rf"{pred_ssa}\s*=\s*arith\.extui\b.*:\s*i1\s+to\s+i32", ttgir))
     has_folded = bool(re.search(rf"{pred_ssa}\s*=\s*arith\.constant\s+\S+\s*:\s*i32", ttgir))
-    assert has_extension or has_folded, (f"expected pred ({tdm_match.group(1)}) to be defined by arith.extui (i1->i32) "
-                                         f"or arith.constant : i32, got:\n" + ttgir)
+    assert has_extension or has_folded, (
+        f"expected pred ({update_match.group(1)}) to be defined by arith.extui (i1->i32) "
+        f"or arith.constant : i32, got:\n" + ttgir)
 
 
 @triton.jit
@@ -1281,6 +1282,50 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     assert len(amdgcn) > 0
     assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn, (
         "expected tensor_store_from_lds intrinsic in AMDGCN, got:\n" + amdgcn)
+
+
+@triton.jit
+def _update_tensor_descriptor_store_kernel(
+    a_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    out_desc = tl.make_tensor_descriptor(
+        output_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    smem = tlx.local_view(buf, 0)
+
+    tlx.async_amd_descriptor_load(a_desc, smem, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+    out_desc = tlx.update_tensor_descriptor(out_desc, add_offsets=[0, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_store(out_desc, smem)
+    tlx.async_amd_descriptor_wait(0)
+
+
+def test_update_tensor_descriptor_store_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _update_tensor_descriptor_store_kernel,
+        signature={"a_ptr": "*fp16", "output_ptr": "*fp16", "M": "i32", "N": "i32"},
+        constexprs={"BLOCK_M": 16, "BLOCK_N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.update_tensor_descriptor" in ttgir, ("expected update_tensor_descriptor in TTGIR, got:\n" + ttgir)
+    assert "clamp_bounds" in ttgir, ("expected clamp_bounds on update_tensor_descriptor in TTGIR, got:\n" + ttgir)
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir, (
+        "expected amdg.async_tdm_copy_local_to_global in TTGIR, got:\n" + ttgir)
 
 
 def test_async_amd_desc_store_correctness_gfx1250(device, fresh_triton_cache):
