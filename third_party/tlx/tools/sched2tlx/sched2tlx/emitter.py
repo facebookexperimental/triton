@@ -4576,6 +4576,37 @@ def _unified_warp_groups(
                 num_regs=num_regs,
             )
         )
+    # Multi-WG OUTER bodies: any outer warp group beyond the default's gets
+    # its own task (e.g. an epilogue store split from the drain compute).
+    # Without these the ops of such a group had no owning task — the silent
+    # drop the task-coverage check now refuses.
+    for wg in outer.warp_groups:
+        if wg.id == epi_outer_wg:
+            continue
+        owns_any = any(
+            n.warp_group == wg.id
+            and n.child_pipeline_id is None
+            and n.op_kind not in _COVERAGE_EXEMPT_KINDS
+            for n in outer.schedule.nodes
+        )
+        if not owns_any:
+            continue
+        roles = "+".join(wg.pipelines)
+        primary = (
+            "TC"
+            if "TC" in wg.pipelines
+            else ("TMA" if "TMA" in wg.pipelines else roles)
+        )
+        out.append(
+            UnifiedWG(
+                name=f"outer_wg{wg.id}_{primary}",
+                role=primary,
+                outer_wg=wg.id,
+                inner_wg=None,
+                num_warps=wg.num_warps,
+                num_regs=152 if wg.num_warps >= 4 else 24,
+            )
+        )
     return _rescale_task_regs(out)
 
 
@@ -4623,6 +4654,67 @@ def _rescale_task_regs(uwgs: list[UnifiedWG]) -> list[UnifiedWG]:
     for u in big:
         u.num_regs = per
     return uwgs
+
+
+# Node kinds that never emit task-body code (hoisted allocs / SSA glue), so a
+# task-less warp group containing ONLY these is not a lowering hole.
+_COVERAGE_EXEMPT_KINDS = {
+    "ttg.local_alloc",
+    "ttng.tmem_alloc",
+    "scf.yield",
+    "arith.constant",
+}
+
+
+def _check_task_coverage(
+    g: ScheduleGraph, outer: Loop, inner: Loop | None, uwgs: list["UnifiedWG"]
+) -> None:
+    """Refuse to emit a kernel with orphaned scheduled ops.
+
+    Every emittable node the schedule assigned to a warp group must be owned
+    by exactly the task that will render it. The historic failure mode this
+    guards against is SILENT: a warp group with no owning async task keeps
+    its barrier declarations (emitted from the semaphore set) while its body
+    ops simply vanish — the kernel compiles, launches, and produces garbage
+    (observed: an outer-loop epilogue split into its own WG dropped its
+    descriptor_store and returned NaN). A named generation-time error turns
+    that into a visible emitter-capability gap instead.
+    """
+    covered_inner = {u.inner_wg for u in uwgs if u.inner_wg is not None}
+    covered_outer = {u.outer_wg for u in uwgs if u.outer_wg is not None}
+
+    def _orphans(loop: Loop, covered: set) -> list[Node]:
+        out = []
+        for n in loop.schedule.nodes:
+            if n.child_pipeline_id is not None:
+                continue  # super-node: replayed by every inner-WG task
+            if n.warp_group is None or n.warp_group < 0:
+                continue  # infra/replicated: attached at emission sites
+            if n.op_kind in _COVERAGE_EXEMPT_KINDS:
+                continue
+            if n.warp_group not in covered:
+                out.append(n)
+        return out
+
+    problems: list[tuple[int, Node]] = []
+    if inner is not None:
+        # Persistent kernel: outer-loop nodes are only reachable through a
+        # task with a matching outer_wg (the per-inner-WG tasks replay the
+        # outer loop but own none of its non-super-node ops).
+        problems += [(outer.loop_id, n) for n in _orphans(outer, covered_outer)]
+        problems += [(inner.loop_id, n) for n in _orphans(inner, covered_inner)]
+    else:
+        problems += [(outer.loop_id, n) for n in _orphans(outer, covered_inner)]
+    if problems:
+        detail = ", ".join(
+            f"loop{lid} wg{n.warp_group} N{n.id} {n.op_kind}" for lid, n in problems
+        )
+        raise RuntimeError(
+            "sched2tlx task-coverage error: scheduled ops with no owning "
+            f"async task ({detail}). This partition shape is not lowerable "
+            "by the current emitter (e.g. a multi-WG OUTER loop body); "
+            "emitting it would silently drop these ops."
+        )
 
 
 def _task_header(uwg: UnifiedWG) -> str:
@@ -5435,9 +5527,23 @@ def _emit_outer_op(n: Node, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) ->
         return
     if op.kind == "tt.descriptor_store":
         desc = _render_operand(op.operands[0], rctx)
-        value_expr = _render_operand(op.operands[1], rctx)
         offsets = [_render_operand(o, rctx) for o in op.operands[2:]]
         offs_str = ", ".join(offsets)
+        # Cross-WG channel store (multi-WG outer body): the producer WG
+        # already staged the tile into the channel SMEM; TMA straight from
+        # it and recycle after the drain — no register round-trip.
+        sc = getattr(rctx, "_store_from_channel", None)
+        if sc is not None:
+            rctx._store_from_channel = None
+            lines += (
+                f"tlx.async_descriptor_store({desc}, "
+                f"{sc['buf_var']}[{sc['slot']}], [{offs_str}])"
+            )
+            lines += "tlx.async_descriptor_store_wait(0)"
+            if sc["arrive"]:
+                lines += sc["arrive"]
+            return
+        value_expr = _render_operand(op.operands[1], rctx)
         lines += f"tlx.local_store(c_smem[0], {value_expr})"
         lines += "tlx.fence_async_shared()"
         lines += f"tlx.async_descriptor_store({desc}, c_smem[0], [{offs_str}])"
@@ -5581,6 +5687,31 @@ def _emit_uwg_body_impl(
     outer_nodes = _outer_nodes_for_uwg(outer, uwg)
     _replicate_infra_deps(g, outer_nodes, outer, rctx, lines)
 
+    # OUTER-loop cross-WG semaphores (multi-WG outer bodies): their lowered
+    # phase expressions are `_it`-based, so a task touching them needs an
+    # outer iteration counter. Inner K-loop bodies rebind `_it` inside their
+    # own loop, so a task owning BOTH an inner loop and outer channels would
+    # clobber it — refuse loudly rather than emit racy phases.
+    has_outer_sems = False
+    if rctx.sem_set is not None:
+        for n in outer_nodes:
+            if n.child_pipeline_id is not None:
+                continue
+            if rctx.sem_set.by_consumer.get(
+                (outer.loop_id, n.id)
+            ) or rctx.sem_set.by_producer.get((outer.loop_id, n.id)):
+                has_outer_sems = True
+                break
+    if has_outer_sems and uwg.inner_wg is not None:
+        raise RuntimeError(
+            "sched2tlx: outer-loop cross-WG channel in a task that also owns "
+            f"an inner loop (task {uwg.name}) — the outer iteration counter "
+            "would collide with the inner `_it`; this partition shape is not "
+            "lowerable yet."
+        )
+    if has_outer_sems:
+        lines += "_oit = 0"
+
     # Outer for-loop scaffolding.
     out_iv = outer.schedule.induction_var_name
     out_lo = _render_operand(outer.schedule.lower_bound, rctx)
@@ -5597,6 +5728,10 @@ def _emit_uwg_body_impl(
             tc = rctx.tmem_count
             lines += f"tmem_buf = tmem_accum_cnt % {tc}"
             lines += f"tmem_phase = (tmem_accum_cnt // {tc}) & 1"
+        if has_outer_sems:
+            # Bind the lowered semaphores' `_it`-based slot/phase expressions
+            # to the per-tile counter.
+            lines += "_it = _oit"
         # Per-iter infra: ops with IV/iter_arg deps that this body needs
         # (e.g., pid_m, pid_n, offs_am, offs_bn for the in-loop accesses).
         in_loop_infra_visited: set[str] = set()
@@ -5740,12 +5875,24 @@ def _emit_uwg_body_impl(
                 and n.id == global_store.id
             ):
                 continue  # epilogue store emitted by the partitioned epilogue in the tmem_load's WG
+            # OUTER cross-WG handshakes: consumer waits/loads before the op
+            # (a descriptor_store consumer instead TMA-stores straight from
+            # the channel buffer via _store_from_channel), producer
+            # wait-empty/store/arrive-full after the value is materialized.
+            if has_outer_sems:
+                _semir_emit_consumer_block(n, g, outer, rctx, lines)
             _emit_outer_op(n, g, rctx, lines)
+            if has_outer_sems and n.op_ref:
+                opv = rctx.op_var.get(n.op_ref)
+                if opv is not None:
+                    _semir_emit_producer_block(n, opv, g, outer, rctx, lines)
 
         # Advance the TMEM ring counter at end of each tile (both default
         # and TC partitions, so tmem_buf/tmem_phase stay in sync).
         if has_tmem:
             lines += "tmem_accum_cnt += 1"
+        if has_outer_sems:
+            lines += "_oit += 1"
 
     # Pass A.7: when a subtiled epilogue chain is active, the per-tile body
     # omits the trailing wait(0) so cross-tile TMA store overlap is possible.
@@ -6449,6 +6596,7 @@ def emit(graph: ScheduleGraph) -> str:
     # Async tasks. One per unified warp group; each runs the outer
     # persistent loop (if any) replicated and trimmed to its ops.
     uwgs = _unified_warp_groups(graph, outer_loop, inner_loop)
+    _check_task_coverage(graph, outer_loop, inner_loop, uwgs)
     with lines.block("with tlx.async_tasks():"):
         for uwg in uwgs:
             # Reference Phase 4's plan so the role attribution is visible.

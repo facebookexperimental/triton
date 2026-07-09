@@ -81,29 +81,43 @@ solves with II as a variable or sweeps II exactly with feasibility as a
 constraint; reservation-table fragmentation is not a failure mode of a
 complete search. No replacement needed.
 
-## Guard 3: outer WS loops forced single-WG
+## Guard 3: outer WS loops forced single-WG — RETIRED 2026-07-09
 
-Where: `ModuloSchedulePass.cpp:applyGlobalWarpPartition` (the `sl.isOuter`
-early-out).
+Where it lived: `ModuloSchedulePass.cpp:applyGlobalWarpPartition` (an
+`sl.isOuter` early-out that skipped the cost-model partitioner and put every
+outer-loop op in one WG).
 
-What: outer persistent loops skip the cost-model partitioner and put every
-op in one WG.
-
-Why it exists: this is an EMITTER-capability constraint, not a hardware or
-search limitation. sched2tlx only lowers multi-WG bodies for INNER loops;
-when the partitioner split case5's outer-loop epilogue
+Why it existed: an EMITTER-capability constraint, not a hardware or search
+limitation. sched2tlx only lowered multi-WG bodies for INNER loops; when the
+partitioner split case5's outer-loop epilogue
 (convert_layout → descriptor_store) into its own TMA WG, the emitter
 silently dropped the store ops and the kernel produced NaN. (Silent, because
 the barrier decls WERE emitted — only the WG body ops vanished.)
 
-Under a global solver: **keep the restriction but express it as a legality
-constraint** ("ops in an outer loop must share one WG" — or, better, fix the
-emitter and drop it). Do NOT let it silently vanish during the rewrite: the
-solver will otherwise rediscover the split (it looks profitable to any cost
-model that undercounts it) and regress correctness, which is worse than
-regressing performance. A solver formulation should carry an explicit list
-of emitter-lowerable partition shapes as hard constraints, versioned with
-the emitter.
+How it was retired (the "fix the emitter and drop it" branch of the original
+migration plan):
+
+1. **Silent → loud.** sched2tlx now refuses to emit any kernel with a
+   scheduled op no async task owns (`_check_task_coverage`, a named
+   generation-time error). The historic hazard shape is a unit test
+   (`test_outer_multiwg_split.py`) — verified the check fires on it before
+   the capability landed.
+2. **Capability.** The emitter lowers multi-WG outer bodies: every outer WG
+   gets its own task; outer cross-WG hand-offs go through the standard
+   semaphore IR with per-task outer-iteration counters (`_oit`) driving the
+   slot/phase expressions; a descriptor_store consumer TMA-stores straight
+   from the channel SMEM. GPU-validated on the forced case2 split:
+   correctness rel=0.0 on four shapes, throughput identical to the
+   single-WG emission (1.00/0.88/0.91/0.97x of handwritten).
+3. **Early-out deleted.** All loops go through the same partitioner. With
+   the calibrated barrier/round-trip costs visible, every example case's
+   winner keeps the outer loop single-WG on merit (the outer II is
+   super-node-dominated, so a split buys nothing and pays real handshake
+   cost) — the seven cases regenerate byte-identically.
+
+A future solver needs no outer-loop special case; the task-coverage check
+remains the last-line defense for any partition shape the emitter of the
+day cannot lower.
 
 ## Related but not a guard: lifetime-based channel depth, store-consumer only
 

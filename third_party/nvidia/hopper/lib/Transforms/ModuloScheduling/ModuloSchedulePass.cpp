@@ -4476,30 +4476,16 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
         continue;
-      // Outer WS loops stay single-WG. The sched2tlx emitter only lowers
-      // multi-WG bodies for INNER loops today; splitting an outer-loop
-      // epilogue chain (e.g. convert_layout → descriptor_store) into its own
-      // WG silently drops those ops in the emitted kernel. The modeled upside
-      // is also marginal: the outer II is dominated by the inner-loop
-      // super-node (thousands of cycles), so overlapping the epilogue saves a
-      // few percent at best while risking an unlowerable partition.
-      // This is an EMITTER-capability legality constraint — keep it (in some
-      // form) even under a global solver. See docs/SolverMigrationNotes.md
-      // (guard 3).
-      if (sl.isOuter) {
-        for (auto &node : schedLoop.nodes)
-          node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
-        schedLoop.topPartitions.clear();
-        schedLoop.topPartitionCosts.clear();
-        demoteScalarArithToInfra(schedLoop);
-        propagateWarpGroupToInfraOps(schedLoop);
-        coLocateOperandAllocsWithLoads(schedLoop);
-        continue;
-      }
-      // All inner loops go through the same cost-model partitioner — no TC vs
-      // TC-free special-casing. The makespan (single-iteration latency chain
-      // over each WG's pipeAvail) plus barrier cost decides the split
-      // uniformly. This rewards warp specialization wherever it overlaps
+      // Guard 3 (outer WS loops forced single-WG) was retired: every loop —
+      // inner AND outer — goes through the same cost-model partitioner. The
+      // silent-drop hazard the guard defended against (an outer-loop WG with
+      // no owning async task lost its ops without a diagnostic) is closed at
+      // the emitter: sched2tlx now hard-errors on any scheduled op no task
+      // owns (task-coverage check) and lowers multi-WG outer bodies. The
+      // makespan (single-iteration latency chain over each WG's pipeAvail)
+      // plus barrier cost decides the split uniformly, and outer-loop
+      // candidates carry the same RecMII'-floor / launchability terms as
+      // inner ones. This rewards warp specialization wherever it overlaps
       // independent pipelines across groups: GEMM/FA (MEM/TC/softmax) AND
       // memory-bound loops like LayerNorm, where putting TMA-load, compute,
       // and TMA-store on separate warp groups frees the compute warps and
