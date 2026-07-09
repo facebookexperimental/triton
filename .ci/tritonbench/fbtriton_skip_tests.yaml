@@ -28,6 +28,9 @@ flash_attention:
   disabled_devices:
     - hip
 # Device specific tests
+blackwell_attentions_mxfp8:
+  devices:
+    - b200
 blackwell_attentions:
   devices:
     - b200
