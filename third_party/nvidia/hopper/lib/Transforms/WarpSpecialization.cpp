@@ -226,12 +226,7 @@ public:
       removeWarpSpecializeAttr(funcOp);
       return;
     }
-    if (dumpIntermediateSteps) {
-      llvm::dbgs() << "// -----// WarpSpec internal IR Dump After: "
-                      "doDynamicTileBroadcast\n";
-      moduleOp.print(llvm::dbgs(), getOpPrintingFlagsWithLoc());
-      llvm::dbgs() << "\n\n\n";
-    }
+    dumpAfter(moduleOp, "doDynamicTileBroadcast");
 
     if (pingpongAutoWS) {
       doPingPongPrep(funcOp, numWarpGroups, capability, defaultNumStages);

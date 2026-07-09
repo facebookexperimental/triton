@@ -1,4 +1,5 @@
 // RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 num-stages=3 smem-budget=232448 tile-prefetch-depth=2" | FileCheck %s --check-prefix=DEPTH2
 
 // Case 2 (transform): a dynamic-persistent matmul whose persistent scf.while
 // claims its next tile via a scalar, loop-carried tt.atomic_rmw replicated to
@@ -15,6 +16,16 @@
 // CHECK-COUNT-1: tt.atomic_rmw
 // CHECK-NOT: tt.atomic_rmw
 // CHECK: tt.unsplat
+
+// tile-prefetch-depth=2 multi-buffers the tile-id broadcast channel: the
+// single-element broadcast slot is pinned to a 2-deep SMEM buffer
+// (memdesc<2x1xi32>), letting the owner publish tile ids ahead of the slower
+// consumer partitions. Warp specialization and the run-once atomic broadcast
+// (tt.unsplat) are otherwise unchanged.
+// DEPTH2: memdesc<2x1xi32
+// DEPTH2: ttg.warp_specialize
+// DEPTH2-COUNT-1: tt.atomic_rmw
+// DEPTH2: tt.unsplat
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>

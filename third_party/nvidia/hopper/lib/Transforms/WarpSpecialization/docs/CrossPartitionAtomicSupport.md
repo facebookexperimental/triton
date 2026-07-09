@@ -111,9 +111,30 @@ The broadcast-channel depth is a compile-time knob, not an env var:
 - Threaded to the `nvgpu-warp-specialization` pass as the `tile-prefetch-depth`
   option (`Passes.td` → `triton_nvidia.cc` → `compiler.py`).
 
-Depth 1 is the single-stage broadcast. (Multi-stage run-ahead, `depth > 1`, is
-future work: it additionally requires drain-on-exit because the `atomic_add` is
-a destructive claim.)
+`depth` is the number of buffer slots the tile-id broadcast channel is
+multi-buffered with. Depth 1 is the single-stage broadcast (producer and
+consumers move in lockstep on the tile id). For `depth > 1`, `transformAtomic`
+stamps the requested count (`kAtomicBroadcastCopiesAttrName`, defined in
+`CodePartitionUtility.h`) on the broadcast slot's `local_alloc`, and the memory
+planner (`allocateSmemBuffers`, phase 1) **pins** that buffer to `depth` copies —
+so the otherwise non-innermost (`P4_Other`) broadcast channel is not left
+single-buffered. The alloc becomes shape `{depth, 1}` and the accumCnt already
+threaded through the persistent `scf.while` rotates the slot/phase across
+iterations, exactly as for any other multi-buffered while-region channel. This
+lets the owner/producer claim and publish up to `depth` tile ids ahead of the
+slower consumer partitions (e.g. the epilogue), so the persistent loop does not
+serialize on the tile-id handoff. (`depth <= 1` is treated as the single-stage
+broadcast.)
+
+No explicit drain-on-exit is required: the terminating tile id (the first claim
+`>= num_tiles`) flows through the *same* broadcast channel and must be loaded by
+every partition to evaluate its own `while` condition, so the producer's store
+count and each consumer's load count stay balanced across the loop exit
+regardless of `depth` — the multi-buffer only adds bounded run-ahead
+backpressure, never an unconsumed slot.
+
+Only the atomic tile-counter path multi-buffers on `depth`; the CLC fetch
+broadcast (`transformCLC`) is single-stage.
 
 ## Tests
 
