@@ -20,7 +20,7 @@ While this approach places more responsibility on the user, it reduces the compi
 [Gluon](https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon)
 (`python/triton/experimental/gluon/`) is **upstream-synced and not a first-class DSL** here
 (TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton
-is a secondary community Triton, we run **fundamental Gluon CI** so we don't silently break it.
+is a secondary Triton, we run **fundamental Gluon CI** so we don't silently break it.
 
 **CI:** the `b200-gluon-test` / `mi350-gluon-test` jobs run `pytest python/test/gluon/` (every
 `test_*.py`). It is **green**: ~200 passed, ~1600 skipped, 0 failed. The real signal is the
