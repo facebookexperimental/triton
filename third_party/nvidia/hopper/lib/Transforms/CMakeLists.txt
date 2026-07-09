@@ -22,6 +22,7 @@ add_triton_library(NVHopperTransforms
   MultiCTAReduction.cpp
   WarpSpecialization.cpp
   WarpSpecialization/CodePartitionUtility.cpp
+  WarpSpecialization/WSAtomicBroadcast.cpp
   WarpSpecialization/PingPong.cpp
   WarpSpecialization/TaskIdPropagation.cpp
   WarpSpecialization/TMEMAlloc1D.cpp
