@@ -3230,11 +3230,21 @@ def reduce(
         raise TypeError(f"reduction_ordering must be None or a ReductionOrdering, got {type(reduction_ordering)}")
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
-    # `reduction_ordering` is a Meta-local extension to the reduction API. Not every
-    # semantic supports it (e.g. Gluon's GluonSemantic.reduction, which is upstream-synced
-    # and only performs unordered reductions), so only forward the kwarg when the target
-    # semantic actually accepts it. This keeps `tl`/Gluon reductions working through the
-    # shared `tl.standard` helpers without modifying the Gluon frontend.
+    # `reduction_ordering` is an fbtriton-LOCAL extension (introduced by #1100,
+    # "bitwise consistent reductions"); it does not exist upstream. `TritonSemantic`
+    # carries it, but the upstream-synced Gluon frontend does not: `GluonSemantic.reduction`
+    # has the plain `(inputs, axis, region_builder_fn)` signature and only does unordered
+    # reductions. Since `tl.sum`/`tl.max`/... (tl.standard) now always thread this kwarg
+    # through `reduce()`, calling `_semantic.reduction(..., reduction_ordering=...)`
+    # unconditionally would raise `TypeError` for Gluon kernels.
+    #
+    # We branch on the target semantic's actual signature rather than editing
+    # `GluonSemantic.reduction`, on purpose:
+    #   * "do not modify Gluon" -- it's upstream-synced; a param added there is silently
+    #     dropped on the next sync (upstream has no `reduction_ordering` to restore), so it
+    #     would re-break every sync.
+    #   * this guard lives next to the fbtriton-local feature it accommodates and adapts
+    #     automatically if Gluon's signature ever changes.
     if "reduction_ordering" in inspect.signature(_semantic.reduction).parameters:
         ret = _semantic.reduction(input, axis, make_combine_region, reduction_ordering=reduction_ordering)
     else:
