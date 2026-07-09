@@ -50,6 +50,13 @@ if [ ! -e "$REAL" ]; then
     exit 1
 fi
 
+# Nothing to do if the system libstdc++ already provides GLIBCXX_3.4.30
+# (version nodes are cumulative, so any newer libstdc++ has it too).
+if objdump -T "$REAL" 2>/dev/null | grep -qE 'GLIBCXX_3\.4\.30([^0-9]|$)'; then
+    echo "glibcxx-compat: $REAL already provides GLIBCXX_3.4.30; nothing to do"
+    exit 0
+fi
+
 BASE="$OUT_DIR/libstdc++_base.so.6"
 AUG="$OUT_DIR/libstdc++.so.6"
 STAMP="$OUT_DIR/.glibcxx-compat.stamp"
