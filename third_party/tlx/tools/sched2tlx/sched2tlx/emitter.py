@@ -177,12 +177,6 @@ class RenderCtx:
     # TMEM ring-buffer depth (count). Set by `_emit_buffers` after hoisting
     # the outer-loop's TMEM accumulator. =1 → no ring buffer indexing.
     tmem_count: int = 1
-    # Eager SMEM-operand release for MMAs (from graph.eager_smem_release). When
-    # True, the MMA's operand `_empty` barriers are released via an explicit
-    # `barrier_arrive` right after `async_dot` rather than the MMA's mBarriers
-    # HW-completion recycle — valid only when the operand rings are
-    # double-buffered (the Twill solver proves this before setting the flag).
-    eager_smem_release: bool = False
     # (loop_id, iter_arg_idx) → Python variable name. Populated by
     # `_emit_inner_loop_in_outer` per-UWG before/inside the loop so
     # `_render_operand(IterArgRef)` can produce a real name. Mirrors Meta's
@@ -3898,38 +3892,11 @@ def _emit_in_loop_node(
                 )
             lines += f"use_acc = {_use_acc_expr(op, loop, rctx)}"
             mbar_list: list[str] = []
-            # Eager SMEM-operand release (Twill memory-aware schedule). The MMA's
-            # SMEM operand `_empty` barriers arrive on its mBarriers list from
-            # two SemIR buckets: the operand lookup (opnd_mbar) and the SemSet
-            # consumer-recycle side (consumer_mb). When the solver proves both
-            # operand rings are double-buffered (count>=2) AND this MMA has no
-            # OTHER recycle obligation (no TMEM-operand bridge, no cross-WG
-            # signal it produces on mBarriers) — i.e. a pure-GEMM MMA whose only
-            # completion consumers are the SMEM producers — we release those
-            # empties with an explicit barrier_arrive right after async_dot
-            # instead of the HW mBarriers recycle. The producer then runs ~1 MMA
-            # ahead (measured +8-11% on GEMM). Mixed MMAs (FA: qk/pv results
-            # consumed cross-WG) keep the safe HW recycle.
-            consumer_mb = _semir_consumer_mbarriers(loop.loop_id, n.id, rctx)
-            producer_mb = _semir_producer_mbarriers(loop.loop_id, n.id, rctx)
-            operand_empties = list(opnd_mbar) + list(consumer_mb)
-            _a_db = not (a_buf is not None and a_loop is loop and a_buf.count < 2)
-            _b_db = not (b_buf is not None and b_loop is loop and b_buf.count < 2)
-            eager_empty = (
-                rctx.eager_smem_release and n.partition_count <= 1
-                and bool(operand_empties) and _a_db and _b_db
-                and not tmem_chan_for_recycle and not producer_mb
-            )
-            # Preserve the exact non-eager ordering (opnd, tmem, consumer,
-            # producer) so the modulo baseline emit is byte-identical; when
-            # eager, opnd+consumer are dropped here and arrive after async_dot.
-            if not eager_empty:
-                mbar_list.extend(opnd_mbar)
+            mbar_list.extend(opnd_mbar)
             mbar_list.extend(tmem_chan_for_recycle)
             mbar_list.extend(ring_consumer_empties)
-            if not eager_empty:
-                mbar_list.extend(consumer_mb)
-            mbar_list.extend(producer_mb)
+            mbar_list.extend(_semir_consumer_mbarriers(loop.loop_id, n.id, rctx))
+            mbar_list.extend(_semir_producer_mbarriers(loop.loop_id, n.id, rctx))
             if ring_prod is not None and n.id == ring_prod["producer_node"]:
                 mbar_list.append(f"{_bar_full(dest_var)}[{ring_prod['slot']}]")
 
@@ -4000,9 +3967,6 @@ def _emit_in_loop_node(
                     f"tlx.async_dot({a_expr_pre}, {b_expr_pre}, "
                     f"{dest_var}[{acc_idx}], use_acc=use_acc)"
                 )
-            if eager_empty:
-                for slot in operand_empties:
-                    lines += f"tlx.barrier_arrive({slot}, 1)"
             return
 
         # ── Legacy channel-based path ─────────────────────────────────────
@@ -5990,7 +5954,6 @@ def emit(graph: ScheduleGraph) -> str:
         buffer_var={},
         alloc_op_var={},
         loop_iv=iv_names,
-        eager_smem_release=graph.eager_smem_release,
     )
     # Per-buffer MMA-consumer counts → intra-WG `extra` empties need
     # arrive_count = N consumers (each consuming async_dot recycles EMPTY).

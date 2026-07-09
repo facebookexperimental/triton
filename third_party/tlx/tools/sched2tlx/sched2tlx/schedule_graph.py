@@ -232,15 +232,6 @@ class ScheduleGraph:
     kernel: Kernel
     ops: dict[str, Op]
     loops: list[Loop]
-    # When True, the emitter releases MMA SMEM-operand `_empty` barriers with an
-    # eager `barrier_arrive` right after issuing `async_dot` (instead of via the
-    # MMA's `mBarriers=[…]` hardware-completion recycle). This lets the producer
-    # run ~1 MMA ahead (measured +8-11% on GEMM). It is only SAFE when every
-    # MMA operand ring is double-buffered (count>=2), which hides the MMA read
-    # latency. The Twill solver proves this from its memory-aware schedule and
-    # sets the flag; modulo dumps never set it, so the conservative HW-recycle
-    # path (default False) is unchanged for the modulo baseline.
-    eager_smem_release: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +352,6 @@ def load_graph(path: str | Path) -> ScheduleGraph:
         data = json.load(f)
     return ScheduleGraph(
         schema_version=data.get("schema_version", "0.0"),
-        eager_smem_release=data.get("eager_smem_release", False),
         kernel=Kernel(
             name=data["kernel"]["name"],
             args=[KernelArg(**a) for a in data["kernel"]["args"]],

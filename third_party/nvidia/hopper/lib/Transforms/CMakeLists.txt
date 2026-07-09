@@ -9,7 +9,6 @@ add_triton_library(TritonGPUModuloCore
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp
   ModuloScheduling/ExhaustiveScheduler.cpp
-  ModuloScheduling/CPSATScheduler.cpp
   ModuloScheduling/ModuloScheduleGraph.cpp
 
   LINK_LIBS PUBLIC

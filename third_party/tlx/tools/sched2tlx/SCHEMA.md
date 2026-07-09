@@ -29,10 +29,10 @@ not need the original IR or any out-of-band context.
 
   `factors` lists every legal split factor (BM % n == 0, BM/n >= max(64,
   TMEM blockM)); `applied_n` is the factor actually applied in THIS dump
-  (1 = unpartitioned). The emitter ignores this section — it is consumed by
-  the twill enumeration driver (`twill_solver/dp_enum.py`), which re-runs
-  the modulo pass with `TRITON_DATA_PARTITION_N=<n>` per candidate and
-  A/B-gates the result on GPU.
+  (1 = unpartitioned). The emitter ignores this section — it exists so
+  external tooling can re-run the modulo pass with
+  `TRITON_DATA_PARTITION_N=<n>` per candidate and compare the resulting
+  schedules.
 - `loops` — each scheduled loop's schedule graph (nodes + edges) plus its
   bounds and induction variable.
 

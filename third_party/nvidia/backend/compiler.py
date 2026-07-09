@@ -753,7 +753,7 @@ class CUDABackend(BaseBackend):
                 # see MMA ops before they're moved into WS regions. It
                 # sets tt.autows annotations (stage/order) on MMA ops.
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
-                # TRITON_USE_MODULO_SCHEDULE=cpsat|sms|exhaustive|random
+                # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # The modulo / LLM scheduler above already produced the full loop
