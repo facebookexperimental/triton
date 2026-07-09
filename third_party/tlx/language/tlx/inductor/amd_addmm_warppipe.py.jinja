@@ -1,0 +1,126 @@
+{{def_kernel("A", "B")}}
+    # TLX warp-pipelined addmm for AMD (MI350X / gfx950), COL-MAJOR B (stride_bk == 1).
+    # A:[M,K] row-major, B:[K,N] col-major (the nn.Linear weight-transpose layout).
+    # B is loaded as (BLOCK_N, BLOCK_K) tiles (K contiguous -> coalesced async_load) and
+    # transposed via tlx.local_trans for the MFMA. Bias is applied by store_output via the
+    # epilogue_fn / prefix_args supplied by the heuristic (not referenced here). num_stages=1.
+    #
+    # NOTE: tlx.async_load lowers to a 32-bit block pointer (flat-offset pattern, like the AMD
+    # warp-pipeline tutorials). It cannot represent 64-bit offsets, and a pre-advanced base pointer
+    # is miscompiled, so this template is restricted (by the heuristic) to shapes Inductor indexes
+    # with int32 (M*K and N*K statically < 2**31, i.e. static/bounded shapes).
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        # early exit due to zero-size input(s)
+        return
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    # re-order program ID for better L2 performance
+    pid = tl.program_id(0).to(INDEX_DTYPE)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    # L2 chiplet swizzle: group adjacent PIDs onto the same XCD in chunks so tiles that
+    # share operands hit warm L2. NUM_XCDS is injected by the heuristic (8 for gfx942/gfx950,
+    # else 1, which makes this an identity). Mirrors the standalone amd_addmm_mul.py
+    # chiplet_transform_chunked (XCD_CHUNK=4). PIDs in the trailing remainder (grid not a
+    # multiple of NUM_XCDS*XCD_CHUNK) pass through unchanged.
+    # Line-by-line walkthrough + chiplet diagrams: P2410594601.
+    XCD_CHUNK: tl.constexpr = 4
+    grid_mn = grid_m * grid_n
+    # aligned = largest whole number of NUM_XCDS*XCD_CHUNK "super-chunks"; only these are remapped.
+    aligned = (grid_mn // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
+    if pid < aligned:
+        xcd = pid % NUM_XCDS            # the XCD the HW already placed this block on (fixed)
+        local_pid = pid // NUM_XCDS     # which round this block is within that XCD
+        # new logical tile = super-chunk base + this XCD's XCD_CHUNK-wide slot + position in slot,
+        # so consecutive tiles land as contiguous chunks on one XCD (a bijection; math unchanged).
+        pid = (local_pid // XCD_CHUNK) * (NUM_XCDS * XCD_CHUNK) + xcd * XCD_CHUNK + (local_pid % XCD_CHUNK)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)) % N
+    offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
+
+    a_base = offs_m[:, None] * stride_am
+    b_base = offs_n[:, None] * stride_bn          # B as (BLOCK_N, BLOCK_K): n is the row of the [N,K] view
+
+    K_ITERS = tl.cdiv(K, BLOCK_K)
+
+    smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)   # holds Bᵀ tile
+
+    # prologue: prefetch the first NUM_BUFFERS K-tiles (heuristic guarantees K_ITERS > NUM_BUFFERS)
+    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
+        k_start = i * BLOCK_K
+        a_offs = a_base + (k_start + offs_k[None, :]) * stride_ak
+        b_offs = b_base + (k_start + offs_k[None, :]) * stride_bk
+        # int32 cast is lossless: the heuristic only emits this template when offsets fit int32.
+        tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
+        tlx.async_load_commit_group([tok_a])
+        tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, i), mask=offs_k[None, :] < K - k_start)
+        tlx.async_load_commit_group([tok_b])
+
+    tlx.async_load_wait_group((NUM_BUFFERS - 1) * 2)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, 0)))
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+
+    for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+        # buffer indices MUST be int32: local_view feeds them to the block-ptr index check, which
+        # rejects int64. tile_id is int64 when K (-> K_ITERS) is symbolic (dynamic shapes).
+        prefetch_buf = (tile_id % NUM_BUFFERS).to(tl.int32)
+        next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
+        k_prefetch = (tile_id + NUM_BUFFERS) * BLOCK_K
+
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+        tlx.async_load_wait_group(2)
+
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_offs = a_base + (k_prefetch + offs_k[None, :]) * stride_ak
+            b_offs = b_base + (k_prefetch + offs_k[None, :]) * stride_bk
+            tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, prefetch_buf),
+                                   mask=offs_k[None, :] < K - k_prefetch)
+            tlx.async_load_commit_group([tok_a])
+            tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, prefetch_buf),
+                                   mask=offs_k[None, :] < K - k_prefetch)
+            tlx.async_load_commit_group([tok_b])
+            a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
+            b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, next_buf)))
+
+    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+    tlx.async_load_wait_group(0)
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        buf = ((K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)   # int32 buffer index
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+    # rematerialize rm and rn to save registers
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+
+    # inductor generates a suffix (bias add via epilogue_fn + prefix_args, cast, store)
+    {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}

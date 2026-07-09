@@ -2437,7 +2437,7 @@ constexpr double kInfeasiblePenalty = 1e7;
 // handwritten reference launches num_sms*4) can enable it via
 // TRITON_MODULO_CORES_PENALTY without a rebuild. case1's committed
 // footprint sits 12.9% above the 2-CTA SMEM bound (the nearest real
-// target); see docs/SolverMigrationNotes.md.
+// target).
 constexpr int kCoResidencyTargetCTAs = 2;
 static double coResidencyPenalty() {
   auto env = triton::tools::getStrEnv("TRITON_MODULO_CORES_PENALTY");
@@ -2891,8 +2891,7 @@ struct CrossWGChannelSpec {
 };
 
 static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
-                                                const ttg::ScheduleEdge &edge,
-                                                bool loopHasTC) {
+                                                const ttg::ScheduleEdge &edge) {
   CrossWGChannelSpec spec;
   const auto &src = loop.nodes[edge.srcId];
   const auto &dst = loop.nodes[edge.dstId];
@@ -2946,35 +2945,28 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
   // P-tile bridge): the value must be staged through a synthesized SMEM
   // channel.
   //
-  // Channel depth. Default: depth-2 for the TMA-load→compute channel of a
-  // TC-free pipelined loop (load warp prefetches one iteration ahead);
-  // depth-1 for other register hand-offs. Deepening register-consumer
-  // channels beyond that measured 6x SLOWER on FA (the P-tile bridge's
-  // extra SMEM + barrier traffic broke the softmax/MMA pingpong), so the
-  // lifetime rule below is scoped to async TMA-STORE consumers only.
-  //
-  // TMA-store consumers get the same `lifetime / II + 1` rule
-  // computeBufferCount applies to data buffers, with the hand-off
-  // spanning src's write to dst's completion (dst.latency included: the
-  // store holds its slot until the transfer drains). A store channel
-  // whose lifetime exceeds II must be double-buffered or the producer WG
-  // serializes on the store WG's drain every iteration — exactly the
-  // layernorm compute→store stall the fixed depth-1 rule produced (0.53x
-  // of handwritten). Store channels short relative to II (GEMM outer-loop
-  // epilogues) keep depth 1, same as before.
-  {
-    unsigned floorDepth =
-        (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2u : 1u;
-    unsigned lifetimeDepth = 1;
+  // Channel depth: the same `lifetime / II + 1` rule computeBufferCount
+  // applies to data buffers, uniformly for every synthesized channel. The
+  // hand-off spans the producer's write to the consumer's read; a TMA-store
+  // consumer additionally holds its slot until the transfer drains
+  // (dst.latency) — a store channel whose lifetime exceeds II must be
+  // double-buffered or the producer WG serializes on the store WG's drain
+  // every iteration (the layernorm compute→store stall, 0.53x of
+  // handwritten under a fixed depth-1 rule). This replaces two earlier
+  // special cases: a depth-2 floor scoped to TMA loads in TC-free loops
+  // (the schedule's own cycles produce depth 2 exactly when the load runs a
+  // stage ahead of its consumer), and store-consumer-only scoping of the
+  // lifetime rule (register hand-offs whose lifetime fits inside II keep
+  // depth 1, same as before).
+  if (loop.II > 0) {
     bool dstIsTMAStore =
         dst.op &&
         isa<tt::DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(dst.op);
-    if (dstIsTMAStore && loop.II > 0) {
-      int chanLifetime =
-          std::max(0, (dst.cycle + std::max(dst.latency, 0)) - src.cycle);
-      lifetimeDepth = static_cast<unsigned>(chanLifetime / loop.II + 1);
-    }
-    spec.depth = std::max(lifetimeDepth, floorDepth);
+    int hold = dstIsTMAStore ? std::max(dst.latency, 0) : 0;
+    int chanLifetime = std::max(0, (dst.cycle + hold) - src.cycle);
+    spec.depth = static_cast<unsigned>(chanLifetime / loop.II + 1);
+  } else {
+    spec.depth = 1;
   }
   // Derive shape + element width from the producer's result type.
   if (src.op && src.op->getNumResults() > 0) {
@@ -3017,9 +3009,6 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
 static int64_t
 predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
                         const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
-  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
-    return n.pipeline == ttg::HWPipeline::TC;
-  });
   int64_t total = 0;
   llvm::SmallDenseSet<std::pair<unsigned, unsigned>, 8> seenPairs;
   for (const auto &edge : loop.edges) {
@@ -3031,7 +3020,7 @@ predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
       continue;
     if (!seenPairs.insert({edge.srcId, edge.dstId}).second)
       continue;
-    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    auto spec = resolveCrossWGChannel(loop, edge);
     if (!spec.synthesize)
       continue;
     total += spec.synthesizedBytes() + 2 * spec.depth * 8;
@@ -3101,6 +3090,309 @@ computeSecondOrderTerms(const ttg::ScheduleLoop &loop,
   return t;
 }
 
+/// Scoring-time preview of propagateWarpGroupToInfraOps for WARP demand:
+/// NONE-pipeline / unclustered ops join their (transitive) consumers' warp
+/// groups after partitioning, and Layer B sizes each WG from its FINAL
+/// membership — so an infra op with minWarps > 1 (e.g. the 4-warp `addptr`
+/// feeding FA-bwd's m/D loads) raises the warp count of whatever WG its
+/// consumers land in. Scoring from clustered nodes alone underprices that:
+/// an FA-bwd candidate scored two such WGs at 1 warp that lower at
+/// 4, hiding a 110K/64K register request behind residual = 0.
+static void
+accumulatePropagatedMinWarps(const ttg::ScheduleLoop &loop,
+                             const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
+                             llvm::SmallDenseMap<int, int> &mwPerWg) {
+  const size_t n = loop.nodes.size();
+  // Transitive consumer-WG sets for unassigned nodes, over distance-0
+  // def-use edges (the propagation pass walks SSA users the same way;
+  // replicated ops charge every consumer WG).
+  llvm::SmallVector<llvm::SmallDenseSet<int, 2>> tgt(n);
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &e : loop.edges) {
+      if (e.distance != 0 || e.srcId >= n || e.dstId >= n)
+        continue;
+      if (nodeToWg.count(e.srcId))
+        continue; // clustered — counted directly by wgRequiredWarps
+      auto dIt = nodeToWg.find(e.dstId);
+      if (dIt != nodeToWg.end()) {
+        if (tgt[e.srcId].insert(dIt->second).second)
+          changed = true;
+      } else {
+        for (int wg : tgt[e.dstId])
+          if (tgt[e.srcId].insert(wg).second)
+            changed = true;
+      }
+    }
+  }
+  for (const auto &node : loop.nodes) {
+    if (node.minWarps <= 1 || nodeToWg.count(node.id) || node.id >= n)
+      continue;
+    for (int wg : tgt[node.id]) {
+      int &mw = mwPerWg[wg];
+      mw = std::max(mw, node.minWarps);
+    }
+  }
+}
+
+/// Partition-induced recurrence bound (cycles). The modulo-scheduling cycle
+/// inequality — sum of latencies around a dependence cycle ≤ II × sum of
+/// distances — made partition-aware: an edge that crosses a warp-group
+/// boundary additionally pays the hand-off latency the synthesized barriers
+/// and staging impose at runtime. For each loop-carried edge (distance ≥ 1)
+/// take the longest augmented distance-0 path from its destination back to
+/// its source and close the cycle:
+///
+///   RecMII'(candidate) = max over back-edges b of
+///       ceil((longestPath(b.dst → b.src) + w(b)) / distance(b))
+///   with w(e) = latency(e) + cross(e), and
+///   cross(e) = 0                                       same WG
+///            = kCrossWGRoundTripLatency + smemMoveCost  register-compute src
+///            = 2 × kBarrierOverhead                     SMEM/TMEM-resident src
+///
+/// A candidate whose RecMII' exceeds the bottleneck makespan is not
+/// "infeasible" — its steady state simply runs no faster than RecMII'. The
+/// scorers therefore compose this as a floor on the primary cost term
+/// (bottleneck' = max(bottleneck, RecMII')), pricing what the partition can
+/// actually sustain instead of what the pre-partition schedule promised.
+/// Workload-agnostic: the inputs are the dependence graph, the WG
+/// assignment, and the globally calibrated hand-off constants above.
+static int
+computePartitionRecMII(const ttg::ScheduleLoop &loop,
+                       const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
+  const size_t n = loop.nodes.size();
+  if (n == 0)
+    return 0;
+
+  // Effective-assignment preview: scoring runs BEFORE
+  // propagateWarpGroupToInfraOps, so NONE/unclustered ops (addptr feeding a
+  // cross-WG load, the local_alloc/memdesc_trans wrapping a channel) carry
+  // no WG yet — paths routing through them would read as free and sever the
+  // very cycles this bound exists to price (measured on FA-bwd: the ds
+  // hand-off truncf→local_alloc→MMA scored cross-free). Assign each
+  // unassigned node to its unique transitive consumer WG; ops whose
+  // consumers span WGs are replicated at lowering (a local copy per WG), so
+  // leaving them uncharged matches reality.
+  llvm::SmallDenseMap<unsigned, int> effWg(nodeToWg);
+  {
+    llvm::SmallVector<llvm::SmallDenseSet<int, 2>> tgt(n);
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto &e : loop.edges) {
+        if (e.distance != 0 || e.srcId >= n || e.dstId >= n)
+          continue;
+        if (nodeToWg.count(e.srcId))
+          continue;
+        auto dIt = nodeToWg.find(e.dstId);
+        if (dIt != nodeToWg.end()) {
+          if (tgt[e.srcId].insert(dIt->second).second)
+            changed = true;
+        } else {
+          for (int wgId : tgt[e.dstId])
+            if (tgt[e.srcId].insert(wgId).second)
+              changed = true;
+        }
+      }
+    }
+    for (unsigned i = 0; i < n; ++i)
+      if (!nodeToWg.count(i) && tgt[i].size() == 1)
+        effWg[i] = *tgt[i].begin();
+  }
+
+  auto crossCost = [&](const ttg::ScheduleEdge &e) -> int {
+    auto sIt = effWg.find(e.srcId);
+    auto dIt = effWg.find(e.dstId);
+    if (sIt == effWg.end() || dIt == effWg.end() || sIt->second == dIt->second)
+      return 0;
+    // Loop-carried hop (distance ≥ 1): the producer's value (if any) was
+    // staged during an earlier iteration — at the consumer's iteration only
+    // the release handshake is left to pay. Charging a fresh round-trip here
+    // overprices every pipelined channel on a cycle (measured: the committed
+    // FA-fwd partition's qk anti-edge would read +552 and push RecMII' to
+    // 1778 where the achieved steady state is ~1459).
+    const auto &sN = loop.nodes[e.srcId];
+    if (e.distance == 0 && isRegisterComputeValue(sN.op)) {
+      int64_t bytes = std::max<int64_t>(registerTensorBytes(sN.op), 0);
+      return kCrossWGRoundTripLatency + smemMoveCost(bytes);
+    }
+    // SMEM/TMEM-resident producer (load/MMA/store) or loop-carried edge:
+    // two-sided barrier handshake, not a data round-trip.
+    return 2 * kBarrierOverhead;
+  };
+
+  // Forward DAG over distance-0 edges, weight = latency + cross.
+  llvm::SmallVector<llvm::SmallVector<std::pair<unsigned, int>, 4>> succ(n);
+  llvm::SmallVector<int> indeg(n, 0);
+  for (const auto &e : loop.edges) {
+    if (e.distance != 0 || e.srcId >= n || e.dstId >= n || e.srcId == e.dstId)
+      continue;
+    succ[e.srcId].push_back({e.dstId, e.latency + crossCost(e)});
+    ++indeg[e.dstId];
+  }
+  // Single-instruction-stream constraint: within one warp group ops issue
+  // serially in emission order, so a recurrence that enters a WG at node A
+  // and leaves at node B ≥ the issue time of everything the stream places
+  // between them — not just the dependence path. Model it as issue-order
+  // chain edges (consecutive same-WG nodes in (cycle, id) order, weight =
+  // the earlier node's selfLatency: async ops block only for their issue
+  // cost, sync ops for their duration). Without these, a partition that
+  // merges a long compute chain INTO a recurrence's WG prices the cycle as
+  // if the chain weren't in the stream (measured: FA-fwd softmax+correction
+  // merged reads RecMII' 1445 while the emitted stream sustains ~2600+).
+  // Stream wrap-around (per WG): barrier waits execute in stream order and
+  // block EVERY warp of the group — warp interleaving hides scoreboard
+  // stalls between waits, but the waits themselves order across iterations:
+  // the last wait-bearing op of iteration j precedes the first wait-bearing
+  // op of iteration j+1. That closes a distance-1 cycle through whatever
+  // cross-WG dependence paths feed those waits — the coupling that makes a
+  // depth-1 channel chain run at the SUM of its hops, not their max
+  // (measured: a 6-WG FA-bwd candidate modeled ~1.5K cyc/iter,
+  // sustained ~4.9K — every iteration's m/D channel stores sit behind a
+  // wait on the previous iteration's LAST pipeline stage). Weight-0 order
+  // edges only; real latencies come from the dependence paths.
+  llvm::SmallVector<std::pair<unsigned, unsigned>, 8> streamWraps;
+  {
+    llvm::SmallVector<bool> bearsWait(n, false);
+    for (const auto &e : loop.edges) {
+      if (e.distance != 0 || e.srcId >= n || e.dstId >= n)
+        continue;
+      auto sIt = effWg.find(e.srcId);
+      auto dIt = effWg.find(e.dstId);
+      if (sIt == effWg.end() || dIt == effWg.end() ||
+          sIt->second == dIt->second)
+        continue;
+      bearsWait[e.srcId] = true; // producer-side channel empty-wait
+      bearsWait[e.dstId] = true; // consumer-side channel full-wait
+    }
+    llvm::DenseMap<int, SmallVector<unsigned>> wgMembers;
+    for (unsigned i = 0; i < n; ++i) {
+      auto it = effWg.find(i);
+      if (it != effWg.end())
+        wgMembers[it->second].push_back(i);
+    }
+    for (auto &[wgId, members] : wgMembers) {
+      (void)wgId;
+      llvm::sort(members, [&](unsigned a, unsigned b) {
+        return std::make_pair(loop.nodes[a].cycle, a) <
+               std::make_pair(loop.nodes[b].cycle, b);
+      });
+      for (size_t i = 0; i + 1 < members.size(); ++i) {
+        unsigned u = members[i], v = members[i + 1];
+        succ[u].push_back({v, std::max(loop.nodes[u].selfLatency, 0)});
+        ++indeg[v];
+      }
+      unsigned firstWaiter = UINT_MAX, lastWaiter = UINT_MAX;
+      for (unsigned m : members) {
+        if (!bearsWait[m])
+          continue;
+        if (firstWaiter == UINT_MAX)
+          firstWaiter = m;
+        lastWaiter = m;
+      }
+      if (firstWaiter != UINT_MAX && lastWaiter != firstWaiter)
+        streamWraps.push_back({lastWaiter, firstWaiter});
+    }
+  }
+  llvm::SmallVector<unsigned> topo;
+  topo.reserve(n);
+  {
+    llvm::SmallVector<unsigned> stack;
+    for (unsigned i = 0; i < n; ++i)
+      if (indeg[i] == 0)
+        stack.push_back(i);
+    while (!stack.empty()) {
+      unsigned u = stack.pop_back_val();
+      topo.push_back(u);
+      for (auto &[v, w] : succ[u]) {
+        (void)w;
+        if (--indeg[v] == 0)
+          stack.push_back(v);
+      }
+    }
+  }
+  if (topo.size() != n) {
+    // The issue-order chain can conflict with a dependence edge whose
+    // endpoints share a cycle (rare tie). Rebuild without the chain edges —
+    // a looser bound beats a wrong one.
+    succ.assign(n, {});
+    indeg.assign(n, 0);
+    for (const auto &e : loop.edges) {
+      if (e.distance != 0 || e.srcId >= n || e.dstId >= n || e.srcId == e.dstId)
+        continue;
+      succ[e.srcId].push_back({e.dstId, e.latency + crossCost(e)});
+      ++indeg[e.dstId];
+    }
+    topo.clear();
+    llvm::SmallVector<unsigned> stack;
+    for (unsigned i = 0; i < n; ++i)
+      if (indeg[i] == 0)
+        stack.push_back(i);
+    while (!stack.empty()) {
+      unsigned u = stack.pop_back_val();
+      topo.push_back(u);
+      for (auto &[v, w] : succ[u]) {
+        (void)w;
+        if (--indeg[v] == 0)
+          stack.push_back(v);
+      }
+    }
+    if (topo.size() != n)
+      return 0; // distance-0 cycle (malformed) — no bound over a wrong one
+  }
+
+  constexpr int64_t kUnreached = std::numeric_limits<int64_t>::min();
+  int recMII = 0;
+  auto boundThrough = [&](unsigned srcId, unsigned dstId, int backWeight,
+                          unsigned distance) {
+    // Longest augmented path dst → src over the distance-0 DAG, closing the
+    // cycle through the back-edge.
+    llvm::SmallVector<int64_t> dist(n, kUnreached);
+    dist[dstId] = 0;
+    for (unsigned u : topo) {
+      if (dist[u] == kUnreached)
+        continue;
+      for (auto &[v, w] : succ[u])
+        dist[v] = std::max(dist[v], dist[u] + w);
+    }
+    if (dist[srcId] == kUnreached)
+      return; // no cycle through this back-edge
+    int64_t total = dist[srcId] + backWeight;
+    int64_t bound = (total + distance - 1) / distance;
+    recMII = std::max(recMII, static_cast<int>(bound));
+  };
+  for (const auto &b : loop.edges) {
+    if (b.distance == 0 || b.srcId >= n || b.dstId >= n)
+      continue;
+    boundThrough(b.srcId, b.dstId, b.latency + crossCost(b), b.distance);
+  }
+  // Stream wrap-around order edges (see streamWraps above): last waiter of
+  // iteration j precedes the first waiter of iteration j+1, weight 0.
+  for (auto &[lastW, firstW] : streamWraps)
+    boundThrough(lastW, firstW, 0, 1);
+  return recMII;
+}
+
+/// TRITON_MODULO_DEBUG_RECMII=1: print the committed partition's RecMII'
+/// against the schedule II — the probe that diagnoses recurrence-bound
+/// partitions without a debug build.
+static void debugPrintFinalRecMII(const ttg::ScheduleLoop &loop,
+                                  const char *tag) {
+  if (!triton::tools::getBoolEnv("TRITON_MODULO_DEBUG_RECMII"))
+    return;
+  llvm::SmallDenseMap<unsigned, int> nodeToWg;
+  for (const auto &node : loop.nodes)
+    if (node.warpGroup >= 0)
+      nodeToWg[node.id] = node.warpGroup;
+  int rec = computePartitionRecMII(loop, nodeToWg);
+  llvm::errs() << "[RecMII] " << tag << " loop" << loop.id
+               << ": committed partition RecMII'=" << rec
+               << " vs II=" << loop.II
+               << (rec > loop.II ? "  (recurrence-bound above II)" : "")
+               << "\n";
+}
+
 static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
                                       const SmallVector<OpCluster> &clusters,
                                       const ttg::ScheduleLoop &loop,
@@ -3124,12 +3416,14 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // Cross-WG register round-trip cost per WG (see accumulateCrossWGRoundTrip).
   llvm::SmallDenseMap<int, int> rtPerWg;
   accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
+  llvm::SmallDenseMap<int, int> mwPerWg;
+  accumulatePropagatedMinWarps(loop, nodeToWg, mwPerWg);
 
   int bottleneck = 0;
   int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
   int explicitWarps = 0;
   for (auto &[wgId, nodes] : wgToNodes) {
-    int wgWarps = wgRequiredWarps(nodes, loop);
+    int wgWarps = std::max(wgRequiredWarps(nodes, loop), mwPerWg.lookup(wgId));
     explicitWarps += wgWarps;
     int ms = computeMultiPipelineMakespan(nodes, loop, wgWarps);
     int barCost = computeWGBarrierCost(nodes, loop, nodeToWg, wgId);
@@ -3152,6 +3446,17 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
     }
     bottleneck = std::max(bottleneck, wgCost);
   }
+
+  // Recurrence floor: the steady state can't beat the partition-aware
+  // cycle bound, whatever the per-WG makespans say. See
+  // computePartitionRecMII.
+  int recMII = computePartitionRecMII(loop, nodeToWg);
+  if (verbose && recMII > bottleneck) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[Score-VERBOSE]   recurrence floor: RecMII'=" << recMII
+               << " > bottleneck=" << bottleneck << " — cost floored\n");
+  }
+  bottleneck = std::max(bottleneck, recMII);
 
   // Cross-wg edges (cost of barriers). Only count edges where both endpoints
   // are non-NONE (NONE ops aren't in any cluster). A cross-wg dep inside the
@@ -3302,10 +3607,13 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
   }
   llvm::SmallDenseMap<int, int> rtPerWg;
   accumulateCrossWGRoundTrip(loop, nodeToWg, rtPerWg);
+  llvm::SmallDenseMap<int, int> mwPerWg;
+  accumulatePropagatedMinWarps(loop, nodeToWg, mwPerWg);
   int bottleneck = 0;
   int explicitWarps = 0;
   for (unsigned wgi = 0; wgi < wgs.size(); ++wgi) {
-    int wgWarps = wgRequiredWarps(wgs[wgi].nodeIds, loop);
+    int wgWarps = std::max(wgRequiredWarps(wgs[wgi].nodeIds, loop),
+                           mwPerWg.lookup(static_cast<int>(wgi)));
     explicitWarps += wgWarps;
     int ms = computeMultiPipelineMakespan(wgs[wgi].nodeIds, loop, wgWarps);
     int barCost = computeWGBarrierCost(wgs[wgi].nodeIds, loop, nodeToWg,
@@ -3319,6 +3627,9 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
   // Channel-SMEM capacity + co-residency, same terms as scoreCandidate.
   auto so = computeSecondOrderTerms(loop, nodeToWg, totalRegs, explicitWarps,
                                     committedSmemBytes);
+  // Recurrence floor — identical term to scoreCandidate so the two
+  // partitioner paths stay directly comparable.
+  bottleneck = std::max(bottleneck, computePartitionRecMII(loop, nodeToWg));
   // Cross-WG barrier-issue cost is folded into per-WG bottleneck via
   // `computeWGBarrierCost`; the legacy global `crossEdges * kBarrierOverhead`
   // term has been dropped to avoid double-charging.
@@ -3422,6 +3733,7 @@ static void partitionClusterGreedy(ttg::ScheduleLoop &loop,
     for (unsigned nid : wgs[wgi].nodeIds)
       loop.nodes[nid].warpGroup = wgi;
   }
+  debugPrintFinalRecMII(loop, "greedy");
   LLVM_DEBUG({
     for (const auto &node : loop.nodes) {
       llvm::dbgs() << "[PassB.1]   N" << node.id << " "
@@ -3590,6 +3902,7 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop,
     for (unsigned nid : c.nodeIds)
       loop.nodes[nid].warpGroup = wg;
   }
+  debugPrintFinalRecMII(loop, "exhaustive");
 
   // Record the top-N candidate partitions for the multi-graph autotuning dump
   // (TRITON_MODULO_DUMP_TOPN). Each is a node-indexed raw warpGroup vector
@@ -3775,9 +4088,6 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
   // load warp run a full iteration ahead of compute (prefetch), which is what
   // turns the 3-WG split from "matches 1-WG" into "beats it ~1.2x". TC loops
   // (GEMM/FA) keep their tuned depth-1 register channels untouched.
-  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
-    return n.pipeline == ttg::HWPipeline::TC;
-  });
   for (const auto &edge : loop.edges) {
     const auto &src = loop.nodes[edge.srcId];
     const auto &dst = loop.nodes[edge.dstId];
@@ -3814,7 +4124,7 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     // Resolve the channel: reuse the producer's data buffer / the TMA
     // destination buffer, or get a synthesis spec (shape + depth rule).
     // Shared with the scoring-time predictor — see resolveCrossWGChannel.
-    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    auto spec = resolveCrossWGChannel(loop, edge);
     unsigned depth = spec.depth;
     unsigned pairedBuf = spec.pairedBuf;
     if (spec.synthesize) {
@@ -3832,6 +4142,10 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       // count via ScheduleBuffer::totalBytes() (= sizeBytes() * count), which
       // the Step-4 budget, the JSON `total_bytes`, and the emitter's
       // local_alloc(..., count) all consume.
+      //
+      // The depth rule itself (TC-free TMA prefetch floor; lifetime/II+1
+      // for TMA-store consumers) lives in resolveCrossWGChannel so the
+      // scoring-time predictor and this synthesis cannot drift.
       ttg::ScheduleBuffer chan;
       chan.id = loop.buffers.size();
       chan.kind = ttg::MemoryKind::SMEM;
@@ -4193,9 +4507,6 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   for (const auto &c : clusters)
     for (unsigned nid : c.nodeIds)
       nodeToCluster[nid] = c.id;
-  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
-    return n.pipeline == ttg::HWPipeline::TC;
-  });
 
   llvm::json::Array jClusters;
   for (const auto &c : clusters) {
@@ -4243,7 +4554,7 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
     int xissue = 2 * freq *
                  (sN.pipeline == ttg::HWPipeline::TC ? kNamedBarrierIssueCost
                                                      : kMBarrierIssueCost);
-    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    auto spec = resolveCrossWGChannel(loop, edge);
     int64_t chanBytes =
         spec.synthesize ? spec.synthesizedBytes() + 2 * spec.depth * 8 : 0;
     jEdges.push_back(llvm::json::Object{
@@ -4363,35 +4674,19 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
         continue;
-      // Outer WS loops stay single-WG. The sched2tlx emitter only lowers
-      // multi-WG bodies for INNER loops today; splitting an outer-loop
-      // epilogue chain (e.g. convert_layout → descriptor_store) into its own
-      // WG silently drops those ops in the emitted kernel. The modeled upside
-      // is also marginal: the outer II is dominated by the inner-loop
-      // super-node (thousands of cycles), so overlapping the epilogue saves a
-      // few percent at best while risking an unlowerable partition.
-      // This is an EMITTER-capability legality constraint — keep it (in some
-      // form) even under a global solver. See docs/SolverMigrationNotes.md
-      // (guard 3).
-      if (sl.isOuter) {
-        for (auto &node : schedLoop.nodes)
-          node.warpGroup = (node.pipeline == ttg::HWPipeline::NONE) ? -1 : 0;
-        schedLoop.topPartitions.clear();
-        schedLoop.topPartitionCosts.clear();
-        demoteScalarArithToInfra(schedLoop);
-        propagateWarpGroupToInfraOps(schedLoop);
-        coLocateOperandAllocsWithLoads(schedLoop);
-        continue;
-      }
-      // All inner loops go through the same cost-model partitioner — no TC vs
-      // TC-free special-casing. The makespan (single-iteration latency chain
-      // over each WG's pipeAvail) plus barrier cost decides the split
-      // uniformly. This rewards warp specialization wherever it overlaps
-      // independent pipelines across groups: GEMM/FA (MEM/TC/softmax) AND
-      // memory-bound loops like LayerNorm, where putting TMA-load, compute,
-      // and TMA-store on separate warp groups frees the compute warps and
-      // removes the in-stream store drain (measured ~1.2x over 1-WG software
-      // pipelining). No env flag, no hard override.
+      // Every loop — inner AND outer — goes through the same cost-model
+      // partitioner: the makespan (single-iteration latency chain over each
+      // WG's pipeAvail) plus barrier cost decides the split uniformly, and
+      // all candidates carry the same RecMII'-floor / launchability terms.
+      // No env flag, no hard override, no outer-loop special case: sched2tlx
+      // lowers multi-WG outer bodies, and its task-coverage check hard-errors
+      // on any scheduled op no task owns rather than dropping it silently.
+      // This rewards warp specialization wherever it overlaps independent
+      // pipelines across groups: GEMM/FA (MEM/TC/softmax) AND memory-bound
+      // loops like LayerNorm, where putting TMA-load, compute, and TMA-store
+      // on separate warp groups frees the compute warps and removes the
+      // in-stream store drain (measured ~1.2x over 1-WG software
+      // pipelining).
       if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
       } else {

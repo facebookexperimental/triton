@@ -308,7 +308,8 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   // modulo-scheduling folklore) is too narrow to absorb reservation-table
   // fragmentation when one pipeline is saturated (ResMII-bound with zero
   // slack, e.g. layernorm's CUDA pipe). Applies to the heuristic paths
-  // below only — the cpsat path above needs no window (guard 2).
+  // below only — a complete (ILP-style) search like the cpsat path above
+  // has no such fragmentation failure mode and needs no window at all.
   maxII = std::min(maxII, minII + std::max(10, minII / 8));
 
   LLVM_DEBUG({

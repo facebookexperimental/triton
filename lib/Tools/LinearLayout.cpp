@@ -193,7 +193,6 @@ LinearLayout::LinearLayout(BasesT bases,
 
 std::optional<std::string>
 LinearLayout::checkInvariants(bool requireSurjective) {
-  LDBG("checkInvariants: " << toString());
 
   // Cache isModular result FIRST, before any validation that uses it.
   // This is computed once during construction since outDims is immutable.

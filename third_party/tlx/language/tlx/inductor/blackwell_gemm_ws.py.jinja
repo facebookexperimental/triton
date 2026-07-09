@@ -1,0 +1,615 @@
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
+
+    dsize: tl.constexpr = 2
+
+    desc_a = tl.make_tensor_descriptor(
+        A,
+        shape=[M, K],
+        strides=[stride_am, 1],
+        block_shape=[BLOCK_M_SPLIT, BLOCK_K],
+    )
+
+    desc_b = tl.make_tensor_descriptor(
+        B,
+        shape=[K, N],
+        strides=[stride_bk, 1],
+        block_shape=[BLOCK_K, BLOCK_N // NUM_CTAS],
+    )
+
+    buffers_A = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BLOCK_K),
+        A.dtype.element_ty,
+        NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
+    )
+    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N // NUM_CTAS), A.dtype.element_ty, NUM_SMEM_BUFFERS)
+    tmem_buffers = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BLOCK_N),
+        tl.float32,
+        NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+        tlx.storage_kind.tmem,
+    )
+{% if SPLIT_K > 1 %}
+    NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
+    ws_smem_buffers = tlx.local_alloc(
+        (BLOCK_M_SPLIT, slice_size),
+        tl.float32,
+        NUM_EPILOGUE_SMEM_BUFFERS,
+    )
+{% elif TMA_EPILOGUE_STORE %}
+    NUM_EPILOGUE_SMEM_BUFFERS: tl.constexpr = NUM_MMA_GROUPS if NUM_MMA_GROUPS > 2 else 2
+    c_smem_buffers = tlx.local_alloc(
+        (BLOCK_M_SPLIT, slice_size),
+        {{output_ptr()}}.dtype.element_ty,
+        NUM_EPILOGUE_SMEM_BUFFERS,
+    )
+    stride_cm = {{stride(None, 0)}}
+    desc_c = tl.make_tensor_descriptor(
+        {{output_ptr()}}, shape=[M, N], strides=[stride_cm, 1],
+        block_shape=[BLOCK_M_SPLIT, slice_size])
+{% endif %}
+
+    if NUM_CTAS == 2:
+        cluster_cta_rank = tlx.cluster_cta_rank()
+        pred_cta0 = cluster_cta_rank == 0
+        cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=2)
+    else:
+        cluster_cta_rank = 0
+        pred_cta0 = False
+        cta_bars = None
+
+    A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
+    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=EPILOGUE_SUBTILE)
+
+    with tlx.async_tasks():
+        with tlx.async_task("default"):  # epilogue consumer
+            (
+                start_pid,
+                num_pid_m,
+                num_pid_n,
+                num_pid_in_group,
+                num_mn_tiles,
+                num_tiles,
+                k_tiles_total,
+            ) = _compute_grid_info(
+                M,
+                N,
+                K,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_SIZE_M,
+                SPLIT_K,
+                NUM_CTAS,
+            )
+
+            tmem_accum_cnt = 0
+            tile_id = start_pid
+
+            while tile_id < num_tiles:
+{% if SPLIT_K > 1 %}
+                split_id = tile_id // num_mn_tiles
+                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                k_tile_start = split_id * k_tiles_per_split
+                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                if k_tile_end > k_tile_start:
+                    cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                    mn_tile_id = tile_id % num_mn_tiles
+                    pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                    offs_bn = pid_n * BLOCK_N
+
+                    # Per-partition descriptor with shape=[M, N] so TMA clips
+                    # at partition boundaries when M is not a multiple of BLOCK_M.
+                    desc_ws = tl.make_tensor_descriptor(
+                        split_k_ws + split_id * M * N,
+                        shape=[M, N], strides=[N, 1],
+                        block_shape=[BLOCK_M_SPLIT, slice_size])
+
+{% if INTERLEAVE_EPILOGUE %}
+                    # Interleaved split-K: alternate group 0/1 stores to hide TMEM read latency.
+                    buf_idx_0 = 0 * NUM_TMEM_BUFFERS + cur_tmem_buf
+                    buf_idx_1 = 1 * NUM_TMEM_BUFFERS + cur_tmem_buf
+                    acc_tmem_0 = tmem_buffers[buf_idx_0]
+                    acc_tmem_1 = tmem_buffers[buf_idx_1]
+                    offs_am_0 = pid_m * BLOCK_M + 0 * BLOCK_M_SPLIT
+                    offs_am_1 = pid_m * BLOCK_M + 1 * BLOCK_M_SPLIT
+
+                    # Group 0 slice 0
+                    tlx.barrier_wait(tmem_full_bars[buf_idx_0], tmem_read_phase)
+                    acc_sub = tlx.local_slice(acc_tmem_0, [0, 0], [BLOCK_M_SPLIT, slice_size])
+                    result = tlx.local_load(acc_sub)
+                    tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
+                    offs_cn = offs_bn
+                    ws_smem = ws_smem_buffers[0]
+                    tlx.async_descriptor_store_wait(1)
+                    tlx.local_store(ws_smem, result)
+                    tlx.fence_async_shared()
+                    tlx.async_descriptor_store(desc_ws, ws_smem, [offs_am_0, offs_cn], eviction_policy="evict_first")
+
+                    # Group 1 slice 0
+                    tlx.barrier_wait(tmem_full_bars[buf_idx_1], tmem_read_phase)
+                    acc_sub = tlx.local_slice(acc_tmem_1, [0, 0], [BLOCK_M_SPLIT, slice_size])
+                    result = tlx.local_load(acc_sub)
+                    tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
+                    offs_cn = offs_bn
+                    ws_smem = ws_smem_buffers[1]
+                    tlx.async_descriptor_store_wait(1)
+                    tlx.local_store(ws_smem, result)
+                    tlx.fence_async_shared()
+                    tlx.async_descriptor_store(desc_ws, ws_smem, [offs_am_1, offs_cn], eviction_policy="evict_first")
+
+                    # Remaining slices: alternate group 0 / group 1
+                    for slice_id in tl.static_range(1, EPILOGUE_SUBTILE):
+                        # Group 0
+                        acc_sub = tlx.local_slice(acc_tmem_0, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
+                        result = tlx.local_load(acc_sub)
+                        tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
+                        offs_cn = offs_bn + slice_id * slice_size
+                        ws_smem = ws_smem_buffers[0]
+                        tlx.async_descriptor_store_wait(1)
+                        tlx.local_store(ws_smem, result)
+                        tlx.fence_async_shared()
+                        tlx.async_descriptor_store(desc_ws, ws_smem, [offs_am_0, offs_cn], eviction_policy="evict_first")
+
+                        # Group 1
+                        acc_sub = tlx.local_slice(acc_tmem_1, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
+                        result = tlx.local_load(acc_sub)
+                        tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
+                        offs_cn = offs_bn + slice_id * slice_size
+                        ws_smem = ws_smem_buffers[1]
+                        tlx.async_descriptor_store_wait(1)
+                        tlx.local_store(ws_smem, result)
+                        tlx.fence_async_shared()
+                        tlx.async_descriptor_store(desc_ws, ws_smem, [offs_am_1, offs_cn], eviction_policy="evict_first")
+
+                    tlx.async_descriptor_store_wait(0)
+                    tmem_accum_cnt += 1
+{% else %}
+                    # Non-interleaved split-K: sequential group loop.
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        buf_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                        tlx.barrier_wait(tmem_full_bars[buf_idx], tmem_read_phase)
+                        acc_tmem = tmem_buffers[buf_idx]
+                        offs_am = pid_m * BLOCK_M + group_id * BLOCK_M_SPLIT
+
+                        for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                            acc_tmem_subslice = tlx.local_slice(
+                                acc_tmem,
+                                [0, slice_id * slice_size],
+                                [BLOCK_M_SPLIT, slice_size],
+                            )
+                            result = tlx.local_load(acc_tmem_subslice)
+                            tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
+                            offs_cn = offs_bn + slice_id * slice_size
+                            ws_smem = ws_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % NUM_EPILOGUE_SMEM_BUFFERS]
+                            tlx.async_descriptor_store_wait(1)
+                            tlx.local_store(ws_smem, result)
+                            tlx.fence_async_shared()
+                            tlx.async_descriptor_store(desc_ws, ws_smem, [offs_am, offs_cn], eviction_policy="evict_first")
+                    tlx.async_descriptor_store_wait(0)
+                    tmem_accum_cnt += 1
+{% endif %}
+{% else %}
+                cur_tmem_buf, tmem_read_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                mn_tile_id = tile_id % num_mn_tiles
+                pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_bn = pid_n * BLOCK_N
+
+{% if INTERLEAVE_EPILOGUE and TMA_EPILOGUE_STORE %}
+                # Interleaved TMA stores across two MMA groups to hide TMEM read latency.
+                # Pattern: wait g0 -> store g0s0 -> wait g1 -> store g1s0, then alternate for remaining slices.
+                buf_idx_0 = 0 * NUM_TMEM_BUFFERS + cur_tmem_buf
+                buf_idx_1 = 1 * NUM_TMEM_BUFFERS + cur_tmem_buf
+                acc_tmem_0 = tmem_buffers[buf_idx_0]
+                acc_tmem_1 = tmem_buffers[buf_idx_1]
+                offs_am_0 = pid_m * BLOCK_M + 0 * BLOCK_M_SPLIT
+                offs_am_1 = pid_m * BLOCK_M + 1 * BLOCK_M_SPLIT
+
+                # Group 0 slice 0
+                tlx.barrier_wait(tmem_full_bars[buf_idx_0], tmem_read_phase)
+                acc_sub = tlx.local_slice(acc_tmem_0, [0, 0], [BLOCK_M_SPLIT, slice_size])
+                result = tlx.local_load(acc_sub)
+                tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
+                offs_cn = offs_bn
+                {{compute_epilogue(("offs_am_0", "offs_cn"), "result", result_name="fused_c", indent_width=16, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
+                c_smem = c_smem_buffers[0]
+                tlx.async_descriptor_store_wait(1)
+                tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(desc_c, c_smem, [offs_am_0, offs_cn], eviction_policy="evict_first")
+
+                # Group 1 slice 0
+                tlx.barrier_wait(tmem_full_bars[buf_idx_1], tmem_read_phase)
+                acc_sub = tlx.local_slice(acc_tmem_1, [0, 0], [BLOCK_M_SPLIT, slice_size])
+                result = tlx.local_load(acc_sub)
+                tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
+                offs_cn = offs_bn
+                {{compute_epilogue(("offs_am_1", "offs_cn"), "result", result_name="fused_c", indent_width=16, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
+                c_smem = c_smem_buffers[1]
+                tlx.async_descriptor_store_wait(1)
+                tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(desc_c, c_smem, [offs_am_1, offs_cn], eviction_policy="evict_first")
+
+                # Remaining slices: alternate group 0 / group 1
+                for slice_id in tl.static_range(1, EPILOGUE_SUBTILE):
+                    # Group 0
+                    acc_sub = tlx.local_slice(acc_tmem_0, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
+                    result = tlx.local_load(acc_sub)
+                    tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
+                    offs_cn = offs_bn + slice_id * slice_size
+                    {{compute_epilogue(("offs_am_0", "offs_cn"), "result", result_name="fused_c", indent_width=20, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
+                    c_smem = c_smem_buffers[0]
+                    tlx.async_descriptor_store_wait(1)
+                    tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                    tlx.fence_async_shared()
+                    tlx.async_descriptor_store(desc_c, c_smem, [offs_am_0, offs_cn], eviction_policy="evict_first")
+
+                    # Group 1
+                    acc_sub = tlx.local_slice(acc_tmem_1, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
+                    result = tlx.local_load(acc_sub)
+                    tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
+                    offs_cn = offs_bn + slice_id * slice_size
+                    {{compute_epilogue(("offs_am_1", "offs_cn"), "result", result_name="fused_c", indent_width=20, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
+                    c_smem = c_smem_buffers[1]
+                    tlx.async_descriptor_store_wait(1)
+                    tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                    tlx.fence_async_shared()
+                    tlx.async_descriptor_store(desc_c, c_smem, [offs_am_1, offs_cn], eviction_policy="evict_first")
+{% else %}
+                for group_id in tl.static_range(NUM_MMA_GROUPS):
+                    buf_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                    tlx.barrier_wait(tmem_full_bars[buf_idx], tmem_read_phase)
+                    acc_tmem = tmem_buffers[buf_idx]
+                    offs_am = pid_m * BLOCK_M + group_id * BLOCK_M_SPLIT
+
+                    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                        acc_tmem_subslice = tlx.local_slice(
+                            acc_tmem,
+                            [0, slice_id * slice_size],
+                            [BLOCK_M_SPLIT, slice_size],
+                        )
+                        result = tlx.local_load(acc_tmem_subslice)
+                        tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
+                        offs_cn = offs_bn + slice_id * slice_size
+{% if TMA_EPILOGUE_STORE %}
+                        {{compute_epilogue(("offs_am", "offs_cn"), "result", result_name="fused_c", indent_width=24, val_shape=("BLOCK_M_SPLIT", "slice_size"))}}
+                        c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % NUM_EPILOGUE_SMEM_BUFFERS]
+                        tlx.async_descriptor_store_wait(1)
+                        tlx.local_store(c_smem, fused_c.to(A.dtype.element_ty))
+                        tlx.fence_async_shared()
+                        tlx.async_descriptor_store(desc_c, c_smem, [offs_am, offs_cn], eviction_policy="evict_first")
+{% else %}
+                        {{store_output(("offs_am", "offs_cn"), "result", indent_width=24, val_shape=("BLOCK_M_SPLIT", "slice_size"), block_indexing=True)}}
+{% endif %}
+{% endif %}
+
+{% if TMA_EPILOGUE_STORE %}
+                tlx.async_descriptor_store_wait(0)
+{% endif %}
+                tmem_accum_cnt += 1
+{% endif %}
+                tile_id += NUM_SMS
+
+        with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
+            (
+                start_pid,
+                num_pid_m,
+                num_pid_n,
+                num_pid_in_group,
+                num_mn_tiles,
+                num_tiles,
+                k_tiles_total,
+            ) = _compute_grid_info(
+                M,
+                N,
+                K,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_SIZE_M,
+                SPLIT_K,
+                NUM_CTAS,
+            )
+
+            tmem_accum_cnt = 0
+            smem_accum_cnt = 0
+            tile_id = start_pid
+
+            while tile_id < num_tiles:
+                split_id = tile_id // num_mn_tiles
+                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                k_tile_start = split_id * k_tiles_per_split
+                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                local_k_tiles = k_tile_end - k_tile_start
+{% if SPLIT_K > 1 %}
+                if k_tile_end > k_tile_start:
+                    cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+
+                    buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+                    tlx.barrier_wait(B_smem_full_bars[buf], phase)
+
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                        acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+
+                        tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+
+                        cur_barrier_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                        tlx.barrier_wait(tmem_empty_bars[cur_barrier_idx], tmem_write_phase ^ 1)
+
+                        if NUM_CTAS == 2:
+                            tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
+                            tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
+
+                        tlx.async_dot(
+                            buffers_A[a_buf],
+                            buffers_B[buf],
+                            tmem_buffers[acc_buf],
+                            use_acc=False,
+                            mBarriers=[A_smem_empty_bars[a_buf]],
+                            two_ctas=NUM_CTAS == 2,
+                            out_dtype=tl.float32,
+                        )
+
+                    smem_accum_cnt += 1
+
+                    for _ in range(1, local_k_tiles):
+                        buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+                        tlx.barrier_wait(B_smem_full_bars[buf], phase)
+
+                        for group_id in tl.static_range(NUM_MMA_GROUPS):
+                            a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                            acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+
+                            tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+
+                            if NUM_CTAS == 2:
+                                tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
+                                tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
+
+                            tlx.async_dot(
+                                buffers_A[a_buf],
+                                buffers_B[buf],
+                                tmem_buffers[acc_buf],
+                                use_acc=True,
+                                mBarriers=[A_smem_empty_bars[a_buf]],
+                                two_ctas=NUM_CTAS == 2,
+                                out_dtype=tl.float32,
+                            )
+
+                        smem_accum_cnt += 1
+
+                    last_buf, last_phase = _get_bufidx_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        a_buf = group_id * NUM_SMEM_BUFFERS + last_buf
+                        tlx.barrier_wait(A_smem_empty_bars[a_buf], last_phase)
+                        acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                        tlx.barrier_arrive(tmem_full_bars[acc_buf], 1)
+
+                    tmem_accum_cnt += 1
+{% else %}
+                cur_tmem_buf, tmem_write_phase = _get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+
+                buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+                tlx.barrier_wait(B_smem_full_bars[buf], phase)
+
+                for group_id in tl.static_range(NUM_MMA_GROUPS):
+                    a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                    acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+
+                    tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+
+                    cur_barrier_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                    tlx.barrier_wait(tmem_empty_bars[cur_barrier_idx], tmem_write_phase ^ 1)
+
+                    if NUM_CTAS == 2:
+                        tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
+                        tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
+
+                    tlx.async_dot(
+                        buffers_A[a_buf],
+                        buffers_B[buf],
+                        tmem_buffers[acc_buf],
+                        use_acc=False,
+                        mBarriers=[A_smem_empty_bars[a_buf]],
+                        two_ctas=NUM_CTAS == 2,
+                        out_dtype=tl.float32,
+                    )
+
+                smem_accum_cnt += 1
+
+                for _ in range(1, local_k_tiles):
+                    buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+                    tlx.barrier_wait(B_smem_full_bars[buf], phase)
+
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                        acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+
+                        tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+
+                        if NUM_CTAS == 2:
+                            tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
+                            tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
+
+                        tlx.async_dot(
+                            buffers_A[a_buf],
+                            buffers_B[buf],
+                            tmem_buffers[acc_buf],
+                            use_acc=True,
+                            mBarriers=[A_smem_empty_bars[a_buf]],
+                            two_ctas=NUM_CTAS == 2,
+                            out_dtype=tl.float32,
+                        )
+
+                    smem_accum_cnt += 1
+
+                last_buf, last_phase = _get_bufidx_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
+                for group_id in tl.static_range(NUM_MMA_GROUPS):
+                    a_buf = group_id * NUM_SMEM_BUFFERS + last_buf
+                    tlx.barrier_wait(A_smem_empty_bars[a_buf], last_phase)
+                    acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                    tlx.barrier_arrive(tmem_full_bars[acc_buf], 1)
+
+                tmem_accum_cnt += 1
+{% endif %}
+                tile_id += NUM_SMS
+
+        with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
+            (
+                start_pid,
+                num_pid_m,
+                num_pid_n,
+                num_pid_in_group,
+                num_mn_tiles,
+                num_tiles,
+                k_tiles_total,
+            ) = _compute_grid_info(
+                M,
+                N,
+                K,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                GROUP_SIZE_M,
+                SPLIT_K,
+                NUM_CTAS,
+            )
+
+            smem_accum_cnt = 0
+            tile_id = start_pid
+
+            expected_bytes: tl.constexpr = dsize * BLOCK_N * BLOCK_K // NUM_CTAS
+
+            while tile_id < num_tiles:
+                split_id = tile_id // num_mn_tiles
+                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                k_tile_start = split_id * k_tiles_per_split
+                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                local_k_tiles = k_tile_end - k_tile_start
+{% if SPLIT_K > 1 %}
+                if k_tile_end > k_tile_start:
+                    mn_tile_id = tile_id % num_mn_tiles
+                    pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                    offs_bn = pid_n * BLOCK_N + cluster_cta_rank * (BLOCK_N // NUM_CTAS)
+
+                    for k_idx in range(0, local_k_tiles):
+                        k = k_tile_start + k_idx
+                        buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+                        offs_k = k * BLOCK_K
+
+                        a_buf = buf
+                        tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
+                        offs_am = pid_m * BLOCK_M
+                        tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
+                        tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                                  eviction_policy="evict_last")
+
+                        last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
+                        tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
+                        tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
+                        tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                                  eviction_policy="evict_last")
+
+                        for group_id in tl.static_range(1, NUM_MMA_GROUPS):
+                            a_buf = group_id * NUM_SMEM_BUFFERS + buf
+
+                            tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
+
+                            offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
+
+                            tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
+                            tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                                      eviction_policy="evict_last")
+
+                        smem_accum_cnt += 1
+{% else %}
+                mn_tile_id = tile_id % num_mn_tiles
+                pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+                offs_bn = pid_n * BLOCK_N + cluster_cta_rank * (BLOCK_N // NUM_CTAS)
+
+                for k_idx in range(0, local_k_tiles):
+                    k = k_tile_start + k_idx
+                    buf, phase = _get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+                    offs_k = k * BLOCK_K
+
+                    a_buf = buf
+                    tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
+                    offs_am = pid_m * BLOCK_M
+                    tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
+                    tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am, offs_k], A_smem_full_bars[a_buf],
+                                              eviction_policy="evict_last")
+
+                    last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
+                    tlx.barrier_wait(A_smem_empty_bars[last_a_buf], phase ^ 1)
+                    tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
+                    tlx.async_descriptor_load(desc_b, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                                              eviction_policy="evict_last")
+
+                    for group_id in tl.static_range(1, NUM_MMA_GROUPS):
+                        a_buf = group_id * NUM_SMEM_BUFFERS + buf
+
+                        tlx.barrier_wait(A_smem_empty_bars[a_buf], phase ^ 1)
+
+                        offs_am2 = offs_am + group_id * BLOCK_M_SPLIT
+
+                        tlx.barrier_expect_bytes(A_smem_full_bars[a_buf], dsize * BLOCK_M_SPLIT * BLOCK_K)
+                        tlx.async_descriptor_load(desc_a, buffers_A[a_buf], [offs_am2, offs_k], A_smem_full_bars[a_buf],
+                                                  eviction_policy="evict_last")
+
+                    smem_accum_cnt += 1
+{% endif %}
+
+                tile_id += NUM_SMS
+
+
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.jit
+def _get_bufidx_phase(accum_cnt, NUM_BUFFERS_KV):
+    bufIdx = accum_cnt % NUM_BUFFERS_KV
+    phase = (accum_cnt // NUM_BUFFERS_KV) & 1
+    return bufIdx, phase
+
+
+@triton.jit
+def _compute_grid_info(
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_K,
+    GROUP_SIZE_M,
+    SPLIT_K,
+    NUM_CTAS: tl.constexpr,
+):
+    """Compute common grid information used across async tasks."""
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M).to(tl.int32)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N).to(tl.int32)
+    num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    num_mn_tiles = num_pid_m * num_pid_n
+    num_tiles = num_mn_tiles * SPLIT_K
+    k_tiles_total = tl.cdiv(K, BLOCK_SIZE_K).to(tl.int32)
+    return start_pid, num_pid_m, num_pid_n, num_pid_in_group, num_mn_tiles, num_tiles, k_tiles_total
