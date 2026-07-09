@@ -514,7 +514,12 @@ class GluonSemantic(TritonSemantic[TensorTy]):
             self._wrap_handle_infer_layout(scan_op.get_result(i), inputs[i].type.scalar, shape)
             for i in range(len(inputs)))
 
-    def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn) -> Tuple[TensorTy, ...]:
+    # NOTE(fbtriton): local patch against the "do not modify gluon" rule -- adds
+    # `reduction_ordering` to match upstream Gluon's gl.max/gl.sum callers (the
+    # base TritonSemantic.reduction already has it). Overwritten on the next Gluon
+    # upstream sync, which should carry this signature.
+    def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn,
+                  reduction_ordering=None) -> Tuple[TensorTy, ...]:
         if axis is None:
             inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=False) for t in inputs)
             axis = 0
