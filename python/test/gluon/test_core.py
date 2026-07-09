@@ -3322,9 +3322,8 @@ def test_scatter_padded_subslice(interval_pairs, order, slice_m_offset, slice_n_
         padded_layout=padded_layout,
         num_warps=1,
     )
-        desc = TensorDescriptor.from_tensor(t, [128, 64], layout)
-        descriptor_shape_kernel[(1, )](desc, t.shape, num_warps=1, debug=True)
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected)
 
 
 @gluon.jit

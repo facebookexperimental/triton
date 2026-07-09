@@ -36,38 +36,53 @@ the Gluon frontend:
 - **Where.** Nightly + per-PR on both accelerators, via the `b200-gluon-test`
   (`.github/workflows/b200.yml`) and `mi350-gluon-test` (`.github/workflows/mi350.yml`)
   jobs. The curated set is selected with a pytest `-k` filter in those workflows.
+- **Frontend status.** After the fixes below, `test_frontend.py` is **176 / 186**
+  passing. The curated CI `-k` set is a subset of those 176 (green on every target).
 - **Not covered (yet).** The GPU-execution Gluon suites (`test_core.py`,
   `test_lowerings.py`, `test_consan.py`, `test_fpsan.py`,
-  `test_layout_format_view.py`) require a live device, are arch-gated, and are flakier;
-  they are out of scope for this minimal signal.
+  `test_layout_format_view.py`) require a live device, are arch-gated / flakier, and
+  currently have widespread failures on this fork (see gaps below); they are out of
+  scope for this minimal signal.
+
+### Fixed as part of enabling this CI
+
+Fork-side (non-Gluon) fixes — the upstream-synced Gluon frontend was **not** modified:
+
+- **`tl.reduce` / `reduction_ordering`** (`python/triton/language/core.py`): forwards the
+  FB-local `reduction_ordering` kwarg only to semantics that accept it, so Gluon
+  reductions work (`GluonSemantic.reduction` doesn't take it).
+- **`dot()` `allow_tf32`** (`python/triton/language/semantic.py`): the FB-local (TLX)
+  rewrite made `allow_tf32` a *required positional* arg, breaking the upstream Gluon
+  callers that omit it (`gluon/language/amd/_ops.py`, AMD wmma/mfma/warp_pipeline). Now
+  defaulted (`dot_precheck` already treats `None` as unspecified) — purely additive.
+- **`test_core.py` collection** (allowed test edit): a bad cherry-pick (`#8480`) left a
+  stray duplicate of the `test_descriptor_shape` body dangling inside the
+  scatter/gather test, an `IndentationError` that made the whole file uncollectable on
+  `main` and here. Removed the stray lines and restored the intended output assertion.
+- **Frontend goldens regenerated** (allowed test edit, with caveat): `EXPECTTEST_ACCEPT=1`
+  refreshed the `assert_expected_inline` strings that drifted from our fork's IR (mostly
+  `reduction_ordering` mangling + version skew). These live in the upstream-synced
+  `test_frontend.py` and **will be overwritten on the next sync** — that's expected.
 
 ### Known gaps / TODO(gluon-ci)
 
-Some frontend tests are intentionally excluded from the curated CI set. They are not
-Gluon defects — they stem from this fork's divergence from upstream and are tracked
-here rather than "fixed" (editing the upstream-synced tests would be undone on sync):
+Not simple frontend fixes; tracked rather than resolved here:
 
-- **Golden-string drift** (`expecttest` `assert_expected_inline` mismatches): several
-  tests pin exact TTGIR that differs from what our fork emits — e.g. FB-local
-  `reduction_ordering` changes JIT function-name mangling (`test_reduce`), plus general
-  version skew (`test_nv_tma_descriptor_load/store`, `test_tcgen05_commit_multicast_two_ctas`,
-  `test_mbarrier_sync_cluster_init`, `test_cluster_arrive_wait_ops`,
-  `test_tensor_layout_type_changed`, and several `test_amd_*`). Resolution belongs
-  upstream or in a fork-local golden-regeneration step, not by hand-editing goldens.
-- **FB-local API skew — `dot()` `allow_tf32`** (TODO): the FB-local (TLX) rewrite of
-  `TritonSemantic.dot()` made `allow_tf32` a *required positional* argument, which the
-  Gluon AMD callers (`gluon/language/amd/_ops.py`, `.../cdna3`) do not pass — breaking
-  `test_amd_mfma`, `test_amd_rdna3/4_wmma`, `test_amd_warp_pipeline`, etc. A clean fix
-  (giving it a default) requires reordering the central `dot()` signature and AMD-side
-  validation, so it is deferred rather than risked.
-- **`create_lds_barrier_wait` binding mismatch** (TODO): `test_amd_mbarrier` /
-  `test_amd_tdm_load_mbarrier` hit a C++ pybind signature mismatch that needs a
-  binding/rebuild change.
-
-**Fixed as part of enabling this CI:** `tl.reduce` (`python/triton/language/core.py`)
-now forwards the FB-local `reduction_ordering` kwarg only to semantics that accept it,
-restoring Gluon reductions (`GluonSemantic.reduction` does not take it). This is a
-core-side fix — the Gluon frontend was not modified.
+- **Frontend, per-target goldens (~9)** — `test_nv_tma_descriptor_load/store`,
+  `test_amd_mfma`, `test_amd_wmma_scaled_scalar`, `test_amd_warp_pipeline` emit IR that
+  legitimately differs per parametrized target (Hopper vs Blackwell; CDNA vs RDNA), so a
+  single inline golden cannot satisfy all params. Needs per-target goldens or an
+  upstream test-structure change.
+- **`create_lds_barrier_wait` binding mismatch** — `test_amd_mbarrier` /
+  `test_amd_tdm_load_mbarrier`: a C++ pybind signature mismatch needing a binding/rebuild.
+- **Execution suites — `distributed_type` divergence** — `test_core.py` and
+  `test_fpsan.py` fail en masse with `expected ... to be a distributed_type but got
+  <..., fp32>` from `ttgl` broadcast/convert_layout, a fork-vs-upstream Gluon type-system
+  divergence (Gluon internals are upstream-synced, so the fix belongs upstream). Plus
+  `test_consan.py` (expected-CUDA-failure / MLIR PassManager errors, inherently flaky)
+  and `test_lowerings.py` (`test_reduce_layouts` is a very large parametrize sweep).
+- **`test_layout_format_view.py::test_format_view_kernel`** — `'block_type' object has
+  no attribute 'layout'` (Gluon type API skew); the other 15 tests pass.
 
 
 ## The DSL Extension

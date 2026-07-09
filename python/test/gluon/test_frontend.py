@@ -696,10 +696,10 @@ def test_mbarrier_sync_cluster_init():
         """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @mbarrier_sync_cluster_init_kernel() attributes {noinline = false} {
-    tt.call @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init__() : () -> ()
+    tt.call @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init____() : () -> ()
     tt.return
   }
-  tt.func private @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init__() attributes {noinline = false} {
+  tt.func private @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init____() attributes {noinline = false} {
     ttng.fence_mbarrier_init_release_cluster
     ttng.cluster_barrier {relaxed = true}
     tt.return
@@ -881,12 +881,12 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func public @tcgen05_commit_multicast_two_ctas_kernel() attributes {noinline = false} {
     %0 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    %2 = tt.call @triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier__cNone_cTrue() : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %2 = tt.call @"triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier____(0,)cNone_(1,)cconstexpr_True_"() : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %true = arith.constant true
     ttng.tc_gen5_commit %2, %true descs %0, %1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     tt.return
   }
-  tt.func private @triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier__cNone_cTrue() -> !ttg.memdesc<1xi64, #shared1, #smem, mutable> attributes {noinline = false} {
+  tt.func private @"triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier____(0,)cNone_(1,)cconstexpr_True_"() -> !ttg.memdesc<1xi64, #shared1, #smem, mutable> attributes {noinline = false} {
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     tt.return %0 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
   ^bb1:  // no predecessors
@@ -1485,10 +1485,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %cst_0 = arith.constant dense<1.000000e+00> : tensor<16x16xf32, #blocked>
     %cst_1 = arith.constant 2.000000e+00 : f32
     %cst_2 = arith.constant dense<2.000000e+00> : tensor<16x16xf32, #blocked>
-    %0 = tt.call @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cNone"(%cst_0) : (tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
-    %1 = tt.call @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_1__(2,)cconstexpr_False__(3,)cNone"(%cst_0) : (tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
-    %2 = tt.call @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cNone_(2,)cconstexpr_False__(3,)cNone"(%cst_0) : (tensor<16x16xf32, #blocked>) -> f32
-    %3 = tt.call @"triton.language.standard.max__fp32S16SLSL0_B1_1_1_32_4_1_1_0_BSLL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cconstexpr_True__(4,)cconstexpr_False_"(%0) : (tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>) -> f32
+    %0 = tt.call @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cNone_(4,)cNone"(%cst_0) : (tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
+    %1 = tt.call @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_1__(2,)cconstexpr_False__(3,)cNone_(4,)cNone"(%cst_0) : (tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %2 = tt.call @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cNone_(2,)cconstexpr_False__(3,)cNone_(4,)cNone"(%cst_0) : (tensor<16x16xf32, #blocked>) -> f32
+    %3 = tt.call @"triton.language.standard.max__fp32S16SLSL0_B1_1_1_32_4_1_1_0_BSLL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cconstexpr_True__(4,)cconstexpr_False__(5,)cNone"(%0) : (tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>) -> f32
     %4 = ttg.convert_layout %1 : tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>
     %5:2 = "tt.reduce"(%cst_0, %cst_2) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32, %arg3: f32, %arg4: f32):
@@ -1505,7 +1505,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.store %12, %9 : tensor<16x!tt.ptr<f32>, #ttg.slice<{dim = 0, parent = #blocked}>>
     tt.return
   }
-  tt.func private @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cNone"(%arg0: tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>> attributes {noinline = false} {
+  tt.func private @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cNone_(4,)cNone"(%arg0: tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>> attributes {noinline = false} {
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %2 = tt.call @triton.language.standard._sum_combine__fp32_fp32__(%arg1, %arg2) : (f32, f32) -> f32
@@ -1523,7 +1523,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %1 = ub.poison : f32
     tt.return %1 : f32
   }
-  tt.func private @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_1__(2,)cconstexpr_False__(3,)cNone"(%arg0: tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>> attributes {noinline = false} {
+  tt.func private @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cconstexpr_1__(2,)cconstexpr_False__(3,)cNone_(4,)cNone"(%arg0: tensor<16x16xf32, #blocked>) -> tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>> attributes {noinline = false} {
     %0 = "tt.reduce"(%arg0) <{axis = 1 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %2 = tt.call @triton.language.standard._sum_combine__fp32_fp32__(%arg1, %arg2) : (f32, f32) -> f32
@@ -1534,7 +1534,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %1 = ub.poison : tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
     tt.return %1 : tensor<16xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
   }
-  tt.func private @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cNone_(2,)cconstexpr_False__(3,)cNone"(%arg0: tensor<16x16xf32, #blocked>) -> f32 attributes {noinline = false} {
+  tt.func private @"triton.language.standard.sum__fp32S16_16SLB1_1_1_32_4_1_1_0_BL__(1,)cNone_(2,)cconstexpr_False__(3,)cNone_(4,)cNone"(%arg0: tensor<16x16xf32, #blocked>) -> f32 attributes {noinline = false} {
     %0 = tt.reshape %arg0 : tensor<16x16xf32, #blocked> -> tensor<256xf32, #linear>
     %1 = "tt.reduce"(%0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
@@ -1546,7 +1546,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %2 = ub.poison : f32
     tt.return %2 : f32
   }
-  tt.func private @"triton.language.standard.max__fp32S16SLSL0_B1_1_1_32_4_1_1_0_BSLL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cconstexpr_True__(4,)cconstexpr_False_"(%arg0: tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>) -> f32 attributes {noinline = false} {
+  tt.func private @"triton.language.standard.max__fp32S16SLSL0_B1_1_1_32_4_1_1_0_BSLL__(1,)cconstexpr_0__(2,)cconstexpr_False__(3,)cconstexpr_True__(4,)cconstexpr_False__(5,)cNone"(%arg0: tensor<16xf32, #ttg.slice<{dim = 0, parent = #blocked}>>) -> f32 attributes {noinline = false} {
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %2 = tt.call @triton.language.standard._elementwise_max__fp32_fp32__(%arg1, %arg2) : (f32, f32) -> f32
@@ -1945,7 +1945,7 @@ def test_cluster_arrive_wait_ops():
         """\
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @cluster_arrive_wait_ops_kernel() attributes {noinline = false} {
-    ttng.cluster_arrive {relaxed = false}
+    ttng.cluster_arrive
     ttng.cluster_wait
     tt.return
   }
@@ -3208,7 +3208,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %cst_3 = arith.constant 0.000000e+00 : f32
     %cst_4 = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
     %cst_5 = arith.constant 0.000000e+00 : f32
-    %0 = tt.dot %cst_0, %cst_2, %cst_4 : tensor<64x32xf32, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x64xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<64x64xf32, #mma>
+    %0 = tt.dot %cst_0, %cst_2, %cst_4, inputPrecision = tf32 : tensor<64x32xf32, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>> * tensor<32x64xf32, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>> -> tensor<64x64xf32, #mma>
     tt.return
   }
 }
@@ -3468,12 +3468,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     %cst_0 = arith.constant dense<34> : tensor<64x16xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>
     %cst_1 = arith.constant 0.000000e+00 : f32
     %cst_2 = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma1>
-    %c127_i8 = arith.constant 127 : i8
-    %cst_3 = arith.constant dense<127> : tensor<16x4xi8, #linear>
-    %c127_i8_4 = arith.constant 127 : i8
-    %cst_5 = arith.constant dense<127> : tensor<16x4xi8, #linear>
+    %c2_i8 = arith.constant 2 : i8
+    %cst_3 = arith.constant dense<2> : tensor<16x4xi8, #linear>
+    %c1_i8 = arith.constant 1 : i8
+    %cst_4 = arith.constant dense<1> : tensor<16x4xi8, #linear>
+    %cst_5 = arith.constant 0.000000e+00 : f32
+    %0 = tt.dot_scaled %cst scale %cst_3, %cst_0 scale %cst_4, %cst_2 lhs = e2m1 rhs = e2m1 {fastMath = false} : tensor<16x64xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<16x4xi8, #linear> * tensor<64x16xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<16x4xi8, #linear> -> tensor<16x16xf32, #mma1>
+    %c3_i32 = arith.constant 3 : i32
+    %1 = arith.trunci %c3_i32 : i32 to i8
+    %c4_i32 = arith.constant 4 : i32
+    %2 = arith.trunci %c4_i32 : i32 to i8
+    %3 = tt.splat %1 : i8 -> tensor<16x4xi8, #linear>
+    %4 = tt.splat %2 : i8 -> tensor<16x4xi8, #linear>
     %cst_6 = arith.constant 0.000000e+00 : f32
-    %0 = tt.dot_scaled %cst scale %cst_3, %cst_0 scale %cst_5, %cst_2 lhs = e2m1 rhs = e2m1 {fastMath = false} : tensor<16x64xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<16x4xi8, #linear> * tensor<64x16xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<16x4xi8, #linear> -> tensor<16x16xf32, #mma1>
+    %5 = tt.dot_scaled %cst scale %3, %cst_0 scale %4, %cst_2 lhs = e2m1 rhs = e2m1 {fastMath = false} : tensor<16x64xi8, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>>, tensor<16x4xi8, #linear> * tensor<64x16xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>, tensor<16x4xi8, #linear> -> tensor<16x16xf32, #mma1>
     tt.return
   }
 }
@@ -4059,7 +4067,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c128_i32 = arith.constant 128 : i32
     %c128_i64 = arith.constant 128 : i64
     %c1_i64 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<16x64xf16, #shared>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<16x64xf16, #shared>>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable>
     %c0_i32 = arith.constant 0 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -4155,7 +4163,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c128_i32 = arith.constant 128 : i32
     %c128_i64 = arith.constant 128 : i64
     %c1_i64 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<16x64xf16, #shared>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<16x64xf16, #shared>>
     %cst = arith.constant 1.000000e+00 : f16
     %cst_0 = arith.constant dense<1.000000e+00> : tensor<16x64xf16, #blocked>
     %1 = ttg.local_alloc %cst_0 : (tensor<16x64xf16, #blocked>) -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable>
@@ -4205,7 +4213,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c128_i32 = arith.constant 128 : i32
     %c128_i64 = arith.constant 128 : i64
     %c1_i64 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<16x64xf16, #shared>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<16x64xf16, #shared>>
     %1 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
     %2 = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable>
     %c0_i32 = arith.constant 0 : i32
@@ -4254,7 +4262,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c128_i32 = arith.constant 128 : i32
     %c128_i64 = arith.constant 128 : i64
     %c1_i64 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<16x64xf16, #shared>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<16x64xf16, #shared>>
     %cst = arith.constant 1.000000e+00 : f16
     %cst_0 = arith.constant dense<1.000000e+00> : tensor<16x64xf16, #blocked>
     %1 = ttg.local_alloc %cst_0 : (tensor<16x64xf16, #blocked>) -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable>
@@ -4299,7 +4307,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c64_i32_0 = arith.constant 64 : i32
     %c64_i64 = arith.constant 64 : i64
     %c1_i64 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c64_i32, %c64_i32_0], [%c64_i64, %c1_i64] : <f16>, <tensor<64x64xf16, #shared>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c64_i32, %c64_i32_0], [%c64_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x64xf16, #shared>>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %c0_i32 = arith.constant 0 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -4465,7 +4473,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c128_i32 = arith.constant 128 : i32
     %c128_i64 = arith.constant 128 : i64
     %c1_i64 = arith.constant 1 : i64
-    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : <f16>, <tensor<16x64xf16, #shared>>
+    %0 = tt.make_tensor_descriptor %arg0, [%c32_i32, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<16x64xf16, #shared>>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %2 = ttg.local_alloc : () -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable>
     amdg.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
