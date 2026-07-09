@@ -19,19 +19,15 @@ from triton.backends.driver import (
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
-# Path(s) to the shared data-driven launcher core. driver.c is compiled via a
-# fixed Remote-Execution command that ignores include_dirs, so we inline this
-# header into the driver.c source at build time (see CudaUtils.__init__) rather
-# than relying on an -I path.
-#
-# The first candidate (backend/launch.h) is a vendored copy that ships with the
-# nvidia backend resources (the BUCK glob packages it next to driver.py), so it
-# is present in packaged/buck builds. The second is the canonical source used by
-# C/C++ consumers (cc_library triton_launch_h). Keep the two in sync; the
-# canonical is python/triton/runtime/launch.h.
+# Path to the shared data-driven launcher core. It lives in the nvidia backend
+# dir (next to driver.c / driver.py) and is the canonical source for C/C++
+# consumers (cc_library triton_launch_h). driver.c is compiled via a fixed
+# Remote-Execution command that ignores include_dirs, so we inline this header
+# into the driver.c source at build time (see CudaUtils.__init__) rather than
+# relying on an -I path. In both source and packaged/buck builds the header
+# sits next to this file.
 _launch_h_candidates = [
     os.path.join(dirname, "launch.h"),
-    os.path.join(dirname, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
 ]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ["libcuda.so.1"]
@@ -130,7 +126,7 @@ class CudaUtils(object):
         if launch_h_path is None:
             raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
         launch_h_src = Path(launch_h_path).read_text()
-        include_marker = '#include "triton/runtime/launch.h"'
+        include_marker = '#include "nvidia/backend/launch.h"'
         if include_marker not in driver_src:
             raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
                                "launch.h inlining, but it was not found")
