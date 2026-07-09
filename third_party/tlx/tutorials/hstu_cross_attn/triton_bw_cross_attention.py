@@ -206,6 +206,14 @@ _HSTU_ATTRS_DQ_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dq"))
 # interaction (spurious correction partition) is under investigation.
 _HSTU_COMPUTE_FOLD = tl.constexpr(os.environ.get("HSTU_COMPUTE_FOLD", "0") == "1")
 
+# When modulo top-K schedule exploration is enabled (TRITON_MODULO_TOPK>1), do
+# NOT emit the user tt.autows annotations on the MMAs: they pin the schedule and
+# make the modulo pass skip the loop (hasExistingAnnotation), turning the picked
+# variant into a no-op. Dropping them lets the modulo scheduler own the schedule.
+_HSTU_MODULO_TOPK = tl.constexpr(
+    int(os.environ.get("TRITON_MODULO_TOPK", "1")) > 1
+)
+
 
 def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
     """Select the autoWS per-dot schedule for `_hstu_attn_bwd_inner`.
@@ -3609,7 +3617,7 @@ def _hstu_attn_bwd_inner(  # noqa C901
             k,
             tl.trans(q),
             attrs=(_HSTU_ATTRS_QKT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD)
-                   else _HSTU_ATTRS_QKT) if WS_ON else None,
+                   else _HSTU_ATTRS_QKT) if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans = backward_valid_mask(
@@ -3642,19 +3650,19 @@ def _hstu_attn_bwd_inner(  # noqa C901
         dact_qk_trans = tl.dot(
             v, tl.trans(do), allow_tf32=ALLOW_TF32,
             attrs=(_HSTU_ATTRS_DPT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD)
-                   else _HSTU_ATTRS_DPT) if WS_ON else None,
+                   else _HSTU_ATTRS_DPT) if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if SHARED_KV:
             dk = tl.dot(
                 act_qk_trans, do, dk, allow_tf32=ALLOW_TF32,
                 attrs=(_HSTU_ATTRS_DV_2KV if _HSTU_COMPUTE_FOLD
-                       else _HSTU_ATTRS_DV) if WS_ON else None,
+                       else _HSTU_ATTRS_DV) if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
         else:
             # pyrefly: ignore [unbound-name]
             dv = tl.dot(
                 act_qk_trans, do, dv, allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DV if WS_ON else None,
+                attrs=_HSTU_ATTRS_DV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
 
         if num_softmax_heads > 0:  # autoWS: constexpr (see note above)
@@ -3672,28 +3680,28 @@ def _hstu_attn_bwd_inner(  # noqa C901
             dqk_trans = (dqk_trans * alpha).to(k.dtype)
             dq_trans = tl.dot(
                 tl.trans(k), dqk_trans,
-                attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
+                attrs=_HSTU_ATTRS_DQ_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
             dk = tl.dot(
                 dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DK_SHARED_2KV if WS_ON else None,
+                attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
         else:
             dqk_trans = dqk_trans.to(k.dtype)
             dq_trans = tl.dot(
                 tl.trans(k), dqk_trans,
-                attrs=_HSTU_ATTRS_DQ if WS_ON else None,
+                attrs=_HSTU_ATTRS_DQ if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
             if SHARED_KV:
                 dk_attn = tl.dot(
                     dqk_trans, q, allow_tf32=ALLOW_TF32,
-                    attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                    attrs=_HSTU_ATTRS_DK if (WS_ON and not _HSTU_MODULO_TOPK) else None,
                 )
                 dk = dk + dk_attn * alpha
             else:
                 dk = tl.dot(
                     dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
-                    attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                    attrs=_HSTU_ATTRS_DK if (WS_ON and not _HSTU_MODULO_TOPK) else None,
                 )
             dq_trans = dq_trans * alpha
         dq = tl.trans(dq_trans)
@@ -3860,7 +3868,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # ---- KV block b0 (SHARED_KV + compute fold) ----
         qk_trans0 = tl.dot(
             k0, tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_QKT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         ######### computation/activation for P0
@@ -3883,7 +3891,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             )
         dact_qk_trans0 = tl.dot(
             v0, tl.trans(do), allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if num_softmax_heads > 0:
             dqk_trans0 = backward_d_softmax_activation(
@@ -3899,7 +3907,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # tiles never alias b0's (which stays on _2KV).
         qk_trans1 = tl.dot(
             k1, tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT_2KV_B1 if WS_ON else None,
+            attrs=_HSTU_ATTRS_QKT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans1 = backward_valid_mask(
@@ -3921,7 +3929,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             )
         dact_qk_trans1 = tl.dot(
             v1, tl.trans(do), allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT_2KV_B1 if WS_ON else None,
+            attrs=_HSTU_ATTRS_DPT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         # calculate dqk_trans
         if num_softmax_heads > 0:
@@ -3941,16 +3949,16 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # partitions under WS) and a two-store race, and needs one TMEM tile.
         dq_trans = tl.dot(
             tl.trans(k0), dqk_trans0,
-            attrs=_HSTU_ATTRS_DQ_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DQ_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         # dv fold: accumulate dv into the shared dk accumulator.
         dk0 = tl.dot(
             act_qk_trans0, do, dk0, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DV_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk0 = tl.dot(
             dqk_trans0, q, dk0, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DK_SHARED_2KV if WS_ON else None,
+            attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         # ---- KV block b1 (SHARED_KV + compute fold) ----
@@ -3961,15 +3969,15 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # _B1), reducing both KV blocks' contributions in TMEM.
         dq_trans = tl.dot(
             tl.trans(k1), dqk_trans1, dq_trans,
-            attrs=_HSTU_ATTRS_DQ_2KV_B1 if WS_ON else None,
+            attrs=_HSTU_ATTRS_DQ_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk1 = tl.dot(
             act_qk_trans1, do, dk1, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DV_2KV_B1 if WS_ON else None,
+            attrs=_HSTU_ATTRS_DV_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk1 = tl.dot(
             dqk_trans1, q, dk1, allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DK_SHARED_2KV_B1 if WS_ON else None,
+            attrs=_HSTU_ATTRS_DK_SHARED_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         # ONE store per Q: dq_trans already holds b0+b1.
