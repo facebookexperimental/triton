@@ -1189,6 +1189,7 @@ def tlx_bw_reduce_dq(
 # qk/p/dk and a persistent dq accumulator -> two independent MMA groups (DP=2).
 # ============================================================================
 
+
 def _get_bw_pipeline_2kv_configs() -> List[triton.Config]:
     return [
         triton.Config(
@@ -1408,9 +1409,8 @@ def attn_bwd_ws_2kv(  # noqa C901
         # Reduce
         # pyrefly: ignore [missing-attribute]
         with tlx.async_task("default"):
-            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (
-                _compute_bwd_reduce_dq_offsets(H, BLOCK_N, seq_offsets_q, seq_offsets)
-            )
+            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (_compute_bwd_reduce_dq_offsets(
+                H, BLOCK_N, seq_offsets_q, seq_offsets))
             if seq_len_kv > 0:
                 dq_end_q = (seq_start_q + seq_len_q).to(tl.int32)
                 desc_dq_t = tl.make_tensor_descriptor(
@@ -1478,9 +1478,8 @@ def attn_bwd_ws_2kv(  # noqa C901
         # Compute
         # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=8, registers=COMPUTE_REG):
-            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (
-                _compute_bwd_reduce_dq_offsets(H, BLOCK_N, seq_offsets_q, seq_offsets)
-            )
+            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (_compute_bwd_reduce_dq_offsets(
+                H, BLOCK_N, seq_offsets_q, seq_offsets))
             if SOFTMAX:
                 M_off = M + off_h + seq_start_q * stride_mm
                 Delta_off = Delta + off_h + seq_start_q * stride_mm
@@ -1506,9 +1505,7 @@ def attn_bwd_ws_2kv(  # noqa C901
                                 scale = tl.load(attn_scale).to(tl.float32)
                             else:
                                 tl.static_assert(ATTN_SCALE_TYPE == "dynamic")
-                                scale = tl.load(attn_scale + offs_n, mask=mask_n).to(
-                                    tl.float32
-                                )
+                                scale = tl.load(attn_scale + offs_n, mask=mask_n).to(tl.float32)
                         _, dp_ph = _get_bufidx_phase(2 * cnt_q + nj, 1)
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(qk_fulls[nj], m_ph)
@@ -1516,9 +1513,7 @@ def attn_bwd_ws_2kv(  # noqa C901
                         qk_trans = tlx.local_load(qk_trans_tiles[nj])
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(qk_empties[nj])
-                        valid_mask_trans = backward_valid_mask(
-                            offs_m, offs_n, 0, seq_len_q, seq_len_kv, False
-                        )
+                        valid_mask_trans = backward_valid_mask(offs_m, offs_n, 0, seq_len_q, seq_len_kv, False)
                         if SOFTMAX:
                             qkt = fast_fma(qk_trans, scaled_alpha, -m[None, :])
                             pT = tl.math.exp2(qkt)
@@ -1570,9 +1565,8 @@ def attn_bwd_ws_2kv(  # noqa C901
         # MMA
         # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=1, registers=MMA_REG):
-            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (
-                _compute_bwd_reduce_dq_offsets(H, BLOCK_N, seq_offsets_q, seq_offsets)
-            )
+            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (_compute_bwd_reduce_dq_offsets(
+                H, BLOCK_N, seq_offsets_q, seq_offsets))
             cnt_q = 0
             cnt_pair = 0
             for start_n0 in tl.range(0, seq_len_kv, 2 * BLOCK_N):
@@ -1677,9 +1671,8 @@ def attn_bwd_ws_2kv(  # noqa C901
         # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=1, registers=LOAD_REG):
             # initialize offsets
-            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (
-                _compute_bwd_reduce_dq_offsets(H, BLOCK_N, seq_offsets_q, seq_offsets)
-            )
+            off_h, _start_n, seq_start_kv, seq_len_kv, seq_start_q, seq_len_q = (_compute_bwd_reduce_dq_offsets(
+                H, BLOCK_N, seq_offsets_q, seq_offsets))
 
             accum_cnt_q = 0
             accum_cnt_pair = 0
