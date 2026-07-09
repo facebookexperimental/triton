@@ -111,6 +111,23 @@ static void expandLoops(ModuleOp moduleOp) {
       continue;
     }
 
+    // Only software-pipeline the partition that contains the gemm (MMAv5) ops.
+    // After warp specialization each partition has its own loop; pipelining a
+    // non-gemm partition (computation/load/reduction/epilogue) only loop-carries
+    // its intermediates in registers (e.g. the softmax pT), while its
+    // cross-partition I/O is already delivered via buffered SMEM/TMEM channels.
+    if (metaWS && forOp->getParentOfType<triton::gpu::WarpSpecializeOp>()) {
+      bool hasMMAv5 = false;
+      for (auto &op : forOp.getBody()->without_terminator()) {
+        if (isa<triton::nvidia_gpu::MMAv5OpInterface>(op)) {
+          hasMMAv5 = true;
+          break;
+        }
+      }
+      if (!hasMMAv5)
+        continue;
+    }
+
     std::vector<std::pair<Operation *, unsigned>> finalSchedule =
         schedule.createFinalSchedule(forOp);
     triton::PipeliningOption options;
