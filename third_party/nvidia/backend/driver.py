@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import triton
+import ctypes
+import sys
 from pathlib import Path
 from triton import knobs
 from triton.runtime.build import compile_module_from_src
@@ -38,6 +40,7 @@ PyKernelArg = None
 ARG_CONSTEXPR = None
 ARG_KERNEL = None
 ARG_TUPLE = None
+GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
 
 
 @functools.lru_cache()
@@ -67,6 +70,40 @@ def libcuda_dirs():
 @functools.lru_cache()
 def library_dirs():
     return [libdevice_dir, *libcuda_dirs()]
+
+
+def _cuda_driver_is_active():
+    candidates = ["libcuda.so.1"]
+    try:
+        candidates.extend([os.path.join(path, "libcuda.so.1") for path in libcuda_dirs()])
+    except Exception:
+        pass
+
+    libcuda = None
+    for candidate in candidates:
+        try:
+            libcuda = ctypes.CDLL(candidate)
+            break
+        except OSError:
+            continue
+
+    if libcuda is None:
+        return False
+
+    cu_init = libcuda.cuInit
+    cu_init.argtypes = [ctypes.c_uint]
+    cu_init.restype = ctypes.c_int
+    if cu_init(0) != 0:
+        return False
+
+    cu_device_get_count = libcuda.cuDeviceGetCount
+    cu_device_get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    cu_device_get_count.restype = ctypes.c_int
+    count = ctypes.c_int()
+    if cu_device_get_count(ctypes.byref(count)) != 0:
+        return False
+
+    return count.value > 0
 
 
 # ------------------------
@@ -117,6 +154,10 @@ class CudaUtils(object):
         ARG_TUPLE = mod.ARG_TUPLE
         self.load_binary = mod.load_binary
         self.unload_module = mod.unload_module
+        self.get_current_device = mod.get_current_device
+        self.set_current_device = mod.set_current_device
+        self.get_default_stream = mod.get_default_stream
+        self.get_device_capability = mod.get_device_capability
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
@@ -517,7 +558,28 @@ class CudaDriver(GPUDriver):
     def __init__(self):
         self.utils = CudaUtils()  # TODO: make static
         self.launcher_cls = CudaLauncher
-        super().__init__()
+        if sys.modules.get("torch") is not None:
+            super().__init__()
+        else:
+            self.get_device_capability = self._get_device_capability
+            self.get_current_stream = self._get_current_stream
+            self.get_current_device = self._get_current_device
+            self.set_current_device = self._set_current_device
+
+    def _get_device_capability(self, device):
+        return self.utils.get_device_capability(device)
+
+    def _get_current_stream(self, device):
+        # The CUDA driver API does not expose PyTorch's notion of the current
+        # stream. In torch-free launches we fall back to the device's default
+        # stream after making that device's primary context current.
+        return self.utils.get_default_stream(device)
+
+    def _get_current_device(self):
+        return self.utils.get_current_device()
+
+    def _set_current_device(self, device):
+        self.utils.set_current_device(device)
 
     def get_current_target(self):
         device = self.get_current_device()
@@ -538,12 +600,7 @@ class CudaDriver(GPUDriver):
 
     @staticmethod
     def is_active():
-        try:
-            import torch
-
-            return torch.cuda.is_available() and (torch.version.hip is None)
-        except ImportError:
-            return False
+        return _cuda_driver_is_active()
 
     def map_python_to_cpp_type(self, ty: str) -> str:
         return ty_to_cpp(ty)

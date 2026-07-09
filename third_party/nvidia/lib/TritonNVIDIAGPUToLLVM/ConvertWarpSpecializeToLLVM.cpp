@@ -24,6 +24,9 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+static constexpr const char kDisableSetMaxRegisterAttr[] =
+    "tti.disable_setmaxregister";
+
 //===----------------------------------------------------------------------===//
 // Utilities
 //===----------------------------------------------------------------------===//
@@ -89,8 +92,12 @@ private:
 
 static void createRegRealloc(TritonLLVMIRRewriter &b, int curRegs,
                              int adjRegs) {
-  curRegs = std::min(256, curRegs);
-  adjRegs = std::min(256, adjRegs);
+  // nvvm.setmaxregister requires the per-thread register count to be in the
+  // range [24, 256] (a multiple of 8). Clamp both ends: below-minimum requests
+  // (e.g. from a do-nothing padding partition) would otherwise emit an illegal
+  // setmaxregister and fail the verifier.
+  curRegs = std::clamp(curRegs, 24, 256);
+  adjRegs = std::clamp(adjRegs, 24, 256);
   // Round to a multiple of 8 (hardware requirement).
   adjRegs = adjRegs / 8 * 8;
   curRegs = curRegs / 8 * 8;
@@ -127,9 +134,14 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   // begin execution.
   auto maxnreg = func->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
       AttrMaxRegistersName);
+  // Disable dynamic register allocation if requested
+  bool emitDynamicRegRealloc = llvm::none_of(wsOps, [](WarpSpecializeOp ws) {
+    return ws->hasAttr(kDisableSetMaxRegisterAttr);
+  });
+
   int lowRegs = -1;
   int defRegs = -1;
-  if (maxnreg) {
+  if (emitDynamicRegRealloc && maxnreg) {
     int numWorkerWarps = totalNumWarpsAttr.getInt() - defaultNumWarps;
     int startRegs = maxnreg.getInt();
 
@@ -192,7 +204,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     oldArg.replaceAllUsesWith(arg);
   entry->eraseArguments([](auto) { return true; });
   b.setInsertionPointToStart(entry);
-  if (maxnreg)
+  if (emitDynamicRegRealloc && maxnreg)
     createRegRealloc(b, maxnreg.getInt(), defRegs);
 
   WarpSpecializeCallbacks callbacks;
@@ -205,6 +217,9 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
   callbacks.reallocRegisters = [&](TritonLLVMIRRewriter &b, WarpSpecializeOp ws,
                                    RegisterReallocPhase phase,
                                    unsigned regionNumber) {
+    if (!emitDynamicRegRealloc)
+      return;
+
     if (phase == RegisterReallocPhase::SwitchLoopStart) {
       if (maxnreg)
         createRegRealloc(b, maxnreg.getInt(), lowRegs);

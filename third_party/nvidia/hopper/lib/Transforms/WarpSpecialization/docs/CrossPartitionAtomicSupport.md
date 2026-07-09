@@ -73,7 +73,7 @@ handshake.
 
 ### Case 3 — graceful reject
 
-`doAtomicBroadcast` returns `failure()`. The caller then calls the canonical
+`doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
 `removeWarpSpecializeAttr(funcOp)`, which strips **both** the partition ids
 (`ttg.partition`) and the task ids (`async_task_id`) from every op, plus the WS
 loop attributes (`tt.warp_specialize`, `ttg.partition.stages`,

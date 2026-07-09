@@ -2,6 +2,7 @@
 
 #include <fstream>
 
+#include "mlir/Analysis/DataFlow/LivenessAnalysis.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Dominance.h"
@@ -85,10 +86,6 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     assert(false && "version not supported");
     return {0, 0};
   }
-}
-
-bool isLoadFromTensorPtr(triton::LoadOp op) {
-  return mlir::triton::isTensorPointerType(op.getPtr().getType());
 }
 
 SmallVector<unsigned, 4>
@@ -591,15 +588,10 @@ Attribute inferDstEncoding(Operation *op, Attribute encoding) {
 }
 
 bool isExpensiveLoadOrStore(Operation *op) {
-  // Case 1: Pointer of tensor is always expensive
-  auto operandType = op->getOperand(0).getType();
-  if (triton::isTensorPointerType(operandType))
-    return true;
-  // Case 2a: A size 1 tensor is not expensive since all threads will load the
-  // same
+  // size 1 tensor is not expensive since all threads will load the same
   if (isSingleValue(op->getOperand(0)))
     return false;
-  // Case 2b: Tensor of pointers has more threads than elements
+  // Tensor of pointers has more threads than elements
   // we can presume a high hit-rate that makes it cheap to load
   auto ptrType = cast<RankedTensorType>(op->getOperand(0).getType());
   auto mod = op->getParentOfType<ModuleOp>();
@@ -847,6 +839,17 @@ LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
   // results / after-args align with scf.condition forwarded operands, not with
   // the iter-arg index. Find the forwarded position carrying this "before" arg
   // (the case for appended counters and pass-through carried values).
+  //
+  // Contract for the two cases this loop does NOT fully resolve:
+  //   - Not forwarded at all: a "before"-only value (e.g. the raw loop
+  //     predicate) is legal in scf.while and leaves slot.result / slot.afterArg
+  //     null. Callers that need them must check (see LoopCarriedSlot in the
+  //     header and the assert in WSCodePartition
+  //     getOutOfScopeBufferIdxAndPhase).
+  //   - Forwarded to more than one condition slot: only the first forwarded
+  //     position is associated with this slot; later duplicates are ignored.
+  //     Safe today because every threaded counter is forwarded exactly once; a
+  //     general duplicate-forwarding loop would need per-position resolution.
   auto condOp = whileOp.getConditionOp();
   for (auto [j, fwd] : llvm::enumerate(condOp.getArgs())) {
     if (fwd == slot.iterArg) {
@@ -1258,9 +1261,6 @@ static bool skipOperand(Operation *op, unsigned operandNumber) {
 Operation *convertDistributedOpEncoding(Attribute encoding, Operation *op) {
   OpBuilder builder(op);
   // Convert operands
-  // For load/store with tensor pointers, we don't have to change the
-  // operands' type, we do this by changing the outputs' type of
-  // `make_tensor_ptr`
   SmallVector<Value, 4> newArgs;
   for (auto &opOperand : op->getOpOperands()) {
     Value operand = opOperand.get();
@@ -1448,6 +1448,25 @@ void populateForOpDeadArgumentElimination(
     const DenseSet<Operation *> &opsCanBeTriviallyDead) {
   patterns.add<ForOpDeadArgElimination>(patterns.getContext(),
                                         opsCanBeTriviallyDead);
+}
+
+void runDeadIterArgElimination(Operation *top) {
+  // The op we are running on must not have any results, because the liveness
+  // analysis will not consider their users.
+  assert(top->hasTrait<OpTrait::ZeroResults>() && "op cannot have results");
+  dataflow::RunLivenessAnalysis la{top};
+
+  // We just replace users of the block arg with their corresponding init value.
+  // Dead code elimination can then do the actual removal.
+  top->walk([&](Operation *op) {
+    if (auto loopLike = dyn_cast<LoopLikeOpInterface>(op)) {
+      for (auto [idx, arg] : llvm::enumerate(loopLike.getRegionIterArgs())) {
+        const auto *liveness = la.getLiveness(arg);
+        if (liveness && !liveness->isLive)
+          arg.replaceAllUsesWith(loopLike.getInits()[idx]);
+      }
+    }
+  });
 }
 
 ttg::LocalAllocOp findShmemAlloc(Value operand) {

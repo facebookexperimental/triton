@@ -379,7 +379,7 @@ struct ModuloWSPartitionPass
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    ttg::LatencyModel model;
+    ttg::NVLatencyModel model;
 
     // Step 1: Modulo partition scheduling for WS loops (bottom-up).
     moduleOp.walk([&](scf::ForOp loop) {

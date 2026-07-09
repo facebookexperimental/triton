@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import math
 import time
 import inspect
@@ -244,7 +245,7 @@ class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
                  prune_configs_by: Optional[Dict] = None, warmup=None, rep=None, use_cuda_graph=False, do_bench=None,
-                 cache_results=False):
+                 cache_results=False, include_npot=False):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
@@ -278,6 +279,7 @@ class Autotuner(KernelInterface):
         else:
             self.configs = configs
         self.keys = key
+        self.include_npot = include_npot
         self.cache: Dict[Tuple, Config] = {}
         self.arg_names = arg_names
         self.cache_results = (cache_results or knobs.autotuning.cache) and not knobs.runtime.interpret
@@ -504,6 +506,14 @@ class Autotuner(KernelInterface):
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
+        except RuntimeError as e:
+            # Prune an NPOT candidate to inf if it hit a device compile/launch failure so the sweep
+            # continues; pow2 configs (and non-device errors) re-raise.
+            if _npot_runtime_error_prunable(config, e, knobs.language.allow_npot):
+                if verbose:
+                    print(f"Autotuning pruned NPOT config after runtime error: {e}")
+                return [float("inf"), float("inf"), float("inf")]
+            raise
         self._last_compiled_kernel = captured[-1] if captured else None
         return timing
 
@@ -752,7 +762,12 @@ class Autotuner(KernelInterface):
             key = tuple(key)
             if key not in self.cache:
                 used_cached_result = False
-                pruned_configs = self.prune_configs(kwargs)
+                if getattr(self, "include_npot", False) and knobs.language.allow_npot:
+                    # Prune the NPOT-augmented list via the helper (keeps prune_configs 1-arg).
+                    configs = self._add_wave_quant_npot_configs(self.configs, _args)
+                    pruned_configs = self._prune_configs(kwargs, configs)
+                else:
+                    pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
                     # facebook begin
@@ -857,6 +872,19 @@ class Autotuner(KernelInterface):
         self._full_nargs = None
         return ret
 
+    def _add_wave_quant_npot_configs(self, configs, named_args):
+        """Append wave-quant NPOT BLOCK_M/N candidates at tune time. No-op on missing shape/SMs or exception."""
+        try:
+            # Spatial grid dims are M and N; the reduction dim K is a loop, not a grid dim.
+            problem_dims = {d: named_args.get(d) for d in ("M", "N") if isinstance(named_args.get(d), int)}
+            if len(problem_dims) < 2:
+                return configs
+            # SM count on NVIDIA / CU count on AMD; None on backends that don't report it, which
+            # makes _generate_wave_quant_candidates a no-op. ctas_per_sm is estimated as 1.
+            return _generate_wave_quant_candidates(configs, problem_dims, _device_num_sms())
+        except Exception:
+            return configs
+
     def _ir_prune_after_bench(self, configs: List[Config], timings: Dict, compiled: Dict) -> None:
         """Apply ``ir_config_prune`` after benchmarking, reusing each config's already-compiled
         artifact — no recompilation, no separate run-pipeline pass.
@@ -903,16 +931,20 @@ class Autotuner(KernelInterface):
                                  "`ir_config_prune` should keep at least one config.")
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
-        pruned_configs = self.configs
+        # Keep 1-arg: subclasses (e.g. hammer, fast_moe) override this; NPOT prunes via _prune_configs.
+        return self._prune_configs(kwargs, self.configs)
+
+    def _prune_configs(self, kwargs: Dict, configs: List[Config]) -> List[Config]:
+        pruned_configs = configs
         if self.early_config_prune:
-            pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
+            pruned_configs = self.early_config_prune(configs, self.nargs, **kwargs)
             if not pruned_configs:
                 raise AutotunerError(
                     "No valid autotuner configs after pruning. `early_config_prune` should return at least one config.")
         if self.perf_model:
             top_k = self.configs_top_k
             if isinstance(top_k, float) and top_k <= 1.0:
-                top_k = int(len(self.configs) * top_k)
+                top_k = int(len(configs) * top_k)
             elif not isinstance(top_k, int):
                 # Slice index must be an integer
                 raise TypeError("Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")
@@ -1086,8 +1118,146 @@ class Config:
         return self_tuple == other_tuple
 
 
+def _is_pow2(x):
+    return x > 0 and (x & (x - 1)) == 0
+
+
+def _cdiv(a, b):
+    return -(-a // b)
+
+
+def _clone_config(config, **kwargs_override):
+    """Clone a Config with kwargs overrides; copy.copy carries future Config fields, replace kwargs to avoid alias."""
+    new_config = copy.copy(config)
+    new_config.kwargs = {**config.kwargs, **kwargs_override}
+    return new_config
+
+
+def _config_has_npot_block(config):
+    """True if any of the config's BLOCK_* tile sizes is non-power-of-2."""
+    return any(isinstance(v, int) and not _is_pow2(v) for k, v in config.kwargs.items() if 'BLOCK' in k.upper())
+
+
+# Markers of a device compile/launch failure (vs a logic bug), matched case-insensitively. The
+# NVIDIA and AMD drivers tag every device RuntimeError with "Triton Error [CUDA]"/"[HIP]"; the rest
+# cover common HW failure signatures (including torch-surfaced wordings).
+_DEVICE_ERROR_MARKERS = (
+    "triton error [cuda]",
+    "triton error [hip]",
+    "out of memory",
+    "misaligned",
+    "illegal memory access",
+    "illegal instruction",
+    "device-side assert",
+)
+
+
+def _npot_runtime_error_prunable(config, err, allow_npot):
+    """Prune only an NPOT config, under the flag, on a device error; else re-raise."""
+    if not (allow_npot and _config_has_npot_block(config)):
+        return False
+    text = str(err).lower()
+    return any(marker in text for marker in _DEVICE_ERROR_MARKERS)
+
+
+def _wave_efficiency(num_tiles, num_units):
+    """Useful work fraction = tiles / (waves * units). 1.0 = full waves."""
+    if num_tiles <= 0 or num_units <= 0:
+        return 1.0
+    waves = _cdiv(num_tiles, num_units)
+    return num_tiles / (waves * num_units)
+
+
+def _legal_npot_blocks(base, legal_multiple):
+    """Legal NPOT multiples of ``legal_multiple`` in [base/2, base*2], excluding base and pow2."""
+    lo = max(legal_multiple, base // 2)
+    hi = base * 2
+    v = lo + ((legal_multiple - lo % legal_multiple) % legal_multiple)  # first legal multiple >= lo
+    out = []
+    while v <= hi:
+        if v != base and not _is_pow2(v):
+            out.append(v)
+        v += legal_multiple
+    return out
+
+
+# Only intervene when the pow2 tiling spans more than one wave and wastes more than (1 - threshold)
+# of capacity; a single wave cannot be improved by re-tiling.
+_WAVE_EFFICIENCY_THRESHOLD = 0.9
+
+# Per-config cap on proposed NPOT tiles (the top-ranked few). This bounds candidate GENERATION; the
+# overall sweep size is then governed by the autotuner's normal pruning (early_config_prune/top_k).
+_MAX_NPOT_CANDIDATES = 4
+
+
+def _wave_quant_npot_candidates(base_m, base_n, problem_m, problem_n, num_units, legal_m=16, legal_n=16):
+    """Up to _MAX_NPOT_CANDIDATES legal NPOT (BLOCK_M, BLOCK_N) improving wave count then efficiency
+    over the pow2 base; [] if pow2 is already efficient (>1 wave and >= threshold)."""
+    if not (base_m and base_n and problem_m and problem_n and num_units):
+        return []
+    pow2_tiles = _cdiv(problem_m, base_m) * _cdiv(problem_n, base_n)
+    pow2_waves = _cdiv(pow2_tiles, num_units)
+    pow2_eff = pow2_tiles / (pow2_waves * num_units)
+    if pow2_waves <= 1 or pow2_eff >= _WAVE_EFFICIENCY_THRESHOLD:
+        return []
+    scored = []
+    for bm in [base_m] + _legal_npot_blocks(base_m, legal_m):
+        for bn in [base_n] + _legal_npot_blocks(base_n, legal_n):
+            if bm == base_m and bn == base_n:
+                continue
+            tiles = _cdiv(problem_m, bm) * _cdiv(problem_n, bn)
+            waves = _cdiv(tiles, num_units)
+            eff = tiles / (waves * num_units)
+            if waves < pow2_waves or (waves == pow2_waves and eff > pow2_eff):
+                scored.append(((waves, -eff), (bm, bn)))
+    scored.sort(key=lambda x: x[0])
+    out, seen = [], set()
+    for _, pair in scored:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+        if len(out) >= _MAX_NPOT_CANDIDATES:
+            break
+    return out
+
+
+def _generate_wave_quant_candidates(configs, problem_dims, num_units):
+    """Append wave-quant NPOT BLOCK_M/N candidates for each pow2 config; no-op if flag off or M/N shape/units unknown.
+
+    ``problem_dims`` = {'M': int, 'N': int} (spatial grid dims; K is a reduction loop)."""
+    if not knobs.language.allow_npot or not num_units:
+        return configs
+    pm = problem_dims.get('M')
+    pn = problem_dims.get('N')
+    if not (isinstance(pm, int) and isinstance(pn, int)):
+        return configs
+    expanded = list(configs)
+    for config in configs:
+        bm = config.kwargs.get('BLOCK_M')
+        bn = config.kwargs.get('BLOCK_N')
+        if not (isinstance(bm, int) and isinstance(bn, int)):
+            continue
+        for (nbm, nbn) in _wave_quant_npot_candidates(bm, bn, pm, pn, num_units):
+            new_config = _clone_config(config, BLOCK_M=nbm, BLOCK_N=nbn)
+            if new_config not in expanded:
+                expanded.append(new_config)
+    return expanded
+
+
+def _device_num_sms():
+    """Best-effort device SM count (from the Triton driver) for the wave-quant model; None ->
+    wave-quant is skipped."""
+    try:
+        dev = driver.active.get_current_device()
+        n = driver.active.utils.get_device_properties(dev).get("multiprocessor_count")
+        return int(n) if n else None
+    except Exception:
+        return None
+
+
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, include_npot=False):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -1145,12 +1315,17 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :type do_bench: lambda fn, quantiles
     :param cache_results: whether to cache autotune timings to disk.  Defaults to False.
     "type cache_results: bool
+    :param include_npot: when True and TRITON_ALLOW_NPOT=1, the autotuner adds wave-quant-targeted
+        NPOT BLOCK_M/BLOCK_N candidates at tune time, but ONLY when the pow2 tiling has a real
+        wave-quantization tail. No-op otherwise, so pow2 autotuning is unchanged. Defaults to False.
+    :type include_npot: bool
     """
 
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                          post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results)
+                         use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
+                         include_npot=include_npot)
 
     return decorator
 

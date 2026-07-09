@@ -4,11 +4,11 @@ import triton.language as tl
 import triton
 
 
-@pytest.mark.parametrize('cond', [True, False])
-@pytest.mark.parametrize('mask', [True, False, None])
-@pytest.mark.parametrize('opt_flag', [True, False, None])
-@pytest.mark.parametrize('env_var', [True, False])
-@pytest.mark.parametrize('jit_flag', [True, False])
+@pytest.mark.parametrize("cond", [True, False])
+@pytest.mark.parametrize("mask", [True, False, None])
+@pytest.mark.parametrize("opt_flag", [True, False, None])
+@pytest.mark.parametrize("env_var", [True, False])
+@pytest.mark.parametrize("jit_flag", [True, False])
 @pytest.mark.forked
 def test_device_assert(monkeypatch, cond, mask, opt_flag, env_var, jit_flag, device):
     monkeypatch.setenv("TRITON_DEBUG", str(int(env_var)))
@@ -17,7 +17,7 @@ def test_device_assert(monkeypatch, cond, mask, opt_flag, env_var, jit_flag, dev
 
     @triton.jit(debug=jit_flag)
     def _kernel(COND: tl.constexpr, MASK: tl.constexpr):
-        tl.device_assert(COND, 'test', mask=MASK)
+        tl.device_assert(COND, "test", mask=MASK)
 
     is_debug = env_var or (opt_flag if opt_flag is not None else jit_flag)
 
@@ -35,6 +35,7 @@ def test_device_assert(monkeypatch, cond, mask, opt_flag, env_var, jit_flag, dev
     getattr(torch, device).synchronize()
 
 
+@pytest.mark.forked
 def test_device_assert_barrier(monkeypatch, device):
     monkeypatch.setenv("TRITON_DEBUG", "1")
     triton.knobs.refresh_knobs()
@@ -83,17 +84,20 @@ def _test_overflow(x, y, x_dtype, y_dtype, debug, should_overflow, tri_func, ref
 # integer overflow sanitization
 
 
-@pytest.mark.parametrize("x, y, x_dtype, y_dtype, debug, should_overflow", [
-    (-2**31, -1, 'int32', 'int32', False, False),
-    (-2**31, -1, 'int32', 'int32', True, True),
-    (2**31 - 1, 1, 'int32', 'int32', True, True),
-    (2**31 - 1, 100, 'int32', 'int32', True, True),
-    (-2**31, 0, 'int32', 'int32', True, False),
-    (-2**31, 2, 'int32', 'int32', True, False),
-    (0, -1, 'int32', 'int32', True, False),
-    (-2**15, -1, 'int16', 'int16', True, True),
-    (2**15 - 1, 1, 'int16', 'int16', True, True),
-])
+@pytest.mark.parametrize(
+    "x, y, x_dtype, y_dtype, debug, should_overflow",
+    [
+        (-(2**31), -1, "int32", "int32", False, False),
+        (-(2**31), -1, "int32", "int32", True, True),
+        (2**31 - 1, 1, "int32", "int32", True, True),
+        (2**31 - 1, 100, "int32", "int32", True, True),
+        (-(2**31), 0, "int32", "int32", True, False),
+        (-(2**31), 2, "int32", "int32", True, False),
+        (0, -1, "int32", "int32", True, False),
+        (-(2**15), -1, "int16", "int16", True, True),
+        (2**15 - 1, 1, "int16", "int16", True, True),
+    ],
+)
 @pytest.mark.forked
 def test_sanitize_int_add_overflow(x, y, x_dtype, y_dtype, debug, should_overflow, device):
 
@@ -101,20 +105,33 @@ def test_sanitize_int_add_overflow(x, y, x_dtype, y_dtype, debug, should_overflo
     def _kernel_add(X, Y, Z):
         tl.store(Z, tl.load(X) + tl.load(Y))
 
-    _test_overflow(x, y, x_dtype, y_dtype, debug, should_overflow, _kernel_add, lambda x, y: x + y, device)
+    _test_overflow(
+        x,
+        y,
+        x_dtype,
+        y_dtype,
+        debug,
+        should_overflow,
+        _kernel_add,
+        lambda x, y: x + y,
+        device,
+    )
 
 
 # mul overflow
 
 
-@pytest.mark.parametrize("x, y, x_dtype, y_dtype, debug, should_overflow", [
-    (2**30, 4, 'int32', 'int32', False, False),
-    (2**30, 4, 'int32', 'int32', True, True),
-    (2**30, 2, 'int32', 'int32', True, True),
-    (-2**30, -4, 'int32', 'int32', True, True),
-    (-2**31, 1, 'int32', 'int32', True, False),
-    (-2**30, 2, 'int32', 'int32', True, False),
-])
+@pytest.mark.parametrize(
+    "x, y, x_dtype, y_dtype, debug, should_overflow",
+    [
+        (2**30, 4, "int32", "int32", False, False),
+        (2**30, 4, "int32", "int32", True, True),
+        (2**30, 2, "int32", "int32", True, True),
+        (-(2**30), -4, "int32", "int32", True, True),
+        (-(2**31), 1, "int32", "int32", True, False),
+        (-(2**30), 2, "int32", "int32", True, False),
+    ],
+)
 @pytest.mark.forked
 def test_sanitize_int_mul_overflow(x, y, x_dtype, y_dtype, debug, should_overflow, device):
 
@@ -122,19 +139,32 @@ def test_sanitize_int_mul_overflow(x, y, x_dtype, y_dtype, debug, should_overflo
     def _kernel_mul(X, Y, Z):
         tl.store(Z, tl.load(X) * tl.load(Y))
 
-    _test_overflow(x, y, x_dtype, y_dtype, debug, should_overflow, _kernel_mul, lambda x, y: x * y, device)
+    _test_overflow(
+        x,
+        y,
+        x_dtype,
+        y_dtype,
+        debug,
+        should_overflow,
+        _kernel_mul,
+        lambda x, y: x * y,
+        device,
+    )
 
 
 # sub overflow
 
 
-@pytest.mark.parametrize("x, y, x_dtype, y_dtype, debug, should_overflow", [
-    (-2**31, 1, 'int32', 'int32', False, False),
-    (-2**31, 1, 'int32', 'int32', True, True),
-    (2**31 - 1, -1, 'int32', 'int32', True, True),
-    (2**31 - 1, 1, 'int32', 'int32', True, False),
-    (-2**31, -1, 'int32', 'int32', True, False),
-])
+@pytest.mark.parametrize(
+    "x, y, x_dtype, y_dtype, debug, should_overflow",
+    [
+        (-(2**31), 1, "int32", "int32", False, False),
+        (-(2**31), 1, "int32", "int32", True, True),
+        (2**31 - 1, -1, "int32", "int32", True, True),
+        (2**31 - 1, 1, "int32", "int32", True, False),
+        (-(2**31), -1, "int32", "int32", True, False),
+    ],
+)
 @pytest.mark.forked
 def test_sanitize_int_sub_overflow(x, y, x_dtype, y_dtype, debug, should_overflow, device):
 
@@ -142,7 +172,17 @@ def test_sanitize_int_sub_overflow(x, y, x_dtype, y_dtype, debug, should_overflo
     def _kernel_sub(X, Y, Z):
         tl.store(Z, tl.load(X) - tl.load(Y))
 
-    _test_overflow(x, y, x_dtype, y_dtype, should_overflow, debug, _kernel_sub, lambda x, y: x - y, device)
+    _test_overflow(
+        x,
+        y,
+        x_dtype,
+        y_dtype,
+        should_overflow,
+        debug,
+        _kernel_sub,
+        lambda x, y: x - y,
+        device,
+    )
 
 
 # TRITON_SANITIZE_OVERFLOW environment variable tests

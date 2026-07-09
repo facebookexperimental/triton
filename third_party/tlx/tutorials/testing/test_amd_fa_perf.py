@@ -10,6 +10,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
     attention as _amd_fa_persistent, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
+from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+    persistent_attention as _amd_fa_cluster_persistent, )
 
 from triton._internal_testing import is_hip
 
@@ -39,6 +41,8 @@ ATTENTION_METHODS = {
     lambda q, k, v, sm_scale, causal: _amd_fa_persistent(q, k, v, sm_scale, causal),
     "cluster":
     lambda q, k, v, sm_scale, causal: _amd_fa_cluster(q, k, v, sm_scale, causal),
+    "cluster_persistent":
+    lambda q, k, v, sm_scale, causal: _amd_fa_cluster_persistent(q, k, v, sm_scale, causal),
 }
 DEFAULT_ATTENTION_VERSIONS = ["simple", "prefetch", "persistent"]
 
@@ -48,7 +52,7 @@ ref_lib = "SDPA"
 def create_benchmark(versions):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
-    x_vals = [(1024, 128), (4096, 128), (8192, 128)] if "cluster" in versions else [
+    x_vals = [
         (1024, 64),
         (4096, 64),
         (8192, 64),

@@ -142,6 +142,26 @@ def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
   ];
 }
 
+def TLXDumpLayout : Pass<"tlx-dump-layout", "mlir::ModuleOp"> {
+  let summary = "Print the resolved layout of tlx.dump_layout operands";
+
+  let description = [{
+    This pass walks all `tlx::DumpLayoutOp` operations and prints, to the
+    compiler log, the operand's value type and its layout in CuTe Shape:Stride
+    notation (a thread-value layout for register tensors, a strided layout for
+    shared/tensor-memory buffers, or `Swizzle<B,M,S> o base` for swizzled
+    buffers). Layouts not representable in CuTe fall back to the raw linear
+    layout string. It is meant to run at the end of the TTGIR pipeline so that
+    the reported layouts are final. Each `tlx::DumpLayoutOp` is erased after its
+    layout is printed.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::tlx::TLXDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 def TLXStorageAliasLowering : Pass<"tlx-storage-alias-lowering", "mlir::ModuleOp"> {
   let summary = "Lower storage alias operations";
 

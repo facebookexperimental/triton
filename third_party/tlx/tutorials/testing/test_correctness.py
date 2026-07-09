@@ -19,11 +19,13 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
     attention as _blackwell_fa_ws_pipelined_persistent,
     _attn_bwd_preprocess as _blackwell_fa_bwd_preprocess,
+    _attn_bwd_dq_postprocess as _blackwell_fa_bwd_dq_postprocess,
     _attn_bwd_ws as _blackwell_fa_bwd_ws,
     _attn_fwd_ws as _blackwell_fa_fwd_ws,
     _host_descriptor_pre_hook as _blackwell_fa_fwd_pre_hook,
     configs_bwd_1cta as _configs_bwd_1cta,
     configs_bwd_2cta as _configs_bwd_2cta,
+    _bwd_selected_meta,
 )
 from triton.language.extra.tlx.tutorials.blackwell_fa_clc import (
     attention as _blackwell_fa_clc, )
@@ -59,6 +61,8 @@ from triton.language.extra.tlx.tutorials.amd_fa_persistent import (
     attention as _amd_fa_persistent, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
+from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
+    persistent_attention as _amd_fa_cluster_persistent, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
@@ -590,9 +594,12 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         _blackwell_fa_bwd_preprocess[pre_grid](o, do, delta, N_CTX, BLOCK_M=PRE_BLOCK, HEAD_DIM=HEAD_DIM)
 
         # Backward: main kernel
-        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
+
+        _HALF_HD = HEAD_DIM // 2
+        dq_accum = torch.zeros([Z, H, N_CTX, HEAD_DIM], device=q.device, dtype=torch.float32)
 
         dummy_block_4d = [1, 1, 1, 1]
         desc_shape = [Z, H, N_CTX, HEAD_DIM]
@@ -601,7 +608,9 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         desc_bv = TensorDescriptor(v, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_bq = TensorDescriptor(q, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_do = TensorDescriptor(do, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
-        desc_dq = TensorDescriptor(dq, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
+        _dq_desc_shape = [Z, H, 2 * N_CTX, _HALF_HD]
+        _dq_desc_strides = [H * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, 1]
+        desc_dq = TensorDescriptor(dq_accum, shape=_dq_desc_shape, strides=_dq_desc_strides, block_shape=dummy_block_4d)
         desc_dk = TensorDescriptor(dk, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_dv = TensorDescriptor(dv, shape=desc_shape, strides=desc_strides, block_shape=dummy_block_4d)
         desc_m = TensorDescriptor(M, shape=[Z * H * N_CTX], strides=[1], block_shape=[1])
@@ -646,6 +655,18 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             HEAD_DIM=HEAD_DIM,
             STAGE=stage,
+        )
+
+        _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
+        post_grid = (N_CTX // PRE_BLOCK, Z * H)
+        _blackwell_fa_bwd_dq_postprocess[post_grid](
+            dq_accum,
+            dq,
+            N_CTX,
+            BLK=_blk,
+            HALF_HD=HEAD_DIM // 2,
+            BLOCK_M=PRE_BLOCK,
+            HEAD_DIM=HEAD_DIM,
         )
 
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
@@ -1024,16 +1045,32 @@ def test_amd_fa_persistent_cross_attention(q_len, kv_len, causal):
 
 @pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
-def test_amd_fa_cluster(causal, dtype):
+def test_amd_fa_cluster(causal, dtype, HEAD_DIM):
     torch.manual_seed(42)
-    B, H, N_CTX, D = 1, 4, 1024, 128
+    B, H, N_CTX, D = 1, 4, 1024, HEAD_DIM
     q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
     k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
     v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
     sm = 1.0 / math.sqrt(D)
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
     out = _amd_fa_cluster(q, k, v, sm, causal)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_persistent_scheduler_knobs(causal, HEAD_DIM):
+    torch.manual_seed(42)
+    B, H, N_CTX, D = 2, 9, 1024, HEAD_DIM
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.bfloat16)
+    v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=torch.bfloat16)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
+    out = _amd_fa_cluster_persistent(q, k, v, sm, causal, config={"NUM_SMS": 16, "NUM_XCDS": 4})
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 

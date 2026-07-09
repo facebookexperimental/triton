@@ -143,3 +143,31 @@ tt.func @respect_user_start_ids() {
 }
 
 }
+
+// -----
+
+// Do-nothing padding partitions must request the legal setmaxregister floor
+// (24 on all sm_90+ targets), not a below-minimum value. If a padding partition
+// forms a warp group in which no partition requests >= 24, a below-floor value
+// reaches nvvm.setmaxregister and fails the verifier ("must be in between 24 to
+// 256"). Two 1-warp partitions (2 warps) are padded up to a full warp group (4
+// warps); the appended padding partition's request must be 24, not 16.
+module attributes {"ttg.num-warps" = 4 : i32} {
+
+// CHECK-LABEL: tt.func @padding_register_floor
+tt.func @padding_register_floor() {
+  // CHECK: ttg.warp_specialize() attributes {actualRegisters = array<i32: {{[0-9]+}}, 24, 24, 24>, requestedRegisters = array<i32: 24, 24, 24>
+  ttg.warp_specialize() attributes {requestedRegisters = array<i32: 24, 24>}
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    ttg.warp_return
+  }
+  partition1() num_warps(1) {
+    ttg.warp_return
+  } : () -> ()
+  tt.return
+}
+
+}

@@ -1,3 +1,22 @@
+# Hardware-agnostic modulo-scheduling core (DDG + reservation table +
+# schedulers + abstract LatencyModel). Depends only on TritonGPU/Triton IR, no
+# backend dialect — so any backend (NVIDIA here, AMD later) can link it and
+# supply its own concrete LatencyModel subclass.
+add_triton_library(TritonGPUModuloCore
+  ModuloScheduling/LatencyModel.cpp
+  ModuloScheduling/AMDLatencyModel.cpp
+  ModuloScheduling/DataDependenceGraph.cpp
+  ModuloScheduling/ModuloReservationTable.cpp
+  ModuloScheduling/SwingScheduler.cpp
+  ModuloScheduling/ExhaustiveScheduler.cpp
+  ModuloScheduling/ModuloScheduleGraph.cpp
+
+  LINK_LIBS PUBLIC
+  TritonIR
+  TritonGPUIR
+  MLIRTransformUtils
+)
+
 add_triton_library(NVHopperTransforms
   MultiCTAReduction.cpp
   WarpSpecialization.cpp
@@ -20,14 +39,9 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSTaskIdPropagate.cpp
   WarpSpecialization/WSTaskPartition.cpp
   WarpSpecialization/PartitionSchedulingMeta.cpp
-  ModuloScheduling/LatencyModel.cpp
-  ModuloScheduling/DataDependenceGraph.cpp
-  ModuloScheduling/ModuloReservationTable.cpp
-  ModuloScheduling/SwingScheduler.cpp
-  ModuloScheduling/ExhaustiveScheduler.cpp
+  ModuloScheduling/NVLatencyModel.cpp
   ModuloScheduling/ModuloSchedulePass.cpp
   ModuloScheduling/ModuloWSPartitionPass.cpp
-  ModuloScheduling/ModuloScheduleGraph.cpp
   ModuloScheduling/LLMSchedulePass.cpp
   ModuloScheduling/ModuloBufferAllocPass.cpp
   ModuloScheduling/ModuloExpandPass.cpp
@@ -42,4 +56,5 @@ add_triton_library(NVHopperTransforms
   TritonIR
   TritonGPUIR
   MLIRTransformUtils
+  TritonGPUModuloCore
 )

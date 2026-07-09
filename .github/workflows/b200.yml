@@ -1,0 +1,209 @@
+name: Meta Triton B200 Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
+    - cron: '30 */6 * * *'
+
+jobs:
+  b200-meta-triton-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: nvidia-dgx-b200
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 240
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.collect.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          install_triton $PWD
+          set -x
+          TRITONBENCH_TRITON_COMMIT_HASH=$(git rev-parse --verify HEAD)
+          TRITONBENCH_TRITON_REPO=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)\.git|\1|')
+          TRITONBENCH_TRITON_COMMIT=${GITHUB_REF_NAME}
+          TRITONBENCH_INSTALL_DIR=${PWD}
+          # If the current conda env matches the env we just created
+          # then export all Triton related envs to shell env
+          cat <<EOF >> "${SETUP_SCRIPT}"
+          if [ \${CONDA_ENV} == "${CONDA_ENV}" ] ; then
+              export TRITONBENCH_TRITON_COMMIT_HASH="${TRITONBENCH_TRITON_COMMIT_HASH}"
+              export TRITONBENCH_TRITON_REPO="${TRITONBENCH_TRITON_REPO}"
+              export TRITONBENCH_TRITON_COMMIT="${TRITONBENCH_TRITON_COMMIT}"
+              export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
+          fi
+          EOF
+      - name: Run TritonBench tests on B200 GPU
+        id: tritonbench
+        env:
+          TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
+          TRITONBENCH_ROOT: /workspace/tritonbench
+        run: |
+          . "${SETUP_SCRIPT}"
+          bash ./.ci/tritonbench/test-gpu.sh
+      - name: Collect nightly failure (TritonBench)
+        id: collect
+        if: always() && github.event_name == 'schedule' && failure()
+        run: |
+          # TritonBench output is not a stable per-test format, so fall back to a
+          # stable logical bucket identity for this job.
+          BUCKET="b200-tritonbench"
+          TITLE="[nightly] ${GITHUB_WORKFLOW} / b200-meta-triton-test / ${BUCKET}"
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"b200-meta-triton-test","summary":"TritonBench tests failed on B200 (see run log).","repro":""}]'
+          echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+
+  b200-tlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: nvidia-dgx-b200
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          install_triton $PWD
+          uv pip install pytest
+      - name: Install torchao from source
+        run: |
+          . "${SETUP_SCRIPT}"
+          uv pip install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"
+          python -c 'from torchao.prototype.mx_formats.mx_tensor import MXTensor, ScaleCalculationMode'
+      - name: Run TLX unit tests
+        id: run_unit_tests
+        timeout-minutes: 5
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
+      - name: Run TLX tutorial correctness tests
+        id: run_correctness_tests
+        timeout-minutes: 5
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
+      - name: Collect nightly failures (TLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_unit_tests.outcome }}" != "success" || "${{ steps.run_correctness_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-tlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/tlx-unit.xml /tmp/tlx-correctness.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "b200-tlx-test" \
+            ${FAILED_FLAG}
+
+  # ----- Nightly issue filing (schedule only) -----
+  report-b200-tritonbench:
+    needs: b200-meta-triton-test
+    if: always() && github.event_name == 'schedule' && needs.b200-meta-triton-test.outputs.failures != '' && needs.b200-meta-triton-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-meta-triton-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  report-b200-tlx:
+    needs: b200-tlx-test
+    if: always() && github.event_name == 'schedule' && needs.b200-tlx-test.outputs.failures != '' && needs.b200-tlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-tlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-b200-tritonbench:
+    needs: b200-meta-triton-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-meta-triton-test.result == 'success' || needs.b200-meta-triton-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: b200-meta-triton-test
+      failures: ${{ needs.b200-meta-triton-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-b200-tlx:
+    needs: b200-tlx-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-tlx-test.result == 'success' || needs.b200-tlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: b200-tlx-test
+      failures: ${{ needs.b200-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true

@@ -178,7 +178,8 @@ struct DataPartitionScheme {
   }
 
   bool isValidPartitionDim(unsigned dim) const {
-    return dim < numPartitions || dim == DataPartitionScheme::noOpPartitionDim;
+    return dim < DataPartitionScheme::noOpPartitionDim ||
+           dim == DataPartitionScheme::noOpPartitionDim;
   }
 
   unsigned flipPartitionDim(unsigned dim, const ArrayRef<int32_t> &order,
@@ -268,7 +269,7 @@ static bool needToSlice(Value v, unsigned dim, int size) {
   if (isa<AsyncTokenType>(v.getType()))
     return true;
   auto shape = getShape(v);
-  return shape.size() > dim && shape[dim] > size;
+  return shape.size() > dim && shape[dim] >= size;
 }
 
 static bool isDotOrMMAv5Op(Operation *op) {
@@ -397,6 +398,111 @@ static unsigned remappedSqueezedDim(SmallVector<int64_t> &shape1,
   }
 }
 
+struct FlatInterval {
+  int64_t begin;
+  int64_t end;
+
+  bool operator==(const FlatInterval &other) const {
+    return begin == other.begin && end == other.end;
+  }
+};
+
+static std::optional<int64_t> product(ArrayRef<int64_t> values) {
+  int64_t result = 1;
+  for (int64_t value : values) {
+    if (value <= 0)
+      return std::nullopt;
+    result *= value;
+  }
+  return result;
+}
+
+static SmallVector<FlatInterval> getPartitionIntervals(ArrayRef<int64_t> shape,
+                                                       unsigned dim,
+                                                       unsigned numPartitions,
+                                                       unsigned offset) {
+  SmallVector<FlatInterval> intervals;
+  if (dim >= shape.size() || shape[dim] < numPartitions ||
+      shape[dim] % numPartitions != 0)
+    return intervals;
+
+  auto maybeOuterCount = product(shape.take_front(dim));
+  auto maybeStride = product(shape.drop_front(dim + 1));
+  if (!maybeOuterCount || !maybeStride)
+    return intervals;
+
+  int64_t outerCount = *maybeOuterCount;
+  int64_t stride = *maybeStride;
+  int64_t chunk = shape[dim] / numPartitions;
+  int64_t intervalLen = chunk * stride;
+  int64_t period = shape[dim] * stride;
+  for (int64_t outer = 0; outer < outerCount; ++outer) {
+    int64_t begin = outer * period + offset * intervalLen;
+    intervals.push_back({begin, begin + intervalLen});
+  }
+
+  SmallVector<FlatInterval> merged;
+  for (FlatInterval interval : intervals) {
+    if (!merged.empty() && merged.back().end == interval.begin) {
+      merged.back().end = interval.end;
+      continue;
+    }
+    merged.push_back(interval);
+  }
+  return merged;
+}
+
+static bool partitionIntervalsMatch(ArrayRef<int64_t> lhsShape, unsigned lhsDim,
+                                    ArrayRef<int64_t> rhsShape, unsigned rhsDim,
+                                    unsigned numPartitions) {
+  for (unsigned offset = 0; offset < numPartitions; ++offset) {
+    auto lhsIntervals =
+        getPartitionIntervals(lhsShape, lhsDim, numPartitions, offset);
+    auto rhsIntervals =
+        getPartitionIntervals(rhsShape, rhsDim, numPartitions, offset);
+    if (lhsIntervals.empty() || rhsIntervals.empty() ||
+        lhsIntervals != rhsIntervals)
+      return false;
+  }
+  return true;
+}
+
+static std::optional<unsigned>
+remapReshapePartitionDim(ArrayRef<int64_t> srcShape, ArrayRef<int64_t> dstShape,
+                         unsigned dim, unsigned numPartitions, bool forward) {
+  auto maybeSrcElements = product(srcShape);
+  auto maybeDstElements = product(dstShape);
+  if (!maybeSrcElements || !maybeDstElements ||
+      *maybeSrcElements != *maybeDstElements)
+    return std::nullopt;
+
+  ArrayRef<int64_t> fromShape = forward ? srcShape : dstShape;
+  ArrayRef<int64_t> toShape = forward ? dstShape : srcShape;
+  if (dim >= fromShape.size())
+    return std::nullopt;
+
+  for (auto [candidateDim, ignored] : llvm::enumerate(toShape)) {
+    (void)ignored;
+    if (partitionIntervalsMatch(fromShape, dim, toShape, candidateDim,
+                                numPartitions))
+      return candidateDim;
+  }
+  return std::nullopt;
+}
+
+static bool shapedResultsCanRepresentDim(Operation *op, unsigned dim) {
+  if (dim == DataPartitionScheme::noOpPartitionDim)
+    return true;
+  for (Value result : op->getResults()) {
+    Type type = result.getType();
+    if (!isa<MemDescType, RankedTensorType, TensorDescType>(type))
+      continue;
+    if (getShape(type).size() <= dim)
+      return false;
+  }
+  return true;
+}
+
 static bool getBackwardSliceToPartition(Value v,
                                         DataPartitionScheme &partitionScheme,
                                         unsigned currentDim) {
@@ -486,9 +592,10 @@ static bool getBackwardSliceToPartition(Value v,
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
                    SplatOp, ConvertLayoutOp, triton::gpu::LocalAllocOp, LoadOp,
-                   TransOp, MemDescTransOp, AtomicRMWOp, triton::AddPtrOp,
-                   nvidia_gpu::TMEMLoadOp, nvidia_gpu::TMEMStoreOp, FpToFpOp,
-                   SplitOp, JoinOp, ReshapeOp, MapElementwiseOp>(op)) {
+                   triton::gpu::LocalLoadOp, TransOp, MemDescTransOp,
+                   AtomicRMWOp, triton::AddPtrOp, nvidia_gpu::TMEMLoadOp,
+                   nvidia_gpu::TMEMStoreOp, FpToFpOp, SplitOp, JoinOp,
+                   MapElementwiseOp>(op)) {
       for (Value operand : op->getOperands())
         if (!getBackwardSliceToPartition(operand, partitionScheme,
                                          currentDim)) {
@@ -537,6 +644,28 @@ static bool getBackwardSliceToPartition(Value v,
                                          DataPartitionScheme::noOpPartitionDim))
           return false;
       }
+    } else if (auto reshapeOp = dyn_cast<ReshapeOp>(op)) {
+      auto srcShape = getShape(reshapeOp.getSrc());
+      auto dstShape = getShape(reshapeOp.getResult());
+      auto srcDim = remapReshapePartitionDim(srcShape, dstShape, currentDim,
+                                             partitionScheme.numPartitions,
+                                             /*forward=*/false);
+      if (!srcDim)
+        return false;
+      if (!getBackwardSliceToPartition(reshapeOp.getSrc(), partitionScheme,
+                                       *srcDim))
+        return false;
+    } else if (auto reshapeOp = dyn_cast<MemDescReshapeOp>(op)) {
+      auto srcShape = getShape(reshapeOp.getSrc());
+      auto dstShape = getShape(reshapeOp.getResult());
+      auto srcDim = remapReshapePartitionDim(srcShape, dstShape, currentDim,
+                                             partitionScheme.numPartitions,
+                                             /*forward=*/false);
+      if (!srcDim)
+        return true;
+      if (!getBackwardSliceToPartition(reshapeOp.getSrc(), partitionScheme,
+                                       *srcDim))
+        return false;
     } else if (isa<ttng::ReinterpretTensorDescOp, MakeTensorDescOp>(op)) {
       return true;
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
@@ -653,7 +782,28 @@ static bool getForwardSliceToPartition(Value v,
     } else if (auto memDescTransOp = dyn_cast<MemDescTransOp>(depOp)) {
       currentDim = partitionScheme.flipPartitionDim(
           currentDim, memDescTransOp.getOrder(), true);
+    } else if (auto reshapeOp = dyn_cast<ReshapeOp>(depOp)) {
+      auto srcShape = getShape(reshapeOp.getSrc());
+      auto dstShape = getShape(reshapeOp.getResult());
+      auto dstDim = remapReshapePartitionDim(srcShape, dstShape, currentDim,
+                                             partitionScheme.numPartitions,
+                                             /*forward=*/true);
+      if (!dstDim)
+        return false;
+      currentDim = *dstDim;
+    } else if (auto reshapeOp = dyn_cast<MemDescReshapeOp>(depOp)) {
+      auto srcShape = getShape(reshapeOp.getSrc());
+      auto dstShape = getShape(reshapeOp.getResult());
+      auto dstDim = remapReshapePartitionDim(srcShape, dstShape, currentDim,
+                                             partitionScheme.numPartitions,
+                                             /*forward=*/true);
+      if (!dstDim)
+        return false;
+      currentDim = *dstDim;
     }
+
+    if (!shapedResultsCanRepresentDim(depOp, currentDim))
+      return false;
 
     // Check dim compatibility
     if (!partitionScheme.ops.insert(depOp)) {
@@ -1191,7 +1341,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
   if ((dim == DataPartitionScheme::noOpPartitionDim) ||
       op->hasTrait<OpTrait::Elementwise>() ||
       isa<ConvertLayoutOp, BroadcastOp, SplatOp, ExpandDimsOp, FpToFpOp,
-          AtomicRMWOp, LocalAllocOp, SplitOp, JoinOp, ReshapeOp>(op)) {
+          AtomicRMWOp, LocalAllocOp, LocalLoadOp, SplitOp, JoinOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
@@ -1328,19 +1478,21 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                  retType.getShape().end()};
       int sliceSize = shape[dim] / numOfPartitions;
       shape[dim] = sliceSize;
-      auto tmem =
-          cast<nvidia_gpu::TensorMemoryEncodingAttr>(retType.getEncoding());
-      auto accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-          builder.getContext(), tmem.getBlockM(),
-          dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
-          tmem.getColStride(), tmem.getCGALayout(), tmem.getTwoCTAs(),
-          tmem.getCtaMode());
+      Attribute accEncoding = retType.getEncoding();
+      if (auto tmem = dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(
+              retType.getEncoding())) {
+        accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
+            builder.getContext(), tmem.getBlockM(),
+            dim == 1 ? tmem.getBlockN() / 2 : tmem.getBlockN(),
+            tmem.getColStride(), tmem.getCGALayout(), tmem.getTwoCTAs(),
+            tmem.getCtaMode());
+      }
       auto newType = MemDescType::get(shape, retType.getElementType(),
                                       accEncoding, retType.getMemorySpace(),
                                       retType.getMutableMemory());
 
       auto newDistributedEncoding =
-          nvidia_gpu::getDefaultLayoutForTmemLdSt(retType, numWarps);
+          nvidia_gpu::getDefaultLayoutForTmemLdSt(newType, numWarps);
       auto newAccType = RankedTensorType::get(
           srcTy.getShape(), srcTy.getElementType(), newDistributedEncoding);
       auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
@@ -1474,6 +1626,53 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     newV.setType(newType);
     mappings.map(v, newV);
     reverseMappings.map(newV, v);
+  } else if (auto reshapeOp = dyn_cast<ReshapeOp>(op)) {
+    auto srcShape = getShape(reshapeOp.getSrc());
+    auto dstShape = getShape(reshapeOp.getResult());
+    auto srcDim = remapReshapePartitionDim(srcShape, dstShape, dim,
+                                           partitionScheme.numPartitions,
+                                           /*forward=*/false);
+    if (!srcDim)
+      llvm_unreachable("partitioned tensor reshape has no source dimension");
+    sliceOp(reshapeOp.getSrc(), offset, mappings, reverseMappings,
+            partitionScheme);
+    newOp = cloneAndSetResultType(op);
+  } else if (auto reshapeOp = dyn_cast<MemDescReshapeOp>(op)) {
+    auto srcShape = getShape(reshapeOp.getSrc());
+    auto dstShape = getShape(reshapeOp.getResult());
+    auto srcDim = remapReshapePartitionDim(srcShape, dstShape, dim,
+                                           partitionScheme.numPartitions,
+                                           /*forward=*/false);
+    if (srcDim) {
+      sliceOp(reshapeOp.getSrc(), offset, mappings, reverseMappings,
+              partitionScheme);
+      newOp = cloneAndSetResultType(op);
+    } else {
+      builder.setInsertionPoint(op);
+      auto clonedReshape = builder.clone(*op, mappings);
+      setAsyncTaskIds(clonedReshape, sliceTaskIds);
+      mappings.map(op, clonedReshape);
+      reverseMappings.map(clonedReshape, op);
+
+      auto result = op->getResult(0);
+      auto type = cast<MemDescType>(result.getType());
+      SmallVector<int64_t> shape{type.getShape().begin(),
+                                 type.getShape().end()};
+      assert(dim < shape.size() &&
+             "memdesc_reshape partition dim out of bounds");
+      int sliceSize = shape[dim] / numOfPartitions;
+      shape[dim] = sliceSize;
+      auto slicedType =
+          MemDescType::get(shape, type.getElementType(), type.getEncoding(),
+                           type.getMemorySpace(), type.getMutableMemory());
+      SmallVector<int32_t> offsets(shape.size(), 0);
+      offsets[dim] = offset * sliceSize;
+      auto subsliceOp = builder.createWithAsyncTaskIds<MemDescSubsliceOp>(
+          op->getLoc(), slicedType, clonedReshape->getResult(0), offsets);
+      mappings.map(result, subsliceOp.getResult());
+      reverseMappings.map(subsliceOp.getResult(), result);
+      newOp = subsliceOp;
+    }
   } else if (isDotOrMMAv5Op(op)) {
     assert(partitionScheme.dotPartitionOperand.contains(op) &&
            "no operand info");
@@ -1753,6 +1952,15 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
         if ((!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i))) &&
             !parentWhileOp)
           yieldOp->insertOperands(op->getNumOperands(), newV);
+        // scf.while: append unconditionally when the operand was sliced. Unlike
+        // scf.for there is no per-index result guard here because the while
+        // branch above appends a loop-carried arg for every sliced init, and
+        // for a while the after-yield operand k feeds before-arg k 1:1, so a
+        // sliced yield operand always has a matching appended before-arg. This
+        // holds for the loop-carried values this pass threads
+        // (accumulators/counters); slicing an after-region-only value whose
+        // init was not sliced would break the 1:1 alignment and needs a guard
+        // analogous to the for path.
         if (parentWhileOp)
           yieldOp->insertOperands(op->getNumOperands(), newV);
       }

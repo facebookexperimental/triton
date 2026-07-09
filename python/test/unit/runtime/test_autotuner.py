@@ -6,7 +6,8 @@ import pytest
 
 import pathlib
 import uuid
-from triton._internal_testing import is_cuda, is_hip_cdna2
+from triton._internal_testing import is_cuda
+from triton.runtime import autotuner as _autotuner
 
 
 def do_bench(kernel_call, quantiles, use_cuda_graph=False):
@@ -84,7 +85,6 @@ def test_restore(pass_kwargs_to_kernel, device):
     triton.testing.assert_close(src, torch.ones_like(src))
 
 
-@pytest.mark.skipif(is_hip_cdna2(), reason="Hit LLVM assertion in splitLiveThroughBlock")
 def test_hooks(device):
     # Autotuner's pre- and post- hooks should be called the same number of times
     N = 4096
@@ -592,3 +592,70 @@ def test_dump_best_config_ir(device, tmp_path):
         knobs.autotuning.dump_best_config_ir = original_dump_best
         knobs.compilation.dump_ir = original_dump_ir
         knobs.cache.dump_dir = original_dump_dir
+
+
+# --- NPOT autotuner: wave-quant candidate generation + bench-path prune gating ---
+
+
+def test_wave_efficiency_and_pre_check():
+    # Full waves -> 1.0; just over a boundary -> a near-empty trailing wave.
+    assert _autotuner._wave_efficiency(64, 64) == 1.0
+    assert _autotuner._wave_efficiency(65, 64) < 0.55
+    # A cleanly-tiling pow2 shape yields no NPOT candidates (no autotune tax on POT shapes).
+    assert _autotuner._wave_quant_npot_candidates(128, 128, 1024, 1024, 64) == []
+    # A single-wave shape cannot be improved by re-tiling -> none, even when it underfills the wave.
+    assert _autotuner._wave_quant_npot_candidates(128, 128, 100, 100, 64) == []
+
+
+def test_wave_quant_candidates_target_bad_tail():
+    # 9x8 = 72 tiles over 64 units -> 2 waves, ~0.56 efficiency: a real wave-quant tail.
+    M, N, U = 1152, 1024, 64
+    cands = _autotuner._wave_quant_npot_candidates(128, 128, M, N, U)
+    assert cands, "expected NPOT candidates for a bad wave tail"
+    pow2_tiles = _autotuner._cdiv(M, 128) * _autotuner._cdiv(N, 128)
+    pow2_waves = _autotuner._cdiv(pow2_tiles, U)
+    pow2_eff = _autotuner._wave_efficiency(pow2_tiles, U)
+    for bm, bn in cands:
+        assert bm % 16 == 0 and bn % 16 == 0  # legal-snapped
+        tiles = _autotuner._cdiv(M, bm) * _autotuner._cdiv(N, bn)
+        waves = _autotuner._cdiv(tiles, U)
+        eff = _autotuner._wave_efficiency(tiles, U)
+        # every candidate strictly improves on (fewer waves, then higher efficiency)
+        assert waves < pow2_waves or (waves == pow2_waves and eff > pow2_eff)
+
+
+def test_generate_wave_quant_candidates_appends_npot_and_noop():
+    base = triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 128})
+    prev = triton.knobs.language.allow_npot
+    try:
+        triton.knobs.language.allow_npot = True
+        # Clean shape -> unchanged (no tax). Unknown shape / no SMs -> no-op.
+        assert _autotuner._generate_wave_quant_candidates([base], {'M': 1024, 'N': 1024}, 64) == [base]
+        assert _autotuner._generate_wave_quant_candidates([base], {}, 64) == [base]
+        assert _autotuner._generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 0) == [base]
+        # Bad tail -> NPOT candidates appended; original preserved (and stays pow2).
+        out = _autotuner._generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 64)
+    finally:
+        triton.knobs.language.allow_npot = prev
+    assert base in out
+    assert not _autotuner._config_has_npot_block(base)
+    npot = [c for c in out if c is not base and _autotuner._config_has_npot_block(c)]
+    assert npot, "expected wave-quant NPOT candidates for a bad tail"
+
+
+def test_npot_runtime_error_prunable_gating():
+    pow2_cfg = triton.Config(kwargs={'BLOCK_M': 128})
+    npot_cfg = _autotuner._clone_config(pow2_cfg, BLOCK_M=96)
+    # A pow2 config must re-raise even a device error (never be masked).
+    assert _autotuner._npot_runtime_error_prunable(pow2_cfg, RuntimeError("Triton Error [CUDA]: out of memory"),
+                                                   allow_npot=True) is False
+    # An NPOT config under the flag is prunable on a device failure -- case-insensitively and across
+    # both backends (CUDA and HIP).
+    for msg in ("Triton Error [CUDA]: misaligned address", "Triton Error [HIP]: out of memory range.", "Out Of Memory",
+                "an illegal memory access was encountered"):
+        assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError(msg), allow_npot=True) is True
+    # Flag off, or a non-device RuntimeError -> re-raise.
+    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("Triton Error [CUDA]: x"),
+                                                   allow_npot=False) is False
+    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("invalid config value"),
+                                                   allow_npot=True) is False
