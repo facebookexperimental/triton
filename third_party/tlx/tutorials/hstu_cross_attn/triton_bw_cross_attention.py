@@ -3705,6 +3705,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             num_stages=1,
             warp_specialize=WS_ON,
             merge_epilogue=False,
+            list_schedule_pick=INNER_PICK,
     ):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
