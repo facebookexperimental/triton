@@ -2412,7 +2412,7 @@ constexpr double kInfeasiblePenalty = 1e7;
 // handwritten reference launches num_sms*4) can enable it via
 // TRITON_MODULO_CORES_PENALTY without a rebuild. case1's committed
 // footprint sits 12.9% above the 2-CTA SMEM bound (the nearest real
-// target); see docs/SolverMigrationNotes.md.
+// target).
 constexpr int kCoResidencyTargetCTAs = 2;
 static double coResidencyPenalty() {
   auto env = triton::tools::getStrEnv("TRITON_MODULO_CORES_PENALTY");

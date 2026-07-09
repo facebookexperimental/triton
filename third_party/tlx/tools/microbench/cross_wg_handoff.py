@@ -2,7 +2,7 @@
 scheduler's partitioner cost model.
 
 Calibrates the second-order terms in ModuloSchedulePass.cpp's
-scoreCandidate (see docs/SolverMigrationNotes.md "Suggested sequencing"):
+scoreCandidate:
   - kCrossWGRoundTripLatency: fixed cost of a reg->SMEM->reg hand-off
     between two warp groups (store visibility + mbarrier arrive + waiter
     wake-up), previously back-fitted from a single FA A/B, never measured.
