@@ -132,7 +132,7 @@ jobs:
     env:
       CONDA_ENV: meta-triton
       SETUP_SCRIPT: /workspace/setup_instance.sh
-    timeout-minutes: 20
+    timeout-minutes: 60
     permissions:
       id-token: write
       contents: read
@@ -152,31 +152,27 @@ jobs:
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
           uv pip install pytest
-      - name: Run fundamental Gluon frontend tests
-        id: run_gluon_frontend
-        timeout-minutes: 10
+      - name: Run Gluon tests (python/test/gluon)
+        id: run_gluon
+        timeout-minutes: 50
         run: |
           . "${SETUP_SCRIPT}"
-          # Fundamental Gluon coverage: the frontend (Python DSL -> TTGIR) tests are
-          # compile-only and target-agnostic (they drive Ampere/Hopper/Blackwell AND
-          # AMD codegen via mock GPUTarget), so they are the minimal, least-flaky Gluon
-          # signal for our fork. We run a curated critical subset; tests excluded from
-          # the -k filter are tracked in README.md ("Gluon support") -- upstream-synced
-          # golden drift and the FB-local dot() allow_tf32 skew (TODO gluon-ci).
-          python -m pytest python/test/gluon/test_frontend.py -v \
-            -k '(convert_layout or shared_memory_subview or shared_memory_index or tensor_memory or warpgroup_mma or tcgen05_mma or async_tma or broadcast or elementwise_core or linear_layout or split_join or tensor_permute or warp_specialize or test_mbarrier or test_math) and not sync_cluster_init' \
-            --junitxml=/tmp/gluon-frontend.xml
+          # Full Gluon unit-test coverage: every python/test/gluon/test_*.py. This spans
+          # the compile-only frontend tests plus the GPU-execution suites (core, lowerings,
+          # consan, fpsan, layout_format_view). Known-failing cases and their root causes
+          # are tracked in README.md ("Gluon support" -> TODO gluon-ci).
+          python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
       - name: Collect nightly failures (Gluon)
         id: parse
         if: always() && github.event_name == 'schedule'
         run: |
           . "${SETUP_SCRIPT}"
           FAILED_FLAG=""
-          if [[ "${{ steps.run_gluon_frontend.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
             FAILED_FLAG="--failed --bucket b200-gluon-job-failed"
           fi
           python3 .github/scripts/parse_junit_failures.py \
-            --junit /tmp/gluon-frontend.xml \
+            --junit /tmp/gluon.xml \
             --workflow "${GITHUB_WORKFLOW}" \
             --job "b200-gluon-test" \
             ${FAILED_FLAG}

@@ -22,18 +22,27 @@ While this approach places more responsibility on the user, it reduces the compi
 (TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton
 is a secondary community Triton, we run **fundamental Gluon CI** so we don't silently break it.
 
-**CI:** a curated, green subset of the *frontend* tests (`python/test/gluon/test_frontend.py`)
-— compile-only and target-agnostic (one run covers NVIDIA + AMD codegen via mock `GPUTarget`),
-selected with a `-k` filter in the `b200-gluon-test` / `mi350-gluon-test` jobs. Full
-`test_frontend.py` is 176/186 after the fork-side fixes below (Gluon itself unmodified):
-`core.py` reduce `reduction_ordering` compat, `semantic.py` `dot()` `allow_tf32` default, a
-`test_core.py` collection fix, and regenerated `test_frontend.py` goldens (upstream-synced —
-overwritten on next sync).
+**CI:** the `b200-gluon-test` / `mi350-gluon-test` jobs run `pytest python/test/gluon/` (every
+`test_*.py`). It is **green**: ~200 passed, ~1600 skipped, 0 failed. The real signal is the
+compile-only, target-agnostic frontend suite (`test_frontend.py`, one run covers NVIDIA + AMD
+codegen via mock `GPUTarget`); the version-skewed cases below are skipped via
+`python/test/gluon/conftest.py` rather than failing the job.
 
-**Not yet covered / TODO(gluon-ci):** the GPU-execution suites (`test_core`, `test_lowerings`,
-`test_consan`, `test_fpsan`, `test_layout_format_view`) fail widely on this fork — mainly an
-upstream-owned `distributed_type` divergence in `ttgl` broadcast/convert_layout; plus ~9 frontend
-per-target golden tests, and the `create_lds_barrier_wait` pybind mismatch (needs a rebuild).
+**Fork-side fixes** (Gluon frontend itself unmodified): `core.py` reduce `reduction_ordering`
+compat, `semantic.py` `dot()` `allow_tf32` default, a `test_core.py` collection fix (a bad
+cherry-pick left an `IndentationError`), and regenerated `test_frontend.py` goldens
+(upstream-synced — overwritten on next sync).
+
+**Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):** the GPU-execution suites
+(`test_core`, `test_lowerings`, `test_consan`, `test_fpsan`, one kernel in
+`test_layout_format_view`) were synced from much newer upstream (e.g. `test_fpsan.py` via bundle
+#1956) than the pinned Gluon frontend (`_semantic.py` ~2026-06-29). They require Gluon behavior
+the frontend doesn't have yet — raw pointer `gl.load`/`gl.store` inferring a *distributed* layout
+— so they fail wholesale with `expected ... distributed_type but got block_type`. The fix is to
+sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped:
+~9 frontend per-target golden tests (single inline golden can't match every parametrized target)
+and the `create_lds_barrier_wait` pybind mismatch. `conftest.py` lists these; remove/trim it after
+the re-sync.
 
 
 ## The DSL Extension
