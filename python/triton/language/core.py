@@ -3882,6 +3882,10 @@ class range(base_value):
     :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
         code outside the loop. This is often useful to avoid creating long liveranges
         within a loop.
+    :param list_schedule_pick: When the list scheduler is enabled
+        (``TRITON_USE_LIST_SCHEDULE=1``), select which ranked schedule variant
+        (0 = best) to apply to this loop. May be a ``tl.constexpr`` so it becomes
+        part of the compilation key and can be swept by ``@triton.autotune``.
 
         Note that warp specialization is only supported on Blackwell GPUs and
         only works on simple matmul loops. Support for arbitrary loops will be
@@ -3901,6 +3905,7 @@ class range(base_value):
         multi_cta=False,
         disable_licm=False,
         data_partition_factor=None,
+        list_schedule_pick=None,
         merge_epilogue=False,
         merge_epilogue_to_computation=False,
         merge_correction=False,
@@ -3924,6 +3929,10 @@ class range(base_value):
         self.loop_unroll_factor = loop_unroll_factor
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.data_partition_factor = data_partition_factor
+        # Rank of the list-schedule variant to apply to THIS loop (0 = best).
+        # May be a tl.constexpr so it participates in the compile key and can be
+        # swept by @triton.autotune. Consumed by nvgpu-list-schedule.
+        self.list_schedule_pick = list_schedule_pick
         self.merge_epilogue = merge_epilogue
         self.merge_epilogue_to_computation = merge_epilogue_to_computation
         self.merge_correction = merge_correction

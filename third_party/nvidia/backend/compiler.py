@@ -755,16 +755,33 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
+            elif knobs.nvidia.use_list_schedule:
+                # Acyclic list schedule (no software pipelining): a single-stage
+                # per-loop reorder that writes loop.stage/loop.cluster like the
+                # default scheduler. Emits top-K variants for autotuning
+                # (TRITON_LIST_SCHEDULE_TOPK / _BEAM / _TOPK_DUMP) and applies
+                # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
+                nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # The modulo / LLM scheduler above already produced the full loop
-            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
-            # schedule_loops here would recompute and OVERRIDE it, so only run
-            # them on the default path where no custom scheduler set the schedule.
-            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            # The modulo / LLM / list scheduler above already produced the full
+            # loop schedule (loop.stage / loop.cluster). Re-running
+            # assign_latencies + schedule_loops here would recompute and OVERRIDE
+            # it, so only run them on the default path where no custom scheduler
+            # set the schedule.
+            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+                                    or knobs.nvidia.use_list_schedule)
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if not knobs.nvidia.use_meta_ws:
+            if knobs.nvidia.use_list_schedule:
+                # List scheduling is a no-warp-specialization transform: it
+                # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
+                # feeds the pipeliner directly. Running either WS path here would
+                # trip PartitionSchedulingMeta (it treats the tt.modulo_ii marker
+                # as a modulo schedule and demands partition attrs the list
+                # scheduler never emits). So skip WS entirely.
+                pass
+            elif not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
