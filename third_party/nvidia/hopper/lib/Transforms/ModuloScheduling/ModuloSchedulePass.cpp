@@ -2866,8 +2866,7 @@ struct CrossWGChannelSpec {
 };
 
 static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
-                                                const ttg::ScheduleEdge &edge,
-                                                bool loopHasTC) {
+                                                const ttg::ScheduleEdge &edge) {
   CrossWGChannelSpec spec;
   const auto &src = loop.nodes[edge.srcId];
   const auto &dst = loop.nodes[edge.dstId];
@@ -2921,35 +2920,28 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
   // P-tile bridge): the value must be staged through a synthesized SMEM
   // channel.
   //
-  // Channel depth. Default: depth-2 for the TMA-load→compute channel of a
-  // TC-free pipelined loop (load warp prefetches one iteration ahead);
-  // depth-1 for other register hand-offs. Deepening register-consumer
-  // channels beyond that measured 6x SLOWER on FA (the P-tile bridge's
-  // extra SMEM + barrier traffic broke the softmax/MMA pingpong), so the
-  // lifetime rule below is scoped to async TMA-STORE consumers only.
-  //
-  // TMA-store consumers get the same `lifetime / II + 1` rule
-  // computeBufferCount applies to data buffers, with the hand-off
-  // spanning src's write to dst's completion (dst.latency included: the
-  // store holds its slot until the transfer drains). A store channel
-  // whose lifetime exceeds II must be double-buffered or the producer WG
-  // serializes on the store WG's drain every iteration — exactly the
-  // layernorm compute→store stall the fixed depth-1 rule produced (0.53x
-  // of handwritten). Store channels short relative to II (GEMM outer-loop
-  // epilogues) keep depth 1, same as before.
-  {
-    unsigned floorDepth =
-        (!loopHasTC && src.pipeline == ttg::HWPipeline::TMA) ? 2u : 1u;
-    unsigned lifetimeDepth = 1;
+  // Channel depth: the same `lifetime / II + 1` rule computeBufferCount
+  // applies to data buffers, uniformly for every synthesized channel. The
+  // hand-off spans the producer's write to the consumer's read; a TMA-store
+  // consumer additionally holds its slot until the transfer drains
+  // (dst.latency) — a store channel whose lifetime exceeds II must be
+  // double-buffered or the producer WG serializes on the store WG's drain
+  // every iteration (the layernorm compute→store stall, 0.53x of
+  // handwritten under a fixed depth-1 rule). This replaces two earlier
+  // special cases: a depth-2 floor scoped to TMA loads in TC-free loops
+  // (the schedule's own cycles produce depth 2 exactly when the load runs a
+  // stage ahead of its consumer), and store-consumer-only scoping of the
+  // lifetime rule (register hand-offs whose lifetime fits inside II keep
+  // depth 1, same as before).
+  if (loop.II > 0) {
     bool dstIsTMAStore =
         dst.op &&
         isa<tt::DescriptorStoreOp, ttng::AsyncTMACopyLocalToGlobalOp>(dst.op);
-    if (dstIsTMAStore && loop.II > 0) {
-      int chanLifetime =
-          std::max(0, (dst.cycle + std::max(dst.latency, 0)) - src.cycle);
-      lifetimeDepth = static_cast<unsigned>(chanLifetime / loop.II + 1);
-    }
-    spec.depth = std::max(lifetimeDepth, floorDepth);
+    int hold = dstIsTMAStore ? std::max(dst.latency, 0) : 0;
+    int chanLifetime = std::max(0, (dst.cycle + hold) - src.cycle);
+    spec.depth = static_cast<unsigned>(chanLifetime / loop.II + 1);
+  } else {
+    spec.depth = 1;
   }
   // Derive shape + element width from the producer's result type.
   if (src.op && src.op->getNumResults() > 0) {
@@ -2992,9 +2984,6 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
 static int64_t
 predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
                         const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
-  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
-    return n.pipeline == ttg::HWPipeline::TC;
-  });
   int64_t total = 0;
   llvm::SmallDenseSet<std::pair<unsigned, unsigned>, 8> seenPairs;
   for (const auto &edge : loop.edges) {
@@ -3006,7 +2995,7 @@ predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
       continue;
     if (!seenPairs.insert({edge.srcId, edge.dstId}).second)
       continue;
-    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    auto spec = resolveCrossWGChannel(loop, edge);
     if (!spec.synthesize)
       continue;
     total += spec.synthesizedBytes() + 2 * spec.depth * 8;
@@ -4074,9 +4063,6 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
   // load warp run a full iteration ahead of compute (prefetch), which is what
   // turns the 3-WG split from "matches 1-WG" into "beats it ~1.2x". TC loops
   // (GEMM/FA) keep their tuned depth-1 register channels untouched.
-  bool loopHasTC = llvm::any_of(loop.nodes, [](const ttg::ScheduleNode &n) {
-    return n.pipeline == ttg::HWPipeline::TC;
-  });
   for (const auto &edge : loop.edges) {
     const auto &src = loop.nodes[edge.srcId];
     const auto &dst = loop.nodes[edge.dstId];
@@ -4113,7 +4099,7 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     // Resolve the channel: reuse the producer's data buffer / the TMA
     // destination buffer, or get a synthesis spec (shape + depth rule).
     // Shared with the scoring-time predictor — see resolveCrossWGChannel.
-    auto spec = resolveCrossWGChannel(loop, edge, loopHasTC);
+    auto spec = resolveCrossWGChannel(loop, edge);
     unsigned depth = spec.depth;
     unsigned pairedBuf = spec.pairedBuf;
     if (spec.synthesize) {
