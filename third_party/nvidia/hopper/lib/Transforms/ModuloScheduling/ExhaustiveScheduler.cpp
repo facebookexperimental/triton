@@ -16,6 +16,8 @@
 #include "ExhaustiveScheduler.h"
 
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <chrono>
@@ -503,6 +505,42 @@ runExhaustiveSearch(const DataDependenceGraph &ddg, int maxII, int smemBudget,
 // Monte Carlo approach: randomly sample stage assignments for key ops
 // (MEM + TC), greedily place everything else, evaluate and keep the best.
 // Guaranteed to complete in O(numSamples × numOps) time.
+//
+// Top-K: the search already enumerates hundreds/thousands of scored candidates
+// internally. TRITON_MODULO_TOPK>1 keeps the K best (deduped by per-node stage
+// signature, ranked by II then score) instead of only the single best;
+// TRITON_MODULO_PICK selects which of the K to apply (0 = best), so an external
+// harness can sweep schedules. Default (unset) preserves single-best behavior.
+
+static int getModuloTopK() {
+  auto v = ::mlir::triton::tools::getStrEnv("TRITON_MODULO_TOPK");
+  if (v.empty())
+    return 1;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 1 : n;
+}
+
+static int getModuloPick() {
+  auto v = ::mlir::triton::tools::getStrEnv("TRITON_MODULO_PICK");
+  if (v.empty())
+    return 0;
+  int n = std::atoi(v.c_str());
+  return n < 0 ? 0 : n;
+}
+
+// Canonical dedup key: per-node stage (cycle / II). Two schedules with the same
+// stage assignment are equivalent for modulo purposes.
+static llvm::SmallVector<int>
+stageSignature(const DataDependenceGraph &ddg,
+               const llvm::DenseMap<unsigned, int> &scheduled, int II) {
+  llvm::SmallVector<int> sig;
+  sig.reserve(ddg.getNumNodes());
+  for (unsigned i = 0; i < ddg.getNumNodes(); ++i) {
+    auto it = scheduled.find(i);
+    sig.push_back((it != scheduled.end() && II > 0) ? it->second / II : -1);
+  }
+  return sig;
+}
 
 FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
                                                 int maxII, int smemBudget,
@@ -553,9 +591,23 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
     return (rngState >> 16) & 0x7fff;
   };
 
-  ModuloScheduleResult best;
-  best.II = INT_MAX;
-  int64_t bestScore = INT64_MIN;
+  // Top-K collection: keep distinct scored candidates instead of one best.
+  const int K = std::max(getModuloTopK(), getModuloPick() + 1);
+  struct Cand {
+    int II;
+    int64_t score;
+    llvm::DenseMap<unsigned, int> scheduled;
+  };
+  llvm::SmallVector<Cand> cands;
+  llvm::DenseSet<uint64_t> seenSigs;
+  auto hashSig = [](const llvm::SmallVector<int> &s) {
+    uint64_t h = 1469598103934665603ull;
+    for (int x : s) {
+      h ^= static_cast<unsigned>(x);
+      h *= 1099511628211ull;
+    }
+    return h;
+  };
 
   for (int II = minII; II <= maxII; ++II) {
     // Timeout check.
@@ -682,24 +734,47 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
                       feas.totalBufferingDepth * 100 - regPressure +
                       smemHeadroom / 1024;
 
-      if (score > bestScore) {
-        bestScore = score;
-        best.II = II;
-        best.nodeToCycle = scheduled;
-        LLVM_DEBUG(DBGS() << "  Random sample " << sample << ": score=" << score
-                          << " maxStage=" << maxStage
-                          << " depth=" << feas.totalBufferingDepth << "\n");
+      // Keep every DISTINCT candidate (deduped by stage signature); ranking
+      // happens after collection.
+      if (seenSigs.insert(hashSig(stageSignature(ddg, scheduled, II))).second) {
+        cands.push_back({II, score, scheduled});
+        LLVM_DEBUG(DBGS() << "  Random sample " << sample << ": NEW cand score="
+                          << score << " maxStage=" << maxStage << " depth="
+                          << feas.totalBufferingDepth << " II=" << II
+                          << " (total " << cands.size() << ")\n");
       }
     }
 
-    if (best.II == II) {
-      LLVM_DEBUG(DBGS() << "Random: SUCCESS at II=" << II << "\n");
-      return best;
+    // Prefer the lowest feasible II: once this II is fully sampled and we have
+    // at least K distinct candidates, stop searching higher IIs.
+    if (static_cast<int>(cands.size()) >= K) {
+      LLVM_DEBUG(DBGS() << "Random: collected " << cands.size()
+                        << " distinct candidates by II=" << II << "\n");
+      break;
     }
   }
 
-  LLVM_DEBUG(DBGS() << "Random: no feasible schedule found\n");
-  return failure();
+  if (cands.empty()) {
+    LLVM_DEBUG(DBGS() << "Random: no feasible schedule found\n");
+    return failure();
+  }
+
+  // Rank by II (throughput first), then score. Candidates are already distinct.
+  llvm::stable_sort(cands, [](const Cand &a, const Cand &b) {
+    return a.II != b.II ? a.II < b.II : a.score > b.score;
+  });
+  int nTop = std::min<int>(K, cands.size());
+  int pick = std::min(getModuloPick(), nTop - 1);
+  LLVM_DEBUG({
+    DBGS() << "Random top-" << nTop << " (applying pick " << pick << "):\n";
+    for (int i = 0; i < nTop; ++i)
+      DBGS() << "   rank " << i << " II=" << cands[i].II
+             << " score=" << cands[i].score << "\n";
+  });
+  ModuloScheduleResult result;
+  result.II = cands[pick].II;
+  result.nodeToCycle = std::move(cands[pick].scheduled);
+  return result;
 }
 
 } // namespace mlir::triton::gpu
