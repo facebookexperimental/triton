@@ -151,7 +151,7 @@ jobs:
           . "${SETUP_SCRIPT}"
           . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
           install_triton $PWD
-          uv pip install pytest
+          uv pip install pytest expecttest
       - name: Run Gluon tests (python/test/gluon)
         id: run_gluon
         timeout-minutes: 50

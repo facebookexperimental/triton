@@ -159,7 +159,7 @@ jobs:
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
-          uv pip install pytest
+          uv pip install pytest expecttest
           # Full Gluon unit-test coverage: every python/test/gluon/test_*.py. This spans
           # the compile-only frontend tests plus the GPU-execution suites (core, lowerings,
           # consan, fpsan, layout_format_view). Known-failing cases and their root causes
