@@ -891,6 +891,8 @@ bool canBeRemat(Operation *op) {
     return false;
   if (auto gather = dyn_cast<GatherOp>(op))
     return !gather.getEfficientLayout();
+  if (auto reshape = dyn_cast<ReshapeOp>(op))
+    return !reshape.getEfficientLayout();
 
   if (isa<scf::WhileOp, scf::ConditionOp>(op))
     return false;
@@ -1816,7 +1818,7 @@ struct PruneLocalStoreOfReshapeConvert : public OpRewritePattern<LocalStoreOp> {
       return failure();
     if (failed(layoutInterface->inferReshapeOpEncoding(
             srcType.getShape(), srcType.getEncoding(), storeSrcType.getShape(),
-            reshapeEncoding, store.getLoc())))
+            reshapeEncoding, /*allowReorder=*/false, store.getLoc())))
       return failure();
 
     auto reshapeType =

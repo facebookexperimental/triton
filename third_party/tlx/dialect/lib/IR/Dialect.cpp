@@ -101,13 +101,14 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
   LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                         bool allowReorder,
                          std::optional<Location> loc) const override {
     return delegateInferredLayout(
         srcEnc, dstEnc,
         [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
             Attribute &result) {
           return delegate->inferReshapeOpEncoding(srcShape, enc, dstShape,
-                                                  result, loc);
+                                                  result, allowReorder, loc);
         });
   }
 
@@ -155,6 +156,10 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
   LogicalResult
   verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
                                    Attribute operandEncodingB) const override {
+    return success();
+  }
+
+  LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
     return success();
   }
 
