@@ -739,7 +739,7 @@ class CUDABackend(BaseBackend):
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         elif capability // 10 >= 10:
-            if not knobs.nvidia.use_modulo_schedule:
+            if not (knobs.nvidia.use_modulo_schedule or knobs.nvidia.use_joint_schedule):
                 passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
@@ -748,19 +748,27 @@ class CUDABackend(BaseBackend):
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
+            elif knobs.nvidia.use_joint_schedule:
+                # CP-SAT joint solver: schedule + warp-group partition +
+                # buffer depths decided in one model. Same slot and same
+                # annotation contract as the modulo pass below, so data
+                # partitioning and downstream WS consume it unchanged.
+                # TRITON_USE_JOINT_SCHEDULE=1
+                nvidia.passes.hopper.add_joint_schedule(pm)
             elif knobs.nvidia.use_modulo_schedule is not None:
                 # Modulo schedule runs BEFORE data partitioning so it can
                 # see MMA ops before they're moved into WS regions. It
                 # sets tt.autows annotations (stage/order) on MMA ops.
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
-                # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
+                # TRITON_USE_MODULO_SCHEDULE=cpsat|sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # The modulo / LLM scheduler above already produced the full loop
             # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
             # schedule_loops here would recompute and OVERRIDE it, so only run
             # them on the default path where no custom scheduler set the schedule.
-            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_joint_schedule
+                                    or knobs.nvidia.use_modulo_schedule is not None)
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)

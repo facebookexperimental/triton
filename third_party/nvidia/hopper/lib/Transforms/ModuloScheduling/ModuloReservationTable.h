@@ -57,14 +57,37 @@ struct ModuloScheduleResult {
 
 /// Run modulo scheduling on the DDG.
 /// Algorithm selected by TRITON_USE_MODULO_SCHEDULE env var value:
+///   "cpsat"      → CP-SAT complete solver (OR-Tools subprocess); falls
+///                  back to Rau on failure
 ///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
 ///   "exhaustive" → Exhaustive search with joint memory feasibility
 ///   "random"     → Random sampling with greedy placement
 ///   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+/// A live ScopedScheduleAlgoOverride takes precedence over the env var.
 /// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
                     int maxBacktracks = 20);
+
+/// RAII override of the algorithm selection above. While an instance is
+/// alive, runModuloScheduling uses `algo` and ignores
+/// TRITON_USE_MODULO_SCHEDULE — the joint-solver pass holds one for its
+/// whole run to force the CP-SAT backend. Config here is process-global
+/// (like the env vars it shadows): single-threaded pass-pipeline use only,
+/// no nesting.
+class ScopedScheduleAlgoOverride {
+public:
+  explicit ScopedScheduleAlgoOverride(std::string algo);
+  ~ScopedScheduleAlgoOverride();
+  ScopedScheduleAlgoOverride(const ScopedScheduleAlgoOverride &) = delete;
+  ScopedScheduleAlgoOverride &
+  operator=(const ScopedScheduleAlgoOverride &) = delete;
+};
+
+/// The algorithm runModuloScheduling would use right now: the live override
+/// if any, else TRITON_USE_MODULO_SCHEDULE, else "rau". Dump/diagnostic
+/// labels should read this instead of re-reading the env var.
+std::string getActiveScheduleAlgo();
 
 /// Result of list scheduling for a non-loop region. The algorithm itself
 /// lives in `ListSchedulePass.cpp` (kept there so its debug output is

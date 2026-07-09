@@ -559,6 +559,7 @@ class nvidia_knobs(base_knobs):
     ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
+    use_joint_schedule: env_bool = env_bool("TRITON_USE_JOINT_SCHEDULE")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")

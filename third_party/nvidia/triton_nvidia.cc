@@ -220,6 +220,8 @@ void init_triton_hopper_passes(py::module &&m) {
                      mlir::createNVGPUMultiCTAReduction);
   ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
   ADD_PASS_WRAPPER_0("add_llm_schedule", mlir::createNVGPULLMSchedule);
+  ADD_PASS_WRAPPER_0("add_joint_schedule",
+                     mlir::createNVGPUJointSolverSchedule);
   ADD_PASS_WRAPPER_0("add_modulo_ws_partition",
                      mlir::createNVGPUModuloWSPartition);
   ADD_PASS_WRAPPER_0("add_insert_2cta_sync", mlir::createNVGPUInsert2CTASync);

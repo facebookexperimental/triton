@@ -81,6 +81,14 @@ solves with II as a variable or sweeps II exactly with feasibility as a
 constraint; reservation-table fragmentation is not a failure mode of a
 complete search. No replacement needed.
 
+**[DONE for the CP-SAT backend, 2026-07-05, branch
+hwu27/modulo-cpsat-backend]** `TRITON_USE_MODULO_SCHEDULE=cpsat` sweeps II
+from minII to the true feasibility bound (critical path + serial work)
+with no window; the window now applies to the heuristic paths only. The
+guard-2 canary resolved exactly as predicted: CP-SAT schedules layernorm
+AT MinII=517 — the perfect CUDA-row packing Rau's incomplete search could
+not find anywhere in [517, 527] — with maxStage 3 vs Rau's 4 at II=534.
+
 ## Guard 3: outer WS loops forced single-WG
 
 Where: `ModuloSchedulePass.cpp:applyGlobalWarpPartition` (the `sl.isOuter`
@@ -292,11 +300,234 @@ correctness.
 2. **Mid**: grow `ExhaustiveScheduler` into a CP-SAT backend for schedule +
    buffer depths only (partitioner stays), with cost normalization. This
    alone deletes guard 2.
+   **[DONE 2026-07-05, branch hwu27/modulo-cpsat-backend]**
+   `TRITON_USE_MODULO_SCHEDULE=cpsat` (opt-in; default path unchanged):
+   `CPSATScheduler.cpp` serializes the DDG + buffers and drives an OR-Tools
+   CP-SAT solver in a Python subprocess
+   (`python/triton/tools/modulo_cpsat.py`, same subprocess pattern as
+   LLMSchedulePass), then RE-VERIFIES the returned schedule in C++ — the
+   solver is advisory, never trusted. Model: modular NoOverlap per pipeline
+   (selfLatency reservations, wrap-around split), dependence + def-before-
+   use, SMEM depth budget decided JOINTLY with the schedule, TMEM as exact
+   cumulative (vs the exhaustive's conservative coloring), objective =
+   ExhaustiveScheduler's score. Rau runs first as a warm-start incumbent
+   hint. Cost normalization (Twill §5.2, side CP-SAT ILP, U=300 via
+   TRITON_MODULO_CPSAT_NORMALIZE) seeds the search — with interval
+   encoding it is an accelerator, not a tractability requirement (that
+   requirement is specific to time-indexed formulations).
+   Validation: case1/5/7 reproduce II=256 (+8192 outer) with identical
+   structure; case3 II=1459; case6 II=517 < Rau's 534 (guard-2 canary,
+   see above); all correctness PASS.
+   **Measured first-principle instance (KEEP THIS IN MIND FOR STEP 3):**
+   at equal II=1459, CP-SAT's model-optimal placement reorders case3 FA's
+   softmax rowsum after the P-tile trunc/store (the regPressure objective
+   strictly prefers it; a linear earliest-placement term cannot fix this —
+   it systematically prefers short-op-first on a serialized pipeline row,
+   639-cycle reduce vs 105-cycle trunc) and measures 598 vs 651 TFLOPS at
+   (1,32,8192) — an 8% loss the model cannot see. The recurrence-chain
+   criticality of the rowsum is exactly the kind of term the joint
+   formulation's objective must price before the solver is allowed to own
+   these decisions. Until then: cpsat is opt-in and the case3 canary gates
+   any default flip.
 3. **Long**: joint schedule+partition formulation (deletes guard 1, converts
    guard 3 to constraints), sub-tiling in front, streaming depths handed to
    the autotuner. Position it as an offline/autotune tool, not the default
    JIT path — Twill's own solve times (tens of seconds to minutes) imply
    the same.
+   **[STARTED 2026-07-05, branch hwu27/modulo-cpsat-joint — two pieces
+   landed]**
+   (a) *Recurrence-chain criticality priced in the schedule objective*:
+   for each loop-carried back edge, the forward-chain span
+   `cycle[src] − cycle[dst]` is minimized at 8x the regPressure weight —
+   compressing recurrence circuits so model-underestimated chains (FA's
+   softmax: ~1745 real vs 1459 modeled cyc/iter) degrade the realized
+   iteration time as little as possible. On case3 this recovered the step-2
+   gap from 598 to 639.5 TFLOPS (canary 651). The remaining ~1.8% is a
+   SCHEDULE-side blind spot no schedule-only term can fix: the alpha
+   hand-off's urgency (its consumer sits in another WG) is invisible
+   before a partition exists — the precise motivation for (b) and for
+   joint cycles+wg (v2).
+   (b) *Joint partition v1* (`TRITON_MODULO_CPSAT_JOINT=1`, opt-in;
+   `partitionJointCPSAT` → `solve_partition` in modulo_cpsat.py): warp
+   assignment solved by CP-SAT against the committed schedule (cycles
+   fixed — Twill's re-solve shape), replacing scoreCandidate's
+   enumerate-and-score with constraints over the SAME calibrated costs:
+   async-flight-window overlap as the split cost (Twill's CONCURRENCY
+   insight — merging blocks sync work scheduled during a TMA/TC flight;
+   this term is what makes or breaks the model, issue-only windows
+   over-merge everything), slack-aware reg→SMEM→reg round-trips (refines
+   accumulateCrossWGRoundTrip, which ignores slack), measured barrier
+   issue costs, register footprint table + default-WG slack, channel SMEM
+   as a hard capacity constraint. Would-be-demoted scalar arith is
+   excluded (its cross-cluster edges are fictional — demotion replicates
+   it per WG; serializing it let the solver glue loader WGs together
+   through a shared index op).
+   **Result: reproduces the committed partitions on ALL five cases —
+   byte-identical generated.py — including case3's 6-WG FA structure with
+   the softmax chain intact.** The partition that guard 1 and the fitted
+   round-trip constant were added to protect now emerges from first
+   principles; this is the concrete path to deleting guard 1 once the
+   joint mode owns partitioning. Full stack (cpsat schedule + joint
+   partition, 2026-07-06 measurements): correctness passes on all cases;
+   on case3 it produces a 5-WG variant (PV-MMA merged into the rescale
+   WG) that measures **664.1 TFLOPS at (1,32,8192) — 2.1% ABOVE the 651
+   canary** (vs 650 for the hand-protected 6-WG + Rau default, 639 for
+   the cpsat schedule under the heuristic partition). The B < A < C
+   ordering is the joint-formulation thesis in one row of data: the
+   solver's schedule loses to Rau under the old partition but wins when
+   paired with its own matching partition. Small shapes are within noise
+   (±5%); case6's II-517 schedule is perf-flat vs the II-534 default
+   (memory-bound — the bottleneck is the emitter's 3-WG structure).
+   Still open for v2: joint cycles+wg in one solve (fixes the alpha-order
+   blind spot), guard-3 as an in-model legality constraint, sub-tiling.
+
+### Step 4 (next, planned 2026-07-06): from v1 to owning the decisions
+
+Agreed priority: **items 1+2 first — they are one unit of work** with
+directly measurable expectations (the two open numbers from step 3: does
+the joint-cycle solve lift the B config past 639, and is 664 the ceiling
+of the C config or just the first point above it). Item 3 rides on
+emitter-side staffing; item 4 is the most research-heavy and has the
+highest ceiling. Item 5 gates any default flip and can proceed in
+parallel.
+
+1. **Step-3 v2: cycles + wg in ONE solve.** Today the joint mode holds
+   the schedule fixed (Twill's two-step shape); v2 makes the flight-window
+   overlap, slack-aware round-trips, and channel constraints functions of
+   cycle VARIABLES instead of precomputed constants, so op order inside a
+   WG can react to partition pressure. This is the only fix for the
+   alpha-order blind spot (the residual 651-vs-639 gap of the B config):
+   the alpha hand-off's urgency exists only relative to a partition.
+   Measured targets: case3 B-config ≥ 651 without joint partitioning
+   enabled being the excuse; explore whether C's 664 improves further.
+   **[2026-07-06 status: infrastructure LANDED
+   (TRITON_MODULO_CPSAT_JOINT=2, solve_joint in modulo_cpsat.py: full
+   dependence + per-pipeline and conditional per-WG modular NoOverlap +
+   circular-difference flight exclusion + depth-from-stage SMEM + cycle
+   write-back with buffer re-derivation and a C++ dependence
+   re-verification), but case3 cycle re-solve is BLOCKED on a data-fidelity
+   gap: ScheduleLoop edges carry issue-order latencies (20/40 edges are
+   0/1, not the DDG's data latencies) and NO anti-dependence (iter-arg
+   WAR) edges — the solver can legally reorder version-sensitive chains,
+   and the emitter then inlines/duplicates operands with iter-arg version
+   skew (measured wrong results; a strict +1 edge separation removed ties
+   but not unconnected reordering, confirming the missing-WAR-edge root
+   cause). A register-loop-carry ⇒ same-WG LEGALITY constraint was added
+   to both joint modes along the way (iter-args have no cross-WG channel
+   semantics).]**
+   **[UNBLOCKED 2026-07-06 (same day): iter-arg WAR edges are now derived
+   from the scf.for at serialization time — every direct reader of a
+   block argument gets a strict ordering edge to the yield-operand
+   producer (the emitter renders the update as a reassignment at the
+   producer's cycle position). With them, ALL v2 configs pass
+   correctness: case1/5/7 hint-parity, case6 re-solved cycles PASS,
+   case3 PASS on both the Rau-hint path (returns to 6-WG committed
+   parity — the 5-WG merge was only objective-profitable together with
+   the now-forbidden version-skewed reorder) and the cpsat-schedule path
+   (5 WGs, re-solved cycles, at both guarded II=1459 and unguarded
+   II=1325). Measured: 664.9 TFLOPS at (1,32,8192) for both v2
+   full-stack configs — the ~665 plateau is now reproduced by THREE
+   independent configurations (v1-joint 664.1, v1-joint+no-guard 665.7,
+   v2 664.9), strong evidence it is the real softmax-chain bound of this
+   5-WG design point rather than a solver artifact. The remaining
+   fidelity item (ScheduleLoop edges carry issue-order latencies, not
+   DDG data latencies) is now a PERF-modeling refinement, not a
+   correctness issue.]**
+2. **Delete guard 1 for the joint path.** Once v2 owns partitioning
+   jointly with cycles, the Phase 2.75 occupancy inflation
+   (DataDependenceGraph.cpp) is a pure solution-space fence for that
+   path. Acceptance: remove it under TRITON_MODULO_CPSAT_JOINT, verify
+   FA's softmax cohesion still emerges from the round-trip/flight-window
+   constraints at the LOWER unguarded MinII (1325), and the case3 canary
+   holds. Keep the guard for the heuristic paths (they still need it).
+   **[DONE 2026-07-06 — VALIDATED, did not need v2:**
+   TRITON_MODULO_DISABLE_MMA_GUARD=1 bypasses Phase 2.75; with the cpsat
+   schedule + the v1 joint partitioner, case3 solves at the unguarded
+   MinII=1325, the partition keeps the softmax chain co-resident (5 WGs,
+   exp2+rowsum together — the cut guard 1 existed to prevent does NOT
+   happen), correctness passes, and it measures **665.7 TFLOPS at
+   (1,32,8192) — the best configuration yet** (vs 664.1 guarded full
+   stack, 650 default, 651 canary). The guard is now provably redundant
+   for the joint path; actual code deletion should land together with
+   making joint partitioning that path's default. The env bypass stays
+   for A/B until then.]**
+3. **Guard 3 → versioned emitter-capability constraints.** Express
+   "outer loops single-WG" and "blockM ≤ 128 TMEM" as explicit legality
+   constraints in the partition model, versioned with the emitter; fix
+   the emitter's blockM>128 TMEM gap to unblock case2 end-to-end (the
+   solver side is already verified healthy on its 256-blockM IR: II=1024,
+   sane 3-WG).
+   **[PARTIAL 2026-07-06: the constraint side is DONE — `EmitterCaps`
+   (versioned, kVersion=1) in ModuloSchedulePass.cpp carries
+   kOuterLoopSingleWG (referenced by the isOuter early-out and plumbed as
+   `max_wgs` into both joint solver modes) and kMaxTMEMBlockM=128; the
+   emitter now raises a clear NotImplementedError naming the capability
+   for blockM>128 TMEM accumulators on all three of its TMEM render paths
+   (case2's trap is a named error instead of a silently-trapping kernel;
+   committed cases emit byte-identically). REMAINING: the actual
+   MMA-splitting emitter feature — staffing-dependent, unchanged.]**
+4. **Sub-tiling in front of the solver** (gap 8 above): without
+   splitting tile-level ops into sub-tile instances, ping-pong/FA4-class
+   schedules are absent from the solution space entirely. Likely reuses
+   AutoWS subtile machinery; the largest expressiveness jump and the
+   least scoped item — treat as its own design note when started.
+   **[DESIGN NOTE DONE 2026-07-06: docs/SubTilingDesign.md.** Key
+   corrections from the scout: the AutoWS SubtiledRegionOp is a pattern
+   recognizer for already-split epilogue chains, NOT a splitter — the
+   reusable slicing core is WSDataPartition.cpp (M-split of MMA/TMEM/
+   reduce/elementwise/iter_args, needs a new non-task-ID driver). Plan:
+   Route A (env-gated IR pre-split, TRITON_MODULO_SUBTILE_M=2, ~zero
+   downstream blast radius since everything is shape-driven) then Route B
+   (DDG-level virtual split, prices split-vs-unsplit in one solve, but
+   breaks the one-node-per-Operation* and one-var-per-op_id invariants).
+   All preconditions are met by items 1+2 (guard-1 off is REQUIRED —
+   with 4 chained TC nodes the guard would price the split at ResMII
+   2918, strictly worse). M-split only (reduce is axis-1); MinII
+   1459→~1198 but the real payoff is schedulability. Acceptance: beat
+   the 665 plateau on case3, anti-phase structure EMERGES from the joint
+   constraints without ping-pong-specific code.]**
+   **[ROUTE A EXECUTED 2026-07-06 — measured post-mortem in
+   SubTilingDesign.md "Experiment log"; assets in
+   `sched2tlx/examples/testing/subtiling/`. End-to-end sub-tiled solver
+   kernel runs CORRECTLY after hand-patching three emitter defect
+   classes (singleton cross-region channels, per-WG-deduped arrive
+   counts vs per-MMA hardware arrives, dropped M_lse epilogue stores —
+   the hand-patch diff is the emitter spec). Partition side of the
+   emergence criterion met — CORRECTED: the 6-WG ping-pong-shaped
+   partition is the HEURISTIC partitioner's own output (verified
+   byte-identical; the winning kernel is Rau + heuristic end to end);
+   joint-v1 diverges on this graph to an unmeasured 5-WG
+   single-MMA-WG variant. As emitted: 206.7 TFLOPS.]**
+   **[ROUTE A ACCEPTANCE MET same day — 703–720 TFLOPS at (1,32,8192),
+   ABOVE the 665–666 single-tile plateau. The clock64 replay
+   (SubTilingDesign.md "Where the 11.3K cycles actually went") showed
+   the dominant cost was REGISTER SPILLS, not TMEM contention: the
+   schedule hoisted each softmax WG's 128-reg acc tmem_load ~5000 cyc
+   ahead of its use; sinking it to the use site is worth ×2.7 alone
+   (206.7→557), P-bridge depth 2 and de-instrumentation the rest.
+   Supporting calibration: tmem_port_contention.py microbench (TMEM
+   round-trip 41 cyc + 4.2 cyc/KB; dual-WG interference ×1.33–1.48 —
+   real but second-order) and the 1197-TFLOPS tutorial dissection
+   (dedicated correction WG, ballot-gated rescale skip, in-order
+   single-MMA-WG anti-phase, TMEM aliasing). Work items re-ranked in
+   SubTilingDesign.md: (1) load-at-use emitter rule / register-liveness
+   in model, (2) emitter multi-instance generalization, (3) shared
+   engines, (4) tutorial-structure items toward 1197.]**
+5. **Default-flip gate (parallelizable):** a kernel corpus beyond
+   case1-7, solve-time budget policy (keep the offline/autotune
+   positioning), solver configs wired into run_regression.py, and the
+   case3 canary as the hard gate.
+   **[FIRST CUT DONE 2026-07-06:
+   `examples/testing/solver_regression.py` — for each solver config
+   (cpsat / joint1 / joint2 / full / full-noguard) × regenerable case:
+   regenerate → emit → byte-parity fast path (identical codegen skips the
+   GPU) → correctness + per-shape perf vs the committed kernel
+   (--perf-tol) → the case3 canary as a hard absolute gate
+   (--canary-tflops, default 651). Validated end-to-end (joint1 all
+   parity; full-noguard case3 canary 664/651 OK). Full per-config,
+   per-shape speedup tables: docs/SolverConfigMeasurements.md
+   (2026-07-06). REMAINING: broader
+   kernel corpus, CI wiring.]**
 
 The validation harness above is the gate for every step, and the
 "Why this note exists" principle is the order of operations: a complete
@@ -304,3 +535,29 @@ solver exploits model error maximally, so model calibration must land
 BEFORE each increment of solver power, not after. (`LLMSchedulePass.cpp`,
 the experimental Claude-API scheduler, shares the same DDG serialization
 and should reuse the same canaries.)
+
+## 2026-07-09: the joint solver becomes its own pass
+
+The joint stack was promoted from env-var hooks inside the modulo pass to
+a sibling pass, `JointSolverSchedulePass.cpp` (`nvgpu-joint-solver-schedule`,
+`TRITON_USE_JOINT_SCHEDULE=1` from Python). Both passes are thin shells
+over one shared driver (`ModuloScheduleDriver.h` / `runScheduleDriver` in
+`ModuloSchedulePass.cpp`), so the annotation contract downstream consumes
+is identical by construction — switching scheduler is purely a
+pass-selection decision in compiler.py, and the two coexist for A/B at any
+time.
+
+Mapping from the retired knobs:
+
+- `TRITON_MODULO_CPSAT_JOINT=2` → joint pass default (`joint-mode=0`,
+  v2 → v1 fallback chain);
+- `TRITON_MODULO_CPSAT_JOINT=1` → `joint-mode=1` (v1 only);
+- `joint-mode=2` (strict v2, no fallback) is new;
+- the joint pass always forces the cpsat schedule backend, so the old
+  rau-schedule + joint-partition combinations no longer exist;
+- `TRITON_MODULO_DISABLE_MMA_GUARD` was retired with guard 1's deletion.
+
+The modulo pass (`TRITON_USE_MODULO_SCHEDULE`) is back to pure heuristic
+scheduling + heuristic partition; its `=cpsat` backend value remains as
+the schedule-only middle ground. `solver_regression.py` configs updated
+to the pass-based selection (cpsat / joint1 / joint2 / full).
