@@ -2070,11 +2070,28 @@ def _hstu_attn_bwd_redq(  # noqa C901
 def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
     # The manual 2-KV-block loop supplies the 2-way parallelism, so BLOCK_N stays
     # well below the compiler-DP trigger (BLOCK_N >= 256) and the pass never runs.
+    #
+    # List-schedule autotuning: when TRITON_USE_LIST_SCHEDULE=1, sweep the inner
+    # (start_m) loop's schedule rank INNER_PICK over 0..K-1 (K from
+    # HSTU_INNER_SCHED_K, default 4). Each INNER_PICK is a distinct tl.constexpr
+    # -> a distinct compile key, so the autotuner compiles+times each inner
+    # schedule and caches the winner. Deliberately NOT keyed on
+    # TRITON_LIST_SCHEDULE_TOPK: that env is the pass's *global* generation count
+    # and would also make the OUTER loop generate variants. We leave it unset so
+    # the outer loop keeps a single schedule (only the inner, which carries the
+    # per-loop pick attr, is generated ranked). With list scheduling off,
+    # INNER_PICK stays [0] (no extra configs; the attr is ignored downstream).
+    if os.environ.get("TRITON_USE_LIST_SCHEDULE"):
+        inner_k = int(os.environ.get("HSTU_INNER_SCHED_K", "4"))
+        inner_picks = list(range(max(1, inner_k)))
+    else:
+        inner_picks = [0]
     configs = [
         triton.Config(
             {
                 "BLOCK_M": M,
                 "BLOCK_N": N,
+                "INNER_PICK": pick,
             },
             num_stages=ns,
             num_warps=nw,
@@ -2090,6 +2107,7 @@ def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
         for N in [64]
         for ns in [1]
         for nw in [4]
+        for pick in inner_picks
     ]
     return configs
 
@@ -2162,6 +2180,10 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
     # pyrefly: ignore [bad-function-definition]
     AUTOWS: tl.constexpr = False,
     WS_ON: tl.constexpr = False,
+    # Inner (start_m) loop list-schedule rank; swept by autotune under
+    # TRITON_USE_LIST_SCHEDULE=1. See _get_triton_bw_redq_2kv_configs.
+    # pyrefly: ignore [bad-function-definition]
+    INNER_PICK: tl.constexpr = 0,
 ):
     """MANUAL 2-KV-block data-partition fork of `_hstu_attn_bwd_redq`.
 
@@ -2292,6 +2314,7 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
             HAS_CAUSAL,
             AUTOWS,
             WS_ON,
+            INNER_PICK,
         )
 
 
@@ -3768,6 +3791,11 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     # pyrefly: ignore [bad-function-definition]
     AUTOWS: tl.constexpr = False,
     WS_ON: tl.constexpr = False,
+    # Rank of the list-schedule variant to apply to the inner (start_m) loop.
+    # Swept by @triton.autotune when TRITON_USE_LIST_SCHEDULE=1; ignored
+    # otherwise. Only the inner loop is autotuned (outer keeps one schedule).
+    # pyrefly: ignore [bad-function-definition]
+    INNER_PICK: tl.constexpr = 0,
 ):
     """MANUAL 2-KV-block fork of `_hstu_attn_bwd_inner`.
 
@@ -3820,6 +3848,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     for start_m in tl.range(
         low_q, seq_len_q, BLOCK_M, num_stages=1,
         warp_specialize=WS_ON, merge_epilogue=False,
+        list_schedule_pick=INNER_PICK,
     ):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
