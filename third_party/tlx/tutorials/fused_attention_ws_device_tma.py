@@ -960,7 +960,50 @@ configs_bwd_persist = [
         num_stages=2,
         pre_hook=_bwd_host_descriptor_pre_hook,
     ),
+    triton.Config(  # idx5: idx3 tile (BM64, dsT-in-TMEM) at num_stages=1 — avoids the
+        {           # num_stages=2 register spill; ~+11% over idx3 at (4,32,8192,128).
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
+        },
+        num_warps=4,
+        num_stages=1,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
 ]
+
+# BWD_CFG_IDX pins _attn_bwd_persist to a single configs_bwd_persist entry for
+# per-config benchmarking; unset runs the full autotune. "3e4" = idx3 tile with
+# EPILOGUE_SUBTILE overridden to 4 (register-spill experiment vs TLX 1cta).
+import copy as _copy
+import os as _os
+
+_BWD_CFG_IDX_ENV = _os.getenv("BWD_CFG_IDX")
+if _BWD_CFG_IDX_ENV == "3e4":
+    _c = _copy.copy(configs_bwd_persist[3])
+    _c.kwargs = dict(_c.kwargs)
+    _c.kwargs["EPILOGUE_SUBTILE"] = 4
+    _configs_bwd_persist_active = [_c]
+elif _BWD_CFG_IDX_ENV == "3s1":
+    _c = _copy.copy(configs_bwd_persist[3])
+    _c.kwargs = dict(_c.kwargs)
+    _c.num_stages = 1
+    _configs_bwd_persist_active = [_c]
+elif _BWD_CFG_IDX_ENV == "3ovr":
+    # idx3 with an ir_override ttgir that has computation as the default region
+    # and requestedRegisters=[88,88,88] (TLX-style budget) — conclusive test.
+    _c = _copy.copy(configs_bwd_persist[3])
+    _c.kwargs = dict(_c.kwargs)
+    _c.ir_override = _os.environ.get("BWD_IR_OVERRIDE", "/tmp/ovr_88.ttgir")
+    _configs_bwd_persist_active = [_c]
+elif _BWD_CFG_IDX_ENV not in (None, ""):
+    _configs_bwd_persist_active = [configs_bwd_persist[int(_BWD_CFG_IDX_ENV)]]
+else:
+    _configs_bwd_persist_active = configs_bwd_persist
 
 
 @triton.jit
@@ -1125,7 +1168,7 @@ def _attn_bwd(
     )
 
 
-@triton.autotune(configs=configs_bwd_persist, key=["N_CTX", "HEAD_DIM"])
+@triton.autotune(configs=_configs_bwd_persist_active, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_persist(
     desc_q,
@@ -1273,7 +1316,8 @@ def _attn_bwd_persist(
 class _attention_opt(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE):
+    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE,
+                early_tma_store_lowering=False):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.

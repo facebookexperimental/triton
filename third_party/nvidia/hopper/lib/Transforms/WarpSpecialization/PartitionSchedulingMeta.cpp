@@ -1977,29 +1977,51 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // Update defaultPartition after computation partitions are created.
   layout.defaultPartition = layout.getDefaultPartition();
 
-  // Scan partitions for one that requires 4 warps (TMEM or WarpGroupDot
-  // ops) and promote it to index 0 so it becomes the default warp group.
-  // Skip if partition 0 already contains 4-warp ops.
-  auto needs4Warps = [](Partition &p) {
-    return llvm::any_of(p.getOps(), [](Operation *op) {
-      return isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
-                 ttng::WarpGroupDotOp>(op);
-    });
-  };
-  bool defaultNeeds4Warps = false;
-  for (Partition &p : schedule.getPartitions()) {
-    if (p.getIndex() == 0) {
-      defaultNeeds4Warps = needs4Warps(p);
-      break;
-    }
+  // EXPERIMENT (TRITON_WS_COMPUTE_DEFAULT): promote the register-heavy
+  // computation partition to the default region so it receives the residual
+  // register budget (TLX-style: default = compute). NOTE: this alone made FA
+  // bwd spills WORSE (276/476 -> 716/988) because requestedRegisters is
+  // assigned POSITIONALLY, not by role -- swapping computation<->reduction
+  // sends the fat maxRegAutoWS budget to the now-explicit reduction and gives
+  // computation(default) a smaller residual. A real fix also needs role-based
+  // per-partition register budgets (small fixed for producers/reduction,
+  // residual for compute). Kept env-gated (off by default) for iteration.
+  // See T279166457.
+  Partition *compDefault = nullptr;
+  if (std::getenv("TRITON_WS_COMPUTE_DEFAULT")) {
+    for (Partition &p : schedule.getPartitions())
+      if (p.getType() == "computation")
+        compDefault = &p; // prefer the last computation partition
   }
-  if (!defaultNeeds4Warps) {
+  if (compDefault) {
+    if (compDefault->getIndex() != 0)
+      layout.makeDefaultPartition(schedule, compDefault, mainLoop);
+    layout.defaultPartition = compDefault;
+  } else {
+    // Scan partitions for one that requires 4 warps (TMEM or WarpGroupDot
+    // ops) and promote it to index 0 so it becomes the default warp group.
+    // Skip if partition 0 already contains 4-warp ops.
+    auto needs4Warps = [](Partition &p) {
+      return llvm::any_of(p.getOps(), [](Operation *op) {
+        return isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp,
+                   ttng::WarpGroupDotOp>(op);
+      });
+    };
+    bool defaultNeeds4Warps = false;
     for (Partition &p : schedule.getPartitions()) {
-      if (p.getIndex() == 0)
-        continue;
-      if (needs4Warps(p)) {
-        layout.makeDefaultPartition(schedule, &p, mainLoop);
+      if (p.getIndex() == 0) {
+        defaultNeeds4Warps = needs4Warps(p);
         break;
+      }
+    }
+    if (!defaultNeeds4Warps) {
+      for (Partition &p : schedule.getPartitions()) {
+        if (p.getIndex() == 0)
+          continue;
+        if (needs4Warps(p)) {
+          layout.makeDefaultPartition(schedule, &p, mainLoop);
+          break;
+        }
       }
     }
   }

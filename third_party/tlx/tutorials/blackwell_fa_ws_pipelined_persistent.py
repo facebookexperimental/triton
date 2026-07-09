@@ -1082,7 +1082,14 @@ configs_bwd_2cta = [
     ),
 ]
 
-configs_bwd_tlx = configs_bwd_1cta + configs_bwd_2cta
+import os as _os
+
+# TLX_BWD_1CTA_ONLY=1 drops the 2-CTA config so the bwd autotune stays 1-CTA.
+if _os.getenv("TLX_BWD_1CTA_ONLY") == "1":
+    # Force the single 1-CTA, USE_WARP_BARRIER=False config.
+    configs_bwd_tlx = [c for c in configs_bwd_1cta if not c.kwargs["USE_WARP_BARRIER"]]
+else:
+    configs_bwd_tlx = configs_bwd_1cta + configs_bwd_2cta
 
 
 @triton.jit
