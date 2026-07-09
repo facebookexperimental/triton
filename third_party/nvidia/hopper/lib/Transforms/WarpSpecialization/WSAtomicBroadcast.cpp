@@ -165,8 +165,10 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
   auto yieldOp = whileOp.getYieldOp();
   int yieldIdx = -1;
   for (auto [i, v] : llvm::enumerate(yieldOp.getOperands()))
-    if (v == atomicRes)
+    if (v == atomicRes) {
       yieldIdx = i;
+      break;
+    }
   if (yieldIdx < 0)
     return failure();
 
