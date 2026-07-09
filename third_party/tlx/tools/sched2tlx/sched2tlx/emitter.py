@@ -2949,7 +2949,7 @@ def _compute_skew_plan(g: ScheduleGraph, loop: Loop, rctx: RenderCtx) -> set:
 def _node_emission_may_wait(n: Node, loop: Loop, rctx: RenderCtx) -> bool:
     """True when emitting `n` can produce a barrier wait. Deferred producer
     triples must flush BEFORE such a node: sinking a channel hand-off below
-    another wait can close a cross-WG cycle (observed on FA-bwd guard-off:
+    another wait can close a cross-WG cycle (observed on an FA-bwd partition:
     the m/D channel stores sank below a wait on an MMA whose inputs depend
     on those very channels — instant deadlock)."""
     if n.op_kind in (
@@ -4624,7 +4624,7 @@ def _rescale_task_regs(uwgs: list[UnifiedWG]) -> list[UnifiedWG]:
     The per-WG request rule (152 regs/thread for a 4-warp task) over-asks when
     a partition carries several 4-warp compute groups: AllocateWarpGroups then
     trims someone below what its code needs and ptxas aborts (C7602 —
-    observed on FA-bwd's guard-off 8-WG partition). Fit the requests to the
+    observed on an 8-WG FA-bwd partition). Fit the requests to the
     register file instead: when the total fits, every task keeps its request
     (committed kernels are byte-identical); otherwise the >24-reg tasks share
     the remainder equally, floored to a multiple of 8.

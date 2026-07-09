@@ -3071,7 +3071,7 @@ computeSecondOrderTerms(const ttg::ScheduleLoop &loop,
 /// membership — so an infra op with minWarps > 1 (e.g. the 4-warp `addptr`
 /// feeding FA-bwd's m/D loads) raises the warp count of whatever WG its
 /// consumers land in. Scoring from clustered nodes alone underprices that:
-/// the FA-bwd guard-off winner scored two such WGs at 1 warp that lower at
+/// an FA-bwd candidate scored two such WGs at 1 warp that lower at
 /// 4, hiding a 110K/64K register request behind residual = 0.
 static void
 accumulatePropagatedMinWarps(const ttg::ScheduleLoop &loop,
@@ -3223,7 +3223,7 @@ computePartitionRecMII(const ttg::ScheduleLoop &loop,
   // op of iteration j+1. That closes a distance-1 cycle through whatever
   // cross-WG dependence paths feed those waits — the coupling that makes a
   // depth-1 channel chain run at the SUM of its hops, not their max
-  // (measured: FA-bwd's 6-WG guard-off winner modeled ~1.5K cyc/iter,
+  // (measured: a 6-WG FA-bwd candidate modeled ~1.5K cyc/iter,
   // sustained ~4.9K — every iteration's m/D channel stores sit behind a
   // wait on the previous iteration's LAST pipeline stage). Weight-0 order
   // edges only; real latencies come from the dependence paths.
@@ -4476,21 +4476,19 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
         continue;
-      // Guard 3 (outer WS loops forced single-WG) was retired: every loop —
-      // inner AND outer — goes through the same cost-model partitioner. The
-      // silent-drop hazard the guard defended against (an outer-loop WG with
-      // no owning async task lost its ops without a diagnostic) is closed at
-      // the emitter: sched2tlx now hard-errors on any scheduled op no task
-      // owns (task-coverage check) and lowers multi-WG outer bodies. The
-      // makespan (single-iteration latency chain over each WG's pipeAvail)
-      // plus barrier cost decides the split uniformly, and outer-loop
-      // candidates carry the same RecMII'-floor / launchability terms as
-      // inner ones. This rewards warp specialization wherever it overlaps
-      // independent pipelines across groups: GEMM/FA (MEM/TC/softmax) AND
-      // memory-bound loops like LayerNorm, where putting TMA-load, compute,
-      // and TMA-store on separate warp groups frees the compute warps and
-      // removes the in-stream store drain (measured ~1.2x over 1-WG software
-      // pipelining). No env flag, no hard override.
+      // Every loop — inner AND outer — goes through the same cost-model
+      // partitioner: the makespan (single-iteration latency chain over each
+      // WG's pipeAvail) plus barrier cost decides the split uniformly, and
+      // all candidates carry the same RecMII'-floor / launchability terms.
+      // No env flag, no hard override, no outer-loop special case: sched2tlx
+      // lowers multi-WG outer bodies, and its task-coverage check hard-errors
+      // on any scheduled op no task owns rather than dropping it silently.
+      // This rewards warp specialization wherever it overlaps independent
+      // pipelines across groups: GEMM/FA (MEM/TC/softmax) AND memory-bound
+      // loops like LayerNorm, where putting TMA-load, compute, and TMA-store
+      // on separate warp groups frees the compute warps and removes the
+      // in-stream store drain (measured ~1.2x over 1-WG software
+      // pipelining).
       if (useGreedy) {
         partitionIntoWarpGroups(schedLoop);
       } else {

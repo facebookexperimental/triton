@@ -1,8 +1,8 @@
-"""Multi-WG OUTER loop bodies lower correctly (guard-3 retirement).
+"""Multi-WG OUTER loop bodies lower correctly.
 
 The fixture is case2 (persistent GEMM) with its outer epilogue store split
 into its own warp group — the exact shape that historically made the emitter
-silently drop the store (the partitioner-side guard 3 existed to prevent it).
+silently drop the store while still emitting its barrier declarations.
 The split WG must get its own async task, and the cvt→store hand-off must
 travel through a synthesized SMEM channel with outer-iteration phases:
 producer waits empty / stores / fences / arrives full; the store task waits

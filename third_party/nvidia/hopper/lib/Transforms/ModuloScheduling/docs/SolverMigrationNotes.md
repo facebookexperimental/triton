@@ -1,4 +1,4 @@
-# Heuristic guards vs. a future global solver
+# The heuristic modulo pipeline vs. a future global solver
 
 Status: design note, written 2026-07 alongside the throughput-based latency
 model change (PR #1912). Audience: whoever replaces the current heuristic
@@ -14,59 +14,25 @@ arXiv:2512.18134) — see "Gap analysis" below.
 The 2026-07 latency-model change made TC/TMA `occupancy` throughput-based
 instead of latency-based. That is the honest hardware model, and it roughly
 halved GEMM II (559 → 256) and deepened the TMA prefetch rings (2 → 3),
-worth +11–40% on the GEMM-family cases. But exposing the scheduler to
-tighter IIs also exposed how fragile the heuristic search + partitioner +
-emitter pipeline is at those IIs. Three *guards* were added to keep the
-pipeline robust. Each guard is a workaround for a limitation of the CURRENT
-search, not a statement about hardware. A global solver changes the
-trade-offs: some guards must become explicit constraints, some must move
-into the objective, and some must be deleted or they will actively block
-better solutions.
+worth +11–40% on the GEMM-family cases. Exposing the scheduler to tighter
+IIs also exposed every place where the heuristic search + partitioner +
+emitter pipeline leaned on slack: those gaps are closed by priced
+constraints (the partitioner's RecMII' floor, calibrated cross-WG hand-off
+costs, register/SMEM launchability) and by emitter capabilities (intra-WG
+software pipelining, multi-WG outer bodies, a task-coverage hard error) —
+not by workload-shaped special cases. One search-budget guard remains
+(below); everything else in the pipeline is either a calibrated cost, a
+structural constraint, or a named generation-time error.
 
 The overarching principle: **an optimal solver exploits model error
 maximally**. A heuristic explores few points, so coarse costs are survivable;
 a global solver drives the schedule exactly onto the model's boundary, so
 every cost the model omits (cross-WG communication, barrier round-trips,
 SMEM/register pressure) becomes a direction in which the solver produces
-"model-optimal, hardware-catastrophic" schedules. The FA case below is a
-measured example.
+"model-optimal, hardware-catastrophic" schedules. The FA softmax-cut case
+below is a measured example.
 
-## Guard 1: serially-dependent MMA occupancy correction ("Phase 2.75")
-
-Where: `DataDependenceGraph.cpp`, Phase 2.75 (between edge construction and
-loop-carried edges).
-
-What: if a loop contains ≥2 distinct TC nodes connected by a distance-0
-dependence path (FA fwd: QK-MMA → softmax → PV-MMA), restore
-`occupancy = latency` for ALL TC nodes in that loop.
-
-Why it exists: with honest throughput occupancy, FA's MinII drops
-1459 → 1325 (RecMII-bound). At II=1325 the Rau placement pushes the rowsum
-(`tt.reduce`, input = the exp2 P-tile) past the stage boundary
-(earliest = exp2_cycle + 570 > stage-1 end), the cluster partitioner then
-cuts the exp2→reduce edge across warp groups, and the emitted kernel ferries
-a 32KB fp32 P-tile through SMEM every iteration: **measured 5x slower**
-(651 → ~100 TFLOPS on (1,32,8192)). FA's real steady-state is
-softmax-chain-bound (~1745 cyc/iter), so the lower II had no upside to
-begin with. The guard restores ResMII(TC) = 1459 and byte-identical
-known-good schedules.
-
-Under a global solver: **delete this guard.** It deliberately inflates
-ResMII, which would fence off genuinely better schedules from a solver that
-can handle them. The two truths it papers over must be expressed natively:
-
-1. One iteration's dependent MMAs cannot overlap — already implied by
-   precedence constraints; nothing extra needed.
-2. Cutting a register compute chain across WGs costs a real round-trip
-   (~500 cyc handshake + SMEM store/load scaled by bytes, see
-   `kCrossWGRoundTripLatency` / `smemMoveCost` in `ModuloSchedulePass.cpp`)
-   and SMEM capacity. This must be a term in the solver's OBJECTIVE (or the
-   partition must be a joint decision variable), not an afterthought in a
-   separate partitioner cost. If the solver schedules and partitions jointly
-   with that term, it will discover on its own that keeping exp2+rowsum
-   co-resident beats the tighter II.
-
-## Guard 2: II search window `minII + max(10, minII/8)`
+## The remaining guard: II search window `minII + max(10, minII/8)`
 
 Where: `ModuloReservationTable.cpp:runModuloScheduling`.
 
@@ -80,60 +46,6 @@ Under a global solver: **this code disappears entirely.** An ILP either
 solves with II as a variable or sweeps II exactly with feasibility as a
 constraint; reservation-table fragmentation is not a failure mode of a
 complete search. No replacement needed.
-
-## Guard 3: outer WS loops forced single-WG — RETIRED 2026-07-09
-
-Where it lived: `ModuloSchedulePass.cpp:applyGlobalWarpPartition` (an
-`sl.isOuter` early-out that skipped the cost-model partitioner and put every
-outer-loop op in one WG).
-
-Why it existed: an EMITTER-capability constraint, not a hardware or search
-limitation. sched2tlx only lowered multi-WG bodies for INNER loops; when the
-partitioner split case5's outer-loop epilogue
-(convert_layout → descriptor_store) into its own TMA WG, the emitter
-silently dropped the store ops and the kernel produced NaN. (Silent, because
-the barrier decls WERE emitted — only the WG body ops vanished.)
-
-How it was retired (the "fix the emitter and drop it" branch of the original
-migration plan):
-
-1. **Silent → loud.** sched2tlx now refuses to emit any kernel with a
-   scheduled op no async task owns (`_check_task_coverage`, a named
-   generation-time error). The historic hazard shape is a unit test
-   (`test_outer_multiwg_split.py`) — verified the check fires on it before
-   the capability landed.
-2. **Capability.** The emitter lowers multi-WG outer bodies: every outer WG
-   gets its own task; outer cross-WG hand-offs go through the standard
-   semaphore IR with per-task outer-iteration counters (`_oit`) driving the
-   slot/phase expressions; a descriptor_store consumer TMA-stores straight
-   from the channel SMEM. GPU-validated on the forced case2 split:
-   correctness rel=0.0 on four shapes, throughput identical to the
-   single-WG emission (1.00/0.88/0.91/0.97x of handwritten).
-3. **Early-out deleted.** All loops go through the same partitioner. With
-   the calibrated barrier/round-trip costs visible, every example case's
-   winner keeps the outer loop single-WG on merit (the outer II is
-   super-node-dominated, so a split buys nothing and pays real handshake
-   cost) — the seven cases regenerate byte-identically.
-
-A future solver needs no outer-loop special case; the task-coverage check
-remains the last-line defense for any partition shape the emitter of the
-day cannot lower.
-
-## Related but not a guard: lifetime-based channel depth, store-consumer only
-
-`insertCrossGroupBarriers` sizes synthesized cross-WG channels by
-`lifetime/II + 1` ONLY when the consumer is an async TMA store; register-
-consumer channels stay depth-1. The scoping is empirical: deepening FA's
-P-tile bridge (register consumer) measured **6x slower**, while the same rule
-on layernorm's compute→store channel is what removes the store-drain
-serialization. A solver that owns buffer depths as decision variables (under
-the SMEM budget, as `ExhaustiveScheduler`'s joint memory feasibility already
-sketches) should replace both the rule and its scoping — but it must price
-the register-consumer case's REAL cost (extra SMEM + barrier traffic inside
-a latency-critical chain) or it will re-deepen the P-tile bridge and
-re-learn the 6x the hard way. There is unexplained microarchitecture here;
-treat the FA depth-2 slowdown as a benchmark to reproduce before trusting
-any model of it.
 
 ## What carries over unchanged
 
@@ -152,10 +64,13 @@ the objective.
 Any solver rewrite should reproduce, on B200:
 - case1/case5/case7: II 256/256/256, SMEM rings depth 3, gen/hw ≥ the
   2026-07 numbers (0.89–1.14x / 1.13–1.40x / 0.65–0.91x).
-- case3 FA: ≥ 651 TFLOPS on (1,32,8192) — this is the guard-1 regression
-  canary; anything that cuts the softmax chain across WGs fails it.
-- case6 layernorm: schedules at all (guard-2 canary), store channel depth 2.
-- case5: non-NaN output (guard-3 canary).
+- case3 FA: ≥ 651 TFLOPS on (1,32,8192) — the softmax-cut canary; anything
+  that cuts the softmax chain across WGs fails it.
+- case4 FA bwd: ≥ 1.2x of the no-WS baseline per shape (the recurrence-floor
+  + emitter-capability canary).
+- case6 layernorm: schedules at all (II-window canary), store channel depth 2.
+- case5: non-NaN output (task-coverage canary — a dropped epilogue op now
+  fails at generation, not at numerics).
 `examples/testing/run_regression.py` automates the correctness+perf sweep.
 
 ## Gap analysis: current pipeline vs. Twill (arXiv:2512.18134)
@@ -173,7 +88,7 @@ Our pipeline is the opposite shape — "schedule first, partition second, patch
 third": DDG → MinII → Rau IMS heuristic (`ModuloReservationTable.cpp`) →
 cluster partitioner scoring a frozen schedule
 (`ModuloSchedulePass.cpp:scoreCandidate`) → `insertCrossGroupBarriers` →
-sched2tlx emitter. The FA softmax-cut 5x regression (guard 1) is a measured
+sched2tlx emitter. The FA softmax-cut 5x regression is a measured
 instance of exactly the failure mode Twill's joint formulation exists to
 prevent: the scheduler picked a tighter II that was only realizable by
 cutting a register chain, and the cost of the cut was invisible to it. The
@@ -187,15 +102,17 @@ constraint models blocking waits interrupting same-warp issue. Our
 equivalents (`kCrossWGRoundTripLatency`, `smemMoveCost`,
 `computeWGBarrierCost`) live in the partitioner's after-the-fact score,
 where they can only de-rank bad partitions of an already-fixed schedule.
-Guard 1's migration plan ("delete the guard, price the cut in the
-objective") is the first step of this; the end state is warp assignment as
-a decision variable co-solved with placement.
+The partitioner's RecMII' floor (the partition-aware cycle inequality with
+same-stream issue chains and stream wrap-around) is the first step of this —
+it prices, after the fact, what a joint formulation would enforce natively;
+the end state is warp assignment as a decision variable co-solved with
+placement.
 
 ### 2. Heuristic search → complete solver
 
-Rau IMS + ejection + a bounded II window is an incomplete search; guard 2
-(the window) exists only because of that incompleteness and disappears under
-any complete method. `ExhaustiveScheduler.cpp` (branch-and-bound + joint
+Rau IMS + ejection + a bounded II window is an incomplete search; the II
+window exists only because of that incompleteness and disappears under any
+complete method. `ExhaustiveScheduler.cpp` (branch-and-bound + joint
 SMEM/TMEM feasibility, practical to ~20 ops) is the in-tree seed: its buffer
 extraction and feasibility check are exactly the constraints a CP-SAT/ILP
 backend needs. Twill uses CBC for the ILP and Yices2 (QF_LIA) for the joint
@@ -272,12 +189,13 @@ machinery) is required before a solver can find them.
 
 ### 9. Emitter legality as explicit constraints
 
-Covered by guard 3 above; restated here because it generalizes: the solver
-formulation should carry a versioned whitelist of emitter-lowerable
-partition/loop shapes (outer-loop single-WG, blockM≤128 TMEM, ...) as hard
-constraints, each removed as the emitter gains the capability — never
-encoded implicitly in costs, or the solver will route around it and regress
-correctness.
+The solver formulation should carry a versioned whitelist of
+emitter-lowerable partition/loop shapes (blockM≤128 TMEM, no outer channels
+in a task that also owns an inner loop, ...) as hard constraints, each
+removed as the emitter gains the capability — never encoded implicitly in
+costs, or the solver will route around it and regress correctness. The
+emitter's task-coverage check is the runtime backstop: any shape it cannot
+lower fails generation with a named error instead of dropping ops.
 
 ### Suggested sequencing
 
@@ -305,9 +223,9 @@ correctness.
    within do_bench noise, kernel unchanged).
 2. **Mid**: grow `ExhaustiveScheduler` into a CP-SAT backend for schedule +
    buffer depths only (partitioner stays), with cost normalization. This
-   alone deletes guard 2.
-3. **Long**: joint schedule+partition formulation (deletes guard 1, converts
-   guard 3 to constraints), sub-tiling in front, streaming depths handed to
+   alone deletes the II window.
+3. **Long**: joint schedule+partition formulation (subsumes the RecMII'
+   floor by construction), sub-tiling in front, streaming depths handed to
    the autotuner. Position it as an offline/autotune tool, not the default
    JIT path — Twill's own solve times (tens of seconds to minutes) imply
    the same.
