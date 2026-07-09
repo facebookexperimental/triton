@@ -1655,9 +1655,14 @@ class TritonSemantic(Generic[TensorTy]):
         rhs: tl.tensor,
         acc: tl.tensor,
         input_precision: Optional[str],
-        allow_tf32,
-        max_num_imprecise_acc: int,
-        out_dtype: tl.dtype,
+        # `allow_tf32` is an fbtriton-fork extra that upstream dropped. Default it
+        # (and the trailing positionals, to satisfy Python arg-order rules) so the
+        # vendored upstream Gluon layer -- e.g. gl.amd.cdna3.mfma -- which calls
+        # dot(input_precision=..., max_num_imprecise_acc=..., out_dtype=...) with
+        # no allow_tf32 keeps working. dot_precheck already handles None.
+        allow_tf32=None,
+        max_num_imprecise_acc: int = None,
+        out_dtype: tl.dtype = tl.float32,
         attrs: Optional[dict] = None,
         two_ctas: bool = False,
     ) -> tl.tensor:
