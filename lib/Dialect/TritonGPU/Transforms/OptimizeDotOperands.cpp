@@ -58,11 +58,32 @@ public:
     auto newLl =
         transposeLinearLayout(oldCGALayout.getLinearLayout(), trans.getOrder());
     auto newCGALayout = CGAEncodingAttr::get(ctx, std::move(newLl));
-    auto newInnerCvtEnc =
-        SwizzledSharedEncodingAttr::get(ctx, cvtEncoding, srcTy.getShape(),
-                                        /*order=*/getOrderForMemory(srcTy),
-                                        newCGALayout, srcTy.getElementType(),
-                                        /*needTrans=*/true);
+    Attribute newInnerCvtEnc;
+    bool isNpot = hasNpotShape(srcTy);
+    if (isNpot && !npotSafeForLinearLayout(cvtEncoding.getParent())) {
+      return failure();
+    }
+    // NPOT on SM90+: use NVMMAShared (SwizzledShared's XOR-coupled bases are
+    // incompatible with the modular solver). The compute capability is only
+    // needed on the NPOT path, so read it lazily behind isNpot. Sub-byte (FP4)
+    // operands need fp4Padded packing on the NVMMAShared encoding that this
+    // path does not derive; bail so they fall back to the standard cvt path
+    // rather than emit a mis-padded encoding (correct FP4 NPOT is a separate
+    // slice).
+    auto mod = cvtOp->getParentOfType<ModuleOp>();
+    assert(mod && "convert op must be nested in a ModuleOp");
+    if (isNpot && srcTy.getElementType().getIntOrFloatBitWidth() < 8) {
+      return failure();
+    }
+    if (isNpot && getNVIDIAComputeCapability(mod) >= 90) {
+      newInnerCvtEnc = NVMMASharedEncodingAttr::get(
+          ctx, srcTy.getShape(), getOrderForMemory(srcTy), newCGALayout,
+          srcTy.getElementType(), /*fp4Padded=*/false);
+    } else {
+      newInnerCvtEnc = SwizzledSharedEncodingAttr::get(
+          ctx, cvtEncoding, srcTy.getShape(), getOrderForMemory(srcTy),
+          newCGALayout, srcTy.getElementType(), /*needTrans=*/true);
+    }
     if (newInnerCvtEnc == cvtEncoding)
       return failure();
     rewriter.setInsertionPoint(trans);

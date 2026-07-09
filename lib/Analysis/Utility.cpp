@@ -13,10 +13,12 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir {
 
@@ -159,6 +161,12 @@ SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
 
 unsigned ReduceOpHelper::getScratchSizeInBytes() {
   auto smemShape = getScratchRepShape();
+  // Round an NPOT reduction axis up to pow2 (the inter-warp shuffle butterfly
+  // needs a pow2 axis); no-op for pow2 axes. product()==0 short-circuits the
+  // {0,0} warp-sync sentinel before indexing smemShape[axis] (OOB when
+  // rank>=3).
+  if (product<unsigned>(smemShape) > 0 && !llvm::isPowerOf2_32(smemShape[axis]))
+    smemShape[axis] = llvm::NextPowerOf2(smemShape[axis]);
   auto elems = product<unsigned>(smemShape);
 
   unsigned bytesPerElem = 0;
@@ -972,14 +980,28 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
+    // NPOT K with swizzle=0 (K*elemBytes not a multiple of the 32B minimum
+    // swizzle granule): the SMEM alloc rounds K to pow2 and WGMMA would read
+    // uninitialized padding, so fall back to a non-MMA path.
+    if (!llvm::isPowerOf2_64(k)) {
+      // Compute in bits (256 bits == the 32B granule) so sub-byte element types
+      // are not silently zeroed by integer division of the byte width.
+      int64_t contigBits = (int64_t)k * aElemTy.getIntOrFloatBitWidth();
+      if (contigBits % 256 != 0) {
+        return false;
+      }
+    }
     auto retShapePerCTA = getShapePerCTA(retType);
     auto rank = retShapePerCTA.size();
     int numWarps = lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
-    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % 16 == 0 &&
+    // Pow2 M requires M%64 (routes pow2 GEMMs to MMAv2); NPOT M only M%16.
+    int64_t mDimV3 = retShapePerCTA[rank - 2];
+    bool mOkV3 =
+        llvm::isPowerOf2_64(mDimV3) ? (mDimV3 % 64 == 0) : (mDimV3 % 16 == 0);
+    if (!(numWarps % 4 == 0 && mOkV3 && retShapePerCTA[rank - 1] % 16 == 0 &&
           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
            aElemTy.isF32()))) {
@@ -990,6 +1012,26 @@ bool supportMMA(triton::DotOp op, int version) {
         (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy)) &&
         cast<RankedTensorType>(op.getType()).getElementType().isF32()) {
       return false;
+    }
+  }
+  // MMAv2 (Ampere and consumer Blackwell) supports NPOT K (multiple of instrK);
+  // NPOT M/N are rejected and fall to FMA.
+  if (version == 2) {
+    RankedTensorType typeA2 = op.getA().getType();
+    int k2 = typeA2.getShape().back();
+    // Only NPOT K is constrained (must be a multiple of instrK); pow2 K
+    // (incl. K < instrK, e.g. f8 K=16) keeps upstream MMAv2 behaviour.
+    if (!llvm::isPowerOf2_64(k2)) {
+      int instrK = 256 / aElemTy.getIntOrFloatBitWidth();
+      if (k2 % instrK != 0) {
+        return false;
+      }
+    }
+    auto retShapePerCTA = getShapePerCTA(op.getType());
+    for (auto d : retShapePerCTA) {
+      if (d > 0 && !llvm::isPowerOf2_64(d)) {
+        return false;
+      }
     }
   }
   if (aElemTy.isF32() && bElemTy.isF32()) {
@@ -1050,7 +1092,34 @@ LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
   return comp;
 }
 
+// Helper: true when an NPOT shape meets an MMA-family encoding. There
+// invertAndCompose's modular solver (lstsqModular) can emit aliased bases --
+// distinct register/lane offsets collapsing onto one -- instead of a clean
+// permutation, so the register-reorder and warp-shuffle fast paths are unsafe
+// and callers must route the conversion through shared memory.
+static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
+    return false;
+  }
+  auto hasMmaFamily = [](Attribute enc) {
+    if (isa<triton::gpu::NvidiaMmaEncodingAttr>(enc)) {
+      return true;
+    }
+    if (auto dot = dyn_cast<triton::gpu::DotOperandEncodingAttr>(enc)) {
+      return isa<triton::gpu::NvidiaMmaEncodingAttr>(dot.getParent());
+    }
+    return false;
+  };
+  return hasMmaFamily(srcTy.getEncoding()) || hasMmaFamily(dstTy.getEncoding());
+}
+
 bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // NPOT + MMA: invertAndCompose's modular solver can alias bases here (see
+  // npotMmaConversion), so a register reorder would be wrong -- report "no" and
+  // let the conversion fall to the shared-memory path.
+  if (npotMmaConversion(srcTy, dstTy)) {
+    return false;
+  }
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1059,6 +1128,12 @@ bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // getWarpLayoutConvertDecomposition is a pow2-only GF(2) bit-permutation and
+  // never terminates on a modular/NPOT layout -- this is the actual compile
+  // hang -- so bail for any NPOT shape.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    return false;
+  }
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1072,6 +1147,18 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // For NPOT shapes, toLinearLayout may crash if the encoding doesn't support
+  // modular layouts. Conservatively assume shared memory is needed for unsafe
+  // encodings.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    bool srcSafe = npotSafeForLinearLayout(srcTy.getEncoding());
+    bool dstSafe = npotSafeForLinearLayout(dstTy.getEncoding());
+    if (!srcSafe || !dstSafe) {
+      return true;
+    }
+  }
+  // NPOT+MMA: the two guards above both return false, so this returns true
+  // without calling invertAndCompose.
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }

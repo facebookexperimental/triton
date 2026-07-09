@@ -1,5 +1,6 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/GenericSwizzling.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton {
 
@@ -52,12 +53,26 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
 
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
+    // actualSize/desiredSize are the true (possibly NPOT) sizes; span/
+    // shrinkTarget are their pow2-rounded counterparts used for basis counting.
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
     if (actualSize <= desiredSize) {
       continue;
     }
-    assert(actualSize % desiredSize == 0);
+    // NPOT desiredSize: shrink to the next pow2 and let the out-dim clamp below
+    // set the real size; modular reduction handles the overshoot at lowering.
+    // Zeroing the boundary basis instead would drop real elements. Pow2: no-op.
+    int32_t shrinkTarget =
+        llvm::isPowerOf2_32(desiredSize)
+            ? desiredSize
+            : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
+    // Count the shrink against the pow2 basis span, not the NPOT out-dim size
+    // (else a basis terminates early). Identity for pow2 actualSize.
+    int32_t span = llvm::isPowerOf2_32(actualSize)
+                       ? actualSize
+                       : static_cast<int32_t>(llvm::NextPowerOf2(actualSize));
+    assert(span % shrinkTarget == 0);
     // <inDimName, basisIdx, outValue>
     std::vector<std::tuple<StringAttr, int, int>> sortedBases;
     for (auto [inDimName, basis] : bases) {
@@ -74,7 +89,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     llvm::sort(sortedBases,
                [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
     for (auto [inDimName, basisIdx, outValue] : sortedBases) {
-      if (actualSize <= desiredSize) {
+      if (span <= shrinkTarget) {
         break;
       }
       if (!broadcastRegisters && inDimName == kRegister) {
@@ -82,7 +97,7 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
       } else {
         bases[inDimName][basisIdx][outDim.index()] = 0;
       }
-      actualSize >>= 1;
+      span >>= 1;
     }
   }
   if (!broadcastRegisters) {
@@ -127,8 +142,19 @@ LinearLayout ensureLayoutNotSmallerThan(
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
-    assert(actualSize > desiredSize || desiredSize % actualSize == 0);
-    ret *= LinearLayout::identity1D(desiredSize / actualSize, kDim, outDimName);
+    // actualSize is always pow2, so grow to the next pow2 >= an NPOT
+    // desiredSize (else desiredSize/actualSize floors, e.g. 192/128 == 1, and
+    // the register dim never grows, dropping real elements). A later
+    // ensureLayoutNotLargerThan clamps to the true NPOT size. Pow2: no-op.
+    assert(llvm::isPowerOf2_32(actualSize));
+    int32_t growTarget =
+        llvm::isPowerOf2_32(desiredSize)
+            ? desiredSize
+            : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
+    if (actualSize >= growTarget)
+      continue;
+    assert(growTarget % actualSize == 0);
+    ret *= LinearLayout::identity1D(growTarget / actualSize, kDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);
   }
   return ret;
@@ -219,7 +245,7 @@ std::optional<ColumnAction> regPermForDivide(const LinearLayout &A,
   llvm::DenseMap<StringAttr, unsigned> log2QuotSize;
   for (StringAttr out : A.getOutDimNames()) {
     log2QuotSize[out] =
-        A.getOutDimSizeLog2(out) - BBroadcast.getOutDimSizeLog2(out);
+        A.getOutDimSizeBits(out) - BBroadcast.getOutDimSizeBits(out);
     if (log2QuotSize[out] < 0)
       return std::nullopt;
   }
@@ -487,7 +513,7 @@ std::optional<LinearLayout> getReps(const LinearLayout &cvt,
   // Precompute tile out-dim bit-widths.
   llvm::SmallDenseMap<StringAttr, int> outBLog2;
   for (StringAttr od : cvt.getOutDimNames())
-    outBLog2[od] = tile.hasOutDim(od) ? tile.getOutDimSizeLog2(od) : 0;
+    outBLog2[od] = tile.hasOutDim(od) ? tile.getOutDimSizeBits(od) : 0;
 
   // Build a per-out-dimension mask by OR-ing all tile bases that touch it.
   llvm::SmallDenseMap<StringAttr, int32_t> tileMaskPerOutDim;

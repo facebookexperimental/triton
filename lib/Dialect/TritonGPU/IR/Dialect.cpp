@@ -120,6 +120,16 @@ bool isExpensiveView(Type srcType, Type dstType) {
   auto tensorDstType = cast<RankedTensorType>(dstType);
   auto llSrc = toLinearLayout(tensorSrcType);
   auto llDst = toLinearLayout(tensorDstType);
+  // NPOT: getFreeVariableMasks() cannot distinguish two different ADD-mod-N
+  // maps, so distinct modular layouts compare "cheap" and callers skip the
+  // relayout -> scramble. Treat a modular, non-identical view as expensive so
+  // it routes through the real remap. pow2 unaffected (isModular() is false).
+  if (llSrc.isModular() || llDst.isModular()) {
+    static const bool allowNpot =
+        mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+    if (allowNpot && llSrc != llDst)
+      return true;
+  }
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -366,6 +376,16 @@ SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
     if (sharedMMALayout.getFp4Padded()) {
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
+    }
+    // Round NPOT tile dims up to pow2 so MMA reps don't read past the buffer
+    // (nvmmaSharedToLinearLayout rounds internally). Only the trailing dims the
+    // swizzle covers -- rounding a leading multi-buffer dim would bill 6 stages
+    // as 8 and waste SMEM. Pow2 shapes are unchanged (NextPowerOf2 is a no-op).
+    unsigned tileRank = sharedMMALayout.getCGALayout().getRank();
+    size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
+    for (size_t i = firstTileDim; i < shape.size(); ++i) {
+      if (!llvm::isPowerOf2_64(shape[i]))
+        shape[i] = llvm::NextPowerOf2(shape[i]);
     }
   }
   return getShapePerCTA(layout, shape);
@@ -3601,13 +3621,22 @@ struct TritonGPUVerifyTensorLayoutInterface
                          << rankedTy.getShape()
                          << " which is not a power of two.";
       }
-      return makeErr()
-             << "NPOT layout not yet supported: tensor shape "
-             << rankedTy.getShape()
-             << " has a non-power-of-2 dimension that is not supported by this "
-                "distributed layout's lowering in this build yet "
-                "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
-                "NPOT slice).";
+      // Layouts whose modular (non-power-of-2) lowering is implemented.
+      // Dot-operand and MMA encodings (Nvidia WGMMA/MMAv5, AMD MFMA/WMMA) are
+      // admitted so an NPOT tl.dot's operand/result tensors pass verification
+      // under the flag; the modular LinearLayout they resolve to is lowered by
+      // the encoding-agnostic ADD+UREM path in applyLinearLayout.
+      if (!isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr,
+               DotOperandEncodingAttr, NvidiaMmaEncodingAttr,
+               AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout)) {
+        return makeErr()
+               << "NPOT layout not yet supported: tensor shape "
+               << rankedTy.getShape()
+               << " has a non-power-of-2 dimension that is not supported by "
+                  "this distributed layout's lowering in this build yet "
+                  "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
+                  "NPOT slice).";
+      }
     }
     auto ll = toLinearLayout(rankedTy);
     ModuleOp module = op->getParentOfType<ModuleOp>();
@@ -3813,7 +3842,7 @@ std::string mlir::triton::gpu::getDistributedLayoutStr(LinearLayout &ll,
   StringAttr kWarp = StringAttr::get(ctx, "warp");
   StringAttr kBlock = StringAttr::get(ctx, "block");
 
-  int64_t tensorSize = ll.getTotalOutDimSize();
+  int64_t tensorSize = ll.getTotalOutDimSizeProduct();
   std::vector<std::string> elementMapping(tensorSize);
   std::vector<std::string> threadMapping;
   auto shape = convertType<int64_t>(llvm::to_vector(ll.getOutDimSizes()));

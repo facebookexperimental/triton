@@ -10,6 +10,10 @@
 #AL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #sliceAd0 = #ttg.slice<{dim = 0, parent = #AL}>
 #BL = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+// 3D blocked with warpsPerCTA[2] == 1: a reduction over axis 2 is
+// warp-synchronous (getScratchRepShape returns the {0, 0} sentinel).
+#AL3D = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 1, 32], warpsPerCTA = [2, 2, 1], order = [2, 1, 0]}>
+#sliceAl3d2 = #ttg.slice<{dim = 2, parent = #AL3D}>
 #A_SHARED = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
 #A_SHARED_1D = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0]}>
 #A_SHARED_T = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [0, 1]}>
@@ -329,6 +333,23 @@ tt.func @scratch() {
     %add = arith.addf %arg0, %arg1 : f16
     tt.reduce.return %add : f16
   }) {axis = 0 : i32} : (tensor<16x16xf16, #AL>) -> tensor<16xf16, #sliceAd0>
+  tt.return
+}
+
+// Regression: a rank-3 pow2 warp-synchronous reduction over the last axis
+// (getScratchRepShape returns the 2-element {0, 0} sentinel). The scratch-size
+// NPOT rounding must short-circuit on product(smemShape) == 0 rather than index
+// smemShape[axis] with axis == 2, which would read out of bounds. No scratch is
+// allocated for a warp-synchronous reduction.
+// expected-remark @below {{scratch_reduce_rank3}}
+// expected-remark @below {{size = 0}}
+tt.func @scratch_reduce_rank3() {
+  %cst0 = arith.constant dense<0.000000e+00> : tensor<4x4x32xf16, #AL3D>
+  %b = "tt.reduce" (%cst0) ({
+  ^bb0(%arg0: f16, %arg1: f16):
+    %add = arith.addf %arg0, %arg1 : f16
+    tt.reduce.return %add : f16
+  }) {axis = 2 : i32} : (tensor<4x4x32xf16, #AL3D>) -> tensor<4x4xf16, #sliceAl3d2>
   tt.return
 }
 

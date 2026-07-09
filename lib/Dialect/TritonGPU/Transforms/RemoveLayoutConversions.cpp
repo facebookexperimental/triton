@@ -515,6 +515,10 @@ static unsigned estimateConvertScratchCost(Value value, Attribute encoding) {
     if (encTrait && srcTy.getRank() != encTrait.getRank())
       continue;
     auto dstTy = srcTy.cloneWithEncoding(encoding);
+    // Skip NPOT cvts the modular solver can't handle (cvtNeedsSharedMemory ->
+    // toLinearLayout would crash); pow2 cvts are unaffected.
+    if (!npotCvtSafe(srcTy, dstTy))
+      continue;
     if (cvtNeedsSharedMemory(srcTy, dstTy)) {
       unsigned elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
       cost += elems * getElementBitWidth(srcTy) / 8;
@@ -1945,6 +1949,10 @@ public:
       funcOp->walk([&](ConvertLayoutOp cvt) {
         auto srcTy = cvt.getSrc().getType();
         auto dstTy = cvt.getType();
+        // Skip NPOT cvts the modular solver can't handle (cvtNeedsSharedMemory
+        // -> toLinearLayout would crash); pow2 cvts are unaffected.
+        if (!npotCvtSafe(srcTy, dstTy))
+          return;
         if (!cvtNeedsSharedMemory(srcTy, dstTy))
           return;
         unsigned scratchBytes = getNumScratchElemsSwizzledCvt(srcTy, dstTy) *
