@@ -181,67 +181,27 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     }
   }
 
-  // Phase 2.75: Serially-dependent MMA correction. The latency model's TC
-  // `occupancy` is the ISSUE-TO-ISSUE throughput of the pipelined tensor
-  // core — correct for a lone MMA accumulating across iterations (GEMM),
-  // where back-to-back issues genuinely overlap. But when a loop contains
-  // MULTIPLE distinct MMAs connected by a dependence chain (FA: QK-MMA →
-  // softmax → PV-MMA), one iteration's MMAs cannot overlap each other on the
-  // TC, and the cross-iteration overlap is capped by the serial chain
-  // between them. Modeling both as fully pipelined understates TC pressure,
-  // drops II below what the downstream structure can exploit, and (measured
-  // on FA fwd) pushes the softmax chain across a stage boundary — the
-  // partitioner then cuts it with a 32KB/iter cross-WG channel, 5x slower.
-  // Restore occupancy = full latency for TC nodes when any TC node reaches
-  // another TC node through intra-iteration (distance-0) dependence edges.
-  // Runs BEFORE Phase 3 so loop-carried TC→TC back-edges see the corrected
-  // occupancy.
-  //
-  // NOTE: this is a guard for the HEURISTIC search pipeline, not a hardware
-  // truth — a future global solver should delete it and price the cross-WG
-  // channel cost in its objective instead. See
-  // docs/SolverMigrationNotes.md (guard 1).
-  {
-    SmallVector<unsigned> tcNodes;
-    for (const auto &node : ddg.nodes)
-      if (node.pipeline == HWPipeline::TC)
-        tcNodes.push_back(node.idx);
-    if (tcNodes.size() > 1) {
-      // Forward reachability over distance-0 edges from each TC node.
-      auto reaches = [&](unsigned from, unsigned to) {
-        llvm::DenseSet<unsigned> seen;
-        SmallVector<unsigned> stack{from};
-        seen.insert(from);
-        while (!stack.empty()) {
-          unsigned cur = stack.pop_back_val();
-          for (const auto &e : ddg.edges) {
-            if (e.srcIdx != cur || e.distance != 0)
-              continue;
-            if (e.dstIdx == to)
-              return true;
-            if (seen.insert(e.dstIdx).second)
-              stack.push_back(e.dstIdx);
-          }
-        }
-        return false;
-      };
-      bool serialChain = false;
-      for (unsigned a : tcNodes) {
-        for (unsigned b : tcNodes) {
-          if (a != b && reaches(a, b)) {
-            serialChain = true;
-            break;
-          }
-        }
-        if (serialChain)
-          break;
-      }
-      if (serialChain)
-        for (unsigned idx : tcNodes)
-          ddg.nodes[idx].occupancy =
-              std::max(ddg.nodes[idx].occupancy, ddg.nodes[idx].latency);
-    }
-  }
+  // Phase 2.75 (serially-dependent MMA occupancy inflation) was retired:
+  // it encoded trust in the downstream pipeline, not a hardware truth —
+  // chained MMAs DO overlap across iterations. Each failure mode it papered
+  // over is now handled at its source. Partitioner (computePartitionRecMII
+  // and friends): the RecMII' floor — the partition-aware cycle inequality
+  // with same-stream issue chains, per-WG stream wrap-around order edges
+  // (barrier waits execute in stream order across iterations, which is what
+  // makes a depth-1 channel chain run at the SUM of its hops), and an
+  // infra-op assignment preview so paths through NONE ops are priced; plus
+  // accumulatePropagatedMinWarps for register footprints. Emitter
+  // (sched2tlx): stage-skew rings for intra-WG async results, producer-side
+  // channel handshakes sunk below independent compute (flushed before the
+  // next waiting op), cross-WG register→local_alloc channels unified onto
+  // the alloc's data buffer, plain tt.load as a named op, and over-budget
+  // register requests rescaled to the register file. Validated on the
+  // calibrated (#1913) latency table: FA-fwd matches its guard-era baseline
+  // on all six shapes at II=1325, FA-bwd beats its guard-era baseline by
+  // 20-30% on all six shapes at II=1033 (the guard's 3x II inflation
+  // returned as a real win), and the other five cases regenerate
+  // byte-identically. History and measurements:
+  // docs/GuardRetirementPlan.md.
 
   // Phase 3: Loop-carried edges via scf.yield → iter_args.
   auto yieldOp = loop.getBody()->getTerminator();

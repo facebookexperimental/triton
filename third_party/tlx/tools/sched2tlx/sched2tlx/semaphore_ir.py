@@ -165,7 +165,9 @@ def _classify_consumer_access(op_kind: str) -> AccessKind:
     return AccessKind.READ
 
 
-def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
+def derive_semaphores(
+    loop: Any, graph: Any = None, intra_wg_skip_pairs: set | None = None
+) -> list[Semaphore]:
     """Derive symbolic semaphores from a loop's schedule.
 
     Source of truth: `loop.schedule.cross_wg_barriers` — the schedule pass
@@ -249,6 +251,16 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
                 if real is not None:
                     data_buf = real
             depth = data_buf.count
+            # Unify the channel onto the alloc's own DATA buffer, not the
+            # synthesized routing buffer: downstream MMA operands resolve to
+            # the alloc's buffer, so a producer that stored into the routing
+            # buffer would fill memory nobody reads (observed on FA-bwd's
+            # guard-off partition: ds stored to the synthesized buf while
+            # both consuming MMAs read the alloc's ring — garbage data and a
+            # mismatched handshake). Mirrors the TMA-fed unification in
+            # Semaphore.name().
+            if data_buf is not paired:
+                buf_ref = BufferRef(loop.loop_id, data_buf.id)
         async_kind = _classify_async_kind(src.op_kind)
         # A cross-WG producer that is a `local_alloc` fed by a TMA load is
         # effectively TMA-produced: the `descriptor_load` + `local_alloc` fuse
@@ -351,7 +363,11 @@ def derive_semaphores(loop: Any, graph: Any = None) -> list[Semaphore]:
     # count, racing the producer's next refill.
     if graph is not None:
         sems.extend(_derive_intrawg_async_consumers(loop, sched, graph, sems))
-        sems.extend(_derive_intrawg_async_result_consumers(loop, sched, graph, sems))
+        sems.extend(
+            _derive_intrawg_async_result_consumers(
+                loop, sched, graph, sems, intra_wg_skip_pairs
+            )
+        )
     return sems
 
 
@@ -366,7 +382,11 @@ _ASYNC_RESULT_KINDS = (
 
 
 def _derive_intrawg_async_result_consumers(
-    loop: Any, sched: Any, graph: Any, existing_sems: list[Semaphore]
+    loop: Any,
+    sched: Any,
+    graph: Any,
+    existing_sems: list[Semaphore],
+    skip_pairs: set | None = None,
 ) -> list[Semaphore]:
     """Completion semaphores for an async producer whose register/TMEM RESULT is
     consumed within the producer's OWN warp group (in-loop).
@@ -447,6 +467,12 @@ def _derive_intrawg_async_result_consumers(
                 continue  # cross-WG — already covered by cross_wg_barriers
             pair = (prod.id, n.id)
             if pair in existing_pairs or pair in seen_pairs:
+                continue
+            # Stage-skewed intra-WG edges are handled by the emitter's
+            # full/empty ring on the producer's destination buffer (see
+            # emitter._compute_skew_plan) — the inline signal-only handshake
+            # here would serialize the async producer against its own WG.
+            if skip_pairs and (loop.loop_id, prod.id, n.id) in skip_pairs:
                 continue
             seen_pairs.add(pair)
             extra.append(
@@ -1067,13 +1093,18 @@ def build_sem_set_for_loop(
 
 
 def build_sem_set_for_graph(
-    graph: Any, *, wg_of_node: dict[tuple[int, int], int] | None = None
+    graph: Any,
+    *,
+    wg_of_node: dict[tuple[int, int], int] | None = None,
+    intra_wg_skip_pairs: set | None = None,
 ) -> SemSet:
     """Build one SemSet covering every loop's cross-WG barriers."""
     all_lowered: list[LoweredSemaphore] = []
     next_id = 0
     for loop in graph.loops:
-        sems = derive_semaphores(loop, graph=graph)
+        sems = derive_semaphores(
+            loop, graph=graph, intra_wg_skip_pairs=intra_wg_skip_pairs
+        )
         sems = combine_semaphores(sems)
         assign_stage_phase(sems, loop)
         bufs_by_id = {b.id: b for b in loop.schedule.buffers}
