@@ -3230,7 +3230,15 @@ def reduce(
         raise TypeError(f"reduction_ordering must be None or a ReductionOrdering, got {type(reduction_ordering)}")
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
-    ret = _semantic.reduction(input, axis, make_combine_region, reduction_ordering=reduction_ordering)
+    # `reduction_ordering` is a Meta-local extension to the reduction API. Not every
+    # semantic supports it (e.g. Gluon's GluonSemantic.reduction, which is upstream-synced
+    # and only performs unordered reductions), so only forward the kwarg when the target
+    # semantic actually accepts it. This keeps `tl`/Gluon reductions working through the
+    # shared `tl.standard` helpers without modifying the Gluon frontend.
+    if "reduction_ordering" in inspect.signature(_semantic.reduction).parameters:
+        ret = _semantic.reduction(input, axis, make_combine_region, reduction_ordering=reduction_ordering)
+    else:
+        ret = _semantic.reduction(input, axis, make_combine_region)
     if keep_dims:
         if axis is not None:
             ret = tuple(expand_dims(t, axis, _semantic=_semantic) for t in ret)
