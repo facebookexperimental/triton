@@ -54,7 +54,13 @@ def main() -> int:
         bytes_moved = M * N * 2 * 2  # read x + write y
 
         def run_gen():
-            generated.layernorm_fwd_nows[(NUM_SMS, )](x, w, b, yg, M, eps, num_warps=4)
+            # Launch hints emitted by the modulo pass for memory-bound kernels
+            # (absent → legacy launch: 1x-SMS grid, register file auto-fill).
+            grid = NUM_SMS * getattr(generated, "RECOMMENDED_GRID_MULTIPLIER", 1)
+            kw = {"num_warps": 4}
+            if (mreg := getattr(generated, "RECOMMENDED_MAXNREG", None)) is not None:
+                kw["maxnreg"] = mreg
+            generated.layernorm_fwd_nows[(grid, )](x, w, b, yg, M, eps, **kw)
 
         def run_hw():
             handwritten.layernorm_fwd_tma[(NUM_PERSIST, )](
