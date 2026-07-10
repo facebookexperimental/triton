@@ -273,6 +273,59 @@ def matmul_kernel_tma_dynamic_persistent_ws_while(
 
 
 # ============================================================================
+# Kernel 2d: matmul_kernel_tma_clc_persistent_ws_while
+# Dynamic (work-stealing) persistent TMA matmul whose while-loop tile id is
+# claimed via the core CLC tile scheduler (tl.clc_tile_scheduler) instead of a
+# global atomic counter. The grid is launched with one cluster per tile so
+# running CTAs can cancel/steal pending clusters (Blackwell hardware CLC).
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_clc_persistent_ws_while(
+    a_desc,
+    b_desc,
+    c_desc,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    dtype = tl.float16
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    sched = tl.clc_tile_scheduler()
+    while sched.is_valid():
+        tile_id = sched.tile_id[0]
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in tl.range(k_tiles, warp_specialize=True):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
+        # Claim the next tile via CLC hardware work-stealing.
+        sched = sched.advance()
+
+
+# ============================================================================
 # Kernel 3: matmul_kernel_descriptor_persistent - Device-side TMA descriptors
 # Uses warp_specialize with flatten in outer tile loop
 # ============================================================================
@@ -859,6 +912,72 @@ def test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize(EPI
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
         assert "ttng.clc_" not in ttgir, "Expected dynamic atomic scheduling, not CLC"
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="CLC requires Blackwell (SM100+)")
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE):
+    """Dynamic persistent matmul whose while-loop tile id is claimed via the core
+    CLC tile scheduler (tl.clc_tile_scheduler) and warp-specialized (Blackwell)."""
+    M, N, K = 2048, 2048, 256
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        # CLC launches one cluster per tile (over-subscribed) so running CTAs can
+        # cancel/steal pending clusters.
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+
+        kernel = matmul_kernel_tma_clc_persistent_ws_while[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert "ttng.tc_gen5_mma" in ttgir, "Expected a Blackwell MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

@@ -65,6 +65,7 @@
 // relocated to a neutral path.
 #include "mlir/IR/IRMapping.h"
 #include "third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/AMDLatencyModel.h"
+#include "third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/AMDWarpPipelinePartition.h"
 #include "third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/DataDependenceGraph.h"
 #include "third_party/nvidia/hopper/lib/Transforms/ModuloScheduling/ModuloReservationTable.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -972,6 +973,39 @@ static void runAMDModuloScaffold(ModuleOp module) {
       node.op->setAttr("ttg.modulo_order", b.getI32IntegerAttr(it->second));
     }
     os << " II=" << sched.II << " maxStage=" << sched.getMaxStage();
+
+    // E1.5: Step 4.7 + 4.8 — warp-pipeline cluster partitioning and s_setprio
+    // derivation. Runs the latency-aware partition, then derives priorities
+    // from MRT occupancy/slack. Annotates each op with its cluster ID and
+    // s_setprio.
+    auto partition = triton::gpu::partitionForAMDWarpPipeline(ddg, sched);
+    if (partition.isWarpPipelineCandidate()) {
+      triton::gpu::assignAMDWarpPipelinePriorities(partition, ddg, sched);
+      for (const auto &c : partition.clusters) {
+        for (unsigned idx : c.nodeIndices) {
+          const auto &node = ddg.getNode(idx);
+          node.op->setAttr("ttg.warp_pipeline_cluster",
+                           b.getI32IntegerAttr(c.clusterId));
+          node.op->setAttr("ttg.warp_pipeline_priority",
+                           b.getI32IntegerAttr(c.sSetprio));
+        }
+      }
+      os << " clusters=" << partition.clusters.size()
+         << " pingpong_offset=" << partition.pingpongOffset;
+      for (const auto &c : partition.clusters) {
+        os << " c" << c.clusterId << "={";
+        bool first = true;
+        for (triton::gpu::HWPipeline p : c.pipelines) {
+          if (!first)
+            os << ",";
+          os << triton::gpu::getPipelineName(p);
+          first = false;
+        }
+        os << " prio=" << c.sSetprio << "}";
+      }
+    } else {
+      os << " clusters=1(no-warp-pipeline)";
+    }
 
     // E3: emit a serialized triton::CoarseSchedule so the EXISTING AMD pipeline
     // expander (tritonamdgpu-pipeline) does multi-buffering + loop expansion —

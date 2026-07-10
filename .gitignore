@@ -68,6 +68,7 @@ nvdisasm
 ptxas
 ptxas-blackwell
 third_party/nvidia/backend/bin
+third_party/tlx/language/tlx/inductor/bin
 
 # Third-party include
 third_party/nvidia/backend/include
