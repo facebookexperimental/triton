@@ -22,7 +22,11 @@ namespace mlir::triton::gpu {
 /// How the global warp-group partition (Pass B) is decided.
 enum class JointSolverMode {
   /// Heuristic partitioners only (exhaustive scorer / greedy). The modulo
-  /// pass runs here.
+  /// pass runs here. The driver promotes Off to V1Only whenever the active
+  /// schedule backend is "cpsat" — heuristic partitioners are shaped by
+  /// Rau-conservative schedules and mis-partition CP-SAT's MinII-aggressive
+  /// ones (see runScheduleDriver), so Off is honoured only for heuristic
+  /// schedules.
   Off,
   /// CP-SAT joint re-solve: v2 (cycles + warp groups in one model) first,
   /// v1 (warp groups only, cycles fixed) if v2 fails, exhaustive scorer if

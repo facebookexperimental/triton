@@ -908,6 +908,166 @@ def _bar_empty(buffer_var: str) -> str:
     return f"{buffer_var}_empty"
 
 
+def _ring_exprs(count: int, rctx: "RenderCtx") -> tuple[str, str]:
+    """(index, phase) for subscripting a SPECIFIC ring buffer in the current
+    WG body.
+
+    The WG-shared `buf`/`phase` counters advance modulo the WG's
+    REPRESENTATIVE (max) ring depth — correct only for buffers whose own
+    count equals it. A shallower ring in the same WG must use its OWN
+    modulus, or its subscript drifts off the slots its producer and
+    barriers use (case4 v2 draw, 2026-07-10: a count-2 dS ring in a
+    rep_depth-3 WG was read at [_it % 3] but written at [_it % 2] — dQ/dK
+    one tile off and index 2 out of bounds, dV clean).
+    """
+    if count == 1:
+        return "0", "(_it & 1)"
+    rep = getattr(rctx, "_wg_rep_depth", None)
+    if rep is not None and count != rep:
+        return f"(_it % {count})", f"((_it // {count}) & 1)"
+    return "buf", "phase"
+
+
+# ── Merge-group alias safety (Step 4.5 storage reuse) ──────────────────────
+# HW-issued producer kinds: the write happens asynchronously (TMA/MMA engine)
+# and its wait-empty lives in op-specific renderers where alias waits are not
+# injected (yet) — a merge group containing one cannot be guarded by the SW
+# producer path below, so its storage reuse is dropped instead.
+_HW_PRODUCER_KINDS = (
+    "tt.descriptor_load",
+    "tt.descriptor_gather",
+    "ttng.tc_gen5_mma",
+    "ttng.tc_gen5_mma_scaled",
+    "ttng.warp_group_dot",
+    "ttng.tmem_copy",
+    "ttg.async_copy_global_to_local",
+)
+
+
+def _alias_group_safety(loop: Loop) -> dict[int, bool]:
+    """merge_group_id → can the SW producer path synchronize the alias?
+
+    Step 4.5's lifetime check proves merged buffers occupy disjoint cycle
+    windows, but cycles are a MODEL — on hardware only barriers order the
+    aliased writes against the other members' readers. A group is guardable
+    iff every member is a synthesized cross-WG channel (has a paired
+    cross_wg_barrier) whose producer is SW-issued and whose channel is
+    forward (a backward/loop-carry channel is signal-only: its empty never
+    arrives, so waiting on it deadlocks). Guardable groups get alias waits
+    at their producers (_alias_wait_stmts); every other multi-member SMEM
+    group has its reuse DROPPED at alloc time — separate bytes are always
+    correct, merely less thrifty. Single-member groups are trivially safe.
+    """
+    cycle_of = {n.id: n.schedule_cycle for n in loop.schedule.nodes}
+    kind_of = {n.id: n.op_kind for n in loop.schedule.nodes}
+    cbs_by_buf: dict[int, list] = {}
+    for cb in loop.schedule.cross_wg_barriers:
+        if cb.paired_buffer_id is not None:
+            cbs_by_buf.setdefault(cb.paired_buffer_id, []).append(cb)
+    groups: dict[int, list] = {}
+    for b in loop.schedule.buffers:
+        if b.merge_group_id is not None and b.kind == "smem":
+            groups.setdefault(b.merge_group_id, []).append(b)
+    safety: dict[int, bool] = {}
+    for mgid, members in groups.items():
+        if len(members) < 2:
+            safety[mgid] = True
+            continue
+        ok = True
+        for m in members:
+            cbs = cbs_by_buf.get(m.id, [])
+            if not cbs:
+                ok = False
+                break
+            for cb in cbs:
+                pc = cycle_of.get(cb.producer_node)
+                cc = cycle_of.get(cb.consumer_node)
+                if (
+                    pc is None
+                    or cc is None
+                    or pc > cc
+                    or kind_of.get(cb.producer_node) in _HW_PRODUCER_KINDS
+                ):
+                    ok = False
+                    break
+            if not ok:
+                break
+        safety[mgid] = ok
+    return safety
+
+
+def _alias_wait_stmts(loop: Loop, rctx: "RenderCtx", buf_id: int) -> list[str]:
+    """Alias-safety waits for a channel producer whose buffer shares bytes
+    with other merge-group members (Step 4.5 storage reuse).
+
+    The group is one physical slot with k producer/consumer pairs per
+    iteration in lifetime order: p1→c1→…→pk→ck→p1(next iter). Enforcement:
+      * a LATER member's producer waits each EARLIER member's empty at the
+        CONSUMER phase (that member's reader of THIS iteration has drained);
+      * the EARLIEST member's producer waits every other member's empty at
+        the PRODUCER phase (their readers of the PREVIOUS iteration — passes
+        immediately on iteration 0), closing the ring.
+    Where a same-WG data dependence already orders the aliased accesses the
+    wait is redundant but cheap; it exists for WG topologies with no such
+    chain (case4 FA-bwd flake, 2026-07-10: two D-load channels merged, the
+    second WG's local_store raced the first channel's reader — dQ/dK/dV
+    corrupt by 1e3 while every cycle-model check passed).
+    """
+    if rctx.sem_set is None:
+        return []
+    safety = getattr(rctx, "_alias_group_safety", {}).get(loop.loop_id, {})
+    own = next((b for b in loop.schedule.buffers if b.id == buf_id), None)
+    if own is None or own.merge_group_id is None or own.kind != "smem":
+        return []
+    mgid = own.merge_group_id
+    if not safety.get(mgid, False):
+        return []  # reuse was dropped at alloc time — bytes are private
+    members = sorted(
+        (
+            b
+            for b in loop.schedule.buffers
+            if b.merge_group_id == mgid and b.kind == "smem"
+        ),
+        key=lambda b: (b.live_start, b.id),
+    )
+    if len(members) < 2:
+        return []
+    idx = getattr(rctx, "_ls_by_buffer", None)
+    if idx is None:
+        idx = {}
+        for ls in rctx.sem_set.lowered:
+            if ls.sem.buffer is not None:
+                idx.setdefault(
+                    (ls.sem.buffer.loop_id, ls.sem.buffer.buffer_id), []
+                ).append(ls)
+        rctx._ls_by_buffer = idx
+    own_key = (own.live_start, own.id)
+    is_earliest = own_key == (members[0].live_start, members[0].id)
+    targets = (
+        [m for m in members if m.id != own.id]
+        if is_earliest
+        else [m for m in members if (m.live_start, m.id) < own_key]
+    )
+    out: list[str] = []
+    for m in targets:
+        seen: set[str] = set()
+        for ls in idx.get((loop.loop_id, m.id), []):
+            if ls.alloc_empty_stmt is None or ls.empty_name in seen:
+                continue
+            seen.add(ls.empty_name)
+            if is_earliest:
+                phase = f"({ls.phase_expr} ^ 1)"
+                note = "alias wrap"
+            else:
+                phase = ls.phase_expr
+                note = "alias predecessor"
+            out.append(
+                f"tlx.barrier_wait({ls.empty_name}[{ls.slot_expr}], {phase})"
+                f"  # {note} (merge group {mgid})"
+            )
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # SemIR barrier-emission helpers (used by in-loop emitters when the flag is on)
 # ──────────────────────────────────────────────────────────────────────────
@@ -1198,8 +1358,7 @@ def _semir_mma_operand_waits_and_mbarriers(
         buf_var = rctx.buffer_var.get((loop.loop_id, buf.id))
         if buf_var is None:
             continue
-        idx = "0" if buf.count == 1 else "buf"
-        ph = "(_it & 1)" if buf.count == 1 else "phase"
+        idx, ph = _ring_exprs(buf.count, rctx)
         # Multi-consumer dedup: when several MMAs in this WG read the same
         # single-buffered operand (e.g. FA-bwd dO feeds both dpT and dV), its
         # `_full` completes ONCE per load — wait it only on the FIRST consumer
@@ -1271,6 +1430,14 @@ def _semir_emit_producer_block(
         # SW producer: wait empty (unless is_released), store, arrive full.
         if w := ls.producer_wait_at.get(n.id):
             _put(w, is_data)
+            # Alias safety: when this buffer shares bytes with other
+            # merge-group members (Step 4.5 reuse), also wait until the
+            # aliased members' readers have drained — cycle-disjoint
+            # lifetimes are a model property, only barriers order the
+            # hardware (case4 FA-bwd flake, 2026-07-10).
+            if sem.buffer is not None:
+                for aw in _alias_wait_stmts(loop, rctx, sem.buffer.buffer_id):
+                    _put(aw, is_data)
         if sem.buffer is not None:
             buf_var = rctx.buffer_var.get((sem.buffer.loop_id, sem.buffer.buffer_id))
             if buf_var is not None:
@@ -1448,6 +1615,14 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
     # buffers in the same group emit `reuse=<first_var>` (Step 4.5 says they
     # have disjoint lifetimes — same physical bytes, different time slots).
     merge_group_owner: dict[int, str] = {}
+    # Alias-safety verdict per SMEM merge group: guardable groups get alias
+    # waits at their producers (_alias_wait_stmts); unguardable multi-member
+    # groups have their reuse dropped right here. Stashed on rctx for the
+    # producer-side emitters.
+    alias_safety = _alias_group_safety(loop)
+    if not hasattr(rctx, "_alias_group_safety"):
+        rctx._alias_group_safety = {}
+    rctx._alias_group_safety[loop.loop_id] = alias_safety
     for b in loop.schedule.buffers:
         # Per-loop unique name to avoid id collisions between inner/outer.
         var = f"L{loop.loop_id}_{_buffer_var_name(b)}"
@@ -1498,6 +1673,12 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 f"II={loop.schedule.II}"
             )
             mgid = b.merge_group_id
+            if mgid is not None and not alias_safety.get(mgid, True):
+                # Unguardable alias (HW producer / signal-only / non-channel
+                # member): allocate private bytes instead of racing on shared
+                # ones. Costs SMEM, never correctness.
+                origin += f"; merge group {mgid} reuse DROPPED (unsynchronizable alias)"
+                mgid = None
             reuse = ""
             if mgid is not None and mgid in merge_group_owner:
                 reuse = f", reuse={merge_group_owner[mgid]}"
@@ -3146,6 +3327,10 @@ def _emit_warp_group(
         if b.id in touched_buf_ids and b.kind in ("smem", "tmem") and b.count > 1
     ]
     rep_depth = max(depths) if depths else 1
+    # Buffers whose count differs from rep_depth must NOT be subscripted
+    # with the shared `buf`/`phase` — _ring_exprs consults this to emit
+    # per-buffer moduli for them.
+    rctx._wg_rep_depth = rep_depth
     iv = loop.schedule.induction_var_name
     # Preserve the IV's MLIR semantic value (= byte offset into K), so the
     # in-loop offsets that reference iv don't need a `* step` multiplier.
@@ -3339,7 +3524,7 @@ def _emit_warp_group(
     # enclosing (function) scope. Re-materialize any function-scope register
     # tensors this WG consumes (e.g. case6 v2's W/B loads) with task-local
     # names; restore the global bindings after the body. No-op if none.
-    _reg_loc_saved = _localize_captured_reg_tensors(g, emit_nodes, rctx, lines)
+    _reg_loc_saved = _localize_captured_reg_tensors(g, loop, emit_nodes, rctx, lines)
 
     if True:
         lo = _render_operand(loop.schedule.lower_bound, rctx)
@@ -3671,15 +3856,14 @@ def _emit_in_loop_node(
             for e in _semir_producer_expect_bytes(loop.loop_id, n.id, rctx):
                 lines += e
             bar_arg = _semir_producer_barrier_for_tma(loop.loop_id, n.id, rctx)
-            data_slot = "buf" if buf is not None and buf.count > 1 else "0"
+            data_slot = _ring_exprs(buf.count, rctx)[0] if buf is not None else "0"
             lines += f"# load → {buf_var}"
             if bar_arg is None:
                 # No cross-WG semaphore for this TMA (producer + consumer in
                 # the same WG). The intra-WG `<buf>_full` barrier was
                 # allocated in the `extra` carve-out — use it: wait empty,
                 # expect bytes, load with full as the mbarrier arg.
-                ph = "(_it & 1)" if buf.count == 1 else "phase"
-                idx = "0" if buf.count == 1 else "buf"
+                idx, ph = _ring_exprs(buf.count, rctx)
                 nbytes = (
                     (
                         buf.shape[0]
@@ -3711,12 +3895,7 @@ def _emit_in_loop_node(
         # Without this, the consumer-signaled empty barrier appears never to
         # release on subsequent iters → producer wait blocks → kernel hang
         # OR illegal barrier op if the state goes inconsistent.
-        if buf.count == 1:
-            idx = "0"
-            ph = "(_it & 1)"
-        else:
-            idx = "buf"
-            ph = "phase"
+        idx, ph = _ring_exprs(buf.count, rctx)
         nbytes = (
             (buf.shape[0] * buf.shape[1] * _bytes_per_elem_bits(buf.element_bits))
             if len(buf.shape) >= 2
@@ -3763,9 +3942,9 @@ def _emit_in_loop_node(
         def _ring_idx_phase(buf, lp):
             if lp is not loop:
                 return "0", "0"
-            if buf is not None and buf.count == 1:
-                return "0", "(_it & 1)"
-            return "buf", "phase"
+            if buf is None:
+                return "buf", "phase"
+            return _ring_exprs(buf.count, rctx)
 
         a_idx, a_ph = _ring_idx_phase(a_buf, a_loop)
         b_idx, b_ph = _ring_idx_phase(b_buf, b_loop)
@@ -4144,7 +4323,7 @@ def _emit_in_loop_node(
             buf_var = rctx.buffer_var.get(
                 (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
             )
-            slot = "buf" if buf.count > 1 else "0"
+            slot = _ring_exprs(buf.count, rctx)[0]
         else:
             buf_var, slot = "c_smem", "0"
         if getattr(rctx, "defer_inloop_store", False):
@@ -4189,7 +4368,7 @@ def _emit_in_loop_node(
             buf_var = rctx.buffer_var.get(
                 (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
             )
-            slot = "buf" if buf.count > 1 else "0"
+            slot = _ring_exprs(buf.count, rctx)[0]
         else:
             buf_var, slot = "dq_smem", "0"
         lines += f"tlx.local_store({buf_var}[{slot}], {value_expr})"
@@ -4774,6 +4953,7 @@ def _result_is_register_tensor(op: Op) -> bool:
 
 def _localize_captured_reg_tensors(
     g: ScheduleGraph,
+    loop: Loop,
     target_nodes: list[Node],
     rctx: RenderCtx,
     lines: _Lines,
@@ -4789,16 +4969,36 @@ def _localize_captured_reg_tensors(
     order: list[Op] = []
     seen: set[str] = set()
 
+    # Values produced by scheduled (non-infra) nodes are bound to task-local
+    # names or channel payloads during node emission — the renderer uses the
+    # binding and never inline-expands past them. Only un-scheduled
+    # (inline-rendered) expression trees can smuggle a function-scope register
+    # tensor into this task's rendered code, so the walk mirrors rendering:
+    # stop at scheduled nodes, recurse through everything else — including
+    # IV/iter-arg-dependent inline ops, whose subtrees can still reference
+    # IV-INVARIANT preamble tensors (case4 v2:
+    # `tl.load(D + (tile_id + range_12))` capturing the preamble `tl.arange`).
+    bound_ids = {
+        n.op_ref for n in loop.schedule.nodes if n.op_ref and n.warp_group >= 0
+    }
+
     def walk(op_id: str) -> None:
         if op_id in seen:
             return
         seen.add(op_id)
+        if op_id in bound_ids:
+            return
         op = g.ops.get(op_id)
-        if op is None or _depends_on_iv_or_iter_arg(g, op_id):
+        if op is None:
             return
         for o in op.operands:
             if isinstance(o, OpRef):
                 walk(o.op_id)
+        # An IV/iter-arg-dependent value can't be hoisted as a task-local
+        # copy (it isn't loop-invariant) — but its operands, walked above,
+        # still can.
+        if _depends_on_iv_or_iter_arg(g, op_id):
+            return
         # Candidate: a register-tensor value already named at function scope
         # (preamble). Re-emit it here so the task doesn't capture it.
         if op.op_id in rctx.op_var and _result_is_register_tensor(op):
@@ -4827,6 +5027,82 @@ def _localize_captured_reg_tensors(
         rctx.op_var[op.op_id] = name
         lines += f"{name} = {rhs}"
     return saved
+
+
+def _localize_rendered_captures(
+    g: ScheduleGraph, rctx: RenderCtx, lines: _Lines, body_start: int
+) -> None:
+    """Safety net behind _localize_captured_reg_tensors. The pre-walk predicts
+    which function-scope register tensors a WG body will reference by walking
+    the graph, but a few render paths expand expressions the walk cannot see
+    (e.g. the prologue/skew re-materialization of a channel producer's address
+    chain — case4 v2's `tl.load(D + (tile_id + range_12))` inlines past a
+    channel-bound node). This pass checks the property the TTIR verifier
+    actually enforces ("WarpSpecializeOp should not capture RankedTensorType"):
+    scan the RENDERED body for function-scope register-tensor names, and
+    re-materialize + substitute any found at the top of the task body. No-op
+    when the pre-walk got everything — which keeps committed-kernel parity
+    byte-exact — and correct by construction when it didn't."""
+    # Every function-scope register tensor currently bound to a preamble name.
+    fn_names: dict[str, Op] = {}
+    for op_id, name in rctx.op_var.items():
+        if not name:
+            continue
+        op = g.ops.get(op_id)
+        if op is not None and op.scope == "function" and _result_is_register_tensor(op):
+            fn_names[name] = op
+    if not fn_names:
+        return
+
+    def names_in(text: str) -> set[str]:
+        return {n for n in fn_names if re.search(rf"\b{re.escape(n)}\b", text)}
+
+    body_text = "\n".join(lines.buf[body_start:])
+    needed = names_in(body_text)
+    if not needed:
+        return
+    # A re-materialized expression can itself reference other function-scope
+    # tensors (case6's arange → W/B-load chain) — chase to a fixpoint.
+    exprs: dict[str, str] = {}
+    work = list(needed)
+    while work:
+        name = work.pop()
+        if name in exprs:
+            continue
+        exprs[name] = _render_op_expr(fn_names[name], rctx)
+        work.extend(n for n in names_in(exprs[name]) if n not in exprs)
+
+    # Topological order by textual dependency (SSA — no cycles).
+    ordered: list[str] = []
+    emitted: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in emitted:
+            return
+        emitted.add(name)
+        for dep in names_in(exprs[name]):
+            if dep != name:
+                visit(dep)
+        ordered.append(name)
+
+    for name in sorted(exprs):
+        visit(name)
+
+    rebound = {name: f"_wgcap{700 + i}" for i, name in enumerate(ordered)}
+    pattern = re.compile("|".join(rf"\b{re.escape(n)}\b" for n in rebound))
+
+    def sub(text: str) -> str:
+        return pattern.sub(lambda m: rebound[m.group(0)], text)
+
+    indent = "    " * lines.indent
+    remat = [
+        f"{indent}# Re-materialize captured function-scope register tensors",
+        f"{indent}# (render-level safety net; see _localize_rendered_captures).",
+    ]
+    remat += [f"{indent}{rebound[name]} = {sub(exprs[name])}" for name in ordered]
+    for i in range(body_start, len(lines.buf)):
+        lines.buf[i] = sub(lines.buf[i])
+    lines.buf[body_start:body_start] = remat
 
 
 # ---------------------------------------------------------------------------
@@ -6494,8 +6770,11 @@ def emit(graph: ScheduleGraph) -> str:
             )
             lines += f"# Async task: role={uwg.role} ← {origin} (Phase 4 plan)"
             with lines.block(_task_header(uwg)):
+                body_start = len(lines.buf)
                 _emit_uwg_body(
                     graph, outer_loop, inner_loop, uwg, channels, rctx, lines
                 )
+                if not uwg.is_default:
+                    _localize_rendered_captures(graph, rctx, lines, body_start)
 
     return lines.render()

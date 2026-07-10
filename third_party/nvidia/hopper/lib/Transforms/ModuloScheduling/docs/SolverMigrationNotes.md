@@ -558,6 +558,343 @@ Mapping from the retired knobs:
 - `TRITON_MODULO_DISABLE_MMA_GUARD` was retired with guard 1's deletion.
 
 The modulo pass (`TRITON_USE_MODULO_SCHEDULE`) is back to pure heuristic
-scheduling + heuristic partition; its `=cpsat` backend value remains as
-the schedule-only middle ground. `solver_regression.py` configs updated
-to the pass-based selection (cpsat / joint1 / joint2 / full).
+scheduling + heuristic partition; its `=cpsat` backend value was left as
+a schedule-only middle ground (cpsat schedule + heuristic partition) —
+UNTIL the 2026-07-10 promotion entry below: the round-1 measurements
+showed that combination is a trap, and the driver now pairs every cpsat
+schedule with the CP-SAT v1 partition. `solver_regression.py` configs
+updated to the pass-based selection (cpsat / joint1 / joint2 / full).
+
+## 2026-07-09 (second entry): Twill-gap implementation round 1
+
+Landed (validated by `solver_regression.py`, now 6 cases × pass-based
+configs including `full-stream` / `full-regcap`):
+
+1. **Emitter tensor-capture gap closed (gap 9, first production instance).**
+   case4 FA-bwd's v2 partition emitted a function-scope `tl.arange` into a
+   non-default task (`WarpSpecializeOp should not capture RankedTensorType`).
+   Root cause chain: `_localize_captured_reg_tensors`' graph pre-walk
+   stopped at IV-dependent ops, but prologue/skew render paths inline past
+   channel-bound nodes into IV-dependent expressions whose IV-INVARIANT
+   sub-tensors still get referenced. Fix in two layers (emitter.py): the
+   pre-walk now stops at schedule-BOUND nodes instead of IV-dependent ops
+   (matches what rendering actually inlines), plus
+   `_localize_rendered_captures` — a render-level safety net that scans each
+   emitted non-default task body for function-scope register-tensor names
+   (exactly the property the TTIR verifier enforces) and re-materializes any
+   found. Committed-kernel parity stays byte-exact on all six cases.
+2. **case4 FA-bwd wired into the regression suite** (correctness-only).
+   It immediately exposed the NEXT v2 blocker: with the capture fixed, the
+   v2 kernel compiles and runs but computes wrong dQ/dK (dV correct — the
+   corruption is exactly the D-load chain, whose address add the partition
+   moved cross-WG). This is another data-fidelity instance of the step-4
+   "operand inlining and version skew" class: prologue inlines version 0
+   while the channel delivers later versions; some version constraint is
+   still missing from the joint problem. case4 stays a hard FAIL for the
+   `full` config until fixed — that is the canary working as designed.
+3. **Streaming variable-latency classification (gap 6, Twill §5.3),
+   opt-in `TRITON_MODULO_STREAMING_VL=1`**: TMA-pipeline DDG nodes with no
+   incoming distance-0 edge solve with latency-0 outgoing edges (ring
+   absorbs the latency); ring depth remains a solver decision (the
+   objective already rewards depth). C++ verifySolution applies the same
+   effective-latency rule so streaming schedules survive re-verification.
+4. **Hard register budget (gap 5, Twill REGISTERLIMIT-lite), opt-in
+   `TRITON_MODULO_REG_BUDGET=<regs>`**: hard `total_regs ≤ budget` in both
+   v1 and v2 partition solves (the soft-deficit model remains the default).
+   Motivated by case4 v2 oversubscribing 91136 > 65536 and getting
+   emitter-downscaled 152→96 regs — Twill's Blackwell finding
+   (model-fits-but-ptxas-spills → re-solve at reduced budget) reproduced.
+
+### Landing design: RRTs (gap 4, not yet implemented)
+
+Replace `ModuloReservationTable`'s one-row-per-pipeline exclusivity with
+per-op reservation vectors: `RRT[v] : cycle → (unit, instances)` rows,
+plus a machine description `cap(unit)`. Concretely: (a) extend
+`LatencyModel` with `getRRT(op)` defaulting to today's
+`(pipeline, selfLatency)` single-row shape so all call sites migrate
+incrementally; (b) `ModuloReservationTable::reserve/isFree` become
+per-unit counting (capacity, not exclusivity); (c) the CP-SAT model swaps
+per-pipeline NoOverlap for per-unit `AddCumulative` over modular
+intervals — the wrap-around split machinery is reusable unchanged;
+(d) calibration: start with TC issue-vs-completion split (the
+occupancy/selfLatency pair becomes a 2-row RRT), then TMA queue depth.
+Gate: byte-parity on all six cases with the default single-row RRTs, then
+canary-measured II changes as real RRTs land per unit.
+
+### Landing design: sub-tiling in the solution space (gap 8, not yet implemented)
+
+The Route A experiment (SubTilingDesign.md, 703-720 TFLOPS hand-patched)
+fixes the target; the missing piece is a pre-scheduling DDG transform, not
+emitter work: (a) a `SubTileTransform` that splits an eligible tile-level
+node (MMA or softmax chain member) into K sub-instances with derived
+latencies/buffers and inter-instance edges, applied BEFORE DDG→solver
+serialization behind `TRITON_MODULO_SUBTILE=<K>`; (b) solver sees the
+sub-instances as ordinary nodes — no model change needed (this is exactly
+how Twill reaches FA3/FA4: their joint problem is UNSAT on un-sub-tiled
+FA); (c) the emitter already carries the A.7 subtile fields on
+ScheduleNode (`subtile_count`), so emission reuses the Route A machinery;
+(d) canary: case3 FA fwd at (1,32,8192) must beat the 665 plateau to
+justify default-on, with the 1197-TFLOPS tutorial dissection as the
+ceiling reference.
+
+### 2026-07-09 round-1 measurements (B200, 4 configs × 6 cases)
+
+- `full` (joint default): unchanged and healthy — case3 canary 662.4/651
+  OK, case6 1.00x, case1/7 byte-parity, case4 the known v2 data-fidelity
+  FAIL (the canary this round wired in).
+- `full-stream` (streaming VL): IIs unchanged (256/1325/517 — this corpus
+  is recurrence/resource-bound, not TMA-latency-bound), case1/7 parity
+  kept, case3 662.4 OK, case6 1.00x. Safe; its value case is a kernel
+  whose II is actually inflated by TMA latency — none in the suite yet.
+- `full-regcap` (hard 65536 cap): case3 REGRESSES to 348.3 (1.88x) — the
+  winning 662-TF partition exceeds the COUNT-BASED footprint table's
+  estimate, so the hard cap forbids it, while ptxas-reality ran it fine.
+  Lesson recorded: hard caps are only as good as the footprint model —
+  liveness-grade REGISTERLIMIT (real per-value register footprints over
+  cycle variables) is a PREREQUISITE for hard-cap default, exactly the
+  RRT-adjacent calibration this doc already sequences. On case4 the capped
+  partition produced a HUNG kernel (killed at 10 min) — yet another
+  emitter/solver contract instance for the case4 canary pile.
+- **NEW COVERAGE FINDING — `cpsat` (schedule-only middle ground) is now a
+  trap on FA**: case3 at the unguarded MinII=1325 with the HEURISTIC
+  partitioner drops to 292.9 TF (2.23x). Guard 1's deletion was validated
+  for the joint path ("deletion should land together with making joint
+  partitioning that path's default" — #1917) but landed for every path;
+  schedule-only cpsat + heuristic partition is exactly the uncovered
+  combination, reproducing the softmax-cut failure class the guard used to
+  prevent. Options: route the cpsat backend's partition through the joint
+  solver too, restore a guard-1-shaped fence for the non-joint path only,
+  or retire the `=cpsat` middle ground once the joint pass is default.
+  **RESOLVED 2026-07-10**: option 1 landed — see the schedule/partition
+  coupling entry below (case3 back to 663.6, canary OK).
+
+## 2026-07-10: case4 v2 data-fidelity root cause + stage-invariance gate
+
+Root cause of the case4 FA-bwd wrong-dQ/dK result (v2 accepted, all
+latency checks green, GPU silently wrong): the emitter's version
+discipline — iter-arg threading, ring phases, and the inline
+re-materialization of IV-dependent address chains — is derived from the
+INCUMBENT schedule's stage assignment at ScheduleGraph-build time. The v2
+writeback re-derives buffer liveness from the new cycles but NOT that
+version structure, so any node that changes STAGE reads/writes values one
+iteration off in the emitted pipeline. Channel bisection confirmed the
+breadth: bypassing the suspect sem6_b10 channel with a local reload still
+failed (dQ=2.17), i.e. not a single-channel bug but a whole-schedule
+version-alignment bug.
+
+Fix (compile-time rejection, "direction 3"): a stage-invariance gate in
+partitionJointCPSAT's v2 acceptance path, after the dependence-latency
+safety net and before the cycle writeback — any solution moving a node to
+a different stage than the incumbent is rejected and the loop falls back
+to v1 (cycles fixed, version-safe by construction). Same-stage cycle
+refinements still land.
+
+Verified on B200 (2026-07-10): `full` and `full-stream` × case1-7 ALL
+GREEN — case4 correctness now PASSES (gate fires: "v2 rejected: N4 stage
+change 0 -> 1", v1 partition applied); case3 canary 662.0-662.4/651 OK
+with NO gate rejection (its v2 solution is same-stage — no over-reject);
+case6 1.00x; case1/7 byte-parity.
+
+Follow-up (planned, not landed): relax whole-schedule stage invariance to
+per-channelized-edge stage/distance consistency once the emitter can
+re-derive version structure for stage-moved nodes — that is the real
+unlock for stage-changing v2 solutions, and it subsumes the gate.
+
+## 2026-07-10 (second entry): schedule/partition coupling — cpsat promotes to V1Only
+
+Resolution of the round-1 coverage finding above ("`cpsat` is now a trap
+on FA"), option 1: `runScheduleDriver` promotes `JointSolverMode::Off` to
+`V1Only` whenever the active schedule backend is `cpsat`. A CP-SAT
+schedule presses II to the proven minimum; the heuristic partitioners
+were shaped by Rau-conservative schedules and mis-partition those (case3:
+292.9 TF, 2.23x). CP-SAT schedules therefore always get the CP-SAT v1
+partition — `TRITON_USE_MODULO_SCHEDULE=cpsat` is now "joint pass minus
+v2" rather than a schedule-only middle ground, and `Off` keeps meaning
+"heuristic partition for heuristic schedules". Verified on B200: config
+`cpsat` case3 canary 663.6/651 OK (was 292.9 MISS), case4/5/6 clean,
+case1/7 parity.
+
+Companion fix in `applyGlobalWarpPartition`: the
+`TRITON_MODULO_EXHAUSTIVE_PARTITION=0` greedy escape used to bypass the
+joint chain entirely — silently disabling the CP-SAT partition for the
+joint pass AND for this promotion (re-creating the very trap). The env
+var now only selects which heuristic (greedy vs exhaustive scorer) serves
+as the joint chain's fallback; it disables the joint solve for no one.
+
+Doc debt paid with it: the 2026-07-09 pass-split entry's "=cpsat remains
+schedule-only" sentence, `solver_regression.py`'s `cpsat` config comment,
+and `SolverConfigMeasurements.md`'s cpsat table (its 638.0 alpha-order
+numbers were measured with the heuristic partition; superseded by the
+v1-partition pairing).
+
+### 2026-07-10 addendum: case4 intermittent correctness FAIL — investigation log
+
+One `full`-config case4 correctness FAIL observed (1 in 24+ draws), not
+yet reproduced. What the investigation ESTABLISHED:
+
+- The CP-SAT schedule solve is nondeterministic run-to-run (wall-clock
+  time limit + portfolio search): 8 consecutive draws produced 8 distinct
+  cycle layouts at the same II=1033 — mostly rigid translations of each
+  other (+345 etc.) plus small local perturbations. The v1 WG partition
+  TOPOLOGY was identical across all draws; v2 was gate-rejected every
+  time. So the varying dimension reaching the emitter is the cycle/stage
+  structure of the schedule itself.
+- **Emitter is translation-robust (tested)**: `TRITON_MODULO_SCHED_SHIFT=k`
+  (new debug knob in CPSATScheduler.cpp) rigidly translates the solution
+  before the native re-verification/liveness pipeline; sweeping k over
+  {0,86,...,1032} — including shifts that change max_stage 3→4 — passed
+  correctness 13/13. Global stage-split choice is NOT the failing
+  dimension.
+- **Exhaustive-fallback partition on a cpsat schedule passed (tested)**:
+  forcing the v1 partition subprocess to fail (wrapper rejecting
+  "mode"-carrying problems) exercised partitionExhaustive on a
+  MinII-aggressive cpsat schedule — case4 numerics correct. The
+  load-induced-fallback hypothesis did not reproduce either.
+- Remaining suspects: a rare LOCAL schedule structure (non-translation)
+  that the emitter mis-lowers, or a transient environment fault. The
+  regression harness now FREEZES failing repros (schedule graph +
+  generated.py + output in a persistent solver-regression-fail-* dir) —
+  the frozen graph replays deterministically through sched2tlx, so the
+  next natural occurrence is caught with evidence instead of vanishing.
+
+## 2026-07-10 (third entry): case4 flake ROOT-CAUSED — Step 4.5 merge aliasing had no hardware ordering
+
+The intermittent case4 FAIL was caught (24-run hunt, run 7: dQ/dK/dV all
+~1e3 wrong, deterministic replay from the frozen graph) and bisected by
+graph hybridization: importing ONLY the buffer merge_group_id fields from
+the failing draw into the passing draw reproduces the failure bit-exactly
+(and the inverse repairs it). The schedule was irrelevant — node-schedule
+hybrids all passed.
+
+Mechanism: Step 4.5 merges same-shape SMEM channel buffers with
+cycle-disjoint lifetimes into one physical allocation (`reuse=` in the
+emitted TLX). But cycle-disjointness is a MODEL property — on hardware
+only barriers order anything. In the passing draws the merged pair
+happened to be chained by a same-WG data dependence (offset-channel
+consumer feeds D-load producer), so program order saved it; the failing
+draw merged the two D-LOAD channels (producers in wg2 and wg3, no
+dependence path), so wg3's local_store raced wg5's read of the aliased
+bytes. Whether solver nondeterminism produced a safe or unsafe merge was
+pure lifetime-layout luck — this was never a schedule-legality bug.
+
+Emitter fix (sched2tlx/emitter.py):
+1. `_alias_group_safety`: an SMEM merge group is guardable iff every
+   member is a forward cross-WG channel with a SW producer. Unguardable
+   multi-member groups (HW/TMA producer, signal-only member, non-channel
+   member) have their `reuse=` DROPPED at alloc — private bytes are always
+   correct, merely less thrifty.
+2. `_alias_wait_stmts`: guardable groups get real ordering. The group is
+   one physical slot with k producer/consumer pairs per iteration in
+   lifetime order (p1→c1→…→pk→ck→p1@next). A later member's producer
+   waits each earlier member's empty at the CONSUMER phase (this
+   iteration's reader drained); the earliest member's producer waits every
+   other member's empty at the PRODUCER phase (previous iteration's
+   readers; passes immediately at iter 0). Acyclic within an iteration,
+   ring-closed across iterations — deadlock-free by construction.
+3. The legacy `_alias_predecessors` Layer 2 (pre-SemIR path) turned out to
+   be DEAD CODE on the SemIR default path — the SW producer emission never
+   called it, which is why no alias wait ever appeared in any kernel.
+
+Verified: the frozen failing graph and the MG1 hybrid (its distilled
+minimal repro) both PASS with the fixed emitter, alias waits landing
+exactly at the two D-load channel producers.
+
+Note the relationship to the stage-invariance gate (first 2026-07-10
+entry): stage moves change buffer liveness, which changes MERGE decisions
+— some of the v2 rejections may have been this same alias bug wearing a
+different hat. Worth re-testing v2 with the gate relaxed now that aliasing
+is ordered; the gate stays until that experiment is run (the original v2
+failure signature — dQ=2.17 with dV clean — differs from the alias
+signature, so the version-structure concern may still be real).
+
+## 2026-07-10 (fourth entry): v2 "version structure" bug ROOT-CAUSED — shared ring counter vs heterogeneous depths
+
+The second case4 failure mode (the ORIGINAL v2 signature: dQ≈2.17,
+dK≈1.67, dV clean) was caught as a v2-ACCEPTED draw (all stages match the
+incumbent — the stage-invariance gate passed it; 8-WG joint partition) and
+root-caused via a 3-lens analysis workflow + a two-line kernel-patch
+discrimination test.
+
+Mechanism — an EMITTER indexing bug, not a scheduling-semantics one: the
+inner-loop body emits ONE shared ring counter per WG (`buf = _it %
+rep_depth`, rep_depth = max count over the WG's ring buffers) and the MMA
+operand renderer subscripts EVERY count>1 buffer with that literal `buf`.
+When a WG touches rings of DIFFERING depths, the shallower ring is read at
+the wrong slot (and out of bounds): in the failing draw wg4 held L0_smem_0
+(count=3) and the dS channel L0_smem_3 (count=2) — consumers read
+dS[_it%3] while the producer wrote dS[_it%2] and the barriers tracked %2.
+dS = P·(dP−D) feeds dK and dQ; dV never touches it — exactly the
+signature. Patching only the two subscripts on the frozen kernel collapsed
+dQ/dK to dV's 1e-3 level.
+
+Why this correlated with v2 (and looked like a "version structure"
+problem): v1 keeps the incumbent cycles, where the dS ring's lifetime
+spans 3 stages → count=3 = rep_depth — the shared counter is
+COINCIDENTALLY correct. v2's same-stage cycle compression shortens the dS
+lifetime → count=2 ≠ rep_depth=3 → heterogeneous depths in one WG. Any
+schedule with mixed ring depths in one WG would trigger it; v2 was just
+the only producer of such schedules in this corpus.
+
+Fix (sched2tlx/emitter.py): `_ring_exprs(count, rctx)` — subscript each
+ring buffer with its OWN modulus (`_it % count`, phase `(_it // count) &
+1`) whenever its count differs from the WG's rep_depth; buffers matching
+rep_depth keep the shared `buf`/`phase` (emitted-text parity for all
+existing kernels). All six literal-`buf` sites (MMA operands, descriptor
+loads SemIR + legacy, TMA store/reduce staging, HW-producer channel path)
+route through it.
+
+Implication for the stage-invariance gate (first entry): the gate's
+factual basis is now partly explained by THIS bug. With ring indexing
+fixed, stage-changing v2 solutions deserve a re-test — the gate may be
+relaxable to per-channelized-edge checks or removable outright. Kept until
+that experiment runs clean.
+
+### 2026-07-10 addendum 2: ring-fix verified on real v2 draws; exhaustive-fallback HANG remains open
+
+joint-mode=2 hunt (12 draws, ring-index fix in): every v2-ACCEPTED draw
+(the 8-WG shape that was previously always wrong) now passes correctness —
+3 independent accepted draws confirmed. One draw HUNG (300s kill): its v2
+was gate-rejected and joint-mode=2 has no v1 fallback, so it took the
+EXHAUSTIVE heuristic partition on the MinII cpsat schedule — a 4-WG layout
+folding TMA loads into compute WGs. Zero alias waits present (not the new
+mechanism); same class as the earlier full-regcap hang. Reachable from the
+default V2ThenV1 chain only when BOTH v2 and v1 fail (e.g. subprocess
+death under load) — low exposure, but nonzero. Frozen repro:
+/projects/kzhou6/hwu27/case4-hang-repro-20260710/ (schedule_graph.json
+replays deterministically through sched2tlx; see its README).
+OPEN — next root-cause target.
+Options while open: make the terminal fallback Rau+heuristic (retreat to
+the fully-heuristic pairing instead of mixing exhaustive-partition with a
+MinII cpsat schedule), or gate the exhaustive fallback behind the same
+schedule/partition coupling rule as the Off->V1Only promotion.
+
+## 2026-07-10 (fifth entry): gate-removal experiment + v1-vs-v2 measurement — gate RESTORED
+
+Gate-removal experiment (case4, joint-mode=2, 12 draws, both emitter fixes
+in): v2 acceptance went to 100% (every prior rejection was the gate; the
+dependence safety-net rejects nothing) — and stage-changing v2 produced
+4/12 HANGS + 1/12 wrong numerics (dQ≈0.8/dK≈0.4, dV clean — a NEW
+D-misalignment signature, distinct from both fixed bugs). The gate is
+therefore RESTORED verbatim: beyond merge-aliasing and ring-indexing, the
+emitter's stage-move contract breaks in at least two further ways. All
+failing draws frozen (hang samples in case4-hang-repro-20260710/; the
+dQ≈0.8 draw in the session hunt archives) — next root-cause targets.
+
+v1 (7-WG) vs same-run v2 (8-WG, PASSING draw) performance, B200,
+perf_generated.py, gen kernel TFLOPS:
+
+| shape (BH,N)   | v1 7-WG | v2 8-WG | v2/v1 |
+|----------------|---------|---------|-------|
+| 8, 8192        | 116.8   |  95.0   | 0.81x |
+| 8, 16384       | 132.1   | 107.0   | 0.81x |
+| 2, 32768       | 118.9   |  96.4   | 0.81x |
+
+The model-optimal joint solution is ~19% SLOWER than v1 on hardware: the
+8th WG (a CUDA cluster split out on its own) adds cross-WG hand-offs whose
+real cost the objective under-prices — the design note's founding
+principle ("an optimal solver exploits model error maximally") measured
+end-to-end. Conclusions: (a) same-stage v2 is SAFE but not yet PROFITABLE
+on case4 — the win condition for v2 is a better-calibrated objective
+(RRT / sync-latency terms), not more solver freedom; (b) both gen kernels
+sit at 0.46-0.68x of the handwritten no-WS baseline on case4 — the
+emitter/annotation gap dominates everything the solver can influence.

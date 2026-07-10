@@ -136,9 +136,18 @@ def solve_at_ii(prob, ii, time_limit_s, hint=None):
         model.AddDivisionEquality(stage[i], cycle[i], ii)
         model.AddModuloEquality(phase[i], cycle[i], ii)
 
-    # Dependences.
+    # Dependences. Streaming producers (Twill §5.3: variable-latency ops
+    # with no incoming deps, e.g. TMA input loads) run ahead of the pipeline
+    # behind their ring buffer, so in steady state consumers do not wait
+    # their latency — model their outgoing edges as latency 0. Ring depth
+    # stays a solver decision: the objective already REWARDS depth
+    # (-102400·Σdepth) against the SMEM budget, so removing the latency
+    # pressure does not collapse the ring. C++-side verifySolution applies
+    # the same effective-latency rule.
+    streaming = ({nd["id"] for nd in nodes if nd.get("streaming")} if prob.get("streaming_vl") else set())
     for e in edges:
-        model.Add(cycle[e["dst"]] >= cycle[e["src"]] + e["latency"] - e["distance"] * ii)
+        lat = 0 if e["src"] in streaming else e["latency"]
+        model.Add(cycle[e["dst"]] >= cycle[e["src"]] + lat - e["distance"] * ii)
         if e["distance"] == 0:
             model.Add(stage[e["src"]] <= stage[e["dst"]])
 
@@ -428,6 +437,14 @@ def solve_partition(prob):
         total_regs_terms.append(fp_w)
     total_regs = model.NewIntVar(0, 1 << 22, "total_regs")
     model.Add(total_regs == prob["default_wg_footprint"] + sum(total_regs_terms))
+    # Twill REGISTERLIMIT-style HARD cap (opt-in): with reg_budget set the
+    # solver may not oversubscribe at all — re-solving at a REDUCED budget is
+    # Twill's documented answer to model-fits-but-ptxas-spills (their
+    # Blackwell FA-bwd found the faster 3-WG strategy only under a lowered
+    # budget; our case4 v2 oversubscribed 91136 > 65536 and got downscaled
+    # 152→96 regs by the emitter). Unset keeps the soft-deficit model.
+    if prob.get("reg_budget"):
+        model.Add(total_regs <= prob["reg_budget"])
     deficit = model.NewIntVar(0, 1 << 22, "deficit")
     model.AddMaxEquality(deficit, [total_regs - prob["sm_regs"], 0])
     residual = model.NewIntVar(0, 1 << 22, "residual")
@@ -692,6 +709,9 @@ def solve_joint(prob):
         fp_terms.append(fp_w)
     total_regs = model.NewIntVar(0, 1 << 22, "total_regs")
     model.Add(total_regs == prob["default_wg_footprint"] + sum(fp_terms))
+    # Hard cap when reg_budget is set — see solve_partition for rationale.
+    if prob.get("reg_budget"):
+        model.Add(total_regs <= prob["reg_budget"])
     deficit = model.NewIntVar(0, 1 << 22, "deficit")
     model.AddMaxEquality(deficit, [total_regs - prob["sm_regs"], 0])
     residual = model.NewIntVar(0, 1 << 22, "residual")

@@ -4732,6 +4732,13 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
       {"warp_footprint", std::move(fpTable)},
       {"time_limit_s", timeLimitS},
   };
+  // TRITON_MODULO_REG_BUDGET: Twill REGISTERLIMIT-style HARD register cap
+  // for the joint partition (v1 and v2). Unset (0) keeps the soft-deficit
+  // model; a value (typically ≤ sm_regs, per Twill's re-solve-at-reduced-
+  // budget answer to ptxas spills) forbids oversubscription outright.
+  if (auto env = triton::tools::getStrEnv("TRITON_MODULO_REG_BUDGET");
+      !env.empty())
+    root["reg_budget"] = std::atoll(env.c_str());
   std::string problemJson;
   llvm::raw_string_ostream os(problemJson);
   os << llvm::json::Value(std::move(root));
@@ -4773,6 +4780,28 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
           *s + edge.latency - static_cast<int64_t>(edge.distance) * loop.II) {
         LLVM_DEBUG(llvm::dbgs() << "[Phase4-JOINT] v2 verify failed: N"
                                 << edge.srcId << " -> N" << edge.dstId << "\n");
+        return false;
+      }
+    }
+    // Stage-invariance gate (2026-07-09, RE-VALIDATED 2026-07-10): accept
+    // only same-stage cycle refinements from v2; stage-changing solutions
+    // fall back to v1. The gate-removal experiment (case4, joint-mode=2,
+    // 12 draws, with the merge-alias and ring-counter emitter fixes in)
+    // measured stage-changing v2 at 4/12 HANGS + 1/12 wrong-numerics
+    // (dQ≈0.8, dV clean) — at least two further emitter-contract breaks
+    // under stage moves (frozen repros: case4-hang-repro-20260710).
+    // Same-stage v2 (8-WG joint partitions) is verified reliable. See
+    // docs/SolverMigrationNotes.md 2026-07-10 entries.
+    for (const auto &node : loop.nodes) {
+      auto v = cyc->getInteger(std::to_string(node.id));
+      if (!v)
+        return false;
+      if (static_cast<int>(*v) / loop.II != node.stage) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[Phase4-JOINT] v2 rejected: N" << node.id
+                   << " stage change " << node.stage << " -> "
+                   << static_cast<int>(*v) / loop.II
+                   << " (emitter stage-move contract not yet safe)\n");
         return false;
       }
     }
@@ -4887,13 +4916,21 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
       // and TMA-store on separate warp groups frees the compute warps and
       // removes the in-stream store drain (measured ~1.2x over 1-WG software
       // pipelining). No env flag, no hard override.
-      if (useGreedy) {
+      // TRITON_MODULO_EXHAUSTIVE_PARTITION=0 selects the greedy heuristic,
+      // but only WITHIN heuristic partitioning: when a joint mode is active
+      // (the joint pass, or the cpsat-schedule promotion in
+      // runScheduleDriver) the env var must not silently disable the CP-SAT
+      // partition — heuristics on a CP-SAT schedule re-create the
+      // softmax-cut failure class. It instead picks which heuristic the
+      // joint chain falls back to.
+      if (useGreedy && jointMode == ttg::JointSolverMode::Off) {
         partitionIntoWarpGroups(schedLoop);
       } else {
         int64_t reserved = allLoopsSmem - computeTotalSmem(schedLoop);
         // Joint-solver modes: v2 solves cycles + warp groups in one model,
         // v1 solves warp groups with cycles fixed. The default chain tries
-        // v2 then v1; both fall back to the exhaustive scorer.
+        // v2 then v1; both fall back to the heuristics (greedy when
+        // requested, exhaustive scorer otherwise).
         bool jointDone = false;
         if (jointMode == ttg::JointSolverMode::V2ThenV1 ||
             jointMode == ttg::JointSolverMode::V2Only)
@@ -4901,8 +4938,12 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
         if (!jointDone && (jointMode == ttg::JointSolverMode::V2ThenV1 ||
                            jointMode == ttg::JointSolverMode::V1Only))
           jointDone = partitionJointCPSAT(schedLoop, reserved, /*v2=*/false);
-        if (!jointDone)
-          partitionExhaustive(schedLoop, reserved);
+        if (!jointDone) {
+          if (useGreedy)
+            partitionIntoWarpGroups(schedLoop);
+          else
+            partitionExhaustive(schedLoop, reserved);
+        }
       }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);
@@ -5902,6 +5943,23 @@ LogicalResult ttg::runScheduleDriver(ModuleOp moduleOp,
   if (!opts.forceScheduleAlgo.empty())
     algoOverride.emplace(opts.forceScheduleAlgo);
 
+  // Schedule/partition capability coupling (2026-07-10): a CP-SAT schedule
+  // presses II to the proven minimum, and the heuristic partitioners were
+  // shaped by Rau-conservative schedules — on FA the combination re-creates
+  // the softmax-cut failure class guard 1 used to fence (case3 at MinII with
+  // the heuristic partitioner: 292.9 TF vs 662 with the CP-SAT partition,
+  // 2.23x). CP-SAT schedules therefore always get the CP-SAT v1 partition:
+  // TRITON_USE_MODULO_SCHEDULE=cpsat becomes "joint pass minus v2" instead
+  // of a trap, and Off keeps meaning "heuristic partition for heuristic
+  // schedules". See docs/SolverMigrationNotes.md (2026-07-10 second entry).
+  JointSolverMode jointMode = opts.jointMode;
+  if (jointMode == JointSolverMode::Off &&
+      ttg::getActiveScheduleAlgo() == "cpsat") {
+    LDBG("CP-SAT schedule backend active — promoting warp partition "
+         "from heuristic to CP-SAT v1");
+    jointMode = JointSolverMode::V1Only;
+  }
+
   ttg::NVLatencyModel model;
   triton::ModuleAxisInfoAnalysis axisInfoAnalysis(moduleOp);
 
@@ -6001,7 +6059,7 @@ LogicalResult ttg::runScheduleDriver(ModuleOp moduleOp,
     if (getDumpTopN() > 1)
       for (auto &sl : scheduledLoops)
         sl.prePartitionGraph = sl.graph;
-    applyGlobalWarpPartition(scheduledLoops, opts.jointMode);
+    applyGlobalWarpPartition(scheduledLoops, jointMode);
 
     // ================================================================
     // Iterative refinement: apply DDG transformations and check if

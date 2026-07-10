@@ -52,8 +52,9 @@ REPO_ROOT = EXAMPLES_DIR.parents[4]  # examples -> sched2tlx -> tools -> tlx -> 
 # then v1 fallback (old CPSAT_JOINT=2), 1 = v1 only (old CPSAT_JOINT=1),
 # 2 = v2 strict (new).
 CONFIGS = {
-    # schedule backend only, heuristic partition (deletes guard 2's II
-    # window for this path)
+    # cpsat schedule via the modulo pass; the driver pairs it with the
+    # CP-SAT v1 partition (2026-07-10 promotion — heuristic partitions
+    # mis-handle MinII-aggressive schedules), so this is "joint minus v2"
     "cpsat": {"pass": "-nvgpu-modulo-schedule",
               "env": {"TRITON_USE_MODULO_SCHEDULE": "cpsat"}},
     # partition-only joint solve (v1: cycles fixed)
@@ -62,11 +63,24 @@ CONFIGS = {
     "joint2": {"pass": "-nvgpu-joint-solver-schedule=joint-mode=2", "env": {}},
     # full solver stack: the joint pass default (v2 then v1 fallback)
     "full": {"pass": "-nvgpu-joint-solver-schedule", "env": {}},
+    # full stack + streaming variable-latency classification (Twill §5.3:
+    # no-incoming-dep TMA loads solve at latency 0 behind their ring)
+    "full-stream": {"pass": "-nvgpu-joint-solver-schedule",
+                    "env": {"TRITON_MODULO_STREAMING_VL": "1"}},
+    # full stack + hard register budget at the SM cap (Twill REGISTERLIMIT;
+    # forbids the oversubscribe-then-downscale partitions case4 v2 picked)
+    "full-regcap": {"pass": "-nvgpu-joint-solver-schedule",
+                    "env": {"TRITON_MODULO_REG_BUDGET": "65536"}},
 }
 
 CASES = {
     "case1_simple_gemm": "pre_modulo.ttgir",
     "case3_FA": "fa_fwd_nows_pre_modulo.ttgir",
+    # FA-bwd: the joint solver's hardest partition canary (2026-07-09: its v2
+    # partition exposed the WarpSpecializeOp tensor-capture emitter gap that
+    # the whole run had been blind to because this case wasn't wired in).
+    # No bench_spec — correctness-only via run_generated.py.
+    "case4_FA_bwd": "fa_bwd_nows_pre_modulo.ttgir",
     "case5_addmm_bias": "addmm_bias_pre_modulo.ttgir",
     "case6_layernorm": "layernorm_fwd_pre_modulo.ttgir",
     "case7_wgrad_bias": "wgrad_bias_pre_modulo.ttgir",
@@ -120,7 +134,13 @@ def dump_and_emit(opt: Path, case: str, cfg: dict, tmp: Path) -> Path | None:
 
 def run_correctness_only(case: str, gen: Path, tmp: Path) -> bool:
     """For cases without a bench_spec: run run_generated.py against the
-    candidate kernel in a throwaway copy of the case dir."""
+    candidate kernel in a throwaway copy of the case dir.
+
+    On failure, freeze the repro (schedule graph + generated.py + output)
+    in a persistent directory: the CP-SAT solves are nondeterministic
+    (wall-clock limits), so a failing draw may not recur for dozens of
+    runs — the frozen graph replays deterministically through sched2tlx
+    (case4 flake, 2026-07-10)."""
     work = tmp / f"{case}.work"
     if work.exists():
         shutil.rmtree(work)
@@ -128,6 +148,13 @@ def run_correctness_only(case: str, gen: Path, tmp: Path) -> bool:
     shutil.copy(gen, work / "generated.py")
     proc = subprocess.run([sys.executable, "run_generated.py"], cwd=work,
                           capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0:
+        keep = Path(tempfile.mkdtemp(prefix=f"solver-regression-fail-{case}-"))
+        for artifact in (tmp / f"{case}.schedule_graph.json", gen):
+            if artifact.exists():
+                shutil.copy(artifact, keep / artifact.name)
+        (keep / "correctness.out").write_text(proc.stdout + proc.stderr)
+        print(f"    correctness FAIL — repro frozen in {keep}")
     return proc.returncode == 0
 
 

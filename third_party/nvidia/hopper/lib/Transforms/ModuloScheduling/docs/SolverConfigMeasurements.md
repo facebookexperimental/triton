@@ -16,6 +16,13 @@ stacks +2% (the ~665 TFLOPS plateau, 4th independent reproduction).
 
 ## Config `cpsat` — TRITON_USE_MODULO_SCHEDULE=cpsat
 
+**SUPERSEDED 2026-07-10**: this table (and the alpha-order-gap rationale
+above) was measured with cpsat schedule + HEURISTIC partition. The driver
+now pairs every cpsat schedule with the CP-SAT v1 partition
+(SolverMigrationNotes.md, 2026-07-10 second entry); remeasured case3
+(1,32,8192) canary: 663.6/651 OK. Table kept as the historical record of
+the heuristic pairing.
+
 | Case / shape | Speedup | Note |
 |---|---|---|
 | case1 (all shapes) | 1.00x | parity |

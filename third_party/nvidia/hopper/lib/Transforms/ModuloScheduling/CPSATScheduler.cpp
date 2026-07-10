@@ -7,6 +7,7 @@
 
 #include "ExhaustiveScheduler.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -48,12 +49,25 @@ static int serialUpperBound(const DataDependenceGraph &ddg, int minII) {
 static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
                                     int maxII, int smemBudget, int tmemColLimit,
                                     const ModuloScheduleResult *incumbent) {
+  // Streaming classification (Twill §5.3): a variable-latency op with no
+  // incoming data dependence (TMA input loads) runs ahead of the pipeline
+  // behind its ring buffer, so in steady state its consumers do not wait its
+  // latency — the solver models its outgoing edges as latency 0 when
+  // TRITON_MODULO_STREAMING_VL=1. Ring depth stays a solver decision (the
+  // objective already rewards depth against the SMEM budget).
+  llvm::DenseSet<unsigned> hasIncoming;
+  for (const auto &edge : ddg.getEdges())
+    if (edge.distance == 0)
+      hasIncoming.insert(edge.dstIdx);
   llvm::json::Array nodes;
   for (const auto &node : ddg.getNodes()) {
+    bool streaming =
+        node.pipeline == HWPipeline::TMA && !hasIncoming.contains(node.idx);
     nodes.push_back(llvm::json::Object{
         {"id", static_cast<int64_t>(node.idx)},
         {"pipeline", getPipelineName(node.pipeline)},
         {"duration", nodeDuration(node)},
+        {"streaming", streaming},
     });
   }
   llvm::json::Array edges;
@@ -88,6 +102,9 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
       !env.empty())
     normalizeU = std::atoll(env.c_str());
 
+  bool streamingVL =
+      tools::getBoolEnv("TRITON_MODULO_STREAMING_VL"); // default off
+
   llvm::json::Object root{
       {"version", "cpsat-0.1"},
       {"min_ii", minII},
@@ -96,6 +113,7 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
       {"tmem_col_limit", tmemColLimit},
       {"time_limit_s", timeLimitS},
       {"normalize_u", normalizeU},
+      {"streaming_vl", streamingVL},
       {"nodes", std::move(nodes)},
       {"edges", std::move(edges)},
       {"buffers", std::move(buffers)},
@@ -117,17 +135,32 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
 /// in-process schedulers enforce: dependences and exclusive modular
 /// reservation. A schedule that fails here is discarded (fall back to the
 /// heuristics) — the Python solver is advisory, never trusted.
+/// Under TRITON_MODULO_STREAMING_VL the solver legitimately places a
+/// streaming producer's consumers inside its raw latency (the ring absorbs
+/// it), so verification uses the same effective latency-0 rule for those
+/// edges — otherwise every streaming schedule would be rejected here.
 static bool verifySolution(const DataDependenceGraph &ddg,
                            const ModuloScheduleResult &res) {
   if (res.II <= 0)
     return false;
+  llvm::DenseSet<unsigned> streaming;
+  if (tools::getBoolEnv("TRITON_MODULO_STREAMING_VL")) {
+    llvm::DenseSet<unsigned> hasIncoming;
+    for (const auto &edge : ddg.getEdges())
+      if (edge.distance == 0)
+        hasIncoming.insert(edge.dstIdx);
+    for (const auto &node : ddg.getNodes())
+      if (node.pipeline == HWPipeline::TMA && !hasIncoming.contains(node.idx))
+        streaming.insert(node.idx);
+  }
   for (const auto &edge : ddg.getEdges()) {
     auto s = res.nodeToCycle.find(edge.srcIdx);
     auto d = res.nodeToCycle.find(edge.dstIdx);
     if (s == res.nodeToCycle.end() || d == res.nodeToCycle.end())
       return false;
+    int lat = streaming.contains(edge.srcIdx) ? 0 : edge.latency;
     if (d->second <
-        s->second + edge.latency - static_cast<int>(edge.distance) * res.II) {
+        s->second + lat - static_cast<int>(edge.distance) * res.II) {
       LLVM_DEBUG(DBGS() << "verify: dependence violated N" << edge.srcIdx
                         << " -> N" << edge.dstIdx << "\n");
       return false;
@@ -240,6 +273,22 @@ runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
   }
   if (result.nodeToCycle.size() != ddg.getNumNodes())
     return failure();
+
+  // TRITON_MODULO_SCHED_SHIFT=k (debug): rigidly translate the solution by
+  // +k cycles before verification. A modulo schedule is model-equivalent
+  // under translation (dependences and modular reservations are invariant),
+  // but the stage split (cycle / II) is NOT — this knob deterministically
+  // samples the emitter-facing stage structures that solver nondeterminism
+  // otherwise draws at random, for hunting shape-dependent emitter bugs
+  // (case4 flake, 2026-07-10).
+  if (auto env = tools::getStrEnv("TRITON_MODULO_SCHED_SHIFT"); !env.empty()) {
+    int shift = std::atoi(env.c_str());
+    if (shift > 0) {
+      LLVM_DEBUG(DBGS() << "shifting schedule by +" << shift << " cycles\n");
+      for (auto &kv : result.nodeToCycle)
+        kv.second += shift;
+    }
+  }
 
   if (!verifySolution(ddg, result)) {
     LLVM_DEBUG(DBGS() << "solution failed re-verification — discarding\n");
