@@ -995,10 +995,20 @@ elif _BWD_CFG_IDX_ENV == "3s1":
     _configs_bwd_persist_active = [_c]
 elif _BWD_CFG_IDX_ENV == "3ovr":
     # idx3 with an ir_override ttgir that has computation as the default region
-    # and requestedRegisters=[88,88,88] (TLX-style budget) — conclusive test.
+    # and requestedRegisters=[88,88,88] (TLX-style budget). Defaults to the
+    # checked-in ovr_88.ttgir at the repo root; override with BWD_IR_OVERRIDE.
     _c = _copy.copy(configs_bwd_persist[3])
     _c.kwargs = dict(_c.kwargs)
-    _c.ir_override = _os.environ.get("BWD_IR_OVERRIDE", "/tmp/ovr_88.ttgir")
+    # Walk up from this file to the repo root (where ovr_88.ttgir is checked in);
+    # robust to the python/ <-> third_party/ tutorial symlinks.
+    _d = _os.path.dirname(_os.path.abspath(__file__))
+    while _d != _os.path.dirname(_d) and not _os.path.exists(
+        _os.path.join(_d, "ovr_88.ttgir")
+    ):
+        _d = _os.path.dirname(_d)
+    _c.ir_override = _os.environ.get(
+        "BWD_IR_OVERRIDE", _os.path.join(_d, "ovr_88.ttgir")
+    )
     _configs_bwd_persist_active = [_c]
 elif _BWD_CFG_IDX_ENV not in (None, ""):
     _configs_bwd_persist_active = [configs_bwd_persist[int(_BWD_CFG_IDX_ENV)]]
