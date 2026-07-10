@@ -45,6 +45,36 @@ inline bool isMMAOp(Operation *op) {
   return isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op);
 }
 
+/// Return a stable identity for an MMAv5 op's accumulator buffer: the backing
+/// tensor-memory allocation (tracing through memdesc view/index ops), or null
+/// for non-MMAv5 ops (e.g. Hopper WarpGroupDot, whose accumulator lives in
+/// registers). Two MMAv5 ops that resolve to the same buffer share a
+/// tensor-memory accumulator and therefore form a serial reduction chain
+/// (e.g. dq += K0^T·dS0 then dq += K1^T·dS1 into one dq tile). Such MMAs must
+/// not be placed in different warp-specialization partitions: concurrent
+/// accumulating MMAs into one accumulator race on the shared tile.
+inline Operation *getAccumulatorBuffer(Operation *op) {
+  auto mma = dyn_cast<ttng::MMAv5OpInterface>(op);
+  if (!mma)
+    return nullptr;
+  Value acc = mma.getAccumulator();
+  while (acc) {
+    Operation *def = acc.getDefiningOp();
+    if (!def)
+      return nullptr; // block/iter arg — no static buffer identity here
+    if (isa<ttng::TMEMAllocOp>(def))
+      return def;
+    // Trace through single memdesc-producing view ops (subview/trans/index).
+    if (def->getNumOperands() >= 1 &&
+        isa<triton::gpu::MemDescType>(def->getOperand(0).getType())) {
+      acc = def->getOperand(0);
+      continue;
+    }
+    return def; // some other producer: use it as the buffer identity
+  }
+  return nullptr;
+}
+
 /// Strip all warp specialization annotations from a function.
 /// Removes partition attributes from ops and tt.warp_specialize from loops.
 static void dropWarpSpec(triton::FuncOp funcOp) {
@@ -536,6 +566,26 @@ private:
           }
         }
       }
+    }
+
+    // Accumulator-chained MMAs must share a data-partition group. Two MMAs
+    // whose accumulators alias the same tensor-memory buffer form a serial
+    // reduction (e.g. dq += K0^T·dS0 then dq += K1^T·dS1 into one dq tile).
+    // The forward walk above stops at MMAs and never sees this dependency (it
+    // flows through the accumulator memdesc/token, not an SSA result operand),
+    // so without this the two dq dots would be counted as independent groups
+    // and split across partitions, racing on the shared accumulator. Union
+    // MMAs that write the same accumulator buffer so they stay together.
+    DenseMap<Operation *, unsigned> accBufToMma;
+    for (unsigned i = 0; i < n; ++i) {
+      Operation *buf = getAccumulatorBuffer(loopMmas[i]);
+      if (!buf)
+        continue;
+      auto it = accBufToMma.find(buf);
+      if (it == accBufToMma.end())
+        accBufToMma[buf] = i;
+      else
+        unite(i, it->second);
     }
 
     // Count distinct groups that have exclusive (non-shared) ops
@@ -1268,13 +1318,13 @@ preScheduleDpOps(SmallVector<CategorizedOp> &dpOps,
   // Shared ops (in >1 MMA backward slice) are centralized in the default
   // partition. But when the default IS the reduction partition (bwd TMA-reduce
   // kernels with no correction partition), sinking the shared softmax/ds
-  // compute chain into reduction forces cross-partition (reduction->computation)
-  // SMEM transports of its MMA operands. Mirror the Phase-4 load-user guard
-  // (getInitialSchedule: defaultPartition != reductionPartition): skip the
-  // reduction sink and let propagatePartitions place these ops in the
-  // computation partition(s) that actually consume them. See
-  // docs/PartitionSchedulingMeta.md (reduction holds only TMA-reduce + pre-loop
-  // tmem_stores).
+  // compute chain into reduction forces cross-partition
+  // (reduction->computation) SMEM transports of its MMA operands. Mirror the
+  // Phase-4 load-user guard (getInitialSchedule: defaultPartition !=
+  // reductionPartition): skip the reduction sink and let propagatePartitions
+  // place these ops in the computation partition(s) that actually consume them.
+  // See docs/PartitionSchedulingMeta.md (reduction holds only TMA-reduce +
+  // pre-loop tmem_stores).
   if (layout.defaultPartition && !dpOps.empty() && !useHopperDpSchedule &&
       layout.defaultPartition != layout.reductionPartition) {
     for (Operation *sharedOp : categorizer.getSharedOps()) {
@@ -2686,9 +2736,10 @@ void PartitionSchedulingMeta::runOnOperation() {
     // of the same warp-specialized region (one physical set of warp groups
     // subdivides the outer loop body). Schedule only the OUTERMOST such loop so
     // the warp budget is counted once for the nest; getInitialSchedule already
-    // schedules the nested loop's ops via mainLoop.getOps<scf::ForOp>(). Without
-    // this, a nested pair is scheduled twice and its budget summed, which can
-    // spuriously exceed the 16-warp limit and drop warp specialization.
+    // schedules the nested loop's ops via mainLoop.getOps<scf::ForOp>().
+    // Without this, a nested pair is scheduled twice and its budget summed,
+    // which can spuriously exceed the 16-warp limit and drop warp
+    // specialization.
     for (Operation *p = loop->getParentOp(); p; p = p->getParentOp()) {
       if (isa<scf::ForOp>(p) && p->hasAttr(kWarpSpecializeAttrName)) {
         nestedWSLoops.push_back(loop);
@@ -2801,6 +2852,45 @@ void PartitionSchedulingMeta::runOnOperation() {
         }
       }
 
+      // Backstop: verify no two accumulator-chained MMAs were assigned to
+      // different partitions. The data-partition grouping (Layer 1) should keep
+      // them together, but any other assignment path (preassignment/flex) that
+      // splits a shared tensor-memory accumulator would silently corrupt the
+      // reduction — concurrent accumulating MMAs race on the shared tile. Turn
+      // that into a hard compile error at the offending op.
+      {
+        DenseMap<Operation *, std::pair<Operation *, int>> accOwner;
+        WalkResult vr = loop.walk([&](Operation *op) -> WalkResult {
+          Operation *buf = getAccumulatorBuffer(op);
+          if (!buf)
+            return WalkResult::advance();
+          SetVector<int> ids = safeGetPartitionIds(op);
+          if (ids.empty())
+            return WalkResult::advance();
+          int pid = ids.front();
+          auto it = accOwner.find(buf);
+          if (it == accOwner.end()) {
+            accOwner[buf] = {op, pid};
+            return WalkResult::advance();
+          }
+          if (it->second.second != pid) {
+            op->emitError()
+                << "warp specialization assigned accumulator-chained MMAs to "
+                   "different partitions (partition "
+                << it->second.second << " and " << pid
+                << "): both accumulate into the same tensor-memory tile. "
+                   "Concurrent accumulating MMAs into one accumulator race and "
+                   "produce incorrect results. Co-locate them in a single "
+                   "partition (lower data_partition_factor) or give each "
+                   "partition its own accumulator and reduce at the end.";
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+        if (vr.wasInterrupted())
+          return signalPassFailure();
+      }
+
       // Estimate total warps for the WS schedule. If the estimate exceeds
       // the hardware warp limit, skip WS for the entire function.
       constexpr int kMaxWarps = 16;
@@ -2831,7 +2921,12 @@ void PartitionSchedulingMeta::runOnOperation() {
       for (auto [id, warps] : partitionWarps)
         estimatedTotal += warps;
 
-      LDBG("Warp budget estimate: " << estimatedTotal << " / " << kMaxWarps);
+      LDBG("Warp budget estimate: " << estimatedTotal << " / " << kMaxWarps
+                                    << " (numPartitions=" << numPartitions
+                                    << ", defaultNumWarps=" << defaultNumWarps
+                                    << ")");
+      for (auto [id, warps] : partitionWarps)
+        LDBG("  [budget] partition " << id << " warps=" << warps);
 
       if (estimatedTotal > kMaxWarps) {
         LDBG("Warp budget exceeded. Skipping warp specialization.");

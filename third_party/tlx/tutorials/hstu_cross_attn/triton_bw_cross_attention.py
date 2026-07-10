@@ -3843,19 +3843,28 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     else:
         low_q = 0
 
-    # merge_epilogue is intentionally OFF (unlike the single-KV inner). Folding
-    # the dq epilogue store into the computation partition duplicates/misplaces
-    # the store for the two-block shared dq accumulator, over-counting dq (norm
-    # ratio ~1.37) while dk stays correct. A separate epilogue partition stores
-    # dq once, correctly. warp_specialize stays ON.
+    # warp_specialize is OFF for the 2-KV inner loop. WS produces an incorrect
+    # dq here (rel-L2 ~89): the two-block shared dq accumulator is written in the
+    # gemm partition but loaded/stored (store_reduce="add") in the reduction
+    # partition, and that cross-partition gemm->reduction handoff over-counts dq.
+    # This is independent of MMA placement (all dq dots already co-locate in the
+    # gemm partition) -- see T279388065. Until that handoff is fixed, run the
+    # 2-KV inner loop unspecialized (correct via the non-WS fallback).
     #
-    # num_stages=1: warp specialization already supplies the parallelism; software
-    # pipelining the two-block loop (num_stages>=2) trips the pipeliner
-    # ("local_alloc can't predicate") on the doubled operand allocs, so the loop
-    # pipeline depth is pinned to 1 here regardless of the kernel num_stages.
+    # NOTE: previously WS was effectively suppressed here by the warp budget
+    # (18/16); the accumulator-chain dpFactor collapse now fits the budget
+    # (14/16), so WS would fire and expose the dq bug -- hence the explicit OFF.
+    #
+    # merge_epilogue is also OFF (unlike the single-KV inner): folding the dq
+    # epilogue store into the computation partition duplicates/misplaces the
+    # store for the shared dq accumulator, over-counting dq.
+    #
+    # num_stages=1: software pipelining the two-block loop (num_stages>=2) trips
+    # the pipeliner ("local_alloc can't predicate") on the doubled operand
+    # allocs, so the loop pipeline depth is pinned to 1 regardless of num_stages.
     for start_m in tl.range(
         low_q, seq_len_q, BLOCK_M, num_stages=1,
-        warp_specialize=WS_ON, merge_epilogue=False,
+        warp_specialize=False, merge_epilogue=False,
         list_schedule_pick=INNER_PICK,
     ):
         offs_m = start_m + tl.arange(0, BLOCK_M)
