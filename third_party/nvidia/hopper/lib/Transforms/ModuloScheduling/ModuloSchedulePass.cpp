@@ -8,7 +8,7 @@
 
 #include <cmath>
 
-#include "CPSATScheduler.h"
+#include "JointSolverScheduler.h"
 #include "llvm/Support/JSON.h"
 
 #include "DataDependenceGraph.h"
@@ -4493,7 +4493,7 @@ struct EmitterCaps {
 // enumerate-and-score with a constraint model over the SAME calibrated costs.
 // Cycles stay fixed (the Twill-style re-solve holds II and, in this v1, the
 // placement); the model derives split/merge pressure from the schedule
-// itself — see solve_partition in python/triton/tools/modulo_cpsat.py.
+// itself — see solve_partition in python/triton/tools/modulo_joint_solver.py.
 // Engaged by the joint-solver pass (JointSolverMode, see
 // ModuloScheduleDriver.h); any failure falls back to partitionExhaustive.
 // ============================================================================
@@ -4522,8 +4522,8 @@ collectRealConsumers(const ttg::ScheduleLoop &loop, unsigned startId,
   }
 }
 
-static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
-                                int64_t reservedSmemBytes, bool v2) {
+static bool partitionJointSolver(ttg::ScheduleLoop &loop,
+                                 int64_t reservedSmemBytes, bool v2) {
   if (loop.II <= 0)
     return false;
   auto clusters = buildClusters(loop);
@@ -4673,7 +4673,8 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
                                                              : 0);
 
   double timeLimitS = 20.0;
-  if (auto env = triton::tools::getStrEnv("TRITON_MODULO_CPSAT_TIMEOUT_S");
+  if (auto env =
+          triton::tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_TIMEOUT_S");
       !env.empty())
     timeLimitS = std::max(1.0, std::atof(env.c_str()));
 
@@ -4710,7 +4711,7 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   int64_t committedSmem = computeTotalSmem(loop) + reservedSmemBytes;
 
   llvm::json::Object root{
-      {"version", "cpsat-0.1"},
+      {"version", "joint-solver-0.1"},
       {"mode", v2 ? "joint" : "partition"},
       {"emitter_caps_version", EmitterCaps::kVersion},
       // Inner loops only reach this partitioner today (the isOuter
@@ -4743,7 +4744,7 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   llvm::raw_string_ostream os(problemJson);
   os << llvm::json::Value(std::move(root));
 
-  auto rawOut = ttg::runCPSATSubprocess(problemJson);
+  auto rawOut = ttg::runJointSolverSubprocess(problemJson);
   if (failed(rawOut))
     return false;
   auto parsed = llvm::json::parse(*rawOut);
@@ -4768,7 +4769,7 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
     auto *cyc = obj->getObject("cycles");
     if (!cyc)
       return false;
-    // Safety net, mirroring runCPSATSchedule's re-verification: never
+    // Safety net, mirroring runJointSolverSchedule's re-verification: never
     // apply a solution that violates a dependence (the subprocess is
     // advisory, not part of the correctness TCB).
     for (const auto &edge : loop.edges) {
@@ -4843,7 +4844,7 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
   if (auto objVal = obj->getNumber("objective"))
     loop.partitionCost = *objVal;
   LLVM_DEBUG({
-    llvm::dbgs() << "[Phase4-JOINT] CP-SAT partition: "
+    llvm::dbgs() << "[Phase4-JOINT] joint-solver partition: "
                  << obj->getInteger("used_wgs").value_or(-1)
                  << " WGs, cost=" << loop.partitionCost << "\n";
     for (const auto &c : clusters)
@@ -4866,7 +4867,7 @@ static bool partitionJointCPSAT(ttg::ScheduleLoop &loop,
 /// `TRITON_MODULO_EXHAUSTIVE_PARTITION=0|off|false` opts into the greedy
 /// fallback partitioner. Default is the exhaustive Phase 4 search.
 /// `jointMode` (set by the joint-solver pass, Off under the modulo pass)
-/// engages the CP-SAT joint partition above; each per-loop solver failure
+/// engages the joint-solver partition above; each per-loop solver failure
 /// falls back down the chain to the exhaustive scorer.
 static void
 applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
@@ -4918,11 +4919,11 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
       // pipelining). No env flag, no hard override.
       // TRITON_MODULO_EXHAUSTIVE_PARTITION=0 selects the greedy heuristic,
       // but only WITHIN heuristic partitioning: when a joint mode is active
-      // (the joint pass, or the cpsat-schedule promotion in
-      // runScheduleDriver) the env var must not silently disable the CP-SAT
-      // partition — heuristics on a CP-SAT schedule re-create the
-      // softmax-cut failure class. It instead picks which heuristic the
-      // joint chain falls back to.
+      // (the joint pass, or the joint_solver-schedule promotion in
+      // runScheduleDriver) the env var must not silently disable the
+      // joint-solver partition — heuristics on a joint-solver schedule
+      // re-create the softmax-cut failure class. It instead picks which
+      // heuristic the joint chain falls back to.
       if (useGreedy && jointMode == ttg::JointSolverMode::Off) {
         partitionIntoWarpGroups(schedLoop);
       } else {
@@ -4934,10 +4935,10 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops,
         bool jointDone = false;
         if (jointMode == ttg::JointSolverMode::V2ThenV1 ||
             jointMode == ttg::JointSolverMode::V2Only)
-          jointDone = partitionJointCPSAT(schedLoop, reserved, /*v2=*/true);
+          jointDone = partitionJointSolver(schedLoop, reserved, /*v2=*/true);
         if (!jointDone && (jointMode == ttg::JointSolverMode::V2ThenV1 ||
                            jointMode == ttg::JointSolverMode::V1Only))
-          jointDone = partitionJointCPSAT(schedLoop, reserved, /*v2=*/false);
+          jointDone = partitionJointSolver(schedLoop, reserved, /*v2=*/false);
         if (!jointDone) {
           if (useGreedy)
             partitionIntoWarpGroups(schedLoop);
@@ -5827,7 +5828,7 @@ void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
   // config — global knobs that shape how the solver turns this DDG into a
   // ScheduleGraph (algorithm choice + memory budgets driving buffer sizing).
   {
-    // Override-aware: reports "cpsat" under the joint-solver pass.
+    // Override-aware: reports "joint_solver" under the joint-solver pass.
     std::string algo = ttg::getActiveScheduleAlgo();
     os << "  \"config\": {\"schedule_algo\": \"" << jsonEscape(algo)
        << "\", \"smem_budget_bytes\": " << kSmemBudgetBytes()
@@ -5935,28 +5936,29 @@ applyEpilogueSubtiling(ModuleOp moduleOp, const ttg::LatencyModel &model,
 /// legal.
 LogicalResult ttg::runScheduleDriver(ModuleOp moduleOp,
                                      const ScheduleDriverOptions &opts) {
-  // The joint-solver pass forces the CP-SAT schedule backend for the whole
-  // run (including super-node child re-schedules deep in
+  // The joint-solver pass forces the "joint_solver" schedule backend for the
+  // whole run (including super-node child re-schedules deep in
   // buildScheduleGraph); the modulo pass leaves selection to
   // TRITON_USE_MODULO_SCHEDULE.
   std::optional<ttg::ScopedScheduleAlgoOverride> algoOverride;
   if (!opts.forceScheduleAlgo.empty())
     algoOverride.emplace(opts.forceScheduleAlgo);
 
-  // Schedule/partition capability coupling (2026-07-10): a CP-SAT schedule
-  // presses II to the proven minimum, and the heuristic partitioners were
-  // shaped by Rau-conservative schedules — on FA the combination re-creates
-  // the softmax-cut failure class guard 1 used to fence (case3 at MinII with
-  // the heuristic partitioner: 292.9 TF vs 662 with the CP-SAT partition,
-  // 2.23x). CP-SAT schedules therefore always get the CP-SAT v1 partition:
-  // TRITON_USE_MODULO_SCHEDULE=cpsat becomes "joint pass minus v2" instead
-  // of a trap, and Off keeps meaning "heuristic partition for heuristic
-  // schedules". See docs/SolverMigrationNotes.md (2026-07-10 second entry).
+  // Schedule/partition capability coupling (2026-07-10): a joint-solver
+  // schedule presses II to the proven minimum, and the heuristic partitioners
+  // were shaped by Rau-conservative schedules — on FA the combination
+  // re-creates the softmax-cut failure class guard 1 used to fence (case3 at
+  // MinII with the heuristic partitioner: 292.9 TF vs 662 with the joint-solver
+  // partition, 2.23x). Joint-solver schedules therefore always get the
+  // joint-solver v1 partition: TRITON_USE_MODULO_SCHEDULE=joint_solver becomes
+  // "joint pass minus v2" instead of a trap, and Off keeps meaning "heuristic
+  // partition for heuristic schedules". See docs/SolverMigrationNotes.md
+  // (2026-07-10 second entry).
   JointSolverMode jointMode = opts.jointMode;
   if (jointMode == JointSolverMode::Off &&
-      ttg::getActiveScheduleAlgo() == "cpsat") {
-    LDBG("CP-SAT schedule backend active — promoting warp partition "
-         "from heuristic to CP-SAT v1");
+      ttg::getActiveScheduleAlgo() == "joint_solver") {
+    LDBG("Joint-solver schedule backend active — promoting warp partition "
+         "from heuristic to joint-solver v1");
     jointMode = JointSolverMode::V1Only;
   }
 
@@ -6201,7 +6203,7 @@ namespace {
 
 /// The main pass — a thin shell over the shared driver with the joint
 /// solver Off and algorithm selection left to TRITON_USE_MODULO_SCHEDULE.
-/// Its CP-SAT sibling lives in JointSolverSchedulePass.cpp.
+/// Its joint-solver sibling lives in JointSolverSchedulePass.cpp.
 struct ModuloSchedulePass
     : public PassWrapper<ModuloSchedulePass, OperationPass<ModuleOp>> {
 

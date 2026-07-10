@@ -10,15 +10,15 @@ kernel passes correctness); case4 does not exist in the repo. Correctness:
 every entry below passed.
 
 Values within ±0.02x are run-to-run noise. The only entries outside noise
-are case3 at (1,32,8192): cpsat alone −2% (the documented alpha-order gap —
-this is why the gate blocks cpsat-alone from default) and the two full
+are case3 at (1,32,8192): joint_solver alone −2% (the documented alpha-order gap —
+this is why the gate blocks joint_solver-alone from default) and the two full
 stacks +2% (the ~665 TFLOPS plateau, 4th independent reproduction).
 
-## Config `cpsat` — TRITON_USE_MODULO_SCHEDULE=cpsat
+## Config `joint_solver` — TRITON_USE_MODULO_SCHEDULE=joint_solver
 
 **SUPERSEDED 2026-07-10**: this table (and the alpha-order-gap rationale
-above) was measured with cpsat schedule + HEURISTIC partition. The driver
-now pairs every cpsat schedule with the CP-SAT v1 partition
+above) was measured with joint_solver schedule + HEURISTIC partition. The driver
+now pairs every joint_solver schedule with the CP-SAT v1 partition
 (SolverMigrationNotes.md, 2026-07-10 second entry); remeasured case3
 (1,32,8192) canary: 663.6/651 OK. Table kept as the historical record of
 the heuristic pairing.
@@ -51,7 +51,7 @@ the heuristic pairing.
 | case6 (65536,512) | 1.00x | 2623 GB/s |
 | case6 (262144,512) | 1.00x | 3084 GB/s |
 
-## Config `full` — cpsat + JOINT=2
+## Config `full` — joint_solver + JOINT=2
 
 | Case / shape | Speedup | Note |
 |---|---|---|
@@ -66,7 +66,7 @@ the heuristic pairing.
 | case6 (all shapes) | 1.00x | 1638 / 2623 / 3084 GB/s |
 | case7 (all shapes) | 1.00x | parity |
 
-## Config `full-noguard` — cpsat + JOINT=2 + DISABLE_MMA_GUARD (case3 II=1325)
+## Config `full-noguard` — joint_solver + JOINT=2 + DISABLE_MMA_GUARD (case3 II=1325)
 
 | Case / shape | Speedup | Note |
 |---|---|---|
@@ -85,7 +85,7 @@ the heuristic pairing.
 
 All five config tables above REPRODUCE within ±0.02x noise (fresh
 `solver_regression.py --keep` run + ad-hoc case5 bench; the only
-outside-noise entries are the same two as before: cpsat-alone case3
+outside-noise entries are the same two as before: joint_solver-alone case3
 canary 639.9/651 MISS, full/full-noguard 664.1/666.1 canary OK).
 
 New: the Route A sub-tiled FA kernel

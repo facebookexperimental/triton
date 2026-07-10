@@ -2,8 +2,8 @@
 
 #include "ModuloReservationTable.h"
 
-#include "CPSATScheduler.h"
 #include "ExhaustiveScheduler.h"
+#include "JointSolverScheduler.h"
 #include "SwingScheduler.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/Debug.h"
@@ -294,7 +294,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
     maxII = 2 * minII;
 
   // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
-  //   "cpsat"      → CP-SAT complete solver (OR-Tools subprocess), joint
+  //   "joint_solver" → complete solver (OR-Tools CP-SAT subprocess), joint
   //                  schedule + buffer depths; falls back to Rau on failure
   //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
   //   "exhaustive" → Exhaustive search with joint memory feasibility
@@ -304,7 +304,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   // env var — getActiveScheduleAlgo folds both into one answer.
   auto algo = getActiveScheduleAlgo();
 
-  if (algo == "cpsat") {
+  if (algo == "joint_solver") {
     // Complete search: sweeps II from minII to a true feasibility bound
     // (critical path + serial work) with NO slack window — the window below
     // (guard 2) exists only to absorb the incomplete heuristics'
@@ -316,18 +316,18 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
     // placement discipline (criticality-ordered issue within a pipeline
     // row) and departs only for a strictly better objective. Rau failing
     // (e.g. layernorm's fragmented CUDA row) just means no hint.
-    LLVM_DEBUG(DBGS() << "Using CP-SAT complete solver\n");
+    LLVM_DEBUG(DBGS() << "Using joint solver (OR-Tools CP-SAT)\n");
     int rauMaxII = std::min(maxII, minII + std::max(10, minII / 8));
     auto incumbent = runRauIMS(ddg, minII, rauMaxII, maxBacktracks);
-    auto res = runCPSATSchedule(ddg, minII,
-                                succeeded(incumbent) ? &*incumbent : nullptr);
+    auto res = runJointSolverSchedule(
+        ddg, minII, succeeded(incumbent) ? &*incumbent : nullptr);
     if (succeeded(res))
       return res;
     if (succeeded(incumbent)) {
-      LLVM_DEBUG(DBGS() << "CP-SAT failed — returning Rau incumbent\n");
+      LLVM_DEBUG(DBGS() << "Joint solver failed — returning Rau incumbent\n");
       return incumbent;
     }
-    LLVM_DEBUG(DBGS() << "CP-SAT failed/unavailable — falling back\n");
+    LLVM_DEBUG(DBGS() << "Joint solver failed/unavailable — falling back\n");
   }
 
   // Cap maxII to avoid spending too long on large DDGs. The slack window
@@ -336,7 +336,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   // modulo-scheduling folklore) is too narrow to absorb reservation-table
   // fragmentation when one pipeline is saturated (ResMII-bound with zero
   // slack, e.g. layernorm's CUDA pipe). Applies to the heuristic paths
-  // below only — the cpsat path above needs no window (guard 2).
+  // below only — the joint_solver path above needs no window (guard 2).
   maxII = std::min(maxII, minII + std::max(10, minII / 8));
 
   LLVM_DEBUG({

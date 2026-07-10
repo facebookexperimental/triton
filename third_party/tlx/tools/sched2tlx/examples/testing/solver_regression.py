@@ -1,6 +1,6 @@
 """Solver-configuration regression gate for the modulo scheduler.
 
-SolverMigrationNotes step-4 item 5 (the default-flip gate): for each CP-SAT
+SolverMigrationNotes step-4 item 5 (the default-flip gate): for each joint-solver
 solver configuration and each regenerable case,
 
     pre_modulo TTGIR --(triton-opt -nvgpu-modulo-schedule, config env)-->
@@ -45,18 +45,18 @@ REPO_ROOT = EXAMPLES_DIR.parents[4]  # examples -> sched2tlx -> tools -> tlx -> 
 
 # Each config names the scheduling pass triton-opt runs plus env tuning it.
 # The joint solver is its own pass (nvgpu-joint-solver-schedule) since the
-# modulo/joint split; it always uses the cpsat schedule backend, so the old
+# modulo/joint split; it always uses the joint_solver schedule backend, so the old
 # rau-schedule + joint-partition combinations (TRITON_MODULO_CPSAT_JOINT on
 # the modulo pass) no longer exist. Guard 1 is deleted outright, so the old
 # "full-noguard" config is simply "full" now. joint-mode mapping: 0 = v2
 # then v1 fallback (old CPSAT_JOINT=2), 1 = v1 only (old CPSAT_JOINT=1),
 # 2 = v2 strict (new).
 CONFIGS = {
-    # cpsat schedule via the modulo pass; the driver pairs it with the
-    # CP-SAT v1 partition (2026-07-10 promotion — heuristic partitions
+    # joint_solver schedule via the modulo pass; the driver pairs it with the
+    # joint-solver v1 partition (2026-07-10 promotion — heuristic partitions
     # mis-handle MinII-aggressive schedules), so this is "joint minus v2"
-    "cpsat": {"pass": "-nvgpu-modulo-schedule",
-              "env": {"TRITON_USE_MODULO_SCHEDULE": "cpsat"}},
+    "joint_solver": {"pass": "-nvgpu-modulo-schedule",
+              "env": {"TRITON_USE_MODULO_SCHEDULE": "joint_solver"}},
     # partition-only joint solve (v1: cycles fixed)
     "joint1": {"pass": "-nvgpu-joint-solver-schedule=joint-mode=1", "env": {}},
     # cycles + wg in one solve, strict (no v1 fallback)
@@ -112,7 +112,7 @@ def dump_and_emit(opt: Path, case: str, cfg: dict, tmp: Path) -> Path | None:
     gen = tmp / f"{case}.generated.py"
     env = dict(os.environ)
     env.update(cfg["env"])
-    env.setdefault("TRITON_MODULO_CPSAT_CMD", f"{sys.executable} -m triton.tools.modulo_cpsat")
+    env.setdefault("TRITON_MODULO_JOINT_SOLVER_CMD", f"{sys.executable} -m triton.tools.modulo_joint_solver")
     env["TRITON_MODULO_DUMP_SCHEDULE"] = str(graph)
     proc = subprocess.run(
         [str(opt), str(EXAMPLES_DIR / case / CASES[case]), "-allow-unregistered-dialect",

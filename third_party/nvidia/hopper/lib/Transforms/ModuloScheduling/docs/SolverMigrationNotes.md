@@ -82,7 +82,7 @@ constraint; reservation-table fragmentation is not a failure mode of a
 complete search. No replacement needed.
 
 **[DONE for the CP-SAT backend, 2026-07-05, branch
-hwu27/modulo-cpsat-backend]** `TRITON_USE_MODULO_SCHEDULE=cpsat` sweeps II
+hwu27/modulo-cpsat-backend]** `TRITON_USE_MODULO_SCHEDULE=joint_solver` sweeps II
 from minII to the true feasibility bound (critical path + serial work)
 with no window; the window now applies to the heuristic paths only. The
 guard-2 canary resolved exactly as predicted: CP-SAT schedules layernorm
@@ -301,10 +301,10 @@ correctness.
    buffer depths only (partitioner stays), with cost normalization. This
    alone deletes guard 2.
    **[DONE 2026-07-05, branch hwu27/modulo-cpsat-backend]**
-   `TRITON_USE_MODULO_SCHEDULE=cpsat` (opt-in; default path unchanged):
-   `CPSATScheduler.cpp` serializes the DDG + buffers and drives an OR-Tools
+   `TRITON_USE_MODULO_SCHEDULE=joint_solver` (opt-in; default path unchanged):
+   `JointSolverScheduler.cpp` serializes the DDG + buffers and drives an OR-Tools
    CP-SAT solver in a Python subprocess
-   (`python/triton/tools/modulo_cpsat.py`, same subprocess pattern as
+   (`python/triton/tools/modulo_joint_solver.py`, same subprocess pattern as
    LLMSchedulePass), then RE-VERIFIES the returned schedule in C++ — the
    solver is advisory, never trusted. Model: modular NoOverlap per pipeline
    (selfLatency reservations, wrap-around split), dependence + def-before-
@@ -312,7 +312,7 @@ correctness.
    cumulative (vs the exhaustive's conservative coloring), objective =
    ExhaustiveScheduler's score. Rau runs first as a warm-start incumbent
    hint. Cost normalization (Twill §5.2, side CP-SAT ILP, U=300 via
-   TRITON_MODULO_CPSAT_NORMALIZE) seeds the search — with interval
+   TRITON_MODULO_JOINT_SOLVER_NORMALIZE) seeds the search — with interval
    encoding it is an accelerator, not a tractability requirement (that
    requirement is specific to time-indexed formulations).
    Validation: case1/5/7 reproduce II=256 (+8192 outer) with identical
@@ -327,7 +327,7 @@ correctness.
    (1,32,8192) — an 8% loss the model cannot see. The recurrence-chain
    criticality of the rowsum is exactly the kind of term the joint
    formulation's objective must price before the solver is allowed to own
-   these decisions. Until then: cpsat is opt-in and the case3 canary gates
+   these decisions. Until then: joint_solver is opt-in and the case3 canary gates
    any default flip.
 3. **Long**: joint schedule+partition formulation (deletes guard 1, converts
    guard 3 to constraints), sub-tiling in front, streaming depths handed to
@@ -348,7 +348,7 @@ correctness.
    before a partition exists — the precise motivation for (b) and for
    joint cycles+wg (v2).
    (b) *Joint partition v1* (`TRITON_MODULO_CPSAT_JOINT=1`, opt-in;
-   `partitionJointCPSAT` → `solve_partition` in modulo_cpsat.py): warp
+   `partitionJointSolver` → `solve_partition` in modulo_joint_solver.py): warp
    assignment solved by CP-SAT against the committed schedule (cycles
    fixed — Twill's re-solve shape), replacing scoreCandidate's
    enumerate-and-score with constraints over the SAME calibrated costs:
@@ -367,12 +367,12 @@ correctness.
    the softmax chain intact.** The partition that guard 1 and the fitted
    round-trip constant were added to protect now emerges from first
    principles; this is the concrete path to deleting guard 1 once the
-   joint mode owns partitioning. Full stack (cpsat schedule + joint
+   joint mode owns partitioning. Full stack (joint_solver schedule + joint
    partition, 2026-07-06 measurements): correctness passes on all cases;
    on case3 it produces a 5-WG variant (PV-MMA merged into the rescale
    WG) that measures **664.1 TFLOPS at (1,32,8192) — 2.1% ABOVE the 651
    canary** (vs 650 for the hand-protected 6-WG + Rau default, 639 for
-   the cpsat schedule under the heuristic partition). The B < A < C
+   the joint_solver schedule under the heuristic partition). The B < A < C
    ordering is the joint-formulation thesis in one row of data: the
    solver's schedule loses to Rau under the old partition but wins when
    paired with its own matching partition. Small shapes are within noise
@@ -401,7 +401,7 @@ parallel.
    Measured targets: case3 B-config ≥ 651 without joint partitioning
    enabled being the excuse; explore whether C's 664 improves further.
    **[2026-07-06 status: infrastructure LANDED
-   (TRITON_MODULO_CPSAT_JOINT=2, solve_joint in modulo_cpsat.py: full
+   (TRITON_MODULO_CPSAT_JOINT=2, solve_joint in modulo_joint_solver.py: full
    dependence + per-pipeline and conditional per-WG modular NoOverlap +
    circular-difference flight exclusion + depth-from-stage SMEM + cycle
    write-back with buffer re-derivation and a C++ dependence
@@ -423,7 +423,7 @@ parallel.
    correctness: case1/5/7 hint-parity, case6 re-solved cycles PASS,
    case3 PASS on both the Rau-hint path (returns to 6-WG committed
    parity — the 5-WG merge was only objective-profitable together with
-   the now-forbidden version-skewed reorder) and the cpsat-schedule path
+   the now-forbidden version-skewed reorder) and the joint_solver-schedule path
    (5 WGs, re-solved cycles, at both guarded II=1459 and unguarded
    II=1325). Measured: 664.9 TFLOPS at (1,32,8192) for both v2
    full-stack configs — the ~665 plateau is now reproduced by THREE
@@ -441,7 +441,7 @@ parallel.
    constraints at the LOWER unguarded MinII (1325), and the case3 canary
    holds. Keep the guard for the heuristic paths (they still need it).
    **[DONE 2026-07-06 — VALIDATED, did not need v2:**
-   TRITON_MODULO_DISABLE_MMA_GUARD=1 bypasses Phase 2.75; with the cpsat
+   TRITON_MODULO_DISABLE_MMA_GUARD=1 bypasses Phase 2.75; with the joint_solver
    schedule + the v1 joint partitioner, case3 solves at the unguarded
    MinII=1325, the partition keeps the softmax chain co-resident (5 WGs,
    exp2+rowsum together — the cut guard 1 existed to prevent does NOT
@@ -519,7 +519,7 @@ parallel.
    case3 canary as the hard gate.
    **[FIRST CUT DONE 2026-07-06:
    `examples/testing/solver_regression.py` — for each solver config
-   (cpsat / joint1 / joint2 / full / full-noguard) × regenerable case:
+   (joint_solver / joint1 / joint2 / full / full-noguard) × regenerable case:
    regenerate → emit → byte-parity fast path (identical codegen skips the
    GPU) → correctness + per-shape perf vs the committed kernel
    (--perf-tol) → the case3 canary as a hard absolute gate
@@ -553,17 +553,17 @@ Mapping from the retired knobs:
   v2 → v1 fallback chain);
 - `TRITON_MODULO_CPSAT_JOINT=1` → `joint-mode=1` (v1 only);
 - `joint-mode=2` (strict v2, no fallback) is new;
-- the joint pass always forces the cpsat schedule backend, so the old
+- the joint pass always forces the joint_solver schedule backend, so the old
   rau-schedule + joint-partition combinations no longer exist;
 - `TRITON_MODULO_DISABLE_MMA_GUARD` was retired with guard 1's deletion.
 
 The modulo pass (`TRITON_USE_MODULO_SCHEDULE`) is back to pure heuristic
-scheduling + heuristic partition; its `=cpsat` backend value was left as
-a schedule-only middle ground (cpsat schedule + heuristic partition) —
+scheduling + heuristic partition; its `=joint_solver` backend value was left as
+a schedule-only middle ground (joint_solver schedule + heuristic partition) —
 UNTIL the 2026-07-10 promotion entry below: the round-1 measurements
-showed that combination is a trap, and the driver now pairs every cpsat
+showed that combination is a trap, and the driver now pairs every joint_solver
 schedule with the CP-SAT v1 partition. `solver_regression.py` configs
-updated to the pass-based selection (cpsat / joint1 / joint2 / full).
+updated to the pass-based selection (joint_solver / joint1 / joint2 / full).
 
 ## 2026-07-09 (second entry): Twill-gap implementation round 1
 
@@ -655,16 +655,16 @@ ceiling reference.
   RRT-adjacent calibration this doc already sequences. On case4 the capped
   partition produced a HUNG kernel (killed at 10 min) — yet another
   emitter/solver contract instance for the case4 canary pile.
-- **NEW COVERAGE FINDING — `cpsat` (schedule-only middle ground) is now a
+- **NEW COVERAGE FINDING — `joint_solver` (schedule-only middle ground) is now a
   trap on FA**: case3 at the unguarded MinII=1325 with the HEURISTIC
   partitioner drops to 292.9 TF (2.23x). Guard 1's deletion was validated
   for the joint path ("deletion should land together with making joint
   partitioning that path's default" — #1917) but landed for every path;
-  schedule-only cpsat + heuristic partition is exactly the uncovered
+  schedule-only joint_solver + heuristic partition is exactly the uncovered
   combination, reproducing the softmax-cut failure class the guard used to
-  prevent. Options: route the cpsat backend's partition through the joint
+  prevent. Options: route the joint_solver backend's partition through the joint
   solver too, restore a guard-1-shaped fence for the non-joint path only,
-  or retire the `=cpsat` middle ground once the joint pass is default.
+  or retire the `=joint_solver` middle ground once the joint pass is default.
   **RESOLVED 2026-07-10**: option 1 landed — see the schedule/partition
   coupling entry below (case3 back to 663.6, canary OK).
 
@@ -683,7 +683,7 @@ failed (dQ=2.17), i.e. not a single-channel bug but a whole-schedule
 version-alignment bug.
 
 Fix (compile-time rejection, "direction 3"): a stage-invariance gate in
-partitionJointCPSAT's v2 acceptance path, after the dependence-latency
+partitionJointSolver's v2 acceptance path, after the dependence-latency
 safety net and before the cycle writeback — any solution moving a node to
 a different stage than the incumbent is rejected and the loop falls back
 to v1 (cycles fixed, version-safe by construction). Same-stage cycle
@@ -700,18 +700,18 @@ per-channelized-edge stage/distance consistency once the emitter can
 re-derive version structure for stage-moved nodes — that is the real
 unlock for stage-changing v2 solutions, and it subsumes the gate.
 
-## 2026-07-10 (second entry): schedule/partition coupling — cpsat promotes to V1Only
+## 2026-07-10 (second entry): schedule/partition coupling — joint_solver promotes to V1Only
 
-Resolution of the round-1 coverage finding above ("`cpsat` is now a trap
+Resolution of the round-1 coverage finding above ("`joint_solver` is now a trap
 on FA"), option 1: `runScheduleDriver` promotes `JointSolverMode::Off` to
-`V1Only` whenever the active schedule backend is `cpsat`. A CP-SAT
+`V1Only` whenever the active schedule backend is `joint_solver`. A CP-SAT
 schedule presses II to the proven minimum; the heuristic partitioners
 were shaped by Rau-conservative schedules and mis-partition those (case3:
 292.9 TF, 2.23x). CP-SAT schedules therefore always get the CP-SAT v1
-partition — `TRITON_USE_MODULO_SCHEDULE=cpsat` is now "joint pass minus
+partition — `TRITON_USE_MODULO_SCHEDULE=joint_solver` is now "joint pass minus
 v2" rather than a schedule-only middle ground, and `Off` keeps meaning
 "heuristic partition for heuristic schedules". Verified on B200: config
-`cpsat` case3 canary 663.6/651 OK (was 292.9 MISS), case4/5/6 clean,
+`joint_solver` case3 canary 663.6/651 OK (was 292.9 MISS), case4/5/6 clean,
 case1/7 parity.
 
 Companion fix in `applyGlobalWarpPartition`: the
@@ -721,9 +721,9 @@ joint pass AND for this promotion (re-creating the very trap). The env
 var now only selects which heuristic (greedy vs exhaustive scorer) serves
 as the joint chain's fallback; it disables the joint solve for no one.
 
-Doc debt paid with it: the 2026-07-09 pass-split entry's "=cpsat remains
-schedule-only" sentence, `solver_regression.py`'s `cpsat` config comment,
-and `SolverConfigMeasurements.md`'s cpsat table (its 638.0 alpha-order
+Doc debt paid with it: the 2026-07-09 pass-split entry's "=joint_solver remains
+schedule-only" sentence, `solver_regression.py`'s `joint_solver` config comment,
+and `SolverConfigMeasurements.md`'s joint_solver table (its 638.0 alpha-order
 numbers were measured with the heuristic partition; superseded by the
 v1-partition pairing).
 
@@ -740,15 +740,15 @@ yet reproduced. What the investigation ESTABLISHED:
   time. So the varying dimension reaching the emitter is the cycle/stage
   structure of the schedule itself.
 - **Emitter is translation-robust (tested)**: `TRITON_MODULO_SCHED_SHIFT=k`
-  (new debug knob in CPSATScheduler.cpp) rigidly translates the solution
+  (new debug knob in JointSolverScheduler.cpp) rigidly translates the solution
   before the native re-verification/liveness pipeline; sweeping k over
   {0,86,...,1032} — including shifts that change max_stage 3→4 — passed
   correctness 13/13. Global stage-split choice is NOT the failing
   dimension.
-- **Exhaustive-fallback partition on a cpsat schedule passed (tested)**:
+- **Exhaustive-fallback partition on a joint_solver schedule passed (tested)**:
   forcing the v1 partition subprocess to fail (wrapper rejecting
   "mode"-carrying problems) exercised partitionExhaustive on a
-  MinII-aggressive cpsat schedule — case4 numerics correct. The
+  MinII-aggressive joint_solver schedule — case4 numerics correct. The
   load-induced-fallback hypothesis did not reproduce either.
 - Remaining suspects: a rare LOCAL schedule structure (non-translation)
   that the emitter mis-lowers, or a transient environment fault. The
@@ -855,7 +855,7 @@ joint-mode=2 hunt (12 draws, ring-index fix in): every v2-ACCEPTED draw
 (the 8-WG shape that was previously always wrong) now passes correctness —
 3 independent accepted draws confirmed. One draw HUNG (300s kill): its v2
 was gate-rejected and joint-mode=2 has no v1 fallback, so it took the
-EXHAUSTIVE heuristic partition on the MinII cpsat schedule — a 4-WG layout
+EXHAUSTIVE heuristic partition on the MinII joint_solver schedule — a 4-WG layout
 folding TMA loads into compute WGs. Zero alias waits present (not the new
 mechanism); same class as the earlier full-regcap hang. Reachable from the
 default V2ThenV1 chain only when BOTH v2 and v1 fail (e.g. subprocess
@@ -865,7 +865,7 @@ replays deterministically through sched2tlx; see its README).
 OPEN — next root-cause target.
 Options while open: make the terminal fallback Rau+heuristic (retreat to
 the fully-heuristic pairing instead of mixing exhaustive-partition with a
-MinII cpsat schedule), or gate the exhaustive fallback behind the same
+MinII joint_solver schedule), or gate the exhaustive fallback behind the same
 schedule/partition coupling rule as the Off->V1Only promotion.
 
 ## 2026-07-10 (fifth entry): gate-removal experiment + v1-vs-v2 measurement — gate RESTORED

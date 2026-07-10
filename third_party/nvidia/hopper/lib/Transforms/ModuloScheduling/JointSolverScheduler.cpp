@@ -1,9 +1,10 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 //
-// See CPSATScheduler.h. Problem/solution schema is versioned "cpsat-0.1"
-// and documented in python/triton/tools/modulo_cpsat.py.
+// See JointSolverScheduler.h. Problem/solution schema is versioned
+// "joint-solver-0.1" and documented in
+// python/triton/tools/modulo_joint_solver.py.
 
-#include "CPSATScheduler.h"
+#include "JointSolverScheduler.h"
 
 #include "ExhaustiveScheduler.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -16,7 +17,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 
-#define DEBUG_TYPE "modulo-scheduling-cpsat"
+#define DEBUG_TYPE "modulo-scheduling-joint-solver"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 
 namespace mlir::triton::gpu {
@@ -94,11 +95,11 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
   }
 
   double timeLimitS = 20.0;
-  if (auto env = tools::getStrEnv("TRITON_MODULO_CPSAT_TIMEOUT_S");
+  if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_TIMEOUT_S");
       !env.empty())
     timeLimitS = std::max(1.0, std::atof(env.c_str()));
   int64_t normalizeU = 300;
-  if (auto env = tools::getStrEnv("TRITON_MODULO_CPSAT_NORMALIZE");
+  if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_NORMALIZE");
       !env.empty())
     normalizeU = std::atoll(env.c_str());
 
@@ -106,7 +107,7 @@ static std::string buildProblemJSON(const DataDependenceGraph &ddg, int minII,
       tools::getBoolEnv("TRITON_MODULO_STREAMING_VL"); // default off
 
   llvm::json::Object root{
-      {"version", "cpsat-0.1"},
+      {"version", "joint-solver-0.1"},
       {"min_ii", minII},
       {"max_ii", maxII},
       {"smem_budget", smemBudget},
@@ -184,11 +185,13 @@ static bool verifySolution(const DataDependenceGraph &ddg,
   return true;
 }
 
-FailureOr<std::string> runCPSATSubprocess(llvm::StringRef problemJson) {
+FailureOr<std::string> runJointSolverSubprocess(llvm::StringRef problemJson) {
   llvm::SmallString<128> inPath, outPath;
-  if (llvm::sys::fs::createTemporaryFile("modulo-cpsat-in", "json", inPath))
+  if (llvm::sys::fs::createTemporaryFile("modulo-joint-solver-in", "json",
+                                         inPath))
     return failure();
-  if (llvm::sys::fs::createTemporaryFile("modulo-cpsat-out", "json", outPath)) {
+  if (llvm::sys::fs::createTemporaryFile("modulo-joint-solver-out", "json",
+                                         outPath)) {
     llvm::sys::fs::remove(inPath);
     return failure();
   }
@@ -207,10 +210,11 @@ FailureOr<std::string> runCPSATSubprocess(llvm::StringRef problemJson) {
 
   // Same subprocess pattern as LLMSchedulePass. The default command form
   // works wherever the invoking environment can import triton (the normal
-  // JIT path); standalone triton-opt runs can point TRITON_MODULO_CPSAT_CMD
-  // at an explicit interpreter + script.
-  std::string cmdPrefix = "python3 -m triton.tools.modulo_cpsat";
-  if (auto env = tools::getStrEnv("TRITON_MODULO_CPSAT_CMD"); !env.empty())
+  // JIT path); standalone triton-opt runs can point
+  // TRITON_MODULO_JOINT_SOLVER_CMD at an explicit interpreter + script.
+  std::string cmdPrefix = "python3 -m triton.tools.modulo_joint_solver";
+  if (auto env = tools::getStrEnv("TRITON_MODULO_JOINT_SOLVER_CMD");
+      !env.empty())
     cmdPrefix = env;
   std::string cmd = cmdPrefix + " " + std::string(inPath) + " " +
                     std::string(outPath) + " 2>/dev/null";
@@ -225,16 +229,16 @@ FailureOr<std::string> runCPSATSubprocess(llvm::StringRef problemJson) {
 }
 
 FailureOr<ModuloScheduleResult>
-runCPSATSchedule(const DataDependenceGraph &ddg, int minII,
-                 const ModuloScheduleResult *incumbent, int smemBudget,
-                 int tmemColLimit) {
+runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
+                       const ModuloScheduleResult *incumbent, int smemBudget,
+                       int tmemColLimit) {
   if (minII <= 0 || ddg.getNumNodes() == 0)
     return failure();
   int maxII = serialUpperBound(ddg, minII);
   LLVM_DEBUG(DBGS() << "minII=" << minII << " maxII(serial bound)=" << maxII
                     << " nodes=" << ddg.getNumNodes() << "\n");
 
-  auto rawOut = runCPSATSubprocess(
+  auto rawOut = runJointSolverSubprocess(
       buildProblemJSON(ddg, minII, maxII, smemBudget, tmemColLimit, incumbent));
   if (failed(rawOut))
     return failure();

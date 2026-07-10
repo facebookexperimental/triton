@@ -16,7 +16,7 @@
 namespace mlir::triton::gpu {
 
 /// One SMEM/TMEM buffer extracted from the DDG for joint schedule+memory
-/// feasibility. Shared by the exhaustive and CP-SAT backends.
+/// feasibility. Shared by the exhaustive and joint-solver backends.
 struct SchedBufferInfo {
   unsigned allocNodeIdx;
   bool isTmem;

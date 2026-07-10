@@ -1,12 +1,12 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 //
-// Joint-solver scheduling pass — ModuloSchedulePass's CP-SAT sibling.
+// Joint-solver scheduling pass — ModuloSchedulePass's complete-solver sibling.
 //
 // Runs the same shared driver (ModuloScheduleDriver.h) with the complete
-// solver engaged end-to-end: the per-loop schedule comes from the CP-SAT
+// solver engaged end-to-end: the per-loop schedule comes from the joint-solver
 // backend (TRITON_USE_MODULO_SCHEDULE is ignored; the algorithm is forced
-// to "cpsat", with Rau as warm-start incumbent and fallback), and the
-// warp-group partition comes from the joint CP-SAT re-solve (v2: cycles +
+// to "joint_solver", with Rau as warm-start incumbent and fallback), and the
+// warp-group partition comes from the joint partition re-solve (v2: cycles +
 // warp groups in one model → v1: warp groups only → exhaustive scorer).
 // Every solver failure degrades down that chain, so the pass never fails
 // where the modulo pass would have succeeded.
@@ -42,7 +42,7 @@ struct JointSolverSchedulePass
   }
 
   StringRef getDescription() const override {
-    return "CP-SAT joint schedule + warp-group partition (Pass A sibling)";
+    return "Joint-solver schedule + warp-group partition (Pass A sibling)";
   }
 
   // Same test-only knob as the modulo pass (lit tests in opt builds).
@@ -71,7 +71,7 @@ struct JointSolverSchedulePass
 
   void runOnOperation() override {
     ttg::ScheduleDriverOptions opts;
-    opts.forceScheduleAlgo = "cpsat";
+    opts.forceScheduleAlgo = "joint_solver";
     switch (jointMode) {
     case 1:
       opts.jointMode = ttg::JointSolverMode::V1Only;

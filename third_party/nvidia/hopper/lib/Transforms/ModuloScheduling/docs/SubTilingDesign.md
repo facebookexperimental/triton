@@ -144,7 +144,7 @@ passes correctness on the default pipeline (312 TFLOPS).
 
 What worked end-to-end:
 
-- DDG grows 31→55 nodes exactly as predicted; cpsat solves II=2396, Rau
+- DDG grows 31→55 nodes exactly as predicted; joint_solver solves II=2396, Rau
   II=2487 (recurrence-bound; MinII ~1198 was the resource floor).
 - The partitioner produced a perfect ping-pong-SHAPED 6-WG partition
   from first principles — 2 TMA, 2 TC, 2 softmax WGs, each sub-tile's

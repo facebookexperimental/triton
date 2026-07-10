@@ -1,11 +1,11 @@
-"""CP-SAT backend for the NV modulo scheduler (nvgpu-modulo-schedule).
+"""Joint-solver (OR-Tools CP-SAT) backend for the NV modulo scheduler.
 
 Complete (solver-based) replacement for the heuristic II search: joint
 schedule + buffer-depth feasibility, the successor of ExhaustiveScheduler's
 branch-and-bound (see docs/SolverMigrationNotes.md, "Suggested sequencing"
-step 2). Invoked as a subprocess by CPSATScheduler.cpp:
+step 2). Invoked as a subprocess by JointSolverScheduler.cpp:
 
-    python3 -m triton.tools.modulo_cpsat <problem.json> <solution.json>
+    python3 -m triton.tools.modulo_joint_solver <problem.json> <solution.json>
 
 The problem JSON is produced by the C++ side from the DDG; the solution JSON
 carries (II, per-node cycles) back. The C++ side re-verifies the solution
@@ -747,7 +747,7 @@ def solve_joint(prob):
 
 def main():
     if len(sys.argv) != 3:
-        print("usage: python -m triton.tools.modulo_cpsat <problem.json> <solution.json>", file=sys.stderr)
+        print("usage: python -m triton.tools.modulo_joint_solver <problem.json> <solution.json>", file=sys.stderr)
         return 2
     with open(sys.argv[1]) as f:
         prob = json.load(f)

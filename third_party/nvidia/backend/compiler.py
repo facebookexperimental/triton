@@ -749,7 +749,7 @@ class CUDABackend(BaseBackend):
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
             elif knobs.nvidia.use_joint_schedule:
-                # CP-SAT joint solver: schedule + warp-group partition +
+                # Joint solver (OR-Tools CP-SAT): schedule + warp-group partition +
                 # buffer depths decided in one model. Same slot and same
                 # annotation contract as the modulo pass below, so data
                 # partitioning and downstream WS consume it unchanged.
@@ -760,7 +760,7 @@ class CUDABackend(BaseBackend):
                 # see MMA ops before they're moved into WS regions. It
                 # sets tt.autows annotations (stage/order) on MMA ops.
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
-                # TRITON_USE_MODULO_SCHEDULE=cpsat|sms|exhaustive|random
+                # TRITON_USE_MODULO_SCHEDULE=joint_solver|sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
             # The modulo / LLM scheduler above already produced the full loop

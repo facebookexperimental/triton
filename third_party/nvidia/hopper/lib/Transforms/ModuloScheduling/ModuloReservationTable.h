@@ -57,7 +57,7 @@ struct ModuloScheduleResult {
 
 /// Run modulo scheduling on the DDG.
 /// Algorithm selected by TRITON_USE_MODULO_SCHEDULE env var value:
-///   "cpsat"      → CP-SAT complete solver (OR-Tools subprocess); falls
+///   "joint_solver" → complete solver (OR-Tools CP-SAT subprocess); falls
 ///                  back to Rau on failure
 ///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
 ///   "exhaustive" → Exhaustive search with joint memory feasibility
@@ -72,7 +72,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
 /// RAII override of the algorithm selection above. While an instance is
 /// alive, runModuloScheduling uses `algo` and ignores
 /// TRITON_USE_MODULO_SCHEDULE — the joint-solver pass holds one for its
-/// whole run to force the CP-SAT backend. Config here is process-global
+/// whole run to force the joint-solver backend. Config here is process-global
 /// (like the env vars it shadows): single-threaded pass-pipeline use only,
 /// no nesting.
 class ScopedScheduleAlgoOverride {

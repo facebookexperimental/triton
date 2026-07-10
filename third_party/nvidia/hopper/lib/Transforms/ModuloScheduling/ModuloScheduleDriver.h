@@ -3,7 +3,7 @@
 // Shared driver for the modulo-scheduling pass family.
 //
 // ModuloSchedulePass (heuristic backends, env-selected) and
-// JointSolverSchedulePass (CP-SAT joint schedule + warp partition) are thin
+// JointSolverSchedulePass (joint solver: schedule + warp partition) are thin
 // shells over the same orchestration: collect loops → schedule → global
 // warp-group partition → emit loop.stage/loop.cluster + buffer annotations.
 // ScheduleDriverOptions is the ONLY behavioural difference between them, so
@@ -23,12 +23,13 @@ namespace mlir::triton::gpu {
 enum class JointSolverMode {
   /// Heuristic partitioners only (exhaustive scorer / greedy). The modulo
   /// pass runs here. The driver promotes Off to V1Only whenever the active
-  /// schedule backend is "cpsat" — heuristic partitioners are shaped by
-  /// Rau-conservative schedules and mis-partition CP-SAT's MinII-aggressive
+  /// schedule backend is "joint_solver" — heuristic partitioners are shaped by
+  /// Rau-conservative schedules and mis-partition the joint solver's
+  /// MinII-aggressive
   /// ones (see runScheduleDriver), so Off is honoured only for heuristic
   /// schedules.
   Off,
-  /// CP-SAT joint re-solve: v2 (cycles + warp groups in one model) first,
+  /// Joint-solver re-solve: v2 (cycles + warp groups in one model) first,
   /// v1 (warp groups only, cycles fixed) if v2 fails, exhaustive scorer if
   /// both fail. The joint-solver pass default.
   V2ThenV1,
@@ -42,7 +43,7 @@ struct ScheduleDriverOptions {
   JointSolverMode jointMode = JointSolverMode::Off;
   /// When non-empty, forces the per-loop scheduling algorithm for the whole
   /// driver run (held as a ScopedScheduleAlgoOverride), ignoring
-  /// TRITON_USE_MODULO_SCHEDULE. The joint-solver pass forces "cpsat".
+  /// TRITON_USE_MODULO_SCHEDULE. The joint-solver pass forces "joint_solver".
   std::string forceScheduleAlgo;
   /// Mirror of the passes' print-schedule-graph test option.
   bool printScheduleGraph = false;
