@@ -293,7 +293,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     if layout is None:
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
-                layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
                 layout._tlx_default = True
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
@@ -305,7 +305,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
                     layout.numCTAOrder,
                 )
             elif _semantic.builder.options.arch.startswith("gfx"):
-                layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+                layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
                 layout._tlx_default = True
                 layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
                     layout.vectorSize,
@@ -344,6 +344,10 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         if storage != tlx.storage_kind.smem:
             raise NotImplementedError("User-specified layout encoding is only supported for shared memory (smem)")
         layout = tl._unwrap_if_constexpr(layout)
+        # A CuTe swizzled_layout (Swizzle<B,M,S>) needs the buffer shape to resolve
+        # its perPhase; do it now that shape is known.
+        if isinstance(layout, tlx.swizzled_layout):
+            layout = layout._to_encoding(unwrapped_shape)
         if not isinstance(layout, tlx.shared_layout_encoding):
             raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
         layout_handle = layout.to_ir(_semantic.builder)
@@ -1046,7 +1050,7 @@ def local_reshape(
     assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
         "TLX local_reshape only supports SMEM")
     reshape_handle = _semantic.builder.create_memdesc_reshape(src.handle, shape)
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=len(shape))
+    layout = tlx.layout(tlx.swizzled_layout.make_default(rank=len(shape)))
     return tlx.buffered_tensor(
         reshape_handle,
         src.type.scalar,
@@ -1173,7 +1177,7 @@ def _amd_tdm_descriptor_layout(desc):
     max_pad_interval = 256 * 32 // elem_width
     if pad_interval <= max_pad_interval:
         return tlx.padded_shared_layout_encoding.with_identity_for([(pad_interval, pad_amount)], block_shape, order)
-    return tlx.swizzled_shared_layout_encoding.make_default(rank=ndim)
+    return tlx.layout(tlx.swizzled_layout.make_default(rank=ndim))
 
 
 def _layouts_match(actual, expected):

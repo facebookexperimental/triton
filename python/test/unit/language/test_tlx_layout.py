@@ -112,3 +112,76 @@ def test_dump_layout_round_trips_shape_stride(capfd, monkeypatch):
     # was built from -> it round-trips through the compiler.
     expected = _cute_shape_stride(_SEPARABLE_QK_SHAPE, _SEPARABLE_QK_STRIDE)
     assert f"cute: {expected}" in err
+
+
+def test_swizzled_layout_cute_mapping():
+    """`tlx.swizzled_layout(B, M, S)` is the CuTe Swizzle<B,M,S> (positional args).
+    It resolves to Triton's (vec, perPhase, maxPhase) for a given contiguous extent,
+    per the inverse of DumpLayout's emitCuteSwizzle. Pure-Python, no GPU."""
+
+    # vec = 2**M, maxPhase = 2**B, perPhase = 2**(S+M) // numContig.
+    # Mirror the SwizzledSharedEncoding doc examples (order=[1,0], numContig = shape[1]):
+    #   vec=1, perPhase=1, maxPhase=4 over a width-4 tile -> Swizzle<2,0,2>
+    enc = tlx.swizzled_layout(2, 0, 2, order=[1, 0])._to_encoding(shape=[4, 4])
+    assert (enc.vectorSize, enc.perPhase, enc.maxPhase) == (1, 1, 4)
+    #   vec=1, perPhase=2, maxPhase=4 over a width-4 tile -> Swizzle<2,0,3>
+    enc = tlx.swizzled_layout(2, 0, 3, order=[1, 0])._to_encoding(shape=[4, 4])
+    assert (enc.vectorSize, enc.perPhase, enc.maxPhase) == (1, 2, 4)
+    #   vec=2, perPhase=1, maxPhase=4 over a width-8 tile -> Swizzle<2,1,2>
+    enc = tlx.swizzled_layout(2, 1, 2, order=[1, 0])._to_encoding(shape=[4, 8])
+    assert (enc.vectorSize, enc.perPhase, enc.maxPhase) == (2, 1, 4)
+
+    # A Swizzle that would give perPhase < 1 for the extent is rejected.
+    with pytest.raises(AssertionError):
+        tlx.swizzled_layout(2, 0, 0, order=[1, 0])._to_encoding(shape=[4, 8])
+
+
+def test_swizzled_layout_vs_register_layout():
+    """`swizzled_layout` is a shared-memory layout; the shape/stride `tlx.layout`
+    stays a register layout. `tlx.layout(swizzled_layout(...))` also accepts one
+    (eagerly resolving the trivial default). Pure-Python, no GPU."""
+
+    # The no-swizzle default is shape-independent -> tlx.layout resolves it eagerly.
+    a = tlx.layout(tlx.swizzled_layout.make_default(rank=2))
+    assert type(a) is tlx.swizzled_shared_layout_encoding  # exact type -> `type() is` checks hold
+    assert (a.vectorSize, a.perPhase, a.maxPhase, a.order) == (1, 1, 1, [1, 0])
+
+    # A real swizzle is deferred (needs the buffer shape): tlx.layout returns it as-is.
+    atom = tlx.layout(tlx.swizzled_layout(2, 0, 2, order=[1, 0]))
+    assert isinstance(atom, tlx.swizzled_layout)
+
+    # the shape/stride form is unchanged: a register layout
+    r = _separable_qk_layout()
+    assert isinstance(r, tlx.layout) and not isinstance(r, tlx.shared_layout_encoding)
+
+    # tlx.layout() with neither a swizzled_layout nor shape/stride is rejected
+    with pytest.raises(AssertionError):
+        tlx.layout()
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
+def test_swizzled_layout_lowers_to_swizzled_shared():
+    """`tlx.swizzled_layout(...)` used directly as a `local_alloc` layout lowers to
+    the `#ttg.swizzled_shared` encoding. The trivial default matches the legacy
+    `swizzled_shared_layout_encoding` byte-for-byte; a real Swizzle<B,M,S> resolves
+    its perPhase from the buffer shape."""
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        x = tl.zeros((128, 64), tl.float16)
+        buf = tlx.local_alloc((128, 64), tl.float16, tl.constexpr(1), layout=LAYOUT)
+        v = tlx.local_view(buf, 0)
+        tlx.local_store(v, x)
+
+    # Trivial swizzled_layout == constructing the legacy encoding directly.
+    cute = tlx.swizzled_layout.make_default(rank=2)
+    direct = tlx.swizzled_shared_layout_encoding.make_default(rank=2)
+    ttgir_cute = kernel.warmup(cute, grid=(1, ), num_warps=4).asm["ttgir"]
+    ttgir_direct = kernel.warmup(direct, grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>" in ttgir_cute
+    assert ttgir_cute == ttgir_direct
+
+    # A real Swizzle<3,0,6> over a width-64 tile -> vec=1, maxPhase=8,
+    # perPhase = 2**(6+0)//64 = 1.
+    swz = kernel.warmup(tlx.swizzled_layout(3, 0, 6, order=[1, 0]), grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in swz
