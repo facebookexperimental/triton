@@ -2,8 +2,8 @@
 
 Triton Cluster Launch Control (CLC) tile scheduler.
 
-Status: **frontend + Stages 1/2/4 lowering landed (single-CTA, non-WS); Stage 3
-(AutoWS) is future work.**
+Status: **frontend + full lowering landed (Stages 1–4), single-CTA. Runs both
+without WS and under AutoWS (Stage 3 fused into the run-once/broadcast pass).**
 
 ## Motivation
 
@@ -188,16 +188,22 @@ scf.while (%v=%v0,%x=%x0,%y=%y0,%z=%z0) : (i1,i32,i32,i32) -> (i1,i32,i32,i32) {
 }
 ```
 
-### Stage 3 — AutoWS handling (fused into `WSAtomicBroadcast`)
+### Stage 3 — AutoWS handling (fused with the atomic broadcast)
 
 The token form flows **into** AutoWS unchanged. The CLC fetch is the same shape
-as the atomic tile-counter that `WSAtomicBroadcast` already handles — a run-once
-"claim the next tile" whose loop-carried result feeds *every* partition — so the
-handling is **fused into that pass** (see
-`third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSAtomicBroadcast.cpp`
-and `docs/.../CrossPartitionAtomicSupport.md`). Without this, each partition would
-run its own `clc_try_cancel_async`, cancel a different pending cluster, and
-diverge → deadlock.
+as the atomic tile-counter that `WSAtomicBroadcast.cpp` already handles — a
+run-once "claim the next tile" whose loop-carried result feeds *every* partition
+— so the two are **handled by one merged entry point**,
+`doDynamicTileBroadcast` (it processes both `tt.atomic_rmw` and `ttng.clc_read`;
+called from `WarpSpecialization.cpp` right after `doTaskIdPropagate`). Without
+this, each partition would run its own `clc_try_cancel_async`, cancel a different
+pending cluster, and diverge → deadlock.
+
+*Enabling WS:* like the dynamic-persistent atomic kernel, WS is requested by
+`tl.range(..., warp_specialize=True)` on the inner K-loop (with `use_meta_ws`);
+the outer persistent `scf.while` is auto-cloned per partition and the CLC fetch
+is broadcast here. The grid launches one cluster per tile so there are pending
+clusters to steal.
 
 Primary scheme:
 
@@ -352,26 +358,25 @@ requires drain-on-exit because the CLC claim is destructive.
 
 ## Status & testing
 
-- **Implemented (this branch):** the `tl.clc_tile_scheduler` frontend and
-  `ttng.clc_advance` op; the token ops `ttng.clc_try_cancel_async` /
-  `ttng.clc_read`; and Stages 1 (`triton-nvidia-gpu-clc-split`), 2
-  (`triton-nvidia-gpu-clc-hoist`) and 4 (`triton-nvidia-gpu-clc-materialize`) as
-  TTGIR passes (`lib/Dialect/TritonNvidiaGPU/Transforms/CLCLowering.cpp`), wired
-  into the NVIDIA Blackwell `make_ttgir` pipeline — split + hoist before warp
-  specialization, materialize after.
+- **Implemented:** the `tl.clc_tile_scheduler` frontend and `ttng.clc_advance`
+  op; the token ops `ttng.clc_try_cancel_async` / `ttng.clc_read`; Stages 1
+  (`triton-nvidia-gpu-clc-split`), 2 (`triton-nvidia-gpu-clc-hoist`) and 4
+  (`triton-nvidia-gpu-clc-materialize`) as TTGIR passes
+  (`lib/Dialect/TritonNvidiaGPU/Transforms/CLCLowering.cpp`); and Stage 3 (AutoWS)
+  merged into `doDynamicTileBroadcast` in
+  `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSAtomicBroadcast.cpp`.
+  Wired into the NVIDIA Blackwell `make_ttgir` — split + hoist before WS,
+  materialize after; the AutoWS broadcast runs inside WS.
 - **Restriction:** single CTA only — `clc-materialize` errors on `num-ctas > 1`.
-- **Not in this branch:** Stage 3 (AutoWS handling / `WSAtomicBroadcast` fusion).
-  Today the kernel runs with `warp_specialize=False`; Stage 2's hoist is
-  same-block only (cross-block unification is a follow-up).
-- **Tests:** `python/test/unit/language/test_triton_clc.py` — frontend IR-shape
-  checks (no GPU) plus Blackwell execution tests (scheduler claims each tile
-  exactly once; CLC GEMM correctness) and a materialized-TTGIR check.
+- **Tests:** `python/test/unit/language/test_triton_clc.py` (frontend IR checks +
+  non-WS Blackwell execution + materialized-TTGIR) and, in
+  `test_tutorial09_warp_specialization.py`,
+  `test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize` (Blackwell
+  warp-specialized CLC GEMM: asserts `ttg.warp_specialize` + `ttng.clc_try_cancel`
+  and correctness).
 
-## Future work (next branch)
+## Future work
 
-- **Stage 3:** AutoWS handling fused into `WSAtomicBroadcast` — the producer runs
-  the fetch and the decoded 4-tuple is broadcast through SMEM; materialization
-  then runs after AutoWS for WS kernels.
 - Multi-cluster / multi-CTA support (lift the single-CTA restriction).
 - Multi-stage prefetch (`depth > 1`) with drain-on-exit (loop-carried token).
 - Cross-basic-block hoist / unification in Stage 2.
