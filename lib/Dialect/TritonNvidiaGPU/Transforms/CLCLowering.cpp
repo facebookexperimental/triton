@@ -174,8 +174,7 @@ struct CLCMaterializePass
       Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
                                                 /*width=*/1);
       BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
-      CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar,
-                             /*multicast=*/false);
+      CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
     }
 
     // Materialize the read: wait_barrier + clc_load_result + decode.
