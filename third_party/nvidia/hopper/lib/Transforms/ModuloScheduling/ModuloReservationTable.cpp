@@ -266,13 +266,6 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   if (maxII <= 0)
     maxII = 2 * minII;
 
-  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
-  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
-  //   "exhaustive" → Exhaustive search with joint memory feasibility
-  //   "random"     → Random sampling with greedy placement
-  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
-  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
-
   // Cap maxII to avoid spending too long on large DDGs. The slack window
   // scales with minII: GPU inner-loop IIs are hundreds of cycles with
   // multi-hundred-cycle op durations, so a fixed +10 window (classic CPU
@@ -288,6 +281,13 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
     DBGS() << "ResMII=" << ddg.computeResMII()
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
+
+  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
+  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
+  //   "exhaustive" → Exhaustive search with joint memory feasibility
+  //   "random"     → Random sampling with greedy placement
+  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
 
   if (algo == "exhaustive") {
     LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");

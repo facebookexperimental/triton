@@ -28,10 +28,18 @@ namespace mlir::triton::gpu {
 
 // ── Buffer extraction ───────────────────────────────────────────────────────
 
-using BufferInfo = SchedBufferInfo;
+enum class BufKind { SMEM, TMEM };
 
-llvm::SmallVector<BufferInfo>
-extractSchedBuffers(const DataDependenceGraph &ddg) {
+struct BufferInfo {
+  unsigned allocNodeIdx;
+  BufKind kind;
+  int64_t sizeBytes;
+  int64_t tmemCols;
+  llvm::SmallVector<unsigned, 4> consumerNodes;
+};
+
+static llvm::SmallVector<BufferInfo>
+extractBuffers(const DataDependenceGraph &ddg) {
   llvm::SmallVector<BufferInfo> buffers;
   for (const auto &node : ddg.getNodes()) {
     Operation *op = node.op;
@@ -42,7 +50,7 @@ extractSchedBuffers(const DataDependenceGraph &ddg) {
       auto memDesc = dyn_cast<MemDescType>(op->getResult(0).getType());
       if (!memDesc)
         continue;
-      buf.isTmem = false;
+      buf.kind = BufKind::SMEM;
       int64_t elems = 1;
       for (auto d : memDesc.getShape())
         elems *= d;
@@ -57,7 +65,7 @@ extractSchedBuffers(const DataDependenceGraph &ddg) {
       // without a backend-specific op check. A 0-col accumulator would be
       // dropped here — asserted impossible in
       // NVLatencyModel::getAccumulatorAllocCols.
-      buf.isTmem = true;
+      buf.kind = BufKind::TMEM;
       buf.tmemCols = node.tmemAllocCols;
       buf.sizeBytes = 0;
     } else {
@@ -128,7 +136,7 @@ checkFeasibility(const llvm::SmallVector<BufferInfo> &buffers,
 
   for (const auto &lv : liveness) {
     const auto &buf = buffers[lv.bufferIdx];
-    if (!buf.isTmem) {
+    if (buf.kind == BufKind::SMEM) {
       int d = lv.depth(II);
       res.totalSmemBytes += buf.sizeBytes * d;
       res.totalBufferingDepth += d;
@@ -147,7 +155,7 @@ checkFeasibility(const llvm::SmallVector<BufferInfo> &buffers,
   llvm::SmallVector<TmemGroup> groups;
   for (unsigned i = 0; i < liveness.size(); ++i) {
     const auto &buf = buffers[liveness[i].bufferIdx];
-    if (!buf.isTmem)
+    if (buf.kind != BufKind::TMEM)
       continue;
     const auto &lv = liveness[i];
     bool placed = false;
@@ -441,7 +449,7 @@ runExhaustiveSearch(const DataDependenceGraph &ddg, int maxII, int smemBudget,
            << "\n";
   });
 
-  auto buffers = extractSchedBuffers(ddg);
+  auto buffers = extractBuffers(ddg);
   auto topoOrder = topologicalOrder(ddg);
 
   if (topoOrder.size() != ddg.getNumNodes()) {
@@ -518,7 +526,7 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
            << "\n";
   });
 
-  auto buffers = extractSchedBuffers(ddg);
+  auto buffers = extractBuffers(ddg);
   auto topoOrder = topologicalOrder(ddg);
   if (topoOrder.size() != ddg.getNumNodes())
     return failure();
