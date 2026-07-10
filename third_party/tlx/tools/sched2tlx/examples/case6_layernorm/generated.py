@@ -6,6 +6,10 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
+# Launch hints from the modulo pass (memory-bound kernel).
+RECOMMENDED_MAXNREG = 56
+RECOMMENDED_GRID_MULTIPLIER = 4
+
 @triton.jit
 def layernorm_fwd_nows(
     X,

@@ -5177,6 +5177,101 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
+// Launch hints for memory-bound warp-specialized kernels (occupancy).
+//
+// Without a maxnreg cap, AllocateWarpGroups auto-fills the full 64K register
+// file (regs/thread = 64K / total_warps / 32), which pins co-residency at
+// 1 CTA/SM. That is right for TC-bound kernels (one CTA should own the SM)
+// but exactly wrong for memory-bound ones, which need several co-resident
+// CTAs interleaving their TMA waits to cover HBM latency. Measured on B200
+// (case6 LayerNorm, M=262144): the committed 3-WG kernel runs 3161 GB/s at
+// the default launch and 6185 GB/s at maxnreg=48-56 with a 4x-SMS persistent
+// grid — parity with the hand-written reference (6151 GB/s), with no change
+// to the kernel body at all.
+//
+// Emitted only when the kernel is memory-bound AND warp-specialized:
+//   memory_bound     — the module contains no MMA op and at least one loop
+//                      schedules a TMA node; >= 2 modulo warp groups exist.
+//   total_warps      — mirrors AllocateWarpGroups' CTA warp layout: the
+//                      default warp group (module ttg.num-warps) plus every
+//                      other modulo WG padded to a whole 4-warp group.
+//   maxnreg          — regs/thread fitting kTargetCoResidentCTAs CTAs:
+//                      floor(64K / (target * total_warps * 32) / 8) * 8,
+//                      floored at the hardware minimum 24.
+//   grid_multiplier  — persistent-grid scale (empirical B200 sweep: 4x SMS
+//                      beats 2x and 8x across M=16K..256K).
+// The sched2tlx emitter forwards these as RECOMMENDED_* module constants in
+// the generated kernel; launchers pass maxnreg= and scale the grid.
+void jsonDumpLaunchHints(llvm::raw_ostream &os, ModuleOp moduleOp,
+                         ArrayRef<ScheduledLoop> scheduledLoops) {
+  bool anyMMA = false;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::WarpGroupDotOp,
+            tt::DotOp>(op))
+      anyMMA = true;
+  });
+  if (anyMMA)
+    return;
+
+  bool anyTMA = false;
+  std::map<int, int> wgMaxMinWarps;
+  for (const auto &sl : scheduledLoops) {
+    for (const auto &loop : sl.graph.loops) {
+      for (const auto &n : loop.nodes) {
+        if (n.pipeline == ttg::HWPipeline::TMA)
+          anyTMA = true;
+        if (n.warpGroup >= 0) {
+          int &mw = wgMaxMinWarps[n.warpGroup];
+          mw = std::max(mw, std::max(n.minWarps, 1));
+        }
+      }
+    }
+  }
+  if (!anyTMA || wgMaxMinWarps.size() < 2)
+    return;
+
+  auto snapWarps = [](int m) {
+    if (m <= 1)
+      return 1;
+    if (m <= 2)
+      return 2;
+    if (m <= 4)
+      return 4;
+    return 8;
+  };
+  int baseWarps = 4;
+  if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+    baseWarps = attr.getInt();
+  // The emitter maps the first >= 4-warp WG onto the default async_task; all
+  // other WGs become explicit tasks, each padded to whole 4-warp groups by
+  // AllocateWarpGroups.
+  int defaultWg = -1;
+  for (const auto &[wg, mw] : wgMaxMinWarps) {
+    if (snapWarps(mw) >= 4) {
+      defaultWg = wg;
+      break;
+    }
+  }
+  int totalWarps = baseWarps;
+  for (const auto &[wg, mw] : wgMaxMinWarps) {
+    if (wg == defaultWg)
+      continue;
+    totalWarps += (snapWarps(mw) + 3) / 4 * 4;
+  }
+
+  constexpr int kSMRegisterFile = 64 * 1024;
+  constexpr int kTargetCoResidentCTAs = 3;
+  constexpr int kGridMultiplier = 4;
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+  int maxnreg =
+      kSMRegisterFile / (kTargetCoResidentCTAs * totalWarps * threadsPerWarp);
+  maxnreg = std::max(24, maxnreg / 8 * 8);
+
+  os << "  \"launch_hints\": {\"memory_bound\": true, \"total_warps\": "
+     << totalWarps << ", \"maxnreg\": " << maxnreg
+     << ", \"grid_multiplier\": " << kGridMultiplier << "},\n";
+}
+
 // Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
 // Factored out so both the single-graph dumper and the multi-variant dumper
 // (top-N autotuning) can reuse it — each variant is a self-contained doc.
@@ -5194,6 +5289,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
     os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
+  jsonDumpLaunchHints(os, moduleOp, scheduledLoops);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
