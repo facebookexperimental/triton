@@ -41,8 +41,7 @@ def parse_commits(log_output):
         if not line.strip():
             continue
         sha, _, subject = line.partition("\t")
-        commits.append({"sha": sha.strip(), "subject": subject.strip(),
-                        "pr": extract_pr(subject)})
+        commits.append({"sha": sha.strip(), "subject": subject.strip(), "pr": extract_pr(subject)})
     return commits
 
 
@@ -120,8 +119,8 @@ def render_markdown(ranked, good_sha, bad_sha, test_dir, limit=10):
         return ("_No merged PRs found in range "
                 f"`{good_sha[:9]}..{bad_sha[:9]}` — suspect list unavailable._")
     lines = [
-        f"**Suspected PRs** (range `{good_sha[:9]}..{bad_sha[:9]}`"
-        + (f", ranked by overlap with `{test_dir}`" if test_dir else ", newest first") + "):",
+        f"**Suspected PRs** (range `{good_sha[:9]}..{bad_sha[:9]}`" +
+        (f", ranked by overlap with `{test_dir}`" if test_dir else ", newest first") + "):",
         "",
         "| Rank | PR | Overlap | Title |",
         "| --- | --- | --- | --- |",

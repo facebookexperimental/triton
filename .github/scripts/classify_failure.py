@@ -22,14 +22,11 @@ import re
 # Patterns run case-insensitively against the failure summary (first error line).
 _SIGNATURES = [
     # --- GPU / driver / runner-hardware infra ---
-    ("gpu-infra", "GPU busy or unavailable (runner infra)",
-     r"all CUDA-capable devices are busy or unavailable"),
+    ("gpu-infra", "GPU busy or unavailable (runner infra)", r"all CUDA-capable devices are busy or unavailable"),
     ("gpu-infra", "No CUDA-capable device on the runner (runner infra)",
      r"no CUDA-capable device (is|are) detected|No CUDA GPUs are available"),
-    ("gpu-infra", "CUDA driver too old for the toolkit (runner infra)",
-     r"CUDA driver version is insufficient"),
-    ("gpu-infra", "GPU/HIP device error (runner infra)",
-     r"HIP error: (invalid device|no ROCm-capable device)"),
+    ("gpu-infra", "CUDA driver too old for the toolkit (runner infra)", r"CUDA driver version is insufficient"),
+    ("gpu-infra", "GPU/HIP device error (runner infra)", r"HIP error: (invalid device|no ROCm-capable device)"),
     ("gpu-infra", "NVML/driver-library mismatch (runner infra)",
      r"Failed to initialize NVML|Driver/library version mismatch"),
 
@@ -53,8 +50,7 @@ _SIGNATURES = [
      r"RPC failed; curl|early EOF"),
 
     # --- runner disk / OS ---
-    ("runner", "Runner out of disk space (runner infra)",
-     r"No space left on device"),
+    ("runner", "Runner out of disk space (runner infra)", r"No space left on device"),
     ("runner", "Runner out of host memory / OOM-killed (runner infra)",
      r"Cannot allocate memory|Out of memory: Killed process|oom-kill"),
 ]

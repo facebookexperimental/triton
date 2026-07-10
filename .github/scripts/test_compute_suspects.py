@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for compute_suspects pure helpers (stdlib-only; run with pytest)."""
 
 import compute_suspects as cs

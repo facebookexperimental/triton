@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for classify_failure.classify (stdlib-only; run with pytest)."""
 
 import classify_failure as cf
