@@ -818,6 +818,29 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // -----
 
+// twoCTAs via ctas_per_cga (num_ctas=1) with BLOCK_M>=128: the 2-CTA MMA is
+// created with a single-CTA accumulator (twoCTAs=true, empty block axis). Meta
+// warp-specialized path -- regression guard for the getBasis crash in
+// TensorMemoryEncodingAttr::verify.
+// CHECK: #[[$TMEM:.+]] = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, twoCTAs = true>
+#blocked_2cta = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: two_ctas_ctas_per_cga
+  tt.func public @two_ctas_ctas_per_cga(
+    %a: tensor<128x64xf16, #blocked_2cta>,
+    %b: tensor<64x128xf16, #blocked_2cta>,
+    %c: tensor<128x128xf32, #blocked_2cta>) -> tensor<128x128xf32, #blocked_2cta> {
+    %ad = ttg.convert_layout %a : tensor<128x64xf16, #blocked_2cta> -> tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_2cta}>>
+    %bd = ttg.convert_layout %b : tensor<64x128xf16, #blocked_2cta> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_2cta}>>
+    // CHECK: ttng.tmem_alloc {{.*}}#[[$TMEM]]
+    // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+    %d = tt.dot %ad, %bd, %c {two_ctas} : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_2cta}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_2cta}>> -> tensor<128x128xf32, #blocked_2cta>
+    tt.return %d : tensor<128x128xf32, #blocked_2cta>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
