@@ -4552,6 +4552,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
   JsonDumpContext dc = buildJsonDumpContext(kernelFn, scheduledLoops);
 
   os << "{\n";
+  os << "  \"@generated\": \"by triton — do not edit by hand.\",\n";
   os << "  \"schema_version\": \"0.1\",\n";
   // Autotuning variant id == predicted-performance rank (0 = cost-model best,
   // emitted first). Absent for legacy single-graph dumps.
@@ -4737,6 +4738,7 @@ void dumpDDGAsJSON(ModuleOp moduleOp, StringRef path,
   }
 
   os << "{\n";
+  os << "  \"@generated\": \"by triton — do not edit by hand.\",\n";
   os << "  \"schema_version\": \"ddg-0.1\",\n";
 
   // config — global knobs that shape how the solver turns this DDG into a
