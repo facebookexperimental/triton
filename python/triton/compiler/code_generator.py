@@ -52,6 +52,21 @@ def check_identifier_legality(name, type):
 
 
 def mangle_fn(name, arg_tys, constants, caller_context):
+    """Build the unique mangled name for a (specialized) callee function.
+
+    Scheme: ``{name}__{arg_type_mangles}__{const_mangles}[{caller_ctx}]`` where the
+    constant part joins ``{i}c{repr(constants[i])}`` over sorted keys (with a few
+    substitutions to keep the result a legal LLVM identifier). It does not encode the
+    return type, which is a pure function of the arg types.
+
+    NOTE: the exact mangled string is not stable across versions -- it has been churned
+    by upstream cherry-picks/back-outs (e.g. the constant-encoding format changed with
+    #8846). It is user-visible in emitted IR, so the Gluon frontend's
+    ``assert_expected_inline`` goldens in ``python/test/gluon/test_frontend.py`` pin it
+    exactly. If you change this function (or land a cherry-pick that does), those goldens
+    drift and must be regenerated with ``EXPECTTEST_ACCEPT=1`` (they are upstream-synced,
+    so the regeneration is overwritten on the next Gluon sync).
+    """
     # doesn't mangle ret type, which must be a function of arg tys
     mangled_arg_names = "_".join([ty.mangle() for ty in arg_tys])
     mangled_constants = "_".join([f"{i}c{repr(constants[i])}" for i in sorted(constants)])
@@ -739,6 +754,8 @@ class CodeGenerator(ast.NodeVisitor):
         arg_names = []
         for arg in node.args:
             arg_names += [self.visit(arg)]
+        if node.vararg is not None:
+            arg_names += [self.visit(node.vararg)]
         kwarg_names = self.visit(node.kwarg)
         return arg_names, kwarg_names
 
@@ -866,15 +883,23 @@ class CodeGenerator(ast.NodeVisitor):
         return self.call_Function(node, fn, [rhs], {})
 
     def visit_BinOp(self, node):
-        lhs = self.visit(node.left)
-        rhs = self.visit(node.right)
-        method_name = self._method_name_for_bin_op.get(type(node.op))
+        op_type = type(node.op)
+        chain = []
+        current = node
+        while isinstance(current, ast.BinOp) and type(current.op) is op_type:
+            chain.append((current, current.right))
+            current = current.left
+        method_name = self._method_name_for_bin_op.get(op_type)
         if method_name is None:
             raise self._unsupported(
                 node,
                 "AST binary operator '{}' is not (currently) implemented.".format(node.op.__name__),
             )
-        return self._apply_binary_method(node, method_name, lhs, rhs)
+        result = self.visit(current)
+        for binop_node, right_node in reversed(chain):
+            rhs = self.visit(right_node)
+            result = self._apply_binary_method(binop_node, method_name, result, rhs)
+        return result
 
     _method_name_for_bin_op: Dict[Type[ast.operator], str] = {
         ast.Add: "__add__",
@@ -1628,6 +1653,9 @@ class CodeGenerator(ast.NodeVisitor):
         for arg in node.args:
             if isinstance(arg, ast.Starred):
                 arg = self.visit(arg.value)
+                arg = _unwrap_if_constexpr(arg)
+                if isinstance(arg, tuple):
+                    arg = language.core.tuple(arg)
                 assert isinstance(arg, language.core.tuple)
                 args.extend(arg.values)
             else:

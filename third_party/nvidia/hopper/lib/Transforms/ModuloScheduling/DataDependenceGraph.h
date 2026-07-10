@@ -17,6 +17,15 @@ struct DDGEdge {
   unsigned distance{}; // 0 = intra-iteration, 1+ = loop-carried
 };
 
+/// Pass A.5 data-partition descriptor for one MMA bundle (or its accumulator
+/// buffer). `count` = number of partitions N, `dim` = 0 (M) / 1 (N), `mSize` =
+/// per-partition size along `dim` (e.g. BM/N for an M-split).
+struct DataPartitionInfo {
+  unsigned count{1};
+  unsigned dim{0};
+  unsigned mSize{0};
+};
+
 struct DDGNode {
   Operation *op{};
   unsigned idx{};
@@ -40,6 +49,22 @@ struct DDGNode {
   bool isSuperNode{false}; // True if this node represents an inner loop
   int innerII{0};          // If super-node, the inner loop's II
   int prologueLatency{0};  // If super-node, cycles before TC starts (MEM busy)
+  // Target-specific accumulator-buffer size (e.g. Blackwell TMEM columns),
+  // precomputed via LatencyModel so the schedulers stay HW-agnostic. 0 = none.
+  // AMDGPU has no separate accumulator memory (MFMA accumulates in VGPRs), so
+  // AMDLatencyModel leaves this 0 — it is NV-only today but kept on the shared
+  // node so the schedulers need no per-backend field.
+  int64_t tmemAllocCols{0};
+
+  // Pass A.5 data partitioning. When partitionCount > 1 this node is a
+  // partition "bundle": the emitter fans it into partitionCount parallel ops
+  // (an MMA → N async_dots, each handling mSize rows along partitionDim into
+  // its own accumulator). The bundle stays a single scheduled node — its
+  // pipeline occupancy is scaled by partitionCount so ResMII reflects the N
+  // hardware issues. Default 1 = unpartitioned.
+  unsigned partitionCount{1};
+  unsigned partitionDim{0}; // 0 = M, 1 = N (emitter supports M only today)
+  unsigned mSize{0};        // per-partition size along partitionDim
   llvm::SmallVector<unsigned> succs;
   llvm::SmallVector<unsigned> preds;
 };
@@ -96,6 +121,13 @@ public:
 
   /// Compute MinII = max(ResMII, RecMII).
   int computeMinII() const;
+
+  /// Pass A.5: tag the MMA nodes named in `mmaInfo` as partition bundles —
+  /// copy their partition fields onto the node and scale TC pipeline occupancy
+  /// by `count`, so ResMII reflects the N hardware MMA issues. Nodes not in the
+  /// map are untouched.
+  void applyDataPartition(
+      const llvm::DenseMap<Operation *, DataPartitionInfo> &mmaInfo);
 
   /// Dump the DDG to llvm::dbgs() for debugging.
   void dump() const;

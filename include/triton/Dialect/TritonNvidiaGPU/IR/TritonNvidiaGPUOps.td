@@ -166,8 +166,7 @@ def TTNG_CLCTryCancelOp : TTNG_Op<"clc_try_cancel", []> {
 
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier,
-    I1Attr:$multicast
+    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$mbarrier
   );
 
   let assemblyFormat = [{
@@ -254,7 +253,7 @@ def TTNG_CLCGetProgramIdOp : TTNG_Op<"clc_get_program_id", [Pure]> {
 // pulls the issue up to overlap the CLC latency with compute, infers the phase,
 // and drops any unused coordinate (dead loop-carried value elimination).
 
-def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", []> {
+def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
   let summary = "High-level CLC advance: fetch the next tile (decoded)";
 
   let description = [{
@@ -282,7 +281,7 @@ def TTNG_CLCAdvanceOp : TTNG_Op<"clc_advance", []> {
 // hoisted for overlap without introducing any mbarrier. A later pass materializes
 // the token into the low-level barrier form.
 
-def TTNG_CLCTryCancelAsyncOp : TTNG_Op<"clc_try_cancel_async", []> {
+def TTNG_CLCTryCancelAsyncOp : TTNG_Op<"clc_try_cancel_async", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
   let summary = "Issue an async CLC request; returns a token (issue half)";
 
   let description = [{
@@ -298,7 +297,7 @@ def TTNG_CLCTryCancelAsyncOp : TTNG_Op<"clc_try_cancel_async", []> {
   let assemblyFormat = [{ attr-dict `:` type($token) }];
 }
 
-def TTNG_CLCReadOp : TTNG_Op<"clc_read", []> {
+def TTNG_CLCReadOp : TTNG_Op<"clc_read", [MemoryEffects<[MemRead<GlobalMemory>]>]> {
   let summary = "Await a CLC token and return the decoded tile (read half)";
 
   let description = [{
@@ -942,6 +941,9 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     This operation takes and produces an optional token to indicate TMEM read
     and write on its accumulator operand. When the tokens are present, they can
     be used to check aliasing and modref on the accumulator memory.
+
+    The `isUnsigned` attribute is only relevant when performing an integer MMA operation.
+    If true, the integer values are treated as unsigned, otherwise they are treated as signed.
   }];
 
   let arguments = (ins
@@ -955,7 +957,8 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     Variadic<I1>:$barrier_preds,
     UnitAttr:$is_async,
     UnitAttr:$two_ctas,
-    UnitAttr:$multicast
+    UnitAttr:$multicast,
+    UnitAttr:$is_unsigned
   );
   let results = (outs Optional<TTG_AsyncToken>:$token);
 
@@ -966,7 +969,8 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
       CArg<"bool", "false">:$multicast,
       CArg<"ValueRange", "{}">:$barriers,
       CArg<"ValueRange", "{}">:$barrier_preds,
-      CArg<"bool", "false">:$is_async)>
+      CArg<"bool", "false">:$is_async,
+      CArg<"bool", "false">:$is_unsigned)>
   ];
 
   let assemblyFormat = [{
@@ -1505,6 +1509,18 @@ def TTNG_SubtiledRegionOp : TTNG_Op<"subtiled_region", [
     /// Append a shared arg and add a corresponding tile block argument.
     /// Returns the new tile block argument.
     BlockArgument addSharedArg(Value value);
+
+    /// Append a NEW per-tile arg position (the inverse of removePerTilePosition):
+    /// `perTileValues` must have exactly numTiles entries (value for tile 0, 1,
+    /// ...). Appends them as the last per-tile position (operands
+    /// [K*numTiles + t]) and inserts one tile block argument at the end of the
+    /// per-tile block args (before the shared args / tileIdx), preserving the
+    /// [perTile.., shared.., tileIdx] ordering. All entries must share a type.
+    /// Returns the new tile block argument (which lowering substitutes with
+    /// `perTileValues[t]` for tile t). Used to thread a per-tile token/barrier
+    /// for inside->outside subtiled channels whose numTiles siblings are
+    /// distinct buffers (each tile handshakes only its own sibling's barrier).
+    ::mlir::BlockArgument addPerTilePosition(::mlir::ValueRange perTileValues);
 
     /// Erase per-tile arg position `posIdx` (0-based among the K positions):
     /// removes its numTiles operands and the matching tile block argument,

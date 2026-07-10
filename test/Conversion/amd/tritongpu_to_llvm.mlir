@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=arch=gfx942 --convert-builtin-func-to-llvm | FileCheck %s
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=arch=gfx950 | FileCheck %s --check-prefix=GFX950
 // RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=arch=gfx1250 | FileCheck %s --check-prefix=GFX1250
+// RUN: triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=arch=gfx906 | FileCheck %s --check-prefix=GFX906
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: atomic_add_f32_scalar
@@ -228,25 +229,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   // CHECK-LABEL: reduce_xor_max
   tt.func @reduce_xor_max(%arg0: tensor<32xf32, #blocked4>) {
-    // CHECK: rocdl.ds_swizzle
+    // stride 16: CDNA fallback to bpermute
+    // CHECK: rocdl.ds_bpermute
+
+    // stride 8: ROW_ROR:8 (0x128 = 296)
+    // CHECK: rocdl.update.dpp
+    // CHECK-SAME: with 296, 15, 15, false : i32
     // CHECK: llvm.intr.maxnum
 
+    // stride 4: ROW_HALF_MIRROR (0x141 = 321) + quad_perm xor 3 (27)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 280, 15, 12, false : i32
+    // CHECK-SAME: with 321, 15, 15, false : i32
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 264, 15, 3, false : i32
+    // CHECK-SAME: with 27, 15, 15, false : i32
     // CHECK: llvm.intr.maxnum
 
-    // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 276, 15, 10, false : i32
-    // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 260, 15, 5, false : i32
-    // CHECK: llvm.intr.maxnum
-
+    // stride 2: quad_perm xor 2 (78)
     // CHECK: rocdl.update.dpp
     // CHECK-SAME: with 78, 15, 15, false : i32
     // CHECK: llvm.intr.maxnum
 
+    // stride 1: quad_perm xor 1 (177)
     // CHECK: rocdl.update.dpp
     // CHECK-SAME: with 177, 15, 15, false : i32
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
@@ -254,6 +257,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
       %1 = arith.maxnumf %arg1, %arg2 : f32
       tt.reduce.return %1 : f32
     }) : (tensor<32xf32, #blocked4>) -> f32
+    tt.return
+  }
+}
+
+// -----
+
+#linear = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [0, 0], [2, 0], [4, 0], [8, 0]], warp = [], block = []}>
+#slice = #ttg.slice<{dim = 0, parent = #linear}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: reduce_xor_row_xmask
+  tt.func @reduce_xor_row_xmask(%arg0: tensor<16x2xf32, #linear>) {
+    // beta gfx1250: ROW_XMASK dpp shuffles only; this #linear reduction produces
+    // no stride-16 permlane step, so neither permlanex16 nor ds_bpermute is emitted.
+    // GFX1250-NOT: rocdl.ds_bpermute
+
+    // stride 8: ROW_XMASK:8
+    // GFX1250: rocdl.update.dpp
+    // GFX1250-SAME: with 360, 15, 15, false
+
+    // stride 4: ROW_XMASK:4
+    // GFX1250: rocdl.update.dpp
+    // GFX1250-SAME: with 356, 15, 15, false
+
+    // stride 2: ROW_XMASK:2
+    // GFX1250: rocdl.update.dpp
+    // GFX1250-SAME: with 354, 15, 15, false
+
+    // stride 1: ROW_XMASK:1
+    // GFX1250: rocdl.update.dpp
+    // GFX1250-SAME: with 353, 15, 15, false
+    %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
+    ^bb0(%arg1: f32, %arg2: f32):
+      %1 = arith.maxnumf %arg1, %arg2 : f32
+      tt.reduce.return %1 : f32
+    }) : (tensor<16x2xf32, #linear>) -> tensor<2xf32, #slice>
     tt.return
   }
 }
@@ -705,6 +743,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
   tt.func private @callee_zero_scratch() attributes {noinline = true} {
+    tt.return
+  }
+}
+
+// -----
+
+/// gfx906 has the same dot intrinsics as gfx908+ (HasDot1Insts) but not
+/// the compact VOP2 encoding (HasDot2Insts); LLVM handles this transparently.
+
+// GFX906-LABEL: v_dot_fp16_gfx906
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+module attributes {"ttg.target" = "hip:gfx906", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @v_dot_fp16_gfx906(%arg0: tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<16x16xf32, #blocked>) {
+    // GFX906-COUNT-8: llvm.call_intrinsic "llvm.amdgcn.fdot2"
+    %0 = tt.dot %arg0, %arg1, %arg2, inputPrecision = ieee : tensor<16x16xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<16x16xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<16x16xf32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+// GFX906-LABEL: v_dot_i8_gfx906
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 2], order = [1, 0]}>
+module attributes {"ttg.target" = "hip:gfx906", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @v_dot_i8_gfx906(%arg0: tensor<16x16xi8, #ttg.dot_op<{opIdx = 0, parent = #blocked}>>, %arg1: tensor<16x16xi8, #ttg.dot_op<{opIdx = 1, parent = #blocked}>>, %arg2: tensor<16x16xi32, #blocked>) {
+    // GFX906-COUNT-4: llvm.call_intrinsic "llvm.amdgcn.sdot4"
+    %0 = tt.dot %arg0, %arg1, %arg2, inputPrecision = ieee : tensor<16x16xi8, #ttg.dot_op<{opIdx = 0, parent = #blocked}>> * tensor<16x16xi8, #ttg.dot_op<{opIdx = 1, parent = #blocked}>> -> tensor<16x16xi32, #blocked>
     tt.return
   }
 }

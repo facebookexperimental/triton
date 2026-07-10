@@ -3,14 +3,27 @@
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 LLVM_TARGETS=${LLVM_TARGETS:-Native;NVPTX;AMDGPU}
-LLVM_PROJECTS=${LLVM_PROJECTS:-mlir;llvm;lld}
+LLVM_PROJECTS=${LLVM_PROJECTS:-mlir;llvm;lld;clang}
 LLVM_BUILD_TYPE=${LLVM_BUILD_TYPE:-RelWithDebInfo}
-LLVM_BUILD_SHARED_LIBS=${LLVM_BUILD_SHARED_LIBS:-OFF}
 LLVM_COMMIT_HASH=${LLVM_COMMIT_HASH:-$(sed -n 's/.*"llvm_hash"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' "$REPO_ROOT/cmake/llvm-info.json")}
 LLVM_PROJECT_PATH=${LLVM_PROJECT_PATH:-"$REPO_ROOT/llvm-project"}
 LLVM_BUILD_PATH=${LLVM_BUILD_PATH:-"$LLVM_PROJECT_PATH/build"}
 LLVM_INSTALL_PATH=${LLVM_INSTALL_PATH:-"$LLVM_PROJECT_PATH/install"}
 LLVM_PROJECT_URL=${LLVM_PROJECT_URL:-"https://github.com/llvm/llvm-project"}
+
+# Build+link with clang+lld only when explicitly requested (the macOS toolchain
+# does not ship lld). Otherwise fall back to the default compiler and linker.
+CLANG_LLD_ARGS=()
+case "$(printf '%s' "$TRITON_BUILD_WITH_CLANG_LLD" | tr '[:upper:]' '[:lower:]')" in
+    1 | on | true) TRITON_BUILD_WITH_CLANG_LLD=1 ;;
+esac
+if [ "$TRITON_BUILD_WITH_CLANG_LLD" = "1" ]; then
+    CLANG_LLD_ARGS=(
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_CXX_COMPILER=clang++
+        -DLLVM_ENABLE_LLD=ON
+    )
+fi
 
 if [ -z "$CMAKE_ARGS" ]; then
     if [ "$#" -eq 0 ]; then
@@ -19,10 +32,7 @@ if [ -z "$CMAKE_ARGS" ]; then
               -DCMAKE_BUILD_TYPE="$LLVM_BUILD_TYPE"
               -DLLVM_CCACHE_BUILD=OFF
               -DLLVM_ENABLE_ASSERTIONS=ON
-              -DCMAKE_C_COMPILER=clang
-              -DCMAKE_CXX_COMPILER=clang++
-              -DLLVM_ENABLE_LLD=ON
-              -DBUILD_SHARED_LIBS="$LLVM_BUILD_SHARED_LIBS"
+              "${CLANG_LLD_ARGS[@]}"
               -DLLVM_OPTIMIZED_TABLEGEN=ON
               -DMLIR_ENABLE_BINDINGS_PYTHON=OFF
               -DLLVM_ENABLE_ZSTD=OFF

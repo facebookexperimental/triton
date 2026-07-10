@@ -1,0 +1,5 @@
+# Runtime dependency for the PTX reduction-equivalence checker (bitequiv.ptx_reduction).
+# pyptx is a pure-Python, zero-dependency PTX parser/emitter (Apache-2.0) used to parse
+# compiled PTX structurally instead of by regex. Pinned exactly: pyptx is pre-1.0, so a
+# deliberate bump is preferred over silent API drift.
+pyptx==0.1.1

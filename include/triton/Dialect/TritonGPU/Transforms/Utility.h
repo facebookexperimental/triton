@@ -33,9 +33,6 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
                                                 const ArrayRef<int64_t> &shape,
                                                 Type type, int numWarps);
 
-// Return true if the Load uses block pointer.
-bool isLoadFromTensorPtr(triton::LoadOp op);
-
 // Gets the order of a tensor from its contiguity. Places the dimensions with
 // the largest contiguity as the inner most dimension. If the contiguity is
 // all ones, returns the order {dim - 1, dim - 2, ..., 0}
@@ -235,9 +232,16 @@ LogicalResult getConvertBackwardSlice(
 // Populate pattern to remove dead cycles in ForOp.
 // opsCanBeTriviallyDead specifies the operations of which the side effect can
 // be ignored.
+// NOTE (beta): retained alongside runDeadIterArgElimination because the beta
+// WSDataPartition deep-cleanup relies on the opsCanBeTriviallyDead allowlist,
+// which the LivenessAnalysis-based runDeadIterArgElimination cannot express.
 void populateForOpDeadArgumentElimination(
     RewritePatternSet &patterns,
     const DenseSet<Operation *> &opsCanBeTriviallyDead = {});
+
+/// Run a dataflow analysis over \p top to identify block arguments to loops
+/// that are dead, and replace their usage with the corresponding init value.
+void runDeadIterArgElimination(Operation *top);
 
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.

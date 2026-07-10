@@ -17,19 +17,47 @@ using mlir::triton::AMD::DppCtrl;
 using mlir::triton::AMD::ISAFamily;
 using mlir::triton::gpu::appendOrGetExternFuncOp;
 
+namespace mlir::LLVM::AMD {
 namespace {
+
 enum class ShflKind : uint32_t {
   bfly = 0,
   up = 1,
-  down = 2,
-  idx = 3,
+  idx = 2,
 };
-} // namespace
 
-namespace mlir::LLVM::AMD {
-static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
-                               ISAFamily isaFamily, Value val, Value i,
-                               int strideInt, ShflKind mode, Value clamp) {
+Value emitDpp(Location loc, RewriterBase &rewriter, Value old, Value src,
+              DppCtrl dppCtrl, uint32_t rowMask = 0xf, uint32_t bankMask = 0xf,
+              bool boundCtrl = false) {
+  return ROCDL::DPPUpdateOp::create(
+      rewriter, loc, src.getType(), old, src,
+      rewriter.getI32IntegerAttr(static_cast<uint32_t>(dppCtrl)),
+      rewriter.getI32IntegerAttr(rowMask), rewriter.getI32IntegerAttr(bankMask),
+      rewriter.getBoolAttr(boundCtrl));
+}
+
+Value emitPermlaneX16Xor(Location loc, RewriterBase &rewriter, Value val,
+                         uint32_t rowMask) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  // PermlaneX16 reads the opposite 16-lane half of a 32-lane wave. It uses a
+  // 16-nibble selector to choose the source lane within that half.
+  // We use it to perform a shuffleXor with mask `rowMask ^ 16`.
+  assert(rowMask < 16 && "Expected a cross-row shuffleXor");
+  auto buildSelectorMask = [&](unsigned startLane) {
+    uint32_t sel = 0;
+    for (unsigned lane = 0; lane < 8; ++lane)
+      sel |= ((startLane + lane) ^ rowMask) << (lane * 4);
+    return sel;
+  };
+  Value loSel = b.i32_val(buildSelectorMask(0));
+  Value hiSel = b.i32_val(buildSelectorMask(8));
+  return ROCDL::PermlaneX16Op::create(rewriter, loc, val.getType(), val, val,
+                                      loSel, hiSel, true, false);
+}
+
+Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
+                        ISAFamily isaFamily, Value val, Value i, int strideInt,
+                        ShflKind mode, Value clamp) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   unsigned bits = val.getType().getIntOrFloatBitWidth();
 
@@ -83,103 +111,80 @@ static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
   };
 
   switch (mode) {
-  case ShflKind::bfly:
-    if (strideInt > 16) {
-      Value stride = b.i32_val(32);
-      Value lineId = b.xor_(threadId, stride);
-      return bpermute(lineId);
-    } else if (strideInt == 16) {
-      if (isRDNA(isaFamily)) {
-        // Lane i in the upper 16 lanes reads the value from lane i in the lower
-        // 16 lanes and vice versa.
-        Value select_lo = b.i32_val(0x76543210);
-        Value select_hi = b.i32_val(0xfedcba98);
-        return ROCDL::PermlaneX16Op::create(rewriter, loc, valType, val, val,
-                                            select_lo, select_hi, true, false);
-      } else {
-        Value offset = b.i32_val(0x401F);
-        return ROCDL::DsSwizzleOp::create(rewriter, loc, valType, val, offset);
+  case ShflKind::bfly: {
+    // We have the following tools to decompose shuffleXor into DPP primitives.
+    // On CDNA:
+    //  - xor by 15  : reflect the lanes within each group of 16 lanes,
+    //  - xor by 8   : right rotate by 8 within each group of 16 lanes,
+    //  - xor by 7   : reflect the lanes within each group of 8 lanes,
+    //  - xor by 1-3 : perform a permutation within each group of 4 lanes.
+    // On RDNA:
+    //  - xor by 1-15 : row_xmask does exactly this.
+    //
+    // On RDNA, we also have permlanex16 which can perform xor by 16-31.
+    // On CDNA, one can see that any shuffleXor with `mask` in [1, 15] can
+    // be implemented using at most 2 DPP instructions by mapping the upper bits
+    // of `mask` to the `xor by 7` and `xor by 8` instructions.
+    uint32_t mask = strideInt;
+    if (mask == 0)
+      return val;
+    assert(mask < iWarpSize &&
+           "shuffle_xor expects a mask within the wave size");
+
+    auto makeDppCtrl = [](DppCtrl base, uint32_t arg) {
+      return static_cast<DppCtrl>(llvm::to_underlying(base) + arg);
+    };
+    auto makeQuadPermCtrl = [](uint32_t quadMask) {
+      DppCtrl ctrl = DppCtrl::QUAD_PERM_FIRST;
+      uint32_t ctrlBits = llvm::to_underlying(ctrl);
+      for (unsigned lane = 0; lane < 4; ++lane)
+        ctrlBits |= (lane ^ quadMask) << (lane * 2);
+      return static_cast<DppCtrl>(ctrlBits);
+    };
+
+    if (isRDNA(isaFamily) || isaFamily == ISAFamily::GFX1250) {
+      if (mask < 16)
+        return emitDpp(loc, rewriter, val, val,
+                       makeDppCtrl(DppCtrl::ROW_XMASK0, mask));
+      else if (mask < 32)
+        return emitPermlaneX16Xor(loc, rewriter, val, mask & 0xf);
+    } else if ((isCDNA(isaFamily) || isaFamily == ISAFamily::GCN5_1) &&
+               mask < 16) {
+      Value result = val;
+      uint32_t highBitsDppBasis = 0;
+
+      if (mask & 4)
+        highBitsDppBasis ^= 7;
+      if (mask & 8)
+        highBitsDppBasis ^= 8;
+
+      uint32_t quadMask = mask ^ highBitsDppBasis;
+
+      if (highBitsDppBasis) {
+        DppCtrl highBitsDppCtrl;
+        switch (highBitsDppBasis) {
+        case 0x7:
+          highBitsDppCtrl = DppCtrl::ROW_HALF_MIRROR;
+          break;
+        case 0x8:
+          highBitsDppCtrl = makeDppCtrl(DppCtrl::ROW_ROR0, 8);
+          break;
+        case 0xf:
+          highBitsDppCtrl = DppCtrl::ROW_MIRROR;
+          break;
+        }
+        result = emitDpp(loc, rewriter, result, result, highBitsDppCtrl);
       }
+
+      if (quadMask) {
+        result =
+            emitDpp(loc, rewriter, result, result, makeQuadPermCtrl(quadMask));
+      }
+      return result;
     } else {
-      if (!llvm::is_contained({ISAFamily::CDNA2, ISAFamily::CDNA3,
-                               ISAFamily::CDNA4, ISAFamily::RDNA3,
-                               ISAFamily::RDNA4, ISAFamily::GFX1250},
-                              isaFamily)) {
-        // DPP is only supported for CDNA2/CDNA3/CDNA4/RDNA3/RDNA4/GFX1250 right
-        // now, so we fallback to ds_swizzle for other architectures.
-        //
-        // This map facilates the butterfly shuffle pattern for a stride less
-        // than 16. The pattern stride is the key of the map.
-        DenseMap<short, unsigned int> masks{
-            {16, 0x401F}, {8, 0x201F}, {4, 0x101F}, {2, 0x081F}, {1, 0x041F}};
-        Value offset = b.i32_val(masks[strideInt]);
-        return ROCDL::DsSwizzleOp::create(rewriter, loc, valType, val, offset);
-      }
-
-      auto createDppOpWithoutBoundCtrl = [&](Value &old, Value &src,
-                                             uint32_t dppCtrl, uint32_t rowMask,
-                                             uint32_t bankMask) {
-        return ROCDL::DPPUpdateOp::create(rewriter, loc, valType, old, src,
-                                          rewriter.getI32IntegerAttr(dppCtrl),
-                                          rewriter.getI32IntegerAttr(rowMask),
-                                          rewriter.getI32IntegerAttr(bankMask),
-                                          rewriter.getBoolAttr(false));
-      };
-
-      const int allRows = 0xf;
-      const int allBanks = 0xf;
-
-      switch (strideInt) {
-      case 1: {
-        // quad_perm: 1, 0, 3, 2
-        uint32_t dppCtrl = static_cast<uint32_t>(DppCtrl::QUAD_PERM_FIRST);
-        std::array<uint32_t, 4> mask = {1, 0, 3, 2};
-        for (int i = 0; i < mask.size(); i++) {
-          dppCtrl |= mask[i] << (i * 2);
-        }
-        return createDppOpWithoutBoundCtrl(val, val, dppCtrl, allRows,
-                                           allBanks);
-      }
-      case 2: {
-        // quad_perm: 2, 3, 0, 1
-        uint32_t dppCtrl = static_cast<uint32_t>(DppCtrl::QUAD_PERM_FIRST);
-        std::array<uint32_t, 4> mask = {2, 3, 0, 1};
-        for (int i = 0; i < mask.size(); i++) {
-          dppCtrl |= mask[i] << (i * 2);
-        }
-        return createDppOpWithoutBoundCtrl(val, val, dppCtrl, allRows,
-                                           allBanks);
-      }
-      case 4: {
-        // row_shr:4 bank_mask: 0xa
-        auto ret = createDppOpWithoutBoundCtrl(
-                       val, val, 4 + static_cast<uint32_t>(DppCtrl::ROW_SHR0),
-                       allRows, 0xa)
-                       .getRes();
-
-        // row_shl:4 bank_mask: 0x5
-        return createDppOpWithoutBoundCtrl(
-            ret, val, 4 + static_cast<uint32_t>(DppCtrl::ROW_SHL0), allRows,
-            0x5);
-      }
-      case 8: {
-        // row_shr:8 bank_mask: 0xc
-        auto ret = createDppOpWithoutBoundCtrl(
-                       val, val, 8 + static_cast<uint32_t>(DppCtrl::ROW_SHR0),
-                       allRows, 0xc)
-                       .getRes();
-
-        // row_shl:8 bank_mask: 0x3
-        return createDppOpWithoutBoundCtrl(
-            ret, val, 8 + static_cast<uint32_t>(DppCtrl::ROW_SHL0), allRows,
-            0x3);
-      }
-      default:
-        assert(false &&
-               "bfly shfl with stride >= 16 should not be handled by dpp.");
-      }
+      return bpermute(b.xor_(laneId, b.i32_val(mask)));
     }
-    break;
+  }
   case ShflKind::up: {
     Value mask = b.icmp_slt(laneId, i);
     Value delta = b.sub(laneId, i);
@@ -195,9 +200,9 @@ static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
   return Value();
 }
 
-static Value shuffleCommon(Location loc, RewriterBase &rewriter,
-                           ISAFamily isaFamily, Value val, Value i,
-                           int strideInt, ShflKind mode, Value clamp) {
+Value shuffleCommon(Location loc, RewriterBase &rewriter, ISAFamily isaFamily,
+                    Value val, Value i, int strideInt, ShflKind mode,
+                    Value clamp) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // To shuffle pointers, convert them to i64.
   Type valTy = val.getType();
@@ -209,6 +214,8 @@ static Value shuffleCommon(Location loc, RewriterBase &rewriter,
     result = b.inttoptr(valTy, result);
   return result;
 }
+
+} // namespace
 
 Value shuffleXor(Location loc, RewriterBase &rewriter, Value val, int i,
                  ISAFamily isaFamily) {
@@ -412,7 +419,7 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 }
 
 // Create the auxiliary/cachepolicy value of ROCDL::RawPtrBufferLoad/StoreOp
-//   gfx942 and gfx950: bit 0 = sc0, bit 1 = nt, bit 3 = swz, bit 4 = sc1
+//   CDNA3 and CDNA4: bit 0 = sc0, bit 1 = nt, bit 3 = swz, bit 4 = sc1
 // Vector Memory instructions (Flat, Global, Scratch, and Buffer) have 3
 // bits to control scope and cacheability:
 // - SC[1:0] System Cache level: 0=wave, 1=group, 2=device, 3=system
@@ -435,8 +442,8 @@ void llStore(RewriterBase &rewriter, Location loc, Value ptr, Value val,
 //        | N/A |  1  |  0  | x  | Setting sc1 performs a system-scope atomic
 // -------+-----+-----+-----+----+--
 static int32_t
-getCtrlBitsForCacheModifierOnGFX_942_950(triton::CacheModifier cm,
-                                         bool isLoad) {
+getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(triton::CacheModifier cm,
+                                          bool isLoad) {
   const int sc0Bit = 0b1, ntBit = 0b10, sc1Bit = 0b10000;
   int32_t aux = 0;
   switch (cm) {
@@ -468,16 +475,78 @@ getCtrlBitsForCacheModifierOnGFX_942_950(triton::CacheModifier cm,
   return aux;
 }
 
-int32_t getCtrlBitsForBufferAtomicsOnGFX_942_950(bool setSC0, bool setSC1,
-                                                 bool setNT) {
-  const int sc0Bit = 0b1, ntBit = 0b10, sc1Bit = 0b10000;
+// Create the auxiliary/cachepolicy value for RDNA3 (and 3.5) buffer ops
+//
+// LLVM CPol bit layout (from SIDefines.h):
+//   bit 0 = GLC  (Graphics L1 cache, GL1)
+//   bit 1 = SLC  (Graphics L2 cache, GL2)
+//   bit 2 = DLC  (Memory-Attached Last-Level cache, MALL)
+//
+// Hardware semantics on RDNA3:
+//   GLC=1  forces MISS_EVICT at GL1 (bypass / invalidate L1 line).
+//   SLC=1  sets GL2 to STREAM (evict-first) policy, limiting L2 pollution.
+//   DLC=1  non-temporal hint for MALL: data is not expected to be reused,
+//          so skip MALL allocation. Ignored if MALL is not present.
+//   DLC=0  temporal (default): allow normal MALL caching.
+//
+// Cache modifier definitions (PTX/Triton semantics):
+//   .ca  Cache at All levels (L1+L2+MALL). Default load policy, LRU eviction.
+//   .cg  Cache at Global level only (L2 and below, bypass L1).
+//   .cs  Cache Streaming, likely accessed once. Evict-first to limit pollution.
+//   .cv  Cache Volatile. Invalidates matching L2 line and re-fetches.
+//   .wb  Write-Back at all cache levels (default store policy).
+//   .wt  Write-Through, writes data directly to system memory.
+//
+// -------+-----+-----+-----+-----+-----------
+// Op     | cm  | DLC | SLC | GLC | aux value
+// -------+-----+-----+-----+-----+-----------
+// Load   | .ca |  0  |  0  |  0  |  0
+//        | .cg |  0  |  0  |  1  |  1
+//        | .cs |  1  |  1  |  1  |  7
+//        | .cv |  1  |  1  |  1  |  7
+// -------+-----+-----+-----+-----+-----------
+// Store  | .wb |  0  |  0  |  0  |  0
+//        | .cg |  0  |  0  |  0  |  0
+//        | .cs |  1  |  1  |  1  |  7
+//        | .wt |  1  |  1  |  1  |  7
+// -------+-----+-----+-----+-----+-----------
+//
+// Condensed hardware behavior:
+//   DLC=0, SLC=0, GLC=0  -> temporal at all levels (MALL+GL2+GL1) (.ca/.wb)
+//   DLC=0, SLC=0, GLC=1  -> bypass GL1, cache in GL2              (.cg load)
+//   DLC=0, SLC=0, GLC=0  -> default (no special flags)            (.cg store)
+//   DLC=1, SLC=1, GLC=1  -> non-temporal: bypass GL1, stream GL2,
+//                           skip MALL                             (.cs/.cv/.wt)
+static int32_t getCtrlBitsForCacheModifierOnRDNA3(triton::CacheModifier cm,
+                                                  bool isLoad) {
+  const int glcBit = 0b1, slcBit = 0b10, dlcBit = 0b100;
   int32_t aux = 0;
-  if (setSC0)
-    aux |= sc0Bit;
-  if (setSC1)
-    aux |= sc1Bit;
-  if (setNT)
-    aux |= ntBit;
+  switch (cm) {
+  case triton::CacheModifier::CA:
+    aux = 0;
+    break;
+  case triton::CacheModifier::CG:
+    if (isLoad)
+      aux |= glcBit;
+    break;
+  case triton::CacheModifier::CS:
+    aux |= glcBit | slcBit | dlcBit;
+    break;
+  case triton::CacheModifier::CV:
+    assert(isLoad);
+    aux |= glcBit | slcBit | dlcBit;
+    break;
+  case triton::CacheModifier::WB:
+    assert(!isLoad);
+    aux = 0;
+    break;
+  case triton::CacheModifier::WT:
+    assert(!isLoad);
+    aux |= glcBit | slcBit | dlcBit;
+    break;
+  default:
+    aux = 0;
+  }
   return aux;
 }
 
@@ -495,19 +564,15 @@ static int32_t getDefaultCtrlBitsForCacheModifier(triton::CacheModifier cm) {
 int32_t getCtrlBitsForCacheModifierOnTarget(
     triton::CacheModifier cm, bool isLoad,
     const mlir::triton::AMD::TargetInfo &targetInfo) {
-  switch (targetInfo.getGPUKind()) {
-  case llvm::AMDGPU::GK_GFX942:
-  case llvm::AMDGPU::GK_GFX950:
-    return getCtrlBitsForCacheModifierOnGFX_942_950(cm, isLoad);
+  switch (targetInfo.getISAFamily()) {
+  case triton::AMD::ISAFamily::CDNA3:
+  case triton::AMD::ISAFamily::CDNA4:
+    return getCtrlBitsForCacheModifierOn_CDNA3_CDNA4(cm, isLoad);
+  case triton::AMD::ISAFamily::RDNA3:
+    return getCtrlBitsForCacheModifierOnRDNA3(cm, isLoad);
   default:
     return getDefaultCtrlBitsForCacheModifier(cm);
   }
-}
-
-Value cvtFp32ToFp16RTNE_oneValue(Location loc, RewriterBase &rewriter,
-                                 const Value &v) {
-  LLVM::RoundingMode rm = LLVM::RoundingMode::NearestTiesToEven;
-  return LLVM::FPTruncOp::create(rewriter, loc, f16_ty, v);
 }
 
 Type getPointerTypeWithShape(Value basePtr, Value offset) {
@@ -809,11 +874,29 @@ bool isChainDotTail(tt::DotOpInterface dotOp) {
   return false;
 }
 
+Value convertF8ToF32_SW(RewriterBase &rewriter, Location loc, Value fp8Val,
+                        bool isE4M3FN) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  if (isE4M3FN) {
+    // Position the 7 magnitude bits at f32 bits [26:20] and multiply by
+    // 2^120 to correct the exponent bias (f32 bias 127 - E4M3 bias 7 = 120).
+    Value absVal = b.and_(fp8Val, b.i8_val(0x7F));
+    Value vi32 = b.shl(b.zext(i32_ty, absVal), b.i32_val(20));
+    Value rawF32 = b.fmul(b.bitcast(vi32, f32_ty), b.f32_val(0x1p120f));
+    Value signBit =
+        b.shl(b.and_(b.zext(i32_ty, fp8Val), b.i32_val(0x80)), b.i32_val(24));
+    return b.bitcast(b.or_(b.bitcast(rawF32, i32_ty), signBit), f32_ty);
+  }
+  // E5M2 -> f16 (same exponent format, simple shift) -> fpext to f32.
+  Value i16Val = b.shl(b.zext(i16_ty, fp8Val), b.i16_val(8));
+  return b.fpext(f32_ty, b.bitcast(i16Val, f16_ty));
+}
+
 SmallVector<Value> upcast8xMxfp4_SW(RewriterBase &rewriter, Operation *op,
                                     bool toFp16, Value packedVec,
                                     ISAFamily isaFamily, Value scale) {
-  assert((isa<triton::amdgpu::UpcastMXFPOp, triton::gpu::Fp4ToFpOp>(op)) &&
-         "Expected UpcastMXFPOp or Fp4ToFpOp");
+  assert((isa<triton::gpu::Fp4ToFpOp, triton::amdgpu::ScaledUpcastFp4Op>(op)) &&
+         "Expected Fp4ToFpOp or ScaledUpcastFp4Op");
   Location loc = op->getLoc();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto permU32FnTy =

@@ -774,7 +774,7 @@ def async_load(
         raise NotImplementedError("async_load by block pointer is not supported yet")
     else:
         # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
-        _, src, mask, other, _ = _semantic._prepare_legacy_load(src, mask, other, None, None)
+        _, src, mask, other, _ = _semantic._prepare_load(src, mask, other, None, None)
 
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
@@ -917,6 +917,32 @@ def local_store(
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
+
+
+@tl.builtin
+def dump_layout(
+    x,
+    _semantic=None,
+) -> None:
+    """
+    Compile-time diagnostic that prints the resolved layout of a value.
+
+    ``x`` may be a register tensor (``tl.tensor``) or a shared/tensor-memory
+    buffer (``tlx.buffered_tensor``). The value's type, encoding, and expanded
+    linear layout are printed to the compiler log during compilation; no device
+    code is emitted and nothing is returned.
+
+    The layout is rendered in CuTe ``Shape:Stride`` notation and maps a
+    coordinate to the *logical* tensor's row-major element index (its codomain):
+    for a register tensor a ``(thread, value)`` coordinate -> the logical
+    element index it holds, and for a buffer an offset -> the buffer element
+    index. Strides are offsets in that logical index space, not physical
+    byte/bank addresses.
+
+    This is a static host-side diagnostic and is distinct from the runtime,
+    device-side ``tl.device_print`` / ``tl.print``.
+    """
+    _semantic.builder.create_dump_layout(x.handle)
 
 
 def _shape_as_ints(shape):

@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import triton
+import ctypes
+import sys
 from pathlib import Path
 from triton import knobs
 from triton.runtime.build import compile_module_from_src
@@ -17,19 +19,15 @@ from triton.backends.driver import (
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
-# Path(s) to the shared data-driven launcher core. driver.c is compiled via a
-# fixed Remote-Execution command that ignores include_dirs, so we inline this
-# header into the driver.c source at build time (see CudaUtils.__init__) rather
-# than relying on an -I path.
-#
-# The first candidate (backend/launch.h) is a vendored copy that ships with the
-# nvidia backend resources (the BUCK glob packages it next to driver.py), so it
-# is present in packaged/buck builds. The second is the canonical source used by
-# C/C++ consumers (cc_library triton_launch_h). Keep the two in sync; the
-# canonical is python/triton/runtime/launch.h.
+# Path to the shared data-driven launcher core. It lives in the nvidia backend
+# dir (next to driver.c / driver.py) and is the canonical source for C/C++
+# consumers (cc_library triton_launch_h). driver.c is compiled via a fixed
+# Remote-Execution command that ignores include_dirs, so we inline this header
+# into the driver.c source at build time (see CudaUtils.__init__) rather than
+# relying on an -I path. In both source and packaged/buck builds the header
+# sits next to this file.
 _launch_h_candidates = [
     os.path.join(dirname, "launch.h"),
-    os.path.join(dirname, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
 ]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ["libcuda.so.1"]
@@ -38,6 +36,7 @@ PyKernelArg = None
 ARG_CONSTEXPR = None
 ARG_KERNEL = None
 ARG_TUPLE = None
+GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
 
 
 @functools.lru_cache()
@@ -69,6 +68,40 @@ def library_dirs():
     return [libdevice_dir, *libcuda_dirs()]
 
 
+def _cuda_driver_is_active():
+    candidates = ["libcuda.so.1"]
+    try:
+        candidates.extend([os.path.join(path, "libcuda.so.1") for path in libcuda_dirs()])
+    except Exception:
+        pass
+
+    libcuda = None
+    for candidate in candidates:
+        try:
+            libcuda = ctypes.CDLL(candidate)
+            break
+        except OSError:
+            continue
+
+    if libcuda is None:
+        return False
+
+    cu_init = libcuda.cuInit
+    cu_init.argtypes = [ctypes.c_uint]
+    cu_init.restype = ctypes.c_int
+    if cu_init(0) != 0:
+        return False
+
+    cu_device_get_count = libcuda.cuDeviceGetCount
+    cu_device_get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    cu_device_get_count.restype = ctypes.c_int
+    count = ctypes.c_int()
+    if cu_device_get_count(ctypes.byref(count)) != 0:
+        return False
+
+    return count.value > 0
+
+
 # ------------------------
 # Utils
 # ------------------------
@@ -93,7 +126,7 @@ class CudaUtils(object):
         if launch_h_path is None:
             raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
         launch_h_src = Path(launch_h_path).read_text()
-        include_marker = '#include "triton/runtime/launch.h"'
+        include_marker = '#include "nvidia/backend/launch.h"'
         if include_marker not in driver_src:
             raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
                                "launch.h inlining, but it was not found")
@@ -117,6 +150,10 @@ class CudaUtils(object):
         ARG_TUPLE = mod.ARG_TUPLE
         self.load_binary = mod.load_binary
         self.unload_module = mod.unload_module
+        self.get_current_device = mod.get_current_device
+        self.set_current_device = mod.set_current_device
+        self.get_default_stream = mod.get_default_stream
+        self.get_device_capability = mod.get_device_capability
         self.get_device_properties = mod.get_device_properties
         self.cuOccupancyMaxActiveClusters = mod.cuOccupancyMaxActiveClusters
         self.set_printf_fifo_size = mod.set_printf_fifo_size
@@ -517,7 +554,28 @@ class CudaDriver(GPUDriver):
     def __init__(self):
         self.utils = CudaUtils()  # TODO: make static
         self.launcher_cls = CudaLauncher
-        super().__init__()
+        if sys.modules.get("torch") is not None:
+            super().__init__()
+        else:
+            self.get_device_capability = self._get_device_capability
+            self.get_current_stream = self._get_current_stream
+            self.get_current_device = self._get_current_device
+            self.set_current_device = self._set_current_device
+
+    def _get_device_capability(self, device):
+        return self.utils.get_device_capability(device)
+
+    def _get_current_stream(self, device):
+        # The CUDA driver API does not expose PyTorch's notion of the current
+        # stream. In torch-free launches we fall back to the device's default
+        # stream after making that device's primary context current.
+        return self.utils.get_default_stream(device)
+
+    def _get_current_device(self):
+        return self.utils.get_current_device()
+
+    def _set_current_device(self, device):
+        self.utils.set_current_device(device)
 
     def get_current_target(self):
         device = self.get_current_device()
@@ -538,12 +596,7 @@ class CudaDriver(GPUDriver):
 
     @staticmethod
     def is_active():
-        try:
-            import torch
-
-            return torch.cuda.is_available() and (torch.version.hip is None)
-        except ImportError:
-            return False
+        return _cuda_driver_is_active()
 
     def map_python_to_cpp_type(self, ty: str) -> str:
         return ty_to_cpp(ty)

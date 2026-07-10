@@ -1,5 +1,5 @@
 """Tests that the JIT variadic launcher (driver.c::launchKernel) routes through
-the shared data-driven core ``triton_launch_kernel`` in ``triton/runtime/launch.h``.
+the shared data-driven core ``triton_launch_kernel`` in ``nvidia/backend/launch.h``.
 
 The default launch path (no ``TRITON_USE_C_DISPATCHER``) goes through
 ``kernel.run() -> CudaLauncher -> launchKernel``. To make these tests robust

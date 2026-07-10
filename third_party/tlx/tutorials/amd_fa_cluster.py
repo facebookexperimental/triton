@@ -7,6 +7,8 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.core import _aggregate as aggregate
 
+CLUSTER_BUF_DEPTH = 2
+
 
 @triton.jit
 def _assume_strides(
@@ -252,11 +254,16 @@ def _attn_inner_pipelined(
 
 
 @triton.jit
-def _attn_fwd_cluster_pipeline(
+def _attn_cluster_tile(
+    pid_m,
+    off_z,
+    off_h,
     Q,
     K,
     V,
     Out,
+    k_buf,
+    v_buf,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -274,39 +281,13 @@ def _attn_fwd_cluster_pipeline(
     stride_om,
     stride_ok,
     N_CTX,
-    sm_scale: tl.constexpr,
+    QK_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BUF_DEPTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
-    _assume_strides(
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qk,
-        stride_kz,
-        stride_kh,
-        stride_kn,
-        stride_kk,
-        stride_vz,
-        stride_vh,
-        stride_vn,
-        stride_vk,
-        stride_oz,
-        stride_oh,
-        stride_om,
-        stride_ok,
-    )
-
-    if IS_CAUSAL:
-        off_h = tl.program_id(0)
-        pid_m = tl.program_id(1)
-    else:
-        pid_m = tl.program_id(0)
-        off_h = tl.program_id(1)
-    off_z = tl.program_id(2)
-
     q_off = off_z * stride_qz + off_h * stride_qh
     k_off = off_z * stride_kz + off_h * stride_kh
     v_off = off_z * stride_vz + off_h * stride_vh
@@ -322,14 +303,9 @@ def _attn_fwd_cluster_pipeline(
         other=0.0,
     )
 
-    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
     DIAG_OFFSET: tl.constexpr = 0
 
     state = SoftmaxState.create(BLOCK_M, HEAD_DIM)
-
-    BUF_DEPTH: tl.constexpr = 2
-    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
-    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, BUF_DEPTH)
 
     k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
@@ -408,32 +384,229 @@ def _attn_fwd_cluster_pipeline(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
 
 
+@triton.jit
+def _attn_fwd_cluster_pipeline(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BUF_DEPTH: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    _assume_strides(
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+    )
+
+    if IS_CAUSAL:
+        off_h = tl.program_id(0)
+        pid_m = tl.program_id(1)
+    else:
+        pid_m = tl.program_id(0)
+        off_h = tl.program_id(1)
+    off_z = tl.program_id(2)
+
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, BUF_DEPTH)
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+    _attn_cluster_tile(
+        pid_m,
+        off_z,
+        off_h,
+        Q,
+        K,
+        V,
+        Out,
+        k_buf,
+        v_buf,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        N_CTX,
+        QK_SCALE,
+        BLOCK_M,
+        BLOCK_N,
+        BUF_DEPTH,
+        HEAD_DIM,
+        IS_CAUSAL,
+    )
+
+
+@triton.jit
+def _attn_fwd_cluster_persistent_pipeline(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BUF_DEPTH: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+):
+    _assume_strides(
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+    )
+
+    # Persistent scheduler: pin flattened (batch, head) work to an XCD for K/V
+    # locality, then round-robin constant-cost work units across local programs.
+    # Causal units bundle zig-zag tile pairs; non-causal units are one tile.
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, BUF_DEPTH)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+    TILES_PER_UNIT: tl.constexpr = 2 if IS_CAUSAL else 1
+    units_per_hz: tl.constexpr = (NUM_M_BLOCKS + TILES_PER_UNIT - 1) // TILES_PER_UNIT
+    hz_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units = hz_per_xcd * units_per_hz
+
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+        local_hz = unit // units_per_hz
+        bundle = unit % units_per_hz
+        pid_hz = xcd + local_hz * NUM_XCDS
+        if pid_hz < Z * H:
+            off_z = pid_hz // H
+            off_h = pid_hz % H
+            for j in tl.static_range(TILES_PER_UNIT):
+                idx = bundle * TILES_PER_UNIT + j
+                if idx < NUM_M_BLOCKS:
+                    if IS_CAUSAL:
+                        half = idx // 2
+                        pid_m = tl.where(idx % 2 == 0, half, NUM_M_BLOCKS - 1 - half)
+                    else:
+                        pid_m = idx
+                    # Safe to reuse the LDS slots across units: the outer loop
+                    # has num_stages=0 and _attn_cluster_tile drains all async
+                    # load groups before it returns.
+                    _attn_cluster_tile(
+                        pid_m,
+                        off_z,
+                        off_h,
+                        Q,
+                        K,
+                        V,
+                        Out,
+                        k_buf,
+                        v_buf,
+                        stride_qz,
+                        stride_qh,
+                        stride_qm,
+                        stride_qk,
+                        stride_kz,
+                        stride_kh,
+                        stride_kn,
+                        stride_kk,
+                        stride_vz,
+                        stride_vh,
+                        stride_vn,
+                        stride_vk,
+                        stride_oz,
+                        stride_oh,
+                        stride_om,
+                        stride_ok,
+                        N_CTX,
+                        QK_SCALE,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BUF_DEPTH,
+                        HEAD_DIM,
+                        IS_CAUSAL,
+                    )
+
+
 def _cluster_default_block_n(causal):
     return 32 if causal else 64
-
-
-def _validate_inputs(q, k, v, causal, block_m, block_n, num_warps):
-    assert q.ndim == 4, f"cluster attention expects q to be 4D, got shape {tuple(q.shape)}"
-    B, H, N_CTX, D = q.shape
-    assert k.shape == (B, H, N_CTX, D), ("cluster attention supports square self-attention only: "
-                                         f"expected k shape {(B, H, N_CTX, D)}, got {tuple(k.shape)}")
-    assert v.shape == (B, H, N_CTX, D), ("cluster attention supports square self-attention only: "
-                                         f"expected v shape {(B, H, N_CTX, D)}, got {tuple(v.shape)}")
-    assert D == 128, f"cluster attention is validated only for D == 128, got {D}"
-    assert N_CTX % block_n == 0, f"cluster attention: N_CTX ({N_CTX}) must be a multiple of BLOCK_N ({block_n})"
-    assert N_CTX % block_m == 0, f"cluster attention: N_CTX ({N_CTX}) must be a multiple of BLOCK_M ({block_m})"
-
-    mfma_m = 32
-    assert block_m >= num_warps * mfma_m, (
-        f"cluster attention: BLOCK_M ({block_m}) must be >= num_warps ({num_warps}) * MFMA_M ({mfma_m})")
-    if causal:
-        assert block_m % block_n == 0, (
-            f"cluster attention causal: BLOCK_M ({block_m}) must be a multiple of BLOCK_N ({block_n})")
-        assert block_m // block_n >= 4, (
-            f"cluster attention causal: diagonal band BLOCK_M/BLOCK_N ({block_m // block_n}) must be >= 4 tiles")
-    else:
-        assert N_CTX // block_n >= 4, "cluster attention requires at least 4 K/V blocks"
-    return B, H, N_CTX, D
 
 
 def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
@@ -442,7 +615,7 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
     block_n = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
     num_warps = kw.pop("num_warps", min(8, max(1, block_m // mfma_m)))
     waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
-    B, H, N_CTX, D = _validate_inputs(q, k, v, causal, block_m, block_n, num_warps)
+    B, H, N_CTX, D = q.shape
 
     o = torch.empty_like(q)
     m_blocks = triton.cdiv(N_CTX, block_m)
@@ -472,8 +645,67 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
         sm_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        BUF_DEPTH=CLUSTER_BUF_DEPTH,
         HEAD_DIM=D,
         IS_CAUSAL=causal,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        **kw,
+    )
+    return o
+
+
+def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw):
+    mfma_m = 32
+    block_m = kw.pop("BLOCK_M", 256)
+    block_n = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
+    num_warps = kw.pop("num_warps", min(8, max(1, block_m // mfma_m)))
+    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
+    B, H, N_CTX, D = q.shape
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    assert num_xcds > 0, f"cluster attention: NUM_XCDS must be positive, got {num_xcds}"
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    assert num_sms >= num_xcds, f"cluster attention: NUM_SMS ({num_sms}) must be >= NUM_XCDS ({num_xcds})"
+    assert num_sms % num_xcds == 0, (
+        f"cluster attention: NUM_SMS ({num_sms}) must be divisible by NUM_XCDS ({num_xcds})")
+
+    o = torch.empty_like(q)
+    m_blocks = triton.cdiv(N_CTX, block_m)
+    grid = (num_sms, )
+    _attn_fwd_cluster_persistent_pipeline[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BUF_DEPTH=CLUSTER_BUF_DEPTH,
+        HEAD_DIM=D,
+        IS_CAUSAL=causal,
+        NUM_M_BLOCKS=m_blocks,
+        NUM_SMS=num_sms,
+        NUM_XCDS=num_xcds,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **kw,
@@ -484,3 +716,8 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
 def attention(q, k, v, sm_scale, causal, config=None):
     config = {} if config is None else dict(config)
     return flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=causal, **config)
+
+
+def persistent_attention(q, k, v, sm_scale, causal, config=None):
+    config = {} if config is None else dict(config)
+    return flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=causal, **config)

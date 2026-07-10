@@ -80,15 +80,20 @@ struct CLCSplitPass
 //
 // clc_try_cancel_async has no operands, so within its block it can move to the
 // front freely; that places the issue above the tile's compute (loop-body top)
-// so the request resolves while the tile is computed. TODO: cross-basic-block
-// hoisting / unification (e.g. clc_advance in both arms of an if/else) is a
-// follow-up; see the design doc.
+// so the request resolves while the tile is computed. The move is restricted to
+// the persistent-loop body (the scf.while after-region), the only block whose
+// front is a safe issue point -- an arbitrary block's front may hold required
+// setup. TODO: cross-basic-block hoisting / unification (e.g. clc_advance in
+// both arms of an if/else) is a follow-up; see the design doc.
 //===--------------------------------------------------------------------===//
 struct CLCHoistPass
     : public impl::TritonNvidiaGPUCLCHoistPassBase<CLCHoistPass> {
   void runOnOperation() override {
     getOperation().walk([&](CLCTryCancelAsyncOp issue) {
       Block *blk = issue->getBlock();
+      auto whileOp = dyn_cast<scf::WhileOp>(blk->getParentOp());
+      if (!whileOp || blk != &whileOp.getAfter().front())
+        return;
       if (&blk->front() != issue.getOperation())
         issue->moveBefore(&blk->front());
     });
@@ -169,8 +174,7 @@ struct CLCMaterializePass
       Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
                                                 /*width=*/1);
       BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
-      CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar,
-                             /*multicast=*/false);
+      CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
     }
 
     // Materialize the read: wait_barrier + clc_load_result + decode.

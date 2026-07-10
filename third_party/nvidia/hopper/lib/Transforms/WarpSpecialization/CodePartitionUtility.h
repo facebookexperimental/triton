@@ -15,6 +15,17 @@ namespace mlir {
 
 namespace tt = mlir::triton;
 
+// Discardable i32 attribute stamped by WSAtomicBroadcast on the
+// dynamic-persistent tile-id broadcast slot's `local_alloc` to request a
+// specific multi-buffer depth (tile prefetch depth). `allocateSmemBuffers`
+// (WSMemoryPlanner) pins the buffer's copy count to this value so the requested
+// depth is honored end-to-end (buffer shape + accumCnt-driven slot/phase),
+// rather than leaving this non-innermost broadcast channel single-buffered.
+// Defined here so the producer (WSAtomicBroadcast) and the consumer
+// (WSMemoryPlanner) share one source of truth for the name.
+constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
+    "ttg.atomic_broadcast_copies";
+
 enum class DataChannelKind : int {
   SMEM = 0,
   TMEM = 1,
@@ -101,6 +112,34 @@ public:
   virtual unsigned getNumBuffers();
 
   Operation *allocOp;
+
+  // Producer op (ttg.local_store / async_tma_copy / the in-body template store
+  // of a ttng.subtiled_region), resolved and cached in createChannelPost at
+  // channel-creation time, before any buffer rewriting. getSrcOp() returns this
+  // when set. Caching is required for subtiled-region producers: when a
+  // *sibling* channel that shares the same template store is lowered,
+  // insertAsyncComm rewires the in-body store and removes the shared per-tile
+  // buffer position, so a later alloc-walk in getSrcOp() would find nothing and
+  // return null (SIGSEGV at the getSrcOp()->getBlock() deref). The template op
+  // itself survives, so the cached pointer stays valid. Null for direct
+  // alloc-with-src producers.
+  Operation *cachedSrcOp = nullptr;
+
+  // For a collapsed both-endpoints-subtiled channel, the per-tile staging
+  // allocs of this (producer region, consumer region) pair other than the
+  // representative (allocOp). collectPostChannels records them here instead of
+  // creating duplicate channels; after the in-body view rewire removes their
+  // per-tile positions they become use_empty and are erased in insertAsyncComm.
+  // Empty for every non-collapsed channel.
+  SmallVector<Operation *> collapsedSiblingAllocs;
+
+  // True only for the representative of a both-endpoints-subtiled collapse
+  // (producer AND consumer in different-task ttng.subtiled_regions), set in
+  // collectPostChannels. This — NOT the broad channelIsSubtiled (which is also
+  // true for a consumer-only-subtiled channel such as an epilogue bias load) —
+  // gates the size-1 subtiled reuse-group / in-body slot-rotation machinery at
+  // buffer.copy == 1. See channelIsCollapsedBothSubtiled.
+  bool isCollapsedBothSubtiled = false;
 };
 
 struct ReuseGroup {
@@ -219,6 +258,17 @@ unsigned getAccumArgIdx(Operation *parentOp, Operation *ctrlOp,
 
 void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
                       SmallVector<Operation *> &chList);
+
+// True when the channel's producer or consumer op is inside (or is) a
+// ttng.subtiled_region. A collapsed both-endpoints-subtiled channel is the sole
+// member of its reuse group, so reuse-group machinery must treat it specially
+// even at size 1.
+bool channelIsSubtiled(Channel *ch);
+// Narrow form of channelIsSubtiled: true only for the representative of a
+// both-endpoints-subtiled collapse (ChannelPost::isCollapsedBothSubtiled). Used
+// to extend the subtiled reuse-group / in-body rotation machinery to
+// buffer.copy == 1 without misfiring on consumer-only-subtiled channels.
+bool channelIsCollapsedBothSubtiled(Channel *ch);
 
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,

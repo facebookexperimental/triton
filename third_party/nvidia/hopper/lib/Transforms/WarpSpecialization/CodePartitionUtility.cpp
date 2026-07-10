@@ -97,6 +97,14 @@ Operation *skipIdxOp(Operation *op) {
 }
 
 Operation *ChannelPost::getSrcOp() {
+  // Prefer the producer cached at channel-creation time. This is the only
+  // reliable source for a producer inside a ttng.subtiled_region: once a
+  // sibling channel (sharing the same in-body template store and per-tile
+  // buffer position) is lowered, insertAsyncComm rewires that store and removes
+  // the shared per-tile position, so the alloc-walk below would no longer reach
+  // it.
+  if (cachedSrcOp)
+    return cachedSrcOp;
   for (auto usr : allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -348,7 +356,12 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
-  if (group->channels[0]->getNumBuffers() <= 1)
+  // A collapsed both-endpoints-subtiled channel is the sole member of its group
+  // and still needs a shared accumCnt (the numTiles counter stride feeds the
+  // in-body per-tile slot/phase rotation) even at buffer.copy == 1. Only plain
+  // single-buffered groups carry no accumCnt.
+  if (group->channels[0]->getNumBuffers() <= 1 &&
+      !channelIsCollapsedBothSubtiled(group->channels[0]))
     return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
@@ -462,12 +475,52 @@ unsigned getAccumArgIdx(Operation *parentForOp, Operation *ctrlOp,
 // Find channels of reuse group that are inside regionOp. If the channel is
 // directly in regionOp, add the channel's DstOp, otherwise add the region Op
 // that is directly in regionOp and encloses the channel.
+// A channel is "subtiled" when its producer or consumer op lives inside (or is)
+// a ttng.subtiled_region. A collapsed both-endpoints-subtiled channel is the
+// sole member of its reuse group (one ChannelPost per producer/consumer region
+// pair, with numTiles internal per-tile instances), so it must be treated as a
+// reuse group even at size 1 to get the in-body per-tile slot rotation and the
+// numTiles counter stride.
+bool channelIsSubtiled(Channel *ch) {
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+  auto inSubtiled = [](Operation *op) {
+    return op && (isa<ttng::SubtiledRegionOp>(op) ||
+                  op->getParentOfType<ttng::SubtiledRegionOp>() != nullptr);
+  };
+  return inSubtiled(ch->getSrcOp()) || inSubtiled(ch->getDstOp());
+}
+
+// True only for the representative of a both-endpoints-subtiled collapse: its
+// producer AND consumer are in different-task ttng.subtiled_regions, so the
+// numTiles per-tile staging allocs were folded into this one ChannelPost in
+// collectPostChannels (which sets the flag). Unlike channelIsSubtiled, this is
+// NOT true for a consumer-only-subtiled channel (e.g. an epilogue bias load
+// whose local_store sits outside the region), so it safely gates the size-1
+// subtiled reuse-group / in-body rotation machinery at buffer.copy == 1 without
+// pulling such channels into a degenerate group (which has no per-tile staging
+// buffer to rotate → empty deadPositions assert in insertAsyncComm).
+bool channelIsCollapsedBothSubtiled(Channel *ch) {
+  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+    return false;
+  return static_cast<ChannelPost *>(ch)->isCollapsedBothSubtiled;
+}
+
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
   if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp) &&
       !isa<scf::WhileOp>(regionOp))
     return;
-  if (group->channels.size() <= 1 || group->channels[0]->getNumBuffers() <= 1)
+  // A collapsed subtiled channel needs its dst region threaded into chList for
+  // the numTiles counter stride even at buffer.copy == 1 (single physical slot,
+  // alternating barrier phase); only plain single-buffered groups bail here.
+  if (group->channels[0]->getNumBuffers() <= 1 &&
+      !channelIsCollapsedBothSubtiled(group->channels[0]))
+    return;
+  // Size-1 reuse groups normally carry no shared circular buffer, but a
+  // collapsed subtiled channel is intentionally alone in its group and still
+  // needs its dst region threaded into chList for the numTiles counter stride.
+  if (group->channels.size() <= 1 && !channelIsSubtiled(group->channels[0]))
     return;
   // Goes through body of regionOp, if the body op is a regionOp, check
   // to see if it contains a channel in the reuse group.
@@ -705,9 +758,13 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 int channelInReuseGroup(Channel *channel, ReuseConfig *config,
                         bool reuseBarrier) {
   for (unsigned idx = 0; idx < config->getGroupSize(); idx++) {
-    // Reuse the same barriers when numBuffers > 1.
+    // Reuse the same barriers when numBuffers > 1. A collapsed subtiled channel
+    // (size-1 group) must still be discoverable even at buffer.copy == 1: its
+    // in-body per-tile rotation drives reuseGrp through
+    // getOrComputeSubtiledSlot.
     if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
-        reuseBarrier)
+        reuseBarrier &&
+        !channelIsCollapsedBothSubtiled(config->getGroup(idx)->channels[0]))
       continue;
     for (auto *ch : config->getGroup(idx)->channels) {
       if (channel == ch)
@@ -838,8 +895,15 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   auto *chA = group->channels[0];
   auto *chB = group->channels[1];
 
-  // Only handle single-copy buffers.
-  if (chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1)
+  // The ordinary 2-channel reuse path is single-copy. A multi-copy pair is
+  // admitted only for the FA-fwd full-overwrite owner shape: the owner MMA
+  // rewrites the whole physical TMEM slot, so its acquire must be relocated to
+  // wait for the sibling's async reader even when the planner raised
+  // buffer.copy for cross-stage liveness.
+  bool hasWholeOverwriteOwner = isWholeAllocationOverwriteReuseOwner(chA) ||
+                                isWholeAllocationOverwriteReuseOwner(chB);
+  if ((chA->getNumBuffers() != 1 || chB->getNumBuffers() != 1) &&
+      !hasWholeOverwriteOwner)
     return false;
 
   // TMEM real reuse requires BOTH:
@@ -996,6 +1060,20 @@ SmallVector<Channel *> orderReuseGroupN(ReuseGroup *group) {
   return ordered;
 }
 
+// A consumer drains its read of the shared buffer at its own program point only
+// if it is *synchronous*. An asynchronous MMA (a Blackwell tcgen05 op with
+// is_async, or an async Hopper wgmma) merely *issues* at that point and reads
+// its operand asynchronously, so same-partition program order does not order
+// the read before a later producer's overwrite. Such a consumer cannot rely on
+// program order for reuse safety and needs an explicit reuse barrier.
+static bool isAsyncReadConsumer(Operation *op) {
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
+    return mma.isAsync();
+  if (auto wgmma = dyn_cast<ttng::WarpGroupDotOp>(op))
+    return wgmma.getIsAsync();
+  return false;
+}
+
 bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   Operation *earlyProducer = earlyChannel->getSrcOp();
   Operation *lateConsumer = lateChannel->getDstOp();
@@ -1021,12 +1099,27 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
     if (!samePartition)
       continue;
 
-    // Same partition: check if earlyProducer appears before lateConsumer.
-    // If so, partition-internal ordering guarantees that lateConsumer's
-    // consumer_release will happen before earlyProducer's next
-    // producer_acquire.
+    // Same partition: program order *issues* the consumer before the producer's
+    // next overwrite. That frees the shared buffer without an explicit reuse
+    // barrier only if the consumer is *synchronous* -- i.e. it drains its read
+    // at its own program point. An asynchronous consumer (a Blackwell tcgen05
+    // is_async mma, or an async Hopper wgmma) merely issues there and reads its
+    // operand asynchronously, so the producer can overwrite the buffer while
+    // the read is still in flight; that case needs the explicit reuse barrier.
+    // (FA-fwd-persistent: the late P channel's only consumer is the PV tcgen05
+    // mma, which is async -- eliding the wait was the WAR race that overwrote P
+    // and produced NaN.)
+    //
+    // FIXME(reuse WAR, quantifier): the buffer is free only after *every*
+    // consumer has read it, so the wait may be elided only if ALL
+    // actualConsumers satisfy same-partition + appearsBefore + synchronous. The
+    // `return false` below still elides on the FIRST qualifying consumer
+    // (existential), which is latent-unsafe when a late channel has multiple
+    // consumers (e.g. one same-partition + one cross-partition). Safe today
+    // only because these reuse-group late channels have a single consumer.
     if (earlyProducer->getBlock() == consumer->getBlock() &&
-        appearsBefore(earlyProducer, consumer)) {
+        appearsBefore(earlyProducer, consumer) &&
+        !isAsyncReadConsumer(consumer)) {
       LDBG("needExplicitReuseWait: no explicit wait needed, "
            << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
            << lateChannel->uniqID << " have same-partition ordering");
@@ -1161,8 +1254,65 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     ++vecIdx;
   }
   assert(theIdx >= 0);
-  if (theIdx == 0)
-    return accumCnt;
+  // Early-TMA *same-partition* staging buffers (buffer.tmaStaging > 0 AND the
+  // channel producer and consumer are in the same warp task): the
+  // EPILOGUE_SUBTILE / DQ_SUBTILE subtiles (S of them) rotate through the
+  // buffer.copy (= K) slots of one circular SMEM buffer that is both written
+  // and TMA-stored by the *same* task. The drain is a fixed in-flight-count TMA
+  // store-wait (cp.async.bulk.wait_group K-1, from can_rotate_by_buffer_count)
+  // with NO cross-partition mbarrier, so the slot must be the per-tile subtile
+  // index (theIdx % numBuffers), NOT the accumCnt-staggered slot used for
+  // loop-carried buffers. Reuse-group members share one accumCnt (the +1-per-
+  // outer-iter loop counter) and add theIdx in [0,S); when S > K those
+  // staggered (slot,phase) ranges of consecutive iterations OVERLAP, so the
+  // first subtile of tile t+1 reuses the slot the last subtile of tile t just
+  // stored -- reuse distance 1, not K -- and wait_group(K-1) leaves that store
+  // in flight, so the new local_store overwrites the slot (or async_tma_reduce
+  // reads it) before the prior TMA store/reduce drained -> wrong dv/dk/dq
+  // (T277224987). Depth-1 (one slot, wait_group(0) = fully serialized) is
+  // immune. Mirrors the TLX reference's `slice_id % DQ_REDUCE_STAGES`.
+  // Correctness of this fixed-slot rotation requires K | S, enforced
+  // defensively by increaseFusedEpilogueCopies in WSMemoryPlanner.cpp.
+  //
+  // CROSS-partition staging (producer task != consumer task, e.g. the FA-fwd
+  // desc_o output store: produced in the compute task, TMA-stored in the
+  // epilogue-store task) is instead a producer/consumer mbarrier channel whose
+  // (slot, phase) BOTH derive from this returned count. There the count MUST
+  // stay the continuous accumCnt so the empty/full phase keeps flipping across
+  // persistent tiles; collapsing it to a constant subtile index pins the phase
+  // and deadlocks the handshake after the first tile (T277224987 fwd
+  // regression). Hence the bare-subtile-index path is gated on same-task
+  // staging.
+  bool isTmaStaging = false;
+  if (auto *allocOp = ch->getAllocOp())
+    if (auto stagingAttr =
+            allocOp->getAttrOfType<IntegerAttr>("buffer.tmaStaging"))
+      isTmaStaging = stagingAttr.getInt() > 0;
+  // Default to false (cross-partition / continuous-accumCnt) when the topology
+  // cannot be determined. The bare-subtile-index path is only safe for genuine
+  // same-task staging; its unsafe direction is the cross-partition deadlock
+  // vector (bug #11), so an indeterminate channel must keep the conservative
+  // continuous-accumCnt rotation. Matches the default in
+  // increaseFusedEpilogueCopies (WSMemoryPlanner.cpp).
+  bool isSameTaskStaging = false;
+  if (isTmaStaging) {
+    Operation *prodOp = ch->getSrcOp();
+    Operation *consOp = ch->getDstOp();
+    if (prodOp && consOp)
+      isSameTaskStaging = (getAsyncTaskIds(prodOp) == getAsyncTaskIds(consOp));
+  }
+  if (theIdx == 0) {
+    if (!isSameTaskStaging)
+      return accumCnt;
+    // Same-partition staging subtile 0 -> slot 0, independent of the outer
+    // accumCnt.
+    if (accumCnt.getType().isIndex())
+      return builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+          op->getLoc(), 0);
+    return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+        op->getLoc(), 0,
+        llvm::cast<IntegerType>(accumCnt.getType()).getWidth());
+  }
   // Stagger the count by the channel's position within the reuse group, so each
   // channel occupies a distinct slot of the shared circular buffer.
   // Create idxVal with the same type as accumCnt to ensure type compatibility.
@@ -1175,6 +1325,11 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
         op->getLoc(), theIdx, intType.getWidth());
   }
+  // Same-partition staging buffers use the subtile index directly (no accumCnt
+  // stagger). Cross-partition staging keeps the continuous accumCnt so its
+  // producer/consumer mbarrier phase keeps rotating (see comment above).
+  if (isSameTaskStaging)
+    return idxVal;
   return builder.createWithAsyncTaskIds<arith::AddIOp>(op->getLoc(), accumCnt,
                                                        idxVal);
 }
@@ -2996,6 +3151,59 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   return success();
 }
 
+// For a both-endpoints-subtiled SMEM channel the per-tile staging alloc is
+// passed as a per-tile (or shared) operand into BOTH a producer
+// `ttng.subtiled_region` (whose tile body has an in-body `local_store` writing
+// the alloc's block arg) AND a consumer `ttng.subtiled_region` (whose tile body
+// has an in-body `async_tma_copy_local_to_global` / `local_load` reading it).
+// Resolves those two regions; either output is null when the alloc is not a
+// both-subtiled staging buffer (e.g. the asymmetric inside->outside case has a
+// flat consumer, so `consRegion` stays null and today's per-alloc path is
+// used).
+//
+// The N per-tile allocs of one logical channel (e.g. %_2/%_1 for numTiles=2)
+// resolve to the SAME (prodRegion, consRegion) pair, which
+// `collectPostChannels` uses to create a single collapsed ChannelPost per pair
+// instead of one channel per alloc.
+static void getSubtiledChannelEndpoints(Operation *allocOp,
+                                        ttng::SubtiledRegionOp &prodRegion,
+                                        ttng::SubtiledRegionOp &consRegion) {
+  prodRegion = nullptr;
+  consRegion = nullptr;
+  if (!isa<ttg::LocalAllocOp>(allocOp))
+    return;
+  Value allocVal = allocOp->getResult(0);
+  for (Operation *user : allocOp->getUsers()) {
+    auto sub = dyn_cast<ttng::SubtiledRegionOp>(user);
+    if (!sub)
+      continue;
+    // Tile-body block args bound to this alloc (per-tile and shared operands).
+    SmallVector<Value> tileArgs;
+    Block &tileBlock = sub.getTileRegion().front();
+    unsigned nTiles = sub.getNumTiles();
+    for (auto [idx, arg] : llvm::enumerate(sub.getPerTileArgs()))
+      if (arg == allocVal)
+        tileArgs.push_back(tileBlock.getArgument(idx / nTiles));
+    unsigned numPerTile = sub.getNumPerTilePositions();
+    for (auto [idx, arg] : llvm::enumerate(sub.getSharedArgs()))
+      if (arg == allocVal)
+        tileArgs.push_back(tileBlock.getArgument(numPerTile + idx));
+    auto bound = [&](Value v) { return llvm::is_contained(tileArgs, v); };
+    for (Operation &op : tileBlock.without_terminator()) {
+      if (auto st = dyn_cast<ttg::LocalStoreOp>(&op)) {
+        if (bound(st.getDst()))
+          prodRegion = sub;
+      } else if (auto cp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(&op)) {
+        if (bound(cp.getSrc()))
+          consRegion = sub;
+      } else if (auto ld = dyn_cast<ttg::LocalLoadOp>(&op)) {
+        if (bound(ld.getSrc()))
+          consRegion = sub;
+      }
+    }
+  }
+}
+
 static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
                               SmallVector<std::unique_ptr<Channel>> &channels,
                               bool includeSameTaskSmemChannels) {
@@ -3191,6 +3399,12 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
       channels.push_back(std::make_unique<ChannelPost>(
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
+      auto *post = static_cast<ChannelPost *>(channels.back().get());
+      // Cache the resolved producer op so getSrcOp() survives a sibling
+      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
+      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
+      if (producerOp != allocOp)
+        post->cachedSrcOp = producerOp;
     }
   }
 }
@@ -3199,12 +3413,60 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
                          triton::FuncOp &funcOp,
                          bool includeSameTaskSmemChannels) {
   mlir::DominanceInfo dom(funcOp);
+  // For both-endpoints-subtiled SMEM channels, the N per-tile staging allocs of
+  // one logical channel resolve to the SAME (producer subtiled region, consumer
+  // subtiled region) pair. Create a single collapsed ChannelPost per pair (its
+  // numTiles per-tile buffers are internal instances indexed in-body by the
+  // builtin tileIdx); the sibling per-tile allocs are recorded on the
+  // representative channel (collapsedSiblingAllocs) so they can be erased once
+  // the in-body view rewire makes them dead. The first alloc encountered for a
+  // pair becomes the channel's representative.
+  DenseMap<std::pair<Operation *, Operation *>, ChannelPost *>
+      seenSubtiledPairs;
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
     // All buffers have been allocated, a channel will be created based on
     // the alloc.
     if (isa<ttng::TMEMAllocOp>(op) || isa<ttg::LocalAllocOp>(op)) {
+      ttng::SubtiledRegionOp prodRegion, consRegion;
+      getSubtiledChannelEndpoints(op, prodRegion, consRegion);
+      // Only collapse a GENUINE cross-partition both-subtiled channel: the
+      // producer and consumer subtiled regions must be in different async
+      // tasks. When they share a task (e.g. separate_epilogue_store=False,
+      // where the truncf+store region and the TMA-copy region are both in the
+      // epilogue task and form no cross-task channel), the per-tile allocs are
+      // handled by the existing same-task reuse-group machinery and must NOT be
+      // collapsed (doing so drops a sibling alloc that is never folded -> SMEM
+      // OOM).
+      if (prodRegion && consRegion &&
+          getAsyncTaskIds(prodRegion.getOperation()) !=
+              getAsyncTaskIds(consRegion.getOperation())) {
+        auto key = std::make_pair(prodRegion.getOperation(),
+                                  consRegion.getOperation());
+        auto it = seenSubtiledPairs.find(key);
+        if (it != seenSubtiledPairs.end()) {
+          // Sibling per-tile alloc: fold it into the collapsed channel. Record
+          // it on the representative so insertAsyncComm can erase it after the
+          // in-body view rewire removes its per-tile positions.
+          if (it->second)
+            it->second->collapsedSiblingAllocs.push_back(op);
+          return;
+        }
+        // First alloc for this pair becomes the representative channel.
+        size_t before = channels.size();
+        createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
+        ChannelPost *rep = nullptr;
+        if (channels.size() > before &&
+            channels.back()->channelKind == DataChannelKind::SMEMPost) {
+          rep = static_cast<ChannelPost *>(channels.back().get());
+          // Mark the representative so the size-1 subtiled reuse-group /
+          // in-body rotation machinery fires for it even at buffer.copy == 1.
+          rep->isCollapsedBothSubtiled = true;
+        }
+        seenSubtiledPairs[key] = rep;
+        return;
+      }
       createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
     }
   });

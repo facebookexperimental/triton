@@ -1347,12 +1347,23 @@ static unsigned computeTotalSmem(const SmallVector<WSBuffer> &wsBuffers) {
 static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
                                   SmallVector<Channel *> &channels) {
   DenseMap<Operation *, SmallVector<unsigned>> loadGroups;
-  // TMA staging buffers: group per descriptor so dk slices share one id,
-  // dv slices share another, dq reduce slices share a third, etc.
-  DenseMap<Value, SmallVector<unsigned>> tmaStagingGroups;
+  // TMA staging buffers: group per (descriptor, original load) so dk slices
+  // share one id, dv slices another, dq reduce slices a third, etc. The
+  // original-load component (the source tmem_load / accumulator, reached via
+  // findOriginalLoadForChannel — the same discriminator the loadGroups path
+  // below uses) keeps the two data partitions of a data-partitioned epilogue
+  // separate: both store to the SAME descriptor but trace back to different
+  // accumulators, so they must NOT share one physical staging buffer (doing so
+  // makes the two concurrent partitions alias one slot/barrier -> corrupt
+  // output + deadlock). When the load can't be traced (origLoad == null), the
+  // key degenerates to the descriptor alone, preserving the prior behavior
+  // (e.g. FA backward, where each descriptor already has a single source).
+  DenseMap<std::pair<Value, Operation *>, SmallVector<unsigned>>
+      tmaStagingGroups;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
-    // TMA staging buffers: group per descriptor regardless of priority.
+    // TMA staging buffers: group per (descriptor, original load) regardless of
+    // priority.
     if (buf.tmaStaging > 0) {
       Value desc;
       for (auto user : buf.allocOp->getUsers()) {
@@ -1365,8 +1376,11 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
           break;
         }
       }
-      if (desc)
-        tmaStagingGroups[desc].push_back(i);
+      if (desc) {
+        Operation *origLoad =
+            findOriginalLoadForChannel(findChannelForOp(buf.allocOp, channels));
+        tmaStagingGroups[{desc, origLoad}].push_back(i);
+      }
       continue;
     }
     if (buf.priority != WSBufferPriority::P4_Other)
@@ -1399,8 +1413,8 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
   for (auto &[origLoad, indices] : loadGroups)
     mergeGroup(indices, "epilogue fusion");
 
-  for (auto &[desc, indices] : tmaStagingGroups)
-    mergeGroup(indices, "TMA staging per-descriptor fusion");
+  for (auto &[key, indices] : tmaStagingGroups)
+    mergeGroup(indices, "TMA staging per-(descriptor,load) fusion");
 }
 
 /// Phase 4.5: Iterative copy increase for fused P2_Other groups.
@@ -1411,6 +1425,7 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
 /// style budget bumping. Inner-loop TMA staging is tried first (highest pay-
 /// off per slot), then outer-loop TMA staging, then regular P4_Other groups.
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
+                                        SmallVector<Channel *> &channels,
                                         unsigned numBuffers,
                                         unsigned smemBudget) {
   // Eligible priority tiers, in the order Phase 4.5 should try to bump them.
@@ -1484,6 +1499,29 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
       unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
 
+      // Defensive K | S cap for same-partition (wait_group-drained) TMA
+      // staging. Such staging rotates S = indices.size() subtiles through K =
+      // numCopies slots of one circular buffer, drained by a fixed
+      // in-flight-count TMA store-wait (cp.async.bulk.wait_group K-1).
+      // Correctness requires same-slot stores to be exactly K apart in issue
+      // order, i.e. K | S; a non-dividing K makes a store clobber a slot before
+      // it drains (T277224987). Cross- partition staging (producer task !=
+      // consumer task, e.g. FA-fwd desc_o) uses a continuous-accumCnt
+      // producer/consumer mbarrier rotation (getStaggeredAccumCnt) that
+      // tolerates any K, so it is exempt.
+      unsigned subtileCount = indices.size();
+      bool sameTaskStaging = false;
+      if (firstTmaStaging > 0) {
+        if (Channel *ch =
+                findChannelForOp(wsBuffers[indices[0]].allocOp, channels)) {
+          Operation *prodOp = ch->getSrcOp();
+          Operation *consOp = ch->getDstOp();
+          if (prodOp && consOp)
+            sameTaskStaging =
+                (getAsyncTaskIds(prodOp) == getAsyncTaskIds(consOp));
+        }
+      }
+
       // Respect the enforced cross-stage floor from Phase 2 (the real stage
       // span via WSBuffer::minCopies, not a hardcoded 2). Phase 4.5 copy
       // bumps must never undercut this floor.
@@ -1512,8 +1550,29 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
         continue;
       }
 
+      // The cross-stage floor is a hard correctness floor; if it already
+      // violates K | S for a wait_group ring there is nothing Phase 4.5 can do
+      // (it must not drop below the floor) — warn so the condition is visible.
+      if (sameTaskStaging && currentCopies > 1 &&
+          (subtileCount % currentCopies != 0))
+        LDBG("Phase 4.5: WARNING bufferId="
+             << bufferId << " floor copies=" << currentCopies
+             << " does not divide subtileCount=" << subtileCount
+             << " — wait_group rotation may be unsafe");
+
       unsigned tryCopies = currentCopies + 1;
       while (tryCopies <= numBuffers) {
+        // For same-partition (wait_group-drained) staging, only depths that
+        // divide the subtile count keep the fixed-count rotation correct
+        // (K | S); skip the rest. Cross-partition staging is unconstrained.
+        if (sameTaskStaging && (subtileCount % tryCopies != 0)) {
+          LDBG("Phase 4.5:     bufferId="
+               << bufferId << " skip copies=" << tryCopies
+               << " (does not divide subtileCount=" << subtileCount
+               << " for same-task wait_group staging)");
+          tryCopies++;
+          continue;
+        }
         SmallVector<unsigned> saved;
         for (unsigned idx : indices)
           saved.push_back(wsBuffers[idx].numCopies);
@@ -1623,6 +1682,28 @@ static int getLastConsumerOrder(const WSBuffer &buf,
   return getLastConsumerOrderDetailed(buf, channels, numClusters).linearOrder;
 }
 
+/// Phase 3.6 reuse is realized later (mergeStagingReuseIntoHost) by viewing a
+/// single backing alloc through one memdesc_reinterpret per alias, which is
+/// only sound when the candidate and target share an identical SMEM encoding,
+/// memory space, and element type (mirrors areEncodingsCompatibleForReuse in
+/// WSCodePartition.cpp). Marking an encoding-incompatible reuse here would let
+/// computeTotalSmem exclude the candidate (it looks reused) while realization
+/// silently drops it and emits the buffer standalone — under-counting the real
+/// footprint and surfacing as an OutOfResources at codegen (T277224987, e.g. a
+/// 128x32 swizzle=64 dk/dv store-staging vs a 128x128 swizzle=128 operand).
+static bool areReuseEncodingsCompatible(const WSBuffer &candidate,
+                                        const WSBuffer &target) {
+  auto candAlloc = dyn_cast_or_null<ttg::LocalAllocOp>(candidate.allocOp);
+  auto tgtAlloc = dyn_cast_or_null<ttg::LocalAllocOp>(target.allocOp);
+  if (!candAlloc || !tgtAlloc)
+    return true; // non-SMEM allocs: leave existing behavior unchanged
+  auto candTy = candAlloc.getType();
+  auto tgtTy = tgtAlloc.getType();
+  return candTy.getEncoding() == tgtTy.getEncoding() &&
+         candTy.getMemorySpace() == tgtTy.getMemorySpace() &&
+         candTy.getElementType() == tgtTy.getElementType();
+}
+
 /// Find an allocated buffer that a non-innermost candidate can reuse.
 /// The candidate must NOT be innermost (partition-unaware liveness is
 /// inaccurate within the inner loop). Can scan allocated innermost buffers
@@ -1664,6 +1745,18 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
            << buf.bufferId << " too small (" << buf.sizeBytes << "*"
            << buf.numCopies << "=" << buf.sizeBytes * buf.numCopies << " < "
            << candidate.sizeBytes << ") — skip");
+      continue;
+    }
+
+    // Reuse must be realizable: the candidate and target SMEM encodings must
+    // match, or mergeStagingReuseIntoHost will drop the reuse and emit the
+    // candidate standalone, leaving computeTotalSmem under-counting
+    // (T277224987).
+    if (!areReuseEncodingsCompatible(candidate, buf)) {
+      LDBG("  findReuseCandidate: target bufferId="
+           << buf.bufferId
+           << " encoding/elem-type incompatible with candidate bufferId="
+           << candidate.bufferId << " — skip");
       continue;
     }
 
@@ -1758,6 +1851,18 @@ static unsigned allocateSmemBuffers(
       buf.isPinned = true;
       LDBG("Phase 1: WSBuffer pinned by annotation: bufferId="
            << buf.bufferId << " numCopies=" << buf.numCopies);
+    } else if (auto copies = alloc->getAttrOfType<IntegerAttr>(
+                   kAtomicBroadcastCopiesAttrName)) {
+      // Cross-partition atomic broadcast slot (dynamic-persistent tile id):
+      // WSAtomicBroadcast stamped the requested tile-prefetch depth on the
+      // alloc. Pin the buffer to it so the planner honors the depth exactly and
+      // accounts for the extra copies against the SMEM budget, instead of
+      // leaving this non-innermost (P4_Other) channel single-buffered.
+      buf.numCopies = copies.getInt();
+      buf.minCopies = copies.getInt();
+      buf.isPinned = true;
+      LDBG("Phase 1: WSBuffer pinned by atomic-broadcast depth: numCopies="
+           << buf.numCopies);
     }
 
     // Detect TMA staging buffers: allocs whose users include
@@ -2157,7 +2262,7 @@ static unsigned allocateSmemBuffers(
   LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
   // ── Phase 4.5: Iterative copy increase for fused eligible groups ────
-  increaseFusedEpilogueCopies(wsBuffers, numBuffers, smemBudget);
+  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, smemBudget);
 
   LDBG("Phase 4.5 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 

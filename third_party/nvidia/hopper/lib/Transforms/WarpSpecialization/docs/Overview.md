@@ -135,3 +135,4 @@ recognizes the `scf.while` outer loop (same doc).
 - [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
 - [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits
+- [Debugging Accuracy / Deadlocks](DebuggingAccuracyAndDeadlocks.md) — triage process for AutoWS wrong-results / hang bugs (tools, skills, methodology)

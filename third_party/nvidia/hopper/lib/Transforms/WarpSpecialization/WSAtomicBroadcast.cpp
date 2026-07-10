@@ -139,7 +139,10 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
 }
 
 // Transform a case-2 atomic (see file header). `depth` is the tile-prefetch
-// depth; v1 only supports depth == 1.
+// depth: the number of buffer slots the broadcast channel is multi-buffered
+// with. depth == 1 is the single-stage broadcast; depth > 1 lets the owner
+// claim and publish up to `depth` tile ids ahead of the slower consumer
+// partitions, so the persistent loop does not serialize on the tile-id handoff.
 //
 // Rather than hand-synthesizing barriers, we install only the *data path*: run
 // the atomic once in the owner partition, splat its scalar result into a 1-CTA
@@ -162,16 +165,20 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
   auto yieldOp = whileOp.getYieldOp();
   int yieldIdx = -1;
   for (auto [i, v] : llvm::enumerate(yieldOp.getOperands()))
-    if (v == atomicRes)
+    if (v == atomicRes) {
       yieldIdx = i;
+      break;
+    }
   if (yieldIdx < 0)
     return failure();
 
   // Function-scope SMEM slot holding the claimed scalar (becomes a WS capture).
   // The per-slot shape is a single element; the channel machinery prepends the
-  // buffer count (numBuffers) when it multi-buffers this channel. `depth` will
-  // drive that buffer count once the channel is registered as multi-buffered.
-  (void)depth;
+  // buffer count (numBuffers) when it multi-buffers this channel. For depth > 1
+  // we stamp the requested count on the alloc (kAtomicBroadcastCopiesAttrName)
+  // so the memory planner pins this otherwise non-innermost broadcast channel
+  // to `depth` buffers; the accumCnt already threaded through the persistent
+  // scf.while then rotates the slot/phase across iterations.
   OpBuilder fb(funcOp);
   fb.setInsertionPointToStart(&funcOp.getBody().front());
   Attribute smem = ttg::SharedMemorySpaceAttr::get(ctx);
@@ -181,9 +188,13 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
   auto elemTy = atomicRes.getType();
   auto slotTy = ttg::MemDescType::get({1}, elemTy, slotEnc, smem,
                                       /*mutableMemory=*/true);
-  Value slot = ttg::LocalAllocOp::create(
+  auto slotOp = ttg::LocalAllocOp::create(
       fb, NameLoc::get(StringAttr::get(ctx, "atomic_bcast_slot"), loc), slotTy,
       Value());
+  if (depth > 1)
+    slotOp->setAttr(kAtomicBroadcastCopiesAttrName,
+                    fb.getI32IntegerAttr(depth));
+  Value slot = slotOp;
 
   // Single-element tensor for the scalar round-trip: splat -> local_store ->
   // local_load -> tt.unsplat. The default blocked layout mirrors the
