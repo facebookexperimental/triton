@@ -307,6 +307,25 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   int minRegAutoWS = minRegAttr ? minRegAttr.getInt() : 24;
   int maxRegAutoWS = hasMax ? maxRegAttr.getInt() : -1;
 
+  // Role-based budget for the bwd-FA layout where the computation partition was
+  // promoted to the default region (PartitionSchedulingMeta). The default takes
+  // the residual budget, so the remaining tensor partition (reduction) must NOT
+  // grab the fat maxRegAutoWS or the default's residual collapses and compute
+  // spills. Give every non-default partition a single balanced budget that
+  // leaves the default the largest residual still within the hardware
+  // setmaxnreg cap (256). For the bwd warp layout (default=4w compute,
+  // reduction=8w, producers=1w, maxnreg base 128) the compute residual is
+  // 512 - 3*R, so R=88 is the smallest legal (largest residual: 248) value --
+  // matching the TLX reference (registers=88). See T279166457.
+  //
+  // The partition types array carries an extra leading entry for the default
+  // region; if that entry is "computation" the promotion happened.
+  constexpr int32_t kBalancedRegAutoWS = 88;
+  bool computeIsDefault =
+      !partitionTypes.empty() &&
+      partitionTypes.size() == partitionNumWarps.size() + 1 &&
+      partitionTypes.front() == "computation";
+
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, hasTensor,
              estRegs] : llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
@@ -316,8 +335,11 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     // When only min is provided (the default), tensor partitions get -1
     // (sentinel for "split leftover evenly") while non-tensor partitions
     // get the fixed minRegAutoWS allocation.
-    estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
-                     : (tensorRegs ? -1 : minRegAutoWS);
+    if (computeIsDefault)
+      estRegs = kBalancedRegAutoWS;
+    else
+      estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
+                       : (tensorRegs ? -1 : minRegAutoWS);
 
     // Layouts need to be reassigned if the number of warps changed and the
     // partition contains any tensor (even a single-element broadcast tensor,

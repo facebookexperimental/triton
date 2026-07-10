@@ -1977,21 +1977,32 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
   // Update defaultPartition after computation partitions are created.
   layout.defaultPartition = layout.getDefaultPartition();
 
-  // EXPERIMENT (TRITON_WS_COMPUTE_DEFAULT): promote the register-heavy
-  // computation partition to the default region so it receives the residual
-  // register budget (TLX-style: default = compute). NOTE: this alone made FA
-  // bwd spills WORSE (276/476 -> 716/988) because requestedRegisters is
-  // assigned POSITIONALLY, not by role -- swapping computation<->reduction
-  // sends the fat maxRegAutoWS budget to the now-explicit reduction and gives
-  // computation(default) a smaller residual. A real fix also needs role-based
-  // per-partition register budgets (small fixed for producers/reduction,
-  // residual for compute). Kept env-gated (off by default) for iteration.
-  // See T279166457.
+  // Promote the register-heavy computation partition to the default region so
+  // it receives the residual register budget (TLX-style: default = compute).
+  // Scoped to the bwd-FA pattern (both a reduction and a computation partition
+  // exist); fwd has no reduction partition and is left untouched. Opt out with
+  // TRITON_WS_COMPUTE_DEFAULT=0.
+  //
+  // This MUST be paired with the role-based register budget in
+  // OptimizePartitionWarps: once compute is the default, the remaining tensor
+  // partition (reduction) must get a balanced budget, not the fat maxRegAutoWS
+  // -- otherwise the residual handed to compute collapses and it spills WORSE
+  // than before (276/476 -> 716/988). See T279166457.
   Partition *compDefault = nullptr;
-  if (std::getenv("TRITON_WS_COMPUTE_DEFAULT")) {
-    for (Partition &p : schedule.getPartitions())
+  {
+    const char *envOverride = std::getenv("TRITON_WS_COMPUTE_DEFAULT");
+    bool enabled = !(envOverride && llvm::StringRef(envOverride) == "0");
+    bool hasReduction = false, hasComputation = false;
+    for (Partition &p : schedule.getPartitions()) {
+      if (p.getType() == "reduction")
+        hasReduction = true;
       if (p.getType() == "computation")
-        compDefault = &p; // prefer the last computation partition
+        hasComputation = true;
+    }
+    if (enabled && hasReduction && hasComputation)
+      for (Partition &p : schedule.getPartitions())
+        if (p.getType() == "computation")
+          compDefault = &p; // prefer the last computation partition
   }
   if (compDefault) {
     if (compDefault->getIndex() != 0)
