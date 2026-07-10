@@ -65,7 +65,7 @@ jobs:
           # stable logical bucket identity for this job.
           BUCKET="b200-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / b200-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"b200-meta-triton-test","summary":"TritonBench tests failed on B200 (see run log).","repro":""}]'
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"b200-meta-triton-test","summary":"TritonBench tests failed on B200 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   b200-tlx-test:
@@ -184,6 +184,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -202,6 +203,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
 
   report-b200-tlx:
     needs: b200-tlx-test
@@ -209,6 +213,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -227,6 +232,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
 
   report-b200-gluon:
     needs: b200-gluon-test
@@ -234,6 +242,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -252,6 +261,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: b200
 
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-b200-tritonbench:
