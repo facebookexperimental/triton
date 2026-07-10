@@ -400,7 +400,7 @@ class CUDABackend(BaseBackend):
     def make_launcher_src(self, metadata, src):
         """Generate a standalone C launcher source from Level 0 metadata.
 
-        The generated C file includes ``triton/runtime/launch.h`` and implements
+        The generated C file includes ``nvidia/backend/launch.h`` and implements
         a single entry point ``triton_launch_<kernel>()`` that sets up
         CUlaunchConfig with compile-time-known parameters baked in as constants,
         builds the kernel parameter array, and calls ``cuLaunchKernelEx``.
@@ -469,7 +469,7 @@ class CUDABackend(BaseBackend):
         lines.append(f"/* Kernel: {kernel_name} */")
         lines.append(f"/* ABI version: {launch_meta['abi_version']} */")
         lines.append("")
-        lines.append('#include "triton/runtime/launch.h"')
+        lines.append('#include "nvidia/backend/launch.h"')
         lines.append("")
 
         # ---- Args struct ----
@@ -746,6 +746,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
+            # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
+            # async-token form and hoist the issue for compute/CLC overlap. This
+            # runs before warp specialization; the token is materialized into the
+            # completion mbarrier after WS (add_clc_materialize below).
+            nvidia.passes.ttnvgpuir.add_clc_split(pm)
+            nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
             elif knobs.nvidia.use_modulo_schedule is not None:
@@ -790,6 +796,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
+            # CLC tile scheduler (Stage 4): materialize the async-token form into
+            # the response buffer + completion mbarrier (single-CTA only). Runs
+            # after warp specialization.
+            nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
@@ -800,7 +810,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        passes.ttgpuir.add_prefetch(pm)
+        if capability // 10 == 8:
+            passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
@@ -834,6 +845,10 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
 
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -876,6 +891,7 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
 
         if "gsan" in options.instrumentation_mode:
+            # GSan introduces layout conversions, so must come before shared memory allocation
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)

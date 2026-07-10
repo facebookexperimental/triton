@@ -1655,9 +1655,15 @@ class TritonSemantic(Generic[TensorTy]):
         rhs: tl.tensor,
         acc: tl.tensor,
         input_precision: Optional[str],
-        allow_tf32,
-        max_num_imprecise_acc: int,
-        out_dtype: tl.dtype,
+        # `allow_tf32` is a Meta-local re-addition to the dot() API. Give it (and the
+        # trailing required args) defaults so callers that predate it -- notably the
+        # upstream-synced Gluon frontend (gluon/language/amd/_ops.py), which passes
+        # input_precision/out_dtype but not allow_tf32 -- keep working. dot_precheck
+        # already treats allow_tf32=None as "unspecified". Existing callers pass these
+        # explicitly, so this is purely additive.
+        allow_tf32=None,
+        max_num_imprecise_acc: int = None,
+        out_dtype: tl.dtype = None,
         attrs: Optional[dict] = None,
         two_ctas: bool = False,
     ) -> tl.tensor:
