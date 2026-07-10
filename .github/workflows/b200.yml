@@ -126,6 +126,57 @@ jobs:
             --job "b200-tlx-test" \
             ${FAILED_FLAG}
 
+  b200-gluon-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: nvidia-dgx-b200
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          install_triton $PWD
+          uv pip install pytest expecttest
+      - name: Run Gluon tests (python/test/gluon)
+        id: run_gluon
+        timeout-minutes: 50
+        run: |
+          . "${SETUP_SCRIPT}"
+          # Full Gluon unit-test coverage: every python/test/gluon/test_*.py. This spans
+          # the compile-only frontend tests plus the GPU-execution suites (core, lowerings,
+          # consan, fpsan, layout_format_view). Known-failing cases and their root causes
+          # are tracked in README.md ("Gluon support" -> TODO gluon-ci).
+          python -m pytest python/test/gluon/ -v --junitxml=/tmp/gluon.xml
+      - name: Collect nightly failures (Gluon)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_gluon.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-gluon-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/gluon.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "b200-gluon-test" \
+            ${FAILED_FLAG}
+
   # ----- Nightly issue filing (schedule only) -----
   report-b200-tritonbench:
     needs: b200-meta-triton-test
@@ -177,6 +228,31 @@ jobs:
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
 
+  report-b200-gluon:
+    needs: b200-gluon-test
+    if: always() && github.event_name == 'schedule' && needs.b200-gluon-test.outputs.failures != '' && needs.b200-gluon-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-gluon-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-b200-tritonbench:
     needs: b200-meta-triton-test
@@ -202,6 +278,19 @@ jobs:
       workflow_name: ${{ github.workflow }}
       job_name: b200-tlx-test
       failures: ${{ needs.b200-tlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-b200-gluon:
+    needs: b200-gluon-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-gluon-test.result == 'success' || needs.b200-gluon-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: b200-gluon-test
+      failures: ${{ needs.b200-gluon-test.outputs.failures }}
       run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 concurrency:
