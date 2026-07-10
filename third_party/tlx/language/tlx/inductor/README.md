@@ -77,8 +77,10 @@ Second, it scales better than manual agentic kernel authoring. There is growing 
 
 ## Knob
 
-`TORCHINDUCTOR_TLX_MODE`
-- default - TLX not considered (standard inductor behavior)
+`TORCHINDUCTOR_TLX_MODE` (unset by default)
+- unset / any other value - TLX not considered (standard inductor behavior; the config value is `None`)
 - allow - TLX added to candidates, competes via autotuning
 - force - TLX templates enabled + forced epilogue fusion
+
+Only `allow` and `force` engage TLX; every other value (including an unset env var or a legacy `default`) maps to `None`, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.
 
