@@ -4673,10 +4673,11 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 // whole search is a few extra in-process schedule runs.
 //
 // Score, lexicographic:
-//   1. TMEM legality — tcgen05 tensor memory has 128 lanes, so an
-//      accumulator whose per-group M exceeds 128 rows cannot be allocated
-//      at all; a split that brings it under the lane count wins outright
-//      (this is what makes BM=256 configs feasible in the first place);
+//   1. TMEM legality — tcgen05 tensor memory has kTmemLanes lanes per
+//      CTA, so an accumulator whose per-CTA, per-group M exceeds the lane
+//      count cannot be allocated at all; a split that brings it under
+//      wins outright (this is what makes BM=256 configs feasible in the
+//      first place);
 //   2. loops scheduled (a variant that fails to schedule a loop loses);
 //   3. sum of loop IIs (steady-state throughput; after the occupancy
 //      de-bias in applyDataPartition an M-split conserves MAC area, so
@@ -4687,6 +4688,10 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 //      operand rings reach full depth.
 // Ties keep the incumbent, so the baseline (N=1) wins unless a split is a
 // strict improvement.
+// tcgen05 tensor memory geometry: 128 lanes per CTA (an alloc is at most
+// 128 rows x 512 columns). Anything taller cannot be allocated at all.
+constexpr int64_t kTmemLanes = 128;
+
 static bool dataPartitionAutoSearch(int optionFactor) {
   if (optionFactor > 1)
     return false; // explicit pass option wins
@@ -4735,12 +4740,25 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
       for (const auto &loop : sl.graph.loops) {
         sc.iiSum += std::max(loop.II, 0);
         for (const auto &buf : loop.buffers) {
-          if (buf.kind == ttg::MemoryKind::TMEM && !buf.shape.empty()) {
-            // Tensor memory has 128 lanes: a per-group accumulator taller
-            // than 128 rows cannot be allocated (hardware bound, the same
-            // one enumerateDataPartitionCandidates' minM encodes).
-            int64_t rows = buf.partitionCount > 1 ? buf.mSize : buf.shape[0];
-            if (rows > 128)
+          if (buf.kind == ttg::MemoryKind::TMEM) {
+            // An accumulator whose per-CTA, per-group M exceeds the TMEM
+            // lane count cannot be allocated. Judge the per-CTA slice
+            // through the same getShapePerCTA lens that
+            // enumerateDataPartitionCandidates uses to derive bm/mSize —
+            // NOT the buffer's raw shape, which for a CTA-split
+            // accumulator is the whole-cluster extent.
+            int64_t rows = -1;
+            if (buf.partitionCount > 1) {
+              rows = buf.mSize; // already per-CTA (from getShapePerCTA(bm))
+            } else if (buf.defOp && buf.defOp->getNumResults() > 0) {
+              if (auto memTy = dyn_cast<ttg::MemDescType>(
+                      buf.defOp->getResult(0).getType())) {
+                auto perCTA = ttg::getShapePerCTA(memTy);
+                if (!perCTA.empty())
+                  rows = perCTA[0];
+              }
+            }
+            if (rows > kTmemLanes)
               sc.tmemLegal = false;
           }
           if (buf.kind == ttg::MemoryKind::SMEM &&
@@ -4760,13 +4778,9 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
   LDBG("[A.5-auto] baseline: tmemLegal="
        << best.tmemLegal << " scheduled=" << best.scheduled << " iiSum="
        << best.iiSum << " shortfall=" << best.shortfallBytes << "B");
-  constexpr unsigned kMaxVariants = 4; // compile-time cost bound
-  unsigned tried = 0;
+  // No variant cap: the candidate set is already bounded by BM's divisor
+  // structure (bm % n == 0 with bm/n >= minM leaves a handful of factors).
   for (unsigned n : factors) {
-    if (++tried > kMaxVariants) {
-      LDBG("[A.5-auto] variant cap reached, stopping at N=" << n);
-      break;
-    }
     DataPartitionPlan plan = computeDataPartitionPlanForN(moduleOp, n);
     if (plan.mmaInfo.empty())
       continue;
