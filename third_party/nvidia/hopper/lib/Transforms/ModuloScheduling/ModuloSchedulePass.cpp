@@ -7,6 +7,8 @@
 // attributes for downstream pipelining passes.
 
 #include <cmath>
+#include <set>
+#include <tuple>
 
 #include "llvm/Support/JSON.h"
 
@@ -964,6 +966,21 @@ enumerateDataPartitionCandidates(Operation *op) {
 // accumulator by factor N, when legal: BM % N == 0, BM/N >= 64, and the sliced
 // M still satisfies the TMEM blockM constraint. A/B SMEM operands stay shared
 // (untagged) — the emitter slices the full-A tile per group itself.
+// Add `op` to `plan` with factor N when N is one of its legal splits.
+static void addMMAToPlanIfLegal(Operation *op, unsigned N,
+                                DataPartitionPlan &plan) {
+  for (const auto &c : enumerateDataPartitionCandidates(op)) {
+    if (c.n != N)
+      continue;
+    ttg::DataPartitionInfo info{c.n, /*dim=*/0u, c.mSize};
+    plan.mmaInfo[op] = info;
+    plan.accInfo[c.allocOp] = info;
+    LDBG("[A.5] partition MMA N=" << c.n << " mSize=" << c.mSize);
+    return;
+  }
+  LDBG("[A.5] skip MMA: no legal M-split for N=" << N);
+}
+
 static DataPartitionPlan computeDataPartitionPlan(ModuleOp moduleOp,
                                                   int optionFactor) {
   DataPartitionPlan plan;
@@ -971,18 +988,21 @@ static DataPartitionPlan computeDataPartitionPlan(ModuleOp moduleOp,
     if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
       return;
     unsigned N = resolveDataPartitionFactor(op, optionFactor);
-    if (N <= 1)
-      return;
-    for (const auto &c : enumerateDataPartitionCandidates(op)) {
-      if (c.n != N)
-        continue;
-      ttg::DataPartitionInfo info{c.n, /*dim=*/0u, c.mSize};
-      plan.mmaInfo[op] = info;
-      plan.accInfo[c.allocOp] = info;
-      LDBG("[A.5] partition MMA N=" << c.n << " mSize=" << c.mSize);
-      return;
-    }
-    LDBG("[A.5] skip MMA: no legal M-split for N=" << N);
+    if (N > 1)
+      addMMAToPlanIfLegal(op, N, plan);
+  });
+  return plan;
+}
+
+// A uniform-factor plan for the A.5 auto search: every MMA where `N` is a
+// legal split gets it; per-loop `tt.data_partition_factor` attrs are NOT
+// consulted (auto mode is whole-module).
+static DataPartitionPlan computeDataPartitionPlanForN(ModuleOp moduleOp,
+                                                      unsigned N) {
+  DataPartitionPlan plan;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
+      addMMAToPlanIfLegal(op, N, plan);
   });
   return plan;
 }
@@ -4214,6 +4234,10 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
   for (auto &schedLoop : graph.loops) {
     allocateBuffersForLoop(schedLoop, plan);
     mergeNonOverlappingBuffers(schedLoop);
+    // Snapshot the lifetime-demanded depths before any budget reduction
+    // below decrements `count` (A.5 auto-search shortfall scoring).
+    for (auto &buf : schedLoop.buffers)
+      buf.requestedCount = buf.count;
   }
 
   llvm::DenseMap<unsigned, unsigned> parentMap;
@@ -4639,6 +4663,130 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
   llvm::stable_sort(
       result, [](const auto &a, const auto &b) { return a.depth > b.depth; });
   return result;
+}
+
+// ── Pass A.5 auto search ─────────────────────────────────────────────────────
+// TRITON_DATA_PARTITION_N=auto: pick the data-partition factor by solving
+// each candidate variant with the same scheduler and comparing on the model,
+// instead of requiring the user to name N. The candidate set comes from
+// enumerateDataPartitionCandidates (a handful of divisors of BM), so the
+// whole search is a few extra in-process schedule runs.
+//
+// Score, lexicographic:
+//   1. TMEM legality — tcgen05 tensor memory has 128 lanes, so an
+//      accumulator whose per-group M exceeds 128 rows cannot be allocated
+//      at all; a split that brings it under the lane count wins outright
+//      (this is what makes BM=256 configs feasible in the first place);
+//   2. loops scheduled (a variant that fails to schedule a loop loses);
+//   3. sum of loop IIs (steady-state throughput; after the occupancy
+//      de-bias in applyDataPartition an M-split conserves MAC area, so
+//      this usually ties);
+//   4. SMEM shortfall in bytes — how far the budget reducers cut buffer
+//      rings below their lifetime-demanded depths (requestedCount vs
+//      count): a shrunk epilogue staging tile frees SMEM that lets
+//      operand rings reach full depth.
+// Ties keep the incumbent, so the baseline (N=1) wins unless a split is a
+// strict improvement.
+static bool dataPartitionAutoSearch(int optionFactor) {
+  if (optionFactor > 1)
+    return false; // explicit pass option wins
+  return triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") == "auto";
+}
+
+static DataPartitionPlan
+searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
+                        triton::ModuleAxisInfoAnalysis &axisInfo) {
+  DataPartitionPlan baseline; // empty plan = N=1 everywhere
+  std::set<unsigned> factors;
+  moduleOp.walk([&](Operation *op) {
+    for (const auto &c : enumerateDataPartitionCandidates(op))
+      factors.insert(c.n);
+  });
+  if (factors.empty())
+    return baseline;
+
+  auto candidates = collectCandidates(moduleOp);
+  // Deeper nests are rejected by the main pass; don't search them.
+  for (const auto &c : candidates)
+    if (c.depth >= 2)
+      return baseline;
+
+  struct Score {
+    bool tmemLegal = true;
+    size_t scheduled = 0;
+    int64_t iiSum = 0;
+    int64_t shortfallBytes = 0;
+  };
+  auto evaluate = [&](const DataPartitionPlan &plan) {
+    Score sc;
+    SmallVector<ScheduledLoop, 2> sls;
+    for (const auto &c : candidates) {
+      if (c.hasExistingAnnotation)
+        continue;
+      if (c.hasInnerLoop)
+        scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model, axisInfo,
+                          plan, /*printScheduleGraph=*/false, sls);
+      else if (c.hasMMA || c.hasTMA)
+        scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model, axisInfo,
+                          plan, /*printScheduleGraph=*/false, sls);
+    }
+    sc.scheduled = sls.size();
+    for (const auto &sl : sls) {
+      for (const auto &loop : sl.graph.loops) {
+        sc.iiSum += std::max(loop.II, 0);
+        for (const auto &buf : loop.buffers) {
+          if (buf.kind == ttg::MemoryKind::TMEM && !buf.shape.empty()) {
+            // Tensor memory has 128 lanes: a per-group accumulator taller
+            // than 128 rows cannot be allocated (hardware bound, the same
+            // one enumerateDataPartitionCandidates' minM encodes).
+            int64_t rows = buf.partitionCount > 1 ? buf.mSize : buf.shape[0];
+            if (rows > 128)
+              sc.tmemLegal = false;
+          }
+          if (buf.kind == ttg::MemoryKind::SMEM &&
+              buf.requestedCount > buf.count)
+            sc.shortfallBytes +=
+                static_cast<int64_t>(buf.requestedCount - buf.count) *
+                buf.sizeBytes();
+        }
+      }
+    }
+    return sc;
+  };
+
+  Score best = evaluate(baseline);
+  DataPartitionPlan bestPlan = baseline;
+  unsigned bestN = 1;
+  LDBG("[A.5-auto] baseline: tmemLegal="
+       << best.tmemLegal << " scheduled=" << best.scheduled << " iiSum="
+       << best.iiSum << " shortfall=" << best.shortfallBytes << "B");
+  constexpr unsigned kMaxVariants = 4; // compile-time cost bound
+  unsigned tried = 0;
+  for (unsigned n : factors) {
+    if (++tried > kMaxVariants) {
+      LDBG("[A.5-auto] variant cap reached, stopping at N=" << n);
+      break;
+    }
+    DataPartitionPlan plan = computeDataPartitionPlanForN(moduleOp, n);
+    if (plan.mmaInfo.empty())
+      continue;
+    Score sc = evaluate(plan);
+    LDBG("[A.5-auto] N=" << n << ": tmemLegal=" << sc.tmemLegal << " scheduled="
+                         << sc.scheduled << " iiSum=" << sc.iiSum
+                         << " shortfall=" << sc.shortfallBytes << "B");
+    auto key = [](const Score &x) {
+      return std::make_tuple(!x.tmemLegal, -static_cast<int64_t>(x.scheduled),
+                             x.iiSum, x.shortfallBytes);
+    };
+    bool better = key(sc) < key(best);
+    if (better) {
+      best = sc;
+      bestPlan = std::move(plan);
+      bestN = n;
+    }
+  }
+  LDBG("[A.5-auto] picked N=" << bestN);
+  return bestPlan;
 }
 
 // ============================================================================
@@ -5578,8 +5726,13 @@ struct ModuloSchedulePass
     // Pass A.5: compute the data-partition plan once (module-stable). Threaded
     // into per-loop scheduling so the inner-loop MMA bundle and the outer-loop
     // TMEM accumulator buffer are both tagged for the emitter.
+    // TRITON_DATA_PARTITION_N=auto searches the candidate factors with the
+    // scheduler itself; otherwise the factor is user-resolved (option > attr
+    // > env), 1 = off.
     DataPartitionPlan partitionPlan =
-        computeDataPartitionPlan(moduleOp, dataPartitionFactor);
+        dataPartitionAutoSearch(dataPartitionFactor)
+            ? searchDataPartitionPlan(moduleOp, model, axisInfoAnalysis)
+            : computeDataPartitionPlan(moduleOp, dataPartitionFactor);
 
     // ================================================================
     // Iterative scheduling loop (design doc Pass A orchestrator)
