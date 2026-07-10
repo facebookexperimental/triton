@@ -10,7 +10,7 @@
 #include <set>
 #include <tuple>
 
-#include "llvm/Support/JSON.h"
+#include "mlir/IR/Diagnostics.h"
 
 #include "DataDependenceGraph.h"
 #include "LatencyModel.h"
@@ -868,9 +868,11 @@ static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
 
 // Which MMA bundles to partition and the matching TMEM accumulator allocs to
 // tag, computed once per module. `mmaInfo` keys the (inner-loop) MMA node — it
-// becomes a partition bundle with xN occupancy; `accInfo` keys the (outer-loop)
-// tmem_alloc whose ScheduleBuffer carries partition_count for the emitter's
-// per-group accumulator split.
+// becomes a partition bundle occupying max(full-tile occupancy, N x issue
+// cost): an M-split conserves MAC area, so only the per-sub-MMA issue floor
+// scales with N (see DataDependenceGraph::applyDataPartition). `accInfo` keys
+// the (outer-loop) tmem_alloc whose ScheduleBuffer carries partition_count for
+// the emitter's per-group accumulator split.
 struct DataPartitionPlan {
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> mmaInfo;
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> accInfo;
@@ -4677,7 +4679,11 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 //      CTA, so an accumulator whose per-CTA, per-group M exceeds the lane
 //      count cannot be allocated at all; a split that brings it under
 //      wins outright (this is what makes BM=256 configs feasible in the
-//      first place);
+//      first place). Judged straight off the candidate surface (per-CTA
+//      bm = n x m_size from enumerateDataPartitionCandidates), so it
+//      covers function-scope accumulators (flat kernels, which never
+//      become ScheduleBuffers) and never touches non-accumulator TMEM
+//      (MMA-scaled scale allocs fold rows into columns and are exempt);
 //   2. loops scheduled (a variant that fails to schedule a loop loses);
 //   3. sum of loop IIs (steady-state throughput; after the occupancy
 //      de-bias in applyDataPartition an M-split conserves MAC area, so
@@ -4692,10 +4698,22 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 // 128 rows x 512 columns). Anything taller cannot be allocated at all.
 constexpr int64_t kTmemLanes = 128;
 
-static bool dataPartitionAutoSearch(int optionFactor) {
+static bool dataPartitionAutoSearch(ModuleOp moduleOp, int optionFactor) {
   if (optionFactor > 1)
     return false; // explicit pass option wins
-  return triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") == "auto";
+  if (triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") != "auto")
+    return false;
+  // Explicit per-loop factors also win: if any loop carries a
+  // tt.data_partition_factor attr, keep the classic user-resolved path
+  // (option > attr > numeric env) instead of searching over it.
+  bool hasExplicitAttr = false;
+  moduleOp.walk([&](scf::ForOp forOp) {
+    if (auto attr =
+            forOp->getAttrOfType<IntegerAttr>("tt.data_partition_factor"))
+      if (attr.getInt() > 1)
+        hasExplicitAttr = true;
+  });
+  return !hasExplicitAttr;
 }
 
 static DataPartitionPlan
@@ -4703,18 +4721,50 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
                         triton::ModuleAxisInfoAnalysis &axisInfo) {
   DataPartitionPlan baseline; // empty plan = N=1 everywhere
   std::set<unsigned> factors;
+  // Per-MMA per-CTA accumulator height, off the candidate surface (every
+  // candidate has mSize = bm / n, so bm = n * mSize). This is the basis of
+  // the TMEM-legality score term — deliberately NOT derived from
+  // ScheduleBuffers, which only exist for allocs inside a scheduled loop
+  // body (a flat kernel's function-scope accumulator would be invisible).
+  SmallVector<std::pair<Operation *, int64_t>> accRows;
   moduleOp.walk([&](Operation *op) {
-    for (const auto &c : enumerateDataPartitionCandidates(op))
+    auto cands = enumerateDataPartitionCandidates(op);
+    if (cands.empty())
+      return;
+    accRows.push_back(
+        {op, static_cast<int64_t>(cands.front().n) * cands.front().mSize});
+    for (const auto &c : cands)
       factors.insert(c.n);
   });
   if (factors.empty())
     return baseline;
+
+  auto tmemLegalFor = [&](const DataPartitionPlan &plan) {
+    for (const auto &[op, bm] : accRows) {
+      int64_t rows = bm;
+      if (auto it = plan.mmaInfo.find(op); it != plan.mmaInfo.end())
+        rows = it->second.mSize;
+      if (rows > kTmemLanes)
+        return false;
+    }
+    return true;
+  };
 
   auto candidates = collectCandidates(moduleOp);
   // Deeper nests are rejected by the main pass; don't search them.
   for (const auto &c : candidates)
     if (c.depth >= 2)
       return baseline;
+
+  // The evaluations below re-run DDG construction once per variant; swallow
+  // warnings/remarks (e.g. the dynamic trip-count note) so each diagnostic
+  // reaches the user once — from the real scheduling run — not once per
+  // variant. Errors still propagate.
+  ScopedDiagnosticHandler quietWarnings(
+      moduleOp.getContext(), [](Diagnostic &diag) {
+        return success(diag.getSeverity() == DiagnosticSeverity::Warning ||
+                       diag.getSeverity() == DiagnosticSeverity::Remark);
+      });
 
   struct Score {
     bool tmemLegal = true;
@@ -4724,6 +4774,7 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
   };
   auto evaluate = [&](const DataPartitionPlan &plan) {
     Score sc;
+    sc.tmemLegal = tmemLegalFor(plan);
     SmallVector<ScheduledLoop, 2> sls;
     for (const auto &c : candidates) {
       if (c.hasExistingAnnotation)
@@ -4739,34 +4790,12 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
     for (const auto &sl : sls) {
       for (const auto &loop : sl.graph.loops) {
         sc.iiSum += std::max(loop.II, 0);
-        for (const auto &buf : loop.buffers) {
-          if (buf.kind == ttg::MemoryKind::TMEM) {
-            // An accumulator whose per-CTA, per-group M exceeds the TMEM
-            // lane count cannot be allocated. Judge the per-CTA slice
-            // through the same getShapePerCTA lens that
-            // enumerateDataPartitionCandidates uses to derive bm/mSize —
-            // NOT the buffer's raw shape, which for a CTA-split
-            // accumulator is the whole-cluster extent.
-            int64_t rows = -1;
-            if (buf.partitionCount > 1) {
-              rows = buf.mSize; // already per-CTA (from getShapePerCTA(bm))
-            } else if (buf.defOp && buf.defOp->getNumResults() > 0) {
-              if (auto memTy = dyn_cast<ttg::MemDescType>(
-                      buf.defOp->getResult(0).getType())) {
-                auto perCTA = ttg::getShapePerCTA(memTy);
-                if (!perCTA.empty())
-                  rows = perCTA[0];
-              }
-            }
-            if (rows > kTmemLanes)
-              sc.tmemLegal = false;
-          }
+        for (const auto &buf : loop.buffers)
           if (buf.kind == ttg::MemoryKind::SMEM &&
               buf.requestedCount > buf.count)
             sc.shortfallBytes +=
                 static_cast<int64_t>(buf.requestedCount - buf.count) *
                 buf.sizeBytes();
-        }
       }
     }
     return sc;
@@ -5744,7 +5773,7 @@ struct ModuloSchedulePass
     // scheduler itself; otherwise the factor is user-resolved (option > attr
     // > env), 1 = off.
     DataPartitionPlan partitionPlan =
-        dataPartitionAutoSearch(dataPartitionFactor)
+        dataPartitionAutoSearch(moduleOp, dataPartitionFactor)
             ? searchDataPartitionPlan(moduleOp, model, axisInfoAnalysis)
             : computeDataPartitionPlan(moduleOp, dataPartitionFactor);
 

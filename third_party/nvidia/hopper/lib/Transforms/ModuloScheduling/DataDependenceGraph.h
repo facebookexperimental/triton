@@ -59,9 +59,10 @@ struct DDGNode {
   // Pass A.5 data partitioning. When partitionCount > 1 this node is a
   // partition "bundle": the emitter fans it into partitionCount parallel ops
   // (an MMA → N async_dots, each handling mSize rows along partitionDim into
-  // its own accumulator). The bundle stays a single scheduled node — its
-  // pipeline occupancy is scaled by partitionCount so ResMII reflects the N
-  // hardware issues. Default 1 = unpartitioned.
+  // its own accumulator). The bundle stays a single scheduled node occupying
+  // max(full-tile occupancy, partitionCount x issue cost) — the M-split
+  // conserves MAC area, so only the per-sub-MMA issue floor scales with N
+  // (see applyDataPartition). Default 1 = unpartitioned.
   unsigned partitionCount{1};
   unsigned partitionDim{0}; // 0 = M, 1 = N (emitter supports M only today)
   unsigned mSize{0};        // per-partition size along partitionDim
