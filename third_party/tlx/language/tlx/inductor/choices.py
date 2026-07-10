@@ -4,7 +4,7 @@ template selection, filtering, and layout logic.
 
 Activated via config.inductor_choices_class set in template_heuristics/tlx.py.
 All methods check config.triton.tlx_mode at runtime and fall through to
-super() when mode is "default".
+super() when TLX is disabled (mode is None).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ class TLXInductorChoices(InductorChoices):
     InductorChoices subclass that handles TLX template injection,
     filtering, and layout fixing.
 
-    In "default" mode: delegates entirely to the parent class.
+    When disabled (mode is None): delegates entirely to the parent class.
     In "allow" mode: TLX templates compete with other backends via autotuning.
     In "force" mode: only TLX templates are used.
     """
@@ -95,7 +95,7 @@ class TLXInductorChoices(InductorChoices):
         kwarg_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> list[ChoiceCaller]:
         tlx_mode = config.triton.tlx_mode
-        if tlx_mode == "default" or op_name in self._UNSUPPORTED_OPS:
+        if tlx_mode is None or op_name in self._UNSUPPORTED_OPS:
             return super().get_template_configs(
                 kernel_inputs, templates, op_name, kwarg_overrides
             )

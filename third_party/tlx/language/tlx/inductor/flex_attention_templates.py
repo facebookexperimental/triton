@@ -28,7 +28,7 @@ def append_tlx_flex_attention_choice(
     """Add Blackwell TLX flex-attention template choices to ``choices``.
 
     Gated by ``config.triton.tlx_mode``:
-      - "default": no-op.
+      - None (disabled): no-op.
       - "allow":   add TLX candidates alongside the standard template.
       - "force":   drop the standard choices and use only TLX.
 
@@ -42,7 +42,7 @@ def append_tlx_flex_attention_choice(
     """
     from torch._inductor import config
 
-    if config.triton.tlx_mode == "default":
+    if config.triton.tlx_mode is None:
         return
 
     if config.triton.tlx_mode == "force":
