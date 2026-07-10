@@ -773,13 +773,14 @@ class CUDABackend(BaseBackend):
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if knobs.nvidia.use_list_schedule:
-                # List scheduling is a no-warp-specialization transform: it
-                # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
-                # feeds the pipeliner directly. Running either WS path here would
-                # trip PartitionSchedulingMeta (it treats the tt.modulo_ii marker
-                # as a modulo schedule and demands partition attrs the list
-                # scheduler never emits). So skip WS entirely.
+            if knobs.nvidia.use_list_schedule and not knobs.nvidia.use_meta_ws:
+                # List scheduling without WS: a pure intra-loop reorder. It writes
+                # loop.stage/loop.cluster and feeds the pipeliner directly; no
+                # partitioning. (With use_meta_ws it instead flows into the meta-WS
+                # path below — the list schedule provides loop.stage/cluster and
+                # PartitionSchedulingMeta derives partitions from it, same as the
+                # default scheduler. The list pass omits tt.modulo_ii so PSM does
+                # not take the modulo-authoritative path.)
                 pass
             elif not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported

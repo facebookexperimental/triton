@@ -5647,8 +5647,13 @@ static void applyListSchedule(scf::ForOp loop,
       op.setAttr(tt::kLoopClusterAttrName,
                  IntegerAttr::get(IntegerType::get(ctx, 32), maxCluster));
   }
-  loop->setAttr("tt.modulo_ii",
-                IntegerAttr::get(IntegerType::get(ctx, 32), result.makespan));
+  // Deliberately do NOT set tt.modulo_ii: that marker tells PartitionScheduling
+  // Meta "the modulo pass owns partitioning" and makes it refuse to derive
+  // partitions (it expects preset ttg.partition.stages/warp_specialize.tag),
+  // which would block list-schedule + warp specialization. The list schedule is
+  // a normal (loop.stage/loop.cluster) schedule, so downstream WS derives
+  // partitions from it like the default path. tt.list_schedule_makespan remains
+  // as the "list-scheduled" marker for any consumer that cares.
   loop->setAttr("tt.list_schedule_makespan",
                 IntegerAttr::get(IntegerType::get(ctx, 32), result.makespan));
   reorderByCluster(loop);
