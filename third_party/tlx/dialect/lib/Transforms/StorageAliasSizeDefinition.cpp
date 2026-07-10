@@ -145,6 +145,26 @@ LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m) {
           blockN = (blockN + scaleFactor - 1) / scaleFactor;
         }
 
+        // 2-CTA (TwoCTA_RHS/LHS) tiles are split along N across the CTA pair,
+        // so each CTA's real footprint is transposed: 2*blockM rows x blockN/2
+        // cols. This is only known after layout propagation resolves the
+        // ctaMode; account for it here so the backing size is consistent with
+        // getTmemAllocSizes (used by the offset/index math). Otherwise a
+        // (64,128) twocta_rhs view is over-counted as 128 cols and dQ cannot be
+        // placed at a non-zero column offset.
+        if (auto tmemEnc =
+                dyn_cast<mlir::triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+                    memDescType.getEncoding())) {
+          auto ctaMode = tmemEnc.getCtaMode();
+          if (ctaMode ==
+                  mlir::triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS ||
+              ctaMode ==
+                  mlir::triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_LHS) {
+            blockN /= 2;
+            blockM *= 2;
+          }
+        }
+
         LDBG("  TMEM allocation: ");
         for (size_t i = 0; i < shape.size(); ++i) {
           LDBG(shape[i] << (i < shape.size() - 1 ? "x" : ""));

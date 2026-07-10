@@ -621,9 +621,9 @@ class CUDABackend(BaseBackend):
             list(opt.cluster_dims),
         )
         passes.common.add_inliner(pm)
-        # Handle storage lowering. In the future this may need
-        # dummy layouts
-        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
+        # Storage alias lowering moved to make_ttgir (after layout propagation)
+        # so the backing TMEM allocation is materialized with the resolved
+        # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -686,6 +686,9 @@ class CUDABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        # Storage alias lowering runs after layout propagation so the backing
+        # TMEM allocation is materialized with the resolved 2-CTA storage format.
+        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         # Only determine reg layouts after TMEM layout is finalized
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
