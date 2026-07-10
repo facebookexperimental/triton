@@ -57,7 +57,7 @@ jobs:
           # stable logical bucket identity for this job.
           BUCKET="amd-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / mi350-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":""}]'
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"mi350-meta-triton-test","summary":"TritonBench tests failed on MI350 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   mi350-tlx-test:
@@ -187,6 +187,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -205,6 +206,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
 
   report-mi350-tlx:
     needs: mi350-tlx-test
@@ -212,6 +216,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -230,6 +235,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
 
   report-mi350-gluon:
     needs: mi350-gluon-test
@@ -237,6 +245,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -255,6 +264,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: mi350
 
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-mi350-tritonbench:
