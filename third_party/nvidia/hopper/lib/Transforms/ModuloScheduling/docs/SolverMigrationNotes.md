@@ -898,3 +898,20 @@ on case4 — the win condition for v2 is a better-calibrated objective
 (RRT / sync-latency terms), not more solver freedom; (b) both gen kernels
 sit at 0.46-0.68x of the handwritten no-WS baseline on case4 — the
 emitter/annotation gap dominates everything the solver can influence.
+
+## 2026-07-10 (sixth entry): CPSAT→JointSolver rename verified ALL GREEN
+
+The rename (commit 5e1609f47: `JointSolverScheduler.{h,cpp}`,
+`modulo_joint_solver.py`, `TRITON_MODULO_JOINT_SOLVER_*` env vars,
+`TRITON_USE_MODULO_SCHEDULE=joint_solver`, schema `joint-solver-0.1`)
+was validated end-to-end with `solver_regression.py --skip-perf` on
+B200: all 6 configs (joint_solver / joint1 / joint2 / full /
+full-stream / full-regcap) × 6 cases green — case1/case7 parity
+(candidate codegen byte-identical to the committed artifacts),
+case3/case4/case5/case6 correctness PASS, zero frozen repros. The
+parity results double as evidence the rename changed no solver
+behavior: the schedule/partition draws reproduce the committed
+kernels exactly through the renamed subprocess chain
+(TRITON_MODULO_JOINT_SOLVER_CMD → python -m
+triton.tools.modulo_joint_solver → joint-solver-0.1 problem/solution
+round-trip).
