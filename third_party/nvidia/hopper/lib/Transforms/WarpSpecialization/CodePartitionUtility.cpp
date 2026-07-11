@@ -5,6 +5,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include <list>
 #include <unordered_set>
@@ -12,6 +13,7 @@
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace nvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-utility"
@@ -113,6 +115,8 @@ Operation *ChannelPost::getSrcOp() {
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
+    if (isa<nvws::DescriptorLoadOp, nvws::DescriptorGatherOp>(user))
+      return user;
     // Look through SubtiledRegionOp: if the alloc is passed as an
     // input, find the local_store in the tile region.
     if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
@@ -134,7 +138,8 @@ static void getAllConsumers(ChannelPost *ch,
     if (!user)
       continue;
     if (!isa<ttg::LocalStoreOp>(user) &&
-        !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
+        !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user) &&
+        !isa<nvws::DescriptorLoadOp, nvws::DescriptorGatherOp>(user))
       consumers.push_back(user);
   }
   // With data partitioning, consumers of shared buffers (e.g., K, V) may
@@ -3282,6 +3287,12 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
       } else if (isa<ttg::LocalStoreOp>(user)) {
+        assert(producerOp == nullptr);
+        producerOp = user;
+      } else if (isa<nvws::DescriptorLoadOp, nvws::DescriptorGatherOp>(user)) {
+        // NVWSInsertAllocas writes descriptor results directly into the
+        // communication buffer. Treat that operation as the producer, just as
+        // the pre-shim MemoryPlannerNVWSAdapter did.
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
