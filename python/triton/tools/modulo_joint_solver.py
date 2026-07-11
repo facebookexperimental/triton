@@ -48,6 +48,7 @@ is always at real cycle granularity and exact.
 """
 
 import json
+import os
 import sys
 
 try:
@@ -55,6 +56,26 @@ try:
 except ImportError:  # pragma: no cover
     print(json.dumps({"status": "error", "message": "ortools not installed (pip install ortools)"}))
     sys.exit(2)
+
+
+def _async_flight_blocking():
+    """Pre-skew emitter model: same-WG sync work is priced as blocked for an
+    async op's whole flight (v1 split-cost window) and excluded from it
+    outright (v2 hard constraint). This over-prices merging by ~2000 cycle
+    units on case4 (the hardware-best 6-WG layout scored 2930 vs the 8-WG
+    pick's 892 while running 2.2x faster — 2026-07-11 calibration). The
+    correctness hazard that first surfaced with blocking disabled (obj-252
+    merged layout emitted WRONG dQ/dK) was an emitter bug — the intra-WG
+    SMEM->MMA bridge wrote slot [0] while consumers read the WG ring slot —
+    fixed 2026-07-11 by clamping bridge buffers to the protocol's depth-1
+    (sched2tlx emitter, _derive_smem_bridge_channels). Merged layouts are
+    now CORRECT but still mis-ranked: the model prefers its 252/892
+    layouts over the hardware-best 2930 one (~2.2x faster on B200), i.e.
+    remaining calibration debt is in xissue vs TC+CUDA issue-stream
+    serialization pricing. Default stays ON until that ranking flips on
+    the case3+case4 witness suite; set
+    TRITON_MODULO_ASYNC_FLIGHT_BLOCKING=0 for calibration experiments."""
+    return os.environ.get("TRITON_MODULO_ASYNC_FLIGHT_BLOCKING", "1") == "1"
 
 
 def _critical_path(nodes, edges):
@@ -362,19 +383,28 @@ def solve_partition(prob):
     terms = []
 
     # Split cost: scheduled parallelism destroyed by merging two clusters
-    # into one in-order warp. The occupied window depends on the op class
-    # (Twill's CONCURRENCY insight / the stageMix penalty's rationale):
-    #   async (TMA/TC) vs sync (CUDA/SFU): the async op's full LATENCY
-    #     window — sync work the schedule placed during the flight is
-    #     blocked by the same-warp wait if merged;
-    #   sync vs sync (different rows): both block the warp for their
-    #     issue duration;
-    #   async vs async: issue duration only — hardware overlaps the
-    #     flights regardless of warp assignment, merging is nearly free.
+    # into one in-order warp. The occupied window is the op's ISSUE duration
+    # for every class: the warp is busy only while issuing; async flights
+    # (TMA/TC) overlap same-WG work because the emitter sinks the waits
+    # below independent ops and stage-skews intra-WG async results. The
+    # legacy pre-skew model additionally charged async-vs-sync pairs the
+    # async op's full LATENCY window ("sync work placed during the flight
+    # is blocked by the same-warp wait if merged") — restorable with
+    # TRITON_MODULO_ASYNC_FLIGHT_BLOCKING=1.
     ASYNC = ("TMA", "TC", "MFMA")
 
     def window(nd, other):
-        if nd["pipeline"] in ASYNC and other["pipeline"] not in ASYNC:
+        # Skew-aware window (2026-07-11 calibration): the emitter stage-skews
+        # intra-WG async results (sinks waits below independent work — the
+        # guard-1 retirement emitter capability), so a merged warp is occupied
+        # only for the async op's ISSUE duration, same as async-vs-async. The
+        # legacy full-latency window priced same-WG sync work as blocked for
+        # the whole flight and inverted case4's ranking: the hardware-best
+        # 6-WG layout (292 TF) scored 2930 vs the 8-WG pick's 892 (132 TF),
+        # with the entire 2036-unit gap in this term.
+        # TRITON_MODULO_ASYNC_FLIGHT_BLOCKING=1 restores the legacy window
+        # (pre-skew emitter model) for A/B.
+        if _async_flight_blocking() and nd["pipeline"] in ASYNC and other["pipeline"] not in ASYNC:
             return max(nd["duration"], nd["latency"])
         return nd["duration"]
 
@@ -648,9 +678,18 @@ def solve_joint(prob):
             model.AddNoOverlap(segs)
 
     # Async-flight exclusion within a WG (circular difference encoding).
+    # Legacy-only (TRITON_MODULO_ASYNC_FLIGHT_BLOCKING=1): this HARD
+    # constraint embodies the pre-skew emitter model — sync work may not sit
+    # anywhere in a same-WG async op's flight, and when flight + duration
+    # >= II the pair may not share a WG at all. With case4's MMA flights
+    # (559/900 cyc) against II=1033 that forbade nearly every merge and
+    # forced the 8-WG layout (95-107 TF vs the 6-WG 292 TF). The emitter's
+    # stage-skew rings make issue-duration NoOverlap (above) the correct
+    # occupancy model; see solve_partition's window() for the soft-cost
+    # analog and the 2026-07-11 calibration numbers.
     ASYNC = ("TMA", "TC", "MFMA")
     clustered = [nid for c in clusters for nid in c["nodes"]]
-    for u in clustered:
+    for u in clustered if _async_flight_blocking() else []:
         nu = node_by_id[u]
         if nu["pipeline"] not in ASYNC or nu["latency"] <= nu["duration"]:
             continue

@@ -908,6 +908,17 @@ def _bar_empty(buffer_var: str) -> str:
     return f"{buffer_var}_empty"
 
 
+def _skw(buffer_var: str) -> str:
+    """Barrier-name namespace for intra-WG stage-skew rings. The ring's DATA
+    var is the accumulator/alloc var itself, but its barriers must not share
+    names with that var's other barrier pairs: the FA-bwd epilogue handoff
+    allocates `{var}_full/_empty` for the same accumulator, and in merged
+    (all-MMA-in-one-WG) layouts both pairs coexist — the later skew-ring
+    binding silently shadowed the handoff pair (case4 merged draw,
+    2026-07-11), mistargeting the epilogue wait and post-loop commit."""
+    return f"{buffer_var}_skw"
+
+
 def _ring_exprs(count: int, rctx: "RenderCtx") -> tuple[str, str]:
     """(index, phase) for subscripting a SPECIFIC ring buffer in the current
     WG body.
@@ -2372,10 +2383,23 @@ def _derive_smem_bridge_channels(g: ScheduleGraph, inner: Loop) -> list[Channel]
                 continue  # cross-WG (cross_wg_barriers cover it) or no MMA consumer
             if any(cb.paired_buffer_id == b.id for cb in L.schedule.cross_wg_barriers):
                 continue  # already staged by a synthesized cross-WG channel
+            # The bridge store/handshake protocol is DEPTH-1 by construction:
+            # the producer store, its full/empty waits, and the operand-side
+            # full wait are all emitted at slot [0] with (_it & 1) parity.
+            # A buffer arriving here with count > 1 (schedule lifetime/II+1
+            # depth) would be written at [0] but read at the WG ring counter
+            # by the consuming MMAs — 2 of every `count` iterations read a
+            # never-written slot (case4 merged-partition draw, 2026-07-11:
+            # dsT depth-3 bridge fed dK/dQ garbage, errors growing with N;
+            # dV clean). Clamp the buffer to the protocol's depth so the
+            # data alloc, the barrier ring, and _ring_exprs all agree; the
+            # depth-1 handshake already serialized the pipeline, so no
+            # overlap is lost.
+            b.count = 1
             out.append(
                 Channel(
                     name=b.def_op,  # resolved to the buffer var by the caller
-                    depth=b.count,
+                    depth=1,
                     producer_wg=val_wg,
                     consumer_wg=val_wg,
                     kind="tmem",  # reuse bridge store+handshake emission
@@ -3189,8 +3213,9 @@ def _emit_skew_ring_consumer_wait(
         var = entry.get("var")
         if var is None or n.id in entry.get("mma_consumers", []):
             continue  # MMA consumers handshake inside the MMA emit branch
+        bv = entry.get("bar_var") or _skw(var)
         w = (
-            f"tlx.barrier_wait({_bar_full(var)}[{entry['slot']}], "
+            f"tlx.barrier_wait({_bar_full(bv)}[{entry['slot']}], "
             f"{entry['phase']})  # intra-WG skew ring (async result ready)"
         )
         seen = getattr(rctx, "_emitted_full_waits", None)
@@ -3212,8 +3237,9 @@ def _emit_skew_ring_consumer_arrive(
             continue
         sw = entry.get("sw_consumers", [])
         if sw and sw[-1] == n.id:
+            bv = entry.get("bar_var") or _skw(var)
             lines += (
-                f"tlx.barrier_arrive({_bar_empty(var)}[{entry['slot']}], 1)"
+                f"tlx.barrier_arrive({_bar_empty(bv)}[{entry['slot']}], 1)"
                 f"  # intra-WG skew ring recycle"
             )
 
@@ -4059,8 +4085,9 @@ def _emit_in_loop_node(
             for side, opnd_var in (("a", a_var), ("b", b_var)):
                 rc = rctx.skew_ring.get(opnd_var)
                 if rc is not None and n.id in rc["consumer_nodes"]:
+                    rc_bv = rc.get("bar_var") or _skw(opnd_var)
                     w = (
-                        f"tlx.barrier_wait({_bar_full(opnd_var)}[{rc['slot']}], "
+                        f"tlx.barrier_wait({_bar_full(rc_bv)}[{rc['slot']}], "
                         f"{rc['phase']})  # intra-WG skew ring operand"
                     )
                     if _seen_fw is None or w not in _seen_fw:
@@ -4068,7 +4095,7 @@ def _emit_in_loop_node(
                         if _seen_fw is not None:
                             _seen_fw.add(w)
                     ring_consumer_empties.append(
-                        f"{_bar_empty(opnd_var)}[{rc['slot']}]"
+                        f"{_bar_empty(rc_bv)}[{rc['slot']}]"
                     )
                     # Re-slot the operand expression onto the ring index.
                     if side == "a":
@@ -4086,8 +4113,9 @@ def _emit_in_loop_node(
             ring_prod = rctx.skew_ring.get(dest_var)
             if ring_prod is not None and n.id == ring_prod["producer_node"]:
                 acc_idx = ring_prod["slot"]
+                rp_bv = ring_prod.get("bar_var") or _skw(dest_var)
                 lines += (
-                    f"tlx.barrier_wait({_bar_empty(dest_var)}[{ring_prod['slot']}], "
+                    f"tlx.barrier_wait({_bar_empty(rp_bv)}[{ring_prod['slot']}], "
                     f"{ring_prod['phase']} ^ 1)  # intra-WG skew ring slot free"
                 )
             lines += f"use_acc = {_use_acc_expr(op, loop, rctx)}"
@@ -4098,7 +4126,8 @@ def _emit_in_loop_node(
             mbar_list.extend(_semir_consumer_mbarriers(loop.loop_id, n.id, rctx))
             mbar_list.extend(_semir_producer_mbarriers(loop.loop_id, n.id, rctx))
             if ring_prod is not None and n.id == ring_prod["producer_node"]:
-                mbar_list.append(f"{_bar_full(dest_var)}[{ring_prod['slot']}]")
+                rp_bv = ring_prod.get("bar_var") or _skw(dest_var)
+                mbar_list.append(f"{_bar_full(rp_bv)}[{ring_prod['slot']}]")
 
             # Pass A.5: when the MMA is partitioned, fan out to N async_dot
             # calls. Each call takes a `tlx.local_slice` view of the shared
@@ -6077,6 +6106,14 @@ def emit(graph: ScheduleGraph) -> str:
     outer_loop = _find_outer_loop(graph)
     inner_loop = _find_inner_loop(graph, outer_loop) if outer_loop else None
 
+    # Pre-pass: clamp intra-WG SMEM→MMA bridge buffers to the bridge
+    # protocol's depth-1 BEFORE buffer allocs render — the same derivation
+    # runs again later for channel construction and its clamp side effect
+    # is idempotent, but by then the alloc lines (count=N) are already out.
+    _bridge_detect_loop = inner_loop if inner_loop is not None else outer_loop
+    if _bridge_detect_loop is not None:
+        _derive_smem_bridge_channels(graph, _bridge_detect_loop)
+
     # Fold pipeline=NONE sink ops (warp_group=-1) into their producer's group.
     for L in graph.loops:
         _reassign_orphan_nodes(graph, L)
@@ -6717,7 +6754,11 @@ def emit(graph: ScheduleGraph) -> str:
         skew_alloc_names = {c.name for c in channels} | {nm for nm, _ in extra or []}
         for var, entry in rctx.skew_ring.items():
             if var in skew_alloc_names or _bar_full(var) in seen_alloc:
+                # Delegated: an existing channel/extra pair already owns
+                # `{var}_full/_empty`; the ring's waits reuse those names.
+                entry["bar_var"] = var
                 continue
+            entry["bar_var"] = _skw(var)
             skew_alloc_names.add(var)
             eac = len(entry.get("mma_consumers", [])) + (
                 1 if entry.get("sw_consumers") else 0
@@ -6728,11 +6769,11 @@ def emit(graph: ScheduleGraph) -> str:
                 f"{entry['depth'] - 1} iter(s) ahead of its consumers)"
             )
             lines += (
-                f"{_bar_full(var)} = tlx.alloc_barriers"
+                f"{_bar_full(entry['bar_var'])} = tlx.alloc_barriers"
                 f"(num_barriers={entry['depth']}, arrive_count=1)"
             )
             lines += (
-                f"{_bar_empty(var)} = tlx.alloc_barriers"
+                f"{_bar_empty(entry['bar_var'])} = tlx.alloc_barriers"
                 f"(num_barriers={entry['depth']}, arrive_count={max(eac, 1)})"
             )
     else:
