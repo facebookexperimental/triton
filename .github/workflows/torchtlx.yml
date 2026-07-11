@@ -1,0 +1,213 @@
+name: Meta Triton TorchTLX Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    # Every 6 hours at :15 past (00:15, 06:15, 12:15, 18:15 UTC).
+    - cron: '15 */6 * * *'
+
+# torchTLX integrates TLX as an Inductor backend, so it needs a nightly PyTorch
+# (it hooks into recent Inductor template/fusion internals) plus the fork Triton
+# on top -- a different environment from the triton-only tritonbench/tlx jobs,
+# hence a dedicated workflow. Both jobs track the latest nightly torch (floating),
+# so the signal reflects torchTLX against current OSS PyTorch.
+
+jobs:
+  b200-torchtlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: nvidia-dgx-b200
+    env:
+      CONDA_ENV: meta-triton
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Tune Nvidia GPU
+        run: |
+          sudo nvidia-smi -pm 1
+          sudo ldconfig
+          nvidia-smi
+      - name: Install nightly PyTorch
+        run: |
+          . "${SETUP_SCRIPT}"
+          # Install nightly torch first: it pulls its own pytorch-triton, which
+          # the fork Triton install below overrides.
+          uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+      - name: Compile Triton
+        run: |
+          . "${SETUP_SCRIPT}"
+          . /workspace/tritonbench/.ci/triton/triton_install_utils.sh
+          # Install the fork Triton on top of nightly torch's pinned pytorch-triton.
+          install_triton $PWD
+          uv pip install pytest expecttest
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 40
+        run: |
+          . "${SETUP_SCRIPT}"
+          python -m pytest \
+            python/test/unit/language/test_torchtlx_templates.py \
+            python/test/unit/language/test_torchtlx_fusions.py \
+            -v --junitxml=/tmp/torchtlx.xml
+      - name: Collect nightly failures (TorchTLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket b200-torchtlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/torchtlx.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "b200-torchtlx-test" \
+            ${FAILED_FLAG}
+
+  mi350-torchtlx-test:
+    if: github.repository_owner == 'facebookexperimental'
+    runs-on: linux-fb-triton-mi350-1
+    env:
+      WORKSPACE_DIR: /workspace
+      CONDA_ENV: pytorch
+      UV_VENV_DIR: /workspace/uv_venvs
+      SETUP_SCRIPT: /workspace/setup_instance.sh
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      failures: ${{ steps.parse.outputs.failures }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Checkout Tritonbench
+        uses: actions/checkout@v3
+        with:
+          repository: meta-pytorch/tritonbench
+          path: tritonbench
+          submodules: recursive
+      - name: Setup Tritonbench environment
+        working-directory: tritonbench
+        run: |
+          set -eux
+          # Omitting --install-torch-wheel makes setup-env.sh fall back to
+          # --install-torch-nightly (latest rocm nightly torch, floating);
+          # --custom-triton installs the fork Triton on top.
+          bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}"
+      - name: Run TorchTLX template + fusion tests
+        id: run_torchtlx_tests
+        timeout-minutes: 40
+        run: |
+          set -eux
+          . "${SETUP_SCRIPT}"
+          uv pip install pytest expecttest
+          # gfx950 addmm warp-pipe cases run; Blackwell cases auto-skip via arch gates.
+          pytest \
+            python/test/unit/language/test_torchtlx_templates.py \
+            python/test/unit/language/test_torchtlx_fusions.py \
+            -v --junitxml=/tmp/torchtlx.xml
+      - name: Collect nightly failures (TorchTLX)
+        id: parse
+        if: always() && github.event_name == 'schedule'
+        run: |
+          . "${SETUP_SCRIPT}"
+          FAILED_FLAG=""
+          if [[ "${{ steps.run_torchtlx_tests.outcome }}" != "success" ]]; then
+            FAILED_FLAG="--failed --bucket mi350-torchtlx-job-failed"
+          fi
+          python3 .github/scripts/parse_junit_failures.py \
+            --junit /tmp/torchtlx.xml \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --job "mi350-torchtlx-test" \
+            ${FAILED_FLAG}
+
+  # ----- Nightly issue filing (schedule only) -----
+  report-b200-torchtlx:
+    needs: b200-torchtlx-test
+    if: always() && github.event_name == 'schedule' && needs.b200-torchtlx-test.outputs.failures != '' && needs.b200-torchtlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.b200-torchtlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  report-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always() && github.event_name == 'schedule' && needs.mi350-torchtlx-test.outputs.failures != '' && needs.mi350-torchtlx-test.outputs.failures != '[]'
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.mi350-torchtlx-test.outputs.failures) }}
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: ${{ matrix.item.issue_title }}
+      normalized_failure_id: ${{ matrix.item.normalized_failure_id }}
+      raw_failure_ids: ${{ matrix.item.raw_failure_ids }}
+      workflow_name: ${{ github.workflow }}
+      job_name: ${{ matrix.item.job_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ref: ${{ github.ref }}
+      sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      run_attempt: ${{ github.run_attempt }}
+      summary: ${{ matrix.item.summary }}
+      repro: ${{ matrix.item.repro }}
+
+  # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
+  reconcile-b200-torchtlx:
+    needs: b200-torchtlx-test
+    if: always() && github.event_name == 'schedule' && (needs.b200-torchtlx-test.result == 'success' || needs.b200-torchtlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: b200-torchtlx-test
+      failures: ${{ needs.b200-torchtlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  reconcile-mi350-torchtlx:
+    needs: mi350-torchtlx-test
+    if: always() && github.event_name == 'schedule' && (needs.mi350-torchtlx-test.result == 'success' || needs.mi350-torchtlx-test.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/reconcile-nightly-issues.yml
+    with:
+      workflow_name: ${{ github.workflow }}
+      job_name: mi350-torchtlx-test
+      failures: ${{ needs.mi350-torchtlx-test.outputs.failures }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
