@@ -6,6 +6,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "llvm/Support/JSON.h"
@@ -186,7 +187,8 @@ Operation *AllocChannel::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user))
+    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp,
+            ttnvws::DescriptorGatherOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
@@ -210,7 +212,8 @@ static void getAllConsumers(AllocChannel *ch,
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user) &&
+    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp,
+             ttnvws::DescriptorGatherOp>(user) &&
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
@@ -3564,7 +3567,11 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
         // Alloc associated with operand D can have multiple producers.
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user)) {
+      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp,
+                     ttnvws::DescriptorGatherOp>(user)) {
+        // NVWSInsertAllocas writes descriptor results directly into the
+        // communication buffer. Treat that operation as the producer, just as
+        // the pre-shim MemoryPlannerNVWSAdapter did.
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
@@ -3630,7 +3637,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
     SmallVector<Operation *> taskOwners = {consumer};
     // A memdesc view can carry boundary task IDs that do not all consume the
     // buffer. Descriptor channels synchronize with the terminal consumers.
-    if (isa<ttnvws::DescriptorLoadOp>(producerOp))
+    if (isa<ttnvws::DescriptorLoadOp, ttnvws::DescriptorGatherOp>(producerOp))
       taskOwners = getActualConsumers(consumer);
     for (Operation *taskOwner : taskOwners) {
       for (int id : getAsyncTaskIds(taskOwner)) {
