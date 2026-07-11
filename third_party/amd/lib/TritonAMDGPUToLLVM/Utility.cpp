@@ -627,14 +627,19 @@ unsigned getVectorSize(Value ptr, ModuleAxisInfoAnalysis &axisAnalysisPass) {
     return 1;
   auto contiguity = getContiguity(ptr, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
-  return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  // No-op for pow2; clamps the NPOT sizePerThread misalign (see NVIDIA).
+  return clampVecSizeForNpot(vec, tensorTy);
 }
 
 unsigned getVectorSize(Value ptr, Value offset,
                        ModuleAxisInfoAnalysis &axisAnalysisPass) {
   auto contiguity = getContiguity(ptr, offset, axisAnalysisPass);
   auto pointeeBitWidth = triton::getPointeeBitWidth(ptr.getType());
-  return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  unsigned vec = std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+  auto tensorTy =
+      dyn_cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
+  return clampVecSizeForNpot(vec, tensorTy);
 }
 
 Type scaleDotElemTypeToMLIRType(MLIRContext *ctx, triton::ScaleDotElemType t) {
