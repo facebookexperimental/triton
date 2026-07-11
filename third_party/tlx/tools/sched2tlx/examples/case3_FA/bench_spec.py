@@ -45,7 +45,11 @@ def _grid(inputs):
 
 
 def gen_call(generated, inputs):
-    generated.fa_fwd_kernel_nows[_grid(inputs)](
+    # Ping-pong lowerings pack several M-tiles per CTA and say so via a
+    # RECOMMENDED_GRID_DIVISOR module constant (cf. #1990's RECOMMENDED_*).
+    div = getattr(generated, "RECOMMENDED_GRID_DIVISOR", 1)
+    g0, g1 = _grid(inputs)
+    generated.fa_fwd_kernel_nows[(triton.cdiv(g0, div), g1)](
         inputs["qf"], inputs["kf"], inputs["vf"], inputs["of"], inputs["m_lse"], inputs["sm"],
         inputs["Z"] * inputs["H"], inputs["N_CTX"],
         num_warps=4, num_ctas=1, num_stages=2,

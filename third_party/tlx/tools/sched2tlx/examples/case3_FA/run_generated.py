@@ -38,7 +38,8 @@ def main() -> int:
         out = torch.empty_like(q)
         m_lse = torch.empty(Z * H, N_CTX, device="cuda", dtype=torch.float32)
         sm_scale = 1.0 / (HEAD_DIM**0.5)
-        grid = (triton.cdiv(N_CTX, BLOCK_M), Z * H)
+        div = getattr(generated, "RECOMMENDED_GRID_DIVISOR", 1)
+        grid = (triton.cdiv(triton.cdiv(N_CTX, BLOCK_M), div), Z * H)
         try:
             generated.fa_fwd_kernel_nows[grid](
                 q.contiguous().view(-1, HEAD_DIM),
