@@ -68,14 +68,254 @@ def _async_flight_blocking():
     merged layout emitted WRONG dQ/dK) was an emitter bug — the intra-WG
     SMEM->MMA bridge wrote slot [0] while consumers read the WG ring slot —
     fixed 2026-07-11 by clamping bridge buffers to the protocol's depth-1
-    (sched2tlx emitter, _derive_smem_bridge_channels). Merged layouts are
-    now CORRECT but still mis-ranked: the model prefers its 252/892
-    layouts over the hardware-best 2930 one (~2.2x faster on B200), i.e.
-    remaining calibration debt is in xissue vs TC+CUDA issue-stream
-    serialization pricing. Default stays ON until that ranking flips on
-    the case3+case4 witness suite; set
-    TRITON_MODULO_ASYNC_FLIGHT_BLOCKING=0 for calibration experiments."""
-    return os.environ.get("TRITON_MODULO_ASYNC_FLIGHT_BLOCKING", "1") == "1"
+    (sched2tlx emitter, _derive_smem_bridge_channels).
+    Default OFF since 2026-07-11: with skew-aware windows plus the
+    recurrence re-ranker (canonical-shape candidates scored by combined =
+    objective + 2*max(0, RecMII_aug - II)), the witness suite flipped —
+    case4's auto-pick is the hardware-best 6-WG layout (268.6 TF measured
+    end-to-end vs 132 under the legacy window, which demotes it to rank 2)
+    and case3's canary holds. Set TRITON_MODULO_ASYNC_FLIGHT_BLOCKING=1 to
+    restore the legacy pre-skew pricing for A/B."""
+    return os.environ.get("TRITON_MODULO_ASYNC_FLIGHT_BLOCKING", "0") == "1"
+
+
+def _recmii_rerank_enabled():
+    """Recurrence re-ranking of the partition solve's K-best assignments.
+    On by default; TRITON_MODULO_RECMII_RERANK=0 restores the raw
+    single-solution objective for A/B."""
+    return os.environ.get("TRITON_MODULO_RECMII_RERANK", "1") == "1"
+
+
+def _has_full_graph(prob):
+    """The re-ranker needs the full dependence graph: plain (non-cross)
+    edges and buffers with ring counts — shipped by the C++ side since the
+    2026-07-11 serialization extension."""
+    return bool(prob.get("buffers")) and any("src_cluster" not in e for e in prob.get("edges", []))
+
+
+_RECMII_HS = 30  # per-handshake overhead (wait/arrive pair), cycles
+
+
+def _set_partitions(items):
+    """All set-partitions of a small list (Bell number growth — callers cap
+    the input size)."""
+    if not items:
+        yield []
+        return
+    head, rest = items[0], items[1:]
+    for part in _set_partitions(rest):
+        for i in range(len(part)):
+            yield part[:i] + [[head] + part[i]] + part[i + 1:]
+        yield [[head]] + part
+
+
+def _canonical_candidates(prob):
+    """Domain-shape candidate assignments for the recurrence re-ranker.
+
+    K-best enumeration of the local-term objective climbs a deep plateau of
+    merged variants and never reaches pipeline-parallel layouts (case4: the
+    hardware-best 6-WG shape sits ~750 objective units above the plateau,
+    beyond any practical K). Generate the canonical warp-specialization
+    shapes directly instead:
+      - every TC cluster gets its own WG (MMA issue streams are cheap and
+        isolating them keeps loop-carried MMA recurrences off the CUDA
+        bodies);
+      - buffer-producing TMA clusters keep their own WGs (their rings
+        already decouple them);
+      - the remaining heavy (min_warps >= 4, non-trivial duration) CUDA
+        clusters are grouped by every set-partition (capped at 5 clusters);
+      - light clusters (register-channel TMA loads, scalars) are tried both
+        folded into the first heavy group's WG (killing their depth-1
+        channel recurrence) and separate.
+    """
+    clusters = prob["clusters"]
+    nodes = {nd["id"]: nd for nd in prob["nodes"]}
+    buf_alloc_producers = set()
+    preds = {}
+    for e in prob["edges"]:
+        if int(e["distance"]) == 0:
+            preds.setdefault(e["dst"], []).append(e["src"])
+    for b in prob.get("buffers", []):
+        # buffer "producer" is the staging alloc; its value producer is the
+        # dist-0 predecessor — walk one hop.
+        for p in preds.get(b["producer"], [b["producer"]]):
+            buf_alloc_producers.add(p)
+        buf_alloc_producers.add(b["producer"])
+
+    def cdur(c):
+        return sum(max(int(nodes[n].get("duration", 0)), 0) for n in c["nodes"])
+
+    tc, ring_tma, heavy, light = [], [], [], []
+    for c in clusters:
+        pipes = {nodes[n]["pipeline"] for n in c["nodes"]}
+        if "TC" in pipes:
+            tc.append(c)
+        elif c["min_warps"] >= 4 and cdur(c) >= 32:
+            # heavy CUDA compute — mergeable even if it stages a buffer
+            # (splitting compute chains cuts register handoffs, which the
+            # rt/xissue terms price correctly; grouping is what the local
+            # objective cannot rank).
+            heavy.append(c)
+        elif pipes == {"TMA"} and any(n in buf_alloc_producers for n in c["nodes"]):
+            ring_tma.append(c)
+        else:
+            light.append(c)
+    if len(heavy) > 5:
+        return []  # Bell growth — fall back to plain K-best
+    out = []
+    for part in _set_partitions(heavy):
+        for fold_light in (True, False):
+            amap, w = {}, 0
+            for c in tc:
+                amap[c["id"]] = w
+                w += 1
+            for c in ring_tma:
+                amap[c["id"]] = w
+                w += 1
+            first_heavy_wg = None
+            for grp in part:
+                for c in grp:
+                    amap[c["id"]] = w
+                if first_heavy_wg is None:
+                    first_heavy_wg = w
+                w += 1
+            for c in light:
+                if fold_light and first_heavy_wg is not None:
+                    amap[c["id"]] = first_heavy_wg
+                else:
+                    amap[c["id"]] = w
+                    w += 1
+            out.append(amap)
+    # dedup
+    seen, uniq = set(), []
+    for amap in out:
+        key = tuple(sorted(amap.items()))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(amap)
+    return uniq
+
+
+def _recmii_augmented(prob, amap):
+    """Predicted steady-state cycles/iteration of the emitted kernel for a
+    cluster->WG assignment: max cycle ratio over the dependence graph
+    augmented with (a) per-WG in-order body edges + a distance-1 wrap edge
+    (a warp re-enters its body once per iteration), (b) buffer-completion
+    back-edges at the emitted ring depths (intra-WG bridges are clamped to
+    depth-1 by the emitter; cross-WG channels use the schedule's count),
+    and (c) depth-1 back-edges for register-channel handoffs. Validated
+    2026-07-11 on case4's six hardware-measured layouts (combined-score
+    winner == hardware winner) and case3's five probes (v1 pick stays
+    first; the softmax-merge trap the raw objective preferred is demoted).
+    Returns predicted cycles, or None if the problem lacks the full graph."""
+    if not _has_full_graph(prob):
+        return None
+    nodes = {nd["id"]: nd for nd in prob["nodes"]}
+    wg_of = {}
+    for c in prob["clusters"]:
+        for nid in c["nodes"]:
+            wg_of[nid] = amap[c["id"]]
+    preds = {}
+    succs0 = {}
+    for e in prob["edges"]:
+        if int(e["distance"]) == 0:
+            preds.setdefault(e["dst"], []).append(e["src"])
+            succs0.setdefault(e["src"], []).append(e["dst"])
+    for _ in range(3):  # glue nodes follow their value producer
+        for nid in nodes:
+            if nid in wg_of:
+                continue
+            for p in preds.get(nid, []):
+                if p in wg_of:
+                    wg_of[nid] = wg_of[p]
+                    break
+
+    E = []
+    dur = {nid: max(int(n.get("duration", 0)), 0) for nid, n in nodes.items()}
+    for e in prob["edges"]:
+        E.append((e["src"], e["dst"], int(e["latency"]), int(e["distance"])))
+
+    # Topological tie-break for equal-cycle body nodes: a body edge opposing
+    # a distance-0 dependence would create a zero-distance positive cycle
+    # (unbounded ratio).
+    indeg = {nid: 0 for nid in nodes}
+    for e in prob["edges"]:
+        if int(e["distance"]) == 0:
+            indeg[e["dst"]] = indeg.get(e["dst"], 0) + 1
+    topo = {}
+    ready = sorted(nid for nid, d in indeg.items() if d == 0)
+    order = 0
+    while ready:
+        cur = ready.pop(0)
+        topo[cur] = order
+        order += 1
+        for s in succs0.get(cur, []):
+            indeg[s] -= 1
+            if indeg[s] == 0:
+                ready.append(s)
+    bodies = {}
+    for nid, w in wg_of.items():
+        if w is not None and nid in nodes:
+            bodies.setdefault(w, []).append(nid)
+    for w, nids in bodies.items():
+        nids.sort(key=lambda i: (nodes[i]["cycle"], topo.get(i, 0)))
+        for a, b in zip(nids, nids[1:]):
+            E.append((a, b, dur[a], 0))
+        E.append((nids[-1], nids[0], dur[nids[-1]], 1))
+
+    covered = set()
+    for b in prob["buffers"]:
+        p = b["producer"]
+        cnt = max(1, int(b.get("count", 1)))
+        for cons in b.get("consumers", []):
+            m = cons["node"]
+            if m not in nodes or nodes[m].get("pipeline") != "TC":
+                continue
+            d = 1 if wg_of.get(p) == wg_of.get(m) else cnt
+            E.append((m, p, int(nodes[m].get("latency", 0)) + _RECMII_HS, d))
+            covered.add((p, m))
+
+    for e in prob["edges"]:
+        u, v = e["src"], e["dst"]
+        if int(e["distance"]) != 0:
+            continue
+        wu, wv = wg_of.get(u), wg_of.get(v)
+        if wu is None or wv is None or wu == wv:
+            continue
+        if (u, v) in covered or (v, u) in covered:
+            continue
+        E.append((v, u, _RECMII_HS, 1))
+
+    # Max cycle ratio: binary search on lambda; a positive cycle under
+    # weights (w - lambda*dist) means the ratio exceeds lambda.
+    ids = list(nodes)
+    idx = {v: i for i, v in enumerate(ids)}
+    m = len(ids)
+
+    def has_pos_cycle(lam):
+        dist = [0.0] * m
+        for _ in range(m):
+            changed = False
+            for (u, v, w, d) in E:
+                iu, iv = idx.get(u), idx.get(v)
+                if iu is None or iv is None:
+                    continue
+                nd = dist[iu] + w - lam * d
+                if nd > dist[iv] + 1e-9:
+                    dist[iv] = nd
+                    changed = True
+            if not changed:
+                return False
+        return True
+
+    lo, hi = 0.0, 8.0 * max(1, prob["ii"])
+    while hi - lo > 0.5:
+        mid = (lo + hi) / 2
+        if has_pos_cycle(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def _critical_path(nodes, edges):
@@ -422,11 +662,14 @@ def solve_partition(prob):
                 terms.append(2 * ov * same_wg(i, j))
 
     # Merge pressure + barrier issue on cross-WG edges; channel SMEM (hard).
+    # The problem now ships EVERY dependence (the recurrence re-ranker needs
+    # the full graph); only cross-cluster edges carry the partition metadata
+    # (src_cluster/dst_cluster/rt/xissue) — plain edges are skipped here.
     chan_bytes_total = []
     seen_pairs = set()
     for e in prob["edges"]:
-        ci = cindex.get(e["src_cluster"])
-        cj = cindex.get(e["dst_cluster"])
+        ci = cindex.get(e.get("src_cluster"))
+        cj = cindex.get(e.get("dst_cluster"))
         if ci is None or cj is None or ci == cj:
             continue
         if e["distance"] > 0 and e.get("rt", 0) > 0:
@@ -450,6 +693,35 @@ def solve_partition(prob):
             chan_bytes_total.append(cb)
     model.Add(prob["committed_smem"] + sum(chan_bytes_total) <= prob["smem_budget"])
 
+    # Cluster→WG assignment indicators, shared by the register-budget and
+    # issue-stream capacity terms below.
+    assign = {}
+    for w in range(ncl):
+        for i in range(ncl):
+            a = model.NewBoolVar(f"a_{i}_{w}")
+            model.Add(wg[i] == w).OnlyEnforceIf(a)
+            model.Add(wg[i] != w).OnlyEnforceIf(a.Not())
+            assign[(i, w)] = a
+
+    # Issue-stream capacity: a warp group's per-iteration occupancy is the
+    # SUM of its ops' issue/execute durations — ops scheduled at different
+    # cycles still serialize on the same in-order instruction stream, so
+    # windows that never OVERLAP still ADD. (The split cost above prices
+    # only pairwise modular overlap; without this term an all-merged WG
+    # whose duration sum approaches II scores as nearly free — case4's
+    # obj-252 layout packs ~896 of II=1033 cycles into one 4-warp WG and
+    # runs at ~0.5x of the scheduled pipeline.) Excess over II inflates the
+    # achieved II one-for-one; charge it at the cycle-term weight (x2).
+    dur_c = [int(sum(max(nodes[u]["duration"], 0) * nodes[u].get("freq", 1) for u in c["nodes"])) for c in clusters]
+    total_dur = max(1, sum(dur_c))
+    if os.environ.get("TRITON_MODULO_CAPACITY_TERM", "1") == "1":
+        for w in range(ncl):
+            occ_w = model.NewIntVar(0, total_dur, f"occ_{w}")
+            model.Add(occ_w == sum(dur_c[i] * assign[(i, w)] for i in range(ncl)))
+            exc_w = model.NewIntVar(0, total_dur, f"exc_{w}")
+            model.AddMaxEquality(exc_w, [occ_w - ii, 0])
+            terms.append(2 * exc_w)
+
     # Register budget: per-WG warp counts from the assigned clusters'
     # minWarps, footprints from the calibrated table, default-WG slack model.
     fp_table = prob["warp_footprint"]  # indexed by warp count 0..8
@@ -458,10 +730,7 @@ def solve_partition(prob):
         warps_w = model.NewIntVar(0, 8, f"warps_{w}")
         model.AddAllowedAssignments([warps_w], [[0], [1], [2], [4], [8]])
         for i, c in enumerate(clusters):
-            a = model.NewBoolVar(f"a_{i}_{w}")
-            model.Add(wg[i] == w).OnlyEnforceIf(a)
-            model.Add(wg[i] != w).OnlyEnforceIf(a.Not())
-            model.Add(warps_w >= c["min_warps"]).OnlyEnforceIf(a)
+            model.Add(warps_w >= c["min_warps"]).OnlyEnforceIf(assign[(i, w)])
         fp_w = model.NewIntVar(0, max(fp_table), f"fp_{w}")
         model.AddElement(warps_w, fp_table, fp_w)
         total_regs_terms.append(fp_w)
@@ -490,12 +759,97 @@ def solve_partition(prob):
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return {"status": "error", "message": f"partition solve status {status}"}
+
+    def _sol(sv):
+        return (
+            [sv.Value(wg[i]) for i in range(ncl)],
+            sv.ObjectiveValue(),
+            sv.Value(used_wgs),
+        )
+
+    candidates = [_sol(solver)]
+    # Recurrence re-ranking (2026-07-11 calibration): the local-term
+    # objective cannot see steady-state recurrence cycles that span WG
+    # bodies and channel depths — case4's hardware-best 6-WG layout (292
+    # TF) and the 132-TF 8-WG pick score within 15% of each other while
+    # running 2.2x apart. Enumerate the K best assignments and re-rank by
+    # objective + 2 * max(0, RecMII_aug - II), where RecMII_aug predicts
+    # the emitted kernel's cycles/iteration (program-order-augmented
+    # recurrence MII). Needs the full graph in the problem (plain edges +
+    # buffers with counts); silently skipped for old-format problems.
+    if _recmii_rerank_enabled() and _has_full_graph(prob):
+        k = int(os.environ.get("TRITON_MODULO_RECMII_K", "8"))
+        for _ in range(max(0, k - 1)):
+            prev = candidates[-1][0]
+            model.Add(sum(assign[(i, prev[i])] for i in range(ncl)) <= ncl - 1)
+            s2 = cp_model.CpSolver()
+            s2.parameters.max_time_in_seconds = 3.0
+            s2.parameters.num_workers = 8
+            st2 = s2.Solve(model)
+            if st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                break
+            candidates.append(_sol(s2))
+        # Canonical-shape candidates: K-best enumeration climbs the local
+        # objective's plateau of merged variants and never reaches pipeline-
+        # parallel layouts (case4: the hardware-best shape sits ~750 units
+        # above the plateau). Score the domain shapes directly with a fixed-
+        # assignment solve (assumptions) — infeasible shapes (SMEM cap,
+        # loop-carry legality) drop out for free.
+        for amap0 in _canonical_candidates(prob):
+            vec0 = [amap0[c["id"]] for c in clusters]
+            relab, vec = {}, []  # symmetry breaking: first-use order
+            for w0 in vec0:
+                if w0 not in relab:
+                    relab[w0] = len(relab)
+                vec.append(relab[w0])
+            if any(vec == c[0] for c in candidates):
+                continue
+            model.ClearAssumptions()
+            model.AddAssumptions([assign[(i, vec[i])] for i in range(ncl)])
+            s3 = cp_model.CpSolver()
+            s3.parameters.max_time_in_seconds = 3.0
+            s3.parameters.num_workers = 8
+            if s3.Solve(model) in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                candidates.append(_sol(s3))
+        model.ClearAssumptions()
+        scored = []
+        for vec, obj, uw in candidates:
+            amap = {clusters[i]["id"]: vec[i] for i in range(ncl)}
+            rec = _recmii_augmented(prob, amap)
+            excess = max(0.0, rec - ii) if rec is not None else 0.0
+            scored.append((obj + 2.0 * excess, rec, vec, obj, uw))
+        scored.sort(key=lambda t: t[0])
+        combined, rec, vec, obj, uw = scored[0]
+        return {
+            "status":
+            "ok",
+            "wg": {str(clusters[i]["id"]): vec[i]
+                   for i in range(ncl)},
+            "used_wgs":
+            uw,
+            "objective":
+            obj,
+            "rec_cycles":
+            rec,
+            "combined":
+            combined,
+            "pool":
+            len(candidates),
+            "pool_scored": [{
+                "wg": list(map(int, s[2])),
+                "objective": s[3],
+                "rec_cycles": s[1],
+                "combined": s[0],
+            } for s in scored],
+        }
+
+    vec, obj, uw = candidates[0]
     return {
         "status": "ok",
-        "wg": {str(c["id"]): solver.Value(wg[i])
-               for i, c in enumerate(clusters)},
-        "used_wgs": solver.Value(used_wgs),
-        "objective": solver.ObjectiveValue(),
+        "wg": {str(clusters[i]["id"]): vec[i]
+               for i in range(ncl)},
+        "used_wgs": uw,
+        "objective": obj,
     }
 
 

@@ -4563,10 +4563,11 @@ static bool partitionJointSolver(ttg::ScheduleLoop &loop,
   }
   llvm::json::Array jNodes;
   for (const auto &n : loop.nodes) {
-    // v1 models only clustered nodes; v2 needs cycle variables for ALL
-    // nodes (buffer producers are NONE-pipeline local_allocs).
-    if (!v2 && !nodeToCluster.count(n.id))
-      continue;
+    // Ship ALL nodes in both modes: v2 needs cycle variables for every node
+    // (buffer producers are NONE-pipeline local_allocs), and v1's
+    // recurrence re-ranker (solve_partition) needs the full graph to build
+    // per-WG program-order bodies and buffer back-edges.
+    (void)0;
     jNodes.push_back(llvm::json::Object{
         {"id", static_cast<int64_t>(n.id)},
         {"cycle", n.cycle},
@@ -4582,10 +4583,11 @@ static bool partitionJointSolver(ttg::ScheduleLoop &loop,
     auto d = nodeToCluster.find(edge.dstId);
     bool crossCluster = s != nodeToCluster.end() && d != nodeToCluster.end() &&
                         s->second != d->second;
-    // v1 models only cross-cluster edges; v2 needs every dependence.
-    if (!v2 && !crossCluster)
-      continue;
-    if (v2 && !crossCluster) {
+    // Cross-cluster edges carry the full partition metadata (rt/xissue/
+    // chan_bytes + cluster ids); every other dependence is shipped in the
+    // plain format below — v2 models all of them, and v1's recurrence
+    // re-ranker rebuilds the steady-state graph from them.
+    if (!crossCluster) {
       jEdges.push_back(llvm::json::Object{
           {"src", static_cast<int64_t>(edge.srcId)},
           {"dst", static_cast<int64_t>(edge.dstId)},
@@ -4685,28 +4687,34 @@ static bool partitionJointSolver(ttg::ScheduleLoop &loop,
   // conservative there).
   llvm::json::Array jBuffers;
   int64_t modeledBytes = 0;
-  if (v2) {
-    for (const auto &n : loop.nodes) {
-      if (n.producesBuffer == UINT_MAX)
-        continue;
-      const auto &buf = loop.buffers[n.producesBuffer];
-      if (buf.kind != ttg::MemoryKind::SMEM)
-        continue;
-      llvm::DenseSet<unsigned> seen;
-      seen.insert(n.id);
-      SmallVector<std::tuple<unsigned, int, int>, 4> consumers;
-      collectRealConsumers(loop, n.id, 0, seen, consumers);
-      llvm::json::Array jCons;
-      for (auto &[cid, lat, dist] : consumers)
-        jCons.push_back(llvm::json::Object{{"node", static_cast<int64_t>(cid)},
-                                           {"latency", lat},
-                                           {"distance", dist}});
-      jBuffers.push_back(
-          llvm::json::Object{{"producer", static_cast<int64_t>(n.id)},
-                             {"size_bytes", buf.sizeBytes()},
-                             {"consumers", std::move(jCons)}});
+  for (const auto &n : loop.nodes) {
+    if (n.producesBuffer == UINT_MAX)
+      continue;
+    const auto &buf = loop.buffers[n.producesBuffer];
+    // v2 models SMEM depths only; v1's recurrence re-ranker also needs
+    // TMEM staging buffers (e.g. the pT bridge) with their ring counts.
+    if (!v2 && buf.kind != ttg::MemoryKind::SMEM &&
+        buf.kind != ttg::MemoryKind::TMEM)
+      continue;
+    if (v2 && buf.kind != ttg::MemoryKind::SMEM)
+      continue;
+    llvm::DenseSet<unsigned> seen;
+    seen.insert(n.id);
+    SmallVector<std::tuple<unsigned, int, int>, 4> consumers;
+    collectRealConsumers(loop, n.id, 0, seen, consumers);
+    llvm::json::Array jCons;
+    for (auto &[cid, lat, dist] : consumers)
+      jCons.push_back(llvm::json::Object{{"node", static_cast<int64_t>(cid)},
+                                         {"latency", lat},
+                                         {"distance", dist}});
+    jBuffers.push_back(llvm::json::Object{
+        {"producer", static_cast<int64_t>(n.id)},
+        {"size_bytes", buf.sizeBytes()},
+        {"count", static_cast<int64_t>(buf.count)},
+        {"kind", buf.kind == ttg::MemoryKind::SMEM ? "smem" : "tmem"},
+        {"consumers", std::move(jCons)}});
+    if (v2 && buf.kind == ttg::MemoryKind::SMEM)
       modeledBytes += buf.totalBytes();
-    }
   }
   int64_t committedSmem = computeTotalSmem(loop) + reservedSmemBytes;
 
