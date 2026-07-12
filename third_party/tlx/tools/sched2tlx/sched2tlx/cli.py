@@ -13,10 +13,22 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("graph", help="schedule_graph.json (modulo dump)")
     p.add_argument("-o", "--output", help="output .py path (default: stdout)")
+    p.add_argument(
+        "--phases",
+        action="store_true",
+        help="multi-phase template lowering for two sibling GEMM nests "
+        "(pools SMEM rings via storage_alias_spec when the dump carries "
+        "smem_phase_group)",
+    )
     args = p.parse_args(argv)
 
     g = schedule_graph.load_graph(args.graph)
-    src = emitter.emit(g)
+    if args.phases:
+        from . import phases
+
+        src = phases.emit(g)
+    else:
+        src = emitter.emit(g)
     if args.output:
         with open(args.output, "w") as f:
             f.write(src)
