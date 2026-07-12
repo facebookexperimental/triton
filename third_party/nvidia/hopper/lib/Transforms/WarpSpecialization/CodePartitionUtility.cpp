@@ -3411,10 +3411,16 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
       auto *post = static_cast<ChannelPost *>(channels.back().get());
-      // Cache the resolved producer op so getSrcOp() survives a sibling
-      // subtiled-region channel's lowering. Skip the direct alloc-with-src case
-      // (producerOp == allocOp), where getSrcOp() intentionally returns null.
-      if (producerOp != allocOp)
+      // Fix the regression introduced by 401386fae8: cache only
+      // subtiled-region producers, whose template store survives sibling
+      // channel lowering. Ordinary TMA producers are replaced and erased by
+      // optimizeTMALoads, so caching them would leave a dangling pointer;
+      // getSrcOp() must rediscover their replacement from alloc users.
+      bool isSubtiledProducer =
+          producerOp &&
+          (isa<ttng::SubtiledRegionOp>(producerOp) ||
+           producerOp->getParentOfType<ttng::SubtiledRegionOp>());
+      if (producerOp != allocOp && isSubtiledProducer)
         post->cachedSrcOp = producerOp;
     }
   }
