@@ -786,12 +786,12 @@ tt.func @implicit_and_explicit_capture_liveness() {
 }
 
 // expected-remark @below {{explicit_capture_liveness}}
-// expected-remark @below {{size = 45}}
-// expected-remark @below {{offset = 44, size = 1}}
+// expected-remark @below {{size = 33}}
+// expected-remark @below {{offset = 32, size = 1}}
 tt.func @explicit_capture_liveness() {
   // expected-remark @below {{offset = 0, size = 16}}
   %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
-  // expected-remark @below {{scratch offset = 32, size = 12}}
+  // expected-remark @below {{scratch offset = 16, size = 12}}
   ttg.warp_specialize(%0)
   default {
     // expected-remark @below {{offset = 16, size = 16}}
@@ -922,12 +922,12 @@ tt.func @two_different_ws() {
 }
 
 // expected-remark @below {{default_partition_outside_alloc_interference}}
-// expected-remark @below {{size = 48}}
-// expected-remark @below {{offset = 44, size = 4}}
+// expected-remark @below {{size = 36}}
+// expected-remark @below {{offset = 32, size = 4}}
 tt.func @default_partition_outside_alloc_interference() {
   // expected-remark @below {{offset = 0, size = 16}}
   %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
-  // expected-remark @below {{offset = 32, size = 12}}
+  // expected-remark @below {{scratch offset = 16, size = 12}}
   ttg.warp_specialize(%0)
   default {
     // Ensure that we do not reuse the memory for %0 even though we are done
@@ -945,12 +945,12 @@ tt.func @default_partition_outside_alloc_interference() {
 }
 
 // expected-remark @below {{partition_outside_alloc_interference}}
-// expected-remark @below {{size = 48}}
-// expected-remark @below {{offset = 44, size = 4}}
+// expected-remark @below {{size = 36}}
+// expected-remark @below {{offset = 32, size = 4}}
 tt.func @partition_outside_alloc_interference() {
   // expected-remark @below {{offset = 0, size = 16}}
   %0 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
-  // expected-remark @below {{offset = 32, size = 12}}
+  // expected-remark @below {{scratch offset = 16, size = 12}}
   ttg.warp_specialize(%0)
   default {
     ttg.warp_yield
