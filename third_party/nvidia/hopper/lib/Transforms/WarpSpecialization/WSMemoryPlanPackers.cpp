@@ -34,23 +34,17 @@ class SmemPacker : public Packer {
 public:
   explicit SmemPacker(const BufferModel &model) : model(model) {}
 
-  bool legalJoin(const PartialPlan &plan, BufferId b,
-                 BlockId blockId) const override {
-    const Block *blk = findBlock(plan, blockId);
-    if (!blk || blk->members.empty())
-      return false;
-    // Circular reuse requires (a) a common encoding and (b) all endpoints in
-    // one basic block, captured by a shared reuseScope (verifyReuseGroup1).
-    // Producer/ consumer separation within the block is handled by the circular
-    // slot indexing, so no liveness check is needed (docs §5.3).
-    // TODO(neutral-reuse): relax the encoding gate under
-    // TRITON_WS_NEUTRAL_REUSE.
-    EncodingKey key = model.encoding(b);
-    unsigned scope = model.reuseScope(b);
-    for (BufferId m : blk->members)
-      if (model.encoding(m) != key || model.reuseScope(m) != scope)
-        return false;
-    return true;
+  bool legalJoin(const PartialPlan &, BufferId, BlockId) const override {
+    // No SMEM circular reuse grouping. Matching encoding + basic block is NOT
+    // sufficient for safe circular reuse: two concurrently-live buffers (e.g.
+    // an addmm/GEMM A and B operand) satisfy it yet must not share one circular
+    // buffer — doing so corrupts data (deterministic wrong results on addmm,
+    // races on GEMM). The upstream heuristic defaults `smem-circular-reuse` OFF
+    // for the same reason. The search therefore only multi-buffers individual
+    // buffers (own block, own copy count), which is always safe. Safe reuse
+    // grouping (the true rotating-entry condition, not just encoding + scope)
+    // is future work; see docs §8.
+    return false;
   }
 
   Footprint footprint(const Block &blk) const override {

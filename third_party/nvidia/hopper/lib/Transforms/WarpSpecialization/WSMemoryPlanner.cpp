@@ -2088,10 +2088,14 @@ static unsigned allocateSmemBuffersViaSearch(
     const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
     unsigned annotationMaxId) {
   // Safety fallback: the search does not yet model (a) annotation /
-  // atomic-broadcast pins, (b) subtiled-region groups, or (c) TMA-staging
-  // buffers (whose entry count / K|S constraints differ from the entries=1
-  // assumption). Defer those kernels to the proven heuristic so the search can
-  // never ship a wrong or ill-formed allocation for them.
+  // atomic-broadcast pins, (b) subtiled-region groups, or (c) *multi-store*
+  // TMA-staging buffers (S>1 subtiles rotating through the buffer, which carry
+  // a K|S constraint the search does not model). A *single-store* staging
+  // buffer (S=1) is fine: the search keeps it in its own block at its floor
+  // copy count (copy=1 for S=1), never reuse-grouping it (SmemPacker rejects
+  // Staging joins). This lets the search engage on Flash Attention, whose
+  // output-store staging is single-store, instead of deferring the whole
+  // kernel.
   bool needsFallback = !allocToAnnotation.empty();
   funcOp->walk([&](Operation *op) {
     if (isa<ttng::SubtiledRegionOp>(op))
@@ -2099,10 +2103,13 @@ static unsigned allocateSmemBuffersViaSearch(
     if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
       if (alloc->hasAttr(kAtomicBroadcastCopiesAttrName))
         needsFallback = true;
+      unsigned storeUsers = 0;
       for (Operation *user : alloc->getUsers())
         if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
                 user))
-          needsFallback = true;
+          ++storeUsers;
+      if (storeUsers > 1)
+        needsFallback = true; // subtiled staging (K|S) unmodeled
     }
   });
   if (needsFallback) {
@@ -2135,6 +2142,29 @@ static unsigned allocateSmemBuffersViaSearch(
                                annotationMaxId);
   }
 
+  // Normalize each plan's block copies to the value that will actually be
+  // emitted, so the dump reflects reality (not the raw CopySolver count) and
+  // emission just reads blk.copies. Floors (cross-stage depth, per-id entry
+  // count) may exceed the numBuffers cap; staging blocks are pinned to floor.
+  for (wsplan::Plan &p : plans) {
+    for (wsplan::Block &blk : p.blocks) {
+      unsigned crossStageFloor = 1, entryFloor = blk.members.size();
+      bool isStaging = false;
+      for (wsplan::BufferId m : blk.members) {
+        Operation *alloc = model.allocOpFor(m);
+        if (isSmemCrossStage(cast<ttg::LocalAllocOp>(alloc), channels))
+          crossStageFloor = std::max(
+              crossStageFloor,
+              getSmemCrossStageDepth(cast<ttg::LocalAllocOp>(alloc), channels));
+        if (model.kind(m) == wsplan::BufferKind::Staging)
+          isStaging = true;
+      }
+      unsigned floor = std::max(crossStageFloor, entryFloor);
+      blk.copies =
+          isStaging ? floor : std::max(floor, std::min(blk.copies, numBuffers));
+    }
+  }
+
   dumpMemPlans(plans, "smem", annotationMaxId);
   const wsplan::Plan &plan =
       plans[std::min<size_t>(getMemPlanPick(), plans.size() - 1)];
@@ -2144,29 +2174,13 @@ static unsigned allocateSmemBuffersViaSearch(
 
   for (const wsplan::Block &blk : plan.blocks) {
     unsigned id = nextId++;
-
-    // Correctness floors (safety net), independent of the search's choice.
-    unsigned crossStageFloor = 1, entryFloor = blk.members.size();
-    for (wsplan::BufferId m : blk.members) {
-      Operation *alloc = model.allocOpFor(m);
-      if (isSmemCrossStage(cast<ttg::LocalAllocOp>(alloc), channels))
-        crossStageFloor = std::max(
-            crossStageFloor,
-            getSmemCrossStageDepth(cast<ttg::LocalAllocOp>(alloc), channels));
-    }
-    unsigned floor = std::max(crossStageFloor, entryFloor);
-
-    // Discretionary copies capped at numBuffers; floors may exceed the cap.
-    unsigned copy = std::max(floor, std::min(blk.copies, numBuffers));
-
     for (wsplan::BufferId m : blk.members) {
       Operation *alloc = model.allocOpFor(m);
       alloc->setAttr("buffer.id", IntegerAttr::get(i32, id));
-      alloc->setAttr("buffer.copy", IntegerAttr::get(i32, copy));
+      alloc->setAttr("buffer.copy", IntegerAttr::get(i32, blk.copies));
     }
     LDBG("SMEM plan-search: block id="
-         << id << " members=" << blk.members.size() << " copy=" << copy
-         << " (searchCopy=" << blk.copies << " floor=" << floor << ")");
+         << id << " members=" << blk.members.size() << " copy=" << blk.copies);
   }
   return nextId;
 }

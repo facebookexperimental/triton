@@ -22,8 +22,14 @@ Landed (all files under `WarpSpecialization/`, gated by `--smem-plan-search` /
   TMEM reuse now also requires a bidirectional data dependency (not just disjoint
   liveness), matching `hasPotentialReuse` — independent buffers can be concurrent
   across WS partitions despite disjoint op-id intervals.
-- Falls back to the heuristic for pins, subtiled regions, TMA-staging (SMEM), and
-  scaled MMA (TMEM) — see §8.
+- SMEM search does **per-buffer multi-buffering only — no circular reuse
+  grouping**. Encoding + basic-block match is NOT a sufficient reuse condition
+  (two concurrently-live operands, e.g. GEMM/addmm A and B, satisfy it but must
+  not share a circular buffer — deterministic wrong results / races). The
+  upstream heuristic defaults `smem-circular-reuse` OFF for the same reason.
+- Falls back to the heuristic for pins, multi-store (subtiled) staging (SMEM),
+  and subtiled regions / scaled MMA (TMEM) — see §8. Single-store staging (S=1)
+  is searched (own block, floor copy).
 
 Top-K search space (mirrors the list/modulo schedulers):
 - `TRITON_WS_MEM_PLAN_TOPK=K` generate K ranked plans; `TRITON_WS_MEM_PLAN_PICK=i`
@@ -31,16 +37,23 @@ Top-K search space (mirrors the list/modulo schedulers):
   dumps each plan as JSON. A harness sweeps PICK over 0..K-1 and times each (the
   cost model only ranks). Validated: PICK 0..3 with TOPK=4 all legal + pass.
 
-Coverage note (honest): the search only runs where nothing forces a fallback.
-Many kernels fall back — e.g. GEMM's TMA-store staging sends SMEM to the
-heuristic (only TMEM searches), and persistent/subtiled FA cases fall back on
-both pools. Lifting these is the coverage work below.
+Validation status: both pools are runtime-validated on the full `run_all.sh`
+suite, **search on**: GEMM 216, addmm 73, quantized 3, FA-correctness 72, FA
+tutorial 30, cross-attn-bwd 18 + 6 xfail — all pass, no regressions, no hangs.
+The SMEM search engages on FA/GEMM/addmm (per-buffer multi-buffering); the TMEM
+search engages on GEMM. Getting here surfaced and fixed two real bugs the suite
+caught: a TMEM reuse hang (missing data-dependency) and an SMEM reuse-grouping
+corruption (now disabled).
 
-Remaining (perf / coverage, not correctness): refine `entries`/`freq` to lift
-the SMEM staging fallback; accumulator per-outer-tile TMEM multi-copy (currently
-pinned to 1 under search); model scaled-MMA scale columns for TMEM; an
-autotune-native `tt.mem_plan_pick` constexpr (like `tt.list_schedule_pick`) so
-the Triton autotuner can sweep PICK without env vars.
+Remaining (perf / coverage, not correctness):
+- **Safe SMEM reuse grouping** — the true rotating-entry condition (not just
+  encoding + scope), to reclaim the reuse the heuristic gets under
+  `smem-circular-reuse`. Currently disabled.
+- Multi-store (subtiled) staging: model `entries` (K|S) to lift its fallback.
+- Accumulator per-outer-tile TMEM multi-copy (currently pinned to 1).
+- Model scaled-MMA scale columns for TMEM.
+- Autotune-native `tt.mem_plan_pick` constexpr (like `tt.list_schedule_pick`) so
+  the Triton autotuner can sweep PICK without env vars.
 **Covers (future)**: `WSMemoryPlanner.cpp`, new `WSMemoryPlanSearch.{h,cpp}`
 **Related docs**: [SmemAllocationDesign.md](SmemAllocationDesign.md),
 [TMEMAllocationHeuristics.md](TMEMAllocationHeuristics.md),
