@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "TMEMUtils.h"
 #include "WSBarrierAnalysis.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"

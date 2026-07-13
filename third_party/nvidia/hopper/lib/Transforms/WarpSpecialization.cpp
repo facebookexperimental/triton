@@ -5,6 +5,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/WarpSpecializationPipeline.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -40,28 +41,6 @@ static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   return applyPatternsGreedily(op, std::move(patterns));
 }
 
-int doTaskIdPropagate(triton::FuncOp &funcOp);
-// Cross-partition run-once atomic support. Returns failure() when an atomic
-// forces a graceful warp-specialization reject (kernel already de-specialized).
-LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
-                                     int tilePrefetchDepth);
-LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
-                              StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
-                              bool smemCircularReuse = false);
-void doBufferAllocation(triton::FuncOp &funcOp);
-void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
-void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
-void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
-void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
-void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
-                    int capability, int defaultNumStages);
-void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
-                    int capability);
-void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
-void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
-void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
 void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
   namespace ttng = triton::nvidia_gpu;
   namespace nvws = triton::nvws;
