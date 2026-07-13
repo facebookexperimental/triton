@@ -217,6 +217,16 @@ std::unique_ptr<CopySolver> createGreedyCopySolver();
 /// the returned object.
 std::unique_ptr<Packer> createSmemPacker(const BufferModel &model);
 
+/// TMEM packer (docs §5.4, Step 7): blocks are row-owners whose members
+/// time-multiplex the same rows x cols space. A join is legal when encodings
+/// match AND the candidate's liveness is disjoint from every member's — the
+/// unconditionally-legal reuse condition the existing placer validates
+/// (columns-fit + liveness-non-overlap). Footprint is `max(member rows) x
+/// max(member cols)`; feasibility is total rows <= 512 and per-owner cols <=
+/// 512. Copies stay 1 (non-accumulator TMEM multi-copy is not yet legal — the
+/// caller pins them). Holds a reference to `model`, which must outlive it.
+std::unique_ptr<Packer> createTmemPacker(const BufferModel &model);
+
 /// Latency-hiding cost model (docs §4). `II` is the loop initiation interval
 /// (`tt.modulo_ii`); `lambda` weights the occupancy penalty (default 0 = pure
 /// latency hiding, docs §8 open item 4). Holds a reference to `model`, which

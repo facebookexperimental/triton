@@ -1,22 +1,33 @@
 # Memory Planner Search Space — Design & Implementation Plan
 
-**Status**: SMEM path implemented (default off); TMEM path pending
+**Status**: SMEM + TMEM search implemented (default off)
 
 ## Implementation status
 
 Landed (all files under `WarpSpecialization/`, gated by `--smem-plan-search` /
-`TRITON_WS_SMEM_PLAN_SEARCH`, default off):
-- Interfaces `WSMemoryPlanSearch.{h}`; ordering (`LivenessStartOrder` +
+`TRITON_WS_SMEM_PLAN_SEARCH`, default off — the one flag enables both pools):
+- Interfaces `WSMemoryPlanSearch.h`; ordering (`LivenessStartOrder` +
   `TopologicalOrder`), cost, greedy copies, beam driver — pure modules.
-- `SmemBufferModel` builder + `SmemPacker`; wired into `doMemoryPlanner`
-  (`allocateSmemBuffersViaSearch`) with a floor safety net.
-- Validated on sm100: autoWS correctness (GEMM/addmm/FA, off+on) and the
-  WarpSpecialization LIT suite pass with no regressions. Search runs on GEMM +
-  FA; falls back to the heuristic for pins, subtiled regions, and TMA-staging
-  buffers (unmodeled — see §8).
+- SMEM: `SmemBufferModel` + `SmemPacker`, wired via `allocateSmemBuffersViaSearch`
+  with a floor safety net; reuse gated by encoding + reuseScope (same-block).
+- TMEM: `TmemBufferModel` + `TmemPacker` (time-multiplexed, liveness-disjoint
+  column reuse; copies pinned to 1), wired via `allocateTmemBuffersViaSearch`.
+- Validated on sm100 with the full `run_all.sh` suite, **off and on**: all 7
+  autoWS files pass identically (GEMM 216, addmm 73, quantized 3, FA-correctness
+  72, FA tutorial 30, cross-attn-bwd 18 + 6 xfail; rest skipped) — the search
+  introduces no correctness difference. WarpSpecialization LIT: 113 passed /
+  11 XFAIL / 0 unexpected. (Full LIT tree has 3 failures in TLX-layout and
+  AMD-atomic tests, unrelated to this change and pre-existing.)
+- A full-suite hang in `fused_attention_ws_device_tma.py` was found and fixed:
+  TMEM reuse now also requires a bidirectional data dependency (not just disjoint
+  liveness), matching `hasPotentialReuse` — independent buffers can be concurrent
+  across WS partitions despite disjoint op-id intervals.
+- Falls back to the heuristic for pins, subtiled regions, TMA-staging (SMEM), and
+  scaled MMA (TMEM) — see §8.
 
-Pending: Steps 7 (`TmemPacker`) and 8 (TMEM `BufferModel` builder); wiring the
-TMEM search; refining `entries`/`freq` so the staging fallback can be lifted.
+Remaining (perf / coverage, not correctness): refine `entries`/`freq` to lift
+the SMEM staging fallback; accumulator per-outer-tile TMEM multi-copy (currently
+pinned to 1 under search); model scaled-MMA scale columns for TMEM.
 **Covers (future)**: `WSMemoryPlanner.cpp`, new `WSMemoryPlanSearch.{h,cpp}`
 **Related docs**: [SmemAllocationDesign.md](SmemAllocationDesign.md),
 [TMEMAllocationHeuristics.md](TMEMAllocationHeuristics.md),
