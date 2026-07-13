@@ -340,14 +340,18 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   SmallVector<Value> group1(8, b.i32_val(0));
   int32_t dataSize = log2(elementSizeInBytes);
   unsigned dwordSize = 32;
-  auto padIntervalInDwords = padInterval * elementBitWidth / dwordSize;
+  auto padIntervalBits = padInterval * elementBitWidth;
+  assert(padIntervalBits % dwordSize == 0 &&
+         "padInterval must be a multiple of dwordSize(32bit)");
+  auto padIntervalInDwords = padIntervalBits / dwordSize;
   auto padAmountInDwords = padAmount * elementBitWidth / dwordSize;
   group1[0] = b.or_(group1[0], b.i32_val(dataSize << 16));
   if (padIntervalInDwords > 0 && padAmountInDwords > 0) {
     assert(llvm::isPowerOf2_32(padIntervalInDwords));
-    int32_t log2PadInterval = log2(padIntervalInDwords);
+    int32_t log2PadIntervalDwords = log2(padIntervalInDwords);
+    assert(log2PadIntervalDwords <= 8 && "padInterval too large");
     group1[0] = b.or_(group1[0], b.i32_val(1 << 20));
-    group1[0] = b.or_(group1[0], b.i32_val((log2PadInterval - 1) << 22));
+    group1[0] = b.or_(group1[0], b.i32_val((log2PadIntervalDwords - 1) << 22));
     group1[0] = b.or_(group1[0], b.i32_val((padAmountInDwords - 1) << 25));
   }
   // Encode 32-bit tensor shapes

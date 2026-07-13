@@ -38,8 +38,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/PluginUtils.h"
-#include "triton/Tools/Sys/Dump.hpp"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/Dump.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/SourceMgr.h"
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
