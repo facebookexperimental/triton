@@ -32,20 +32,20 @@ def gemm_kernel(
     mul_8 = (pid_1 * 128)
 
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
-    # inner-loop buf 0: SMEM count=2 (modulo lifetime [556..1145], II=559)
-    L0_smem_0 = tlx.local_alloc((128, 64), tl.float16, 2)
-    # inner-loop buf 1: SMEM count=2 (modulo lifetime [586..1145], II=559)
-    L0_smem_1 = tlx.local_alloc((64, 128), tl.float16, 2)
+    # inner-loop buf 0: SMEM count=3 (modulo lifetime [556..1145], II=256)
+    L0_smem_0 = tlx.local_alloc((128, 64), tl.float16, 3)
+    # inner-loop buf 1: SMEM count=3 (modulo lifetime [586..1145], II=256)
+    L0_smem_1 = tlx.local_alloc((64, 128), tl.float16, 3)
     acc_tmem = tlx.local_alloc((128, 128), tl.float32, 1, tlx.storage_kind.tmem)
     c_smem = tlx.local_alloc((128, 128), tl.float16, 1)
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
     # L0_smem_0: N1→N4  ttg.local_alloc→ttng.tc_gen5_mma  cyc556→cyc586  forward  buf=0  kind=mbarrier
-    L0_smem_0_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    L0_smem_0_full = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
     # L0_smem_1: N3→N4  ttg.local_alloc→ttng.tc_gen5_mma  cyc586→cyc586  forward  buf=1  kind=mbarrier
-    L0_smem_1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    L0_smem_1_full = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
     # acc_tmem: cross-region TC-loop → default-epilogue hand-off, depth=1 (legacy carve-out)
     acc_tmem_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     acc_tmem_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
@@ -68,8 +68,8 @@ def gemm_kernel(
         with tlx.async_task(num_warps=1, num_regs=24):
             for tile_id in range(0, K, 64):
                 _it = (tile_id - 0) // 64
-                buf = _it % 2
-                phase = (_it // 2) & 1
+                buf = _it % 3
+                phase = (_it // 3) & 1
                 # load → L0_smem_0
                 tlx.barrier_wait(L0_smem_0_empty[buf], phase ^ 1)
                 tlx.barrier_expect_bytes(L0_smem_0_full[buf], 16384)
@@ -78,8 +78,8 @@ def gemm_kernel(
         with tlx.async_task(num_warps=1, num_regs=24):
             for tile_id in range(0, K, 64):
                 _it = (tile_id - 0) // 64
-                buf = _it % 2
-                phase = (_it // 2) & 1
+                buf = _it % 3
+                phase = (_it // 3) & 1
                 # load → L0_smem_1
                 tlx.barrier_wait(L0_smem_1_empty[buf], phase ^ 1)
                 tlx.barrier_expect_bytes(L0_smem_1_full[buf], 16384)
@@ -90,12 +90,12 @@ def gemm_kernel(
             i0_0 = False
             for tile_id in range(0, K, 64):
                 _it = (tile_id - 0) // 64
-                buf = _it % 2
-                phase = (_it // 2) & 1
+                buf = _it % 3
+                phase = (_it // 3) & 1
                 # MMA
-                tlx.barrier_wait(L0_smem_0_full[(_it % 2)], ((_it // 2) & 1))
-                tlx.barrier_wait(L0_smem_1_full[(_it % 2)], ((_it // 2) & 1))
+                tlx.barrier_wait(L0_smem_0_full[(_it % 3)], ((_it // 3) & 1))
+                tlx.barrier_wait(L0_smem_1_full[(_it % 3)], ((_it // 3) & 1))
                 use_acc = (tile_id > 0)
-                tlx.async_dot(L0_smem_0[buf], L0_smem_1[buf], acc_tmem[0], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 2)], L0_smem_1_empty[(_it % 2)]])
+                tlx.async_dot(L0_smem_0[buf], L0_smem_1[buf], acc_tmem[0], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 3)], L0_smem_1_empty[(_it % 3)]])
                 i0_0 = True
             tlx.tcgen05_commit(acc_tmem_full[0])
