@@ -6,6 +6,12 @@ from . import extra
 # Import TLX features (async_task, async_tasks) for backward compatibility
 from .extra.tlx import async_task, async_tasks
 from .clc import clc_tile_scheduler, ClcTileScheduler
+from .schedule import (
+    TileScheduler,
+    NonPersistentScheduler,
+    StaticPersistent1DScheduler,
+    DynamicPersistent1DScheduler,
+)
 from .standard import (
     argmax,
     argmin,
@@ -173,6 +179,10 @@ __all__ = [
     "assume",
     "clc_tile_scheduler",
     "ClcTileScheduler",
+    "TileScheduler",
+    "NonPersistentScheduler",
+    "StaticPersistent1DScheduler",
+    "DynamicPersistent1DScheduler",
     "atomic_add",
     "atomic_and",
     "atomic_cas",
