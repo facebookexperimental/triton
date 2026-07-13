@@ -2049,7 +2049,20 @@ static unsigned getMemPlanTopK() {
   int n = std::atoi(v.c_str());
   return n < 1 ? 1u : static_cast<unsigned>(n);
 }
-static unsigned getMemPlanPick() {
+// Which ranked plan to apply. Autotune-native path first: a `tt.mem_plan_pick`
+// attr on any op (set from the tl.range mem_plan_pick constexpr, mirroring
+// tt.list_schedule_pick) — part of the compilation key so @triton.autotune can
+// sweep it. Falls back to TRITON_WS_MEM_PLAN_PICK, then 0 (cost-best).
+static unsigned getMemPlanPick(triton::FuncOp funcOp) {
+  std::optional<unsigned> attrPick;
+  funcOp->walk([&](Operation *op) {
+    if (attrPick)
+      return;
+    if (auto a = op->getAttrOfType<IntegerAttr>("tt.mem_plan_pick"))
+      attrPick = static_cast<unsigned>(std::max<int64_t>(0, a.getInt()));
+  });
+  if (attrPick)
+    return *attrPick;
   auto v = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_PICK");
   if (v.empty())
     return 0;
@@ -2184,7 +2197,7 @@ static unsigned allocateSmemBuffersViaSearch(
 
   dumpMemPlans(plans, "smem", annotationMaxId);
   const wsplan::Plan &plan =
-      plans[std::min<size_t>(getMemPlanPick(), plans.size() - 1)];
+      plans[std::min<size_t>(getMemPlanPick(funcOp), plans.size() - 1)];
   auto *ctx = funcOp.getContext();
   auto i32 = IntegerType::get(ctx, 32);
   unsigned nextId = annotationMaxId;
@@ -4773,7 +4786,7 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
 
   dumpMemPlans(plans, "tmem", bufferId);
   const wsplan::Plan &plan =
-      plans[std::min<size_t>(getMemPlanPick(), plans.size() - 1)];
+      plans[std::min<size_t>(getMemPlanPick(funcOp), plans.size() - 1)];
   auto *ctx = funcOp.getContext();
   auto i32 = IntegerType::get(ctx, 32);
 
