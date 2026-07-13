@@ -352,6 +352,7 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
                                     const WarpSpecializeCallbacks &callbacks,
                                     unsigned switchLoopBarrierIdx) {
   TritonLLVMIRRewriter b(ws.getLoc(), ws.getContext());
+  auto mod = ws->getParentOfType<ModuleOp>();
   for (Region *partition : ws.getPartitionRegions()) {
     // Load the explicit captures from shared memory and replace the block args
     // if there are any.
@@ -390,10 +391,13 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
-      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-      callbacks.reallocRegisters(b, ws,
-                                 RegisterReallocPhase::WorkerPartitionEnd,
-                                 partition->getRegionNumber());
+      // no need to restore register at region end
+      if (!hasSingleWarpSpecialize(mod)) {
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+        callbacks.reallocRegisters(b, ws,
+                                   RegisterReallocPhase::WorkerPartitionEnd,
+                                   partition->getRegionNumber());
+      }
       if (hasClusterSyncKernelCleanup) {
         // If there was a cluster sync point before tmem de-alloc, it would
         // block default warps. Non default warps should arrive at the end of
@@ -413,7 +417,7 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     unsigned defaultNumWarps, unsigned totalNumWarps,
     const TargetInfoBase &targetInfo, const WarpSpecializeCallbacks &callbacks,
     unsigned switchLoopBarrierIdx) {
-
+  auto mod = func->getParentOfType<ModuleOp>();
   TritonLLVMIRRewriter b(func.getLoc(), ctx);
   Type int8Type = b.getIntegerType(8);
   LLVM::LLVMPointerType ptrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
@@ -541,9 +545,12 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
 
     ws.getDefaultRegion().walk([&, ws = ws](WarpYieldOp op) mutable {
       TritonLLVMIRRewriter b(op.getLoc(), op);
-      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-      callbacks.reallocRegisters(b, ws,
-                                 RegisterReallocPhase::DefaultPartitionEnd, 0);
+      // default partition does not need to re-alloc if there's only one WS Op
+      if (!hasSingleWarpSpecialize(mod)) {
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+        callbacks.reallocRegisters(
+            b, ws, RegisterReallocPhase::DefaultPartitionEnd, 0);
+      }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, op.getOperands(), after);
     });
     after->getParent()->getBlocks().splice(after->getIterator(),
