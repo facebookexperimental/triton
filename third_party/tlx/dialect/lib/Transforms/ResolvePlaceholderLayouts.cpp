@@ -23,6 +23,7 @@ namespace triton {
 namespace tlx {
 
 #define GEN_PASS_DEF_TLXRESOLVEPLACEHOLDERLAYOUTS
+#define GEN_PASS_DEF_TLXFINALIZEUSERLAYOUTS
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
@@ -49,6 +50,17 @@ static NoVerifyLayoutAttr getNoVerifyLayoutFromType(Type type) {
   }
   if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
     return dyn_cast_or_null<NoVerifyLayoutAttr>(memDescType.getEncoding());
+  }
+  return nullptr;
+}
+
+/// Extract a user-layout wrapper on a *shared* (MemDescType) value, if present.
+/// Register (RankedTensorType) user layouts are intentionally left wrapped
+/// here: they must survive as anchors through remove-layout-conversions and are
+/// unwrapped later by tlx-finalize-user-layouts.
+static UserLayoutAttr getUserLayoutFromType(Type type) {
+  if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
+    return dyn_cast_or_null<UserLayoutAttr>(memDescType.getEncoding());
   }
   return nullptr;
 }
@@ -260,8 +272,47 @@ static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
   return failure(foundResidualNoVerifyLayout);
 }
 
+/// Unwrap every user-pinned layout (#tlx.user_layout<...>) back
+/// to the concrete shared layout the user requested, and verify none remain.
+static LogicalResult unwrapUserLayouts(ModuleOp moduleOp) {
+  DenseMap<Value, Attribute> valuesToUnwrap;
+  collectValuesWithEncodings(
+      moduleOp,
+      [](Type type) -> Attribute { return getUserLayoutFromType(type); },
+      valuesToUnwrap);
+
+  for (auto &[value, layout] : valuesToUnwrap) {
+    auto userLayout = cast<UserLayoutAttr>(layout);
+    replaceTypeWithNewEncoding(value, userLayout.getLayout());
+  }
+
+  bool foundResidual = false;
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes()) {
+      if (getUserLayoutFromType(type)) {
+        foundResidual = true;
+        op->emitError("unresolved TLX user shared layout after placeholder "
+                      "layout resolution");
+      }
+    }
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          if (getUserLayoutFromType(arg.getType())) {
+            foundResidual = true;
+            op->emitError("unresolved TLX user shared layout on block argument "
+                          "after placeholder layout resolution");
+          }
+  });
+
+  return failure(foundResidual);
+}
+
 LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
   if (failed(unwrapNoVerifyLayouts(moduleOp)))
+    return failure();
+
+  if (failed(unwrapUserLayouts(moduleOp)))
     return failure();
 
   // Collect all values that have dummy layouts
@@ -313,6 +364,45 @@ public:
     if (failed(tlx::resolvePlaceholderLayouts(m))) {
       signalPassFailure();
     }
+  }
+};
+
+/// Unwrap user-pinned *register* layouts (a #tlx.user_layout wrapper on a
+/// RankedTensorType) back to the concrete wrapped layout, and verify none
+/// remain. These are kept wrapped through the layout-optimization passes (they
+/// anchor via PinnedEncodingTrait) and retired here.
+static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
+  auto tensorUserLayout = [](Type type) -> Attribute {
+    if (auto tensorType = dyn_cast<RankedTensorType>(type))
+      return dyn_cast_or_null<UserLayoutAttr>(tensorType.getEncoding());
+    return nullptr;
+  };
+
+  DenseMap<Value, Attribute> valuesToUnwrap;
+  collectValuesWithEncodings(moduleOp, tensorUserLayout, valuesToUnwrap);
+  for (auto &[value, layout] : valuesToUnwrap)
+    replaceTypeWithNewEncoding(value, cast<UserLayoutAttr>(layout).getLayout());
+
+  bool residual = false;
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes())
+      if (tensorUserLayout(type)) {
+        residual = true;
+        op->emitError("unresolved TLX user register layout after finalization");
+      }
+  });
+  return failure(residual);
+}
+
+struct TLXFinalizeUserLayoutsPass
+    : public impl::TLXFinalizeUserLayoutsBase<TLXFinalizeUserLayoutsPass> {
+public:
+  using impl::TLXFinalizeUserLayoutsBase<
+      TLXFinalizeUserLayoutsPass>::TLXFinalizeUserLayoutsBase;
+
+  void runOnOperation() override {
+    if (failed(finalizeUserLayouts(getOperation())))
+      signalPassFailure();
   }
 };
 

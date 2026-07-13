@@ -1,7 +1,9 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <numeric>
 
 // clang-format off
 #include "IR/Dialect.h"
@@ -249,6 +251,63 @@ Attribute mlir::triton::tlx::unwrapNoVerifyLayout(Attribute layout) {
 
 bool mlir::triton::tlx::hasNoVerifyLayout(Attribute layout) {
   return isa_and_nonnull<NoVerifyLayoutAttr>(layout);
+}
+
+//-- UserLayoutAttr --
+
+LogicalResult mlir::triton::tlx::UserLayoutAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, Attribute layout) {
+  if (isa<UserLayoutAttr>(layout))
+    return emitError() << "nested user layouts are not supported";
+  if (!isa<ttg::DistributedEncodingTrait>(layout) &&
+      !isa<ttg::SharedEncodingTrait>(layout))
+    return emitError()
+           << "user layout must wrap a distributed or shared layout";
+  return success();
+}
+
+SmallVector<unsigned> mlir::triton::tlx::UserLayoutAttr::getRepOrder() const {
+  if (auto distributed = dyn_cast<ttg::DistributedEncodingTrait>(getLayout()))
+    return distributed.getRepOrder();
+  // Shared inner: getRepOrder is a distributed-only concept; fall back to a
+  // natural (row-major) order over the rank so any generic caller stays
+  // well-formed.
+  unsigned rank = getCGALayout().getRank();
+  SmallVector<unsigned> order(rank);
+  std::iota(order.rbegin(), order.rend(), 0);
+  return order;
+}
+
+::mlir::triton::LinearLayout mlir::triton::tlx::UserLayoutAttr::toLinearLayout(
+    ArrayRef<int64_t> shape) const {
+  // Dispatch on the concrete inner layout (works for both distributed and
+  // shared encodings) rather than re-entering through this wrapper.
+  return ttg::toLinearLayout(shape, getLayout());
+}
+
+int32_t mlir::triton::tlx::UserLayoutAttr::getAlignment() const {
+  if (auto shared = dyn_cast<ttg::SharedEncodingTrait>(getLayout()))
+    return shared.getAlignment();
+  return 16;
+}
+
+ttg::CGAEncodingAttr mlir::triton::tlx::UserLayoutAttr::getCGALayout() const {
+  return cast<ttg::LayoutEncodingTrait>(getLayout()).getCGALayout();
+}
+
+Attribute mlir::triton::tlx::wrapUserLayout(Attribute layout) {
+  if (!layout || isa<UserLayoutAttr>(layout))
+    return layout;
+  if (!isa<ttg::DistributedEncodingTrait>(layout) &&
+      !isa<ttg::SharedEncodingTrait>(layout))
+    return layout;
+  return UserLayoutAttr::get(layout.getContext(), layout);
+}
+
+Attribute mlir::triton::tlx::unwrapUserLayout(Attribute layout) {
+  if (auto userLayout = dyn_cast_or_null<UserLayoutAttr>(layout))
+    return userLayout.getLayout();
+  return layout;
 }
 
 bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {

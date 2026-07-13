@@ -288,6 +288,14 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
+  // A user-pinned result (an encoding carrying PinnedEncodingTrait, e.g. TLX's
+  // #tlx.user_layout) is a hard anchor regardless of the producing op: the user
+  // explicitly chose that layout, so layout optimization must not rewrite it.
+  for (Value result : op->getResults())
+    if (auto rankedTy = dyn_cast<RankedTensorType>(result.getType()))
+      if (isa_and_nonnull<PinnedEncodingTrait>(rankedTy.getEncoding()))
+        return true;
+
   if (isa<DescriptorOpInterface>(op))
     return true;
   if (isa<LoadOp, StoreOp>(op))
