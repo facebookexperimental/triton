@@ -1477,6 +1477,15 @@ def _bwd_mma_dots_2cta(
         # TMEM region), and kt_fulls is now waited once before the loop, so
         # neither needs re-waiting here.
         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
+        # dq (cols 0-63) also aliases the qk TMEM region, which at this point
+        # holds qk(j) that the compute task may still be reading: ds_fulls
+        # above only proves compute consumed qk(j-1) — one iteration stale on
+        # the single-buffered TMEM ring. Wait for compute to release qk(j)
+        # before Dot 5's write lands in its storage (the same guard Dot 1
+        # uses for the full overwrite). Latent hazard: without this, Dot 5's
+        # write is ordered against compute's qk(j) read only by MMA-pipe
+        # timing.
+        tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase)
         dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
         tlx.async_dot(
             dsT_view,
@@ -1983,6 +1992,8 @@ def _bwd_compute_inner_loop(
     cluster_cta_rank=0,
     P_BUF_OFFSET: tl.constexpr = 0,
     num_steps_override=0,
+    qk_read_done=None,
+    dp_read_done=None,
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
@@ -2016,6 +2027,12 @@ def _bwd_compute_inner_loop(
 
         # Store P to TMEM.
         ppT = pT.to(do_out_dtype)
+        # Hazard 1 (intra-task WAR): P (f16) aliases the upper half of the qk
+        # (f32) TMEM region; tcgen05 ld/st warp->chunk maps differ, so a fast
+        # warp's P store can overwrite a 32x32 chunk a slow warp has not read as
+        # qkT. Rendezvous all 8 compute warps between the read and the store.
+        tlx.barrier_arrive(qk_read_done[tmem_buf_id])
+        tlx.barrier_wait(qk_read_done[tmem_buf_id], tmem_phase)
         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
         # P aliases the QK TMEM region, so qk_empties (which frees that region for
         # reuse) must be signaled after P is stored, not before. The
@@ -2037,6 +2054,10 @@ def _bwd_compute_inner_loop(
         tlx.barrier_arrive(d_empties[d_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
+        # Hazard 1 (intra-task WAR): dsT (f16) aliases dp's (f32) region -- same
+        # warp->chunk mismatch as the P store above.
+        tlx.barrier_arrive(dp_read_done[tmem_buf_id])
+        tlx.barrier_wait(dp_read_done[tmem_buf_id], tmem_phase)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
         # for reuse) must be signaled after dsT is stored, not before. The
@@ -2206,6 +2227,12 @@ def _attn_bwd_ws(
         p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
     dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    # Dedicated 8-warp rendezvous barriers for the intra-task aliased-TMEM WAR
+    # (Hazard 1): all compute warps must finish reading qk/dp before any warp
+    # overwrites that region with P/dsT. Intra-CTA (per-CTA) regardless of
+    # NUM_CTAS -- a first-class TLX warp barrier in place of tl.debug_barrier().
+    qk_read_done = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+    dp_read_done = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
     if USE_WARP_BARRIER:
         dq_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=4)
     else:
@@ -2446,7 +2473,7 @@ def _attn_bwd_ws(
                     REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                     M_STAGE=M_STAGE,
                     D_STAGE=D_STAGE,
-                    USE_2CTA=USE_2CTA,
+                    USE_2CTA=USE_2CTA, qk_read_done=qk_read_done, dp_read_done=dp_read_done,
                     NUM_CTAS=NUM_CTAS,
                     dsT_xchg_tiles=None,
                     ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
@@ -2494,7 +2521,7 @@ def _attn_bwd_ws(
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
                         D_STAGE=D_STAGE,
-                        USE_2CTA=USE_2CTA,
+                        USE_2CTA=USE_2CTA, qk_read_done=qk_read_done, dp_read_done=dp_read_done,
                         NUM_CTAS=NUM_CTAS,
                         dsT_xchg_tiles=None,
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
@@ -2540,7 +2567,7 @@ def _attn_bwd_ws(
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                         M_STAGE=M_STAGE,
                         D_STAGE=D_STAGE,
-                        USE_2CTA=USE_2CTA,
+                        USE_2CTA=USE_2CTA, qk_read_done=qk_read_done, dp_read_done=dp_read_done,
                         NUM_CTAS=NUM_CTAS,
                         dsT_xchg_tiles=None,
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
