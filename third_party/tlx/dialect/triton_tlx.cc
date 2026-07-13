@@ -14,8 +14,19 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
 
 namespace py = pybind11;
+
+// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays
+// pybind11-free and matches upstream; the pybind11 builder class is only
+// needed by this python-binding TU and ir.cc.
+namespace ir {
+extern py::class_<TritonOpBuilder> *getBuilderClass();
+} // namespace ir
+
 using namespace ir;
 using namespace mlir;
 namespace tt = triton;

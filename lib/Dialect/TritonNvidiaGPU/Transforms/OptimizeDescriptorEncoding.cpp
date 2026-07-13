@@ -7,10 +7,10 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
+#include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
-#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/ADT/PriorityWorklist.h"
 #include <algorithm>
@@ -297,7 +297,7 @@ Attribute getFallbackSharedEncoding(RankedTensorType tensorType,
     cgaLayout = ttg::CGAEncodingAttr::fromSplitParams(ctx, ctasPerCGA,
                                                       ctasPerCGA, order);
   } else if (cgaLayout.getRank() != tensorType.getRank())
-    cgaLayout = updateCGALayoutForShape(cgaLayout, shape);
+    cgaLayout = ttg::updateCGALayoutForShape(cgaLayout, shape);
 
   return ttg::NVMMASharedEncodingAttr::get(ctx, shape, order, cgaLayout,
                                            tensorType.getElementType(),
@@ -308,7 +308,7 @@ TensorDescType getTensorDescTypeWithEncoding(Operation *op,
                                              RankedTensorType existingTy,
                                              Attribute encoding) {
   auto sharedEnc = cast<triton::gpu::SharedEncodingTrait>(encoding);
-  encoding = updateEncodingForShape(op, sharedEnc, existingTy);
+  encoding = ttg::updateEncodingForShape(op, sharedEnc, existingTy);
   auto blockTy = existingTy.cloneWithEncoding(encoding);
   return TensorDescType::get(existingTy.getContext(), blockTy);
 }
