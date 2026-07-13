@@ -1,12 +1,9 @@
 #pragma once
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/DialectRegistry.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <memory>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/stl_bind.h>
-
-namespace py = pybind11;
+#include <string>
 
 using namespace mlir;
 using namespace triton;
@@ -106,7 +103,3 @@ private:
     return builder->getUnknownLoc();
   }
 };
-
-namespace ir {
-extern py::class_<TritonOpBuilder> *getBuilderClass();
-} // namespace ir
