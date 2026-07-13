@@ -1,6 +1,22 @@
 # Memory Planner Search Space — Design & Implementation Plan
 
-**Status**: proposal / not yet implemented
+**Status**: SMEM path implemented (default off); TMEM path pending
+
+## Implementation status
+
+Landed (all files under `WarpSpecialization/`, gated by `--smem-plan-search` /
+`TRITON_WS_SMEM_PLAN_SEARCH`, default off):
+- Interfaces `WSMemoryPlanSearch.{h}`; ordering (`LivenessStartOrder` +
+  `TopologicalOrder`), cost, greedy copies, beam driver — pure modules.
+- `SmemBufferModel` builder + `SmemPacker`; wired into `doMemoryPlanner`
+  (`allocateSmemBuffersViaSearch`) with a floor safety net.
+- Validated on sm100: autoWS correctness (GEMM/addmm/FA, off+on) and the
+  WarpSpecialization LIT suite pass with no regressions. Search runs on GEMM +
+  FA; falls back to the heuristic for pins, subtiled regions, and TMA-staging
+  buffers (unmodeled — see §8).
+
+Pending: Steps 7 (`TmemPacker`) and 8 (TMEM `BufferModel` builder); wiring the
+TMEM search; refining `entries`/`freq` so the staging fallback can be lifted.
 **Covers (future)**: `WSMemoryPlanner.cpp`, new `WSMemoryPlanSearch.{h,cpp}`
 **Related docs**: [SmemAllocationDesign.md](SmemAllocationDesign.md),
 [TMEMAllocationHeuristics.md](TMEMAllocationHeuristics.md),

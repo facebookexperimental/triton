@@ -138,6 +138,13 @@ public:
   virtual EncodingKey encoding(BufferId) const = 0;
   virtual BufferKind kind(BufferId) const = 0;
 
+  // Reuse-scope id: two buffers may share a multi-buffered reuse group only if
+  // their scopes match. Captures the "all producers/consumers in one basic
+  // block" invariant that circular accumCnt staggering requires
+  // (verifyReuseGroup1); buffers whose endpoints span blocks get a unique scope
+  // so they never group. See docs §5.3.
+  virtual unsigned reuseScope(BufferId) const = 0;
+
   // producer L_b — issue-to-result latency the builder gets on demand from
   // ttg::NVLatencyModel (docs §4 / Step 0 revised); no scheduler annotation.
   virtual double latency(BufferId) const = 0;
@@ -202,6 +209,13 @@ public:
 
 /// Concave-knapsack copy allocator (docs §2.3, Step 4).
 std::unique_ptr<CopySolver> createGreedyCopySolver();
+
+/// SMEM packer (docs §5.3, Step 3): blocks are circular multi-buffer reuse
+/// groups sized `max(member bytes) * copies`; a join is legal when encodings
+/// match (circular indexing handles producer/consumer separation, so no
+/// liveness check is needed). Holds a reference to `model`, which must outlive
+/// the returned object.
+std::unique_ptr<Packer> createSmemPacker(const BufferModel &model);
 
 /// Latency-hiding cost model (docs §4). `II` is the loop initiation interval
 /// (`tt.modulo_ii`); `lambda` weights the occupancy penalty (default 0 = pure
