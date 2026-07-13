@@ -103,9 +103,9 @@ struct TritonAMDGPULowerInstructionSchedHints
     : public triton::impl::TritonAMDGPULowerInstructionSchedHintsBase<
           TritonAMDGPULowerInstructionSchedHints> {
 
-  explicit TritonAMDGPULowerInstructionSchedHints(StringRef arch,
+  explicit TritonAMDGPULowerInstructionSchedHints(StringRef gfxArch,
                                                   int32_t numStages) {
-    this->arch = arch.str();
+    this->gfxArch = gfxArch.str();
     this->numStages = numStages;
   }
 
@@ -122,7 +122,7 @@ struct TritonAMDGPULowerInstructionSchedHints
 
     RewritePatternSet patterns(ctx);
 
-    patterns.add<InstructionSchedHintsRewriter>(ctx, this->arch,
+    patterns.add<InstructionSchedHintsRewriter>(ctx, this->gfxArch,
                                                 this->numStages);
 
     if (failed(applyPartialConversion(getOperation(), target,
@@ -185,9 +185,9 @@ struct TritonAMDGPUInsertInstructionSchedHints
 
 namespace mlir::triton {
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPULowerInstructionSchedHintsPass(StringRef arch,
+createTritonAMDGPULowerInstructionSchedHintsPass(StringRef gfxArch,
                                                  int32_t numStages) {
-  return std::make_unique<TritonAMDGPULowerInstructionSchedHints>(arch,
+  return std::make_unique<TritonAMDGPULowerInstructionSchedHints>(gfxArch,
                                                                   numStages);
 }
 

@@ -13,9 +13,9 @@ from ._layouts import SharedLayout, DistributedLayout, BlockedLayout, DotOperand
 from triton._C.libtriton import ir
 import triton.language.core as tl_core
 from triton.language.core import (
-    constexpr,
     base_value,
     base_type,
+    constexpr,
     dtype,
     block_type,  # TODO: block type with layout info
     pointer_type,
