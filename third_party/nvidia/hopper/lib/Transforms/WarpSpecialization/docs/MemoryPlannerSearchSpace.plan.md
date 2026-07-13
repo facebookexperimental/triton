@@ -207,8 +207,15 @@ Score(P) = Σ_block hidden_latency(block, copies) − λ · occupancy_penalty(P)
 hidden_latency(block, c) = freq · min(c · II, L_block)
 ```
 
-- `L_block` = producer `tt.self_latency`, `freq` = trip count, `II` =
-  `tt.modulo_ii`.
+- `L_block` = producer latency, `freq` = trip count, `II` = `tt.modulo_ii`.
+- **Latency source (revised)**: `L_block` is obtained *on demand* inside the
+  `BufferModel` builder by instantiating `ttg::NVLatencyModel` and calling
+  `getLatency(producer).latency` (issue-to-result — the quantity multi-buffering
+  hides). `II` is read from the existing `tt.modulo_ii` loop attribute. **No new
+  scheduler annotation is required** — see the Step 0 revision in §6. This avoids
+  stamping attrs on every scheduled op (which would change IR output and risk
+  breaking `lit` CHECK lines). The `tt.issue_cycle` annotation is only needed for
+  cycle-accurate TMEM liveness and is deferred (§8).
 - `bound(partial, rest)` = optimistic completion: best-case latency hidden for the
   unplaced suffix assuming free reuse + full copies. Admissible ⇒ branch-and-bound
   is exhaustive w.r.t. top-K; under beam it is just the ranking key.
@@ -217,9 +224,10 @@ hidden_latency(block, c) = freq · min(c · II, L_block)
   makes the proxy easy to validate against runtime.
 
 **Schedule dependence**: the cost model needs `II` + latencies, so a plan search
-is always *relative to a fixed schedule's annotations*. When later folded into the
-modulo-schedule top-K search, the plan enumeration re-runs per schedule (memory
-pick is conditional on schedule pick).
+is always *relative to a fixed schedule*. Both inputs come from the already-
+scheduled IR (`tt.modulo_ii` + `NVLatencyModel`), so no per-schedule re-annotation
+is needed. When later folded into the modulo-schedule top-K search, the plan
+enumeration re-runs per schedule (memory pick is conditional on schedule pick).
 
 ---
 
@@ -242,7 +250,8 @@ as-is; **refactor** = extract/generalize existing logic behind the new interface
 | entries → slot floor | inline in `enforceMinBufferCopy` (:689, counting per `buffer.id` at :664–704) | refactor → `slotFloor(block)` |
 | encoding compat | `areReuseEncodingsCompatible` (:1702), `neutralReuseEnabled` (:1698) | reuse |
 | kind (TMA/innermost/staging/accum) | `isSmemTMAChannel` (:1197), `isInnermostLoop` (:137), `usersInInnermostLoop` (:464), `isInnermostSmemChannel` (:1145), `WSBuffer.tmaStaging`, channel `isOperandD`, `hasLoopCarriedAccToken` (`CodePartitionUtility.cpp:64`) | reuse |
-| **latency `L_b` / `II` / freq** | — none — | **new** (read `tt.self_latency`, `tt.modulo_ii`; freq from trip counts) |
+| **latency `L_b`** | `ttg::NVLatencyModel::getLatency(op).latency` (LatencyModel.h) | reuse (on-demand; no annotation) |
+| **`II` / freq** | `tt.modulo_ii` loop attr; trip counts | reuse / **new** (freq reader) |
 | `dependsOn(a,b)` | `isDataDependent` (:2487), `alongDependencyChain` | reuse |
 | the struct itself | `WSBuffer` (:853) ≈ SMEM model; TMEM uses `BufferT` | refactor → one generic `BufferModel` |
 
@@ -321,13 +330,17 @@ the `BufferModel`/`Packer`/`OrderingPolicy` interfaces** that tie them together.
 Ordered by dependency. Each step is independently testable against a synthetic
 `BufferModel` (no IR, no GPU) unless noted.
 
-### Step 0 — Scheduler annotations (prerequisite)
-- Emit `tt.self_latency` and `tt.issue_cycle` per op in the modulo/list
-  scheduler (`ModuloSchedulePass.cpp` / `LLMSchedulePass.cpp`), sourced from
-  `NVLatencyModel`. `tt.modulo_ii` and `loop.stage` already exist.
-- Verify the attrs survive intervening passes down to `doMemoryPlanner`
-  (`loop.stage` already makes this trip — precedent exists).
-- **Test**: lit test asserting the attrs appear on ops after scheduling.
+### Step 0 — Latency source (REVISED: no scheduler annotation)
+Original plan stamped `tt.self_latency`/`tt.issue_cycle` on every scheduled op.
+That changes IR output (breaks `lit` CHECK lines) for no benefit, because the
+cost model's inputs are already reachable from the scheduled IR:
+- **`L_b`**: instantiate `ttg::NVLatencyModel` (LatencyModel.h, same library) in
+  the `BufferModel` builder and call `getLatency(producer).latency` on demand.
+- **`II`**: read the existing `tt.modulo_ii` loop attribute.
+
+So Step 0 folds into the `BufferModel` builder (Step 1/8) — **no separate
+scheduler change, no behavior change**. The `tt.issue_cycle` annotation is only
+needed for cycle-accurate TMEM liveness and is deferred (§8).
 
 ### Step 1 — `BufferModel` interface + SMEM builder
 - New `WSMemoryPlanSearch.h` with the interfaces from §3.2.
@@ -337,7 +350,8 @@ Ordered by dependency. Each step is independently testable against a synthetic
   `isSmemTMAChannel`/`isInnermostSmemChannel` (:1197/:1145), `WSBuffer.tmaStaging`.
 - `entries()`: **refactor** the per-`buffer.id` counting from
   `enforceMinBufferCopy` (:689, :664–704) into a standalone `slotFloor` helper.
-- `latency()`/`freq()`: **new** readers for the Step-0 attrs.
+- `latency()`: **new**, via on-demand `ttg::NVLatencyModel::getLatency`.
+  `freq()`: **new** trip-count reader. `II` from `tt.modulo_ii` (Step 0 revised).
 - `dependsOn()`: reuse `isDataDependent` (:2487).
 - **Test**: synthetic + one real kernel; assert fields match the current planner's
   derived values.
@@ -439,3 +453,7 @@ Ordered by dependency. Each step is independently testable against a synthetic
 4. **`λ` occupancy term**: enable only if benchmarks show occupancy losses.
 5. **SMEM/TMEM coupling**: current plan keeps them independent; revisit if a
    kernel has buffers that can live in either pool.
+6. **`tt.issue_cycle` annotation**: needed only for cycle-accurate TMEM liveness
+   (tighter reuse packing than op-ID intervals). Requires a scheduler change
+   (`ModuloSchedulePass`); deferred since the op-ID intervals already work and
+   the cost-model latency comes from `NVLatencyModel` on demand (Step 0 revised).
