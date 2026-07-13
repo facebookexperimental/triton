@@ -16,6 +16,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -2017,6 +2019,53 @@ static double getModuloII(triton::FuncOp funcOp) {
   return ii;
 }
 
+// Top-K / pick knobs for the plan-space search, mirroring the list/modulo
+// schedulers (TRITON_LIST_SCHEDULE_TOPK/PICK, TRITON_MODULO_TOPK/PICK):
+// generate K ranked plans and apply rank `pick` (0 = cost-best). An external
+// harness sets TOPK=K and sweeps PICK over 0..K-1, compiling and timing each,
+// since the cost model only ranks (it may be inaccurate). One PICK applies to
+// both pools, clamped to each pool's plan count.
+static unsigned getMemPlanTopK() {
+  auto v = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_TOPK");
+  if (v.empty())
+    return 1;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 1u : static_cast<unsigned>(n);
+}
+static unsigned getMemPlanPick() {
+  auto v = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_PICK");
+  if (v.empty())
+    return 0;
+  int n = std::atoi(v.c_str());
+  return n < 0 ? 0u : static_cast<unsigned>(n);
+}
+
+// Append the top-K plans (one JSON object per plan: rank, cost score, per-block
+// id/copy/member-count) to TRITON_WS_MEM_PLAN_TOPK_DUMP so a harness can see
+// what each PICK rank does. `pool` is "smem" or "tmem".
+static void dumpMemPlans(ArrayRef<wsplan::Plan> plans, StringRef pool,
+                         unsigned firstId) {
+  auto path = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_TOPK_DUMP");
+  if (path.empty() || plans.empty())
+    return;
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Append);
+  if (ec)
+    return;
+  for (unsigned r = 0; r < plans.size(); ++r) {
+    const wsplan::Plan &p = plans[r];
+    os << "{\"pool\": \"" << pool << "\", \"rank\": " << r
+       << ", \"score\": " << llvm::format("%.3f", p.score) << ", \"blocks\": [";
+    for (unsigned bi = 0; bi < p.blocks.size(); ++bi) {
+      const wsplan::Block &blk = p.blocks[bi];
+      os << (bi ? ", " : "") << "{\"id\": " << (firstId + blk.id)
+         << ", \"copy\": " << blk.copies
+         << ", \"members\": " << blk.members.size() << "}";
+    }
+    os << "]}\n";
+  }
+}
+
 // Step 9 (docs §6): SMEM allocation via the plan-space search. Runs the beam
 // search (SmemBufferModel + SmemPacker + latency cost + greedy copies), then
 // stamps buffer.id/buffer.copy from the top plan. Discretionary copies are
@@ -2075,8 +2124,10 @@ static unsigned allocateSmemBuffersViaSearch(
   wsplan::Budget budget;
   budget.smemBytes = smemBudget;
 
-  auto plans = wsplan::beamSearch(model, *ordering, *packer, *cost, *copies,
-                                  budget, /*W=*/16, /*K=*/1);
+  unsigned topK = getMemPlanTopK();
+  auto plans =
+      wsplan::beamSearch(model, *ordering, *packer, *cost, *copies, budget,
+                         /*W=*/std::max(16u, topK), /*K=*/topK);
   if (plans.empty()) {
     LDBG("SMEM plan-search: no plan found, falling back to heuristic");
     return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
@@ -2084,7 +2135,9 @@ static unsigned allocateSmemBuffersViaSearch(
                                annotationMaxId);
   }
 
-  const wsplan::Plan &plan = plans.front();
+  dumpMemPlans(plans, "smem", annotationMaxId);
+  const wsplan::Plan &plan =
+      plans[std::min<size_t>(getMemPlanPick(), plans.size() - 1)];
   auto *ctx = funcOp.getContext();
   auto i32 = IntegerType::get(ctx, 32);
   unsigned nextId = annotationMaxId;
@@ -4671,14 +4724,25 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   budget.tmemRows = 512;
   budget.tmemCols = 512;
 
-  auto plans = wsplan::beamSearch(model, *ordering, *packer, *cost, *copies,
-                                  budget, /*W=*/16, /*K=*/1);
+  unsigned topK = getMemPlanTopK();
+  auto plans =
+      wsplan::beamSearch(model, *ordering, *packer, *cost, *copies, budget,
+                         /*W=*/std::max(16u, topK), /*K=*/topK);
   if (plans.empty()) {
     LDBG("TMEM plan-search: no plan found, falling back");
     return false;
   }
 
-  const wsplan::Plan &plan = plans.front();
+  // TMEM copies are pinned to 1 (non-accumulator multi-copy is not yet legal).
+  // The generic CopySolver's footprint model is copy-agnostic for TMEM and may
+  // inflate blk.copies; normalize to 1 so the dump and emission agree.
+  for (wsplan::Plan &p : plans)
+    for (wsplan::Block &blk : p.blocks)
+      blk.copies = 1;
+
+  dumpMemPlans(plans, "tmem", bufferId);
+  const wsplan::Plan &plan =
+      plans[std::min<size_t>(getMemPlanPick(), plans.size() - 1)];
   auto *ctx = funcOp.getContext();
   auto i32 = IntegerType::get(ctx, 32);
 
