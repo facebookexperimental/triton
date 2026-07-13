@@ -146,6 +146,25 @@ def clock64(_semantic=None):
 
 
 @tl.builtin
+def sched_barrier(mask: tl.constexpr = 0, _semantic=None) -> None:
+    """
+    Emit an AMD LLVM scheduler barrier.
+
+    This is an experimental scheduling hint for hand-tuned AMD kernels.  It
+    lowers to ``rocdl.sched.barrier`` and does not synchronize memory.
+    """
+    mask = tl._unwrap_if_constexpr(mask)
+    if not isinstance(mask, int):
+        raise TypeError(f"sched_barrier mask must be an integer constexpr, got {type(mask).__name__}")
+    if mask < 0:
+        raise ValueError(f"sched_barrier mask must be non-negative, got {mask}")
+    arch = _semantic.builder.options.arch
+    if not isinstance(arch, str) or not arch.startswith("gfx"):
+        raise NotImplementedError(f"tlx.sched_barrier is AMD-only, got arch={arch}")
+    _semantic.builder.create_sched_barrier(mask)
+
+
+@tl.builtin
 def stoch_round(
     src: tl.tensor,
     dst_ty: tl.dtype,
