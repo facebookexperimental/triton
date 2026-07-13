@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"

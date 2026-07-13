@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/Pass.h"
@@ -4050,11 +4051,12 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
   return success();
 }
 
+// Default arguments are declared in WarpSpecializationPipeline.h (the single
+// declaration site); they must not be repeated on the definition.
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
-                              StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
-                              bool smemCircularReuse = false) {
+                              StringRef readDecisionFile,
+                              StringRef writeDecisionFile, int smemAllocAlgo,
+                              unsigned smemBudget, bool smemCircularReuse) {
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
