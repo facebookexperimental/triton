@@ -669,6 +669,14 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     for (Operation &op : reverse(*block)) {
       if (isa<scf::ForOp, scf::IfOp>(op))
         break;
+      // Never treat the block terminator (e.g. scf.yield) as an epilog op.
+      // When the epilogue store lives inside the loop body, the terminator is
+      // block.back() and would otherwise be swept into epilogOps; a channel
+      // consumer whose forward slice reaches the loop-carried yield (e.g. the
+      // tmem_load accumulator token) then moves scf.yield out of terminator
+      // position, leaving the block without a valid terminator.
+      if (op.hasTrait<OpTrait::IsTerminator>())
+        continue;
       epilogOps.insert(&op);
     }
 
