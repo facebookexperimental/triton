@@ -49,13 +49,23 @@ jobs:
               export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
           fi
           EOF
+      - name: Checkout TritonBench (Optional)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          PR_BODY_FILE="$(mktemp)"
+          printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
+          bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}"
       - name: Run TritonBench tests on B200 GPU
         id: tritonbench
         env:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
-          TRITONBENCH_ROOT: /workspace/tritonbench
         run: |
           . "${SETUP_SCRIPT}"
+          # Use the TritonBench checked out for a linked PR if present, else the
+          # pre-provisioned copy on the runner.
+          export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
           bash ./.ci/tritonbench/test-gpu.sh
       - name: Collect nightly failure (TritonBench)
         id: collect
