@@ -82,6 +82,7 @@ from .types import (
     shared_layout_encoding,
     layout,
     storage_kind,
+    swizzled_layout,
     swizzled_shared_layout_encoding,
     tensor_descriptor_ptr,
     tensor_descriptor_ptr_type,
@@ -110,6 +111,7 @@ __all__ = [
     # types
     "layout_encoding",
     "shared_layout_encoding",
+    "swizzled_layout",
     "swizzled_shared_layout_encoding",
     "padded_shared_layout_encoding",
     "tensor_memory_layout_encoding",
