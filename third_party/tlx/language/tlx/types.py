@@ -115,9 +115,9 @@ class swizzled_layout:
     bit-count args, e.g. ``tlx.swizzled_layout(3, 3, 3)``. Use it directly as a
     ``tlx.local_alloc(..., layout=...)`` layout; it lowers to ``#ttg.swizzled_shared``.
 
-      - ``bits``  (B): number of XOR phases      -> ``maxPhase = 2**B``
-      - ``base``  (M): unswizzled contiguous unit -> ``vec = 2**M``
-      - ``shift`` (S): distance between the XOR'd bit fields
+      - ``bits``  (B): log2 number of XOR phases      -> ``maxPhase = 2**B``
+      - ``base``  (M): log2 unswizzled contiguous unit -> ``vec = 2**M``
+      - ``shift`` (S): distance between the XOR'd bit fields in log2 units
 
     ``order`` lists axes fastest-varying first (like the Triton encoding); it may
     be omitted, in which case a row-major default is used once the rank is known.
@@ -154,6 +154,16 @@ class swizzled_layout:
     def vectorSize(self):
         return 1 << self.base
 
+    def __repr__(self):
+        return f"swizzled_layout(Swizzle<{self.bits},{self.base},{self.shift}>, order={self.order})"
+
+    def __eq__(self, other):
+        return (isinstance(other, swizzled_layout) and self.bits == other.bits and self.base == other.base
+                and self.shift == other.shift and self.order == other.order)
+
+    def __hash__(self):
+        return hash((self.bits, self.base, self.shift, tuple(self.order) if self.order else None))
+
     def _to_encoding(self, shape=None):
         """Resolve to a concrete swizzled_shared_layout_encoding for `shape`.
 
@@ -177,7 +187,7 @@ class swizzled_layout:
                                  "pass it via tlx.local_alloc(..., layout=tlx.swizzled_layout(...))")
             numContig = int(shape[order[0]])
             span = 1 << (self.shift + self.base)
-            assert span >= numContig and span % numContig == 0, (
+            assert span % numContig == 0, (
                 f"swizzled_layout: Swizzle<{self.bits},{self.base},{self.shift}> gives perPhase < 1 "
                 f"for contiguous extent {numContig} (need shift + base >= log2(numContig))")
             perPhase = span // numContig
@@ -486,6 +496,9 @@ class layout(layout_encoding):
 
     def __new__(cls, spec=None, *, shape=None, stride=None):
         # ``tlx.layout(swizzled_layout(...))`` -> a swizzled shared-memory layout.
+        # shape/stride are declared here only to mirror __init__ signature;
+        # they are unused in __new__ because __new__ returns early for swizzled
+        # case and super().__new__ for register case does not need them.
         if isinstance(spec, swizzled_layout):
             # A trivial (non-)swizzle is shape-independent, so resolve it now to a
             # concrete encoding. A real swizzle's perPhase depends on the buffer
@@ -497,6 +510,10 @@ class layout(layout_encoding):
 
     def __init__(self, spec=None, *, shape=None, stride=None):
         super().__init__()
+        # Note: shape and stride are keyword-only as of the swizzled_layout
+        # refactor to avoid ambiguity with positional swizzled_layout args.
+        # Pre-existing callers in-tree already use kwargs; positional use
+        # would be misinterpreted as spec and fail with a clear AssertionError.
         assert shape is not None and stride is not None, \
             "tlx.layout requires a swizzled_layout(...), or shape=/stride= for a register layout"
         assert len(shape) == 2 and len(stride) == 2, \
