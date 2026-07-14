@@ -479,6 +479,30 @@ def _get_bw_configs() -> List[triton.Config]:
         ]
     else:
         print("WARNING: temporarily disabled some autotune configs for CUDA 12.8+")
+    # HSTU_SELF_AUTOWS needs a big-enough tile + enough warps or meta-WS silently
+    # does NOT partition the bwd M-loop (the tiny default BLOCK_M=16/num_warps=2
+    # config stays SIMT). Pin one num_warps>=8, BLOCK_M>=64, num_stages>=1 config.
+    # DP is left at 1 for bwd (TLX bwd uses replicate=1), so no split-dim doubling.
+    # Use the non-SEQUENCE_PARALLEL path (single program per (z,h); dq is a direct
+    # global RMW, ATOMIC_ADD=False) and UNROLL=1 (no unroll under WS).
+    if os.environ.get("HSTU_SELF_AUTOWS") == "1":
+        _w = int(os.environ.get("HSTU_SELF_AUTOWS_WARPS", "8"))
+        _bm = int(os.environ.get("HSTU_SELF_AUTOWS_BWD_BM", "64"))
+        _bn = int(os.environ.get("HSTU_SELF_AUTOWS_BWD_BN", "64"))
+        _ns = int(os.environ.get("HSTU_SELF_AUTOWS_BWD_STAGES", "1"))
+        return [
+            triton.Config(
+                {
+                    "BLOCK_M": _bm,
+                    "BLOCK_N": _bn,
+                    "SEQUENCE_PARALLEL": False,
+                    "UNROLL": 1,
+                },
+                num_stages=_ns,
+                num_warps=_w,
+                pre_hook=_bwd_pre_hook,
+            )
+        ]
     # HSTU_SELF_PIN=1 shrinks the bwd autotune to one config so tritonbench
     # --mode bwd compiles fast instead of building all ~29 configs.
     if os.environ.get("HSTU_SELF_PIN"):
@@ -1432,7 +1456,16 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         contextual_block_end = tl.cdiv(contextual_seq_len, BLOCK_M) * BLOCK_M
         if low < contextual_block_end:
             low = contextual_block_end
-    for start_m in tl.range(low, high, BLOCK_M, loop_unroll_factor=UNROLL):
+    for start_m in tl.range(
+        low,
+        high,
+        BLOCK_M,
+        loop_unroll_factor=UNROLL,
+        # autoWS on the bwd compute loop (dk/dv/dq MMAs). DP=1 (bwd uses TLX
+        # replicate=1); pair with a num_warps>=8, BLOCK_M>=64, num_stages>=1
+        # config from _get_bw_configs() (HSTU_SELF_AUTOWS branch).
+        warp_specialize=_HSTU_SELF_AUTOWS,
+    ):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         dk, dv = _hstu_attn_bwd_one_block_0(
             start_m=start_m,
