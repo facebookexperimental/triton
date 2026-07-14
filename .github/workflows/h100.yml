@@ -8,6 +8,12 @@ on:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
 
+# torchTLX (TLX-as-Inductor-backend) is Blackwell-focused and is exercised by the
+# dedicated torchtlx.yml workflow. Keep it disabled on Hopper: only "allow"/"force"
+# enable it, so an empty value forces it off regardless of any environment default.
+env:
+  TORCHINDUCTOR_TLX_MODE: ""
+
 jobs:
   h100-meta-triton-test:
     if: github.repository_owner == 'facebookexperimental'
