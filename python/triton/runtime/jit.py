@@ -974,7 +974,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             # where signature/constexprs are in scope. Never affects the user run.
             if os.environ.get("TRITON_COMPILE_IQ_COLLECT"):
                 try:
-                    from triton.compile_iq.collector import capture as _ciq_capture
+                    from triton.magnon.collector import capture as _ciq_capture
                     _ck = kernel.result() if hasattr(kernel, "result") else kernel
                     _cg = grid(bound_args) if callable(grid) else grid
                     _ciq_capture(jitfn=self, kernel=_ck, bound_args=bound_args, signature=signature,
