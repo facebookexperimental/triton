@@ -62,6 +62,53 @@ Owner buffers get a fresh `buffer.id`; non-owner (reusing) buffers receive the
 same `buffer.id` as their owner plus a `buffer.offset` encoding the column
 offset within the owner's TMEM row.
 
+## Shapes that are NOT reuse groups (assessment)
+
+Two patterns that show up in the HSTU 2-KV backward (`_hstu_attn_bwd_redq_2kv`,
+`attn_bwd_ws_2kv`) look like reuse but are deliberately **out of scope** for the
+A1–A6 machinery. Neither needs a new A-category; both are handled elsewhere.
+Documented here so future readers don't try to force them into a reuse group.
+
+### N1. Chained accumulator (multiple MMAs, one `allocOp`)
+
+A single TMEM tile written by **several `tc_gen5_mma` in a `useC=false → useC=true`
+chain** (fresh overwrite, then one or more accumulates), then read once. Examples
+in the 2-KV kernel: `dq` (`buffer.id 11`: b0 `useC=false` + b1 `useC=true`), and
+the dv+dk_attn compute-fold (`id 7`, `id 17`: two accumulating writes into one dk
+tile).
+
+This is **not** a reuse group — requirement #2 above excludes it: all the writers
+target the **same `allocOp`**, so they are *lifecycle phases of one buffer*, not
+two allocs sharing an id. It is owned by the operand-D channel model
+(`handleOperandD`, see `OperandDHandling.md`), whose correct synchronization is a
+**single forward barrier armed by the last writer** and a **single reuse/WAR
+barrier waited by the first writer** (the fresh-overwrite MMA). A new *reuse*
+category is **not** warranted; what is missing is explicit chained-accumulator
+handling in `handleOperandD`, which today emits one forward channel **per** writer
+(`createChannelsForProducers` loops over all of `currentProds`) and skips the
+wrap/guard block (gated on `numChannelsCreated >= 2` and `isa<TMEMStoreOp>` of the
+first producer). For an **in-loop, cross-partition** consumer this leaves the
+fresh overwrite of iteration N+1 unguarded against the read of iteration N — the
+`dq` race (T279388065). (dk `id 7`/`id 17` accumulate across the whole inner loop
+and are read once **post-loop**, so the missing in-loop WAR does not corrupt
+them.)
+
+### N2. Data-partition halves with a shared reduction accumulator
+
+The manual 2-KV kernel mirrors two DP halves (b0 on the `_2KV` buffer ids, b1 on
+`_2KV_B1`) so their concurrently-live tiles use **disjoint** ids (e.g. `dpT` id 5
+vs 15, `dv/dk` id 7 vs 17) — correctly **not** reused, because both halves are
+live at once. The one exception is the **reduction accumulator** `dq`
+(`buffer.id 11`), which is **shared** across both halves: b0 fresh-writes it, b1
+accumulates into it, and it is reduced/stored once. That shared accumulator is
+exactly the N1 chained-accumulator shape (its two writers happen to be the two DP
+halves). So for `dq` the "dp0/dp1 reuse" pattern and the "chained accumulator"
+pattern are the **same underlying shape**, and it is handled by the operand-D
+model, not by reuse groups. The compiler DP pass, when it synthesizes the two
+halves automatically, must produce the same single-shared-reduction-accumulator
+result (one `allocOp`, one forward-from-last-writer + WAR-to-first-writer), not a
+per-half duplicate.
+
 ## Data Structures
 
 Defined in `CodePartitionUtility.h`:
