@@ -3736,6 +3736,22 @@ static int getDumpTopN() {
   return n < 1 ? 1 : n;
 }
 
+/// Which partition variant to COMMIT for lowering, by cost-model rank — 0-based,
+/// matching `variant_id` in the TRITON_MODULO_DUMP_TOPN dump (0 = the rank-0
+/// winner). Default -1 = commit the winner. Set TRITON_MODULO_SELECT_VARIANT=k
+/// to instead lower the k-th-ranked partition as a single schedule, so you can
+/// empirically test whether the cost model's rank 0 is really the fastest (dump
+/// top-N, pick a variant_id, re-run with this flag to run just that one).
+/// Out-of-range clamps to the last available variant. Only the exhaustive
+/// partitioner enumerates variants; the greedy fallback has just one.
+static int getSelectVariant() {
+  auto v = triton::tools::getStrEnv("TRITON_MODULO_SELECT_VARIANT");
+  if (v.empty())
+    return -1;
+  int n = std::atoi(v.c_str());
+  return n < 0 ? -1 : n;
+}
+
 /// Build the multi-variant dump filename by pluralizing the base path: insert
 /// an `s` before the final extension, so `schedule_graph.json` ->
 /// `schedule_graphs.json` (and `foo.json` -> `foos.json`). With no extension,
@@ -3868,12 +3884,27 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop,
   });
   const auto &winner = scored.front();
 
-  // Reset NONE ops to -1; cluster members get the winning WG. propagateWarp-
+  // Default: commit the cost-model winner (rank 0). TRITON_MODULO_SELECT_VARIANT
+  // overrides this to commit the k-th-ranked partition instead (0-based,
+  // matching variant_id in the TOPN dump) so a specific variant can be lowered
+  // and tested. Out-of-range clamps to the last available.
+  size_t commitIdx = 0;
+  if (int sel = getSelectVariant(); sel >= 0) {
+    commitIdx = std::min<size_t>(sel, scored.size() - 1);
+    llvm::errs() << "[modulo-schedule] TRITON_MODULO_SELECT_VARIANT=" << sel
+                 << ": committing partition variant " << commitIdx << " of "
+                 << scored.size() << " (cost " << scored[commitIdx].cost
+                 << " vs rank-0 " << winner.cost << ")"
+                 << ((size_t)sel != commitIdx ? " [clamped]" : "") << "\n";
+  }
+  const auto &committed = scored[commitIdx];
+
+  // Reset NONE ops to -1; cluster members get the committed WG. propagateWarp-
   // GroupToInfraOps later attaches NONE ops to their consumer's WG.
   for (auto &node : loop.nodes)
     node.warpGroup = -1;
   for (const auto &c : clusters) {
-    int wg = winner.assignment.clusterToWg[c.id];
+    int wg = committed.assignment.clusterToWg[c.id];
     for (unsigned nid : c.nodeIds)
       loop.nodes[nid].warpGroup = wg;
   }
@@ -3881,11 +3912,12 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop,
 
   // Record the top-N candidate partitions for the multi-graph autotuning dump
   // (TRITON_MODULO_DUMP_TOPN). Each is a node-indexed raw warpGroup vector
-  // (NONE ops = -1), best-first; [0] mirrors the winner just applied above.
+  // (NONE ops = -1), best-first; [0] is the rank-0 winner (the committed
+  // partition above may differ under TRITON_MODULO_SELECT_VARIANT).
   // The dumper later re-finalizes each (infra-op propagation + barrier
   // synthesis + buffer merging) on a pre-partition snapshot and emits it as a
   // separate JSON so the schedule is explored, not just the partition.
-  loop.partitionCost = winner.cost; // committed (rank-0) cost
+  loop.partitionCost = committed.cost; // cost of the committed variant
   loop.topPartitions.clear();
   loop.topPartitionCosts.clear();
   if (int topN = getDumpTopN(); topN > 1) {
