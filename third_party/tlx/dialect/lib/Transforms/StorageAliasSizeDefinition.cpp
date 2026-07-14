@@ -145,6 +145,31 @@ LogicalResult computeOrValidateStorageAliasSizes(ModuleOp m) {
           blockN = (blockN + scaleFactor - 1) / scaleFactor;
         }
 
+        // 2-CTA (blockM=64) tiles occupy a per-CTA footprint whose rows double
+        // across the CTA pair. Columns behave differently by ctaMode, and this
+        // must match getTmemAllocSizes / tensorMemoryToLinearLayout (used by
+        // the offset/index math), else neighboring alias buffers overlap:
+        //   - TwoCTA_RHS (the MMA accumulator, split along N): cols halve,
+        //     rows double -> 2*blockM x blockN/2. Otherwise a (64,128) view is
+        //     over-counted as 128 cols and dQ cannot sit at a non-zero offset.
+        //   - TwoCTA_LHS (an A/LHS operand): N is NOT split; the second
+        //     row-half is a broadcast, so cols stay blockN and only rows
+        //     double.
+        // The ctaMode is only known after layout propagation.
+        if (auto tmemEnc =
+                dyn_cast<mlir::triton::nvidia_gpu::TensorMemoryEncodingAttr>(
+                    memDescType.getEncoding())) {
+          auto ctaMode = tmemEnc.getCtaMode();
+          if (ctaMode ==
+              mlir::triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS) {
+            blockN /= 2;
+            blockM *= 2;
+          } else if (ctaMode == mlir::triton::nvidia_gpu::TensorMemoryCTAMode::
+                                    TwoCTA_LHS) {
+            blockM *= 2;
+          }
+        }
+
         LDBG("  TMEM allocation: ");
         for (size_t i = 0; i < shape.size(); ++i) {
           LDBG(shape[i] << (i < shape.size() - 1 ? "x" : ""));
