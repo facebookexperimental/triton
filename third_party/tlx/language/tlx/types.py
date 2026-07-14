@@ -108,6 +108,101 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class swizzled_layout:
+    """A CuTe ``Swizzle<B, M, S>`` shared-memory layout.
+
+    Constructed exactly like ``cute::Swizzle<B, M, S>`` with three positional
+    bit-count args, e.g. ``tlx.swizzled_layout(3, 3, 3)``. Use it directly as a
+    ``tlx.local_alloc(..., layout=...)`` layout; it lowers to ``#ttg.swizzled_shared``.
+
+      - ``bits``  (B): log2 number of XOR phases      -> ``maxPhase = 2**B``
+      - ``base``  (M): log2 unswizzled contiguous unit -> ``vec = 2**M``
+      - ``shift`` (S): distance between the XOR'd bit fields in log2 units
+
+    ``order`` lists axes fastest-varying first (like the Triton encoding); it may
+    be omitted, in which case a row-major default is used once the rank is known.
+
+    Because CuTe's ``S`` is defined on the flat offset while Triton's ``perPhase``
+    is per-row, the layout is resolved to concrete ``(vec, perPhase, maxPhase)`` only
+    once the buffer shape is known (at ``local_alloc``), via the inverse of
+    ``DumpLayout``'s ``emitCuteSwizzle``::
+
+        vec      = 2**base
+        maxPhase = 2**bits
+        perPhase = 2**(shift + base) // numContig   # numContig = shape[order[0]]
+
+    A no-op (non-swizzled) default is ``swizzled_layout.make_default(rank)``
+    (``Swizzle<0,0,0>``), which is shape-independent and resolves eagerly.
+    """
+
+    def __init__(self, bits, base=0, shift=0, order=None):
+        self.bits = bits  # B
+        self.base = base  # M
+        self.shift = shift  # S
+        self.order = list(order) if order is not None else None
+
+    @classmethod
+    def make_default(cls, rank):
+        # No swizzle (Swizzle<0,0,0>), row-major order.
+        return cls(bits=0, base=0, shift=0, order=list(reversed(range(rank))))
+
+    @property
+    def maxPhase(self):
+        return 1 << self.bits
+
+    @property
+    def vectorSize(self):
+        return 1 << self.base
+
+    def __repr__(self):
+        return f"swizzled_layout(Swizzle<{self.bits},{self.base},{self.shift}>, order={self.order})"
+
+    def __eq__(self, other):
+        return (isinstance(other, swizzled_layout) and self.bits == other.bits and self.base == other.base
+                and self.shift == other.shift and self.order == other.order)
+
+    def __hash__(self):
+        return hash((self.bits, self.base, self.shift, tuple(self.order) if self.order else None))
+
+    def _to_encoding(self, shape=None):
+        """Resolve to a concrete swizzled_shared_layout_encoding for `shape`.
+
+        `shape` is required for a real swizzle (maxPhase > 1); the trivial
+        default (maxPhase == 1) is shape-independent.
+        """
+        if self.order is not None:
+            rank = len(self.order)
+        elif shape is not None:
+            rank = len(shape)
+        else:
+            raise ValueError("swizzled_layout: cannot resolve without an order or a shape")
+        order = list(self.order) if self.order is not None else list(reversed(range(rank)))
+        vec = 1 << self.base
+        maxPhase = 1 << self.bits
+        if maxPhase == 1:
+            perPhase = 1
+        else:
+            if shape is None:
+                raise ValueError("swizzled_layout: a non-trivial Swizzle requires the buffer shape; "
+                                 "pass it via tlx.local_alloc(..., layout=tlx.swizzled_layout(...))")
+            numContig = int(shape[order[0]])
+            span = 1 << (self.shift + self.base)
+            assert span % numContig == 0, (
+                f"swizzled_layout: Swizzle<{self.bits},{self.base},{self.shift}> gives perPhase < 1 "
+                f"for contiguous extent {numContig} (need shift + base >= log2(numContig))")
+            perPhase = span // numContig
+        return swizzled_shared_layout_encoding(
+            vec,
+            perPhase,
+            maxPhase,
+            order,
+            [1] * rank,
+            [1] * rank,
+            [1] * rank,
+            list(reversed(range(rank))),
+        )
+
+
 class padded_shared_layout_encoding(shared_layout_encoding):
     """Padded shared encoding with an identity offset map.
 
@@ -376,6 +471,11 @@ class layout(layout_encoding):
     **stride** (a CuTe-style thread-value layout), for
     `tlx.local_load(buf, layout=...)`.
 
+    For a swizzled shared-memory layout use :class:`swizzled_layout` (a CuTe
+    ``Swizzle<B, M, S>``) directly; ``tlx.layout(swizzled_layout(...))`` also
+    accepts one and forwards it as a shared-memory layout rather than a register
+    layout.
+
     The layout has two top-level modes — `(thread, value)`:
       - ``shape``  = ``(thread_shape, value_shape)``
       - ``stride`` = ``(thread_stride, value_stride)``
@@ -394,8 +494,28 @@ class layout(layout_encoding):
         )
     """
 
-    def __init__(self, shape, stride):
+    def __new__(cls, spec=None, *, shape=None, stride=None):
+        # ``tlx.layout(swizzled_layout(...))`` -> a swizzled shared-memory layout.
+        # shape/stride are declared here only to mirror __init__ signature;
+        # they are unused in __new__ because __new__ returns early for swizzled
+        # case and super().__new__ for register case does not need them.
+        if isinstance(spec, swizzled_layout):
+            # A trivial (non-)swizzle is shape-independent, so resolve it now to a
+            # concrete encoding. A real swizzle's perPhase depends on the buffer
+            # shape, so defer it: local_alloc resolves the atom once shape is known.
+            if spec.maxPhase == 1:
+                return spec._to_encoding()
+            return spec
+        return super().__new__(cls)
+
+    def __init__(self, spec=None, *, shape=None, stride=None):
         super().__init__()
+        # Note: shape and stride are keyword-only as of the swizzled_layout
+        # refactor to avoid ambiguity with positional swizzled_layout args.
+        # Pre-existing callers in-tree already use kwargs; positional use
+        # would be misinterpreted as spec and fail with a clear AssertionError.
+        assert shape is not None and stride is not None, \
+            "tlx.layout requires a swizzled_layout(...), or shape=/stride= for a register layout"
         assert len(shape) == 2 and len(stride) == 2, \
             "layout: shape and stride must each be (thread, value)"
         self.thread_shape, self.value_shape = shape

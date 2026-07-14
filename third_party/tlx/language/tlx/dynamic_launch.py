@@ -13,7 +13,7 @@ def _alloc_clc_responses(
     num_responses: tl.constexpr,
     _semantic=None,
 ) -> tlx.clc_response:
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
+    layout = tlx.layout(tlx.swizzled_layout.make_default(rank=1))
     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
         layout.vectorSize,
         layout.perPhase,
