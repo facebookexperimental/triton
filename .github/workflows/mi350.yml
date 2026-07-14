@@ -30,11 +30,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+      - name: Checkout TritonBench (Optional)
+        id: tritonbench_pr
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          PR_BODY_FILE="$(mktemp)"
+          printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
+          bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}" --ref-only
       - name: Checkout Tritonbench
         uses: actions/checkout@v3
         with:
           repository: meta-pytorch/tritonbench
           path: tritonbench
+          ref: ${{ steps.tritonbench_pr.outputs.ref }}
           submodules: recursive
       - name: Setup Tritonbench environment
         working-directory: tritonbench
