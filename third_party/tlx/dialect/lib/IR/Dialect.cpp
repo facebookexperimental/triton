@@ -31,12 +31,26 @@ getInferLayoutInterfaceFor(Attribute layout) {
   return dyn_cast<triton::DialectInferLayoutInterface>(&layout.getDialect());
 }
 
+// Strip all TLX layout wrappers (no-verify and user-pinned, in any nesting such
+// as #tlx.user_layout<#tlx.no_verify_layout<...>>) to reach the concrete
+// encoding, whose dialect provides the real layout-inference interface. Without
+// this a wrapped layout (a TLX-dialect attribute) would resolve its delegate
+// back to this same TLX interface and recurse forever (stack overflow).
+static Attribute unwrapTlxLayoutWrappers(Attribute layout) {
+  Attribute prev;
+  do {
+    prev = layout;
+    layout = unwrapUserLayout(unwrapNoVerifyLayout(layout));
+  } while (layout != prev);
+  return layout;
+}
+
 LogicalResult delegateInferredLayout(
     Attribute srcLayout, Attribute &resultLayout,
     function_ref<LogicalResult(const triton::DialectInferLayoutInterface *,
                                Attribute, Attribute &)>
         infer) {
-  Attribute unwrappedSrcLayout = unwrapNoVerifyLayout(srcLayout);
+  Attribute unwrappedSrcLayout = unwrapTlxLayoutWrappers(srcLayout);
   const triton::DialectInferLayoutInterface *delegate =
       getInferLayoutInterfaceFor(unwrappedSrcLayout);
   if (!delegate)
@@ -64,40 +78,48 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
+  // reduce/expand_dims produce or consume a `slice` encoding whose parent is
+  // the full-tensor encoding. Keep any TLX wrapper on the slice's *parent*
+  // (matching ReduceOp/ExpandDimsOp's own result inference) rather than
+  // wrapping the whole slice, which would produce `no_verify<slice<parent=L>>`
+  // where the IR has `slice<parent=no_verify<L>>` and fail the op verifier. So
+  // we locate the concrete dialect from the unwrapped encoding but delegate
+  // with the *wrapped* operand and do not re-wrap the result.
   LogicalResult
   inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
                         Attribute &resultEncoding,
                         std::optional<Location> loc) const override {
-    return delegateInferredLayout(
-        operandEncoding, resultEncoding,
-        [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
-            Attribute &result) {
-          return delegate->inferReduceOpEncoding(enc, axis, result, loc);
-        });
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(operandEncoding));
+    if (!delegate)
+      return failure();
+    return delegate->inferReduceOpEncoding(operandEncoding, axis,
+                                           resultEncoding, loc);
   }
 
   LogicalResult
   inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
                             Attribute &resultEncoding,
                             std::optional<Location> loc) const override {
-    return delegateInferredLayout(
-        operandEncoding, resultEncoding,
-        [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
-            Attribute &result) {
-          return delegate->inferExpandDimsOpEncoding(enc, axis, result, loc);
-        });
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(operandEncoding));
+    if (!delegate)
+      return failure();
+    return delegate->inferExpandDimsOpEncoding(operandEncoding, axis,
+                                               resultEncoding, loc);
   }
 
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,
                                    std::optional<Location> loc) const override {
-    Attribute unwrappedRetEncoding = unwrapNoVerifyLayout(retEncoding);
+    Attribute unwrappedRetEncoding = unwrapTlxLayoutWrappers(retEncoding);
     const triton::DialectInferLayoutInterface *delegate =
         getInferLayoutInterfaceFor(unwrappedRetEncoding);
     if (!delegate)
       return failure();
-    return delegate->inferDotOpEncoding(unwrapNoVerifyLayout(operandEncoding),
-                                        opIdx, unwrappedRetEncoding, loc);
+    return delegate->inferDotOpEncoding(
+        unwrapTlxLayoutWrappers(operandEncoding), opIdx, unwrappedRetEncoding,
+        loc);
   }
 
   LogicalResult
@@ -121,8 +143,8 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     if (hasNoVerifyLayout(expected) || hasNoVerifyLayout(got))
       return success();
 
-    Attribute unwrappedExpected = unwrapNoVerifyLayout(expected);
-    Attribute unwrappedGot = unwrapNoVerifyLayout(got);
+    Attribute unwrappedExpected = unwrapTlxLayoutWrappers(expected);
+    Attribute unwrappedGot = unwrapTlxLayoutWrappers(got);
     const triton::DialectInferLayoutInterface *delegate =
         getInferLayoutInterfaceFor(unwrappedExpected);
     if (!delegate)

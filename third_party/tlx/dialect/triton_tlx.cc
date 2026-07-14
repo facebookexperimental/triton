@@ -147,12 +147,13 @@ void init_triton_tlx_ir(py::module &&m) {
               // PinnedEncodingTrait so remove-layout-conversions anchors the
               // load and never rewrites it to a "preferred" layout; it is
               // unwrapped to the concrete layout after the layout passes have
-              // run. Strip any no-verify wrapper first (register encodings
-              // arrive wrapped for inlining) -- UserLayout is itself TLX-owned
-              // and skips the tensor verifier, so no nested no-verify wrapper
-              // is needed or wanted.
+              // run. Keep the inner no-verify wrapper (register encodings
+              // arrive wrapped so they defer tensor verification through
+              // inlining): resolve-placeholder-layouts strips the nested
+              // no-verify (keeping the user-layout marker) once inlining is
+              // done.
               Attribute enc = tlx::wrapUserLayout(
-                  tlx::unwrapNoVerifyLayout(layoutEncoding.value()));
+                  tlx::wrapNoVerifyLayout(layoutEncoding.value()));
               newType = RankedTensorType::get(
                   subViewType.getShape(), subViewType.getElementType(), enc);
             } else {
@@ -529,22 +530,16 @@ void init_triton_tlx_ir(py::module &&m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding must be TMEM compatible. For user-pinned case,
-            // wrap with #tlx.user_layout so generic layout passes treat it as
-            // hard anchor (same mechanism as SMEM local_load path). UserLayout
-            // itself is TLX-owned and defers verification, so strip any
-            // no-verify wrapper first to avoid nested
-            // #tlx.user_layout<#tlx.no_verify...> which would survive
-            // resolve-placeholder-layouts and cause "unresolved no-verify"
-            // errors (NoVerify is unwrapped before UserLayout in the
-            // placeholder pipeline).
-            Attribute tensorEncoding;
-            if (userLayout) {
-              tensorEncoding = tlx::wrapUserLayout(
-                  tlx::unwrapNoVerifyLayout(layoutEncoding));
-            } else {
-              tensorEncoding = tlx::wrapNoVerifyLayout(layoutEncoding);
-            }
+            // layoutEncoding must be TMEM compatible. For the user-pinned case,
+            // wrap with #tlx.user_layout so generic layout passes treat it as a
+            // hard anchor (same mechanism as the SMEM local_load path), keeping
+            // the inner no-verify wrapper for inlining. resolve-placeholder-
+            // layouts strips the nested no-verify (keeping the user-layout
+            // marker) once inlining is done.
+            Attribute tensorEncoding =
+                userLayout ? tlx::wrapUserLayout(
+                                 tlx::wrapNoVerifyLayout(layoutEncoding))
+                           : tlx::wrapNoVerifyLayout(layoutEncoding);
             auto newType = RankedTensorType::get(subViewType.getShape(),
                                                  subViewType.getElementType(),
                                                  tensorEncoding);

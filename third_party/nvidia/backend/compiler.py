@@ -699,9 +699,6 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
-        # User-pinned register layouts (#tlx.user_layout) anchored the loads through
-        # the layout-optimization passes above; retire the markers now.
-        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
         # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
@@ -820,6 +817,11 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
+        # User-pinned register layouts (#tlx.user_layout) stayed wrapped so they
+        # anchor the loads through the layout-optimization passes above, including
+        # optimize_tmem_layouts which reads the wrapper to keep the user's TMEM
+        # load layout. Retire the markers now (before the remaining conversions).
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
