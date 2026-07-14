@@ -529,16 +529,21 @@ void init_triton_tlx_ir(py::module &&m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding must be TMEM compatible
-            Attribute tensorEncoding = tlx::wrapNoVerifyLayout(layoutEncoding);
-            // If user explicitly pinned layout via tlx.local_load(...,
-            // layout=...), wrap with #tlx.user_layout so generic layout passes
-            // treat it as hard anchor (same mechanism as SMEM local_load path).
-            // UserLayout carries PinnedEncodingTrait, so OptimizeTMemLayouts,
-            // PropagateLayout, RemoveLayoutConversions and Coalesce all detect
-            // it via type encoding without needing a separate op attribute.
+            // layoutEncoding must be TMEM compatible. For user-pinned case,
+            // wrap with #tlx.user_layout so generic layout passes treat it as
+            // hard anchor (same mechanism as SMEM local_load path). UserLayout
+            // itself is TLX-owned and defers verification, so strip any
+            // no-verify wrapper first to avoid nested
+            // #tlx.user_layout<#tlx.no_verify...> which would survive
+            // resolve-placeholder-layouts and cause "unresolved no-verify"
+            // errors (NoVerify is unwrapped before UserLayout in the
+            // placeholder pipeline).
+            Attribute tensorEncoding;
             if (userLayout) {
-              tensorEncoding = tlx::wrapUserLayout(tensorEncoding);
+              tensorEncoding = tlx::wrapUserLayout(
+                  tlx::unwrapNoVerifyLayout(layoutEncoding));
+            } else {
+              tensorEncoding = tlx::wrapNoVerifyLayout(layoutEncoding);
             }
             auto newType = RankedTensorType::get(subViewType.getShape(),
                                                  subViewType.getElementType(),
