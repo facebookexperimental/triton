@@ -35,6 +35,20 @@ def is_gfx950() -> bool:
         return False
 
 
+def flex_choices_hook_available() -> bool:
+    """True if torch exposes the flex-attention choices hook the template needs.
+
+    Absent on the current ROCm nightly, so the flex-attention Inductor tests skip
+    there (the template can only be exercised end-to-end on a newer torch).
+    """
+    try:
+        from torch._inductor.choices import InductorChoices
+
+        return hasattr(InductorChoices, "append_flex_attention_choices")
+    except Exception:
+        return False
+
+
 torch.set_float32_matmul_precision("high")
 
 # Shapes for template testing - representative shapes from gemm_rule categories
@@ -682,6 +696,127 @@ HEURISTIC_CODEGEN_CASES = [
         True,
     ),
 ]
+
+
+@instantiate_parametrized_tests
+class TestFlexAttention(TestCase):
+    """AMD (gfx950/MI350) FlexAttention Inductor template.
+
+    Exercises torch.compile(flex_attention) under tlx_mode and asserts the
+    tlx_amd_flex_attention template is selected and numerically correct across
+    score_mod / mask_mod / logsumexp. Gated on the torch flex-choices hook, which
+    the current ROCm nightly lacks, so these skip there and are validated on a
+    newer torch (e.g. fbsource).
+    """
+
+    def _qkv(self, B, H, N, D, dtype):
+        torch.manual_seed(0)
+        return [torch.randn(B, H, N, D, device=GPU_TYPE, dtype=dtype) for _ in range(3)]
+
+    def _run(self, fn, q, k, v):
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+        }):
+            out, code = run_and_get_code(torch.compile(fn), q, k, v)
+        return out, "\n".join(code)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices (old ROCm nightly)",
+    )
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_flex_none(self, dtype):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        B, H, N, D = 1, 2, 256, 64
+        sm = 1.0 / (D**0.5)
+        q, k, v = self._qkv(B, H, N, D, dtype)
+        out, code = self._run(lambda q, k, v: flex_attention(q, k, v, scale=sm), q, k, v)
+        ref = flex_attention(q, k, v, scale=sm)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_amd_flex_attention", code)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices (old ROCm nightly)",
+    )
+    def test_flex_causal(self):
+        from torch.nn.attention.flex_attention import (
+            create_block_mask,
+            flex_attention,
+        )
+
+        B, H, N, D = 1, 2, 256, 64
+        sm = 1.0 / (D**0.5)
+        q, k, v = self._qkv(B, H, N, D, torch.float16)
+        bm = create_block_mask(lambda b, h, m, n: m >= n, B, H, N, N, device=GPU_TYPE)
+        out, code = self._run(lambda q, k, v: flex_attention(q, k, v, block_mask=bm, scale=sm), q, k, v)
+        ref = flex_attention(q, k, v, block_mask=bm, scale=sm)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_amd_flex_attention", code)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices (old ROCm nightly)",
+    )
+    def test_flex_score_mod(self):
+        from torch.nn.attention.flex_attention import flex_attention
+
+        B, H, N, D = 1, 2, 256, 64
+        sm = 1.0 / (D**0.5)
+        slope = 0.1
+        q, k, v = self._qkv(B, H, N, D, torch.float16)
+        score_mod = lambda s, b, h, m, n: s - slope * (m - n)  # noqa: E731
+        out, code = self._run(
+            lambda q, k, v: flex_attention(q, k, v, score_mod=score_mod, scale=sm),
+            q,
+            k,
+            v,
+        )
+        ref = flex_attention(q, k, v, score_mod=score_mod, scale=sm)
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+        self.assertIn("tlx_amd_flex_attention", code)
+
+    @unittest.skipIf(not is_gfx950(), "Need AMD MI350X (gfx950)")
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @unittest.skipIf(
+        not flex_choices_hook_available(),
+        "torch lacks append_flex_attention_choices (old ROCm nightly)",
+    )
+    def test_flex_logsumexp(self):
+        from torch.nn.attention.flex_attention import (
+            create_block_mask,
+            flex_attention,
+        )
+
+        B, H, N, D = 1, 2, 256, 64
+        sm = 1.0 / (D**0.5)
+        q, k, v = self._qkv(B, H, N, D, torch.float16)
+        bm = create_block_mask(lambda b, h, m, n: m >= n, B, H, N, N, device=GPU_TYPE)
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+        }):
+            (out, lse), code = run_and_get_code(
+                torch.compile(lambda q, k, v: flex_attention(q, k, v, block_mask=bm, scale=sm, return_lse=True)),
+                q,
+                k,
+                v,
+            )
+        ref_o, ref_lse = flex_attention(q, k, v, block_mask=bm, scale=sm, return_lse=True)
+        torch.testing.assert_close(out, ref_o, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(lse, ref_lse, atol=3e-2, rtol=3e-2)
+        self.assertIn("tlx_amd_flex_attention", "\n".join(code))
+
 
 if __name__ == "__main__":
     run_tests()
