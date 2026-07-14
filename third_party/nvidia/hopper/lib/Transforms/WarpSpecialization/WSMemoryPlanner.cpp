@@ -1430,10 +1430,27 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
 /// Phase 4.5: Iterative copy increase for fused groups eligible for epilogue-
 /// style budget bumping. Inner-loop TMA staging is tried first (highest pay-
 /// off per slot), then outer-loop TMA staging, then regular P4_Other groups.
+// Optional cap on the fused TMA-staging pipeline depth, exposing staging copies
+// as a search/autotune axis. TRITON_WS_STAGING_COPIES=K bounds Phase 4.5's bump
+// target to min(numBuffers, K); the K|S divisibility and budget checks still
+// apply, so a harness sweeping K over {1,2,4,...} explores only legal staging
+// depths (the copy actually applied is the largest K|S-valid depth <= this cap
+// that fits). 0/unset = no cap (current max-depth behavior).
+static unsigned getStagingCopiesCap() {
+  auto v = triton::tools::getStrEnv("TRITON_WS_STAGING_COPIES");
+  if (v.empty())
+    return 0;
+  int n = std::atoi(v.c_str());
+  return n < 1 ? 0u : static_cast<unsigned>(n);
+}
+
 static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
                                         SmallVector<Channel *> &channels,
                                         unsigned numBuffers,
                                         unsigned smemBudget) {
+  // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
+  if (unsigned cap = getStagingCopiesCap())
+    numBuffers = std::min(numBuffers, cap);
   // Eligible priority tiers, in the order Phase 4.5 should try to bump them.
   static const WSBufferPriority kPhase45Order[] = {
       WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot

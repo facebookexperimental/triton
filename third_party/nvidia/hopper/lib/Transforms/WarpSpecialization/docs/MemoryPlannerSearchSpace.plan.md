@@ -45,11 +45,31 @@ search engages on GEMM. Getting here surfaced and fixed two real bugs the suite
 caught: a TMEM reuse hang (missing data-dependency) and an SMEM reuse-grouping
 corruption (now disabled).
 
+Staging copies (search axis): `TRITON_WS_STAGING_COPIES=K` caps the fused
+TMA-staging pipeline depth (`increaseFusedEpilogueCopies`) to `min(numBuffers, K)`
+— K|S divisibility, cross-stage floor, and budget all still enforced, so a
+harness sweeping K explores only legal staging depths via the proven path.
+Staging copies exist only for subtiled staging (S>1); S=1 is fixed at K=1.
+Validated: sweeping K on a subtiled addmm case gives depths {floor, 2, 3}, all
+pass. (This is a heuristic-path knob; the beam itself still defers multi-store
+staging — reimplementing fusion + K|S in the beam is deliberately avoided.)
+
 Remaining (perf / coverage, not correctness):
 - **Safe SMEM reuse grouping** — the true rotating-entry condition (not just
   encoding + scope), to reclaim the reuse the heuristic gets under
-  `smem-circular-reuse`. Currently disabled.
-- Multi-store (subtiled) staging: model `entries` (K|S) to lift its fallback.
+  `smem-circular-reuse`. Currently disabled. (Studied: the safe condition is
+  exactly-2 same-priority innermost buffers with `copy = 2·N−1`; reimplementing
+  in the beam is low-value since the heuristic already does it.)
+- **Staging reuse** (spatial aliasing, Phase 3.6 `findReuseCandidate` /
+  `mergeStagingReuseIntoHost` — a non-innermost buffer aliases another's bytes).
+  **Attempted and reverted**: a `TRITON_WS_STAGING_REUSE` knob to run Phase 3.6
+  *proactively* (not only under budget pressure) regressed FA (4/4 fa_dp) and an
+  addmm case. The reuse's liveness-disjointness is *approximate*
+  (partition-unaware, last-consumer-order based); the `baseTotal > smemBudget`
+  trigger is **load-bearing** for its safety envelope, so forcing it broadly
+  aliases buffers that aren't actually disjoint → wrong results. Making staging
+  reuse a *legal* search axis needs a partition-aware liveness/disjointness
+  check (a real project), not just exposing the existing trigger.
 - Accumulator per-outer-tile TMEM multi-copy (currently pinned to 1).
 - Model scaled-MMA scale columns for TMEM.
 - Autotune-native `tt.mem_plan_pick` constexpr (like `tt.list_schedule_pick`) so
