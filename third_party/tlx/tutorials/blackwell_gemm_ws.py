@@ -923,14 +923,17 @@ def _process_tile_mma_inner(
 
         smem_accum_cnt += 1
 
-    # Wait for last MMA to complete and signal epilogue for all subtiles
-    last_buf, last_phase = get_bufidx_phase(smem_accum_cnt - 1, NUM_SMEM_BUFFERS)
+    # Signal the epilogue when the MMAs complete via an async tcgen05 commit,
+    # instead of blocking on the last MMA's A_smem_empty and then arriving on
+    # tmem_full. The commit makes tmem_full track completion of the prior
+    # tcgen05 MMAs asynchronously, so the MMA warpgroup can return and start
+    # the next tile's MMAs while this tile's final MMAs still drain -- closing
+    # the per-tile pipeline bubble between consecutive K-loops. In 2-CTA mode
+    # the commit multicasts the mbarrier signal to both CTAs' tmem_full (one
+    # arrive each), matching the previous local + remote_cta_rank arrives.
     for group_id in tl.static_range(NUM_MMA_GROUPS):
-        a_buf = group_id * NUM_SMEM_BUFFERS + last_buf
-        tlx.barrier_wait(A_smem_empty_bars[a_buf], last_phase)
         acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
-        # Done filling this buffer, signal epilogue consumer
-        tlx.barrier_arrive(tmem_full_bars[acc_buf], 1)
+        tlx.tcgen05_commit(tmem_full_bars[acc_buf], two_ctas=NUM_CTAS == 2)
 
     return smem_accum_cnt
 
@@ -1174,13 +1177,12 @@ def matmul_kernel_tma_ws_blackwell(
     A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
     if USE_WARP_BARRIER:
-        tmem_full_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=1)
         tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
                                                  num_arrivals=EPILOGUE_SUBTILE)
     else:
-        tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
         tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
                                              arrive_count=EPILOGUE_SUBTILE)
 
