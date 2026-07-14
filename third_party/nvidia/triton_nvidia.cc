@@ -189,6 +189,14 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUInterleaveTMemPass);
   ADD_PASS_WRAPPER_0("add_prune_unused_barriers",
                      ttng::createTritonNvidiaGPUPruneUnusedBarriersPass);
+  ADD_PASS_WRAPPER_0("add_warn_tmem_alias_war",
+                     ttng::createTritonNvidiaGPUWarnTMemAliasWARPass);
+  m.def("get_tmem_alias_war_warnings", [](mlir::ModuleOp mod) {
+    py::list result;
+    for (const auto &w : ttng::collectTMemAliasWARWarnings(mod))
+      result.append(py::str(w));
+    return result;
+  });
   ADD_PASS_WRAPPER_0("add_clc_split", ttng::createTritonNvidiaGPUCLCSplitPass);
   ADD_PASS_WRAPPER_0("add_clc_hoist", ttng::createTritonNvidiaGPUCLCHoistPass);
   ADD_PASS_WRAPPER_0("add_clc_materialize",

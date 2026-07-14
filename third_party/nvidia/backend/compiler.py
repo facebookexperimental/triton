@@ -851,6 +851,10 @@ class CUDABackend(BaseBackend):
         tlx.tlx_passes.add_tlx_dump_layout(pm)
 
         pm.run(mod, "make_ttgir")
+        # Surface intra-task aliased-TMEM write-after-read warnings
+        # (CudaWarnings-style: static analysis on the final TTGIR).
+        for _msg in nvidia.passes.ttnvgpuir.get_tmem_alias_war_warnings(mod):
+            warnings.warn(_msg, stacklevel=2)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
