@@ -25,9 +25,22 @@ Landed (all files under `WarpSpecialization/`, gated by `--smem-plan-search` /
 - Falls back to the heuristic for pins, subtiled regions, TMA-staging (SMEM), and
   scaled MMA (TMEM) — see §8.
 
+Top-K search space (mirrors the list/modulo schedulers):
+- `TRITON_WS_MEM_PLAN_TOPK=K` generate K ranked plans; `TRITON_WS_MEM_PLAN_PICK=i`
+  apply rank i (0 = cost-best, clamped per pool); `TRITON_WS_MEM_PLAN_TOPK_DUMP`
+  dumps each plan as JSON. A harness sweeps PICK over 0..K-1 and times each (the
+  cost model only ranks). Validated: PICK 0..3 with TOPK=4 all legal + pass.
+
+Coverage note (honest): the search only runs where nothing forces a fallback.
+Many kernels fall back — e.g. GEMM's TMA-store staging sends SMEM to the
+heuristic (only TMEM searches), and persistent/subtiled FA cases fall back on
+both pools. Lifting these is the coverage work below.
+
 Remaining (perf / coverage, not correctness): refine `entries`/`freq` to lift
 the SMEM staging fallback; accumulator per-outer-tile TMEM multi-copy (currently
-pinned to 1 under search); model scaled-MMA scale columns for TMEM.
+pinned to 1 under search); model scaled-MMA scale columns for TMEM; an
+autotune-native `tt.mem_plan_pick` constexpr (like `tt.list_schedule_pick`) so
+the Triton autotuner can sweep PICK without env vars.
 **Covers (future)**: `WSMemoryPlanner.cpp`, new `WSMemoryPlanSearch.{h,cpp}`
 **Related docs**: [SmemAllocationDesign.md](SmemAllocationDesign.md),
 [TMEMAllocationHeuristics.md](TMEMAllocationHeuristics.md),
