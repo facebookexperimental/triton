@@ -2808,6 +2808,28 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   Operation *lastConsumer = nullptr;
   unsigned numChannelsCreated = 0;
 
+  // True if `o` is an MMAv5 whose operand D is this accumulator and whose
+  // use_accumulator is (traceably) constant-false -- i.e. a fresh whole-tile
+  // overwrite. Mirrors the currentProds-seed logic below.
+  auto isFreshOverwriteMMA = [&](Operation *o) -> bool {
+    auto mma = dyn_cast<ttng::MMAv5OpInterface>(o);
+    if (!mma || mma.getAccumulator() != tmemAllocOp.getResult())
+      return false;
+    Value uf = mma.useAccumulator();
+    if (!uf)
+      return false;
+    if (auto ba = dyn_cast<BlockArgument>(uf))
+      if (ba.getOwner() == forOp.getBody() && ba.getArgNumber() > 0)
+        uf = forOp.getInitArgs()[ba.getArgNumber() - 1];
+    if (auto c = uf.getDefiningOp<arith::ConstantOp>()) {
+      if (auto b = dyn_cast<BoolAttr>(c.getValue()))
+        return !b.getValue();
+      if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+        return i.getInt() == 0;
+    }
+    return false;
+  };
+
   // Detect the operand-D channel-loop pattern: an in-body TMEMLoadOp on this
   // alloc that appears (in program order) BEFORE any in-body TMEMStoreOp /
   // mmaOp. In that case the in-body load reads the previous iteration's MMA
@@ -3004,8 +3026,32 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
             firstProducer = currentProds.front();
           lastConsumer = &op;
           numChannelsCreated++;
-          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
-                                     tmemAllocOp.getOperation(), &op, channels);
+          // Chained accumulator (T279388065): several same-task MMA writers into
+          // one operand-D tile, the first use_acc=false (fresh overwrite),
+          // consumed in-loop by this tmem_load. Emit ONE forward channel from the
+          // LAST writer (full commit from the last MMA, like TLX dq_fulls on n1)
+          // and place the reuse/empty producer_acquire before the FIRST writer
+          // via acquireBeforeOp (like TLX's single dq_empties acquire before n0),
+          // instead of one full/empty pair per writer -- the per-writer shape
+          // fails to serialize the fresh overwrite against the consumer's read.
+          if (currentProds.size() > 1 &&
+              isFreshOverwriteMMA(currentProds.front()) &&
+              isa<ttng::MMAv5OpInterface>(currentProds.back())) {
+            auto channelID = channels.size();
+            channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+                producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+                /*isOperandD=*/true, /*isOperandDNoAcc=*/false, channelID));
+            auto *tmemCh =
+                static_cast<ttng::TmemDataChannelPost *>(channels.back().get());
+            tmemCh->acquireBeforeOp = currentProds.front();
+            channels.back()->srcName =
+                getOutermostNameFromLoc(tmemAllocOp->getLoc());
+            setTmemChannelAttr(currentProds.back(), channelID, "tmem.start");
+            setTmemChannelAttr(&op, channelID, "tmem.end");
+          } else {
+            createChannelsForProducers(currentProds, producerTaskId, consumerIds,
+                                       tmemAllocOp.getOperation(), &op, channels);
+          }
         } else {
           // Channel skipped - append to producers vector
           currentProds.push_back(&op);

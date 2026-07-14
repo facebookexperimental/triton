@@ -3331,6 +3331,17 @@ void insertAsyncComm(
       if (bwdCh)
         producerAcquireForChannelLoop = bwdCh->getDstOp();
     }
+    // Collapsed chained-accumulator channel (T279388065): the forward commit is
+    // on the LAST writer (headProducer), but the reuse/empty producer_acquire
+    // must precede the FIRST (fresh-overwrite) writer so the whole chain waits
+    // for the consumer's read of the previous iteration. Honor acquireBeforeOp.
+    if (!producerAcquireForChannelLoop &&
+        masterChannel->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+      if (tmemCh->acquireBeforeOp &&
+          tmemCh->acquireBeforeOp->getBlock() == headProducer->getBlock())
+        producerAcquireForChannelLoop = tmemCh->acquireBeforeOp;
+    }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
 
     // 2-buffer reuse group handling: determine if producer_acquire needs to
