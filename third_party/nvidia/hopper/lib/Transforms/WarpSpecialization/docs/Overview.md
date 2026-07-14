@@ -127,6 +127,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Operand D Handling](OperandDHandling.md) — MMA accumulator lifecycle through WS
 - [TMEM Allocation Heuristics](TMEMAllocationHeuristics.md) — TMEM memory planning algorithms
 - [SMEM Allocation Design](SmemAllocationDesign.md) — SMEM budget-aware allocation
+- [Memory Planner Search Space](MemoryPlannerSearchSpace.plan.md) — *(proposal)* plan-space beam search over legal/feasible allocations
 - [Barrier Fusion](BarrierFusion.md) — TMA fusion, tcgen05_commit combining
 - [Barrier Constraints](BarrierConstraints.md) — generic barrier constraints and WSBarrier reordering metadata
 - [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs
