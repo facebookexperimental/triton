@@ -2,6 +2,7 @@
 #include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -141,6 +142,17 @@ static void computeDesiredEncodingAttr(mlir::ModuleOp &m) {
 static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
   llvm::DenseMap<Value, Attribute> descToEncoding;
 
+  auto mergeEncoding = [&](Operation *op, Value desc,
+                           Attribute encoding) -> LogicalResult {
+    auto [it, inserted] = descToEncoding.try_emplace(desc, encoding);
+    if (!inserted && it->second != encoding) {
+      op->emitError() << "TDM ops using the same descriptor require "
+                         "conflicting memdesc layouts";
+      return failure();
+    }
+    return success();
+  };
+
   auto record = [&](Operation *op, Value desc,
                     Attribute encoding) -> WalkResult {
     SmallVector<Value> descChain;
@@ -154,12 +166,8 @@ static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
     }
 
     for (Value chainedDesc : descChain) {
-      auto [it, inserted] = descToEncoding.try_emplace(chainedDesc, encoding);
-      if (!inserted && it->second != encoding) {
-        op->emitError() << "TDM ops using the same descriptor require "
-                           "conflicting memdesc layouts";
+      if (failed(mergeEncoding(op, chainedDesc, encoding)))
         return WalkResult::interrupt();
-      }
     }
     return WalkResult::advance();
   };
@@ -189,6 +197,96 @@ static LogicalResult alignTDMDescriptorEncodings(mlir::ModuleOp &m) {
   });
   if (result.wasInterrupted())
     return failure();
+
+  auto collectRegionBranchSuccessors =
+      [](RegionBranchOpInterface branchOp,
+         SmallVectorImpl<RegionSuccessor> &successors) {
+        auto appendUniqueSuccessors =
+            [&](ArrayRef<RegionSuccessor> newSuccessors) {
+              for (RegionSuccessor successor : newSuccessors) {
+                if (!llvm::is_contained(successors, successor))
+                  successors.push_back(successor);
+              }
+            };
+
+        SmallVector<RegionSuccessor> newSuccessors;
+        branchOp.getSuccessorRegions(RegionBranchPoint::parent(),
+                                     newSuccessors);
+        appendUniqueSuccessors(newSuccessors);
+        for (Region &region : branchOp->getRegions()) {
+          newSuccessors.clear();
+          branchOp.getSuccessorRegions(region, newSuccessors);
+          appendUniqueSuccessors(newSuccessors);
+        }
+      };
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    result = m.walk([&](RegionBranchOpInterface branchOp) -> WalkResult {
+      SmallVector<RegionSuccessor> successors;
+      collectRegionBranchSuccessors(branchOp, successors);
+
+      for (RegionSuccessor successor : successors) {
+        ValueRange successorInputs = branchOp.getSuccessorInputs(successor);
+        for (auto [index, successorInput] : llvm::enumerate(successorInputs)) {
+          if (!isa<tt::TensorDescType>(successorInput.getType()))
+            continue;
+
+          SmallVector<Value> values;
+          values.push_back(successorInput);
+          branchOp.getPredecessorValues(successor, index, values);
+
+          Attribute consensusEncoding;
+          for (Value value : values) {
+            if (!isa<tt::TensorDescType>(value.getType()))
+              continue;
+
+            auto it = descToEncoding.find(value);
+            if (it == descToEncoding.end())
+              continue;
+
+            if (!consensusEncoding) {
+              consensusEncoding = it->second;
+              continue;
+            }
+
+            if (consensusEncoding != it->second) {
+              branchOp->emitError()
+                  << "TDM descriptor region branch carrier requires "
+                     "conflicting memdesc layouts";
+              return WalkResult::interrupt();
+            }
+          }
+
+          if (!consensusEncoding)
+            continue;
+
+          for (Value value : values) {
+            if (!isa<tt::TensorDescType>(value.getType()))
+              continue;
+
+            auto [it, inserted] =
+                descToEncoding.try_emplace(value, consensusEncoding);
+            if (inserted) {
+              changed = true;
+              continue;
+            }
+
+            if (it->second != consensusEncoding) {
+              branchOp->emitError()
+                  << "TDM descriptor region branch carrier requires "
+                     "conflicting memdesc layouts";
+              return WalkResult::interrupt();
+            }
+          }
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+      return failure();
+  }
 
   for (auto [desc, encoding] : descToEncoding) {
     auto descTy = cast<tt::TensorDescType>(desc.getType());
