@@ -1,7 +1,6 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
 # pyre-unsafe
-
 """
 Cross-attention kernels with optional TMA (Tensor Memory Accelerator) support.
 
@@ -64,6 +63,7 @@ HAS_TENSOR_DESCRIPTOR = hasattr(tl, "make_tensor_descriptor")
 # triton.Config kwarg. Supports .get(key) like a dict but is hashable for Triton's
 # JIT cache key. Mirrors the pattern in fused_attention_ws_device_tma.py.
 class FrozenDotAttrs:
+
     def __init__(self, d):
         import json as _json
 
@@ -95,16 +95,14 @@ class FrozenDotAttrs:
 #
 # DEFAULT: the schedule this kernel shipped with (FA-derived; dq^T on its own
 # single-copy TMEM buffer id 11, dP on id 5).
-_HSTU_BWD_DOT_ATTRS_DEFAULT = FrozenDotAttrs(
-    {
-        "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
-        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
-        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
-        "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
-        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
-        "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
-    }
-)
+_HSTU_BWD_DOT_ATTRS_DEFAULT = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
+})
 
 # TLX-aligned: mirror the hand-written TLX kernel (attn_bwd_ws) TMEM buffer scheme.
 # TLX reuses the dP tile in dq's TMEM slot (`dp_tiles reuse=dq_tiles`): dP is fully
@@ -113,16 +111,14 @@ _HSTU_BWD_DOT_ATTRS_DEFAULT = FrozenDotAttrs(
 # (the larger 128x64 tile, which subsumes dP's 64x64) instead of a separate id 5.
 # Stages/order match DEFAULT (== TLX: qkT/dpT/dv "current", dq/dk one iteration
 # behind). Everything single-copy, as in TLX (NUM_BUFFERS_TMEM=1).
-_HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs(
-    {
-        "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
-        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
-        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,11"]},
-        "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
-        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
-        "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
-    }
-)
+_HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,11"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
+})
 
 # for SHARED_KV + DP and _HSTU_COMPUTE_FOLD
 # --> we can do dk += dot(...) dk += dot(...)
@@ -132,17 +128,14 @@ _HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs(
 # over KV blocks -- like the hand-written attn_bwd_ws_2kv), then ONE store. So
 # dpT must NOT time-share id 11 with dq (as the single-KV _TLX schedule does); it
 # gets its own tile (id 5). Everything else (qkT/S+P id 2, dv/dk id 7) is b0's.
-_HSTU_BWD_DOT_ATTRS_2KV = FrozenDotAttrs(
-    {
-        "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
-        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
-        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
-        "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
-        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
-        "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
-    }
-)
-
+_HSTU_BWD_DOT_ATTRS_2KV = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
+})
 
 # Triton's @jit frontend accepts `attrs=` only as a dict literal or a bare
 # module-global name bound to a dict -- it rejects passing a FrozenDotAttrs (or
@@ -190,20 +183,18 @@ _HSTU_ATTRS_DQ_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dq"))
 #     (576 -> 512). The planner packs dp1 at colOffset 0 in dp0's tile and
 #     inserts the reuse WAR barrier that serializes dp0-consume -> dp1-write.
 #     (qk stays split/depth-2 for overlap, as in TLX.)
-_HSTU_BWD_DOT_ATTRS_2KV_B1 = FrozenDotAttrs(
-    {
-        "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,12"]},
-        "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,12", "opndD,tmem,1,17"]},
-        # dpT opndD id 5 is SHARED with b0 (dp0/dp1 reuse one TMEM tile, TLX-style)
-        # so BLOCK_N=128 fits TMEM; see the module comment above.
-        "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
-        "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,20"]},
-        "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,17"]},
-        # dq opndD id 11 is SHARED with b0 (single dq accumulator over both KV
-        # blocks); only its input operand (opndB smem) is b1's own (id 9).
-        "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,9", "opndD,tmem,1,11"]},
-    }
-)
+_HSTU_BWD_DOT_ATTRS_2KV_B1 = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,12"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,12", "opndD,tmem,1,17"]},
+    # dpT opndD id 5 is SHARED with b0 (dp0/dp1 reuse one TMEM tile, TLX-style)
+    # so BLOCK_N=128 fits TMEM; see the module comment above.
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,20"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,17"]},
+    # dq opndD id 11 is SHARED with b0 (single dq accumulator over both KV
+    # blocks); only its input operand (opndB smem) is b1's own (id 9).
+    "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,9", "opndD,tmem,1,11"]},
+})
 _HSTU_ATTRS_QKT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("qkT"))
 _HSTU_ATTRS_DV_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dv"))
 _HSTU_ATTRS_DPT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dpT"))
@@ -221,9 +212,7 @@ _HSTU_COMPUTE_FOLD = tl.constexpr(os.environ.get("HSTU_COMPUTE_FOLD", "0") == "1
 # NOT emit the user tt.autows annotations on the MMAs: they pin the schedule and
 # make the modulo pass skip the loop (hasExistingAnnotation), turning the picked
 # variant into a no-op. Dropping them lets the modulo scheduler own the schedule.
-_HSTU_MODULO_TOPK = tl.constexpr(
-    int(os.environ.get("TRITON_MODULO_TOPK", "1")) > 1
-)
+_HSTU_MODULO_TOPK = tl.constexpr(int(os.environ.get("TRITON_MODULO_TOPK", "1")) > 1)
 
 
 def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
@@ -239,8 +228,6 @@ def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
     _HSTU_ATTRS_DK = tl.constexpr(cfg.get("dk"))
     _HSTU_ATTRS_DK_SHARED = tl.constexpr(cfg.get("dk_shared"))
     _HSTU_ATTRS_DQ = tl.constexpr(cfg.get("dq"))
-
-
 
 
 class FwdVariant(Enum):
@@ -338,8 +325,6 @@ def _compute_offsets(
     )
 
 
-
-
 def get_fwd_triton_configs() -> List[triton.Config]:
     configs = [
         triton.Config(
@@ -366,9 +351,7 @@ def get_fwd_triton_configs() -> List[triton.Config]:
 
 
 @triton.jit
-def forward_valid_mask_trans(
-    offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL: tl.constexpr
-):
+def forward_valid_mask_trans(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL: tl.constexpr):
     valid_mask = (offs_m[None, :] < seq_len_q) & (offs_n[:, None] < seq_len_kv)
     if HAS_CAUSAL:
         offs_m = offs_m + seq_len_kv - uih_len_q
@@ -449,20 +432,15 @@ def _attn_fwd_compute(
     # Main loop - no masking needed for non-last kv blocks
     for start_n in tl.range(0, last_block_start_n, BLOCK_N):
         if ENABLE_TMA:
-            k = desc_k.load(
-                [
-                    (seq_start_kv + start_n).to(tl.int32),
-                    off_h_kv * stride_kh,
-                ]
-            )
+            k = desc_k.load([
+                (seq_start_kv + start_n).to(tl.int32),
+                off_h_kv * stride_kh,
+            ])
         else:
             offs_n_load = start_n + tl.arange(0, BLOCK_N)
             offs_qk_d = tl.arange(0, HEAD_DIM)
-            k_ptrs = (
-                K
-                + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_kn
-                + (off_h_kv * stride_kh + offs_qk_d)[None, :]
-            )
+            k_ptrs = (K + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_kn +
+                      (off_h_kv * stride_kh + offs_qk_d)[None, :])
             k = tl.load(k_ptrs)
 
         if TRANS:
@@ -472,13 +450,9 @@ def _attn_fwd_compute(
         if HAS_CAUSAL:
             offs_n = offs_n_0 + start_n
             if TRANS:
-                causal_mask = (offs_m[None, :] + seq_len_kv - uih_len_q) >= offs_n[
-                    :, None
-                ]
+                causal_mask = (offs_m[None, :] + seq_len_kv - uih_len_q) >= offs_n[:, None]
             else:
-                causal_mask = (offs_m[:, None] + seq_len_kv - uih_len_q) >= offs_n[
-                    None, :
-                ]
+                causal_mask = (offs_m[:, None] + seq_len_kv - uih_len_q) >= offs_n[None, :]
             if IS_SOFTMAX:
                 qk = tl.where(causal_mask, qk, float("-inf"))
             else:
@@ -508,20 +482,15 @@ def _attn_fwd_compute(
             v = k
         else:
             if ENABLE_TMA:
-                v = desc_v.load(
-                    [
-                        (seq_start_kv + start_n).to(tl.int32),
-                        off_h_kv * stride_vh,
-                    ]
-                )
+                v = desc_v.load([
+                    (seq_start_kv + start_n).to(tl.int32),
+                    off_h_kv * stride_vh,
+                ])
             else:
                 offs_n_load = start_n + tl.arange(0, BLOCK_N)
                 offs_v_d = tl.arange(0, BLOCK_D_V)
-                v_ptrs = (
-                    V
-                    + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_vn
-                    + (off_h_kv * stride_vh + offs_v_d)[None, :]
-                )
+                v_ptrs = (V + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_vn +
+                          (off_h_kv * stride_vh + offs_v_d)[None, :])
                 v = tl.load(v_ptrs)
         act_qk = act_qk.to(v.dtype)
         if TRANS:
@@ -533,20 +502,15 @@ def _attn_fwd_compute(
     # q masking is not needed here because we mask when storing results.
     start_n = last_block_start_n
     if ENABLE_TMA:
-        k = desc_k.load(
-            [
-                (seq_start_kv + start_n).to(tl.int32),
-                off_h_kv * stride_kh,
-            ]
-        )
+        k = desc_k.load([
+            (seq_start_kv + start_n).to(tl.int32),
+            off_h_kv * stride_kh,
+        ])
     else:
         offs_n_load = start_n + tl.arange(0, BLOCK_N)
         offs_qk_d = tl.arange(0, HEAD_DIM)
-        k_ptrs = (
-            K
-            + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_kn
-            + (off_h_kv * stride_kh + offs_qk_d)[None, :]
-        )
+        k_ptrs = (K + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_kn +
+                  (off_h_kv * stride_kh + offs_qk_d)[None, :])
         k = tl.load(
             k_ptrs,
             mask=(offs_n_load < seq_len_kv)[:, None],
@@ -578,13 +542,9 @@ def _attn_fwd_compute(
         )
     if IS_SOFTMAX:
         if TRANS:
-            act_qk, acc, l_i, m_i = forward_softmax_activation_trans_scaled_alpha(
-                qk, alpha, valid_mask, m_i, acc, l_i
-            )
+            act_qk, acc, l_i, m_i = forward_softmax_activation_trans_scaled_alpha(qk, alpha, valid_mask, m_i, acc, l_i)
         else:
-            act_qk, acc, l_i, m_i = forward_softmax_activation_scaled_alpha(
-                qk, alpha, valid_mask, m_i, acc, l_i
-            )
+            act_qk, acc, l_i, m_i = forward_softmax_activation_scaled_alpha(qk, alpha, valid_mask, m_i, acc, l_i)
     else:
         masked_alpha = tl.where(valid_mask, alpha, 0.0)
         qk = qk * masked_alpha
@@ -593,20 +553,15 @@ def _attn_fwd_compute(
         v = k
     else:
         if ENABLE_TMA:
-            v = desc_v.load(
-                [
-                    (seq_start_kv + start_n).to(tl.int32),
-                    off_h_kv * stride_vh,
-                ]
-            )
+            v = desc_v.load([
+                (seq_start_kv + start_n).to(tl.int32),
+                off_h_kv * stride_vh,
+            ])
         else:
             offs_n_load = start_n + tl.arange(0, BLOCK_N)
             offs_v_d = tl.arange(0, BLOCK_D_V)
-            v_ptrs = (
-                V
-                + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_vn
-                + (off_h_kv * stride_vh + offs_v_d)[None, :]
-            )
+            v_ptrs = (V + (seq_start_kv + offs_n_load).to(tl.int64)[:, None] * stride_vn +
+                      (off_h_kv * stride_vh + offs_v_d)[None, :])
             v = tl.load(
                 v_ptrs,
                 mask=(offs_n_load < seq_len_kv)[:, None],
@@ -707,12 +662,8 @@ def _attn_fwd_triton_inner(
             q = desc_q.load([qo_offset_y_split.to(tl.int32), off_h * stride_qh])
         else:
             offs_qk_d = tl.arange(0, HEAD_DIM)
-            q_ptrs = (
-                Q
-                + (qo_offset_y_split + tl.arange(0, BLOCK_M)).to(tl.int64)[:, None]
-                * stride_qm
-                + (off_h * stride_qh + offs_qk_d)[None, :]
-            )
+            q_ptrs = (Q + (qo_offset_y_split + tl.arange(0, BLOCK_M)).to(tl.int64)[:, None] * stride_qm +
+                      (off_h * stride_qh + offs_qk_d)[None, :])
             q = tl.load(
                 q_ptrs,
                 mask=(offs_m < seq_len_q)[:, None],
@@ -946,9 +897,7 @@ def _attn_fwd_triton(
         seq_start_q,
         seq_len_q,
         off_z,
-    ) = _compute_offsets(
-        H, G, BLOCK_M, seq_offsets_q, seq_offsets, max_seq_len, TRUNCATE_METHOD
-    )
+    ) = _compute_offsets(H, G, BLOCK_M, seq_offsets_q, seq_offsets, max_seq_len, TRUNCATE_METHOD)
     if HAS_CAUSAL:
         n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
         uih_len_q = uih_common_preprocess(n_targets, seq_len_q, HAS_NUM_TARGETS)
@@ -1001,8 +950,6 @@ def _attn_fwd_triton(
     )
 
 
-
-
 def get_fwd_triton_spec_configs() -> List[triton.Config]:
     if torch.version.hip:
         configs = []
@@ -1030,8 +977,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                                         },
                                         num_stages=num_stages,
                                         num_warps=num_warps,
-                                    )
-                                )
+                                    ))
         return configs
     if get_full_autotune():
         configs = [
@@ -1355,9 +1301,7 @@ def _attn_fwd_triton_spec(
         seq_start_q,
         seq_len_q,
         off_z,
-    ) = _compute_offsets(
-        H, G, BLOCK_M, seq_offsets_q, seq_offsets, max_seq_len, TRUNCATE_METHOD
-    )
+    ) = _compute_offsets(H, G, BLOCK_M, seq_offsets_q, seq_offsets, max_seq_len, TRUNCATE_METHOD)
     if HAS_CAUSAL:
         n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
         uih_len_q = uih_common_preprocess(n_targets, seq_len_q, HAS_NUM_TARGETS)
@@ -1490,8 +1434,7 @@ def _get_triton_bw_configs() -> List[triton.Config]:
             num_stages=ns,
             num_warps=nw,
             pre_hook=_bwd_pre_hook_v3,
-        )
-        for (M, N, M1, N1) in [
+        ) for (M, N, M1, N1) in [
             (128, 64, 32, 128),
             (128, 64, 64, 64),
             (64, 128, 32, 128),
@@ -1499,9 +1442,7 @@ def _get_triton_bw_configs() -> List[triton.Config]:
             (64, 64, 32, 128),
             (32, 64, 32, 64),
             (32, 128, 32, 128),
-        ]
-        for ns in [2, 3]
-        for nw in [4, 8]
+        ] for ns in [2, 3] for nw in [4, 8]
     ]
     return configs
 
@@ -1618,9 +1559,9 @@ def _get_triton_bw_redq_configs() -> List[triton.Config]:
             num_warps=nw,
             pre_hook=_bwd_pre_hook_redq_v3,
         )
-        for M in [64]#, 32]
-        for N in [128]#, 128]
-        for ns in [2]#, 3]
+        for M in [64]  #, 32]
+        for N in [128]  #, 128]
+        for ns in [2]  #, 3]
         # EXPERIMENT (autoWS): force nw=4 only to test whether the PSM warp-budget
         # guard (skip WS if estimate > 16) is what suppresses warp specialization.
         for nw in [4]
@@ -1785,42 +1726,34 @@ def _hstu_attn_bwd_redq(  # noqa C901
                     scaled_alpha = alpha * 1.44269504
                 else:
                     scaled_alpha = alpha
-                M_off, Delta_off = backward_common_preprocess(
-                    M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-                )
+                M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q,
+                                                              stride_mm)
                 # EXPERIMENT (autoWS): warp_specialize the inner Q loop. The
                 # `warp_specialize` kwarg only exists in beta triton, so this
                 # variant must be built with -m ovr_config//triton:beta. Guard
                 # before landing (constexpr-branch the tl.range on AUTOWS).
-                for start_m in tl.range(
-                    0, seq_len_q, BLOCK_M, num_stages=1, warp_specialize=WS_ON
-                ):
+                for start_m in tl.range(0, seq_len_q, BLOCK_M, num_stages=1, warp_specialize=WS_ON):
                     offs_m = start_m + tl.arange(0, BLOCK_M)
                     mask_m = offs_m < seq_len_q
-                    valid_mask_trans = backward_valid_mask(
-                        offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
-                    )
+                    valid_mask_trans = backward_valid_mask(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
                     q_offset = (seq_start_q + start_m).to(tl.int32)
                     q = desc_q.load([q_offset, off_h * stride_qh])
                     do = desc_do.load([q_offset, off_h * stride_doh])
                     qk_trans = tl.dot(k, tl.trans(q), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        qk_trans, act_qk_trans, pT = (
-                            backward_softmax_activation_scaled_alpha(
-                                qk_trans,
-                                scaled_alpha,
-                                valid_mask_trans,
-                                M_off,
-                                offs_m,
-                                stride_mm,
-                                mask_m,
-                                k,
-                            )
-                        )
+                        qk_trans, act_qk_trans, pT = (backward_softmax_activation_scaled_alpha(
+                            qk_trans,
+                            scaled_alpha,
+                            valid_mask_trans,
+                            M_off,
+                            offs_m,
+                            stride_mm,
+                            mask_m,
+                            k,
+                        ))
                     else:
-                        qk_trans, act_qk_trans, pT = backward_silu_activation(
-                            qk_trans, alpha, valid_mask_trans, k.dtype, scale
-                        )
+                        qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans,
+                                                                              k.dtype, scale)
                     if SHARED_KV:
                         dk += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
                     else:
@@ -1828,37 +1761,26 @@ def _hstu_attn_bwd_redq(  # noqa C901
                         dv += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
                     dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        dqk_trans = backward_d_softmax_activation(
-                            dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-                        )
+                        dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m,
+                                                                  pT)
                     else:
-                        dqk_trans = backward_d_silu_activation(
-                            dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-                        )
+                        dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
                     dqk_trans = dqk_trans.to(k.dtype)
                     dk += tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32) * alpha
-                    dq_trans = (
-                        tl.dot(tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32) * alpha
-                    )
+                    dq_trans = (tl.dot(tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32) * alpha)
                     dq = tl.trans(dq_trans)
                     desc_dq.store(
                         [q_offset, DimQ * off_h],
                         dq.to(desc_dq.dtype),
                         store_reduce="add",
                     )
-            DK_off = (
-                DK
-                + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64)
-                + off_h_kv * tl.cast(stride_dkh, tl.int64)
-            )
+            DK_off = (DK + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64) +
+                      off_h_kv * tl.cast(stride_dkh, tl.int64))
             dk_ptrs = DK_off + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
             tl.store(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None])
             if not SHARED_KV:
-                DV_off = (
-                    DV
-                    + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64)
-                    + off_h_kv * tl.cast(stride_dvh, tl.int64)
-                )
+                DV_off = (DV + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64) +
+                          off_h_kv * tl.cast(stride_dvh, tl.int64))
                 dv_ptrs = DV_off + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
                 # pyrefly: ignore [unbound-name]
                 tl.store(dv_ptrs, dv.to(k.dtype), mask=mask_n[:, None])
@@ -1945,17 +1867,17 @@ def _hstu_attn_bwd_redq(  # noqa C901
         # loop — masking is a no-op for full blocks. Kept autoWS-only (constexpr)
         # so the non-WS peeled fast path is unchanged.
         for start_n in tl.range(
-            0,
-            seq_len_kv,
-            BLOCK_N,
-            warp_specialize=WS_ON,
-            merge_epilogue_to_computation=WS_ON,
-            # With the compute fold, the dk accumulator's cross-iteration
-            # tmem_load is categorized as a correction op; merge it into the
-            # computation partition instead of spawning a separate correction
-            # partition (which would exceed the 16-warp budget).
-            merge_correction=WS_ON,
-            data_partition_factor=(2 if BLOCK_N >= 256 else 1),
+                0,
+                seq_len_kv,
+                BLOCK_N,
+                warp_specialize=WS_ON,
+                merge_epilogue_to_computation=WS_ON,
+                # With the compute fold, the dk accumulator's cross-iteration
+                # tmem_load is categorized as a correction op; merge it into the
+                # computation partition instead of spawning a separate correction
+                # partition (which would exceed the 16-warp budget).
+                merge_correction=WS_ON,
+                data_partition_factor=(2 if BLOCK_N >= 256 else 1),
         ):
             _hstu_attn_bwd_inner(
                 start_n,
@@ -2480,21 +2402,13 @@ def _hstu_attn_bwd(  # noqa C901
         mask_m = offs_m < seq_len_q
         tl.static_assert(ATTN_SCALE_TYPE == "scalar")
         scale = tl.load(attn_scale).to(tl.float32)
-        M_off, Delta_off = backward_common_preprocess(
-            M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-        )
-        DK_off = (
-            DK
-            + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64)
-            + off_h_kv * tl.cast(stride_dkh, tl.int64)
-        )
+        M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm)
+        DK_off = (DK + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64) +
+                  off_h_kv * tl.cast(stride_dkh, tl.int64))
         DV_off = DV
         if not SHARED_KV:
-            DV_off = (
-                DV
-                + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64)
-                + off_h_kv * tl.cast(stride_dvh, tl.int64)
-            )
+            DV_off = (DV + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64) +
+                      off_h_kv * tl.cast(stride_dvh, tl.int64))
         dq_acc = tl.zeros([DimQ, BLOCK_M], dtype=tl.float32)
         if off_h < num_softmax_heads:
             scaled_alpha = alpha * 1.44269504
@@ -2512,9 +2426,7 @@ def _hstu_attn_bwd(  # noqa C901
                 v = desc_v.load([k_offset, off_h_kv * stride_vh])
             qk_trans = tl.dot(k, q_trans)
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            valid_mask_trans = (offs_n[:, None] < seq_len_kv) & (
-                offs_m[None, :] < seq_len_q
-            )
+            valid_mask_trans = (offs_n[:, None] < seq_len_kv) & (offs_m[None, :] < seq_len_q)
             if off_h < num_softmax_heads:
                 qk_trans, act_qk_trans, pT = backward_softmax_activation_scaled_alpha(
                     qk_trans,
@@ -2527,22 +2439,16 @@ def _hstu_attn_bwd(  # noqa C901
                     k,
                 )
             else:
-                qk_trans, act_qk_trans, pT = backward_silu_activation(
-                    qk_trans, alpha, valid_mask_trans, k.dtype, scale
-                )
+                qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans, k.dtype, scale)
             if SHARED_KV:
                 dk = tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
             else:
                 dv = tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
             dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
             if off_h < num_softmax_heads:
-                dqk_trans = backward_d_softmax_activation(
-                    dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-                )
+                dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT)
             else:
-                dqk_trans = backward_d_silu_activation(
-                    dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-                )
+                dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
             dqk_trans = dqk_trans.to(k.dtype)
             if SHARED_KV:
                 dk_attn = tl.dot(dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32)
@@ -2554,9 +2460,7 @@ def _hstu_attn_bwd(  # noqa C901
             dk_ptrs = DK_off + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
             mask_n = offs_n < seq_len_kv
             if G > 1:
-                tl.atomic_add(
-                    dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None], sem="relaxed"
-                )
+                tl.atomic_add(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None], sem="relaxed")
             else:
                 tl.store(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None])
             if not SHARED_KV:
@@ -2578,12 +2482,7 @@ def _hstu_attn_bwd(  # noqa C901
             dq_trans = dq_trans * alpha
             dq_acc += dq_trans
         dq = tl.trans(dq_acc)
-        dq_ptrs = (
-            DQ
-            + (seq_start_q + offs_m[:, None]) * stride_dqm
-            + off_h * stride_dqh
-            + tl.arange(0, DimQ)[None, :]
-        )
+        dq_ptrs = (DQ + (seq_start_q + offs_m[:, None]) * stride_dqm + off_h * stride_dqh + tl.arange(0, DimQ)[None, :])
         tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=mask_m[:, None])
     else:
         for start_n in tl.range(0, last_block_start_n, BLOCK_N):
@@ -2808,9 +2707,7 @@ def _hstu_attn_bwd_redkv(
             for start_n in tl.range(0, seq_len_kv, BLOCK_N):
                 offs_n = start_n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
-                valid_mask_trans = backward_valid_mask(
-                    offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
-                )
+                valid_mask_trans = backward_valid_mask(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
                 k_offset = (seq_start_kv + start_n).to(tl.int32)
                 k = desc_k.load([k_offset, off_h_kv * stride_kh])
                 if SHARED_KV:
@@ -2825,80 +2722,55 @@ def _hstu_attn_bwd_redkv(
                         scaled_alpha = alpha * 1.44269504
                     else:
                         scaled_alpha = alpha
-                    M_off, Delta_off = backward_common_preprocess(
-                        M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-                    )
+                    M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q,
+                                                                  stride_mm)
                     q = desc_q.load([seq_start_q, off_h * stride_qh])
                     do = desc_do.load([seq_start_q, off_h * stride_doh])
                     qk_trans = tl.dot(k, tl.trans(q), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        qk_trans, act_qk_trans, pT = (
-                            backward_softmax_activation_scaled_alpha(
-                                qk_trans,
-                                scaled_alpha,
-                                valid_mask_trans,
-                                M_off,
-                                offs_m,
-                                stride_mm,
-                                mask_m,
-                                k,
-                            )
-                        )
+                        qk_trans, act_qk_trans, pT = (backward_softmax_activation_scaled_alpha(
+                            qk_trans,
+                            scaled_alpha,
+                            valid_mask_trans,
+                            M_off,
+                            offs_m,
+                            stride_mm,
+                            mask_m,
+                            k,
+                        ))
                     else:
-                        qk_trans, act_qk_trans, pT = backward_silu_activation(
-                            qk_trans, alpha, valid_mask_trans, k.dtype, scale
-                        )
+                        qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans,
+                                                                              k.dtype, scale)
                     if SHARED_KV:
                         dk += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
                     else:
                         dv += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
                     dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        dqk_trans = backward_d_softmax_activation(
-                            dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-                        )
+                        dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m,
+                                                                  pT)
                     else:
-                        dqk_trans = backward_d_silu_activation(
-                            dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-                        )
+                        dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
                     dqk_trans = dqk_trans.to(k.dtype)
                     dk += tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32) * alpha
                     # dq for head g
                     dq_g = tl.dot(tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32)
-                    dq_acc += tl.where(
-                        (offs_g == g)[None, :, None], dq_g[:, None, :], 0.0
-                    )
-                DK_off = (
-                    DK
-                    + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64)
-                    + off_h_kv * tl.cast(stride_dkh, tl.int64)
-                )
+                    dq_acc += tl.where((offs_g == g)[None, :, None], dq_g[:, None, :], 0.0)
+                DK_off = (DK + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64) +
+                          off_h_kv * tl.cast(stride_dkh, tl.int64))
                 dk_ptrs = DK_off + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
                 tl.store(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None])
                 if not SHARED_KV:
-                    DV_off = (
-                        DV
-                        + tl.cast(seq_start_kv, tl.int64)
-                        * tl.cast(stride_dvn, tl.int64)
-                        + off_h_kv * tl.cast(stride_dvh, tl.int64)
-                    )
-                    dv_ptrs = DV_off + (
-                        offs_n[:, None] * stride_dvn + offs_v_d[None, :]
-                    )
+                    DV_off = (DV + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64) +
+                              off_h_kv * tl.cast(stride_dvh, tl.int64))
+                    dv_ptrs = DV_off + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
                     tl.store(dv_ptrs, dv.to(k.dtype), mask=mask_n[:, None])
             # Write dq per head from the accumulator.
             for g in range(G):
                 off_h = off_h_kv * G + g
-                dq_trans = tl.sum(
-                    tl.where((offs_g == g)[None, :, None], dq_acc, 0.0), axis=1
-                )
+                dq_trans = tl.sum(tl.where((offs_g == g)[None, :, None], dq_acc, 0.0), axis=1)
                 dq = tl.trans(dq_trans) * alpha
-                dq_ptrs = (
-                    DQ
-                    + (seq_start_q + offs_m[:, None]) * stride_dqm
-                    + off_h * stride_dqh
-                    + offs_qk_d[None, :]
-                )
+                dq_ptrs = (DQ + (seq_start_q + offs_m[:, None]) * stride_dqm + off_h * stride_dqh + offs_qk_d[None, :])
                 tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=mask_m[:, None])
             return
 
@@ -2920,64 +2792,49 @@ def _hstu_attn_bwd_redkv(
                     scaled_alpha = alpha * 1.44269504
                 else:
                     scaled_alpha = alpha
-                M_off, Delta_off = backward_common_preprocess(
-                    M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-                )
+                M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q,
+                                                              stride_mm)
                 for start_m in tl.range(0, seq_len_q, BLOCK_M):
                     offs_m = start_m + tl.arange(0, BLOCK_M)
                     mask_m = offs_m < seq_len_q
-                    valid_mask_trans = backward_valid_mask(
-                        offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
-                    )
+                    valid_mask_trans = backward_valid_mask(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
                     q_offset = (seq_start_q + start_m).to(tl.int32)
                     q = desc_q.load([q_offset, off_h * stride_qh])
                     do = desc_do.load([q_offset, off_h * stride_doh])
                     qk_trans = tl.dot(k, tl.trans(q), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        qk_trans, act_qk_trans, pT = (
-                            backward_softmax_activation_scaled_alpha(
-                                qk_trans,
-                                scaled_alpha,
-                                valid_mask_trans,
-                                M_off,
-                                offs_m,
-                                stride_mm,
-                                mask_m,
-                                k,
-                            )
-                        )
+                        qk_trans, act_qk_trans, pT = (backward_softmax_activation_scaled_alpha(
+                            qk_trans,
+                            scaled_alpha,
+                            valid_mask_trans,
+                            M_off,
+                            offs_m,
+                            stride_mm,
+                            mask_m,
+                            k,
+                        ))
                     else:
-                        qk_trans, act_qk_trans, pT = backward_silu_activation(
-                            qk_trans, alpha, valid_mask_trans, k.dtype, scale
-                        )
+                        qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans,
+                                                                              k.dtype, scale)
                     if SHARED_KV:
                         dk += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
                     else:
                         dv += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
                     dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        dqk_trans = backward_d_softmax_activation(
-                            dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-                        )
+                        dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m,
+                                                                  pT)
                     else:
-                        dqk_trans = backward_d_silu_activation(
-                            dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-                        )
+                        dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
                     dqk_trans = dqk_trans.to(k.dtype)
                     dk += tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32) * alpha
-            DK_off = (
-                DK
-                + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64)
-                + off_h_kv * tl.cast(stride_dkh, tl.int64)
-            )
+            DK_off = (DK + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64) +
+                      off_h_kv * tl.cast(stride_dkh, tl.int64))
             dk_ptrs = DK_off + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
             tl.store(dk_ptrs, dk.to(k.dtype), mask=mask_n[:, None])
             if not SHARED_KV:
-                DV_off = (
-                    DV
-                    + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64)
-                    + off_h_kv * tl.cast(stride_dvh, tl.int64)
-                )
+                DV_off = (DV + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64) +
+                          off_h_kv * tl.cast(stride_dvh, tl.int64))
                 dv_ptrs = DV_off + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
                 tl.store(dv_ptrs, dv.to(k.dtype), mask=mask_n[:, None])
         # Phase 2: dq (per head, tile over Q).
@@ -2987,9 +2844,7 @@ def _hstu_attn_bwd_redkv(
                 scaled_alpha = alpha * 1.44269504
             else:
                 scaled_alpha = alpha
-            M_off, Delta_off = backward_common_preprocess(
-                M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-            )
+            M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm)
             for start_m in tl.range(0, seq_len_q, BLOCK_M):
                 offs_m = start_m + tl.arange(0, BLOCK_M)
                 mask_m = offs_m < seq_len_q
@@ -3000,9 +2855,7 @@ def _hstu_attn_bwd_redkv(
                 dq_trans = tl.zeros([DimQ, BLOCK_M], dtype=tl.float32)
                 for start_n in tl.range(0, seq_len_kv, BLOCK_N):
                     offs_n = start_n + tl.arange(0, BLOCK_N)
-                    valid_mask_trans = backward_valid_mask(
-                        offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
-                    )
+                    valid_mask_trans = backward_valid_mask(offs_m, offs_n, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
                     k_offset = (seq_start_kv + start_n).to(tl.int32)
                     k = desc_k.load([k_offset, off_h_kv * stride_kh])
                     if SHARED_KV:
@@ -3011,40 +2864,29 @@ def _hstu_attn_bwd_redkv(
                         v = desc_v.load([k_offset, off_h_kv * stride_vh])
                     qk_trans = tl.dot(k, q_trans, allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        qk_trans, act_qk_trans, pT = (
-                            backward_softmax_activation_scaled_alpha(
-                                qk_trans,
-                                scaled_alpha,
-                                valid_mask_trans,
-                                M_off,
-                                offs_m,
-                                stride_mm,
-                                mask_m,
-                                k,
-                            )
-                        )
+                        qk_trans, act_qk_trans, pT = (backward_softmax_activation_scaled_alpha(
+                            qk_trans,
+                            scaled_alpha,
+                            valid_mask_trans,
+                            M_off,
+                            offs_m,
+                            stride_mm,
+                            mask_m,
+                            k,
+                        ))
                     else:
-                        qk_trans, act_qk_trans, pT = backward_silu_activation(
-                            qk_trans, alpha, valid_mask_trans, k.dtype, scale
-                        )
+                        qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans,
+                                                                              k.dtype, scale)
                     dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
                     if off_h < num_softmax_heads:
-                        dqk_trans = backward_d_softmax_activation(
-                            dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-                        )
+                        dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m,
+                                                                  pT)
                     else:
-                        dqk_trans = backward_d_silu_activation(
-                            dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-                        )
+                        dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
                     dqk_trans = dqk_trans.to(k.dtype)
                     dq_trans += tl.dot(tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32)
                 dq = tl.trans(dq_trans) * alpha
-                dq_ptrs = (
-                    DQ
-                    + (seq_start_q + offs_m[:, None]) * stride_dqm
-                    + off_h * stride_dqh
-                    + offs_qk_d[None, :]
-                )
+                dq_ptrs = (DQ + (seq_start_q + offs_m[:, None]) * stride_dqm + off_h * stride_dqh + offs_qk_d[None, :])
                 tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=mask_m[:, None])
         return
 
@@ -3258,17 +3100,11 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
     offs_m = start_m + tl.arange(0, BLOCK_M)
     # Offset DQ, DK, DV pointers by sequence start and head offset
     DQ = DQ + seq_start_q * stride_dqm + off_h * stride_dqh
-    DK = (
-        DK
-        + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64)
-        + off_h_kv * tl.cast(stride_dkh, tl.int64)
-    )
+    DK = (DK + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dkn, tl.int64) +
+          off_h_kv * tl.cast(stride_dkh, tl.int64))
     if not SHARED_KV:
-        DV = (
-            DV
-            + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64)
-            + off_h_kv * tl.cast(stride_dvh, tl.int64)
-        )
+        DV = (DV + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64) +
+              off_h_kv * tl.cast(stride_dvh, tl.int64))
     mask_m = offs_m < seq_len_q
     if ATTN_SCALE_TYPE == "scalar":
         scale = tl.load(attn_scale).to(tl.float32)
@@ -3277,9 +3113,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
         scale = tl.load(attn_scale + offs_m, mask=mask_m).to(tl.float32)
 
     # Preprocess M and Delta offsets for softmax
-    M_off, Delta_off = backward_common_preprocess(
-        M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-    )
+    M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm)
 
     if HAS_CAUSAL:
         high_kv = start_m + BLOCK_M + seq_len_kv - uih_len_q
@@ -3338,9 +3172,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
                     seq_len_kv,
                     HAS_CAUSAL,
                 )
-                qk_trans, act_qk_trans, pT = backward_silu_activation(
-                    qk_trans, alpha, valid_mask_trans, k.dtype, scale
-                )
+                qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans, k.dtype, scale)
             else:
                 qk_trans = qk_trans * alpha
                 pT = fast_silu(qk_trans, MULT_BY_X=False)
@@ -3372,9 +3204,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
 
         dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
         if off_h < num_softmax_heads:
-            dqk_trans = backward_d_softmax_activation(
-                dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-            )
+            dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT)
         else:
             if q_needs_mask or HAS_CAUSAL:
                 valid_mask_trans = backward_valid_mask(
@@ -3393,9 +3223,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
                     valid_mask_trans,
                 )
             else:
-                dqk_trans = (
-                    dact_qk_trans * pT * (1 + qk_trans * (1 - pT)) * scale[None, :]
-                )
+                dqk_trans = (dact_qk_trans * pT * (1 + qk_trans * (1 - pT)) * scale[None, :])
         dqk_trans = dqk_trans.to(k.dtype)
         if SHARED_KV:
             dk_attn = tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32)
@@ -3450,9 +3278,7 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
                 k,
             )
         else:
-            qk_trans, act_qk_trans, pT = backward_silu_activation(
-                qk_trans, alpha, valid_mask_trans, k.dtype, scale
-            )
+            qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans, k.dtype, scale)
         if SHARED_KV:
             dk = tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
             v = k
@@ -3475,13 +3301,9 @@ def _hstu_attn_bwd_redkv_inner(  # noqa C901
 
         dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
         if off_h < num_softmax_heads:
-            dqk_trans = backward_d_softmax_activation(
-                dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-            )
+            dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT)
         else:
-            dqk_trans = backward_d_silu_activation(
-                dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-            )
+            dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
         dqk_trans = dqk_trans.to(k.dtype)
         if SHARED_KV:
             dk_attn = tl.dot(dqk_trans, q, allow_tf32=ALLOW_TF32)
@@ -3585,17 +3407,12 @@ def _hstu_attn_bwd_inner(  # noqa C901
         dv = tl.zeros([BLOCK_N, DimV], dtype=tl.float32)
     # Offset DV pointers by sequence start and head offset
     if not SHARED_KV:
-        DV = (
-            DV
-            + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64)
-            + off_h_kv * tl.cast(stride_dvh, tl.int64)
-        )
+        DV = (DV + tl.cast(seq_start_kv, tl.int64) * tl.cast(stride_dvn, tl.int64) +
+              off_h_kv * tl.cast(stride_dvh, tl.int64))
     tl.static_assert(ATTN_SCALE_TYPE == "scalar")
     scale = tl.load(attn_scale).to(tl.float32)
 
-    M_off, Delta_off = backward_common_preprocess(
-        M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-    )
+    M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm)
 
     offs_n = start_n + tl.arange(0, BLOCK_N)
     # EXPERIMENT (autoWS): for the all-or-nothing softmax shape (num_softmax_heads
@@ -3617,9 +3434,7 @@ def _hstu_attn_bwd_inner(  # noqa C901
     # partition (Meta partition-scheduler merge-epilogue knob) so autoWS has the
     # same 4-partition layout as the hand-TLX kernel (which stores dk/dv in the
     # reduction/default task) instead of a separate epilogue partition.
-    for start_m in tl.range(
-        low_q, seq_len_q, BLOCK_M, warp_specialize=WS_ON, merge_epilogue=WS_ON
-    ):
+    for start_m in tl.range(low_q, seq_len_q, BLOCK_M, warp_specialize=WS_ON, merge_epilogue=WS_ON):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
         q_offset = seq_start_q + start_m
@@ -3627,8 +3442,8 @@ def _hstu_attn_bwd_inner(  # noqa C901
         qk_trans = tl.dot(
             k,
             tl.trans(q),
-            attrs=(_HSTU_ATTRS_QKT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD)
-                   else _HSTU_ATTRS_QKT) if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            attrs=(_HSTU_ATTRS_QKT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD) else _HSTU_ATTRS_QKT) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans = backward_valid_mask(
@@ -3653,65 +3468,77 @@ def _hstu_attn_bwd_inner(  # noqa C901
                 k,
             )
         else:
-            qk_trans, act_qk_trans, pT = backward_silu_activation(
-                qk_trans, alpha, valid_mask_trans, k.dtype, scale
-            )
+            qk_trans, act_qk_trans, pT = backward_silu_activation(qk_trans, alpha, valid_mask_trans, k.dtype, scale)
         do = desc_do.load([q_offset.to(tl.int32), off_h * stride_doh])
 
         dact_qk_trans = tl.dot(
-            v, tl.trans(do), allow_tf32=ALLOW_TF32,
-            attrs=(_HSTU_ATTRS_DPT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD)
-                   else _HSTU_ATTRS_DPT) if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            v,
+            tl.trans(do),
+            allow_tf32=ALLOW_TF32,
+            attrs=(_HSTU_ATTRS_DPT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD) else _HSTU_ATTRS_DPT) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if SHARED_KV:
             dk = tl.dot(
-                act_qk_trans, do, dk, allow_tf32=ALLOW_TF32,
-                attrs=(_HSTU_ATTRS_DV_2KV if _HSTU_COMPUTE_FOLD
-                       else _HSTU_ATTRS_DV) if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+                act_qk_trans,
+                do,
+                dk,
+                allow_tf32=ALLOW_TF32,
+                attrs=(_HSTU_ATTRS_DV_2KV if _HSTU_COMPUTE_FOLD else _HSTU_ATTRS_DV) if
+                (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
         else:
             # pyrefly: ignore [unbound-name]
             dv = tl.dot(
-                act_qk_trans, do, dv, allow_tf32=ALLOW_TF32,
+                act_qk_trans,
+                do,
+                dv,
+                allow_tf32=ALLOW_TF32,
                 attrs=_HSTU_ATTRS_DV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
 
         if num_softmax_heads > 0:  # autoWS: constexpr (see note above)
-            dqk_trans = backward_d_softmax_activation(
-                dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT
-            )
+            dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT)
         else:
-            dqk_trans = backward_d_silu_activation(
-                dact_qk_trans, pT, qk_trans, scale, valid_mask_trans
-            )
+            dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
         if SHARED_KV and _HSTU_COMPUTE_FOLD:
             # Fold dk_attn into dk: pre-scale alpha into dqk_trans (fp32) so both
             # the dq and dk_attn dots carry alpha, then accumulate dk_attn
             # directly into the dv/dk accumulator (dk_shared -> buffer id 7).
             dqk_trans = (dqk_trans * alpha).to(k.dtype)
             dq_trans = tl.dot(
-                tl.trans(k), dqk_trans,
+                tl.trans(k),
+                dqk_trans,
                 attrs=_HSTU_ATTRS_DQ_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
             dk = tl.dot(
-                dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
+                dqk_trans,
+                q,
+                dk,
+                allow_tf32=ALLOW_TF32,
                 attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
         else:
             dqk_trans = dqk_trans.to(k.dtype)
             dq_trans = tl.dot(
-                tl.trans(k), dqk_trans,
+                tl.trans(k),
+                dqk_trans,
                 attrs=_HSTU_ATTRS_DQ if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
             if SHARED_KV:
                 dk_attn = tl.dot(
-                    dqk_trans, q, allow_tf32=ALLOW_TF32,
+                    dqk_trans,
+                    q,
+                    allow_tf32=ALLOW_TF32,
                     attrs=_HSTU_ATTRS_DK if (WS_ON and not _HSTU_MODULO_TOPK) else None,
                 )
                 dk = dk + dk_attn * alpha
             else:
                 dk = tl.dot(
-                    dqk_trans, q, dk, allow_tf32=ALLOW_TF32,
+                    dqk_trans,
+                    q,
+                    dk,
+                    allow_tf32=ALLOW_TF32,
                     attrs=_HSTU_ATTRS_DK if (WS_ON and not _HSTU_MODULO_TOPK) else None,
                 )
             dq_trans = dq_trans * alpha
@@ -3839,9 +3666,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
 
     scale = tl.load(attn_scale).to(tl.float32)
 
-    M_off, Delta_off = backward_common_preprocess(
-        M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm
-    )
+    M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm)
 
     offs_n0 = start_n + tl.arange(0, BLOCK_N)
     offs_n1 = start_n + BLOCK_N + tl.arange(0, BLOCK_N)
@@ -3874,8 +3699,12 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     # the pipeliner ("local_alloc can't predicate") on the doubled operand
     # allocs, so the loop pipeline depth is pinned to 1 regardless of num_stages.
     for start_m in tl.range(
-        low_q, seq_len_q, BLOCK_M, num_stages=1,
-        warp_specialize=WS_ON, merge_epilogue=False,
+            low_q,
+            seq_len_q,
+            BLOCK_M,
+            num_stages=1,
+            warp_specialize=WS_ON,
+            merge_epilogue=False,
     ):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
@@ -3886,79 +3715,79 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
 
         # ---- KV block b0 (SHARED_KV + compute fold) ----
         qk_trans0 = tl.dot(
-            k0, tl.trans(q),
+            k0,
+            tl.trans(q),
             attrs=_HSTU_ATTRS_QKT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
         ######### computation/activation for P0
         if MASK_KV or HAS_CAUSAL:
-            valid_mask_trans0 = backward_valid_mask(
-                offs_m, offs_n0, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
-            )
+            valid_mask_trans0 = backward_valid_mask(offs_m, offs_n0, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
         else:
             valid_mask_trans0 = offs_m[None, :] < seq_len_q
         if num_softmax_heads > 0:
-            qk_trans0, act_qk_trans0, pT0 = (
-                backward_softmax_activation_scaled_alpha(
-                    qk_trans0, scaled_alpha, valid_mask_trans0, M_off, offs_m,
-                    stride_mm, mask_m, k0,
-                )
-            )
+            qk_trans0, act_qk_trans0, pT0 = (backward_softmax_activation_scaled_alpha(
+                qk_trans0,
+                scaled_alpha,
+                valid_mask_trans0,
+                M_off,
+                offs_m,
+                stride_mm,
+                mask_m,
+                k0,
+            ))
         else:
-            qk_trans0, act_qk_trans0, pT0 = backward_silu_activation(
-                qk_trans0, alpha, valid_mask_trans0, k0.dtype, scale
-            )
+            qk_trans0, act_qk_trans0, pT0 = backward_silu_activation(qk_trans0, alpha, valid_mask_trans0, k0.dtype,
+                                                                     scale)
         dact_qk_trans0 = tl.dot(
-            v0, tl.trans(do), allow_tf32=ALLOW_TF32,
+            v0,
+            tl.trans(do),
+            allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if num_softmax_heads > 0:
-            dqk_trans0 = backward_d_softmax_activation(
-                dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0
-            )
+            dqk_trans0 = backward_d_softmax_activation(dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0)
         else:
-            dqk_trans0 = backward_d_silu_activation(
-                dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0
-            )
+            dqk_trans0 = backward_d_silu_activation(dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0)
         ######### computation/activation for P1
         # ---- KV block b1 (SHARED_KV + compute fold) ----
         # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
         # tiles never alias b0's (which stays on _2KV).
         qk_trans1 = tl.dot(
-            k1, tl.trans(q),
+            k1,
+            tl.trans(q),
             attrs=_HSTU_ATTRS_QKT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if MASK_KV or HAS_CAUSAL:
-            valid_mask_trans1 = backward_valid_mask(
-                offs_m, offs_n1, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL
-            )
+            valid_mask_trans1 = backward_valid_mask(offs_m, offs_n1, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
         else:
             valid_mask_trans1 = offs_m[None, :] < seq_len_q
         # calculate pT
         if num_softmax_heads > 0:
-            qk_trans1, act_qk_trans1, pT1 = (
-                backward_softmax_activation_scaled_alpha(
-                    qk_trans1, scaled_alpha, valid_mask_trans1, M_off, offs_m,
-                    stride_mm, mask_m, k1,
-                )
-            )
+            qk_trans1, act_qk_trans1, pT1 = (backward_softmax_activation_scaled_alpha(
+                qk_trans1,
+                scaled_alpha,
+                valid_mask_trans1,
+                M_off,
+                offs_m,
+                stride_mm,
+                mask_m,
+                k1,
+            ))
         else:
-            qk_trans1, act_qk_trans1, pT1 = backward_silu_activation(
-                qk_trans1, alpha, valid_mask_trans1, k1.dtype, scale
-            )
+            qk_trans1, act_qk_trans1, pT1 = backward_silu_activation(qk_trans1, alpha, valid_mask_trans1, k1.dtype,
+                                                                     scale)
         dact_qk_trans1 = tl.dot(
-            v1, tl.trans(do), allow_tf32=ALLOW_TF32,
+            v1,
+            tl.trans(do),
+            allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DPT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         # calculate dqk_trans
         if num_softmax_heads > 0:
-            dqk_trans1 = backward_d_softmax_activation(
-                dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1
-            )
+            dqk_trans1 = backward_d_softmax_activation(dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1)
         else:
-            dqk_trans1 = backward_d_silu_activation(
-                dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1
-            )
+            dqk_trans1 = backward_d_silu_activation(dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1)
 
         # compute fold: pre-scale alpha into dqk so both dq and dk_attn carry it.
         dqk_trans0 = (dqk_trans0 * alpha).to(k0.dtype)
@@ -3967,16 +3796,23 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # cross-partition register sum (dq0 and dq1 land in different warp
         # partitions under WS) and a two-store race, and needs one TMEM tile.
         dq_trans = tl.dot(
-            tl.trans(k0), dqk_trans0,
+            tl.trans(k0),
+            dqk_trans0,
             attrs=_HSTU_ATTRS_DQ_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         # dv fold: accumulate dv into the shared dk accumulator.
         dk0 = tl.dot(
-            act_qk_trans0, do, dk0, allow_tf32=ALLOW_TF32,
+            act_qk_trans0,
+            do,
+            dk0,
+            allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DV_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk0 = tl.dot(
-            dqk_trans0, q, dk0, allow_tf32=ALLOW_TF32,
+            dqk_trans0,
+            q,
+            dk0,
+            allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
@@ -3987,15 +3823,23 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # Accumulate b1's dq into the SAME dq_trans TMEM tile (opndD id 11 via
         # _B1), reducing both KV blocks' contributions in TMEM.
         dq_trans = tl.dot(
-            tl.trans(k1), dqk_trans1, dq_trans,
+            tl.trans(k1),
+            dqk_trans1,
+            dq_trans,
             attrs=_HSTU_ATTRS_DQ_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk1 = tl.dot(
-            act_qk_trans1, do, dk1, allow_tf32=ALLOW_TF32,
+            act_qk_trans1,
+            do,
+            dk1,
+            allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DV_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         dk1 = tl.dot(
-            dqk_trans1, q, dk1, allow_tf32=ALLOW_TF32,
+            dqk_trans1,
+            q,
+            dk1,
+            allow_tf32=ALLOW_TF32,
             attrs=_HSTU_ATTRS_DK_SHARED_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
 
@@ -4035,12 +3879,7 @@ def triton_hstu_cross_attn_v3_fwd(
     num_targets: Optional[torch.Tensor] = None,
     causal: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    enable_tma = (
-        enable_tma
-        and HAS_TENSOR_DESCRIPTOR
-        and is_sm90_plus()
-        and not torch.version.hip
-    )
+    enable_tma = (enable_tma and HAS_TENSOR_DESCRIPTOR and is_sm90_plus() and not torch.version.hip)
     q = switch_to_contiguous_if_needed(q)
     k = switch_to_contiguous_if_needed(k)
     v = switch_to_contiguous_if_needed(v)
@@ -4192,14 +4031,9 @@ def triton_hstu_cross_attn_v3_bwd(
     bwd_variant = get_bwd_variant()
     if (bwd_variant == BwdVariant.AUTO) and (max_q_len < 128):
         bwd_variant = BwdVariant.TRITON_REDKV
-    use_per_kv_head = (
-        bwd_variant in (BwdVariant.AUTO, BwdVariant.TRITON_REDKV)
-        and G > 1
-        and (max_q_len < 192 or (num_softmax_heads == 0 and max_q_len <= 256))
-    )
-    use_redq_per_kv_head = (
-        bwd_variant in (BwdVariant.TRITON_REDQ, BwdVariant.TRITON_AUTOWS) and G > 1
-    )
+    use_per_kv_head = (bwd_variant in (BwdVariant.AUTO, BwdVariant.TRITON_REDKV) and G > 1
+                       and (max_q_len < 192 or (num_softmax_heads == 0 and max_q_len <= 256)))
+    use_redq_per_kv_head = (bwd_variant in (BwdVariant.TRITON_REDQ, BwdVariant.TRITON_AUTOWS) and G > 1)
     if use_per_kv_head:
         dq_dtype = q.dtype
         dkdv_dtype = k.dtype
@@ -4258,7 +4092,7 @@ def triton_hstu_cross_attn_v3_bwd(
     if use_per_kv_head or bwd_variant == BwdVariant.TRITON_REDKV:
         if use_per_kv_head:
             H_kv = H // G
-            grid = lambda meta: (Z * H_kv,)  # noqa E731
+            grid = lambda meta: (Z * H_kv, )  # noqa E731
         else:
             grid = lambda meta: (  # noqa E731
                 triton.cdiv(max_q_len, meta["BLOCK_M"]),
@@ -4319,7 +4153,7 @@ def triton_hstu_cross_attn_v3_bwd(
     elif bwd_variant in (BwdVariant.TRITON_REDQ, BwdVariant.TRITON_AUTOWS):
         if use_redq_per_kv_head:
             H_kv = H // G
-            grid = lambda meta: (Z * H_kv,)  # noqa E731
+            grid = lambda meta: (Z * H_kv, )  # noqa E731
         else:
             grid = lambda meta: (Z * H, 1)  # noqa E731
         _hstu_attn_bwd_redq[grid](
@@ -4374,10 +4208,7 @@ def triton_hstu_cross_attn_v3_bwd(
             AUTOWS=(bwd_variant == BwdVariant.TRITON_AUTOWS),
             # WS_ON == AUTOWS normally; set HSTU_AUTOWS_WS_OFF=1 to run the autoWS
             # loop STRUCTURE with warp specialization DISABLED (isolation reference).
-            WS_ON=(
-                (bwd_variant == BwdVariant.TRITON_AUTOWS)
-                and os.environ.get("HSTU_AUTOWS_WS_OFF", "0") != "1"
-            ),
+            WS_ON=((bwd_variant == BwdVariant.TRITON_AUTOWS) and os.environ.get("HSTU_AUTOWS_WS_OFF", "0") != "1"),
         )
     elif bwd_variant == BwdVariant.TRITON_AUTOWS_2KV:
         # MANUAL 2-KV-block data-partition variant. Shared-KV only; G == 1
@@ -4500,6 +4331,7 @@ def triton_hstu_cross_attn_v3_bwd(
 
 
 class AttentionFunction(torch.autograd.Function):
+
     @staticmethod
     # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
@@ -4527,7 +4359,6 @@ class AttentionFunction(torch.autograd.Function):
             v = switch_to_contiguous_if_needed(v)
         else:
             v = k
-        Z = seq_offsets.numel() - 1
         total_seq_len_q, H, DimQ = q.shape
         _, H_kv, DimV = v.shape
         assert H % H_kv == 0, f"H ({H}) must be divisible by H_kv ({H_kv})"
@@ -4536,12 +4367,7 @@ class AttentionFunction(torch.autograd.Function):
             out = torch.zeros(total_seq_len_q, H, DimV, device=q.device, dtype=q.dtype)
             return out
 
-        if (
-            G > 1
-            and H_kv == 1
-            and (num_softmax_heads == 0 or num_softmax_heads == H)
-            and not causal
-        ):
+        if (G > 1 and H_kv == 1 and (num_softmax_heads == 0 or num_softmax_heads == H) and not causal):
             # GQA can not enabled with causal masking
             seq_offsets_q = seq_offsets_q * G
             max_q_len = max_q_len * G
@@ -4604,33 +4430,28 @@ class AttentionFunction(torch.autograd.Function):
     def backward(
         ctx, dout: torch.Tensor
     ) -> Tuple[
-        None,
-        None,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+            None,
+            None,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
     ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale, seq_offsets_q = saved_tensors[:6]
         idx = 6
         num_softmax_heads = ctx.num_softmax_heads
         # Reshape dout from [T, H, DimV] to folded [T*G, H_kv, DimV]
-        if (
-            ctx.H > 1
-            and ctx.H_kv == 1
-            and (num_softmax_heads == 0 or num_softmax_heads == ctx.H)
-            and not ctx.causal
-        ):
+        if (ctx.H > 1 and ctx.H_kv == 1 and (num_softmax_heads == 0 or num_softmax_heads == ctx.H) and not ctx.causal):
             dout = dout.view(ctx.total_seq_len_q * ctx.H, -1, dout.shape[-1])
         if num_softmax_heads > 0:
             M = saved_tensors[idx]
@@ -4640,12 +4461,7 @@ class AttentionFunction(torch.autograd.Function):
             Delta = torch.empty_like(M)
             pre_grid = (triton.cdiv(out.shape[0], 128), num_softmax_heads)
             _attn_bwd_preprocess[pre_grid](
-                out,
-                dout,
-                Delta,
-                out.shape[0],
-                H=out.shape[1],
-                softmax_heads=num_softmax_heads,
+                out, dout, Delta, out.shape[0], H=out.shape[1], softmax_heads=num_softmax_heads,
                 BLOCK_M=128,  # pyre-ignore [6]
                 HEAD_DIM=out.shape[2],  # pyre-ignore [6]
             )
@@ -4666,9 +4482,7 @@ class AttentionFunction(torch.autograd.Function):
             from tlx_bw_cross_attention import tlx_bw_reduce_dq
 
             use_2kv = get_bwd_variant() == BwdVariant.TLX_2KV
-            assert not use_2kv or ctx.shared_kv, (
-                "BwdVariant.TLX_2KV (attn_bwd_ws_2kv) requires shared_kv"
-            )
+            assert not use_2kv or ctx.shared_kv, ("BwdVariant.TLX_2KV (attn_bwd_ws_2kv) requires shared_kv")
             out_t = out if num_softmax_heads > 0 else None
             M_t = M if num_softmax_heads > 0 else None
             dq, dk, dv = tlx_bw_reduce_dq(
@@ -4809,7 +4623,3 @@ def triton_bw_hstu_mha_wrapper(
         actual_max_seq_len=actual_max_seq_len,
         truncate_method=truncate_method,
     )
-
-
-
-
