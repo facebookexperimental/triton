@@ -37,7 +37,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
                               int smemAllocAlgo = 1, unsigned smemBudget = 0,
-                              bool smemCircularReuse = false);
+                              bool smemCircularReuse = false,
+                              bool smemPlanSearch = false);
 
 void doBufferAllocation(triton::FuncOp &funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);

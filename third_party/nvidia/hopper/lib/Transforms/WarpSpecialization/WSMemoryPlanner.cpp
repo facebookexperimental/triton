@@ -1,4 +1,6 @@
+#include "../ModuloScheduling/LatencyModel.h"
 #include "CodePartitionUtility.h"
+#include "WSMemoryPlanSearch.h"
 #include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -13,6 +15,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -1692,6 +1695,15 @@ static int getLastConsumerOrder(const WSBuffer &buf,
 /// silently drops it and emits the buffer standalone — under-counting the real
 /// footprint and surfacing as an OutOfResources at codegen (T277224987, e.g. a
 /// 128x32 swizzle=64 dk/dv store-staging vs a 128x128 swizzle=128 operand).
+// Prototype opt-in (T278685041 SMEM follow-up): neutral-backing reuse allows a
+// candidate to alias a target of DIFFERENT encoding/element-type by realizing
+// the alias class through one memdesc_reinterpret per view over a shared
+// backing (mergeStagingReuseIntoHost). Off by default so existing
+// behavior/tests are unchanged.
+static bool neutralReuseEnabled() {
+  const char *e = std::getenv("TRITON_WS_NEUTRAL_REUSE");
+  return e && StringRef(e) == "1";
+}
 static bool areReuseEncodingsCompatible(const WSBuffer &candidate,
                                         const WSBuffer &target) {
   auto candAlloc = dyn_cast_or_null<ttg::LocalAllocOp>(candidate.allocOp);
@@ -1816,6 +1828,297 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
 /// Phase 5: Emit buffer.id and buffer.copy attributes.
 ///
 /// Returns the next available buffer ID after the SMEM allocations.
+//===----------------------------------------------------------------------===//
+// SMEM BufferModel builder (plan-space search — docs §5.1, Step 1 builder)
+//===----------------------------------------------------------------------===//
+//
+// Adapts the SMEM `local_alloc`s + channels into the wsplan::BufferModel the
+// plan-space search consumes. Reuses the existing fact helpers
+// (getSmemAllocSizeBytes, isSmemCrossStage/Depth, isSmemTMAChannel, ...) and
+// gets producer latency on demand from ttg::NVLatencyModel (docs §4 / Step 0
+// revised). Liveness is computed here from op order, since the SMEM allocation
+// path does not populate WSBuffer::liveness.
+//
+// Dead code until the search is wired into doMemoryPlanner (Step 9). First-cut
+// approximations are marked TODO and MUST be resolved before enabling:
+// `entries` (data-partition slot count) and `freq` (loop trip count) are
+// correctness- and ranking-relevant respectively.
+namespace {
+
+class SmemBufferModel : public wsplan::BufferModel {
+public:
+  SmemBufferModel(triton::FuncOp funcOp, SmallVector<Channel *> &channels) {
+    DenseMap<Operation *, unsigned> opOrder;
+    unsigned next = 0;
+    funcOp->walk<WalkOrder::PreOrder>(
+        [&](Operation *op) { opOrder[op] = next++; });
+
+    ttg::NVLatencyModel latencyModel;
+
+    funcOp->walk<WalkOrder::PreOrder>([&](ttg::LocalAllocOp alloc) {
+      if (!alloc.isSharedMemoryAlloc())
+        return;
+      Record r;
+      r.allocOp = alloc.getOperation();
+      r.footprint.bytes = getSmemAllocSizeBytes(alloc);
+
+      // Liveness [firstUser, lastUser+1) in op-order space.
+      size_t lo = opOrder.lookup(r.allocOp), hi = lo;
+      for (Operation *user : r.allocOp->getUsers()) {
+        auto it = opOrder.find(user);
+        if (it == opOrder.end())
+          continue;
+        lo = std::min<size_t>(lo, it->second);
+        hi = std::max<size_t>(hi, it->second);
+      }
+      r.liveness = Interval<size_t>(lo, hi + 1);
+
+      r.stageSpan = isSmemCrossStage(alloc, channels)
+                        ? std::max(1u, getSmemCrossStageDepth(alloc, channels))
+                        : 1u;
+      r.entries = 1; // TODO(step9): data-partition expansion count.
+      r.freq = 1.0;  // TODO(step9): enclosing-loop trip count.
+
+      auto memTy = alloc.getType();
+      r.encoding = {memTy.getElementType(), memTy.getEncoding()};
+
+      // Kind classification.
+      bool staging = false;
+      for (Operation *user : r.allocOp->getUsers()) {
+        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+                user)) {
+          staging = true;
+          break;
+        }
+      }
+      if (staging)
+        r.kind = wsplan::BufferKind::Staging;
+      else if (isInnermostSmemChannel(alloc, channels) &&
+               isSmemTMAChannel(alloc, channels))
+        r.kind = wsplan::BufferKind::TMALoad;
+      else
+        r.kind = wsplan::BufferKind::Operand;
+
+      // Producer op + latency (issue-to-result, the hideable latency).
+      r.producer = nullptr;
+      if (Channel *ch = findChannelForOp(r.allocOp, channels))
+        r.producer = getLogicalProducerOp(ch);
+      r.latency =
+          r.producer ? latencyModel.getLatency(r.producer).latency : 0.0;
+
+      records.push_back(std::move(r));
+    });
+
+    // Reuse scopes: a multi-buffered reuse group needs all its logical buffers'
+    // producers/consumers in one basic block (verifyReuseGroup1). Assign a
+    // shared scope id to buffers whose alloc users all live in one block; give
+    // a unique (ungroupable) scope to any buffer whose users span blocks.
+    DenseMap<Block *, unsigned> blockScope;
+    unsigned nextScope = 0;
+    for (Record &r : records) {
+      SmallPtrSet<Block *, 4> blocks;
+      for (Operation *user : r.allocOp->getUsers())
+        blocks.insert(user->getBlock());
+      if (blocks.size() == 1) {
+        Block *blk = *blocks.begin();
+        auto it = blockScope.find(blk);
+        r.scope = it != blockScope.end() ? it->second
+                                         : (blockScope[blk] = nextScope++);
+      } else {
+        r.scope = nextScope++; // spans blocks (or none) -> ungroupable
+      }
+    }
+
+    ids.reserve(records.size());
+    for (unsigned i = 0; i < records.size(); ++i)
+      ids.push_back(i);
+  }
+
+  ArrayRef<wsplan::BufferId> buffers() const override { return ids; }
+  wsplan::Footprint size(wsplan::BufferId b) const override {
+    return records[b].footprint;
+  }
+  Interval<size_t> liveness(wsplan::BufferId b) const override {
+    return records[b].liveness;
+  }
+  unsigned stageSpan(wsplan::BufferId b) const override {
+    return records[b].stageSpan;
+  }
+  unsigned entries(wsplan::BufferId b) const override {
+    return records[b].entries;
+  }
+  wsplan::EncodingKey encoding(wsplan::BufferId b) const override {
+    return records[b].encoding;
+  }
+  wsplan::BufferKind kind(wsplan::BufferId b) const override {
+    return records[b].kind;
+  }
+  unsigned reuseScope(wsplan::BufferId b) const override {
+    return records[b].scope;
+  }
+  double latency(wsplan::BufferId b) const override {
+    return records[b].latency;
+  }
+  double freq(wsplan::BufferId b) const override { return records[b].freq; }
+
+  // Concrete accessor (not part of the abstract interface): maps a BufferId
+  // back to its local_alloc so the Step-9 translation can stamp attributes.
+  Operation *allocOpFor(wsplan::BufferId b) const { return records[b].allocOp; }
+
+  bool dependsOn(wsplan::BufferId a, wsplan::BufferId b) const override {
+    Operation *from = records[a].producer, *to = records[b].producer;
+    if (!from || !to || from == to)
+      return false;
+    // Backward def-use reachability: does `from` transitively consume `to`?
+    SmallVector<Operation *> worklist{from};
+    DenseSet<Operation *> seen;
+    while (!worklist.empty()) {
+      Operation *op = worklist.pop_back_val();
+      for (Value operand : op->getOperands()) {
+        Operation *def = operand.getDefiningOp();
+        if (!def || !seen.insert(def).second)
+          continue;
+        if (def == to)
+          return true;
+        worklist.push_back(def);
+      }
+    }
+    return false;
+  }
+
+private:
+  struct Record {
+    Operation *allocOp = nullptr;
+    Operation *producer = nullptr;
+    wsplan::Footprint footprint;
+    Interval<size_t> liveness;
+    unsigned stageSpan = 1;
+    unsigned entries = 1;
+    wsplan::EncodingKey encoding;
+    wsplan::BufferKind kind = wsplan::BufferKind::Other;
+    unsigned scope = 0;
+    double latency = 0.0;
+    double freq = 1.0;
+  };
+  SmallVector<Record> records;
+  SmallVector<wsplan::BufferId> ids;
+};
+
+} // namespace
+
+// Read the modulo initiation interval (tt.modulo_ii) from any annotated loop;
+// defaults to 1 when absent (the cost model then hides latency one slot at a
+// time, and the numBuffers cap below bounds the copy count).
+static double getModuloII(triton::FuncOp funcOp) {
+  double ii = 1.0;
+  funcOp->walk([&](Operation *op) {
+    if (auto attr = op->getAttrOfType<IntegerAttr>("tt.modulo_ii"))
+      ii = std::max(ii, static_cast<double>(attr.getInt()));
+  });
+  return ii;
+}
+
+// Step 9 (docs §6): SMEM allocation via the plan-space search. Runs the beam
+// search (SmemBufferModel + SmemPacker + latency cost + greedy copies), then
+// stamps buffer.id/buffer.copy from the top plan. Discretionary copies are
+// capped at numBuffers; correctness floors (cross-stage depth, per-id entry
+// count) are re-applied as a safety net so the search output can never drop
+// below the proven floors (docs §2.2 / Algo-0 hazard). Returns nextBufferId.
+//
+// Falls back to the heuristic allocateSmemBuffers when the kernel uses features
+// the search does not yet model (annotation/atomic-broadcast pins, subtiled
+// regions, TMA-staging buffers) or when the search yields no plan.
+static unsigned allocateSmemBuffers(
+    triton::FuncOp funcOp, SmallVector<Channel *> &channels,
+    unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
+    unsigned annotationMaxId);
+
+static unsigned allocateSmemBuffersViaSearch(
+    triton::FuncOp funcOp, SmallVector<Channel *> &channels,
+    unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
+    const DenseMap<Operation *, ChannelAnnotation> &allocToAnnotation,
+    unsigned annotationMaxId) {
+  // Safety fallback: the search does not yet model (a) annotation /
+  // atomic-broadcast pins, (b) subtiled-region groups, or (c) TMA-staging
+  // buffers (whose entry count / K|S constraints differ from the entries=1
+  // assumption). Defer those kernels to the proven heuristic so the search can
+  // never ship a wrong or ill-formed allocation for them.
+  bool needsFallback = !allocToAnnotation.empty();
+  funcOp->walk([&](Operation *op) {
+    if (isa<ttng::SubtiledRegionOp>(op))
+      needsFallback = true;
+    if (auto alloc = dyn_cast<ttg::LocalAllocOp>(op)) {
+      if (alloc->hasAttr(kAtomicBroadcastCopiesAttrName))
+        needsFallback = true;
+      for (Operation *user : alloc->getUsers())
+        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+                user))
+          needsFallback = true;
+    }
+  });
+  if (needsFallback) {
+    LDBG("SMEM plan-search: unmodeled feature present, falling back to "
+         "heuristic");
+    return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
+                               smemCircularReuse, allocToAnnotation,
+                               annotationMaxId);
+  }
+
+  SmemBufferModel model(funcOp, channels);
+  if (model.buffers().empty())
+    return annotationMaxId;
+
+  auto ordering = wsplan::createOrderingPolicy("liveness");
+  auto packer = wsplan::createSmemPacker(model);
+  auto cost = wsplan::createLatencyCostModel(model, getModuloII(funcOp));
+  auto copies = wsplan::createGreedyCopySolver();
+  wsplan::Budget budget;
+  budget.smemBytes = smemBudget;
+
+  auto plans = wsplan::beamSearch(model, *ordering, *packer, *cost, *copies,
+                                  budget, /*W=*/16, /*K=*/1);
+  if (plans.empty()) {
+    LDBG("SMEM plan-search: no plan found, falling back to heuristic");
+    return allocateSmemBuffers(funcOp, channels, numBuffers, smemBudget,
+                               smemCircularReuse, allocToAnnotation,
+                               annotationMaxId);
+  }
+
+  const wsplan::Plan &plan = plans.front();
+  auto *ctx = funcOp.getContext();
+  auto i32 = IntegerType::get(ctx, 32);
+  unsigned nextId = annotationMaxId;
+
+  for (const wsplan::Block &blk : plan.blocks) {
+    unsigned id = nextId++;
+
+    // Correctness floors (safety net), independent of the search's choice.
+    unsigned crossStageFloor = 1, entryFloor = blk.members.size();
+    for (wsplan::BufferId m : blk.members) {
+      Operation *alloc = model.allocOpFor(m);
+      if (isSmemCrossStage(cast<ttg::LocalAllocOp>(alloc), channels))
+        crossStageFloor = std::max(
+            crossStageFloor,
+            getSmemCrossStageDepth(cast<ttg::LocalAllocOp>(alloc), channels));
+    }
+    unsigned floor = std::max(crossStageFloor, entryFloor);
+
+    // Discretionary copies capped at numBuffers; floors may exceed the cap.
+    unsigned copy = std::max(floor, std::min(blk.copies, numBuffers));
+
+    for (wsplan::BufferId m : blk.members) {
+      Operation *alloc = model.allocOpFor(m);
+      alloc->setAttr("buffer.id", IntegerAttr::get(i32, id));
+      alloc->setAttr("buffer.copy", IntegerAttr::get(i32, copy));
+    }
+    LDBG("SMEM plan-search: block id="
+         << id << " members=" << blk.members.size() << " copy=" << copy
+         << " (searchCopy=" << blk.copies << " floor=" << floor << ")");
+  }
+  return nextId;
+}
+
 static unsigned allocateSmemBuffers(
     triton::FuncOp funcOp, SmallVector<Channel *> &channels,
     unsigned numBuffers, unsigned smemBudget, bool smemCircularReuse,
@@ -2821,8 +3124,11 @@ public:
           reuserAlloc->setAttr("buffer.offset",
                                IntegerAttr::get(i32Type, nextColOffset));
           handledAllocs.insert(reuserAlloc.getOperation());
-          LDBG("TMEM pre-assign: reuser buffer.id="
-               << bid << " colOffset=" << nextColOffset
+          LDBG("TMEM pre-assign: reuser \""
+               << getLocName(reuserAlloc.getOperation())
+               << "\" buffer.id=" << bid << " reuses owner \""
+               << getLocName(ownerAlloc.getOperation())
+               << "\" colOffset=" << nextColOffset
                << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
           // When we have 3 buffers sharing one space, we don't move the
           // colOffset. As moving the colOffset can make it exceed the size of
@@ -4056,7 +4362,8 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
                               StringRef readDecisionFile,
                               StringRef writeDecisionFile, int smemAllocAlgo,
-                              unsigned smemBudget, bool smemCircularReuse) {
+                              unsigned smemBudget, bool smemCircularReuse,
+                              bool smemPlanSearch) {
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -4107,6 +4414,12 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
   // Check for per-loop SMEM allocation attributes on the WS ForOp.
   // These override the pass-level defaults, following the same pattern
   // as tt.tmem_alloc_algo.
+  // Env override so every caller (combined WarpSpecialization pass and the
+  // standalone memory-planner pass) can enable the search for the correctness
+  // suite without threading a new option through the Python pipeline.
+  smemPlanSearch =
+      smemPlanSearch || triton::tools::getBoolEnv("TRITON_WS_SMEM_PLAN_SEARCH");
+
   int effectiveSmemAllocAlgo = smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
   bool effectiveSmemCircularReuse = smemCircularReuse;
@@ -4158,9 +4471,15 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
         annotationMaxId = std::max(annotationMaxId, ann.bufferId + 1);
     }
 
-    bufferId = allocateSmemBuffers(
-        funcOp, channels, numBuffers, effectiveSmemBudget,
-        effectiveSmemCircularReuse, smemAllocAnnotations, annotationMaxId);
+    bufferId = smemPlanSearch
+                   ? allocateSmemBuffersViaSearch(
+                         funcOp, channels, numBuffers, effectiveSmemBudget,
+                         effectiveSmemCircularReuse, smemAllocAnnotations,
+                         annotationMaxId)
+                   : allocateSmemBuffers(funcOp, channels, numBuffers,
+                                         effectiveSmemBudget,
+                                         effectiveSmemCircularReuse,
+                                         smemAllocAnnotations, annotationMaxId);
   } else {
     // Original SMEM allocation.
     LDBG("using SMEM allocation algorithm 0 (original)");
@@ -4222,10 +4541,14 @@ public:
       NVGPUTestWSMemoryPlannerPass>::NVGPUTestWSMemoryPlannerBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
+    // Env override lets the correctness suite exercise the search path without
+    // threading a new option through the Python pipeline (default off).
+    bool searchEnabled = smemPlanSearch || triton::tools::getBoolEnv(
+                                               "TRITON_WS_SMEM_PLAN_SEARCH");
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
       if (failed(doMemoryPlanner(funcOp, numBuffers, readDecisionFile,
                                  writeDecisionFile, smemAllocAlgo, smemBudget,
-                                 smemCircularReuse)))
+                                 smemCircularReuse, searchEnabled)))
         signalPassFailure();
     }
   }
