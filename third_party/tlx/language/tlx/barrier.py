@@ -5,7 +5,7 @@ from .utility import is_hip
 
 
 def _make_mbarrier_layout_handle(_semantic):
-    layout = tlx.swizzled_shared_layout_encoding.make_default(rank=1)
+    layout = tlx.layout(tlx.swizzled_layout.make_default(rank=1))
     layout_handle = _semantic.builder.make_swizzled_shared_encoding_attr(
         layout.vectorSize,
         layout.perPhase,
