@@ -3757,23 +3757,45 @@ public:
 
     BufferT *buf = getBuffer(allocs[idx].getOperation());
 
-    // Collect reuse candidates sorted by priority (descending)
-    SmallVector<std::pair<BufferT *, int>> candidates;
+    // Collect reuse candidates, then order them deterministically.
+    //
+    // `state.owners` is a DenseMap keyed by BufferT* (pointer), so iterating it
+    // yields a heap-layout-dependent order. The previous sort broke ties on
+    // priority only, leaving equal-priority owners in that unstable order — so
+    // which owner a buffer reused (and its column offset within that owner)
+    // depended on pointer addresses. For an accumulator like dq this is a
+    // correctness bug, not just churn: two same-priority owners can offer
+    // colOffset 0 (a tight, pure time-multiplexed reuse) vs a spatially-packed
+    // colOffset that aliases a co-live region, and the pointer-order pick flips
+    // between them run-to-run (observable as a Heisenbug that vanishes under IR
+    // dumping). Compute the column offset up front and order by: priority desc,
+    // then tighter packing (lower colOffset — also perf-positive), then the
+    // owner's liveness start for a stable total order.
+    struct ReuseCand {
+      BufferT *owner;
+      int priority;
+      size_t colOffset;
+    };
+    SmallVector<ReuseCand> candidates;
     for (auto &[owner, placement] : state.owners) {
       int priority = hasPotentialReuse(owner, buf, ctrlOp);
-      if (priority > 0)
-        candidates.push_back({owner, priority});
-    }
-    // Sort by priority descending
-    llvm::sort(candidates, [](const auto &a, const auto &b) {
-      return a.second > b.second;
-    });
-
-    // Try each reuse candidate
-    for (auto &[owner, priority] : candidates) {
+      if (priority <= 0)
+        continue;
       size_t colOffset = computeColOffset(buf, owner, state, ctrlOp);
       if (colOffset == std::numeric_limits<size_t>::max())
         continue; // Can't fit or dependency check failed
+      candidates.push_back({owner, priority, colOffset});
+    }
+    llvm::sort(candidates, [&](const ReuseCand &a, const ReuseCand &b) {
+      if (a.priority != b.priority)
+        return a.priority > b.priority;
+      if (a.colOffset != b.colOffset)
+        return a.colOffset < b.colOffset;
+      return bufferRange[a.owner].start() < bufferRange[b.owner].start();
+    });
+
+    // Try each reuse candidate
+    for (auto &[owner, priority, colOffset] : candidates) {
 
       // Tentatively assign
       AllocationState newState = state;
