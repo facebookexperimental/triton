@@ -24,7 +24,10 @@
 #ifndef TRITON_DIALECT_TRITONNVIDIAGPU_TRANSFORMS_PASSES_H_
 #define TRITON_DIALECT_TRITONNVIDIAGPU_TRANSFORMS_PASSES_H_
 
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include <string>
+#include <vector>
 
 namespace mlir {
 namespace triton {
@@ -33,6 +36,10 @@ namespace nvidia_gpu {
 std::unique_ptr<Pass> createTritonNvidiaGPUPlanCTAPass();
 
 void registerConSanNVIDIAHooks();
+
+// Collect intra-task aliased-TMEM write-after-read warning strings (does not
+// modify the IR); surfaced from Python via warnings.warn.
+std::vector<std::string> collectTMemAliasWARWarnings(ModuleOp module);
 
 #define GEN_PASS_DECL
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h.inc"

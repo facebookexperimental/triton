@@ -229,6 +229,27 @@ def TritonNvidiaGPUPruneUnusedBarriersPass
   ];
 }
 
+def TritonNvidiaGPUWarnTMemAliasWARPass
+    : Pass<"triton-nvidia-gpu-warn-tmem-alias-war", "mlir::ModuleOp"> {
+  let summary = "Warn about intra-task write-after-read hazards on aliased TMEM";
+
+  let description = [{
+    Compile-time diagnostic (no IR/codegen change): in a warp-specialized task
+    with more than one warp, warns when a TMEM region is read (tcgen05.ld) and
+    then overwritten by an aliased store (tcgen05.st) with an incompatible
+    layout (different element type / encoding, e.g. an f32 qk accumulator reused
+    as an f16 P operand) with no intervening intra-CTA barrier. The tcgen05
+    ld/st warp->chunk mappings differ, so a fast warp's store can clobber a
+    32x32 chunk a slow warp has not finished reading. The author should add a
+    task-scoped barrier between the read and the aliased store.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
   let summary = "Verify legal and consistent two_ctas usage across matmuls";
 
