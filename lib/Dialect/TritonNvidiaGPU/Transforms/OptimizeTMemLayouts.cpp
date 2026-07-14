@@ -217,6 +217,14 @@ public:
     // one.
     if (tmemLoadOp->hasAttr("tlx.user_layout"))
       return failure();
+    // Also check type encoding for UserLayoutAttr via PinnedEncodingTrait,
+    // for consistency with other passes that rely on type encoding wrapper
+    // rather than op attribute (TLX user layout is now represented as
+    // #tlx.user_layout encoding in addition to historical op attribute).
+    if (auto resultType = dyn_cast<RankedTensorType>(tmemLoadOp.getType())) {
+      if (isa_and_nonnull<ttg::PinnedEncodingTrait>(resultType.getEncoding()))
+        return failure();
+    }
     int numWarps = ttg::lookupNumWarps(tmemLoadOp);
     // If there is only 1 warpgroup there is nothing to optimize as the layout
     // is already reduction friendly.
@@ -337,6 +345,11 @@ public:
     // Respect a user-pinned register layout (tlx.layout).
     if (tmemLoadOp->hasAttr("tlx.user_layout"))
       return failure();
+    // Also check type encoding for consistency with TLX user_layout wrapper.
+    if (auto resultType = dyn_cast<RankedTensorType>(tmemLoadOp.getType())) {
+      if (isa_and_nonnull<ttg::PinnedEncodingTrait>(resultType.getEncoding()))
+        return failure();
+    }
     auto tmemEnc = dyn_cast<triton::nvidia_gpu::TensorMemoryEncodingAttr>(
         tmemLoadOp.getSrc().getType().getEncoding());
     if (!tmemEnc)

@@ -531,6 +531,15 @@ void init_triton_tlx_ir(py::module &&m) {
 
             // layoutEncoding must be TMEM compatible
             Attribute tensorEncoding = tlx::wrapNoVerifyLayout(layoutEncoding);
+            // If user explicitly pinned layout via tlx.local_load(...,
+            // layout=...), wrap with #tlx.user_layout so generic layout passes
+            // treat it as hard anchor (same mechanism as SMEM local_load path).
+            // Keep NoVerify inside UserLayout to defer full verification until
+            // after inlining, matching historical behavior where op attribute
+            // was used as marker.
+            if (userLayout) {
+              tensorEncoding = tlx::wrapUserLayout(tensorEncoding);
+            }
             auto newType = RankedTensorType::get(subViewType.getShape(),
                                                  subViewType.getElementType(),
                                                  tensorEncoding);
@@ -542,9 +551,9 @@ void init_triton_tlx_ir(py::module &&m) {
                     : ttng::TMEMLoadOp::create(self.getBuilder(),
                                                self.getLastLoc(), newType,
                                                subView);
-            // Mark the result layout as user-specified so layout passes treat
-            // it as a hard anchor and do not rewrite it to a "preferred" TMEM
-            // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
+            // Keep op attribute for backward compatibility with existing
+            // OptimizeTMemLayouts pattern; new code should prefer type encoding
+            // check via UserLayoutAttr trait.
             if (userLayout)
               loadOp->setAttr("tlx.user_layout",
                               self.getBuilder().getUnitAttr());
