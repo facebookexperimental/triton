@@ -214,13 +214,8 @@ public:
                                 PatternRewriter &rewriter) const override {
     // Respect a user-pinned register layout (tlx.layout): the author chose this
     // load layout deliberately, so do not rewrite it to a reduction-friendly
-    // one.
-    if (tmemLoadOp->hasAttr("tlx.user_layout"))
-      return failure();
-    // Also check type encoding for UserLayoutAttr via PinnedEncodingTrait,
-    // for consistency with other passes that rely on type encoding wrapper
-    // rather than op attribute (TLX user layout is now represented as
-    // #tlx.user_layout encoding in addition to historical op attribute).
+    // one. User layout is represented as #tlx.user_layout encoding wrapping
+    // the concrete layout, which implements PinnedEncodingTrait.
     if (auto resultType = dyn_cast<RankedTensorType>(tmemLoadOp.getType())) {
       if (isa_and_nonnull<ttg::PinnedEncodingTrait>(resultType.getEncoding()))
         return failure();
@@ -342,10 +337,9 @@ public:
 
   LogicalResult matchAndRewrite(TMEMLoadOp tmemLoadOp,
                                 PatternRewriter &rewriter) const override {
-    // Respect a user-pinned register layout (tlx.layout).
-    if (tmemLoadOp->hasAttr("tlx.user_layout"))
-      return failure();
-    // Also check type encoding for consistency with TLX user_layout wrapper.
+    // Respect a user-pinned register layout (tlx.layout): user layout is
+    // represented as #tlx.user_layout encoding implementing
+    // PinnedEncodingTrait.
     if (auto resultType = dyn_cast<RankedTensorType>(tmemLoadOp.getType())) {
       if (isa_and_nonnull<ttg::PinnedEncodingTrait>(resultType.getEncoding()))
         return failure();
