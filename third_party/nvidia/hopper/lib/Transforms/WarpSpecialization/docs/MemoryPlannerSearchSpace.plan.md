@@ -36,6 +36,11 @@ Top-K search space (mirrors the list/modulo schedulers):
   apply rank i (0 = cost-best, clamped per pool); `TRITON_WS_MEM_PLAN_TOPK_DUMP`
   dumps each plan as JSON. A harness sweeps PICK over 0..K-1 and times each (the
   cost model only ranks). Validated: PICK 0..3 with TOPK=4 all legal + pass.
+- **Autotune-native**: `tl.range(..., mem_plan_pick=<constexpr>)` stamps
+  `tt.mem_plan_pick` on the loop (mirroring `tt.list_schedule_pick`); the planner
+  reads it (attr > env > 0), and being a `tl.constexpr` it is part of the
+  compilation key so `@triton.autotune` sweeps it without env vars. Validated:
+  attr flows tl.range → TTIR → TTGIR (planner level).
 
 Validation status: both pools are runtime-validated on the full `run_all.sh`
 suite, **search on**: GEMM 216, addmm 73, quantized 3, FA-correctness 72, FA
@@ -72,8 +77,6 @@ Remaining (perf / coverage, not correctness):
   check (a real project), not just exposing the existing trigger.
 - Accumulator per-outer-tile TMEM multi-copy (currently pinned to 1).
 - Model scaled-MMA scale columns for TMEM.
-- Autotune-native `tt.mem_plan_pick` constexpr (like `tt.list_schedule_pick`) so
-  the Triton autotuner can sweep PICK without env vars.
 **Covers (future)**: `WSMemoryPlanner.cpp`, new `WSMemoryPlanSearch.{h,cpp}`
 **Related docs**: [SmemAllocationDesign.md](SmemAllocationDesign.md),
 [TMEMAllocationHeuristics.md](TMEMAllocationHeuristics.md),
