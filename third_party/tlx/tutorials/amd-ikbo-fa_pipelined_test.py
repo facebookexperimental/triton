@@ -8,11 +8,6 @@ a longer shared user/request K/V history. `ad_to_user_mapping[ad]` gives the use
 batch that owns the K/V for that ad, so the KV sequence length is independent of
 the query length and the kernels broadcast K/V across ads internally.
 
-This script is SELF-CONTAINED: the five IKBO TLX kernels are inlined here (copied
-from ads_mkl/ops/triton/tlx_amd_ikbo_fa_base.py and tlx_amd_ikbo_fa_ref.py) as
-plain host wrappers that launch the triton kernels directly, so no ads_mkl kernel
-imports are needed. Modeled on amd_fa_pipelined_test.py (its `run_benchmark` + CLI).
-
 Two calling conventions:
   * base layout  (tlx_base, tlx_tricks):
         query [B*n_seed, H, D], key/value [Bu*kv, H, D], mapping, n_seed, kv
@@ -22,15 +17,10 @@ Two calling conventions:
 Reference is PyTorch SDPA over the broadcast (index_select'd) K/V.
 
 Usage:
-    python amd_ikbo_fa_pipelined_test.py
-    python amd_ikbo_fa_pipelined_test.py --kernel tlx_base -b 32 -nseed 256 -skv 512
-    python amd_ikbo_fa_pipelined_test.py --mode correctness
-
-Run under buck (MI350x / gfx950), TLX needs the triton beta toolchain:
-    buck2 run @mode/opt-amd-gpu -m rocm70 -m rccl_dev -c fbcode.nvcc_arch=mi350 \
-        -m ovr_config//triton:beta \
-        //scripts/aocai/python_script:amd_ikbo_fa_pipelined_test -- \
-        --kernel tlx_base tlx_tricks async_simple async_prefetch cluster_pipeline -b 1024 -nseed 256 -skv 2560 -d 128 --low 60 --high 70
+    python amd-ikbo-fa_pipelined_test.py
+    python amd-ikbo-fa_pipelined_test.py --kernel tlx_base -b 32 -nseed 256 -skv 512
+    python amd-ikbo-fa_pipelined_test.py --kernel tlx_base tlx_tricks async_simple async_prefetch cluster_pipeline -b 1024 -nseed 256 -skv 2560 -d 128 --low 60 --high 70
+    python amd-ikbo-fa_pipelined_test.py --mode correctness
 """
 
 import argparse
@@ -113,41 +103,8 @@ def _get_base_amd_autotune_configs():
     return _BASE_AMD_CONFIGS
 
 
-_BASE_NVDA_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "NUM_BUFFERS": 2}, num_stages=1, num_warps=8
-    ),
-]
-
-
-def _get_base_nvda_autotune_configs():
-    if TRITON_AUTOTUNE == "1":
-        configs = []
-        for block_m in [32, 64, 128]:
-            for block_n in [32, 64, 128]:
-                for num_stage in [1, 2, 3, 4]:
-                    for num_warp in [2, 4, 8]:
-                        configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_M": block_m,
-                                    "BLOCK_N": block_n,
-                                    "NUM_BUFFERS": 2,
-                                },
-                                num_stages=num_stage,
-                                num_warps=num_warp,
-                            )
-                        )
-        return configs
-    return _BASE_NVDA_CONFIGS
-
-
 @triton.autotune(
-    configs=(
-        _get_base_amd_autotune_configs()
-        if _is_hip
-        else _get_base_nvda_autotune_configs()
-    ),
+    configs=_get_base_amd_autotune_configs(),
     key=["q_seq_len", "kv_seq_len", "d_model"],
 )
 @triton.jit  # pragma: no cover
@@ -348,11 +305,7 @@ def tlx_flash_attn_ikbo_base(
 
 
 @triton.autotune(
-    configs=(
-        _get_base_amd_autotune_configs()
-        if _is_hip
-        else _get_base_nvda_autotune_configs()
-    ),
+    configs=_get_base_amd_autotune_configs(),
     key=["q_seq_len", "kv_seq_len", "d_model"],
 )
 @triton.jit  # pragma: no cover
