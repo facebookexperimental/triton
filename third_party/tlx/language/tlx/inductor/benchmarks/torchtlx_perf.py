@@ -11,7 +11,7 @@ integration; until then, use this.
 Recommended entry point (sets up the env for you)::
 
     scripts/run_torchtlx_perf.sh --op mm --only aten,torch_tlx_mm --precision bf16 \
-        --m 4096 --n 4096 --k 4096 --metrics accuracy,tflops
+        --shapes 4096x4096x4096 --metrics accuracy,tflops
 
 Providers for ``--op mm``:
   * ``aten``          -- torch.matmul / cuBLAS (default baseline)
@@ -301,13 +301,9 @@ def print_table(rows, providers, metrics, dtype_name, baseline):
 
 
 def resolve_shapes(args):
-    if args.m is not None or args.n is not None or args.k is not None:
-        if None in (args.m, args.n, args.k):
-            sys.exit("single-shape mode needs all of --m --n --k")
-        return [(args.m, args.n, args.k)]
-    if args.shapes:
-        return shape_catalog.parse_shapes(args.shapes)
-    sys.exit("provide a shape: --m/--n/--k (single) or --shapes MxNxK,... (batch)")
+    if not args.shapes:
+        sys.exit("provide --shapes MxNxK[,MxNxK,...]")
+    return shape_catalog.parse_shapes(args.shapes)
 
 
 def main(argv=None):
@@ -321,12 +317,8 @@ def main(argv=None):
     p.add_argument("--baseline", default="aten", help="provider used for speedup + accuracy ref")
     p.add_argument("--precision", "--dtype", dest="precision", default="bf16", choices=list(DTYPES.keys()))
     p.add_argument("--metrics", default="tflops,speedup,accuracy")
-    # single shape
-    p.add_argument("--m", type=int, default=None)
-    p.add_argument("--n", type=int, default=None)
-    p.add_argument("--k", type=int, default=None)
-    # batch shape
-    p.add_argument("--shapes", default=None, help="ad-hoc shapes: MxNxK,MxNxK,...")
+    # shapes: one or more MxNxK (a single MxNxK is just a one-element list)
+    p.add_argument("--shapes", default=None, help="shapes: MxNxK[,MxNxK,...]")
     # torch_tlx knobs
     p.add_argument("--tlx-mode", dest="tlx_mode", default="force", choices=["allow", "force"])
     p.add_argument(

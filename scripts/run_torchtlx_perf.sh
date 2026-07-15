@@ -10,16 +10,14 @@
 # then reuses that .venv.
 #
 # Usage:
-#   # single shape
+#   # single shape (a one-element --shapes list)
 #   scripts/run_torchtlx_perf.sh --op mm --only aten,torch_tlx_mm,tlx_ws \
-#       --precision bf16 --m 4096 --n 4096 --k 4096 --metrics accuracy,tflops
+#       --precision bf16 --shapes 4096x4096x4096 --metrics accuracy,tflops
 #
-#   # batch (named shape set: default | square | ads)
+#   # multiple shapes
 #   scripts/run_torchtlx_perf.sh --op mm --only aten,torch_tlx_mm \
-#       --precision bf16 --shape-set default --metrics tflops,speedup --baseline aten
-#
-#   # ad-hoc shapes
-#   scripts/run_torchtlx_perf.sh --shapes 4096x4096x4096,8192x8192x8192
+#       --precision bf16 --shapes 4096x4096x4096,8192x8192x8192 \
+#       --metrics tflops,speedup,accuracy --baseline aten
 #
 #   scripts/run_torchtlx_perf.sh --list      # list torchTLX templates
 #
