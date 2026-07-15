@@ -24,11 +24,11 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-# Register split (mirrors CUTLASS setmaxnreg 48 / 256): lean load+MMA warps
-# donate registers so the promotion warpgroup can run heavy fp32 math.
+# Register split (mirrors CUTLASS setmaxnreg): the lean load/MMA warps cap at 48
+# regs and donate the surplus to the promotion warpgroup (the "default" task),
+# which inherits it implicitly for the heavy fp32 math.
 LOAD_REGS = tl.constexpr(48)
 MMA_REGS = tl.constexpr(48)
-PROMO_REGS = tl.constexpr(256)
 
 
 def _autotune_configs():
@@ -388,8 +388,9 @@ def _pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     group_id = tile_id // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (tile_id % group_size_m)
-    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    pid_in_group = tile_id % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
     return pid_m, pid_n
 
 
