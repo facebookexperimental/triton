@@ -376,8 +376,8 @@ def render_stage3(results):
             lines.append(f"{r['name']}: no configs benchmarked (failed {r.get('fails', 0)}).")
             lines.append("")
             continue
-        rows, cols = r["size"]
-        lines.append(f"{r['name']}  (size {rows}x{cols}, do_bench x3 min-of-medians)")
+        size_txt = "x".join(str(d) for d in r["size"])  # 2-D (rows, cols) reductions or 3-D (M, N, K) GEMMs
+        lines.append(f"{r['name']}  (size {size_txt}, do_bench x3 min-of-medians)")
         lines.append(f"  unconstrained CEILING (fastest of all, bits NOT reproducible): "
                      f"{r['ceiling']:.3f} ms @ {config_label(r['ceiling_config'])}")
         lines.append(f"  full-space spread: {r['slowest']:.3f} ms slowest -> {r['slowest'] / r['ceiling']:.2f}x")
@@ -407,9 +407,9 @@ def render_stage4(results):
             lines.append("")
             continue
         total_om += r["over_merges"]
-        nr, nc = r["size"]
+        size_txt = "x".join(str(d) for d in r["size"])  # 2-D (rows, cols) reductions or 3-D (M, N, K) GEMMs
         caps = ["none" if c is None else str(c) for c in r["caps"]]
-        lines.append(f"{r['name']}  (size {nr}x{nc}; {r['n_configs']} configs x maxnreg{caps} = "
+        lines.append(f"{r['name']}  (size {size_txt}; {r['n_configs']} configs x maxnreg{caps} = "
                      f"{r['ok']}/{r['attempted']} members)")
         rr, sr = r["reg_range"], r["spill_range"]
         lines.append(f"  ptxas variation: n_regs {rr[0]}..{rr[1]}" +
