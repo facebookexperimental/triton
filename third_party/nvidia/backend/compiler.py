@@ -1099,7 +1099,7 @@ class CUDABackend(BaseBackend):
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
-                    from triton.compile_iq.consume import acf_args_for
+                    from triton.magnon.consume import acf_args_for
 
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
@@ -1174,8 +1174,8 @@ please share the reproducer above with Triton project.
             ptx = ck.asm.get("ptx")
             if not ptx:
                 return
-            from triton.compile_iq import store
-            from triton.compile_iq.consume import acf_args_for
+            from triton.magnon import store
+            from triton.magnon.consume import acf_args_for
             arch = sm_arch_from_capability(self.target.arch)
             ver = get_ptxas(self.target.arch).version
             sha = store.ptx_sha256(ptx)

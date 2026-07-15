@@ -92,7 +92,6 @@ docs/sg_execution_times.rst
 
 # Symlink after pip install
 python/triton/tlx
-python/triton/compile_iq
 
 # Vim
 *.swp
