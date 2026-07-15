@@ -105,12 +105,43 @@ tlx.fence("async_shared")
 tlx.async_descriptor_store(desc, smem_buf, offsets)
 ```
 
-## AMD TDM Descriptor Loads
+## AMD TDM Descriptor Operations
 
 `tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
 TDM descriptor load from global memory to a TLX local buffer. It is available on
 TDM-capable AMD targets (`gfx1250+`) and should be synchronized with
 `tlx.async_amd_descriptor_wait`.
+
+`tlx.update_tensor_descriptor(desc, add_offsets=None, set_bounds=None,
+pred=None, clamp_bounds=False)` returns an updated AMD TDM tensor descriptor.
+It mirrors Gluon's `gl.amd.gfx1250.tdm.update_tensor_descriptor` and lowers to
+`amdg.update_tensor_descriptor`.
+
+| Argument | Description |
+|----------|-------------|
+| `desc` | Tensor descriptor to update. |
+| `add_offsets` | Optional per-rank offsets to add to the descriptor tile position. |
+| `set_bounds` | Optional per-rank bounds to write into the descriptor. |
+| `pred` | Optional predicate to write into the descriptor. |
+| `clamp_bounds` | If true, derive edge-tile bounds from `add_offsets`. |
+
+At least one of `add_offsets`, `set_bounds`, or `pred` must be provided.
+`add_offsets` and `set_bounds` must match the descriptor rank.
+`clamp_bounds=True` requires `add_offsets` and is mutually exclusive with
+`set_bounds`.
+
+Example:
+```python
+offs = [pid_m * BLOCK_M, pid_n * BLOCK_N]
+load_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=offs)
+store_desc = tlx.update_tensor_descriptor(c_desc, add_offsets=offs,
+                                          clamp_bounds=True)
+
+tlx.async_amd_descriptor_load(load_desc, tile, [0, 0])
+tlx.async_amd_descriptor_wait(0)
+tlx.async_amd_descriptor_store(store_desc, tile)
+tlx.async_amd_descriptor_wait(0)
+```
 
 `tlx.async_amd_descriptor_load_group(descs, results, offsets, warp_masks,
 preds=None)` groups multiple AMD TDM descriptor loads behind one static hardware
