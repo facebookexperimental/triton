@@ -29,7 +29,8 @@ from triton._C.libtriton import getenv, getenv_bool  # type: ignore
 
 if TYPE_CHECKING:
     from .runtime.cache import CacheManager, RemoteCacheBackend
-    from .runtime.jit import JitFunctionInfo, KernelParam
+    from .runtime.jit import JitFunctionInfo, KernelParam, JITFunction
+    from .runtime.autotuner import Config
     from .compiler.compiler import ASTSource, LazyDict, IRSource
 
 
@@ -402,6 +403,13 @@ class compilation_knobs(base_knobs):
     listener: Union[CompilationListener, None] = None
 
 
+class AutotuneListener(Protocol):
+
+    def __call__(self, *, fn: JITFunction, key: tuple, best_config: Config, configs_timings: dict[Config, list[float]],
+                 duration: Optional[float], cache_hit: bool) -> None:
+        ...
+
+
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
@@ -409,6 +417,7 @@ class autotuning_knobs(base_knobs):
     warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
     rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
     use_entropy: env_bool = env_bool("TRITON_AUTOTUNE_USE_ENTROPY", True)
+    listener: Union[AutotuneListener, None] = None
 
 
 class LaunchHook(Protocol):

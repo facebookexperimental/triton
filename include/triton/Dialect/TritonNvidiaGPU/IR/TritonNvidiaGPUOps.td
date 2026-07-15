@@ -59,7 +59,8 @@ def TTNG_FenceAsyncSharedOp : TTNG_Op<"fence_async_shared"> {
 
   let extraClassDeclaration = [{
     static bool isSupported(int computeCapability) {
-      return computeCapability >= 90;
+      return ::mlir::triton::nvidia_gpu::TargetFeatures(computeCapability)
+          .supportClusterOps();
     }
   }];
 }
