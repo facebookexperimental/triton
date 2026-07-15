@@ -1330,3 +1330,106 @@ llvm.func @gsan_dynamic_register_reallocation_disabled() attributes {allocation.
 }
 
 }
+
+// -----
+
+// When the module is marked single-warp-specialize, worker warps are dispatched
+// to their partition directly from `wid` -- there is no SMEM state-id load and
+// no switch table, and each partition branches to the shared exit/return block
+// instead of looping back to the switch. The dispatch is target independent, so
+// it is checked with COMMON for both the NVIDIA and AMD backends.
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.total-num-warps" = 16 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// COMMON-LABEL: @single_ws_dispatch
+llvm.func @single_ws_dispatch() attributes {allocation.offset = 32 : i32} {
+  // COMMON: llvm.cond_br %{{.*}}, [[BODY:\^bb[0-9]+]], [[SWITCH_LOOP:\^bb[0-9]+]]
+
+  // COMMON: [[SWITCH_LOOP]]:
+  // No SMEM state id: neither a state load nor a switch table is generated.
+  // COMMON-NOT: llvm.switch
+  // COMMON-NOT: llvm.load
+  // COMMON: [[UGE_HI:%.*]] = llvm.icmp "uge" [[WID:%.*]], %{{.*}}
+  // COMMON-NEXT: llvm.cond_br [[UGE_HI]], [[P2:\^bb[0-9]+]], [[NEXT:\^bb[0-9]+]]
+  // COMMON: [[NEXT]]:
+  // COMMON-NEXT: [[UGE_LO:%.*]] = llvm.icmp "uge" [[WID]], %{{.*}}
+  // COMMON-NEXT: llvm.cond_br [[UGE_LO]], [[P1:\^bb[0-9]+]], [[P0PRE:\^bb[0-9]+]]
+  // COMMON: [[P0PRE]]:
+  // COMMON-NEXT: llvm.br [[P0:\^bb[0-9]+]]
+
+  // COMMON: [[EXIT:\^bb[0-9]+]]:
+  // COMMON-NEXT: llvm.return
+
+  // Each partition runs once and branches to the exit block (no loop back).
+  // COMMON: [[P0]]:
+  // COMMON: "partition0"
+  // COMMON-NEXT: llvm.br [[EXIT]]
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(4) {
+    "partition1"() : () -> ()
+    ttg.warp_return
+  }
+  partition2() num_warps(4) {
+    "partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
+
+// -----
+
+// Single-warp-specialize keeps the register de-allocation on entry to each
+// region (SwitchLoopStart / WorkerPartitionStart / DefaultPartitionStart) but
+// drops the restoration at region end: warp_return and warp_yield no longer
+// emit a trailing barrier or setmaxregister. NVIDIA-specific (setmaxregister).
+module attributes {ttg.maxnreg = 80 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.total-num-warps" = 16 : i32, "ttg.single-warp-specialize" = true} {
+
+llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+
+// CHECK-LABEL: @single_ws_no_end_realloc
+llvm.func @single_ws_no_end_realloc() attributes {allocation.offset = 0 : i32} {
+  // Entry de-allocation in the switch loop is preserved.
+  // CHECK: nvvm.setmaxregister decrease 24
+
+  // A partition restores its registers on entry, then ends with just a branch:
+  // no trailing barrier and no setmaxregister restore.
+  // CHECK: nvvm.setmaxregister increase 80
+  // CHECK-NEXT: "llvm.nvvm.barrier.cta.sync.all"
+  // CHECK-NEXT: "partition0"
+  // CHECK-NEXT: llvm.br
+
+  // The default region likewise ends with just a branch.
+  // CHECK: "default"
+  // CHECK-NEXT: llvm.br
+  ttg.warp_specialize() attributes {allocation.offset = 0 : i32, warpGroupStartIds = array<i32: 4, 8, 12>, actualRegisters = array<i32: 152, 80, 48, 128>}
+  default {
+    "default"() : () -> ()
+    ttg.warp_yield
+  }
+  partition0() num_warps(4) {
+    "partition0"() : () -> ()
+    ttg.warp_return
+  }
+  partition1() num_warps(4) {
+    "partition1"() : () -> ()
+    ttg.warp_return
+  }
+  partition2() num_warps(4) {
+    "partition2"() : () -> ()
+    ttg.warp_return
+  } : () -> ()
+  llvm.return
+}
+
+}
