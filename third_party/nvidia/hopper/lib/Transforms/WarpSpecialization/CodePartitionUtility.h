@@ -380,6 +380,18 @@ void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
 
+// Shared reuse-legality primitive: is `dstOp` in the forward slice of `srcOp`,
+// following SSA results AND memory (store -> buffer -> load)?  Single source of
+// truth for "one op's value flows into another"; used by both the memory
+// planner (hasPotentialReuse) and code partitioning (hasDependencyChain).
+//
+// `followBufferReuse` widens the memory hop from the store's own slot to any
+// view/slot of the root buffer (see the .cpp). Use it only to ORDER an
+// already-decided reuse (code partitioning), never to gate the planner's
+// packing decision -- the wider walk over-forms reuse groups.
+bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
+                          bool followBufferReuse = false);
+
 // Verify that an A1 (SMEM circular reuse) group is well-formed:
 // - Multi-buffered (channels[0]->getNumBuffers() > 1).
 // - Every producer/consumer of every channel lives in one common basic block.

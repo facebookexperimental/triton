@@ -2008,21 +2008,13 @@ public:
     Operation *from = records[a].producer, *to = records[b].producer;
     if (!from || !to || from == to)
       return false;
-    // Backward def-use reachability: does `from` transitively consume `to`?
-    SmallVector<Operation *> worklist{from};
-    DenseSet<Operation *> seen;
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      for (Value operand : op->getOperands()) {
-        Operation *def = operand.getDefiningOp();
-        if (!def || !seen.insert(def).second)
-          continue;
-        if (def == to)
-          return true;
-        worklist.push_back(def);
-      }
-    }
-    return false;
+    // "a depends on b" == b's producer is in the backward slice of a's producer
+    // == a's producer is in the forward slice of b's producer. Delegate to the
+    // shared dependsThroughMemory so this matches the proven reuse predicate
+    // (isDataDependent / hasPotentialReuse): it follows SSA results AND memory
+    // (store -> buffer -> load), which a plain operand walk misses for values
+    // that flow between buffers through SMEM/TMEM (e.g. FA-bwd dsT -> dq).
+    return dependsThroughMemory(to, from);
   }
 
 private:
@@ -2942,20 +2934,10 @@ public:
     Operation *from = records[a].producer, *to = records[b].producer;
     if (!from || !to || from == to)
       return false;
-    SmallVector<Operation *> worklist{from};
-    DenseSet<Operation *> seen;
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      for (Value operand : op->getOperands()) {
-        Operation *def = operand.getDefiningOp();
-        if (!def || !seen.insert(def).second)
-          continue;
-        if (def == to)
-          return true;
-        worklist.push_back(def);
-      }
-    }
-    return false;
+    // See SmemBufferModel::dependsOn: delegate to the shared memory-aware
+    // predicate so the TMEM reuse-legality gate (TmemPacker::legalJoin) accepts
+    // sibling reuse whose dependency flows through a buffer, not only via SSA.
+    return dependsThroughMemory(to, from);
   }
 
 private:
@@ -3020,39 +3002,13 @@ private:
   SmallVector<BufferT *> buffers;
   DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
 
-  /// Check whether dstOp is in the forward SSA slice of srcOp,
-  /// i.e. dstOp transitively uses a result of srcOp.  Also follows
-  /// memory dependencies (local_store, tmem_store).
+  /// Check whether dstOp is in the forward SSA slice of srcOp, i.e. dstOp
+  /// transitively uses a result of srcOp.  Also follows memory dependencies
+  /// (local_store, tmem_store).  Delegates to the shared `dependsThroughMemory`
+  /// (CodePartitionUtility) so the planner and code partitioning use one source
+  /// of truth for reuse-chain data dependencies.
   static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
-    SmallVector<Operation *, 16> worklist;
-    DenseSet<Operation *> visited;
-    auto enqueueUsers = [&](Operation *op) {
-      for (Value result : op->getResults()) {
-        for (Operation *user : result.getUsers()) {
-          if (visited.insert(user).second)
-            worklist.push_back(user);
-        }
-      }
-      if (isa<triton::gpu::LocalStoreOp>(op) ||
-          isa<triton::nvidia_gpu::TMEMStoreOp>(op)) {
-        for (Value operand : op->getOperands()) {
-          if (isa<triton::gpu::MemDescType>(operand.getType())) {
-            for (Operation *user : operand.getUsers()) {
-              if (user != op && visited.insert(user).second)
-                worklist.push_back(user);
-            }
-          }
-        }
-      }
-    };
-    enqueueUsers(srcOp);
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      if (op == dstOp)
-        return true;
-      enqueueUsers(op);
-    }
-    return false;
+    return dependsThroughMemory(srcOp, dstOp);
   }
 
   /// Look up the BufferT for a given alloc operation.
