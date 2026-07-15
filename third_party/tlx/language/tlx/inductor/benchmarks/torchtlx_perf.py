@@ -252,22 +252,33 @@ def print_csv(rows, providers, dtype_name):
             print(f"{M},{N},{K},{dtype_name},{name},{tflops},{sp},{acc}")
 
 
-def print_table(rows, providers, metrics, dtype_name):
-    """One aligned table across all shapes, with dynamic column widths."""
-    headers = ["M", "N", "K", "provider"]
-    metric_cols = [m for m in ("tflops", "speedup", "accuracy") if m in metrics]
-    labels = {"tflops": "TFLOPS", "speedup": "speedup", "accuracy": "accuracy"}
-    headers += [labels[m] for m in metric_cols]
+def print_table(rows, providers, metrics, dtype_name, baseline):
+    """One row per shape; providers become columns (dynamic widths).
 
-    # Build every row as a list of strings, then size columns to the widest cell.
+    Each provider contributes a column per requested metric. speedup/accuracy are
+    omitted for the baseline provider (trivially 1.000x / ref).
+    """
+    metric_cols = [m for m in ("tflops", "speedup", "accuracy") if m in metrics]
+    short = {"tflops": "TFLOPS", "speedup": "spdup", "accuracy": "acc"}
+
+    # Column spec: (provider, metric) pairs, grouped by provider.
+    col_specs = []
+    for p in providers:
+        for m in metric_cols:
+            if m in ("speedup", "accuracy") and p == baseline:
+                continue
+            col_specs.append((p, m))
+
+    headers = ["M", "N", "K"] + [f"{p}:{short[m]}" for (p, m) in col_specs]
+    # M/N/K and numeric metrics right-aligned; accuracy string left-aligned.
+    aligns = ["r", "r", "r"] + ["l" if m == "accuracy" else "r" for (_, m) in col_specs]
+
     table = []
     for shape, results in rows:
         M, N, K = shape
-        for name in providers:
-            rec = results[name]
-            cells = [str(M), str(N), str(K), name]
-            cells += [_fmt_cell(rec, m) for m in metric_cols]
-            table.append(cells)
+        cells = [str(M), str(N), str(K)]
+        cells += [_fmt_cell(results[p], m) for (p, m) in col_specs]
+        table.append(cells)
 
     ncol = len(headers)
     widths = [len(headers[i]) for i in range(ncol)]
@@ -276,13 +287,13 @@ def print_table(rows, providers, metrics, dtype_name):
             widths[i] = max(widths[i], len(cells[i]))
 
     def render(cells):
-        # numeric M/N/K right-aligned; everything else left-aligned.
-        out = []
-        for i, c in enumerate(cells):
-            out.append(c.rjust(widths[i]) if i < 3 else c.ljust(widths[i]))
+        out = [
+            c.rjust(widths[i]) if aligns[i] == "r" else c.ljust(widths[i])
+            for i, c in enumerate(cells)
+        ]
         return "  ".join(out).rstrip()
 
-    print(f"\n# dtype={dtype_name}")
+    print(f"\n# dtype={dtype_name} baseline={baseline}")
     print(render(headers))
     print("-" * (sum(widths) + 2 * (ncol - 1)))
     for cells in table:
@@ -380,7 +391,7 @@ def main(argv=None):
     if args.simple_output:
         print_csv(rows, providers, args.precision)
     else:
-        print_table(rows, providers, metrics, args.precision)
+        print_table(rows, providers, metrics, args.precision, args.baseline)
 
     return 0
 
