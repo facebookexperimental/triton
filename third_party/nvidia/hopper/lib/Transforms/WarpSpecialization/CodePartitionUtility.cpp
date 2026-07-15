@@ -3026,14 +3026,15 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
             firstProducer = currentProds.front();
           lastConsumer = &op;
           numChannelsCreated++;
-          // Chained accumulator (T279388065): several same-task MMA writers into
-          // one operand-D tile, the first use_acc=false (fresh overwrite),
-          // consumed in-loop by this tmem_load. Emit ONE forward channel from the
-          // LAST writer (full commit from the last MMA, like TLX dq_fulls on n1)
-          // and place the reuse/empty producer_acquire before the FIRST writer
-          // via acquireBeforeOp (like TLX's single dq_empties acquire before n0),
-          // instead of one full/empty pair per writer -- the per-writer shape
-          // fails to serialize the fresh overwrite against the consumer's read.
+          // Chained accumulator (T279388065): several same-task MMA writers
+          // into one operand-D tile, the first use_acc=false (fresh overwrite),
+          // consumed in-loop by this tmem_load. Emit ONE forward channel from
+          // the LAST writer (full commit from the last MMA, like TLX dq_fulls
+          // on n1) and place the reuse/empty producer_acquire before the FIRST
+          // writer via acquireBeforeOp (like TLX's single dq_empties acquire
+          // before n0), instead of one full/empty pair per writer -- the
+          // per-writer shape fails to serialize the fresh overwrite against the
+          // consumer's read.
           if (currentProds.size() > 1 &&
               isFreshOverwriteMMA(currentProds.front()) &&
               isa<ttng::MMAv5OpInterface>(currentProds.back())) {
@@ -3049,8 +3050,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
             setTmemChannelAttr(currentProds.back(), channelID, "tmem.start");
             setTmemChannelAttr(&op, channelID, "tmem.end");
           } else {
-            createChannelsForProducers(currentProds, producerTaskId, consumerIds,
-                                       tmemAllocOp.getOperation(), &op, channels);
+            createChannelsForProducers(currentProds, producerTaskId,
+                                       consumerIds, tmemAllocOp.getOperation(),
+                                       &op, channels);
           }
         } else {
           // Channel skipped - append to producers vector

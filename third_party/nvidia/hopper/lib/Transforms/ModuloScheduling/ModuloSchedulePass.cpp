@@ -3736,14 +3736,15 @@ static int getDumpTopN() {
   return n < 1 ? 1 : n;
 }
 
-/// Which partition variant to COMMIT for lowering, by cost-model rank — 0-based,
-/// matching `variant_id` in the TRITON_MODULO_DUMP_TOPN dump (0 = the rank-0
-/// winner). Default -1 = commit the winner. Set TRITON_MODULO_SELECT_VARIANT=k
-/// to instead lower the k-th-ranked partition as a single schedule, so you can
-/// empirically test whether the cost model's rank 0 is really the fastest (dump
-/// top-N, pick a variant_id, re-run with this flag to run just that one).
-/// Out-of-range clamps to the last available variant. Only the exhaustive
-/// partitioner enumerates variants; the greedy fallback has just one.
+/// Which partition variant to COMMIT for lowering, by cost-model rank —
+/// 0-based, matching `variant_id` in the TRITON_MODULO_DUMP_TOPN dump (0 = the
+/// rank-0 winner). Default -1 = commit the winner. Set
+/// TRITON_MODULO_SELECT_VARIANT=k to instead lower the k-th-ranked partition as
+/// a single schedule, so you can empirically test whether the cost model's rank
+/// 0 is really the fastest (dump top-N, pick a variant_id, re-run with this
+/// flag to run just that one). Out-of-range clamps to the last available
+/// variant. Only the exhaustive partitioner enumerates variants; the greedy
+/// fallback has just one.
 static int getSelectVariant() {
   auto v = triton::tools::getStrEnv("TRITON_MODULO_SELECT_VARIANT");
   if (v.empty())
@@ -3884,10 +3885,11 @@ static void partitionExhaustive(ttg::ScheduleLoop &loop,
   });
   const auto &winner = scored.front();
 
-  // Default: commit the cost-model winner (rank 0). TRITON_MODULO_SELECT_VARIANT
-  // overrides this to commit the k-th-ranked partition instead (0-based,
-  // matching variant_id in the TOPN dump) so a specific variant can be lowered
-  // and tested. Out-of-range clamps to the last available.
+  // Default: commit the cost-model winner (rank 0).
+  // TRITON_MODULO_SELECT_VARIANT overrides this to commit the k-th-ranked
+  // partition instead (0-based, matching variant_id in the TOPN dump) so a
+  // specific variant can be lowered and tested. Out-of-range clamps to the last
+  // available.
   size_t commitIdx = 0;
   if (int sel = getSelectVariant(); sel >= 0) {
     commitIdx = std::min<size_t>(sel, scored.size() - 1);
