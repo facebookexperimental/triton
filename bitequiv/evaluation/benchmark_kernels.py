@@ -889,28 +889,32 @@ def _mul_combine(a, b):
     return a * b
 
 
+# ORD is an optional reduction_ordering (default None = compiler default). It lets a
+# determinism-focused caller (e.g. the bitequiv M2 eval) request inner_tree; standalone
+# benchmark use leaves it None, so behavior is unchanged. These are 1-D per-row reduces
+# (no kept dim), so they are order-invariant to layout and M2 does not fire on them.
 @triton.jit
-def _rowreduce_kernel(x_ptr, o_ptr, M, N, KIND: tl.constexpr, BLOCK_N: tl.constexpr):
+def _rowreduce_kernel(x_ptr, o_ptr, M, N, KIND: tl.constexpr, BLOCK_N: tl.constexpr, ORD: tl.constexpr = None):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     m = cols < N
     if KIND == 0:  # sum
-        r = tl.sum(tl.load(x_ptr + row * N + cols, mask=m, other=0.0), axis=0)
+        r = tl.sum(tl.load(x_ptr + row * N + cols, mask=m, other=0.0), axis=0, reduction_ordering=ORD)
     elif KIND == 1:  # mean
-        r = tl.sum(tl.load(x_ptr + row * N + cols, mask=m, other=0.0), axis=0) / N
+        r = tl.sum(tl.load(x_ptr + row * N + cols, mask=m, other=0.0), axis=0, reduction_ordering=ORD) / N
     elif KIND == 2:  # max
         r = tl.max(tl.load(x_ptr + row * N + cols, mask=m, other=-float("inf")), axis=0)
     elif KIND == 3:  # min
         r = tl.min(tl.load(x_ptr + row * N + cols, mask=m, other=float("inf")), axis=0)
     elif KIND == 4:  # var (population)
         x = tl.load(x_ptr + row * N + cols, mask=m, other=0.0)
-        mean = tl.sum(x, axis=0) / N
+        mean = tl.sum(x, axis=0, reduction_ordering=ORD) / N
         xc = tl.where(m, x - mean, 0.0)
-        r = tl.sum(xc * xc, axis=0) / N
+        r = tl.sum(xc * xc, axis=0, reduction_ordering=ORD) / N
     else:  # KIND == 5: logsumexp
         x = tl.load(x_ptr + row * N + cols, mask=m, other=-float("inf"))
         mx = tl.max(x, axis=0)
-        r = mx + tl.log(tl.sum(tl.exp(x - mx), axis=0))
+        r = mx + tl.log(tl.sum(tl.exp(x - mx), axis=0, reduction_ordering=ORD))
     tl.store(o_ptr + row, r)
 
 
@@ -2230,6 +2234,48 @@ register(name="rmsnorm_bwd_dx", category="backward",
          source="https://github.com/pytorch-labs/tritonbench/blob/main/tritonbench/operators/rms_norm/fused_triton.py",
          make_inputs=lambda: (randn(2048, 2048, seed=109), randn(2048, 2048, seed=110), randn(2048, seed=111)),
          run=_run_rmsnorm_bwd, ref=_ref_rmsnorm_bwd, rtol=2e-3, atol=2e-3, shape_note="2048x2048")
+
+
+# Final stage of LayerNorm/RMSNorm backward: sum the per-row-block partial buffers over the ROW
+# axis (dim 0, strided by N) to get dw[N] and db[N]. This reduces a NON-contiguous axis with the
+# kept feature axis contiguous -- the M2 firing shape (the weight-grad companion to the dx kernels
+# above; the zoo had input-grad reductions but not this weight-grad one). ORD defaults to None so
+# the standalone benchmark is unchanged; the bitequiv M2 eval passes inner_tree.
+@triton.jit
+def _norm_bwd_dwdb_kernel(dw_partial_ptr, db_partial_ptr, dw_ptr, db_ptr, M, N,
+                          BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, ORD: tl.constexpr = None):
+    pid = tl.program_id(0)
+    cols = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = tl.arange(0, BLOCK_M)
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+    offs = rows[:, None] * N + cols[None, :]
+    dw = tl.sum(tl.load(dw_partial_ptr + offs, mask=mask, other=0.0), axis=0, reduction_ordering=ORD)
+    db = tl.sum(tl.load(db_partial_ptr + offs, mask=mask, other=0.0), axis=0, reduction_ordering=ORD)
+    cmask = cols < N
+    tl.store(dw_ptr + cols, dw, mask=cmask)
+    tl.store(db_ptr + cols, db, mask=cmask)
+
+
+def _run_norm_bwd_dwdb(inp):
+    dwp, dbp = inp
+    M, N = dwp.shape
+    dw = torch.empty(N, device=DEVICE, dtype=torch.float32)
+    db = torch.empty(N, device=DEVICE, dtype=torch.float32)
+    BLOCK_N = 256
+    _norm_bwd_dwdb_kernel[(triton.cdiv(N, BLOCK_N), )](dwp, dbp, dw, db, M, N,
+                                                       BLOCK_M=triton.next_power_of_2(M), BLOCK_N=BLOCK_N)
+    return torch.cat([dw, db])
+
+
+def _ref_norm_bwd_dwdb(inp):
+    dwp, dbp = inp
+    return torch.cat([dwp.sum(0), dbp.sum(0)])
+
+
+register(name="layernorm_bwd_dwdb", category="backward",
+         source="https://github.com/triton-lang/triton/blob/main/python/tutorials/05-layer-norm.py",
+         make_inputs=lambda: (randn(64, 2048, seed=112), randn(64, 2048, seed=113)),
+         run=_run_norm_bwd_dwdb, ref=_ref_norm_bwd_dwdb, rtol=2e-3, atol=2e-3, shape_note="64x2048 partials")
 
 
 @triton.jit
