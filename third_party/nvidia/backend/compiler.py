@@ -817,11 +817,6 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
-        # User-pinned register layouts (#tlx.user_layout) stayed wrapped so they
-        # anchor the loads through the layout-optimization passes above, including
-        # optimize_tmem_layouts which reads the wrapper to keep the user's TMEM
-        # load layout. Retire the markers now (before the remaining conversions).
-        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
         if capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
             nvidia.passes.ttnvgpuir.add_tma_store_buffer_reuse(pm)
@@ -855,6 +850,12 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # Retire user-pinned register layout markers (#tlx.user_layout) only after
+        # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
+        # marker; every remove_layout_conversions / reduce_data_duplication above
+        # would otherwise be free to rewrite the unwrapped pinned layout). Placing
+        # it here keeps the pin an anchor through the whole pipeline.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
 
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
