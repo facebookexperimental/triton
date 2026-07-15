@@ -71,6 +71,14 @@ public:
 //   tensor -> ttg.local_alloc -> ttg.local_load(dot)
 // Fold it back to either an identity or an explicit convert_layout so the
 // fallback does not survive to LLVM as LDS traffic.
+// A local_alloc whose encoding is the user-pinned wrapper is a hard constraint:
+// it must not be retagged or folded away (the user explicitly asked for this
+// buffer with this layout). These checks run while the wrapper is still present
+// -- the unwrap to the concrete layout happens after the greedy patterns.
+static bool isUserPinnedAlloc(ttg::LocalAllocOp allocOp) {
+  return isa_and_nonnull<UserLayoutAttr>(allocOp.getType().getEncoding());
+}
+
 class FoldRetaggedLocalAllocLoad
     : public mlir::OpRewritePattern<ttg::LocalLoadOp> {
 public:
@@ -81,6 +89,8 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     auto allocOp = localLoadOp.getSrc().getDefiningOp<ttg::LocalAllocOp>();
     if (!allocOp || !allocOp.getSrc())
+      return failure();
+    if (isUserPinnedAlloc(allocOp))
       return failure();
     if (localLoadOp.getToken())
       return failure();
@@ -114,6 +124,8 @@ public:
                   mlir::PatternRewriter &rewriter) const override {
     Value src = allocOp.getSrc();
     if (!src || !isa<RankedTensorType>(src.getType()))
+      return failure();
+    if (isUserPinnedAlloc(allocOp))
       return failure();
     SmallVector<ttg::LocalLoadOp> loads;
     for (Operation *user : allocOp->getUsers()) {
@@ -163,6 +175,10 @@ static Type getTensorCandidateType(Value value, DataFlowSolver &solver,
                                    const llvm::DenseSet<Value> &blockedValues) {
   auto tensorType = cast<RankedTensorType>(value.getType());
   if (blockedValues.contains(value))
+    return tensorType;
+
+  // A user-pinned register layout is a hard constraint: never retag it.
+  if (isa_and_nonnull<UserLayoutAttr>(tensorType.getEncoding()))
     return tensorType;
 
   auto *lattice = solver.lookupState<TensorLayoutLattice>(value);
@@ -245,6 +261,12 @@ static LogicalResult rewriteMemDescValueFromLattice(Value value,
                                                     Operation *diagnosticOp) {
   auto origType = dyn_cast<ttg::MemDescType>(value.getType());
   if (!origType)
+    return success();
+
+  // A user-pinned shared layout is a hard constraint: never retag it to satisfy
+  // a consumer. Leave the wrapper in place; tlx-resolve-placeholder-layouts
+  // unwraps it to the concrete layout the user asked for.
+  if (isa<UserLayoutAttr>(origType.getEncoding()))
     return success();
 
   FailureOr<const LayoutEncodingLattice *> lattice =
@@ -383,6 +405,33 @@ updateTensorRegionBranchTypes(triton::FuncOp funcOp, DataFlowSolver &solver,
   });
 }
 
+// Retire user-pinned *shared* layouts: replace every #tlx.user_layout<L>
+// encoding on a MemDescType (results and block arguments) with its wrapped
+// concrete layout L. Runs after the dataflow rewrite has refused to retag these
+// buffers, so the user's choice has been honored and the marker is no longer
+// needed. Done here (not only in tlx-resolve-placeholder-layouts) because the
+// AMD pipeline does not run that pass, but always runs this one.
+//
+// Register (RankedTensorType) user layouts are intentionally left wrapped: they
+// must survive as anchors through remove-layout-conversions and the other
+// layout passes, and are unwrapped later by tlx-finalize-user-layouts.
+static void unwrapUserLayoutEncodings(Operation *root) {
+  auto rewrite = [](Value v) {
+    if (auto md = dyn_cast<ttg::MemDescType>(v.getType())) {
+      if (auto w = dyn_cast_or_null<UserLayoutAttr>(md.getEncoding()))
+        v.setType(getNewMemDescType(md, w.getLayout()));
+    }
+  };
+  root->walk([&](Operation *op) {
+    for (Value result : op->getResults())
+      rewrite(result);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          rewrite(arg);
+  });
+}
+
 class TlxPropagateLayoutPass
     : public impl::TlxPropagateLayoutBase<TlxPropagateLayoutPass> {
 public:
@@ -427,6 +476,9 @@ public:
              llvm::enumerate(wsOp.getPartitionOp().getExplicitCaptures())) {
           auto captureType = dyn_cast<ttg::MemDescType>(capture.getType());
           if (!captureType)
+            continue;
+          // User-pinned shared layouts are fixed; don't retag WS captures.
+          if (isa<UserLayoutAttr>(captureType.getEncoding()))
             continue;
 
           SmallVector<Value> relatedValues;
@@ -503,6 +555,13 @@ public:
 
     if (applyPatternsGreedily(getOperation(), std::move(patterns)).failed())
       signalPassFailure();
+
+    // Honor-then-retire user-pinned layouts. The dataflow rewrite and the fold
+    // patterns above all skip values whose encoding is the wrapper (so the
+    // user's choice is never retagged or folded away); only now, after they
+    // have run, do we unwrap the marker back to the concrete layout the user
+    // asked for.
+    unwrapUserLayoutEncodings(getOperation());
   }
 };
 

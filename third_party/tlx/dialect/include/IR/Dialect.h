@@ -42,6 +42,13 @@ Attribute wrapNoVerifyLayout(Attribute layout);
 Attribute unwrapNoVerifyLayout(Attribute layout);
 bool hasNoVerifyLayout(Attribute layout);
 
+// Wrap a concrete layout (distributed or shared) as a user-pinned layout (no-op
+// if the layout is already wrapped or is not a distributed/shared encoding).
+// Unwrap returns the inner layout, or the argument unchanged if it is not a
+// UserLayoutAttr.
+Attribute wrapUserLayout(Attribute layout);
+Attribute unwrapUserLayout(Attribute layout);
+
 bool hasClusterSyncKernelInit(Operation *op);
 void setClusterSyncKernelInitOnMod(Operation *op, bool value);
 
