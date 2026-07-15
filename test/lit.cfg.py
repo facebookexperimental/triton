@@ -67,6 +67,21 @@ tools = [
 if config.triton_ext_enabled:
     config.available_features.add("triton-ext-enabled")
 
+# Detect an assertions build so tests that rely on `-debug-only` output (only
+# emitted when LLVM_ENABLE_ASSERTIONS is on) can guard with `REQUIRES: asserts`.
+# The `-debug-only` option itself is only registered in assertions builds, so its
+# presence in the (hidden) help is a reliable probe.
+import subprocess  # noqa: E402
+_opt = lit.util.which('triton-opt', config.environment['PATH'])
+if _opt:
+    try:
+        _help = subprocess.run([_opt, '--help-hidden'], capture_output=True,
+                               text=True, timeout=60).stdout
+        if '-debug-only' in _help:
+            config.available_features.add("asserts")
+    except Exception:
+        pass
+
 llvm_config.add_tool_substitutions(tools, tool_dirs)
 
 # TODO: what's this?
