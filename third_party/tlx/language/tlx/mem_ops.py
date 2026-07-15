@@ -116,6 +116,16 @@ def buffer_load_to_local(
     Directly emits amdg.buffer_load_to_local. The ConvertTritonToTritonGPU pass
     adds tensor encoding, and the AMD backend lowers it to LLVM.
 
+    This lowers to a single direct-to-LDS hardware copy, which fails to lower with
+    a compile-time error unless the following requirements are met:
+    - Each thread's load must reach a supported direct-to-LDS width (32 or 128
+      bits, e.g. 2 or 8 fp16 elements). A smaller vectorization cannot be lowered.
+    - The alignment needed for that width must be statically provable.
+    - If `mask` is given it must be aligned to the vector width: each group of
+      (vector width) consecutive mask values must be identical. The copy moves
+      each lane's whole vector in one transaction, so a mask whose boundary cannot
+      be proven vector-aligned (e.g. `offs < K` for runtime `K`) cannot lower.
+
     Args:
         dest: Destination buffer in shared memory (buffered_tensor).
         ptr: Global memory scalar base pointer.

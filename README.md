@@ -1079,6 +1079,11 @@ token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cach
 
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
 
+**Requirements.** The direct-to-LDS copy has the following hardware constraints:
+- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
+- **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
+
 ### Example
 
 ```python
