@@ -164,10 +164,10 @@ public:
 
 /// Returns the taskId if op has a single taskId, otherwise, returns -1.
 static int getSingleTaskId(Operation *op) {
-  auto asyncTasks = getAsyncTaskIds(op);
-  if (asyncTasks.size() != 1)
+  auto partitionIds = getWSPartitionIds(op);
+  if (partitionIds.size() != 1)
     return -1;
-  return asyncTasks[0];
+  return partitionIds[0];
 }
 
 static unsigned getLoopDepth(Operation *op) {

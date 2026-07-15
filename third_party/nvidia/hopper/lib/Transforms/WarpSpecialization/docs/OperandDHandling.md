@@ -50,9 +50,9 @@ Operand D channels are `TmemDataChannelPost` objects with special flags:
 
 ```cpp
 struct CommChannel {                           // CodePartitionUtility.h
-    DenseMap<int, Value> tokens;               // task-id → token (nvws.create_token)
+    DenseMap<int, Value> tokens;               // partition-id → token (nvws.create_token)
     std::optional<Value>  producerBarrier;     // barrier for TMA / gen5 producer
-    DenseMap<int, Value>  consumerBarriers;    // task-id → barrier for gen5 consumer
+    DenseMap<int, Value>  consumerBarriers;    // partition-id → barrier for gen5 consumer
 };
 ```
 
@@ -239,7 +239,7 @@ consumerOp = actual consumer (resolved via getActualConsumers)
    └─ Producer is TMA load?  → producerBarrier = createBarrierAlloc(numBuffers)
    (Otherwise producerBarrier stays empty.)
 
-2. For each consumer task ID:
+2. For each consumer partition ID:
    a. Resolve the actual consumer op (via getActualConsumers).
    b. useGen5Barrier = ALL actual consumers are MMAv5 ops?
    c. Token:
@@ -489,8 +489,8 @@ if (llvm::is_contained(loadTaskIds, storeTaskId))
   continue;
 ```
 
-If the `tmem_store`'s producer task ID appears in the sibling
-`tmem_load`'s consumer task IDs, the fix is skipped. This ensures:
+If the `tmem_store`'s producer partition ID appears in the sibling
+`tmem_load`'s consumer partition IDs, the fix is skipped. This ensures:
 
 - **FA BWD (fires):** `storeTaskId = 0` (reduction), `loadTaskIds = {3}`
   (computation). `0 ∉ {3}` → different tasks → token fix applied.

@@ -2452,7 +2452,8 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
 /// LocalAllocOp is NOT cloned: a shared SMEM buffer (e.g. K/V in FA) is one
 /// producer feeding N consumer partitions, so cloning would duplicate the
 /// buffer. separateLocalAllocWithSrc instead tags the local_store with the
-/// source op's single task ID, letting createChannelPost build a 1→N channel.
+/// source op's single partition ID, letting createChannelPost build a 1→N
+/// channel.
 ///
 /// When a ConvertLayoutOp sits between an ExpandDimsOp/BroadcastOp and its
 /// consumer (e.g., due to upstream layout choices producing different

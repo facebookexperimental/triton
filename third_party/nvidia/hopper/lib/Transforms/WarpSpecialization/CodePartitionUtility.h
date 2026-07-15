@@ -305,22 +305,22 @@ void insertAsyncCopy(
     DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
     bool isPost = false);
 
-Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+Value getAccumCount(OpBuilderWithPartitionIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx);
-std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithPartitionIds &builder,
                                              Location loc, Value accumCnt,
                                              unsigned numBuffers);
-void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+void getBufferIdxAndPhase(OpBuilderWithPartitionIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
                           int reuseGroupIdx, Channel *ch);
 
-Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
+Value getBarrierForPipelineStage(OpBuilderWithPartitionIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+Operation *optimizeTMALoads(OpBuilderWithPartitionIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
@@ -331,7 +331,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             bool isPost = false,
                             DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
-Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
+Value createBufferView(OpBuilderWithPartitionIds &builder, Value alloc,
                        Value idx);
 // Same-task SMEM records are useful for memory-planner bookkeeping, but code
 // partitioning should only consume cross-partition communication channels.

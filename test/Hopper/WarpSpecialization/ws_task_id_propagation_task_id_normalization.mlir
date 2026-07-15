@@ -2,7 +2,7 @@
 
 // Regression test for B-9-F1 / T273481168.
 //
-// `getAsyncTaskIds` is documented to return sorted task IDs. The test task-id
+// `getWSPartitionIds` is documented to return sorted partition IDs. The test partition-id
 // propagation pass normalizes pre-existing task annotations through that helper
 // before propagation. A non-zero-based partition set should therefore be
 // remapped to the canonical contiguous set `{0, 1}`.

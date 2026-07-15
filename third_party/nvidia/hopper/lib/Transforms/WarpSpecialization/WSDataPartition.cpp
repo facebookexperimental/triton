@@ -22,9 +22,9 @@ namespace mlir {
 
 static const char *kDataPartitionAttrName = "tt.data_partition_factor";
 
-static bool containsAll(const SmallVector<AsyncTaskId> &superset,
-                        const SmallVector<AsyncTaskId> &subset) {
-  for (AsyncTaskId id : subset) {
+static bool containsAll(const SmallVector<WSPartitionId> &superset,
+                        const SmallVector<WSPartitionId> &subset) {
+  for (WSPartitionId id : subset) {
     if (!llvm::is_contained(superset, id))
       return false;
   }
@@ -36,13 +36,13 @@ static bool isControlFlowOp(Operation *op) {
              scf::IfOp, scf::WhileOp>(op);
 }
 
-// Ensure all ops in the def-use chain carry the correct async task IDs.
+// Ensure all ops in the def-use chain carry the correct partition IDs.
 static void fixTaskId(triton::FuncOp &funcOp) {
   bool changed = false;
   do {
     changed = false;
     funcOp.walk([&](Operation *op) {
-      auto asyncTaskIds = getAsyncTaskIds(op);
+      auto partitionIds = getWSPartitionIds(op);
       for (Value operand : op->getOperands()) {
         Operation *defOp = operand.getDefiningOp();
         if (!defOp)
@@ -50,21 +50,22 @@ static void fixTaskId(triton::FuncOp &funcOp) {
         // Do not update loads.
         if (isa<LoadOp, DescriptorLoadOp>(defOp))
           continue;
-        auto defTaskIds = getAsyncTaskIds(defOp);
-        // Backward propagation: ensure def covers op's task IDs.
-        if (!containsAll(defTaskIds, asyncTaskIds)) {
+        auto defTaskIds = getWSPartitionIds(defOp);
+        // Backward propagation: ensure def covers op's partition IDs.
+        if (!containsAll(defTaskIds, partitionIds)) {
           // Skip control flow ops.
           if (isa<scf::YieldOp, scf::ConditionOp, scf::ForOp, scf::IfOp,
                   scf::WhileOp>(op))
             continue;
           // Only propagate backward to arithmetic ops (e.g. constants).
-          // Const ops with same value but different task ids can be folded.
+          // Const ops with same value but different partition ids can be
+          // folded.
           if (defOp->getDialect()->getNamespace() == "arith") {
             LLVM_DEBUG({
               LDBG("backward fixing taskId for");
               defOp->dump();
             });
-            addAsyncTaskIds(defOp, asyncTaskIds);
+            addWSPartitionIds(defOp, partitionIds);
             changed = true;
             LLVM_DEBUG({
               LDBG("resulting");
@@ -73,8 +74,8 @@ static void fixTaskId(triton::FuncOp &funcOp) {
           }
         }
 
-        // Forward propagation: ensure op covers def's task IDs
-        if (operand.hasOneUse() && !containsAll(asyncTaskIds, defTaskIds)) {
+        // Forward propagation: ensure op covers def's partition IDs
+        if (operand.hasOneUse() && !containsAll(partitionIds, defTaskIds)) {
           // YieldOp/ConditionOp may lose task attributes during MLIR
           // canonicalization.
           if (isa<scf::YieldOp, scf::ConditionOp, scf::IfOp, scf::WhileOp>(
@@ -83,7 +84,7 @@ static void fixTaskId(triton::FuncOp &funcOp) {
               LDBG("forward fixing taskId for");
               defOp->dump();
             });
-            addAsyncTaskIds(op, defTaskIds);
+            addWSPartitionIds(op, defTaskIds);
             changed = true;
             LLVM_DEBUG({
               LDBG("resulting");
@@ -1021,12 +1022,12 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
   SetVector<Operation *> dots;
   SetVector<Operation *> fallbackDots;
 
-  // Prefer dots that span multiple async task IDs, but preserve explicit data
+  // Prefer dots that span multiple partition IDs, but preserve explicit data
   // partitioning for IR that does not have multi-task dot annotations.
   funcOp.walk([&](Operation *op) {
     if (!isDotOrMMAv5Op(op))
       return;
-    if (getAsyncTaskIds(op).size() > 1)
+    if (getWSPartitionIds(op).size() > 1)
       dots.insert(op);
     else
       fallbackDots.insert(op);
@@ -1055,9 +1056,9 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
       LDBG("\n");
     });
 
-    auto asyncTaskIds = getAsyncTaskIds(op);
+    auto partitionIds = getWSPartitionIds(op);
     if (partitionScheme.numPartitions == 0) {
-      partitionScheme.numPartitions = asyncTaskIds.size();
+      partitionScheme.numPartitions = partitionIds.size();
     }
 
     auto shapePerCTA = getShapePerCTA(dotType);
@@ -1139,13 +1140,13 @@ static void rewriteRematerializedOps(triton::FuncOp &funcOp,
   if (partitionScheme.rematerializedOps.empty())
     return;
 
-  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
+  OpBuilderWithPartitionIds builder(funcOp.getContext());
 
   // For each rematerialized op, create a new op and replace its user with it.
   for (auto opDim : partitionScheme.rematerializedOps) {
     auto oldOp = opDim.first;
     builder.setInsertionPoint(oldOp);
-    builder.setAsyncTaskIdsFromOp(oldOp);
+    builder.setPartitionIdsFromOp(oldOp);
 
     // Skip the first dim which will be using the original op.
     for (unsigned i = 1; i < opDim.second.size(); i++) {
@@ -1166,7 +1167,7 @@ static void rewriteRematerializedOps(triton::FuncOp &funcOp,
             shape, memdescType.getElementType(), memdescType.getEncoding(),
             memdescType.getMemorySpace(), memdescType.getMutableMemory());
         SmallVector<int32_t> offsets(shape.size(), 0);
-        auto viewOp = builder.createWithAsyncTaskIds<MemDescSubsliceOp>(
+        auto viewOp = builder.createWithPartitionIds<MemDescSubsliceOp>(
             allocOp.getLoc(), slicedMemdescType, allocOp.getResult(), offsets);
         newOp = viewOp;
       } else if (isa<arith::ConstantOp>(oldOp)) {
@@ -1180,7 +1181,7 @@ static void rewriteRematerializedOps(triton::FuncOp &funcOp,
         newOp->dump();
       });
 
-      setAsyncTaskIds(newOp, getAsyncTaskIds(oldOp));
+      setWSPartitionIds(newOp, getWSPartitionIds(oldOp));
       partitionScheme.ops.insert(newOp);
       partitionScheme.opPartitionDims[newOp] = dim;
 
@@ -1241,28 +1242,28 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     op->dump();
   });
 
-  auto asyncTaskIds = getAsyncTaskIds(op);
-  SmallVector<mlir::AsyncTaskId, 3> sliceTaskIds;
-  if (asyncTaskIds.size() == numOfPartitions) {
+  auto partitionIds = getWSPartitionIds(op);
+  SmallVector<mlir::WSPartitionId, 3> sliceTaskIds;
+  if (partitionIds.size() == numOfPartitions) {
     // We are slicing the op for consumer only
-    sliceTaskIds.push_back(asyncTaskIds[offset]);
-  } else if (asyncTaskIds.size() == 1) {
+    sliceTaskIds.push_back(partitionIds[offset]);
+  } else if (partitionIds.size() == 1) {
     // We are slicing the op for producer only
-    sliceTaskIds.push_back(asyncTaskIds.front());
-  } else if (asyncTaskIds.size() > numOfPartitions) {
+    sliceTaskIds.push_back(partitionIds.front());
+  } else if (partitionIds.size() > numOfPartitions) {
     // We are slicing the op for both producer and consumer
-    sliceTaskIds.push_back(asyncTaskIds.front());
-    sliceTaskIds.push_back(asyncTaskIds[offset + 1]);
+    sliceTaskIds.push_back(partitionIds.front());
+    sliceTaskIds.push_back(partitionIds[offset + 1]);
   } else {
-    assert(asyncTaskIds.empty() && "Unexpected asyncTaskIds.size()");
+    assert(partitionIds.empty() && "Unexpected partitionIds.size()");
   }
 
-  OpBuilderWithAsyncTaskIds builder(op->getContext());
-  builder.setAsynTaskIdsFromArray(sliceTaskIds);
+  OpBuilderWithPartitionIds builder(op->getContext());
+  builder.setPartitionIdsFromArray(sliceTaskIds);
   auto cloneAndSetResultType = [&](Operation *op) {
     builder.setInsertionPoint(op);
     auto newOp = builder.clone(*op, mappings);
-    setAsyncTaskIds(newOp, sliceTaskIds);
+    setWSPartitionIds(newOp, sliceTaskIds);
     if (numOfPartitions > 1 && isa<LocalAllocOp, ttng::TMEMAllocOp>(newOp)) {
       newOp->setLoc(appendToNameLoc(
           newOp->getLoc(), "_" + std::to_string(offset), op->getContext()));
@@ -1374,12 +1375,12 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
     // Create token
     if (auto token = tmemLdOp.getDep()) {
-      ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
+      ld = builder.createWithPartitionIds<triton::nvidia_gpu::TMEMLoadOp>(
           op->getLoc(), newAccType, token.getType(),
           mappings.lookupOrNull(tmemLdOp.getSrc()),
           mappings.lookupOrNull(token));
     } else {
-      ld = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMLoadOp>(
+      ld = builder.createWithPartitionIds<triton::nvidia_gpu::TMEMLoadOp>(
           op->getLoc(), newAccType, mappings.lookupOrNull(tmemLdOp.getSrc()));
     }
 
@@ -1390,7 +1391,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
         shape, oldRetType.getElementType(), oldRetType.getEncoding());
     Value loadResult = ld.getResult();
     if (loadResult.getType() != slicedOrigType) {
-      auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
+      auto cvtOp = builder.createWithPartitionIds<ConvertLayoutOp>(
           op->getLoc(), slicedOrigType, loadResult);
       mappings.map(tmemLdOp.getResult(), cvtOp->getResult(0));
     } else {
@@ -1495,7 +1496,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
           nvidia_gpu::getDefaultLayoutForTmemLdSt(newType, numWarps);
       auto newAccType = RankedTensorType::get(
           srcTy.getShape(), srcTy.getElementType(), newDistributedEncoding);
-      auto cvtOp = builder.createWithAsyncTaskIds<ConvertLayoutOp>(
+      auto cvtOp = builder.createWithPartitionIds<ConvertLayoutOp>(
           op->getLoc(), newAccType,
           mappings.lookupOrNull(tmemAllocOp.getSrc()));
 
@@ -1504,14 +1505,14 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       // Create token
       if (auto token = tmemAllocOp.getToken()) {
         auto newAllocOp =
-            builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMAllocOp>(
+            builder.createWithPartitionIds<triton::nvidia_gpu::TMEMAllocOp>(
                 op->getLoc(), newType, token.getType(), cvtOp);
         auto newToken = newAllocOp.getToken();
         mappings.map(token, newToken);
         reverseMappings.map(newToken, token);
         alloc = newAllocOp;
       } else {
-        alloc = builder.createWithAsyncTaskIds<triton::nvidia_gpu::TMEMAllocOp>(
+        alloc = builder.createWithPartitionIds<triton::nvidia_gpu::TMEMAllocOp>(
             op->getLoc(), newType, cvtOp);
       }
       auto v = tmemAllocOp->getResult(0);
@@ -1531,10 +1532,11 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     shape[dim] = sliceSize;
     auto newValType = valType.clone(shape);
     auto newValAttr = valAttr.resizeSplat(newValType);
-    newOp = builder.createWithAsyncTaskIds<arith::ConstantOp>(op->getLoc(),
+    newOp = builder.createWithPartitionIds<arith::ConstantOp>(op->getLoc(),
                                                               newValAttr);
-    // Do not drop original task id as constant folding may lose one constant.
-    setAsyncTaskIds(newOp, getAsyncTaskIds(op));
+    // Do not drop original partition id as constant folding may lose one
+    // constant.
+    setWSPartitionIds(newOp, getWSPartitionIds(op));
     auto v = op->getResult(0);
     auto newV = newOp->getResult(0);
     mappings.map(v, newV);
@@ -1550,7 +1552,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto type = cast<RankedTensorType>(v.getType());
     auto newType = RankedTensorType::get({sliceSize}, builder.getI32Type(),
                                          type.getEncoding());
-    newOp = builder.createWithAsyncTaskIds<MakeRangeOp>(
+    newOp = builder.createWithPartitionIds<MakeRangeOp>(
         op->getLoc(), newType, newRangeStart, newRangeEnd);
     auto newV = newOp->getResult(0);
     mappings.map(v, newV);
@@ -1580,9 +1582,9 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
         builder.setInsertionPointAfter(defOp);
       else
         builder.setInsertionPoint(op);
-      Value offsetVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      Value offsetVal = builder.createWithPartitionIds<arith::ConstantIntOp>(
           op->getLoc(), offset * shape[dim] / numOfPartitions, 32);
-      newCoordVal = builder.createWithAsyncTaskIds<arith::AddIOp>(
+      newCoordVal = builder.createWithPartitionIds<arith::AddIOp>(
           op->getLoc(), coordVal, offsetVal);
       mappings.map(coordVal, newCoordVal);
       reverseMappings.map(newCoordVal, coordVal);
@@ -1621,7 +1623,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     }
     builder.setInsertionPoint(op);
     newOp = builder.clone(*op, mappings);
-    setAsyncTaskIds(newOp, sliceTaskIds);
+    setWSPartitionIds(newOp, sliceTaskIds);
     auto newV = newOp->getResult(0);
     newV.setType(newType);
     mappings.map(v, newV);
@@ -1650,7 +1652,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     } else {
       builder.setInsertionPoint(op);
       auto clonedReshape = builder.clone(*op, mappings);
-      setAsyncTaskIds(clonedReshape, sliceTaskIds);
+      setWSPartitionIds(clonedReshape, sliceTaskIds);
       mappings.map(op, clonedReshape);
       reverseMappings.map(clonedReshape, op);
 
@@ -1667,7 +1669,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                            type.getMemorySpace(), type.getMutableMemory());
       SmallVector<int32_t> offsets(shape.size(), 0);
       offsets[dim] = offset * sliceSize;
-      auto subsliceOp = builder.createWithAsyncTaskIds<MemDescSubsliceOp>(
+      auto subsliceOp = builder.createWithPartitionIds<MemDescSubsliceOp>(
           op->getLoc(), slicedType, clonedReshape->getResult(0), offsets);
       mappings.map(result, subsliceOp.getResult());
       reverseMappings.map(subsliceOp.getResult(), result);
@@ -1751,7 +1753,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
 
     // Create newForOp and take the region of forOp
     builder.setInsertionPoint(op);
-    auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
+    auto newForOp = builder.createWithPartitionIds<scf::ForOp>(
         forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
         forOp.getStep(), newLoopArgs);
     assert(newForOp.getRegionIterArgs().size() ==
@@ -1867,7 +1869,7 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     for (Value newArg :
          llvm::drop_begin(newLoopArgs, whileOp.getInits().size()))
       resultTypes.push_back(newArg.getType());
-    auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+    auto newWhileOp = builder.createWithPartitionIds<scf::WhileOp>(
         whileOp.getLoc(), resultTypes, newLoopArgs);
     newWhileOp->setAttrs(whileOp->getAttrs());
     partitionScheme.ops.insert(newWhileOp);
@@ -1997,16 +1999,16 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
-    // recursively set async task ids for child ops
+    // recursively set partition ids for child ops
     newOp->walk(
-        [&](Operation *childOp) { setAsyncTaskIds(childOp, sliceTaskIds); });
+        [&](Operation *childOp) { setWSPartitionIds(childOp, sliceTaskIds); });
   } else if (isa<MapElementwiseOp>(op)) {
     for (Value operand : op->getOperands())
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
-    // recursively set async task ids for child ops
+    // recursively set partition ids for child ops
     newOp->walk(
-        [&](Operation *childOp) { setAsyncTaskIds(childOp, sliceTaskIds); });
+        [&](Operation *childOp) { setWSPartitionIds(childOp, sliceTaskIds); });
   } else {
     llvm_unreachable("unsupported op type");
   }

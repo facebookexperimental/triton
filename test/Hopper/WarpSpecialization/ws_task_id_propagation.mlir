@@ -124,9 +124,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked>
     // Allocate tmem accumulator
     %acc, %acc_token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
-    // Initialize accumulator with zeros (no task ID — should get {0} from earliest user)
+    // Initialize accumulator with zeros (no partition ID — should get {0} from earliest user)
     %init_token = ttng.tmem_store %cst, %acc[%acc_token], %true : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // Loop with tmem_load (task 0) and tc_gen5_mma (task 1) — mixed task IDs
+    // Loop with tmem_load (task 0) and tc_gen5_mma (task 1) — mixed partition IDs
     %result = scf.for %iv = %c0 to %n_tiles step %c1 iter_args(%dep = %init_token) -> (!ttg.async.token) : i32 {
       // tmem_load for rescale (task 0) — earliest annotated user of %acc
       %loaded, %load_token = ttng.tmem_load %acc[%dep] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
@@ -140,10 +140,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// Test that task IDs propagate correctly through tt.map_elementwise ops and
+// Test that partition IDs propagate correctly through tt.map_elementwise ops and
 // into their region bodies. This validates the fix for a crash where
 // TaskIdPropagation hit an unsupported parent op (MapElementwiseOp) when
-// propagating task IDs for ops inside the map_elementwise region.
+// propagating partition IDs for ops inside the map_elementwise region.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -154,13 +154,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
   // CHECK-LABEL: @matmul_with_map_elementwise
   //
-  // Verify ops inside the map_elementwise region get task IDs.
+  // Verify ops inside the map_elementwise region get partition IDs.
   // CHECK:      "tt.map_elementwise"
   // CHECK:        arith.constant {ttg.partition = array<i32: 1, 2>} 0xFF800000 : f32
   // CHECK:        arith.maxnumf %{{.*}}, %{{.*}} {ttg.partition = array<i32: 1, 2>} : f32
   // CHECK:        tt.map_elementwise.return {ttg.partition = array<i32: 1, 2>} %{{.*}} : f32
   //
-  // Verify the map_elementwise op itself gets the consumer task IDs.
+  // Verify the map_elementwise op itself gets the consumer partition IDs.
   // CHECK:      }) {ttg.partition = array<i32: 1, 2>} :
 
   tt.func public @matmul_with_map_elementwise(%arg0: !tt.tensordesc<tensor<128x64xf16>>, %arg1: !tt.tensordesc<tensor<64x256xf16>>, %arg2: !tt.tensordesc<tensor<128x256xf16>>, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}) {

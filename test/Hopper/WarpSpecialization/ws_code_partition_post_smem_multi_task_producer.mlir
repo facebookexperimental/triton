@@ -3,7 +3,7 @@
 // Regression test for B-1-F2 / T273462656.
 // Multi-task SMEM producers can have consumers in multiple task partitions.
 // The post channel collector should filter per partition instead of asserting
-// when both the producer and consumer task-id sets contain more than one id.
+// when both the producer and consumer partition-id sets contain more than one id.
 
 // CHECK-LABEL: @multi_task_smem_producer_multiple_consumers
 // CHECK: tt.return

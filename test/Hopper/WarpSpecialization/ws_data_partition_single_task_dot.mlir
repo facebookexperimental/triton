@@ -1,8 +1,8 @@
 // RUN: triton-opt %s --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s
 
 // Regression test for B-14-F1 / T273489733.
-// Data partitioning is driven by dots with multiple consumer task ids. An
-// unrelated dot with a single consumer task id should not be sliced merely
+// Data partitioning is driven by dots with multiple consumer partition ids. An
+// unrelated dot with a single consumer partition id should not be sliced merely
 // because another dot in the same function needs partitioning.
 
 // CHECK-LABEL: @single_task_dot_not_partitioned

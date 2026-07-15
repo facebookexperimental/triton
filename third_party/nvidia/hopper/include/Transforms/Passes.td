@@ -84,12 +84,12 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
 }
 
 def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::ModuleOp"> {
-  let summary = "test warp specialization task id propagation";
+  let summary = "test warp specialization partition propagation";
 
   let description = [{
     This pass propagates the `ttg.partition` annotation to the dependencies
     of any op that has it set.  This has the functional effect of partitioning
-    the graph into multiple async tasks, based on the initial annotation.
+    the graph into multiple partitions, based on the initial annotation.
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
@@ -117,7 +117,7 @@ def NVGPUWSDataPartition : Pass<"nvgpu-ws-data-partition", "mlir::ModuleOp"> {
 def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::ModuleOp"> {
   let summary = "test warp specialization code partition";
 
-  let description = "This pass generates warp specialized code baed on task id attributes.";
+  let description = "This pass generates warp specialized code based on ttg.partition attributes.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
                            "mlir::triton::TritonDialect",
@@ -166,7 +166,7 @@ def NVGPUTest1DTMEMAlloc : Pass<"nvgpu-test-1D-tmem-alloc", "mlir::ModuleOp"> {
 def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir::ModuleOp"> {
   let summary = "test buffer allocation";
 
-  let description = "This pass creates buffers for each async task channel.";
+  let description = "This pass creates buffers for each partition channel.";
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }

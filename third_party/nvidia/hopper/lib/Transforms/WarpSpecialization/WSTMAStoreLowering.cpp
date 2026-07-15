@@ -49,9 +49,9 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
   for (auto storeOp : storeOps) {
     auto loc = storeOp.getLoc();
-    auto asyncTaskIds = getAsyncTaskIds(storeOp);
+    auto partitionIds = getWSPartitionIds(storeOp);
 
-    OpBuilderWithAsyncTaskIds builder(storeOp);
+    OpBuilderWithPartitionIds builder(storeOp);
     builder.setInsertionPoint(storeOp);
 
     auto src = storeOp.getSrc();
@@ -116,7 +116,7 @@ void doTMAStoreLowering(triton::FuncOp &funcOp) {
 
   for (auto reduceOp : reduceOps) {
     auto loc = reduceOp.getLoc();
-    OpBuilderWithAsyncTaskIds builder(reduceOp);
+    OpBuilderWithPartitionIds builder(reduceOp);
     builder.setInsertionPoint(reduceOp);
 
     auto src = reduceOp.getSrc();

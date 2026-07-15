@@ -18,7 +18,7 @@ while tile_id < num_tiles:
 
 AutoWS clones the persistent `scf.while` once per partition. That is correct for
 the *pure* static update (`tile_id += NUM_SMS`) but **wrong** for the
-side-effecting `tl.atomic_add`: task-id propagation assigns the atomic (whose
+side-effecting `tl.atomic_add`: partition-id propagation assigns the atomic (whose
 result is the loop-carried value used by every partition) to **all** partitions,
 so each warp group bumps the counter independently, diverges onto a different
 tile, and the producer/consumer barriers never match → **runtime deadlock**.
@@ -38,7 +38,7 @@ tile, and the producer/consumer barriers never match → **runtime deadlock**.
 > `tt.atomic_rmw` and `ttng.clc_read`.
 
 Runs in `WarpSpecialization.cpp::runOnFuncOp` immediately **after**
-`doTaskIdPropagate` (so partitions are materialized as `async_task_id`) and
+`doTaskIdPropagate` (so partitions are materialized as `ttg.partition`) and
 before `doBufferAllocation`. For each `tt.atomic_rmw` it classifies into one of
 three cases:
 
@@ -75,12 +75,12 @@ handshake.
 
 `doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
 `removeWarpSpecializeAttr(funcOp)`, which strips **both** the partition ids
-(`ttg.partition`) and the task ids (`async_task_id`) from every op, plus the WS
+(`ttg.partition`) and the partition ids (`ttg.partition`) from every op, plus the WS
 loop attributes (`tt.warp_specialize`, `ttg.partition.stages`,
 `ttg.partition.types`, `ttg.warp_specialize.tag`) from `scf.for`/`scf.while`
 loops. The kernel is left unspecialized-but-compilable (never a crash/assert).
 This is the same teardown used by the other AutoWS bail-outs (`numWarps < 4`,
-`scf.if` else-block); `removeWarpSpecializeAttr` clears `async_task_id` too
+`scf.if` else-block); `removeWarpSpecializeAttr` clears `ttg.partition` too
 because this reject runs *after* propagation, unlike the earlier bail-outs.
 
 ## Two supporting fixes this feature required
@@ -143,4 +143,4 @@ broadcast (`transformCLC`) is single-stage.
   `EPILOGUE_SUBTILE ∈ {1,2,4}`.
 - LIT: `test/Hopper/WarpSpecialization/ws_atomic_broadcast_transform.mlir`
   (case 2 — exactly one atomic + broadcast) and `ws_atomic_broadcast_reject.mlir`
-  (case 3 — no WS / no partition ids / no task ids left, atomic preserved).
+  (case 3 — no WS / no partition ids / no partition ids left, atomic preserved).

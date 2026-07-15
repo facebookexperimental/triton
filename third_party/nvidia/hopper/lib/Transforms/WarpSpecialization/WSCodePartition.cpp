@@ -58,7 +58,7 @@ injectChannelGraphOnWSBarrierEndpoints(triton::FuncOp &funcOp,
     auto wsAttr = WSBarrierAttr::parse(constraints);
     if (!wsAttr.dstTask)
       return;
-    auto taskIds = getAsyncTaskIds(op);
+    auto taskIds = getWSPartitionIds(op);
     if (taskIds.size() != 1)
       return;
     int srcTask = taskIds[0];
@@ -111,7 +111,7 @@ static unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
 
 // Get the bufferIdx and phase for the last iteration of the immediate scope.
 std::pair<Value, Value>
-getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+getOutOfScopeBufferIdxAndPhase(OpBuilderWithPartitionIds &builder,
                                Operation *op, unsigned numBuffers,
                                const DenseSet<Operation *> &regionsWithChannels,
                                ReuseConfig *config, int reuseGroupIdx) {
@@ -143,8 +143,8 @@ getOutOfScopeBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   // The accumulation count is one past the last iteration. Subtract one to get
   // the last valid iteration index.
   auto loc = bbAargOwner->getLoc();
-  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-  accumCnt = builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, one);
+  Value one = builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 64);
+  accumCnt = builder.createWithPartitionIds<arith::SubIOp>(loc, accumCnt, one);
 
   return getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
 }
@@ -200,7 +200,7 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
                           bool opndAOfGen5, unsigned producerNumBuffers) {
   // For TMEM channels, op is MMAv5 op, producerOp can be either A operand
   // or accumulator.
-  auto producerTaskIds = getAsyncTaskIds(producerOp);
+  auto producerTaskIds = getWSPartitionIds(producerOp);
   auto producerTaskId = producerTaskIds.front();
   for (auto result : producerOp->getResults()) {
     if (result.use_empty()) {
@@ -224,10 +224,10 @@ static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
           continue;
       }
 
-      auto consumerTaskIds = getAsyncTaskIds(userOp);
+      auto consumerTaskIds = getWSPartitionIds(userOp);
       if (consumerTaskIds.empty())
         continue;
-      // Remove producer task id from consumerTaskIds.
+      // Remove producer partition id from consumerTaskIds.
       auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
                               producerTaskId);
       consumerTaskIds.erase(iter, consumerTaskIds.end());
@@ -299,10 +299,10 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
     // FIXME: It is possible that a local_alloc can start a channel, when a
     // gemm's operand is in smem and comes from local_alloc.
     if (isChannelAnchorOp(producerOp)) {
-      auto producerTaskIds = getAsyncTaskIds(producerOp);
+      auto producerTaskIds = getWSPartitionIds(producerOp);
       if (producerTaskIds.empty() || producerTaskIds.size() > 1) {
         LLVM_DEBUG({
-          LDBG(" ignoring ops without async task id or with multiple task "
+          LDBG(" ignoring ops without partition id or with multiple task "
                "ids: ");
           producerOp->dump();
         });
@@ -327,8 +327,8 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       LDBG("channel [" << i << "]  " << to_string(channel->channelKind));
       LDBG("producer op: " << channel->relation.first);
       channel->getSrcOp()->dump();
-      for (auto &asyncTaskId : channel->relation.second)
-        LDBG("consumer: " << asyncTaskId);
+      for (auto &partitionId : channel->relation.second)
+        LDBG("consumer: " << partitionId);
       channel->getDstOp()->dump();
       LDBG("numBuffers: " << channel->getNumBuffers() << "\n");
     }
@@ -341,18 +341,18 @@ static Operation *getUniqueActualConsumer(Operation *consumerOp) {
 }
 
 static Operation *getUniqueActualConsumer(Operation *consumerOp,
-                                          AsyncTaskId taskId) {
+                                          WSPartitionId taskId) {
   auto consumers = getActualConsumers(consumerOp);
   if (consumers.size() == 1)
     return consumers[0];
   // Check to see if there is only one consumer with the specific taskId.
   Operation *uniqOp = nullptr;
   for (auto *op : consumers) {
-    SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(op);
-    assert(asyncTasks.size() > 0);
-    if (asyncTasks.size() > 1)
+    SmallVector<WSPartitionId> partitionIds = getWSPartitionIds(op);
+    assert(partitionIds.size() > 0);
+    if (partitionIds.size() > 1)
       return consumerOp;
-    if (asyncTasks[0] == taskId) {
+    if (partitionIds[0] == taskId) {
       if (uniqOp)
         return consumerOp;
       uniqOp = op;
@@ -452,10 +452,10 @@ void groupChannels(
     // task 0 and consumer task 1, while channel p is between producer task 2
     // and consumer task 1, but in createToken, we only consider the first
     // channel in the group.
-    if (getAsyncTaskIds(c1->getSrcOp()) != getAsyncTaskIds(c2->getSrcOp()))
+    if (getWSPartitionIds(c1->getSrcOp()) != getWSPartitionIds(c2->getSrcOp()))
       return false;
     // Check taskIds on dstOps.
-    if (getAsyncTaskIds(dst1) != getAsyncTaskIds(dst2))
+    if (getWSPartitionIds(dst1) != getWSPartitionIds(dst2))
       return false;
     auto dst1User = getUniqueActualConsumer(dst1);
     auto dst2User = getUniqueActualConsumer(dst2);
@@ -540,8 +540,8 @@ void groupChannels(
       for (auto &channel : kv.second) {
         DBGS() << "producer: ";
         channel->getSrcOp()->dump();
-        for (auto &asyncTaskId : channel->relation.second)
-          DBGS() << asyncTaskId << ", ";
+        for (auto &partitionId : channel->relation.second)
+          DBGS() << partitionId << ", ";
         DBGS() << "] ";
         LDBG("numBuffers: " << channel->getNumBuffers());
         DBGS() << "\n";
@@ -567,10 +567,10 @@ void reorderProducerOps(SmallVector<Channel *> &channels) {
   // Group channels by the first consumer taskId of each channel. Smaller taskId
   // has higher priority.
   // TODO: consider consumer priority
-  std::map<AsyncTaskId, SmallVector<Channel *>> groupedProducerOps;
+  std::map<WSPartitionId, SmallVector<Channel *>> groupedProducerOps;
   for (auto &channel : channels) {
-    auto asyncTaskId = channel->relation.second.front();
-    groupedProducerOps[asyncTaskId].push_back(channel);
+    auto partitionId = channel->relation.second.front();
+    groupedProducerOps[partitionId].push_back(channel);
   }
 
   // No need to reorder if all channels are in the same group.
@@ -666,7 +666,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     });
     // Find the last scf::ForOp in the block
     SetVector<Operation *> epilogOps;
-    std::map<AsyncTaskId, SmallVector<Operation *>> channelOps;
+    std::map<WSPartitionId, SmallVector<Operation *>> channelOps;
     for (Operation &op : reverse(*block)) {
       if (isa<scf::ForOp, scf::IfOp>(op))
         break;
@@ -770,7 +770,7 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     };
 
     // Streamline ops on a channel chain.
-    // Starting with producers with smaller task ids, moving forward
+    // Starting with producers with smaller partition ids, moving forward
     // dependencies of the consumer ops close to the them.
     for (auto item : channelOps) {
       for (auto op : item.second) {
@@ -899,7 +899,7 @@ getTaskTopRegion(triton::FuncOp funcOp,
         continue;
       // If this op does not contain both a producer taskId and a consumer
       // taskId, continue.
-      if (getAsyncTaskIds(op).size() == 1)
+      if (getWSPartitionIds(op).size() == 1)
         continue;
       if (isAsyncTaskTopOp(op))
         asyncTaskOps.push_back(op);
@@ -1044,10 +1044,10 @@ void createToken(
       commChannel.producerBarrier = createBarrierAlloc(
           funcOp, channel->getNumBuffers(), channel->srcName);
 
-    for (auto consumerAsyncTaskId : channel->relation.second) {
+    for (auto consumerWSPartitionId : channel->relation.second) {
       // It is possible that this channel has two consumer taskIds.
       Operation *consumerOp =
-          getUniqueActualConsumer(dstOp, consumerAsyncTaskId);
+          getUniqueActualConsumer(dstOp, consumerWSPartitionId);
 
       // For channels associated with MMAv5 accumulators, consumerOp is usually
       // the tmem_load rather than the MMA op itself.
@@ -1104,13 +1104,13 @@ void createToken(
         else
           v = ttnvws::CreateTokenOp::create(builder, tokenLoc, 1,
                                             tokenLoadType);
-        commChannel.tokens[consumerAsyncTaskId] = v;
+        commChannel.tokens[consumerWSPartitionId] = v;
       }
 
       if (useGen5Barrier) {
         Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
                                      channel->srcName);
-        commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+        commChannel.consumerBarriers[consumerWSPartitionId] = v;
         gen5Barriers[consumerOp] = channel;
       }
     }
@@ -1165,7 +1165,7 @@ static Operation *isProducerTMA(Channel *ch, bool isPost) {
 // Handle buffer index and phase computation for operations outside loops
 // (epilogue/prologue). Returns a pair of (bufferIdx, phase).
 static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
-    OpBuilderWithAsyncTaskIds &builder, Operation *user, Channel *channel,
+    OpBuilderWithPartitionIds &builder, Operation *user, Channel *channel,
     Operation *oldAllocOp, unsigned numBuffers,
     const DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
     int reuseGrp) {
@@ -1221,9 +1221,9 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
       if (parentLoop) {
         builder.setInsertionPoint(parentLoop);
       }
-      bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      bufferIdx = builder.createWithPartitionIds<arith::ConstantIntOp>(
           user->getLoc(), 0, 32);
-      _phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      _phase = builder.createWithPartitionIds<arith::ConstantIntOp>(
           user->getLoc(), 0, 1);
     } else {
       // For epilogue operations, compute final loop values
@@ -1240,9 +1240,9 @@ static std::pair<Value, Value> getBufferIdxAndPhaseForOutsideLoopOps(
   } else {
     // Fallback: if we can't find a parent loop, use constant 0
     // (this should only happen for operations truly outside any loop)
-    bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    bufferIdx = builder.createWithPartitionIds<arith::ConstantIntOp>(
         user->getLoc(), 0, 32);
-    _phase = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+    _phase = builder.createWithPartitionIds<arith::ConstantIndexOp>(
         user->getLoc(), 0);
   }
 
@@ -1279,8 +1279,8 @@ static bool checkConsumersInLoops(Channel *channel) {
 
   // If both producer and consumer ops are outside loops, check if actual
   // consumers are inside loops. This handles both cases:
-  // 1. Multiple consumer task IDs in different loops
-  // 2. Single consumer task ID but actual consumer is inside a loop
+  // 1. Multiple consumer partition IDs in different loops
+  // 2. Single consumer partition ID but actual consumer is inside a loop
   if (producerOutsideLoop && consumerOutsideLoop) {
     // Collect all destination operations
     SmallVector<Operation *> dstOps;
@@ -1291,19 +1291,19 @@ static bool checkConsumersInLoops(Channel *channel) {
       dstOps.push_back(dstOp);
     }
 
-    // Check if actual consumers (with the consumer task IDs) are inside
+    // Check if actual consumers (with the consumer partition IDs) are inside
     // loops
     bool hasConsumersInLoops = false;
 
-    // For each consumer task ID, check if operations with that task ID are
-    // in loops
+    // For each consumer partition ID, check if operations with that partition
+    // ID are in loops
     for (auto consumerTaskId : channel->relation.second) {
       // Check actual consumers from dstOps
       for (auto *dst : dstOps) {
         auto consumers = getActualConsumers(dst);
         for (auto *consumer : consumers) {
-          auto consumerTasks = getAsyncTaskIds(consumer);
-          // Check if this consumer has the task ID we're looking for
+          auto consumerTasks = getWSPartitionIds(consumer);
+          // Check if this consumer has the partition ID we're looking for
           if (std::find(consumerTasks.begin(), consumerTasks.end(),
                         consumerTaskId) != consumerTasks.end()) {
             // Check if this consumer is inside a loop
@@ -1420,8 +1420,8 @@ void createTokenPost(
         // computation-partition tmem_store deadlocks waiting on
         // dsT_0's empty mbarrier.
         auto dstOp = it->second.front()->getDstOp();
-        for (auto consumerAsyncTaskId : channel->relation.second) {
-          if (commChannel.consumerBarriers.count(consumerAsyncTaskId))
+        for (auto consumerWSPartitionId : channel->relation.second) {
+          if (commChannel.consumerBarriers.count(consumerWSPartitionId))
             continue;
           // Recompute useGen5Barrier for THIS channel's consumer task,
           // mirroring the logic used for the representative below
@@ -1438,11 +1438,11 @@ void createTokenPost(
           for (auto *dst : dstOps) {
             auto consumers = getActualConsumers(dst);
             for (auto *t : consumers) {
-              SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
-              if (asyncTasks.empty())
+              SmallVector<WSPartitionId> partitionIds = getWSPartitionIds(t);
+              if (partitionIds.empty())
                 continue;
-              if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                            consumerAsyncTaskId) != asyncTasks.end()) {
+              if (std::find(partitionIds.begin(), partitionIds.end(),
+                            consumerWSPartitionId) != partitionIds.end()) {
                 actualConsumers.insert(t);
                 if (!isa<ttng::TCGen5MMAOp>(t))
                   useGen5Barrier = false;
@@ -1453,12 +1453,12 @@ void createTokenPost(
             continue;
           Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
                                        channel->srcName);
-          commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+          commChannel.consumerBarriers[consumerWSPartitionId] = v;
           LDBG("createTokenPost Fix1: non-rep channel "
                << channel->uniqID
                << " allocated gen5 consumer barrier for task "
-               << consumerAsyncTaskId << " (rep channel " << repChannel->uniqID
-               << " did not cover this task)");
+               << consumerWSPartitionId << " (rep channel "
+               << repChannel->uniqID << " did not cover this task)");
         }
 
         // Share the (possibly extended) CommChannel.
@@ -1525,9 +1525,9 @@ void createTokenPost(
     for (auto *commSourceChannel : channelsForComm) {
       checkConsumersInLoops(commSourceChannel);
       auto sourceDstOp = commSourceChannel->getDstOp();
-      for (auto consumerAsyncTaskId : commSourceChannel->relation.second) {
-        if (commChannel.tokens.count(consumerAsyncTaskId) &&
-            commChannel.consumerBarriers.count(consumerAsyncTaskId))
+      for (auto consumerWSPartitionId : commSourceChannel->relation.second) {
+        if (commChannel.tokens.count(consumerWSPartitionId) &&
+            commChannel.consumerBarriers.count(consumerWSPartitionId))
           continue;
 
         // It is possible that this channel has two consumer taskIds.
@@ -1547,23 +1547,23 @@ void createTokenPost(
         for (auto *dst : dstOps) {
           auto consumers = getActualConsumers(dst);
           for (auto *t : consumers) {
-            SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
+            SmallVector<WSPartitionId> partitionIds = getWSPartitionIds(t);
 
             // Handle operations that belong to multiple tasks (e.g., boundary
             // ops) Only include if this consumer belongs to the task we're
             // processing
-            if (asyncTasks.empty()) {
+            if (partitionIds.empty()) {
               LLVM_DEBUG({
-                LDBG("Skipping operation with no async tasks");
+                LDBG("Skipping operation with no partitions");
                 t->dump();
               });
               continue;
             }
 
-            if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                          consumerAsyncTaskId) != asyncTasks.end()) {
+            if (std::find(partitionIds.begin(), partitionIds.end(),
+                          consumerWSPartitionId) != partitionIds.end()) {
               actualConsumers.insert(t);
-              // XXX: Op can have multiple async tasks
+              // XXX: Op can have multiple partitions
 
               // If consumer and producer are not in the same block, but
               // as long as all consumers are MMAv5 ops, we can use their
@@ -1587,7 +1587,7 @@ void createTokenPost(
         });
         // Need token only when we are not using inline barriers
         if ((!hasProdBar || !useGen5Barrier) &&
-            !commChannel.tokens.count(consumerAsyncTaskId)) {
+            !commChannel.tokens.count(consumerWSPartitionId)) {
           ttnvws::TokenLoadType tokenLoadType;
           auto copyOp = commSourceChannel->getSrcOp();
           if (isa<ttg::AsyncCopyGlobalToLocalOp>(copyOp)) {
@@ -1618,15 +1618,15 @@ void createTokenPost(
           v = ttnvws::CreateTokenOp::create(builder, tokenLoc,
                                             commSourceChannel->getNumBuffers(),
                                             tokenLoadType);
-          commChannel.tokens[consumerAsyncTaskId] = v;
+          commChannel.tokens[consumerWSPartitionId] = v;
         }
 
         if (useGen5Barrier &&
-            !commChannel.consumerBarriers.count(consumerAsyncTaskId)) {
+            !commChannel.consumerBarriers.count(consumerWSPartitionId)) {
           Value v =
               createBarrierAlloc(funcOp, commSourceChannel->getNumBuffers(),
                                  commSourceChannel->srcName);
-          commChannel.consumerBarriers[consumerAsyncTaskId] = v;
+          commChannel.consumerBarriers[consumerWSPartitionId] = v;
         }
       }
     }
@@ -1664,7 +1664,7 @@ void createTokenPost(
 }
 
 static Value hoistLocalAlloc(
-    OpBuilderWithAsyncTaskIds &builder, Operation *oldAlloc,
+    OpBuilderWithPartitionIds &builder, Operation *oldAlloc,
     std::function<void(Operation *, Operation *)> rewriteCallback = nullptr) {
 
   Type oldAllocType;
@@ -1705,13 +1705,13 @@ static Value hoistLocalAlloc(
   }
 
   auto newBuf = newAlloc->getResult(0);
-  auto originTaskIds = builder.getAsyncTaskIds();
+  auto originTaskIds = builder.getWSPartitionIds();
   auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
-  builder.setAsyncTaskIdsFromOp(oldAlloc);
+  builder.setPartitionIdsFromOp(oldAlloc);
   if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(oldAlloc)) {
     builder.setLoopScheduleInfoFromOp(oldAlloc);
     if (localAlloc.getSrc() != nullptr) {
-      auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+      auto storeOp = builder.createWithPartitionIds<ttg::LocalStoreOp>(
           oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
       storeOp->moveBefore(oldAlloc);
     }
@@ -1720,16 +1720,16 @@ static Value hoistLocalAlloc(
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     builder.setLoopScheduleInfoFromOp(tmemAlloc);
     if (tmemAlloc.getSrc() != nullptr) {
-      auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      auto pred = builder.createWithPartitionIds<arith::ConstantIntOp>(
           oldAlloc->getLoc(), 1, 1);
-      auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
+      auto storeOp = builder.createWithPartitionIds<ttng::TMEMStoreOp>(
           oldAlloc->getLoc(), newBuf, tmemAlloc.getSrc(), pred);
       pred->moveBefore(oldAlloc);
       storeOp->moveBefore(oldAlloc);
     }
     oldAlloc->replaceAllUsesWith(newAlloc);
   }
-  builder.setAsynTaskIdsFromArray(originTaskIds);
+  builder.setPartitionIdsFromArray(originTaskIds);
   builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
   oldAlloc->erase();
   return newBuf;
@@ -1738,7 +1738,7 @@ static Value hoistLocalAlloc(
 // Create a local buffer for register channels. Return the allocated buffer and
 // the new producer (reloaded value).
 static std::pair<Value, Value>
-createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
+createLocalAlloc(OpBuilderWithPartitionIds &builder, Channel *channel,
                  bool useTMEM, bool isPost) {
   auto srcResult = channel->getSrcOperand();
   auto srcOp = channel->getSrcOp();
@@ -1792,10 +1792,10 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         allocOp);
     buffer = allocOp->getResult(0);
   } else {
-    auto originTaskIds = builder.getAsyncTaskIds();
+    auto originTaskIds = builder.getWSPartitionIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
     if (isPost)
-      builder.setAsyncTaskIdsFromOp(srcOp);
+      builder.setPartitionIdsFromOp(srcOp);
     tt::DescriptorStoreOp tmaStore;
     bool requireMMASharedEncoding =
         llvm::any_of(actualConsumers, [&](Operation *op) {
@@ -1859,19 +1859,19 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
     if (isPost) {
       // Generate the local store
       builder.setLoopScheduleInfoFromOp(srcOp);
-      auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+      auto storeOp = builder.createWithPartitionIds<ttg::LocalStoreOp>(
           srcOp->getLoc(), srcResult, allocOp);
       storeOp->moveAfter(srcOp);
 
       // local load
-      builder.setAsyncTaskIdsFromOp(dstOp);
+      builder.setPartitionIdsFromOp(dstOp);
       builder.setLoopScheduleInfoFromOp(dstOp);
-      auto loadOp = builder.createWithAsyncTaskIds<ttg::LocalLoadOp>(
+      auto loadOp = builder.createWithPartitionIds<ttg::LocalLoadOp>(
           srcOp->getLoc(), srcResult.getType(), allocOp, Value());
       loadOp->moveBefore(dstOp);
       dstOp->replaceUsesOfWith(srcResult, loadOp->getResult(0));
       newProducer = loadOp->getResult(0);
-      builder.setAsynTaskIdsFromArray(originTaskIds);
+      builder.setPartitionIdsFromArray(originTaskIds);
       builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
     }
   }
@@ -1953,7 +1953,7 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     }
   });
 
-  OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+  OpBuilderWithPartitionIds builder(funcOp->getContext());
   Operation *lastHoistedAlloc = nullptr;
   auto setHoistInsertionPoint = [&]() {
     if (lastHoistedAlloc)
@@ -2276,13 +2276,13 @@ DenseMap<Channel *, Value> createBufferPost(
       ttng::TmemDataChannelPost *tmemChannel =
           static_cast<ttng::TmemDataChannelPost *>(channel);
       oldAllocOp = tmemChannel->allocOp;
-      OpBuilderWithAsyncTaskIds builder(oldAllocOp);
+      OpBuilderWithPartitionIds builder(oldAllocOp);
       buffer = createTMemAllocPost(
           builder, cast<ttng::TMEMAllocOp>(tmemChannel->allocOp), numBuffers);
     } else { // must be SMEMPost
       ChannelPost *smemChannel = static_cast<ChannelPost *>(channel);
       oldAllocOp = smemChannel->allocOp;
-      OpBuilderWithAsyncTaskIds builder(oldAllocOp);
+      OpBuilderWithPartitionIds builder(oldAllocOp);
       buffer = hoistLocalAllocPost(
           builder, cast<ttg::LocalAllocOp>(smemChannel->allocOp), numBuffers);
     }
@@ -2319,7 +2319,7 @@ DenseMap<Channel *, Value> createBufferPost(
     for (auto *user : users) {
       Value bufferIdx;
       Value _phase = Value();
-      OpBuilderWithAsyncTaskIds builder(user);
+      OpBuilderWithPartitionIds builder(user);
       builder.clearLoopScheduleInfo();
       if (isOperandDTmem) {
         // For operandD TMEM users inside a loop with a loop-carried
@@ -2327,7 +2327,7 @@ DenseMap<Channel *, Value> createBufferPost(
         // rotate within that loop. Pass the inner ForOp itself as the 'op'
         // to getBufferIdxAndPhase so that getAccumCount looks up to the
         // outer loop for the accumCnt. The builder stays at the user's
-        // position with its task IDs, so arith ops are per-task.
+        // position with its partition IDs, so arith ops are per-task.
         auto innerFor = user->getParentOfType<scf::ForOp>();
         if (innerFor && hasLoopCarriedAccToken(oldAllocOp, innerFor)) {
           getBufferIdxAndPhase(builder, innerFor.getOperation(), numBuffers,
@@ -2412,7 +2412,7 @@ DenseMap<Channel *, Value> createBufferPost(
     // Make modifications to IR and channels.
     for (auto *user : users) {
       Value bufferIdx = userToBufIdx[user];
-      OpBuilderWithAsyncTaskIds builder(user);
+      OpBuilderWithPartitionIds builder(user);
       // Replace TMEM accesses.
       if (channel->channelKind == DataChannelKind::TMEMPost) {
         auto newTMemAllocOp = cast<ttng::TMEMAllocOp>(buffer.getDefiningOp());
@@ -2493,13 +2493,13 @@ DenseMap<Channel *, Value> createBufferPost(
 // generate a wait on the specific MMA's A/B barrier (from the final iteration)
 // + arrive on the D barrier for per-MMA completion tracking.
 //
-// The caller must set the builder's insertion point, async task IDs, and loop
+// The caller must set the builder's insertion point, partition IDs, and loop
 // schedule info before calling this function.
 //
 // Returns true if the replacement was performed, false if the MMA doesn't have
 // an inline A/B barrier (caller should fall back to creating a commit).
 static bool replaceCommitWithBarrierSync(
-    OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
+    OpBuilderWithPartitionIds &builder, ttng::MMAv5OpInterface mmaOp,
     Value dBarrierAlloc, int dReuseGroupIdx, Value abBarrierAlloc,
     unsigned abNumBuffers, int abReuseGroupIdx,
     DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config) {
@@ -2516,11 +2516,11 @@ static bool replaceCommitWithBarrierSync(
       getBarrierForPipelineStage(builder, abBarrierAlloc, abBufIdx);
 
   // Zero-extend phase from i1 to i32 for WaitBarrierOp.
-  Value phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+  Value phase = builder.createWithPartitionIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), finalPhase);
 
   // Wait on the MMA's A/B barrier from the final iteration.
-  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(loc, abBarrier, phase);
+  builder.createWithPartitionIds<ttng::WaitBarrierOp>(loc, abBarrier, phase);
 
   // Compute D barrier buffer index. The D barrier may have a different number
   // of buffers than the A/B barrier (e.g., D has 1 buffer while A/B has 3)
@@ -2533,7 +2533,7 @@ static bool replaceCommitWithBarrierSync(
   if (dNumBuffers == abNumBuffers) {
     dBufIdx = abBufIdx;
   } else if (dNumBuffers == 1) {
-    dBufIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 32);
+    dBufIdx = builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 0, 32);
   } else {
     auto [idx, unused] = getOutOfScopeBufferIdxAndPhase(
         builder, mmaOp.getOperation(), dNumBuffers, regionsWithChannels, config,
@@ -2543,7 +2543,7 @@ static bool replaceCommitWithBarrierSync(
 
   // Arrive on the D barrier.
   Value dBarrier = getBarrierForPipelineStage(builder, dBarrierAlloc, dBufIdx);
-  builder.createWithAsyncTaskIds<ttng::ArriveBarrierOp>(loc, dBarrier,
+  builder.createWithPartitionIds<ttng::ArriveBarrierOp>(loc, dBarrier,
                                                         /*count=*/1);
   return true;
 }
@@ -2563,7 +2563,7 @@ static bool replaceCommitWithBarrierSync(
 // directly set by the MMA operation. If False we should have generated
 // a tcgen05.commit Operation instead.
 ttng::WaitBarrierOp
-desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
+desyncMMAv5Op(OpBuilderWithPartitionIds &builder, ttng::MMAv5OpInterface mmaOp,
               Value barrierAlloc, Value bufferIdx, Value inPhase,
               Operation *producerOrConsumer, bool asProducerAcquire,
               bool addCompletionBarrier, DictionaryAttr waitConstraints = {},
@@ -2571,7 +2571,7 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp.getOperation());
-  builder.setAsyncTaskIdsFromOp(mmaOp.getOperation());
+  builder.setPartitionIdsFromOp(mmaOp.getOperation());
   builder.setLoopScheduleInfoFromOp(mmaOp.getOperation());
   if (addCompletionBarrier) {
     auto consumerBarrier =
@@ -2589,13 +2589,13 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
       // kernel's per-KV-block k/v release on the epilogue MMA).
       auto forOp = mmaOp->template getParentOfType<scf::ForOp>();
       assert(forOp && "releaseOnLastIterOnly requires an enclosing loop");
-      Value nextIv = builder.createWithAsyncTaskIds<arith::AddIOp>(
+      Value nextIv = builder.createWithPartitionIds<arith::AddIOp>(
           mmaOp->getLoc(), forOp.getInductionVar(), forOp.getStep());
-      pred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+      pred = builder.createWithPartitionIds<arith::CmpIOp>(
           mmaOp->getLoc(), arith::CmpIPredicate::sge, nextIv,
           forOp.getUpperBound());
     } else {
-      pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      pred = builder.createWithPartitionIds<arith::ConstantIntOp>(
           mmaOp->getLoc(), true, 1);
     }
     mmaOp.addCompletionBarrier(consumerBarrier, pred);
@@ -2606,7 +2606,7 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
   // true this wait_barrier serves as producer_acquire. When asProducerAcquire
   // is false this wait_barrier serves as consumer_wait.
   builder.setInsertionPoint(producerOrConsumer);
-  builder.setAsyncTaskIdsFromOp(producerOrConsumer);
+  builder.setPartitionIdsFromOp(producerOrConsumer);
   // Use the actual consumer's stage/cluster, not the memdesc_trans prep op's.
   // producerOrConsumer may be a memdesc_trans/memdesc_index at stage 0, but
   // the real consumer (e.g. dQ/dK MMA) may be at stage 1. The wait_barrier
@@ -2621,17 +2621,17 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
   auto loc = producerOrConsumer->getLoc();
   if (asProducerAcquire) {
     Value _1_1b =
-        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+        builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 1);
     // Creating phase for producerOrConsumer.
-    phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(loc, inPhase,
+    phase = builder.createWithPartitionIds<mlir::arith::XOrIOp>(loc, inPhase,
                                                                 _1_1b);
   }
   // Use zero extension (ExtUIOp) instead of sign extension (ExtSIOp)
   // When phase is i1 with value 1, ExtSIOp produces -1 (all bits set)
   // because the sign bit is 1. ExtUIOp correctly produces 1.
-  phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+  phase = builder.createWithPartitionIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), phase);
-  auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+  auto waitOp = builder.createWithPartitionIds<ttng::WaitBarrierOp>(
       loc, producerBarrier, phase, /*pred=*/Value(), /*deps=*/ValueRange{},
       waitConstraints);
   builder.clearLoopScheduleInfo();
@@ -2722,9 +2722,9 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
 
       // Single pass: create reinterpret ops and replace uses
       for (auto *user : users) {
-        OpBuilderWithAsyncTaskIds builder(user->getContext());
+        OpBuilderWithPartitionIds builder(user->getContext());
         builder.setInsertionPoint(user);
-        builder.setAsyncTaskIdsFromOp(user);
+        builder.setPartitionIdsFromOp(user);
         auto bufferOff =
             channel->getAllocOp()->getAttrOfType<IntegerAttr>("buffer.offset");
         int64_t offset = bufferOff ? bufferOff.getInt() : 0;
@@ -2869,8 +2869,9 @@ void insertAsyncComm(
 
   mlir::DominanceInfo dom(funcOp);
   mlir::PostDominanceInfo pdom(funcOp);
-  auto consumerReleaseHeuristic = [&](Operation *p, Operation *c,
-                                      int consumerAsyncTaskId) -> Operation * {
+  auto consumerReleaseHeuristic =
+      [&](Operation *p, Operation *c,
+          int consumerWSPartitionId) -> Operation * {
     if (c->getBlock() != p->getBlock())
       return getSameLevelOp(p, c);
 
@@ -2903,8 +2904,8 @@ void insertAsyncComm(
     }
 
     for (auto &op : reverse(c->getBlock()->getOperations())) {
-      auto asyncTasks = getAsyncTaskIds(&op);
-      if (asyncTasks.size() == 1 && asyncTasks[0] == consumerAsyncTaskId)
+      auto partitionIds = getWSPartitionIds(&op);
+      if (partitionIds.size() == 1 && partitionIds[0] == consumerWSPartitionId)
         return &op;
     }
 
@@ -3140,20 +3141,20 @@ void insertAsyncComm(
     auto &commChannel = tokenIt->second;
     auto masterChannel = kv.first;
 
-    SmallVector<AsyncTaskId> asyncTaskP;
+    SmallVector<WSPartitionId> asyncTaskP;
     asyncTaskP.push_back(masterChannel->relation.first);
-    SmallVector<AsyncTaskId> &asyncTaskC = masterChannel->relation.second;
-    SmallVector<AsyncTaskId> asyncTasksPC = asyncTaskP;
-    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
-                        asyncTaskC.end());
+    SmallVector<WSPartitionId> &asyncTaskC = masterChannel->relation.second;
+    SmallVector<WSPartitionId> partitionIdsPC = asyncTaskP;
+    partitionIdsPC.insert(partitionIdsPC.end(), asyncTaskC.begin(),
+                          asyncTaskC.end());
 
-    OpBuilderWithAsyncTaskIds builder(headProducer->getContext());
+    OpBuilderWithPartitionIds builder(headProducer->getContext());
     if (auto funcOp = dyn_cast<triton::FuncOp>(headProducer->getParentOp())) {
       builder.setInsertionPointToStart(&(funcOp.getBody().front()));
     } else {
       builder.setInsertionPoint(headProducer->getParentOp());
     }
-    builder.setAsynTaskIdsFromArray(asyncTasksPC);
+    builder.setPartitionIdsFromArray(partitionIdsPC);
 
     SmallVector<tt::DescriptorLoadOp> tmaLoads;
     SmallVector<Value> buffers;
@@ -3178,8 +3179,8 @@ void insertAsyncComm(
     }
 
     auto withSameTask = [&](Operation *A, Operation *B) -> bool {
-      auto aTasks = getAsyncTaskIds(A);
-      auto bTasks = getAsyncTaskIds(B);
+      auto aTasks = getWSPartitionIds(A);
+      auto bTasks = getWSPartitionIds(B);
       return aTasks == bTasks;
     };
 
@@ -3742,9 +3743,9 @@ void insertAsyncComm(
                            reuseGrp, masterChannel);
     } else {
       // Producer is truly outside any loop, create phase and bufferIdx here.
-      bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      bufferIdx = builder.createWithPartitionIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 32);
-      phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      phase = builder.createWithPartitionIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 1);
     }
 
@@ -3790,7 +3791,7 @@ void insertAsyncComm(
           (numBuffers > 1 || channelIsCollapsedBothSubtiled(masterChannel)) &&
           repAlloc) {
         // accumCnt is created OUTSIDE the region so it dominates `sub`.
-        OpBuilderWithAsyncTaskIds idxB(sub.getOperation());
+        OpBuilderWithPartitionIds idxB(sub.getOperation());
         Value accumCnt = getAccumCount(idxB, sub.getOperation(),
                                        regionsWithChannels, config, reuseGrp);
         BlockArgument accumArg = sub.addSharedArg(accumCnt);
@@ -3798,9 +3799,9 @@ void insertAsyncComm(
         BlockArgument tileIdx = sub.getTileIndexArg();
         assert(tileIdx && "subtiled region missing builtin tile index");
         Block &tileBlock = sub.getTileRegion().front();
-        OpBuilderWithAsyncTaskIds b(sub.getOperation());
+        OpBuilderWithPartitionIds b(sub.getOperation());
         b.setInsertionPointToStart(&tileBlock);
-        b.setAsyncTaskIdsFromOp(sub.getOperation());
+        b.setPartitionIdsFromOp(sub.getOperation());
         // In-body ops must NOT carry loop.stage/loop.cluster: the region is
         // inlined before scheduleLoops.
         b.clearLoopScheduleInfo();
@@ -3810,10 +3811,10 @@ void insertAsyncComm(
         Value tileIdxExt;
         if (cntTy.isIndex())
           tileIdxExt =
-              b.createWithAsyncTaskIds<arith::IndexCastOp>(loc, cntTy, tileIdx);
+              b.createWithPartitionIds<arith::IndexCastOp>(loc, cntTy, tileIdx);
         else
           tileIdxExt =
-              b.createWithAsyncTaskIds<arith::ExtUIOp>(loc, cntTy, tileIdx);
+              b.createWithPartitionIds<arith::ExtUIOp>(loc, cntTy, tileIdx);
         // flattened = accumCnt + tileIdx. `accumCnt` already advances by the
         // per-iteration consumption stride (numTiles, applied on the
         // loop-carried reuse-group counter in
@@ -3823,7 +3824,7 @@ void insertAsyncComm(
         // moving it onto the counter keeps a single per-channel stride rule and
         // stops it from leaking onto non-subtile counters.
         Value flattened =
-            b.createWithAsyncTaskIds<arith::AddIOp>(loc, accumArg, tileIdxExt);
+            b.createWithPartitionIds<arith::AddIOp>(loc, accumArg, tileIdxExt);
         std::tie(slot.bufferIdx, slot.phase) =
             getBufferIdxAndPhase(b, loc, flattened, numBuffers);
         // Build the staging view from the in-body base (IsolatedFromAbove: must
@@ -3898,7 +3899,8 @@ void insertAsyncComm(
         auto tokIt = tokenMap.find(kv2.second.front());
         if (tokIt == tokenMap.end() || sib->relation.second.empty())
           continue;
-        // tokens is keyed by consumer task id; take this sibling's own token.
+        // tokens is keyed by consumer partition id; take this sibling's own
+        // token.
         Value sibToken =
             tokIt->second.tokens.lookup(sib->relation.second.front());
         if (!sibToken)
@@ -3941,7 +3943,7 @@ void insertAsyncComm(
       tailConsumer->dump();
     });
 
-    builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+    builder.setPartitionIdsFromArray(masterChannel->relation.first);
 
     if (commChannel.producerBarrier) {
       // If we are using producer barrier, it is either TMA or MMAv5. Handle
@@ -3961,7 +3963,7 @@ void insertAsyncComm(
         if (!addCompletionBarrier) {
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
-          builder.setAsyncTaskIdsFromOp(mmaOp.getOperation());
+          builder.setPartitionIdsFromOp(mmaOp.getOperation());
           // Only attempt the barrier-sync replacement when there are
           // multiple MMAs in the loop (data-partitioned case). With a
           // single MMA the global tcgen05_commit is equivalent and simpler.
@@ -3984,8 +3986,8 @@ void insertAsyncComm(
             assert(tokenIt != tokenMap.end());
             auto &abCommChannel = tokenIt->second;
             // Get the consumer barrier allocation for this MMA's task.
-            SmallVector<AsyncTaskId> mmaTaskIds =
-                getAsyncTaskIds(mmaOp.getOperation());
+            SmallVector<WSPartitionId> mmaTaskIds =
+                getWSPartitionIds(mmaOp.getOperation());
             assert(mmaTaskIds.size() == 1);
             auto barrierIt = abCommChannel.consumerBarriers.find(mmaTaskIds[0]);
             if (barrierIt != abCommChannel.consumerBarriers.end()) {
@@ -3999,7 +4001,7 @@ void insertAsyncComm(
           if (!replaced) {
             auto indexedBarrier = getBarrierForPipelineStage(
                 builder, *commChannel.producerBarrier, bufferIdx);
-            builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+            builder.createWithPartitionIds<ttng::TCGen5CommitOp>(
                 mmaOp->getLoc(), indexedBarrier, /*pred=*/Value(),
                 /*descs=*/ValueRange{});
             // Clear loop schedule info after commit creation so subsequent
@@ -4029,23 +4031,23 @@ void insertAsyncComm(
         // filter with consumerTaskId
         DenseSet<Operation *> filteredOps;
         for (auto *tCon : actualConsumerOps) {
-          SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(tCon);
+          SmallVector<WSPartitionId> partitionIds = getWSPartitionIds(tCon);
 
           // Handle operations that belong to multiple tasks (e.g., boundary
           // ops) Only include if this consumer belongs to the task we're
           // processing
-          if (asyncTasks.empty()) {
+          if (partitionIds.empty()) {
             LLVM_DEBUG({
-              LDBG("Skipping operation with no async tasks");
+              LDBG("Skipping operation with no partitions");
               tCon->dump();
             });
             continue;
           }
 
-          if (std::find(asyncTasks.begin(), asyncTasks.end(), consumerTaskId) !=
-              asyncTasks.end()) {
+          if (std::find(partitionIds.begin(), partitionIds.end(),
+                        consumerTaskId) != partitionIds.end()) {
             filteredOps.insert(tCon);
-            // XXX: Op can have multiple async tasks
+            // XXX: Op can have multiple partitions
           }
         }
         // Get the last MMAv5 op.
@@ -4054,9 +4056,10 @@ void insertAsyncComm(
         if (!mmaOp)
           continue;
         // Assume a single task for mmaOp.
-        SmallVector<AsyncTaskId> asyncTasksMma =
-            getAsyncTaskIds(mmaOp.getOperation());
-        assert(asyncTasksMma.size() == 1 && asyncTasksMma[0] == consumerTaskId);
+        SmallVector<WSPartitionId> partitionIdsMma =
+            getWSPartitionIds(mmaOp.getOperation());
+        assert(partitionIdsMma.size() == 1 &&
+               partitionIdsMma[0] == consumerTaskId);
         LLVM_DEBUG({
           LDBG("unique actual consumer is MMAv5 op " << masterChannel->uniqID
                                                      << " ");
@@ -4088,10 +4091,10 @@ void insertAsyncComm(
           // We need to place the commit after the for loop.
           builder.setInsertionPointAfter(nestedInsertionTarget);
           builder.setLoopScheduleInfoFromOp(nestedInsertionTarget);
-          builder.setAsyncTaskIdsFromOp(mmaOp.getOperation());
+          builder.setPartitionIdsFromOp(mmaOp.getOperation());
           auto indexedConsumerBarrier =
               getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-          builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+          builder.createWithPartitionIds<ttng::TCGen5CommitOp>(
               mmaOp->getLoc(), indexedConsumerBarrier, /*pred=*/Value(),
               /*descs=*/ValueRange{});
           builder.clearLoopScheduleInfo();
@@ -4153,10 +4156,10 @@ void insertAsyncComm(
               ttnvws::TokenLoadType::TmemLoadOp);
 
           // Insert ProducerAcquireOp before the tmem_store.
-          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+          builder.setPartitionIdsFromArray(masterChannel->relation.first);
           builder.setInsertionPoint(producerAcquirePoint);
           builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
-          builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+          builder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
               headProducer->getLoc(), guardToken, bufferIdx, phase,
               WSBarrierAttr::forDstTask(funcOp.getContext(),
                                         foundGuardCh->relation.first)
@@ -4168,19 +4171,19 @@ void insertAsyncComm(
           auto guardConsumerTaskId = foundGuardCh->relation.first;
           auto guardConsumerReleasePoint = consumerReleaseHeuristic(
               foundGuardCh->getDstOp(), guardTmemLoad, guardConsumerTaskId);
-          builder.setAsynTaskIdsFromArray(foundGuardCh->relation.first);
+          builder.setPartitionIdsFromArray(foundGuardCh->relation.first);
           builder.setInsertionPointAfter(guardConsumerReleasePoint);
           builder.setLoopScheduleInfoFromOp(guardConsumerReleasePoint);
           // Compute bufferIdx in the consumer's async-task context so that
-          // the defining ops carry the consumer's task IDs and survive
-          // partitioning (the producer's bufferIdx carries producer task IDs
-          // and would be destroyed in the consumer partition).
+          // the defining ops carry the consumer's partition IDs and survive
+          // partitioning (the producer's bufferIdx carries producer partition
+          // IDs and would be destroyed in the consumer partition).
           Value guardBufIdx, guardPhase;
           getBufferIdxAndPhase(builder, guardConsumerReleasePoint,
                                masterChannel->getNumBuffers(),
                                regionsWithChannels, guardBufIdx, guardPhase,
                                config, reuseGrp, masterChannel);
-          builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+          builder.createWithPartitionIds<ttnvws::ConsumerReleaseOp>(
               guardConsumerReleasePoint->getLoc(), guardToken, guardBufIdx,
               WSBarrierAttr::forDstTask(funcOp.getContext(),
                                         masterChannel->relation.first)
@@ -4195,12 +4198,12 @@ void insertAsyncComm(
 
           // Add completion barrier to MMA.
           builder.setInsertionPoint(mmaOp.getOperation());
-          builder.setAsyncTaskIdsFromOp(mmaOp.getOperation());
+          builder.setPartitionIdsFromOp(mmaOp.getOperation());
           builder.setLoopScheduleInfoFromOp(mmaOp.getOperation());
           if (addCompletionBarrier) {
             auto barrierForStage =
                 getBarrierForPipelineStage(builder, consumerBarrier, bufferIdx);
-            auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            auto pred = builder.createWithPartitionIds<arith::ConstantIntOp>(
                 mmaOp->getLoc(), true, 1);
             mmaOp.addCompletionBarrier(barrierForStage, pred);
           }
@@ -4278,7 +4281,7 @@ void insertAsyncComm(
           if (perTileTok) {
             if (!emittedSubtiledPerTileProducer.count(
                     producerSubtiled.getOperation())) {
-              OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+              OpBuilderWithPartitionIds tileBuilder(annotTarget);
               tileBuilder.setInsertionPoint(annotTarget);
               Value tileBufIdx = producerSubtiled.addSharedArg(bufferIdx);
               Value tilePhase = producerSubtiled.addSharedArg(phase);
@@ -4292,7 +4295,7 @@ void insertAsyncComm(
             }
           } else {
             auto tileToken = producerSubtiled.addSharedArg(token.second);
-            OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+            OpBuilderWithPartitionIds tileBuilder(annotTarget);
             tileBuilder.setInsertionPoint(annotTarget);
             Value tileBufIdx, tilePhase;
             if (slot.valid) {
@@ -4311,7 +4314,7 @@ void insertAsyncComm(
                  << masterChannel->uniqID << " ");
           }
         } else {
-          builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+          builder.setPartitionIdsFromArray(masterChannel->relation.first);
           if (producerAcquireForChannelLoop) {
             builder.setInsertionPoint(producerAcquireForChannelLoop);
             builder.setLoopScheduleInfoFromOp(producerAcquireForChannelLoop);
@@ -4320,7 +4323,7 @@ void insertAsyncComm(
             builder.setLoopScheduleInfoFromOp(producerAcquirePoint);
           }
           auto acquireOp =
-              builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+              builder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
                   headProducer->getLoc(), token.second, bufferIdx, phase,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
@@ -4346,12 +4349,12 @@ void insertAsyncComm(
         auto earlyTokenIt = tokenMap.find(earlyChannelForReuseSync);
         if (earlyTokenIt != tokenMap.end()) {
           for (const auto &earlyToken : earlyTokenIt->second.tokens) {
-            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setPartitionIdsFromArray(masterChannel->relation.first);
             builder.setInsertionPoint(headProducer);
             builder.setLoopScheduleInfoFromOp(headProducer);
-            Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+            Value one = builder.createWithPartitionIds<arith::ConstantIntOp>(
                 headProducer->getLoc(), 1, 1);
-            Value phaseFlipped = builder.createWithAsyncTaskIds<arith::XOrIOp>(
+            Value phaseFlipped = builder.createWithPartitionIds<arith::XOrIOp>(
                 headProducer->getLoc(), phase, one);
             // If the early channel's consumer is a gen5 MMA, it releases the
             // reused buffer on its inline consumerBarrier, not on this token.
@@ -4366,9 +4369,9 @@ void insertAsyncComm(
             if (cbIt != earlyTokenIt->second.consumerBarriers.end()) {
               Value cbar =
                   getBarrierForPipelineStage(builder, cbIt->second, bufferIdx);
-              Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+              Value phI32 = builder.createWithPartitionIds<arith::ExtUIOp>(
                   headProducer->getLoc(), builder.getI32Type(), phaseFlipped);
-              builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+              builder.createWithPartitionIds<ttng::WaitBarrierOp>(
                   headProducer->getLoc(), cbar, phI32);
               LLVM_DEBUG({
                 LDBG("Insert intra-iteration reuse WaitBarrier (gen5 consumer) "
@@ -4379,7 +4382,7 @@ void insertAsyncComm(
               continue;
             }
             auto acquireOp =
-                builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                builder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
                     headProducer->getLoc(), earlyToken.second, bufferIdx,
                     phaseFlipped,
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
@@ -4417,7 +4420,7 @@ void insertAsyncComm(
           for (const auto &wrapToken : wrapTokenIt->second.tokens) {
             if (!emittedReuseTokens.insert(wrapToken.second).second)
               continue;
-            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setPartitionIdsFromArray(masterChannel->relation.first);
             builder.setInsertionPoint(headProducer);
             builder.setLoopScheduleInfoFromOp(headProducer);
             // gen5 consumer: release is on the consumerBarrier, not the token
@@ -4429,14 +4432,14 @@ void insertAsyncComm(
             if (wcbIt != wrapTokenIt->second.consumerBarriers.end()) {
               Value cbar =
                   getBarrierForPipelineStage(builder, wcbIt->second, bufferIdx);
-              Value phI32 = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+              Value phI32 = builder.createWithPartitionIds<arith::ExtUIOp>(
                   headProducer->getLoc(), builder.getI32Type(), phase);
-              builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+              builder.createWithPartitionIds<ttng::WaitBarrierOp>(
                   headProducer->getLoc(), cbar, phI32);
               continue;
             }
             auto acquireOp =
-                builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+                builder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
                     headProducer->getLoc(), wrapToken.second, bufferIdx, phase,
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               wrapToken.first)
@@ -4515,7 +4518,7 @@ void insertAsyncComm(
           if (perTileTok) {
             if (!emittedSubtiledPerTileProducer.count(
                     commitSubtiled.getOperation())) {
-              OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+              OpBuilderWithPartitionIds tileBuilder(annotTarget);
               tileBuilder.setInsertionPointAfter(annotTarget);
               Value tileBufIdx = commitSubtiled.addSharedArg(bufferIdx);
               ttnvws::ProducerCommitOp::create(
@@ -4529,7 +4532,7 @@ void insertAsyncComm(
             }
           } else {
             auto tileToken = commitSubtiled.addSharedArg(token.second);
-            OpBuilderWithAsyncTaskIds tileBuilder(annotTarget);
+            OpBuilderWithPartitionIds tileBuilder(annotTarget);
             tileBuilder.setInsertionPointAfter(annotTarget);
             Value tileBufIdx;
             if (slot.valid) {
@@ -4553,7 +4556,7 @@ void insertAsyncComm(
           builder.setInsertionPointAfter(producerCommitPoint);
           builder.setLoopScheduleInfoFromOp(producerCommitPoint);
           auto commitOp =
-              builder.createWithAsyncTaskIds<ttnvws::ProducerCommitOp>(
+              builder.createWithPartitionIds<ttnvws::ProducerCommitOp>(
                   tailProducer->getLoc(), token.second, bufferIdx,
                   WSBarrierAttr::forDstTask(funcOp.getContext(), token.first)
                       .build(funcOp.getContext()));
@@ -4587,7 +4590,7 @@ void insertAsyncComm(
           for (const auto &sibTok : sibTokenIt->second.tokens) {
             if (!emittedBackedgeTokens.insert(sibTok.second).second)
               continue;
-            builder.setAsynTaskIdsFromArray(masterChannel->relation.first);
+            builder.setPartitionIdsFromArray(masterChannel->relation.first);
             builder.setInsertionPoint(ownerOverwriteLoop);
             builder.clearLoopScheduleInfo();
             // Compute the sibling's own phase at the loop containing the
@@ -4599,7 +4602,7 @@ void insertAsyncComm(
                                  sib->getNumBuffers(), regionsWithChannels,
                                  sibBufferIdx, sibPhase, config,
                                  /*reuseGroupIdx=*/-1, sib);
-            builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+            builder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
                 ownerOverwriteLoop.getLoc(), sibTok.second, sibBufferIdx,
                 sibPhase,
                 WSBarrierAttr::forDstTask(funcOp.getContext(), sibTok.first)
@@ -4610,21 +4613,21 @@ void insertAsyncComm(
     }
 
     for (const auto &token : commChannel.tokens) {
-      builder.setAsynTaskIdsFromArray(token.first);
+      builder.setPartitionIdsFromArray(token.first);
       // Insert ConsumerWaitOp
       if (!commChannel.producerBarrier) {
-        // For channels with multiple consumer task IDs, find the correct
-        // headConsumer for this token's task ID. Each consumer partition
+        // For channels with multiple consumer partition IDs, find the correct
+        // headConsumer for this token's partition ID. Each consumer partition
         // needs its own wait point.
         int tokenTaskId = token.first;
-        auto headConsumerTaskIds = getAsyncTaskIds(headConsumer);
+        auto headConsumerTaskIds = getWSPartitionIds(headConsumer);
         LDBG("ConsumerWaitOp: tokenTaskId="
              << tokenTaskId << " headConsumer task="
              << (headConsumerTaskIds.empty() ? -1 : headConsumerTaskIds[0]));
         Operation *tokenHeadConsumer = headConsumer;
         for (auto &op : headConsumer->getBlock()->getOperations()) {
           if (consumerOps.count(&op)) {
-            auto taskIds = getAsyncTaskIds(&op);
+            auto taskIds = getWSPartitionIds(&op);
             if (std::find(taskIds.begin(), taskIds.end(), tokenTaskId) !=
                 taskIds.end()) {
               tokenHeadConsumer = &op;
@@ -4655,7 +4658,7 @@ void insertAsyncComm(
             insertTarget = consumerWaitPoint;
           }
           auto tileToken = subtiled.addSharedArg(token.second);
-          OpBuilderWithAsyncTaskIds tileBuilder(insertTarget);
+          OpBuilderWithPartitionIds tileBuilder(insertTarget);
           tileBuilder.setInsertionPoint(insertTarget);
           Value tileBufIdx, tilePhase;
           SubtiledSlot slot = getOrComputeSubtiledSlot(subtiled);
@@ -4678,7 +4681,7 @@ void insertAsyncComm(
           auto *actualCons = getUniqueActualConsumer(consumerWaitPoint);
           builder.setLoopScheduleInfoFromOp(actualCons);
           LDBG("  inserting ConsumerWaitOp for task " << tokenTaskId);
-          auto waitOp = builder.createWithAsyncTaskIds<ttnvws::ConsumerWaitOp>(
+          auto waitOp = builder.createWithPartitionIds<ttnvws::ConsumerWaitOp>(
               tokenHeadConsumer->getLoc(), token.second, bufferIdx, phase,
               WSBarrierAttr::forDstTask(funcOp.getContext(),
                                         masterChannel->relation.first)
@@ -4731,7 +4734,7 @@ void insertAsyncComm(
         for (auto &op :
              llvm::reverse(tailConsumer->getBlock()->getOperations())) {
           if (consumerOps.count(&op)) {
-            auto taskIds = getAsyncTaskIds(&op);
+            auto taskIds = getWSPartitionIds(&op);
             if (std::find(taskIds.begin(), taskIds.end(), token.first) !=
                 taskIds.end()) {
               tokenTailConsumer = &op;
@@ -4759,7 +4762,7 @@ void insertAsyncComm(
             insertTarget = consumerReleasePoint;
           }
           auto tileToken = subtiled.addSharedArg(token.second);
-          OpBuilderWithAsyncTaskIds tileBuilder(insertTarget);
+          OpBuilderWithPartitionIds tileBuilder(insertTarget);
           tileBuilder.setInsertionPointAfter(insertTarget);
           Value tileBufIdx;
           SubtiledSlot slot = getOrComputeSubtiledSlot(subtiled);
@@ -4786,7 +4789,7 @@ void insertAsyncComm(
           } else {
             builder.setInsertionPointAfter(consumerReleasePoint);
             auto releaseOp =
-                builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+                builder.createWithPartitionIds<ttnvws::ConsumerReleaseOp>(
                     consumerReleasePoint->getLoc(), token.second, bufferIdx,
                     WSBarrierAttr::forDstTask(funcOp.getContext(),
                                               masterChannel->relation.first)
@@ -4843,9 +4846,10 @@ void insertAsyncComm(
     if (tmaLoads.size() > 0) {
       // Instead of headConsumer, need to lift out to the same scope.
       auto consumerWaitPoint = getSameLevelOp(tmaHeadProducer, headConsumer);
-      // Collect additional consumer task IDs beyond the primary headConsumer.
+      // Collect additional consumer partition IDs beyond the primary
+      // headConsumer.
       SmallVector<int> additionalConsumerTaskIds;
-      auto primaryTaskIds = getAsyncTaskIds(headConsumer);
+      auto primaryTaskIds = getWSPartitionIds(headConsumer);
       for (const auto &token : commChannel.tokens) {
         int taskId = token.first;
         if (std::find(primaryTaskIds.begin(), primaryTaskIds.end(), taskId) ==
@@ -4919,13 +4923,13 @@ void foldLocalLoads(triton::FuncOp funcOp) {
     if (auto src = localAlloc.getSrc()) {
       if (auto localLoad = dyn_cast<ttg::LocalLoadOp>(src.getDefiningOp())) {
         // Only fold within the same tasks
-        if (getAsyncTaskIds(localLoad) == getAsyncTaskIds(localAlloc)) {
+        if (getWSPartitionIds(localLoad) == getWSPartitionIds(localAlloc)) {
           opsToReplace[localAlloc] = localLoad.getSrc();
         }
       }
     }
   });
-  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
+  OpBuilderWithPartitionIds builder(funcOp.getContext());
   for (auto kv : opsToReplace)
     mlir::triton::replaceUsesAndPropagateType(builder, kv.getFirst(),
                                               kv.getSecond());
@@ -4961,7 +4965,7 @@ static void cleanupTmemTokens(triton::FuncOp funcOp) {
 // Split local_alloc ops that have a tensor source into a separate
 // empty local_alloc + local_store. This ensures doCodePartitionPost
 // can detect cross-task SMEM channels via the LocalStoreOp producer.
-// The local_store's task ID (assigned below) determines the producer
+// The local_store's partition ID (assigned below) determines the producer
 // partition for that channel.
 static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
   SmallVector<ttg::LocalAllocOp> toSplit;
@@ -4970,7 +4974,7 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
       toSplit.push_back(allocOp);
   });
 
-  OpBuilderWithAsyncTaskIds builder(funcOp->getContext());
+  OpBuilderWithPartitionIds builder(funcOp->getContext());
   for (auto allocOp : toSplit) {
     auto allocDescType = cast<ttg::MemDescType>(allocOp.getType());
     SmallVector<int64_t> shape(allocDescType.getShape());
@@ -4982,35 +4986,35 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
     auto newAlloc =
         ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
 
-    auto originTaskIds = builder.getAsyncTaskIds();
+    auto originTaskIds = builder.getWSPartitionIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
 
-    // Determine the producer task IDs for the local_store. Prefer the
-    // source value's defining op's task IDs (the actual data producer)
-    // over the alloc's task IDs (which include all consumers from
+    // Determine the producer partition IDs for the local_store. Prefer the
+    // source value's defining op's partition IDs (the actual data producer)
+    // over the alloc's partition IDs (which include all consumers from
     // backward propagation). This enables 1->N channels where a single
     // TMA load produces data consumed by multiple warp groups.
     Value src = allocOp.getSrc();
     Operation *srcOp = src.getDefiningOp();
-    SmallVector<AsyncTaskId> srcTaskIds;
+    SmallVector<WSPartitionId> srcTaskIds;
     if (srcOp)
-      srcTaskIds = getAsyncTaskIds(srcOp);
+      srcTaskIds = getWSPartitionIds(srcOp);
 
     if (srcOp && srcTaskIds.size() == 1) {
-      // Source has a single task ID -- use it as the producer.
-      builder.setAsynTaskIdsFromArray(srcTaskIds);
+      // Source has a single partition ID -- use it as the producer.
+      builder.setPartitionIdsFromArray(srcTaskIds);
     } else {
-      // Fallback: source has no defining op, no task IDs, or multiple
-      // task IDs. Use the alloc's task IDs (original behavior).
-      builder.setAsyncTaskIdsFromOp(allocOp);
+      // Fallback: source has no defining op, no partition IDs, or multiple
+      // partition IDs. Use the alloc's partition IDs (original behavior).
+      builder.setPartitionIdsFromOp(allocOp);
     }
     builder.setLoopScheduleInfoFromOp(allocOp);
-    auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+    auto storeOp = builder.createWithPartitionIds<ttg::LocalStoreOp>(
         allocOp.getLoc(), allocOp.getSrc(), newAlloc);
 
     mlir::triton::replaceUsesAndPropagateType(builder, allocOp,
                                               newAlloc.getResult());
-    builder.setAsynTaskIdsFromArray(originTaskIds);
+    builder.setPartitionIdsFromArray(originTaskIds);
     builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
     allocOp.erase();
   }
@@ -5434,13 +5438,13 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
+  // Lower SubtiledRegionOps whose tile body spans multiple partitions.
   {
     SmallVector<ttng::SubtiledRegionOp> multiTaskOps;
     funcOp.walk([&](ttng::SubtiledRegionOp op) {
-      llvm::DenseSet<AsyncTaskId> taskIds;
+      llvm::DenseSet<WSPartitionId> taskIds;
       op.getTileRegion().walk([&](Operation *childOp) {
-        for (auto tid : getAsyncTaskIds(childOp))
+        for (auto tid : getWSPartitionIds(childOp))
           taskIds.insert(tid);
       });
       if (taskIds.size() > 1)
@@ -5651,8 +5655,8 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
       // move onto the host view below.
       if (auto alignAttr = hostAlloc->getAttr("alignment"))
         backingAlloc->setAttr("alignment", alignAttr);
-      if (auto taskIds = getAsyncTaskIds(hostAlloc); !taskIds.empty())
-        setAsyncTaskIds(backingAlloc, taskIds);
+      if (auto taskIds = getWSPartitionIds(hostAlloc); !taskIds.empty())
+        setWSPartitionIds(backingAlloc, taskIds);
     }
 
     // (e) Replace host uses. If maxType == hostType we wire host consumers
@@ -5698,8 +5702,8 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
         if (auto a = stagingAlloc->getAttr(name))
           stagingView->setAttr(name, a);
       }
-      if (auto taskIds = getAsyncTaskIds(stagingAlloc); !taskIds.empty())
-        setAsyncTaskIds(stagingView, taskIds);
+      if (auto taskIds = getWSPartitionIds(stagingAlloc); !taskIds.empty())
+        setWSPartitionIds(stagingView, taskIds);
 
       LDBG("[staging-reuse] merged staging (buffer.id="
            << stagingAlloc->getAttrOfType<IntegerAttr>("buffer.id").getInt()
@@ -6035,10 +6039,10 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     //
     // Derive staging/load tasks from the *matched* entry (not from
     // stagingReuseInfos.front(), which may have been skipped above) so the
-    // barrier's task IDs always agree with the selected outer loop.
+    // barrier's partition IDs always agree with the selected outer loop.
     scf::ForOp outerLoop;
-    AsyncTaskId stagingTask = -1;
-    AsyncTaskId loadTask = -1;
+    WSPartitionId stagingTask = -1;
+    WSPartitionId loadTask = -1;
     unsigned matched = 0;
     bool consistent = true;
     for (auto &info : stagingReuseInfos) {
@@ -6048,12 +6052,12 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       auto loop = info.firstStore->getParentOfType<scf::ForOp>();
       if (!loop)
         continue;
-      auto sTaskIds = getAsyncTaskIds(info.firstStore);
-      auto lTaskIds = getAsyncTaskIds(it->second->getSrcOp());
+      auto sTaskIds = getWSPartitionIds(info.firstStore);
+      auto lTaskIds = getWSPartitionIds(it->second->getSrcOp());
       if (sTaskIds.empty() || lTaskIds.empty())
         continue;
-      AsyncTaskId sTask = sTaskIds.front();
-      AsyncTaskId lTask = lTaskIds.front();
+      WSPartitionId sTask = sTaskIds.front();
+      WSPartitionId lTask = lTaskIds.front();
       if (matched++ == 0) {
         outerLoop = loop;
         stagingTask = sTask;
@@ -6088,9 +6092,9 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
       // persistent case, whose body carries the real tile id separately) this
       // is just the induction variable and the extra arith is folded away.
       Operation *firstBodyOp = &outerLoop.getBody()->front();
-      OpBuilderWithAsyncTaskIds acqBuilder(firstBodyOp);
+      OpBuilderWithPartitionIds acqBuilder(firstBodyOp);
       acqBuilder.setInsertionPoint(firstBodyOp);
-      acqBuilder.setAsynTaskIdsFromArray({loadTask});
+      acqBuilder.setPartitionIdsFromArray({loadTask});
       Location acqLoc = firstBodyOp->getLoc();
       Value iterIdx = outerLoop.getInductionVar();
       APInt lbVal, stepVal;
@@ -6101,27 +6105,27 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
           matchPattern(outerLoop.getStep(), m_ConstantInt(&stepVal)) &&
           stepVal.isOne();
       if (!lbIsZero || !stepIsOne) {
-        Value rel = acqBuilder.createWithAsyncTaskIds<arith::SubIOp>(
+        Value rel = acqBuilder.createWithPartitionIds<arith::SubIOp>(
             acqLoc, iterIdx, outerLoop.getLowerBound());
-        iterIdx = acqBuilder.createWithAsyncTaskIds<arith::DivUIOp>(
+        iterIdx = acqBuilder.createWithPartitionIds<arith::DivUIOp>(
             acqLoc, rel, outerLoop.getStep());
       }
-      Value ivExt = acqBuilder.createWithAsyncTaskIds<arith::ExtUIOp>(
+      Value ivExt = acqBuilder.createWithPartitionIds<arith::ExtUIOp>(
           acqLoc, acqBuilder.getIntegerType(64), iterIdx);
       auto idxPhase =
           getBufferIdxAndPhase(acqBuilder, acqLoc, ivExt, /*numBuffers=*/1);
-      acqBuilder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+      acqBuilder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
           acqLoc, reuseToken, idxPhase.first, idxPhase.second,
           WSBarrierAttr::forDstTask(ctx, stagingTask).build(ctx));
 
       // consumer_release (staging task) at the bottom, after staging stores.
       Operation *term = outerLoop.getBody()->getTerminator();
-      OpBuilderWithAsyncTaskIds relBuilder(term);
+      OpBuilderWithPartitionIds relBuilder(term);
       relBuilder.setInsertionPoint(term);
-      relBuilder.setAsynTaskIdsFromArray({stagingTask});
-      Value bufIdx = relBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+      relBuilder.setPartitionIdsFromArray({stagingTask});
+      Value bufIdx = relBuilder.createWithPartitionIds<arith::ConstantIntOp>(
           term->getLoc(), 0, 32);
-      relBuilder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+      relBuilder.createWithPartitionIds<ttnvws::ConsumerReleaseOp>(
           term->getLoc(), reuseToken, bufIdx,
           WSBarrierAttr::forDstTask(ctx, loadTask).build(ctx));
       LDBG("Step 7.5: inserted cross-tile staging-reuse WAR barrier (load "
@@ -6162,14 +6166,14 @@ void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
     funcOp.dump();
   });
 
-  // Lower SubtiledRegionOps whose tile body spans multiple async tasks.
+  // Lower SubtiledRegionOps whose tile body spans multiple partitions.
   // Single-task SubtiledRegionOps are preserved and handled by SpecializeOp.
   {
     SmallVector<ttng::SubtiledRegionOp> multiTaskOps;
     funcOp.walk([&](ttng::SubtiledRegionOp op) {
-      llvm::DenseSet<AsyncTaskId> taskIds;
+      llvm::DenseSet<WSPartitionId> taskIds;
       op.getTileRegion().walk([&](Operation *childOp) {
-        for (auto tid : getAsyncTaskIds(childOp))
+        for (auto tid : getWSPartitionIds(childOp))
           taskIds.insert(tid);
       });
       if (taskIds.size() > 1)

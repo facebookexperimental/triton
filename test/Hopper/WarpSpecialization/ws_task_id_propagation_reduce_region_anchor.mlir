@@ -1,8 +1,8 @@
 // RUN: triton-opt %s --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s
 
 // Regression test for B-5-F1 / T273472464.
-// A region-bodied anchor op should propagate its own task ID into its scalar
-// region body, not a downstream consumer's task ID.
+// A region-bodied anchor op should propagate its own partition ID into its scalar
+// region body, not a downstream consumer's partition ID.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #slice = #ttg.slice<{dim = 1, parent = #blocked}>

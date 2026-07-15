@@ -13,7 +13,7 @@ See [Overview.md](Overview.md) for the full pipeline and Hopper/Blackwell
 differences.
 
 `doPingPongPrep` runs **before** code partitioning (ops still have
-`async_task_id` but are not physically separated). `doPingPongSync` runs
+`ttg.partition` but are not physically separated). `doPingPongSync` runs
 **after** code partitioning (ops are inside `WarpSpecializeOp` regions).
 
 **File**: `PingPong.cpp`

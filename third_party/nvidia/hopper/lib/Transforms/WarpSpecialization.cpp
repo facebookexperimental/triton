@@ -107,14 +107,11 @@ public:
     funcOp->walk([&](scf::ForOp forOp) { stripLoop(forOp); });
     funcOp->walk([&](scf::WhileOp whileOp) { stripLoop(whileOp); });
     funcOp->walk([&](Operation *op) {
-      // Strip both the partition id (`ttg.partition`) and the task id
-      // (`async_task_id`). The task id is only present once `doTaskIdPropagate`
-      // has run (e.g. the atomic-broadcast reject path bails after
-      // propagation); for the earlier bail-outs it simply does not exist yet
-      // and this is a no-op. Leaving either behind produces a half-tagged state
-      // that the downstream `tritongpu-pipeline` pass mis-treats as a WS
-      // region. Use the shared helper so the attr name lives in one place.
-      removeAsyncTaskIds(op);
+      // Strip the partition id (`ttg.partition`). Leaving it behind produces a
+      // half-tagged state that the downstream `tritongpu-pipeline` pass
+      // mis-treats as a WS region. Use the shared helper so the attr name lives
+      // in one place.
+      removeWSPartitionIds(op);
       op->removeAttr(mlir::triton::gpu::kPartitionAttrName);
       op->removeAttr(mlir::triton::gpu::kPartitionOutputsAttrName);
     });
@@ -195,7 +192,7 @@ public:
     // loop-carried result(s) to every partition through SMEM, or gracefully
     // bail out of warp specialization (unsupported shape). On a reject we strip
     // all WS metadata via removeWarpSpecializeAttr (which also clears the
-    // `async_task_id`s that doTaskIdPropagate materialized above) so downstream
+    // partition ids that doTaskIdPropagate materialized above so downstream
     // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
     // from the `tile-prefetch-depth` pass option (a Python knob), not an env
     // var.

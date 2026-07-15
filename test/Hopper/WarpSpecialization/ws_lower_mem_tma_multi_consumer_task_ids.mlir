@@ -5,7 +5,7 @@
 // A TMA descriptor load feeding multiple consumer tasks needs the replacement
 // local_load to survive in every consumer partition. The fused barrier path
 // already creates waits for each task; the data load must carry the same full
-// consumer task-id set instead of inheriting only the last extra task.
+// consumer partition-id set instead of inheriting only the last extra task.
 
 // CHECK-LABEL: @tma_multi_consumer_task_ids
 // CHECK: ttng.wait_barrier {{.*}}ttg.partition = array<i32: 1>

@@ -11,7 +11,7 @@ normalizes `local_alloc` ops for downstream code partitioning passes.
 ## Pipeline Context
 
 ```
-doTaskIdPropagate       ← assigns async_task_id to all ops
+doTaskIdPropagate       ← assigns ttg.partition to all ops
   → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
   → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
   → doCodePartitionPost ← inserts accumCnts, async copies, sync ops
@@ -47,7 +47,7 @@ first alloc.
 ### Step 1: `collectAsyncChannels`
 
 Walk the function to find cross-partition data dependencies. For each
-operation with a single `async_task_id` that is a **channel anchor op**
+operation with a single `ttg.partition` that is a **channel anchor op**
 (loads, dots, allocs with source, etc.), call `createChannel` to identify
 consumers in different partitions. All channels are created with
 `numBuffers=1` (single-buffered).
@@ -92,9 +92,9 @@ cross-partition SMEM dependencies as separate store ops, enabling
 downstream `doCodePartition`/`doCodePartitionPost` to detect them
 as channels.
 
-The `local_store`'s task ID determines the producer partition for the
+The `local_store`'s partition ID determines the producer partition for the
 channel. When the source is produced by a single-partition op (e.g. a TMA
-`DescriptorLoadOp`), the store takes the source op's task ID rather than the
+`DescriptorLoadOp`), the store takes the source op's partition ID rather than the
 alloc's, which also carries consumer partitions from backward propagation.
 This models a 1-producer to N-consumer channel — one TMA load writes the
 shared buffer and every consumer partition reads it — instead of duplicating

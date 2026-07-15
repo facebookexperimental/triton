@@ -71,7 +71,7 @@ Step 4:   separateLocalAllocWithSrc   — split local_alloc(src) → alloc + sto
 
 Walks the function to find all cross-partition data dependencies:
 
-1. For each operation with `async_task_id`, check if it is a **channel anchor
+1. For each operation with `ttg.partition`, check if it is a **channel anchor
    op** (`isChannelAnchorOp`).
 2. If so, call `createChannel` to identify consumers in different partitions.
 
@@ -96,7 +96,7 @@ The core channel creation logic:
    operands feed while results and after-region arguments.
 2. Filter by **dominance**: only consider users properly dominated by the
    producer.
-3. For each user in a **different partition** (different `async_task_id`),
+3. For each user in a **different partition** (different `ttg.partition`),
    create a `Channel` with the appropriate kind (`SMEM`, `TMEM`, or `REG`).
 
 ### `collectPostChannels`
@@ -116,7 +116,7 @@ Groups channels along two dimensions:
   sharing (one buffer serves multiple consumers of the same producer).
 - **By consumer**: Channels are merged for barrier sharing when their
   producers are in the same block AND their destination ops have the same
-  task IDs and share a unique actual consumer (`channelCanBeMerged`).
+  partition IDs and share a unique actual consumer (`channelCanBeMerged`).
 
 The `orderedChannels` list provides a deterministic iteration order, keyed
 by `getDstOp()`.
@@ -126,7 +126,7 @@ by `getDstOp()`.
 ### `reorderProducerOps`
 
 Physically reorders producer operations in the IR to interleave producers
-for different consumers. Groups producers by consumer task ID (smaller ID
+for different consumers. Groups producers by consumer partition ID (smaller ID
 = higher priority), sorts each group by number of consumers, then
 interleaves. After reordering, moves backward dependency slices as late as
 possible.
@@ -173,7 +173,7 @@ Creates synchronization tokens for each channel group:
   completion barrier instead of a separate token (checked via
   `ProducerIsGen5`).
 - Results are stored in a `CommChannel` struct per channel, containing
-  `tokens` (per consumer task ID), optional `producerBarrier` (for TMA/gen5),
+  `tokens` (per consumer partition ID), optional `producerBarrier` (for TMA/gen5),
   and optional `consumerBarriers` (for gen5 inline barriers).
 
 ## Synchronization Insertion

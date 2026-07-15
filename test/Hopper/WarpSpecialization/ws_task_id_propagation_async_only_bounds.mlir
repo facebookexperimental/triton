@@ -5,7 +5,7 @@
 // This is the Hopper async-only variant of `nested_for_constant_bounds` from
 // `ws_task_id_propagation.mlir`: anchors already have `ttg.partition`, but no
 // op has `ttg.partition`. Loop bound constants should still receive the union
-// of all task IDs.
+// of all partition IDs.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>

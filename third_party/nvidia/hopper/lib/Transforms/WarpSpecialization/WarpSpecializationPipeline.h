@@ -21,7 +21,7 @@
 
 namespace mlir {
 
-// Assigns/normalizes async_task_id across the function. Returns -1 on failure.
+// Assigns/normalizes ttg.partition across the function. Returns -1 on failure.
 int doTaskIdPropagate(triton::FuncOp &funcOp);
 
 // Cross-partition run-once atomic support. Returns failure() when an atomic

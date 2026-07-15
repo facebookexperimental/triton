@@ -126,7 +126,7 @@ are *correct* — depends on the channel's producer/consumer topology:
   mbarrier rotation and tolerate **any** K.
 
 Phase 4.5 therefore detects same-partition staging via
-`getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
+`getWSPartitionIds(ch->getSrcOp()) == getWSPartitionIds(ch->getDstOp())` and, for
 those groups, only accepts a `tryCopies` that divides S (others are skipped).
 This is a **defensive backstop**: in all shipped configs `num_stages = 2` and
 `S ∈ {2,4}`, so `K | S` already holds and the cap is a no-op — it exists to

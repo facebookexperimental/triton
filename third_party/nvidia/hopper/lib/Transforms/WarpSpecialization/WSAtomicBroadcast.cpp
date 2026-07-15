@@ -10,7 +10,7 @@
 //
 // Under AutoWS the persistent `scf.while` is cloned once per partition. Cloning
 // is correct for the *pure* static update (`tile_id += NUM_SMS`) but wrong for
-// the *side-effecting, non-deterministic* atomic: task-id propagation assigns
+// the *side-effecting, non-deterministic* atomic: partition propagation assigns
 // the atomic (whose result is the loop-carried value used by every partition)
 // to *all* partitions, so each warp group bumps the counter independently, the
 // partitions diverge onto different tiles, and their producer/consumer barriers
@@ -61,9 +61,9 @@ enum class AtomicWSCase {
 };
 
 // The full set of partitions the kernel is being specialized into. Derived from
-// the union of task ids on the enclosing persistent loop.
-static SmallVector<AsyncTaskId> getAllPartitions(scf::WhileOp whileOp) {
-  return getAsyncTaskIds(whileOp.getOperation());
+// the union of partition ids on the enclosing persistent loop.
+static SmallVector<WSPartitionId> getAllPartitions(scf::WhileOp whileOp) {
+  return getWSPartitionIds(whileOp.getOperation());
 }
 
 // Return the enclosing persistent `scf.while` whose after-region terminator
@@ -92,7 +92,8 @@ static bool isScalarAtomic(tt::AtomicRMWOp atomicOp) {
 
 static AtomicWSCase classifyAtomic(tt::AtomicRMWOp atomicOp,
                                    scf::WhileOp &carryingWhileOut) {
-  SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(atomicOp.getOperation());
+  SmallVector<WSPartitionId> taskIds =
+      getWSPartitionIds(atomicOp.getOperation());
 
   // Case 1: mapped to exactly one partition -> no cross-partition concern.
   if (taskIds.size() <= 1)
@@ -109,7 +110,7 @@ static AtomicWSCase classifyAtomic(tt::AtomicRMWOp atomicOp,
     LDBG("reject: replicated scalar atomic is not while-loop-carried");
     return AtomicWSCase::Reject;
   }
-  SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
+  SmallVector<WSPartitionId> allParts = getAllPartitions(whileOp);
   if (taskIds.size() != allParts.size()) {
     LDBG("reject: atomic replicated to a strict subset of partitions");
     return AtomicWSCase::Reject;
@@ -121,15 +122,15 @@ static AtomicWSCase classifyAtomic(tt::AtomicRMWOp atomicOp,
 // Owner of the run-once atomic = the producer / TMA-load partition already
 // assigned by PartitionSchedulingMeta. We locate it by the partition that owns
 // the loop's TMA loads. Falls back to the smallest partition id.
-static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
-                                     ArrayRef<AsyncTaskId> allParts) {
-  AsyncTaskId owner = allParts.front();
+static WSPartitionId getOwnerPartition(scf::WhileOp whileOp,
+                                       ArrayRef<WSPartitionId> allParts) {
+  WSPartitionId owner = allParts.front();
   bool found = false;
   whileOp.getAfterBody()->walk([&](Operation *op) {
     if (found)
       return;
     if (isa<tt::DescriptorLoadOp, ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-      auto ids = getAsyncTaskIds(op);
+      auto ids = getWSPartitionIds(op);
       if (ids.size() == 1) {
         owner = ids[0];
         found = true;
@@ -157,8 +158,8 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
                                      tt::AtomicRMWOp atomicOp,
                                      scf::WhileOp whileOp, int depth) {
   MLIRContext *ctx = funcOp.getContext();
-  SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
-  AsyncTaskId owner = getOwnerPartition(whileOp, allParts);
+  SmallVector<WSPartitionId> allParts = getAllPartitions(whileOp);
+  WSPartitionId owner = getOwnerPartition(whileOp, allParts);
   Location loc = atomicOp.getLoc();
 
   // The atomic result must be the loop-carried yield operand we rewrite.
@@ -210,23 +211,23 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
                                                     threadsPerWarp, numCTAs);
   auto bcastTy = RankedTensorType::get({1}, elemTy, bcastLayout);
 
-  OpBuilderWithAsyncTaskIds b(ctx);
+  OpBuilderWithPartitionIds b(ctx);
 
   // Owner: run the atomic once, then publish its result into the slot.
-  setAsyncTaskIds(atomicOp, {owner});
-  b.setAsynTaskIdsFromArray({owner});
+  setWSPartitionIds(atomicOp, owner);
+  b.setPartitionIdsFromArray({owner});
   b.setInsertionPointAfter(atomicOp);
-  Value splat = b.createWithAsyncTaskIds<tt::SplatOp>(loc, bcastTy, atomicRes)
+  Value splat = b.createWithPartitionIds<tt::SplatOp>(loc, bcastTy, atomicRes)
                     .getResult();
-  b.createWithAsyncTaskIds<ttg::LocalStoreOp>(loc, splat, slot);
+  b.createWithPartitionIds<ttg::LocalStoreOp>(loc, splat, slot);
 
   // Every partition: read the broadcast value back and unsplat to a scalar.
-  b.setAsynTaskIdsFromArray(allParts);
+  b.setPartitionIdsFromArray(allParts);
   Value loaded =
-      b.createWithAsyncTaskIds<ttg::LocalLoadOp>(loc, bcastTy, slot, Value())
+      b.createWithPartitionIds<ttg::LocalLoadOp>(loc, bcastTy, slot, Value())
           .getResult();
   Value bcastScalar =
-      b.createWithAsyncTaskIds<tt::UnsplatOp>(loc, elemTy, loaded).getResult();
+      b.createWithPartitionIds<tt::UnsplatOp>(loc, elemTy, loaded).getResult();
 
   // Rewire the loop-carried tile id to the broadcast value; the atomic now
   // feeds only the slot store, so it is cloned into the owner partition alone.
@@ -241,7 +242,7 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
 // next tile with the token pair `ttng.clc_try_cancel_async` (->
 // !ttg.async.token) + `ttng.clc_read` (token -> {isValid, x, y, z}). Those
 // decoded results are the loop-carried values of the persistent `scf.while` and
-// are used by every partition (loop condition + tile compute), so task-id
+// are used by every partition (loop condition + tile compute), so partition
 // propagation replicates the read to *all* partitions -- which would make each
 // warp group run its own try_cancel, claim a different pending cluster, and
 // diverge -> deadlock. This is the exact analogue of the atomic tile-counter
@@ -258,7 +259,7 @@ enum class CLCWSCase {
 };
 
 static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
-  SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(readOp.getOperation());
+  SmallVector<WSPartitionId> taskIds = getWSPartitionIds(readOp.getOperation());
   if (taskIds.size() <= 1)
     return CLCWSCase::PassThrough;
 
@@ -271,7 +272,7 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
     LDBG("reject: clc_read token is not from clc_try_cancel_async");
     return CLCWSCase::Reject;
   }
-  SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
+  SmallVector<WSPartitionId> allParts = getAllPartitions(whileOp);
   if (taskIds.size() != allParts.size()) {
     LDBG("reject: clc_read replicated to a strict subset of partitions");
     return CLCWSCase::Reject;
@@ -286,9 +287,9 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
 // becomes SMEM channels in doCodePartitionPost. `b`'s insertion point must be
 // after the scalar's producer.
 static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
-                                        OpBuilderWithAsyncTaskIds &b,
-                                        AsyncTaskId owner,
-                                        ArrayRef<AsyncTaskId> allParts,
+                                        OpBuilderWithPartitionIds &b,
+                                        WSPartitionId owner,
+                                        ArrayRef<WSPartitionId> allParts,
                                         Value scalar, Location loc) {
   MLIRContext *ctx = funcOp.getContext();
   Type origTy = scalar.getType();
@@ -323,24 +324,24 @@ static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
                                                     threadsPerWarp, numCTAs);
   auto bcastTy = RankedTensorType::get({1}, transportTy, bcastLayout);
 
-  b.setAsynTaskIdsFromArray({owner});
+  b.setPartitionIdsFromArray({owner});
   Value toStore = scalar;
   if (widen)
-    toStore = b.createWithAsyncTaskIds<arith::ExtUIOp>(loc, transportTy, scalar)
+    toStore = b.createWithPartitionIds<arith::ExtUIOp>(loc, transportTy, scalar)
                   .getResult();
   Value splat =
-      b.createWithAsyncTaskIds<tt::SplatOp>(loc, bcastTy, toStore).getResult();
-  b.createWithAsyncTaskIds<ttg::LocalStoreOp>(loc, splat, slot);
+      b.createWithPartitionIds<tt::SplatOp>(loc, bcastTy, toStore).getResult();
+  b.createWithPartitionIds<ttg::LocalStoreOp>(loc, splat, slot);
 
-  b.setAsynTaskIdsFromArray(allParts);
+  b.setPartitionIdsFromArray(allParts);
   Value loaded =
-      b.createWithAsyncTaskIds<ttg::LocalLoadOp>(loc, bcastTy, slot, Value())
+      b.createWithPartitionIds<ttg::LocalLoadOp>(loc, bcastTy, slot, Value())
           .getResult();
   Value unsplat =
-      b.createWithAsyncTaskIds<tt::UnsplatOp>(loc, transportTy, loaded)
+      b.createWithPartitionIds<tt::UnsplatOp>(loc, transportTy, loaded)
           .getResult();
   if (widen)
-    unsplat = b.createWithAsyncTaskIds<arith::TruncIOp>(loc, origTy, unsplat)
+    unsplat = b.createWithPartitionIds<arith::TruncIOp>(loc, origTy, unsplat)
                   .getResult();
   return unsplat;
 }
@@ -350,8 +351,8 @@ static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
 static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
                                   scf::WhileOp whileOp) {
   MLIRContext *ctx = funcOp.getContext();
-  SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
-  AsyncTaskId owner = getOwnerPartition(whileOp, allParts);
+  SmallVector<WSPartitionId> allParts = getAllPartitions(whileOp);
+  WSPartitionId owner = getOwnerPartition(whileOp, allParts);
   Location loc = readOp.getLoc();
 
   auto issue = readOp.getToken().getDefiningOp<ttng::CLCTryCancelAsyncOp>();
@@ -361,10 +362,10 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
   auto yieldOp = whileOp.getYieldOp();
 
   // Run the fetch (issue + read) in the owner partition alone.
-  setAsyncTaskIds(issue, {owner});
-  setAsyncTaskIds(readOp, {owner});
+  setWSPartitionIds(issue, owner);
+  setWSPartitionIds(readOp, owner);
 
-  OpBuilderWithAsyncTaskIds b(ctx);
+  OpBuilderWithPartitionIds b(ctx);
   b.setInsertionPointAfter(readOp);
 
   // Broadcast each loop-carried result; the read's results only feed the yield.
@@ -396,8 +397,8 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // (run once in the owner/producer partition + broadcast the loop-carried
 // result(s) to all partitions), or reject. Returns failure() to force a
 // graceful warp-specialization reject; the caller strips WS metadata via
-// removeWarpSpecializeAttr (which clears both partition ids and
-// async_task_ids), leaving the kernel unspecialized-but-compilable — one source
+// removeWarpSpecializeAttr (which clears partition ids), leaving the kernel
+// unspecialized-but-compilable — one source
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
                                      int tilePrefetchDepth) {

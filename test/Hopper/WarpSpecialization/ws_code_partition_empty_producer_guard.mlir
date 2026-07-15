@@ -12,7 +12,7 @@
 // with no partition needs no channel). Without the guard the `else` branch
 // trips `assert(producerTaskIds.size() == 1)` and triton-opt aborts, so this
 // test fails with empty FileCheck input. The guard is the load-bearing change:
-// the separateLocalAllocWithSrc source-task-id and optimizeSchedule cleanup
+// the separateLocalAllocWithSrc source-partition-id and optimizeSchedule cleanup
 // hunks are not required to keep this kernel passing.
 
 // CHECK-LABEL: @_attn_bwd_persist

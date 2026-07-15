@@ -67,7 +67,7 @@ array captures.
 ### Same-partition elision
 
 Token lowering detects when a `ProducerCommitOp` and `ConsumerWaitOp` share
-the same `async_task_id` — meaning the producer and consumer are in the same
+the same `ttg.partition` — meaning the producer and consumer are in the same
 warp group partition. In this case, the synchronization is redundant (program
 order within a partition already guarantees correctness), so both ops are
 erased. This happens for OperandD channels where the MMA accumulator is both
@@ -141,7 +141,7 @@ arrive count depends on the `TokenLoadType`:
 ### Step 2: Elide Same-Partition Synchronization
 
 Before lowering individual ops, the pass detects `ProducerCommitOp` /
-`ConsumerWaitOp` pairs that share the same `async_task_id`. These are in the
+`ConsumerWaitOp` pairs that share the same `ttg.partition`. These are in the
 same warp-specialize partition where program order already guarantees
 correctness, so they are erased. This typically occurs for OperandD channels.
 

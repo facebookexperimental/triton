@@ -22,7 +22,7 @@ Visualizes tensor memory buffer allocations with:
 
 ### 3. Combined Key Ops + Channel Graph (`dumpCombinedGraph`)
 Visualizes the complete dataflow structure:
-- Operations grouped by partition (async task ID)
+- Operations grouped by partition (partition ID)
 - Vertical program order within each partition
 - Channel edges showing data dependencies:
   - **Green edges**: SMEM channels

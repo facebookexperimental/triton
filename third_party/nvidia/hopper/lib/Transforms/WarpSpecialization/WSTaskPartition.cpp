@@ -18,15 +18,16 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace mlir {
 
 // Compute a partition schedule for later passes to actually partition the
-// program into async tasks.
+// program into partitions.
 void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
   if (numWarpGroups <= 1)
     return;
 
   // Bail out in the presence of user annotations.
   DenseSet<int> allAsyncTasks;
-  funcOp->walk(
-      [&](Operation *op) { allAsyncTasks.insert_range(getAsyncTaskIds(op)); });
+  funcOp->walk([&](Operation *op) {
+    allAsyncTasks.insert_range(getWSPartitionIds(op));
+  });
 
   if (!allAsyncTasks.empty())
     return;
@@ -94,24 +95,24 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
   if (consumerOps.empty() || producerOps.empty())
     return;
 
-  // Annotate the program with task ids
-  SmallVector<AsyncTaskId, 1> producerTaskIds{0};
-  SmallVector<AsyncTaskId, 2> consumerTaskIds;
+  // Annotate the program with partition ids
+  SmallVector<WSPartitionId, 1> producerTaskIds{0};
+  SmallVector<WSPartitionId, 2> consumerTaskIds;
   for (unsigned i = 0; i < numWarpGroups - 1; ++i) {
     consumerTaskIds.push_back(i + producerTaskIds.size());
   }
 
   for (auto op : producerOps) {
-    setAsyncTaskIds(op, producerTaskIds);
+    setWSPartitionIds(op, producerTaskIds);
   }
 
   for (auto op : consumerOps) {
-    setAsyncTaskIds(op, consumerTaskIds);
+    setWSPartitionIds(op, consumerTaskIds);
   }
 
   // All stores go with the consumers.
   for (auto op : stores) {
-    setAsyncTaskIds(op, consumerTaskIds);
+    setWSPartitionIds(op, consumerTaskIds);
   }
 
   LLVM_DEBUG({

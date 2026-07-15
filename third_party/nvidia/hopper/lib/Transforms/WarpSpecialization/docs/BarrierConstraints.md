@@ -78,8 +78,8 @@ intervening waits).
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `dstTask` | `I32Attr` | Destination task ID — the foreign partition this barrier communicates with. The source task is the partition where the barrier lives (available via `async_task_id`). |
-| `channelGraph` | `DenseI32ArrayAttr` | Set of task IDs reachable from the destination through the channel adjacency graph (excluding the source). Used by `canAdvanceWSBarrier` to check if two barriers can be safely reordered. |
+| `dstTask` | `I32Attr` | Destination partition ID — the foreign partition this barrier communicates with. The source task is the partition where the barrier lives (available via `ttg.partition`). |
+| `channelGraph` | `DenseI32ArrayAttr` | Set of partition IDs reachable from the destination through the channel adjacency graph (excluding the source). Used by `canAdvanceWSBarrier` to check if two barriers can be safely reordered. |
 | `direction` | `StringAttr` | Direction for direct non-token TTNG barrier endpoints. `"forward"` means data-ready synchronization; `"backward"` means resource-reuse synchronization. NVWS token ops derive this from the token op type and do not need this field. |
 | `parentId` | `I32Attr` | Local ID for the nearest ordered parent scope (`scf.for`, `scf.while`, or containing `tt.func`). Used only inside the current function for V2 ordered-region checks. |
 | `minRegionId` | `I32Attr` | Earliest ordered region reached by this channel summary. |
@@ -292,7 +292,7 @@ bool canAdvanceWSBarrier(optional<DictionaryAttr> constraintsA,
 ```
 
 Returns true when both barriers have `WSBarrier.channelGraph` and the two sets
-are disjoint (no shared task ID). Returns false conservatively if either
+are disjoint (no shared partition ID). Returns false conservatively if either
 barrier lacks `WSBarrier` or `channelGraph`.
 
 ```cpp

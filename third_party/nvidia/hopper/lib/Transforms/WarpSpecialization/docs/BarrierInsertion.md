@@ -54,14 +54,14 @@ if (commChannel.consumerBarriers.empty()) {
     } else {
         builder.setInsertionPoint(producerAcquirePoint);
     }
-    builder.createWithAsyncTaskIds<ttnvws::ProducerAcquireOp>(
+    builder.createWithPartitionIds<ttnvws::ProducerAcquireOp>(
         headProducer->getLoc(), token, bufferIdx, phase);
 }
 ```
 
 - Inserted **before** the head producer.
 - For loop-carried channels, moved to before the backward channel's `dstOp`.
-- Uses the **producer's** async task IDs.
+- Uses the **producer's** partition IDs.
 
 ### `ConsumerReleaseOp`
 
@@ -70,7 +70,7 @@ if (commChannel.consumerBarriers.empty()) {
     auto consumerReleasePoint =
         consumerReleaseHeuristic(tailProducer, tailConsumer, consumerTaskId);
     builder.setInsertionPointAfter(consumerReleasePoint);
-    builder.createWithAsyncTaskIds<ttnvws::ConsumerReleaseOp>(
+    builder.createWithPartitionIds<ttnvws::ConsumerReleaseOp>(
         consumerReleasePoint->getLoc(), token, bufferIdx);
 }
 ```
@@ -107,13 +107,13 @@ equivalent to a producer_acquire.
 
 ```cpp
 if (asProducerAcquire) {
-    Value _1_1b = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    Value _1_1b = builder.createWithPartitionIds<arith::ConstantIntOp>(
         loc, 1, 1);
-    phase = builder.createWithAsyncTaskIds<mlir::arith::XOrIOp>(
+    phase = builder.createWithPartitionIds<mlir::arith::XOrIOp>(
         loc, inPhase, _1_1b);
 }
-phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(loc, i32Type, phase);
-auto waitOp = builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+phase = builder.createWithPartitionIds<arith::ExtUIOp>(loc, i32Type, phase);
+auto waitOp = builder.createWithPartitionIds<ttng::WaitBarrierOp>(
     loc, producerBarrier, phase);
 ```
 
@@ -191,7 +191,7 @@ how all the pieces fit together.
 
 ### Partitions
 
-| Partition | Type | async_task_id | Warps | Role |
+| Partition | Type | ttg.partition | Warps | Role |
 |-----------|------|---------------|-------|------|
 | default / partition0 | reduction | 0 | 1 | dQ epilogue: tmem_load dQ → scale → TMA atomic_add to global |
 | partition1 | gemm | 1 | 1 | All MMA operations: qkT, dpT, dV, dK, dQ |

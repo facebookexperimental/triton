@@ -406,7 +406,7 @@ Flash Attention) is consumed by ops in multiple partitions, the correct
 model is a 1-producer to N-consumer channel: one TMA load writes the buffer,
 all consumer partitions read from it. The downstream
 `separateLocalAllocWithSrc` assigns the `local_store` the source op's
-single task ID (the TMA load partition), and `createChannelPost` creates a
+single partition ID (the TMA load partition), and `createChannelPost` creates a
 proper 1-to-N channel. This avoids buffer duplication and the SMEM it costs
 (per-consumer copies pushed FA3 forward over H100's 228KB SMEM limit).
 
@@ -428,7 +428,7 @@ partition (e.g., `local_alloc -> memdesc_trans -> dot`), the backward walk
 stops at the `LocalAllocOp` boundary. The `MemDescTransOp` clone keeps a
 reference to the original shared alloc, which is correct because the alloc
 is shared across partitions. The `separateLocalAllocWithSrc` pass later
-assigns the producer task ID from the source op, creating a 1-to-N channel.
+assigns the producer partition ID from the source op, creating a 1-to-N channel.
 
 Without the backward walk, the cloned op would reference an operand in a
 different partition, creating an unintended cross-partition boundary and
