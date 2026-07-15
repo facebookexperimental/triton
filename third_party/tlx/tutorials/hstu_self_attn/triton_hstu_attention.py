@@ -70,6 +70,31 @@ _HSTU_SELF_DQ_REDUCE = tl.constexpr(os.environ.get("HSTU_SELF_DQ_REDUCE") == "1"
 # Each subtile is an independent store_reduce the compiler can stage. Must be a
 # power of 2 dividing HEAD_DIM. Default 1 (whole tile); override HSTU_SELF_DQ_ITERS.
 _HSTU_SELF_DQ_ITERS = tl.constexpr(int(os.environ.get("HSTU_SELF_DQ_ITERS", "1")))
+# EXPERIMENTAL, opt-in via HSTU_SELF_DQ_REUSE=1 (default OFF): when set (and
+# dq-reduce is on), annotate the bwd MMAs' opndD with FA-bwd-style tt.autows
+# channel attrs (see WarpSpecialization/docs/AnnotationBasedBufferPreAssignment.md)
+# forming a TMEM reuse scheme that mirrors _BWD_DOT_ATTRS in
+# fused_attention_ws_device_tma.py + TLX REUSE_DP_FOR_DQ / NUM_BUFFERS_TMEM=1. At
+# BM=BN=HEAD_DIM=128 every opndD accumulator is [128,128] f32 = 128 cols; four
+# reuse groups pack to exactly 512 cols:
+#   id2 : qk_trans (f32) -> reused by act_qk_trans (bf16, dv's opndA)
+#   id5 : dp (dact_qk_trans) -> reused by dq_trans          [REUSE_DP_FOR_DQ]
+#   id7 : dv  (persistent accumulator, live across the inner loop)
+#   id10: dk  (persistent accumulator, live across the inner loop)
+# Sharing id5 also gives the otherwise-standalone single-buffered dq accumulator
+# dp's cross-iteration WAR barrier (the fix for the gemm->reduction ping-pong
+# deadlock). dp/dq have disjoint liveness (dp is consumed into dqk_trans before dq
+# is produced) and dk is emitted before dq, so nothing reads id5 after dq
+# overwrites it (BwdTmemReuseSlotHazard.md). Reuse validity needs dp and dq
+# shape-compatible, which holds only at BLOCK_N==HEAD_DIM==128 (dp=[BLOCK_N,BLOCK_M],
+# dq=[HEAD_DIM,BLOCK_M]); at BLOCK_N=64 the shapes differ and the reuse falls back.
+# The attrs are inline dict literals gated by a constexpr bool -- tl.dot's attrs=
+# is a trace-time literal, so this avoids referencing a (dict) JIT global, which
+# is unsupported. None (reuse off) leaves the dots unannotated (heuristic alloc).
+_HSTU_DQ_REUSE = tl.constexpr(
+    os.environ.get("HSTU_SELF_DQ_REDUCE") == "1"
+    and os.environ.get("HSTU_SELF_DQ_REUSE", "0") == "1"
+)
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -257,6 +282,21 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
             return [
                 triton.Config(
                     {"BLOCK_M": 128 * _dp, "BLOCK_N": _bn},
+                    num_stages=1,
+                    num_warps=_w,
+                )
+            ]
+        # DP off (DP=1): optionally force an exact BLOCK_M/BLOCK_N tile. The
+        # dq-reduce reuse path needs BM=BN=HEAD_DIM=128 so the dp and dq opndD
+        # accumulators are shape-compatible for the REUSE_DP_FOR_DQ reuse group and
+        # the four reuse groups pack to the 512-col TMEM budget -- matching TLX's
+        # BLOCK_M1=BLOCK_N1=128 config. Set HSTU_SELF_AUTOWS_BM (and optionally BN).
+        _bm_force = os.environ.get("HSTU_SELF_AUTOWS_BM")
+        if _bm_force is not None:
+            _bn = int(os.environ.get("HSTU_SELF_AUTOWS_BN", _bm_force))
+            return [
+                triton.Config(
+                    {"BLOCK_M": int(_bm_force), "BLOCK_N": _bn},
                     num_stages=1,
                     num_warps=_w,
                 )
@@ -845,7 +885,9 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             mask=mask_m[None, :],
             other=0.0,
         )
-    qk_trans = tl.dot(k, q_trans, allow_tf32=ALLOW_TF32)
+    qk_trans = tl.dot(
+        k, q_trans, allow_tf32=ALLOW_TF32, attrs=({"channels": ["opndD,tmem,1,2"]} if _HSTU_DQ_REUSE else None)
+    )
     valid_mask_trans = backward_valid_mask(
         offs_m,
         pos_offs_n,
@@ -874,17 +916,28 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             mask=mask_m[:, None],
             other=0.0,
         )
-    dv += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
+    dv += tl.dot(
+        act_qk_trans, do, allow_tf32=ALLOW_TF32, attrs=(
+            {"channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]}
+            if _HSTU_DQ_REUSE
+            else None
+        )
+    )
 
     # compute dk and dq
-    dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
+    dact_qk_trans = tl.dot(
+        v, tl.trans(do), allow_tf32=ALLOW_TF32, attrs=({"channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None)
+    )
     dqk_trans = backward_d_activation(
         dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans
     )
     dqk_trans = dqk_trans.to(k.dtype)
 
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
-    dk += tl.dot(dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32)
+    dk += tl.dot(
+        dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32,
+        attrs=({"channels": ["opndD,tmem,1,10"]} if _HSTU_DQ_REUSE else None),
+    )
     if _HSTU_SELF_DQ_REDUCE and ENABLE_TMA:
         # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
         # (tl.trans(k) is a cheap memdesc_trans on the SMEM k tile), then transpose
@@ -893,7 +946,13 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         # keeps the MMA structure meta-WS can partition. DQ is pre-zeroed; the head
         # slice is selected by the store column offset (device_desc_dq base has only
         # the seq offset). Mirrors triton_bw_cross_attention.py's autoWS dq reduce.
-        dq_trans = tl.dot(tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32) * alpha
+        dq_trans = (
+            tl.dot(
+                tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32,
+                attrs=({"channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None),
+            )
+            * alpha
+        )
         dq = tl.trans(dq_trans).to(k.dtype)
         # Subtile the dq reduce into _HSTU_SELF_DQ_ITERS contiguous column-subtiles
         # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
