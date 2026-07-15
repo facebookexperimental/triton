@@ -199,17 +199,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %a2, %a3 = tt.split %t2b : tensor<128x64x2xf32, #t3d_64_mt> -> tensor<128x64xf32, #d2_64_mt>
 
     // Chain 0: truncf{3} → convert_layout{4}
-    %x0 = arith.truncf %a0 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
-    %y0 = ttg.convert_layout %x0 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    %x0 = arith.truncf %a0 {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y0 = ttg.convert_layout %x0 {ttg.partition = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
     // Chain 1
-    %x1 = arith.truncf %a1 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
-    %y1 = ttg.convert_layout %x1 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    %x1 = arith.truncf %a1 {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y1 = ttg.convert_layout %x1 {ttg.partition = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
     // Chain 2
-    %x2 = arith.truncf %a2 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
-    %y2 = ttg.convert_layout %x2 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    %x2 = arith.truncf %a2 {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y2 = ttg.convert_layout %x2 {ttg.partition = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
     // Chain 3
-    %x3 = arith.truncf %a3 {async_task_id = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
-    %y3 = ttg.convert_layout %x3 {async_task_id = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
+    %x3 = arith.truncf %a3 {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #d2_64_mt> to tensor<128x64xf16, #d2_64_mt>
+    %y3 = ttg.convert_layout %x3 {ttg.partition = array<i32: 4>} : tensor<128x64xf16, #d2_64_mt> -> tensor<128x64xf16, #d2_64_mt2>
 
     tt.return
   }

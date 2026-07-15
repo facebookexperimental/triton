@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
 
 // Test: with EPILOGUE_SUBTILE=4 (numTiles=4) the N epilogue subtiles form a
 // reuse group that shares ONE physical SMEM staging buffer (buffer.copy=3) AND
@@ -31,26 +31,26 @@
 // The epilogue staging buffer is a single shared 3-deep 128x32 alloc.
 // CHECK: ttg.local_alloc {allocation.shareGroup = 0 : i32, buffer.copy = 3 : i32, buffer.id = 2 : i32{{.*}}} : () -> !ttg.memdesc<3x128x32xf16
 //
-// In the epilogue partition (async_task_id = 0): the numTiles factor lives on the
+// In the epilogue partition (ttg.partition = 0): the numTiles factor lives on the
 // loop-carried reuse-group counter, which advances by numTiles(4) per iteration
 // (`addi %CNT, %c4_i64`). The SAME counter feeds the per-tile slot: tile 0
 // (tileIdx 0, the +0 folds) flattens to just %CNT, then % numBuffers(3); the
 // resulting %IDX indexes BOTH the 3x128x32 data staging buffer and the 3x1xi64
 // barrier (data slot == barrier slot). There is NO in-body `* numTiles`.
-// CHECK:      arith.addi %[[CNT:arg[0-9]+]], %c4_i64 {async_task_id = array<i32: 0>}
-// CHECK:      %[[DIV:[0-9]+]] = arith.divui %[[CNT]], %c3_i64 {async_task_id = array<i32: 0>}
-// CHECK:      %[[MUL:[0-9]+]] = arith.muli %[[DIV]], %c3_i64 {async_task_id = array<i32: 0>}
-// CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[CNT]], %[[MUL]] {async_task_id = array<i32: 0>}
-// CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {async_task_id = array<i32: 0>} : i64 to i32
-// CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x128x32xf16
-// CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x1xi64
+// CHECK:      arith.addi %[[CNT:arg[0-9]+]], %c4_i64 {ttg.partition = array<i32: 0>}
+// CHECK:      %[[DIV:[0-9]+]] = arith.divui %[[CNT]], %c3_i64 {ttg.partition = array<i32: 0>}
+// CHECK:      %[[MUL:[0-9]+]] = arith.muli %[[DIV]], %c3_i64 {ttg.partition = array<i32: 0>}
+// CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[CNT]], %[[MUL]] {ttg.partition = array<i32: 0>}
+// CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {ttg.partition = array<i32: 0>} : i64 to i32
+// CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {ttg.partition = array<i32: 0>} : !ttg.memdesc<3x128x32xf16
+// CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {ttg.partition = array<i32: 0>} : !ttg.memdesc<3x1xi64
 //
 // Tiles 1-3 flatten to %CNT + {1,2,3}: four DISTINCT generations of the shared
 // buffer (the buggy generic reuse-position stagger collapsed these to {0,1,1,1},
 // aliasing three subtiles onto one slot -> the 49.5%-wrong data race).
-// CHECK:      arith.addi %[[CNT]], %c1_i64 {async_task_id = array<i32: 0>}
-// CHECK:      arith.addi %[[CNT]], %c2_i64 {async_task_id = array<i32: 0>}
-// CHECK:      arith.addi %[[CNT]], %c3_i64 {async_task_id = array<i32: 0>}
+// CHECK:      arith.addi %[[CNT]], %c1_i64 {ttg.partition = array<i32: 0>}
+// CHECK:      arith.addi %[[CNT]], %c2_i64 {ttg.partition = array<i32: 0>}
+// CHECK:      arith.addi %[[CNT]], %c3_i64 {ttg.partition = array<i32: 0>}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>

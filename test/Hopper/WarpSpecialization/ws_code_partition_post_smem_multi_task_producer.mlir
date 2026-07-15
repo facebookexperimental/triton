@@ -13,11 +13,11 @@
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @multi_task_smem_producer_multiple_consumers(%src: tensor<16xf32, #blocked>) attributes {noinline = false} {
-    %alloc = ttg.local_alloc {async_task_id = array<i32: 0, 1>, buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
-    ttg.local_store %src, %alloc {async_task_id = array<i32: 0, 1>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
-    %loaded0 = ttg.local_load %alloc {async_task_id = array<i32: 0>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
-    %loaded1 = ttg.local_load %alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
-    %used = arith.addf %loaded0, %loaded1 {async_task_id = array<i32: 0, 1>} : tensor<16xf32, #blocked>
+    %alloc = ttg.local_alloc {ttg.partition = array<i32: 0, 1>, buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    ttg.local_store %src, %alloc {ttg.partition = array<i32: 0, 1>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    %loaded0 = ttg.local_load %alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+    %loaded1 = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+    %used = arith.addf %loaded0, %loaded1 {ttg.partition = array<i32: 0, 1>} : tensor<16xf32, #blocked>
     tt.return
   }
 }

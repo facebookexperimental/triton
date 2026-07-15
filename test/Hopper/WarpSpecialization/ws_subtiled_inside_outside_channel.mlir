@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
 
 // Test: inside->outside subtiled epilogue channel with a STRADDLE. This is the
 // addmm EPILOGUE_SUBTILE=2, separate_epilogue_store=True,
@@ -39,26 +39,26 @@
 // CHECK: ttg.warp_specialize
 //
 // Producer (task 0), tile 0: acquire its own buffer, store, commit (one each).
-// CHECK:      arith.truncf {{.*}} {async_task_id = array<i32: 0>}
-// CHECK:      ttng.wait_barrier {{.*}}async_task_id = array<i32: 0>{{.*}}dstTask = 2
-// CHECK:      ttg.local_store {{.*}} {async_task_id = array<i32: 0>}
-// CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 0>{{.*}}dstTask = 2
+// CHECK:      arith.truncf {{.*}} {ttg.partition = array<i32: 0>}
+// CHECK:      ttng.wait_barrier {{.*}}dstTask = 2{{.*}}ttg.partition = array<i32: 0>
+// CHECK:      ttg.local_store {{.*}} {ttg.partition = array<i32: 0>}
+// CHECK:      ttng.arrive_barrier {{.*}}dstTask = 2{{.*}}ttg.partition = array<i32: 0>
 // tile 1: its own distinct buffer, one acquire + one commit (NOT both barriers).
-// CHECK:      arith.truncf {{.*}} {async_task_id = array<i32: 0>}
-// CHECK:      ttng.wait_barrier {{.*}}async_task_id = array<i32: 0>{{.*}}dstTask = 2
-// CHECK:      ttg.local_store {{.*}} {async_task_id = array<i32: 0>}
-// CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 0>{{.*}}dstTask = 2
+// CHECK:      arith.truncf {{.*}} {ttg.partition = array<i32: 0>}
+// CHECK:      ttng.wait_barrier {{.*}}dstTask = 2{{.*}}ttg.partition = array<i32: 0>
+// CHECK:      ttg.local_store {{.*}} {ttg.partition = array<i32: 0>}
+// CHECK:      ttng.arrive_barrier {{.*}}dstTask = 2{{.*}}ttg.partition = array<i32: 0>
 //
 // Epilogue-store partition (task 2): each flat consumer waits, loads, stores,
 // then RELEASES its barrier (balanced 2 waits + 2 releases).
-// CHECK:      ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
-// CHECK:      ttg.local_load {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      tt.descriptor_store {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 2>
-// CHECK:      ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
-// CHECK:      ttg.local_load {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      tt.descriptor_store {{.*}} {async_task_id = array<i32: 2>}
-// CHECK:      ttng.arrive_barrier {{.*}}async_task_id = array<i32: 2>
+// CHECK:      ttng.wait_barrier {{.*}}ttg.partition = array<i32: 2>
+// CHECK:      ttg.local_load {{.*}} {ttg.partition = array<i32: 2>}
+// CHECK:      tt.descriptor_store {{.*}} {ttg.partition = array<i32: 2>}
+// CHECK:      ttng.arrive_barrier {{.*}}ttg.partition = array<i32: 2>
+// CHECK:      ttng.wait_barrier {{.*}}ttg.partition = array<i32: 2>
+// CHECK:      ttg.local_load {{.*}} {ttg.partition = array<i32: 2>}
+// CHECK:      tt.descriptor_store {{.*}} {ttg.partition = array<i32: 2>}
+// CHECK:      ttng.arrive_barrier {{.*}}ttg.partition = array<i32: 2>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
 
 // Test: per-tile barrier index for the SMEM channel that flows through an
 // epilogue ttng.subtiled_region. The N subtiles of a tile share ONE barrier
@@ -26,7 +26,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   // CHECK-LABEL: @matmul_kernel_tma_persistent_ws
   // CHECK: ttg.warp_specialize
   //
-  // Epilogue producer partition (async_task_id 0): the staging-buffer slot AND
+  // Epilogue producer partition (ttg.partition 0): the staging-buffer slot AND
   // the shared barrier slot are both derived IN-BODY from the per-tile flattened
   // count flattened = accumCnt + tileIdx, taken % numBuffers(3). The numTiles
   // factor lives on the loop-carried reuse-group counter, which advances by
@@ -34,12 +34,12 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   // slot, and tile 0 (tileIdx 0, the +0 folds) flattens to just accumCnt (there
   // is NO in-body `* numTiles`). The resulting %IDX indexes BOTH the 3x128x64
   // data staging buffer and the 3x1xi64 barrier (data slot == barrier slot).
-  // CHECK:      arith.addi %[[CNT:arg[0-9]+]], %c2_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      %[[DIV:[0-9]+]] = arith.divui %[[CNT]], %c3_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      %[[MUL:[0-9]+]] = arith.muli %[[DIV]], %c3_i64 {async_task_id = array<i32: 0>}
-  // CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[CNT]], %[[MUL]] {async_task_id = array<i32: 0>}
-  // CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {async_task_id = array<i32: 0>} : i64 to i32
-  // CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {async_task_id = array<i32: 0>} : !ttg.memdesc<3x128x64xf16
+  // CHECK:      arith.addi %[[CNT:arg[0-9]+]], %c2_i64 {ttg.partition = array<i32: 0>}
+  // CHECK:      %[[DIV:[0-9]+]] = arith.divui %[[CNT]], %c3_i64 {ttg.partition = array<i32: 0>}
+  // CHECK:      %[[MUL:[0-9]+]] = arith.muli %[[DIV]], %c3_i64 {ttg.partition = array<i32: 0>}
+  // CHECK:      %[[MOD:[0-9]+]] = arith.subi %[[CNT]], %[[MUL]] {ttg.partition = array<i32: 0>}
+  // CHECK:      %[[IDX:[0-9]+]] = arith.trunci %[[MOD]] {ttg.partition = array<i32: 0>} : i64 to i32
+  // CHECK:      ttg.memdesc_index %{{[0-9]+}}[%[[IDX]]] {ttg.partition = array<i32: 0>} : !ttg.memdesc<3x128x64xf16
   // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
   // CHECK:      ttg.local_store
   // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
@@ -47,7 +47,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   // The second subtile (tileIdx 1) flattens to `addi accumCnt, %c1_i64`, giving a
   // DISTINCT barrier generation -- the property the buggy shared-index version
   // lacked (it deadlocked).
-  // CHECK:      arith.addi %[[CNT]], %c1_i64 {async_task_id = array<i32: 0>}
+  // CHECK:      arith.addi %[[CNT]], %c1_i64 {ttg.partition = array<i32: 0>}
   // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
   // CHECK:      ttg.local_store
   // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}

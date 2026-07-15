@@ -7,7 +7,7 @@
 // Real FA3 backward kernel (same body as partition-scheduling-meta-fa-bwd.mlir)
 // driven through the full warp-specialization pipeline so it reaches
 // `createChannelPost`. `separateLocalAllocWithSrc` splits a shared alloc that
-// carries no async_task_id, leaving a `local_store` with an empty producer
+// carries no ttg.partition, leaving a `local_store` with an empty producer
 // set; the `if (producerTaskIds.empty()) return;` guard skips it (a producer
 // with no partition needs no channel). Without the guard the `else` branch
 // trips `assert(producerTaskIds.size() == 1)` and triton-opt aborts, so this

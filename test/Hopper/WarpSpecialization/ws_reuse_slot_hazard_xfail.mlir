@@ -7,14 +7,14 @@
 //
 // One TMEM slot (buffer.id = 5) is shared by the dpT/dq MMA results and dsT
 // (dk's operand A). dsT is materialized into the slot by the *computation*
-// partition (async_task_id = 3) and read by the dk MMA (async_task_id = 1);
-// the dq MMA (async_task_id = 1) writes the same slot. dk MUST read dsT before
+// partition (ttg.partition = 3) and read by the dk MMA (ttg.partition = 1);
+// the dq MMA (ttg.partition = 1) writes the same slot. dk MUST read dsT before
 // dq overwrites the slot. Here dq is emitted BEFORE dk in the gemm partition
 // with no barrier that can order dk first -> dq clobbers dsT -> NaN at runtime
 // (the bug fixed by emitting dk before dq in the kernel).
 //
 // This module is shaped like post-insertAsyncComm / pre-specializeRegion IR:
-// a single region whose ops carry async_task_id and whose cross-partition
+// a single region whose ops carry ttg.partition and whose cross-partition
 // dependencies are materialized as mbarriers. The proposed pass
 // (--nvgpu-verify-reuse-slot-hazard, not yet implemented) must:
 //   1. group accesses by physical slot (resolve tmem_subslice / reinterpret /
@@ -59,23 +59,23 @@ module attributes {"ttg.num-warps" = 8 : i32, "ttg.threads-per-warp" = 32 : i32,
     %re = ttg.memdesc_reinterpret %sub : !ttg.memdesc<1x128x64xf32, #tmem1, #ttng.tensor_memory, mutable, 1x128x128> -> !ttg.memdesc<1x128x128xf16, #tmem3, #ttng.tensor_memory, mutable>
 
     // --- computation partition (task 3): write dsT into the slot, then signal.
-    %dsT_slot = ttg.memdesc_index %re[%c0] {async_task_id = array<i32: 3>} : !ttg.memdesc<1x128x128xf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
-    ttng.tmem_store %dsT_val, %dsT_slot, %true {async_task_id = array<i32: 3>} : tensor<128x128xf16, #linear2> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
-    ttng.arrive_barrier %dsT_full, 1 {async_task_id = array<i32: 3>} : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
+    %dsT_slot = ttg.memdesc_index %re[%c0] {ttg.partition = array<i32: 3>} : !ttg.memdesc<1x128x128xf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tmem_store %dsT_val, %dsT_slot, %true {ttg.partition = array<i32: 3>} : tensor<128x128xf16, #linear2> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+    ttng.arrive_barrier %dsT_full, 1 {ttg.partition = array<i32: 3>} : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
 
     // --- gemm partition (task 1) ---
     // HAZARD: dq writes the shared slot (opndD, buffer.id=5) before dk reads
     // dsT from it, in the same partition, with no barrier ordering dk first.
-    %dq_d = ttg.memdesc_index %slot[%c0] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %dq_d = ttg.memdesc_index %slot[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // expected-error@+1 {{reuse group slot hazard}}
-    ttng.tc_gen5_mma %a_dq, %b_smem, %dq_d, %false, %true {async_task_id = array<i32: 1>, is_async} : !ttg.memdesc<128x128xf16, #shared4, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %a_dq, %b_smem, %dq_d, %false, %true {ttg.partition = array<i32: 1>, is_async} : !ttg.memdesc<128x128xf16, #shared4, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
 
     // dk waits for dsT then reads it (operand A, buffer.id=5) -- too late, dq
     // already clobbered the slot above.
-    ttng.wait_barrier %dsT_full, %c0 {async_task_id = array<i32: 1>} : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
-    %dk_d = ttg.memdesc_index %dk_acc[%c0] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    %dsT_read = ttg.memdesc_index %re[%c0] {async_task_id = array<i32: 1>} : !ttg.memdesc<1x128x128xf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
-    ttng.tc_gen5_mma %dsT_read, %b_smem, %dk_d, %false, %true {async_task_id = array<i32: 1>, is_async} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    ttng.wait_barrier %dsT_full, %c0 {ttg.partition = array<i32: 1>} : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
+    %dk_d = ttg.memdesc_index %dk_acc[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %dsT_read = ttg.memdesc_index %re[%c0] {ttg.partition = array<i32: 1>} : !ttg.memdesc<1x128x128xf16, #tmem3, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+    ttng.tc_gen5_mma %dsT_read, %b_smem, %dk_d, %false, %true {ttg.partition = array<i32: 1>, is_async} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
 }

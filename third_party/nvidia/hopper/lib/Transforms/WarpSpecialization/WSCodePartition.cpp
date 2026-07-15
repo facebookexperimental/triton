@@ -3325,7 +3325,7 @@ void insertAsyncComm(
         // (Column-range overlap can't distinguish them — the owner spans the
         // packed siblings' columns in both cases; and block-based
         // verifyReuseGroupCrossPartition is unusable here since partitions are
-        // still async_task_id tags in one block.)
+        // still ttg.partition tags in one block.)
         llvm::DenseSet<int64_t> bufferOffsets;
         for (auto *ch : group->channels) {
           int64_t off = 0;
@@ -5486,16 +5486,16 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
     bool maxEqualsHost = (maxType == hostTy);
     if (maxEqualsHost) {
       // Stamp every host attribute (alignment, buffer.id, buffer.copy,
-      // async_task_id, allocation.shareGroup, ...) onto the backing alloc.
+      // ttg.partition, allocation.shareGroup, ...) onto the backing alloc.
       for (NamedAttribute attr : hostAlloc->getAttrs())
         backingAlloc->setAttr(attr.getName(), attr.getValue());
     } else {
-      // Backing carries only alignment + async_task_id; planner attrs
+      // Backing carries only alignment + ttg.partition; planner attrs
       // move onto the host view below.
       if (auto alignAttr = hostAlloc->getAttr("alignment"))
         backingAlloc->setAttr("alignment", alignAttr);
-      if (auto taskIds = hostAlloc->getAttr("async_task_id"))
-        backingAlloc->setAttr("async_task_id", taskIds);
+      if (auto taskIds = getAsyncTaskIds(hostAlloc); !taskIds.empty())
+        setAsyncTaskIds(backingAlloc, taskIds);
     }
 
     // (e) Replace host uses. If maxType == hostType we wire host consumers
@@ -5524,7 +5524,7 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
     hostAllocById.erase(hostIt);
 
     // (f) Build one stagingView per viable staging. Propagate planner
-    // attributes (including async_task_id) but explicitly OMIT
+    // attributes (including ttg.partition) but explicitly OMIT
     // buffer.tmaStaging — downstream passes walk ttg.local_alloc ops with
     // that attribute and assume the defining op is castable to
     // LocalAllocOp; a MemDescReinterpretOp carrying it would be
@@ -5537,10 +5537,12 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
       auto stagingView = ttg::MemDescReinterpretOp::create(
           builder, stagingAlloc.getLoc(), stagingTy, backingAlloc.getResult());
       for (StringRef name : {"buffer.id", "buffer.copy", "buffer.idx_in_group",
-                             "allocation.shareGroup", "async_task_id"}) {
+                             "allocation.shareGroup"}) {
         if (auto a = stagingAlloc->getAttr(name))
           stagingView->setAttr(name, a);
       }
+      if (auto taskIds = getAsyncTaskIds(stagingAlloc); !taskIds.empty())
+        setAsyncTaskIds(stagingView, taskIds);
 
       LDBG("[staging-reuse] merged staging (buffer.id="
            << stagingAlloc->getAttrOfType<IntegerAttr>("buffer.id").getInt()

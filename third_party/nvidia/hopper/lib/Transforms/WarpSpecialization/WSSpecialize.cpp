@@ -377,8 +377,8 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   // This is needed to preserve tt.warp_specialize,
   // and tt.loop_schedule among others.
   for (auto attr : forOp->getAttrs()) {
-    // async_task_id is set in the creation step.
-    if (attr.getName() != "async_task_id") {
+    // The partition attribute is set in the creation step.
+    if (attr.getName() != ttg::kPartitionAttrName) {
       newForOp->setAttr(attr.getName(), attr.getValue());
     }
   }
@@ -451,7 +451,7 @@ Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
       whileOp.getLoc(), whileOp->getResultTypes(), newInits);
   builder.clearLoopScheduleInfo();
   for (auto attr : whileOp->getAttrs()) {
-    if (attr.getName() != "async_task_id")
+    if (attr.getName() != ttg::kPartitionAttrName)
       newWhileOp->setAttr(attr.getName(), attr.getValue());
   }
 
@@ -924,11 +924,9 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       logOpStillHasUsers(op);
       // The op has been cloned into partition regions but still has users
       // outside the WS regions (e.g. a MemDescIndexOp at the function level
-      // that wasn't given asyncTaskIds). Keep the op alive by removing its
-      // async_task_id so it stays at the function level as a shared value.
-      op->removeAttr("async_task_id");
-      if (op->hasAttr(ttg::kPartitionAttrName))
-        op->removeAttr(ttg::kPartitionAttrName);
+      // that wasn't given a partition). Keep the op alive by removing its
+      // partition so it stays at the function level as a shared value.
+      op->removeAttr(ttg::kPartitionAttrName);
       continue;
     }
 

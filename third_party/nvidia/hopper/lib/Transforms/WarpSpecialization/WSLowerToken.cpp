@@ -56,7 +56,7 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase,
                                             /*pred=*/Value(), /*deps=*/{},
                                             op.getConstraintsAttr());
-  assert(op.getOperation()->hasAttr("async_task_id"));
+  assert(!getAsyncTaskIds(op.getOperation()).empty());
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
 }
@@ -72,7 +72,7 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
       builder, loc, bufferFull, 1, /*pred=*/Value(), /*perThread=*/false,
       op.getConstraintsAttr());
 
-  assert(op.getOperation()->hasAttr("async_task_id"));
+  assert(!getAsyncTaskIds(op.getOperation()).empty());
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
 }
@@ -86,7 +86,7 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase,
                                             /*pred=*/Value(), /*deps=*/{},
                                             op.getConstraintsAttr());
-  assert(op.getOperation()->hasAttr("async_task_id"));
+  assert(!getAsyncTaskIds(op.getOperation()).empty());
   setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(waitOp, op);
 }
@@ -98,7 +98,7 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
   auto arriveOp = ttng::ArriveBarrierOp::create(
       builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
       op.getConstraintsAttr());
-  assert(op.getOperation()->hasAttr("async_task_id"));
+  assert(!getAsyncTaskIds(op.getOperation()).empty());
   setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
 }
@@ -255,14 +255,14 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       // We need bufferFullArray and bufferEmptyArray.
       if (auto op = dyn_cast<ttnvws::ProducerAcquireOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
+        assert(!getAsyncTaskIds(user).empty());
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processProducerAcquireOp(builder, op, bufferEmpty);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ProducerCommitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
+        assert(!getAsyncTaskIds(user).empty());
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processProducerCommitOp(builder, op, bufferFull, loadType,
                                 bufferFullCount);
@@ -270,14 +270,14 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
+        assert(!getAsyncTaskIds(user).empty());
         setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerWaitOp(builder, op, bufferFull);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerReleaseOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
+        assert(!getAsyncTaskIds(user).empty());
         setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
                                  bufferEmptyCount);

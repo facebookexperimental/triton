@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="capability=100 generate-subtiled-region=true num-stages=3 pingpong-auto-ws=false smem-budget=232448" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100 generate-subtiled-region=true num-stages=3 pingpong-auto-ws=false smem-budget=232448" | FileCheck %s
 
 // Test: both-endpoints-subtiled SMEM channels with DATA_PARTITION_FACTOR=2 +
 // early_tma_store_lowering + EPILOGUE_SUBTILE=2 (tutorial09

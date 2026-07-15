@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
 
 // Test: SAME-TASK epilogue subtiling (separate_epilogue_store=False).
 // The per-tile truncf -> local_store -> async_tma_copy_local_to_global ->
@@ -44,16 +44,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %lhs, %rhs = tt.split %transposed : tensor<128x64x2xf32, #blocked3d_perm2> -> tensor<128x64xf32, #blocked2d2>
 
     // Tile 0: truncf -> store -> copy -> drain, all task 3.
-    %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
-    ttg.local_store %trunc0, %smem0 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
-    %tok0 = ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {async_task_id = array<i32: 3>} : !tt.tensordesc<tensor<128x64xf16, #shared2>>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok0 {async_task_id = array<i32: 3>} : !ttg.async.token
+    %trunc0 = arith.truncf %lhs {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
+    ttg.local_store %trunc0, %smem0 {ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    %tok0 = ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x64xf16, #shared2>>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %tok0 {ttg.partition = array<i32: 3>} : !ttg.async.token
 
     // Tile 1: same chain, all task 3.
-    %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
-    ttg.local_store %trunc1, %smem1 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
-    %tok1 = ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {async_task_id = array<i32: 3>} : !tt.tensordesc<tensor<128x64xf16, #shared2>>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable> -> !ttg.async.token
-    ttng.async_tma_store_token_wait %tok1 {async_task_id = array<i32: 3>} : !ttg.async.token
+    %trunc1 = arith.truncf %rhs {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
+    ttg.local_store %trunc1, %smem1 {ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    %tok1 = ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x64xf16, #shared2>>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %tok1 {ttg.partition = array<i32: 3>} : !ttg.async.token
 
     tt.return
   }

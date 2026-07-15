@@ -28,9 +28,9 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 
-/// Given a TMEMStoreOp, check its source value for async_task_id.
+/// Given a TMEMStoreOp, check its source value for ttg.partition.
 /// Traverse back through the def chain looking for an operation with
-/// async_task_id set.
+/// ttg.partition set.
 static SmallVector<AsyncTaskId>
 findAsyncIdFromTMEMStoreSource(ttng::TMEMStoreOp storeOp) {
   Value src = storeOp.getSrc();
@@ -104,7 +104,7 @@ static ttng::TMEMAllocOp findBaseTMEMAlloc(Value desc) {
 
 /// Handle operand D for MMA ops with task_id set.
 /// This function finds TMEMStoreOp (initialization) before the loop
-/// containing the MMA and assigns async_task_id to it if not already set.
+/// containing the MMA and assigns ttg.partition to it if not already set.
 static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
   funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
     // Step 1: Check if the MMA op has a task_id set.
@@ -178,28 +178,31 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
 }
 
 int doTaskIdPropagate(triton::FuncOp &funcOp) {
-  // Compute the min partition to normalize to 0
+  // Compute the min partition to normalize to 0.
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0];
-      assert(idx >= 0);
-      minPartition = std::min(idx, minPartition);
+      for (int64_t idx : attr.asArrayRef()) {
+        assert(idx >= 0);
+        minPartition = std::min(idx, minPartition);
+      }
     }
   });
   DenseSet<AsyncTaskId> totalTaskIds;
-  // Convert ttg.partition to async_task_id
+  // Normalize ttg.partition indices to start at 0, in place. ttg.partition is
+  // the single partition representation for the whole WS pipeline.
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0] - minPartition;
-      totalTaskIds.insert(idx);
-      assert(idx >= 0);
-      setAsyncTaskIds(op, idx);
-      op->removeAttr(ttg::kPartitionAttrName);
+      SmallVector<AsyncTaskId> ids;
+      for (int64_t rawIdx : attr.asArrayRef()) {
+        AsyncTaskId idx = static_cast<AsyncTaskId>(rawIdx - minPartition);
+        assert(idx >= 0);
+        totalTaskIds.insert(idx);
+        ids.push_back(idx);
+      }
+      setAsyncTaskIds(op, ids);
     }
   });
 
@@ -207,7 +210,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // TMEMStoreOps before loops.
   handleOperandDTaskIdPropagation(funcOp);
 
-  // Existing async_task_id anchors also contribute to the global task union.
+  // Existing ttg.partition anchors also contribute to the global task union.
   // In async-only inputs there may be no ttg.partition attrs to normalize, but
   // loops, assumes, and loop bounds still need to be visible to all tasks.
   funcOp.walk([&](mlir::Operation *op) {
@@ -218,7 +221,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   std::vector<int> allTasksVec(totalTaskIds.begin(), totalTaskIds.end());
   ArrayRef<AsyncTaskId> allTasks(allTasksVec);
 
-  // Hack: set async_task_id to all tasks for all assume ops.
+  // Hack: set ttg.partition to all tasks for all assume ops.
   // This is not necesssarily generally desirable because it could
   // force data into multiple partitions. However, for now we will
   // assume this is for the inputs and can state this as needed.
@@ -272,16 +275,17 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
         isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
         llvm::none_of(op->getResultTypes(),
                       [](Type t) { return isa<RankedTensorType>(t); });
-    bool isAnchor = !isScalarArithOrMath && op->hasAttr("async_task_id");
+    bool isAnchor =
+        !isScalarArithOrMath && op->hasAttr(ttg::kPartitionAttrName);
     if (!taskIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !isAnchor)) {
       // For non-anchor ops with existing annotations, merge the lattice
       // value with the annotation to preserve the original task assignment.
       if (auto existing =
-              op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
+              op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
         taskIds = ttg::TaskId::meet(taskIds, ttg::TaskId(existing));
       }
-      op->setAttr("async_task_id", taskIds.getTaskIds());
+      op->setAttr(ttg::kPartitionAttrName, taskIds.getTaskIds());
     }
   });
   // Re-propagate allTasks to ForOp loop bounds after the solver. The solver
@@ -322,7 +326,7 @@ public:
         if (!isa<arith::ConstantOp, arith::ConstantIntOp>(op))
           anchorOps.insert(op);
         if (numWarpGroups == 0)
-          op->removeAttr("async_task_id");
+          op->removeAttr(ttg::kPartitionAttrName);
       }
     });
     if (numWarpGroups == 0 || anchorOps.empty())

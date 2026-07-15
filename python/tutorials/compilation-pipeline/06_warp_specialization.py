@@ -6,10 +6,10 @@ Pipeline: **TTGIR** automatic warp specialization
 ``TRITON_USE_META_WS`` (``knobs.nvidia.use_meta_ws``) on a loop marked
 ``tl.range(..., warp_specialize=True)``, the pass partitions a warp group into
 **producer** warps (TMA loads) and **consumer** warps (MMA), wrapping them in a
-``ttg.warp_specialize`` region and tagging ops with ``async_task_id``.
+``ttg.warp_specialize`` region and tagging ops with ``ttg.partition``.
 
 What to notice: with AutoWS on, the persistent matmul's TTGIR gains
-``ttg.warp_specialize`` and ``async_task_id`` annotations that are absent otherwise.
+``ttg.warp_specialize`` and ``ttg.partition`` annotations that are absent otherwise.
 
 Bit-neutral mechanic: WS is a *scheduling* transform (who does what), not a change
 to the MMA math — the numeric result is the same. Requires datacenter Blackwell
@@ -83,16 +83,16 @@ def main():
                           GROUP_M=GROUP, NUM_SMS=NUM_SMS, grid=grid)
         banner("06 — AutoWS partitions warps (producer TMA loads / consumer MMA)")
         print(f"    ttg.warp_specialize ops = {count(ck, 'ttgir', 'warp_specialize')}")
-        print(f"    async_task_id tags      = {count(ck, 'ttgir', 'async_task_id')}")
+        print(f"    ttg.partition tags      = {count(ck, 'ttgir', 'ttg.partition')}")
         show(ck, "ttgir", grep="warp_specialize", limit=3, label="\nwarp_specialize region(s):")
 
         # The pass responsible: `nvgpu-warp-specialization`. pass_diff shows it
         # wrapping the loop body in a ttg.warp_specialize region and tagging ops
-        # with async_task_id (producer vs consumer).
+        # with ttg.partition (producer vs consumer).
         banner("06 — the pass responsible: nvgpu-warp-specialization")
         dumps = dump_passes(matmul, a_desc, b_desc, c_desc, M, N, K, False, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
                             GROUP_M=GROUP, NUM_SMS=NUM_SMS, grid=grid)
-        pass_diff(dumps, "warp-specialization", grep=["warp_specialize", "async_task_id"], limit=20)
+        pass_diff(dumps, "warp-specialization", grep=["warp_specialize", "ttg.partition"], limit=20)
 
         matmul[grid](a_desc, b_desc, c_desc, M, N, K, False, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_M=GROUP,
                      NUM_SMS=NUM_SMS)

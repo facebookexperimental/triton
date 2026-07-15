@@ -15,7 +15,7 @@ namespace mlir::triton::gpu {
 // TaskId
 //===----------------------------------------------------------------------===//
 
-/// This lattice value represents known information on the async_task_id of a
+/// This lattice value represents known information on the ttg.partition of a
 /// lattice.
 class TaskId {
 public:
@@ -72,7 +72,7 @@ public:
 //===----------------------------------------------------------------------===//
 
 /// This analysis implements sparse backward propagation, which attempts to
-/// determine the async_task_id of an SSA value.
+/// determine the ttg.partition of an SSA value.
 
 class TaskIdBackwardPropagation
     : public SparseBackwardDataFlowAnalysis<TaskIdLattice> {

@@ -27,20 +27,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func public @preserve_reshape_nvmma_shared(%src_3d: tensor<128x2x32xbf16, #blocked3d>) {
     %true = arith.constant true
     %false = arith.constant false
-    %c0_i32 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 0 : i32
-    %c1_i32 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 1 : i32
-    %c4_i32 = arith.constant {async_task_id = array<i32: 0, 1, 2, 3>} 4 : i32
-    %acc, %acc_token = ttng.tmem_alloc {async_task_id = array<i32: 0, 3>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %c0_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2, 3>} 0 : i32
+    %c1_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2, 3>} 1 : i32
+    %c4_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2, 3>} 4 : i32
+    %acc, %acc_token = ttng.tmem_alloc {ttg.partition = array<i32: 0, 3>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // B operand
-    %b_smem = ttg.local_alloc {async_task_id = array<i32: 1>} : () -> !ttg.memdesc<64x128xbf16, #nvmma, #smem, mutable>
+    %b_smem = ttg.local_alloc {ttg.partition = array<i32: 1>} : () -> !ttg.memdesc<64x128xbf16, #nvmma, #smem, mutable>
     %loop:2 = scf.for %iv = %c0_i32 to %c4_i32 step %c1_i32 iter_args(%use_d = %false, %dep = %acc_token) -> (i1, !ttg.async.token) : i32 {
       // Producer (task 3): alloc A with shared_linear 3D encoding
-      %a_alloc = ttg.local_alloc %src_3d {async_task_id = array<i32: 3>} : (tensor<128x2x32xbf16, #blocked3d>) -> !ttg.memdesc<128x2x32xbf16, #sl3d, #smem>
+      %a_alloc = ttg.local_alloc %src_3d {ttg.partition = array<i32: 3>} : (tensor<128x2x32xbf16, #blocked3d>) -> !ttg.memdesc<128x2x32xbf16, #sl3d, #smem>
       // Consumer (task 0): reshape to nvmma_shared 2D encoding, then MMA
-      %a_reshaped = ttg.memdesc_reshape %a_alloc {async_task_id = array<i32: 0>} : !ttg.memdesc<128x2x32xbf16, #sl3d, #smem> -> !ttg.memdesc<128x64xbf16, #nvmma, #smem>
-      %tok = ttng.tc_gen5_mma %a_reshaped, %b_smem, %acc[%dep], %use_d, %true {async_task_id = array<i32: 0>} : !ttg.memdesc<128x64xbf16, #nvmma, #smem>, !ttg.memdesc<64x128xbf16, #nvmma, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %a_reshaped = ttg.memdesc_reshape %a_alloc {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x2x32xbf16, #sl3d, #smem> -> !ttg.memdesc<128x64xbf16, #nvmma, #smem>
+      %tok = ttng.tc_gen5_mma %a_reshaped, %b_smem, %acc[%dep], %use_d, %true {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xbf16, #nvmma, #smem>, !ttg.memdesc<64x128xbf16, #nvmma, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       scf.yield %true, %tok : i1, !ttg.async.token
-    } {async_task_id = array<i32: 0, 1, 2, 3>, tt.warp_specialize}
+    } {ttg.partition = array<i32: 0, 1, 2, 3>, tt.warp_specialize}
     tt.return
   }
 }

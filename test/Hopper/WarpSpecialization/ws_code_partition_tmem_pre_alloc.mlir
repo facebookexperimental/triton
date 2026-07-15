@@ -23,12 +23,12 @@
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tmem_alloc_src_cross_partition(%b_smem: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>) attributes {noinline = false} {
-    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
-    %false = arith.constant {async_task_id = array<i32: 0, 1>} false
-    %cst = arith.constant {async_task_id = array<i32: 0>} dense<1.000000e+00> : tensor<128x128xbf16, #blocked>
-    %acc, %acc_token = ttng.tmem_alloc {async_task_id = array<i32: 1>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
-    %p_tmem = ttng.tmem_alloc %cst {async_task_id = array<i32: 0>} : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>
-    %mma_token = ttng.tc_gen5_mma %p_tmem, %b_smem, %acc[%acc_token], %false, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %true = arith.constant {ttg.partition = array<i32: 0, 1>} true
+    %false = arith.constant {ttg.partition = array<i32: 0, 1>} false
+    %cst = arith.constant {ttg.partition = array<i32: 0>} dense<1.000000e+00> : tensor<128x128xbf16, #blocked>
+    %acc, %acc_token = ttng.tmem_alloc {ttg.partition = array<i32: 1>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %p_tmem = ttng.tmem_alloc %cst {ttg.partition = array<i32: 0>} : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>
+    %mma_token = ttng.tc_gen5_mma %p_tmem, %b_smem, %acc[%acc_token], %false, %true {ttg.partition = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #tmem, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
 }

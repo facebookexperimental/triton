@@ -23,19 +23,19 @@
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @else_direct_smem_channel(%src: tensor<16xf32, #blocked>) attributes {noinline = false} {
-    %alloc = ttg.local_alloc {async_task_id = array<i32: 0>, buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
-    %c0_i32 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
-    %c1_i32 = arith.constant {async_task_id = array<i32: 0, 1>} 1 : i32
-    %pred = arith.cmpi eq, %c0_i32, %c1_i32 {async_task_id = array<i32: 0, 1>} : i32
+    %alloc = ttg.local_alloc {ttg.partition = array<i32: 0>, buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+    %c0_i32 = arith.constant {ttg.partition = array<i32: 0, 1>} 0 : i32
+    %c1_i32 = arith.constant {ttg.partition = array<i32: 0, 1>} 1 : i32
+    %pred = arith.cmpi eq, %c0_i32, %c1_i32 {ttg.partition = array<i32: 0, 1>} : i32
     scf.if %pred {
       scf.yield
     } else {
-      %stored = arith.addf %src, %src {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked>
-      ttg.local_store %stored, %alloc {async_task_id = array<i32: 0>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
-      %loaded = ttg.local_load %alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
-      %used = arith.addf %loaded, %loaded {async_task_id = array<i32: 1>} : tensor<16xf32, #blocked>
+      %stored = arith.addf %src, %src {ttg.partition = array<i32: 0>} : tensor<16xf32, #blocked>
+      ttg.local_store %stored, %alloc {ttg.partition = array<i32: 0>} : tensor<16xf32, #blocked> -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
+      %loaded = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
+      %used = arith.addf %loaded, %loaded {ttg.partition = array<i32: 1>} : tensor<16xf32, #blocked>
       scf.yield
-    } {async_task_id = array<i32: 0, 1>}
+    } {ttg.partition = array<i32: 0, 1>}
     tt.return
   }
 }

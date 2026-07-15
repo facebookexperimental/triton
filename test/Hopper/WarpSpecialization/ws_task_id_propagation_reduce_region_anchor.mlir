@@ -12,10 +12,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK-LABEL: @reduce_body_keeps_anchor_task
   // CHECK:      %[[REDUCE:.*]] = "tt.reduce"(%{{.*}}) <{axis = 1 : i32}> ({
   // CHECK-NEXT: ^bb0(%[[LHS:.*]]: f32, %[[RHS:.*]]: f32):
-  // CHECK-NEXT:   %[[BODY_ADD:.*]] = arith.addf %[[LHS]], %[[RHS]] {{.*}}async_task_id = array<i32: 1>{{.*}} : f32
-  // CHECK-NEXT:   tt.reduce.return %[[BODY_ADD]] {{.*}}async_task_id = array<i32: 1>{{.*}} : f32
+  // CHECK-NEXT:   %[[BODY_ADD:.*]] = arith.addf %[[LHS]], %[[RHS]] {{.*}}ttg.partition = array<i32: 1>{{.*}} : f32
+  // CHECK-NEXT:   tt.reduce.return %[[BODY_ADD]] {{.*}}ttg.partition = array<i32: 1>{{.*}} : f32
   // CHECK-NEXT: }) {{.*}} :
-  // CHECK:      arith.addf %[[REDUCE]], %{{.*}} {{.*}}async_task_id = array<i32: 0>{{.*}} : tensor<16xf32,
+  // CHECK:      arith.addf %[[REDUCE]], %{{.*}} {{.*}}ttg.partition = array<i32: 0>{{.*}} : tensor<16xf32,
   tt.func public @reduce_body_keeps_anchor_task(%input: tensor<16x16xf32, #blocked>) {
     %bias = arith.constant dense<1.000000e+00> : tensor<16xf32, #slice>
     %sum = "tt.reduce"(%input) <{axis = 1 : i32}> ({

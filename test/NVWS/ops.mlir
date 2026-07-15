@@ -99,13 +99,13 @@ tt.func @token_producer_consumer() {
 
   %0 = nvws.create_token {loadType = 1 : i32, numBuffers = 3 : i32} : tensor<3x!nvws.token>
 
-  %c0_i32 = arith.constant {async_task_id = dense<0> : vector<1xi32>} 0 : i32
-  %false = arith.constant {async_task_id = dense<0> : vector<1xi32>} false
+  %c0_i32 = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
+  %false = arith.constant {ttg.partition = array<i32: 0>} false
 
-  nvws.producer_acquire %0, %c0_i32, %false {async_task_id = dense<0> : vector<1xi32>} : tensor<3x!nvws.token>, i32, i1
-  nvws.producer_commit %0, %c0_i32 {async_task_id = dense<0> : vector<1xi32>} : tensor<3x!nvws.token>, i32
-  nvws.consumer_wait %0, %c0_i32, %false {async_task_id = dense<1> : vector<1xi32>} : tensor<3x!nvws.token>, i32, i1
-  nvws.consumer_release %0, %c0_i32 {async_task_id = dense<1> : vector<1xi32>} : tensor<3x!nvws.token>, i32
+  nvws.producer_acquire %0, %c0_i32, %false {ttg.partition = array<i32: 0>} : tensor<3x!nvws.token>, i32, i1
+  nvws.producer_commit %0, %c0_i32 {ttg.partition = array<i32: 0>} : tensor<3x!nvws.token>, i32
+  nvws.consumer_wait %0, %c0_i32, %false {ttg.partition = array<i32: 1>} : tensor<3x!nvws.token>, i32, i1
+  nvws.consumer_release %0, %c0_i32 {ttg.partition = array<i32: 1>} : tensor<3x!nvws.token>, i32
   tt.return
 }
 
@@ -123,12 +123,12 @@ tt.func @token_with_ws_constraints() {
 
   %0 = nvws.create_token {loadType = 1 : i32, numBuffers = 3 : i32} : tensor<3x!nvws.token>
 
-  %c0_i32 = arith.constant {async_task_id = dense<0> : vector<1xi32>} 0 : i32
-  %false = arith.constant {async_task_id = dense<0> : vector<1xi32>} false
+  %c0_i32 = arith.constant {ttg.partition = array<i32: 0>} 0 : i32
+  %false = arith.constant {ttg.partition = array<i32: 0>} false
 
-  nvws.producer_acquire %0, %c0_i32, %false {async_task_id = dense<0> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 1 : i32}}} : tensor<3x!nvws.token>, i32, i1
-  nvws.producer_commit %0, %c0_i32 {async_task_id = dense<0> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 1 : i32}}} : tensor<3x!nvws.token>, i32
-  nvws.consumer_wait %0, %c0_i32, %false {async_task_id = dense<1> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32, i1
-  nvws.consumer_release %0, %c0_i32 {async_task_id = dense<1> : vector<1xi32>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32
+  nvws.producer_acquire %0, %c0_i32, %false {ttg.partition = array<i32: 0>, constraints = {WSBarrier = {dstTask = 1 : i32}}} : tensor<3x!nvws.token>, i32, i1
+  nvws.producer_commit %0, %c0_i32 {ttg.partition = array<i32: 0>, constraints = {WSBarrier = {dstTask = 1 : i32}}} : tensor<3x!nvws.token>, i32
+  nvws.consumer_wait %0, %c0_i32, %false {ttg.partition = array<i32: 1>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32, i1
+  nvws.consumer_release %0, %c0_i32 {ttg.partition = array<i32: 1>, constraints = {WSBarrier = {dstTask = 0 : i32}}} : tensor<3x!nvws.token>, i32
   tt.return
 }

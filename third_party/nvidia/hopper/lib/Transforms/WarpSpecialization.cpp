@@ -91,7 +91,7 @@ void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
   // OptimizeTMemLayouts runs later via add_optimize_tmem_layouts in
   // compiler.py. This avoids transforming bare splits into tmem_subslice
-  // ops that lack async_task_id and would crash createChannelPost.
+  // ops that lack ttg.partition and would crash createChannelPost.
   (void)pm.run(moduleOp);
 }
 
@@ -128,8 +128,6 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp, int defaultNumStages) {
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
-      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
-        enabled = true;
       if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
               triton::gpu::kPartitionAttrName))
         enabled = true;

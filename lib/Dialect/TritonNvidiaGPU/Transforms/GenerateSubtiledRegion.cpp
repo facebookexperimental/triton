@@ -18,8 +18,6 @@ namespace {
 
 /// Get the async task IDs from an operation.
 static SmallVector<int32_t> getOpAsyncTaskIds(Operation *op) {
-  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
-    return SmallVector<int32_t>(attr.asArrayRef());
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(gpu::kPartitionAttrName))
     return SmallVector<int32_t>(attr.asArrayRef());
   return {};
@@ -692,7 +690,8 @@ static void buildSingleSubtiledRegionN(
   for (Operation *op : tplChain) {
     auto taskIds = getOpAsyncTaskIds(op);
     if (!taskIds.empty()) {
-      regionOp->setAttr("async_task_id", DenseI32ArrayAttr::get(ctx, taskIds));
+      regionOp->setAttr(gpu::kPartitionAttrName,
+                        DenseI32ArrayAttr::get(ctx, taskIds));
       break;
     }
   }
@@ -992,7 +991,7 @@ static bool buildMultiTaskSubtiledRegionsN(
   return true;
 }
 
-/// Return true if any op across the N chains has a different async_task_id
+/// Return true if any op across the N chains has a different ttg.partition
 /// than the first task-annotated op.
 static bool isMultiTask(ArrayRef<SmallVector<Operation *>> chains) {
   SmallVector<int32_t> firstTaskIds;

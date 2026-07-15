@@ -4,15 +4,15 @@
 //
 // `getAsyncTaskIds` is documented to return sorted task IDs. The test task-id
 // propagation pass normalizes pre-existing task annotations through that helper
-// before propagation. A non-canonical spelling with a repeated, non-adjacent
-// task ID should therefore become the sorted unique set `{0, 1}`.
+// before propagation. A non-zero-based partition set should therefore be
+// remapped to the canonical contiguous set `{0, 1}`.
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: @async_task_id_attribute_is_canonicalized
-  // CHECK:       tt.get_program_id x {async_task_id = array<i32: 0, 1>} : i32
-  // CHECK-NOT:   async_task_id = array<i32: 0, 1, 1>
-  tt.func public @async_task_id_attribute_is_canonicalized() {
-    %pid = tt.get_program_id x {async_task_id = array<i32: 1, 0, 1>} : i32
+  // CHECK-LABEL: @ttg.partition_attribute_is_canonicalized
+  // CHECK:       tt.get_program_id x {ttg.partition = array<i32: 0, 1>} : i32
+  // CHECK-NOT:   ttg.partition = array<i32: 0, 1, 1>
+  tt.func public @ttg.partition_attribute_is_canonicalized() {
+    %pid = tt.get_program_id x {ttg.partition = array<i32: 1, 2>} : i32
     tt.return
   }
 }

@@ -1152,11 +1152,11 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
 
 bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
   // Cross-partition reuse: a single-copy reuse group of >= 3 channels whose
-  // PRODUCERS span more than one partition (async_task_id) AND that admit a
+  // PRODUCERS span more than one partition (ttg.partition) AND that admit a
   // unique total dependency-chain order (channel i's consumer reaches channel
   // i+1's producer). Such a group cannot be handled by the same-block A3 path:
   // its channels share one block at this stage (partitions are still
-  // async_task_id tags pre-specialization, so a block-based test would always
+  // ttg.partition tags pre-specialization, so a block-based test would always
   // see "one block"), but the cross-partition writers need explicit reuse
   // barriers — a same-partition program-order elision is unsound for them.
   //
@@ -2008,7 +2008,7 @@ static void dumpKeyOpsSubgraph(triton::FuncOp funcOp, llvm::raw_ostream &os,
           // Build label using the new format
           std::string label = getKeyOpLabel(op);
 
-          // Color based on partition number (async_task_id)
+          // Color based on partition number (ttg.partition)
           // Color palette for different partitions
           static const std::vector<std::string> partitionColors = {
               "lightblue",   // Partition 0
@@ -2117,7 +2117,7 @@ void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
 
     // Check if this is a key operation
     if (isKeyOp(op)) {
-      // Get partition from async_task_id
+      // Get partition from ttg.partition
       auto taskIds = getAsyncTaskIds(op);
       if (!taskIds.empty()) {
         int partitionId = taskIds.front();
@@ -3631,13 +3631,13 @@ void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
     // Check all existing operations for a matching task id.
     // Within the same task we will pick the earliest by
     // program order.
-    auto taskId = waiter->getAttr("async_task_id");
+    auto taskId = getAsyncTaskIds(waiter);
     bool matched = false;
     bool keptWait = true;
     for (size_t j = 0; j < processedConsumers.size(); j++) {
       auto existingConsumer = processedConsumers[j];
       auto existingWaiter = processedWaiters[j];
-      auto existingTaskID = existingWaiter->getAttr("async_task_id");
+      auto existingTaskID = getAsyncTaskIds(existingWaiter);
       if (taskId == existingTaskID) {
         // If task ids match we should delete whichever one comes later
         // in program order.

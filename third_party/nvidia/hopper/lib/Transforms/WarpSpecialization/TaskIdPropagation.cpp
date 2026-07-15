@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Support/LLVM.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -121,9 +122,7 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
 LogicalResult TaskIdBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<TaskIdLattice *> operands,
     ArrayRef<const TaskIdLattice *> results) {
-  // TODO(Arda): Replace the following with getAsyncTaskIds when we no longer
-  // need to dump the task ids into the IR.
-  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
+  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName);
 
   // An op is a non-anchor (allows backward propagation to flow through) only
   // if it is a scalar arithmetic/math op. These ops compute shared addresses

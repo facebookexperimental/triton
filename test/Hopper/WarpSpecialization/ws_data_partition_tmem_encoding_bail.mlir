@@ -22,8 +22,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
     scf.for %i = %c0_i32 to %c1_i32 step %c1_i32  : i32 {
-      %acc, %acc_tok = ttng.tmem_alloc {async_task_id = array<i32: 1, 2>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
-      %mma_tok = ttng.tc_gen5_mma %a_smem, %b_smem, %acc[%acc_tok], %false, %true {async_task_id = array<i32: 1, 2>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %acc, %acc_tok = ttng.tmem_alloc {ttg.partition = array<i32: 1, 2>} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %mma_tok = ttng.tc_gen5_mma %a_smem, %b_smem, %acc[%acc_tok], %false, %true {ttg.partition = array<i32: 1, 2>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     } {tt.data_partition_factor = 2 : i32, tt.warp_specialize}
     tt.return
   }
@@ -57,11 +57,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
     scf.for %i = %c0_i32 to %c1_i32 step %c1_i32  : i32 {
-      %acc, %acc_tok = ttng.tmem_alloc {async_task_id = array<i32: 1, 2>} : () -> (!ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+      %acc, %acc_tok = ttng.tmem_alloc {ttg.partition = array<i32: 1, 2>} : () -> (!ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %a_scale_0 = ttg.memdesc_reshape %a_scale_smem : !ttg.memdesc<1x1x1x2x256xi8, #shared2, #smem> -> !ttg.memdesc<1x1x32x4x4xi8, #shared3, #smem>
       %a_scale_1 = ttg.memdesc_trans %a_scale_0 {order = array<i32: 0, 3, 2, 1, 4>} : !ttg.memdesc<1x1x32x4x4xi8, #shared3, #smem> -> !ttg.memdesc<1x4x32x1x4xi8, #shared4, #smem>
       %a_scale = ttg.memdesc_reshape %a_scale_1 : !ttg.memdesc<1x4x32x1x4xi8, #shared4, #smem> -> !ttg.memdesc<128x4xi8, #shared5, #smem>
-      %mma_tok = ttng.tc_gen5_mma_scaled %a_smem, %b_smem, %acc[%acc_tok], %a_scale, %b_scale_smem, %false, %true lhs = e4m3 rhs = e4m3 {async_task_id = array<i32: 1, 2>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf8E4M3FN, #shared, #smem>, !ttg.memdesc<128x256xf8E4M3FN, #shared1, #smem>, !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x4xi8, #shared5, #smem>, !ttg.memdesc<256x4xi8, #shared6, #smem>
+      %mma_tok = ttng.tc_gen5_mma_scaled %a_smem, %b_smem, %acc[%acc_tok], %a_scale, %b_scale_smem, %false, %true lhs = e4m3 rhs = e4m3 {ttg.partition = array<i32: 1, 2>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf8E4M3FN, #shared, #smem>, !ttg.memdesc<128x256xf8E4M3FN, #shared1, #smem>, !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x4xi8, #shared5, #smem>, !ttg.memdesc<256x4xi8, #shared6, #smem>
     } {tt.data_partition_factor = 2 : i32, tt.warp_specialize}
     tt.return
   }

@@ -404,7 +404,7 @@ def test_gpu_autows_keeps_warp_specialized(device="cuda"):
 
     def keep_ws(config, asm, metadata):
         ttgir = asm.get("ttgir", "")
-        return ("ttg.warp_specialize" in ttgir) or ("async_task_id" in ttgir)
+        return ("ttg.warp_specialize" in ttgir) or ("ttg.partition" in ttgir)
 
     # FLATTEN=False warp-specializes (kept); FLATTEN=True does not (dropped).
     configs = [triton.Config({"FLATTEN": flat}, num_warps=4, num_stages=2) for flat in (False, True)]

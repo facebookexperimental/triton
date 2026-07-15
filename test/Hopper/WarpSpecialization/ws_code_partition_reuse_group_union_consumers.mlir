@@ -26,7 +26,7 @@
 
 // default region == task 0: waits on %b's TMA producer, then reads %b.
 // CHECK:      default {
-// CHECK:        async_task_id = array<i32: 0>
+// CHECK:        ttg.partition = array<i32: 0>
 // CHECK:        ttng.wait_barrier
 // CHECK:        ttg.local_load
 
@@ -53,24 +53,24 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
   tt.func public @reuse_group_union_consumers(%a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
     %a = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %b = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-    %c0 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
-    %c1 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 1 : i32
-    %c4 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 4 : i32
-    %ptrs0 = tt.splat %out0 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
-    %ptrs1 = tt.splat %out1 {async_task_id = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %c0 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : i32
+    %c1 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 1 : i32
+    %c4 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 4 : i32
+    %ptrs0 = tt.splat %out0 {ttg.partition = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    %ptrs1 = tt.splat %out1 {ttg.partition = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
     scf.for %iv = %c0 to %c4 step %c1 : i32 {
-      %a_tile = tt.descriptor_load %a_desc[%c0, %c0] {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
-      ttg.local_store %a_tile, %a {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %b_tile = tt.descriptor_load %b_desc[%c0, %c0] {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
-      ttg.local_store %b_tile, %b {async_task_id = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %b0 = ttg.local_load %b {async_task_id = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
-      tt.store %ptrs0, %b0 {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
-      %a1 = ttg.local_load %a {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
-      %b1 = ttg.local_load %b {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
-      %sum = arith.addf %a1, %b1 {async_task_id = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
-      tt.store %ptrs1, %sum {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
-      scf.yield {async_task_id = array<i32: 0, 1, 2>}
-    } {async_task_id = array<i32: 0, 1, 2>, tt.warp_specialize}
+      %a_tile = tt.descriptor_load %a_desc[%c0, %c0] {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %a_tile, %a {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %b_tile = tt.descriptor_load %b_desc[%c0, %c0] {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %b_tile, %b {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %b0 = ttg.local_load %b {ttg.partition = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs0, %b0 {ttg.partition = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      %a1 = ttg.local_load %a {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %b1 = ttg.local_load %b {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %sum = arith.addf %a1, %b1 {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
+      tt.store %ptrs1, %sum {ttg.partition = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      scf.yield {ttg.partition = array<i32: 0, 1, 2>}
+    } {ttg.partition = array<i32: 0, 1, 2>, tt.warp_specialize}
     tt.return
   }
 }

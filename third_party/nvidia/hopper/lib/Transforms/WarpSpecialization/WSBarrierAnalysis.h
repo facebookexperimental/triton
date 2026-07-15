@@ -19,7 +19,7 @@ namespace mlir {
 // Standard representation of a WS barrier constraint.
 //
 // The source task is always the partition where the barrier op lives (available
-// from async_task_id). The destination is the partition on the other side of
+// from ttg.partition). The destination is the partition on the other side of
 // the channel that this barrier communicates with.
 //
 // WS barrier metadata is stored under a top-level constraints.WSBarrier key so
