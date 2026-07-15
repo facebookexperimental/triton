@@ -856,27 +856,17 @@ static bool hasDependencyChain(Channel *A, Channel *B) {
   if (!aConsumer || !bProducer)
     return false;
 
-  // Walk transitive users of aConsumer's results.
-  DenseSet<Operation *> visited;
-  SmallVector<Operation *> worklist;
-  for (auto result : aConsumer->getResults()) {
-    for (auto *user : result.getUsers())
-      worklist.push_back(user);
-  }
-  while (!worklist.empty()) {
-    auto *op = worklist.pop_back_val();
-    if (!visited.insert(op).second)
-      continue;
-    if (op == bProducer)
-      return true;
-    for (auto result : op->getResults()) {
-      for (auto *user : result.getUsers())
-        worklist.push_back(user);
-    }
-  }
+  // (1) data dependency (SSA or through memory, following buffer reuse across
+  // slots), cross-partition OK.
+  if (dependsThroughMemory(aConsumer, bProducer, /*followBufferReuse=*/true))
+    return true;
 
-  // Also check program order: if both are in the same block and aConsumer
-  // appears before bProducer, there is an implicit dependency via ordering.
+  // (2) program order within the same block (cross-partition included).
+  // NOTE: restricting this to the same partition is UNSOUND -- it drops
+  // legitimate cross-partition program-order reuse edges that real kernels rely
+  // on (regressed FA-bwd previously and HSTU 2-KV reduce_dq: wrong dq). The
+  // cost is that a hand-pinned unorderable group (t_bwd_badgroup) is not
+  // fast-failed here; that is the still-open N-way ordering crux (T279873316).
   if (aConsumer->getBlock() == bProducer->getBlock())
     return appearsBefore(aConsumer, bProducer);
 
