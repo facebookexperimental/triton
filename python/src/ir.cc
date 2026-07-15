@@ -47,20 +47,6 @@
 
 #include "llvm/ADT/SmallVector.h"
 
-typedef int AsyncTaskId;
-
-void setAsyncTaskIds(mlir::Operation *op,
-                     llvm::ArrayRef<AsyncTaskId> asyncTaskIds) {
-  llvm::SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
-                                                    asyncTaskIds.end());
-  sort(sortedAsyncTaskIds);
-  auto i32Ty = IntegerType::get(op->getContext(), 32);
-  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
-  auto vecTy = VectorType::get(size, i32Ty);
-  op->setAttr("async_task_id",
-              DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
-}
-
 namespace py = pybind11;
 using namespace mlir;
 using namespace triton;

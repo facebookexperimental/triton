@@ -729,7 +729,7 @@ finished writing.
 Fix: Propagate `two_ctas` from the MMA op when creating `TCGen5CommitOp`:
 ```cpp
 bool twoCTAs = cast<ttng::TCGen5MMAOp>(mmaOp).getTwoCtas();
-builder.createWithAsyncTaskIds<ttng::TCGen5CommitOp>(
+builder.createWithPartitionIds<ttng::TCGen5CommitOp>(
     mmaOp->getLoc(), barrier, twoCTAs);
 ```
 
