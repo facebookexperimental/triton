@@ -1030,6 +1030,7 @@ class Config:
         early_tma_store_lowering=None,
         generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
+        auto_tma=None,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1047,6 +1048,9 @@ class Config:
         self.early_tma_store_lowering = early_tma_store_lowering
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
+        # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
+        # knob; True/False lets the autotuner A/B auto-TMA per shape.
+        self.auto_tma = auto_tma
 
     def __setstate__(self, state):
         self.kwargs = state.get("kwargs", {})
@@ -1063,6 +1067,7 @@ class Config:
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
+        self.auto_tma = state.get("auto_tma", None)
 
     def all_kwargs(self):
         return {
@@ -1082,6 +1087,7 @@ class Config:
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
                     ("generate_subtiled_region", self.generate_subtiled_region),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
+                    ("auto_tma", self.auto_tma),
                 ) if v is not None
             },
         }
@@ -1101,6 +1107,7 @@ class Config:
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
         res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
+        res.append(f"auto_tma: {self.auto_tma}")
         return ", ".join(res)
 
     def __hash__(self):
