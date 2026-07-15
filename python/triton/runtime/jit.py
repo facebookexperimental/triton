@@ -1010,6 +1010,13 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
             if hasattr(kernel, "result"):
                 kernel = kernel.result()
+            # Ensure module/function handles and the C dispatcher are built before we
+            # read `_dispatcher` below. Without this, the plain run path reads
+            # `_dispatcher` before `_init_handles()` (called lazily inside kernel.run)
+            # has built it, so TRITON_USE_C_DISPATCHER never engages on this path.
+            # `_init_handles` is idempotent (early-returns once module is loaded).
+            if hasattr(kernel, "_init_handles"):
+                kernel._init_handles()
             # compile_iq free-win: if a tuned ACF candidate is pending, run the one-shot plain-vs-ACF
             # competition with the real args before launching, and keep the winner (no-op/near-zero
             # cost otherwise; suppressed while the autotuner is benchmarking). Read _disp afterward so
