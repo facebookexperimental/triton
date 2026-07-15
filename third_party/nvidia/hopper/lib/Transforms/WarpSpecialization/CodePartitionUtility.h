@@ -205,10 +205,11 @@ struct TmemDataChannelPost : Channel {
   // For a collapsed chained-accumulator channel (multiple same-task MMA writers
   // into one operand-D tile, first writer use_acc=false): the channel's forward
   // commit comes from the LAST writer (getSrcOp), but the reuse/empty
-  // producer_acquire must be placed before the FIRST (fresh-overwrite) writer so
-  // the whole chain waits for the consumer's read of the previous iteration
-  // (mirrors TLX attn_bwd_ws_2kv: one dq_empties acquire before n0, one dq_fulls
-  // from n1). When set, insertAsyncComm relocates producer_acquire here.
+  // producer_acquire must be placed before the FIRST (fresh-overwrite) writer
+  // so the whole chain waits for the consumer's read of the previous iteration
+  // (mirrors TLX attn_bwd_ws_2kv: one dq_empties acquire before n0, one
+  // dq_fulls from n1). When set, insertAsyncComm relocates producer_acquire
+  // here.
   Operation *acquireBeforeOp = nullptr;
   Operation *allocOp;
 

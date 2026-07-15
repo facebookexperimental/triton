@@ -2890,7 +2890,8 @@ void PartitionSchedulingMeta::runOnOperation() {
       // would need care, while {0,1},{0,2},{2,3} has empty overall intersection
       // (no common partition) yet every pair overlaps. So track the RUNNING
       // intersection across all MMAs writing the same buffer and error the
-      // moment it empties. Store the first writer to point the diagnostic at it.
+      // moment it empties. Store the first writer to point the diagnostic at
+      // it.
       DenseMap<Operation *, std::pair<Operation *, SetVector<int>>> accOwner;
       auto idsToStr = [](const SetVector<int> &ids) {
         std::string s;
@@ -2920,7 +2921,8 @@ void PartitionSchedulingMeta::runOnOperation() {
         if (next.empty()) {
           InFlightDiagnostic diag =
               op->emitError()
-              << "warp specialization assigned accumulator-chained MMAs with no "
+              << "warp specialization assigned accumulator-chained MMAs with "
+                 "no "
                  "common partition (running intersection {"
               << idsToStr(running) << "} does not meet this MMA's {"
               << idsToStr(ids)
@@ -2930,7 +2932,8 @@ void PartitionSchedulingMeta::runOnOperation() {
                  "partition (lower data_partition_factor) or give each "
                  "partition its own accumulator and reduce at the end.";
           diag.attachNote(firstWriter->getLoc())
-              << "first accumulator-chained MMA writing this tensor-memory tile "
+              << "first accumulator-chained MMA writing this tensor-memory "
+                 "tile "
                  "is here";
           return WalkResult::interrupt();
         }
