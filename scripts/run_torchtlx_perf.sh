@@ -23,9 +23,13 @@
 #
 # Pin a GPU with CUDA_VISIBLE_DEVICES=<id> as usual.
 #
+# Runs under third_party/tlx/denoise.sh by default (locks GPU clocks/power for
+# stable numbers); needs passwordless sudo. Set TORCHTLX_NO_DENOISE=1 to skip it.
+#
 # Env knobs:
 #   TORCHTLX_VENV=<dir>     venv location (default: <repo>/.venv)
 #   TORCHTLX_STDCXX_DIR=<d> dir with a modern libstdc++.so.6 (auto-detected)
+#   TORCHTLX_NO_DENOISE=1   do not wrap the run in denoise.sh (no clock locking)
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -66,4 +70,13 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 
 "$PY" -c "import triton; print('[run_torchtlx_perf] triton ->', triton.__file__)" >&2
 
-exec "$PY" -m "$MODULE" "$@"
+# Stable-clock benchmarking: wrap in denoise.sh (locks GPU clocks/power + pins
+# NUMA) so users don't have to. It needs passwordless sudo for nvidia-smi/rocm-smi;
+# set TORCHTLX_NO_DENOISE=1 to skip it where that is unavailable.
+DENOISE="$REPO/third_party/tlx/denoise.sh"
+if [ "${TORCHTLX_NO_DENOISE:-0}" != "1" ] && [ -x "$DENOISE" ]; then
+  exec "$DENOISE" "$PY" -m "$MODULE" "$@"
+else
+  [ "${TORCHTLX_NO_DENOISE:-0}" = "1" ] && log "TORCHTLX_NO_DENOISE=1: skipping denoise (unstable clocks)"
+  exec "$PY" -m "$MODULE" "$@"
+fi

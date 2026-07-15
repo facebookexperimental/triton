@@ -35,14 +35,6 @@ import torch
 
 import triton
 
-try:
-    # Normal case: run as a module (python -m ...benchmarks.torchtlx_perf).
-    from . import shapes as shape_catalog
-except ImportError:
-    # Fallback: run as a plain script (python path/to/torchtlx_perf.py); Python
-    # puts the script's dir on sys.path, so a bare import resolves.
-    import shapes as shape_catalog  # type: ignore
-
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
@@ -300,10 +292,24 @@ def print_table(rows, providers, metrics, dtype_name, baseline):
         print(render(cells))
 
 
+def parse_shapes(spec: str):
+    """Parse a ``MxNxK,MxNxK,...`` string into a list of (M, N, K) tuples."""
+    out = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.lower().replace(" ", "").split("x")
+        if len(parts) != 3:
+            raise ValueError(f"bad shape {chunk!r}; expected MxNxK")
+        out.append(tuple(int(p) for p in parts))
+    return out
+
+
 def resolve_shapes(args):
     if not args.shapes:
         sys.exit("provide --shapes MxNxK[,MxNxK,...]")
-    return shape_catalog.parse_shapes(args.shapes)
+    return parse_shapes(args.shapes)
 
 
 def main(argv=None):
