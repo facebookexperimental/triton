@@ -185,3 +185,157 @@ def test_swizzled_layout_lowers_to_swizzled_shared():
     # perPhase = 2**(6+0)//64 = 1.
     swz = kernel.warmup(tlx.swizzled_layout(3, 0, 6, order=[1, 0]), grid=(1, ), num_warps=4).asm["ttgir"]
     assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in swz
+
+
+# ---------------------------------------------------------------------------
+# "Does the compiler understand user layouts?" -- adversarial end-to-end cases.
+#
+# Every user-pinned layout rides through the pipeline as #tlx.user_layout<...>
+# and must (a) survive to the final TTGIR as the exact concrete layout the user
+# asked for, and (b) leave no #tlx.user_layout / no_verify_layout residue.
+# ---------------------------------------------------------------------------
+
+
+def _assert_no_layout_residue(ttgir):
+    # Match the *encoding* form (#tlx.user_layout<...>) specifically: the TMEM
+    # register-layout path sets an unrelated op attribute literally named
+    # `tlx.user_layout` (see triton_tlx.cc), which must not trip this check.
+    assert "#tlx.user_layout" not in ttgir, "user-layout wrapper encoding leaked into final IR"
+    assert "#tlx.no_verify_layout" not in ttgir, "no-verify wrapper encoding leaked into final IR"
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
+def test_user_shared_layout_survives_readback():
+    """Start from the read side: alloc with a user swizzle, write, then read it
+    back. The buffer's exact user swizzle must survive to final TTGIR."""
+
+    @triton.jit
+    def kernel(SW: tl.constexpr):
+        x = tl.zeros((128, 64), tl.float16)
+        buf = tlx.local_alloc((128, 64), tl.float16, tl.constexpr(1), layout=SW)
+        v = tlx.local_view(buf, 0)
+        tlx.local_store(v, x)
+        y = tlx.local_load(v)  # read back
+        tlx.local_store(v, y)
+
+    # Swizzle<3,0,6> over width-64 -> vec=1, perPhase=1, maxPhase=8.
+    ttgir = kernel.warmup(tlx.swizzled_layout(3, 0, 6, order=[1, 0]), grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell (num_warps=8 register layout + TMEM)")
+def test_user_shared_and_register_layouts_coexist():
+    """The compiler must honor BOTH a user shared layout (swizzle, on an SMEM
+    alloc) and a user register layout (#linear, on a TMEM read) in one kernel:
+    both the swizzled_shared and the #linear appear in final TTGIR.
+
+    (The register layout is pinned via a TMEM read -- the SMEM read path lets
+    RemoveLayoutConversions relax the register layout when the only consumer is a
+    layout-flexible store, so it wouldn't be a reliable probe on its own.)"""
+
+    @triton.jit
+    def kernel(SW: tl.constexpr, REG: tl.constexpr):
+        # user shared layout on an SMEM buffer, read back
+        x = tl.zeros((128, 64), tl.float16)
+        sbuf = tlx.local_alloc((128, 64), tl.float16, tl.constexpr(1), layout=SW)
+        sv = tlx.local_view(sbuf, 0)
+        tlx.local_store(sv, x)
+        s = tlx.local_load(sv)
+        # user register layout on a TMEM read
+        qk = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        qv = tlx.local_view(qk, 0)
+        r = tlx.local_load(qv, layout=REG)
+        tlx.local_store(qv, r)
+        tlx.local_store(sv, s)
+
+    # Swizzle<3,0,6> over width-64 -> vec=1, perPhase=1, maxPhase=8.
+    sw = tlx.swizzled_layout(3, 0, 6, order=[1, 0])
+    ttgir = kernel.warmup(sw, _separable_qk_layout(), grid=(1, ), num_warps=8).asm["ttgir"]
+    assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in ttgir
+    assert _SEPARABLE_QK_LINEAR in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell (num_warps=8 register layout)")
+def test_user_register_layout_anchored_on_smem():
+    """A user register layout on an SMEM read is anchored end-to-end even when the
+    only consumer is a layout-flexible store: the #linear survives all the layout
+    passes (coalesce, remove-layout-conversions, ...). Regression for the case
+    where the load was previously relaxed to #blocked."""
+
+    @triton.jit
+    def kernel(REG: tl.constexpr):
+        x = tl.zeros((128, 128), tl.float16)
+        buf = tlx.local_alloc((128, 128), tl.float16, tl.constexpr(1))
+        v = tlx.local_view(buf, 0)
+        tlx.local_store(v, x)
+        y = tlx.local_load(v, layout=REG)  # only consumer is a flexible store
+        tlx.local_store(v, y)
+
+    ttgir = kernel.warmup(_separable_qk_layout(), grid=(1, ), num_warps=8).asm["ttgir"]
+    assert _SEPARABLE_QK_LINEAR in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
+def test_user_padded_shared_layout_survives():
+    """The wrapper is general across the shared family, not just swizzled: a
+    user-pinned padded_shared layout must survive as #ttg.padded_shared."""
+
+    @triton.jit
+    def kernel(PAD: tl.constexpr):
+        x = tl.zeros((128, 64), tl.float16)
+        buf = tlx.local_alloc((128, 64), tl.float16, tl.constexpr(1), layout=PAD)
+        v = tlx.local_view(buf, 0)
+        tlx.local_store(v, x)
+        y = tlx.local_load(v)
+        tlx.local_store(v, y)
+
+    pad = tlx.padded_shared_layout_encoding.with_identity_for([(64, 8)], [128, 64], [1, 0])
+    ttgir = kernel.warmup(pad, grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.padded_shared" in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
+def test_user_shared_layout_multibuffer_views():
+    """A user swizzle on a multi-buffered alloc survives across several local_view
+    subviews that are each read back."""
+
+    @triton.jit
+    def kernel(SW: tl.constexpr):
+        x = tl.zeros((128, 64), tl.float16)
+        buf = tlx.local_alloc((128, 64), tl.float16, tl.constexpr(2), layout=SW)
+        v0 = tlx.local_view(buf, 0)
+        v1 = tlx.local_view(buf, 1)
+        tlx.local_store(v0, x)
+        tlx.local_store(v1, x)
+        a = tlx.local_load(v0)
+        b = tlx.local_load(v1)
+        tlx.local_store(v0, a + b)
+
+    ttgir = kernel.warmup(tlx.swizzled_layout(3, 0, 6, order=[1, 0]), grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in ttgir
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
+def test_user_shared_layout_in_loop():
+    """A user-pinned buffer read inside a loop keeps its swizzle (adversarial:
+    loop-carried IV / region-carried values must not drop the wrapper)."""
+
+    @triton.jit
+    def kernel(SW: tl.constexpr, N: tl.constexpr):
+        x = tl.zeros((128, 64), tl.float16)
+        buf = tlx.local_alloc((128, 64), tl.float16, tl.constexpr(1), layout=SW)
+        v = tlx.local_view(buf, 0)
+        tlx.local_store(v, x)
+        acc = tl.zeros((128, 64), tl.float16)
+        for _ in range(N):
+            acc += tlx.local_load(v)
+        tlx.local_store(v, acc)
+
+    ttgir = kernel.warmup(tlx.swizzled_layout(3, 0, 6, order=[1, 0]), 4, grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in ttgir
+    _assert_no_layout_residue(ttgir)

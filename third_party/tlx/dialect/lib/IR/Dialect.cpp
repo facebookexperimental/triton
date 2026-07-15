@@ -1,7 +1,9 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <numeric>
 
 // clang-format off
 #include "IR/Dialect.h"
@@ -29,12 +31,26 @@ getInferLayoutInterfaceFor(Attribute layout) {
   return dyn_cast<triton::DialectInferLayoutInterface>(&layout.getDialect());
 }
 
+// Strip all TLX layout wrappers (no-verify and user-pinned, in any nesting such
+// as #tlx.user_layout<#tlx.no_verify_layout<...>>) to reach the concrete
+// encoding, whose dialect provides the real layout-inference interface. Without
+// this a wrapped layout (a TLX-dialect attribute) would resolve its delegate
+// back to this same TLX interface and recurse forever (stack overflow).
+static Attribute unwrapTlxLayoutWrappers(Attribute layout) {
+  Attribute prev;
+  do {
+    prev = layout;
+    layout = unwrapUserLayout(unwrapNoVerifyLayout(layout));
+  } while (layout != prev);
+  return layout;
+}
+
 LogicalResult delegateInferredLayout(
     Attribute srcLayout, Attribute &resultLayout,
     function_ref<LogicalResult(const triton::DialectInferLayoutInterface *,
                                Attribute, Attribute &)>
         infer) {
-  Attribute unwrappedSrcLayout = unwrapNoVerifyLayout(srcLayout);
+  Attribute unwrappedSrcLayout = unwrapTlxLayoutWrappers(srcLayout);
   const triton::DialectInferLayoutInterface *delegate =
       getInferLayoutInterfaceFor(unwrappedSrcLayout);
   if (!delegate)
@@ -62,40 +78,48 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
+  // reduce/expand_dims produce or consume a `slice` encoding whose parent is
+  // the full-tensor encoding. Keep any TLX wrapper on the slice's *parent*
+  // (matching ReduceOp/ExpandDimsOp's own result inference) rather than
+  // wrapping the whole slice, which would produce `no_verify<slice<parent=L>>`
+  // where the IR has `slice<parent=no_verify<L>>` and fail the op verifier. So
+  // we locate the concrete dialect from the unwrapped encoding but delegate
+  // with the *wrapped* operand and do not re-wrap the result.
   LogicalResult
   inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
                         Attribute &resultEncoding,
                         std::optional<Location> loc) const override {
-    return delegateInferredLayout(
-        operandEncoding, resultEncoding,
-        [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
-            Attribute &result) {
-          return delegate->inferReduceOpEncoding(enc, axis, result, loc);
-        });
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(operandEncoding));
+    if (!delegate)
+      return failure();
+    return delegate->inferReduceOpEncoding(operandEncoding, axis,
+                                           resultEncoding, loc);
   }
 
   LogicalResult
   inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
                             Attribute &resultEncoding,
                             std::optional<Location> loc) const override {
-    return delegateInferredLayout(
-        operandEncoding, resultEncoding,
-        [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
-            Attribute &result) {
-          return delegate->inferExpandDimsOpEncoding(enc, axis, result, loc);
-        });
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(operandEncoding));
+    if (!delegate)
+      return failure();
+    return delegate->inferExpandDimsOpEncoding(operandEncoding, axis,
+                                               resultEncoding, loc);
   }
 
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
                                    Attribute retEncoding,
                                    std::optional<Location> loc) const override {
-    Attribute unwrappedRetEncoding = unwrapNoVerifyLayout(retEncoding);
+    Attribute unwrappedRetEncoding = unwrapTlxLayoutWrappers(retEncoding);
     const triton::DialectInferLayoutInterface *delegate =
         getInferLayoutInterfaceFor(unwrappedRetEncoding);
     if (!delegate)
       return failure();
-    return delegate->inferDotOpEncoding(unwrapNoVerifyLayout(operandEncoding),
-                                        opIdx, unwrappedRetEncoding, loc);
+    return delegate->inferDotOpEncoding(
+        unwrapTlxLayoutWrappers(operandEncoding), opIdx, unwrappedRetEncoding,
+        loc);
   }
 
   LogicalResult
@@ -118,8 +142,8 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     if (hasNoVerifyLayout(expected) || hasNoVerifyLayout(got))
       return success();
 
-    Attribute unwrappedExpected = unwrapNoVerifyLayout(expected);
-    Attribute unwrappedGot = unwrapNoVerifyLayout(got);
+    Attribute unwrappedExpected = unwrapTlxLayoutWrappers(expected);
+    Attribute unwrappedGot = unwrapTlxLayoutWrappers(got);
     const triton::DialectInferLayoutInterface *delegate =
         getInferLayoutInterfaceFor(unwrappedExpected);
     if (!delegate)
@@ -244,6 +268,63 @@ Attribute mlir::triton::tlx::unwrapNoVerifyLayout(Attribute layout) {
 
 bool mlir::triton::tlx::hasNoVerifyLayout(Attribute layout) {
   return isa_and_nonnull<NoVerifyLayoutAttr>(layout);
+}
+
+//-- UserLayoutAttr --
+
+LogicalResult mlir::triton::tlx::UserLayoutAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, Attribute layout) {
+  if (isa<UserLayoutAttr>(layout))
+    return emitError() << "nested user layouts are not supported";
+  if (!isa<ttg::DistributedEncodingTrait>(layout) &&
+      !isa<ttg::SharedEncodingTrait>(layout))
+    return emitError()
+           << "user layout must wrap a distributed or shared layout";
+  return success();
+}
+
+SmallVector<unsigned> mlir::triton::tlx::UserLayoutAttr::getRepOrder() const {
+  if (auto distributed = dyn_cast<ttg::DistributedEncodingTrait>(getLayout()))
+    return distributed.getRepOrder();
+  // Shared inner: getRepOrder is a distributed-only concept; fall back to a
+  // natural (row-major) order over the rank so any generic caller stays
+  // well-formed.
+  unsigned rank = getCGALayout().getRank();
+  SmallVector<unsigned> order(rank);
+  std::iota(order.rbegin(), order.rend(), 0);
+  return order;
+}
+
+::mlir::triton::LinearLayout mlir::triton::tlx::UserLayoutAttr::toLinearLayout(
+    ArrayRef<int64_t> shape) const {
+  // Dispatch on the concrete inner layout (works for both distributed and
+  // shared encodings) rather than re-entering through this wrapper.
+  return ttg::toLinearLayout(shape, getLayout());
+}
+
+int32_t mlir::triton::tlx::UserLayoutAttr::getAlignment() const {
+  if (auto shared = dyn_cast<ttg::SharedEncodingTrait>(getLayout()))
+    return shared.getAlignment();
+  return 16;
+}
+
+ttg::CGAEncodingAttr mlir::triton::tlx::UserLayoutAttr::getCGALayout() const {
+  return cast<ttg::LayoutEncodingTrait>(getLayout()).getCGALayout();
+}
+
+Attribute mlir::triton::tlx::wrapUserLayout(Attribute layout) {
+  if (!layout || isa<UserLayoutAttr>(layout))
+    return layout;
+  if (!isa<ttg::DistributedEncodingTrait>(layout) &&
+      !isa<ttg::SharedEncodingTrait>(layout))
+    return layout;
+  return UserLayoutAttr::get(layout.getContext(), layout);
+}
+
+Attribute mlir::triton::tlx::unwrapUserLayout(Attribute layout) {
+  if (auto userLayout = dyn_cast_or_null<UserLayoutAttr>(layout))
+    return userLayout.getLayout();
+  return layout;
 }
 
 bool mlir::triton::tlx::tlxEnablePairedMMA(Operation *op) {

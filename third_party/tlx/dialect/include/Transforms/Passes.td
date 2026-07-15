@@ -119,6 +119,28 @@ def TLXResolvePlaceholderLayouts : Pass<"tlx-resolve-placeholder-layouts", "mlir
   ];
 }
 
+def TLXFinalizeUserLayouts : Pass<"tlx-finalize-user-layouts", "mlir::ModuleOp"> {
+  let summary = "Unwrap user-pinned register layouts after layout optimization";
+
+  let description = [{
+    Unwraps every remaining `#tlx.user_layout<L>` encoding on a RankedTensorType
+    (a user-pinned *register* layout on a `ttg.local_load`) back to its concrete
+    wrapped layout `L`, and verifies none remain.
+
+    User-pinned register layouts are kept wrapped through the layout-optimization
+    passes (remove-layout-conversions, accelerate-matmul, optimize-dot-operands):
+    the wrapper carries `PinnedEncodingTrait`, so those passes anchor the load and
+    do not rewrite it. This pass runs after them to retire the marker. (Shared
+    user layouts on `local_alloc` are unwrapped much earlier, in
+    tlx-propagate-layout, since nothing rewrites a buffer's shared encoding.)
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::tlx::TLXDialect",
+    "mlir::triton::gpu::TritonGPUDialect"
+  ];
+}
+
 def TLXPrintTTGIRToTLX : Pass<"tlx-print-ttgir-to-tlx", "mlir::ModuleOp"> {
   let summary = "Print TTGIR operations with their TLX equivalents";
 
