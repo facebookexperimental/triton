@@ -1022,6 +1022,7 @@ class Config:
         minRegAutoWS=None,
         maxRegAutoWS=None,
         pingpongAutoWS=None,
+        single_warp_specialize=False,
         num_buffers_warp_spec=0,
         num_consumer_groups=0,
         reg_dec_producer=0,
@@ -1043,6 +1044,7 @@ class Config:
         self.minRegAutoWS = minRegAutoWS
         self.maxRegAutoWS = maxRegAutoWS
         self.pingpongAutoWS = pingpongAutoWS
+        self.single_warp_specialize = single_warp_specialize
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
         self.generate_subtiled_region = generate_subtiled_region
@@ -1059,6 +1061,7 @@ class Config:
         self.minRegAutoWS = state.get("minRegAutoWS", None)
         self.maxRegAutoWS = state.get("maxRegAutoWS", None)
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
+        self.single_warp_specialize = state.get("single_warp_specialize", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
@@ -1078,6 +1081,7 @@ class Config:
                     ("minRegAutoWS", self.minRegAutoWS),
                     ("maxRegAutoWS", self.maxRegAutoWS),
                     ("pingpongAutoWS", self.pingpongAutoWS),
+                    ("single_warp_specialize", self.single_warp_specialize),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
                     ("generate_subtiled_region", self.generate_subtiled_region),
@@ -1097,6 +1101,7 @@ class Config:
         res.append(f"minRegAutoWS: {self.minRegAutoWS}")
         res.append(f"maxRegAutoWS: {self.maxRegAutoWS}")
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
+        res.append(f"single_warp_specialize: {self.single_warp_specialize}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
         res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
