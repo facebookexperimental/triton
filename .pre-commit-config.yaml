@@ -79,5 +79,6 @@ exclude: |
     ^third_party/tileir|
     ^python/test/gluon/|
     ^python/triton/experimental/gluon/|
-    ^third_party/tlx/tools/
+    ^third_party/tlx/tools/|
+    ^bitequiv/
   )

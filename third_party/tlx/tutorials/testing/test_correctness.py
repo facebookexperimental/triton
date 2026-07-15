@@ -63,6 +63,11 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     persistent_attention as _amd_fa_cluster_persistent, )
+from triton.language.extra.tlx.tutorials.amd_pa_decode import (
+    pa_decode_tlx as _amd_pa_decode,
+    build_inputs as _amd_pa_decode_build_inputs,
+    ref_decode as _amd_pa_decode_ref,
+)
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
@@ -1072,6 +1077,39 @@ def test_amd_fa_cluster_persistent_scheduler_knobs(causal, HEAD_DIM):
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
     out = _amd_fa_cluster_persistent(q, k, v, sm, causal, config={"NUM_SMS": 16, "NUM_XCDS": 4})
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# =============================================================================
+# AMD Paged-Attention Decode Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("num_splits", [1, 4], ids=["split1", "split4"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode(num_splits, query_length):
+    """Split-K paged decode with bf16 KV cache and GQA, incl. multi-token
+    prediction (query_length 1-4). Reference is dense fp32 attention gathered
+    from the page table with bottom-right causal masking over the query block.
+    """
+    num_kv_heads, group = 2, 4
+    num_q_heads = num_kv_heads * group
+    head_dim, page_size = 128, 16
+    ctx_lens = [40, 71]
+    num_seqs = len(ctx_lens)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size,
+        query_length=query_length, device=DEVICE)
+
+    out = torch.empty_like(query)
+    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                   query_length=query_length, num_splits=num_splits)
+
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                             num_q_heads, num_kv_heads, query_length)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================

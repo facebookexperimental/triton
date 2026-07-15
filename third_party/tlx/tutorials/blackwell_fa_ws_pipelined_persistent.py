@@ -2285,11 +2285,8 @@ def _attn_bwd_ws(
     qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem,
                                reuse=qk_p_storage_alias)
-    # In 2-CTA mode, P is offset to column 64 (after dQ's 64 cols at column 0).
-    # P's per-buffer stride is 64 i32 cols (128x128 f16), so num=2 + index 1
-    # naturally places P at column 64. In 1-CTA mode, P stays at column 0.
-    P_NUM_BUFFERS: tl.constexpr = 2 if USE_2CTA and not REUSE_DP_FOR_DQ else NUM_BUFFERS_TMEM
-    P_BUF_IDX: tl.constexpr = 1 if USE_2CTA and not REUSE_DP_FOR_DQ else 0
+    P_NUM_BUFFERS: tl.constexpr = NUM_BUFFERS_TMEM
+    P_BUF_IDX: tl.constexpr = 0
     p_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
@@ -2341,11 +2338,11 @@ def _attn_bwd_ws(
             ))
     else:
         if USE_2CTA:
-            # 2-CTA: dQ at column 0, P offset to column 64.
-            # dQ (64x128 f32 twocta_rhs) = 64 i32 cols at columns 0-63.
-            # P (128x128 f16) = 64 i32 cols at columns 64-127.
-            # P uses num=2 with index 1 to get the offset; P's per-buffer
-            # stride is naturally 64 from getTmemAllocSizes(128x128 f16).
+            # 2-CTA: place P and dQ explicitly via set_buffer_overlap.
+            # SWAP: P at column 0, dQ at column 64 (was the reverse). dQ's real
+            # TwoCTA_RHS footprint is 128x64 (64 i32 cols); storage-alias
+            # lowering runs after layout propagation, so it knows this and can
+            # place dQ at a non-zero column offset.
             DQ_BUF_IDX: tl.constexpr = 0
             dq_tiles = tlx.local_alloc(
                 (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
@@ -2361,6 +2358,23 @@ def _attn_bwd_ws(
                 tlx.storage_kind.tmem,
                 reuse=qk_p_storage_alias,
             )
+            # qk shares the whole region; within it, P and dQ occupy distinct
+            # 64-col halves (P first -> col 0, dQ next -> col 64). dq_tiles and
+            # dq_phys are two views of the same dQ storage (shared subgroup).
+            qk_p_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(
+                        p_tiles,
+                        tlx.reuse_group(
+                            dq_tiles,
+                            dq_phys,
+                            group_type=tlx.reuse_group_type.shared,
+                        ),
+                        group_type=tlx.reuse_group_type.distinct,
+                    ),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
         else:
             # 1-CTA with bm1=64: separate dQ TMEM
             DQ_BUF_IDX: tl.constexpr = 0

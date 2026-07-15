@@ -11,10 +11,13 @@ questions at once:
      scope (an M3 / future target)?" This makes the corpus concrete evidence of how much the
      project can contribute to real Triton kernels, not just reductions.
 
-    ⚠️  This module is a REFERENCE corpus. It is intentionally NOT wired into ``evaluate.py``:
-        the bodies are inspected, never compiled here (they hard-code shapes and reference
-        Inductor helpers). Treat every kernel as "realistic customer usage → target", not as
-        an in-scope requirement. Each future checker improvement can be measured against it.
+    ⚠️  This module is mainly a REFERENCE corpus, NOT wired into ``evaluate.py``: GROUPS 2+ are
+        inspected, never compiled (they hard-code shapes and reference Inductor helpers). Treat
+        those as "realistic customer usage → target", not an in-scope requirement — each future
+        checker improvement can be measured against them. The EXCEPTION is GROUP 1 (A..H): its
+        six ordered add-reductions are made RUNNABLE (an ``ORD`` reduction_ordering param) and
+        have a self-contained M2 harness at the bottom of the file (this is where the former
+        ``complex_fusion_eval.py`` experiment was merged, to avoid a duplicate kernel copy).
 
 How these kernels were collected (reproducible)
 -----------------------------------------------
@@ -139,22 +142,36 @@ Big-picture takeaway
     tail-masked / accumulate-then-reduce trees; (4) real FMA/welford numerics on TTGIR;
     (5) MMA / tensor-core equivalence for GEMM + attention + warp specialization (M3).
 
-Nothing in this file is meant to be launched here; the bodies are kept faithful (only the
-Inductor ``@triton_heuristics(...)`` decorator was replaced with a plain ``@triton.jit`` and the
-trailing async-compile wrapper stripped) so they stay inspectable and can be wired into
-``evaluate.py`` later if/when the checker grows to cover them.
+GROUPS 2+ are not meant to be launched here; their bodies are kept faithful (only the Inductor
+``@triton_heuristics(...)`` decorator was replaced with a plain ``@triton.jit`` and the trailing
+async-compile wrapper stripped) so they stay inspectable and can be wired into ``evaluate.py``
+later if/when the checker grows to cover them. GROUP 1 is faithful in the same way but ALSO
+runnable: each ordered add-reduction takes an ``ORD`` param and its hard-coded ``xnumel`` /
+``r0_numel`` were made harness arguments, so the M2 harness at the bottom can compile + time it.
 """
+
+import os
+import sys
 
 import triton
 import triton.language as tl
+from triton.runtime.jit import JITFunction
 
-# The Inductor bodies below reference these exactly as emitted. This module is a REFERENCE
-# corpus — the kernels are never compiled here — so tolerate a missing torch/inductor at import.
+# GROUP 1 (A..H) is RUNNABLE via the M2 harness at the bottom of this file; GROUPS 2+ stay a
+# REFERENCE corpus (inspected, not compiled). The harness needs torch, and COMPILING GROUP 1
+# needs the Inductor helpers below (libdevice.rsqrt, welford). Tolerate the absence of either
+# at import time so the corpus still imports in a torch-less / inductor-less environment (only
+# RUNNING the harness then fails, not importing the module).
+try:
+    import torch
+except Exception:  # noqa: BLE001 - reference-only import path; the harness needs torch to run
+    torch = None
+
 try:
     from torch._inductor.runtime import triton_helpers  # welford_reduce / welford
     from torch._inductor.runtime.triton_helpers import libdevice  # rsqrt
     from torch._inductor.runtime.triton_helpers import math as tl_math  # noqa: F401 (some variants use it)
-except Exception:  # noqa: BLE001 - reference-only module; bodies are not compiled at import
+except Exception:  # noqa: BLE001 - some bodies compile only when inductor is present
     triton_helpers = libdevice = tl_math = None
 
 
@@ -181,9 +198,8 @@ def _triton_helper_fn_add0(arg0_0, arg1_0):
 # invariant collapse purely because the one reduction result fans out into TWO stores.
 # ========================================================================================= #
 @triton.jit
-def A_rms_norm_fwd(in_out_ptr0, in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    xnumel = 1024
-    r0_numel = 256
+def A_rms_norm_fwd(in_out_ptr0, in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr,
+                   ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -205,7 +221,7 @@ def A_rms_norm_fwd(in_out_ptr0, in_ptr0, in_ptr1, out_ptr0, xnumel, r0_numel, XB
     tmp2 = tmp1 * tmp1
     tmp3 = tl.broadcast_to(tmp2, [XBLOCK, R0_BLOCK])
     tmp5 = tl.where(xmask, tmp3, 0)
-    tmp6 = tl.sum(tmp5, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp6 = tl.sum(tmp5, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     tmp7 = tl.full([1, 1], 256.0, tl.float32)
     tmp8 = (tmp6 / tmp7)
     tmp9 = tl.full([1, 1], 1e-05, tl.float32)
@@ -332,8 +348,7 @@ def B_layernorm_welford_gather(in_out_ptr0, in_ptr0, in_ptr1, in_ptr2, in_ptr3, 
 # ========================================================================================= #
 @triton.jit
 def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, out_ptr1, out_ptr5, xnumel,
-                           r0_numel, XBLOCK: tl.constexpr):
-    r0_numel = 256
+                           r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -373,7 +388,7 @@ def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5,
     tmp24 = tl.where(xmask, tmp22, 0)
     # [scope: neither] REDUCTION 1 (add-tree). Handled soundly by both. Its leaf subtree carries a
     # sigmoid (opaque, not pure-elementwise), so PTX cannot layout-invariant-collapse it anyway.
-    tmp25 = tl.sum(tmp24, 1)[:, None].to(tl.float32)
+    tmp25 = tl.sum(tmp24, 1, reduction_ordering=ORD)[:, None].to(tl.float32)
     tmp26 = tl.full([1, 1], 0.00390625, tl.float32)
     tmp27 = tmp5 * tmp26
     tmp28 = tmp27 * tmp25  # <-- reduce-of-reduce: reduction 2's input depends on reduction 1 (tmp25)
@@ -386,7 +401,7 @@ def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5,
     # signature (the def-use link to reduce 1 is not tracked, which is conservative/sound). PTX
     # reconstructs the combined DAG soundly but over-splits (reduce-1's shfl/smem partial sits
     # inside reduce-2's leaves -> not layout-invariant). No wrong-merge risk either way.
-    tmp35 = tl.sum(tmp34, 1)[:, None].to(tl.float32)
+    tmp35 = tl.sum(tmp34, 1, reduction_ordering=ORD)[:, None].to(tl.float32)
     tmp36 = tmp14 * tmp10
     tmp37 = tmp36 + tmp30
     tmp38 = tmp35 * tmp26
@@ -407,9 +422,7 @@ def C_rms_norm_bwd_2reduce(in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5,
 # subtree; empirically it lowers to `selp` and gives 4 distinct PTX descriptors across num_warps.
 # ========================================================================================= #
 @triton.jit
-def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    xnumel = 1
-    r0_numel = 608
+def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 1024
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -429,7 +442,7 @@ def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexp
     # balanced region containing it will not collapse -> the reduction stays layout-bearing (a
     # smaller pure sub-region still collapses). Sound, but not num_warps-invariant.
     tmp3 = tl.where(r0_mask, tmp1, 0)
-    tmp4 = tl.sum(tmp3, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp4 = tl.sum(tmp3, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     tl.store(out_ptr0 + (tl.full([1, 1], 0, tl.int32).broadcast_to(XBLOCK, 1)), tmp4, None)
 
 
@@ -443,9 +456,7 @@ def D_masked_global_sum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexp
 # (multi-output) single-tile reduce — the pure multi-output-collapse-guard case (no loop fence).
 # ========================================================================================= #
 @triton.jit
-def E_triu_masked_rowsum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    xnumel = 592
-    r0_numel = 235
+def E_triu_masked_rowsum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -464,7 +475,7 @@ def E_triu_masked_rowsum(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constex
     # [scope: neither] identity-pad of the odd extent 235 into the 256-wide axis (masked lanes add
     # 0.0). Both checkers handle this: TTGIR ignores masks by design, PTX rides it as a per-leaf flag.
     tmp3 = tl.where(r0_mask & xmask, tmp1, 0)
-    tmp4 = tl.sum(tmp3, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp4 = tl.sum(tmp3, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     # [scope: PTX] (sound; over-splits) per-row store => one st.global root PER row (roots>1 when
     # XBLOCK>1) => the num_warps-invariant collapse is refused (the multi-output G3 guard).
     tl.store(out_ptr0 + (x0), tmp4, xmask)
@@ -527,9 +538,8 @@ def F_cumsum_scan(in_out_ptr0, in_ptr0, out_ptr0, ks0, ks1, xnumel, r0_numel, XB
 # reduce (a different composition), and the R0_BLOCK==128 boundary flips PTX collapse on/off.
 # ========================================================================================= #
 @triton.jit
-def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr):
-    xnumel = 5760
-    r0_numel = 128
+def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr,
+                       ORD: tl.constexpr):
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
     xoffset = tl.program_id(0) * XBLOCK
@@ -561,7 +571,7 @@ def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr
         # loops=). At R0_BLOCK==128 the loop runs once and the final tree CAN collapse.
         tmp6 = _tmp5 + tmp4
         _tmp5 = tl.where(r0_mask & xmask, tmp6, _tmp5)
-    tmp5 = tl.sum(_tmp5, 1)[:, None]  # [scope: neither] the final tree-reduce; in scope for both
+    tmp5 = tl.sum(_tmp5, 1, reduction_ordering=ORD)[:, None]  # [scope: neither] the final tree-reduce; in scope for both
     tl.store(out_ptr0 + (x3), tmp5, xmask)
 
 
@@ -575,8 +585,7 @@ def G_plain_sum_looped(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr
 # constexpr, so it straddles the single-output vs multi-output boundary of the PTX collapse.
 # ========================================================================================= #
 @triton.jit
-def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
-    r0_numel = 256
+def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, ORD: tl.constexpr):
     R0_BLOCK: tl.constexpr = 256
     rnumel = r0_numel
     RBLOCK: tl.constexpr = R0_BLOCK
@@ -594,7 +603,7 @@ def H_mean_permute(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr):
     tmp1 = tmp0.to(tl.float32)
     tmp2 = tl.broadcast_to(tmp1, [XBLOCK, R0_BLOCK])
     tmp4 = tl.where(xmask, tmp2, 0)
-    tmp5 = tl.sum(tmp4, 1)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
+    tmp5 = tl.sum(tmp4, 1, reduction_ordering=ORD)[:, None].to(tl.float32)  # the one add-reduction (TTGIR: in scope)
     # [scope: PTX] (sound; over-splits) per-row store => multiple st.global roots when XBLOCK>1 =>
     # collapse refused. At the tuned XBLOCK==1 it is single-output and the collapse CAN fire.
     tl.store(out_ptr0 + (x0), tmp5, xmask)
@@ -1981,3 +1990,166 @@ REALISTIC_KERNELS = (
     + POINTWISE_KERNELS
     + NONFP_REDUCTION_KERNELS
 )
+
+
+# #########################################################################################
+# ## RUNNABLE M2 HARNESS for GROUP 1 (the six ordered add-reductions A, C, D, E, G, H).   ##
+# #########################################################################################
+# The GROUP 1 kernels above are made runnable via their ``ORD`` param (B_layernorm_welford_gather
+# and F_cumsum_scan are OUT of M2 scope — welford's combine and tt.scan are not ordered add-
+# reductions — so they stay reference-only). This harness compiles each inner_tree, checks that
+# inner_tree == inner_tree+M2 is bit-identical, and reports the 3-way perf (base / +M2 / unordered
+# ceiling). It is SELF-CONTAINED: it defines its own input/timing helpers and imports nothing from
+# eval_kernels, so Suite 2 stays independent of Suite 1. (This is where complex_fusion_eval.py was
+# merged in — the runnable inner_tree transcriptions were a duplicate of these six GROUP 1 bodies.)
+#
+# Run:  PYTHONPATH=. python -m bitequiv.evaluation.realistic_inductor_kernels [kernels] [num_warps]
+# Findings (H100): all six compile inner_tree + are bit-identical under M2; perf ~1.00x with base
+# ~= ceiling — these are CONTIGUOUS-axis reductions the compiler already parallelizes, so there is
+# no ordered-vs-unordered gap for M2 to close (it correctly inserts nothing). M2's wins need a
+# non-contiguous / outer-axis reduce (see eval_kernels GROUP 2). The only fixes this needed were
+# harness-level (the ORD param + passing xnumel / r0_numel at launch), not pass changes.
+_DEV = "cuda"
+_ORD = {"inner_tree": tl.ReductionOrdering.INNER_TREE, "unordered": tl.ReductionOrdering.UNORDERED}
+_SUM_LOGSPACE = (-6, 6)  # wide dynamic range: the reduction ORDER decides the result bits.
+
+
+def _adv_nd(numel, seed):
+    """Flat wide-dynamic-range, alternating-sign f32 buffer (reduction ORDER affects the bits)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    base = torch.randn(numel, generator=g, dtype=torch.float32)
+    scale = torch.logspace(_SUM_LOGSPACE[0], _SUM_LOGSPACE[1], numel, dtype=torch.float32)
+    signs = torch.where(torch.arange(numel) % 2 == 0, torch.tensor(1.0), torch.tensor(-1.0))
+    return (base * scale * signs).to(_DEV, torch.float32)
+
+
+def _to_bytes(t):
+    """Exact output bits as a bytes object (the equality unit)."""
+    return t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def _bench_ms(thunk):
+    """Min-of-medians over 3 do_bench runs, to suppress noise."""
+    from triton.testing import do_bench
+    return min(do_bench(thunk, warmup=50, rep=200) for _ in range(3))
+
+
+# Per-kernel arg builders: return (jit_fn, args, outs, scalars, constexprs, grid_rows). XBLOCK is
+# set >1 (a real kept dim) where the x-extent allows, so M2 has room to relayout.
+def _spec_A(nw):
+    X = 1024
+    ins = [_adv_nd(X * 256, 1), _adv_nd(256, 2)]  # in_ptr0 (x), in_ptr1 (weight)
+    outs = [torch.empty(X, device=_DEV), torch.empty(X * 256, device=_DEV)]  # in_out_ptr0, out_ptr0
+    return A_rms_norm_fwd, [outs[0], ins[0], ins[1], outs[1]], outs, [X, 256], dict(XBLOCK=8), X // 8
+
+
+def _spec_C(nw):
+    X = 1024
+    ins = [_adv_nd(X * 256, i) for i in range(1, 3)] + [_adv_nd(X, 3), _adv_nd(X, 4), _adv_nd(256, 5), _adv_nd(256, 6)]
+    # order: in_ptr0[X*256], in_ptr1[X], in_ptr2[X], in_ptr3[256], in_ptr4[256], in_ptr5[X*256]
+    in_ptr0, in_ptr5, in_ptr1, in_ptr2, in_ptr3, in_ptr4 = ins
+    outs = [torch.empty(X * 256, device=_DEV) for _ in range(3)]
+    args = [in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, outs[0], outs[1], outs[2]]
+    return C_rms_norm_bwd_2reduce, args, outs, [X, 256], dict(XBLOCK=8), X // 8
+
+
+def _spec_D(nw):
+    ins = [_adv_nd(1024, 1)]
+    outs = [torch.empty(1, device=_DEV)]
+    return D_masked_global_sum, [ins[0], outs[0]], outs, [1, 608], dict(XBLOCK=1), 1
+
+
+def _spec_E(nw):
+    X = 592
+    ins = [_adv_nd(X * 235, 1)]
+    outs = [torch.empty(X, device=_DEV)]
+    return E_triu_masked_rowsum, [ins[0], outs[0]], outs, [X, 235], dict(XBLOCK=8), (X + 7) // 8
+
+
+def _spec_G(nw):
+    X = 5760
+    ins = [_adv_nd(737280, 1)]
+    outs = [torch.empty(X, device=_DEV)]
+    return G_plain_sum_looped, [ins[0], outs[0]], outs, [X, 128], dict(XBLOCK=8, R0_BLOCK=128), (X + 7) // 8
+
+
+def _spec_H(nw):
+    X = 1024
+    ins = [_adv_nd(X * 256, 1)]
+    outs = [torch.empty(X, device=_DEV)]
+    return H_mean_permute, [ins[0], outs[0]], outs, [X, 256], dict(XBLOCK=8), X // 8
+
+
+SPECS = {"A_rms_norm_fwd": _spec_A, "C_rms_norm_bwd_2reduce": _spec_C, "D_masked_global_sum": _spec_D,
+         "E_triu_masked_rowsum": _spec_E, "G_plain_sum_looped": _spec_G, "H_mean_permute": _spec_H}
+
+
+def _clear():
+    """Clear every JITFunction cache so a TRITON_M2_ENABLE toggle actually recompiles."""
+    for o in list(globals().values()):
+        if isinstance(o, JITFunction):
+            for a in ("device_caches", "cache"):
+                c = getattr(o, a, None)
+                if hasattr(c, "clear"):
+                    try:
+                        c.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+
+def _compile(spec_fn, ordering, m2, nw):
+    os.environ.setdefault("TRITON_ALWAYS_COMPILE", "1")
+    os.environ["TRITON_M2_ENABLE"] = "1" if m2 else "0"
+    _clear()
+    fn, args, outs, scalars, cst, grid = spec_fn(nw)
+    # Runtime args = pointers (args) + the non-constexpr scalars (xnumel, r0_numel); both warmup
+    # and launch must pass them identically.
+    runtime = [*args, *scalars]
+    ck = fn.warmup(*runtime, grid=(grid, ), num_warps=nw, ORD=_ORD[ordering], **cst)
+    return runtime, outs, grid, ck
+
+
+def _run(spec_fn, ordering, m2, nw):
+    runtime, outs, grid, ck = _compile(spec_fn, ordering, m2, nw)
+    ck[(grid, 1, 1)](*runtime)
+    torch.cuda.synchronize()
+    return b"".join(_to_bytes(o) for o in outs)
+
+
+def _bench(spec_fn, ordering, m2, nw):
+    runtime, outs, grid, ck = _compile(spec_fn, ordering, m2, nw)
+
+    def thunk():
+        ck[(grid, 1, 1)](*runtime)
+
+    thunk()
+    torch.cuda.synchronize()
+    return _bench_ms(thunk)
+
+
+def main(argv):
+    kernels = argv[0].split(",") if argv else list(SPECS)
+    warps = [int(x) for x in argv[1].split(",")] if len(argv) > 1 else [2, 4, 8]
+    print(f"device: {torch.cuda.get_device_name()}")
+    print(f"{'kernel':24s} {'nw':>3s} {'support':>8s} {'correct':>8s} "
+          f"{'base(ms)':>9s} {'m2(ms)':>9s} {'ceil(ms)':>9s} {'m2/base':>8s} {'gapclos':>8s}")
+    for name in kernels:
+        spec_fn = SPECS[name]
+        for nw in warps:
+            try:
+                b_bytes = _run(spec_fn, "inner_tree", False, nw)
+                m_bytes = _run(spec_fn, "inner_tree", True, nw)
+                correct = (b_bytes == m_bytes)
+                tb = _bench(spec_fn, "inner_tree", False, nw)
+                tm = _bench(spec_fn, "inner_tree", True, nw)
+                tc = _bench(spec_fn, "unordered", False, nw)
+                denom = tb - tc
+                gap = (tb - tm) / denom if abs(denom) > 1e-9 else float("nan")
+                print(f"{name:24s} {nw:>3d} {'yes':>8s} {str(correct):>8s} "
+                      f"{tb:9.4f} {tm:9.4f} {tc:9.4f} {tb / tm:>7.3f}x {gap:>8.2f}")
+            except Exception as e:  # noqa: BLE001
+                print(f"{name:24s} {nw:>3d} {'FAIL':>8s}  {type(e).__name__}: {str(e).splitlines()[0][:44]}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

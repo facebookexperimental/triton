@@ -11,12 +11,43 @@ from torch._inductor.template_heuristics.registry import register_template_heuri
 from torch._inductor.template_heuristics.triton import (
     CUDAConfigHeuristic,
     GemmConfig,
-    IS_ROCM,
     ROCmMMTemplateConfigHeuristic,
     TMATemplateConfigMixin,
 )
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
-from torch._inductor.utils import get_default_kpack, get_num_sms
+from torch._inductor.utils import get_num_sms
+
+# IS_ROCM was dropped from torch._inductor.template_heuristics.triton on newer
+# nightlies (the module now branches on ``torch.version.hip`` inline). Derive it
+# locally so the fork loads across torch versions; matches torch's own definition
+# (CUDA vs ROCm keyed on torch.version.hip).
+IS_ROCM = torch.version.hip is not None
+
+try:
+    from torch._inductor.utils import get_default_kpack
+except ImportError:
+    # get_default_kpack is absent from some torch nightlies (notably ROCm
+    # wheels). Mirror torch's own definition so the fork loads across versions:
+    # 0 on CUDA; on AMD, kpack keyed on arch/block_k.
+    def get_default_kpack(block_k: int = 16) -> int:
+        if not torch.version.hip:
+            return 0
+        try:
+            arch = torch.cuda.get_device_properties(0).gcnArchName
+        except Exception:
+            arch = ""
+        if "gfx942" in arch and block_k <= 16:
+            return 1
+        return 2
+
+
+def _sizevar_hint(sizevars, expr, fallback):
+    # ``optimization_hint`` is the newer name; older torch (e.g. the current ROCm
+    # wheel) exposes ``size_hint`` with the same fallback semantics (example-input
+    # hint, ``fallback`` when unbacked/symbolic). Use whichever exists.
+    fn = getattr(sizevars, "optimization_hint", None) or sizevars.size_hint
+    return fn(expr, fallback=fallback)
+
 
 from . import tlx_config
 from .mm_templates import amd_addmm_warppipe_template, blackwell_gemm_ws_template
@@ -1168,8 +1199,8 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         # under AOTI dynamic shapes.
         int32_max = 2**31 - 1
         if not (
-            sizevars.optimization_hint(m * k, fallback=int32_max) < int32_max
-            and sizevars.optimization_hint(n * k, fallback=int32_max) < int32_max
+            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
+            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
         ):
             return
         num_xcds = _amd_num_xcds()
@@ -1667,7 +1698,15 @@ TritonTemplateKernel.compute_epilogue = _tlx_compute_epilogue  # type: ignore[me
 
 # -- codegen_template_body: wrap to set _final_output_name and handle
 #    COMPUTE_EPILOGUE subgraphs --
-_orig_codegen_template_body = TritonTemplateKernel.codegen_template_body
+# The epilogue-fusion codegen API below (codegen_template_body,
+# _emit_post_kernel_code, _compute_fusion_metadata, get_unfused_epilogues) only
+# exists on newer torch. On older wheels (e.g. the current ROCm nightly) these
+# base methods are absent; grab them defensively so the module still imports and
+# the core template path keeps working — the wrappers are only installed when the
+# base method exists.
+_orig_codegen_template_body = getattr(
+    TritonTemplateKernel, "codegen_template_body", None
+)
 
 
 def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
@@ -1732,7 +1771,8 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     )
 
 
-TritonTemplateKernel.codegen_template_body = _tlx_codegen_template_body  # type: ignore[method-assign]
+if _orig_codegen_template_body is not None:
+    TritonTemplateKernel.codegen_template_body = _tlx_codegen_template_body  # type: ignore[method-assign]
 
 # -- render: add compute_epilogue and output_ptr to template env --
 _orig_render = TritonTemplateKernel.render
@@ -1749,7 +1789,9 @@ def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=Fal
 TritonTemplateKernel.render = _tlx_render  # type: ignore[method-assign]
 
 # -- _emit_post_kernel_code: emit split-K reduction kernel after main GEMM --
-_orig_emit_post_kernel = TritonTemplateKernel._emit_post_kernel_code
+_orig_emit_post_kernel = getattr(
+    TritonTemplateKernel, "_emit_post_kernel_code", None
+)
 
 
 def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-untyped-def]
@@ -1781,7 +1823,8 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
     _orig_emit_post_kernel(self, wrapper, kernel_name)
 
 
-TritonTemplateKernel._emit_post_kernel_code = _tlx_emit_post_kernel_code  # type: ignore[method-assign]
+if _orig_emit_post_kernel is not None:
+    TritonTemplateKernel._emit_post_kernel_code = _tlx_emit_post_kernel_code  # type: ignore[method-assign]
 
 
 # -- _compute_fusion_metadata: disable epilogue fusion for SPLIT_K > 1 ------
@@ -1790,7 +1833,9 @@ TritonTemplateKernel._emit_post_kernel_code = _tlx_emit_post_kernel_code  # type
 # so scheduler-level epilogue fusion can't work — the fused ops would be
 # silently dropped.  Instead, mark all epilogue nodes as "unfused" so the
 # scheduler codegen's them as separate kernels after reduce_k.
-_orig_compute_fusion_metadata = TritonTemplateKernel._compute_fusion_metadata
+_orig_compute_fusion_metadata = getattr(
+    TritonTemplateKernel, "_compute_fusion_metadata", None
+)
 
 
 def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
@@ -1804,7 +1849,7 @@ def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
         self._unfused_epilogues = list(epilogue_nodes)
         self._prologue_sources = {}
         self._scheduling_ref = scheduling
-    else:
+    elif _orig_compute_fusion_metadata is not None:
         _orig_compute_fusion_metadata(
             self,
             scheduling,
@@ -1814,10 +1859,13 @@ def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
         )
 
 
-TritonTemplateKernel._compute_fusion_metadata = _tlx_compute_fusion_metadata  # type: ignore[method-assign]
+if _orig_compute_fusion_metadata is not None:
+    TritonTemplateKernel._compute_fusion_metadata = _tlx_compute_fusion_metadata  # type: ignore[method-assign]
 
 # -- get_unfused_epilogues: return split-K unfused epilogues -----------------
-_orig_get_unfused_epilogues = TritonTemplateKernel.get_unfused_epilogues
+_orig_get_unfused_epilogues = getattr(
+    TritonTemplateKernel, "get_unfused_epilogues", None
+)
 
 
 def _tlx_get_unfused_epilogues(self):  # type: ignore[no-untyped-def]
@@ -1827,7 +1875,8 @@ def _tlx_get_unfused_epilogues(self):  # type: ignore[no-untyped-def]
     return _orig_get_unfused_epilogues(self)
 
 
-TritonTemplateKernel.get_unfused_epilogues = _tlx_get_unfused_epilogues  # type: ignore[method-assign]
+if _orig_get_unfused_epilogues is not None:
+    TritonTemplateKernel.get_unfused_epilogues = _tlx_get_unfused_epilogues  # type: ignore[method-assign]
 
 # -- call_kernel: codegen unfused epilogues after split-K reduce_k -----------
 _orig_call_kernel = TritonTemplateKernel.call_kernel

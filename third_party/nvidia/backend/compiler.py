@@ -623,9 +623,9 @@ class CUDABackend(BaseBackend):
             list(opt.cluster_dims),
         )
         passes.common.add_inliner(pm)
-        # Handle storage lowering. In the future this may need
-        # dummy layouts
-        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
+        # Storage alias lowering moved to make_ttgir (after layout propagation)
+        # so the backing TMEM allocation is materialized with the resolved
+        # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -688,6 +688,9 @@ class CUDABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        # Storage alias lowering runs after layout propagation so the backing
+        # TMEM allocation is materialized with the resolved 2-CTA storage format.
+        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         # Only determine reg layouts after TMEM layout is finalized
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
@@ -763,16 +766,33 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
+            elif knobs.nvidia.use_list_schedule:
+                # Acyclic list schedule (no software pipelining): a single-stage
+                # per-loop reorder that writes loop.stage/loop.cluster like the
+                # default scheduler. Emits top-K variants for autotuning
+                # (TRITON_LIST_SCHEDULE_TOPK / _BEAM / _TOPK_DUMP) and applies
+                # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
+                nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # The modulo / LLM scheduler above already produced the full loop
-            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
-            # schedule_loops here would recompute and OVERRIDE it, so only run
-            # them on the default path where no custom scheduler set the schedule.
-            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            # The modulo / LLM / list scheduler above already produced the full
+            # loop schedule (loop.stage / loop.cluster). Re-running
+            # assign_latencies + schedule_loops here would recompute and OVERRIDE
+            # it, so only run them on the default path where no custom scheduler
+            # set the schedule.
+            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+                                    or knobs.nvidia.use_list_schedule)
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if not knobs.nvidia.use_meta_ws:
+            if knobs.nvidia.use_list_schedule:
+                # List scheduling is a no-warp-specialization transform: it
+                # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
+                # feeds the pipeliner directly. Running either WS path here would
+                # trip PartitionSchedulingMeta (it treats the tt.modulo_ii marker
+                # as a modulo schedule and demands partition attrs the list
+                # scheduler never emits). So skip WS entirely.
+                pass
+            elif not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
@@ -1102,7 +1122,7 @@ class CUDABackend(BaseBackend):
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
-                    from triton.compile_iq.consume import acf_args_for
+                    from triton.magnon.consume import acf_args_for
 
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
@@ -1177,8 +1197,8 @@ please share the reproducer above with Triton project.
             ptx = ck.asm.get("ptx")
             if not ptx:
                 return
-            from triton.compile_iq import store
-            from triton.compile_iq.consume import acf_args_for
+            from triton.magnon import store
+            from triton.magnon.consume import acf_args_for
             arch = sm_arch_from_capability(self.target.arch)
             ver = get_ptxas(self.target.arch).version
             sha = store.ptx_sha256(ptx)
