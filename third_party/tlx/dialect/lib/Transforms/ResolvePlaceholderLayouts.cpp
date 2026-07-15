@@ -1,4 +1,6 @@
 #include "IR/Dialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -23,6 +25,7 @@ namespace triton {
 namespace tlx {
 
 #define GEN_PASS_DEF_TLXRESOLVEPLACEHOLDERLAYOUTS
+#define GEN_PASS_DEF_TLXFINALIZEUSERLAYOUTS
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
 
@@ -49,6 +52,17 @@ static NoVerifyLayoutAttr getNoVerifyLayoutFromType(Type type) {
   }
   if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
     return dyn_cast_or_null<NoVerifyLayoutAttr>(memDescType.getEncoding());
+  }
+  return nullptr;
+}
+
+/// Extract a user-layout wrapper on a *shared* (MemDescType) value, if present.
+/// Register (RankedTensorType) user layouts are intentionally left wrapped
+/// here: they must survive as anchors through remove-layout-conversions and are
+/// unwrapped later by tlx-finalize-user-layouts.
+static UserLayoutAttr getUserLayoutFromType(Type type) {
+  if (auto memDescType = dyn_cast<ttg::MemDescType>(type)) {
+    return dyn_cast_or_null<UserLayoutAttr>(memDescType.getEncoding());
   }
   return nullptr;
 }
@@ -209,59 +223,80 @@ collectValuesWithEncodings(ModuleOp moduleOp,
 }
 
 static LogicalResult unwrapNoVerifyLayouts(ModuleOp moduleOp) {
+  // Strip #tlx.no_verify_layout everywhere it appears -- including nested
+  // inside other encodings (e.g. slice<parent = ...>) and inside a user-layout
+  // wrapper
+  // (#tlx.user_layout<#tlx.no_verify_layout<L>> -> #tlx.user_layout<L>). The
+  // no-verify marker only defers tensor verification through inlining; once
+  // inlining is done it is no longer needed. A user-layout marker is preserved
+  // (it is retired later by tlx-finalize-user-layouts).
+  mlir::AttrTypeReplacer replacer;
+  replacer.addReplacement([](NoVerifyLayoutAttr wrapper) -> Attribute {
+    return wrapper.getLayout();
+  });
+
+  moduleOp->walk([&](Operation *op) {
+    replacer.replaceElementsIn(op, /*replaceAttrs=*/true, /*replaceLocs=*/false,
+                               /*replaceTypes=*/true);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          arg.setType(replacer.replace(arg.getType()));
+  });
+
+  bool residual = false;
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes())
+      if (containsNoVerifyLayout(type)) {
+        residual = true;
+        op->emitError("unresolved TLX no-verify layout after placeholder "
+                      "layout resolution");
+      }
+  });
+  return failure(residual);
+}
+
+/// Unwrap every user-pinned layout (#tlx.user_layout<...>) back
+/// to the concrete shared layout the user requested, and verify none remain.
+static LogicalResult unwrapUserLayouts(ModuleOp moduleOp) {
   DenseMap<Value, Attribute> valuesToUnwrap;
   collectValuesWithEncodings(
       moduleOp,
-      [](Type type) -> Attribute { return getNoVerifyLayoutFromType(type); },
+      [](Type type) -> Attribute { return getUserLayoutFromType(type); },
       valuesToUnwrap);
 
   for (auto &[value, layout] : valuesToUnwrap) {
-    auto noVerifyLayout = cast<NoVerifyLayoutAttr>(layout);
-    LLVM_DEBUG({
-      DBGS() << "Unwrapping no-verify layout: ";
-      noVerifyLayout.dump();
-      DBGS() << "  to: ";
-      noVerifyLayout.getLayout().dump();
-    });
-    replaceTypeWithNewEncoding(value, noVerifyLayout.getLayout());
+    auto userLayout = cast<UserLayoutAttr>(layout);
+    replaceTypeWithNewEncoding(value, userLayout.getLayout());
   }
 
-  bool foundResidualNoVerifyLayout = false;
-  auto checkType = [&](Type type, Operation *op) {
-    if (!containsNoVerifyLayout(type))
-      return;
-    foundResidualNoVerifyLayout = true;
-    op->emitError("unresolved TLX no-verify layout after placeholder "
-                  "layout resolution");
-  };
+  bool foundResidual = false;
   moduleOp.walk([&](Operation *op) {
-    for (Type type : op->getResultTypes())
-      checkType(type, op);
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        for (BlockArgument arg : block.getArguments()) {
-          if (containsNoVerifyLayout(arg.getType())) {
-            foundResidualNoVerifyLayout = true;
-            op->emitError("unresolved TLX no-verify layout on block argument "
+    for (Type type : op->getResultTypes()) {
+      if (getUserLayoutFromType(type)) {
+        foundResidual = true;
+        op->emitError("unresolved TLX user shared layout after placeholder "
+                      "layout resolution");
+      }
+    }
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          if (getUserLayoutFromType(arg.getType())) {
+            foundResidual = true;
+            op->emitError("unresolved TLX user shared layout on block argument "
                           "after placeholder layout resolution");
           }
-        }
-      }
-    }
-    for (NamedAttribute attr : op->getAttrs()) {
-      if (containsNoVerifyLayout(attr.getValue())) {
-        foundResidualNoVerifyLayout = true;
-        op->emitError("unresolved TLX no-verify layout in operation attribute "
-                      "after placeholder layout resolution");
-      }
-    }
   });
 
-  return failure(foundResidualNoVerifyLayout);
+  return failure(foundResidual);
 }
 
 LogicalResult resolvePlaceholderLayouts(ModuleOp moduleOp) {
   if (failed(unwrapNoVerifyLayouts(moduleOp)))
+    return failure();
+
+  if (failed(unwrapUserLayouts(moduleOp)))
     return failure();
 
   // Collect all values that have dummy layouts
@@ -313,6 +348,93 @@ public:
     if (failed(tlx::resolvePlaceholderLayouts(m))) {
       signalPassFailure();
     }
+  }
+};
+
+/// Recursively true if a type/attr embeds a #tlx.user_layout anywhere.
+static bool containsUserLayout(Type type);
+static bool containsUserLayout(Attribute attr) {
+  if (!attr)
+    return false;
+  if (isa<UserLayoutAttr>(attr))
+    return true;
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute a) { found |= containsUserLayout(a); },
+      [&](Type t) { found |= containsUserLayout(t); });
+  return found;
+}
+static bool containsUserLayout(Type type) {
+  if (!type)
+    return false;
+  bool found = false;
+  type.walkImmediateSubElements(
+      [&](Attribute a) { found |= containsUserLayout(a); },
+      [&](Type t) { found |= containsUserLayout(t); });
+  return found;
+}
+
+/// Unwrap user-pinned register layouts (#tlx.user_layout on a RankedTensorType)
+/// back to the concrete wrapped layout, and verify none remain. These are kept
+/// wrapped through the layout-optimization passes (they anchor via
+/// PinnedEncodingTrait) and retired here.
+///
+/// Uses an AttrTypeReplacer so the wrapper is stripped *everywhere* it appears,
+/// including nested inside other encodings (e.g. a reduce's
+/// `slice<parent = #tlx.user_layout<...>>`) and inside a constant's `value`
+/// DenseElementsAttr type. Stripping only top-level result encodings would
+/// leave nested wrappers behind and produce inconsistent op types.
+static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
+  mlir::AttrTypeReplacer replacer;
+  replacer.addReplacement(
+      [](UserLayoutAttr wrapper) -> Attribute { return wrapper.getLayout(); });
+  // Defensively also strip any no-verify wrapper that reached this point (e.g.
+  // nested under a user-layout that resolve-placeholder-layouts left in place).
+  replacer.addReplacement([](NoVerifyLayoutAttr wrapper) -> Attribute {
+    return wrapper.getLayout();
+  });
+
+  moduleOp->walk([&](Operation *op) {
+    replacer.replaceElementsIn(op, /*replaceAttrs=*/true, /*replaceLocs=*/false,
+                               /*replaceTypes=*/true);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          arg.setType(replacer.replace(arg.getType()));
+  });
+
+  // A constant's `value` DenseElementsAttr carries its own (shaped) type, which
+  // AttrTypeReplacer does not rebuild; realign it with the unwrapped result
+  // type.
+  moduleOp->walk([&](arith::ConstantOp cst) {
+    auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+    if (!dense)
+      return;
+    auto resultType = dyn_cast<ShapedType>(cst.getType());
+    if (resultType && dense.getType() != resultType)
+      cst.setValueAttr(dense.reshape(resultType));
+  });
+
+  bool residual = false;
+  moduleOp.walk([&](Operation *op) {
+    for (Type type : op->getResultTypes())
+      if (containsUserLayout(type)) {
+        residual = true;
+        op->emitError("unresolved TLX user layout after finalization");
+      }
+  });
+  return failure(residual);
+}
+
+struct TLXFinalizeUserLayoutsPass
+    : public impl::TLXFinalizeUserLayoutsBase<TLXFinalizeUserLayoutsPass> {
+public:
+  using impl::TLXFinalizeUserLayoutsBase<
+      TLXFinalizeUserLayoutsPass>::TLXFinalizeUserLayoutsBase;
+
+  void runOnOperation() override {
+    if (failed(finalizeUserLayouts(getOperation())))
+      signalPassFailure();
   }
 };
 
