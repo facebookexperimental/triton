@@ -105,7 +105,7 @@ def test_hooks(device):
         assert values["counter"] == 0
 
     @triton.autotune(configs=configs, key=['N'], do_bench=do_bench, pre_hook=_pre_hook, post_hook=_post_hook)
-    @triton.heuristics({"N_STAGES": lambda nargs: 100 if nargs['N'] == 4096 else 4})
+    @triton.heuristics({"N_STAGES": lambda nargs: 64 if nargs['N'] == 4096 else 4})
     @triton.jit
     def _kernel(src, N, N_STAGES: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         offsets = tl.arange(0, BLOCK_SIZE)
@@ -118,8 +118,7 @@ def test_hooks(device):
     _kernel[(1, )](src, N)
 
     # On NVIDIA GPUs:
-    # The tuning knob `num_stages` can be set by users.
-    # This will cause out of resources when N_STAGES = 100
+    # This will cause out of resources when N_STAGES = 64
     # shared memory bytes = N_STAGES * BLOCK_SIZE * sizeof(float)
     # On AMD GPUs:
     # `num_stages` is a fixed value of 2, so it won't cause out of resources

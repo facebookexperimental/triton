@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "TMEMUtils.h"
 #include "WSBarrierAnalysis.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -669,6 +670,14 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     for (Operation &op : reverse(*block)) {
       if (isa<scf::ForOp, scf::IfOp>(op))
         break;
+      // Never treat the block terminator (e.g. scf.yield) as an epilog op.
+      // When the epilogue store lives inside the loop body, the terminator is
+      // block.back() and would otherwise be swept into epilogOps; a channel
+      // consumer whose forward slice reaches the loop-carried yield (e.g. the
+      // tmem_load accumulator token) then moves scf.yield out of terminator
+      // position, leaving the block without a valid terminator.
+      if (op.hasTrait<OpTrait::IsTerminator>())
+        continue;
       epilogOps.insert(&op);
     }
 
@@ -1654,8 +1663,9 @@ void createTokenPost(
   });
 }
 
-static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
-                             Operation *oldAlloc) {
+static Value hoistLocalAlloc(
+    OpBuilderWithAsyncTaskIds &builder, Operation *oldAlloc,
+    std::function<void(Operation *, Operation *)> rewriteCallback = nullptr) {
 
   Type oldAllocType;
 
@@ -1705,7 +1715,8 @@ static Value hoistLocalAlloc(OpBuilderWithAsyncTaskIds &builder,
           oldAlloc->getLoc(), localAlloc.getSrc(), newBuf);
       storeOp->moveBefore(oldAlloc);
     }
-    mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf);
+    mlir::triton::replaceUsesAndPropagateType(builder, oldAlloc, newBuf,
+                                              rewriteCallback);
   } else if (auto tmemAlloc = dyn_cast<ttng::TMEMAllocOp>(oldAlloc)) {
     builder.setLoopScheduleInfoFromOp(tmemAlloc);
     if (tmemAlloc.getSrc() != nullptr) {
@@ -1983,6 +1994,32 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
     }
   }
 
+  // Map every channel by its current consumer op so that, when hoisting a
+  // producer alloc rewrites/erases a memdesc-view consumer (e.g. an outer-block
+  // `memdesc_trans` that shares a hoisted `local_alloc` with an inner-loop
+  // MMA), we can repoint the affected channels at the freshly created view op
+  // instead of leaving them with a dangling op pointer. This is the cross-block
+  // analogue of the shared-`memdesc_trans` producer case; the view is
+  // metadata-only and `replaceUsesAndPropagateType` recreates it on the new
+  // buffer.
+  DenseMap<Operation *, SmallVector<Channel *>> consumerToChannels;
+  for (auto *c : channels)
+    consumerToChannels[c->getDstOp()].push_back(c);
+  auto remapConsumerChannels = [&](Operation *oldUser, Operation *newUser) {
+    auto it = consumerToChannels.find(oldUser);
+    if (it == consumerToChannels.end())
+      return;
+    // Copy out before mutating the map (insert below may rehash and invalidate
+    // `it`).
+    SmallVector<Channel *> affected = it->second;
+    consumerToChannels.erase(oldUser);
+    for (auto *c : affected) {
+      if (c->op == oldUser)
+        c->op = newUser;
+    }
+    consumerToChannels[newUser].append(affected.begin(), affected.end());
+  };
+
   mlir::DominanceInfo dom(funcOp);
   LDBG("channels in group");
   for (auto &[repChannel, channels] : channelsGroupedByProducers) {
@@ -2084,11 +2121,15 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       } else
         llvm_unreachable("Unexpected srcOp type");
     } else if (channel->channelKind == DataChannelKind::SMEM) {
-      // Move LocalAlloc to the beginning of the function.
+      // Move LocalAlloc to the beginning of the function. Hoisting rewrites the
+      // alloc's memdesc-view users (e.g. memdesc_trans) onto the new buffer;
+      // repoint any channels that referenced those views so sibling channel
+      // groups sharing this producer are not left with a dangling consumer op.
       if (auto oldAlloc = dyn_cast<ttg::LocalAllocOp>(srcOp)) {
-        buffer = hoistLocalAlloc(builder, oldAlloc);
-      } else
+        buffer = hoistLocalAlloc(builder, oldAlloc, remapConsumerChannels);
+      } else {
         llvm_unreachable("Unexpected srcOp type");
+      }
     } else if (auto tensorType =
                    dyn_cast<RankedTensorType>(srcValue.getType())) {
       int cc = getNVIDIAComputeCapability(funcOp->getParentOfType<ModuleOp>());
@@ -2525,7 +2566,8 @@ ttng::WaitBarrierOp
 desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
               Value barrierAlloc, Value bufferIdx, Value inPhase,
               Operation *producerOrConsumer, bool asProducerAcquire,
-              bool addCompletionBarrier, DictionaryAttr waitConstraints = {}) {
+              bool addCompletionBarrier, DictionaryAttr waitConstraints = {},
+              bool releaseOnLastIterOnly = false) {
   // Attach the barrier as an operand of the mma op, either as producerCommit
   // or consumerRelease.
   builder.setInsertionPoint(mmaOp.getOperation());
@@ -2535,8 +2577,27 @@ desyncMMAv5Op(OpBuilderWithAsyncTaskIds &builder, ttng::MMAv5OpInterface mmaOp,
     auto consumerBarrier =
         getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
     // assert(mmaOp.getBarriers().empty() && "mmaOp should not have barriers");
-    auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        mmaOp->getLoc(), true, 1);
+    Value pred;
+    if (releaseOnLastIterOnly) {
+      // The released input is loop-invariant across the MMA's (inner) loop —
+      // its producer lives in an enclosing loop, so the buffer is loaded once
+      // per outer iteration and read by every inner iteration. Arriving the
+      // consumer-release (EMPTY) every inner iteration lets the producer
+      // overwrite the single buffer before the last inner iteration reads it.
+      // Fire the release only on the last inner iteration so it acts as a
+      // single per-outer-iteration release (matches the hand-written TLX
+      // kernel's per-KV-block k/v release on the epilogue MMA).
+      auto forOp = mmaOp->template getParentOfType<scf::ForOp>();
+      assert(forOp && "releaseOnLastIterOnly requires an enclosing loop");
+      Value nextIv = builder.createWithAsyncTaskIds<arith::AddIOp>(
+          mmaOp->getLoc(), forOp.getInductionVar(), forOp.getStep());
+      pred = builder.createWithAsyncTaskIds<arith::CmpIOp>(
+          mmaOp->getLoc(), arith::CmpIPredicate::sge, nextIv,
+          forOp.getUpperBound());
+    } else {
+      pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+          mmaOp->getLoc(), true, 1);
+    }
     mmaOp.addCompletionBarrier(consumerBarrier, pred);
   }
   mmaOp.setIsAsync(true);
@@ -3137,8 +3198,14 @@ void insertAsyncComm(
       for (auto *ch : orderedChannels) {
         if (ch == chF)
           continue;
-        if (withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
-            ch->getAllocOp() == chF->getAllocOp() &&
+        // Compare the cached allocOp pointers first: getSrcOp()/getDstOp() on a
+        // TMEMPost channel walk the allocOp's use-list (findTmemStartEnd), so
+        // calling them on a channel whose alloc was already erased dereferences
+        // freed memory (non-deterministic SIGSEGV). A stale channel's allocOp
+        // pointer never equals the live chF's, so this cheap pointer check
+        // short-circuits before any op is dereferenced.
+        if (ch->getAllocOp() == chF->getAllocOp() &&
+            withSameTask(ch->getDstOp(), chF->getSrcOp()) &&
             ch->getSrcOp() == chF->getDstOp() &&
             chF->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chF->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
@@ -3162,8 +3229,11 @@ void insertAsyncComm(
       for (auto *ch : orderedChannels) {
         if (ch == chB)
           continue;
-        if (withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
-            ch->getAllocOp() == chB->getAllocOp() &&
+        // See isForwardOfChannelLoop: compare cached allocOp pointers before
+        // getSrcOp()/getDstOp() so a stale channel (alloc already erased) is
+        // filtered out before findTmemStartEnd dereferences freed memory.
+        if (ch->getAllocOp() == chB->getAllocOp() &&
+            withSameTask(ch->getSrcOp(), chB->getDstOp()) &&
             ch->getDstOp() == chB->getSrcOp() &&
             chB->getSrcOp()->getBlock() == ch->getSrcOp()->getBlock() &&
             chB->getSrcOp()->getBlock() == ch->getDstOp()->getBlock()) {
@@ -3182,9 +3252,36 @@ void insertAsyncComm(
       if (regionCmp < 0) {
         // A/producer in nested region. Lift up headProducer till it is
         // in the same scope as headConsumer.
+        //
+        // Besides MMAv5 / SubtiledRegion producers, the operand-D accumulator
+        // whose final in-loop writer is a `tmem_store` read by a post-loop
+        // `tmem_load` is also supported (e.g. HSTU reduce_dq: the gen5 MMA
+        // accumulates into the dq TMEM, a correction partition does a
+        // read-modify-write `tmem_store`, and the epilogue reads the corrected
+        // value). The store — not the upstream MMA — is this channel's real
+        // producer, so it is synchronized via the token path (ProducerCommit
+        // after the loop / ConsumerWait at the epilogue), not a gen5 completion
+        // barrier. `createTokenPost` leaves `producerBarrier` unset for this
+        // shape (the producer is not an MMAv5 op), so lifting the buffer/phase
+        // computation to the loop level here is all that is required; assert
+        // that invariant so a future producerBarrier path is not silently
+        // dropped.
+        bool isOperandDTmemStore = false;
+        if (!isa<ttng::MMAv5OpInterface>(headProducer) &&
+            !headProducer->getParentOfType<ttng::SubtiledRegionOp>() &&
+            masterChannel->channelKind == DataChannelKind::TMEMPost &&
+            isa<ttng::TMEMStoreOp>(headProducer) &&
+            isa<ttng::TMEMLoadOp>(headConsumer)) {
+          auto *tmemCh =
+              static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+          isOperandDTmemStore =
+              tmemCh->isOperandD && !commChannel.producerBarrier;
+        }
         assert((isa<ttng::MMAv5OpInterface>(headProducer) ||
-                headProducer->getParentOfType<ttng::SubtiledRegionOp>()) &&
-               "Only MMAv5 or SubtiledRegionOp-nested ops supported");
+                headProducer->getParentOfType<ttng::SubtiledRegionOp>() ||
+                isOperandDTmemStore) &&
+               "Only MMAv5, SubtiledRegionOp-nested, or operand-D tmem_store "
+               "producers supported");
         nestedInsertionTarget = getSameLevelOp(headConsumer, headProducer);
         producerInNestedRegion = true;
       } else if (regionCmp > 0) {
@@ -3241,6 +3338,17 @@ void insertAsyncComm(
       auto *bwdCh = isForwardOfChannelLoop(masterChannel);
       if (bwdCh)
         producerAcquireForChannelLoop = bwdCh->getDstOp();
+    }
+    // Collapsed chained-accumulator channel (T279388065): the forward commit is
+    // on the LAST writer (headProducer), but the reuse/empty producer_acquire
+    // must precede the FIRST (fresh-overwrite) writer so the whole chain waits
+    // for the consumer's read of the previous iteration. Honor acquireBeforeOp.
+    if (!producerAcquireForChannelLoop &&
+        masterChannel->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+      if (tmemCh->acquireBeforeOp &&
+          tmemCh->acquireBeforeOp->getBlock() == headProducer->getBlock())
+        producerAcquireForChannelLoop = tmemCh->acquireBeforeOp;
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
 
@@ -3415,14 +3523,34 @@ void insertAsyncComm(
           });
           if (isTmemGroup && !isSpatialPacking && group->channels.size() >= 3 &&
               orderReuseGroupChain(group).empty()) {
-            llvm::report_fatal_error(
+            // Name the offending group + its members so the failure is
+            // self-diagnosing (which buffer.id / which allocs / their locs).
+            std::string detail;
+            llvm::raw_string_ostream os(detail);
+            if (auto *a0 = group->channels.front()->getAllocOp())
+              if (auto id = a0->getAttrOfType<IntegerAttr>("buffer.id"))
+                os << " buffer.id=" << id.getInt();
+            os << " members=" << group->channels.size() << " [";
+            for (auto *ch : group->channels) {
+              if (auto *a = ch->getAllocOp()) {
+                int64_t off = 0;
+                if (auto o = a->getAttrOfType<IntegerAttr>("buffer.offset"))
+                  off = o.getInt();
+                os << " {off=" << off << " ";
+                a->getLoc().print(os);
+                os << "}";
+              }
+            }
+            os << " ]";
+            llvm::report_fatal_error(llvm::Twine(
                 "TMEM reuse group with >= 3 buffers has no unique "
                 "dependency-chain order: the shared TMEM slot's producers and "
                 "consumers are not totally ordered, so a correct reuse barrier "
                 "cannot be emitted (this would otherwise deadlock or "
                 "miscompile). Order the slot's writers/readers into a chain - "
                 "e.g. ensure dk reads dsT before dq overwrites the shared "
-                "slot.");
+                "slot." +
+                detail));
           }
           if (verifyReuseGroupCrossPartition(group)) {
             // A5: cross-partition dependency-chain reuse (e.g. FA-bwd
@@ -3591,9 +3719,14 @@ void insertAsyncComm(
                            kv.second.front()->getNumBuffers(),
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
-    } else if (auto forOp = headProducer->getParentOfType<scf::ForOp>()) {
+    } else if (headProducer->getParentOfType<scf::ForOp>() ||
+               headProducer->getParentOfType<scf::WhileOp>()) {
       // headProducer can be local_store but bufferIdx will be used
-      // by tmaLoad as well.
+      // by tmaLoad as well. A producer directly in a persistent scf.while
+      // after region (e.g. the dynamic-persistent tile-id broadcast slot)
+      // also needs the accumCnt-derived buffer index/phase so the mbarrier
+      // parity toggles across persistent iterations; getBufferIdxAndPhase ->
+      // getAccumCount resolves the counter from the while's after-region args.
       if (producerAcquireForChannelLoop) {
         builder.setInsertionPoint(producerAcquireForChannelLoop);
       } else {
@@ -3608,7 +3741,7 @@ void insertAsyncComm(
                            regionsWithChannels, bufferIdx, phase, config,
                            reuseGrp, masterChannel);
     } else {
-      // Producer is not in a ForOp, create phase and bufferIdx here.
+      // Producer is truly outside any loop, create phase and bufferIdx here.
       bufferIdx = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
           headProducer->getLoc(), 0, 32);
       phase = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
@@ -4077,9 +4210,33 @@ void insertAsyncComm(
                                      funcOp.getContext(), consumerTaskId,
                                      WSBarrierAttr::kDirectionBackward)
                                      .build(funcOp.getContext());
+          // If the channel's producer lives in a loop that strictly encloses
+          // the consumer MMA's loop, the buffer is loop-invariant across the
+          // inner loop (e.g. HSTU reduce_dq: k/v are TMA-loaded per KV block in
+          // the outer loop and read by every inner Q-block MMA on a single
+          // copy=1 buffer). Releasing it as a per-iteration MMA completion
+          // barrier lets the load overwrite the buffer before the last inner
+          // read -> wrong result on the trailing Q-blocks. Predicate the
+          // release to the last inner iteration only. FA-style single-loop
+          // kernels (producer and consumer share the loop) are unaffected.
+          bool releaseOnLastIterOnly = false;
+          if (addCompletionBarrier) {
+            if (auto mmaLoop = mmaOp->getParentOfType<scf::ForOp>()) {
+              if (auto prodLoop = headProducer->getParentOfType<scf::ForOp>()) {
+                for (Operation *anc = mmaLoop->getParentOp();
+                     anc && !isa<triton::FuncOp>(anc);
+                     anc = anc->getParentOp()) {
+                  if (anc == prodLoop.getOperation()) {
+                    releaseOnLastIterOnly = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
           desyncMMAv5Op(builder, mmaOp, consumerBarrier, bufferIdx, phase,
                         producerAcquirePoint, true, addCompletionBarrier,
-                        waitConstraints);
+                        waitConstraints, releaseOnLastIterOnly);
         }
       }
     }

@@ -30,6 +30,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/Support/ErrorHandling.h"
 
 // TritonNvidiaGPU depends on Triton

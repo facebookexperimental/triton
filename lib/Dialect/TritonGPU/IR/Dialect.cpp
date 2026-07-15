@@ -22,7 +22,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
@@ -99,6 +99,29 @@ unsigned getTotalElemsPerThread(Type type) {
                                 tensorType.getShape());
 }
 
+FailureOr<RankedTensorType>
+inferFp4ToFpResultType(RankedTensorType srcType, Type elemType, int32_t axis,
+                       std::optional<Location> loc) {
+  auto rank = srcType.getRank();
+  if (!(0 <= axis && axis < rank))
+    return failure();
+
+  auto shape = llvm::to_vector(srcType.getShape());
+  shape[axis] *= 2;
+
+  Attribute inEnc = srcType.getEncoding();
+  Attribute outEnc;
+  auto result =
+      inEnc.getDialect()
+          .getRegisteredInterface<triton::DialectInferLayoutInterface>()
+          ->inferFp4ToFpOpEncoding(shape, axis, inEnc, outEnc,
+                                   /*fwdInference=*/true, loc);
+  if (failed(result))
+    return failure();
+
+  return RankedTensorType::get(shape, elemType, outEnc);
+}
+
 SmallVector<unsigned> getThreadsPerWarp(Attribute layout,
                                         ArrayRef<int64_t> shape) {
   return toLinearEncoding(cast<DistributedEncodingTrait>(layout), shape)
@@ -115,11 +138,10 @@ SmallVector<unsigned> getContigPerThread(RankedTensorType type) {
   return toLinearEncoding(type).getContigPerThread();
 }
 
-bool isExpensiveView(Type srcType, Type dstType) {
-  auto tensorSrcType = cast<RankedTensorType>(srcType);
-  auto tensorDstType = cast<RankedTensorType>(dstType);
-  auto llSrc = toLinearLayout(tensorSrcType);
-  auto llDst = toLinearLayout(tensorDstType);
+bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
+                     ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
+  auto llSrc = toLinearLayout(srcShape, srcEncoding);
+  auto llDst = toLinearLayout(dstShape, dstEncoding);
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -128,7 +150,8 @@ bool isExpensiveView(Type srcType, Type dstType) {
     if (srcMask.second != dstMask.second)
       return true;
   }
-  return getTotalElemsPerThread(srcType) != getTotalElemsPerThread(dstType);
+  return getTotalElemsPerThread(srcEncoding, srcShape) !=
+         getTotalElemsPerThread(dstEncoding, dstShape);
 }
 
 /* Utility function used by get.*Order methods of SliceEncodingAttr.
@@ -205,6 +228,10 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
   }
   if (auto sharedLayout = dyn_cast<AMDRotatingSharedEncodingAttr>(layout)) {
     return llvm::to_vector(sharedLayout.getOrder());
+  }
+  if (auto partitionedLayout =
+          dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
+    return getOrder(partitionedLayout.getPartitionLayout(), shape);
   }
   llvm::report_fatal_error("Unimplemented usage of getOrder for MemDescType");
   return {};
@@ -406,16 +433,27 @@ SmallVector<unsigned> orderPerDimImpl(const LinearLayout &ll,
   return order.takeVector();
 }
 
-bool isExpensiveCat(CatOp cat, Attribute targetEncoding) {
-  // If the new elements per thread is less than the old one, we will need to
-  // do convert encoding that goes through shared memory anyway. So we
-  // consider it as expensive.
-  RankedTensorType tensorTy = cat.getType();
-  auto totalElemsPerThread = gpu::getTotalElemsPerThread(tensorTy);
-  auto shape = tensorTy.getShape();
-  auto newTotalElemsPerThread =
-      gpu::getTotalElemsPerThread(targetEncoding, shape);
-  return newTotalElemsPerThread < totalElemsPerThread;
+static int64_t getNumNonBroadcastRegisters(ArrayRef<int64_t> shape,
+                                           Attribute encoding) {
+  auto kReg = StringAttr::get(encoding.getContext(), "register");
+  auto strippedLayout =
+      toLinearLayout(shape, encoding).removeZeroBasesAlongDim(kReg);
+  return strippedLayout.getInDimSize(kReg);
+}
+
+static int64_t getNumNonBroadcastRegisters(RankedTensorType tensorType) {
+  return getNumNonBroadcastRegisters(tensorType.getShape(),
+                                     tensorType.getEncoding());
+}
+
+bool isLegalCatEncoding(CatOp cat, Attribute targetEncoding) {
+  // Cat lowering concatenates the operands' unique register values. So the
+  // number of unique register values in the result must be equal to those in
+  // the operands.
+  int64_t operandRegs = getNumNonBroadcastRegisters(cat.getLhs().getType()) * 2;
+  int64_t resultRegs =
+      getNumNonBroadcastRegisters(cat.getType().getShape(), targetEncoding);
+  return resultRegs == operandRegs;
 }
 
 static LogicalResult
@@ -425,6 +463,27 @@ verifyLayoutOrder(function_ref<InFlightDiagnostic()> emitError,
     return emitError()
            << "order must be a permutation of 0..(rank-1), but was [" << order
            << "]";
+  }
+  return success();
+}
+
+static LogicalResult
+verifyDistributedLinearLayout(function_ref<InFlightDiagnostic()> emitError,
+                              const LinearLayout &linearLayout,
+                              StringRef subject) {
+  LinearLayout flattened = linearLayout.flattenIns().flattenOuts();
+  auto inDim = *flattened.getInDimNames().begin();
+  LinearLayout withoutBroadcast = flattened.removeZeroBasesAlongDim(inDim);
+  if (!llvm::all_of(withoutBroadcast.getBases().lookup(inDim),
+                    [](const auto &basis) {
+                      return llvm::isPowerOf2_32(basis.front());
+                    })) {
+    return emitError() << "After removing the zero bases " << subject
+                       << " must be a permutation matrix";
+  }
+  if (!withoutBroadcast.isInvertible()) {
+    return emitError() << "After removing the zero bases " << subject
+                       << " must be a permutation matrix";
   }
   return success();
 }
@@ -451,7 +510,8 @@ CGAEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                        << outDimNames << "].";
   }
 
-  return success();
+  return verifyDistributedLinearLayout(emitError, linearLayout,
+                                       "the CGA encoding");
 }
 
 CGAEncodingAttr CGAEncodingAttr::get1CTALayout(MLIRContext *ctx, int rank) {
@@ -852,7 +912,6 @@ mlir::triton::gpu::parseCGAAttr(AsmParser &parser, Attribute attr,
   auto ctx = parser.getContext();
   auto cgaName = StringAttr::get(ctx, "CGALayout");
   std::vector<std::vector<int32_t>> bases;
-  bases.reserve(array.size());
   for (Attribute vecAttr : array) {
     SmallVector<unsigned> basisValues;
     NamedAttribute basisAttr(cgaName, vecAttr);
@@ -865,7 +924,6 @@ mlir::triton::gpu::parseCGAAttr(AsmParser &parser, Attribute attr,
       return {};
     }
     std::vector<int32_t> basis;
-    basis.reserve(basisValues.size());
     for (unsigned value : basisValues)
       basis.push_back(static_cast<int32_t>(value));
     bases.push_back(std::move(basis));
@@ -874,8 +932,21 @@ mlir::triton::gpu::parseCGAAttr(AsmParser &parser, Attribute attr,
   LinearLayout::BasesT namedBases;
   namedBases.insert(
       std::make_pair(StringAttr::get(ctx, "block"), std::move(bases)));
-  LinearLayout ll(namedBases, standardOutDimNames(ctx, rank));
-  return CGAEncodingAttr::get(ctx, std::move(ll));
+  // Compute the minimum size that the LL fits in to be able to call the
+  // requiresSurjective = false constructor. Thisway, if the CGAEncoding
+  // is not surjective it'll error out with a nice message rather than crash
+  auto outDims = standardOutDimPairs(ctx, SmallVector<int64_t>(rank, 1));
+  for (const auto &basis : namedBases.begin()->second) {
+    for (auto [i, value] : llvm::enumerate(basis))
+      outDims[i].second =
+          std::max<int64_t>(outDims[i].second, llvm::NextPowerOf2(value));
+  }
+  LinearLayout ll(std::move(namedBases), outDims,
+                  /*requireSurjective=*/false);
+  auto cgaLayout = parser.getChecked<CGAEncodingAttr>(ctx, std::move(ll));
+  if (!cgaLayout)
+    return {};
+  return cgaLayout;
 }
 
 Attribute BlockedEncodingAttr::parse(AsmParser &parser, Type type) {
@@ -1558,7 +1629,8 @@ AMDWmmaEncodingAttr::verify(function_ref<mlir::InFlightDiagnostic()> emitError,
     return emitError() << "invalid WMMA v2 instruction shape";
 
   auto validShapesV3 = std::vector<llvm::SmallVector<unsigned>>{
-      {16, 16, 4}, {16, 16, 32}, {16, 16, 64}, {16, 16, 128}};
+      {16, 16, 4},   {16, 16, 32}, {16, 16, 64},
+      {16, 16, 128}, {32, 16, 64}, {32, 16, 128}};
   if (version == 3 && !llvm::is_contained(validShapesV3, shape))
     return emitError() << "invalid WMMA v3 instruction shape";
 
@@ -2606,10 +2678,10 @@ NvidiaMmaEncodingAttr::getRepForOperand(ArrayRef<int64_t> shape, int bitwidth,
     tileSize.push_back(1);
   }
   // warpSizeK * (warpRepK * VecBitWidth)
-  auto tileBitWidthK = (isAmpere() && bitwidth == 64) ? (4 * 256) : (4 * 64);
+  auto tileBitWidthK = bitwidth == 64 ? (1 * 256) : (4 * 64);
   if (opIdx == 0) {
     // m x k
-    tileSize.push_back(16);
+    tileSize.push_back(bitwidth == 64 ? 8 : 16);
     tileSize.push_back(tileBitWidthK / bitwidth);
   } else {
     // k x n
@@ -3009,6 +3081,20 @@ struct TritonGPUInferLayoutInterface
     return success();
   }
 
+  LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
+    auto cat = cast<CatOp>(op);
+    int64_t operandRegs =
+        getNumNonBroadcastRegisters(cat.getLhs().getType()) * 2;
+    int64_t resultRegs = getNumNonBroadcastRegisters(cat.getType());
+    if (resultRegs != operandRegs) {
+      return op->emitError("tt.cat result encoding requires ")
+             << resultRegs
+             << " non-broadcast register values, but operands provide "
+             << operandRegs;
+    }
+    return success();
+  }
+
   // Given a src shape + encoding and a dst shape, our goal is to compute a dst
   // encoding that makes the reshape a "nop".  That is, if GPU thread [x,y,z]
   // contains elements [a,b,c,d] before the reshape, it contains those same
@@ -3276,11 +3362,17 @@ struct TritonGPUInferLayoutInterface
   LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
+                         bool allowReorder,
                          std::optional<Location> loc) const override {
     if (product(srcShape) != product(dstShape)) {
       return emitOptionalError(loc, "numel of dst shape does not match "
                                     "numel of src shape");
     }
+    // If allowReorder is true, there are multiple valid encodings. Prefer the
+    // hint if it is set and valid.
+    if (allowReorder && dstEnc)
+      if (!isExpensiveView(srcShape, srcEnc, dstShape, dstEnc))
+        return success();
     auto result =
         inferReshapeOpLegacyEncoding(srcShape, srcEnc, dstShape, dstEnc);
     if (succeeded(result)) {
@@ -3564,13 +3656,19 @@ struct TritonGPUVerifyTensorLayoutInterface
                          << rankedTy.getShape()
                          << " which is not a power of two.";
       }
-      return makeErr()
-             << "NPOT layout not yet supported: tensor shape "
-             << rankedTy.getShape()
-             << " has a non-power-of-2 dimension that is not supported by this "
-                "distributed layout's lowering in this build yet "
-                "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
-                "NPOT slice).";
+      // Layouts whose modular (non-power-of-2) lowering is implemented.
+      bool npotLoweringImplemented =
+          isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr>(
+              layout);
+      if (!npotLoweringImplemented) {
+        return makeErr()
+               << "NPOT layout not yet supported: tensor shape "
+               << rankedTy.getShape()
+               << " has a non-power-of-2 dimension that is not supported by "
+                  "this distributed layout's lowering in this build yet "
+                  "(TRITON_ALLOW_NPOT only enables shapes handled by a landed "
+                  "NPOT slice).";
+      }
     }
     auto ll = toLinearLayout(rankedTy);
     ModuleOp module = op->getParentOfType<ModuleOp>();

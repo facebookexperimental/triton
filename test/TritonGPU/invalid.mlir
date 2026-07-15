@@ -1,5 +1,30 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+// expected-error @+1 {{After removing the zero bases the CGA encoding must be a permutation matrix}}
+#blocked_bad_cga = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [0, 1], CGALayout = [[1, 0], [1, 0]]}>
+module {
+  tt.func public @invalid_cga_layout(%arg0: tensor<1x1xf32, #blocked_bad_cga>) {
+    tt.return
+  }
+}
+
+// -----
+
+// beta divergence (NPOT reland, T276910804): beta's LinearEncodingAttr::verify
+// accepts modular/NPOT distributed layouts (e.g. register = [[1], [3]]) that
+// upstream rejects, so upstream's "must be a permutation matrix" case for such a
+// layout is not invalid here and was dropped. The remaining case checks beta's
+// own "each base must move in at most one dimension" rejection.
+// expected-error @+1 {{In a distributed layout, each base must move in at most one dimension.}}
+#linear_bad_after_flatten = #ttg.linear<{register = [[1, 1], [1, 0]], lane = [], warp = [], block = []}>
+module {
+  tt.func public @invalid_linear_layout_after_flatten(%arg0: tensor<2x2xi32, #linear_bad_after_flatten>) {
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32} {
@@ -163,6 +188,31 @@ module attributes {"ttg.num-warps" = 1 : i32} {
   tt.func @convert_dot(%A: tensor<16x16xf16>, %B: tensor<16x16xf16, #dot_operand_b>, %C: tensor<16x16xf32, #mma0>) {
     // expected-error@+1 {{mismatching encoding between A and B operands}}
     %D = tt.dot %A, %B, %C : tensor<16x16xf16> * tensor<16x16xf16, #dot_operand_b> -> tensor<16x16xf32, #mma0>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_multicast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
+#shared_local = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32} {
+  tt.func public @memdesc_reinterpret_changed_broadcast_count(%arg0: !ttg.memdesc<128x128xf16, #shared_multicast, #smem>) {
+    // expected-error @+1 {{source and result must have the same number of broadcast CTA dims}}
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x128xf16, #shared_multicast, #smem> -> !ttg.memdesc<128x128xf16, #shared_local, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_bc0 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1], [0, 0]]}>
+#shared_bc1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0], [0, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 4 : i32} {
+  tt.func public @memdesc_reinterpret_changed_broadcast_mask(%arg0: !ttg.memdesc<128x128xf16, #shared_bc0, #smem>) {
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x128xf16, #shared_bc0, #smem> -> !ttg.memdesc<128x128xf16, #shared_bc1, #smem>
     tt.return
   }
 }

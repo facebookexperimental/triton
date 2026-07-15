@@ -554,7 +554,11 @@ class nvidia_knobs(base_knobs):
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")
     use_meta_ws: env_bool = env_bool("TRITON_USE_META_WS")
+    # Number of buffers for the dynamic-persistent tile-id broadcast channel
+    # (cross-partition run-once atomic support). 1 = single-stage.
+    ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
+    use_list_schedule: env_bool = env_bool("TRITON_USE_LIST_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
@@ -606,6 +610,7 @@ class proton_knobs(base_knobs):
         str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti-blackwell"),
     )
     profile_buffer_size: env_int = env_int("TRITON_PROFILE_BUFFER_SIZE", 64 * 1024 * 1024)
+    profile_metric_buffer_size: env_int = env_int("TRITON_PROFILE_METRIC_BUFFER_SIZE", 64 * 1024 * 1024)
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
     # This knob is effective only on Blackwell+ GPUs.
     #

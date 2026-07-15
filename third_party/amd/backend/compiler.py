@@ -285,11 +285,33 @@ class HIPBackend(BaseBackend):
         use_async_copy = is_async_copy_enabled(options.arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
 
-        amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
-        amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
+        # E4: when TRITON_ENABLE_AMD_MODULO is set, the AMD modulo scheduler
+        # replaces schedule-loops — it builds the DDG (TritonGPUModuloCore) with
+        # AMDLatencyModel and serializes a CoarseSchedule that add_pipeline then
+        # consumes (multi-buffer + expansion). Needs TRITON_AMD_MODULO_SERIALIZE=1.
+        if os.environ.get("TRITON_USE_MODULO_SCHEDULE"):
+            # decompose+modulo pipeline (changes #1-#4): early-lower tt.load ->
+            # single-buffer async_copy+local_load, then the ModuloDotSchedule
+            # expander (re-buffer single->multi + ring index, general expander),
+            # replacing schedule_loops + add_pipeline. async_wait counts are
+            # fixed by add_update_async_wait_count downstream.
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
+        elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
+            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
+        else:
+            amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
+            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         if use_async_copy:
             amd.passes.ttgpuir.add_coalesce_async_copy(pm, options.arch)
         amd.passes.ttgpuir.add_convert_to_tensor_ops(pm)
+        # Phase 0 — opt-in TTGIR-level scheduler scaffold. No-ops unless
+        # TRITON_ENABLE_TTGIR_SCHED=1 (also re-checked inside the pass).
+        # Subsequent phases (M/N split + scheduling) will land behind the
+        # same gate. See ~/AMD/triton/claude/llir_sched_at_ttgir_{design,plan}.md.
+        if os.environ.get("TRITON_ENABLE_TTGIR_SCHED"):
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
         passes.common.add_canonicalizer(pm)
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
@@ -336,6 +358,12 @@ class HIPBackend(BaseBackend):
         # kernels) and as the last pass before pm.run so the cleanup passes above do
         # not strip the priority markers before the pipeliner consumes them.
         amd.passes.ttgpuir.add_warp_pipeline(pm)
+        if options.instrumentation_mode == "fpsan":
+            amd.passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm)
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -354,6 +382,10 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
+
+        if options.instrumentation_mode == "fpsan":
+            amd.passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_fp_sanitizer(pm)
 
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

@@ -115,10 +115,59 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
     return ret;
   };
   auto nCol = A.getTotalInDimSizeLog2();
-  auto nRow = A.getTotalOutDimSizeLog2();
   SmallVector<int32_t> matrix = flatten(A.getBases().begin()->second);
   assert(matrix.size() == nCol);
 
+  // NPOT: accumulate ADD without an intermediate urem; applyNpotModulo does the
+  // single final modulo, which is equivalent for non-negative integers. No i32
+  // overflow: nCol <= ~20 bits and each basisValue < 2*outDimSize, so the sum
+  // stays < 2^25 for any practical dim.
+  if (A.isModular()) {
+    // Fast path for dense identity bases [1,2,...,2^(highBit-1)]: x mod
+    // 2^highBit == x & ((1u<<highBit)-1). Bail if a zero column sits below the
+    // highest set bit (a gap would leak that bit through the mask); trailing
+    // zero columns above the set bits are harmless.
+    unsigned nColU = static_cast<unsigned>(nCol);
+    bool isIdentity = true;
+    unsigned highBit = 0;
+    int firstZeroCol = -1;
+    for (unsigned col = 0; col < nColU; ++col) {
+      int32_t bv = matrix[col];
+      if (bv == 0) {
+        if (firstZeroCol < 0)
+          firstZeroCol = static_cast<int>(col);
+        continue;
+      }
+      // Set bit above an earlier zero column: the zero was a gap, not trailing.
+      if (firstZeroCol >= 0) {
+        isIdentity = false;
+        break;
+      }
+      if (bv != static_cast<int32_t>(1u << col)) {
+        isIdentity = false;
+        break;
+      }
+      highBit = col + 1;
+    }
+    if (isIdentity && highBit > 0)
+      return b.and_(x, b.i32_val((1u << highBit) - 1));
+
+    // General modular path: select+add per basis vector.
+    Value sum = b.i32_val(0);
+    for (unsigned col = 0; col < nColU; ++col) {
+      int32_t basisValue = matrix[col];
+      if (basisValue == 0)
+        continue;
+      Value bit = b.and_(x, b.i32_val(1u << col));
+      Value bitIsZero = b.icmp_eq(bit, b.i32_val(0));
+      Value term = b.select(bitIsZero, b.i32_val(0), b.i32_val(basisValue));
+      sum = b.add(sum, term);
+    }
+    return sum;
+  }
+
+  // Power-of-2 path: XOR-based optimization (unchanged)
+  auto nRow = A.getTotalOutDimSizeLog2();
   // Row-wise popcount to detect rows that appear exactly once across columns.
   uint32_t rowsUnique = 0;
   {
@@ -197,16 +246,29 @@ Value matrixVectorProd(TritonLLVMOpBuilder &b, const LinearLayout &A, Value x) {
   Value zero = b.i32_val(0);
   for (int i = 0; i < nCol; i++) {
     if ((explicitCols >> i) & 1) {
-      Value bit = b.and_(x, b.i32_val(1 << i));
-      Value bit_is_zero = b.icmp_eq(bit, zero);
       int32_t basis = matrix[i];
       if (basis == 0)
         continue;
-      auto select = b.select(bit_is_zero, zero, b.i32_val(basis));
-      if ((rowsUnique & basis) == basis) {
-        ors.push_back(select);
+      Value term;
+      Value bit = b.and_(x, b.i32_val(1 << i));
+      uint32_t basisBits = basis;
+      if (llvm::isPowerOf2_32(basisBits)) {
+        unsigned row = llvm::countr_zero(basisBits);
+        unsigned col = i;
+        if (row == col)
+          term = bit;
+        else if (row > col)
+          term = b.shl(bit, b.i32_val(row - col));
+        else
+          term = b.lshr(bit, b.i32_val(col - row));
       } else {
-        xors.push_back(select);
+        Value bit_is_zero = b.icmp_eq(bit, zero);
+        term = b.select(bit_is_zero, zero, b.i32_val(basis));
+      }
+      if ((rowsUnique & basis) == basis) {
+        ors.push_back(term);
+      } else {
+        xors.push_back(term);
       }
     }
   }
@@ -237,7 +299,116 @@ bool cvtAlwaysUseWarpShuffle(ConvertLayoutOp cvt) {
   return cvt->getParentOp()->hasAttrOfType<UnitAttr>("always_use_warp_shuffle");
 }
 
+Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b) {
+  auto tb = TritonLLVMOpBuilder(loc, builder);
+  if (a && b) {
+    return tb.and_(a, b);
+  }
+  return a ? a : b;
+}
+
+Value emitRedundantThreadPredicate(
+    const llvm::MapVector<StringAttr, int32_t> &freeVarMasks,
+    ConversionPatternRewriter &rewriter, Location loc,
+    const TargetInfoBase &targetInfo) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto ctx = rewriter.getContext();
+  auto kLane = str_attr("lane");
+  auto kWarp = str_attr("warp");
+  auto kBlock = str_attr("block");
+
+  Value zero = b.i32_val(0);
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  Value blockId = freeVarMasks.lookup(kBlock) == 0
+                      ? zero
+                      : targetInfo.getClusterCTAId(rewriter, loc);
+
+  Value pred;
+  auto dimNames = {kLane, kWarp, kBlock};
+  auto dimIds = {laneId, warpId, blockId};
+  for (auto [dimName, dimId] : llvm::zip(dimNames, dimIds)) {
+    int32_t mask = freeVarMasks.lookup(dimName);
+    if (mask != 0) {
+      auto dimPred = b.icmp_eq(b.and_(dimId, b.i32_val(mask)), zero);
+      pred = maybeAnd(rewriter, loc, pred, dimPred);
+    }
+  }
+  return pred;
+}
+
 } // namespace triton::gpu
+
+// Cheap modulo for inputs provably < 2N: compare-and-subtract (2 ops vs
+// Barrett's 6; matters on AMD gfx950 where i64 multiply is slow).
+static Value smallModulo(TritonLLVMOpBuilder &b, Value x, int32_t N) {
+  Value cmp = b.icmp_uge(x, b.i32_val(N));
+  return b.select(cmp, b.sub(x, b.i32_val(N)), x);
+}
+
+// Largest input for which barrettModulo below is proven correct: the choice
+// k = 32 + ceil(log2 N) makes q = (x*M)>>k exact for all x in [0, 2^25).
+static constexpr uint32_t kBarrettMaxInput = 1u << 25;
+
+// Barrett reduction: replace urem with multiply-shift for compile-time moduli.
+// For x mod N where N is known at compile time: q = (x * M) >> k; x - q * N
+// where M = ceil(2^k / N). Uses i64 intermediate to avoid overflow.
+// Correct for all x in [0, kBarrettMaxInput) with k = 32 + ceil(log2(N)).
+static Value barrettModulo(TritonLLVMOpBuilder &b, Value x, int32_t N) {
+  assert(N > 0 && !llvm::isPowerOf2_32(N));
+  int k = 32 + llvm::Log2_32_Ceil(N);
+  // NB: M is uint64_t but i64_val() takes int64_t. This is safe because
+  // k = 32 + ceil(log2(N)) <= 63 for any int32_t N, so M < 2^63.
+  uint64_t M = (uint64_t{1} << k) / N + 1; // ceil(2^k / N)
+  auto i64Ty = b.builder->getIntegerType(64);
+  auto i32Ty = b.builder->getIntegerType(32);
+  Value x64 = b.zext(i64Ty, x);
+  Value prod = b.mul(x64, b.i64_val(M));
+  Value q64 = b.lshr(prod, b.i64_val(k));
+  Value q = b.trunc(i32Ty, q64);
+  return b.sub(x, b.mul(q, b.i32_val(N)));
+}
+
+// Combine two values along an output dim of `layout`. NPOT (modular) dims use
+// integer ADD; pow2 dims use XOR.
+static Value combineModularOrXor(TritonLLVMOpBuilder &b,
+                                 const LinearLayout &layout, StringAttr outDim,
+                                 Value lhs, Value rhs) {
+  if (layout.isOutDimModular(outDim))
+    return b.add(lhs, rhs);
+  return b.xor_(lhs, rhs);
+}
+
+// Apply modular reduction for non-power-of-2 output dimensions.
+// Uses smallModulo (compare+subtract) when the accumulated value is provably
+// < 2N, otherwise falls back to Barrett reduction.
+static void
+applyNpotModulo(TritonLLVMOpBuilder &b, const LinearLayout &layout,
+                MutableArrayRef<std::pair<StringAttr, Value>> indices) {
+  if (!layout.isModular())
+    return;
+  for (auto &[outDimName, outIdx] : indices) {
+    int32_t outDimSize = layout.getOutDimSize(outDimName);
+    if (!llvm::isPowerOf2_32(outDimSize)) {
+      // Compute max possible value: sum of all basis entries for this dim
+      // (from matrixVectorProd) + outDimSize - 1 (max constant part).
+      int32_t outDimIdx = layout.getOutDimIndex(outDimName);
+      int32_t maxBasisSum = 0;
+      for (auto &[inDimName, bases] : layout.getBases()) {
+        for (auto &basisVec : bases)
+          maxBasisSum += basisVec[outDimIdx];
+      }
+      int32_t maxValue = maxBasisSum + outDimSize - 1;
+      if (maxValue < 2 * outDimSize)
+        outIdx = smallModulo(b, outIdx, outDimSize);
+      else if (static_cast<uint32_t>(maxValue) < kBarrettMaxInput)
+        outIdx = barrettModulo(b, outIdx, outDimSize);
+      else
+        // Beyond the Barrett-proven range: fall back to a plain urem so release
+        // builds stay correct rather than silently miscomputing.
+        outIdx = b.urem(outIdx, b.i32_val(outDimSize));
+    }
+  }
+}
 
 SmallVector<std::pair<StringAttr, Value>>
 applyLinearLayout(Location loc, RewriterBase &rewriter,
@@ -296,19 +467,17 @@ applyLinearLayout(Location loc, RewriterBase &rewriter,
     shift += layout.getInDimSizeLog2(inDimName);
   }
 
-  if (layout.isModular()) {
-    mlir::emitError(loc) << "NPOT layout not yet supported in lowering: "
-                            "applyLinearLayout cannot index a modular "
-                            "(non-power-of-2) output dimension yet";
-    return outIndices;
-  }
-
+  // NPOT: per-out-dim ADD then modulo (mixed layouts like [32,48] combine
+  // ADD/XOR per dim); the pow2 path is XOR + no-op modulo -> flag-off builds
+  // are byte-identical (a layout is only modular under TRITON_ALLOW_NPOT).
   for (auto &[outDimName, outIdx] : outIndices) {
-    // Apply flattened sublayout for this output
+    // Apply flattened sublayout for this output dimension
     auto matrix = layout.sublayout(inDimNames, outDimName).flattenIns();
     auto out = triton::gpu::matrixVectorProd(b, matrix, x);
-    outIdx = b.xor_(outIdx, out);
+    outIdx = combineModularOrXor(b, layout, outDimName, outIdx, out);
   }
+
+  applyNpotModulo(b, layout, outIndices);
 
   return outIndices;
 }
@@ -437,7 +606,6 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
 
   SmallVector<SmallVector<std::pair<StringAttr, Value>>> ret;
 
-  // Iterate over registers, applying XOR trick
   for (auto reg : registers) {
     SmallVector<std::pair<StringAttr, int32_t>> constRegIndices;
     for (const auto &[attr, val] : indices) {
@@ -448,11 +616,30 @@ applyLinearLayoutVec(Location loc, RewriterBase &rewriter,
     SmallVector<std::pair<StringAttr, Value>> combinedIndices;
     for (auto [base, regIdx] : llvm::zip(baseIndices, regIndices)) {
       assert(base.first == regIdx.first);
-      Value combined = b.xor_(base.second, b.i32_val(regIdx.second));
+      // baseIndices already got modular handling via applyLinearLayout; add the
+      // per-register delta with the same per-dim algebra (ADD for NPOT, XOR for
+      // pow2). See applyLinearLayout for the pow2 no-op rationale.
+      Value regVal = b.i32_val(regIdx.second);
+      Value combined =
+          combineModularOrXor(b, layout, base.first, base.second, regVal);
       combinedIndices.emplace_back(base.first, combined);
     }
 
     ret.push_back(combinedIndices);
+  }
+
+  // Final modulo per NPOT out-dim (no-op for pow2). baseIndices are already in
+  // [0, N) (applyLinearLayout reduced them) and each per-register delta is in
+  // [0, N), so the ADD above is < 2N -> the cheap compare-subtract is exact and
+  // we skip the full-layout maxValue recompute that would force Barrett.
+  if (layout.isModular()) {
+    for (auto &entry : ret) {
+      for (auto &[outDimName, outIdx] : entry) {
+        int32_t outDimSize = layout.getOutDimSize(outDimName);
+        if (!llvm::isPowerOf2_32(outDimSize))
+          outIdx = smallModulo(b, outIdx, outDimSize);
+      }
+    }
   }
 
   return ret;
@@ -610,21 +797,6 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                    warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
                    barrierPtr);
 }
-
-// Build a vector containing multiple base pointers for dynamic indexing.
-static Value buildBasePtrVector(Location loc, RewriterBase &rewriter,
-                                ArrayRef<Value> smemBases) {
-  assert(smemBases.size() > 1 && "Need multiple bases to build a vector");
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  auto ptrTy = smemBases[0].getType();
-  auto vecTy = VectorType::get({static_cast<int64_t>(smemBases.size())}, ptrTy);
-  Value basesVec = b.undef(vecTy);
-  for (size_t i = 0; i < smemBases.size(); ++i) {
-    basesVec = b.insert_element(basesVec, smemBases[i], b.i32_val(i));
-  }
-  return basesVec;
-}
-
 SmallVector<Value> lowerLdSt(
     Location loc, MLIRContext *ctx, LinearLayout cvt,
     ArrayRef<Value> valsArray, // Input for store, output for load
@@ -641,7 +813,7 @@ SmallVector<Value> lowerLdSt(
   auto vals = to_vector(valsArray);
   bool isStore = !vals.empty();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  auto smemPtrTy = ptr_ty(ctx, 3);
+  auto smemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
   auto kReg = str_attr("register");
   auto kLane = str_attr("lane");
   auto kWarp = str_attr("warp");
@@ -663,7 +835,7 @@ SmallVector<Value> lowerLdSt(
   Value basesVec;
   if (isPartitioned) {
     partitionLayout = cvt.sublayout(inDimNames, {kPartition});
-    basesVec = buildBasePtrVector(loc, rewriter, smemBases);
+    basesVec = LLVM::buildBasePtrVector(loc, rewriter, smemBases);
   }
 
   // Strip kPartition output for vectorization analysis.
@@ -1268,6 +1440,20 @@ SharedMemoryObject getSharedMemoryObjectFromStruct(Location loc,
           /*offsets=*/{elems.begin() + numBases, elems.end()}};
 }
 
+// Build a vector containing multiple base pointers for dynamic indexing.
+Value buildBasePtrVector(Location loc, RewriterBase &rewriter,
+                         ArrayRef<Value> smemBases) {
+  assert(smemBases.size() > 1 && "Need multiple bases to build a vector");
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto ptrTy = smemBases[0].getType();
+  auto vecTy = VectorType::get({static_cast<int64_t>(smemBases.size())}, ptrTy);
+  Value basesVec = b.undef(vecTy);
+  for (size_t i = 0; i < smemBases.size(); ++i) {
+    basesVec = b.insert_element(basesVec, smemBases[i], b.i32_val(i));
+  }
+  return basesVec;
+}
+
 Value getStackPointer(RewriterBase &rewriter, FunctionOpInterface funcOp) {
   // See NOTE: [Additional Function Arguments]
   if (!isKernel(funcOp)) {
@@ -1294,7 +1480,8 @@ static Value getScratchPtrImpl(Location loc, RewriterBase &rewriter,
                                const TargetInfoBase &targetInfo,
                                FunctionOpInterface funcOp, Value allocOffset,
                                int32_t bufferArgOffset, StringRef allocSizeAttr,
-                               bool addOffsetIfNoAllocSizeAttr) {
+                               bool addOffsetIfNoAllocSizeAttr,
+                               bool currentCTA = true) {
   // See NOTE: [Additional Function Arguments]
   auto gmemBase =
       funcOp.getArgument(funcOp.getNumArguments() + bufferArgOffset);
@@ -1326,7 +1513,10 @@ static Value getScratchPtrImpl(Location loc, RewriterBase &rewriter,
   auto numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(mod);
   if (numCTAs > 1) {
     linearId = b.mul(linearId, b.i32_val(numCTAs));
-    linearId = b.add(linearId, targetInfo.getClusterCTAId(rewriter, loc));
+    // currentCTA sets whether to rebase the linearId to the CTA id or
+    // just keep the pointer to the whole tensor
+    if (currentCTA)
+      linearId = b.add(linearId, targetInfo.getClusterCTAId(rewriter, loc));
   }
 
   auto allocSize = allocSizeAttrVal.getValue().getZExtValue();
@@ -1350,11 +1540,12 @@ Value getGlobalScratchPtr(Location loc, RewriterBase &rewriter,
 
 Value getProfileScratchPtr(Location loc, RewriterBase &rewriter,
                            const TargetInfoBase &targetInfo,
-                           FunctionOpInterface funcOp, Value allocOffset) {
+                           FunctionOpInterface funcOp, Value allocOffset,
+                           bool currentCTA) {
   return getScratchPtrImpl(loc, rewriter, targetInfo, funcOp, allocOffset,
                            kProfileScratchBufferOffset,
                            "ttg.profile_scratch_memory_size",
-                           /*addOffsetIfNoAllocSizeAttr=*/true);
+                           /*addOffsetIfNoAllocSizeAttr=*/true, currentCTA);
 }
 
 Value getSharedMemoryBase(Location loc, RewriterBase &rewriter,

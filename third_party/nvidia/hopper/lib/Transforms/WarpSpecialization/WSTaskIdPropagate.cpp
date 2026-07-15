@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "TaskIdPropagation.h"
 #include "Utility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"

@@ -6,6 +6,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
 
+#include "TritonNVIDIAGPUToLLVM/AtomicPTXBuilder.h"
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 
 #include "PatternTritonGPUOpToLLVM.h"
@@ -92,23 +93,6 @@ unsigned getCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return index & ~freeVarMask;
 }
 
-std::string getRegisterSizeCode(int size, bool is_float) {
-  switch (size) {
-  case 1:
-    return "b";
-  case 16:
-    return "h";
-  case 32:
-    return is_float ? "f" : "r";
-  case 64:
-    return is_float ? "d" : "l";
-  case 128:
-    return "q";
-  default:
-    llvm_unreachable("Unsupported register size");
-  }
-}
-
 Value createCachePolicy(triton::EvictionPolicy opEvict,
                         ConversionPatternRewriter &rewriter, Location loc,
                         int computeCapability) {
@@ -161,8 +145,14 @@ struct LoadStoreConversionBase {
     auto pointeeBitWidth = triton::getPointeeBitWidth(tensorTy);
     LDBG("getVectorSize contiguity = " << contiguity << " pointeeBitWidth = "
                                        << pointeeBitWidth);
-    // The maximum vector size is 128 bits on NVIDIA GPUs.
-    return std::min<unsigned>(128 / pointeeBitWidth, contiguity);
+    // Blackwell (sm_100+) with PTX 8.8+ supports 256-bit global load/store.
+    unsigned maxVecBits = 128;
+    if (targetInfo.getComputeCapability() >= 100 &&
+        targetInfo.getPtxVersion() >= 88) {
+      maxVecBits = 256;
+    }
+    unsigned vec = std::min<unsigned>(maxVecBits / pointeeBitWidth, contiguity);
+    return clampVecSizeForNpot(vec, tensorTy);
   }
 
   unsigned getMaskAlignment(Value mask) const {
@@ -469,6 +459,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     const size_t valueElemNBits = dtsize * 8;
 
     auto freeVarMasks = getFreeVariableMasks(ptr.getType());
+    if (op.getIgnoreCta())
+      freeVarMasks[str_attr("block")] = 0;
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
@@ -523,7 +515,7 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       Value pred = threadPred;
       if (llMask) {
         auto mask = maskElems[vecStart];
-        pred = maybeAnd(rewriter, loc, pred, mask);
+        pred = ttg::maybeAnd(rewriter, loc, pred, mask);
       }
 
       auto *asmAddr =
@@ -612,6 +604,9 @@ struct AtomicCASOpConversion
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
                  : valueTy;
     auto valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
+    std::string tyId =
+        NVIDIA::getPtxRegisterSizeCode(valueElemNBits, /*isFloat=*/false);
+    std::string sTy = "b" + std::to_string(valueElemNBits);
     auto elemsPerThread = getTotalElemsPerThread(op.getVal().getType());
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
@@ -631,28 +626,13 @@ struct AtomicCASOpConversion
       Value casVal = valElements[i];
       Value casCmp = cmpElements[i];
       Value casPtr = ptrElements[i];
-      PTXBuilder ptxBuilderAtomicCAS;
-      std::string tyId =
-          valueElemNBits == 64 ? "l" : (valueElemNBits == 32 ? "r" : "h");
-      auto *dstOpr = ptxBuilderAtomicCAS.newOperand("=" + tyId, /*init=*/true);
-      auto *ptrOpr = ptxBuilderAtomicCAS.newAddrOperand(casPtr, "l");
-      auto *cmpOpr = ptxBuilderAtomicCAS.newOperand(casCmp, tyId);
-      auto *valOpr = ptxBuilderAtomicCAS.newOperand(casVal, tyId);
-      auto &atom = *ptxBuilderAtomicCAS.create("atom");
-      auto sTy = "b" + std::to_string(valueElemNBits);
-      std::string semStr;
-      llvm::raw_string_ostream os(semStr);
-      os << op.getSem();
-      auto scope = stringifyMemSyncScope(op.getScope()).str();
-      atom.global().o(semStr).o(scope).o("cas").o(sTy);
-      atom(dstOpr, ptrOpr, cmpOpr, valOpr).maybePredicate(threadPred);
+      Value old = NVIDIA::emitPtxAtomicCAS(rewriter, loc, valueElemTy, casPtr,
+                                           casCmp, casVal, op.getSem(),
+                                           op.getScope(), threadPred);
 
       if (tensorTy) {
-        auto retType = valueElemTy;
-        auto ret = ptxBuilderAtomicCAS.launch(rewriter, loc, retType);
-        resultVals[i] = ret;
+        resultVals[i] = old;
       } else {
-        auto old = ptxBuilderAtomicCAS.launch(rewriter, loc, valueElemTy);
         if (op.getResult().use_empty()) {
           rewriter.eraseOp(op);
           return success();
@@ -841,8 +821,9 @@ public:
       }
 
       Value rmwPtr = ptrElements[i];
-      Value pred = llMask ? maybeAnd(rewriter, loc, threadPred, maskElements[i])
-                          : threadPred;
+      Value pred =
+          llMask ? ttg::maybeAnd(rewriter, loc, threadPred, maskElements[i])
+                 : threadPred;
 
       if (doPTXLDPromotion) {
         Type convertedValueTy =
@@ -965,104 +946,17 @@ public:
         continue;
       }
 
-      std::string sTy;
-      PTXBuilder ptxBuilderAtomicRMW;
-      // 16-bit -> "h", 32-bit -> "r", 64-bit -> "l"
-      std::string tyId =
-          getRegisterSizeCode(valueElemNBits * packed, /*is_float=*/false);
-
-      PTXBuilder::Operand *dstOpr;
-      if (vec > 1) {
-        dstOpr = ptxBuilderAtomicRMW.newListOperand();
-        for (unsigned ii = 0; ii < vec; ++ii) {
-          dstOpr->listAppend(
-              ptxBuilderAtomicRMW.newOperand("=" + tyId, /*init=*/true));
-        }
-      } else {
-        dstOpr = ptxBuilderAtomicRMW.newOperand("=" + tyId, /*init=*/true);
-      }
-
-      auto *ptrOpr = ptxBuilderAtomicRMW.newAddrOperand(rmwPtr, "l");
-
-      PTXBuilder::Operand *valOpr;
-      if (vec > 1) {
-        valOpr = ptxBuilderAtomicRMW.newListOperand();
-        for (unsigned ii = 0; ii < vec; ++ii) {
-          valOpr->listAppend(
-              ptxBuilderAtomicRMW.newOperand(valElements[i + ii], tyId));
-        }
-      } else if (packed > 1) {
-        Value rmwVal = b.undef(packedTy);
-        for (int ii = 0; ii < packed; ++ii) {
-          rmwVal = b.insert_element(packedTy, rmwVal, valElements[i + ii],
-                                    b.i32_val(ii));
-        }
-        valOpr = ptxBuilderAtomicRMW.newOperand(rmwVal, tyId);
-      } else {
-        valOpr = ptxBuilderAtomicRMW.newOperand(valElements[i], tyId);
-      }
-
-      auto scope = stringifyMemSyncScope(op.getScope()).str();
-      auto &atom = ptxBuilderAtomicRMW.create("atom")->global().o(scope);
-      auto rmwOp = stringifyRMWOp(atomicRmwAttr).str();
-      auto sBits = std::to_string(valueElemNBits);
-      switch (atomicRmwAttr) {
-      case RMWOp::AND:
-        sTy = "b" + sBits;
-        break;
-      case RMWOp::OR:
-        sTy = "b" + sBits;
-        break;
-      case RMWOp::XOR:
-        sTy = "b" + sBits;
-        break;
-      case RMWOp::ADD:
-        sTy = "u" + sBits;
-        break;
-      case RMWOp::FADD:
-        rmwOp = "add";
-        rmwOp += (valueElemNBits == 16 ? ".noftz" : "");
-        sTy = (valueElemTy.isBF16() ? "bf" : "f") + sBits;
-        sTy += (packed == 2 && valueElemNBits == 16) ? "x2" : "";
-        break;
-      case RMWOp::MAX:
-        sTy = "s" + sBits;
-        break;
-      case RMWOp::MIN:
-        sTy = "s" + sBits;
-        break;
-      case RMWOp::UMAX:
-        rmwOp = "max";
-        sTy = "u" + sBits;
-        break;
-      case RMWOp::UMIN:
-        rmwOp = "min";
-        sTy = "u" + sBits;
-        break;
-      case RMWOp::XCHG:
-        sTy = "b" + sBits;
-        break;
-      default:
+      SmallVector<Value> rmwVals;
+      rmwVals.reserve(vec > 1 ? vec : packed);
+      for (unsigned ii = 0; ii < (vec > 1 ? vec : packed); ++ii)
+        rmwVals.push_back(valElements[i + ii]);
+      auto old = NVIDIA::emitPtxAtomicRMW(rewriter, loc, valueElemTy, rmwPtr,
+                                          rmwVals, atomicRmwAttr, op.getSem(),
+                                          op.getScope(), pred, vec, packed);
+      if (failed(old))
         return failure();
-      }
-      std::string semStr;
-      llvm::raw_string_ostream os(semStr);
-      os << op.getSem();
-      atom.o(semStr).o(rmwOp).v(vec).o(sTy);
       if (tensorTy) {
-        atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred);
-        Type retType;
-        if (vec > 1) {
-          SmallVector<Type> retTys(vec, valueElemTy);
-          retType = struct_ty(retTys);
-        } else if (packed > 1) {
-          retType = packedTy;
-        } else {
-          retType = valueElemTy;
-        }
-
-        Value ret = ptxBuilderAtomicRMW.launch(rewriter, loc, retType);
-
+        Value ret = *old;
         if (vec > 1) {
           for (unsigned ii = 0; ii < vec; ++ii) {
             resultVals[i + ii] = b.extract_val(valueElemTy, ret, ii);
@@ -1076,9 +970,6 @@ public:
           resultVals[i] = ret;
         }
       } else {
-        auto ASMReturnTy = void_ty(ctx);
-        atom(dstOpr, ptrOpr, valOpr).maybePredicate(pred);
-        auto old = ptxBuilderAtomicRMW.launch(rewriter, loc, valueElemTy);
         if (op.getResult().use_empty()) {
           rewriter.eraseOp(op);
           return success();
@@ -1087,7 +978,7 @@ public:
                                                   op.getOperation());
         atomPtr = b.bitcast(atomPtr, ptr_ty(ctx, 3));
         // Only threads with rmwMask = True store the result
-        targetInfo.storeShared(rewriter, loc, atomPtr, old, pred);
+        targetInfo.storeShared(rewriter, loc, atomPtr, *old, pred);
         createBarrier(rewriter, loc, numCTAs);
         Value ret = b.load(valueElemTy, atomPtr);
         rewriter.replaceOp(op, {ret});

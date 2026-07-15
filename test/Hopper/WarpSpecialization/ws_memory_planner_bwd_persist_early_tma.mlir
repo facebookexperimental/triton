@@ -10,8 +10,13 @@
 // producer and the dk consumer collide on a single slot one iteration apart).
 //
 // The fix makes the cross-stage depth a strict floor that is applied FIRST and
-// is never reverted for budget; the budget is reconciled by reusing the
-// discretionary TMA store-staging SMEM (Phase 3.6) instead of dropping q.
+// is never reverted for budget. Phase 3.6 may reclaim discretionary TMA
+// store-staging SMEM to fit, but for this 128-wide config the store-staging is
+// a 128x32 subtile with swizzle=64 (#shared2) while the operands it could alias
+// are 128x128 with swizzle=128 (#shared) — incompatible encodings, so the reuse
+// is unrealizable (mergeStagingReuseIntoHost would drop it). Phase 3.6 therefore
+// does NOT mark it (areReuseEncodingsCompatible), and the floor is honored by
+// the ship-anyway backstop (the real HW SMEM limit, not the soft budget).
 //
 // This is a trimmed doBufferAllocation dump: source-location metadata is
 // dropped and the dq/dv/dk subtile epilogue arithmetic (which only computes the
@@ -20,18 +25,21 @@
 // are kept verbatim.
 //
 // Key verification:
-//   - q keeps its cross-stage floor: buffer.copy = 2 (the fix; was 1).
-//   - TMA store-staging allocs (buffer.tmaStaging = 1) are reused
-//     (allocation.shareGroup) to make room, rather than q being downgraded.
+//   - q keeps its cross-stage floor: buffer.copy = 2 (the fix; was 1), even
+//     though the budget can only be met by the ship-anyway backstop.
+//   - TMA store-staging allocs (buffer.tmaStaging = 1) are NOT reuse-marked:
+//     their swizzle=64 encoding is incompatible with the swizzle=128 operands,
+//     so Phase 3.6 leaves them standalone (no allocation.reuseTarget /
+//     allocation.shareGroup) rather than marking an unrealizable reuse.
 //   - In-loop TMA reduce-staging allocs (buffer.tmaStaging = 2) are innermost
 //     and left as dedicated copy=1.
 
 // CHECK-LABEL: tt.func public @_attn_bwd_persist
 // CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
-// The reused TMA store-staging alloc also carries `allocation.reuseTarget`
-// (the FA-bwd staging-reuse mechanism), emitted before `allocation.shareGroup`;
-// {{.*}} tolerates it.
-// CHECK: ttg.local_alloc {{.*}}allocation.shareGroup = {{[0-9]+}} : i32, buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.tmaStaging = 1 : i32}
+// The store-staging alloc starts its attr dict directly with `buffer.copy`
+// (attrs sort alphabetically), confirming no `allocation.*` reuse attribute is
+// stamped — the encoding-incompatible reuse is correctly not marked.
+// CHECK: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.tmaStaging = 1 : i32}
 
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>

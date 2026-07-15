@@ -19,19 +19,15 @@ from triton.backends.driver import (
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
-# Path(s) to the shared data-driven launcher core. driver.c is compiled via a
-# fixed Remote-Execution command that ignores include_dirs, so we inline this
-# header into the driver.c source at build time (see CudaUtils.__init__) rather
-# than relying on an -I path.
-#
-# The first candidate (backend/launch.h) is a vendored copy that ships with the
-# nvidia backend resources (the BUCK glob packages it next to driver.py), so it
-# is present in packaged/buck builds. The second is the canonical source used by
-# C/C++ consumers (cc_library triton_launch_h). Keep the two in sync; the
-# canonical is python/triton/runtime/launch.h.
+# Path to the shared data-driven launcher core. It lives in the nvidia backend
+# dir (next to driver.c / driver.py) and is the canonical source for C/C++
+# consumers (cc_library triton_launch_h). driver.c is compiled via a fixed
+# Remote-Execution command that ignores include_dirs, so we inline this header
+# into the driver.c source at build time (see CudaUtils.__init__) rather than
+# relying on an -I path. In both source and packaged/buck builds the header
+# sits next to this file.
 _launch_h_candidates = [
     os.path.join(dirname, "launch.h"),
-    os.path.join(dirname, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
 ]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ["libcuda.so.1"]
@@ -40,6 +36,7 @@ PyKernelArg = None
 ARG_CONSTEXPR = None
 ARG_KERNEL = None
 ARG_TUPLE = None
+GSAN_PER_DEVICE_STATE_STRIDE = 1 << 30
 
 
 @functools.lru_cache()
@@ -129,7 +126,7 @@ class CudaUtils(object):
         if launch_h_path is None:
             raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
         launch_h_src = Path(launch_h_path).read_text()
-        include_marker = '#include "triton/runtime/launch.h"'
+        include_marker = '#include "nvidia/backend/launch.h"'
         if include_marker not in driver_src:
             raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
                                "launch.h inlining, but it was not found")
@@ -557,44 +554,27 @@ class CudaDriver(GPUDriver):
     def __init__(self):
         self.utils = CudaUtils()  # TODO: make static
         self.launcher_cls = CudaLauncher
-        self.get_device_capability = self._get_device_capability
-        self.get_current_stream = self._get_current_stream
-        self.get_current_device = self._get_current_device
-        self.set_current_device = self._set_current_device
-
-    @staticmethod
-    def _get_loaded_torch():
-        torch = sys.modules.get("torch")
-        if torch is None:
-            return None
-        return torch
+        if sys.modules.get("torch") is not None:
+            super().__init__()
+        else:
+            self.get_device_capability = self._get_device_capability
+            self.get_current_stream = self._get_current_stream
+            self.get_current_device = self._get_current_device
+            self.set_current_device = self._set_current_device
 
     def _get_device_capability(self, device):
-        torch = self._get_loaded_torch()
-        if torch is not None:
-            return torch.cuda.get_device_capability(device)
         return self.utils.get_device_capability(device)
 
     def _get_current_stream(self, device):
-        torch = self._get_loaded_torch()
-        if torch is not None:
-            return torch.cuda.current_stream(device).cuda_stream
         # The CUDA driver API does not expose PyTorch's notion of the current
         # stream. In torch-free launches we fall back to the device's default
         # stream after making that device's primary context current.
         return self.utils.get_default_stream(device)
 
     def _get_current_device(self):
-        torch = self._get_loaded_torch()
-        if torch is not None:
-            return torch.cuda.current_device()
         return self.utils.get_current_device()
 
     def _set_current_device(self, device):
-        torch = self._get_loaded_torch()
-        if torch is not None:
-            torch.cuda.set_device(device)
-            return
         self.utils.set_current_device(device)
 
     def get_current_target(self):

@@ -8,6 +8,12 @@ on:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
 
+# torchTLX (TLX-as-Inductor-backend) is Blackwell-focused and is exercised by the
+# dedicated torchtlx.yml workflow. Keep it disabled on Hopper: only "allow"/"force"
+# enable it, so an empty value forces it off regardless of any environment default.
+env:
+  TORCHINDUCTOR_TLX_MODE: ""
+
 jobs:
   h100-meta-triton-test:
     if: github.repository_owner == 'facebookexperimental'
@@ -49,13 +55,23 @@ jobs:
               export TRITONBENCH_TRITON_INSTALL_DIR="${TRITONBENCH_INSTALL_DIR}"
           fi
           EOF
+      - name: Checkout TritonBench (Optional)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          PR_BODY_FILE="$(mktemp)"
+          printf '%s' "${PR_BODY}" > "${PR_BODY_FILE}"
+          bash ./.ci/tritonbench/checkout.sh "${PR_BODY_FILE}"
       - name: Run TritonBench tests on H100 GPU
         id: tritonbench
         env:
           TRITONBENCH_TEST_SKIP_FILE: ${{ github.workspace }}/.ci/tritonbench/fbtriton_skip_tests.yaml
-          TRITONBENCH_ROOT: /workspace/tritonbench
         run: |
           . "${SETUP_SCRIPT}"
+          # Use the TritonBench checked out for a linked PR if present, else the
+          # pre-provisioned copy on the runner.
+          export TRITONBENCH_ROOT="${TRITONBENCH_ROOT:-/workspace/tritonbench}"
           bash ./.ci/tritonbench/test-gpu.sh
       - name: Collect nightly failure (TritonBench)
         id: collect
@@ -65,7 +81,7 @@ jobs:
           # stable logical bucket identity for this job.
           BUCKET="h100-tritonbench"
           TITLE="[nightly] ${GITHUB_WORKFLOW} / h100-meta-triton-test / ${BUCKET}"
-          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log).","repro":""}]'
+          FAILURES='[{"normalized_failure_id":"'"${BUCKET}"'","raw_failure_ids":"","issue_title":"'"${TITLE}"'","job_name":"h100-meta-triton-test","summary":"TritonBench tests failed on H100 (see run log).","repro":"","external_dep":false,"external_dep_reason":""}]'
           echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
 
   h100-tlx-test:
@@ -107,7 +123,7 @@ jobs:
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           . "${SETUP_SCRIPT}"
           python -m pytest third_party/tlx/tutorials/testing/test_correctness.py -v --junitxml=/tmp/tlx-correctness.xml
@@ -133,6 +149,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -151,6 +168,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: h100
 
   report-h100-tlx:
     needs: h100-tlx-test
@@ -158,6 +178,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +197,9 @@ jobs:
       run_attempt: ${{ github.run_attempt }}
       summary: ${{ matrix.item.summary }}
       repro: ${{ matrix.item.repro }}
+      external_dep: ${{ matrix.item.external_dep }}
+      external_dep_reason: ${{ matrix.item.external_dep_reason }}
+      platform: h100
 
   # ----- Nightly issue reconciliation: close recovered issues (schedule only) -----
   reconcile-h100-tritonbench:

@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -222,41 +223,91 @@ void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
     }
     return;
   }
-  assert((isa<scf::IfOp, scf::ForOp, scf::WhileOp>(defOp)));
 
-  SmallVector<TaskId> lattices(defOp->getNumResults(),
-                               TaskId::getUninitialized());
-  for (auto [i, result] : llvm::enumerate(defOp->getResults())) {
-    auto resultLattice = getLatticeElement(result);
-    // Wait for all the results to be initialized.
-    if (resultLattice->getValue().isUninitialized())
-      return;
-    lattices[i] =
-        resultLattice->getValue().meet(lattices[i], resultLattice->getValue());
-  }
-
-  // Propagate to the yield ops
-  if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
-    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
-    propagateToYield(yieldOp, lattices);
-  } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
-    propagateToYield(ifOp.thenYield(), lattices);
-    if (!ifOp.getElseRegion().empty())
-      propagateToYield(ifOp.elseYield(), lattices);
-  } else if (auto whileOp = dyn_cast<scf::WhileOp>(defOp)) {
-    auto condOp = whileOp.getConditionOp();
-    for (auto [lattice, forwarded] :
-         llvm::zip_equal(lattices, condOp.getArgs())) {
-      auto forwardedLattice = getLatticeElement(forwarded);
-      ChangeResult changed = forwardedLattice->meet(lattice);
-      propagateIfChanged(forwardedLattice, changed);
+  // The framework routes here every operand of a branch-like op that is NOT
+  // forwarded into a successor region/block (forwarded operands are meet with
+  // their region/block-argument lattices by the framework directly). For the
+  // structured scf ops this is the trip-count / condition control operand; we
+  // propagate the union of the op's result task ids into the loop/if body via
+  // its yield(s) so the body computes for every consumer task.
+  if (isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp) ||
+      isa<scf::WhileOp>(defOp)) {
+    SmallVector<TaskId> lattices(defOp->getNumResults(),
+                                 TaskId::getUninitialized());
+    for (auto [i, result] : llvm::enumerate(defOp->getResults())) {
+      auto resultLattice = getLatticeElement(result);
+      // Wait for all the results to be initialized.
+      if (resultLattice->getValue().isUninitialized())
+        return;
+      lattices[i] = resultLattice->getValue().meet(lattices[i],
+                                                   resultLattice->getValue());
     }
-  } else {
-    llvm_unreachable("Unknown branch operation");
-  }
-  return;
 
-  // TODO(Arda): Address what happens when loop is annotated
+    // Propagate to the yield ops
+    if (auto forOp = dyn_cast<scf::ForOp>(defOp)) {
+      auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      propagateToYield(yieldOp, lattices);
+    } else if (auto ifOp = dyn_cast<scf::IfOp>(defOp)) {
+      propagateToYield(ifOp.thenYield(), lattices);
+      if (!ifOp.getElseRegion().empty())
+        propagateToYield(ifOp.elseYield(), lattices);
+    } else if (auto whileOp = dyn_cast<scf::WhileOp>(defOp)) {
+      auto condOp = whileOp.getConditionOp();
+      for (auto [lattice, forwarded] :
+           llvm::zip_equal(lattices, condOp.getArgs())) {
+        auto forwardedLattice = getLatticeElement(forwarded);
+        ChangeResult changed = forwardedLattice->meet(lattice);
+        propagateIfChanged(forwardedLattice, changed);
+      }
+    }
+    return;
+    // TODO(Arda): Address what happens when loop is annotated
+  }
+
+  // Unstructured control flow (`cf.cond_br` / `cf.br`), e.g. from an early-exit
+  // `return` / bounds guard at the top of a kernel (the common case for these
+  // autoWS kernels), or from a loop transform such as
+  // tritongpu-fuse-nested-loops. The non-forwarded operand is the branch
+  // condition / selector. It must be available on every warp group that
+  // executes either successor, so give it the union of the task ids flowing
+  // into the successor blocks (the forwarded destination operands, whose
+  // lattices the framework has already populated from the block arguments). A
+  // pure control op like `cf.cond_br` has no results, so there is nothing to
+  // back-propagate from results; the successor-operand union is the correct
+  // backward signal. It is empty for a bare early-return guard (successors take
+  // no forwarded operands), which is benign: a task-id-less scalar control op
+  // replicates across partitions. This mirrors how scf.if's condition acquires
+  // the union of its body task ids.
+  if (auto branch = dyn_cast<BranchOpInterface>(defOp)) {
+    auto condLattice = getLatticeElement(operand.get());
+    for (unsigned i = 0, e = defOp->getNumSuccessors(); i < e; ++i) {
+      SuccessorOperands succOperands = branch.getSuccessorOperands(i);
+      for (Value forwarded : succOperands.getForwardedOperands()) {
+        auto fwdLattice = getLatticeElement(forwarded);
+        if (fwdLattice->getValue().isUninitialized())
+          continue;
+        ChangeResult changed = condLattice->meet(fwdLattice->getValue());
+        propagateIfChanged(condLattice, changed);
+      }
+    }
+    return;
+  }
+
+  // RegionBranchOpInterface ops other than the scf ops handled above (e.g. a
+  // future ttg.warp_specialize) only reach here for operands not forwarded to
+  // any region; such ops carry no extra control operand needing a task id
+  // today, so ignore rather than abort.
+  if (isa<RegionBranchOpInterface>(defOp))
+    return;
+
+  // visitBranchOperand is only invoked for RegionBranchOpInterface /
+  // BranchOpInterface ops, all handled above. Anything else is unanticipated at
+  // this stage: fail loudly here (at task-id propagation) so it is easy to
+  // triage, rather than silently dropping propagation -- a missing/wrong
+  // async_task_id would otherwise surface much later as a hard-to-triage
+  // warp-specialization miscompile (wrong partition / missing barrier). Extend
+  // the handling above when a new branch shape is introduced.
+  llvm_unreachable("Unhandled branch op in task-id propagation");
 }
 
 void TaskIdBackwardPropagation::visitCallOperand(OpOperand &operand) {

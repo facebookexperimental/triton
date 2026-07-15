@@ -945,6 +945,28 @@ def _attn_bwd_preprocess(O, DO,  #
 
 
 @triton.jit
+def _attn_bwd_dq_postprocess(DQ_ACCUM, DQ_OUT,  #
+                             N_CTX,  #
+                             BLK: tl.constexpr, HALF_HD: tl.constexpr,  #
+                             BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                             ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_hz = tl.program_id(1)
+    off_h = tl.arange(0, HEAD_DIM)
+    q = off_m[:, None]
+    h = off_h[None, :]
+    tile_base = (q // BLK) * BLK
+    local = q % BLK
+    half = h // HALF_HD
+    col = h % HALF_HD
+    packed_row = 2 * tile_base + local + BLK * half
+    src = DQ_ACCUM + off_hz * N_CTX * HEAD_DIM + packed_row * HALF_HD + col
+    val = tl.load(src)
+    dst = DQ_OUT + off_hz * N_CTX * HEAD_DIM + q * HEAD_DIM + h
+    tl.store(dst, val.to(DQ_OUT.dtype.element_ty))
+
+
+@triton.jit
 def bwd_calculate_offsets(
     tile_idx,
     n_tile_num,
@@ -968,11 +990,17 @@ def bwd_calculate_offsets(
     return off_chz, batch, head, start_m, start_n, num_steps
 
 
+_bwd_selected_meta = {}
+
+
 def _bwd_host_descriptor_pre_hook_tlx(nargs):
     BLOCK_M1 = nargs["BLOCK_M1"]
     BLOCK_N1 = nargs["BLOCK_N1"]
     HEAD_DIM = nargs["HEAD_DIM"]
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
+
+    _bwd_selected_meta["BLOCK_M1"] = BLOCK_M1
+    _bwd_selected_meta["NUM_CTAS"] = NUM_CTAS
 
     # Reset dq accumulator to zeros before each autotuner warmup run.
     # dq uses TMA reduce-add, so stale values accumulate across runs.
@@ -983,8 +1011,13 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_do"].block_shape = [1, 1, BLOCK_M1, HEAD_DIM // NUM_CTAS]
     nargs["desc_v"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [1, 1, BLOCK_N1, HEAD_DIM]
-    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 4)
-    nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1 // NUM_CTAS, HEAD_DIM // EPILOGUE_SUBTILE]
+    if NUM_CTAS > 1:
+        EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
+        DQ_SLICE_N = HEAD_DIM // EPILOGUE_SUBTILE
+        nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, DQ_SLICE_N]
+    else:
+        DQ_REDUCE_NCOL = nargs["DQ_REDUCE_NCOL"]
+        nargs["desc_dq"].block_shape = [1, 1, BLOCK_M1, DQ_REDUCE_NCOL]
     DKV_STORE_NCOL = nargs["DKV_STORE_NCOL"]
     nargs["desc_dv"].block_shape = [1, 1, BLOCK_N1, DKV_STORE_NCOL]
     nargs["desc_dk"].block_shape = [1, 1, BLOCK_N1, DKV_STORE_NCOL]
@@ -1019,7 +1052,7 @@ configs_bwd_1cta = [
         num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
-    ) for bm1 in [64, 128] for uwb in [False, True]
+    ) for bm1 in [64] for uwb in [False, True]
 ]
 
 configs_bwd_2cta = [
@@ -2231,7 +2264,7 @@ def _attn_bwd_ws(
     DQ_STORE_M: tl.constexpr = BLOCK_M1 // NUM_CTAS
     DQ_SLICE_N: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     if USE_2CTA:
-        dq_store_buf = tlx.local_alloc((DQ_STORE_M, DQ_SLICE_N), tlx.dtype_of(desc_dq), 2)
+        dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_SLICE_N), tlx.dtype_of(desc_dq), 2)
     else:
         DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
         dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
@@ -2252,11 +2285,8 @@ def _attn_bwd_ws(
     qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem,
                                reuse=qk_p_storage_alias)
-    # In 2-CTA mode, P is offset to column 64 (after dQ's 64 cols at column 0).
-    # P's per-buffer stride is 64 i32 cols (128x128 f16), so num=2 + index 1
-    # naturally places P at column 64. In 1-CTA mode, P stays at column 0.
-    P_NUM_BUFFERS: tl.constexpr = 2 if USE_2CTA and not REUSE_DP_FOR_DQ else NUM_BUFFERS_TMEM
-    P_BUF_IDX: tl.constexpr = 1 if USE_2CTA and not REUSE_DP_FOR_DQ else 0
+    P_NUM_BUFFERS: tl.constexpr = NUM_BUFFERS_TMEM
+    P_BUF_IDX: tl.constexpr = 0
     p_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
@@ -2308,11 +2338,11 @@ def _attn_bwd_ws(
             ))
     else:
         if USE_2CTA:
-            # 2-CTA: dQ at column 0, P offset to column 64.
-            # dQ (64x128 f32 twocta_rhs) = 64 i32 cols at columns 0-63.
-            # P (128x128 f16) = 64 i32 cols at columns 64-127.
-            # P uses num=2 with index 1 to get the offset; P's per-buffer
-            # stride is naturally 64 from getTmemAllocSizes(128x128 f16).
+            # 2-CTA: place P and dQ explicitly via set_buffer_overlap.
+            # SWAP: P at column 0, dQ at column 64 (was the reverse). dQ's real
+            # TwoCTA_RHS footprint is 128x64 (64 i32 cols); storage-alias
+            # lowering runs after layout propagation, so it knows this and can
+            # place dQ at a non-zero column offset.
             DQ_BUF_IDX: tl.constexpr = 0
             dq_tiles = tlx.local_alloc(
                 (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
@@ -2321,6 +2351,30 @@ def _attn_bwd_ws(
                 tlx.storage_kind.tmem,
                 reuse=qk_p_storage_alias,
             )
+            dq_phys = tlx.local_alloc(
+                (BLOCK_M1, HEAD_DIM // NUM_CTAS),
+                tl.float32,
+                NUM_BUFFERS_TMEM,
+                tlx.storage_kind.tmem,
+                reuse=qk_p_storage_alias,
+            )
+            # qk shares the whole region; within it, P and dQ occupy distinct
+            # 64-col halves (P first -> col 0, dQ next -> col 64). dq_tiles and
+            # dq_phys are two views of the same dQ storage (shared subgroup).
+            qk_p_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(
+                        p_tiles,
+                        tlx.reuse_group(
+                            dq_tiles,
+                            dq_phys,
+                            group_type=tlx.reuse_group_type.shared,
+                        ),
+                        group_type=tlx.reuse_group_type.distinct,
+                    ),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
         else:
             # 1-CTA with bm1=64: separate dQ TMEM
             DQ_BUF_IDX: tl.constexpr = 0
@@ -2573,13 +2627,16 @@ def _attn_bwd_ws(
                 tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
                 if USE_2CTA:
                     dq_m_offset = cluster_cta_rank * DQ_STORE_M
-                    dq_full = tlx.local_load(dq_tiles[tmem_buf_id + DQ_BUF_IDX])
-                    # Release TMEM early: dQ is in registers, so the MMA
-                    # can reuse the TMEM slot for QK/dQ while we store.
-                    tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
+                    packed_row_base = 2 * (curr_m + dq_m_offset)
+                    DQ_PACK_ITERS: tl.constexpr = (HEAD_DIM // NUM_CTAS) // DQ_SLICE_N
+                    dq_full = tlx.local_load(dq_phys[tmem_buf_id + DQ_BUF_IDX])
+                    if USE_WARP_BARRIER:
+                        tlx.barrier_arrive(dq_empties[tmem_buf_id])
+                    else:
+                        tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
                     dq_full = dq_full * LN2
-                    dq_slices = _split_n_2D(dq_full, EPILOGUE_SUBTILE)
-                    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    dq_slices = _split_n_2D(dq_full, DQ_PACK_ITERS)
+                    for slice_id in tl.static_range(DQ_PACK_ITERS):
                         dq_smem = dq_store_buf[slice_id % 2]
                         tlx.async_descriptor_store_wait(1)
                         tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
@@ -2589,12 +2646,14 @@ def _attn_bwd_ws(
                             [
                                 batch,
                                 head,
-                                curr_m + dq_m_offset,
+                                packed_row_base,
                                 slice_id * DQ_SLICE_N,
                             ],
                             store_reduce="add",
                         )
                 else:
+                    HALF_HD: tl.constexpr = HEAD_DIM // 2
+                    SLICES_PER_HALF: tl.constexpr = HALF_HD // DQ_REDUCE_NCOL
                     for slice_id in tl.static_range(DQ_REDUCE_ITERS):
                         dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                         dq_slice = tlx.local_slice(
@@ -2609,14 +2668,16 @@ def _attn_bwd_ws(
                             dq_store_buf[dq_smem_idx],
                             dq.to(tlx.dtype_of(desc_dq)),
                         )
+                        packed_half = slice_id // SLICES_PER_HALF
+                        packed_col = (slice_id % SLICES_PER_HALF) * DQ_REDUCE_NCOL
                         tlx.async_descriptor_store(
                             desc_dq,
                             dq_store_buf[dq_smem_idx],
                             [
                                 batch,
                                 head,
-                                curr_m,
-                                slice_id * DQ_REDUCE_NCOL,
+                                2 * curr_m + BLOCK_M1 * packed_half,
+                                packed_col,
                             ],
                             store_reduce="add",
                         )
@@ -2863,6 +2924,11 @@ def _attn_bwd_ws(
                     tlx.fence("async_shared")
                     tlx.barrier_arrive(ds_fulls[ds_buf_id_relay], 1, remote_cta_rank=0)
 
+        # TODO: empty task to absorb warps — needs num_warps bump in configs
+        # EMPTY_WARPS: tl.constexpr = 1 if USE_2CTA else 2
+        # with tlx.async_task(num_warps=EMPTY_WARPS, registers=24):
+        #     pass
+
 
 class _attention(torch.autograd.Function):
 
@@ -2942,10 +3008,12 @@ class _attention(torch.autograd.Function):
         q, k, v, o, M = ctx.saved_tensors
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert o.is_contiguous() and do.is_contiguous()
-        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dq = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
+        _HALF_HD = ctx.HEAD_DIM // 2
+        dq_accum = torch.zeros([BATCH, N_HEAD, N_CTX, ctx.HEAD_DIM], device=q.device, dtype=torch.float32)
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
@@ -2989,10 +3057,12 @@ class _attention(torch.autograd.Function):
             strides=desc_strides,
             block_shape=dummy_block,
         )
+        packed_shape = [BATCH, N_HEAD, 2 * N_CTX, _HALF_HD]
+        packed_strides = [N_HEAD * N_CTX * HEAD_DIM, N_CTX * HEAD_DIM, _HALF_HD, 1]
         desc_dq = TensorDescriptor(
-            dq,
-            shape=desc_shape,
-            strides=desc_strides,
+            dq_accum,
+            shape=packed_shape,
+            strides=packed_strides,
             block_shape=dummy_block,
         )
         desc_dk = TensorDescriptor(
@@ -3048,6 +3118,15 @@ class _attention(torch.autograd.Function):
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
             STAGE=stage,  #
+        )
+
+        _blk = _bwd_selected_meta["BLOCK_M1"] // _bwd_selected_meta["NUM_CTAS"]
+        post_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        _attn_bwd_dq_postprocess[post_grid](
+            dq_accum, dq,  #
+            N_CTX,  #
+            BLK=_blk, HALF_HD=_HALF_HD,  #
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
         )
 
         return dq, dk, dv, None, None

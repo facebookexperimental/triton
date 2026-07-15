@@ -14,8 +14,19 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/Support/Casting.h"
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
 
 namespace py = pybind11;
+
+// Defined in ir.cc. Declared here rather than in ir.h so ir.h stays
+// pybind11-free and matches upstream; the pybind11 builder class is only
+// needed by this python-binding TU and ir.cc.
+namespace ir {
+extern py::class_<TritonOpBuilder> *getBuilderClass();
+} // namespace ir
+
 using namespace ir;
 using namespace mlir;
 namespace tt = triton;
@@ -118,6 +129,10 @@ void init_triton_tlx_ir(py::module &&m) {
              } else {
                throw std::runtime_error("Unsupported type");
              }
+           })
+      .def("create_dump_layout",
+           [](TritonOpBuilder &self, Value &v) -> void {
+             self.create<tlx::DumpLayoutOp>(v);
            })
       .def("create_local_load",
            [](TritonOpBuilder &self, Value subView,
@@ -1044,6 +1059,7 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXResolvePlaceholderLayouts);
   ADD_PASS_WRAPPER_0("add_tlx_print_ttgir_to_tlx",
                      tlx::createTLXPrintTTGIRToTLX);
+  ADD_PASS_WRAPPER_0("add_tlx_dump_layout", tlx::createTLXDumpLayout);
   ADD_PASS_WRAPPER_0("add_tlx_storage_alias_lowering",
                      tlx::createTLXStorageAliasLowering);
   // Custom wrapper for TritonTLXFixup to handle cluster_dims as vector

@@ -26,6 +26,8 @@ def min_dot_size(target: GPUTarget):
         # For small M/N the input we can still use tensorcores with padding.
         if lhs_bitwidth == 8:
             return (1, 1, 32)
+        elif lhs_bitwidth == 64:
+            return (1, 1, 4)
         else:
             return (1, 1, 16)
 
@@ -194,6 +196,12 @@ class CUDAOptions:
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if not extern_libs.get("libdevice", None):
             extern_libs["libdevice"] = knobs.nvidia.libdevice_path or str(default_libdir / "libdevice.10.bc")
+        if "gsan" in self.instrumentation_mode:
+            gsan_lib = default_libdir / "gsan.ll"
+            if not gsan_lib.exists():
+                raise FileNotFoundError(f"GSan runtime is missing at {gsan_lib}. "
+                                        "Rebuild Triton to generate it.")
+            extern_libs["gsan"] = str(gsan_lib)
 
         object.__setattr__(self, "extern_libs", tuple(extern_libs.items()))
         assert (self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0), "num_warps must be a power of 2"
@@ -394,7 +402,7 @@ class CUDABackend(BaseBackend):
     def make_launcher_src(self, metadata, src):
         """Generate a standalone C launcher source from Level 0 metadata.
 
-        The generated C file includes ``triton/runtime/launch.h`` and implements
+        The generated C file includes ``nvidia/backend/launch.h`` and implements
         a single entry point ``triton_launch_<kernel>()`` that sets up
         CUlaunchConfig with compile-time-known parameters baked in as constants,
         builds the kernel parameter array, and calls ``cuLaunchKernelEx``.
@@ -463,7 +471,7 @@ class CUDABackend(BaseBackend):
         lines.append(f"/* Kernel: {kernel_name} */")
         lines.append(f"/* ABI version: {launch_meta['abi_version']} */")
         lines.append("")
-        lines.append('#include "triton/runtime/launch.h"')
+        lines.append('#include "nvidia/backend/launch.h"')
         lines.append("")
 
         # ---- Args struct ----
@@ -615,9 +623,9 @@ class CUDABackend(BaseBackend):
             list(opt.cluster_dims),
         )
         passes.common.add_inliner(pm)
-        # Handle storage lowering. In the future this may need
-        # dummy layouts
-        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
+        # Storage alias lowering moved to make_ttgir (after layout propagation)
+        # so the backing TMEM allocation is materialized with the resolved
+        # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
@@ -680,6 +688,9 @@ class CUDABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        # Storage alias lowering runs after layout propagation so the backing
+        # TMEM allocation is materialized with the resolved 2-CTA storage format.
+        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         # Only determine reg layouts after TMEM layout is finalized
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
@@ -726,6 +737,7 @@ class CUDABackend(BaseBackend):
                 dump_enabled,
                 smem_budget,
                 generate_subtiled,
+                knobs.nvidia.ws_tile_prefetch_depth,
             )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
@@ -739,6 +751,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
+            # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
+            # async-token form and hoist the issue for compute/CLC overlap. This
+            # runs before warp specialization; the token is materialized into the
+            # completion mbarrier after WS (add_clc_materialize below).
+            nvidia.passes.ttnvgpuir.add_clc_split(pm)
+            nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
             elif knobs.nvidia.use_modulo_schedule is not None:
@@ -748,16 +766,33 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
+            elif knobs.nvidia.use_list_schedule:
+                # Acyclic list schedule (no software pipelining): a single-stage
+                # per-loop reorder that writes loop.stage/loop.cluster like the
+                # default scheduler. Emits top-K variants for autotuning
+                # (TRITON_LIST_SCHEDULE_TOPK / _BEAM / _TOPK_DUMP) and applies
+                # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
+                nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # The modulo / LLM scheduler above already produced the full loop
-            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
-            # schedule_loops here would recompute and OVERRIDE it, so only run
-            # them on the default path where no custom scheduler set the schedule.
-            uses_custom_schedule = knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+            # The modulo / LLM / list scheduler above already produced the full
+            # loop schedule (loop.stage / loop.cluster). Re-running
+            # assign_latencies + schedule_loops here would recompute and OVERRIDE
+            # it, so only run them on the default path where no custom scheduler
+            # set the schedule.
+            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+                                    or knobs.nvidia.use_list_schedule)
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if not knobs.nvidia.use_meta_ws:
+            if knobs.nvidia.use_list_schedule:
+                # List scheduling is a no-warp-specialization transform: it
+                # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
+                # feeds the pipeliner directly. Running either WS path here would
+                # trip PartitionSchedulingMeta (it treats the tt.modulo_ii marker
+                # as a modulo schedule and demands partition attrs the list
+                # scheduler never emits). So skip WS entirely.
+                pass
+            elif not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
@@ -776,12 +811,17 @@ class CUDABackend(BaseBackend):
                     dump_enabled,
                     smem_budget,
                     generate_subtiled,
+                    knobs.nvidia.ws_tile_prefetch_depth,
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
+            # CLC tile scheduler (Stage 4): materialize the async-token form into
+            # the response buffer + completion mbarrier (single-CTA only). Runs
+            # after warp specialization.
+            nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
@@ -792,7 +832,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        passes.ttgpuir.add_prefetch(pm)
+        if capability // 10 == 8:
+            passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
@@ -819,11 +860,20 @@ class CUDABackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
+        if "fpsan" in opt.instrumentation_mode:
+            passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         # Budget-aware layout conversion elimination — runs last to ensure
         # converts whose scratch would exceed SMEM budget are eliminated
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
 
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -850,6 +900,13 @@ class CUDABackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
+        if "fpsan" in options.instrumentation_mode:
+            passes.ttgpuir.add_fp_sanitizer(pm)
+        if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
+
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -861,6 +918,10 @@ class CUDABackend(BaseBackend):
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+
+        if "gsan" in options.instrumentation_mode:
+            # GSan introduces layout conversions, so must come before shared memory allocation
+            passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
@@ -874,6 +935,8 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
             passes.gluon.add_canonicalizer(pm)
             passes.common.add_cse(pm)
+        if "gsan" in options.instrumentation_mode:
+            passes.ttgpuir.add_global_sanitizer(pm)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
         tlx_dump_dir = None
         tlx_saved_fd = None
@@ -1053,7 +1116,7 @@ class CUDABackend(BaseBackend):
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
-                    from triton.compile_iq.consume import acf_args_for
+                    from triton.magnon.consume import acf_args_for
 
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
@@ -1128,8 +1191,8 @@ please share the reproducer above with Triton project.
             ptx = ck.asm.get("ptx")
             if not ptx:
                 return
-            from triton.compile_iq import store
-            from triton.compile_iq.consume import acf_args_for
+            from triton.magnon import store
+            from triton.magnon.consume import acf_args_for
             arch = sm_arch_from_capability(self.target.arch)
             ver = get_ptxas(self.target.arch).version
             sha = store.ptx_sha256(ptx)

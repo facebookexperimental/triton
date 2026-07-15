@@ -342,7 +342,10 @@ class TritonSemantic(Generic[TensorTy]):
         if not input_scalar_ty.is_floating() or not other_scalar_ty.is_floating():
             raise TypeError("both operands of fdiv must have floating scalar type")
         input, other = self.binary_op_type_checking_impl(input, other, False, False, False, True)
-        ret = self.builder.create_fdiv(input.handle, other.handle)
+        if ieee_rounding:
+            ret = self.builder.create_precise_divf(input.handle, other.handle)
+        else:
+            ret = self.builder.create_fdiv(input.handle, other.handle)
         return self.tensor(ret, input.type)
 
     def mod(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
@@ -1276,6 +1279,16 @@ class TritonSemantic(Generic[TensorTy]):
     def tensormap_fenceproxy_acquire(self, desc_ptr: tl.tensor) -> TensorTy:
         return self.tensor(self.builder.create_tensormap_fenceproxy_acquire(desc_ptr.handle), tl.void)
 
+    def _broadcast_ptr_val_mask(self, ptr, val, mask):
+        ptr_shape = ptr.shape
+        if mask is None:
+            ptr, val = self.broadcast_tensors(ptr, val)
+        else:
+            ptr, val, mask = self.broadcast_tensors(ptr, val, mask)
+        if ptr_shape != ptr.shape:
+            raise ValueError(f"Expected pointer argument to have shape {ptr.shape} but got {ptr_shape}")
+        return ptr, val, mask
+
     def store(self, ptr: TensorTy, val: TensorTy, mask: Optional[TensorTy], boundary_check, cache_modifier: str,
               eviction_policy: str) -> TensorTy:
         cache = self._str_to_store_cache_modifier(cache_modifier)
@@ -1302,13 +1315,7 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Make `mask` and `val` into the same shape as `ptr`
         if ptr.type.is_block():
-            ptr_shape = ptr.shape
-            if mask is None:
-                ptr, val = self.broadcast_tensors(ptr, val)
-            else:
-                ptr, val, mask = self.broadcast_tensors(ptr, val, mask)
-            if ptr_shape != ptr.shape:
-                raise ValueError(f"Expected pointer argument to have shape {ptr.shape} but got {ptr_shape}")
+            ptr, val, mask = self._broadcast_ptr_val_mask(ptr, val, mask)
 
         ptr_ty = ptr.type.scalar
         elt_ty = ptr_ty.element_ty
@@ -1356,10 +1363,7 @@ class TritonSemantic(Generic[TensorTy]):
         if element_ty in [tl.int16, tl.uint16] or element_ty.primitive_bitwidth < 16:
             raise ValueError("atomic_" + op + " does not support " + str(element_ty))
         if ptr.type.is_block():
-            if mask is not None:
-                mask = self.broadcast_impl_shape(mask, ptr.type.get_block_shapes())
-            if val is not None:
-                val = self.broadcast_impl_shape(val, ptr.type.get_block_shapes())
+            ptr, val, mask = self._broadcast_ptr_val_mask(ptr, val, mask)
         val = self.cast(val, ptr.type.scalar.element_ty)
         if mask is None:
             mask_ir = self.builder.get_int1(True)
@@ -1654,9 +1658,15 @@ class TritonSemantic(Generic[TensorTy]):
         rhs: tl.tensor,
         acc: tl.tensor,
         input_precision: Optional[str],
-        allow_tf32,
-        max_num_imprecise_acc: int,
-        out_dtype: tl.dtype,
+        # `allow_tf32` is a Meta-local re-addition to the dot() API. Give it (and the
+        # trailing required args) defaults so callers that predate it -- notably the
+        # upstream-synced Gluon frontend (gluon/language/amd/_ops.py), which passes
+        # input_precision/out_dtype but not allow_tf32 -- keep working. dot_precheck
+        # already treats allow_tf32=None as "unspecified". Existing callers pass these
+        # explicitly, so this is purely additive.
+        allow_tf32=None,
+        max_num_imprecise_acc: int = None,
+        out_dtype: tl.dtype = None,
         attrs: Optional[dict] = None,
         two_ctas: bool = False,
     ) -> tl.tensor:
@@ -1713,6 +1723,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         def _to_scale_handle(scale):
             if scale is None or isinstance(scale, tl.constexpr):
+                return None
+            elif isinstance(scale, tl.tensor) and scale.numel.value == 1:
                 return None
 
             return scale.handle

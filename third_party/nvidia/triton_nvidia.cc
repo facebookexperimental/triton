@@ -189,6 +189,10 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUInterleaveTMemPass);
   ADD_PASS_WRAPPER_0("add_prune_unused_barriers",
                      ttng::createTritonNvidiaGPUPruneUnusedBarriersPass);
+  ADD_PASS_WRAPPER_0("add_clc_split", ttng::createTritonNvidiaGPUCLCSplitPass);
+  ADD_PASS_WRAPPER_0("add_clc_hoist", ttng::createTritonNvidiaGPUCLCHoistPass);
+  ADD_PASS_WRAPPER_0("add_clc_materialize",
+                     ttng::createTritonNvidiaGPUCLCMaterializePass);
   ttng::registerConSanNVIDIAHooks();
 }
 
@@ -204,9 +208,9 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
 
 void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
-  ADD_PASS_OPTION_WRAPPER_6("add_hopper_warpspec",
+  ADD_PASS_OPTION_WRAPPER_7("add_hopper_warpspec",
                             mlir::createNVGPUWarpSpecialization, int, int, bool,
-                            bool, int, bool);
+                            bool, int, bool, int);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
   ADD_PASS_WRAPPER_0("add_tma_store_lowering",
@@ -219,6 +223,7 @@ void init_triton_hopper_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_multi_cta_reduction",
                      mlir::createNVGPUMultiCTAReduction);
   ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
+  ADD_PASS_WRAPPER_0("add_list_schedule", mlir::createNVGPUListSchedule);
   ADD_PASS_WRAPPER_0("add_llm_schedule", mlir::createNVGPULLMSchedule);
   ADD_PASS_WRAPPER_0("add_modulo_ws_partition",
                      mlir::createNVGPUModuloWSPartition);

@@ -48,6 +48,8 @@ def TT_IntToPtrOp : TT_Op<"int_to_ptr", [Elementwise,
     let results = (outs TT_PtrLike:$result);
 
     let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+
+    let hasCanonicalizer = 1;
 }
 
 def TT_PtrToIntOp : TT_Op<"ptr_to_int", [Elementwise,
@@ -297,7 +299,8 @@ def TT_StoreOp : TT_Op<"store", [
       TT_Type:$value,
       Optional<TT_BoolLike>:$mask,
       DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
-      DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict
+      DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
+      UnitAttr:$ignore_cta
     );
 
     let builders = [
@@ -497,6 +500,8 @@ def TT_CatOp : TT_Op<"cat", [NoMemoryEffect,
     let results = (outs TT_Tensor:$result);
 
     let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)";
+
+    let hasVerifier = 1;
 }
 
 def TT_JoinOp : TT_Op<"join", [

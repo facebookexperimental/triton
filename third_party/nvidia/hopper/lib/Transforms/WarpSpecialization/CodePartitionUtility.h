@@ -15,6 +15,17 @@ namespace mlir {
 
 namespace tt = mlir::triton;
 
+// Discardable i32 attribute stamped by WSAtomicBroadcast on the
+// dynamic-persistent tile-id broadcast slot's `local_alloc` to request a
+// specific multi-buffer depth (tile prefetch depth). `allocateSmemBuffers`
+// (WSMemoryPlanner) pins the buffer's copy count to this value so the requested
+// depth is honored end-to-end (buffer shape + accumCnt-driven slot/phase),
+// rather than leaving this non-innermost broadcast channel single-buffered.
+// Defined here so the producer (WSAtomicBroadcast) and the consumer
+// (WSMemoryPlanner) share one source of truth for the name.
+constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
+    "ttg.atomic_broadcast_copies";
+
 enum class DataChannelKind : int {
   SMEM = 0,
   TMEM = 1,
@@ -191,6 +202,15 @@ struct TmemDataChannelPost : Channel {
   // finishes reading before the next iteration's tmem_store overwrites.
   // This is the reverse direction of the wrap-around data-flow channel.
   bool isSameIterGuard = false;
+  // For a collapsed chained-accumulator channel (multiple same-task MMA writers
+  // into one operand-D tile, first writer use_acc=false): the channel's forward
+  // commit comes from the LAST writer (getSrcOp), but the reuse/empty
+  // producer_acquire must be placed before the FIRST (fresh-overwrite) writer
+  // so the whole chain waits for the consumer's read of the previous iteration
+  // (mirrors TLX attn_bwd_ws_2kv: one dq_empties acquire before n0, one
+  // dq_fulls from n1). When set, insertAsyncComm relocates producer_acquire
+  // here.
+  Operation *acquireBeforeOp = nullptr;
   Operation *allocOp;
 
   // Can be produced by tmem_store or operand D of gen5, consumed by tmem_load

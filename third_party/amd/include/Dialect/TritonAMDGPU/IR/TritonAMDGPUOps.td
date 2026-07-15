@@ -585,7 +585,17 @@ def ScaledUpcastFp4Op : TT_AMDGPU_Op<"scaled_upcast_fp4", [Pure, DeclareOpInterf
     RankedTensorOf<[I8]>:$input,
     RankedTensorOf<[BF16, I8]>:$scale,
     I32Attr:$axis);
-  let results = (outs RankedTensorOf<[AnyTypeOf<[F16, BF16, F32]>]>:$output);
+  let results = (outs RankedTensorOf<[AnyTypeOf<[F16, BF16]>]>:$output);
+
+  let builders = [
+      OpBuilder<(ins "Value":$input, "Value":$scale, "Type":$elemType, "int32_t":$axis), [{
+        auto inputTy = cast<RankedTensorType>(input.getType());
+        auto resultTy = mlir::triton::gpu::inferFp4ToFpResultType(
+            inputTy, elemType, axis, $_state.location);
+        assert(succeeded(resultTy));
+        build($_builder, $_state, *resultTy, input, scale, axis);
+      }]>
+  ];
 
   let assemblyFormat = [{
     $input `scale` $scale attr-dict
@@ -616,7 +626,7 @@ def ScaledUpcastFp8Op : TT_AMDGPU_Op<"scaled_upcast_fp8", [
   let arguments = (ins
     RankedTensorOf<[AnyTypeOf<[F8E4M3FN, F8E5M2]>]>:$input,
     RankedTensorOf<[AnyTypeOf<[BF16, I8]>]>:$scale);
-  let results = (outs RankedTensorOf<[AnyTypeOf<[F16, BF16, F32]>]>:$output);
+  let results = (outs RankedTensorOf<[AnyTypeOf<[F16, BF16]>]>:$output);
 
   let assemblyFormat = [{
     $input `scale` $scale attr-dict
@@ -797,7 +807,7 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
   ];
 
   let assemblyFormat = [{
-    $desc `[` $indices `]` `into` $result `,` $pred (`,` `barrier` `=` $barrier^)?
+    $desc `[` $indices `]` `into` $result `,` `pred` `=` $pred (`,` `barrier` `=` $barrier^)?
     attr-dict `:` qualified(type($desc)) (`,` qualified(type($barrier))^)? `->` qualified(type($result))
   }];
 
@@ -904,12 +914,19 @@ def AsyncTDMGatherOp : TT_AMDGPU_Op<"async_tdm_gather"> {
     TensorOf<[I16, I32]>:$src_row_indices,
     I32:$src_col_offset,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-    Optional<TTG_MemDescType>:$barrier
+    I32:$pred,
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier
   );
   let results = (outs TTG_AsyncToken:$token);
 
+  let builders = [
+    OpBuilder<(ins "Value":$desc, "Value":$src_row_indices, "Value":$src_col_offset, "Value":$dst, "Value":$pred), [{
+      return build($_builder, $_state, desc, src_row_indices, src_col_offset, dst, pred, /*barrier=*/static_cast<mlir::Value>(nullptr));
+    }]>
+  ];
+
   let assemblyFormat = [{
-    $desc `[` $src_row_indices `,` $src_col_offset `]` `to` $dst (`,` `barrier` `=` $barrier^)?
+    $desc `[` $src_row_indices `,` $src_col_offset `]` `to` $dst `,` `pred` `=` $pred (`,` `barrier` `=` $barrier^)?
     attr-dict `:` qualified(type($src_row_indices)) `,` qualified(type($dst)) (`,` qualified(type($barrier))^)? `->` qualified(type($desc))
   }];
 

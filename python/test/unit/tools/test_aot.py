@@ -114,6 +114,10 @@ elif is_hip():
 #define __HIP_PLATFORM_AMD__
 #include <hip/hip_runtime.h>
 """
+else:
+    # No GPU during reactor-ci --list-only collection (ASAN host, CUDA disabled),
+    # so neither is_cuda() nor is_hip() is true; keep the module importable.
+    test_utils_src = ""
 
 test_utils_src += """
 #include <stdio.h>

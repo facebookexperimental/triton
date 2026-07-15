@@ -21,12 +21,8 @@ def v2_async_copy(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk,
     # Plain (unpadded) swizzled layouts — this step uses async copy but NOT yet
     # the bank-conflict-avoiding padded layout (that's v3). Specify them
     # explicitly so the compiler's padded-layout inference doesn't pad here.
-    layout_a: tl.constexpr = tlx.swizzled_shared_layout_encoding(vectorSize=1, perPhase=1, maxPhase=1, order=[1, 0],
-                                                                 numCTAs=[1, 1], numCTAsPerCGA=[1, 1],
-                                                                 numCTASplit=[1, 1], numCTAOrder=[1, 1])
-    layout_b: tl.constexpr = tlx.swizzled_shared_layout_encoding(vectorSize=1, perPhase=1, maxPhase=1, order=[0, 1],
-                                                                 numCTAs=[1, 1], numCTAsPerCGA=[1, 1],
-                                                                 numCTASplit=[1, 1], numCTAOrder=[1, 1])
+    layout_a: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[1, 0])
+    layout_b: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
     smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, 1, layout=layout_a)
     smem_b = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, 1, layout=layout_b)
 

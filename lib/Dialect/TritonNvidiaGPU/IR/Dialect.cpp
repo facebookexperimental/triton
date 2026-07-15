@@ -24,7 +24,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 
 #include <numeric>
 
@@ -432,12 +432,17 @@ LogicalResult TensorMemoryEncodingAttr::verify(
     return emitError() << "CGALayout must have rank 2";
   }
   if (twoCTAs) {
+    // twoCTAs does not imply a sharded accumulator: num_ctas>1 shards it across
+    // the cluster (block axis = [1,0]), while ctas_per_cga with num_ctas==1
+    // keeps it single-CTA (empty block axis). Only check the shard direction
+    // when a shard exists -- never getBasis() an empty axis.
     auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
     auto cgaLL = cgaLayout.getLinearLayout();
-    if (cgaLL.getBasis(kBlock, 0) != ArrayRef{1, 0}) {
+    if (cgaLL.hasInDim(kBlock) && cgaLL.getInDimSizeLog2(kBlock) >= 1 &&
+        cgaLL.getBasis(kBlock, 0) != ArrayRef{1, 0}) {
       return emitError()
-             << "twoCTAs layout requires the first CGALayout block basis to "
-                "be [1, 0]";
+             << "twoCTAs layout with a CTA shard requires the first CGALayout "
+                "block basis to be [1, 0]";
     }
   }
   if (blockM != 64 && blockM != 128) {

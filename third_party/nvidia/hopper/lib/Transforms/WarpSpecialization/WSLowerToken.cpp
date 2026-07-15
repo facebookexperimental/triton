@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 

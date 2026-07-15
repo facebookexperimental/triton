@@ -58,27 +58,68 @@ namespace {
 // mapping between global and shared memory addresses.
 int getNumberOfAsyncCopyInstructions(RankedTensorType globalType,
                                      ttg::MemDescType sharedType, Value mask,
-                                     int contig,
-                                     ModuleAxisInfoAnalysis &axisInfo) {
+                                     int ptrContig, int contigHint,
+                                     ModuleAxisInfoAnalysis &axisInfo,
+                                     const AMD::TargetInfo &targetInfo,
+                                     bool isStore) {
   LinearLayout globalLayout = tt::gpu::toLinearLayout(globalType);
-  LinearLayout sharedLayout;
-  if (auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(
-          sharedType.getEncoding())) {
-    sharedLayout = paddedEnc.getLinearComponent();
-  } else {
-    sharedLayout = triton::gpu::toLinearLayout(sharedType);
-  }
+  triton::LinearLayout sharedLayout =
+      triton::gpu::isPaddedEncoding(sharedType.getEncoding())
+          ? paddedLinearLayout(sharedType)
+          : toLinearLayout(sharedType);
   LinearLayout globalToSharedLayout =
       globalLayout.invertAndCompose(sharedLayout);
-  contig = std::min(contig, globalToSharedLayout.getNumConsecutiveInOut());
 
+  // If the warp dimension has free variables, not all warps execute this async
+  // copy — the lowering will predicate execution to canonical warps only (via
+  // emitRedundantThreadPredicate + emitBranch). Non-canonical warps branch over
+  // the buffer_load instructions entirely, so their vmcnt is not incremented.
+  auto kWarp = StringAttr::get(globalType.getContext(), "warp");
+  if (globalToSharedLayout.getFreeVariableMasks().lookup(kWarp) != 0) {
+    return 0;
+  }
+
+  // We progressively tighten the pointer contiguity to mirror the lowering of
+  // async ops, starting with the mask alignment.
   if (mask)
-    contig = std::min<int>(contig, axisInfo.getMaskAlignment(mask));
+    ptrContig = std::min<int>(ptrContig, axisInfo.getMaskAlignment(mask));
 
-  // Divide number of registers by contig to get the number of async intrinsics
-  int numberOfRegisters = globalToSharedLayout.getInDimSize(
-      StringAttr::get(globalType.getContext(), "register"));
-  return std::max(1, numberOfRegisters / contig);
+  // Ops may carry a contiguity hint that raises the contiguity beyond what
+  // the pointer and mask axis info analysis can prove.
+  ptrContig = std::max<int>(ptrContig, contigHint);
+
+  // The global-to-shared layout limits the consecutive elements which can be
+  // transferred by a single async intrinsic.
+  ptrContig =
+      std::min(ptrContig, globalToSharedLayout.getNumConsecutiveInOut());
+
+  // For padded layouts the padding interval limits the vectorization.
+  auto srcEnc = sharedType.getEncoding();
+  if (auto padEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(srcEnc)) {
+    ptrContig = std::min<int>(ptrContig, padEnc.getMinInterval());
+  }
+
+  // Divide number of registers by contig to get the number of async intrinsics.
+  // Strip zero bases from the register dimension first — a zero basis means
+  // multiple register indices map to the same offset, so no additional load
+  // instruction is generated.
+  auto kReg = StringAttr::get(globalType.getContext(), "register");
+  int numberOfRegisters =
+      globalToSharedLayout.removeZeroBasesAlongDim(kReg).getInDimSize(kReg);
+  int numInstructions = std::max(1, numberOfRegisters / ptrContig);
+
+  // When a given vector width is unsupported but half of it is, the store
+  // lowering splits each async store into two half-width stores.
+  if (isStore) {
+    int elemBitWidth = sharedType.getElementType().getIntOrFloatBitWidth();
+    int vecBits = ptrContig * elemBitWidth;
+    if (!targetInfo.supportsDirectFromLdsStoreBitWidth(vecBits) &&
+        targetInfo.supportsDirectFromLdsStoreBitWidth(vecBits / 2)) {
+      numInstructions *= 2;
+    }
+  }
+
+  return numInstructions;
 }
 
 // Return the number of generated intrinsics for async ops; 0 otherwise
@@ -92,7 +133,9 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
     int contig = LLVM::AMD::getVectorSize(copyOp.getSrc(), axisInfo);
     return getNumberOfAsyncCopyInstructions(
         cast<RankedTensorType>(copyOp.getSrc().getType()),
-        copyOp.getResult().getType(), copyOp.getMask(), contig, axisInfo);
+        copyOp.getResult().getType(), copyOp.getMask(), contig,
+        copyOp.getContiguity(), axisInfo, targetInfo,
+        /*isStore=*/false);
   } else if (auto bufferOp = dyn_cast<amdgpu::BufferLoadToLocalOp>(op)) {
     auto ptrType = cast<RankedTensorType>(LLVM::AMD::getPointerTypeWithShape(
         bufferOp.getPtr(), bufferOp.getOffsets()));
@@ -100,12 +143,13 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
                                           bufferOp.getOffsets(), axisInfo);
     return getNumberOfAsyncCopyInstructions(
         ptrType, bufferOp.getDest().getType(), bufferOp.getMask(), contig,
-        axisInfo);
+        bufferOp.getContiguity(), axisInfo, targetInfo, /*isStore=*/false);
   } else if (auto copyOp = dyn_cast<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getDst(), axisInfo);
     return getNumberOfAsyncCopyInstructions(
         cast<RankedTensorType>(copyOp.getDst().getType()),
-        copyOp.getSrc().getType(), copyOp.getMask(), contig, axisInfo);
+        copyOp.getSrc().getType(), copyOp.getMask(), contig,
+        copyOp.getContiguity(), axisInfo, targetInfo, /*isStore=*/true);
   } else if (emitRemarkOnNonAsyncOp) {
     SmallVector<mlir::MemoryEffects::EffectInstance> effects;
     if (auto memEffectIface = dyn_cast<MemoryEffectOpInterface>(op))
@@ -367,7 +411,7 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
   using Base::Base;
 
   void runOnOperation() override {
-    tt::AMD::TargetInfo targetInfo(archGenerationName);
+    tt::AMD::TargetInfo targetInfo(gfxArch);
     if (!isCDNA(targetInfo.getISAFamily()) &&
         targetInfo.getISAFamily() != tt::AMD::ISAFamily::GFX1250) {
       return;
@@ -420,9 +464,20 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
 
       auto v = [&]() -> int {
         using namespace triton::amdgpu;
-        // Load and store always emit 1 instrinsic
-        if (isa<AsyncTDMCopyGlobalToLocalOp, AsyncTDMCopyLocalToGlobalOp>(op)) {
-          return 1;
+        if (auto copyOp = dyn_cast<AsyncTDMCopyGlobalToLocalOp>(op)) {
+          auto smemTy = copyOp.getResult().getType();
+          int numWarps = ttg::lookupNumWarps(op);
+          auto [_, numInstr] =
+              mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+          return numInstr;
+        } else if (auto copyOp = dyn_cast<AsyncTDMCopyLocalToGlobalOp>(op)) {
+          auto smemTy = copyOp.getSrc().getType();
+          int numWarps = ttg::lookupNumWarps(op);
+          auto [_, numInstr] =
+              mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+          return numInstr;
         } else if (isa<AsyncTDMScatterOp, AsyncTDMGatherOp>(op)) {
           // For scatter and gather we need to get the count of TDM intrinsics
           // based on the row indices tensor type
