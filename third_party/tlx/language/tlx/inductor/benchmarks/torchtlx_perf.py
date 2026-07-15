@@ -229,42 +229,64 @@ def bench_shape(op, shape, dtype, providers, baseline, metrics, args):
     return results
 
 
-def print_results(shape, dtype_name, providers, results, metrics, simple):
-    M, N, K = shape
-    if simple:
+def _fmt_cell(rec, key):
+    if key == "tflops":
+        return f"{rec['tflops']:.1f}" if rec["tflops"] is not None else "n/a"
+    if key == "speedup":
+        return f"{rec['speedup']:.3f}x" if rec["speedup"] is not None else "n/a"
+    if key == "accuracy":
+        return rec["accuracy"] if rec["accuracy"] is not None else "-"
+    return ""
+
+
+def print_csv(rows, providers, dtype_name):
+    """Machine-readable CSV (one line per (shape, provider))."""
+    print("M,N,K,dtype,provider,tflops,speedup,accuracy")
+    for shape, results in rows:
+        M, N, K = shape
         for name in providers:
             rec = results[name]
             tflops = f"{rec['tflops']:.1f}" if rec["tflops"] is not None else "n/a"
             sp = f"{rec['speedup']:.3f}" if rec["speedup"] is not None else "n/a"
             acc = rec["accuracy"] if rec["accuracy"] is not None else ""
             print(f"{M},{N},{K},{dtype_name},{name},{tflops},{sp},{acc}")
-        return
 
-    print(f"\n=== M={M} N={N} K={K} dtype={dtype_name} ===")
-    cols = ["provider"]
-    if "tflops" in metrics:
-        cols.append("TFLOPS")
-    if "speedup" in metrics:
-        cols.append("speedup")
-    if "accuracy" in metrics:
-        cols.append("accuracy")
-    widths = {"provider": 16, "TFLOPS": 10, "speedup": 10, "accuracy": 26}
-    header = "".join(c.ljust(widths[c]) for c in cols)
-    print(header)
-    print("-" * len(header))
-    for name in providers:
-        rec = results[name]
-        row = [name.ljust(widths["provider"])]
-        if "tflops" in metrics:
-            v = f"{rec['tflops']:.1f}" if rec["tflops"] is not None else "n/a"
-            row.append(v.ljust(widths["TFLOPS"]))
-        if "speedup" in metrics:
-            v = f"{rec['speedup']:.3f}x" if rec["speedup"] is not None else "n/a"
-            row.append(v.ljust(widths["speedup"]))
-        if "accuracy" in metrics:
-            v = rec["accuracy"] if rec["accuracy"] is not None else "-"
-            row.append(v.ljust(widths["accuracy"]))
-        print("".join(row))
+
+def print_table(rows, providers, metrics, dtype_name):
+    """One aligned table across all shapes, with dynamic column widths."""
+    headers = ["M", "N", "K", "provider"]
+    metric_cols = [m for m in ("tflops", "speedup", "accuracy") if m in metrics]
+    labels = {"tflops": "TFLOPS", "speedup": "speedup", "accuracy": "accuracy"}
+    headers += [labels[m] for m in metric_cols]
+
+    # Build every row as a list of strings, then size columns to the widest cell.
+    table = []
+    for shape, results in rows:
+        M, N, K = shape
+        for name in providers:
+            rec = results[name]
+            cells = [str(M), str(N), str(K), name]
+            cells += [_fmt_cell(rec, m) for m in metric_cols]
+            table.append(cells)
+
+    ncol = len(headers)
+    widths = [len(headers[i]) for i in range(ncol)]
+    for cells in table:
+        for i in range(ncol):
+            widths[i] = max(widths[i], len(cells[i]))
+
+    def render(cells):
+        # numeric M/N/K right-aligned; everything else left-aligned.
+        out = []
+        for i, c in enumerate(cells):
+            out.append(c.rjust(widths[i]) if i < 3 else c.ljust(widths[i]))
+        return "  ".join(out).rstrip()
+
+    print(f"\n# dtype={dtype_name}")
+    print(render(headers))
+    print("-" * (sum(widths) + 2 * (ncol - 1)))
+    for cells in table:
+        print(render(cells))
 
 
 def resolve_shapes(args):
@@ -274,7 +296,7 @@ def resolve_shapes(args):
         return [(args.m, args.n, args.k)]
     if args.shapes:
         return shape_catalog.parse_shapes(args.shapes)
-    return shape_catalog.SHAPE_SETS[args.shape_set]
+    sys.exit("provide a shape: --m/--n/--k (single) or --shapes MxNxK,... (batch)")
 
 
 def main(argv=None):
@@ -294,7 +316,6 @@ def main(argv=None):
     p.add_argument("--k", type=int, default=None)
     # batch shape
     p.add_argument("--shapes", default=None, help="ad-hoc shapes: MxNxK,MxNxK,...")
-    p.add_argument("--shape-set", default="default", choices=list(shape_catalog.SHAPE_SETS.keys()))
     # torch_tlx knobs
     p.add_argument("--tlx-mode", dest="tlx_mode", default="force", choices=["allow", "force"])
     p.add_argument(
@@ -350,12 +371,16 @@ def main(argv=None):
         f"warmup={args.warmup} rep={args.rep}",
         file=sys.stderr,
     )
-    if args.simple_output:
-        print("M,N,K,dtype,provider,tflops,speedup,accuracy")
-
-    for shape in shapes:
+    rows = []
+    for i, shape in enumerate(shapes):
+        print(f"# [{i + 1}/{len(shapes)}] benchmarking M={shape[0]} N={shape[1]} K={shape[2]}", file=sys.stderr)
         results = bench_shape(op, shape, dtype, providers, args.baseline, metrics, args)
-        print_results(shape, args.precision, providers, results, metrics, args.simple_output)
+        rows.append((shape, results))
+
+    if args.simple_output:
+        print_csv(rows, providers, args.precision)
+    else:
+        print_table(rows, providers, metrics, args.precision)
 
     return 0
 
