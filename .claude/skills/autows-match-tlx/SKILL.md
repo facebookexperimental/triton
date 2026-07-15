@@ -90,6 +90,18 @@ grep -oE 'ttg.partition.types = \[[^]]*\]' "$G" | head -1   # e.g. [computation,
   `.llms/rules/partition-scheduler-bugs.md`.
 - `numStages >= 1` assert = a `num_stages=0` config reached meta-WS. autoWS needs
   `num_stages >= 1`.
+- **If autoWS is WRONG or DEADLOCKS: dump BOTH final ttgirs (TLX with meta-WS
+  off, autoWS with it on, separate processes) and run the `barrier-visualization`
+  skill on EACH, then diff them side by side.** TLX lowers to the same
+  `ttg.warp_specialize`/`wait_barrier`/`arrive_barrier`/`init_barrier` ops, so the
+  two are directly comparable at the mbarrier level. Diff cheapest-first:
+  per-partition `num_warps` + total (`<=16`); the `init_barrier` count histogram
+  (a barrier released by an N-warp partition must be `init N` — a TLX `init 4` vs
+  autoWS `init 1` on the same channel is a silent phase desync; but TLX's
+  CLC-persistent `clc_context` barrier `init num_consumers` has no autoWS analog,
+  don't mistake it for the bug); then per-channel arrive/wait/phase for each
+  reused/accumulator/reduction buffer (same-iteration-counter lockstep check).
+  Full recipe: `.../WarpSpecialization/docs/DebuggingAccuracyAndDeadlocks.md` §6.
 
 ## Step 3 - Compare against TLX (measure them SEPARATELY)
 

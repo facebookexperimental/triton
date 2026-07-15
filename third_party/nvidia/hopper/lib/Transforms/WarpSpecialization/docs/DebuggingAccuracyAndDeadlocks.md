@@ -93,6 +93,44 @@ explains later ones):
   `reuse=` aliasing; schedule = program order within each task; barriers =
   `tlx.alloc_barriers` + `barrier_wait`/`barrier_arrive`.
 
+> **Dump BOTH final TTGIRs and run `barrier-visualization` on each, then diff
+> them side by side.** This is the single most effective way to compare TLX vs
+> AutoWS synchronization — TLX lowers to the *same* `ttg.warp_specialize` +
+> `ttng.wait_barrier`/`arrive_barrier`/`init_barrier` ops AutoWS does, so the two
+> final TTGIRs are directly comparable at the mbarrier level (do NOT stop at the
+> Python/TLX-DSL vs compiler-IR mismatch). Get both with `TRITON_KERNEL_DUMP=1`
+> (run TLX with meta-WS **off** and AutoWS with it **on**, in separate processes —
+> see the skill). Then diff, cheapest-signal-first:
+> 1. **Partitions + per-partition `num_warps`** and total warp count (must be
+>    `<= 16`; AutoWS `optimize-partition-warps` can push a compute partition to 8
+>    and blow the budget where TLX uses `num_warps=4`).
+> 2. **`init_barrier` count histogram** (`grep -oE 'init_barrier %[^,]+, [0-9]+'`
+>    ... `sort | uniq -c`). A count-`N` barrier means `N` arrivers must complete a
+>    phase flip — so a barrier released by an `N`-warp partition must be `init N`,
+>    not 1. A per-channel init-count mismatch (TLX `init 4` vs AutoWS `init 1` on
+>    the same 4-warp-consumer channel) is a silent phase desync invisible to
+>    arrive/wait balancing. (Caveat: TLX's CLC-persistent kernels also carry a
+>    `clc_context` barrier `init num_consumers` that a non-persistent AutoWS
+>    kernel simply won't have — don't mistake that for the bug.)
+> 3. **Per-channel arrive/wait/phase — enumerate EVERY cross-partition channel,
+>    not just the new/suspect one.** Build the full channel inventory on both
+>    sides (`grep` the `wait_barrier`/`arrive_barrier` + their `WSBarrier`
+>    `{direction, dstTask, channelGraph}` and group by barrier), then for each
+>    channel (qk, p/dp, dv, dk, dq, and the load channels k/v/q/do) compare: which
+>    task arrives, which waits, forward vs backward edge present, the phase expr
+>    (continuous counter vs `~counter`), and whether producer/consumer derive the
+>    phase from the *same* iteration count (the lockstep check). A deadlock can
+>    sit in a channel a structural change *perturbed* (e.g. `merge_epilogue`
+>    moves dk/dv into the compute partition), not only the obviously-new one — a
+>    dq-only spot-check will miss it. A producer pipelined/peeled differently from
+>    its consumer (e.g. TLX's one-step `prev_blk_idx` producer + flat consumer vs
+>    an AutoWS flat producer + compiler-peeled consumer) breaks lockstep here.
+>
+> **Tip:** `ttgir2tlx` (`triton-opt --tlx-print-ttgir-to-tlx <final.ttgir>`, or
+> `TRITON_DUMP_TTGIR_TO_TLX=1`) rewrites each final TTGIR back into readable
+> TLX-Python (`tlx.barrier_wait`/`barrier_arrive`/`async_tma_reduce` per task), so
+> the two kernels land in the *same* form and the per-channel diff is a text diff.
+
 Then compare, in this **strict order** — do not move to the next level until the
 current one matches. Most of the value is in levels 1–2; get those right before
 touching synchronization:
