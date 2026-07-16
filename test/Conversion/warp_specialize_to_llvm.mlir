@@ -1207,7 +1207,7 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // non default warps arrive before jumping to switch loop
 // CHECK: llvm.inline_asm
-// CHECK-SAME: @!$0 barrier.cluster.arrive.aligned
+// CHECK-SAME: @!$0 barrier.cluster.arrive.relaxed.aligned
 // CHECK-NEXT: llvm.cond_br
 
 // default warps keep arrive/wait after bar init
@@ -1277,7 +1277,7 @@ llvm.mlir.global external @global_smem() {addr_space = 3 : i32, alignment = 16 :
 
 // Init: non-default warps arrive before the default/partition branch
 // CHECK: llvm.inline_asm
-// CHECK-SAME: @!$0 barrier.cluster.arrive.aligned
+// CHECK-SAME: @!$0 barrier.cluster.arrive.relaxed.aligned
 // CHECK-NEXT: llvm.cond_br
 
 // Cleanup: non-default warps arrive at partition end before looping back
