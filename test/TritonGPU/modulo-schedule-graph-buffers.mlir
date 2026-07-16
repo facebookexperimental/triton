@@ -4,7 +4,9 @@
 //===----------------------------------------------------------------------===//
 // Test: Buffer allocations and barrier pairing
 //   SMEM buffers for A (128x64xf16) and B (64x128xf16) tiles,
-//   TMEM buffer for accumulator (128x128xf32), each with paired barriers.
+//   TMEM buffer for accumulator (128x128xf32) with a paired barrier record;
+//   the SMEM tiles' producer/consumer sync surfaces as cross-group mbarriers
+//   (record consolidation folded their BARRIER alloc records away).
 //===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -15,37 +17,50 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- SMEM buffers: count=2, shapes match tiles, live=[start, end) per
-//     design doc §215 worked example. ---
-// CHECK: %buf0 = modulo.alloc SMEM [2 x 128x64 x f16]
+// --- SMEM buffers: count=1 under the honest latency model — the SMEM live
+//     ranges ([557,1146) and [587,1146)) fit inside a single II=1091, so no
+//     double-buffering is needed. Shapes match tiles, live=[start, end)
+//     (design doc §215 worked example predates the honest latency model). ---
+// CHECK: %buf0 = modulo.alloc SMEM [1 x 128x64 x f16]
 // CHECK-SAME: live=[
 // CHECK-SAME: bytes total
-// CHECK: %buf1 = modulo.alloc SMEM [2 x 64x128 x f16]
+// CHECK: %buf1 = modulo.alloc SMEM [1 x 64x128 x f16]
 // CHECK-SAME: live=[
 // CHECK-SAME: bytes total
 //
-// --- TMEM buffer: count=3 for accumulator ---
-// CHECK: %buf2 = modulo.alloc TMEM [3 x 128x128 x f32]
-// CHECK-SAME: live=[
-// CHECK-SAME: 196608 bytes total
+// --- TMEM buffer: count=2 for accumulator (live=[0,1678) spans two IIs of
+//     1091; 2 x 128x128 x f32 = 131072 bytes) ---
+// CHECK: %buf2 = modulo.alloc TMEM [2 x 128x128 x f32]
+// CHECK-SAME: live=[0, 1678)
+// CHECK-SAME: 131072 bytes total
 //
-// --- Paired barriers carry the same live interval as their data buffer ---
-// CHECK: %bar3 = modulo.alloc BARRIER [2] for buf0
-// CHECK-SAME: live=[
-// CHECK: %bar4 = modulo.alloc BARRIER [2] for buf1
-// CHECK-SAME: live=[
-// CHECK: %bar5 = modulo.alloc BARRIER [3] for buf2
-// CHECK-SAME: live=[
+// --- Paired barrier carries the same live interval as its data buffer
+//     (live=[0, 1678) matches buf2 above; barrier slot count 2 matches the
+//     buffer count). Record consolidation removed the per-SMEM-buffer
+//     BARRIER records — SMEM sync is checked as cross-group mbarriers at
+//     the bottom of this file. ---
+// CHECK: %bar3 = modulo.alloc BARRIER [2] for buf2
+// CHECK-SAME: live=[0, 1678)
 //
-// --- Producers: local_alloc → ->buf ---
-// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf0}
-// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf1}
+// --- Producers: local_alloc → ->buf (local_alloc is an infra op on the NONE
+//     pipe now; the TMA pipe is carried by the tt.descriptor_load) ---
+// CHECK: ttg.local_alloc  {pipe: NONE, {{.*}}->buf0}
+// CHECK: ttg.local_alloc  {pipe: NONE, {{.*}}->buf1}
 //
 // --- Consumer: MMA consumes all three buffers ---
 // CHECK: ttng.tc_gen5_mma  {pipe: TC, {{.*}}<-buf0, <-buf1, <-buf2}
 //
 // --- tmem_load consumes TMEM buffer ---
 // CHECK: ttng.tmem_load  {pipe: CUDA, {{.*}}<-buf2}
+//
+// --- SMEM buffers' producer→consumer pairing now surfaces as cross-group
+//     mbarriers: N3/N4 are the local_allocs (->buf0/->buf1), N6 the MMA;
+//     depth=1 matches the buffer count, expect = full tile bytes (16384).
+//     Warp-group ids are incidental to this test (near-tied partition
+//     candidates), so they are regexed. ---
+// CHECK: [PassB.2] Barrier: N3(wg{{[0-9]+}}) → N6(wg{{[0-9]+}}) mbarrier depth=1 {{.*}}expect=16384B
+// CHECK: [PassB.2] Barrier: N4(wg{{[0-9]+}}) → N6(wg{{[0-9]+}}) mbarrier depth=1 {{.*}}expect=16384B
+// CHECK: [PassB.2] Total cross-group barriers: 2
 tt.func @test_buffers(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
   %b_desc: !tt.tensordesc<tensor<64x128xf16>>

@@ -18,7 +18,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // Step 4.5: Merge first (before budget check — reduces memory footprint)
 // Step 4.6: Budget check passes (SMEM ~65KB << 232KB, TMEM ~196KB << 256KB)
 //
-// CHECK: [Step4.5] 6 buffers -> 3 physical groups
+// A/B operand SMEM (overlapping lifetimes) stay in separate groups; the TMEM
+// accumulator gets its own; the mbarrier record is excluded from merging.
+// CHECK: [Step4.5] 4 buffers -> 3 physical groups
 // CHECK: [Step4.6] Budget: SMEM {{[0-9]+}}/{{[0-9]+}} OK, TMEM {{[0-9]+}}/{{[0-9]+}} OK
 tt.func @test_budget_and_merge(
   %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
