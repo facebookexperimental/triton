@@ -3380,6 +3380,66 @@ public:
            << ctrlInt.end());
       for (auto t : allocsForThisLoop)
         LLVM_DEBUG(t.getOperation()->dump());
+
+      // ---- Test-only: run the unified group-level reuse predicate
+      // (orderReuseGroupChain) over EVERY candidate pair/triple of this loop's
+      // TMEM allocs and emit one CHECK-able verdict line each. This changes NO
+      // planning decision (observation only) — it is the fast-iteration harness
+      // for wiring the shared predicate into the planner (step 1 of the N-way
+      // reuse-grouping plan). Gated by TRITON_WS_MEM_PLAN_VERIFY_GROUPS so the
+      // default path is byte-identical (no regression by construction).
+      if (::getenv("TRITON_WS_MEM_PLAN_VERIFY_GROUPS")) {
+        // This loop's allocs that carry a TMEM channel, in a stable (index)
+        // order, each with a readable name for the verdict line. Scan by
+        // liveness interval rather than `allocsForThisLoop` so PRE-ASSIGNED
+        // (annotation-pinned) allocs — which are already in `handledAllocs` and
+        // thus dropped from `allocsForThisLoop` — are still observed. The
+        // hand-pinned {dpT,dsT,dq} fixtures pin every alloc, so without this
+        // the harness would see nothing there.
+        SmallVector<std::pair<Channel *, std::string>> members;
+        unsigned vIdx = 0;
+        for (auto alloc : allocs) {
+          auto allocInt = bufferRange.lookup(buffers[vIdx]);
+          ++vIdx;
+          bool inLoop = ctrlInt.intersects(allocInt) ||
+                        ctrlIdx == innermostLoops.size() - 1;
+          if (!inLoop)
+            continue;
+          auto it = allocToChannel.find(alloc.getOperation());
+          if (it == allocToChannel.end() || !it->second)
+            continue;
+          members.push_back({it->second, getLocName(alloc.getOperation())});
+        }
+        auto emit = [&](ArrayRef<unsigned> idxs) {
+          ReuseGroup g;
+          std::string names;
+          for (unsigned k : idxs) {
+            g.channels.push_back(members[k].first);
+            names += (names.empty() ? "" : ",") + members[k].second;
+          }
+          // Sound group-FORMATION gate: drop cross-partition program order so
+          // data-independent cross-partition siblings are not spuriously
+          // ordered (see hasDependencyChain / orderReuseGroupChain).
+          auto order = orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false);
+          llvm::errs() << "[ws-mem-plan-verify] group {" << names << "} => ";
+          if (order.empty()) {
+            llvm::errs() << "REJECT (no unique dependency-chain order)\n";
+          } else {
+            std::string ord;
+            for (auto *ch : order)
+              ord += (ord.empty() ? "" : "->") + getLocName(ch->getAllocOp());
+            llvm::errs() << "ACCEPT order=" << ord << "\n";
+          }
+        };
+        unsigned m = members.size();
+        for (unsigned i = 0; i < m; ++i)
+          for (unsigned j = i + 1; j < m; ++j) {
+            emit(SmallVector<unsigned, 3>{i, j});
+            for (unsigned k = j + 1; k < m; ++k)
+              emit(SmallVector<unsigned, 3>{i, j, k});
+          }
+      }
+
       // Check for per-loop tt.tmem_alloc_algo attribute on the forOp
       // or its parent ForOps (e.g., the WS loop wrapping the innermost
       // scheduled loop in persistent kernels).
