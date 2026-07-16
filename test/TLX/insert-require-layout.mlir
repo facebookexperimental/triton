@@ -294,3 +294,72 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     tt.return %dot0 : tensor<64x64xf32, #mma_5>
   }
 }
+
+// -----
+// A user-pinned shared alloc -- #tlx.user_layout wrapping a padded_shared -- is
+// a hard constraint: the author picked the exact LDS layout (e.g. to kill bank
+// conflicts), so InsertRequireLayout must NOT synthesize a memdesc-side
+// require_layout that overrides it, and must not crash querying getOrder on the
+// pinned wrapper (before this change getOrder on the #tlx.user_layout wrapper hit
+// report_fatal_error; it now unwraps PinnedEncodingTrait to the concrete layout).
+// Contrast with @async_copy_local_load_dot_uses_padded above, where the same
+// async producer *does* get a synthesized padded require_layout.
+
+#blocked_p = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_p = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#padded_p = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#user_p = #tlx.user_layout<#padded_p>
+#smem_p = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @user_pinned_alloc_not_overridden
+  // The pinned padded_shared reaches the local_load untouched -- no memdesc-side
+  // require_layout is inserted between the alloc and the load.
+  // CHECK-NOT: tlx.require_layout %{{.*}} -> !ttg.memdesc
+  tt.func public @user_pinned_alloc_not_overridden(
+      %ptrs: tensor<64x64x!tt.ptr<bf16>, #blocked_p>,
+      %lhs: tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma_p, kWidth = 4}>>,
+      %acc: tensor<256x64xf32, #mma_p>) -> tensor<256x64xf32, #mma_p> {
+    %c0_i32 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xbf16, #user_p, #smem_p, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<1x64x64xbf16, #user_p, #smem_p, mutable> -> !ttg.memdesc<64x64xbf16, #user_p, #smem_p, mutable>
+    %tok = ttg.async_copy_global_to_local %ptrs, %buf {contiguity = 8 : i32} : tensor<64x64x!tt.ptr<bf16>, #blocked_p> -> <64x64xbf16, #user_p, #smem_p, mutable>
+    %rhs = ttg.local_load %buf : !ttg.memdesc<64x64xbf16, #user_p, #smem_p, mutable> -> tensor<64x64xbf16, #blocked_p>
+    %rhs_dot = ttg.convert_layout %rhs : tensor<64x64xbf16, #blocked_p> -> tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma_p, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs_dot, %acc : tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma_p, kWidth = 4}>> * tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma_p, kWidth = 4}>> -> tensor<256x64xf32, #mma_p>
+    tt.return %dot : tensor<256x64xf32, #mma_p>
+  }
+}
+
+// -----
+// The headline capability: pin a *swizzled* padded_shared given as an explicit
+// {offset = ..., block = ...} linear component (row/col-permuted bases), NOT the
+// identity {order, shape} form above. This is the form `with_bases` emits, and
+// mirrors the Gluon a16w16 LDS layout (cf. the intra_wave/a16w16 kernel's
+// `a_shared`) that drops CDNA4 LDS bank conflicts to zero. Like the identity
+// case it must survive InsertRequireLayout untouched -- no synthesized memdesc
+// require_layout -- with getOrder unwrapping the pinned wrapper rather than
+// faulting on the {offset, block} form.
+
+#blocked_sw = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_sw = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#padded_sw = #ttg.padded_shared<[64:+4] {offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]], block = []}>
+#user_sw = #tlx.user_layout<#padded_sw>
+#smem_sw = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @user_pinned_swizzled_alloc_not_overridden
+  // The pinned swizzled padded_shared reaches the local_load untouched.
+  // CHECK-NOT: tlx.require_layout %{{.*}} -> !ttg.memdesc
+  tt.func public @user_pinned_swizzled_alloc_not_overridden(
+      %ptrs: tensor<64x64x!tt.ptr<bf16>, #blocked_sw>,
+      %lhs: tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma_sw, kWidth = 4}>>,
+      %acc: tensor<256x64xf32, #mma_sw>) -> tensor<256x64xf32, #mma_sw> {
+    %c0_i32 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x64x64xbf16, #user_sw, #smem_sw, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0_i32] : !ttg.memdesc<1x64x64xbf16, #user_sw, #smem_sw, mutable> -> !ttg.memdesc<64x64xbf16, #user_sw, #smem_sw, mutable>
+    %tok = ttg.async_copy_global_to_local %ptrs, %buf {contiguity = 8 : i32} : tensor<64x64x!tt.ptr<bf16>, #blocked_sw> -> <64x64xbf16, #user_sw, #smem_sw, mutable>
+    %rhs = ttg.local_load %buf : !ttg.memdesc<64x64xbf16, #user_sw, #smem_sw, mutable> -> tensor<64x64xbf16, #blocked_sw>
+    %rhs_dot = ttg.convert_layout %rhs : tensor<64x64xbf16, #blocked_sw> -> tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma_sw, kWidth = 4}>>
+    %dot = tt.dot %lhs, %rhs_dot, %acc : tensor<256x64xbf16, #ttg.dot_op<{opIdx = 0, parent = #mma_sw, kWidth = 4}>> * tensor<64x64xbf16, #ttg.dot_op<{opIdx = 1, parent = #mma_sw, kWidth = 4}>> -> tensor<256x64xf32, #mma_sw>
+    tt.return %dot : tensor<256x64xf32, #mma_sw>
+  }
+}

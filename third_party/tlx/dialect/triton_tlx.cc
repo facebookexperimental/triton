@@ -97,28 +97,35 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
            })
-      .def("create_require_layout",
-           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
-             Type newType;
-             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
-               // consider allocation type for subslice
-               SmallVector<int64_t> allocShape(type.getAllocShape());
-               if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
-                 allocShape.assign(type.getShape().begin(),
-                                   type.getShape().end());
-               newType = ttg::MemDescType::get(
-                   type.getShape(), type.getElementType(), encoding,
-                   type.getMemorySpace(), type.getMutableMemory(), allocShape);
-               return self.create<tlx::RequireLayoutOp>(newType, v);
-             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
-               newType = RankedTensorType::get(
-                   type.getShape(), type.getElementType(), tensorEncoding);
-               return self.create<tlx::RequireLayoutOp>(newType, v);
-             } else {
-               throw std::runtime_error("Unsupported type");
-             }
-           })
+      .def(
+          "create_require_layout",
+          [](TritonOpBuilder &self, Value &v, Attribute &encoding,
+             bool pinned) -> Value {
+            Type newType;
+            if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+              // consider allocation type for subslice
+              SmallVector<int64_t> allocShape(type.getAllocShape());
+              if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+                allocShape.assign(type.getShape().begin(),
+                                  type.getShape().end());
+              newType = ttg::MemDescType::get(
+                  type.getShape(), type.getElementType(), encoding,
+                  type.getMemorySpace(), type.getMutableMemory(), allocShape);
+              return self.create<tlx::RequireLayoutOp>(newType, v);
+            } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+              // pinned -> wrap as #tlx.user_layout (anchored; layout passes never
+              // rewrite it); otherwise wrap as #tlx.no_verify_layout.
+              Attribute tensorEncoding =
+                  pinned ? tlx::wrapUserLayout(encoding)
+                         : tlx::wrapNoVerifyLayout(encoding);
+              newType = RankedTensorType::get(
+                  type.getShape(), type.getElementType(), tensorEncoding);
+              return self.create<tlx::RequireLayoutOp>(newType, v);
+            } else {
+              throw std::runtime_error("Unsupported type");
+            }
+          },
+          py::arg("v"), py::arg("encoding"), py::arg("pinned") = false)
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
@@ -253,6 +260,35 @@ void init_triton_tlx_ir(py::module &&m) {
                  makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
+           })
+      .def("make_padded_shared_encoding_attr_with_bases",
+           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases, int rank) {
+             // Build #ttg.padded_shared from explicit linear bases ({offset,
+             // block}), so a caller can pin a swizzled layout, not just identity.
+             if (intervals.size() != paddings.size())
+               throw std::runtime_error(
+                   "make_padded_shared_encoding_attr_with_bases: intervals and "
+                   "paddings must have the same length");
+             auto context = self.getBuilder().getContext();
+             llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+             intervalPads.reserve(intervals.size());
+             for (auto [i, p] : llvm::zip(intervals, paddings))
+               intervalPads.emplace_back(i, p);
+             auto kOffset = mlir::StringAttr::get(context, "offset");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             tt::LinearLayout::BasesT bases;
+             bases[kOffset] = offsetBases;
+             bases[kBlock] = blockBases;
+             llvm::SmallVector<mlir::StringAttr> outDimNames;
+             for (int i = 0; i < rank; ++i)
+               outDimNames.push_back(
+                   mlir::StringAttr::get(context, "dim" + llvm::Twine(i)));
+             tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 context, intervalPads, std::move(ll)));
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,

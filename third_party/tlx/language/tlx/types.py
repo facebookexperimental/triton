@@ -210,7 +210,8 @@ class padded_shared_layout_encoding(shared_layout_encoding):
     ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
     """
 
-    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder):
+    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder, offset_bases=None,
+                 block_bases=None):
         super().__init__()
         assert len(intervals) == len(paddings), \
             "intervals and paddings must have the same length"
@@ -221,6 +222,44 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.numCTAsPerCGA = list(numCTAsPerCGA)
         self.numCTASplit = list(numCTASplit)
         self.numCTAOrder = list(numCTAOrder)
+        # When set, the layout is built from an explicit linear component
+        # (offset/block bases) instead of the identity {order, shape} form.
+        self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
+        self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
+
+    @staticmethod
+    @constexpr_function
+    def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):
+        """Build a padded_shared encoding with an explicit linear component.
+
+        Mirrors ``#ttg.padded_shared<[i:+p, ...] {offset = [...], block = [...]}>``.
+        ``offset_bases`` is a list of per-dim base vectors (one per offset bit),
+        e.g. ``[[0, 1], [0, 2], ..., [16, 0], [1, 0], ...]`` — this lets you pin
+        a swizzled (row/col-permuted) shared layout rather than the identity one.
+        """
+        rank = len(shape)
+        assert rank > 0, "shape must be non-empty"
+        assert len(offset_bases) > 0, "offset_bases must be non-empty"
+        for b in offset_bases:
+            assert len(b) == rank, \
+                f"each offset base vector must have length rank={rank}, got {len(b)}: {b}"
+        for b in (block_bases or []):
+            assert len(b) == rank, \
+                f"each block base vector must have length rank={rank}, got {len(b)}: {b}"
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        enc = padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+            offset_bases=[[int(x) for x in b] for b in offset_bases],
+            block_bases=[[int(x) for x in b] for b in (block_bases or [])],
+        )
+        return enc
 
     @staticmethod
     @constexpr_function
@@ -254,6 +293,14 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self.offset_bases is not None:
+            return builder.make_padded_shared_encoding_attr_with_bases(
+                self.intervals,
+                self.paddings,
+                self.offset_bases,
+                self.block_bases if self.block_bases is not None else [],
+                len(self.shape),
+            )
         return builder.make_padded_shared_encoding_attr(
             self.intervals,
             self.paddings,
@@ -462,6 +509,45 @@ def _flat_to_coord(flat, tensor_shape):
             dim_stride *= int(later)
         coord.append((flat // dim_stride) % int(tensor_shape[d]))
     return coord
+
+
+class distributed_linear_layout(layout_encoding):
+    """A user-specified distributed (register) layout given by **explicit linear
+    bases** — the direct analogue of Gluon's ``gl.DistributedLinearLayout``.
+
+    ``reg_bases`` / ``lane_bases`` / ``warp_bases`` are each a list of per-dim
+    base vectors (one per bit of register / lane / warp index), e.g.
+    ``reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]]``. ``block_bases`` is usually
+    ``[]`` (single CTA). Unlike :class:`layout` (CuTe shape/stride), this lets you
+    transcribe an explicit ``#ttg.linear`` layout verbatim — useful to pin the
+    offset-tensor layout of an AMD ``buffer_load_to_local`` so its direct-to-LDS
+    write matches a pinned swizzled shared layout.
+    """
+
+    def __init__(self, reg_bases, lane_bases, warp_bases, shape, block_bases=None):
+        super().__init__()
+        self.reg_bases = [[int(x) for x in b] for b in reg_bases]
+        self.lane_bases = [[int(x) for x in b] for b in lane_bases]
+        self.warp_bases = [[int(x) for x in b] for b in warp_bases]
+        self.block_bases = [[int(x) for x in b] for b in (block_bases or [])]
+        self.shape = [int(s) for s in shape]
+        rank = len(self.shape)
+        assert rank > 0, "shape must be non-empty"
+        for name, bases in (("reg_bases", self.reg_bases), ("lane_bases", self.lane_bases),
+                            ("warp_bases", self.warp_bases), ("block_bases", self.block_bases)):
+            for b in bases:
+                assert len(b) == rank, \
+                    f"each {name} vector must have length rank={rank}, got {len(b)}: {b}"
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type: tl.dtype = None):
+        if shape is not None and list(shape) != self.shape:
+            raise ValueError(f"distributed_linear_layout was built for shape {self.shape} "
+                             f"but applied to a tensor of shape {list(shape)}")
+        return builder.make_linear_encoding_attr(self.reg_bases, self.lane_bases, self.warp_bases, self.shape)
+
+    def __repr__(self):
+        return (f"distributed_linear_layout(reg={self.reg_bases}, lane={self.lane_bases}, "
+                f"warp={self.warp_bases}, shape={self.shape})")
 
 
 class layout(layout_encoding):

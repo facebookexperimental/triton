@@ -107,6 +107,7 @@ def buffer_load_to_local(
     mask=None,
     other=None,
     cache_modifier: str = "",
+    offset_layout=None,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -133,8 +134,20 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
+        offset_layout: Optional distributed (register) layout to pin on the
+            offset tensor (e.g. a tlx.distributed_linear_layout) so the
+            direct-to-LDS write matches a pinned swizzled shared layout on
+            `dest`.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    # Pin the offset layout right before the load (after all address math) so the
+    # direct-to-LDS write matches the swizzled shared layout without arith mismatch.
+    offset_layout = tl._unwrap_if_constexpr(offset_layout)
+    if offset_layout is not None:
+        enc = offset_layout.to_ir(_semantic.builder, offsets.shape, offsets.dtype)
+        off_handle = _semantic.builder.create_require_layout(offsets.handle, enc, True)
+        offsets = tl.tensor(off_handle, offsets.type)
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
