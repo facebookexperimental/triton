@@ -383,6 +383,25 @@ void mlir::triton::tlx::setClusterSyncKernelCleanupOnMod(Operation *op,
                   BoolAttr::get(module->getContext(), value));
 }
 
+bool mlir::triton::tlx::hasUserPostWsSync(Operation *op) {
+  assert(op != nullptr &&
+         "expecting nonnull op for checking user post-WS sync");
+  auto module = getModuleOp(op);
+  assert(module != nullptr && "expecting op nested in a module for checking "
+                              "user post-WS sync marker");
+  auto attr = module->getAttrOfType<BoolAttr>(AttrUserPostWsSyncName);
+  return attr != nullptr && attr.getValue();
+}
+
+void mlir::triton::tlx::setUserPostWsSyncOnMod(Operation *op, bool value) {
+  assert(op != nullptr && "expecting nonnull op for setting user post-WS sync");
+  auto module = getModuleOp(op);
+  assert(module != nullptr && "expecting op nested in a module for setting "
+                              "user post-WS sync marker");
+  module->setAttr(AttrUserPostWsSyncName,
+                  BoolAttr::get(module->getContext(), value));
+}
+
 bool mlir::triton::tlx::tlxIsClustered(Operation *op) {
   assert(op != nullptr && "expecting nonnull op for checking cluster dims");
   auto moduleOp = getModuleOp(op);
