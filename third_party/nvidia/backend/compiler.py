@@ -151,9 +151,6 @@ class CUDAOptions:
     minRegAutoWS: Optional[int] = 24
     maxRegAutoWS: Optional[int] = None
     pingpongAutoWS: bool = False
-    # Opt-in lower overhead path for the warp-specialize -> LLVM lowering,
-    # e.g. no SMEM based state id, no tailing register re-alloc etc.
-    single_warp_specialize: bool = False
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
     # maximum number of 32-bit registers used by one thread.
     maxnreg: Optional[int] = None
@@ -657,14 +654,6 @@ class CUDABackend(BaseBackend):
             mod.set_attr(
                 "ttg.max_reg_auto_ws",
                 ir.builder(mod.context).get_int32_attr(opt.maxRegAutoWS),
-            )
-
-        # Opt-in single warp-specialize fast path (see CUDAOptions). Read by the
-        # WS-to-LLVM lowering and shared-memory allocation.
-        if opt.single_warp_specialize:
-            mod.set_attr(
-                "ttg.single-warp-specialize",
-                ir.builder(mod.context).get_bool_attr(True),
             )
 
         # Add early TMA store lowering attribute. Default value is True.

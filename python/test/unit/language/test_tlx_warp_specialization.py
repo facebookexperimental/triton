@@ -744,16 +744,18 @@ def test_store_ws(device):
 @pytest.mark.skipif(not is_blackwell(), reason="single_warp_specialize lowering targets Blackwell")
 def test_single_warp_specialize(device):
     # A single warp_specialize op (captures the pointers/size): the `default`
-    # warp group computes x + y, one worker warp group computes a + b. Launching
-    # with single_warp_specialize=True sets the ttg.single-warp-specialize module
-    # attribute, which makes the warp-specialize -> LLVM lowering dispatch worker
-    # warps from `wid` (no SMEM state id / switch table) and reclaim the state
-    # SMEM.
+    # warp group computes x + y, one worker warp group computes a + b. Marking
+    # the async_tasks block `exclusive=True` makes the Fixup pass set the
+    # ttg.single-warp-specialize module attribute (after validating there is
+    # exactly one warp_specialize op), which makes the warp-specialize -> LLVM
+    # lowering dispatch worker warps from `wid` (no SMEM state id / switch table)
+    # and reclaim the state SMEM.
     @triton.jit
-    def add2_ws_kernel(x_ptr, y_ptr, z_ptr, a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    def add2_ws_kernel(x_ptr, y_ptr, z_ptr, a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: tl.constexpr,
+                       EXCLUSIVE: tl.constexpr):
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
-        with tlx.async_tasks():
+        with tlx.async_tasks(exclusive=EXCLUSIVE):
             with tlx.async_task("default"):
                 offs = block_start + tl.arange(0, BLOCK_SIZE)
                 mask = offs < n_elements
@@ -763,24 +765,23 @@ def test_single_warp_specialize(device):
                 mask = offs < n_elements
                 tl.store(c_ptr + offs, tl.load(a_ptr + offs, mask=mask) + tl.load(b_ptr + offs, mask=mask), mask=mask)
 
-    def run(single_warp_specialize):
+    def run(exclusive):
         torch.manual_seed(0)
         n = 98432
         x, y, a, b = (torch.rand(n, device=device) for _ in range(4))
         z, c = torch.empty_like(x), torch.empty_like(a)
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
-        compiled = add2_ws_kernel[grid](x, y, z, a, b, c, n, BLOCK_SIZE=1024,
-                                        single_warp_specialize=single_warp_specialize)
+        compiled = add2_ws_kernel[grid](x, y, z, a, b, c, n, BLOCK_SIZE=1024, EXCLUSIVE=exclusive)
         # Same result regardless of the dispatch strategy.
         torch.testing.assert_close(z, x + y, check_dtype=False)
         torch.testing.assert_close(c, a + b, check_dtype=False)
         return compiled
 
-    single = run(single_warp_specialize=True)
-    multi = run(single_warp_specialize=False)
+    single = run(exclusive=True)
+    multi = run(exclusive=False)
 
-    # The option is plumbed through to the module attribute, and there is exactly
-    # one warp_specialize op (a precondition of the fast path).
+    # The exclusive marker is propagated to the module attribute, and there is
+    # exactly one warp_specialize op (a precondition of the fast path).
     assert '"ttg.single-warp-specialize" = true' in single.asm["ttgir"]
     assert single.asm["ttgir"].count("ttg.warp_specialize(") == 1
     assert "single-warp-specialize" not in multi.asm["ttgir"]
