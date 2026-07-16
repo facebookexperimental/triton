@@ -1,5 +1,5 @@
 """Benchmark spec for case4 (FA bwd dK/dV 5-MMA) consumed by
-examples/testing/perf_engine.py.
+examples/testing/perf_regression/perf_harness.py.
 
 Launch logic mirrors perf_generated.py (generated) and handwritten.fa_bwd_dkdv_ws
 (reference). The kernel writes dK/dV directly and accumulates dQ via atomics,

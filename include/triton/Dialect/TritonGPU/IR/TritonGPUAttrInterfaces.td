@@ -38,6 +38,18 @@ def SharedEncodingTrait : AttrInterface<"SharedEncodingTrait"> {
 def DeclareSharedEncodingMethods : DeclareAttrInterfaceMethods<
   SharedEncodingTrait, ["getAlignment"]>;
 
+// Marker interface for encodings that the user pinned explicitly and that layout
+// passes must treat as fixed (e.g. an anchor in remove-layout-conversions). It
+// carries no methods; a layout attribute (such as TLX's UserLayoutAttr) advertises
+// itself as user-pinned by implementing this interface, so core TritonGPU passes
+// can recognize it without depending on the dialect that defines the wrapper.
+def PinnedEncodingTrait : AttrInterface<"PinnedEncodingTrait"> {
+  let cppNamespace = "::mlir::triton::gpu";
+  let description = [{
+    Marks an encoding as user-pinned: layout optimization must not rewrite it.
+  }];
+}
+
 def DistributedEncodingTrait : AttrInterface<"DistributedEncodingTrait"> {
   let cppNamespace = "::mlir::triton::gpu";
 

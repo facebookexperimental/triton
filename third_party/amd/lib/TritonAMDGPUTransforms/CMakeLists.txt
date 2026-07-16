@@ -31,6 +31,7 @@ add_triton_library(TritonAMDGPUTransforms
   TritonAMDGPUIR
   TritonAMDGPUTransformsIncGen
   TritonGPUIR
+  TritonGPUModuloCore
   TritonAMDUtils
   TritonAMDAnalysis
 )

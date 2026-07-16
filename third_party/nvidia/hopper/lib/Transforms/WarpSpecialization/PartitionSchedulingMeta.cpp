@@ -39,10 +39,76 @@ inline bool isEpilogueStoreOp(Operation *op) {
              ttng::TMAStoreTokenWaitOp>(op);
 }
 
+// A TMAStoreTokenWaitOp that waits on an async_tma_reduce / descriptor_reduce.
+// Such a wait must live in the SAME partition as its reduce (the reduction
+// partition), not the epilogue-store partition: otherwise doCodePartitionPost
+// clones the reduce into the store partition to satisfy the mis-placed wait,
+// reducing e.g. reduce_dq into global twice (double-count / stale-staging
+// garbage). See T279388065.
+inline bool isReduceTokenWait(Operation *op) {
+  if (!isa<ttng::TMAStoreTokenWaitOp>(op))
+    return false;
+  for (Value v : op->getOperands())
+    if (Operation *d = v.getDefiningOp())
+      if (isa<DescriptorReduceOp, ttng::AsyncTMAReduceOp>(d))
+        return true;
+  return false;
+}
+
 /// Check if an operation is an MMA-like operation (MMAv5 or WarpGroupDot).
 /// Used for backward slice analysis and data partition detection.
 inline bool isMMAOp(Operation *op) {
   return isa<ttng::MMAv5OpInterface>(op) || isa<ttng::WarpGroupDotOp>(op);
+}
+
+/// Return a stable identity for an MMAv5 op's accumulator buffer: the backing
+/// tensor-memory allocation (tracing through memdesc view/index ops), or null
+/// for non-MMAv5 ops (e.g. Hopper WarpGroupDot, whose accumulator lives in
+/// registers). Two MMAv5 ops that resolve to the same buffer share a
+/// tensor-memory accumulator and therefore form a serial reduction chain
+/// (e.g. dq += K0^T·dS0 then dq += K1^T·dS1 into one dq tile). Such MMAs must
+/// not be placed in different warp-specialization partitions: concurrent
+/// accumulating MMAs into one accumulator race on the shared tile.
+inline Operation *getAccumulatorBuffer(Operation *op) {
+  auto mma = dyn_cast<ttng::MMAv5OpInterface>(op);
+  if (!mma)
+    return nullptr;
+  Value acc = mma.getAccumulator();
+  while (acc) {
+    Operation *def = acc.getDefiningOp();
+    if (!def)
+      return nullptr; // block/iter arg — no static buffer identity here
+    if (isa<ttng::TMEMAllocOp>(def))
+      return def; // backing allocation: canonical buffer identity
+    // Trace ONLY through region-preserving, metadata-only views (same tile,
+    // same offset), so the identity is stable across them. Restrict to the
+    // known view ops instead of "any op whose operand 0 is a memdesc": an op
+    // with several memdesc inputs would otherwise be traversed by blindly
+    // following operand 0 and yield a wrong identity.
+    if (isa<triton::gpu::MemDescTransOp, triton::gpu::MemDescReinterpretOp>(
+            def)) {
+      acc = def->getOperand(0);
+      continue;
+    }
+    // Offset-selecting views (memdesc_index) alias the SAME allocation at a
+    // DIFFERENT offset: two such views are DISJOINT sub-tiles, not one shared
+    // accumulator. Do NOT trace to the backing alloc — that would collapse
+    // distinct offsets and falsely group (or hard-error in the Layer-2
+    // backstop) independent sub-accumulators. Use the view op itself as the
+    // identity: the same view value => the same tile; different offset ops =>
+    // different identities.
+    if (isa<triton::gpu::MemDescIndexOp>(def))
+      return def;
+    // Unrecognized producer: do NOT guess an identity. A wrong guess could
+    // fabricate an aliasing pair (false backstop error) or, if two distinct
+    // ops alias the same tile, silently miss a real one. Bail conservatively
+    // (no known buffer) and log so the shape can be handled explicitly.
+    LDBG("getAccumulatorBuffer: unrecognized accumulator producer, no buffer "
+         "identity: "
+         << *def);
+    return nullptr;
+  }
+  return nullptr;
 }
 
 /// Strip all warp specialization annotations from a function.
@@ -538,6 +604,26 @@ private:
       }
     }
 
+    // Accumulator-chained MMAs must share a data-partition group. Two MMAs
+    // whose accumulators alias the same tensor-memory buffer form a serial
+    // reduction (e.g. dq += K0^T·dS0 then dq += K1^T·dS1 into one dq tile).
+    // The forward walk above stops at MMAs and never sees this dependency (it
+    // flows through the accumulator memdesc/token, not an SSA result operand),
+    // so without this the two dq dots would be counted as independent groups
+    // and split across partitions, racing on the shared accumulator. Union
+    // MMAs that write the same accumulator buffer so they stay together.
+    DenseMap<Operation *, unsigned> accBufToMma;
+    for (unsigned i = 0; i < n; ++i) {
+      Operation *buf = getAccumulatorBuffer(loopMmas[i]);
+      if (!buf)
+        continue;
+      auto it = accBufToMma.find(buf);
+      if (it == accBufToMma.end())
+        accBufToMma[buf] = i;
+      else
+        unite(i, it->second);
+    }
+
     // Count distinct groups that have exclusive (non-shared) ops
     DenseSet<unsigned> groupsWithExclusiveOps;
     for (unsigned i = 0; i < n; ++i) {
@@ -750,12 +836,26 @@ private:
     }
   }
 
+  // Pick the category for an epilogue-store-like op. A TMAStoreTokenWaitOp must
+  // be co-located with the store/reduce it waits on: when it waits on an
+  // async_tma_reduce/descriptor_reduce (categorized TMAReduction -> reduction
+  // partition, e.g. the reduce_dq store_reduce), categorize it TMAReduction
+  // too. Otherwise it is routed to the epilogue-store partition while the
+  // reduce stays in the reduction partition; doCodePartitionPost then CLONES
+  // the reduce into the store partition to satisfy the mis-placed wait, so the
+  // dq is reduced into global twice (double-count / stale-staging garbage).
+  // T279388065.
+  static OpCategory epilogueStoreCategoryFor(Operation *op) {
+    return isReduceTokenWait(op) ? OpCategory::TMAReduction
+                                 : OpCategory::EpilogueStore;
+  }
+
   void categorizeEpilogueStores() {
     // Collect stores inside the loops.
     for (auto loop : loops) {
       loop.walk([&](Operation *op) {
         if (isEpilogueStoreOp(op))
-          addCategorizedOp(op, OpCategory::EpilogueStore);
+          addCategorizedOp(op, epilogueStoreCategoryFor(op));
       });
     }
     // Also collect stores AFTER the main loop in the parent block (e.g., bwd
@@ -771,7 +871,7 @@ private:
         continue;
       }
       if (afterLoop && isEpilogueStoreOp(&op)) {
-        addCategorizedOp(&op, OpCategory::EpilogueStore);
+        addCategorizedOp(&op, epilogueStoreCategoryFor(&op));
       }
     }
   }
@@ -1533,7 +1633,12 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
     // post-lowering AsyncTMACopyLocalToGlobalOp)
     for (auto loop : loops) {
       loop.walk([&](Operation *op) {
-        if (isEpilogueStoreOp(op))
+        // A reduce's token_wait belongs in the reduction partition with its
+        // reduce (see isReduceTokenWait); do NOT pull it into the epilogue
+        // partition here, or doCodePartitionPost clones the reduce into the
+        // epilogue to satisfy the wait -> double reduce (T279388065). Phase 5's
+        // TMAReduction scheduling places it in the reduction partition.
+        if (isEpilogueStoreOp(op) && !isReduceTokenWait(op))
           tryScheduleOp(epiloguePartition, op);
       });
     }
@@ -2770,6 +2875,74 @@ void PartitionSchedulingMeta::runOnOperation() {
         }
       }
 
+      // Backstop: verify no two accumulator-chained MMAs were assigned to
+      // partitions that cannot be co-located. The data-partition grouping
+      // (Layer 1) should keep them together, but any other assignment path
+      // (preassignment/flex) that splits a shared tensor-memory accumulator
+      // would silently corrupt the reduction — concurrent accumulating MMAs
+      // race on the shared tile. Turn that into a hard compile error.
+      //
+      // All MMAs that write one accumulator are co-locatable iff a SINGLE
+      // partition is common to every one of them, i.e. the intersection of all
+      // their partition-id sets is non-empty. Comparing each MMA only against
+      // the first-seen set is both unsound and over-eager for chains of 3+:
+      // e.g. {0,1},{0,2},{0,3} share partition 0 (fine) but pairwise-vs-first
+      // would need care, while {0,1},{0,2},{2,3} has empty overall intersection
+      // (no common partition) yet every pair overlaps. So track the RUNNING
+      // intersection across all MMAs writing the same buffer and error the
+      // moment it empties. Store the first writer to point the diagnostic at
+      // it.
+      DenseMap<Operation *, std::pair<Operation *, SetVector<int>>> accOwner;
+      auto idsToStr = [](const SetVector<int> &ids) {
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        llvm::interleaveComma(ids, os);
+        return os.str();
+      };
+      WalkResult vr = loop.walk([&](Operation *op) -> WalkResult {
+        Operation *buf = getAccumulatorBuffer(op);
+        if (!buf)
+          return WalkResult::advance();
+        SetVector<int> ids = safeGetPartitionIds(op);
+        if (ids.empty())
+          return WalkResult::advance();
+        auto it = accOwner.find(buf);
+        if (it == accOwner.end()) {
+          accOwner[buf] = {op, ids};
+          return WalkResult::advance();
+        }
+        Operation *firstWriter = it->second.first;
+        SetVector<int> &running = it->second.second;
+        // Narrow the running intersection by this MMA's partition set.
+        SetVector<int> next;
+        for (int id : running)
+          if (ids.contains(id))
+            next.insert(id);
+        if (next.empty()) {
+          InFlightDiagnostic diag =
+              op->emitError()
+              << "warp specialization assigned accumulator-chained MMAs with "
+                 "no "
+                 "common partition (running intersection {"
+              << idsToStr(running) << "} does not meet this MMA's {"
+              << idsToStr(ids)
+              << "}): they all accumulate into the same tensor-memory tile. "
+                 "Concurrent accumulating MMAs into one accumulator race and "
+                 "produce incorrect results. Co-locate them in a single "
+                 "partition (lower data_partition_factor) or give each "
+                 "partition its own accumulator and reduce at the end.";
+          diag.attachNote(firstWriter->getLoc())
+              << "first accumulator-chained MMA writing this tensor-memory "
+                 "tile "
+                 "is here";
+          return WalkResult::interrupt();
+        }
+        running = std::move(next);
+        return WalkResult::advance();
+      });
+      if (vr.wasInterrupted())
+        return signalPassFailure();
+
       // Estimate total warps for the WS schedule. If the estimate exceeds
       // the hardware warp limit, skip WS for the entire function.
       constexpr int kMaxWarps = 16;
@@ -2800,7 +2973,12 @@ void PartitionSchedulingMeta::runOnOperation() {
       for (auto [id, warps] : partitionWarps)
         estimatedTotal += warps;
 
-      LDBG("Warp budget estimate: " << estimatedTotal << " / " << kMaxWarps);
+      LDBG("Warp budget estimate: " << estimatedTotal << " / " << kMaxWarps
+                                    << " (numPartitions=" << numPartitions
+                                    << ", defaultNumWarps=" << defaultNumWarps
+                                    << ")");
+      for (auto [id, warps] : partitionWarps)
+        LDBG("  [budget] partition " << id << " warps=" << warps);
 
       if (estimatedTotal > kMaxWarps) {
         LDBG("Warp budget exceeded. Skipping warp specialization.");

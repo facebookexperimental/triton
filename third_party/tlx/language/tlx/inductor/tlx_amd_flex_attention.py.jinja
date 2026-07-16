@@ -1,0 +1,258 @@
+{{def_kernel("Q", "K", "V", "LSE", "MAX", "KV_NUM_BLKS", "KV_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX")}}
+    # tlx_amd_flex_attention: TLX AMD (CDNA4 / gfx950) FlexAttention forward kernel.
+    #
+    # Single-task (no warp specialization: MI350 has no WS) online-softmax FA with
+    # the FlexAttention scaffolding shared with the Blackwell template — block-sparse
+    # KV iteration, score_mod/mask_mod via modification() macros, logsumexp/max.
+    # AMD compute engine:
+    #   * K/V staged to LDS via tlx.async_load (K and V committed in ONE group),
+    #   * Q@K^T through tlx.local_trans + MFMA tl.dot,
+    #   * P@V through MFMA tl.dot, accumulated in registers.
+    # No TMEM / TMA / tcgen05 (Blackwell-only).
+
+    tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
+    tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
+
+    stride_qz, stride_qh, stride_qm, stride_qk = {{stride("Q")}}
+    stride_kz, stride_kh, stride_kn, stride_kk = {{stride("K")}}
+    stride_vz, stride_vh, stride_vn, stride_vk = {{stride("V")}}
+
+    ZQ = {{size("Q", 0)}}
+    HQ = {{size("Q", 1)}}
+    Q_LEN = {{size("Q", 2)}}
+    ZKV = {{size("K", 0)}}
+    KV_LEN = {{size("K", 2)}}
+
+    MATMUL_PRECISION = Q.dtype.element_ty
+
+    q_start = tl.program_id(0).to(INDEX_DTYPE)
+    off_zq = tl.program_id(1).to(INDEX_DTYPE)
+    off_hq = tl.program_id(2).to(INDEX_DTYPE)
+
+    off_zkv = off_zq % ZKV
+    off_hkv = off_hq // GQA_SHARED_HEADS
+    off_g = off_hq % GQA_SHARED_HEADS
+
+    q_offset = off_zq * stride_qz + off_hq * stride_qh
+    k_offset = off_zkv * stride_kz + off_hkv * stride_kh
+    v_offset = off_zkv * stride_vz + off_hkv * stride_vh
+
+    Q = Q + q_offset
+    K = K + k_offset
+    V = V + v_offset
+
+    # Sparse block setup (identical to the Blackwell template)
+    SPARSE_Z = {{size("KV_NUM_BLKS", 0)}}
+    SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
+    sparse_idx_z = off_zq % SPARSE_Z
+    sparse_idx_hq = off_hq % SPARSE_HQ
+    SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+    SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
+    stride_kv_num_blks_h = {{stride("KV_NUM_BLKS", 1)}}
+    stride_kv_idx_h = {{stride("KV_IDX", 1)}}
+    stride_kv_idx_m = {{stride("KV_IDX", 2)}}
+    sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
+    sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
+    sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
+
+    # ===================== CONSTANTS =====================
+    NUM_KV_BUFFERS: tl.constexpr = 2
+    RCP_LN2: tl.constexpr = 1.44269504  # log2(e): change of base for exp2 softmax
+
+    offs_m = q_start * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, QK_HEAD_DIM_ROUNDED)
+    offs_vd = tl.arange(0, V_HEAD_DIM_ROUNDED)
+
+    # ---- Load Q tile into registers ----
+    q = tl.load(
+        Q + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk,
+        mask=(offs_m[:, None] < Q_LEN) & (offs_d[None, :] < QK_HEAD_DIM),
+        other=0.0,
+    )
+
+    # ---- LDS staging buffers for K / V ----
+    k_tiles = tlx.local_alloc((BLOCK_N, QK_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
+    v_tiles = tlx.local_alloc((BLOCK_N, V_HEAD_DIM_ROUNDED), MATMUL_PRECISION, NUM_KV_BUFFERS)
+
+    # ---- Softmax accumulators (registers) ----
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, V_HEAD_DIM_ROUNDED], dtype=tl.float32)
+
+    qk_scale = SM_SCALE
+
+    # ===================== NORMAL BLOCKS (score_mod AND mask_mod) =====================
+    kv_indices = KV_IDX + sparse_kv_idx_offset
+    kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE
+    kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+    block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+    offs_n = kv_start + tl.arange(0, BLOCK_N)
+    buf = 0
+    for _sn in range(0, block_n_end):
+        # Stage K/V for this block into LDS. Commit K and V in ONE group: separate
+        # groups + wait_group(0) mis-syncs the LDS reads on gfx950 (garbage/NaN).
+        k_ptrs = K + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        v_ptrs = V + offs_n[:, None] * stride_vn + offs_vd[None, :] * stride_vk
+        if IS_DIVISIBLE:
+            tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, buf))
+            tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf))
+        else:
+            tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, buf),
+                                   mask=offs_n[:, None] < KV_LEN)
+            tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf),
+                                   mask=offs_n[:, None] < KV_LEN)
+        tlx.async_load_commit_group([tok_k, tok_v])
+        wait = tlx.async_load_wait_group(0)
+
+        kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, buf)), token=wait, relaxed=True)
+        qk = tl.dot(q, kt)
+
+        qk = qk * qk_scale
+        m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
+        n = get_bounded_indices(offs_n[None, :], KV_LEN if not IS_DIVISIBLE else None)
+
+        {{ modification(
+            subgraph_number=0,
+            output_name="post_mod_scores",
+            score="qk",
+            b="off_zq",
+            h="off_hq",
+            m="m",
+            n="n",
+            out="qk"
+        ) | indent_except_first(2) }}
+
+        if not IS_DIVISIBLE:
+            post_mod_scores = tl.where(offs_n[None, :] < KV_LEN, post_mod_scores, float("-inf"))
+
+        {{ modification(
+            subgraph_number=1,
+            output_name="mask_mod_output",
+            score="qk",
+            b="off_zq",
+            h="off_hq",
+            m="m",
+            n="n",
+        ) | indent_except_first(2) }}
+
+        if not IS_DIVISIBLE:
+            mask_mod_output = tl.where(offs_n[None, :] < KV_LEN, mask_mod_output, False)
+        post_mod_scores = tl.where(mask_mod_output, post_mod_scores, float("-inf"))
+        post_mod_scores = post_mod_scores * RCP_LN2
+
+        # Online softmax update
+        m_ij = tl.maximum(m_i, tl.max(post_mod_scores, 1))
+        if not ROWS_GUARANTEED_SAFE:
+            m_ij_masked = tl.where(m_ij == float("-inf"), 0, m_ij)
+        else:
+            m_ij_masked = m_ij
+        alpha = tl.math.exp2(m_i - m_ij_masked)
+        p = tl.math.exp2(post_mod_scores - m_ij_masked[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None]
+
+        v = tlx.local_load(tlx.local_view(v_tiles, buf), token=wait, relaxed=True)
+        acc = tl.dot(p.to(MATMUL_PRECISION), v, acc)
+        m_i = m_ij
+
+        offset = get_offset_for_next_block(
+            _sn, kv_indices, kv_num_blocks,
+            SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
+        )
+        offs_n = offs_n + offset
+        buf = (buf + 1) % NUM_KV_BUFFERS
+
+    # ===================== FULL BLOCKS (score_mod ONLY, skip mask_mod) =====================
+    if HAS_FULL_BLOCKS:
+        fkv_indices = FULL_KV_IDX + sparse_kv_idx_offset
+        fkv_start = tl.load(fkv_indices) * SPARSE_KV_BLOCK_SIZE
+        fkv_num_blocks = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
+        fblock_n_end = tl.minimum(fkv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+        offs_n = fkv_start + tl.arange(0, BLOCK_N)
+
+        for _sn in range(0, fblock_n_end):
+            k_ptrs = K + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+            v_ptrs = V + offs_n[:, None] * stride_vn + offs_vd[None, :] * stride_vk
+            if IS_DIVISIBLE:
+                tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, buf))
+                tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf))
+            else:
+                tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_tiles, buf),
+                                       mask=offs_n[:, None] < KV_LEN)
+                tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_tiles, buf),
+                                       mask=offs_n[:, None] < KV_LEN)
+            tlx.async_load_commit_group([tok_k, tok_v])
+            wait = tlx.async_load_wait_group(0)
+
+            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_tiles, buf)), token=wait, relaxed=True)
+            qk = tl.dot(q, kt)
+
+            qk = qk * qk_scale
+            m = get_bounded_indices(offs_m[:, None], Q_LEN if not IS_DIVISIBLE else None)
+            n = get_bounded_indices(offs_n[None, :], KV_LEN if not IS_DIVISIBLE else None)
+
+            {{ modification(
+                subgraph_number=0,
+                output_name="post_mod_scores",
+                score="qk",
+                b="off_zq",
+                h="off_hq",
+                m="m",
+                n="n",
+                out="qk"
+            ) | indent_except_first(3) }}
+
+            if not IS_DIVISIBLE:
+                post_mod_scores = tl.where(offs_n[None, :] < KV_LEN, post_mod_scores, float("-inf"))
+
+            post_mod_scores = post_mod_scores * RCP_LN2
+
+            m_ij = tl.maximum(m_i, tl.max(post_mod_scores, 1))
+            if not ROWS_GUARANTEED_SAFE:
+                m_ij_masked = tl.where(m_ij == float("-inf"), 0, m_ij)
+            else:
+                m_ij_masked = m_ij
+            alpha = tl.math.exp2(m_i - m_ij_masked)
+            p = tl.math.exp2(post_mod_scores - m_ij_masked[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+
+            v = tlx.local_load(tlx.local_view(v_tiles, buf), token=wait, relaxed=True)
+            acc = tl.dot(p.to(MATMUL_PRECISION), v, acc)
+            m_i = m_ij
+
+            offset = get_offset_for_next_block(
+                _sn, fkv_indices, fkv_num_blocks,
+                SPARSE_KV_BLOCK_SIZE, SPARSE_KV_MULTIPLE, BLOCK_N, BLOCKS_ARE_CONTIGUOUS
+            )
+            offs_n = offs_n + offset
+            buf = (buf + 1) % NUM_KV_BUFFERS
+
+    # ===================== EPILOGUE: normalize + store =====================
+    l_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    acc = acc / l_safe[:, None]
+
+    idx_zq = off_zq
+    idx_hq = off_hq
+    idx_m = offs_m[:, None].to(INDEX_DTYPE)
+    idx_d = offs_vd[None, :].to(INDEX_DTYPE)
+    mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
+    {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask", val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"))}}
+
+    if OUTPUT_LOGSUMEXP:
+        off_hz = off_zq * HQ + off_hq
+        l_ptrs = LSE + off_hz * Q_LEN + offs_m
+        lse = tl.where(m_i == float("-inf"), float("-inf"), m_i + tl.math.log2(l_safe))
+        if IS_DIVISIBLE:
+            tl.store(l_ptrs, lse)
+        else:
+            tl.store(l_ptrs, lse, mask=offs_m < Q_LEN)
+
+    if OUTPUT_MAX:
+        off_hz = off_zq * HQ + off_hq
+        max_ptrs = MAX + off_hz * Q_LEN + offs_m
+        if IS_DIVISIBLE:
+            tl.store(max_ptrs, m_i)
+        else:
+            tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)

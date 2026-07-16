@@ -660,6 +660,17 @@ class CompiledKernel:
             plain_function = self.function
             acf_module, acf_function, _, _, _ = driver.active.utils.load_binary(self.name, acf_cubin,
                                                                                 self.metadata.shared, device)
+            # Force-apply knob (default off): install the ACF twin without running the plain-vs-ACF
+            # competition. Production keeps the no-regression A/B; smoke tests set this so a store HIT
+            # deterministically applies regardless of in-process measurement noise.
+            if os.environ.get("TRITON_COMPILE_IQ_FORCE_APPLY"):
+                self.module, self.function, self.kernel = acf_module, acf_function, acf_cubin
+                self.asm["cubin"] = acf_cubin
+                self._build_dispatcher()
+                if os.environ.get("TRITON_COMPILE_IQ_DEBUG"):
+                    print(f"[compile_iq.freewin] {self.name}: FORCE-APPLY -> kept acf "
+                          "(competition skipped)", flush=True)
+                return
             bargs = tuple(bound_args.values())
 
             def _call(func):

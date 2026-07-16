@@ -1,4 +1,4 @@
-"""Benchmark spec for case3 (Flash-Attention fwd) consumed by examples/testing/perf_engine.py.
+"""Benchmark spec for case3 (Flash-Attention fwd) consumed by examples/testing/perf_regression/perf_harness.py.
 
 Launch logic mirrors perf_generated_vs_handwritten.py (gen + hw side by side).
 """

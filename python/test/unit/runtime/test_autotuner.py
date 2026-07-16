@@ -6,7 +6,7 @@ import pytest
 
 import pathlib
 import uuid
-from triton._internal_testing import is_cuda
+from triton._internal_testing import is_cuda, is_hip_cdna2
 from triton.runtime import autotuner as _autotuner
 
 
@@ -85,6 +85,7 @@ def test_restore(pass_kwargs_to_kernel, device):
     triton.testing.assert_close(src, torch.ones_like(src))
 
 
+@pytest.mark.skipif(is_hip_cdna2(), reason="Hit LLVM assertion in splitLiveThroughBlock")
 def test_hooks(device):
     # Autotuner's pre- and post- hooks should be called the same number of times
     N = 4096
@@ -104,7 +105,7 @@ def test_hooks(device):
         assert values["counter"] == 0
 
     @triton.autotune(configs=configs, key=['N'], do_bench=do_bench, pre_hook=_pre_hook, post_hook=_post_hook)
-    @triton.heuristics({"N_STAGES": lambda nargs: 100 if nargs['N'] == 4096 else 4})
+    @triton.heuristics({"N_STAGES": lambda nargs: 64 if nargs['N'] == 4096 else 4})
     @triton.jit
     def _kernel(src, N, N_STAGES: tl.constexpr, BLOCK_SIZE: tl.constexpr):
         offsets = tl.arange(0, BLOCK_SIZE)
@@ -117,8 +118,7 @@ def test_hooks(device):
     _kernel[(1, )](src, N)
 
     # On NVIDIA GPUs:
-    # The tuning knob `num_stages` can be set by users.
-    # This will cause out of resources when N_STAGES = 100
+    # This will cause out of resources when N_STAGES = 64
     # shared memory bytes = N_STAGES * BLOCK_SIZE * sizeof(float)
     # On AMD GPUs:
     # `num_stages` is a fixed value of 2, so it won't cause out of resources

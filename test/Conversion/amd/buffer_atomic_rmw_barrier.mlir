@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --allocate-amdgpu-shared-memory --convert-triton-amdgpu-to-llvm="arch=gfx1250" | FileCheck %s
+// RUN: triton-opt %s --allocate-amdgpu-shared-memory --convert-triton-amdgpu-to-llvm="gfx-arch=gfx1250" | FileCheck %s
 
 // XFAIL: *
 // Deferred to the AMD-backend owner (cherry-pick 6440b589d / upstream #9605 test).

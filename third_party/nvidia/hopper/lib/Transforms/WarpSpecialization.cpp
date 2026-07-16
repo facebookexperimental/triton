@@ -5,6 +5,7 @@
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/WarpSpecializationPipeline.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -14,6 +15,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
+#include "triton/Tools/Sys/Dump.h"
 #include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "nvgpu-warp-specialization"
@@ -40,27 +42,6 @@ static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   return applyPatternsGreedily(op, std::move(patterns));
 }
 
-int doTaskIdPropagate(triton::FuncOp &funcOp);
-// Cross-partition run-once atomic support. Returns failure() when an atomic
-// forces a graceful warp-specialization reject (kernel already de-specialized).
-LogicalResult doAtomicBroadcast(triton::FuncOp funcOp, int tilePrefetchDepth);
-LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
-                              StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
-                              bool smemCircularReuse = false);
-void doBufferAllocation(triton::FuncOp &funcOp);
-void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
-void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
-void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
-void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
-void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
-                    int capability, int defaultNumStages);
-void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
-                    int capability);
-void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
-void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
-void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
 void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
   namespace ttng = triton::nvidia_gpu;
   namespace nvws = triton::nvws;
@@ -151,7 +132,7 @@ public:
     llvm::dbgs() << "\n\n\n";
   }
 
-  void runOnFuncOp(triton::FuncOp funcOp, int defaultNumStages) {
+  void runOnFuncOp(triton::FuncOp funcOp) {
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
       if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
@@ -209,24 +190,26 @@ public:
     }
     dumpAfter(moduleOp, "doTaskIdPropagate");
 
-    // Cross-partition run-once atomic support: classify each side-effecting
-    // atomic and either pass it through (single-partition), transform it into a
-    // run-once + SMEM broadcast (all-partition scalar loop-carried counter), or
-    // gracefully bail out of warp specialization (unsupported shape). On a
-    // reject we strip all WS metadata via removeWarpSpecializeAttr (which now
-    // also clears the `async_task_id`s that doTaskIdPropagate materialized
-    // above) so downstream sees a plain, compilable non-WS kernel. The
-    // broadcast channel depth comes from the `tile-prefetch-depth` pass option
-    // (a Python knob), not an env var.
-    if (failed(doAtomicBroadcast(funcOp, tilePrefetchDepth))) {
-      LDBG("Atomic broadcast rejected warp specialization. Skipping.");
+    // Cross-partition run-once, loop-carried "claim the next tile" support for
+    // dynamic-persistent kernels. Handles both the `tt.atomic_rmw` tile counter
+    // and the CLC tile-scheduler fetch (`ttng.clc_read`) with the same idea:
+    // run the claim once in the owner/producer partition and broadcast the
+    // loop-carried result(s) to every partition through SMEM, or gracefully
+    // bail out of warp specialization (unsupported shape). On a reject we strip
+    // all WS metadata via removeWarpSpecializeAttr (which also clears the
+    // `async_task_id`s that doTaskIdPropagate materialized above) so downstream
+    // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
+    // from the `tile-prefetch-depth` pass option (a Python knob), not an env
+    // var.
+    if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth))) {
+      LDBG("Dynamic tile broadcast rejected warp specialization. Skipping.");
       removeWarpSpecializeAttr(funcOp);
       return;
     }
-    dumpAfter(moduleOp, "doAtomicBroadcast");
+    dumpAfter(moduleOp, "doDynamicTileBroadcast");
 
     if (pingpongAutoWS) {
-      doPingPongPrep(funcOp, numWarpGroups, capability, defaultNumStages);
+      doPingPongPrep(funcOp, numWarpGroups, capability, numStages);
       dumpAfter(moduleOp, "doPingPongPrep");
     }
 
@@ -285,7 +268,7 @@ public:
     triton::gpu::doLoopSchedulePreprocessing(moduleOp, builder);
     dumpAfter(moduleOp, "doLoopSchedulePreprocessing");
 
-    triton::gpu::scheduleLoops(moduleOp, defaultNumStages, true);
+    triton::gpu::scheduleLoops(moduleOp, numStages, true);
     dumpAfter(moduleOp, "doLoopSchedule");
 
     doLowerRemainingSubtiledRegions(funcOp);
@@ -301,8 +284,7 @@ public:
 
   void runOnOperation() override {
     assert(numStages >= 1 && "numStages must be at least 1");
-    getOperation()->walk(
-        [&](triton::FuncOp funcOp) { runOnFuncOp(funcOp, numStages); });
+    getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });
 
     // Cleanup code generated by warp specialization.
     if (failed(cleanupWarpSpecializedLoops(getOperation())))

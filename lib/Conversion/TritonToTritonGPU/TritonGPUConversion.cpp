@@ -113,27 +113,28 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::nvidia_gpu::WarpGroupDotWaitOp,
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
-      triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
-      triton::amdgpu::BufferLoadToLocalOp>([&](Operation *op) -> bool {
-    // make sure every RankedTensorType operand has encoding
-    for (auto operandType : op->getOperandTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+      triton::tlx::DumpLayoutOp, triton::amdgpu::BufferLoadOp,
+      triton::amdgpu::BufferStoreOp, triton::amdgpu::BufferLoadToLocalOp>(
+      [&](Operation *op) -> bool {
+        // make sure every RankedTensorType operand has encoding
+        for (auto operandType : op->getOperandTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(operandType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
-      }
-    }
 
-    // make sure result type has encoding if it is RankedTensorType
-    for (auto resultType : op->getResultTypes()) {
-      if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
-        if (rankedTensorType.getEncoding() == nullptr) {
-          return false;
+        // make sure result type has encoding if it is RankedTensorType
+        for (auto resultType : op->getResultTypes()) {
+          if (auto rankedTensorType = dyn_cast<RankedTensorType>(resultType)) {
+            if (rankedTensorType.getEncoding() == nullptr) {
+              return false;
+            }
+          }
         }
-      }
-    }
-    return true;
-  });
+        return true;
+      });
 
   addDynamicallyLegalOp<triton::FuncOp>([](triton::FuncOp funcOp) -> bool {
     for (auto arg : funcOp.getArguments()) {
