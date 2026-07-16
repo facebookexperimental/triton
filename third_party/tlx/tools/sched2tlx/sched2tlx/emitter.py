@@ -5932,6 +5932,12 @@ def emit(graph: ScheduleGraph) -> str:
         lines += f"RECOMMENDED_MAXNREG = {graph.launch_hints['maxnreg']}"
         lines += (f"RECOMMENDED_GRID_MULTIPLIER = "
                   f"{graph.launch_hints['grid_multiplier']}")
+        # The derivation is trusted to ±1 CTA/SM: candidates bracket the
+        # recommendation so a sweep harness can measure and pick instead of
+        # betting on the closed form. Each entry: {"occupancy", "maxnreg",
+        # "grid_multiplier"}.
+        if cands := graph.launch_hints.get("occupancy_candidates"):
+            lines += f"RECOMMENDED_OCC_CANDIDATES = {cands!r}"
     lines += ""
     _kernel_sig_lines(graph, lines)
 

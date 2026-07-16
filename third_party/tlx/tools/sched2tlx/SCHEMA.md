@@ -12,7 +12,11 @@ not need the original IR or any out-of-band context.
   "kernel": { ... },
   "ops": { "<id>": { ... }, ... },
   "launch_hints": { "memory_bound": true, "total_warps": 12,
-                    "maxnreg": 56, "grid_multiplier": 4 },
+                    "maxnreg": 56, "grid_multiplier": 4, "occupancy": 3,
+                    "occupancy_candidates": [
+                      { "occupancy": 2, "maxnreg": 80, "grid_multiplier": 3 },
+                      { "occupancy": 3, "maxnreg": 56, "grid_multiplier": 4 },
+                      { "occupancy": 4, "maxnreg": 40, "grid_multiplier": 5 } ] },
   "loops": [ { ... }, ... ]
 }
 ```
@@ -21,16 +25,25 @@ not need the original IR or any out-of-band context.
 - `ops` — flat **table** (string id → op record) of every op the emitter may
   need: function-scope (preamble/epilogue) ops AND in-loop scheduled ops.
 - `launch_hints` — OPTIONAL; present only for memory-bound warp-specialized
-  kernels (no MMA in the module, ≥1 TMA node, ≥2 warp groups). Without a
-  maxnreg cap the WS lowering auto-fills the full register file, pinning
-  residency at 1 CTA/SM — right for TC-bound kernels, wrong for memory-bound
-  ones. `maxnreg` = regs/thread sized for 3 co-resident CTAs given
-  `total_warps` (default WG + non-default WGs padded to 4-warp groups);
-  `grid_multiplier` = persistent-grid scale (× NUM_SMS). The emitter forwards
-  these as `RECOMMENDED_MAXNREG` / `RECOMMENDED_GRID_MULTIPLIER` module
-  constants in the generated kernel; launchers pass `maxnreg=` and scale the
-  grid. Measured on B200 case6 LayerNorm: 3161 → 6185 GB/s (parity with the
-  hand-written reference) with no kernel-body change.
+  kernels (no MMA in the module, ≥1 TMA node, ≥2 warp groups) whose derived
+  co-residency target exceeds 1. Without a maxnreg cap the WS lowering
+  auto-fills the full register file, pinning residency at 1 CTA/SM — right
+  for TC-bound kernels, wrong for memory-bound ones. `occupancy` = the
+  derived CTAs/SM target: ceil(B_sm × L_mem / bytesPerIter) (the co-residency
+  at which the loop's TMA traffic saturates one SM's share of HBM bandwidth),
+  capped by what SMEM/TMEM/warps/the maxnreg floor admit. `maxnreg` =
+  regs/thread sized for that many co-resident CTAs given `total_warps`
+  (default WG + non-default WGs padded to 4-warp groups); `grid_multiplier` =
+  persistent-grid scale (× NUM_SMS), occupancy + 1 (one tail wave).
+  `occupancy_candidates` brackets the derivation (±1 CTA/SM, clamped to the
+  admissible range) — the static formula is only trusted to ±1, so a sweep
+  harness should measure the candidates and pick. The emitter forwards these
+  as `RECOMMENDED_MAXNREG` / `RECOMMENDED_GRID_MULTIPLIER` /
+  `RECOMMENDED_OCC_CANDIDATES` module constants in the generated kernel;
+  launchers pass `maxnreg=` and scale the grid. Measured on B200 case6
+  LayerNorm (M=262144, best grid per occupancy): occ=1 3161, occ=2 5731,
+  occ=3 6153, occ=4 5749 GB/s — the derived occ=3 is the measured optimum,
+  at parity with the hand-written reference.
 - `loops` — each scheduled loop's schedule graph (nodes + edges) plus its
   bounds and induction variable.
 

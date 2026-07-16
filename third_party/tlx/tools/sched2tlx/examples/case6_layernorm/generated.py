@@ -9,6 +9,7 @@ import triton.language.extra.tlx as tlx
 # Launch hints from the modulo pass (memory-bound kernel).
 RECOMMENDED_MAXNREG = 56
 RECOMMENDED_GRID_MULTIPLIER = 4
+RECOMMENDED_OCC_CANDIDATES = [{'occupancy': 2, 'maxnreg': 80, 'grid_multiplier': 3}, {'occupancy': 3, 'maxnreg': 56, 'grid_multiplier': 4}, {'occupancy': 4, 'maxnreg': 40, 'grid_multiplier': 5}]
 
 @triton.jit
 def layernorm_fwd_nows(

@@ -234,7 +234,10 @@ class ScheduleGraph:
     loops: list[Loop]
     # Optional launch hints from the modulo pass (present only for
     # memory-bound WS kernels): {"memory_bound": true, "maxnreg": N,
-    # "grid_multiplier": M, "total_warps": W}. See SCHEMA.md.
+    # "grid_multiplier": M, "total_warps": W, "occupancy": O,
+    # "occupancy_candidates": [{"occupancy", "maxnreg", "grid_multiplier"},
+    # ...]}. maxnreg/grid_multiplier are the derived-occupancy pick; the
+    # candidates bracket it (±1 CTA/SM) for a sweep harness. See SCHEMA.md.
     launch_hints: dict[str, Any] | None = None
 
 

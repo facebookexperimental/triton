@@ -136,6 +136,15 @@ static void getTMATile(Operation *op, int64_t &totalBytes,
   }
 }
 
+// Total bytes moved by a TMA op, from the same tile geometry the latency
+// tables are keyed on. Exposed (LatencyModel.h) for the occupancy
+// derivation's bytes-per-iteration; 0 for shapeless ops.
+int64_t getTMATransferBytes(Operation *op) {
+  int64_t totalBytes, innerBytes;
+  getTMATile(op, totalBytes, innerBytes);
+  return std::max<int64_t>(totalBytes, 0);
+}
+
 // A source TMA op lowers to ceil(innerBytes/512) hardware cp.async.bulk.tensor
 // instructions (the box inner dim caps at 512 bytes); the outer (M) dim is not
 // split. Verified by PTX instruction counting on B200 (latency_model study).
