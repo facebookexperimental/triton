@@ -1,16 +1,26 @@
-"""Accuracy harness for the ported HSTU SELF-attention kernels (MetaMain2 OSS).
+"""Accuracy + perf harness for the ported HSTU SELF-attention kernels (MetaMain2 OSS).
 
 Variants:
   * triton - hammer-template Triton self-attn (triton_hstu_mha), fwd+bwd. Trusted ref.
   * tlx    - hand-written TLX warp-specialized self-attn (tlx_bw_hstu_mha), Blackwell.
+  * autows - the SAME triton_hstu_mha compiled under meta-WS (HSTU_SELF_AUTOWS=1) +
+             the TLX-matching dq-reduce bwd config (BM=BN=128, ns=2, TMEM reuse,
+             mem-plan search).
 
-Checks fwd output + dq/dk/dv grads:
-  - triton vs a torch-float HSTU-SiLU reference (both causal and non-causal, to
-    identify which masking the kernel uses),
+Accuracy (--acc, default): checks fwd output + dq/dk/dv grads
+  - triton vs a torch-float HSTU-SiLU reference (both causal and non-causal),
   - tlx vs triton (the byte-ish correctness check; same hammer math).
 
+Perf (--perf): fwd + bwd latency per variant via triton.testing.do_bench, N-rep
+  mean/std, and speedup vs TLX (mirrors hstu_cross_attn/bench_bwd.py run_perf).
+  Because autoWS (meta-WS on; HSTU_SELF_AUTOWS is a tl.constexpr baked at import)
+  cannot share a process with TLX (TLX asserts under meta-WS), EACH variant is
+  timed in its OWN subprocess with the right env, and this parent tabulates.
+
 Usage (from this dir, on a Blackwell GPU):
-  CUDA_VISIBLE_DEVICES=1 ~/.conda/envs/metamain2/bin/python bench_self.py
+  CUDA_VISIBLE_DEVICES=1 ~/.conda/envs/metamain2/bin/python bench_self.py            # accuracy
+  CUDA_VISIBLE_DEVICES=1 ~/.conda/envs/metamain2/bin/python bench_self.py --perf --nrep 5
+  ... --perf --variants autows,tlx --seqlens 512,1024,4096 --batch 2
 """
 import os
 import sys
@@ -95,8 +105,8 @@ def grads(run, q, k, v, so, L, asc, do, **kw):
     return out.detach(), q.grad.clone(), k.grad.clone(), v.grad.clone()
 
 
-def main():
-    for (L, Z) in [(256, 4), (512, 2)]:
+def run_accuracy(shapes):
+    for (L, Z) in shapes:
         print(f"\n=== L={L} Z={Z} H={H} D={D} ===")
         torch.manual_seed(0)
         q, k, v, do, so, asc = make(L, Z)
@@ -126,6 +136,131 @@ def main():
                 print(line)
             except Exception as e:
                 print(f"  tlx(causal={causal}) ERROR {type(e).__name__}: {str(e)[:120]}")
+
+
+# ---- perf ---------------------------------------------------------------
+# Per-variant env applied BEFORE the child imports the kernel (autoWS flags are
+# tl.constexpr baked at import). "autows" uses the TLX-matching dq-reduce config.
+_PERF_ENV = {
+    "triton": {},
+    "tlx": {},
+    "autows": {
+        "HSTU_SELF_AUTOWS": "1", "HSTU_SELF_DQ_REDUCE": "1", "HSTU_SELF_DQ_REUSE": "1",
+        "HSTU_SELF_DP": "1", "HSTU_SELF_AUTOWS_BWD_BM": "128", "HSTU_SELF_AUTOWS_BWD_BN": "128",
+        "HSTU_SELF_AUTOWS_BWD_STAGES": "2", "HSTU_SELF_AUTOWS_WARPS": "4",
+        "HSTU_SELF_PIN": "1", "HSTU_SELF_DQ_ITERS": "4", "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+    },
+}
+
+
+def _bench_one(variant, L, Z, nrep):
+    """Time fwd + bwd of ONE variant in THIS process (env already set by parent).
+    Prints a machine-parseable PERF line."""
+    import statistics
+    torch.manual_seed(0)
+    q, k, v, do, so, asc = make(L, Z)
+    run = run_tlx if variant == "tlx" else run_triton  # triton & autows share triton_hstu_mha
+    kw = {"causal": True} if variant == "tlx" else {}
+    meta_ws = variant == "autows"
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = meta_ws
+        triton.knobs.nvidia.disable_wsbarrier_reorder = True
+        fwd = lambda: run(q, k, v, so, L, asc, **kw)  # noqa: E731
+        out = fwd()  # warm / compile / autotune
+        torch.cuda.synchronize()
+        fwd_s = [triton.testing.do_bench(fwd, warmup=25, rep=100) for _ in range(nrep)]
+
+        def bwd():
+            for t in (q, k, v):
+                t.grad = None
+            out.backward(do, retain_graph=True)
+
+        bwd()  # warm
+        bwd_s = [triton.testing.do_bench(bwd, warmup=25, rep=100) for _ in range(nrep)]
+    fm, bm = statistics.mean(fwd_s), statistics.mean(bwd_s)
+    fsd = statistics.stdev(fwd_s) if len(fwd_s) > 1 else 0.0
+    bsd = statistics.stdev(bwd_s) if len(bwd_s) > 1 else 0.0
+    print(f"PERF {variant} L={L} Z={Z} fwd={fm:.4f} fwd_sd={fsd:.4f} bwd={bm:.4f} bwd_sd={bsd:.4f}")
+
+
+def run_perf(shapes, variants, nrep=1, timeout=1800):
+    """Time each variant's fwd+bwd in its own subprocess and tabulate (speedup vs tlx)."""
+    import re
+    import subprocess
+
+    print(f"\n=== Perf (self-attn fwd/bwd latency, nrep={nrep}) "
+          f"— each variant in its own process ===")
+    for (L, Z) in shapes:
+        print(f"\n  L={L} Z={Z} H={H} D={D} tokens={Z * L}")
+        hdr = f"  {'variant':<10}{'fwd ms':>10}{'bwd ms':>10}"
+        hdr += f"{'fwd sd':>9}{'bwd sd':>9}" if nrep > 1 else f"{'fwd/tlx':>9}{'bwd/tlx':>9}"
+        print(hdr)
+        rows = []
+        for var in variants:
+            env = dict(os.environ)
+            env.update(_PERF_ENV[var])
+            try:
+                r = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__), "--bench-one", var,
+                     str(L), str(Z), str(nrep)],
+                    env=env, capture_output=True, text=True, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"  {var:<10} TIMEOUT/HANG")
+                continue
+            m = re.search(r"PERF \S+ L=\d+ Z=\d+ fwd=(\S+) fwd_sd=(\S+) bwd=(\S+) bwd_sd=(\S+)",
+                          r.stdout)
+            if not m:
+                tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or ["(no output)"]
+                print(f"  {var:<10} ERROR: {tail[0][:70]}")
+                continue
+            fm, fsd, bm, bsd = map(float, m.groups())
+            rows.append((var, fm, fsd, bm, bsd))
+        tlx = next((x for x in rows if x[0] == "tlx"), None)
+        for var, fm, fsd, bm, bsd in rows:
+            if nrep > 1:
+                print(f"  {var:<10}{fm:>10.4f}{bm:>10.4f}{fsd:>9.4f}{bsd:>9.4f}")
+            else:
+                fx = f"{tlx[1] / fm:.2f}x" if tlx and fm else "-"
+                bx = f"{tlx[3] / bm:.2f}x" if tlx and bm else "-"
+                print(f"  {var:<10}{fm:>10.3f}{bm:>10.3f}{fx:>9}{bx:>9}")
+
+
+def main():
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--perf", action="store_true", help="run the fwd/bwd latency benchmark")
+    ap.add_argument("--acc", action="store_true", help="run the accuracy check (default)")
+    ap.add_argument("--nrep", type=int, default=1,
+                    help="do_bench repetitions per point; >1 reports mean + std")
+    ap.add_argument("--variants", default="autows,tlx,triton",
+                    help="comma subset of autows,tlx,triton (perf)")
+    ap.add_argument("--seqlens", default=None, help="comma L list, e.g. 256,512,1024,4096")
+    ap.add_argument("--batch", type=int, default=None, help="batch Z (default 2)")
+    # hidden per-variant subprocess entry: --bench-one <variant> <L> <Z> <nrep>
+    ap.add_argument("--bench-one", nargs=4, default=None, help=argparse.SUPPRESS,
+                    metavar=("VARIANT", "L", "Z", "NREP"))
+    args = ap.parse_args()
+
+    if args.bench_one:
+        var, L, Z, nrep = args.bench_one
+        _bench_one(var, int(L), int(Z), int(nrep))
+        return
+
+    Z = args.batch if args.batch is not None else 2
+    if args.seqlens:
+        shapes = [(int(x), Z) for x in args.seqlens.split(",")]
+    else:
+        shapes = [(256, 4), (512, 2)] if args.batch is None else [(256, Z), (512, Z)]
+
+    do_acc = args.acc or not args.perf
+    do_perf = args.perf or not args.acc
+    if do_acc:
+        run_accuracy(shapes)
+    if do_perf:
+        variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+        run_perf(shapes, variants, nrep=args.nrep)
 
 
 if __name__ == "__main__":
