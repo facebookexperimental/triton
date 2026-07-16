@@ -7,7 +7,7 @@
 #include "JointSolverScheduler.h"
 
 #include "ExhaustiveScheduler.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"

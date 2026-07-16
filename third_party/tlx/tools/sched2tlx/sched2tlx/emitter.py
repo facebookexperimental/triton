@@ -3696,7 +3696,7 @@ def _emit_warp_group(
     # enclosing (function) scope. Re-materialize any function-scope register
     # tensors this WG consumes (e.g. case6 v2's W/B loads) with task-local
     # names; restore the global bindings after the body. No-op if none.
-    _reg_loc_saved = _localize_captured_reg_tensors(g, loop, emit_nodes, rctx, lines)
+    _reg_loc_saved = _localize_captured_reg_tensors(g, [loop], emit_nodes, rctx, lines)
 
     if True:
         lo = _render_operand(loop.schedule.lower_bound, rctx)
@@ -5233,7 +5233,7 @@ def _result_is_register_tensor(op: Op) -> bool:
 
 def _localize_captured_reg_tensors(
     g: ScheduleGraph,
-    loop: Loop,
+    loops: list[Loop],
     target_nodes: list[Node],
     rctx: RenderCtx,
     lines: _Lines,
@@ -5260,7 +5260,10 @@ def _localize_captured_reg_tensors(
     # IV-INVARIANT preamble tensors (case4 v2:
     # `tl.load(D + (tile_id + range_12))` capturing the preamble `tl.arange`).
     bound_ids = {
-        n.op_ref for n in loop.schedule.nodes if n.op_ref and n.warp_group >= 0
+        n.op_ref
+        for lp in loops
+        for n in lp.schedule.nodes
+        if n.op_ref and n.warp_group >= 0
     }
 
     def walk(op_id: str) -> None:
@@ -6239,7 +6242,12 @@ def _emit_uwg_body_impl(
     _loc_nodes = list(_outer_nodes_for_uwg(outer, uwg))
     if inner is not None and uwg.inner_wg is not None:
         _loc_nodes += _inner_nodes_for_uwg(inner, uwg)
-    _localize_captured_reg_tensors(g, _loc_nodes, rctx, lines, descend_iv=True)
+    # No scheduled-node stop-set on this walk (loops=[]): the per-UWG
+    # localization descends the full operand tree like the walk that emitted
+    # the committed fixtures; the stop-set is scoped to the per-loop WG
+    # emission site, and anything missed there is caught by the render-level
+    # capture safety net.
+    _localize_captured_reg_tensors(g, [], _loc_nodes, rctx, lines, descend_iv=True)
 
     # Loop-carry pre-arrives (is_released semaphores, e.g. case9 sem4 acc_tmem
     # release): PRIME ONCE here, before the persistent loop. The inner-loop carry
