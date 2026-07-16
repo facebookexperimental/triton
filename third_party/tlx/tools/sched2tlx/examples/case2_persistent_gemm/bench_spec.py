@@ -1,4 +1,4 @@
-"""Benchmark spec for case2 (persistent GEMM) consumed by examples/testing/perf_engine.py.
+"""Benchmark spec for case2 (persistent GEMM) consumed by examples/testing/perf_regression/perf_harness.py.
 
 Launch logic mirrors run_generated.py (generated) and run_handwritten.py (reference).
 Large shapes are included so the persistent outer loop runs many tiles — the exact

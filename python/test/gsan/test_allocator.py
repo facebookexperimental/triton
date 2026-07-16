@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
 from triton._internal_testing import is_cuda
 from triton.experimental.gsan import create_mem_pool
-from triton.experimental.gsan._allocator import get_reserve_pointer, get_reserve_size, gsan_free, gsan_malloc
+from triton.experimental.gsan._allocator import (export_allocation_handles, free_allocation, get_reserve_pointer,
+                                                 get_reserve_size, gsan_free, gsan_malloc, import_allocation_handles)
 from triton.experimental.gsan._testing_utils import shadow_tensor_for
+from triton.experimental.gsan._utils import uint8_cuda_tensor_from_ptr
+
+# With 2 MiB pages, this rounds to a 6 MiB allocation inside an 8 MiB tree node.
+# This tests cases where AllocNode.size != AllocNode.allocSize
+_ODD_LARGE_ALLOCATION_SIZE = 4 * 1024 * 1024 + 1
 
 
 @pytest.fixture
@@ -95,6 +103,17 @@ def test_malloc_fragmentation_reuse_and_coalesce(_direct_allocator):
 
 
 @pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+def test_malloc_free_large_odd_size(_direct_allocator):
+    malloc, free, _, _ = _direct_allocator
+
+    ptr = malloc(_ODD_LARGE_ALLOCATION_SIZE)
+    assert ptr != 0
+
+    free(ptr)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
 def test_free_invalid_pointer_and_double_free(_direct_allocator):
     malloc, free, _, _ = _direct_allocator
 
@@ -144,3 +163,45 @@ def test_mem_pool():
     del real
     del shadow
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_cuda(), reason="requires CUDA backend")
+@pytest.mark.parametrize("size", [4096, _ODD_LARGE_ALLOCATION_SIZE])
+def test_export_import_allocation_handles_maps_real_and_shadow(_direct_allocator, size):
+    malloc, free, reserve_ptr, reserve_size = _direct_allocator
+    device = torch.cuda.current_device()
+
+    real_ptr = malloc(size)
+    assert real_ptr != 0
+
+    imported_ptr = 0
+    real_fd = -1
+    shadow_fd = -1
+    try:
+        real_fd, shadow_fd, alloc_size = export_allocation_handles(real_ptr)
+        assert alloc_size > 0
+
+        imported_ptr = import_allocation_handles(real_fd, shadow_fd, alloc_size, device)
+        assert imported_ptr != 0
+        assert imported_ptr != real_ptr
+
+        local_real = uint8_cuda_tensor_from_ptr(real_ptr, alloc_size, device)
+        imported_real = uint8_cuda_tensor_from_ptr(imported_ptr, alloc_size, device)
+
+        local_shadow = shadow_tensor_for(local_real)
+        imported_shadow = shadow_tensor_for(imported_real)
+        assert local_shadow.numel() == imported_shadow.numel()
+
+        imported_real.fill_(11)
+        assert torch.all(local_real == 11).item()
+
+        imported_shadow.fill_(5)
+        assert torch.all(local_shadow == 5).item()
+    finally:
+        if real_fd >= 0:
+            os.close(real_fd)
+        if shadow_fd >= 0:
+            os.close(shadow_fd)
+        if imported_ptr != 0:
+            free_allocation(imported_ptr, device)
+        free(real_ptr)

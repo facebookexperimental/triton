@@ -29,7 +29,8 @@ from triton._C.libtriton import getenv, getenv_bool  # type: ignore
 
 if TYPE_CHECKING:
     from .runtime.cache import CacheManager, RemoteCacheBackend
-    from .runtime.jit import JitFunctionInfo, KernelParam
+    from .runtime.jit import JitFunctionInfo, KernelParam, JITFunction
+    from .runtime.autotuner import Config
     from .compiler.compiler import ASTSource, LazyDict, IRSource
 
 
@@ -402,6 +403,13 @@ class compilation_knobs(base_knobs):
     listener: Union[CompilationListener, None] = None
 
 
+class AutotuneListener(Protocol):
+
+    def __call__(self, *, fn: JITFunction, key: tuple, best_config: Config, configs_timings: dict[Config, list[float]],
+                 duration: Optional[float], cache_hit: bool) -> None:
+        ...
+
+
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
@@ -409,6 +417,7 @@ class autotuning_knobs(base_knobs):
     warmup: env_int = env_int("TRITON_AUTOTUNE_WARMUP_MS", 25)
     rep: env_int = env_int("TRITON_AUTOTUNE_REP_MS", 100)
     use_entropy: env_bool = env_bool("TRITON_AUTOTUNE_USE_ENTROPY", True)
+    listener: Union[AutotuneListener, None] = None
 
 
 class LaunchHook(Protocol):
@@ -558,6 +567,7 @@ class nvidia_knobs(base_knobs):
     # (cross-partition run-once atomic support). 1 = single-stage.
     ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
+    use_list_schedule: env_bool = env_bool("TRITON_USE_LIST_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
     disable_wsbarrier_reorder: env_bool = env_bool("TRITON_DISABLE_WSBARRIER_REORDER")
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
@@ -609,6 +619,7 @@ class proton_knobs(base_knobs):
         str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti-blackwell"),
     )
     profile_buffer_size: env_int = env_int("TRITON_PROFILE_BUFFER_SIZE", 64 * 1024 * 1024)
+    profile_metric_buffer_size: env_int = env_int("TRITON_PROFILE_METRIC_BUFFER_SIZE", 64 * 1024 * 1024)
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
     # This knob is effective only on Blackwell+ GPUs.
     #

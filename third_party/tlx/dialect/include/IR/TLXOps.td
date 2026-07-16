@@ -23,7 +23,13 @@ class TLX_Op<string mnemonic, list<Trait> traits = []> :
 // Storage Alias Spec Operation
 //===----------------------------------------------------------------------===//
 
-def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", [Pure]> {
+// NOTE: intentionally NOT Pure. Each storage_alias_spec is a distinct logical
+// buffer group. Two specs with identical attributes (e.g. both
+// storage_alias_spec<tmem>) must NOT be merged by CSE -- doing so collapses
+// separate reuse groups into one, tripping the "duplicate set_buffer_overlap"
+// check and corrupting size/offset computation. This matters once storage-alias
+// lowering runs after CSE (i.e. after layout propagation).
+def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", []> {
   let summary = "Define a storage alias specification";
 
   let description = [{
@@ -69,8 +75,14 @@ def TLX_StorageAliasSpecOp : TLX_Op<"storage_alias_spec", [Pure]> {
 // Storage Alias Local Alloc Operation
 //===----------------------------------------------------------------------===//
 
+// NOTE: intentionally NOT Pure. Each storage_alias_local_alloc is a distinct
+// logical allocation. If marked Pure, CSE merges identically-shaped allocs
+// (e.g. FA's alpha/l/m tmem tiles), collapsing them to one SSA value and
+// making a `distinct` reuse_group contain duplicate leaves. Declaring an
+// allocation memory effect keeps each op distinct (not CSE-able) while still
+// allowing dead-alloc elimination.
 def TLX_StorageAliasLocalAllocOp : TLX_Op<"storage_alias_local_alloc",
-                                          [Pure]> {
+                                          [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Allocate local memory referencing a storage alias specification";
 
   let description = [{
@@ -281,6 +293,29 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 
   let hasFolder = 1;
+}
+
+def TLX_DumpLayoutOp : TLX_Op<"dump_layout", []> {
+  let summary = "compile-time diagnostic that prints the layout of a value";
+
+  let description = [{
+    `tlx.dump_layout` prints the resolved layout/encoding of a register tensor
+    or a shared/tensor-memory buffer (memdesc) to the compiler log at compile
+    time. It emits no device code and produces no result.
+
+    The op is consumed by the `tlx-dump-layout` pass, which runs at the end of
+    the TTGIR pipeline so that the reported layout is final. The pass prints the
+    value type and its layout in CuTe Shape:Stride notation, then erases the op.
+
+    This is a static, host-side diagnostic and is distinct from the runtime,
+    device-side `tt.print` / `tl.device_print` family.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$src);
+
+  let results = (outs);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
 }
 
 def TLX_LocalAliasOp : TLX_Op<"local_alias",

@@ -1,13 +1,10 @@
 """Run emitter-generated case5 addmm-bias on B200 vs torch.
 
-NOTE: as of 2026-05-17, sched2tlx does NOT yet emit working code for the
-outer-loop epilogue bias TMA load (`_render_descriptor_load` returns
-`<tma_load_inline_unsupported>` for in-the-default-partition-body usage).
-This runner exists so the regression sweep covers case5 once the emitter
-gap is closed. The non-WS baseline (`run_handwritten_nows.py`) and the
-hand-written TLX-WS target (`run_handwritten.py`) both pass on all 6
-shapes today; they pin the correctness target the generated kernel should
-match.
+sched2tlx now emits working code for the outer-loop epilogue bias TMA load,
+so this case is an active participant in the before/after regression suite
+(examples/testing/perf_regression/, driven by the bench_spec.py alongside this
+runner). The hand-written TLX-WS target (`run_handwritten.py`) pins the
+correctness target the generated kernel must match on all 6 shapes.
 """
 
 from __future__ import annotations

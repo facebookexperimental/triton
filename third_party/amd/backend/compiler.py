@@ -25,7 +25,8 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 
 def is_in_thread_transpose_enabled(arch):
-    return ((arch == "gfx942") if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose)
+    return (arch == "gfx942" or "gfx120" in arch) \
+        if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
 def is_async_copy_enabled(arch):
@@ -321,6 +322,9 @@ class HIPBackend(BaseBackend):
         if is_in_thread_transpose_enabled(options.arch):
             amd.passes.ttgpuir.add_in_thread_transpose(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+        # User-pinned register layouts (#tlx.user_layout) anchored the loads
+        # through the layout-optimization passes above; retire the markers now.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
         amd.passes.ttgpuir.add_move_up_prologue_loads(pm)
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -361,6 +365,9 @@ class HIPBackend(BaseBackend):
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod

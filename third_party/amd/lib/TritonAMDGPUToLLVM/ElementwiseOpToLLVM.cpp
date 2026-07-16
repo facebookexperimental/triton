@@ -989,7 +989,8 @@ Fp32_to_Fp8E4M3FNUZ_SW(Location loc, ConversionPatternRewriter &rewriter,
 }
 
 static ConverterT Fp32_to_Fp8E4M3FNUZ(AMD::ISAFamily isaFamily) {
-  return isCDNA4(isaFamily) ? Fp32_to_Fp8E4M3FNUZ_SW : Fp32_to_Fp8E4M3FNUZ_HW;
+  return isaFamily == AMD::ISAFamily::CDNA3 ? Fp32_to_Fp8E4M3FNUZ_HW
+                                            : Fp32_to_Fp8E4M3FNUZ_SW;
 }
 
 // Nanoo Bf8 -> Fp32 on CDNA3+
@@ -2100,6 +2101,33 @@ Value EmitDualBF16ElementwiseOp(Location loc,
   return convertFp32ToBf16(loc, rewriter, result, RoundingMode::RTNE);
 }
 
+// Override pattern that packs adjacent elementwise ops into vector LLVM ops.
+// The default elementwise patterns remain target-agnostic.
+template <typename SourceOp, typename LLVMOp>
+struct PackedArithOpConversion
+    : ElementwiseOpConversionBase<SourceOp,
+                                  PackedArithOpConversion<SourceOp, LLVMOp>> {
+  using Base =
+      ElementwiseOpConversionBase<SourceOp,
+                                  PackedArithOpConversion<SourceOp, LLVMOp>>;
+  using OpAdaptor = typename Base::OpAdaptor;
+
+  using Base::Base;
+
+  SmallVector<Value> createDestOps(SourceOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    if (operands.size() < 2 || !(elemTy.isF32() || elemTy.isBF16()))
+      return {};
+
+    Value va = packLLVector(loc, {operands[0][0], operands[1][0]}, rewriter);
+    Value vb = packLLVector(loc, {operands[0][1], operands[1][1]}, rewriter);
+    Value vr = LLVMOp::create(rewriter, loc, va.getType(), va, vb);
+    return unpackLLVector(loc, vr, rewriter);
+  }
+};
+
 struct FDivOpConversion
     : ElementwiseOpConversionBase<arith::DivFOp, FDivOpConversion> {
   using ElementwiseOpConversionBase::ElementwiseOpConversionBase;
@@ -2454,14 +2482,8 @@ struct SqrtOpConversion
 
     // llvm.amdgcn.sqrt.f32 provides direct access to v_sqrt_f32, which provides
     // 1ULP accuracy and flushs denorms.
-    StringRef funcName = "llvm.amdgcn.sqrt.f32";
-
-    Type funcType = getFunctionType(elemTy, operands[0]);
-    LLVM::LLVMFuncOp funcOp =
-        appendOrGetExternFuncOp(rewriter, op, funcName, funcType);
-
     Value intrinsicsOutput =
-        LLVM::createLLVMCallOp(rewriter, loc, funcOp, operands[0]).getResult();
+        ROCDL::ROCDLSqrt::create(rewriter, loc, elemTy, scaledSrc);
 
     if (!ftz) {
       // In case of non-ftz, we need to calibrate the results by scaling down by
@@ -2526,6 +2548,16 @@ void populateElementwiseOpToLLVMPatterns(
       typeConverter, axisInfoAnalysis, benefit);
   patterns.add<ElementwiseOpConversion<triton::PreciseSqrtOp, LLVM::SqrtOp>>(
       typeConverter, axisInfoAnalysis, benefit);
+
+  if (targetInfo.getISAFamily() == AMD::ISAFamily::GFX1250) {
+    auto gfx1250Benefit = benefit.getBenefit() + 1;
+    patterns.add<PackedArithOpConversion<arith::SubFOp, LLVM::FSubOp>>(
+        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+    patterns.add<PackedArithOpConversion<arith::AddFOp, LLVM::FAddOp>>(
+        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+    patterns.add<PackedArithOpConversion<arith::MulFOp, LLVM::FMulOp>>(
+        typeConverter, axisInfoAnalysis, gfx1250Benefit);
+  }
 
   patterns.add<FDivOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FSubOpConversion>(typeConverter, axisInfoAnalysis, benefit);

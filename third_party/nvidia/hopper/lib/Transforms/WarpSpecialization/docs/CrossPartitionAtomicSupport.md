@@ -23,7 +23,19 @@ result is the loop-carried value used by every partition) to **all** partitions,
 so each warp group bumps the counter independently, diverges onto a different
 tile, and the producer/consumer barriers never match → **runtime deadlock**.
 
-## Pass: `doAtomicBroadcast`
+## Pass: `doDynamicTileBroadcast`
+
+> Also handles the CLC tile scheduler. The same run-once + broadcast idea applies
+> to `tl.clc_tile_scheduler`, whose fetch is the token pair
+> `ttng.clc_try_cancel_async` (→ `!ttg.async.token`) + `ttng.clc_read` (→
+> `{isValid, x, y, z}`). Those decoded results are the loop-carried values used by
+> every partition, so — exactly like the atomic counter — the pass runs the fetch
+> once in the owner (producer) partition and broadcasts the decoded results
+> through SMEM (the `is_valid` i1 is widened to i32 for the SMEM round-trip). The
+> owner-local CLC completion mbarrier is materialized separately, after AutoWS, by
+> the `clc-materialize` pass (see `docs/design/triton-clc-tile-scheduler.md`).
+> `doDynamicTileBroadcast` is the single merged entry that processes both
+> `tt.atomic_rmw` and `ttng.clc_read`.
 
 Runs in `WarpSpecialization.cpp::runOnFuncOp` immediately **after**
 `doTaskIdPropagate` (so partitions are materialized as `async_task_id`) and
@@ -61,7 +73,7 @@ handshake.
 
 ### Case 3 — graceful reject
 
-`doAtomicBroadcast` returns `failure()`. The caller then calls the canonical
+`doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
 `removeWarpSpecializeAttr(funcOp)`, which strips **both** the partition ids
 (`ttg.partition`) and the task ids (`async_task_id`) from every op, plus the WS
 loop attributes (`tt.warp_specialize`, `ttg.partition.stages`,
@@ -111,24 +123,24 @@ threaded through the persistent `scf.while` rotates the slot/phase across
 iterations, exactly as for any other multi-buffered while-region channel. This
 lets the owner/producer claim and publish up to `depth` tile ids ahead of the
 slower consumer partitions (e.g. the epilogue), so the persistent loop does not
-serialize on the tile-id handoff.
+serialize on the tile-id handoff. (`depth <= 1` is treated as the single-stage
+broadcast.)
 
 No explicit drain-on-exit is required: the terminating tile id (the first claim
 `>= num_tiles`) flows through the *same* broadcast channel and must be loaded by
 every partition to evaluate its own `while` condition, so the producer's store
 count and each consumer's load count stay balanced across the loop exit
 regardless of `depth` — the multi-buffer only adds bounded run-ahead
-backpressure, never an unconsumed slot. A nonsensical `depth < 1` is clamped to
-1 with a warning.
+backpressure, never an unconsumed slot.
+
+Only the atomic tile-counter path multi-buffers on `depth`; the CLC fetch
+broadcast (`transformCLC`) is single-stage.
 
 ## Tests
 
 - E2E: `test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize`
   (un-xfailed; runs on Hopper or Blackwell) asserts correctness for
-  `EPILOGUE_SUBTILE ∈ {1,2,4}`; verified at `TRITON_WS_TILE_PREFETCH_DEPTH` 1, 2,
-  and 3.
+  `EPILOGUE_SUBTILE ∈ {1,2,4}`.
 - LIT: `test/Hopper/WarpSpecialization/ws_atomic_broadcast_transform.mlir`
-  (case 2 — exactly one atomic + broadcast; second RUN line checks
-  `tile-prefetch-depth=2` multi-buffers the slot to `memdesc<2x1xi32>`) and
-  `ws_atomic_broadcast_reject.mlir` (case 3 — no WS / no partition ids / no task
-  ids left, atomic preserved).
+  (case 2 — exactly one atomic + broadcast) and `ws_atomic_broadcast_reject.mlir`
+  (case 3 — no WS / no partition ids / no task ids left, atomic preserved).

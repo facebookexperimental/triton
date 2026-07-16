@@ -32,6 +32,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -137,12 +139,11 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
   return owner;
 }
 
-// Transform a case-2 atomic (see file header). `depth` (>= 1) is the
-// tile-prefetch depth: the number of buffer slots the broadcast channel is
-// multi-buffered with. depth == 1 is the single-stage broadcast; depth > 1 lets
-// the owner/producer claim and publish up to `depth` tile ids ahead of the
-// slower consumer partitions (e.g. the epilogue), so the persistent loop does
-// not serialize on the tile-id handoff.
+// Transform a case-2 atomic (see file header). `depth` is the tile-prefetch
+// depth: the number of buffer slots the broadcast channel is multi-buffered
+// with. depth == 1 is the single-stage broadcast; depth > 1 lets the owner
+// claim and publish up to `depth` tile ids ahead of the slower consumer
+// partitions, so the persistent loop does not serialize on the tile-id handoff.
 //
 // Rather than hand-synthesizing barriers, we install only the *data path*: run
 // the atomic once in the owner partition, splat its scalar result into a 1-CTA
@@ -152,8 +153,6 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
 // cross-partition `local_store`→`local_load` into (N) SMEM channels with the
 // correct full/empty mbarriers and phase — i.e. the broadcast is expressed in
 // terms of an existing, tested AutoWS channel rather than a bespoke handshake.
-// Multi-buffering (depth) is likewise delegated: we stamp the requested count
-// on the slot alloc and the memory planner pins the channel to it.
 static LogicalResult transformAtomic(triton::FuncOp funcOp,
                                      tt::AtomicRMWOp atomicOp,
                                      scf::WhileOp whileOp, int depth) {
@@ -162,11 +161,7 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
   AsyncTaskId owner = getOwnerPartition(whileOp, allParts);
   Location loc = atomicOp.getLoc();
 
-  // The atomic result must be the loop-carried yield operand we rewrite. The
-  // tile-id pattern forwards the atomic to exactly one carried value, so stop
-  // at the first match: rewiring only the last occurrence would leave any other
-  // operand referencing the raw atomic, which is now retagged to the owner
-  // partition alone and no longer produced in the others.
+  // The atomic result must be the loop-carried yield operand we rewrite.
   Value atomicRes = atomicOp.getResult();
   auto yieldOp = whileOp.getYieldOp();
   int yieldIdx = -1;
@@ -239,57 +234,211 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
   return success();
 }
 
+//===--------------------------------------------------------------------===//
+// CLC tile-scheduler fetch broadcast (Stage 3 of the CLC lowering).
+//
+// A dynamic-persistent kernel driven by `tl.clc_tile_scheduler` fetches its
+// next tile with the token pair `ttng.clc_try_cancel_async` (->
+// !ttg.async.token) + `ttng.clc_read` (token -> {isValid, x, y, z}). Those
+// decoded results are the loop-carried values of the persistent `scf.while` and
+// are used by every partition (loop condition + tile compute), so task-id
+// propagation replicates the read to *all* partitions -- which would make each
+// warp group run its own try_cancel, claim a different pending cluster, and
+// diverge -> deadlock. This is the exact analogue of the atomic tile-counter
+// handled above, so we handle it the same way: run the fetch once in the owner
+// (producer) partition and broadcast the decoded results to every partition
+// through SMEM slots. The owner-local CLC completion barrier is materialized
+// later by the `clc-materialize` pass (which runs after AutoWS).
+//===--------------------------------------------------------------------===//
+
+enum class CLCWSCase {
+  PassThrough, // mapped to a single partition
+  Transform,   // all-partition, loop-carried fetch
+  Reject       // unsupported -> bail out of WS
+};
+
+static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
+  SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(readOp.getOperation());
+  if (taskIds.size() <= 1)
+    return CLCWSCase::PassThrough;
+
+  auto whileOp = readOp->getParentOfType<scf::WhileOp>();
+  if (!whileOp) {
+    LDBG("reject: clc_read replicated across partitions but not in a while");
+    return CLCWSCase::Reject;
+  }
+  if (!readOp.getToken().getDefiningOp<ttng::CLCTryCancelAsyncOp>()) {
+    LDBG("reject: clc_read token is not from clc_try_cancel_async");
+    return CLCWSCase::Reject;
+  }
+  SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
+  if (taskIds.size() != allParts.size()) {
+    LDBG("reject: clc_read replicated to a strict subset of partitions");
+    return CLCWSCase::Reject;
+  }
+  whileOut = whileOp;
+  return CLCWSCase::Transform;
+}
+
+// Broadcast a scalar produced in `owner` to every partition through a
+// function-scope SMEM slot (splat -> local_store in owner; local_load ->
+// unsplat in all partitions). Mirrors the atomic case; the store/load edge
+// becomes SMEM channels in doCodePartitionPost. `b`'s insertion point must be
+// after the scalar's producer.
+static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
+                                        OpBuilderWithAsyncTaskIds &b,
+                                        AsyncTaskId owner,
+                                        ArrayRef<AsyncTaskId> allParts,
+                                        Value scalar, Location loc) {
+  MLIRContext *ctx = funcOp.getContext();
+  Type origTy = scalar.getType();
+
+  // Sub-32-bit integers (e.g. the `is_valid` i1) don't have a well-formed SMEM
+  // tensor layout for the round-trip; widen to i32 for transport and narrow
+  // back on the far side.
+  Type transportTy = origTy;
+  bool widen = false;
+  if (auto intTy = dyn_cast<IntegerType>(origTy);
+      intTy && intTy.getWidth() < 32) {
+    transportTy = b.getI32Type();
+    widen = true;
+  }
+
+  OpBuilder fb(funcOp);
+  fb.setInsertionPointToStart(&funcOp.getBody().front());
+  Attribute smem = ttg::SharedMemorySpaceAttr::get(ctx);
+  auto numCTAs = ttg::lookupNumCTAs(funcOp);
+  auto cga = ttg::CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  auto slotEnc = ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, cga);
+  auto slotTy = ttg::MemDescType::get({1}, transportTy, slotEnc, smem,
+                                      /*mutableMemory=*/true);
+  Value slot = ttg::LocalAllocOp::create(
+      fb, NameLoc::get(StringAttr::get(ctx, "clc_bcast_slot"), loc), slotTy,
+      Value());
+
+  int numWarps = ttg::lookupNumWarps(funcOp);
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(
+      funcOp->getParentOfType<ModuleOp>());
+  auto bcastLayout = ttg::getDefaultBlockedEncoding(ctx, {1}, numWarps,
+                                                    threadsPerWarp, numCTAs);
+  auto bcastTy = RankedTensorType::get({1}, transportTy, bcastLayout);
+
+  b.setAsynTaskIdsFromArray({owner});
+  Value toStore = scalar;
+  if (widen)
+    toStore = b.createWithAsyncTaskIds<arith::ExtUIOp>(loc, transportTy, scalar)
+                  .getResult();
+  Value splat =
+      b.createWithAsyncTaskIds<tt::SplatOp>(loc, bcastTy, toStore).getResult();
+  b.createWithAsyncTaskIds<ttg::LocalStoreOp>(loc, splat, slot);
+
+  b.setAsynTaskIdsFromArray(allParts);
+  Value loaded =
+      b.createWithAsyncTaskIds<ttg::LocalLoadOp>(loc, bcastTy, slot, Value())
+          .getResult();
+  Value unsplat =
+      b.createWithAsyncTaskIds<tt::UnsplatOp>(loc, transportTy, loaded)
+          .getResult();
+  if (widen)
+    unsplat = b.createWithAsyncTaskIds<arith::TruncIOp>(loc, origTy, unsplat)
+                  .getResult();
+  return unsplat;
+}
+
+// Transform: run the CLC fetch once in the owner partition and broadcast each
+// loop-carried decoded result to every partition.
+static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
+                                  scf::WhileOp whileOp) {
+  MLIRContext *ctx = funcOp.getContext();
+  SmallVector<AsyncTaskId> allParts = getAllPartitions(whileOp);
+  AsyncTaskId owner = getOwnerPartition(whileOp, allParts);
+  Location loc = readOp.getLoc();
+
+  auto issue = readOp.getToken().getDefiningOp<ttng::CLCTryCancelAsyncOp>();
+  if (!issue)
+    return failure();
+
+  auto yieldOp = whileOp.getYieldOp();
+
+  // Run the fetch (issue + read) in the owner partition alone.
+  setAsyncTaskIds(issue, {owner});
+  setAsyncTaskIds(readOp, {owner});
+
+  OpBuilderWithAsyncTaskIds b(ctx);
+  b.setInsertionPointAfter(readOp);
+
+  // Broadcast each loop-carried result; the read's results only feed the yield.
+  for (Value res : readOp.getResults()) {
+    int yieldIdx = -1;
+    for (auto [i, v] : llvm::enumerate(yieldOp.getOperands()))
+      if (v == res) {
+        yieldIdx = i;
+        break;
+      }
+    if (yieldIdx < 0)
+      continue; // not loop-carried (e.g. an unused/DCE'd coordinate)
+    Value bcast =
+        broadcastScalarThroughSmem(funcOp, b, owner, allParts, res, loc);
+    yieldOp->setOperand(yieldIdx, bcast);
+  }
+  return success();
+}
+
 } // namespace
 
-// Entry point: classify and (where applicable) transform every `tt.atomic_rmw`.
-// Returns failure() when an atomic forces a graceful warp-specialization
-// reject. The caller is responsible for stripping WS metadata (via
-// removeWarpSpecializeAttr, which clears both the partition ids and the
-// async_task_ids) so the kernel is left unspecialized-but-compilable; this
-// keeps a single source of truth for the reject teardown shared with the other
-// AutoWS bail-outs.
-LogicalResult doAtomicBroadcast(triton::FuncOp funcOp, int tilePrefetchDepth) {
+// Entry point: handle every cross-partition, run-once, loop-carried "claim the
+// next tile" producer in a dynamic-persistent kernel. Two kinds share the exact
+// same run-once + SMEM-broadcast idea and are handled together here:
+//   * the `tt.atomic_rmw` global tile counter, and
+//   * the CLC tile-scheduler fetch (`ttng.clc_read` fed by
+//     `ttng.clc_try_cancel_async`).
+// Each producer is classified into pass-through (single partition), transform
+// (run once in the owner/producer partition + broadcast the loop-carried
+// result(s) to all partitions), or reject. Returns failure() to force a
+// graceful warp-specialization reject; the caller strips WS metadata via
+// removeWarpSpecializeAttr (which clears both partition ids and
+// async_task_ids), leaving the kernel unspecialized-but-compilable — one source
+// of truth for the reject teardown shared with the other AutoWS bail-outs.
+LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
+                                     int tilePrefetchDepth) {
+  // Atomic global tile counter.
   SmallVector<tt::AtomicRMWOp> atomics;
   funcOp.walk([&](tt::AtomicRMWOp op) { atomics.push_back(op); });
-
-  // Phase 1: classify every atomic *before* mutating any of them. A Reject
-  // aborts the whole pass, and the reject teardown (removeWarpSpecializeAttr)
-  // only strips WS attributes -- it does not undo an already-applied broadcast
-  // transform. Classifying up front keeps the pass transactional: a later
-  // Reject can never leave an earlier atomic half-transformed with dangling
-  // SMEM broadcast plumbing and a rewired yield.
-  SmallVector<std::pair<tt::AtomicRMWOp, scf::WhileOp>> toTransform;
   for (auto atomicOp : atomics) {
     scf::WhileOp whileOp;
     switch (classifyAtomic(atomicOp, whileOp)) {
     case AtomicWSCase::PassThrough:
-      continue;
+      break;
     case AtomicWSCase::Reject:
       LDBG("Warp specialization does not support this atomic shape. Skipping.");
       return failure();
     case AtomicWSCase::Transform:
-      toTransform.emplace_back(atomicOp, whileOp);
-      continue;
+      if (failed(
+              transformAtomic(funcOp, atomicOp, whileOp, tilePrefetchDepth))) {
+        LDBG("atomic broadcast transform failed; skipping WS.");
+        return failure();
+      }
+      break;
     }
   }
 
-  // `tile-prefetch-depth` is the broadcast channel's multi-buffer depth (>= 1);
-  // see transformAtomic. A nonsensical value is clamped to the single-stage
-  // default rather than silently mis-sizing the buffer.
-  int depth = tilePrefetchDepth;
-  if (depth < 1) {
-    if (!toTransform.empty())
-      toTransform.front().first.emitWarning()
-          << "tile-prefetch-depth=" << tilePrefetchDepth
-          << " is invalid; using a single-stage (depth 1) broadcast channel";
-    depth = 1;
-  }
-
-  // Phase 2: every collected atomic is transformable; apply the broadcast.
-  for (auto &[atomicOp, whileOp] : toTransform) {
-    if (failed(transformAtomic(funcOp, atomicOp, whileOp, depth))) {
-      LDBG("atomic broadcast transform failed; skipping WS.");
+  // CLC tile-scheduler fetch.
+  SmallVector<ttng::CLCReadOp> reads;
+  funcOp.walk([&](ttng::CLCReadOp op) { reads.push_back(op); });
+  for (auto readOp : reads) {
+    scf::WhileOp whileOp;
+    switch (classifyCLC(readOp, whileOp)) {
+    case CLCWSCase::PassThrough:
+      break;
+    case CLCWSCase::Reject:
+      LDBG("Warp specialization does not support this CLC fetch. Skipping.");
       return failure();
+    case CLCWSCase::Transform:
+      if (failed(transformCLC(funcOp, readOp, whileOp))) {
+        LDBG("CLC broadcast transform failed; skipping WS.");
+        return failure();
+      }
+      break;
     }
   }
   return success();

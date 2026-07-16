@@ -828,6 +828,19 @@ class Autotuner(KernelInterface):
                 else:
                     benchmark()
 
+                if knobs.autotuning.listener is not None:
+                    jit_fn = self.fn
+                    while not isinstance(jit_fn, JITFunction):
+                        jit_fn = jit_fn.fn
+                    knobs.autotuning.listener(
+                        fn=jit_fn,
+                        key=key,
+                        best_config=self.cache[key],
+                        configs_timings=self.configs_timings,
+                        duration=getattr(self, 'bench_time', None) if not used_cached_result else None,
+                        cache_hit=used_cached_result,
+                    )
+
             config = self.cache[key]
             self._last_key = key
             # Seed the C-level autotune proxy with this key→config mapping
