@@ -4681,6 +4681,138 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
+// Text summary (grep prefix "[ws-summary]") that makes the SMEM/TMEM dataflow
+// legible without the .dot graph: (A) key ops per partition with value names,
+// (B) each buffer's producer-partition -> consumer-partition(s) + buffer.id/
+// reuse-offset, (C) scf.for loop listing. Under -debug-only=nvgpu-ws-memory-planner.
+static void dumpPartitionAndBufferSummary(triton::FuncOp funcOp,
+                                          SmallVector<Channel *> &channels) {
+  // Partition type names (best-effort; falls back to "?" when absent).
+  // The `ttg.partition.types` array lives on the warp-specialized scf.for.
+  SmallVector<std::string> ptypes;
+  Attribute typesAttr = funcOp->getAttr("ttg.partition.types");
+  if (!typesAttr)
+    funcOp.walk([&](Operation *op) {
+      if (auto a = op->getAttr("ttg.partition.types")) {
+        typesAttr = a;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+  if (auto arr = dyn_cast_or_null<ArrayAttr>(typesAttr))
+    for (Attribute a : arr)
+      if (auto s = dyn_cast<StringAttr>(a))
+        ptypes.push_back(s.str());
+  auto taskStr = [&](int t) -> std::string {
+    std::string ty = (t >= 0 && (size_t)t < ptypes.size()) ? ptypes[t] : "?";
+    return "task" + std::to_string(t) + "(" + ty + ")";
+  };
+
+  // Stable per-op id (program order) so Section A and Section B
+  // cross-reference: an op#N in A is the same op referenced as srcOp/dstOp op#N
+  // in B.
+  DenseMap<Operation *, unsigned> opId;
+  unsigned nextId = 0;
+  funcOp.walk<WalkOrder::PreOrder>([&](Operation *op) { opId[op] = nextId++; });
+  auto opRef = [&](Operation *op) -> std::string {
+    if (!op)
+      return "op#?";
+    auto it = opId.find(op);
+    return it != opId.end() ? ("op#" + std::to_string(it->second)) : "op#?";
+  };
+  auto forRef = [&](Operation *op) -> std::string {
+    if (!op)
+      return "-";
+    auto f = op->template getParentOfType<scf::ForOp>();
+    return f ? opRef(f.getOperation()) : std::string("-");
+  };
+
+  // Loops (scf.for): op id, nesting depth, enclosing loop, partition set.
+  LDBG("[ws-summary] ==== loops (scf.for) ====");
+  funcOp.walk([&](scf::ForOp forOp) {
+    unsigned depth = 0;
+    for (Operation *p = forOp->getParentOp(); p; p = p->getParentOp())
+      if (isa<scf::ForOp>(p))
+        depth++;
+    std::string tasks;
+    for (int t : getAsyncTaskIds(forOp.getOperation()))
+      tasks += std::to_string(t) + ",";
+    LDBG("[ws-summary] " << opRef(forOp.getOperation()) << " scf.for depth="
+                         << depth << " parent=" << forRef(forOp.getOperation())
+                         << " tasks={" << tasks << "}");
+  });
+
+  // (A) key ops per partition, with op id, enclosing for, and value name.
+  LDBG("[ws-summary] ==== partition -> key ops (op# in for#) ====");
+  std::map<int, SmallVector<std::string>> byTask;
+  funcOp.walk([&](Operation *op) {
+    StringRef n = op->getName().getStringRef();
+    bool key = isa<ttng::MMAv5OpInterface, ttng::TMEMAllocOp, ttng::TMEMLoadOp,
+                   ttng::TMEMStoreOp, ttg::LocalAllocOp, ttg::LocalStoreOp,
+                   ttg::LocalLoadOp, ttg::MemDescTransOp>(op) ||
+               n.contains("descriptor_load") || n.contains("async_tma") ||
+               n == "math.exp2" || n == "arith.truncf";
+    if (!key)
+      return;
+    auto ids = getAsyncTaskIds(op);
+    if (ids.empty())
+      return;
+    std::string label = opRef(op) + " in " + forRef(op) + "  " + n.str();
+    std::string nm = getLocName(op);
+    if (!nm.empty())
+      label += " \"" + nm + "\"";
+    for (int t : ids)
+      byTask[t].push_back(label);
+  });
+  for (auto &[t, ops] : byTask) {
+    LDBG("[ws-summary] " << taskStr(t) << ":");
+    for (auto &o : ops)
+      LDBG("[ws-summary]     " << o);
+  }
+
+  // (B) per-buffer producer-partition -> consumer-partition(s), with op ids.
+  LDBG("[ws-summary] ==== buffers: producer-partition -> consumer-partition(s) "
+       "====");
+  for (Channel *ch : channels) {
+    bool tmem = ch->channelKind == DataChannelKind::TMEM ||
+                ch->channelKind == DataChannelKind::TMEMPost;
+    Operation *alloc = ch->getAllocOp();
+    std::string name = alloc ? getLocName(alloc) : std::string("?");
+    std::string bid = "?";
+    if (alloc)
+      if (auto a = alloc->getAttrOfType<IntegerAttr>("buffer.id"))
+        bid = std::to_string(a.getInt());
+    // Size: SMEM in bytes; TMEM in columns x rows plus its buffer.offset
+    // (the reuse column offset within the buffer.id's owner).
+    std::string sizeStr;
+    if (auto sAlloc = dyn_cast_or_null<ttg::LocalAllocOp>(alloc)) {
+      sizeStr = " bytes=" + std::to_string(getSmemAllocSizeBytes(sAlloc));
+    } else if (auto tAlloc = dyn_cast_or_null<ttng::TMEMAllocOp>(alloc)) {
+      ttng::TMemAllocation sz = ttng::getTmemAllocSizes(tAlloc.getType());
+      sizeStr = " cols=" + std::to_string(sz.numCols) +
+                " rows=" + std::to_string(sz.numRows);
+      if (auto off = alloc->getAttrOfType<IntegerAttr>("buffer.offset"))
+        sizeStr += " colOffset=" + std::to_string(off.getInt());
+    }
+    std::string cons;
+    for (int c : ch->relation.second)
+      cons += taskStr(c) + " ";
+    Operation *srcOp = ch->getSrcOp();
+    Operation *dstOp = ch->getDstOp();
+    std::string src =
+        srcOp ? (opRef(srcOp) + " " + srcOp->getName().getStringRef().str())
+              : std::string("op#? ?");
+    std::string dst =
+        dstOp ? (opRef(dstOp) + " " + dstOp->getName().getStringRef().str())
+              : std::string("op#? ?");
+    LDBG("[ws-summary] " << (tmem ? "tmem" : "smem") << " \"" << name
+                         << "\" id=" << bid << sizeStr << " ch#" << ch->uniqID
+                         << " alloc=" << opRef(alloc) << "  "
+                         << taskStr(ch->relation.first) << " -> " << cons << "("
+                         << src << " -> " << dst << ")");
+  }
+}
+
 // Default arguments are declared in WarpSpecializationPipeline.h (the single
 // declaration site); they must not be repeated on the definition.
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
@@ -4854,6 +4986,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
       return failure();
     }
   }
+
+  // Emit the text summary after planning so buffer.id is populated.
+  LLVM_DEBUG(dumpPartitionAndBufferSummary(funcOp, channels));
 
   // allocateTMem(funcOp, channels, bufferId);
   return success();
