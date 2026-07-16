@@ -160,6 +160,16 @@ def _validate_warp_group_start_ids(
 @tlx_enter_sub_region()
 def visit_withAsyncTasks(self, node):
     from triton.compiler.code_generator import enter_sub_region, _is_list_like, _is_constexpr
+    from triton.language.core import _unwrap_if_constexpr
+
+    # `tlx.async_tasks(exclusive=...)` marks the sole warp_specialize for the
+    # lower-overhead lowering; the Fixup pass reads it and validates that the
+    # module then contains exactly one warp_specialize op.
+    ws_context = node.items[0].context_expr
+    exclusive = False
+    for kw in getattr(ws_context, "keywords", []):
+        if kw.arg == "exclusive":
+            exclusive = bool(_unwrap_if_constexpr(self.visit(kw.value)))
 
     with enter_sub_region(self) as sr:
         liveins, _ = sr
@@ -271,6 +281,8 @@ def visit_withAsyncTasks(self, node):
             sum(task_replicas),
             task_warp_group_start_ids if task_warp_group_start_ids else None,
         )
+        if exclusive:
+            ws_op.set_attr("tlx.exclusive", self.builder.get_unit_attr())
 
         # dry visit async task body to calculate captures
         index = 0
