@@ -368,11 +368,18 @@ def bench_main(argv: list[str] | None = None) -> int:
     if args.cases:
         names = args.cases.split(",")
     else:
-        names = [
-            p.name
-            for p in sorted(examples_dir.iterdir())
-            if p.is_dir() and p.name.startswith("case") and (p / "bench_spec.py").exists()
-        ]
+        # Flat caseN_* dirs with a bench_spec.py, plus nested variant subdirs
+        # (case9_scaled_mm/blockwise, ...) for container cases holding several.
+        names = []
+        for p in sorted(examples_dir.iterdir()):
+            if not p.is_dir() or not p.name.startswith("case"):
+                continue
+            if (p / "bench_spec.py").exists():
+                names.append(p.name)
+            else:
+                for sub in sorted(p.iterdir()):
+                    if sub.is_dir() and (sub / "bench_spec.py").exists():
+                        names.append(f"{p.name}/{sub.name}")
     for name in names:
         case_dir = examples_dir / name
         gen = case_dir / "generated.py"
@@ -511,10 +518,18 @@ def regression_main(argv: list[str] | None = None) -> int:
 
     before_tree, after_tree = materialize(repo_root, workdir, before_rev, after_rev)
 
-    discovered = sorted(
-        p.name for p in after_tree.examples.iterdir()
-        if p.is_dir() and p.name.startswith("case")
-    )
+    # Flat caseN_* dirs with their own schedule_graph.json, plus nested variant
+    # subdirs (case9_scaled_mm/blockwise) for container cases holding several.
+    discovered = []
+    for p in sorted(after_tree.examples.iterdir()):
+        if not p.is_dir() or not p.name.startswith("case"):
+            continue
+        if (p / "schedule_graph.json").exists():
+            discovered.append(p.name)
+        else:
+            for sub in sorted(p.iterdir()):
+                if sub.is_dir() and (sub / "schedule_graph.json").exists():
+                    discovered.append(f"{p.name}/{sub.name}")
     selected = args.cases.split(",") if args.cases else discovered
 
     print(f"{'case':<24}{'correctness':<12}{'perf':<8} detail", flush=True)
