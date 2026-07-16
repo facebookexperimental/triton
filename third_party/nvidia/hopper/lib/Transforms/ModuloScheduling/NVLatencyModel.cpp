@@ -650,6 +650,48 @@ int NVLatencyModel::getMinWarps(Operation *op) const {
   return 1;
 }
 
+// True hardware floor on the containing WG's warp count. Everything in
+// getMinWarps above is a THROUGHPUT anchor ("selfLatency was calibrated at
+// this width") except the TMEM constraint, which TLX/Blackwell enforce:
+// tmem_load/tmem_store require numWarps == 4 or 8. A width search may narrow
+// a WG below its anchor (paying the modeled issue-cost scaling) but never
+// below this floor.
+static int getHardMinWarps(Operation *op) {
+  if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp>(op))
+    return 4;
+  return 1;
+}
+
+// Cross-warp reduce facts for the width search (see OpLatencyInfo).
+// `axisWarps` = warpsPerCTA[axis] of the operand's actual encoding — the
+// exact predicate ReduceOpToLLVM uses (isWarpSynchronous ⇔ axisWarps == 1)
+// to decide whether the SMEM + 2×bar.sync cross-warp path runs.
+// `syncSelfLat1w` = modeled issue cost of the warp-synchronous form at
+// 1 warp: each lane serially combines its inputElems/32 column strip at
+// ~1 cyc/elem (fadd/max issue), no SMEM, no bar.sync.
+static void getReduceWidthFacts(Operation *op, int &axisWarps,
+                                int &syncSelfLat1w) {
+  axisWarps = 0;
+  syncSelfLat1w = 0;
+  auto reduceOp = dyn_cast<tt::ReduceOp>(op);
+  if (!reduceOp)
+    return;
+  for (Value v : reduceOp.getOperands()) {
+    auto t = dyn_cast<RankedTensorType>(v.getType());
+    if (!t || !t.getEncoding())
+      continue;
+    unsigned axis = reduceOp.getAxis();
+    auto warps = getWarpsPerCTA(t.getEncoding(), t.getShape());
+    if (axis < warps.size())
+      axisWarps = static_cast<int>(warps[axis]);
+    int64_t inElems = 1;
+    for (auto d : t.getShape())
+      inElems *= d;
+    syncSelfLat1w = static_cast<int>(std::max<int64_t>(inElems / 32, 1));
+    return;
+  }
+}
+
 OpLatencyInfo NVLatencyModel::getLatency(Operation *op) const {
   auto pipeline = classifyPipeline(op);
 
@@ -734,8 +776,11 @@ OpLatencyInfo NVLatencyModel::getLatency(Operation *op) const {
 
   // CUDA/SFU are pipelined synchronous units: occupancy = selfLatency (the
   // per-op pipe slot count). NONE → 0 (no resource).
-  return OpLatencyInfo{pipeline, latency, selfLatency, getMinWarps(op),
-                       /*occupancy=*/selfLatency};
+  OpLatencyInfo info{pipeline, latency, selfLatency, getMinWarps(op),
+                     /*occupancy=*/selfLatency};
+  info.hardMinWarps = getHardMinWarps(op);
+  getReduceWidthFacts(op, info.reduceAxisWarps, info.reduceSyncSelfLat1w);
+  return info;
 }
 
 Value NVLatencyModel::getAccumulatorWrite(Operation *op) const {

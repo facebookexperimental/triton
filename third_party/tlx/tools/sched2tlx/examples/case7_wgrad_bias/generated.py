@@ -126,7 +126,7 @@ def wgrad_bias_nows(
                 tlx.tcgen05_commit(acc_tmem_full[tmem_buf])
                 tmem_accum_cnt += 1
         # Async task: role=CUDA ← inner wg3 (Phase 4 plan)
-        with tlx.async_task(num_warps=4, num_regs=152):
+        with tlx.async_task(num_warps=1, num_regs=232):
             smem_accum = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_7, nprog_0):

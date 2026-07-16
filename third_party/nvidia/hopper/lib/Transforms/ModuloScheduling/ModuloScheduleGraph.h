@@ -118,14 +118,11 @@ struct ScheduleNode {
                     // See OpLatencyInfo::occupancy. 0 = unset (fall back).
   int minWarps{1};  // warp count assumed by selfLatency; effective scales
                     // up by minWarps/actualWarps when WG has fewer warps
-
-  // Frequency this op fires per outer-loop iteration. Outer-loop ops have
-  // frequencyMultiplier = 1; inner K-loop ops have frequencyMultiplier =
-  // K_TRIPS so the flat-view warp-makespan and barrier costs reflect that
-  // an inner op runs K times per outer iteration. Set by buildFlatView
-  // based on each ScheduledLoop's nesting depth. Default 1 (single-loop
-  // kernels and non-flat callers don't need it).
-  int frequencyMultiplier{1};
+  int hardMinWarps{1};        // true hardware floor on WG width (TMEM = 4);
+                              // minWarps is only the calibration anchor
+  int reduceAxisWarps{0};     // warpsPerCTA[axis] at the reduce's encoding
+                              // (>1 = cross-warp SMEM+bar.sync lowering)
+  int reduceSyncSelfLat1w{0}; // modeled 1-warp warp-synchronous issue cost
 
   // Super-node: if this node represents a child pipeline (inner loop)
   unsigned childPipelineId{UINT_MAX}; // index into ScheduleGraph::pipelines
@@ -266,6 +263,18 @@ struct ScheduleLoop {
   double partitionCost{0.0};
   // Costs parallel to `topPartitions[k]` (best-first), populated with it.
   llvm::SmallVector<double, 3> topPartitionCosts;
+
+  // Committed per-WG (warp count, regs/thread), chosen by the SAME
+  // chooseWgWidthRegs the scoring paths use, recomputed on FINAL
+  // post-propagation membership at commit time. Single source of truth for
+  // BOTH emission paths (jsonDumpWarpGroups and ttg.partition_num_warps) —
+  // consumers must not re-derive width from node minWarps. regs == 0 means
+  // "emitter default for this width". Empty until commitWgWidthRegs runs.
+  struct WGWidthRegs {
+    int warps{4};
+    int regs{0};
+  };
+  llvm::SmallDenseMap<int, WGWidthRegs, 8> committedWgWidthRegs;
 
   // Lookup
   llvm::DenseMap<Operation *, unsigned> opToNodeId;

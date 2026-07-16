@@ -4514,9 +4514,11 @@ def _unified_warp_groups(
             # (= max minWarps over the WG's ops, snapped to {1,2,4,8}).
             # The previous binary "has TMEM ops? → 4w/152r else 1w/24r"
             # rule mis-sized WGs whose SFU/CUDA work demanded 4 warps
-            # without touching TMEM.
+            # without touching TMEM. An explicit per-WG num_regs from the
+            # pass (reduce-sink WGs: 1 warp / 232 regs) wins over the
+            # warp-count heuristic.
             num_warps = wg.num_warps
-            num_regs = 152 if num_warps >= 4 else 24
+            num_regs = wg.num_regs or (152 if num_warps >= 4 else 24)
             is_def = wg.id == default_wg_id
             out.append(
                 UnifiedWG(
@@ -4565,7 +4567,7 @@ def _unified_warp_groups(
             else ("TMA" if "TMA" in wg.pipelines else roles)
         )
         num_warps = wg.num_warps
-        num_regs = 152 if num_warps >= 4 else 24
+        num_regs = wg.num_regs or (152 if num_warps >= 4 else 24)
         out.append(
             UnifiedWG(
                 name=f"inner_wg{wg.id}_{primary}",
@@ -4604,7 +4606,7 @@ def _unified_warp_groups(
                 outer_wg=wg.id,
                 inner_wg=None,
                 num_warps=wg.num_warps,
-                num_regs=152 if wg.num_warps >= 4 else 24,
+                num_regs=wg.num_regs or (152 if wg.num_warps >= 4 else 24),
             )
         )
     return _rescale_task_regs(out)
