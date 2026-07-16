@@ -621,7 +621,13 @@ class CompiledKernel:
                 schema = json.loads(self.asm["launch_metadata"])
                 # Build both values before assigning to self so that a failure
                 # in either step leaves both attributes as None (atomic assignment).
-                dispatcher = make_triton_dispatcher(schema, self.function)
+                # Auto-TMA kernels carry compiler-synthesized descriptor params
+                # that only the variadic CudaLauncher injects; skip the dispatcher
+                # (fast path) for them so they fall back to the working launcher.
+                if schema.get("auto_tma_recipes"):
+                    dispatcher = None
+                else:
+                    dispatcher = make_triton_dispatcher(schema, self.function)
                 if dispatcher is not None:
                     indices = tuple(a["index"] for a in schema["args"])
                     self._dispatcher = dispatcher

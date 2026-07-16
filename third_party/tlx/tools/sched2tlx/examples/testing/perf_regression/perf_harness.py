@@ -368,11 +368,18 @@ def bench_main(argv: list[str] | None = None) -> int:
     if args.cases:
         names = args.cases.split(",")
     else:
-        names = [
-            p.name
-            for p in sorted(examples_dir.iterdir())
-            if p.is_dir() and p.name.startswith("case") and (p / "bench_spec.py").exists()
-        ]
+        # Flat caseN_* dirs with a bench_spec.py, plus nested variant subdirs
+        # (case9_scaled_mm/blockwise, ...) for container cases holding several.
+        names = []
+        for p in sorted(examples_dir.iterdir()):
+            if not p.is_dir() or not p.name.startswith("case"):
+                continue
+            if (p / "bench_spec.py").exists():
+                names.append(p.name)
+            else:
+                for sub in sorted(p.iterdir()):
+                    if sub.is_dir() and (sub / "bench_spec.py").exists():
+                        names.append(f"{p.name}/{sub.name}")
     for name in names:
         case_dir = examples_dir / name
         gen = case_dir / "generated.py"
@@ -380,6 +387,94 @@ def bench_main(argv: list[str] | None = None) -> int:
             print(f"== {name} == SKIP (missing bench_spec.py or generated.py)")
             continue
         _print_table(run_bench(case_dir, gen))
+    return 0
+
+
+def compare_main(argv: list[str] | None = None) -> int:
+    """``compare`` subcommand: one row per case, ``--rev`` vs working tree.
+
+    Compares committed KERNELS (each side's generated.py fixture), both run
+    under the CURRENT build with the CURRENT bench_spec — cheap and exact when
+    a diff only changes what the emitter produces. It does NOT rebuild the
+    other revision's toolchain; for a full before/after of the emitter itself
+    use ``regression``, and for a separately built master use ``e2e``.
+
+    Scans every ``case*/`` dir in examples/ so new cases appear automatically;
+    cases without a bench_spec.py are listed (not silently dropped). A case
+    whose generated.py is byte-identical on both sides is measured once and
+    reported "unchanged" — anything else would just be re-measuring noise.
+    """
+    ap = argparse.ArgumentParser(
+        prog="perf_harness.py compare",
+        description="per-case gen/hw summary table: a git revision's generated.py vs the working tree's",
+    )
+    ap.add_argument("--rev", default="origin/main", help="git revision for the left column (default: origin/main)")
+    ap.add_argument("--cases", help="comma-separated case dir names (default: every case*/ in examples/)")
+    args = ap.parse_args(argv)
+
+    examples_dir = Path(__file__).resolve().parents[2]
+    repo_root = Path(
+        subprocess.check_output(
+            ["git", "-C", str(examples_dir), "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+    )
+    names = args.cases.split(",") if args.cases else sorted(
+        p.name for p in examples_dir.iterdir() if p.is_dir() and p.name.startswith("case")
+    )
+
+    def _cell(result: dict[str, Any]) -> str:
+        # Per-shape gen/hw ratios in SHAPES order; raw throughput when the
+        # case has no handwritten baseline. Any correctness failure taints
+        # the whole cell — a fast wrong kernel must not read as a win.
+        parts = []
+        for r in result["shapes"]:
+            if r["hw_throughput"]:
+                parts.append(f"{r['throughput'] / r['hw_throughput']:.2f}x")
+            else:
+                parts.append(f"{r['throughput']:.0f} {r['unit']}")
+        if not all(r["ok"] for r in result["shapes"]):
+            parts.append("FAIL")
+        return ", ".join(parts) if parts else "-"
+
+    rows: list[tuple[str, str, str]] = []
+    for name in names:
+        case_dir = examples_dir / name
+        gen = case_dir / "generated.py"
+        if not (case_dir / "bench_spec.py").exists() or not gen.exists():
+            rows.append((name, "(no bench_spec)", "(no bench_spec)"))
+            continue
+        relpath = gen.resolve().relative_to(repo_root).as_posix()
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{args.rev}:{relpath}"],
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            rows.append((name, f"(not on {args.rev})", _cell(run_bench(case_dir, gen))))
+        elif proc.stdout == gen.read_bytes():
+            rows.append((name, _cell(run_bench(case_dir, gen)), "unchanged"))
+        else:
+            with tempfile.TemporaryDirectory() as td:
+                rev_gen = Path(td) / "generated.py"
+                rev_gen.write_bytes(proc.stdout)
+                left = _cell(run_bench(case_dir, rev_gen))
+            rows.append((name, left, _cell(run_bench(case_dir, gen))))
+
+    left_hdr = (
+        "master"
+        if args.rev in ("origin/main", "main", "origin/master", "master")
+        else args.rev
+    )
+    right_hdr = "branch"
+    w0 = max(len("case"), *(len(r[0]) for r in rows)) + 2
+    w1 = max(len(left_hdr), *(len(r[1]) for r in rows)) + 2
+    print(f"\n{'case':<{w0}}{left_hdr:<{w1}}{right_hdr}")
+    print("-" * (w0 + w1 + len(right_hdr)))
+    for name, left, right in rows:
+        print(f"{name:<{w0}}{left:<{w1}}{right}")
+    print(
+        "\ncells: per-shape gen/handwritten ratios (SHAPES order); both columns run"
+        "\nunder the current build; 'unchanged' = byte-identical generated.py."
+    )
     return 0
 
 
@@ -511,10 +606,18 @@ def regression_main(argv: list[str] | None = None) -> int:
 
     before_tree, after_tree = materialize(repo_root, workdir, before_rev, after_rev)
 
-    discovered = sorted(
-        p.name for p in after_tree.examples.iterdir()
-        if p.is_dir() and p.name.startswith("case")
-    )
+    # Flat caseN_* dirs with their own schedule_graph.json, plus nested variant
+    # subdirs (case9_scaled_mm/blockwise) for container cases holding several.
+    discovered = []
+    for p in sorted(after_tree.examples.iterdir()):
+        if not p.is_dir() or not p.name.startswith("case"):
+            continue
+        if (p / "schedule_graph.json").exists():
+            discovered.append(p.name)
+        else:
+            for sub in sorted(p.iterdir()):
+                if sub.is_dir() and (sub / "schedule_graph.json").exists():
+                    discovered.append(f"{p.name}/{sub.name}")
     selected = args.cases.split(",") if args.cases else discovered
 
     print(f"{'case':<24}{'correctness':<12}{'perf':<8} detail", flush=True)
@@ -1072,6 +1175,7 @@ _SUBCOMMANDS = {
     "e2e": e2e_main,
     "e2e-worker": e2e_worker_main,
     "bench": bench_main,
+    "compare": compare_main,
 }
 
 

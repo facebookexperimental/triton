@@ -471,6 +471,10 @@ class CudaLauncher(object):
         self.arg_annotations = annotate_arguments(expanded_signature)
 
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
+        # launcher builds each CUtensorMap host-side from existing scalar args
+        # via the launch.h recipe core and injects it (no device global scratch).
+        self.auto_tma_recipes = getattr(metadata, "auto_tma_recipes", []) or []
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -546,6 +550,7 @@ class CudaLauncher(object):
             profile_scratch,
             self.arg_annotations,
             self.kernel_signature,
+            self.auto_tma_recipes,
             args,
         )
 

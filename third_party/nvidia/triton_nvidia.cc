@@ -163,8 +163,12 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      createTritonGPUFenceInsertionWrapper, int32_t);
   ADD_PASS_WRAPPER_1("add_proxy_fence_insertion",
                      createTritonGPUProxyFenceInsertionWrapper, int32_t);
+  ADD_PASS_WRAPPER_0("add_tmem_load_reduce",
+                     ttng::createTritonNvidiaGPUFuseTMEMLoadReducePass);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
+  ADD_PASS_WRAPPER_0("add_promote_load_to_tma",
+                     ttng::createTritonNvidiaGPUPromoteLoadToTMAPass);
   ADD_PASS_WRAPPER_0("add_tma_store_buffer_reuse",
                      ttng::createTritonNvidiaGPUTMAStoreBufferReusePass);
   ADD_PASS_WRAPPER_0("add_promote_lhs_to_tmem",

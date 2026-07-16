@@ -2661,7 +2661,7 @@ bool visit_make_tensordesc_args(PyObject *arg, PyObject *sig,
 
   Py_ssize_t arg_len = PySequence_Fast_GET_SIZE(arg_fast.ptr());
   Py_ssize_t sig_len = PyTuple_GET_SIZE(sig);
-  assert(sig_len == arg_len && "Invalid signature");
+  assert((sig_len == arg_len) && "Invalid signature");
   Py_ssize_t len = arg_len;
 
   for (Py_ssize_t i = 0; i < len; ++i) {
