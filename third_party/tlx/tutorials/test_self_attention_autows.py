@@ -6,6 +6,15 @@ Enables autoWS on the hammer-template Triton self-attn kernel via the
 baked as a tl.constexpr at import) and asserts the fwd output AND the dq/dk/dv
 gradients match a torch-autograd float causal-SiLU reference.
 
+Two configs are covered:
+- The DEFAULT autoWS config (in-process): `test_self_attention_fwd_autows`.
+- The TLX-matching dq-reduce config (BM=BN=128, num_stages=2, TMEM reuse, dsT in
+  SMEM): `test_self_attention_bwd_autows_dqreduce`. Its flags
+  (HSTU_SELF_DQ_REDUCE / HSTU_SELF_DQ_REUSE / the BWD tile knobs) are baked as
+  tl.constexpr / read into the autotune configs AT IMPORT, so they can't coexist
+  with the default config in one interpreter -> that case runs in a SUBPROCESS
+  (this same file re-invoked with `--run-dqreduce`) with the env set first.
+
 Notes:
 - autoWS needs TRITON_USE_META_WS=1 + TRITON_DISABLE_WSBARRIER_REORDER=1; these
   are set BEFORE importing the kernel so the constexpr/config pick see them.
@@ -13,12 +22,14 @@ Notes:
   >=128 TMEM rows) which OOMs TMEM on this kernel, so DP is off here.
 - The TLX self-attn *fwd* uses num_stages=0 and asserts under meta-WS, so it
   cannot be compiled in the same (META_WS) process; the accuracy oracle here is
-  the torch reference (as in test_cross_attention_bwd_autows.py).
+  the torch reference (as in test_cross_attention_bwd_autows.py). The dq-reduce
+  config's grads match this torch ref to bf16 precision, i.e. the same numerics
+  the hand-written TLX bwd produces.
 
 Run: pytest third_party/tlx/tutorials/test_self_attention_autows.py
 """
-import math
 import os
+import subprocess
 import sys
 
 _HSTU_DIR = os.path.join(os.path.dirname(__file__), "hstu_self_attn")
@@ -39,6 +50,28 @@ import triton_hstu_attention as A  # noqa: E402
 
 D = 128
 H = 2
+
+# The TLX-matching dq-reduce config: BM=BN=128 with num_stages=2 (annotation-
+# driven SWP schedule), FA-style TMEM reuse (id2={qk,act}, id5={dp,dq}, id7=dv,
+# id10=dk) with dsT pinned to SMEM (opndA,smem) so it does NOT column-pack into
+# the qk reuse buffer, and dq via TMA reduce-add subtiled x4. This is the config
+# whose final ttgir matches the hand-written TLX bwd (prologue/body/epilogue
+# structure + reuse groups) and whose grads match the torch/TLX numerics.
+_DQREDUCE_ENV = {
+    "HSTU_SELF_AUTOWS": "1",
+    "HSTU_SELF_DQ_REDUCE": "1",
+    "HSTU_SELF_DQ_REUSE": "1",
+    "HSTU_SELF_DP": "1",
+    "HSTU_SELF_AUTOWS_BWD_BM": "128",
+    "HSTU_SELF_AUTOWS_BWD_BN": "128",
+    "HSTU_SELF_AUTOWS_BWD_STAGES": "2",
+    "HSTU_SELF_AUTOWS_WARPS": "4",
+    "HSTU_SELF_PIN": "1",
+    "HSTU_SELF_DQ_ITERS": "4",
+    "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+    "TRITON_USE_META_WS": "1",
+    "TRITON_DISABLE_WSBARRIER_REORDER": "1",
+}
 
 
 def _torch_ref(q, k, v, do, so, asc):
@@ -64,15 +97,12 @@ def _rel_l2(a, b):
     return (torch.norm(a.float() - b.float()) / (torch.norm(b.float()) + 1e-12)).item()
 
 
-@pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
-def test_self_attention_fwd_autows(L, Z):
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    assert bool(A._HSTU_SELF_AUTOWS), "autoWS flag not baked on"
-
+def _run_autows_bwd(L, Z):
+    """Run the (already-imported) autoWS kernel fwd+bwd and return the grads plus
+    the torch-float reference grads. Config is whatever env was baked at import."""
     torch.manual_seed(0)
     t = Z * L
-    g = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)
+    g = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
     q, k, v = g().requires_grad_(True), g().requires_grad_(True), g().requires_grad_(True)
     so = torch.arange(0, t + 1, L, device="cuda", dtype=torch.int64)
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
@@ -87,8 +117,67 @@ def test_self_attention_fwd_autows(L, Z):
         attn_scale=asc, enable_tma=True,
     )
     o.backward(do)
-    dq, dk, dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
+    return (q.grad.clone(), k.grad.clone(), v.grad.clone()), (rq, rk, rv)
+
+
+@pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
+def test_self_attention_fwd_autows(L, Z):
+    """DEFAULT autoWS config (in-process): fwd + grads vs torch reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    assert bool(A._HSTU_SELF_AUTOWS), "autoWS flag not baked on"
+
+    (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(L, Z)
 
     for name, got, want in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv)):
         rl2 = _rel_l2(got, want)
         assert rl2 < 1e-2, f"autoWS {name} rel-L2 {rl2:.2e} too high (L={L} Z={Z})"
+
+
+@pytest.mark.parametrize("L,Z", [(256, 2)])
+def test_self_attention_bwd_autows_dqreduce(L, Z):
+    """TLX-matching dq-reduce config (BM=BN=128, ns=2, TMEM reuse, dsT-in-SMEM).
+
+    Runs in a SUBPROCESS because its flags are constexpr-baked at import and
+    cannot share an interpreter with the default config above. Asserts the bwd
+    grads match the torch-float reference (== TLX numerics) to bf16 precision;
+    this is the case that previously produced dv rel-L2 ~0.5 before the
+    dsT-in-SMEM / mmaSelfLatency fixes.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    env = dict(os.environ)
+    env.update(_DQREDUCE_ENV)
+    r = subprocess.run(
+        [sys.executable, __file__, "--run-dqreduce", str(L), str(Z)],
+        env=env, capture_output=True, text=True, timeout=900,
+    )
+    # Surface the child's REL_L2 line (and any error) in the pytest output.
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    assert r.returncode == 0, (
+        f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
+    )
+
+
+if __name__ == "__main__":
+    # Subprocess entry point for the dq-reduce config. The env (_DQREDUCE_ENV) is
+    # already in os.environ before this file's top-level import ran, so the kernel
+    # was imported with the dq-reduce constexprs baked on.
+    if len(sys.argv) >= 4 and sys.argv[1] == "--run-dqreduce":
+        _L, _Z = int(sys.argv[2]), int(sys.argv[3])
+        assert bool(A._HSTU_DQ_REUSE), "dq-reduce reuse flag not baked on"
+        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z)
+        rls = {n: _rel_l2(g_, w) for n, g_, w in
+               (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
+        print(
+            f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
+            f"(L={_L} Z={_Z})"
+        )
+        bad = {n: v for n, v in rls.items() if not (v < 1e-2)}
+        if bad:
+            print(f"FAIL: rel-L2 too high: {bad}")
+            sys.exit(1)
+        print("OK")
+        sys.exit(0)
+    sys.exit("usage: test_self_attention_autows.py --run-dqreduce L Z")

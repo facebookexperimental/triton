@@ -15,11 +15,12 @@ import sys
 _HSTU_DIR = os.path.join(os.path.dirname(__file__), "hstu_self_attn")
 sys.path.insert(0, _HSTU_DIR)
 
-# plain Triton + TLX (no autoWS, no meta-WS); TLX needs the wsbarrier-reorder off.
+# HSTU_SELF_* are the tutorial's own env knobs, baked as constexpr at kernel
+# import, so they must be set before importing bench_self. The Triton compiler
+# knobs (use_meta_ws off, wsbarrier-reorder off for TLX) are applied per-run via
+# a knobs scope in bench_self.grads(), not through os.environ.
 os.environ.pop("HSTU_SELF_AUTOWS", None)
-os.environ.pop("TRITON_USE_META_WS", None)
 os.environ["HSTU_SELF_PIN"] = "1"
-os.environ["TRITON_DISABLE_WSBARRIER_REORDER"] = "1"
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
