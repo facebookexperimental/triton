@@ -83,4 +83,3 @@ Second, it scales better than manual agentic kernel authoring. There is growing 
 - force - TLX templates enabled + forced epilogue fusion
 
 Only `allow` and `force` engage TLX; every other value (including an unset env var or a legacy `default`) maps to `None`, leaving TLX off. TLX is additionally a no-op unless the active Triton is the fbtriton fork.
-
