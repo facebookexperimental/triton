@@ -606,7 +606,8 @@ def solve_partition(prob):
     used_wgs = model.NewIntVar(1, ncl, "used_wgs")
     model.Add(used_wgs == prefix_max + 1)
     # Emitter-capability legality (versioned; see EmitterCaps in
-    # ModuloSchedulePass.cpp): e.g. outer loops are single-WG.
+    # ModuloSchedulePass.cpp): max_wgs bounds the WG count (caps v2
+    # retired the outer-loop single-WG constraint).
     model.Add(used_wgs <= prob.get("max_wgs", ncl))
 
     same_cache = {}
@@ -923,7 +924,8 @@ def solve_joint(prob):
     used_wgs = model.NewIntVar(1, ncl, "used_wgs")
     model.Add(used_wgs == prefix_max + 1)
     # Emitter-capability legality (versioned; see EmitterCaps in
-    # ModuloSchedulePass.cpp): e.g. outer loops are single-WG.
+    # ModuloSchedulePass.cpp): max_wgs bounds the WG count (caps v2
+    # retired the outer-loop single-WG constraint).
     model.Add(used_wgs <= prob.get("max_wgs", ncl))
 
     same_cache = {}

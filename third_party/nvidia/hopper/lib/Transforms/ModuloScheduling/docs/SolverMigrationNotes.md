@@ -91,6 +91,14 @@ not find anywhere in [517, 527] — with maxStage 3 vs Rau's 4 at II=534.
 
 ## Guard 3: outer WS loops forced single-WG
 
+> **RETIRED 2026-07 (upstream main merge, EmitterCaps v2):** the "better,
+> fix the emitter and drop it" branch below happened — sched2tlx now lowers
+> multi-WG OUTER bodies and its `_check_task_coverage` hard-errors on any
+> scheduled op no task owns instead of silently dropping it. The `sl.isOuter`
+> early-out and `EmitterCaps::kOuterLoopSingleWG` are gone; every loop goes
+> through the same partitioner (and the joint chain). The section is kept as
+> written for the historical record.
+
 Where: `ModuloSchedulePass.cpp:applyGlobalWarpPartition` (the `sl.isOuter`
 early-out).
 

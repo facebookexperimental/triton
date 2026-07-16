@@ -4496,12 +4496,12 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
 // capability and delete the corresponding constraint.
 // ============================================================================
 struct EmitterCaps {
-  static constexpr int kVersion = 1; // sched2tlx as of 2026-07
-  // Outer persistent loops must stay single-WG: only INNER loop bodies
-  // lower multi-WG; splitting an outer epilogue silently drops its ops
-  // (guard 3's NaN). Enforced by the isOuter early-out in
-  // applyGlobalWarpPartition and by max_wgs in the joint model.
-  static constexpr bool kOuterLoopSingleWG = true;
+  // v2: the outer-loop single-WG constraint (guard 3) was retired —
+  // sched2tlx lowers multi-WG OUTER bodies and its task-coverage check
+  // hard-errors on any scheduled op no task owns instead of silently
+  // dropping it, so every loop (inner and outer) goes through the same
+  // partitioner in applyGlobalWarpPartition.
+  static constexpr int kVersion = 2; // sched2tlx as of 2026-07
   // TMEM accumulator allocation supports blockM <= 128 (no MMA splitting
   // for larger tiles). Blocks case2's 256-blockM pre_modulo end-to-end;
   // the emitter raises a clear error (see _emit_buffers in emitter.py).
@@ -4740,10 +4740,9 @@ static bool partitionJointSolver(ttg::ScheduleLoop &loop,
       {"version", "joint-solver-0.1"},
       {"mode", v2 ? "joint" : "partition"},
       {"emitter_caps_version", EmitterCaps::kVersion},
-      // Inner loops only reach this partitioner today (the isOuter
-      // early-out enforces EmitterCaps::kOuterLoopSingleWG before it);
-      // max_wgs carries the same legality in-model for when outer loops
-      // are routed here.
+      // Every loop — inner AND outer — reaches this partitioner (the
+      // outer-loop single-WG legality was retired in EmitterCaps v2);
+      // max_wgs = clusters.size() is the only WG-count bound in-model.
       {"max_wgs", static_cast<int64_t>(clusters.size())},
       {"ii", loop.II},
       {"clusters", std::move(jClusters)},

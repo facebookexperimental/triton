@@ -909,7 +909,14 @@ class CUDABackend(BaseBackend):
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if knobs.nvidia.use_list_schedule:
+            # The elif chain above gives the llm/joint/modulo schedulers
+            # priority over the list scheduler, so gate the WS skip on the arm
+            # that actually RAN, not on the raw knob — with e.g. joint+list both
+            # set, the joint schedule's partition annotations still need the WS
+            # passes below.
+            ran_list_schedule = (knobs.nvidia.use_list_schedule and not knobs.nvidia.use_llm_schedule
+                                 and not knobs.nvidia.use_joint_schedule and knobs.nvidia.use_modulo_schedule is None)
+            if ran_list_schedule:
                 # List scheduling is a no-warp-specialization transform: it
                 # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
                 # feeds the pipeliner directly. Running either WS path here would
