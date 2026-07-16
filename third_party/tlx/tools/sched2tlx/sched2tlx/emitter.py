@@ -75,7 +75,12 @@ def _bits_to_tl_dtype(bits: int, is_float: bool = True) -> str:
 # Parse `tensor<128x64xf16, ...>` → ([128, 64], "f16")
 # Restrict dtype to the small set of MLIR scalar types we care about so the
 # greedy match doesn't swallow the last dimension.
-_DTYPE_ALT = r"(?:bf16|f8e4m3|f8e5m2|f16|f32|f64|i1|i8|i16|i32|i64)"
+# fp8 uses MLIR's canonical spelling (f8E4M3FN, f8E5M2, ...); list the longer
+# FNUZ variants first so the alternation doesn't stop at the shorter prefix.
+_DTYPE_ALT = (
+    r"(?:bf16|f8E4M3FNUZ|f8E5M2FNUZ|f8E4M3FN|f8E5M2|f8E4M3|f8E8M0FNU"
+    r"|f8e4m3|f8e5m2|f16|f32|f64|i1|i8|i16|i32|i64)"
+)
 _TENSOR_TYPE_RE = re.compile(rf"tensor<([0-9x]+)x({_DTYPE_ALT})\b")
 _DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<tensor<([0-9x]+)x({_DTYPE_ALT})\b")
 # `!ttg.memdesc<128x128xbf16, ...>` — used for hoisted SMEM/TMEM allocs.
@@ -105,15 +110,27 @@ def _parse_desc_block_shape(type_str: str) -> tuple[list[int], str] | None:
     return dims, dtype
 
 
+# MLIR fp8 type name → tl dtype. e4m3fn is the NVIDIA/OCP "nv" variant.
+_FP8_TO_TL = {
+    "f8E4M3FN": "tl.float8e4nv",
+    "f8E4M3": "tl.float8e4nv",
+    "f8E4M3FNUZ": "tl.float8e4b8",
+    "f8E5M2": "tl.float8e5",
+    "f8E5M2FNUZ": "tl.float8e5b16",
+}
+
+
 def _dtype_str_to_tl(dtype: str) -> str:
+    if dtype in _FP8_TO_TL:
+        return _FP8_TO_TL[dtype]
+    if dtype.startswith("bf"):
+        return "tl.bfloat16"
     if dtype.startswith("f"):
         bits = int(dtype[1:])
         return _bits_to_tl_dtype(bits, is_float=True)
     if dtype.startswith("i"):
         bits = int(dtype[1:])
         return _bits_to_tl_dtype(bits, is_float=False)
-    if dtype.startswith("bf"):
-        return "tl.bfloat16"
     return f"tl.{dtype}"
 
 
@@ -1441,14 +1458,47 @@ def _auto_name(op: Op, idx: int) -> str:
 # ===========================================================================
 
 
+def _signal_only_buffer_ids(loop: Loop) -> set[int]:
+    """Buffer ids that carry NO data — paired only with a backward (loop-carry
+    release) cross-WG barrier. Such a barrier is a slot-free SIGNAL (e.g. the
+    acc_tmem release in blockwise scaled_mm: the promotion tells the MMA the TMEM
+    slot is free; the real data lives in TMEM). Materializing a SMEM data buffer
+    for it is pure waste — a 128x128 fp32 phantom is 64 KB. A buffer paired by any
+    FORWARD barrier, or produced/consumed by a node, carries real data and is
+    kept (e.g. the sa channel, whose store/load the channel path emits)."""
+    cyc = {n.id: n.schedule_cycle for n in loop.schedule.nodes}
+    data_used: set[int] = set()
+    for n in loop.schedule.nodes:
+        if n.produces_buffer is not None:
+            data_used.add(n.produces_buffer)
+        data_used.update(n.consumes_buffers or [])
+    fwd_paired: set[int] = set()
+    bwd_paired: set[int] = set()
+    for cb in loop.schedule.cross_wg_barriers:
+        if cb.paired_buffer_id is None:
+            continue
+        pc, cc = cyc.get(cb.producer_node), cyc.get(cb.consumer_node)
+        if pc is not None and cc is not None and pc > cc:
+            bwd_paired.add(cb.paired_buffer_id)
+        else:
+            fwd_paired.add(cb.paired_buffer_id)
+    return {b for b in bwd_paired if b not in fwd_paired and b not in data_used}
+
+
 def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) -> None:
     lines += "# ── Multi-buffered allocations (from modulo's lifetime analysis) ──"
     loop_tag = "inner" if not loop.is_outer else "outer"
+    signal_only = _signal_only_buffer_ids(loop)
     # Track the FIRST allocated variable for each merge_group_id so subsequent
     # buffers in the same group emit `reuse=<first_var>` (Step 4.5 says they
     # have disjoint lifetimes — same physical bytes, different time slots).
     merge_group_owner: dict[int, str] = {}
     for b in loop.schedule.buffers:
+        # Signal-only loop-carry-release buffer: no data, so no alloc (the
+        # handshake uses its own named barrier, not this buffer). Skips the 64 KB
+        # phantom acc_tmem-release buffer in blockwise scaled_mm.
+        if b.id in signal_only:
+            continue
         # Per-loop unique name to avoid id collisions between inner/outer.
         var = f"L{loop.loop_id}_{_buffer_var_name(b)}"
         rctx.buffer_var[(loop.loop_id, b.id)] = var
@@ -1828,6 +1878,80 @@ class Channel:
     num_consumers: int = 1
 
 
+def _result_feeds_descriptor_store(
+    g: ScheduleGraph, for_op_id: str, idx: int, epi_scopes: set[str]
+) -> bool:
+    """Forward-walk from scf.for result[idx]: True iff it reaches a
+    `tt.descriptor_store` (the default epilogue's TMA store) before any pointer
+    `tt.store`. Distinguishes a genuine cross-WG epilogue value (case9 blockwise
+    scaled_mm: running-sum → truncf → descriptor_store) from a fused reduction
+    (case7 bias db: reduce → convert_layout → tt.store), which is emitted in the
+    producing WG by `_emit_outer_reduction_stores` and needs no staging channel.
+    """
+    seeds = [
+        oid
+        for oid, o in g.ops.items()
+        if o.scope in epi_scopes
+        and any(
+            isinstance(x, OpRef) and x.op_id == for_op_id and x.result_idx == idx
+            for x in o.operands
+        )
+    ]
+    seen = set(seeds)
+    stack = list(seeds)
+    while stack:
+        cur = stack.pop()
+        op = g.ops.get(cur)
+        if op is None:
+            continue
+        if op.kind == "tt.descriptor_store":
+            return True
+        if op.kind == "tt.store":
+            continue  # pointer-store reduction terminal — emitted in producer WG
+        for oid, o in g.ops.items():
+            if oid in seen:
+                continue
+            if any(isinstance(x, OpRef) and x.op_id == cur for x in o.operands):
+                seen.add(oid)
+                stack.append(oid)
+    return False
+
+
+def _epilogue_colocation_wg(g: ScheduleGraph) -> int | None:
+    """The single inner warp group that produces the outer-loop epilogue's
+    register input — the WG the epilogue can be CO-LOCATED into (promotion +
+    store in one task, like the hand-written kernel), dropping the cross-WG SMEM
+    staging entirely. Returns None when there are zero or multiple such producers
+    (multi-producer, e.g. FA-bwd dK/dV, keeps the SMEM fallback) or the kernel is
+    non-persistent (no separate outer-epilogue task to merge)."""
+    outer_scopes = {f"loop:{L.loop_id}" for L in g.loops if L.is_outer}
+    if not outer_scopes:
+        return None
+    producers: set[int] = set()
+    for loop in g.loops:
+        if loop.is_outer:
+            continue
+        for_op = _find_loop_for(g, loop)
+        if for_op is None:
+            continue
+        wg_of_op = {n.op_ref: n.warp_group for n in loop.schedule.nodes if n.op_ref}
+        for idx, init, yld in _loop_iter_args(g, loop):
+            if not isinstance(yld, OpRef):
+                continue
+            pw = wg_of_op.get(yld.op_id)
+            if pw is None:
+                continue
+            if not (
+                isinstance(init, ConstRef)
+                and init.type
+                and _TENSOR_TYPE_RE.search(init.type)
+            ):
+                continue
+            if _result_feeds_descriptor_store(g, for_op.op_id, idx, outer_scopes):
+                producers.add(pw)
+    return next(iter(producers)) if len(producers) == 1 else None
+
+
 def _derive_crossloop_result_channels(
     g: ScheduleGraph, rctx: RenderCtx
 ) -> list[dict[str, Any]]:
@@ -1842,6 +1966,11 @@ def _derive_crossloop_result_channels(
     Returns one descriptor per (loop, idx) pair needing staging.
     """
     out: list[dict[str, Any]] = []
+    # Epilogue consumers of an inner-loop result live either at function scope
+    # (non-persistent: ops after the single loop) or inside the OUTER loop body
+    # (persistent: the per-tile epilogue). The outer scf.for carries no results
+    # in these kernels, so any scf.for-result reference is to the inner loop.
+    epi_scopes = {"function"} | {f"loop:{L.loop_id}" for L in g.loops if L.is_outer}
     for loop in g.loops:
         if loop.is_outer:
             continue  # only inner-loop iter_arg results need this staging
@@ -1852,6 +1981,10 @@ def _derive_crossloop_result_channels(
         wg_of_op: dict[str, int] = {
             n.op_ref: n.warp_group for n in loop.schedule.nodes if n.op_ref
         }
+        for_op = _find_loop_for(g, loop)
+        if for_op is None:
+            continue
+        outer_scopes = {f"loop:{L.loop_id}" for L in g.loops if L.is_outer}
         for idx, init, yld in specs:
             # Find the producer WG of the yield value.
             if not isinstance(yld, OpRef):
@@ -1859,34 +1992,47 @@ def _derive_crossloop_result_channels(
             prod_wg = wg_of_op.get(yld.op_id)
             if prod_wg is None:
                 continue
-            # Default partition is wg=-1 / -2 typically; treat anything other
-            # than the producer's WG as cross-WG when reading from epilogue.
-            # Determine if any function-scope op references scf.for.result[idx].
-            referenced_by_epi = False
-            for op in g.ops.values():
-                if op.scope != "function":
-                    continue
-                for o in op.operands:
-                    if (
-                        isinstance(o, OpRef)
-                        and o.result_idx == idx
-                        and (find := g.ops.get(o.op_id))
-                        and find.kind == "scf.for"
-                    ):
-                        referenced_by_epi = True
-                        break
-                if referenced_by_epi:
-                    break
-            if not referenced_by_epi:
+            # Only stage a real register tensor value. Async tokens / memdesc
+            # iter_args (e.g. the tmem_alloc token threaded through case7's inner
+            # loop) are not registers and must not get a channel.
+            if not (
+                isinstance(init, ConstRef)
+                and init.type
+                and _TENSOR_TYPE_RE.search(init.type)
+            ):
+                continue
+            # Function-scope epilogue consumer (non-persistent, e.g. case3 FA
+            # m_i): the original rule — any non-`tt.store` reference to
+            # result[idx].
+            func_ref = any(
+                op.scope == "function"
+                and op.kind != "tt.store"
+                and any(
+                    isinstance(o, OpRef)
+                    and o.result_idx == idx
+                    and (f := g.ops.get(o.op_id))
+                    and f.kind == "scf.for"
+                    for o in op.operands
+                )
+                for op in g.ops.values()
+            )
+            # Outer-loop-scope epilogue consumer (persistent): only when the
+            # value flows to the default TMA store (case9 blockwise running-sum),
+            # NOT a producer-WG pointer-store reduction (case7 bias db).
+            outer_ref = _result_feeds_descriptor_store(
+                g, for_op.op_id, idx, outer_scopes
+            )
+            # Lever #2: if this producer WG will own the epilogue itself
+            # (co-location), the register value never crosses a WG boundary — no
+            # SMEM staging channel is needed. Only the SMEM fallback path (no
+            # co-location, or a function-scope consumer) still stages.
+            if outer_ref and prod_wg == _epilogue_colocation_wg(g):
+                outer_ref = False
+            if not (func_ref or outer_ref):
                 continue
             # Resolve type / shape from the init.
-            shape = [128]
-            dtype = "tl.float32"
-            if isinstance(init, ConstRef) and init.type:
-                sd = _parse_tensor_shape(init.type)
-                if sd:
-                    shape, dt = sd
-                    dtype = _dtype_str_to_tl(dt)
+            shape, dt = _parse_tensor_shape(init.type)
+            dtype = _dtype_str_to_tl(dt)
             var_name = _iter_arg_python_name(loop.loop_id, idx, init)
             out.append(
                 {
@@ -4546,16 +4692,23 @@ def _unified_warp_groups(
         if n.op_kind in ("tt.descriptor_store", "ttng.tmem_load"):
             epi_outer_wg = n.warp_group
             break
-    out.append(
-        UnifiedWG(
-            name="default",
-            role="default",
-            outer_wg=epi_outer_wg,
-            inner_wg=None,
-            num_warps=4,
-            is_default=True,
+    # Lever #2: when the epilogue's register input comes from a single inner WG,
+    # CO-LOCATE the epilogue into that WG (it becomes the default task owning both
+    # its inner loop and the outer epilogue) instead of a separate default task
+    # fed by a cross-WG SMEM channel. Matches the hand-written PROMO=default and
+    # drops the epi_* staging buffer + round-trip.
+    colo_wg = _epilogue_colocation_wg(graph)
+    if colo_wg is None:
+        out.append(
+            UnifiedWG(
+                name="default",
+                role="default",
+                outer_wg=epi_outer_wg,
+                inner_wg=None,
+                num_warps=4,
+                is_default=True,
+            )
         )
-    )
 
     # One UWG per inner warp group. Trust the schedule pass's num_warps
     # decision (Layer B); see the case1 branch above for the rationale.
@@ -4568,14 +4721,20 @@ def _unified_warp_groups(
         )
         num_warps = wg.num_warps
         num_regs = wg.num_regs or (152 if num_warps >= 4 else 24)
+        # Lever #2: the co-located WG becomes the default task and also owns the
+        # outer epilogue (outer_wg=epi_outer_wg); as the default task it gets the
+        # leftover (largest) register budget — right for the register-heavy
+        # promotion + store.
+        is_colo = wg.id == colo_wg
         out.append(
             UnifiedWG(
-                name=f"inner_wg{wg.id}_{primary}",
-                role=primary,
-                outer_wg=None,
+                name="default" if is_colo else f"inner_wg{wg.id}_{primary}",
+                role="default" if is_colo else primary,
+                outer_wg=epi_outer_wg if is_colo else None,
                 inner_wg=wg.id,
                 num_warps=num_warps,
-                num_regs=num_regs,
+                num_regs=(None if is_colo else num_regs),
+                is_default=is_colo,
             )
         )
     # Multi-WG OUTER bodies: any outer warp group beyond the default's gets
@@ -4850,6 +5009,7 @@ def _localize_captured_reg_tensors(
     target_nodes: list[Node],
     rctx: RenderCtx,
     lines: _Lines,
+    descend_iv: bool = False,
 ) -> dict[str, str | None]:
     """Re-materialize, with task-local names, any function-scope register-tensor
     op a non-default warp group consumes that is currently bound to a global
@@ -4867,14 +5027,26 @@ def _localize_captured_reg_tensors(
             return
         seen.add(op_id)
         op = g.ops.get(op_id)
-        if op is None or _depends_on_iv_or_iter_arg(g, op_id):
+        if op is None:
+            return
+        # By default prune at IV / iter-arg-dependent ops (they're rematerialized
+        # per-tile by the infra path). With descend_iv=True (persistent per-UWG
+        # localization) keep descending so we reach IV-INDEPENDENT captured
+        # register tensors nested inside them — e.g. a tt.make_range buried in a
+        # per-tile scale-offset addptr (blockwise scaled_mm). Only IV-independent
+        # leaves are localized either way.
+        if not descend_iv and _depends_on_iv_or_iter_arg(g, op_id):
             return
         for o in op.operands:
             if isinstance(o, OpRef):
                 walk(o.op_id)
         # Candidate: a register-tensor value already named at function scope
         # (preamble). Re-emit it here so the task doesn't capture it.
-        if op.op_id in rctx.op_var and _result_is_register_tensor(op):
+        if (
+            not _depends_on_iv_or_iter_arg(g, op_id)
+            and op.op_id in rctx.op_var
+            and _result_is_register_tensor(op)
+        ):
             order.append(op)
 
     for n in target_nodes:
@@ -5096,15 +5268,19 @@ def _emit_inner_loop_in_outer(
     # TC partition: wait for epilogue release before starting next tile's K-loop.
     # Uses tmem_buf / tmem_phase computed at top of per-tile body for ring
     # buffer indexing (depth = tmem_count).
-    if persistent and uwg.role == "TC":
+    if persistent and uwg.role == "TC" and rctx.has_acc_tmem_handoff:
         lines += "tlx.barrier_wait(acc_tmem_empty[tmem_buf], tmem_phase ^ 1)"
 
     # Loop-carry pre-arrive: under SemIR, looked up from is_released
     # semaphores keyed by (loop, wg). Legacy path uses cycle comparison.
-    if _use_semaphore_ir():
+    # For a PERSISTENT kernel the inner-loop carry is continuous across tiles
+    # (smem_accum/_it persists), so the prime is hoisted to ONCE before the outer
+    # loop by the caller — re-priming here per tile would add an unmatched arrive
+    # and drift the barrier phase → cross-tile deadlock (case9 sem4).
+    if _use_semaphore_ir() and not persistent:
         for line in _semir_pre_arrives_for_wg(inner.loop_id, uwg.inner_wg, rctx):
             lines += line
-    else:
+    elif not _use_semaphore_ir():
         cycle_of = {n.id: n.schedule_cycle for n in inner.schedule.nodes}
         for c in rctx.channels:
             if c.loop_id is not None and c.loop_id != inner.loop_id:
@@ -5190,7 +5366,7 @@ def _emit_inner_loop_in_outer(
     # K=128 / 2 inner iters) the read happens before the last MMA lands
     # and the epilogue reads stale TMEM. Manifests as ~1/4 of each m-tile's
     # rows being wrong (one warp's share of the 4-warp tmem_load layout).
-    if persistent and uwg.role == "TC":
+    if persistent and uwg.role == "TC" and rctx.has_acc_tmem_handoff:
         lines += "tlx.tcgen05_commit(acc_tmem_full[tmem_buf])"
 
 
@@ -5714,6 +5890,41 @@ def _emit_uwg_body_impl(
     if has_outer_sems:
         lines += "_oit = 0"
 
+    # Cross-loop register-result channels (persistent kernels): the producing
+    # inner WG stages its final iter_arg value through SMEM once per tile; the
+    # default (epilogue) task drains it. Registers can't cross warp groups, so
+    # this is the SMEM analogue of the acc_tmem TC→default hand-off. Per-tile
+    # phase via a dedicated counter, mirroring tmem_accum_cnt.
+    cl_prod = [
+        ch
+        for ch in rctx.crossloop_channels
+        if inner is not None
+        and uwg.inner_wg is not None
+        and ch["loop_id"] == inner.loop_id
+        and ch["producer_wg"] == uwg.inner_wg
+    ]
+    cl_cons = list(rctx.crossloop_channels) if uwg.is_default else []
+    for ch in {c["bufname"]: c for c in cl_prod + cl_cons}.values():
+        lines += f"{ch['bufname']}_cnt = 0"
+
+    # A non-default async_task cannot capture a RankedTensorType from function
+    # scope. Re-materialize any function-scope register tensors this task's ops
+    # consume (e.g. blockwise scaled_mm's scale-offset tt.make_range) with
+    # task-local names. The per-task op_var snapshot in _emit_uwg_body restores
+    # the global bindings afterward. No-op when the task captures nothing.
+    _loc_nodes = list(_outer_nodes_for_uwg(outer, uwg))
+    if inner is not None and uwg.inner_wg is not None:
+        _loc_nodes += _inner_nodes_for_uwg(inner, uwg)
+    _localize_captured_reg_tensors(g, _loc_nodes, rctx, lines, descend_iv=True)
+
+    # Loop-carry pre-arrives (is_released semaphores, e.g. case9 sem4 acc_tmem
+    # release): PRIME ONCE here, before the persistent loop. The inner-loop carry
+    # is continuous across tiles (smem_accum/_it persists), so priming per tile
+    # would add an unmatched arrive and drift the phase → cross-tile deadlock.
+    if _use_semaphore_ir() and inner is not None and uwg.inner_wg is not None:
+        for line in _semir_pre_arrives_for_wg(inner.loop_id, uwg.inner_wg, rctx):
+            lines += line
+
     # Outer for-loop scaffolding.
     out_iv = outer.schedule.induction_var_name
     out_lo = _render_operand(outer.schedule.lower_bound, rctx)
@@ -5734,6 +5945,13 @@ def _emit_uwg_body_impl(
             # Bind the lowered semaphores' `_it`-based slot/phase expressions
             # to the per-tile counter.
             lines += "_it = _oit"
+        # Cross-loop result channel (consumer side): drain the producing WG's
+        # staged final iter_arg value and bind its var so the epilogue reads it.
+        for ch in cl_cons:
+            _ph = f"({ch['bufname']}_cnt & 1)"
+            lines += f"tlx.barrier_wait({_bar_full(ch['bufname'])}[0], {_ph})"
+            lines += f"{ch['var_name']} = tlx.local_load({ch['bufname']}[0])"
+            lines += f"tlx.barrier_arrive({_bar_empty(ch['bufname'])}[0], 1)"
         # Per-iter infra: ops with IV/iter_arg deps that this body needs
         # (e.g., pid_m, pid_n, offs_am, offs_bn for the in-loop accesses).
         in_loop_infra_visited: set[str] = set()
@@ -5843,6 +6061,15 @@ def _emit_uwg_body_impl(
                 # Fused post-loop reduction store (e.g. case7 bias gradient db),
                 # emitted in the WG that owns the reduction accumulator.
                 _emit_outer_reduction_stores(g, outer, inner, uwg, rctx, lines)
+                # Cross-loop result channel (producer side): stage this WG's
+                # final iter_arg value through SMEM for the epilogue task.
+                for ch in cl_prod:
+                    _ph = f"({ch['bufname']}_cnt & 1)"
+                    lines += (
+                        f"tlx.barrier_wait({_bar_empty(ch['bufname'])}[0], {_ph} ^ 1)"
+                    )
+                    lines += f"tlx.local_store({ch['bufname']}[0], {ch['var_name']})"
+                    lines += f"tlx.barrier_arrive({_bar_full(ch['bufname'])}[0], 1)"
                 continue
             if sub_info and i == subtile_start:
                 chain_nodes = outer_nodes[subtile_start:subtile_end]
@@ -5889,6 +6116,10 @@ def _emit_uwg_body_impl(
                 if opv is not None:
                     _semir_emit_producer_block(n, opv, g, outer, rctx, lines)
 
+        # Advance the cross-loop result-channel counter(s) at end of each tile
+        # (producer and consumer stay in phase lockstep).
+        for ch in {c["bufname"]: c for c in cl_prod + cl_cons}.values():
+            lines += f"{ch['bufname']}_cnt += 1"
         # Advance the TMEM ring counter at end of each tile (both default
         # and TC partitions, so tmem_buf/tmem_phase stay in sync).
         if has_tmem:
@@ -5960,13 +6191,25 @@ def emit(graph: ScheduleGraph) -> str:
     # Per-buffer MMA-consumer counts → intra-WG `extra` empties need
     # arrive_count = N consumers (each consuming async_dot recycles EMPTY).
     rctx._buf_consumer_count = _buf_mma_consumer_counts(graph)
-    # The acc_tmem TC→default-epilogue hand-off only exists if the kernel has
-    # an MMA producing the accumulator. Without one (e.g. case6 LayerNorm), the
-    # default task must not wait on acc_tmem_full (nothing arrives it → hang).
-    rctx.has_acc_tmem_handoff = any(
+    # The acc_tmem TC→default-epilogue carve-out only applies when the epilogue
+    # actually reads the accumulator via a tmem_load OUTSIDE the inner loop
+    # (cases 2/5: MMA accumulates across K into acc_tmem, epilogue reads it once
+    # per tile). Two cases where it must NOT fire, else the TC's acc_tmem_empty
+    # wait is never arrived and the kernel hangs / the default waits a full that
+    # never comes: (a) no MMA at all (case6 LayerNorm); (b) the only tmem_load is
+    # INSIDE the inner loop (blockwise scaled_mm: a fresh per-group MMA partial
+    # the promotion drains via its own sem channels — acc_tmem is intra-loop
+    # scratch, not a per-tile accumulator).
+    _epi_scopes = {"function"} | {f"loop:{L.loop_id}" for L in graph.loops if L.is_outer}
+    _has_mma = any(
         op.kind in ("ttng.tc_gen5_mma", "ttng.tc_gen5_mma_scaled")
         for op in graph.ops.values()
     )
+    _epi_tmem_read = any(
+        op.kind == "ttng.tmem_load" and op.scope in _epi_scopes
+        for op in graph.ops.values()
+    )
+    rctx.has_acc_tmem_handoff = _has_mma and _epi_tmem_read
 
     lines.indent = 1
     if outer_loop is None:
@@ -6081,9 +6324,12 @@ def emit(graph: ScheduleGraph) -> str:
             rctx.buffer_var[(outer_loop.loop_id, buf.id)] = name
             if buf.def_op:
                 rctx.alloc_op_var[buf.def_op] = name
-            # Stash the primary's count for the TC↔default ring depth.
+            # Stash the primary's count for the TC↔default ring depth. When
+            # acc_tmem is intra-loop scratch (no epilogue read — blockwise), the
+            # MMA↔promotion sem channels are single-slot, so force depth-1 and
+            # the MMA writes acc_tmem[0] where the in-loop promotion reads.
             if buf is primary:
-                rctx.tmem_count = buf.count
+                rctx.tmem_count = buf.count if rctx.has_acc_tmem_handoff else 1
             if buf.partition_count > 1:
                 # Pass A.5: emit N separate TMEM allocs each (m_size, *trailing).
                 # Each MMA partition writes to its own acc_tmem_g{i}; the
