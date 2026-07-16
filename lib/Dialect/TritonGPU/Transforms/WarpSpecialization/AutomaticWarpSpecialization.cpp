@@ -157,6 +157,13 @@ static bool useMetaNVWSAllocas() {
 } // namespace
 
 void AutomaticWarpSpecialization::runOnOperation() {
+  bool enabled = false;
+  getOperation().walk([&](FuncOp func) {
+    enabled |= hasWarpSpecializeLoop(func);
+  });
+  if (!enabled)
+    return;
+
   // The default and Meta-NVWS sub-pipelines, including each pass handoff, are
   // documented in sema-docs/nvws-aws-overview.md.
   // META_WS_CHANGE: Preserve Meta's manual-WS bailout.
