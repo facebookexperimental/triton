@@ -118,9 +118,35 @@ kernel too and typically CRASH it (e.g. TLX fwd uses `num_stages=0` ->
 
 ## Step 3.5 - Data partitioning (DP) = the autoWS analog of TLX `replicate=NUM_MMA_GROUPS`
 
-TLX gets its multi-compute-group structure from `tlx.async_task(...,
-replicate=NUM_MMA_GROUPS)`. The autoWS analog is a **`data_partition_factor=N`
-kwarg on the annotated `tl.range`** (a `tl.constexpr`), e.g.:
+**What DP is.** Data partitioning splits ONE logical loop tile into N independent
+compute groups that run concurrently on separate warp partitions, each handling
+`tile / N` of the split dimension (usually M). It is how a kernel gets multiple
+compute groups (a ping-pong / N-way overlap) instead of one, roughly N× the
+compute-partition parallelism. TLX expresses it by hand as
+`tlx.async_task(..., replicate=NUM_MMA_GROUPS)` (+ `BLOCK_M_SPLIT = BLOCK_M //
+NUM_MMA_GROUPS`, indexed by a per-group `cid`); autoWS expresses it as the
+`data_partition_factor=N` loop attr the `WSDataPartition` pass consumes. It is
+distinct from *pipelining depth* (`num_stages` / buffer copies), which overlaps
+iterations of a SINGLE group — a kernel can have DP, pipeline depth, both, or
+neither.
+
+**VERIFY whether TLX actually uses DP for the DIRECTION you are matching — do not
+assume.** `NUM_MMA_GROUPS` / `replicate` / `cid` are frequently **forward-only**.
+Concrete trap (HSTU, cost me three wrong claims): the HSTU *forward* persistent
+kernel uses `NUM_MMA_GROUPS=2` (in `get_fwd_persistent_configs`,
+`_softmax_inner_loop`/`_silu_inner_loop`), but the *backward*
+(`_hstu_attn_bwd_ws_non_persistent`) uses **none** — `get_hstu_bwd_configs` never
+sets `NUM_MMA_GROUPS` and the bwd body never references `cid`/`BLOCK_M_SPLIT`. A
+`grep NUM_MMA_GROUPS` hit tells you nothing until you confirm its **enclosing
+function** (`awk 'NR<=L && /^def /{f=$0} NR==L{print f}'`) and which config dict
+sets it. If TLX-for-this-direction has no DP, then a DP=1 autoWS run is already
+matched on that axis and the gap is elsewhere (pipeline depth / WS quality) — do
+not chase DP.
+
+TLX gets its multi-compute-group structure (when it has one) from
+`tlx.async_task(..., replicate=NUM_MMA_GROUPS)`. The autoWS analog is a
+**`data_partition_factor=N` kwarg on the annotated `tl.range`** (a `tl.constexpr`),
+e.g.:
 ```python
 for start_n in tl.range(lo, hi, BLOCK_N, warp_specialize=True,
                         data_partition_factor=2, merge_epilogue=True,
@@ -179,43 +205,280 @@ manual DP DOES reproduce TLX's per-partition TMEM fit today; the compiler
 `data_partition_factor` path still needs the DP-aware per-partition TMEM
 allocation fix to match it hands-free.
 
+## Step 3.6 - Fix TLX on its best config FIRST, then match autoWS to it
+
+Do the comparison at ONE fully-specified config, not "TLX autotuned vs autoWS
+autotuned" (that compares two different tiles and hides the real gap).
+
+1. **Pin TLX to its best config.** Read `get_<kernel>_bwd_configs()` (e.g.
+   `get_hstu_bwd_configs`) and identify the winner for your `(seq_len, HEAD_DIM)`
+   autotune key — or shrink the space to one entry (an env-gated `..._PIN`) so
+   compile is fast and deterministic. Record EVERY field: `BLOCK_M1/N1/M2/N2`,
+   `num_warps`, `num_stages`, and the staging/buffer knobs (`NUM_BUFFERS_Q/KV/DO/
+   DS/TMEM`, `EPILOGUE_SUBTILE`, `DQ_REDUCE_FACTOR`, `DQ_REDUCE_STAGES`,
+   `EARLY_RELEASE_SUBTILES`). These are the target autoWS must reproduce.
+2. **Force autoWS to the SAME tile.** The autoWS config picker usually chooses its
+   own tile; add an env knob (e.g. `HSTU_SELF_AUTOWS_BM`/`_BN`) to pin
+   `BLOCK_M`/`BLOCK_N` to TLX's `BLOCK_M1`/`BLOCK_N1`, plus matching `num_warps`
+   and `num_stages`. Verify the compiled autoWS ttgir has the same tile shapes.
+3. **Confirm the WS layout is actually comparable** (Step 4.1): partition types,
+   per-partition `num_warps` (grep `num_warps(` on each `partitionN(` region — NOT
+   just the config `num_warps`, which is only the default region; sum the
+   partitions for the true warp budget), and whether WS even fired.
+4. Only now is a perf delta attributable to WS *quality* rather than config skew.
+   Worked example (HSTU self-attn bwd, GB200): once autoWS dq-reduce was pinned to
+   TLX's BM1=BN1=128 (and confirmed TLX bwd has no DP, Step 3.5), the residual
+   ~8x bwd gap isolated cleanly to pipeline/staging depth + WS codegen quality.
+
+## Step 3.7 - Align buffer reuse & staging with TLX (annotations + `[ws-summary]`)
+
+TLX hand-places every TMEM/SMEM buffer (reuse groups, staging depth); autoWS's
+memory planner decides heuristically and often differently. Two levers make
+autoWS's memory plan match TLX's:
+
+**ORDERING (important): settle the SWP schedule FIRST, then do these
+memory-planner annotations.** Align the software-pipelining schedule — partition
+structure and #GEMMs via `num_stages` / unroll / subtiling (Step 4 items 1–2) —
+BEFORE touching reuse-group / staging-depth annotations. The memory planner
+allocates against the *scheduled* op liveness (which buffers are simultaneously
+live is set by the pipeline schedule), so annotations applied against an unsettled
+schedule mismatch the eventual schedule or get silently invalidated when you later
+change `num_stages`/unroll. EXCEPTION: a reuse annotation needed for CORRECTNESS or
+TMEM-fit (e.g. the dq deadlock/512-col fix below) is a prerequisite and can go in
+early; PERF-oriented staging/reuse tuning follows SWP alignment.
+
+**(a) Reuse groups via per-dot channel annotations.** Pass
+`attrs={"channels":["opndD,tmem,<copy>,<bufId>"]}` to `tl.dot`; MMAs sharing a
+`bufId` form one TMEM reuse group (the compiler analog of TLX's `REUSE_DP_FOR_DQ`
+/ `NUM_BUFFERS_TMEM=1`). Full spec:
+`.../WarpSpecialization/docs/AnnotationBasedBufferPreAssignment.md` (partial
+annotation is supported — un-annotated buffers stay heuristic). Worked example
+(HSTU self-attn bwd, commit 603af6048): four groups pack to exactly 512 TMEM cols
+at BM=BN=HEAD_DIM=128 — `id2` qk(+act reuses it as dv's opndA), `id5` dp(+dq =
+REUSE_DP_FOR_DQ), `id7` dv, `id10` dk — which BOTH fits TMEM and fixes a
+single-buffered-dq deadlock (dq inherits dp's cross-iteration WAR). Gotchas:
+- Reuse validity needs the two accumulators **shape-compatible**; e.g. dp
+  `[BLOCK_N,BLOCK_M]` and dq `[HEAD_DIM,BLOCK_M]` match only at `BLOCK_N==HEAD_DIM`.
+  At a mismatched tile the reuse silently falls back.
+- Ordering hazard (`BwdTmemReuseSlotHazard.md`): if two same-partition MMAs share a
+  slot, emit the reader before the writer (e.g. dk before dq).
+- The attrs value must be a **trace-time literal or constexpr kernel arg**, NOT a
+  dict module-global (`NameError`) and NOT `constexpr(FrozenAttrs).value.get()`
+  (tracer rejects the method call). Simplest: inline dict literal gated by a
+  `tl.constexpr` bool — `attrs=({"channels":[...]} if _REUSE else None)`.
+
+**(b) Staging depth via the `[ws-summary]` MemoryPlanner dump.** To compare
+autoWS's actual per-buffer staging against TLX's config (`DQ_REDUCE_STAGES`,
+`NUM_BUFFERS_Q`, `dq_store_buf` depth), dump the memory planner's summary:
+```bash
+MLIR_ENABLE_DUMP=1 TRITON_KERNEL_DUMP=1 ... python driver.py 2>&1 | grep -A80 '\[ws-summary\]'
+# or run the pass alone with -debug-only on the pre-MP IR:
+triton-opt --nvgpu-ws-memory-planner -debug-only=... pre_mp.mlir 2>&1 | grep -A80 'ws-summary'
+```
+`dumpPartitionAndBufferSummary` emits one row per buffer: `<tmem|smem> "name"
+id=<buffer.id> cols=N rows=M colOffset=K ch#.. <prodTask> -> <consTask(s)>`.
+Read off: which buffers share a `buffer.id` (reuse groups), each buffer's `copy`
+(staging depth), and `colOffset` (packing). Compare against TLX: if TLX stages dq
+through a depth-2 `dq_store_buf` (`DQ_REDUCE_STAGES=2`) but the ws-summary shows
+autoWS's dq staging at `copy=1`, that single-slot staging is a concrete perf
+(and sometimes deadlock) gap — raise it via the annotation copy count or a
+memory-plan-search pick (Step 4.6). NOTE the emitter is behind `LLVM_DEBUG`; if
+`[ws-summary]` is silent, confirm the `dumpPartitionAndBufferSummary` call site is
+wired (it was dead code on some branches) and you built with asserts.
+
 ## Step 4 - Close the perf gap (make autoWS match TLX)
 
 An untuned autoWS kernel is usually SLOWER than TLX (HSTU self-attn fwd example:
-autoWS 76 vs TLX 106 vs GR-triton 123 TFLOPS). Dump BOTH final ttgirs and diff
-the WS structure, then make autoWS match TLX's:
+autoWS 76 vs TLX 106 vs GR-triton 123 TFLOPS).
 
-1. **Warp counts per partition** - `num_warps(...)` on each partition region and
-   `ttg.num-warps`. TLX often puts the heavy compute partition on more warps.
-2. **num_stages / pipelining** - match TLX's stage count on the annotated loop.
-   Too many stages -> register spills; too few -> no overlap.
-3. **Register budget (the big lever)** - compare `requestedRegisters = array<i32:...>`
-   and `partition.types`. The winning pattern (from FA bwd) is ROLE-BASED, not
-   positional: the register-heavy **computation partition = the default region**
-   (gets the residual budget), and producers/reduction get a **balanced** modest
-   budget (~88) so the default's residual stays under the setmaxnreg cap (256).
-   Check spills with CUDA-13 `ptxas -arch=sm_100a -v` (expect 0 spill bytes).
-4. **Per-dot / buffer annotations** - for FA-style kernels, the autotune config
-   carries per-MMA scheduling (`_BWD_DOT_ATTRS_*`), buffer copy counts, and
-   `EPILOGUE_SUBTILE`; match TLX's tile (BLOCK_M/N) and dsT-in-TMEM-vs-SMEM choice.
-5. **2-CTA** - TLX bwd may use a 2-CTA collaborative MMA (`ctas_per_cga`) that
-   autoWS configs lack; that is a separate ~13% that needs a 2-CTA autoWS config.
-6. **Memory-plan search (autotune-native TMEM/SMEM allocation)** - the WS memory
-   planner can SEARCH allocation plans instead of using the single cost-best one:
-   `TRITON_WS_SMEM_PLAN_SEARCH=1`, `TRITON_WS_MEM_PLAN_TOPK=K`, and a
-   `mem_plan_pick` `tl.range` kwarg (a `tl.constexpr` the autotuner sweeps; stamps
-   `tt.mem_plan_pick`). This is the config-knob lever for the TMEM-fit gap in
-   Step 3.5. Validated on FA fwd (search engages, results correct).
-7. **Instruction / modulo-schedule search** - `TRITON_USE_LIST_SCHEDULE=1`,
-   `TRITON_LIST_SCHEDULE_TOPK`, and a `list_schedule_pick` kwarg reorder the loop
-   body (top-K/beam) for autotuning; `TRITON_MODULO_TOPK` does the same for the
-   modulo scheduler. CAUTION: currently BUGGY on the bwd reduce_dq path - the
-   picked schedule corrupts `dq` (rel-L2 ~0.7), tracked in T279643623. Usable for
-   exploration, not yet trustworthy for bwd correctness.
+### Verify by ttgir diff after EVERY fix - do NOT infer from config
 
-Iterate: change annotation/config -> dump ttgir -> confirm the WS layout matches
-TLX -> re-measure. The register ASSIGNMENT (role-based budget) is often the
-decisive lever.
+The final ttgir is GROUND TRUTH; a config knob may silently not take effect (wrong
+tile, DP declined, subtiling off, annotation fell back). NEVER attribute the gap
+from config values or "should" reasoning - dump BOTH final ttgirs (autoWS meta-WS
+on, TLX meta-WS off, separate processes; Step 3) and diff the checklist below after
+EACH change. Every fix must move a metric TOWARD TLX; if a change leaves the ttgir
+unchanged, the knob didn't apply (fix that before measuring). A perf number without
+a ttgir diff behind it is not evidence.
+
+**Runtime correctness and the ttgir comparison are SEPARATE, PARALLEL tracks - do
+NOT block structural alignment on a runtime fix.** A kernel that hangs, OOMs, or
+returns wrong results STILL emits its final ttgir at compile time (the dump is
+written before launch). So at every step: (1) dump + diff the final ttgir toward
+TLX regardless of runtime state, and (2) keep a running NOTE of any runtime issue
+(deadlock / wrong grads / OOM) to fix on the parallel correctness track. Example
+(HSTU bwd, num_stages=2): grads were wrong (dv rel-L2 0.5) yet the gemm-partition
+ttgir comparison was fully informative - it showed BOTH the stage split
+(qk/dv/dp=stage0, dk/dq=stage1) AND the order MATCHED TLX, so the failure was a
+pure runtime/correctness bug (accumulator-carry at ns>=2), not a schedule mismatch.
+**For the FINAL ttgir comparison, compare the ACTUAL PROGRAM ORDER of the ops in
+the loop - do NOT use `loop.cluster`.** `loop.cluster`/`loop.stage` are
+INTERMEDIATE scheduling attrs (post-ScheduleLoops, pre-pipeline); by the FINAL
+ttgir the pipeliner has MATERIALIZED the schedule into the physical program order
+(prologue peeled out + steady-state body in scheduled order), and `loop.cluster`
+is stale/gone. So read the literal op sequence in the final loop body (and the
+peeled prologue) and diff that against TLX's final-ttgir loop program order. Use
+`loop.cluster` only when inspecting the pre-pipeline IR to see the intended
+schedule; for the ground-truth final comparison, program order is authoritative.
+   - **RULE - the `order` annotation only orders dots ACROSS clusters, NOT within a
+     stage. Two dots in the SAME stage with the SAME `order` keep their SOURCE
+     PROGRAM ORDER.** So to reorder two same-stage/same-order dots to match TLX, you
+     must SWAP THEIR CALL SITES in the kernel source - changing `order` won't do it
+     (and giving them different `order` would move one to a different cluster, which
+     you may not want). Worked example (HSTU bwd): the only final-ttgir order diff
+     vs TLX was dv/dp (both stage 0, order 2) - autoWS emitted dv-then-dp, TLX is
+     dp-then-dv; fix = move the dp (`dact`) `tl.dot` above the dv `tl.dot` in the
+     source (they are data-independent - dv reads act_qk, dp reads v/do^T - so the
+     swap is safe), which makes the final program order match TLX.
+
+**Produce a SIDE-BY-SIDE table (autoWS | TLX) of the metrics below AFTER EACH
+alignment step - not just at the end.** Each step must show its metric moved to
+TLX's column before you move on; a step is "matched" only when the side-by-side
+row matches. Keep the whole table so regressions from later steps are visible.
+Layout (one row per metric, two columns):
+
+```
+metric                     | autoWS                    | TLX
+partition.types            | [reduction,gemm,load,comp]| (roles)
+per-partition num_warps     | compute=8 gemm=1 load=1 …  | compute=8 gemm=1 …
+op categories per partition | MMAs->gemm, reduce->reduc… | (same mapping)
+gemm PROGRAM order (body)   | qk->dk->dq->dp->dv        | qk->dk->dq->dp->dv
+prologue peel vs in-body    | in-body interleave        | 3-MMA prologue peel
+TMEM alloc / reuse          | 4 groups id2/5/7/10 =512c | REUSE_DP_FOR_DQ, N allocs
+SMEM staging depth          | multibuf N                | dq_store_buf depth 2
+requestedRegisters          | (TUNE LAST)               | 192/80/80
+```
+CAVEATS when building the table:
+- **Capture the DEFAULT region** - it is a partition too (often the reduction or
+  computation role); an `awk` that only keys on `partitionN(` misses it.
+- **TLX is hand-WS and has NO `buffer.id`** attrs - do NOT compare TMEM reuse by
+  `buffer.id`; instead compare the count of DISTINCT `tmem_alloc`s and total TMEM
+  columns (and which logical tensors share an alloc).
+- Compare op CATEGORY->partition mapping, not op COUNTS (counts differ from
+  pipelining/peel; see schedule step).
+
+Metric checklist (grep both final ttgirs):
+- `partition.types` AND which op CATEGORIES live in each partition: for each
+  `partitionN(` region grep `tc_gen5_mma` / `async_tma_*` / `tt.reduce` /
+  `tmem_load` to read its role. The same op CATEGORY must land in the same-role
+  partition as TLX (compare category-to-partition mapping, NOT op counts).
+- per-partition `num_warps(` (sum = true warp budget), NOT the config num_warps.
+- **gemm PROGRAM order** in the final ttgir loop body (NOT `loop.cluster`).
+- **# of GEMMs = `tc_gen5_mma` count** (align via the SWP schedule, below).
+- `async_tma_reduce` count + SMEM multibuf depth (`memdesc<[2-9]x...`) = staging.
+- TMEM: distinct `tmem_alloc` count + total cols + which tensors share an alloc.
+- `wait_barrier` count.
+- `requestedRegisters` - TUNE LAST.
+
+### Alignment ORDER - loop structure first, registers LAST
+
+Do these STRICTLY in order, and **dump both final ttgirs and compare after EACH
+step** (a step isn't done until the ttgir metric moved toward TLX). Do not start a
+later step until the earlier ones match - each later decision is computed against
+the earlier structure, so aligning out of order is wasted/invalidated.
+
+1. **Loop structure FIRST = PERSISTENCY alignment.** The loop-structure axis that
+   must match is **persistency**: is there a persistent outer tile loop / CLC
+   context, or is the kernel grid-launched one-tile-per-program? Compare the SAME
+   mode - a persistent autoWS vs non-persistent TLX (or vice-versa) is not
+   apples-to-apple. Check both: autoWS grep `tl.program_id`/persistent-outer-loop;
+   TLX grep `clc_create_context` / a `..._non_persistent` variant + its
+   `HSTU_TLX_PERSISTENT`-style selector (default may be PERSISTENT). Pick the TLX
+   variant whose persistency matches autoWS (usually: autoWS bwd is non-persistent
+   -> compare vs TLX `_non_persistent`).
+   NOTE - do NOT force the inner causal masked/unmasked TWO-LOOP split. TLX often
+   splits the causal iteration into a masked-boundary loop + an unmasked loop
+   (2x static MMAs); autoWS uses ONE causal loop that masks uniformly (half the
+   MMAs). A single causal loop is the RIGHT choice for autoWS (two loops are
+   problematic for the WS pass), so the resulting `tc_gen5_mma` count difference
+   (e.g. 5 vs 10) is EXPECTED and NOT a mismatch to fix - do not rewrite into two
+   loops. Only persistency must align here.
+2. **Tile match (BLOCK_M/BLOCK_N).** Force autoWS's tile to TLX's `BLOCK_M1/N1`.
+   VERIFY THE ACTUAL COMPILED TILE IN THE TTGIR (mma operand `memdesc<AxB>` shapes
+   and loop `step %cN`) - a config knob that "returns" a value can be the wrong
+   knob or wrong function (real bug hit on HSTU: the bwd tile knob is
+   `HSTU_SELF_AUTOWS_BWD_BM/_BN`, not `..._BM`; runs were silently at 64 not 128
+   for a long time). OOM at the matched tile is OK for now - fix it in step 5/6.
+3. **Partition match (op CATEGORIES per partition, NOT counts).** Check that the
+   same *category* of op lands in the same-role partition as TLX - MMAs in the gemm
+   partition, TMA loads in the load partition, `tt.reduce`/`async_tma_reduce` in the
+   reduction partition, softmax/elementwise in the compute partition. Do NOT compare
+   the NUMBER of ops per category here (5 vs 10 MMAs is the loop-structure/schedule
+   concern from steps 1/4, not a partition mismatch). Only the category-to-partition
+   mapping must match. Adjust via `merge_epilogue`, `separate_epilogue_store`, DP
+   (Steps 3.5/3.6).
+4. **Schedule match (SWP) via per-dot `stage`/`order` - works on the DEFAULT
+   scheduler.** The default pipeliner `ScheduleLoops.cpp` (`add_schedule_loops`)
+   DOES consume `tt.autows` `stage`/`order`: `scheduleKeyOpsAnnotation` (L703-742)
+   parses `stage`/`order` off each MMA and builds the CoarseSchedule from them, and
+   `scheduleKeyOps` (L762) tries it FIRST - "takes priority over all other
+   scheduling." (This is how FA bwd's `_BWD_DOT_ATTRS` stage/order takes effect - no
+   modulo/llm/list scheduler needed; those are separate, experimental, and buggy on
+   bwd reduce_dq, T279643623 - avoid.)
+   - **TWO gates can silently drop the annotation (verify with an MLIR pass-dump
+     trace of the annotated `tc_gen5_mma`'s `loop.stage` before/after ScheduleLoops):**
+     (a) `scheduleLoop` L886-908: if the loop ALREADY has `loop.stage`
+     (`stageAssigned`) from a prior pass, annotation scheduling is DISABLED and the
+     existing schedule is kept; (b) `getInitialSchedule` L788: `scheduleKeyOps` (the
+     annotation consumer) is only called if `hasLatenciesAssigned` AND
+     `isSafeToPipeline`. DOMINANT cause of (b): `AssignLatencies` BAILS for
+     `num_stages <= 1` (AssignLatencies.cpp:289-291) -> a num_stages=1 loop gets NO
+     latencies -> `hasLatenciesAssigned=false` -> annotation never consumed. VERIFIED
+     end-to-end on HSTU bwd via pass-dump `loop.stage` trace: at num_stages=1 the
+     annotated MMAs stay loop.stage-ABSENT through every pass (inert); switching to
+     **num_stages>=2** -> AssignLatencies assigns latencies -> ScheduleLoops ->
+     `scheduleKeyOpsAnnotation` sets `loop.stage` to EXACTLY the annotation (annotated
+     stage 0/0/0/1/1 -> loop.stage 0/0/0/1/1). So **stage/order-driven scheduling
+     REQUIRES num_stages>=2** (this is how FA's works). Use the correct per-direction
+     num_stages knob (HSTU bwd = `HSTU_SELF_AUTOWS_BWD_STAGES`, not the fwd knob) and
+     verify with the pass-dump `loop.stage` trace, not a single final diff.
+   - So verify effect the right way: a **clean semantic ttgir diff** (strip
+     `loc(...)` and the `tt.autows` string) - NOT op counts and NOT the dump hash
+     (both change trivially with the source and mislead).
+   - **DERIVE the stage/order values from the TLX kernel's SWP schedule - do NOT
+     guess them.** A hand-TLX kernel's software-pipeline is structured as
+     `prologue + steady-state loop body + epilogue`. Read that structure and map:
+       * a GEMM peeled into the **prologue** -> `stage = 0`;
+       * a GEMM in the **epilogue** -> `stage = 1` (i.e. last stage = num_stages-1);
+       * the **left-to-right order of the GEMMs within the steady-state loop body**
+         -> the `order` values (0,1,2,... in body order).
+     Then set each autoWS dot's `stage`/`order` to those values so the default
+     scheduler reproduces TLX's pipeline. CAUTION: running accumulators (`acc +=`,
+     e.g. dv/dk) have a loop-carried dependency - their stage assignment must keep
+     the accumulator read/write in a consistent stage or the pipelined value goes
+     stale (observed failure: a guessed FA-style split gave dv rel-L2 0.5 / a
+     deadlock at num_stages=2). Get the split from TLX's actual prologue/epilogue
+     placement, not from another kernel's table.
+5. **Reuse match EXCLUDING staging buffers.** Align the TMEM reuse GROUPS (which
+   accumulators share a `buffer.id`) via the per-dot `channels` annotations (Step
+   3.7a) - `REUSE_DP_FOR_DQ` etc. Do NOT try to match staging-buffer depth yet.
+   **How to verify the reuse grouping matches (TLX has NO `buffer.id`, so map by
+   variable name + `reuse=`):**
+   - TLX side: grep `storage_kind.tmem` / `reuse=` (ttgir2tlx) or `tmem_alloc` +
+     `memdesc_reinterpret` (raw) to build the variable->group map - which NAMED
+     tensors share one TMEM alloc. Example (HSTU bwd): `qk_tiles`+`qk_tiles_11`
+     (reuse) = {qk, act}; `dp_tiles`+dq (REUSE_DP_FOR_DQ) = {dp, dq}; `dv_tiles`;
+     `dk_tiles` -> **4 TMEM allocs, 512 cols**.
+   - autoWS side: group `ttng.tmem_alloc` by `buffer.id` (same id = one group);
+     confirm they are TMEM not SMEM (`ttg.local_alloc` with a buffer.id is SMEM -
+     those ids are a SEPARATE space, don't count them as TMEM allocs).
+   - Then check: SAME set of tensors grouped, SAME count of distinct TMEM allocs +
+     total cols. Worked example: autoWS id2={qk,act}, id5={dp,dq}, id7={dv},
+     id10={dk} = 4 allocs/512c -> EXACTLY TLX's grouping. Match confirmed.
+6. **Staging buffers (depth) - after 1-5 match.** Now align dq staging depth /
+   `NUM_BUFFERS_*` and resolve any OOM, using `[ws-summary]` (Step 3.7b) and
+   memory-plan search (`TRITON_WS_SMEM_PLAN_SEARCH=1` + `mem_plan_pick`).
+7. **Warp counts per partition**, then **2-CTA** (`ctas_per_cga`) if TLX uses it.
+8. **Register budget - LAST.** ONLY after 1-7 match in the ttgir.
+   `requestedRegisters` role-based (FA bwd): the register-heavy computation
+   partition = the default region (residual budget); producers/reduction get a
+   balanced modest budget (~88) under the setmaxnreg cap (256). Check spills with
+   CUDA-13 `ptxas -arch=sm_100a -v` (0 spill). Tuning registers on a
+   structurally-mismatched kernel is wasted - that is why it is last.
+
+Iterate: change ONE thing -> dump BOTH ttgirs -> confirm the metric moved toward
+TLX -> next step. Loop structure -> tile -> partition -> schedule -> reuse
+(excl staging) -> staging -> warps/2-CTA -> registers.
 
 ## Gotchas / methodology
 
