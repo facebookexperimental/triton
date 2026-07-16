@@ -2543,8 +2543,13 @@ def dot_scaled(
     :param rhs_k_pack: If false, the rhs tensor is packed into uint8 along N dimension.
     :type rhs_k_pack: bool, optional
     """
-    out_dtype = _unwrap_if_constexpr(out_dtype)
+    lhs_format = _unwrap_if_constexpr(lhs_format)
+    rhs_format = _unwrap_if_constexpr(rhs_format)
     acc = _unwrap_if_constexpr(acc)
+    fast_math = _unwrap_if_constexpr(fast_math)
+    out_dtype = _unwrap_if_constexpr(out_dtype)
+    lhs_k_pack = _unwrap_if_constexpr(lhs_k_pack)
+    rhs_k_pack = _unwrap_if_constexpr(rhs_k_pack)
     assert out_dtype == float32, "Only float32 is supported for out_dtype at the moment"
     return _semantic.dot_scaled(
         lhs,
@@ -2607,7 +2612,7 @@ def load(
     :param mask: if `mask[idx]` is false, do not load the data at address `pointer[idx]`
         (must be `None` with block pointers)
     :type mask: Block of `triton.int1`, optional
-    :param other: if `mask[idx]` is false, return `other[idx]`
+    :param other: if `mask[idx]` is false, return `other[idx]`. If `other` is `None`, the masked-out value is undefined.
     :type other: Block, optional
     :param boundary_check: tuple of integers, indicating the dimensions which should do the boundary check
     :type boundary_check: tuple of ints, optional
@@ -3379,6 +3384,7 @@ def associative_scan(input, axis, combine_fn, reverse=False, _semantic=None, _ge
             builder.create_scan_ret(*handles)
 
     axis = _unwrap_if_constexpr(axis)
+    reverse = _unwrap_if_constexpr(reverse)
     if axis is not None:
         axis = _wrap_axis(axis, len(input[0].shape))
     return _semantic.associative_scan(input, axis, make_combine_region, reverse)
@@ -3909,6 +3915,10 @@ class range(base_value):
     :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
         code outside the loop. This is often useful to avoid creating long liveranges
         within a loop.
+    :param list_schedule_pick: When the list scheduler is enabled
+        (``TRITON_USE_LIST_SCHEDULE=1``), select which ranked schedule variant
+        (0 = best) to apply to this loop. May be a ``tl.constexpr`` so it becomes
+        part of the compilation key and can be swept by ``@triton.autotune``.
 
         Note that warp specialization is only supported on Blackwell GPUs and
         only works on simple matmul loops. Support for arbitrary loops will be
@@ -3928,6 +3938,7 @@ class range(base_value):
         multi_cta=False,
         disable_licm=False,
         data_partition_factor=None,
+        list_schedule_pick=None,
         merge_epilogue=False,
         merge_epilogue_to_computation=False,
         merge_correction=False,
@@ -3951,6 +3962,10 @@ class range(base_value):
         self.loop_unroll_factor = loop_unroll_factor
         self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
         self.data_partition_factor = data_partition_factor
+        # Rank of the list-schedule variant to apply to THIS loop (0 = best).
+        # May be a tl.constexpr so it participates in the compile key and can be
+        # swept by @triton.autotune. Consumed by nvgpu-list-schedule.
+        self.list_schedule_pick = list_schedule_pick
         self.merge_epilogue = merge_epilogue
         self.merge_epilogue_to_computation = merge_epilogue_to_computation
         self.merge_correction = merge_correction

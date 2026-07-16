@@ -342,7 +342,10 @@ class TritonSemantic(Generic[TensorTy]):
         if not input_scalar_ty.is_floating() or not other_scalar_ty.is_floating():
             raise TypeError("both operands of fdiv must have floating scalar type")
         input, other = self.binary_op_type_checking_impl(input, other, False, False, False, True)
-        ret = self.builder.create_fdiv(input.handle, other.handle)
+        if ieee_rounding:
+            ret = self.builder.create_precise_divf(input.handle, other.handle)
+        else:
+            ret = self.builder.create_fdiv(input.handle, other.handle)
         return self.tensor(ret, input.type)
 
     def mod(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
@@ -1209,6 +1212,8 @@ class TritonSemantic(Generic[TensorTy]):
 
         # Validate offsets.
         assert len(x_offsets.shape) == 1, f"x offsets must be 1D, but got {x_offsets.shape}"
+        assert x_offsets.dtype in {tl.int16,
+                                   tl.int32}, f"x offsets must have dtype int16 or int32, but got {x_offsets.dtype}"
 
         # Validate minimum block size.
         assert x_offsets.shape[0] >= 8, f"descriptor gather must have at least 8 rows, but got {x_offsets.shape}"
@@ -1230,7 +1235,9 @@ class TritonSemantic(Generic[TensorTy]):
         assert desc.block_shape[0] == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
 
         # Validate offsets.
-        assert len(x_offsets.shape) == 1, f"x offsets must be 1D, but got {x_offsets.shapae}"
+        assert len(x_offsets.shape) == 1, f"x offsets must be 1D, but got {x_offsets.shape}"
+        assert x_offsets.dtype in {tl.int16,
+                                   tl.int32}, f"x offsets must have dtype int16 or int32, but got {x_offsets.dtype}"
 
         # Validate minimum block size.
         assert x_offsets.shape[0] >= 8, f"descriptor scatter must have at least 8 rows, but got {x_offsets.shape}"
@@ -1719,18 +1726,13 @@ class TritonSemantic(Generic[TensorTy]):
     def deduce_scale_factor(self, lhs, lhs_scale, lhs_format, lhs_k_pack, rhs, rhs_scale, rhs_format, rhs_k_pack):
 
         def _to_scale_handle(scale):
-            if scale is None or isinstance(scale, tl.constexpr):
-                return None
-            elif isinstance(scale, tl.tensor) and scale.numel.value == 1:
-                return None
+            if isinstance(scale, tl.tensor) and scale.numel.value != 1:
+                return scale.handle
+            return None
 
-            return scale.handle
-
-        lhs_format_str = lhs_format.value if hasattr(lhs_format, 'value') else lhs_format
-        rhs_format_str = rhs_format.value if hasattr(rhs_format, 'value') else rhs_format
-        return ir.deduce_scale_factor(lhs.handle, _to_scale_handle(lhs_scale), self._str_to_fp_type(lhs_format_str),
+        return ir.deduce_scale_factor(lhs.handle, _to_scale_handle(lhs_scale), self._str_to_fp_type(lhs_format),
                                       lhs_k_pack, rhs.handle, _to_scale_handle(rhs_scale),
-                                      self._str_to_fp_type(rhs_format_str), rhs_k_pack)
+                                      self._str_to_fp_type(rhs_format), rhs_k_pack)
 
     def verify_scaled_shape(self, M, N, K, lhs_scale, rhs_scale, scale_factor):
         if lhs_scale is not None:
@@ -1744,28 +1746,17 @@ class TritonSemantic(Generic[TensorTy]):
                 N, K // scale_factor
             ], f"rhs_scale must be a tensor of shape [..., {N}, {K // scale_factor}]. Got {rhs_scale_shape}"
 
-    def dot_scaled(
-        self,
-        lhs: TensorTy,
-        lhs_scale: TensorTy,
-        lhs_format: str,
-        rhs: TensorTy,
-        rhs_scale: Optional[TensorTy],
-        rhs_format: str,
-        acc: TensorTy | None,
-        fast_math: bool,
-        lhs_k_pack: bool,
-        rhs_k_pack: bool,
-        out_dtype: tl.dtype,
-    ) -> TensorTy:
+    def dot_scaled(self, lhs: TensorTy, lhs_scale: TensorTy, lhs_format: str, rhs: TensorTy,
+                   rhs_scale: Optional[TensorTy], rhs_format: str, acc: TensorTy | None, fast_math: bool,
+                   lhs_k_pack: bool, rhs_k_pack: bool, out_dtype: tl.dtype) -> TensorTy:
+        fast_math = tl._unwrap_if_constexpr(fast_math)
+        lhs_k_pack = tl._unwrap_if_constexpr(lhs_k_pack)
+        rhs_k_pack = tl._unwrap_if_constexpr(rhs_k_pack)
         assert lhs.type.is_block() and rhs.type.is_block()
         # TODO: validate types.
         lhs_rank = len(lhs.shape)
         rhs_rank = len(rhs.shape)
-        assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, (
-            f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})")
-        lhs_format: str = lhs_format.value
-        rhs_format: str = rhs_format.value
+        assert lhs_rank == rhs_rank == 2 or lhs_rank == rhs_rank == 3, f"Both inputs must be either 2D or 3D; (lhs: {lhs.shape} vs rhs: {rhs.shape})"
         lhs_format_enum = self._str_to_fp_type(lhs_format)
         rhs_format_enum = self._str_to_fp_type(rhs_format)
         allowed_formats = {"e2m1", "e4m3", "e5m2", "bf16", "fp16"}

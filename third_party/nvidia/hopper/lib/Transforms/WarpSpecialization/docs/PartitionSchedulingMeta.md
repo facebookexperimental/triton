@@ -167,6 +167,20 @@ rescaling) are not stolen by the data partition categorizer.
    in separate computation partitions. Following the specific operand index
    (rather than the whole `scf.if`) keeps distinct data partitions separate
    for cases like flex attention.
+
+   A **second union-find edge** groups MMAs that write the **same accumulator
+   TMEM buffer**. Accumulator-chained MMAs (e.g. `dq += K0ᵀ·dS0` then
+   `dq += K1ᵀ·dS1` into one `dq` tile, or `acc = A@B; acc += C@D`) form a serial
+   reduction whose dependency flows through the accumulator memdesc/token, *not*
+   an SSA result operand — so the forward-user-set walk above stops at each MMA
+   and never sees it. Without this edge the chained dots would be counted as
+   independent groups and split across partitions, racing on the shared tile.
+   `getAccumulatorBuffer` resolves each MMA's accumulator to a canonical buffer
+   identity: it stops at the backing `TMEMAllocOp`; traces through
+   region/offset-preserving views only (`MemDescTransOp`, `MemDescReinterpretOp`);
+   treats an offset-selecting `MemDescIndexOp` as its **own** identity (so two
+   different-offset sub-tiles of one allocation are *not* collapsed); and bails
+   to `nullptr` (logged) on any unrecognized producer rather than guessing.
 3. **Builds `opToDpId` map** for ALL reachable ops:
    - **Inner-loop ops**: From backward slices, using normalized group IDs.
      Ops appearing in multiple groups get `SHARED_DPID` sentinel.
@@ -182,14 +196,35 @@ which auto-resolves the dpId when not explicitly provided.
 
 1. **Collect backward slices** for each MMA.
 2. **Identify shared ops** — ops appearing in multiple slices.
-3. **Union-find grouping** — MMAs whose forward user sets overlap another MMA's
-   backward slice are grouped together.
+3. **Union-find grouping** — MMAs are grouped by two edges: (a) forward user
+   sets that overlap another MMA's backward slice, and (b) writing the same
+   accumulator buffer (`getAccumulatorBuffer`, see above). Edge (b) keeps
+   accumulator-chained MMAs in one group even when no slice overlap exists.
 4. **Count groups with exclusive ops** — only groups with at least one
    non-shared, non-constant op count. This becomes `dataPartitionFactor`.
 
 For FA forward with `data_partition_factor=2`, this yields `dpFactor=2`.
 For FA backward, MMAs are data-dependent (QK feeds PV via the same accumulator),
 so all MMAs group together → `dpFactor=1`.
+
+### Accumulator-chain backstop
+
+After all partition assignments are finalized (post `propagatePartitions` +
+`optimizeSchedule`, before serialization), a verification walk guards against
+any assignment path — union-find above, preassignment, or flex — that splits a
+shared tensor-memory accumulator across partitions that cannot be co-located.
+Concurrent accumulating MMAs into one tile race and silently corrupt the
+reduction, so this is turned into a **hard compile error** rather than a latent
+accuracy bug.
+
+The check maintains, per accumulator buffer, the **running intersection** of the
+partition-id sets of every MMA that writes it, and errors the moment that
+intersection becomes empty (no single partition is common to the whole chain).
+This is correct for chains of 3+ writers: `{0,1},{0,2},{2,3}` is flagged (empty
+overall intersection) while `{0,1},{0,2},{0,3}` passes on common partition `0`.
+The diagnostic attaches a note pointing at the first MMA on the chain. The fix
+is to co-locate the chain in one partition (lower `data_partition_factor`) or to
+give each partition its own accumulator and reduce at the end.
 
 ## Phase 2: Partition Layout (`createPartitionLayout`)
 

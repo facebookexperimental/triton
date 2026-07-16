@@ -1947,22 +1947,38 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     for (int i = 0; i < num; i++) {
       auto operand = yieldOp.getOperand(i);
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
-      if (auto newV = mappings.lookupOrNull(operand)) {
-        // Only append if the parent ForOp also has a corresponding new result.
-        if ((!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i))) &&
-            !parentWhileOp)
-          yieldOp->insertOperands(op->getNumOperands(), newV);
-        // scf.while: append unconditionally when the operand was sliced. Unlike
-        // scf.for there is no per-index result guard here because the while
-        // branch above appends a loop-carried arg for every sliced init, and
-        // for a while the after-yield operand k feeds before-arg k 1:1, so a
-        // sliced yield operand always has a matching appended before-arg. This
-        // holds for the loop-carried values this pass threads
-        // (accumulators/counters); slicing an after-region-only value whose
-        // init was not sliced would break the 1:1 alignment and needs a guard
-        // analogous to the for path.
-        if (parentWhileOp)
-          yieldOp->insertOperands(op->getNumOperands(), newV);
+      auto newV = mappings.lookupOrNull(operand);
+      if (parentWhileOp) {
+        // scf.while: the while slicing appends a loop-carried arg for every
+        // sliced init, and the after-yield operand k feeds before-arg k 1:1,
+        // so a sliced yield operand always has a matching appended before-arg;
+        // append unconditionally when the operand was sliced. (Slicing an
+        // after-region-only value whose init was not sliced would break the
+        // 1:1 alignment and would need a guard analogous to the for path.)
+        if (newV)
+          yieldOp->insertOperands(yieldOp->getNumOperands(), newV);
+        continue;
+      }
+      if (!parentForOp) {
+        if (newV)
+          yieldOp->insertOperands(yieldOp->getNumOperands(), newV);
+        continue;
+      }
+      // scf.for: the ForOp slicing appended one new result/iter-arg for every
+      // sliced init arg (its result i is now mapped). Keep results and yield
+      // operands 1:1 so the loop stays well-formed (numResults ==
+      // numYieldOperands): append exactly one operand per new iter-arg. Prefer
+      // the sliced yield value; if this slot's yield operand was NOT itself
+      // sliced (e.g. a token/predicate carried across a short loop), carry the
+      // appended partition-copy region iter-arg through instead. Without this,
+      // a sliced init with an unsliced yield leaves the ForOp with more results
+      // than yield operands, which later crashes ForOpDeadArgElimination.
+      if (mappings.lookupOrNull(parentForOp.getResult(i))) {
+        Value yieldVal =
+            newV ? newV
+                 : mappings.lookupOrNull(parentForOp.getRegionIterArg(i));
+        assert(yieldVal && "no yield value for sliced ForOp iter-arg");
+        yieldOp->insertOperands(yieldOp->getNumOperands(), yieldVal);
       }
     }
     newOp = op;

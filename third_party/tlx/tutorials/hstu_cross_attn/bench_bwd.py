@@ -41,9 +41,12 @@ VARIANTS = [
     ("autows", xa.BwdVariant.TRITON_AUTOWS, "1"),
     ("tlx", xa.BwdVariant.TLX, "0"),
     ("tlx_2kv", xa.BwdVariant.TLX_2KV, "0"),
+    # Manual 2-KV data-partition + compute-fold + shared-KV. WS dispatch ("1");
+    # under TRITON_USE_LIST_SCHEDULE=1 its inner loop's schedule is autotuned.
+    ("autows_2kv", xa.BwdVariant.TRITON_AUTOWS_2KV, "1"),
 ]
 # Variants that require shared-KV (V aliases K); only run under --shared-kv.
-SHARED_KV_ONLY = {"tlx_2kv"}
+SHARED_KV_ONLY = {"tlx_2kv", "autows_2kv"}
 
 
 def force(ns=2, bm=BLOCK, bn=BLOCK):
@@ -61,6 +64,22 @@ def force(ns=2, bm=BLOCK, bn=BLOCK):
     c.kwargs["BLOCK_M"] = bm
     c.kwargs["BLOCK_N"] = bn
     xa._hstu_attn_bwd_redq.configs = [c]
+    if hasattr(xa, "_hstu_attn_bwd_redq_2kv"):
+        # Pin block sizes / stages but KEEP the per-INNER_PICK variants so the
+        # autotuner still sweeps the inner-loop list schedule (one config per
+        # distinct INNER_PICK). With list scheduling off there is only
+        # INNER_PICK=0, so this collapses to a single config as before.
+        kept, seen = [], set()
+        for c2 in xa._hstu_attn_bwd_redq_2kv.configs:
+            c2.num_stages = ns
+            c2.kwargs["BLOCK_M"] = bm
+            c2.kwargs["BLOCK_N"] = bn
+            pk = c2.kwargs.get("INNER_PICK", 0)
+            if pk in seen:
+                continue
+            seen.add(pk)
+            kept.append(c2)
+        xa._hstu_attn_bwd_redq_2kv.configs = kept
     xa.set_fwd_variant(xa.FwdVariant.TRITON)
 
 

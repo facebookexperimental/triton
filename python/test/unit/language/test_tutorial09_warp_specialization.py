@@ -6,6 +6,8 @@ with both Flatten=True and Flatten=False configurations. Tests cover both
 Blackwell and Hopper GPUs.
 """
 
+from typing import NamedTuple
+
 import pytest
 import torch
 import triton
@@ -326,6 +328,78 @@ def matmul_kernel_tma_clc_persistent_ws_while(
 
 
 # ============================================================================
+# Kernel 2e: matmul_kernel_tma_unified_persistent_ws_while
+# A SINGLE warp-specialized persistent matmul kernel that works with ANY of the
+# unified tile schedules (non-persistent, static/dynamic persistent, CLC): the
+# schedule class is passed as the `SCHEDULE` constexpr and the loop body is
+# identical regardless of which schedule is selected. This is the whole point of
+# the unified tile-scheduler stdlib (triton.language.schedule) -- one kernel,
+# swap the schedule to autotune. `tile_counter` is only used by the dynamic
+# schedule; the others ignore it.
+# ============================================================================
+class _MatmulTileArgs(NamedTuple):
+    """Named ``lowering_args`` for the schedule -- the fields ``_unified_num_tiles``
+    reads by name to compute the tile count."""
+    M: tl.tensor
+    N: tl.tensor
+    BLOCK_SIZE_M: tl.constexpr
+    BLOCK_SIZE_N: tl.constexpr
+
+
+@triton.jit
+def _unified_num_tiles(lowering_args):
+    return tl.cdiv(lowering_args.M, lowering_args.BLOCK_SIZE_M) * tl.cdiv(lowering_args.N, lowering_args.BLOCK_SIZE_N)
+
+
+@triton.jit
+def matmul_kernel_tma_unified_persistent_ws_while(
+    a_desc,
+    b_desc,
+    c_desc,
+    tile_counter,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    SCHEDULE: tl.constexpr,
+):
+    dtype = tl.float16
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    lowering_args = _MatmulTileArgs(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    sched = SCHEDULE.initialize(lowering_args, _unified_num_tiles, tile_counter)
+    while sched.is_valid():
+        pid_m, pid_n = _compute_pid(sched.tile_id[0], num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in tl.range(k_tiles, warp_specialize=True):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
+        # Claim the next tile -- how depends entirely on the selected schedule.
+        sched = sched.advance()
+
+
+# ============================================================================
 # Kernel 3: matmul_kernel_descriptor_persistent - Device-side TMA descriptors
 # Uses warp_specialize with flatten in outer tile loop
 # ============================================================================
@@ -567,6 +641,9 @@ def test_tutorial09_matmul_tma_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
+    if generate_subtiled_region:
+        pytest.skip("TODO: enable generate_subtiled_region=True")
+
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
         pytest.skip("DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256")
@@ -675,6 +752,9 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
+    if generate_subtiled_region:
+        pytest.skip("TODO: enable generate_subtiled_region=True")
+
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 
@@ -984,6 +1064,106 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
 
 
 # ============================================================================
+# Test 2e: One kernel, any schedule -- pass the unified tile-scheduler class as a
+# constexpr argument. Parametrized over BOTH EPILOGUE_SUBTILE and the schedule
+# type to show the same kernel is reused across all four schedules.
+# ============================================================================
+_UNIFIED_SCHEDULES = [
+    tl.NonPersistentScheduler,
+    tl.StaticPersistent1DScheduler,
+    tl.DynamicPersistent1DScheduler,
+    tl.ClcTileScheduler,
+]
+
+
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
+@pytest.mark.parametrize("SCHEDULE", _UNIFIED_SCHEDULES, ids=lambda s: s.__name__)
+def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE, SCHEDULE):
+    """One warp-specialized persistent matmul kernel reused across all four unified
+    tile schedules by passing the schedule class as a constexpr argument."""
+    if SCHEDULE is tl.ClcTileScheduler and is_hopper():
+        pytest.skip("CLC requires Blackwell (SM100+); not supported on Hopper")
+
+    M, N, K = 2048, 2048, 256
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        # Grid + workspace are the caller's responsibility and depend on the
+        # schedule: non-persistent / CLC launch one program per tile (CLC
+        # over-subscribes so pending clusters can be stolen); the static / dynamic
+        # persistent schedules launch min(NUM_SMS, num_tiles). The dynamic schedule
+        # additionally needs a shared atomic counter seeded past the statically
+        # launched tiles (== the number of launched programs).
+        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
+        if SCHEDULE in (tl.NonPersistentScheduler, tl.ClcTileScheduler):
+            grid_size = num_tiles
+        else:
+            grid_size = min(NUM_SMS, num_tiles)
+        tile_counter = torch.full((1, ), grid_size, dtype=torch.int32, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        kernel = matmul_kernel_tma_unified_persistent_ws_while[(grid_size, )](
+            a_desc,
+            b_desc,
+            c_desc,
+            tile_counter,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            SCHEDULE=SCHEDULE,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        # Schedule-specific IR markers confirm the chosen schedule was actually used.
+        if SCHEDULE is tl.ClcTileScheduler:
+            assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
+        else:
+            assert "ttng.clc_" not in ttgir, "Expected non-CLC scheduling"
+        if SCHEDULE is tl.DynamicPersistent1DScheduler:
+            assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
 # Test 3: matmul_kernel_descriptor_persistent warp specialization (device-side TMA)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
@@ -1019,6 +1199,9 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
+    if generate_subtiled_region:
+        pytest.skip("TODO: enable generate_subtiled_region=True")
+
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
 

@@ -14,6 +14,7 @@
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "ttgpu_to_llvm"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -454,6 +455,11 @@ SharedMemoryObject getSharedMemoryObjectFromStruct(Location loc,
                                                    Type elemTy,
                                                    RewriterBase &rewriter);
 
+// Build a vector of shared-memory base pointers for dynamic partition
+// indexing (expects at least two bases).
+Value buildBasePtrVector(Location loc, RewriterBase &rewriter,
+                         ArrayRef<Value> smemBases);
+
 // Convert an \param index to a multi-dim coordinate given \param shape and
 // \param order.
 SmallVector<Value> delinearize(RewriterBase &rewriter, Location loc,
@@ -593,6 +599,21 @@ SmallVector<SmallVector<Value>>
 emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
             Attribute layout, RankedTensorType type, bool withCTAOffset);
 
+SmallVector<SmallVector<Value>>
+emitIndices(Location loc, RewriterBase &rewriter, const TargetInfoBase &target,
+            const LinearLayout &layout, RankedTensorType type,
+            bool withCTAOffset);
+
+// Compute per-element shared-memory pointers for a local atomic/ldst update by
+// replacing `coords[*][axis]` with `idxValues[*]` and mapping the resulting
+// logical coordinates back to shared-memory offsets.
+SmallVector<Value> computeLocalPtrs(Location loc,
+                                    triton::gpu::MemDescType memDescTy,
+                                    SharedMemoryObject smemObj, Type llvmElemTy,
+                                    ArrayRef<Value> idxValues,
+                                    ArrayRef<SmallVector<Value>> coords,
+                                    unsigned axis, RewriterBase &rewriter);
+
 // Calculates the required interval chunking and padding logical-shift values
 // for shared memory padding, depending on elements' bit width and whether
 // offsets count the number of bytes or number of elements.
@@ -668,6 +689,30 @@ std::optional<LLVM::AtomicOrdering> getMemoryOrdering(MemSemantic memOrdering);
 llvm::MapVector<StringAttr, int32_t> getAllFreeVarMasks(MLIRContext *ctx);
 
 llvm::MapVector<StringAttr, int32_t> getFreeVariableMasks(Type type);
+
+/// Clamp vec size for NPOT dims: round down to a pow2 load/store width, then
+/// clamp to the alignment of a non-pow2 sizePerThread (Blocked only; Slice/
+/// Linear don't reach here). No-op for pow2, so safe to run unconditionally
+/// (not flag-gated).
+inline unsigned clampVecSizeForNpot(unsigned vec, RankedTensorType tensorTy) {
+  if (vec <= 1)
+    return vec; // avoids Log2_32(0) UB
+  if (!llvm::isPowerOf2_32(vec))
+    vec = 1u << llvm::Log2_32(vec);
+  if (!tensorTy)
+    return vec;
+  if (auto blocked =
+          dyn_cast<triton::gpu::BlockedEncodingAttr>(tensorTy.getEncoding())) {
+    auto contOrder = triton::gpu::getOrder(tensorTy);
+    unsigned spt = blocked.getSizePerThread()[contOrder[0]];
+    if (spt > 0 && !llvm::isPowerOf2_32(spt)) {
+      // Largest pow2 divisor (lowest set bit) = the guaranteed alignment.
+      unsigned maxAligned = spt & (0u - spt);
+      vec = std::min(vec, maxAligned);
+    }
+  }
+  return vec;
+}
 
 inline bool isCanonicalIndex(unsigned index, unsigned freeVarMask) {
   return (index & freeVarMask) == 0;

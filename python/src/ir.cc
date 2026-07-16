@@ -38,8 +38,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/PluginUtils.h"
-#include "triton/Tools/Sys/Dump.hpp"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/Dump.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/SourceMgr.h"
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
@@ -366,23 +366,9 @@ void init_triton_ir(py::module &&m) {
   m.def("load_dialects", [](MLIRContext &context) {
     DialectRegistry registry;
 
-    if (std::string filename =
-            mlir::triton::tools::getStrEnv("TRITON_PASS_PLUGIN_PATH");
-        !filename.empty()) {
-      TritonPlugin TP(filename);
-
-      std::vector<const char *> dialectNames;
-      if (auto result = TP.getDialectHandles(dialectNames); !result)
-        llvm::report_fatal_error(result.takeError());
-
-      for (unsigned i = 0; i < dialectNames.size(); ++i) {
-        const char *dialectName = dialectNames.data()[i];
-        auto result = TP.getDialectPluginInfo(dialectName);
-        if (!result)
-          throw TP.err2exp(result.takeError());
-        ::mlir::DialectPluginLibraryInfo dialectPluginInfo = *result;
-        dialectPluginInfo.registerDialectRegistryCallbacks(&registry);
-      }
+    // Register plugin dialects.
+    for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
+      plugin.registerDialects(registry);
     }
 
     registry.insert<
@@ -905,18 +891,15 @@ void init_triton_ir(py::module &&m) {
       .def_property_readonly("type", &FuncOp::getFunctionType)
       .def("reset_type", &FuncOp::setType);
 
-  py::class_<mlir::OpBuilder>(m, "op_builder", py::module_local(),
-                              py::dynamic_attr())
-      .def(py::init<MLIRContext *>());
-
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  // The static builderClass object persists throughout the compilation,
-  // allowing third-party backends to register their ops separately.
-  static py::class_<TritonOpBuilder> builderClass(
+  // The builder binding is static so it persists throughout compilation,
+  // letting DSL plugins (registerCustomOps) and third-party backends (TLX,
+  // via getBuilderClass) register their ops on it separately.
+  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(
       m, "builder", py::module_local(), py::dynamic_attr());
-  builderClassPtr = &builderClass;
-  builderClass.def(py::init<MLIRContext *>())
+  builderClassPtr = &TritonOpBuilderBinding;
+  TritonOpBuilderBinding.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
       // getters
       .def("create_module",
@@ -1265,7 +1248,8 @@ void init_triton_ir(py::module &&m) {
            })
 
       // Cast instructions
-      // Conversions for custom FP types (FP8 and non-standard rounding modes)
+      // Conversions for custom FP types (FP8 and non-standard rounding
+      // modes)
       .def("create_fp_to_fp",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
               std::optional<RoundingMode> roundingMode) -> Value {
@@ -1406,8 +1390,8 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MinUIOp>(lhs, rhs));
            })
-      // minimumf follows the torch.minimum convention and returns NaN if either
-      // operand is NaN
+      // minimumf follows the torch.minimum convention and returns NaN if
+      // either operand is NaN
       .def("create_minimumf",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MinimumFOp>(lhs, rhs));
@@ -1426,8 +1410,8 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MaxUIOp>(lhs, rhs));
            })
-      // maximumf follows the torch.maximum convention and returns NaN if either
-      // operand is NaN
+      // maximumf follows the torch.maximum convention and returns NaN if
+      // either operand is NaN
       .def("create_maximumf",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MaximumFOp>(lhs, rhs));
@@ -1994,6 +1978,18 @@ void init_triton_ir(py::module &&m) {
                                                   tensorShape, isSignedInteger,
                                                   paddingOption);
            });
+
+  // Add custom operations.
+  for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
+    for (const auto &op : plugin.listOps()) {
+      TritonOpBuilderBinding.def(
+          op.name, [op](TritonOpBuilder &self, std::vector<Value> args) {
+            args.insert(args.begin(), Value());
+            op.addOp(self, args);
+            return args[0];
+          });
+    }
+  }
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
       .def(py::init<MLIRContext *>())

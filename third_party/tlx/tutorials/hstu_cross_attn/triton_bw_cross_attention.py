@@ -100,6 +100,7 @@ _HSTU_BWD_DOT_ATTRS_DEFAULT = FrozenDotAttrs({
     "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
     "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
     "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
     "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
 })
 
@@ -115,6 +116,24 @@ _HSTU_BWD_DOT_ATTRS_TLX = FrozenDotAttrs({
     "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
     "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,11"]},
     "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
+})
+
+# for SHARED_KV + DP and _HSTU_COMPUTE_FOLD
+# --> we can do dk += dot(...) dk += dot(...)
+# --> we use "dk_shared" instead of "dk"
+# Block b0 schedule. dq (opndD id 11) is a SINGLE accumulator SHARED with block
+# b1: both blocks MMA-accumulate dq^T into the same TMEM tile (dq is a reduction
+# over KV blocks -- like the hand-written attn_bwd_ws_2kv), then ONE store. So
+# dpT must NOT time-share id 11 with dq (as the single-KV _TLX schedule does); it
+# gets its own tile (id 5). Everything else (qkT/S+P id 2, dv/dk id 7) is b0's.
+_HSTU_BWD_DOT_ATTRS_2KV = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,7"]},
     "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,8", "opndD,tmem,1,11"]},
 })
 
@@ -133,7 +152,67 @@ _HSTU_ATTRS_QKT = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("qkT"))
 _HSTU_ATTRS_DV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dv"))
 _HSTU_ATTRS_DPT = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dpT"))
 _HSTU_ATTRS_DK = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk"))
+_HSTU_ATTRS_DK_SHARED = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dk_shared"))
 _HSTU_ATTRS_DQ = tl.constexpr(_HSTU_BWD_DOT_ATTRS_TLX.get("dq"))
+
+# Per-dot 2KV variants, selected in-kernel on the SHARED_KV + compute-fold path
+# (SHARED_KV and _HSTU_COMPUTE_FOLD). The 2KV schedule is fixed to the TLX
+# 2-KV-block layout and is NOT swapped by set_bwd_dot_attrs(); the active globals
+# above still drive the non-fold paths.
+_HSTU_ATTRS_QKT_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("qkT"))
+_HSTU_ATTRS_DV_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dv"))
+_HSTU_ATTRS_DPT_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dpT"))
+_HSTU_ATTRS_DK_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dk"))
+_HSTU_ATTRS_DK_SHARED_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dk_shared"))
+_HSTU_ATTRS_DQ_2KV = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV.get("dq"))
+
+# MANUAL 2-KV DP (milestone 2): with warp specialization ON, the two KV blocks'
+# per-block MMAs run concurrently and their operand/accumulator tiles are
+# simultaneously live, so block b1 uses DISJOINT buffer.ids from b0 (which keeps
+# _2KV above) for qkT/S+P (2->12), dv/dk (7->17), and the smem operands (8->9).
+# This is the hand-written equivalent of the per-half id-remap the compiler DP
+# pass is supposed to synthesize.
+#
+# TWO exceptions are INTENTIONALLY shared across the halves:
+#   * dq's accumulator (opndD id 11): dq is a reduction over both KV blocks,
+#     accumulated into one TMEM tile and stored once.
+#   * dpT (dP) accumulator (opndD id 5, NOT 15): dp0/dp1 REUSE one TMEM tile
+#     (b1's dpT points at b0's id 5), mirroring TLX (`dp_tiles` depth-1 recycled
+#     across n0->n1). This trades the b0<->b1 overlap on the dpT->dqk step for
+#     64 TMEM columns, which is what lets BLOCK_N=128 fit the 512-col budget
+#     (576 -> 512). The planner packs dp1 at colOffset 0 in dp0's tile and
+#     inserts the reuse WAR barrier that serializes dp0-consume -> dp1-write.
+#     (qk stays split/depth-2 for overlap, as in TLX.)
+_HSTU_BWD_DOT_ATTRS_2KV_B1 = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndD,tmem,1,12"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,12", "opndD,tmem,1,17"]},
+    # dpT opndD id 5 is SHARED with b0 (dp0/dp1 reuse one TMEM tile, TLX-style)
+    # so BLOCK_N=128 fits TMEM; see the module comment above.
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,20"]},
+    "dk_shared": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,9", "opndD,tmem,1,17"]},
+    # dq opndD id 11 is SHARED with b0 (single dq accumulator over both KV
+    # blocks); only its input operand (opndB smem) is b1's own (id 9).
+    "dq": {"stage": "1", "order": "1", "channels": ["opndB,smem,1,9", "opndD,tmem,1,11"]},
+})
+_HSTU_ATTRS_QKT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("qkT"))
+_HSTU_ATTRS_DV_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dv"))
+_HSTU_ATTRS_DPT_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dpT"))
+_HSTU_ATTRS_DK_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dk"))
+_HSTU_ATTRS_DK_SHARED_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dk_shared"))
+_HSTU_ATTRS_DQ_2KV_B1 = tl.constexpr(_HSTU_BWD_DOT_ATTRS_2KV_B1.get("dq"))
+
+# "compute fold": fold dk_attn (dqk @ q) into the dv/dk accumulator (TLX 2kv
+# parity) instead of a separate dk_attn tile + register add. Kept behind a
+# constexpr gate (env HSTU_COMPUTE_FOLD=1) while the partition scheduler
+# interaction (spurious correction partition) is under investigation.
+_HSTU_COMPUTE_FOLD = tl.constexpr(os.environ.get("HSTU_COMPUTE_FOLD", "0") == "1")
+
+# When modulo top-K schedule exploration is enabled (TRITON_MODULO_TOPK>1), do
+# NOT emit the user tt.autows annotations on the MMAs: they pin the schedule and
+# make the modulo pass skip the loop (hasExistingAnnotation), turning the picked
+# variant into a no-op. Dropping them lets the modulo scheduler own the schedule.
+_HSTU_MODULO_TOPK = tl.constexpr(int(os.environ.get("TRITON_MODULO_TOPK", "1")) > 1)
 
 
 def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
@@ -142,11 +221,12 @@ def set_bwd_dot_attrs(cfg: "FrozenDotAttrs") -> None:
     Pass _HSTU_BWD_DOT_ATTRS_DEFAULT or _HSTU_BWD_DOT_ATTRS_TLX. Call before the
     kernel compiles (use TRITON_ALWAYS_COMPILE=1 to force a recompile).
     """
-    global _HSTU_ATTRS_QKT, _HSTU_ATTRS_DV, _HSTU_ATTRS_DPT, _HSTU_ATTRS_DK, _HSTU_ATTRS_DQ
+    global _HSTU_ATTRS_QKT, _HSTU_ATTRS_DV, _HSTU_ATTRS_DPT, _HSTU_ATTRS_DK, _HSTU_ATTRS_DK_SHARED, _HSTU_ATTRS_DQ
     _HSTU_ATTRS_QKT = tl.constexpr(cfg.get("qkT"))
     _HSTU_ATTRS_DV = tl.constexpr(cfg.get("dv"))
     _HSTU_ATTRS_DPT = tl.constexpr(cfg.get("dpT"))
     _HSTU_ATTRS_DK = tl.constexpr(cfg.get("dk"))
+    _HSTU_ATTRS_DK_SHARED = tl.constexpr(cfg.get("dk_shared"))
     _HSTU_ATTRS_DQ = tl.constexpr(cfg.get("dq"))
 
 
@@ -168,6 +248,11 @@ class BwdVariant(Enum):
     # TLX 2-KV-block data-partitioned reduce_dq (attn_bwd_ws_2kv): two independent
     # MMA groups per program. Shared-KV only (V aliases K).
     TLX_2KV = "tlx_2kv"
+    # MANUAL 2-KV-block data-partitioned reduce_dq written explicitly in Triton
+    # (_hstu_attn_bwd_redq_2kv): processes two KV blocks per step to get 2-way
+    # parallelism WITHOUT triggering the compiler's automatic DP pass. Shared-KV +
+    # compute-fold only. Milestone 1: WS off.
+    TRITON_AUTOWS_2KV = "triton_autows_2kv"
 
 
 # Global variables for variant selection, can be overridden in unit tests
@@ -1781,7 +1866,19 @@ def _hstu_attn_bwd_redq(  # noqa C901
         # Match the TLX kernel (attn_bwd_ws): iterate every KV block in one masked
         # loop — masking is a no-op for full blocks. Kept autoWS-only (constexpr)
         # so the non-WS peeled fast path is unchanged.
-        for start_n in tl.range(0, seq_len_kv, BLOCK_N):
+        for start_n in tl.range(
+                0,
+                seq_len_kv,
+                BLOCK_N,
+                warp_specialize=WS_ON,
+                merge_epilogue_to_computation=WS_ON,
+                # With the compute fold, the dk accumulator's cross-iteration
+                # tmem_load is categorized as a correction op; merge it into the
+                # computation partition instead of spawning a separate correction
+                # partition (which would exceed the 16-warp budget).
+                merge_correction=WS_ON,
+                data_partition_factor=(2 if BLOCK_N >= 256 else 1),
+        ):
             _hstu_attn_bwd_inner(
                 start_n,
                 seq_start_kv,
@@ -1909,6 +2006,257 @@ def _hstu_attn_bwd_redq(  # noqa C901
         HAS_CAUSAL=HAS_CAUSAL,
         AUTOWS=AUTOWS,
     )
+
+
+def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
+    # The manual 2-KV-block loop supplies the 2-way parallelism, so BLOCK_N stays
+    # well below the compiler-DP trigger (BLOCK_N >= 256) and the pass never runs.
+    #
+    # List-schedule autotuning: when TRITON_USE_LIST_SCHEDULE=1, sweep the inner
+    # (start_m) loop's schedule rank INNER_PICK over 0..K-1 (K from
+    # HSTU_INNER_SCHED_K, default 4). Each INNER_PICK is a distinct tl.constexpr
+    # -> a distinct compile key, so the autotuner compiles+times each inner
+    # schedule and caches the winner. Deliberately NOT keyed on
+    # TRITON_LIST_SCHEDULE_TOPK: that env is the pass's *global* generation count
+    # and would also make the OUTER loop generate variants. We leave it unset so
+    # the outer loop keeps a single schedule (only the inner, which carries the
+    # per-loop pick attr, is generated ranked). With list scheduling off,
+    # INNER_PICK stays [0] (no extra configs; the attr is ignored downstream).
+    if os.environ.get("TRITON_USE_LIST_SCHEDULE"):
+        inner_k = int(os.environ.get("HSTU_INNER_SCHED_K", "4"))
+        inner_picks = list(range(max(1, inner_k)))
+    else:
+        inner_picks = [0]
+    configs = [
+        triton.Config(
+            {
+                "BLOCK_M": M,
+                "BLOCK_N": N,
+                "INNER_PICK": pick,
+            },
+            num_stages=ns,
+            num_warps=nw,
+            pre_hook=_bwd_pre_hook_redq_v3,
+        )
+        # BLOCK_M=64, BLOCK_N=64. The compute fold MMA-accumulates BOTH KV blocks'
+        # dk in TMEM (each [BLOCK_N, DimQ]); at BLOCK_N=64 the two dk tiles stack
+        # in TMEM's two 64-row groups at the SAME columns (128 cols for both, not
+        # 256), which -- with dq as a single shared accumulator -- keeps the peak
+        # at ~480 < 512 cols and lets BLOCK_M reach 64. BLOCK_N=128 would need 256
+        # dk cols and overflows at BLOCK_M=64 (608 > 512).
+        for M in [64]
+        for N in [64]
+        for ns in [1]
+        for nw in [4]
+        for pick in inner_picks
+    ]
+    return configs
+
+
+@triton_autotune(
+    configs=_get_triton_bw_redq_2kv_configs(),
+    key=[
+        "AUTOTUNE_Z",
+        "H",
+        "max_q_len",
+        "AUTOTUNE_MAX_SEQ_LEN",
+        "DimQ",
+        "DimV",
+        "num_softmax_heads",
+    ],
+)
+@triton.jit
+def _hstu_attn_bwd_redq_2kv(  # noqa C901
+    Q,
+    K,
+    V,
+    DO,
+    total_seq_len_q,
+    total_seq_len_kv,
+    seq_offsets,
+    seq_offsets_q,
+    DQ,
+    DK,
+    DV,
+    stride_qm,
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_dom,
+    stride_doh,
+    stride_dqm,
+    stride_dqh,
+    stride_dkn,
+    stride_dkh,
+    stride_dvn,
+    stride_dvh,
+    alpha,
+    max_seq_len,
+    attn_scale,
+    M,
+    Delta,
+    stride_mm,
+    num_targets,
+    Z,
+    AUTOTUNE_Z,
+    H,
+    G: tl.constexpr,
+    num_softmax_heads: tl.constexpr,
+    max_q_len: tl.constexpr,
+    AUTOTUNE_MAX_SEQ_LEN,  # Quantized MAX_SEQ_LEN used as an autotuning key
+    DimQ: tl.constexpr,
+    DimV: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ATTN_SCALE_TYPE: tl.constexpr,
+    SHARED_KV: tl.constexpr,
+    TRUNCATE_METHOD: tl.constexpr,
+    HAS_CAUSAL: tl.constexpr,
+    HAS_NUM_TARGETS: tl.constexpr,
+    # pyrefly: ignore [bad-function-definition]
+    PER_KV_HEAD: tl.constexpr = False,
+    # pyrefly: ignore [bad-function-definition]
+    AUTOWS: tl.constexpr = False,
+    WS_ON: tl.constexpr = False,
+    # Inner (start_m) loop list-schedule rank; swept by autotune under
+    # TRITON_USE_LIST_SCHEDULE=1. See _get_triton_bw_redq_2kv_configs.
+    # pyrefly: ignore [bad-function-definition]
+    INNER_PICK: tl.constexpr = 0,
+):
+    """MANUAL 2-KV-block data-partition fork of `_hstu_attn_bwd_redq`.
+
+    Steps the KV loop by 2*BLOCK_N and dispatches `_hstu_attn_bwd_inner_2kv`
+    (two KV blocks per call), rounding the block count up so an odd leftover
+    block is handled by the same 2-KV inner with its second block fully masked
+    (no separate single-KV tail, whose buffer.ids would clash under WS).
+    SHARED_KV + compute-fold only.
+    """
+    tl.static_assert(SHARED_KV, "_hstu_attn_bwd_redq_2kv is SHARED_KV only")
+    tl.static_assert(not PER_KV_HEAD, "_hstu_attn_bwd_redq_2kv requires G == 1")
+    (
+        off_h,
+        off_h_kv,
+        start_n,
+        seq_start_kv,
+        seq_len_kv,
+        seq_start_q,
+        seq_len_q,
+        off_z,
+    ) = _compute_bwd_reduce_dq_offsets(
+        H,
+        G,
+        BLOCK_N,
+        seq_offsets_q,
+        seq_offsets,
+        max_seq_len,
+        TRUNCATE_METHOD,
+    )
+    n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
+    uih_len_q = uih_common_preprocess(n_targets, seq_len_q, HAS_NUM_TARGETS)
+    if seq_len_kv == 0:
+        return
+    H_kv = H // G
+    desc_q = tl.make_tensor_descriptor(
+        Q,
+        shape=[total_seq_len_q, H * DimQ],
+        # pyrefly: ignore [bad-argument-type]
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_M, DimQ],
+    )
+    desc_k = tl.make_tensor_descriptor(
+        K,
+        shape=[total_seq_len_kv, H_kv * DimQ],
+        # pyrefly: ignore [bad-argument-type]
+        strides=[H_kv * DimQ, 1],
+        block_shape=[BLOCK_N, DimQ],
+    )
+    desc_v = tl.make_tensor_descriptor(
+        V,
+        shape=[total_seq_len_kv, H_kv * DimV],
+        # pyrefly: ignore [bad-argument-type]
+        strides=[H_kv * DimV, 1],
+        block_shape=[BLOCK_N, DimV],
+    )
+    desc_do = tl.make_tensor_descriptor(
+        DO,
+        shape=[total_seq_len_q, H * DimV],
+        # pyrefly: ignore [bad-argument-type]
+        strides=[H * DimV, 1],
+        block_shape=[BLOCK_M, DimV],
+    )
+    end_kv = seq_start_kv + seq_len_kv
+    desc_dk = tl.make_tensor_descriptor(
+        DK,
+        shape=[end_kv.to(tl.int32), DimQ * H_kv],
+        # pyrefly: ignore [bad-argument-type]
+        strides=[DimQ * H_kv, 1],
+        block_shape=[BLOCK_N, DimQ],
+    )
+    end_dq = seq_start_q + seq_len_q
+    desc_dq = tl.make_tensor_descriptor(
+        DQ,
+        shape=[end_dq.to(tl.int32), DimQ * H],
+        # pyrefly: ignore [bad-argument-type]
+        strides=[DimQ * H, 1],
+        block_shape=[BLOCK_M, DimQ],
+    )
+
+    # Pair up BLOCK_N KV blocks: process two blocks per _hstu_attn_bwd_inner_2kv
+    # call, rounding the block count UP so an odd leftover block is handled by
+    # the SAME 2-KV inner with its second block (b1) fully masked -- b1's dq
+    # contribution is zero and its dk1 store lands past end_kv (dropped by the
+    # desc_dk TMA bounds). This avoids a separate single-KV tail inner, whose
+    # distinct TLX buffer.ids collide with the 2-KV ids and crash the WS pass.
+    n_blocks = tl.cdiv(seq_len_kv, BLOCK_N)
+    n_pairs = tl.cdiv(n_blocks, 2)
+    pair_end_n = n_pairs * 2 * BLOCK_N
+    for start_n in tl.range(0, pair_end_n, 2 * BLOCK_N):
+        _hstu_attn_bwd_inner_2kv(
+            start_n,
+            seq_start_kv,
+            seq_len_kv,
+            seq_start_q,
+            seq_len_q,
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_do,
+            desc_dk,
+            desc_dq,
+            DV,
+            stride_qh,
+            stride_kh,
+            stride_vh,
+            stride_doh,
+            stride_dvn,
+            stride_dvh,
+            alpha,
+            attn_scale,
+            M,
+            Delta,
+            stride_mm,
+            off_h,
+            off_h_kv,
+            H_kv,
+            uih_len_q,
+            num_softmax_heads,
+            DimQ,
+            DimV,
+            ALLOW_TF32,
+            BLOCK_M,
+            BLOCK_N,
+            ATTN_SCALE_TYPE,
+            G > 1,  # GQA_ATOMIC_ADD
+            SHARED_KV,
+            True,  # MASK_KV
+            HAS_CAUSAL,
+            AUTOWS,
+            WS_ON,
+            INNER_PICK,
+        )
 
 
 @triton_autotune(
@@ -3094,7 +3442,8 @@ def _hstu_attn_bwd_inner(  # noqa C901
         qk_trans = tl.dot(
             k,
             tl.trans(q),
-            attrs=_HSTU_ATTRS_QKT if WS_ON else None,
+            attrs=(_HSTU_ATTRS_QKT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD) else _HSTU_ATTRS_QKT) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if MASK_KV or HAS_CAUSAL:
             valid_mask_trans = backward_valid_mask(
@@ -3126,7 +3475,8 @@ def _hstu_attn_bwd_inner(  # noqa C901
             v,
             tl.trans(do),
             allow_tf32=ALLOW_TF32,
-            attrs=_HSTU_ATTRS_DPT if WS_ON else None,
+            attrs=(_HSTU_ATTRS_DPT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD) else _HSTU_ATTRS_DPT) if
+            (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if SHARED_KV:
             dk = tl.dot(
@@ -3134,7 +3484,8 @@ def _hstu_attn_bwd_inner(  # noqa C901
                 do,
                 dk,
                 allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DV if WS_ON else None,
+                attrs=(_HSTU_ATTRS_DV_2KV if _HSTU_COMPUTE_FOLD else _HSTU_ATTRS_DV) if
+                (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
         else:
             # pyrefly: ignore [unbound-name]
@@ -3143,36 +3494,54 @@ def _hstu_attn_bwd_inner(  # noqa C901
                 do,
                 dv,
                 allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DV if WS_ON else None,
+                attrs=_HSTU_ATTRS_DV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
 
         if num_softmax_heads > 0:  # autoWS: constexpr (see note above)
             dqk_trans = backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT)
         else:
             dqk_trans = backward_d_silu_activation(dact_qk_trans, pT, qk_trans, scale, valid_mask_trans)
-        dqk_trans = dqk_trans.to(k.dtype)
-        dq_trans = tl.dot(
-            tl.trans(k),
-            dqk_trans,
-            attrs=_HSTU_ATTRS_DQ if WS_ON else None,
-        )
-        if SHARED_KV:
-            dk_attn = tl.dot(
+        if SHARED_KV and _HSTU_COMPUTE_FOLD:
+            # Fold dk_attn into dk: pre-scale alpha into dqk_trans (fp32) so both
+            # the dq and dk_attn dots carry alpha, then accumulate dk_attn
+            # directly into the dv/dk accumulator (dk_shared -> buffer id 7).
+            dqk_trans = (dqk_trans * alpha).to(k.dtype)
+            dq_trans = tl.dot(
+                tl.trans(k),
                 dqk_trans,
-                q,
-                allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                attrs=_HSTU_ATTRS_DQ_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
-            dk = dk + dk_attn * alpha
-        else:
             dk = tl.dot(
                 dqk_trans,
                 q,
                 dk,
                 allow_tf32=ALLOW_TF32,
-                attrs=_HSTU_ATTRS_DK if WS_ON else None,
+                attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
             )
-        dq_trans = dq_trans * alpha
+        else:
+            dqk_trans = dqk_trans.to(k.dtype)
+            dq_trans = tl.dot(
+                tl.trans(k),
+                dqk_trans,
+                attrs=_HSTU_ATTRS_DQ if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            )
+            if SHARED_KV:
+                dk_attn = tl.dot(
+                    dqk_trans,
+                    q,
+                    allow_tf32=ALLOW_TF32,
+                    attrs=_HSTU_ATTRS_DK if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+                )
+                dk = dk + dk_attn * alpha
+            else:
+                dk = tl.dot(
+                    dqk_trans,
+                    q,
+                    dk,
+                    allow_tf32=ALLOW_TF32,
+                    attrs=_HSTU_ATTRS_DK if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+                )
+            dq_trans = dq_trans * alpha
         dq = tl.trans(dq_trans)
         desc_dq.store(
             [q_offset.to(tl.int32), DimQ * off_h],
@@ -3223,6 +3592,272 @@ def _hstu_attn_bwd_inner(  # noqa C901
         desc_dk.atomic_add([kv_offset, DimQ * off_h_kv], dk.to(desc_dk.dtype))
     else:
         desc_dk.store([kv_offset, DimQ * off_h_kv], dk.to(desc_dk.dtype))
+
+
+@triton.jit
+def _hstu_attn_bwd_inner_2kv(  # noqa C901
+    start_n,
+    seq_start_kv,
+    seq_len_kv,
+    seq_start_q,
+    seq_len_q,
+    desc_q,
+    desc_k,
+    desc_v,
+    desc_do,
+    desc_dk,
+    desc_dq,
+    DV,
+    stride_qh,
+    stride_kh,
+    stride_vh,
+    stride_doh,
+    stride_dvn,
+    stride_dvh,
+    alpha,
+    attn_scale,
+    M,
+    Delta,
+    stride_mm,
+    off_h,
+    off_h_kv,
+    H_kv,
+    uih_len_q,
+    num_softmax_heads: tl.constexpr,
+    DimQ: tl.constexpr,
+    DimV: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ATTN_SCALE_TYPE: tl.constexpr,
+    GQA_ATOMIC_ADD: tl.constexpr,
+    SHARED_KV: tl.constexpr,
+    MASK_KV: tl.constexpr,
+    HAS_CAUSAL: tl.constexpr,
+    # pyrefly: ignore [bad-function-definition]
+    AUTOWS: tl.constexpr = False,
+    WS_ON: tl.constexpr = False,
+    # Rank of the list-schedule variant to apply to the inner (start_m) loop.
+    # Swept by @triton.autotune when TRITON_USE_LIST_SCHEDULE=1; ignored
+    # otherwise. Only the inner loop is autotuned (outer keeps one schedule).
+    # pyrefly: ignore [bad-function-definition]
+    INNER_PICK: tl.constexpr = 0,
+):
+    """MANUAL 2-KV-block fork of `_hstu_attn_bwd_inner`.
+
+    Processes TWO KV blocks per call -- block b0 at `start_n` and block b1 at
+    `start_n + BLOCK_N` -- so a single program does the 2-way KV parallelism the
+    compiler DP pass would otherwise synthesize, but written out explicitly in
+    Triton so that pass never runs. SHARED_KV + compute-fold ONLY.
+    """
+    tl.static_assert(SHARED_KV, "_hstu_attn_bwd_inner_2kv is SHARED_KV only")
+    tl.static_assert(ATTN_SCALE_TYPE == "scalar")
+
+    kv_offset0 = (seq_start_kv + start_n).to(tl.int32)
+    kv_offset1 = (seq_start_kv + start_n + BLOCK_N).to(tl.int32)
+    k0 = desc_k.load([kv_offset0, off_h_kv * stride_kh])
+    k1 = desc_k.load([kv_offset1, off_h_kv * stride_kh])
+    # shared-KV: v aliases k.
+    v0 = k0
+    v1 = k1
+
+    dk0 = tl.zeros([BLOCK_N, DimQ], dtype=tl.float32)
+    dk1 = tl.zeros([BLOCK_N, DimQ], dtype=tl.float32)
+
+    scale = tl.load(attn_scale).to(tl.float32)
+
+    M_off, Delta_off = backward_common_preprocess(M, Delta, off_h, num_softmax_heads, seq_start_q, stride_mm)
+
+    offs_n0 = start_n + tl.arange(0, BLOCK_N)
+    offs_n1 = start_n + BLOCK_N + tl.arange(0, BLOCK_N)
+    if num_softmax_heads > 0:
+        scaled_alpha = alpha * 1.44269504
+    else:
+        scaled_alpha = alpha
+    if HAS_CAUSAL:
+        low_q = max(0, start_n + uih_len_q - seq_len_kv)
+    else:
+        low_q = 0
+
+    # warp_specialize is OFF for the 2-KV inner loop. WS produces an incorrect
+    # dq here (rel-L2 ~89): the two-block shared dq accumulator is written in the
+    # gemm partition but loaded/stored (store_reduce="add") in the reduction
+    # partition, and that cross-partition gemm->reduction handoff over-counts dq.
+    # This is independent of MMA placement (all dq dots already co-locate in the
+    # gemm partition) -- see T279388065. Until that handoff is fixed, run the
+    # 2-KV inner loop unspecialized (correct via the non-WS fallback).
+    #
+    # NOTE: previously WS was effectively suppressed here by the warp budget
+    # (18/16); the accumulator-chain dpFactor collapse now fits the budget
+    # (14/16), so WS would fire and expose the dq bug -- hence the explicit OFF.
+    #
+    # merge_epilogue is also OFF (unlike the single-KV inner): folding the dq
+    # epilogue store into the computation partition duplicates/misplaces the
+    # store for the shared dq accumulator, over-counting dq.
+    #
+    # num_stages=1: software pipelining the two-block loop (num_stages>=2) trips
+    # the pipeliner ("local_alloc can't predicate") on the doubled operand
+    # allocs, so the loop pipeline depth is pinned to 1 regardless of num_stages.
+    for start_m in tl.range(
+            low_q,
+            seq_len_q,
+            BLOCK_M,
+            num_stages=1,
+            warp_specialize=WS_ON,
+            merge_epilogue=False,
+    ):
+        offs_m = start_m + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < seq_len_q
+        q_offset = seq_start_q + start_m
+        # q/do are loaded ONCE and shared by both KV blocks.
+        q = desc_q.load([q_offset.to(tl.int32), off_h * stride_qh])
+        do = desc_do.load([q_offset.to(tl.int32), off_h * stride_doh])
+
+        # ---- KV block b0 (SHARED_KV + compute fold) ----
+        qk_trans0 = tl.dot(
+            k0,
+            tl.trans(q),
+            attrs=_HSTU_ATTRS_QKT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+
+        ######### computation/activation for P0
+        if MASK_KV or HAS_CAUSAL:
+            valid_mask_trans0 = backward_valid_mask(offs_m, offs_n0, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
+        else:
+            valid_mask_trans0 = offs_m[None, :] < seq_len_q
+        if num_softmax_heads > 0:
+            qk_trans0, act_qk_trans0, pT0 = (backward_softmax_activation_scaled_alpha(
+                qk_trans0,
+                scaled_alpha,
+                valid_mask_trans0,
+                M_off,
+                offs_m,
+                stride_mm,
+                mask_m,
+                k0,
+            ))
+        else:
+            qk_trans0, act_qk_trans0, pT0 = backward_silu_activation(qk_trans0, alpha, valid_mask_trans0, k0.dtype,
+                                                                     scale)
+        dact_qk_trans0 = tl.dot(
+            v0,
+            tl.trans(do),
+            allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        if num_softmax_heads > 0:
+            dqk_trans0 = backward_d_softmax_activation(dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0)
+        else:
+            dqk_trans0 = backward_d_silu_activation(dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0)
+        ######### computation/activation for P1
+        # ---- KV block b1 (SHARED_KV + compute fold) ----
+        # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
+        # tiles never alias b0's (which stays on _2KV).
+        qk_trans1 = tl.dot(
+            k1,
+            tl.trans(q),
+            attrs=_HSTU_ATTRS_QKT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        if MASK_KV or HAS_CAUSAL:
+            valid_mask_trans1 = backward_valid_mask(offs_m, offs_n1, uih_len_q, seq_len_q, seq_len_kv, HAS_CAUSAL)
+        else:
+            valid_mask_trans1 = offs_m[None, :] < seq_len_q
+        # calculate pT
+        if num_softmax_heads > 0:
+            qk_trans1, act_qk_trans1, pT1 = (backward_softmax_activation_scaled_alpha(
+                qk_trans1,
+                scaled_alpha,
+                valid_mask_trans1,
+                M_off,
+                offs_m,
+                stride_mm,
+                mask_m,
+                k1,
+            ))
+        else:
+            qk_trans1, act_qk_trans1, pT1 = backward_silu_activation(qk_trans1, alpha, valid_mask_trans1, k1.dtype,
+                                                                     scale)
+        dact_qk_trans1 = tl.dot(
+            v1,
+            tl.trans(do),
+            allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DPT_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        # calculate dqk_trans
+        if num_softmax_heads > 0:
+            dqk_trans1 = backward_d_softmax_activation(dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1)
+        else:
+            dqk_trans1 = backward_d_silu_activation(dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1)
+
+        # compute fold: pre-scale alpha into dqk so both dq and dk_attn carry it.
+        dqk_trans0 = (dqk_trans0 * alpha).to(k0.dtype)
+        # dq is a SINGLE accumulator over both KV blocks: b0 fresh-writes it, b1
+        # accumulates into the same TMEM tile (opndD id 11) below. This avoids a
+        # cross-partition register sum (dq0 and dq1 land in different warp
+        # partitions under WS) and a two-store race, and needs one TMEM tile.
+        dq_trans = tl.dot(
+            tl.trans(k0),
+            dqk_trans0,
+            attrs=_HSTU_ATTRS_DQ_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        # dv fold: accumulate dv into the shared dk accumulator.
+        dk0 = tl.dot(
+            act_qk_trans0,
+            do,
+            dk0,
+            allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DV_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        dk0 = tl.dot(
+            dqk_trans0,
+            q,
+            dk0,
+            allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DK_SHARED_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+
+        # ---- KV block b1 (SHARED_KV + compute fold) ----
+        # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
+        # tiles never alias b0's (which stays on _2KV).
+        dqk_trans1 = (dqk_trans1 * alpha).to(k1.dtype)
+        # Accumulate b1's dq into the SAME dq_trans TMEM tile (opndD id 11 via
+        # _B1), reducing both KV blocks' contributions in TMEM.
+        dq_trans = tl.dot(
+            tl.trans(k1),
+            dqk_trans1,
+            dq_trans,
+            attrs=_HSTU_ATTRS_DQ_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        dk1 = tl.dot(
+            act_qk_trans1,
+            do,
+            dk1,
+            allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DV_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+        dk1 = tl.dot(
+            dqk_trans1,
+            q,
+            dk1,
+            allow_tf32=ALLOW_TF32,
+            attrs=_HSTU_ATTRS_DK_SHARED_2KV_B1 if (WS_ON and not _HSTU_MODULO_TOPK) else None,
+        )
+
+        # ONE store per Q: dq_trans already holds b0+b1.
+        dq = tl.trans(dq_trans)
+        desc_dq.store(
+            [q_offset.to(tl.int32), DimQ * off_h],
+            dq.to(desc_dq.dtype),
+            store_reduce="add",
+        )
+
+    # No dv store (shared-KV: dv folded into dk). alpha already folded into dk.
+    if GQA_ATOMIC_ADD:
+        desc_dk.atomic_add([kv_offset0, DimQ * off_h_kv], dk0.to(desc_dk.dtype))
+        desc_dk.atomic_add([kv_offset1, DimQ * off_h_kv], dk1.to(desc_dk.dtype))
+    else:
+        desc_dk.store([kv_offset0, DimQ * off_h_kv], dk0.to(desc_dk.dtype))
+        desc_dk.store([kv_offset1, DimQ * off_h_kv], dk1.to(desc_dk.dtype))
 
 
 @maybe_register_custom_op("hammer::triton_hstu_cross_attn_v3_fwd", mutates_args=())
@@ -3575,6 +4210,67 @@ def triton_hstu_cross_attn_v3_bwd(
             # loop STRUCTURE with warp specialization DISABLED (isolation reference).
             WS_ON=((bwd_variant == BwdVariant.TRITON_AUTOWS) and os.environ.get("HSTU_AUTOWS_WS_OFF", "0") != "1"),
         )
+    elif bwd_variant == BwdVariant.TRITON_AUTOWS_2KV:
+        # MANUAL 2-KV-block data-partition variant. Shared-KV only; G == 1
+        # (self-attn) so no per-kv-head atomic path is needed.
+        assert shared_kv, "BwdVariant.TRITON_AUTOWS_2KV requires shared_kv"
+        assert G == 1, "BwdVariant.TRITON_AUTOWS_2KV requires G == 1"
+        grid = lambda meta: (Z * H, 1)  # noqa E731
+        _hstu_attn_bwd_redq_2kv[grid](
+            Q=q,
+            K=k,
+            V=v,
+            DO=dout,
+            total_seq_len_q=total_seq_len_q,
+            total_seq_len_kv=total_seq_len_kv,
+            seq_offsets=seq_offsets,
+            seq_offsets_q=seq_offsets_q,
+            DQ=dq,
+            DK=dk,
+            DV=dv,
+            stride_qm=q.stride(0),
+            stride_qh=q.stride(1),
+            stride_kn=k.stride(0),
+            stride_kh=k.stride(1),
+            stride_vn=v.stride(0),
+            stride_vh=v.stride(1),
+            stride_dom=dout.stride(0),
+            stride_doh=dout.stride(1),
+            stride_dqm=dq.stride(0),
+            stride_dqh=dq.stride(1),
+            stride_dkn=dk.stride(0),
+            stride_dkh=dk.stride(1),
+            stride_dvn=dv.stride(0),
+            stride_dvh=dv.stride(1),
+            alpha=alpha,
+            max_seq_len=max_seq_len,
+            attn_scale=attn_scale,
+            M=M,
+            Delta=Delta,
+            stride_mm=stride_mm,
+            num_targets=num_targets,
+            Z=Z,
+            AUTOTUNE_Z=AUTOTUNE_Z,
+            H=H,
+            G=G,
+            num_softmax_heads=num_softmax_heads,
+            max_q_len=next_power_of_2(max_q_len),
+            AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
+            DimQ=DimQ,
+            DimV=DimV,
+            ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            ATTN_SCALE_TYPE=attn_scale_type,
+            SHARED_KV=shared_kv,
+            TRUNCATE_METHOD=truncate_method,
+            HAS_CAUSAL=HAS_CAUSAL,
+            HAS_NUM_TARGETS=HAS_NUM_TARGETS,
+            PER_KV_HEAD=False,
+            # AUTOWS=False keeps the compiler DP pass from ever running; the
+            # manual 2-KV loop + disjoint b0/b1 buffer.ids do the partitioning.
+            AUTOWS=False,
+            # Milestone 2: warp specialization ON.
+            WS_ON=True,
+        )
     else:
         grid = lambda meta: (Z * H, 1)  # noqa E731
         _hstu_attn_bwd[grid](
@@ -3663,7 +4359,6 @@ class AttentionFunction(torch.autograd.Function):
             v = switch_to_contiguous_if_needed(v)
         else:
             v = k
-        Z = seq_offsets.numel() - 1  # noqa: F841
         total_seq_len_q, H, DimQ = q.shape
         _, H_kv, DimV = v.shape
         assert H % H_kv == 0, f"H ({H}) must be divisible by H_kv ({H_kv})"

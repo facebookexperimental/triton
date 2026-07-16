@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "TMEMUtils.h"
 #include "WSBarrierAnalysis.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -669,6 +670,14 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
     for (Operation &op : reverse(*block)) {
       if (isa<scf::ForOp, scf::IfOp>(op))
         break;
+      // Never treat the block terminator (e.g. scf.yield) as an epilog op.
+      // When the epilogue store lives inside the loop body, the terminator is
+      // block.back() and would otherwise be swept into epilogOps; a channel
+      // consumer whose forward slice reaches the loop-carried yield (e.g. the
+      // tmem_load accumulator token) then moves scf.yield out of terminator
+      // position, leaving the block without a valid terminator.
+      if (op.hasTrait<OpTrait::IsTerminator>())
+        continue;
       epilogOps.insert(&op);
     }
 
@@ -3329,6 +3338,17 @@ void insertAsyncComm(
       auto *bwdCh = isForwardOfChannelLoop(masterChannel);
       if (bwdCh)
         producerAcquireForChannelLoop = bwdCh->getDstOp();
+    }
+    // Collapsed chained-accumulator channel (T279388065): the forward commit is
+    // on the LAST writer (headProducer), but the reuse/empty producer_acquire
+    // must precede the FIRST (fresh-overwrite) writer so the whole chain waits
+    // for the consumer's read of the previous iteration. Honor acquireBeforeOp.
+    if (!producerAcquireForChannelLoop &&
+        masterChannel->channelKind == DataChannelKind::TMEMPost) {
+      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(masterChannel);
+      if (tmemCh->acquireBeforeOp &&
+          tmemCh->acquireBeforeOp->getBlock() == headProducer->getBlock())
+        producerAcquireForChannelLoop = tmemCh->acquireBeforeOp;
     }
     int reuseGrp = channelInReuseGroup(masterChannel, config);
 

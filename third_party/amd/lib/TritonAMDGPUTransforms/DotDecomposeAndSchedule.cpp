@@ -59,7 +59,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 // Backend-neutral modulo scheduling core (Phase A extraction). Cross-tree
 // include via the global `third_party` include dir — interim until the core is
 // relocated to a neutral path.

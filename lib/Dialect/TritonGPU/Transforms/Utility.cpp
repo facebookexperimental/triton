@@ -38,7 +38,7 @@ SmallVector<unsigned, 3> mmaVersionToInstrShape(int version,
     auto rank = shape.size();
     SmallVector<unsigned, 3> ret(rank, 1);
     ret[rank - 1] = 8;
-    ret[rank - 2] = 16;
+    ret[rank - 2] = eltType.isF64() ? 8 : 16;
     return ret;
   } else if (version == 3) {
     unsigned k = 256 / eltType.getIntOrFloatBitWidth();
@@ -134,10 +134,16 @@ getAtomicWriteElementsPerThreadCap(Operation *op) {
   if (elemTy.isInteger() || elemTy.isF64())
     return 1;
 
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+
+  if (moduleOp && getAMDArch(moduleOp)) {
+    unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
+    return std::max(1u, 32u / elemBitwidth);
+  }
+
   if (atomicRmw.getAtomicRmwOp() != RMWOp::FADD)
     return std::nullopt;
 
-  auto moduleOp = op->getParentOfType<ModuleOp>();
   auto targetAttr =
       moduleOp ? moduleOp->getAttrOfType<StringAttr>(ttg::AttrTargetName)
                : nullptr;
@@ -1144,21 +1150,8 @@ bool isPureUnaryInlineAsm(Operation *op) {
 }
 
 int getNVIDIAComputeCapability(Operation *module) {
-  StringAttr targetAttr =
-      module->getAttrOfType<StringAttr>(triton::gpu::AttrTargetName);
-  assert(targetAttr && "Expected a target attribute on the module operation");
-
-  StringRef ref = targetAttr.strref();
-  assert(ref.starts_with("cuda:") &&
-         "expected target attribute to be prefixed with \"cuda:\"");
-
-  StringRef capabilityStr = ref.drop_front(5); // drop the "cuda:"
-  int computeCapability;
-  bool parseError = capabilityStr.getAsInteger(10, computeCapability);
-  assert(!parseError &&
-         "invalid compute capability string in target attribute");
-
-  return computeCapability;
+  return ttng::TargetFeatures::fromModuleOp(cast<ModuleOp>(module))
+      .getComputeCapability();
 }
 
 std::optional<StringRef> getAMDArch(Operation *module) {
