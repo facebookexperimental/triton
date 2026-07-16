@@ -1067,36 +1067,11 @@ def e2e_main(argv: list[str] | None = None) -> int:
 # ``regression`` / ``e2e-worker`` subcommand as the first argument after ``--``.
 # ===========================================================================
 
-def worker_main(argv: list[str] | None = None) -> int:
-    """``worker`` subcommand: benchmark ONE generated.py for one case, write JSON.
-
-    Process-isolated single-variant bench used by examples/testing/topn_autotune.py
-    (the role the retired examples/testing/perf_engine.py played before its
-    engine was folded into this module): the sweep driver stays CUDA-free and
-    spawns one worker per emitted variant so a crashing variant cannot take
-    down the whole sweep.
-    """
-    ap = argparse.ArgumentParser(
-        prog="perf_harness.py worker",
-        description="benchmark one case's generated.py, write JSON",
-    )
-    ap.add_argument("--case-dir", required=True)
-    ap.add_argument("--generated", required=True, help="path to the generated.py to benchmark")
-    ap.add_argument("--out", required=True, help="path to write the JSON result")
-    ap.add_argument("--no-hw", action="store_true", help="skip the handwritten baseline")
-    args = ap.parse_args(argv)
-
-    res = run_bench(Path(args.case_dir), Path(args.generated), want_hw=not args.no_hw)
-    Path(args.out).write_text(json.dumps(res))
-    return 0
-
-
 _SUBCOMMANDS = {
     "regression": regression_main,
     "e2e": e2e_main,
     "e2e-worker": e2e_worker_main,
     "bench": bench_main,
-    "worker": worker_main,
 }
 
 
