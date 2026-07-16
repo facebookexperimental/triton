@@ -662,11 +662,10 @@ _BWD_DOT_ATTRS_BM64_MEMTYPE = FrozenDotAttrs({
 })
 
 # BM128 memtype-only variant (same intent as _BWD_DOT_ATTRS_BM64_MEMTYPE but for
-# BLOCK_M1=128). PromoteLHSToTMem promotes dsT to TMEM, but at BM128 the planner
-# cannot yet form the tight {dpT,dq,dsT} reuse group that the hand-pinned
-# _BWD_DOT_ATTRS_TMEM config achieves, so it OOBs TMEM. Kept as a motivating case
-# for the memory-planner search-space work (see test_bwd_bm128_memtype_only_xfail
-# and task T279873316).
+# BLOCK_M1=128). PromoteLHSToTMem promotes dsT to TMEM; the planner forms the
+# tight {dpT,dq,dsT} reuse group that the hand-pinned _BWD_DOT_ATTRS_TMEM config
+# expresses via the repairUnsafeReuseGroups post-pass (see
+# test_bwd_bm128_memtype_only and task T279873316).
 _BWD_DOT_ATTRS_BM128_MEMTYPE = FrozenDotAttrs({
     "qkT": {"stage": "0", "order": "0"},
     "dpT": {"stage": "0", "order": "2"},
@@ -1909,19 +1908,14 @@ def test_bwd_memtype_only_annotation():
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
-@pytest.mark.xfail(strict=False, reason="Memory-planner search-space gap (T279873316): "
-                   "BM128 memtype-only promotes dsT to TMEM, but the planner cannot form "
-                   "the tight {dpT,dq,dsT} reuse group that hand _BWD_DOT_ATTRS_TMEM pins, "
-                   "so it OOBs TMEM. dq (accumulator) and the tmem dsT (dk operand) relate "
-                   "only through a common ancestor, which the planner's data-dependency "
-                   "reuse check rejects; a naive same-partition relaxation is unsafe (op-id "
-                   "liveness underestimates qkT's lifetime via pT). Expected to pass once "
-                   "the planner learns to form the group safely.")
-def test_bwd_bm128_memtype_only_xfail():
-    # Motivating case kept for the memory-planner search-space work. Builds a
-    # BM128 memtype-only config (opndA,tmem on dv/dk, opndA,smem on dq — no
-    # copies/id) and runs the bwd; currently OOBs TMEM (xfail). Appends the config
-    # transiently so it is not swept by the parametrized test_op matrix.
+def test_bwd_bm128_memtype_only():
+    # Memory-planner N-way TMEM reuse gate (T279873316). BM128 memtype-only
+    # config (opndA,tmem on dv/dk, opndA,smem on dq — no copies/id): the planner
+    # must form the tight {dpT,dq,dsT} reuse group that the hand-pinned
+    # _BWD_DOT_ATTRS_TMEM config expresses. First-fit lands dsT in the
+    # unorderable {qkT,ppT,dsT}; the repairUnsafeReuseGroups post-pass relocates
+    # dsT into {dpT,dq} -> {dpT,dsT,dq}, leaving {qkT,ppT}, so this now passes.
+    # Appended transiently so it is not swept by the parametrized test_op matrix.
     cfg = triton.Config(
         {
             "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128,

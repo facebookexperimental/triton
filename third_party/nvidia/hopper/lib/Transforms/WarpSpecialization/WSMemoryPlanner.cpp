@@ -3784,6 +3784,120 @@ public:
     return maxColOffset;
   }
 
+  /// N-way group formation: can `candidate` join `owner`'s reuse group as a
+  /// time-multiplexed (offset 0) member even without a pairwise data dependency
+  /// to any current member? This is the case for common-ancestor siblings like
+  /// FA-bwd {dpT,dsT,dq} (dq reads dsT from SMEM, dk from TMEM, so dq<->dsT have
+  /// no direct producer->consumer edge), which hasPotentialReuse cannot form.
+  ///
+  /// Accept only when the WHOLE prospective group admits a unique dependency-
+  /// chain order under BOTH edge policies. Chain order is a happens-before, so
+  /// the members are not co-live and time-multiplexing the shared slot is safe.
+  /// Requires >=3 members (pairwise is handled by hasPotentialReuse) and that
+  /// candidate fits the owner's columns.
+  ///
+  /// Two gates, both required:
+  ///   (1) crossPartitionProgOrder=false (SOUND formation gate): refuses to
+  ///       order data-independent cross-partition siblings, so we never form a
+  ///       spurious group.
+  ///   (2) crossPartitionProgOrder=true (code partitioning's edge policy): the
+  ///       loose gate has MORE edges than the strict one, so a strict-orderable
+  ///       group is NOT guaranteed loose-orderable -- an added cross-partition
+  ///       program-order edge can create a cycle. If it does, insertAsyncComm
+  ///       (WSCodePartition) would later hit its report_fatal_error on this very
+  ///       group. Requiring loose-orderability here refuses such a group up
+  ///       front so a repair can never manufacture a group code partitioning
+  ///       then rejects.
+  ///
+  /// Called only by repairUnsafeReuseGroups, which runs on the default path but
+  /// is INERT unless first-fit produced an unorderable (>=3) group, so packings
+  /// first-fit already gets right never reach here (default compiles unchanged).
+  bool canJoinReuseGroupChain(BufferT *owner, BufferT *candidate,
+                              const AllocationState &state) {
+    if (candidate->colSize > owner->colSize)
+      return false;
+    if (bufferRange[owner].intersects(bufferRange[candidate]))
+      return false;
+    ReuseGroup g;
+    SmallVector<BufferT *, 4> members{owner};
+    for (auto &[reuser, asg] : state.assignment)
+      if (asg.first == owner)
+        members.push_back(reuser);
+    members.push_back(candidate);
+    if (members.size() < 3)
+      return false;
+    for (auto *m : members) {
+      auto *ch = allocToChannel.lookup(m->owner);
+      if (!ch)
+        return false;
+      g.channels.push_back(ch);
+    }
+    return !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false).empty() &&
+           !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/true).empty();
+  }
+
+  /// Post-pass repair: first-fit builds reuse groups incrementally in buffer
+  /// order, which cannot assemble a common-ancestor sibling group whose bridge
+  /// member sorts last -- FA-bwd BM128 lands dsT in {qkT,ppT,dsT} (ppT<->dsT
+  /// make it unorderable) instead of {dpT,dsT,dq}. This order-independent pass
+  /// repairs it: for each unorderable group, relocate a reuser to another group
+  /// where it forms a chain-orderable slot, provided the source group is left
+  /// orderable too. One relocation per call; the caller loops to a fixpoint
+  /// (each move takes a member from an unsafe group to a safe one, so it
+  /// terminates).
+  ///
+  /// INERT unless first-fit produced an unorderable (>=3, single-copy) group, so
+  /// packings first-fit already gets right are byte-identical (no regression).
+  bool repairUnsafeReuseGroups(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
+                               AllocationState &state) {
+    auto membersOf = [&](BufferT *owner) {
+      SmallVector<BufferT *, 4> m{owner};
+      for (auto &[r, a] : state.assignment)
+        if (a.first == owner)
+          m.push_back(r);
+      return m;
+    };
+    auto orderable = [&](ArrayRef<BufferT *> mem) -> bool {
+      if (mem.size() < 3)
+        return true; // 2-way is covered by pairwise legality at formation
+      ReuseGroup g;
+      for (auto *b : mem) {
+        auto *c = allocToChannel.lookup(b->owner);
+        if (!c)
+          return false;
+        g.channels.push_back(c);
+      }
+      return !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false).empty();
+    };
+    for (auto &[owner, pl] : state.owners) {
+      SmallVector<BufferT *, 4> mem = membersOf(owner);
+      if (orderable(mem))
+        continue; // group is safe
+      // Relocate a reuser member (never the owner -- it holds the slot).
+      for (BufferT *m : mem) {
+        if (m == owner)
+          continue;
+        SmallVector<BufferT *, 4> rest;
+        for (auto *b : mem)
+          if (b != m)
+            rest.push_back(b);
+        if (!orderable(rest))
+          continue; // removing m alone doesn't make the source orderable
+        for (auto &[dOwner, dpl] : state.owners) {
+          if (dOwner == owner)
+            continue;
+          if (canJoinReuseGroupChain(dOwner, m, state)) {
+            LDBG("repairUnsafeReuseGroups: relocating a reuser from an "
+                 "unorderable group into a chain-orderable group");
+            state.assignment[m] = {dOwner, 0};
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
                    AllocationState &state, size_t maxCols, Operation *ctrlOp) {
@@ -4223,6 +4337,10 @@ public:
     if (!enumerated && !tryAllocate(allocs, 0, state, kMaxTMemCols, ctrlOp)) {
       return allocs[0].emitError(
           "allocateTMemAllocs2: failed to allocate TMEM buffers");
+    }
+
+    // Repair any unorderable reuse group first-fit produced (inert otherwise).
+    while (repairUnsafeReuseGroups(allocs, state)) {
     }
 
     // Apply the final allocation state (skip pre-assigned buffers)
