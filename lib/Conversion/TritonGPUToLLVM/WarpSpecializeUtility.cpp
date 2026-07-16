@@ -350,8 +350,10 @@ static void disableLICM(LLVM::BrOp latchBr) {
 static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
                                     const TargetInfoBase &targetInfo,
                                     const WarpSpecializeCallbacks &callbacks,
-                                    unsigned switchLoopBarrierIdx) {
+                                    unsigned switchLoopBarrierIdx,
+                                    Block *exitBlock) {
   TritonLLVMIRRewriter b(ws.getLoc(), ws.getContext());
+  auto mod = ws->getParentOfType<ModuleOp>();
   for (Region *partition : ws.getPartitionRegions()) {
     // Load the explicit captures from shared memory and replace the block args
     // if there are any.
@@ -389,10 +391,13 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
-      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-      callbacks.reallocRegisters(b, ws,
-                                 RegisterReallocPhase::WorkerPartitionEnd,
-                                 partition->getRegionNumber());
+      // no need to restore register at region end
+      if (!hasSingleWarpSpecialize(mod)) {
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+        callbacks.reallocRegisters(b, ws,
+                                   RegisterReallocPhase::WorkerPartitionEnd,
+                                   partition->getRegionNumber());
+      }
       if (hasClusterSyncKernelCleanup) {
         // If there was a cluster sync point before tmem de-alloc, it would
         // block default warps. Non default warps should arrive at the end of
@@ -401,7 +406,12 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
         NVVM::ClusterArriveOp::create(b, b.getLoc(),
                                       UnitAttr::get(b.getContext()));
       }
-      b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
+      if (hasSingleWarpSpecialize(mod)) {
+        // directly jump to exit/ret instead of going back to switchLoop
+        b.replaceOpWithNewOp<LLVM::BrOp>(op, exitBlock);
+      } else {
+        b.replaceOpWithNewOp<LLVM::BrOp>(op, switchLoop);
+      }
     });
   }
 }
@@ -412,7 +422,9 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     unsigned defaultNumWarps, unsigned totalNumWarps,
     const TargetInfoBase &targetInfo, const WarpSpecializeCallbacks &callbacks,
     unsigned switchLoopBarrierIdx) {
-
+  auto mod = func->getParentOfType<ModuleOp>();
+  // this is the block of ret
+  Block *switchExit = new Block;
   TritonLLVMIRRewriter b(func.getLoc(), ctx);
   Type int8Type = b.getIntegerType(8);
   LLVM::LLVMPointerType ptrTy = ptr_ty(ctx, 3);
@@ -421,17 +433,20 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   callbacks.reallocRegisters(b, wsOps[0], RegisterReallocPhase::SwitchLoopStart,
                              0);
   callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-  Value statePtr = LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
-  Value relWid = b.sub(wid, b.i32_val(defaultNumWarps));
 
-  // The default warp group will populate the state pointer with the state ID
-  // for all warps.
-  // %warp_state_ptr = getelementptr ptr %state_tr[%rel_wid]
-  // %warp_state = load i8 %warp_state_ptr
-  Value warpStatePtr = b.gep(ptrTy, int8Type, statePtr, relWid);
-  // All threads in a warp reading from the same smem address will not create
-  // bank conflicts and is better than predicated load.
-  Value warpState = b.load(int8Type, warpStatePtr);
+  Value warpState;
+  if (!hasSingleWarpSpecialize(mod)) {
+    Value statePtr = LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
+    Value relWid = b.sub(wid, b.i32_val(defaultNumWarps));
+    // The default warp group will populate the state pointer with the state ID
+    // for all warps.
+    // %warp_state_ptr = getelementptr ptr %state_tr[%rel_wid]
+    // %warp_state = load i8 %warp_state_ptr
+    Value warpStatePtr = b.gep(ptrTy, int8Type, statePtr, relWid);
+    // All threads in a warp reading from the same smem address will not create
+    // bank conflicts and is better than predicated load.
+    warpState = b.load(int8Type, warpStatePtr);
+  }
 
   // Pull the partition regions out. Switch based on the state ID to the right
   // partition.
@@ -444,15 +459,22 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   int32_t maxNumWarps = totalNumWarps - defaultNumWarps;
   SmallVector<SmallVector<int32_t>> warpToState(
       wsOps.size(), SmallVector<int32_t>(maxNumWarps, -1));
+  SmallVector<DenseMap<int, Block *>> startWarpToBlock(
+      wsOps.size(), DenseMap<int, Block *>());
 
   for (size_t i = 0; i < wsOps.size(); ++i) {
     WarpSpecializeOp op = wsOps[i];
     auto &stateMap = warpToState[i];
+    auto &targetBlockMap = startWarpToBlock[i];
     rewritePartitionRegions(op, switchLoop, targetInfo, callbacks,
-                            switchLoopBarrierIdx);
+                            switchLoopBarrierIdx, switchExit);
     for (auto [partition, partitionNumWarps, startId] :
          llvm::zip(op.getPartitionRegions(), op.getPartitionNumWarps(),
                    *op.getWarpGroupStartIds())) {
+      // build the map of start warp id to target block for more efficient cases
+      // where we bypass SMEM based state id
+      targetBlockMap[startId] = &partition->front();
+
       partitionStates.push_back(partitionStateCounter++);
       partitionBlocks.push_back(&partition->front());
       for (int32_t &stateId : MutableArrayRef(stateMap).slice(
@@ -484,19 +506,56 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   disableLICM(latchBr);
 
   // Exit state.
-  Block *switchExit = new Block;
   funcBlocks.insert(std::next(defaultBlock->getIterator()), switchExit);
   partitionBlocks.push_back(switchExit);
   partitionStates.push_back(partitionStateCounter);
 
   // Create the switch.
   b.setInsertionPointToEnd(switchLoop);
-  SmallVector<APInt> caseValues;
-  for (int32_t state : partitionStates)
-    caseValues.push_back(APInt(8, state));
-  LLVM::SwitchOp::create(b, b.getLoc(), warpState, defaultBlock, ValueRange(),
-                         caseValues, partitionBlocks,
-                         SmallVector<ValueRange>(partitionBlocks.size()));
+  if (hasSingleWarpSpecialize(mod)) {
+    // in this mode we do not rely on SMEM based state id
+    assert(startWarpToBlock.size() == 1 && "Expecting exactly 1 WS Op");
+    auto targetBlockMap = startWarpToBlock[0];
+    SmallVector<int> startIds;
+    for (const auto &KV : targetBlockMap)
+      startIds.push_back(KV.first);
+    llvm::sort(startIds);
+
+    // Dispatch each worker warp to its partition directly from `wid`, with no
+    // SMEM state involved. Every worker warp is covered by a partition (padding
+    // included), and each partition branches to the exit block on completion,
+    // so there is no exit case here.
+    //
+    //   if wid >= widN:       jump to blkN     (largest start id first)
+    //   elif wid >= wid{N-1}: jump to blk{N-1}
+    //   ...
+    //   else:                 jump to blk0     (smallest start id == the first
+    //                                           worker warp)
+    Block *dispatch = switchLoop;
+    unsigned remaining = startIds.size();
+    for (int startWarpId : llvm::reverse(startIds)) {
+      Block *target = targetBlockMap[startWarpId];
+      if (--remaining == 0) {
+        // Smallest start id == first worker warp, so `wid >= startWarpId`
+        // holds for every worker: branch unconditionally.
+        LLVM::BrOp::create(b, b.getLoc(), target);
+        break;
+      }
+      Block *next = new Block;
+      funcBlocks.insert(std::next(dispatch->getIterator()), next);
+      LLVM::CondBrOp::create(
+          b, b.getLoc(), b.icmp_uge(wid, b.i32_val(startWarpId)), target, next);
+      dispatch = next;
+      b.setInsertionPointToEnd(dispatch);
+    }
+  } else {
+    SmallVector<APInt> caseValues;
+    for (int32_t state : partitionStates)
+      caseValues.push_back(APInt(8, state));
+    LLVM::SwitchOp::create(b, b.getLoc(), warpState, defaultBlock, ValueRange(),
+                           caseValues, partitionBlocks,
+                           SmallVector<ValueRange>(partitionBlocks.size()));
+  }
 
   // Now add synchronization around the default regions.
   for (size_t i = 0; i < wsOps.size(); ++i) {
@@ -506,13 +565,16 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
     Block *after = b.splitBlock(before, ws->getIterator());
     TritonLLVMIRRewriter b(ws.getLoc(), OpBuilder::atBlockEnd(before));
     Type int8Type = b.getIntegerType(8);
-    Value statePtrWs =
-        LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
-    for (auto [j, state] : llvm::enumerate(stateMap)) {
-      Value stateVal = b.i8_val(state);
-      b.store(stateVal, b.gep(ptrTy, int8Type, statePtrWs, LLVM::GEPArg(j)));
+    // The single-WS path dispatches from `wid`, so per-warp state IDs are not
+    // published to SMEM.
+    if (!hasSingleWarpSpecialize(mod)) {
+      Value statePtrWs =
+          LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
+      for (auto [j, state] : llvm::enumerate(stateMap)) {
+        Value stateVal = b.i8_val(state);
+        b.store(stateVal, b.gep(ptrTy, int8Type, statePtrWs, LLVM::GEPArg(j)));
+      }
     }
-
     // Store the captures if there are any.
     auto partOp = ws.getPartitionOp();
     if (partOp.getNumOperands()) {
@@ -540,9 +602,12 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
 
     ws.getDefaultRegion().walk([&, ws = ws](WarpYieldOp op) mutable {
       TritonLLVMIRRewriter b(op.getLoc(), op);
-      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-      callbacks.reallocRegisters(b, ws,
-                                 RegisterReallocPhase::DefaultPartitionEnd, 0);
+      // default partition does not need to re-alloc if there's only one WS Op
+      if (!hasSingleWarpSpecialize(mod)) {
+        callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+        callbacks.reallocRegisters(
+            b, ws, RegisterReallocPhase::DefaultPartitionEnd, 0);
+      }
       b.replaceOpWithNewOp<LLVM::BrOp>(op, op.getOperands(), after);
     });
     after->getParent()->getBlocks().splice(after->getIterator(),
@@ -557,16 +622,21 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   }
 
   // Signal all warp groups to exit.
-  func.walk([&](LLVM::ReturnOp op) {
-    TritonLLVMIRRewriter b(op.getLoc(), op);
-    Type int8Type = b.getIntegerType(8);
-    Value statePtrExit =
-        LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
-    Value cst = b.i8_val(partitionStateCounter);
-    for (int32_t i : llvm::seq(maxNumWarps))
-      b.store(cst, b.gep(ptrTy, int8Type, statePtrExit, LLVM::GEPArg(i)));
-    callbacks.createAllBarrier(b, switchLoopBarrierIdx);
-  });
+  // The single-WS path's partitions branch to the exit block directly, so no
+  // exit signaling is needed here; emitting the release barrier would
+  // deadlock, since no worker loops back to observe it.
+  if (!hasSingleWarpSpecialize(mod)) {
+    func.walk([&](LLVM::ReturnOp op) {
+      TritonLLVMIRRewriter b(op.getLoc(), op);
+      Type int8Type = b.getIntegerType(8);
+      Value statePtrExit =
+          LLVM::getSharedMemoryBase(b.getLoc(), b, targetInfo, func);
+      Value cst = b.i8_val(partitionStateCounter);
+      for (int32_t i : llvm::seq(maxNumWarps))
+        b.store(cst, b.gep(ptrTy, int8Type, statePtrExit, LLVM::GEPArg(i)));
+      callbacks.createAllBarrier(b, switchLoopBarrierIdx);
+    });
+  }
   b.setInsertionPointToStart(switchExit);
   LLVM::ReturnOp::create(b, b.getLoc(), ValueRange());
 
