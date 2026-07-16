@@ -76,10 +76,12 @@ def grouped_gemm_naive_kernel(
             tile_n_idx = tile_idx_in_gemm % num_n_tiles
 
             # Row offsets for a
-            offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_am = tl.multiple_of((tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
 
             # Column offsets for b
-            offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            offs_bn = tl.max_contiguous(
+                tl.multiple_of((tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn, BLOCK_SIZE_N),
+                BLOCK_SIZE_N)
 
             # Offsets into k reduction dimension
             offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -88,29 +90,44 @@ def grouped_gemm_naive_kernel(
             a_ptrs = a_ptr + offs_am[:, None] * lda + offs_k[None, :]
             b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]
 
-            # Ensure accesses do not go out of bounds if m or n are not
-            # divisible by block size
-            row_mask = offs_am[:, None] < gm
-            col_mask = offs_bn[None, :] < gn
-
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-            for kk in range(0, tl.cdiv(gk, BLOCK_SIZE_K)):
-                # How much more we have remanining along k to reduce along
-                k_remaining = gk - kk * BLOCK_SIZE_K
+            k_full_chunk_iters = gk // BLOCK_SIZE_K
 
-                # Ensure k-tail is masked to prevent garbage from accumulating
-                # into acc as we reduce along k
-                k_mask = offs_k < k_remaining
+            for kk in tl.range(0, k_full_chunk_iters):
+                tl.multiple_of(a_ptrs, [16, 16])
+                tl.multiple_of(b_ptrs, [16, 16])
 
-                a = tl.load(a_ptrs, mask=row_mask & k_mask[None, :], other=0.0)
-                b = tl.load(b_ptrs, mask=k_mask[:, None] & col_mask, other=0.0)
+                # k_start = kk * BLOCK_SIZE_K
+
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs)
 
                 accumulator += tl.dot(a, b)
 
                 # Move to next k tile
                 a_ptrs += BLOCK_SIZE_K
                 b_ptrs += BLOCK_SIZE_K * ldb
+
+            if k_full_chunk_iters * BLOCK_SIZE_K < gk:
+                k_start = k_full_chunk_iters * BLOCK_SIZE_K
+
+                offs_am_2 = tl.multiple_of((tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
+                offs_bn_2 = tl.max_contiguous(
+                    tl.multiple_of((tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn, BLOCK_SIZE_N),
+                    BLOCK_SIZE_N)
+                offs_k_2 = tl.arange(0, BLOCK_SIZE_K)
+
+                a_ptrs_2 = a_ptr + offs_am_2[:, None] * lda + (k_start + offs_k_2[None, :])
+                b_ptrs_2 = b_ptr + (k_start + offs_k_2[:, None]) * ldb + offs_bn_2[None, :]
+
+                tl.multiple_of(a_ptrs_2, [16, 16])
+                tl.multiple_of(b_ptrs_2, [16, 16])
+
+                a = tl.load(a_ptrs_2, mask=offs_k_2[None, :] < gk - k_start, other=0.0)
+                b = tl.load(b_ptrs_2, mask=offs_k_2[:, None] < gk - k_start, other=0.0)
+
+                accumulator += tl.dot(a, b)
 
             c = accumulator.to(tl.float16)
 

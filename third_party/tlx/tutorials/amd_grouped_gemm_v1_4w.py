@@ -75,6 +75,7 @@ def grouped_gemm_kernel(
         # get the gemm size of the current problem
         gm = tl.load(group_gemm_sizes + g * 3)
         gn = tl.load(group_gemm_sizes + g * 3 + 1)
+        gn = tl.multiple_of(gn, 16)
         gk = tl.load(group_gemm_sizes + g * 3 + 2)
 
         stride_am = tl.load(g_lds + g * 3)
@@ -138,8 +139,9 @@ def grouped_gemm_kernel(
                     b_offs = b_base_off + (k_start + offs_k[:, None]) * stride_bk
 
                     # GR i
-                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[i])
-                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i])
+                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[i], cache_modifier=".ca",
+                                           eviction_policy="evict_first")
+                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i], cache_modifier=".ca", eviction_policy="evict_last")
 
                     tlx.async_load_commit_group([tok_a, tok_b])
 
@@ -150,29 +152,72 @@ def grouped_gemm_kernel(
                 a_tile = tlx.local_load(smemA[0], relaxed=True)
                 b_tile = tlx.local_load(smemB[0], relaxed=True)
 
-                # Hot loop loop: mfma(i) overlaps GR i+NUM_BUFFERS, LR i+1
-                for i in tl.range(0, k_full_chunk_iters - NUM_BUFFERS, loop_unroll_factor=0,
-                                  disallow_acc_multi_buffer=True):
+                # Hot loop, manually 2-K unrolled: two K-steps per iteration. Each
+                # step keeps its own async_load_wait_group (as in the 1-step loop) --
+                # without it, local_load reads a buffer before its async copy lands.
+                # Loop bounded to n_steady-1 (+odd remainder) so step B never runs past
+                # the steady region into the epilogue's tiles.
+                n_steady = k_full_chunk_iters - NUM_BUFFERS
+                for i in tl.range(0, n_steady - 1, 2, disallow_acc_multi_buffer=True):
+                    # --- step A (K-tile i) ---
                     prefetch_buf = i % NUM_BUFFERS
                     next_buf = (i + 1) % NUM_BUFFERS
                     k_prefetch = (i + NUM_BUFFERS) * BLOCK_SIZE_K
 
-                    with tlx.warp_pipeline_stage("mfma", priority=0):
-                        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+                    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-                    with tlx.warp_pipeline_stage("mem", priority=1):
-                        a_offs = a_base_off + (k_prefetch + offs_k[None, :])
-                        b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
+                    a_offs = a_base_off + (k_prefetch + offs_k[None, :])
+                    b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
+                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
+                                           eviction_policy="evict_first")
+                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf], mask=offs_n[None, :] < gn,
+                                           cache_modifier=".ca", eviction_policy="evict_last")
+                    tlx.async_load_commit_group([tok_a, tok_b])
 
-                        tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf])
-                        tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf])
+                    a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
+                    b_tile = tlx.local_load(smemB[next_buf], relaxed=True)
 
-                        tlx.async_load_commit_group([tok_a, tok_b])
+                    tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
 
-                        a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
-                        b_tile = tlx.local_load(smemB[next_buf], relaxed=True)
+                    prefetch_buf = (i + 1) % NUM_BUFFERS
+                    next_buf = (i + 2) % NUM_BUFFERS
+                    k_prefetch = (i + 1 + NUM_BUFFERS) * BLOCK_SIZE_K
 
-                    # Most reently committed buffers (GR i + num_buffers) can be in flight
+                    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+                    a_offs = a_base_off + (k_prefetch + offs_k[None, :])
+                    b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
+                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
+                                           eviction_policy="evict_first")
+                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf], mask=offs_n[None, :] < gn,
+                                           cache_modifier=".ca", eviction_policy="evict_last")
+                    tlx.async_load_commit_group([tok_a, tok_b])
+
+                    a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
+                    b_tile = tlx.local_load(smemB[next_buf], relaxed=True)
+
+                    tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
+
+                # Remainder: one leftover K-step when (k_full_chunk_iters - NUM_BUFFERS) is odd.
+                if (n_steady % 2) != 0:
+                    ri = n_steady - 1
+                    prefetch_buf = ri % NUM_BUFFERS
+                    next_buf = (ri + 1) % NUM_BUFFERS
+                    k_prefetch = (ri + NUM_BUFFERS) * BLOCK_SIZE_K
+
+                    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+                    a_offs = a_base_off + (k_prefetch + offs_k[None, :])
+                    b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
+                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
+                                           eviction_policy="evict_first")
+                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf], mask=offs_n[None, :] < gn,
+                                           cache_modifier=".ca", eviction_policy="evict_last")
+                    tlx.async_load_commit_group([tok_a, tok_b])
+
+                    a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
+                    b_tile = tlx.local_load(smemB[next_buf], relaxed=True)
+
                     tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
 
                 # Epilogue: drain the last NUM_BUFFERS K-tiles
@@ -194,8 +239,9 @@ def grouped_gemm_kernel(
                     a_offs = a_base_off + (k_start + offs_k[None, :])
                     b_offs = b_base_off + (k_start + offs_k[:, None]) * stride_bk
 
-                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[i])
-                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i])
+                    tok_a = tlx.async_load(a_ptr + a_offs, smemA[i], cache_modifier=".ca",
+                                           eviction_policy="evict_first")
+                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i], cache_modifier=".ca", eviction_policy="evict_last")
 
                     tlx.async_load_commit_group([tok_a, tok_b])
 
@@ -237,9 +283,9 @@ _CONFIG = {
     "BLOCK_SIZE_M": 128,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 32,
-    "GROUP_SIZE_M": 4,
+    "GROUP_SIZE_M": 8,
     "NUM_BUFFERS": 4,
-    "XCD_CHUNK": 16,
+    "XCD_CHUNK": 32,
     "num_warps": 4,
 }
 
@@ -356,6 +402,6 @@ def _bench():
 
 
 if __name__ == "__main__":
-    test_op()
+    # test_op()
     print("\n16 x 4096 x 4096 x 4096:")
     _bench()
