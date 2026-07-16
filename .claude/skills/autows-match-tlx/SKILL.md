@@ -116,6 +116,33 @@ kernel too and typically CRASH it (e.g. TLX fwd uses `num_stages=0` ->
   (e.g. a non-WS baseline) is unaffected by META_WS, so it can co-run with autoWS
   as the accuracy baseline.
 
+## Step 3.4 - THE MATCHING WORKFLOW (canonical ordered steps)
+
+Match autoWS to TLX in THIS order, doing a **side-by-side final-ttgir diff after
+EACH step** (compare **program order**, not `loop.cluster`; runtime correctness is a
+SEPARATE parallel track - a broken kernel still emits a ttgir). Do NOT reorder -
+each later step is computed against the earlier structure:
+
+1. **Loop structure / persistency** - match persistent-vs-non-persistent; a single
+   causal loop is fine (do NOT force TLX's masked+unmasked two-loop split).
+2. **Tile** (BLOCK_M/N) - verify the ACTUAL compiled tile in the ttgir, not the knob.
+3. **Partition** - op CATEGORIES per partition (MMAs->gemm, loads->load,
+   reduces->reduction, softmax->compute), NOT op counts.
+4. **Schedule (SWP)** - derive `stage`/`order` from TLX's prologue/body/epilogue
+   (prologue GEMM->stage0, epilogue->last stage, body GEMM order->`order`); needs
+   `num_stages>=2`; SAME-stage dots keep PROGRAM order -> reorder by swapping call
+   sites, not `order`.
+5. **Reuse EXCLUDING staging buffers** - match TMEM reuse GROUPS (shared alloc);
+   verify with `[ws-summary]` (TLX has no `buffer.id` -> map by variable name).
+6. **Staging buffers (depth)** - align dq staging depth; resolve OOM here
+   (mem-plan search).
+7. **Warps per partition**, then **2-CTA**.
+8. **Register budget** - LAST.
+
+The sections below (Step 3.5 DP, 3.6 pin-TLX-config, 3.7 reuse+`[ws-summary]`) and
+Step 4 (the ttgir-diff verification method + detailed per-step notes) are the
+MECHANISM REFERENCE these numbered steps cite - not a competing numbering.
+
 ## Step 3.5 - Data partitioning (DP) = the autoWS analog of TLX `replicate=NUM_MMA_GROUPS`
 
 **What DP is.** Data partitioning splits ONE logical loop tile into N independent
@@ -330,6 +357,63 @@ schedule; for the ground-truth final comparison, program order is authoritative.
      dp-then-dv; fix = move the dp (`dact`) `tl.dot` above the dv `tl.dot` in the
      source (they are data-independent - dv reads act_qk, dp reads v/do^T - so the
      swap is safe), which makes the final program order match TLX.
+
+### Compare PROLOGUE / LOOP-BODY / EPILOGUE vs TLX (do this once the SWP schedule annotation is aligned and autoWS emits a final ttgir)
+
+Once Step 4's schedule (stage/order) is aligned and you HAVE a final autoWS ttgir,
+split the gemm partition into its three physical regions and diff each against TLX
+region-by-region - do NOT compare the flat MMA list. The 2-stage software pipeline
+is MATERIALIZED by the **`TritonGPUPipeline` pass (the pipeline expander), which runs
+AFTER the WS pass**; it peels a prologue + steady body + epilogue from the single
+annotated loop. `TritonGPUScheduleLoops` DECIDES the schedule (`loop.stage` /
+`loop.cluster`, driven by the `tt.autows` stage/order annotations); the expander only
+EXECUTES it. So the prologue/epilogue shape is a consequence of the annotation, and
+comparing the three regions is how you see whether autoWS's peel matches TLX's
+hand-crafted 2-stage skew.
+
+How to isolate which pass built the peel (when the peel looks wrong): recompile with
+`MLIR_ENABLE_DUMP=1` (stderr), then for the gemm partition count `tc_gen5_mma`
+inside-vs-outside the inner loop at each `IR Dump Before <pass>` / `WarpSpec internal
+IR Dump After: <step>` boundary. The MMA count stays flat through AssignLatencies /
+ScheduleLoops / all WS-internal steps (incl. `doLoopSchedule`) and JUMPS at
+`TritonGPUPipeline` - that jump IS the peel. (Worked example, HSTU bwd ns=2: 5 MMAs
+in one loop before `TritonGPUPipeline` -> 8-MMA prologue + 5-MMA body + `scf.if`
+epilogue after it.)
+
+Region-by-region table (autoWS | TLX), one row per region, list the MMA sequence
+with use_acc (F=init/false, T=accumulate/true) per channel:
+```
+region     | autoWS                              | TLX (hand 2-stage)
+prologue   | qk,dp,dv(F) | qk,dk,dq,dp,dv(T)  8  | qk,dp,dv(F)                3
+body       | qk,dk(T),dq,dp,dv(T)                | qk,dq,dk(T),dp,dv(T)
+epilogue   | (commits only, 0 MMAs)             | dk(T),dq(F)                2
+```
+What the diff tells you (HSTU bwd): TLX skews ONLY dk/dq BACKWARD (they lag one
+block -> land in the EPILOGUE), keeping qk->act->dv depth-1 (prologue peels just the
+dv INIT). An un-fixed autoWS expander instead does a FULL 2-stage fill: it hoists
+iter-1's stage-0 `dv(T)` accumulate into the PROLOGUE (alongside iter-0's stage-1
+dk/dq) -> the prologue is 8 MMAs / 2 pipeline time-slots instead of 3.
+
+ROOT of the over-peel = a LATENCY, not the stage annotation. The per-op `loop.stage`
+comes from the `tt.autows` annotation (ScheduleLoops), but the PEEL DEPTH (maxStage)
+is inflated by the accumulator's `mmaSelfLatency`. In `AssignLatencies.cpp` the
+loop-carried-accumulator branch (`useMetaWS && allUsersAreLoopCarried`) sets
+`opLatency=0` then `continue`s, SKIPPING the line that would zero `mmaSelfLatency`
+- so dv/dk keep self_latency=1, which raises maxStage -> the 2-part prologue.
+**FIX (verified): add `mmaSelfLatency[mma]=0` before that `continue`** (upstream commit
+`7f187af446`, FA bwd). Effect on HSTU bwd ns=2: gemm 13->10, prologue 8->3
+(dv-init only, dv-acc back in the body), epilogue dk/dq restored = TLX structure;
+dk NaN->finite. VERIFY the structure fix by: prologue dv-MMA count == 1.
+
+CRITICAL LESSON: **matching the prologue/body/epilogue structure to TLX is NECESSARY
+but NOT SUFFICIENT for correctness.** On HSTU bwd, after the mmaSelfLatency fix the
+region split matched TLX exactly, yet dv was STILL wrong (rel-L2 0.5, growing with
+seq_len) - a SEPARATE autoWS barrier/reuse-sync bug (the act/id2 cross-partition WAR),
+independent of the peel. So run TWO checks: (1) structure (region diff vs TLX) AND
+(2) correctness, ISOLATED - compile the same kernel with meta-WS OFF (plain triton):
+if grads are correct there but wrong under autoWS, the residual bug is in the WS
+barrier/reuse sync, not the schedule/peel - chase it with barrier-visualization
+(per-channel FULL/EMPTY phase diff), NOT more schedule tuning.
 
 **Produce a SIDE-BY-SIDE table (autoWS | TLX) of the metrics below AFTER EACH
 alignment step - not just at the end.** Each step must show its metric moved to
