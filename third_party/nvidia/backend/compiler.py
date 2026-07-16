@@ -16,6 +16,15 @@ from triton._C.libtriton import ir, llvm, nvidia, passes, tlx
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton.runtime.errors import PTXASError
 
+# Auto-TMA host-launcher caps. These MUST stay in lockstep with the C macros of
+# the same name in nvidia/backend/launch.h and nvidia/backend/driver.c: the
+# generated launcher (this file) and the JIT driver share statically-sized
+# recipe/shadow buffers dimensioned by these, so bumping one requires bumping
+# all. Python can't include the C header, so this is the mirrored source of
+# truth on the codegen side -- keep the values identical.
+TRITON_MAX_TMA_DESCS = 8
+TRITON_MAX_TMA_DIMS = 5
+
 
 def min_dot_size(target: GPUTarget):
 
@@ -26,6 +35,8 @@ def min_dot_size(target: GPUTarget):
         # For small M/N the input we can still use tensorcores with padding.
         if lhs_bitwidth == 8:
             return (1, 1, 32)
+        elif lhs_bitwidth == 64:
+            return (1, 1, 4)
         else:
             return (1, 1, 16)
 
@@ -188,6 +199,9 @@ class CUDAOptions:
     instrumentation_mode: str = ""
     early_tma_store_lowering: Optional[None] = None
     generate_subtiled_region: bool = False
+    # Per-config auto-TMA toggle (autotunable). Falls back to the global
+    # TRITON_AUTO_TMA knob when left at the default in make_ttir.
+    auto_tma: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -374,6 +388,7 @@ class CUDABackend(BaseBackend):
                 constants_dict[str_key] = str(v)
 
         tensordesc_meta = _get("tensordesc_meta")
+        auto_tma_recipes = _get("auto_tma_recipes")
 
         schema = {
             "abi_version": 1,
@@ -394,13 +409,14 @@ class CUDABackend(BaseBackend):
             "args": args,
             "constants": constants_dict,
             "tensordesc_meta": tensordesc_meta or [],
+            "auto_tma_recipes": auto_tma_recipes or [],
         }
         return schema
 
     def make_launcher_src(self, metadata, src):
         """Generate a standalone C launcher source from Level 0 metadata.
 
-        The generated C file includes ``triton/runtime/launch.h`` and implements
+        The generated C file includes ``nvidia/backend/launch.h`` and implements
         a single entry point ``triton_launch_<kernel>()`` that sets up
         CUlaunchConfig with compile-time-known parameters baked in as constants,
         builds the kernel parameter array, and calls ``cuLaunchKernelEx``.
@@ -464,12 +480,58 @@ class CUDABackend(BaseBackend):
         global_scratch_size = launch_meta["global_scratch_size"]
         profile_scratch_size = launch_meta["profile_scratch_size"]
 
+        # Auto-TMA recipes: compiler-synthesized host-built TMA descriptors. Each
+        # becomes an is_tma kernel param the generated launcher builds via the
+        # launch.h recipe core (triton_construct_tma_desc), positioned
+        # [user args, auto-TMA descriptors, scratch] to match the kernel ABI.
+        auto_tma_recipes = launch_meta.get("auto_tma_recipes", []) or []
+        num_recipes = len(auto_tma_recipes)
+        # int64 shadow slots for shape/stride (the encoder reads int64; user
+        # scalar args may be i32). 2*ndim per recipe (shape[ndim] + stride[ndim]).
+        _shadow_base = []
+        _shadow_slots = 0
+        for _r in auto_tma_recipes:
+            _shadow_base.append(_shadow_slots)
+            _shadow_slots += 2 * len(_r["shape_arg_indices"])
+        # Auto-TMA's arg indices assume the kernel FuncOp arg order matches
+        # `args` (true for eligible kernels: plain ptr/scalar args). Bail to the
+        # no-launcher comment if that doesn't hold or a cap is exceeded.
+        _auto_tma_ok = num_recipes <= TRITON_MAX_TMA_DESCS
+        for _r in auto_tma_recipes:
+            _idxs = [
+                _r["base_ptr_arg_index"], *_r["shape_arg_indices"], *[s for s in _r["stride_arg_indices"] if s >= 0]
+            ]
+            _ndim = len(_r["shape_arg_indices"])
+            # stride list must be 1:1 with the shape list -- the codegen below
+            # (and driver.c) index stride_arg_indices[j] for j in range(_ndim), so
+            # a short/long stride list would IndexError in codegen instead of
+            # hitting this actionable warning.
+            if (any(i < 0 or i >= len(args) for i in _idxs) or _ndim > TRITON_MAX_TMA_DIMS
+                    or len(_r["stride_arg_indices"]) != _ndim):
+                _auto_tma_ok = False
+                break
+        if num_recipes and not _auto_tma_ok:
+            # Surface the reason at compile time (parity with the _c_type warning
+            # on unknown types): without a launcher symbol, any AOT/TritonCC
+            # consumer that links this generated file fails at link time with an
+            # opaque missing-symbol error instead of this actionable message.
+            warnings.warn(
+                f"Auto-TMA: host launcher not generated for kernel {kernel_name!r} "
+                f"-- recipe layout unsupported (non-1:1 arg mapping, >{TRITON_MAX_TMA_DIMS} "
+                f"shape dims, or >{TRITON_MAX_TMA_DESCS} descriptors). The kernel will "
+                "have no host-built TMA launcher symbol.",
+                stacklevel=2,
+            )
+            return ("/* Launcher not generated: auto-TMA recipe layout unsupported "
+                    f"(non-1:1 arg mapping, >{TRITON_MAX_TMA_DIMS} shape dims, or "
+                    f">{TRITON_MAX_TMA_DESCS} descriptors) */\n")
+
         lines = []
         lines.append("/* Generated by Triton compiler — do not edit. */")
         lines.append(f"/* Kernel: {kernel_name} */")
         lines.append(f"/* ABI version: {launch_meta['abi_version']} */")
         lines.append("")
-        lines.append('#include "triton/runtime/launch.h"')
+        lines.append('#include "nvidia/backend/launch.h"')
         lines.append("")
 
         # ---- Args struct ----
@@ -495,6 +557,9 @@ class CUDABackend(BaseBackend):
         lines.append(f"    {safe_name}_args_t k;")
         lines.append("    CUdeviceptr _global_scratch;")
         lines.append("    CUdeviceptr _profile_scratch;")
+        if _shadow_slots:
+            # int64 shadow for auto-TMA shape/stride (recipe encoder reads int64).
+            lines.append(f"    int64_t _auto_tma_shadow[{_shadow_slots}];")
         lines.append(f"}} {buf_t};")
         lines.append("")
 
@@ -510,6 +575,11 @@ class CUDABackend(BaseBackend):
         for arg in args:
             c_ty = _c_type(arg["type"])
             param_entries.append((_off(arg["name"]), f"(int)sizeof({c_ty})", 0))
+        # Auto-TMA descriptor params (is_tma=1; built from recipes below). Not
+        # read from args_buf -- the launcher binds &tma_descs[k]. Positioned
+        # before scratch to match the kernel ABI [user, auto-TMA, scratch].
+        for _k in range(num_recipes):
+            param_entries.append(("0", 128, 1))
         # Scratch params (device pointers).
         param_entries.append((f"(int)offsetof({buf_t}, _global_scratch)", "(int)sizeof(CUdeviceptr)", 0))
         param_entries.append((f"(int)offsetof({buf_t}, _profile_scratch)", "(int)sizeof(CUdeviceptr)", 0))
@@ -563,13 +633,57 @@ class CUDABackend(BaseBackend):
         lines.append(f"        .preferred_cluster_dims = {{{preferred[0]}, {preferred[1]}, {preferred[2]}}},")
         lines.append(f"        .num_params = {num_params},")
         lines.append("        .params = desc_params,")
-        lines.append("        .num_tma_recipes = 0,")
-        lines.append("        /* tma_recipes zero-initialized by C default */")
+        if num_recipes == 0:
+            lines.append("        .num_tma_recipes = 0,")
+            lines.append("        /* tma_recipes zero-initialized by C default */")
+        else:
+            lines.append(f"        .num_tma_recipes = {num_recipes},")
+            lines.append("        .tma_recipes = {")
+            for _k, _r in enumerate(auto_tma_recipes):
+                _ndim = len(_r["shape_arg_indices"])
+                _b = _shadow_base[_k]
+                _block = ", ".join(str(int(v)) for v in _r["block_shape"])
+                _base_name = args[_r["base_ptr_arg_index"]]["name"]
+                _shape_offs = ", ".join(f"(int)offsetof({buf_t}, _auto_tma_shadow[{_b + j}])" for j in range(_ndim))
+                _stride_offs = ", ".join(
+                    (f"(int)offsetof({buf_t}, _auto_tma_shadow[{_b + _ndim + j}])" if _r["stride_arg_indices"][j] >=
+                     0 else "-1") for j in range(_ndim))
+                lines.append("            {")
+                lines.append(f"                .ndim = {_ndim},")
+                lines.append(f"                .block_shape = {{{_block}}},")
+                lines.append(f"                .swizzle = {int(_r.get('swizzle', -1))},")
+                lines.append(f"                .elem_type = {int(_r['elem_type'])},")
+                lines.append(f"                .elem_size = {int(_r['elem_size'])},")
+                lines.append(f"                .fp4_padded = {int(_r['fp4_padded'])},")
+                lines.append(f"                .fill_mode = {int(_r['fill_mode'])},")
+                lines.append(f"                .ptr_offset = {_off(_base_name)},")
+                lines.append(f"                .shape_offsets = {{{_shape_offs}}},")
+                lines.append(f"                .stride_offsets = {{{_stride_offs}}},")
+                lines.append(f"                .desc_param_idx = {len(args) + _k},")
+                lines.append("            },")
+            lines.append("        },")
         lines.append("    };")
         lines.append("")
         lines.append("    /* Pack args + scratch into one buffer; launcher reads by offset. */")
         lines.append(f"    {buf_t} buf;")
         lines.append("    buf.k = *args;")
+        if num_recipes:
+            lines.append("    /* Widen auto-TMA shape/stride to int64 for the recipe encoder. */")
+            for _k, _r in enumerate(auto_tma_recipes):
+                _ndim = len(_r["shape_arg_indices"])
+                _b = _shadow_base[_k]
+                for j in range(_ndim):
+                    _sn = args[_r["shape_arg_indices"][j]]["name"]
+                    lines.append(f"    buf._auto_tma_shadow[{_b + j}] = (int64_t)buf.k.{_sn};")
+                    _sd = _r["stride_arg_indices"][j]
+                    if _sd >= 0:
+                        _dn = args[_sd]["name"]
+                        lines.append(f"    buf._auto_tma_shadow[{_b + _ndim + j}] = (int64_t)buf.k.{_dn};")
+                    else:
+                        # Contiguous dim: the stride slot is reserved (fixed
+                        # 2*ndim layout) but unused (stride_offsets = -1). Zero it
+                        # so the reserved slot is never left uninitialized.
+                        lines.append(f"    buf._auto_tma_shadow[{_b + _ndim + j}] = 0;")
         lines.append("    buf._global_scratch = global_scratch;")
         lines.append("    buf._profile_scratch = profile_scratch;")
         lines.append("")
@@ -621,12 +735,18 @@ class CUDABackend(BaseBackend):
             list(opt.cluster_dims),
         )
         passes.common.add_inliner(pm)
-        # Handle storage lowering. In the future this may need
-        # dummy layouts
-        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
+        # Storage alias lowering moved to make_ttgir (after layout propagation)
+        # so the backing TMEM allocation is materialized with the resolved
+        # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
+        # Auto-TMA: rewrite eligible masked block loads into descriptor_load so
+        # the standard sm_90+ TMA lowering turns them into real TMA copies. The
+        # per-config option (autotunable) takes precedence; otherwise fall back
+        # to the global TRITON_AUTO_TMA knob.
+        if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
+            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
@@ -686,6 +806,9 @@ class CUDABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
+        # Storage alias lowering runs after layout propagation so the backing
+        # TMEM allocation is materialized with the resolved 2-CTA storage format.
+        tlx.tlx_passes.add_tlx_storage_alias_lowering(pm)
         # Only determine reg layouts after TMEM layout is finalized
         tlx.tlx_passes.add_tlx_resolve_placeholder_layouts(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
@@ -746,6 +869,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_accumulator_init(pm)
             passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
+            # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
+            # async-token form and hoist the issue for compute/CLC overlap. This
+            # runs before warp specialization; the token is materialized into the
+            # completion mbarrier after WS (add_clc_materialize below).
+            nvidia.passes.ttnvgpuir.add_clc_split(pm)
+            nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
                 nvidia.passes.hopper.add_llm_schedule(pm)
             elif knobs.nvidia.use_joint_schedule:
@@ -762,17 +891,33 @@ class CUDABackend(BaseBackend):
                 # TRITON_USE_MODULO_SCHEDULE=1 (default algo: rau)
                 # TRITON_USE_MODULO_SCHEDULE=joint_solver|sms|exhaustive|random
                 nvidia.passes.hopper.add_modulo_schedule(pm)
+            elif knobs.nvidia.use_list_schedule:
+                # Acyclic list schedule (no software pipelining): a single-stage
+                # per-loop reorder that writes loop.stage/loop.cluster like the
+                # default scheduler. Emits top-K variants for autotuning
+                # (TRITON_LIST_SCHEDULE_TOPK / _BEAM / _TOPK_DUMP) and applies
+                # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
+                nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
-            # The modulo / LLM scheduler above already produced the full loop
-            # schedule (loop.stage / loop.cluster). Re-running assign_latencies +
-            # schedule_loops here would recompute and OVERRIDE it, so only run
-            # them on the default path where no custom scheduler set the schedule.
-            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_joint_schedule
-                                    or knobs.nvidia.use_modulo_schedule is not None)
+            # The modulo / LLM / joint / list scheduler above already produced
+            # the full loop schedule (loop.stage / loop.cluster). Re-running
+            # assign_latencies + schedule_loops here would recompute and OVERRIDE
+            # it, so only run them on the default path where no custom scheduler
+            # set the schedule.
+            uses_custom_schedule = (knobs.nvidia.use_llm_schedule or knobs.nvidia.use_modulo_schedule is not None
+                                    or knobs.nvidia.use_list_schedule or knobs.nvidia.use_joint_schedule)
             if not uses_custom_schedule:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
-            if not knobs.nvidia.use_meta_ws:
+            if knobs.nvidia.use_list_schedule:
+                # List scheduling is a no-warp-specialization transform: it
+                # writes only loop.stage/loop.cluster (+ tt.modulo_ii marker) and
+                # feeds the pipeliner directly. Running either WS path here would
+                # trip PartitionSchedulingMeta (it treats the tt.modulo_ii marker
+                # as a modulo schedule and demands partition attrs the list
+                # scheduler never emits). So skip WS entirely.
+                pass
+            elif not knobs.nvidia.use_meta_ws:
                 # 2-CTA + upstream WS is not supported
                 if opt.cluster_dims is None or max(opt.cluster_dims) < 2:
                     passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
@@ -798,6 +943,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
+            # CLC tile scheduler (Stage 4): materialize the async-token form into
+            # the response buffer + completion mbarrier (single-CTA only). Runs
+            # after warp specialization.
+            nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
@@ -808,7 +957,8 @@ class CUDABackend(BaseBackend):
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_loop_aware_cse(pm)
-        passes.ttgpuir.add_prefetch(pm)
+        if capability // 10 == 8:
+            passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
@@ -835,16 +985,35 @@ class CUDABackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)
-        if opt.instrumentation_mode == "fpsan":
+        if "fpsan" in opt.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         # Budget-aware layout conversion elimination — runs last to ensure
         # converts whose scratch would exceed SMEM budget are eliminated
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # Retire user-pinned register layout markers (#tlx.user_layout) only after
+        # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
+        # marker; every remove_layout_conversions / reduce_data_duplication above
+        # would otherwise be free to rewrite the unwrapped pinned layout). Placing
+        # it here keeps the pin an anchor through the whole pipeline.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
+
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
 
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        # Capture compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA)
+        # here, AFTER WS / 2-CTA / data-partitioning, so each recipe's
+        # block_shape reflects the final (possibly halved) descriptor arg type
+        # rather than the TTIR-time value. get_auto_tma_recipes reads the live
+        # FuncOp arg type for block_shape (see ir.cc).
+        metadata["auto_tma_recipes"] = mod.get_auto_tma_recipes()
         # Track whether ctas_per_cga was explicitly set to distinguish between
         # Triton's way (num_ctas > 1) and TLX/CUDA way (ctas_per_cga set).
         metadata["ctas_per_cga"] = opt.ctas_per_cga
@@ -868,8 +1037,12 @@ class CUDABackend(BaseBackend):
         passes.gluon.add_canonicalizer(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
 
-        if options.instrumentation_mode == "fpsan":
+        if "fpsan" in options.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
+        if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.common.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
 
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
@@ -884,6 +1057,7 @@ class CUDABackend(BaseBackend):
         pm.enable_debug()
 
         if "gsan" in options.instrumentation_mode:
+            # GSan introduces layout conversions, so must come before shared memory allocation
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
@@ -1079,7 +1253,7 @@ class CUDABackend(BaseBackend):
             # the ACF store, append --apply-controls (version check + lookup live in the helper).
             if os.environ.get("TRITON_COMPILE_IQ_APPLY"):
                 try:
-                    from triton.compile_iq.consume import acf_args_for
+                    from triton.magnon.consume import acf_args_for
 
                     ptx_extra_options += acf_args_for(src, arch, get_ptxas(self.target.arch).version)
                 except Exception:
@@ -1154,8 +1328,8 @@ please share the reproducer above with Triton project.
             ptx = ck.asm.get("ptx")
             if not ptx:
                 return
-            from triton.compile_iq import store
-            from triton.compile_iq.consume import acf_args_for
+            from triton.magnon import store
+            from triton.magnon.consume import acf_args_for
             arch = sm_arch_from_capability(self.target.arch)
             ver = get_ptxas(self.target.arch).version
             sha = store.ptx_sha256(ptx)

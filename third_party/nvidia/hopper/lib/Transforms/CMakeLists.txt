@@ -5,6 +5,7 @@
 add_triton_library(TritonGPUModuloCore
   ModuloScheduling/LatencyModel.cpp
   ModuloScheduling/AMDLatencyModel.cpp
+  ModuloScheduling/AMDWarpPipelinePartition.cpp
   ModuloScheduling/DataDependenceGraph.cpp
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp
@@ -53,6 +54,8 @@ add_triton_library(NVHopperTransforms
 
   DEPENDS
   NVHopperTransformsIncGen
+  NVWSTableGen
+  NVWSAttrDefsIncGen
 
   LINK_LIBS PUBLIC
   TritonIR

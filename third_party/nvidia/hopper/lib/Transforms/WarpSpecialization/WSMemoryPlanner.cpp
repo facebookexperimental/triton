@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Pass/Pass.h"
@@ -1499,15 +1500,16 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
       unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
 
-      // Defensive K | S cap for same-partition (wait_group-drained) TMA staging.
-      // Such staging rotates S = indices.size() subtiles through K = numCopies
-      // slots of one circular buffer, drained by a fixed in-flight-count TMA
-      // store-wait (cp.async.bulk.wait_group K-1). Correctness requires same-slot
-      // stores to be exactly K apart in issue order, i.e. K | S; a non-dividing K
-      // makes a store clobber a slot before it drains (T277224987). Cross-
-      // partition staging (producer task != consumer task, e.g. FA-fwd desc_o)
-      // uses a continuous-accumCnt producer/consumer mbarrier rotation
-      // (getStaggeredAccumCnt) that tolerates any K, so it is exempt.
+      // Defensive K | S cap for same-partition (wait_group-drained) TMA
+      // staging. Such staging rotates S = indices.size() subtiles through K =
+      // numCopies slots of one circular buffer, drained by a fixed
+      // in-flight-count TMA store-wait (cp.async.bulk.wait_group K-1).
+      // Correctness requires same-slot stores to be exactly K apart in issue
+      // order, i.e. K | S; a non-dividing K makes a store clobber a slot before
+      // it drains (T277224987). Cross- partition staging (producer task !=
+      // consumer task, e.g. FA-fwd desc_o) uses a continuous-accumCnt
+      // producer/consumer mbarrier rotation (getStaggeredAccumCnt) that
+      // tolerates any K, so it is exempt.
       unsigned subtileCount = indices.size();
       bool sameTaskStaging = false;
       if (firstTmaStaging > 0) {
@@ -1749,7 +1751,8 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
 
     // Reuse must be realizable: the candidate and target SMEM encodings must
     // match, or mergeStagingReuseIntoHost will drop the reuse and emit the
-    // candidate standalone, leaving computeTotalSmem under-counting (T277224987).
+    // candidate standalone, leaving computeTotalSmem under-counting
+    // (T277224987).
     if (!areReuseEncodingsCompatible(candidate, buf)) {
       LDBG("  findReuseCandidate: target bufferId="
            << buf.bufferId
@@ -4048,11 +4051,12 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
   return success();
 }
 
+// Default arguments are declared in WarpSpecializationPipeline.h (the single
+// declaration site); they must not be repeated on the definition.
 LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
-                              StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
-                              bool smemCircularReuse = false) {
+                              StringRef readDecisionFile,
+                              StringRef writeDecisionFile, int smemAllocAlgo,
+                              unsigned smemBudget, bool smemCircularReuse) {
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;

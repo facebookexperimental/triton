@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import shutil
 import subprocess
@@ -158,17 +157,30 @@ def run_correctness_only(case: str, gen: Path, tmp: Path) -> bool:
     return proc.returncode == 0
 
 
+def _load_perf_harness():
+    """Import the consolidated harness (perf_regression/perf_harness.py).
+
+    It replaced the old standalone ``perf_engine.py``; its
+    ``_bench_isolated`` has the exact worker semantics we need (forked
+    child owns the CUDA context, parent survives kernel crashes). Safe to
+    call from here: this module never imports torch/triton in the parent.
+    """
+    import importlib.util
+
+    path = TESTING_DIR / "perf_regression" / "perf_harness.py"
+    spec = importlib.util.spec_from_file_location("perf_harness", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def run_worker(case: str, gen: Path, tmp: Path) -> dict | None:
     out = tmp / f"{case}.{gen.stem}.perf.json"
-    proc = subprocess.run(
-        [sys.executable, str(TESTING_DIR / "perf_engine.py"), "worker",
-         "--case-dir", str(EXAMPLES_DIR / case), "--generated", str(gen),
-         "--out", str(out)],
-        capture_output=True, text=True, timeout=1800)
-    if proc.returncode != 0 or not out.exists():
-        print(f"    perf worker FAILED: {proc.stderr.strip().splitlines()[-1:] or '?'}")
+    res = _load_perf_harness()._bench_isolated(EXAMPLES_DIR / case, gen, out)
+    if res is None or "error" in res:
+        print(f"    perf worker FAILED: {(res or {}).get('error', '?')}")
         return None
-    return json.loads(out.read_text())
+    return res
 
 
 def main() -> int:

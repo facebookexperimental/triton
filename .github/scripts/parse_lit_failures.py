@@ -20,6 +20,8 @@ import json
 import os
 import re
 
+from classify_failure import classify
+
 # e.g. "FAIL: TRITON :: Conversion/foo.mlir (12 of 345)"
 LIT_LINE = re.compile(r"^(?:FAIL|UNRESOLVED|TIMEOUT|XPASS):\s+(.*?)\s*(?:\(\d+ of \d+\))?\s*$")
 
@@ -57,16 +59,21 @@ def lit_repro(ident, fallback):
 def build_items(ids, workflow, job, fallback):
     items = []
     for ident in ids:
+        summary = f"LIT test failed: {ident}"
+        is_external, reason = classify(summary)
         items.append({
             "normalized_failure_id": ident,
             "raw_failure_ids": ident,
             "issue_title": f"[nightly] {workflow} / {job} / {ident}",
             "job_name": job,
-            "summary": f"LIT test failed: {ident}",
+            "summary": summary,
             "repro": lit_repro(ident, fallback),
             # fallback=True means the bucket identity (no per-test signal), so
             # reconcile must not close per-test issues from this run.
             "fallback": fallback,
+            # External-dep failures skip bisection and are annotated instead.
+            "external_dep": is_external,
+            "external_dep_reason": reason,
         })
     return items
 

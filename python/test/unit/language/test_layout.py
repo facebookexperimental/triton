@@ -25,6 +25,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+from triton._internal_testing import is_hip
 
 # ---------------------------------------------------------------------------
 # Layout Parsing Utilities
@@ -1274,6 +1275,12 @@ def test_flash_attn_bwd_layout(HEAD_DIM, num_warps):
 
     grid = (N_CTX // BLOCK_N1, 1, Z * H)
 
+    # AMD MI300 (gfx942) has 64 KiB of LDS per workgroup. num_stages=5 with these
+    # NVIDIA-sized blocks needs ~68 KiB and overflows AMD's LDS (OutOfResources).
+    # Fewer pipeline stages fit AMD while producing the same blocked layouts (the
+    # coalesced layout is independent of pipeline depth); NVIDIA keeps 5.
+    num_stages = 2 if is_hip() else 5
+
     compiled_kernel = _flash_attn_bwd_layout_test[grid](
         q,
         k_scaled,
@@ -1299,7 +1306,7 @@ def test_flash_attn_bwd_layout(HEAD_DIM, num_warps):
         HEAD_DIM=HEAD_DIM,
         CAUSAL=CAUSAL,
         num_warps=num_warps,
-        num_stages=5,
+        num_stages=num_stages,
     )
 
     ttgir = compiled_kernel.asm["ttgir"]

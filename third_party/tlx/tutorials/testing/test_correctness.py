@@ -16,6 +16,8 @@ from triton.language.extra.tlx.tutorials.blackwell_gemm_pipelined import (
     matmul as _blackwell_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.blackwell_gemm_2cta import (
     matmul as _blackwell_gemm_2cta, )
+from triton.language.extra.tlx.tutorials.blackwell_scaled_mm_ws import (
+    blackwell_scaled_mm_ws as _blackwell_scaled_mm_ws, )
 from triton.language.extra.tlx.tutorials.blackwell_fa_ws_pipelined_persistent import (
     attention as _blackwell_fa_ws_pipelined_persistent,
     _attn_bwd_preprocess as _blackwell_fa_bwd_preprocess,
@@ -63,6 +65,11 @@ from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     attention as _amd_fa_cluster, )
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     persistent_attention as _amd_fa_cluster_persistent, )
+from triton.language.extra.tlx.tutorials.amd_pa_decode import (
+    pa_decode_tlx as _amd_pa_decode,
+    build_inputs as _amd_pa_decode_build_inputs,
+    ref_decode as _amd_pa_decode_ref,
+)
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_gemm_pipelined, )
 from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
@@ -371,6 +378,74 @@ class FlashAttention:
     @staticmethod
     def get_reference(q, k, v, sm_scale, causal):
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale, is_causal=causal)
+
+
+# =============================================================================
+# Scaled-MM: Common utilities and configs
+# =============================================================================
+
+
+class ScaledMM:
+    """Common utilities and configs for FP8 scaled_mm tests (blockwise / rowwise / tensorwise)."""
+
+    # (M, N, K), N and K multiples of 128: square (small/large) plus igctr
+    # production moderate / tall (large N, small K) / wide (small N, large K).
+    SHAPES = [
+        (2048, 2048, 2048),
+        (8192, 8192, 8192),
+        (4096, 6144, 4608),
+        (4096, 16896, 3840),
+        (4096, 4608, 16896),
+    ]
+
+    SCALE_MODES = ["blockwise", "rowwise", "tensorwise"]
+
+    @staticmethod
+    def create_inputs(M, N, K, scale_mode):
+        torch.manual_seed(0)
+        a = (torch.randn(M, K, device=DEVICE) * 0.1).to(torch.float8_e4m3fn)
+        b = (torch.randn(N, K, device=DEVICE) * 0.1).to(torch.float8_e4m3fn)
+        if scale_mode == "blockwise":
+            # DeepSeek: scale_a M-major [M, K//128], scale_b row-major [N//128, K//128].
+            scale_a = torch.rand(M, K // 128, device=DEVICE, dtype=torch.float32).t().contiguous().t()
+            scale_b = torch.rand(N // 128, K // 128, device=DEVICE, dtype=torch.float32)
+        elif scale_mode == "rowwise":
+            scale_a = torch.rand(M, device=DEVICE, dtype=torch.float32)
+            scale_b = torch.rand(N, device=DEVICE, dtype=torch.float32)
+        else:  # tensorwise: one scalar per operand
+            scale_a = torch.rand(1, device=DEVICE, dtype=torch.float32)
+            scale_b = torch.rand(1, device=DEVICE, dtype=torch.float32)
+        return a, b, scale_a, scale_b
+
+    @staticmethod
+    def get_reference(a, b, scale_a, scale_b, scale_mode):
+        af, bf = a.to(torch.float32), b.to(torch.float32)
+        if scale_mode == "blockwise":
+            # Scales are K-dependent: rescale-and-sum each 128-wide K group.
+            M, K = a.shape
+            N = b.shape[0]
+            out = torch.zeros((M, N), dtype=torch.float32, device=a.device)
+            for g in range(K // 128):
+                partial = af[:, g * 128:(g + 1) * 128] @ bf[:, g * 128:(g + 1) * 128].t()
+                sa = scale_a[:, g][:, None]
+                sb = scale_b[:, g].repeat_interleave(128)[None, :]
+                out += partial * sa * sb
+            return out.to(torch.bfloat16)
+        # K-independent: accumulate all K, then apply scales once.
+        prod = af @ bf.t()
+        if scale_mode == "rowwise":
+            return (prod * scale_a[:, None] * scale_b[None, :]).to(torch.bfloat16)
+        return (prod * scale_a * scale_b).to(torch.bfloat16)  # tensorwise
+
+    @staticmethod
+    def run_test(scale_mode, shapes=None):
+        if shapes is None:
+            shapes = ScaledMM.SHAPES
+        for M, N, K in shapes:
+            a, b, scale_a, scale_b = ScaledMM.create_inputs(M, N, K, scale_mode)
+            ref = ScaledMM.get_reference(a, b, scale_a, scale_b, scale_mode)
+            out = _blackwell_scaled_mm_ws(a, b, scale_a, scale_b, scale_mode=scale_mode)
+            torch.testing.assert_close(out, ref, atol=1e-1, rtol=0.05)
 
 
 # =============================================================================
@@ -900,6 +975,22 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
 
 
 # =============================================================================
+# Blackwell Scaled-MM (FP8) Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("scale_mode", ScaledMM.SCALE_MODES)
+@pytest.mark.parametrize("shape", ScaledMM.SHAPES, ids=[f"{m}x{n}x{k}" for m, n, k in ScaledMM.SHAPES])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_scaled_mm_ws(shape, scale_mode):
+    M, N, K = shape
+    # Blockwise stages per-K-group scales in SMEM (~12*K bytes); it OOMs at large K.
+    if scale_mode == "blockwise" and K >= 12288:
+        pytest.skip("blockwise scale SMEM does not fit at large K")
+    ScaledMM.run_test(scale_mode, shapes=[shape])
+
+
+# =============================================================================
 # Hopper GEMM Tests
 # =============================================================================
 
@@ -1072,6 +1163,39 @@ def test_amd_fa_cluster_persistent_scheduler_knobs(causal, HEAD_DIM):
     ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
     out = _amd_fa_cluster_persistent(q, k, v, sm, causal, config={"NUM_SMS": 16, "NUM_XCDS": 4})
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+# =============================================================================
+# AMD Paged-Attention Decode Tests (gfx950)
+# =============================================================================
+
+
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("num_splits", [1, 4], ids=["split1", "split4"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode(num_splits, query_length):
+    """Split-K paged decode with bf16 KV cache and GQA, incl. multi-token
+    prediction (query_length 1-4). Reference is dense fp32 attention gathered
+    from the page table with bottom-right causal masking over the query block.
+    """
+    num_kv_heads, group = 2, 4
+    num_q_heads = num_kv_heads * group
+    head_dim, page_size = 128, 16
+    ctx_lens = [40, 71]
+    num_seqs = len(ctx_lens)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size,
+        query_length=query_length, device=DEVICE)
+
+    out = torch.empty_like(query)
+    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                   query_length=query_length, num_splits=num_splits)
+
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                             num_q_heads, num_kv_heads, query_length)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 # =============================================================================

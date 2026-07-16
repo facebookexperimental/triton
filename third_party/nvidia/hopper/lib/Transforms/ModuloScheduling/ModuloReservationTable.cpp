@@ -5,7 +5,7 @@
 #include "ExhaustiveScheduler.h"
 #include "JointSolverScheduler.h"
 #include "SwingScheduler.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>

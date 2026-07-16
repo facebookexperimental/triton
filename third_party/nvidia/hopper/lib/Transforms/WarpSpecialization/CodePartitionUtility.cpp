@@ -1257,22 +1257,22 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // Early-TMA *same-partition* staging buffers (buffer.tmaStaging > 0 AND the
   // channel producer and consumer are in the same warp task): the
   // EPILOGUE_SUBTILE / DQ_SUBTILE subtiles (S of them) rotate through the
-  // buffer.copy (= K) slots of one circular SMEM buffer that is both written and
-  // TMA-stored by the *same* task. The drain is a fixed in-flight-count TMA
+  // buffer.copy (= K) slots of one circular SMEM buffer that is both written
+  // and TMA-stored by the *same* task. The drain is a fixed in-flight-count TMA
   // store-wait (cp.async.bulk.wait_group K-1, from can_rotate_by_buffer_count)
   // with NO cross-partition mbarrier, so the slot must be the per-tile subtile
   // index (theIdx % numBuffers), NOT the accumCnt-staggered slot used for
   // loop-carried buffers. Reuse-group members share one accumCnt (the +1-per-
-  // outer-iter loop counter) and add theIdx in [0,S); when S > K those staggered
-  // (slot,phase) ranges of consecutive iterations OVERLAP, so the first subtile
-  // of tile t+1 reuses the slot the last subtile of tile t just stored -- reuse
-  // distance 1, not K -- and wait_group(K-1) leaves that store in flight, so the
-  // new local_store overwrites the slot (or async_tma_reduce reads it) before the
-  // prior TMA store/reduce drained -> wrong dv/dk/dq (T277224987). Depth-1 (one
-  // slot, wait_group(0) = fully serialized) is immune. Mirrors the TLX
-  // reference's `slice_id % DQ_REDUCE_STAGES`. Correctness of this fixed-slot
-  // rotation requires K | S, enforced defensively by
-  // increaseFusedEpilogueCopies in WSMemoryPlanner.cpp.
+  // outer-iter loop counter) and add theIdx in [0,S); when S > K those
+  // staggered (slot,phase) ranges of consecutive iterations OVERLAP, so the
+  // first subtile of tile t+1 reuses the slot the last subtile of tile t just
+  // stored -- reuse distance 1, not K -- and wait_group(K-1) leaves that store
+  // in flight, so the new local_store overwrites the slot (or async_tma_reduce
+  // reads it) before the prior TMA store/reduce drained -> wrong dv/dk/dq
+  // (T277224987). Depth-1 (one slot, wait_group(0) = fully serialized) is
+  // immune. Mirrors the TLX reference's `slice_id % DQ_REDUCE_STAGES`.
+  // Correctness of this fixed-slot rotation requires K | S, enforced
+  // defensively by increaseFusedEpilogueCopies in WSMemoryPlanner.cpp.
   //
   // CROSS-partition staging (producer task != consumer task, e.g. the FA-fwd
   // desc_o output store: produced in the compute task, TMA-stored in the
@@ -1280,8 +1280,9 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // (slot, phase) BOTH derive from this returned count. There the count MUST
   // stay the continuous accumCnt so the empty/full phase keeps flipping across
   // persistent tiles; collapsing it to a constant subtile index pins the phase
-  // and deadlocks the handshake after the first tile (T277224987 fwd regression).
-  // Hence the bare-subtile-index path is gated on same-task staging.
+  // and deadlocks the handshake after the first tile (T277224987 fwd
+  // regression). Hence the bare-subtile-index path is gated on same-task
+  // staging.
   bool isTmaStaging = false;
   if (auto *allocOp = ch->getAllocOp())
     if (auto stagingAttr =
@@ -1309,7 +1310,8 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       return builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
           op->getLoc(), 0);
     return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        op->getLoc(), 0, llvm::cast<IntegerType>(accumCnt.getType()).getWidth());
+        op->getLoc(), 0,
+        llvm::cast<IntegerType>(accumCnt.getType()).getWidth());
   }
   // Stagger the count by the channel's position within the reuse group, so each
   // channel occupies a distinct slot of the shared circular buffer.
@@ -2806,6 +2808,28 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   Operation *lastConsumer = nullptr;
   unsigned numChannelsCreated = 0;
 
+  // True if `o` is an MMAv5 whose operand D is this accumulator and whose
+  // use_accumulator is (traceably) constant-false -- i.e. a fresh whole-tile
+  // overwrite. Mirrors the currentProds-seed logic below.
+  auto isFreshOverwriteMMA = [&](Operation *o) -> bool {
+    auto mma = dyn_cast<ttng::MMAv5OpInterface>(o);
+    if (!mma || mma.getAccumulator() != tmemAllocOp.getResult())
+      return false;
+    Value uf = mma.useAccumulator();
+    if (!uf)
+      return false;
+    if (auto ba = dyn_cast<BlockArgument>(uf))
+      if (ba.getOwner() == forOp.getBody() && ba.getArgNumber() > 0)
+        uf = forOp.getInitArgs()[ba.getArgNumber() - 1];
+    if (auto c = uf.getDefiningOp<arith::ConstantOp>()) {
+      if (auto b = dyn_cast<BoolAttr>(c.getValue()))
+        return !b.getValue();
+      if (auto i = dyn_cast<IntegerAttr>(c.getValue()))
+        return i.getInt() == 0;
+    }
+    return false;
+  };
+
   // Detect the operand-D channel-loop pattern: an in-body TMEMLoadOp on this
   // alloc that appears (in program order) BEFORE any in-body TMEMStoreOp /
   // mmaOp. In that case the in-body load reads the previous iteration's MMA
@@ -2877,8 +2901,15 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
       continue;
     handledUsers.insert(&op);
     if (auto mmaOpT = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
-      if (&op == mmaOp.getOperation()) {
-        // This uses and defines D. Will be both producer and consumer.
+      if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
+        // Any MMA whose accumulator IS this alloc writes operand D, so it is a
+        // producer+consumer link in the operand-D chain. Classify by role
+        // (writes D), not identity (== mmaOp): a second chained accumulator MMA
+        // (e.g. the HSTU reduce_dq fold coalesces dv then dk_attn into one TMEM
+        // tile) is handled here as another producer in the chain rather than
+        // rejected as an aliasing MMA. When two D-writers share a task the
+        // needsChannel check below skips the (redundant) same-task MMA->MMA
+        // channel and just extends currentProds. See T278685041.
         // If useAcc is false, the MMA doesn't read the accumulator - it
         // overwrites it completely. In this case, the MMA is the first
         // producer and doesn't need a prior producer.
@@ -2916,7 +2947,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           }
         }
         if (currentProds.empty()) {
-          mmaOp->emitError(
+          op.emitError(
               "handleOperandD: no producer found for MMA operand D. "
               "Expected a tmem_store before the loop or use_acc=false.");
           return failure();
@@ -2925,7 +2956,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         auto producerTaskIds = getAsyncTaskIds(currentProds.front());
         auto consumerIds = getAsyncTaskIds(&op);
         if (producerTaskIds.size() != 1) {
-          mmaOp->emitError(
+          op.emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
@@ -2945,12 +2976,9 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           currentProds.push_back(&op);
         }
       } else {
-        if (mmaOpT.getAccumulator() == tmemAllocOp.getResult()) {
-          mmaOp->emitError(
-              "handleOperandD: unexpected MMA using same TMEM as operand D");
-          return failure();
-        }
-        // This uses tmem. mark as tmem.end = channel_id
+        // This MMA reads the alloc as an A/B operand (its own accumulator is a
+        // different TMEM tile): consumer only.
+        // mark as tmem.end = channel_id
         if (currentProds.empty()) {
           mmaOpT->emitError(
               "handleOperandD: no producer found for MMA consumer");
@@ -2998,8 +3026,34 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
             firstProducer = currentProds.front();
           lastConsumer = &op;
           numChannelsCreated++;
-          createChannelsForProducers(currentProds, producerTaskId, consumerIds,
-                                     tmemAllocOp.getOperation(), &op, channels);
+          // Chained accumulator (T279388065): several same-task MMA writers
+          // into one operand-D tile, the first use_acc=false (fresh overwrite),
+          // consumed in-loop by this tmem_load. Emit ONE forward channel from
+          // the LAST writer (full commit from the last MMA, like TLX dq_fulls
+          // on n1) and place the reuse/empty producer_acquire before the FIRST
+          // writer via acquireBeforeOp (like TLX's single dq_empties acquire
+          // before n0), instead of one full/empty pair per writer -- the
+          // per-writer shape fails to serialize the fresh overwrite against the
+          // consumer's read.
+          if (currentProds.size() > 1 &&
+              isFreshOverwriteMMA(currentProds.front()) &&
+              isa<ttng::MMAv5OpInterface>(currentProds.back())) {
+            auto channelID = channels.size();
+            channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+                producerTaskId, consumerIds, tmemAllocOp.getOperation(),
+                /*isOperandD=*/true, /*isOperandDNoAcc=*/false, channelID));
+            auto *tmemCh =
+                static_cast<ttng::TmemDataChannelPost *>(channels.back().get());
+            tmemCh->acquireBeforeOp = currentProds.front();
+            channels.back()->srcName =
+                getOutermostNameFromLoc(tmemAllocOp->getLoc());
+            setTmemChannelAttr(currentProds.back(), channelID, "tmem.start");
+            setTmemChannelAttr(&op, channelID, "tmem.end");
+          } else {
+            createChannelsForProducers(currentProds, producerTaskId,
+                                       consumerIds, tmemAllocOp.getOperation(),
+                                       &op, channels);
+          }
         } else {
           // Channel skipped - append to producers vector
           currentProds.push_back(&op);

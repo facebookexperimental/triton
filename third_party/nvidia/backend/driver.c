@@ -11,7 +11,7 @@
 
 /* Shared, Python-free data-driven launch core (params[]/TMA/attrs/launch).
  * The same core is used by TritonCC / AOT-T via make_launcher_src. */
-#include "triton/runtime/launch.h"
+#include "nvidia/backend/launch.h"
 
 typedef struct {
   PyObject_HEAD;
@@ -1686,6 +1686,32 @@ bool launchHook(PyObject *hook, PyObject *metadata) {
   return true;
 }
 
+/* Read a signed integer of `sz` bytes from p and widen to int64 (for auto-TMA
+ * shape/stride shadow slots, which the recipe encoder reads as int64). */
+static int64_t td_read_int_widen(const void *p, int sz) {
+  if (sz == 8) {
+    int64_t v;
+    memcpy(&v, p, 8);
+    return v;
+  }
+  if (sz == 4) {
+    int32_t v;
+    memcpy(&v, p, 4);
+    return (int64_t)v;
+  }
+  if (sz == 2) {
+    int16_t v;
+    memcpy(&v, p, 2);
+    return (int64_t)v;
+  }
+  // Only {1,2,4,8}-byte scalars are expected. Fail loudly on an unexpected
+  // (or zero) size rather than silently widening a wrong value into the
+  // CUtensorMap.
+  assert(sz == 1);
+  int8_t v;
+  memcpy(&v, p, 1);
+  return (int64_t)v;
+}
 static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // ensure cuda context is valid before calling any CUDA APIs, e.g. before
   // calls to cuPointerGetAttributes
@@ -1707,13 +1733,15 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   PyObject *arg_annotations = NULL;
   Py_buffer signature;
   PyObject *kernel_args = NULL;
+  PyObject *auto_tma_recipes_obj = NULL;
   if (!PyArg_ParseTuple(
-          args, "iiiKKpp(iiiiii)OOOOOOy*O", &gridX, &gridY, &gridZ, &_stream,
+          args, "iiiKKpp(iiiiii)OOOOOOy*OO", &gridX, &gridY, &gridZ, &_stream,
           &_function, &launch_cooperative_grid, &launch_pdl, &num_warps,
           &num_ctas, &shared_memory, &preferredClusterDimX,
           &preferredClusterDimY, &preferredClusterDimZ, &launch_metadata,
           &launch_enter_hook, &launch_exit_hook, &global_scratch_obj,
-          &profile_scratch_obj, &arg_annotations, &signature, &kernel_args)) {
+          &profile_scratch_obj, &arg_annotations, &signature,
+          &auto_tma_recipes_obj, &kernel_args)) {
     return NULL;
   }
 
@@ -1744,7 +1772,26 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   // Safety net: if triton_launch_kernel fails, we automatically fall back to
   // the proven legacy _launch() path and print a warning, so a bug in the
   // new path never silently breaks production.
-  int num_params = (int)num_args + 2; // + global & profile scratch
+  // Auto-TMA recipes: compiler-synthesized host-built TMA descriptors. Each
+  // becomes an is_tma kernel param the launcher builds via the launch.h recipe
+  // core (no device global scratch). Kernel param order matches the signature
+  // amendFuncOp produces: [user args, auto-TMA descs, global scratch, profile].
+  int num_recipes = 0;
+  if (auto_tma_recipes_obj && PyList_Check(auto_tma_recipes_obj))
+    num_recipes = (int)PyList_Size(auto_tma_recipes_obj);
+
+  int num_params =
+      (int)num_args + num_recipes + 2; // + global & profile scratch
+  // Params use a dynamic pdescs table (no TRITON_MAX_PARAMS cap), but the
+  // auto-TMA recipe shadow buffers below are still statically sized, so bound
+  // the recipe count.
+  if (num_recipes > TRITON_MAX_TMA_DESCS) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "Triton kernel has %d auto-TMA descriptors, exceeds "
+                 "TRITON_MAX_TMA_DESCS (%d)",
+                 num_recipes, TRITON_MAX_TMA_DESCS);
+    goto cleanup;
+  }
 
   triton_kernel_launch_desc_t desc;
   desc.abi_version = TRITON_LAUNCH_DESC_ABI_VERSION;
@@ -1775,10 +1822,9 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
   triton_param_desc_t *pdescs = (triton_param_desc_t *)alloca(
       (size_t)num_params * sizeof(triton_param_desc_t));
   desc.params = pdescs;
-  // JIT TMA descriptors are pre-built in Python and passed by value through
-  // args_buf as ordinary params (is_tma = 0); the launcher-built recipe path
-  // (num_tma_recipes > 0) is reserved for auto-TMA.
-  desc.num_tma_recipes = 0;
+  // User-passed JIT TMA descriptors are still pre-built in Python (is_tma = 0);
+  // num_tma_recipes covers ONLY compiler-synthesized auto-TMA descriptors.
+  desc.num_tma_recipes = num_recipes;
 
   // First pass: compute the args_buf layout (offset + size per param) using the
   // same per-type extractor size/alignment the legacy path used, so the kernel
@@ -1819,15 +1865,104 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
     pdescs[i].is_tma = 0;
     buf_size += e.size;
   }
-  // Scratch params: two device pointers, 8-byte aligned.
+
+  // Auto-TMA descriptor params (is_tma; built from recipes below) occupy slots
+  // [num_args .. num_args+num_recipes-1]. They are not read from args_buf (the
+  // core binds &tma_descs[k]). We reserve an int64 "shadow" region for each
+  // recipe's shape/stride so the recipe encoder (which reads int64) gets the
+  // right widths regardless of the user arg's declared type. The base pointer
+  // (8 bytes) is read in place from its user-arg slot.
+  size_t shadow_off[TRITON_MAX_TMA_DESCS][2 * TRITON_MAX_TMA_DIMS];
+  for (int k = 0; k < num_recipes; ++k) {
+    PyObject *r = PyList_GetItem(auto_tma_recipes_obj, k);
+    PyObject *shapeIdx = PyDict_GetItemString(r, "shape_arg_indices");
+    PyObject *strideIdx = PyDict_GetItemString(r, "stride_arg_indices");
+    PyObject *blk = PyDict_GetItemString(r, "block_shape");
+    if (!shapeIdx || !strideIdx || !blk) {
+      PyErr_SetString(PyExc_RuntimeError, "auto-TMA: malformed recipe");
+      goto cleanup;
+    }
+    int ndim = (int)PyList_Size(shapeIdx);
+    if (ndim < 1 || ndim > TRITON_MAX_TMA_DIMS) {
+      PyErr_SetString(PyExc_RuntimeError, "auto-TMA: bad ndim");
+      goto cleanup;
+    }
+    // stride_arg_indices and block_shape are indexed by j in range(ndim) below;
+    // verify they are 1:1 with shape_arg_indices so a short list reports the
+    // targeted "malformed recipe" error instead of PyList_GetItem returning
+    // NULL -> PyLong_AsLong(NULL) SystemError.
+    if ((int)PyList_Size(strideIdx) != ndim || (int)PyList_Size(blk) != ndim) {
+      PyErr_SetString(PyExc_RuntimeError, "auto-TMA: malformed recipe");
+      goto cleanup;
+    }
+    int pslot = (int)num_args + k;
+    // Write through the mutable local table (desc.params is a const view).
+    pdescs[pslot].offset = 0; // unused for is_tma params
+    pdescs[pslot].size = 128;
+    pdescs[pslot].is_tma = 1;
+
+    triton_tma_recipe_t *rec = &desc.tma_recipes[k];
+    memset(rec, 0, sizeof(*rec));
+    rec->ndim = ndim;
+    PyObject *swz = PyDict_GetItemString(r, "swizzle");
+    rec->swizzle = swz ? (int)PyLong_AsLong(swz) : -1; // -1: derive host-side
+    // Required integer recipe fields. Check presence explicitly (parity with
+    // the shape/stride/block-shape check above) so a malformed or incomplete
+    // recipe reports the targeted "malformed recipe" error here, rather than a
+    // future producer omitting a key surfacing as a generic SystemError (null
+    // argument to internal routine) via the trailing PyErr_Occurred() check.
+    PyObject *elemType = PyDict_GetItemString(r, "elem_type");
+    PyObject *elemSize = PyDict_GetItemString(r, "elem_size");
+    PyObject *fp4Padded = PyDict_GetItemString(r, "fp4_padded");
+    PyObject *fillMode = PyDict_GetItemString(r, "fill_mode");
+    PyObject *baseIdxObj = PyDict_GetItemString(r, "base_ptr_arg_index");
+    if (!elemType || !elemSize || !fp4Padded || !fillMode || !baseIdxObj) {
+      PyErr_SetString(PyExc_RuntimeError, "auto-TMA: malformed recipe");
+      goto cleanup;
+    }
+    rec->elem_type = (int)PyLong_AsLong(elemType);
+    rec->elem_size = (int)PyLong_AsLong(elemSize);
+    rec->fp4_padded = (int)PyLong_AsLong(fp4Padded);
+    rec->fill_mode = (int)PyLong_AsLong(fillMode);
+    rec->desc_param_idx = pslot;
+    int base_idx = (int)PyLong_AsLong(baseIdxObj);
+    if (base_idx < 0 || base_idx >= (int)num_args) {
+      PyErr_SetString(PyExc_RuntimeError, "auto-TMA: bad base_ptr_arg_index");
+      goto cleanup;
+    }
+    rec->ptr_offset = desc.params[base_idx].offset;
+    for (int j = 0; j < ndim; ++j) {
+      buf_size = (buf_size + 7) & ~((size_t)7);
+      shadow_off[k][j] = buf_size; // shape[j] (int64)
+      rec->shape_offsets[j] = (int)buf_size;
+      buf_size += 8;
+      int stIdx = (int)PyLong_AsLong(PyList_GetItem(strideIdx, j));
+      if (stIdx >= 0) {
+        buf_size = (buf_size + 7) & ~((size_t)7);
+        shadow_off[k][ndim + j] = buf_size; // stride[j] (int64)
+        rec->stride_offsets[j] = (int)buf_size;
+        buf_size += 8;
+      } else {
+        rec->stride_offsets[j] = -1; // contiguous
+        shadow_off[k][ndim + j] = (size_t)-1;
+      }
+      rec->block_shape[j] = (uint32_t)PyLong_AsLong(PyList_GetItem(blk, j));
+    }
+  }
+  if (PyErr_Occurred())
+    goto cleanup;
+
+  // Scratch params: two device pointers, 8-byte aligned, after the auto-TMA
+  // descriptor slots (matching the kernel signature order).
+  int scratch_slot0 = (int)num_args + num_recipes;
   buf_size = (buf_size + 7) & ~((size_t)7);
-  pdescs[num_args].offset = (int)buf_size;
-  pdescs[num_args].size = (int)sizeof(void *);
-  pdescs[num_args].is_tma = 0;
+  pdescs[scratch_slot0].offset = (int)buf_size;
+  pdescs[scratch_slot0].size = (int)sizeof(void *);
+  pdescs[scratch_slot0].is_tma = 0;
   buf_size += sizeof(void *);
-  pdescs[num_args + 1].offset = (int)buf_size;
-  pdescs[num_args + 1].size = (int)sizeof(void *);
-  pdescs[num_args + 1].is_tma = 0;
+  pdescs[scratch_slot0 + 1].offset = (int)buf_size;
+  pdescs[scratch_slot0 + 1].size = (int)sizeof(void *);
+  pdescs[scratch_slot0 + 1].is_tma = 0;
   buf_size += sizeof(void *);
 
   // Allocate args_buf aligned to the largest element alignment so that every
@@ -1843,11 +1978,49 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
       goto cleanup;
     }
   }
-  if (!extractPointer((char *)args_buf + pdescs[num_args].offset,
+
+  // Populate auto-TMA int64 shadow shape/stride from the extracted user scalar
+  // args (widening i32 -> i64 as needed) so the recipe encoder reads them.
+  for (int k = 0; k < num_recipes; ++k) {
+    PyObject *r = PyList_GetItem(auto_tma_recipes_obj, k);
+    PyObject *shapeIdx = PyDict_GetItemString(r, "shape_arg_indices");
+    PyObject *strideIdx = PyDict_GetItemString(r, "stride_arg_indices");
+    int ndim = (int)PyList_Size(shapeIdx);
+    for (int j = 0; j < ndim; ++j) {
+      int shIdx = (int)PyLong_AsLong(PyList_GetItem(shapeIdx, j));
+      // Preserve a conversion error (OverflowError/TypeError) instead of
+      // overwriting it with the generic "bad shape_arg_index" below.
+      if (PyErr_Occurred())
+        goto cleanup;
+      if (shIdx < 0 || shIdx >= (int)num_args) {
+        PyErr_SetString(PyExc_RuntimeError, "auto-TMA: bad shape_arg_index");
+        goto cleanup;
+      }
+      int64_t shapeVal =
+          td_read_int_widen((char *)args_buf + desc.params[shIdx].offset,
+                            desc.params[shIdx].size);
+      memcpy((char *)args_buf + shadow_off[k][j], &shapeVal, 8);
+      int stIdx = (int)PyLong_AsLong(PyList_GetItem(strideIdx, j));
+      if (PyErr_Occurred())
+        goto cleanup;
+      if (stIdx >= 0) {
+        if (stIdx >= (int)num_args) {
+          PyErr_SetString(PyExc_RuntimeError, "auto-TMA: bad stride_arg_index");
+          goto cleanup;
+        }
+        int64_t strideVal =
+            td_read_int_widen((char *)args_buf + desc.params[stIdx].offset,
+                              desc.params[stIdx].size);
+        memcpy((char *)args_buf + shadow_off[k][ndim + j], &strideVal, 8);
+      }
+    }
+  }
+
+  if (!extractPointer((char *)args_buf + pdescs[scratch_slot0].offset,
                       global_scratch_obj)) {
     goto cleanup;
   }
-  if (!extractPointer((char *)args_buf + pdescs[num_args + 1].offset,
+  if (!extractPointer((char *)args_buf + pdescs[scratch_slot0 + 1].offset,
                       profile_scratch_obj)) {
     goto cleanup;
   }
@@ -1872,15 +2045,21 @@ static PyObject *launchKernel(PyObject *self, PyObject *args) {
                                        (CUfunction)_function, args_buf, &desc);
     Py_END_ALLOW_THREADS;
     if (_launch_err != CUDA_SUCCESS) {
-      /* TRITON_ASSERT_NEW_LAUNCHER: in test/debug mode, skip fallback and
-       * fail hard so we know the new launcher has a bug (not masked). */
-      if (getenv("TRITON_ASSERT_NEW_LAUNCHER")) {
+      /* No legacy fallback when TRITON_ASSERT_NEW_LAUNCHER is set, or when this
+       * launch uses compiler-synthesized auto-TMA descriptors: the legacy
+       * _launch path rebuilds params from Python args only and has no knowledge
+       * of the injected descriptor, so falling back would launch with the wrong
+       * parameter list. Fail hard instead. (TRITON_ASSERT_NEW_LAUNCHER is read
+       * via getenv so a test toggling it after import still takes effect.) */
+      if (getenv("TRITON_ASSERT_NEW_LAUNCHER") || num_recipes > 0) {
         const char *_err_str = NULL;
         cuGetErrorString(_launch_err, &_err_str);
         PyErr_Format(PyExc_RuntimeError,
                      "Triton Error [CUDA]: triton_launch_kernel failed: %s "
-                     "(TRITON_ASSERT_NEW_LAUNCHER=1, no fallback)",
-                     _err_str ? _err_str : "unknown");
+                     "(no legacy fallback%s)",
+                     _err_str ? _err_str : "unknown",
+                     num_recipes > 0 ? "; auto-TMA recipe path"
+                                     : "; TRITON_ASSERT_NEW_LAUNCHER=1");
         goto cleanup;
       }
       /* Shared-core launch failed — fall back to the proven legacy _launch()

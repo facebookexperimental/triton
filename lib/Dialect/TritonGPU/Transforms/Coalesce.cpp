@@ -95,7 +95,14 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
           return;
       } else if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(curr)) {
         // Handle local_load - we assume full contiguity for shared memory reads
-        if (!isa<RankedTensorType>(localLoad.getResult().getType()))
+        auto resultType =
+            dyn_cast<RankedTensorType>(localLoad.getResult().getType());
+        if (!resultType)
+          return;
+        // Respect a user-pinned result layout (PinnedEncodingTrait, e.g. TLX's
+        // #tlx.user_layout): don't coalesce it to a "full contiguity" blocked
+        // layout -- the user chose this register layout on purpose.
+        if (isa_and_nonnull<PinnedEncodingTrait>(resultType.getEncoding()))
           return;
       } else {
         // Not a memory operation we handle

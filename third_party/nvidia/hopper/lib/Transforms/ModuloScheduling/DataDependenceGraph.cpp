@@ -181,27 +181,14 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     }
   }
 
-  // Phase 2.75 (serially-dependent MMA occupancy inflation) was retired:
-  // it encoded trust in the downstream pipeline, not a hardware truth —
-  // chained MMAs DO overlap across iterations. Each failure mode it papered
-  // over is now handled at its source. Partitioner (computePartitionRecMII
-  // and friends): the RecMII' floor — the partition-aware cycle inequality
-  // with same-stream issue chains, per-WG stream wrap-around order edges
-  // (barrier waits execute in stream order across iterations, which is what
-  // makes a depth-1 channel chain run at the SUM of its hops), and an
-  // infra-op assignment preview so paths through NONE ops are priced; plus
-  // accumulatePropagatedMinWarps for register footprints. Emitter
-  // (sched2tlx): stage-skew rings for intra-WG async results, producer-side
-  // channel handshakes sunk below independent compute (flushed before the
-  // next waiting op), cross-WG register→local_alloc channels unified onto
-  // the alloc's data buffer, plain tt.load as a named op, and over-budget
-  // register requests rescaled to the register file. Validated on the
-  // calibrated (#1913) latency table: FA-fwd matches its guard-era baseline
-  // on all six shapes at II=1325, FA-bwd beats its guard-era baseline by
-  // 20-30% on all six shapes at II=1033 (the guard's 3x II inflation
-  // returned as a real win), and the other five cases regenerate
-  // byte-identically. History and measurements:
-  // docs/GuardRetirementPlan.md.
+  // NOTE: no serial-chained-MMA occupancy correction is applied here, on
+  // purpose. Chained MMAs (FA: QK → softmax → PV) DO overlap across
+  // iterations on the pipelined tensor core, so inflating TC occupancy to
+  // full latency would overstate the II (measured: 3x on FA-bwd). What a
+  // low II demands from the rest of the pipeline is handled where it
+  // belongs: the partitioner prices recurrence-bound partitions via the
+  // RecMII' floor (computePartitionRecMII), and the sched2tlx emitter
+  // software-pipelines intra-WG async results.
 
   // Phase 3: Loop-carried edges via scf.yield → iter_args.
   auto yieldOp = loop.getBody()->getTerminator();

@@ -25,6 +25,8 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
+from classify_failure import classify
+
 # Matches a single trailing bracketed parametrization suffix: test_x[a-b] -> test_x
 PARAM_SUFFIX = re.compile(r"\[.*\]$")
 
@@ -100,6 +102,7 @@ def build_items(failures, workflow, job):
     items = []
     for norm in order:
         info = grouped[norm]
+        is_external, reason = classify(info["summary"])
         items.append({
             "normalized_failure_id": norm,
             "raw_failure_ids": "\n".join(info["raw"]),
@@ -109,6 +112,9 @@ def build_items(failures, workflow, job):
             "repro": pytest_repro(norm),
             # Real per-test signal: safe for reconcile to close on recovery.
             "fallback": False,
+            # External-dep failures skip bisection and are annotated instead.
+            "external_dep": is_external,
+            "external_dep_reason": reason,
         })
     return items
 
@@ -117,15 +123,19 @@ def build_missing_junit_item(missing_paths, workflow, job):
     """Build a stable job-level item for pytest failures without JUnit XML."""
     norm = "pytest-junit-missing"
     missing = "\n".join(missing_paths)
+    summary = f"Pytest failed before producing JUnit XML: {', '.join(missing_paths)}"
+    is_external, reason = classify(summary)
     return {
         "normalized_failure_id": norm,
         "raw_failure_ids": missing,
         "issue_title": f"[nightly] {workflow} / {job} / {norm}",
         "job_name": job,
-        "summary": f"Pytest failed before producing JUnit XML: {', '.join(missing_paths)}",
+        "summary": summary,
         "repro": "",
         # Job-level fallback: no per-test signal -> reconcile must not close.
         "fallback": True,
+        "external_dep": is_external,
+        "external_dep_reason": reason,
     }
 
 
@@ -140,6 +150,9 @@ def build_bucket_item(bucket, workflow, job):
         "repro": "",
         # Job-level fallback: no per-test signal -> reconcile must not close.
         "fallback": True,
+        # No parseable summary to classify; treat as a code failure (not external).
+        "external_dep": False,
+        "external_dep_reason": "",
     }
 
 

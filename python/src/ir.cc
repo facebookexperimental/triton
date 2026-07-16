@@ -38,8 +38,8 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/PluginUtils.h"
-#include "triton/Tools/Sys/Dump.hpp"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/Dump.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/SourceMgr.h"
 
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
@@ -206,6 +206,11 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
     auto descTy = dyn_cast<TensorDescInterface>(arg.getType());
     if (!descTy)
       continue;
+    // Skip compiler-synthesized auto-TMA descriptors: they have no
+    // user-provided Python arg and are surfaced to the launcher via
+    // getAutoTmaRecipes().
+    if (kernelFunc.getArgAttr(i, "tt.auto_tma"))
+      continue;
 
     bool isIm2Col = isa<ttng::TensorDescIm2ColType>(arg.getType());
     auto blockType = descTy.getBlockType();
@@ -249,6 +254,87 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
       }
     }
     result.append(std::move(metadata));
+  }
+  return result;
+}
+
+// Surfaces compiler-synthesized auto-TMA descriptors (from PromoteLoadToTMA) to
+// the launcher. Each entry says how to build one CUtensorMap on the host from
+// existing scalar kernel args (base ptr / shape / stride), and which kernel
+// param slot (desc_arg_index) receives it.
+py::list getAutoTmaRecipes(ModuleOp &mod) {
+  py::list result;
+  auto arr = mod->getAttrOfType<ArrayAttr>("ttg.auto_tma_recipes");
+  if (!arr)
+    return result;
+  // Locate the kernel FuncOp so we can read each synthetic descriptor arg's
+  // shared-encoding swizzle from its final (post-pass) type. The swizzle is
+  // assigned by optimize_descriptor_encoding during TTGIR, so it is only
+  // available off the live arg type (parity with getTensorDescMetadata for user
+  // descriptors). Falls back to no swizzle if the arg/type can't be resolved.
+  triton::FuncOp kernelFunc;
+  mod.walk([&](triton::FuncOp func) {
+    if (triton::isKernel(func)) {
+      kernelFunc = func;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::skip();
+  });
+  // Required integer recipe fields: raise rather than silently defaulting to 0
+  // for a missing key. A defaulted desc_arg_index=0 would read the swizzle off
+  // the wrong arg, and elem_type=0 / elem_size=0 would build a malformed
+  // CUtensorMap on the launcher side.
+  auto getReqI = [](DictionaryAttr d, StringRef k) -> int {
+    auto a = d.getAs<IntegerAttr>(k);
+    if (!a)
+      throw py::key_error(
+          std::string("auto-TMA recipe: missing required integer key '") +
+          k.str() + "'");
+    return (int)a.getInt();
+  };
+  auto getIArr = [](DictionaryAttr d, StringRef k) -> std::vector<int> {
+    std::vector<int> v;
+    if (auto a = d.getAs<ArrayAttr>(k))
+      for (auto e : a)
+        v.push_back((int)cast<IntegerAttr>(e).getInt());
+    return v;
+  };
+  for (auto attr : arr) {
+    auto d = cast<DictionaryAttr>(attr);
+    py::dict r;
+    int descArgIdx = getReqI(d, "desc_arg_index");
+    r["desc_arg_index"] = descArgIdx;
+    r["base_ptr_arg_index"] = getReqI(d, "base_ptr_arg_index");
+    r["shape_arg_indices"] = getIArr(d, "shape_arg_indices");
+    r["stride_arg_indices"] = getIArr(d, "stride_arg_indices");
+    // swizzle: read from the descriptor arg's final shared encoding (assigned
+    // by optimize_descriptor_encoding) -- a GEMM dot operand's NVMMAShared
+    // swizzle differs from a box-geometry heuristic, so read it via
+    // getTMASwizzleMode (parity with getTensorDescMetadata). -1 means "derive
+    // host-side from box geometry" (non-NVMMAShared / rank<2).
+    std::vector<int> blockShape = getIArr(d, "block_shape");
+    int swizzle = -1;
+    if (kernelFunc && descArgIdx >= 0 &&
+        descArgIdx < (int)kernelFunc.getNumArguments()) {
+      Value descArg = kernelFunc.getArgument(descArgIdx);
+      if (auto descTy = dyn_cast<TensorDescInterface>(descArg.getType())) {
+        auto blockTy = descTy.getBlockType();
+        auto shp = blockTy.getShape();
+        if (shp.size() >= 2 &&
+            isa<ttg::NVMMASharedEncodingAttr>(blockTy.getEncoding())) {
+          auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
+          if (succeeded(sw))
+            swizzle = *sw;
+        }
+      }
+    }
+    r["block_shape"] = blockShape;
+    r["swizzle"] = swizzle;
+    r["elem_type"] = getReqI(d, "elem_type");
+    r["elem_size"] = getReqI(d, "elem_size");
+    r["fp4_padded"] = getReqI(d, "fp4_padded");
+    r["fill_mode"] = getReqI(d, "fill_mode");
+    result.append(std::move(r));
   }
   return result;
 }
@@ -366,23 +452,9 @@ void init_triton_ir(py::module &&m) {
   m.def("load_dialects", [](MLIRContext &context) {
     DialectRegistry registry;
 
-    if (std::string filename =
-            mlir::triton::tools::getStrEnv("TRITON_PASS_PLUGIN_PATH");
-        !filename.empty()) {
-      TritonPlugin TP(filename);
-
-      std::vector<const char *> dialectNames;
-      if (auto result = TP.getDialectHandles(dialectNames); !result)
-        llvm::report_fatal_error(result.takeError());
-
-      for (unsigned i = 0; i < dialectNames.size(); ++i) {
-        const char *dialectName = dialectNames.data()[i];
-        auto result = TP.getDialectPluginInfo(dialectName);
-        if (!result)
-          throw TP.err2exp(result.takeError());
-        ::mlir::DialectPluginLibraryInfo dialectPluginInfo = *result;
-        dialectPluginInfo.registerDialectRegistryCallbacks(&registry);
-      }
+    // Register plugin dialects.
+    for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
+      plugin.registerDialects(registry);
     }
 
     registry.insert<
@@ -820,6 +892,7 @@ void init_triton_ir(py::module &&m) {
              return py::bool_(ret.getValue());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+      .def("get_auto_tma_recipes", getAutoTmaRecipes)
       .def("get_cuda_warnings",
            [](ModuleOp &self, int32_t computeCapability) -> py::list {
              py::list result;
@@ -905,18 +978,15 @@ void init_triton_ir(py::module &&m) {
       .def_property_readonly("type", &FuncOp::getFunctionType)
       .def("reset_type", &FuncOp::setType);
 
-  py::class_<mlir::OpBuilder>(m, "op_builder", py::module_local(),
-                              py::dynamic_attr())
-      .def(py::init<MLIRContext *>());
-
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  // The static builderClass object persists throughout the compilation,
-  // allowing third-party backends to register their ops separately.
-  static py::class_<TritonOpBuilder> builderClass(
+  // The builder binding is static so it persists throughout compilation,
+  // letting DSL plugins (registerCustomOps) and third-party backends (TLX,
+  // via getBuilderClass) register their ops on it separately.
+  static py::class_<TritonOpBuilder> TritonOpBuilderBinding(
       m, "builder", py::module_local(), py::dynamic_attr());
-  builderClassPtr = &builderClass;
-  builderClass.def(py::init<MLIRContext *>())
+  builderClassPtr = &TritonOpBuilderBinding;
+  TritonOpBuilderBinding.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
       // getters
       .def("create_module",
@@ -1265,7 +1335,8 @@ void init_triton_ir(py::module &&m) {
            })
 
       // Cast instructions
-      // Conversions for custom FP types (FP8 and non-standard rounding modes)
+      // Conversions for custom FP types (FP8 and non-standard rounding
+      // modes)
       .def("create_fp_to_fp",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
               std::optional<RoundingMode> roundingMode) -> Value {
@@ -1406,8 +1477,8 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MinUIOp>(lhs, rhs));
            })
-      // minimumf follows the torch.minimum convention and returns NaN if either
-      // operand is NaN
+      // minimumf follows the torch.minimum convention and returns NaN if
+      // either operand is NaN
       .def("create_minimumf",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MinimumFOp>(lhs, rhs));
@@ -1426,8 +1497,8 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MaxUIOp>(lhs, rhs));
            })
-      // maximumf follows the torch.maximum convention and returns NaN if either
-      // operand is NaN
+      // maximumf follows the torch.maximum convention and returns NaN if
+      // either operand is NaN
       .def("create_maximumf",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return Value(self.create<arith::MaximumFOp>(lhs, rhs));
@@ -1777,6 +1848,17 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("program_id must be in [0,3]");
              return self.create<GetNumProgramsOp>(axis);
            })
+      // CLC (Cluster Launch Control) scheduler - SM100+ (Blackwell).
+      // `clc_advance` is the single high-level, barrier-free op: it returns the
+      // decoded next tile {isValid, x, y, z}. The initial tile needs no op
+      // (just program_id + true). A later lowering pass materializes the
+      // response buffer + mbarrier, splits the fetch into an (overlap-hoisted)
+      // issue + wait + decode, and infers the phase.
+      .def("create_clc_advance",
+           [](TritonOpBuilder &self) -> std::vector<Value> {
+             auto op = self.create<ttng::CLCAdvanceOp>();
+             return {op.getIsValid(), op.getX(), op.getY(), op.getZ()};
+           })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
               mlir::Value &c, InputPrecision inputPrecision,
@@ -1983,6 +2065,18 @@ void init_triton_ir(py::module &&m) {
                                                   tensorShape, isSignedInteger,
                                                   paddingOption);
            });
+
+  // Add custom operations.
+  for (const auto &plugin : mlir::triton::plugin::loadPlugins()) {
+    for (const auto &op : plugin.listOps()) {
+      TritonOpBuilderBinding.def(
+          op.name, [op](TritonOpBuilder &self, std::vector<Value> args) {
+            args.insert(args.begin(), Value());
+            op.addOp(self, args);
+            return args[0];
+          });
+    }
+  }
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
       .def(py::init<MLIRContext *>())

@@ -253,14 +253,14 @@ def test_launcher_src_exists():
 
 
 def test_launcher_src_includes_launch_h():
-    """Generated C source should include triton/runtime/launch.h."""
+    """Generated C source should include nvidia/backend/launch.h."""
     compiled = _compile_kernel(
         add_kernel,
         signature={"X": "*fp32", "Y": "*fp32", "OUT": "*fp32", "N": "i32"},
         constexprs={"BLOCK": 1024},
     )
     src = compiled.asm["launcher_src"]
-    assert '#include "triton/runtime/launch.h"' in src
+    assert '#include "nvidia/backend/launch.h"' in src
 
 
 def test_launcher_src_no_python_h():
@@ -433,7 +433,7 @@ def test_launcher_src_compiles_with_gcc():
         # triton_include path resolution in buck link-tree environments.
         from pathlib import Path
         launch_h_content = Path(launch_h).read_text()
-        test_src = src.replace('#include "triton/runtime/launch.h"', launch_h_content)
+        test_src = src.replace('#include "nvidia/backend/launch.h"', launch_h_content)
         f.write(test_src)
         f.flush()
         try:
