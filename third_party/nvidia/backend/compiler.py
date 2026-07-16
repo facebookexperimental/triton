@@ -741,6 +741,12 @@ class CUDABackend(BaseBackend):
 
         if capability // 10 < 9:
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
+        # Auto-TMA: rewrite eligible masked block loads into descriptor_load so
+        # the standard sm_90+ TMA lowering turns them into real TMA copies. The
+        # per-config option (autotunable) takes precedence; otherwise fall back
+        # to the global TRITON_AUTO_TMA knob.
+        if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
+            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
