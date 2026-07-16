@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 
-import generated
 import torch
 import triton
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    import generated
+except ModuleNotFoundError:  # buck par: module lives under the dotted package
+    generated = importlib.import_module(
+        (__package__ + ".generated") if __package__ else "generated"
+    )
 
 NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
@@ -19,7 +25,6 @@ def alloc_fn(size: int, alignment: int, stream):
 def main() -> int:
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
-    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
 
     shapes = [
         # K-heavy square shapes (original 6) — exercise the K-loop pipeline.
@@ -42,24 +47,18 @@ def main() -> int:
         b = torch.randn(K, N, device="cuda", dtype=torch.float16)
         c = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float16)
 
-        a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
-        # Generated uses [offs_bn, offs_k] for B → load order is [N, K], so
-        # transpose to [K, N] view first then descriptor on [N, K].
-        b_t = b.t().contiguous()  # [N, K]
-        b_desc = TensorDescriptor.from_tensor(b_t, [BLOCK_N, BLOCK_K])
-        c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
-
-        grid = (NUM_SMS, )
-        # The kernel signature has 18 args from the deduped TensorDescriptor
-        # flattening. We pass each TensorDescriptor as a single object — Triton
-        # reflattens automatically into the 5 underlying fields per descriptor.
-        generated.matmul_kernel_tma_persistent_simple[grid](
-            a_desc,
-            b_desc,
-            c_desc,
+        # The kernel builds its own TMA descriptors internally; pass raw
+        # pointers + leading strides with the persistent (NUM_SMS,) grid.
+        generated._gemm_persistent[(NUM_SMS,)](
+            a,
+            b,
+            c,
             M,
             N,
             K,
+            a.stride(0),
+            b.stride(0),
+            c.stride(0),
             num_warps=4,
             num_ctas=1,
             num_stages=2,

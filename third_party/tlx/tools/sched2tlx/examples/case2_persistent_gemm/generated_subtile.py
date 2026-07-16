@@ -24,7 +24,7 @@ def _gemm_persistent(
     ext_3 = stride_bk
     b_desc = tl.make_tensor_descriptor(B, [K, N], [ext_3, 1], [64, 128])
     ext_5 = stride_cm
-    c_desc = tl.make_tensor_descriptor(C, [M, N], [ext_5, 1], [128, 128])
+    c_desc = tl.make_tensor_descriptor(C, [M, N], [ext_5, 1], [128, 32])
     pid_0 = tl.program_id(0)
     add_8 = (M + 127)
     div_9 = (add_8 // 128)
@@ -42,7 +42,7 @@ def _gemm_persistent(
 
     # acc_tmem: outer-loop buf 0, count=2 (TC writes / default reads across 2 tiles)
     acc_tmem = tlx.local_alloc((128, 128), tl.float32, 2, tlx.storage_kind.tmem)
-    c_smem = tlx.local_alloc((128, 128), tl.float16, 1)
+    c_smem = tlx.local_alloc((128, 32), tl.float16, 2)
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
     # L0_smem_0: N2→N5  ttg.local_alloc→ttng.tc_gen5_mma  cyc557→cyc587  forward  buf=0  kind=mbarrier
@@ -66,15 +66,39 @@ def _gemm_persistent(
                 rem_16 = (tile_id % div_11)
                 mul_17 = (div_15 * 128)
                 mul_18 = (rem_16 * 128)
+                # Pass A.7 epilogue subtile (S=4, sub_size=32)
                 tlx.barrier_wait(acc_tmem_full[tmem_buf], tmem_phase)
-                acc = tlx.local_load(acc_tmem[tmem_buf])
-                tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
-                trunc_19 = acc.to(tl.float16)
-                tlx.local_store(c_smem[0], trunc_19)
+                acc_sub_0 = tlx.subslice(acc_tmem[tmem_buf], 0, 32)
+                acc_0 = tlx.local_load(acc_sub_0)
+                trunc_0_19 = acc_0.to(tl.float16)
+                tlx.async_descriptor_store_wait(1)
+                tlx.local_store(c_smem[0], trunc_0_19)
                 tlx.fence_async_shared()
-                tlx.async_descriptor_store(c_desc, c_smem[0], [mul_17, mul_18])
-                tlx.async_descriptor_store_wait(0)
+                tlx.async_descriptor_store(c_desc, c_smem[0], [mul_17, (mul_18 + 0)], eviction_policy="evict_first")
+                acc_sub_1 = tlx.subslice(acc_tmem[tmem_buf], 32, 32)
+                acc_1 = tlx.local_load(acc_sub_1)
+                trunc_1_20 = acc_1.to(tl.float16)
+                tlx.async_descriptor_store_wait(1)
+                tlx.local_store(c_smem[1], trunc_1_20)
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(c_desc, c_smem[1], [mul_17, (mul_18 + 32)], eviction_policy="evict_first")
+                acc_sub_2 = tlx.subslice(acc_tmem[tmem_buf], 64, 32)
+                acc_2 = tlx.local_load(acc_sub_2)
+                trunc_2_21 = acc_2.to(tl.float16)
+                tlx.async_descriptor_store_wait(1)
+                tlx.local_store(c_smem[0], trunc_2_21)
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(c_desc, c_smem[0], [mul_17, (mul_18 + 64)], eviction_policy="evict_first")
+                acc_sub_3 = tlx.subslice(acc_tmem[tmem_buf], 96, 32)
+                acc_3 = tlx.local_load(acc_sub_3)
+                tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
+                trunc_3_22 = acc_3.to(tl.float16)
+                tlx.async_descriptor_store_wait(1)
+                tlx.local_store(c_smem[1], trunc_3_22)
+                tlx.fence_async_shared()
+                tlx.async_descriptor_store(c_desc, c_smem[1], [mul_17, (mul_18 + 96)], eviction_policy="evict_first")
                 tmem_accum_cnt += 1
+            tlx.async_descriptor_store_wait(0)  # A.7: drain remaining TMA stores
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
