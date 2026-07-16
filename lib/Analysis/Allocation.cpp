@@ -254,10 +254,14 @@ private:
     if (auto func = dyn_cast<FunctionOpInterface>(op)) {
       unsigned numWarpIndices = 0;
       // Warp specialization communicates states over shared memory to each
-      // warp. Add space for an i8 for each warpgroup warp.
-      func.walk([&](gpu::WarpSpecializeOp op) {
-        numWarpIndices = std::max(numWarpIndices, op.getTotalPartitionWarps());
-      });
+      // warp. Add space for an i8 for each warpgroup warp. If single-WS
+      // lowering, dispatch from warp id instead of a state id, so it needs no
+      // state array and we skip this allocation.
+      if (!gpu::hasSingleWarpSpecialize(op->getParentOfType<ModuleOp>()))
+        func.walk([&](gpu::WarpSpecializeOp op) {
+          numWarpIndices =
+              std::max(numWarpIndices, op.getTotalPartitionWarps());
+        });
       maybeAddScratchBuffer<BufferT::BufferKind::Scratch>(op, numWarpIndices);
       return;
     }

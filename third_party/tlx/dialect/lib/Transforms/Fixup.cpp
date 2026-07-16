@@ -213,6 +213,30 @@ public:
     if (hasTLXTwoCTAs) {
       mod->setAttr(AttrTLXEnablePairedCTAMMAName, b.getBoolAttr(true));
     }
+
+    // Propagate the `exclusive` marker from `tlx.async_tasks(exclusive=True)`:
+    // it enables the single-warp-specialize lowering, which requires the module
+    // to contain exactly one warp_specialize op. Only NVIDIA consumes this; on
+    // AMD `exclusive` is ignored.
+    if (!isAMD()) {
+      int numWarpSpecializeOps = 0;
+      bool hasExclusiveWS = false;
+      mod.walk([&](ttg::WarpSpecializeOp op) {
+        ++numWarpSpecializeOps;
+        if (op->hasAttr("tlx.exclusive"))
+          hasExclusiveWS = true;
+      });
+      if (hasExclusiveWS) {
+        if (numWarpSpecializeOps != 1) {
+          mod.emitError()
+              << "tlx.async_tasks(exclusive=True) requires exactly one "
+                 "warp_specialize op in the module, but found "
+              << numWarpSpecializeOps;
+          return signalPassFailure();
+        }
+        ttg::setHasSingleWarpSpecialize(mod, /*value=*/true);
+      }
+    }
   }
 };
 

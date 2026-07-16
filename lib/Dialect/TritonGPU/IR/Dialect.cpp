@@ -4347,6 +4347,16 @@ int triton::gpu::lookupNumWarps(Region *region) {
   return lookupNumWarps(region->getParentOp());
 }
 
+void triton::gpu::setHasSingleWarpSpecialize(ModuleOp module, bool value) {
+  module->setAttr(AttrSingleWarpSpecializeName,
+                  BoolAttr::get(module.getContext(), value));
+}
+
+bool triton::gpu::hasSingleWarpSpecialize(ModuleOp module) {
+  auto attr = module->getAttrOfType<BoolAttr>(AttrSingleWarpSpecializeName);
+  return attr && attr.getValue();
+}
+
 int triton::gpu::lookupThreadsPerWarp(OpBuilder &rewriter) {
   assert(rewriter.getInsertionBlock() && "expected an insertion point");
   Operation *op =
