@@ -925,7 +925,12 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
     dk += tl.dot(
         dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32,
-        attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]} if _HSTU_DQ_REUSE else None),
+        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
+        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
+        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
+        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
+        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
+        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if _HSTU_DQ_REUSE else None),
     )
     if _HSTU_SELF_DQ_REDUCE and ENABLE_TMA:
         # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
