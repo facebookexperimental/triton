@@ -574,6 +574,7 @@ class nvidia_knobs(base_knobs):
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
     use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER")
+    auto_tma: env_bool = env_bool("TRITON_AUTO_TMA")
     use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
