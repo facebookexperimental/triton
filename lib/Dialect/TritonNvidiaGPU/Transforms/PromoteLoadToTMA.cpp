@@ -677,6 +677,44 @@ static bool cmpBoundsDim(arith::CmpIOp cmpOp, const DimInfo &dim, int &argIdx) {
   return true;
 }
 
+// A store mask may be reduced to the descriptor's globalDim bounds ONLY if it
+// is exactly a rectangular per-dim boundary AND_d(offs_d < E_d). Any extra
+// predicate (causal / data-dependent) would make the promoted TMA store write
+// the whole in-bounds box, clobbering elements the original masked off -- a
+// miscompile (unlike loads, where an extra in-bounds read is harmless). Return
+// false if any AND-term of the mask is not a recognized per-dim boundary of
+// some decomp dim.
+static bool storeMaskIsRectangular(Value mask, const DecomposedLoad &decomp) {
+  if (!mask)
+    return true; // no mask -> nothing masked off beyond globalDim
+  SmallVector<Value> terms;
+  std::function<void(Value)> collect = [&](Value v) {
+    if (auto andOp = v.getDefiningOp<arith::AndIOp>()) {
+      collect(andOp.getLhs());
+      collect(andOp.getRhs());
+    } else {
+      terms.push_back(v);
+    }
+  };
+  collect(mask);
+  for (Value t : terms) {
+    Value c = t;
+    if (auto bcast = c.getDefiningOp<tt::BroadcastOp>())
+      c = bcast.getSrc();
+    auto cmpOp = c.getDefiningOp<arith::CmpIOp>();
+    int argIdx = -1;
+    bool matched = false;
+    for (const DimInfo &dim : decomp.dims)
+      if (cmpBoundsDim(cmpOp, dim, argIdx)) {
+        matched = true;
+        break;
+      }
+    if (!matched)
+      return false;
+  }
+  return true;
+}
+
 static int findShapeArgForDim(tt::FuncOp func, Value ownMask,
                               const DimInfo &dim) {
   if (!dim.offset)
@@ -878,6 +916,47 @@ static bool dimStrideIs16BAligned(tt::FuncOp func, const DimInfo &dim,
   return argIs16BAligned(func, dim.strideArgIdx, elemBytes);
 }
 
+// TMA-eligibility for a store's value tensor — mirrors isTMAEligible minus the
+// load-only `other`/OOB-fill check (TMA store bounds via the descriptor's
+// globalDim, so a masked store maps to a bounded TMA copy).
+static bool isTMAEligibleStore(tt::StoreOp storeOp,
+                               const DecomposedLoad &decomp) {
+  auto valTy = dyn_cast<RankedTensorType>(storeOp.getValue().getType());
+  if (!valTy)
+    return false;
+  // Shared eligibility core (dtype, rank, single contiguous dim, inner box a
+  // 16B multiple, every box dim <= 256). The store drops only the load's OOB
+  // `other`-fill check; the caller additionally requires the store mask to be a
+  // pure rectangular boundary (storeMaskIsRectangular) before reducing it to
+  // the descriptor's globalDim bounds, and verifies base-ptr / stride 16B
+  // alignment.
+  return isTMAEligibleCommon(valTy.getElementType(), decomp);
+}
+
+// Store promotion is WS-gated: the TMA store stages the value reg->smem then
+// bulk-copies smem->global, which only pays off when overlapped with compute in
+// a separate epilogue partition under warp specialization (standalone it just
+// adds a round-trip).
+//
+// IR shape assumed: at the point this pass runs (TTIR, before WS lowering) a
+// warp-specialized loop is an `scf.for` carrying the `tt.warp_specialize` unit
+// attribute, set by `tl.range(warp_specialize=True)`. This is deliberately a
+// narrow structural check -- if a future pipeline represents WS differently (a
+// different op, or the attr on a non-ForOp construct) this returns false and
+// store promotion is simply skipped (a missed optimization, never a
+// miscompile). Broaden the walk here if/when such a representation is added.
+static bool kernelIsWarpSpecialized(tt::FuncOp func) {
+  bool ws = false;
+  func.walk([&](scf::ForOp forOp) {
+    if (forOp->hasAttr("tt.warp_specialize")) {
+      ws = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return ws;
+}
+
 struct Promotion {
   tt::LoadOp loadOp;
   DecomposedLoad decomp;
@@ -885,6 +964,12 @@ struct Promotion {
   // Logical-tile -> descriptor-memory dim order (the single contiguous dim is
   // moved last). Identity when the contiguous dim is already innermost.
   SmallVector<int> perm;
+};
+
+struct StorePromotion {
+  tt::StoreOp storeOp;
+  DecomposedLoad decomp;
+  SmallVector<int> shapeArgIndices;
 };
 
 class TritonNvidiaGPUPromoteLoadToTMAPass
@@ -986,7 +1071,79 @@ public:
       promotions.push_back(std::move(p));
     });
 
-    if (promotions.empty())
+    // Phase 1b: collect eligible stores, WS-gated (TMA store only pays off
+    // under warp specialization). Only promote stores whose contiguous dim is
+    // already innermost (the standard row-major C[M,N] output); a transposed
+    // store would need the value transposed before descriptor_store -- skipped
+    // for now.
+    SmallVector<StorePromotion> storePromotions;
+    if (kernelIsWarpSpecialized(kernelFunc)) {
+      kernelFunc.walk([&](tt::StoreOp storeOp) {
+        DecomposedLoad decomp = decomposePointer(storeOp.getPtr());
+        if (!decomp.valid || !isTMAEligibleStore(storeOp, decomp))
+          return;
+        int rank = decomp.dims.size();
+        // contiguous dim must already be innermost (identity perm).
+        if (decomp.dims[rank - 1].strideArgIdx >= 0)
+          return;
+        // Reject any loop-advanced (pointer-increment) dim. Phase 2b builds the
+        // store index directly from dim.offset and -- unlike the load rewrite
+        // -- does NOT reconstruct loopIV * perIterElems, so a loop-advanced dim
+        // would emit a wrong per-iteration index. This is also why the Phase 1b
+        // extent search below omits the findShapeArgForLoopDim fallback that
+        // Phase 1 uses: a loop-advanced dim never survives to need it. In
+        // practice the output store is the row-major C tile, not a
+        // pointer-increment operand, so this excludes nothing real.
+        bool loopAdvanced = false;
+        for (int d = 0; d < rank; d++)
+          if (decomp.dims[d].loopAdvanced)
+            loopAdvanced = true;
+        if (loopAdvanced)
+          return;
+        // static_cast<unsigned>: dodge GCC 13 -Wstringop-overflow false
+        // positive.
+        SmallVector<int> shapeArgs(static_cast<unsigned>(rank), -1);
+        for (int d = 0; d < rank; d++) {
+          const DimInfo &dim = decomp.dims[d];
+          int s = dim.shapeArgIdx;
+          if (s < 0)
+            s = findShapeArgForDim(kernelFunc, storeOp.getMask(), dim);
+          if (s < 0)
+            s = findShapeArgFromTileBound(kernelFunc, dim);
+          shapeArgs[d] = s;
+        }
+        bool ok = true;
+        for (int d = 0; d < rank; d++)
+          if (shapeArgs[d] < 0)
+            ok = false;
+        if (!ok)
+          return;
+        int elemBytes = cast<RankedTensorType>(storeOp.getValue().getType())
+                            .getElementType()
+                            .getIntOrFloatBitWidth() /
+                        8;
+        for (int d = 0; d < rank; d++)
+          if (!dimStrideIs16BAligned(kernelFunc, decomp.dims[d], elemBytes))
+            return;
+        // TMA requires a 16B-aligned global base address (mirrors the load path
+        // and the outer-stride check above).
+        if (!argIs16BAligned(kernelFunc, decomp.basePtrArgIndex, elemBytes))
+          return;
+        // Only a provably rectangular store mask (AND_d(offs_d < E_d)) may be
+        // reduced to the descriptor's globalDim bounds. An extra predicate
+        // would make the TMA store write elements the original masked off ->
+        // clobber.
+        if (!storeMaskIsRectangular(storeOp.getMask(), decomp))
+          return;
+        StorePromotion p;
+        p.storeOp = storeOp;
+        p.decomp = decomp;
+        p.shapeArgIndices = shapeArgs;
+        storePromotions.push_back(std::move(p));
+      });
+    }
+
+    if (promotions.empty() && storePromotions.empty())
       return;
 
     // Phase 2: rewrite each eligible load into a HOST-side TMA descriptor
@@ -1123,6 +1280,88 @@ public:
       SmallVector<Attribute> shapeIdx, strideIdx, blk;
       for (int i = 0; i < rank; i++) {
         int d = promo.perm[i];
+        shapeIdx.push_back(i32Attr(promo.shapeArgIndices[d]));
+        strideIdx.push_back(i32Attr(promo.decomp.dims[d].strideArgIdx));
+        blk.push_back(i32Attr((int)promo.decomp.dims[d].blockSize));
+      }
+      int tmaDtype = getTMADataType(elemTy).value();
+      int elemBytes = elemTy.getIntOrFloatBitWidth() / 8;
+      SmallVector<NamedAttribute> fields = {
+          b.getNamedAttr("desc_arg_index", i32Attr((int)descArgIdx)),
+          b.getNamedAttr("base_ptr_arg_index",
+                         i32Attr(promo.decomp.basePtrArgIndex)),
+          b.getNamedAttr("shape_arg_indices", b.getArrayAttr(shapeIdx)),
+          b.getNamedAttr("stride_arg_indices", b.getArrayAttr(strideIdx)),
+          b.getNamedAttr("block_shape", b.getArrayAttr(blk)),
+          b.getNamedAttr("elem_type", i32Attr(tmaDtype)),
+          b.getNamedAttr("elem_size", i32Attr(elemBytes)),
+          b.getNamedAttr("fp4_padded", i32Attr(0)),
+          b.getNamedAttr("fill_mode", i32Attr(0)),
+      };
+      recipeAttrs.push_back(b.getDictionaryAttr(fields));
+    }
+    // Phase 2b: rewrite eligible stores into descriptor_store against a
+    // synthesized host-side descriptor (symmetric to loads; the
+    // descriptor_store TTGIR lowering creates the reg->smem staging +
+    // async_tma_copy_local_to_global).
+    for (auto &promo : storePromotions) {
+      tt::StoreOp storeOp = promo.storeOp;
+      int rank = promo.decomp.dims.size();
+      Value value = storeOp.getValue();
+      auto valTy = cast<RankedTensorType>(value.getType());
+      Type elemTy = valTy.getElementType();
+      Location loc = storeOp.getLoc();
+
+      auto descTy = tt::TensorDescType::get(ctx, valTy);
+      unsigned descArgIdx = kernelFunc.getNumArguments();
+      auto argAttrs =
+          b.getDictionaryAttr({b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});
+      LogicalResult inserted =
+          kernelFunc.insertArgument(descArgIdx, descTy, argAttrs, loc);
+      assert(succeeded(inserted) &&
+             "failed to insert TMA descriptor kernel argument");
+      (void)inserted;
+      Value descArg = kernelFunc.getArgument(descArgIdx);
+
+      builder.setInsertionPoint(storeOp);
+      Type i32 = builder.getI32Type();
+      // Same width handling as the load path's toIntWidth: descriptor_store
+      // indices must be i32, but a tile offset may be index / i16 / i64 / etc.
+      // depending on how the kernel computed it. Sign-extend or truncate as
+      // needed; unexpected non-integer types fall through to the op verifier.
+      auto toI32 = [&](Value v) -> Value {
+        Type ty = v.getType();
+        if (ty == i32)
+          return v;
+        if (ty.isIndex())
+          return arith::IndexCastOp::create(builder, loc, i32, v);
+        if (auto it = dyn_cast<IntegerType>(ty)) {
+          if (it.getWidth() > 32)
+            return arith::TruncIOp::create(builder, loc, i32, v);
+          return arith::ExtSIOp::create(builder, loc, i32, v);
+        }
+        return v;
+      };
+      SmallVector<Value> indices;
+      for (int d = 0; d < rank; d++) {
+        const DimInfo &dim = promo.decomp.dims[d];
+        if (!dim.offset) {
+          // Bare make_range with no tile offset (e.g. `arange % M` or a
+          // select-clamp that peels to a bare range): the tile starts at 0.
+          // Phase 1b can accept such a dim via shapeArgIdx alone, so mirror the
+          // load path (Phase 2) here instead of calling toI32 on a null offset.
+          indices.push_back(arith::ConstantOp::create(
+              builder, loc, builder.getI32IntegerAttr(0)));
+        } else {
+          indices.push_back(toI32(dim.offset));
+        }
+      }
+
+      tt::DescriptorStoreOp::create(builder, loc, descArg, value, indices);
+      storeOp.erase();
+
+      SmallVector<Attribute> shapeIdx, strideIdx, blk;
+      for (int d = 0; d < rank; d++) {
         shapeIdx.push_back(i32Attr(promo.shapeArgIndices[d]));
         strideIdx.push_back(i32Attr(promo.decomp.dims[d].strideArgIdx));
         blk.push_back(i32Attr((int)promo.decomp.dims[d].blockSize));

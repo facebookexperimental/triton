@@ -224,3 +224,95 @@ def test_auto_tma_mixed_promoted_and_oversize_load():
     assert k.asm["ttir"].count("tt.descriptor_load") == 1, (
         "exactly the BLOCK_A=256 load must be auto-TMA promoted; the BLOCK_B=512 "
         "load exceeds the box cap and must stay an ordinary load")
+
+
+# Store promotion is WS-gated (see PromoteLoadToTMA.cpp): a tl.range with
+# warp_specialize=True carries the tt.warp_specialize attr, which is what
+# isTMAEligibleStore keys off. This kernel makes the store's contiguous box dim
+# (BLOCK_N) the thing under test.
+@triton.jit
+def _ws_scale_store(x_ptr, o_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NUM_SMS: tl.constexpr):
+    start_pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = num_pid_m * num_pid_n
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        x = tl.load(x_ptr + offs_m[:, None] * stride_m + offs_n[None, :], mask=mask, other=0.0)
+        tl.store(o_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
+
+
+@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
+def test_auto_tma_store_block_over_256_not_promoted():
+    # Symmetric to the load check, for the STORE path. cuTensorMapEncodeTiled
+    # caps every box dim at 256, and the host store recipe builds the CUtensorMap
+    # with box_dim == block_shape (launch.h does not clamp/decompose). So a store
+    # whose contiguous box dim (BLOCK_N) is > 256 must NOT be promoted to a
+    # descriptor_store -- otherwise it would fail encode at launch. Unlike a
+    # dp-halved outer dim, BLOCK_N is not halved by data partitioning, so 512
+    # would survive to the descriptor. It must stay an ordinary store and still
+    # compute the right result.
+    M, N = 128, 512
+    BLOCK_M, BLOCK_N = 64, 512  # 512 > 256 element box cap, on the store's contiguous dim
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    x = torch.randn((M, N), device="cuda", dtype=torch.float16)
+    o = torch.empty((M, N), device="cuda", dtype=torch.float16)
+    grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
+    k = _ws_scale_store[grid](x, o, M, N, x.stride(0), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NUM_SMS=NUM_SMS, num_warps=4)
+    torch.testing.assert_close(o, x * 2.0, atol=1e-2, rtol=1e-2)
+    assert "tt.descriptor_store" not in k.asm["ttir"], (
+        "BLOCK_N>256 exceeds the TMA box limit and must not be auto-TMA store-promoted")
+
+
+# A store whose mask carries an extra (non-rectangular) predicate on top of the
+# per-dim boundary. Store promotion may only reduce a mask to the descriptor's
+# globalDim bounds when the mask is exactly AND_d(offs_d < E_d); an extra term
+# would make the TMA store write elements the original masked off.
+@triton.jit
+def _ws_extra_pred_store(x_ptr, o_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                         NUM_SMS: tl.constexpr):
+    start_pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = num_pid_m * num_pid_n
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, warp_specialize=True):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rect = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        # other=1.0 (non-zero) keeps this load ineligible for auto-TMA, so the
+        # kernel has no promoted TMA load -- isolates the store path and avoids an
+        # unrelated WS partition-scheduler issue with a TMA load in a trivial
+        # elementwise WS loop. rect is fully in-bounds here, so the fill is unused.
+        x = tl.load(x_ptr + offs_m[:, None] * stride_m + offs_n[None, :], mask=rect, other=1.0)
+        # extra predicate beyond the rectangular boundary: skip column 0.
+        mask = rect & (offs_n[None, :] > 0)
+        tl.store(o_ptr + offs_m[:, None] * stride_m + offs_n[None, :], x * 2.0, mask=mask)
+
+
+@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
+def test_auto_tma_store_nonrectangular_mask_not_promoted():
+    # A store whose mask is not a pure rectangular boundary (here: an extra
+    # skip-column-0 predicate) must NOT be promoted to a descriptor_store: the TMA
+    # store bounds only via globalDim, so it would write the whole in-bounds box
+    # and clobber the elements the extra predicate masked off (a miscompile). It
+    # must stay an ordinary masked store and leave the masked-off elements
+    # untouched.
+    M, N = 128, 128
+    BLOCK_M, BLOCK_N = 64, 128  # <=256 so the box guard is not what rejects it; single n-tile
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    x = torch.randn((M, N), device="cuda", dtype=torch.float16)
+    o = torch.zeros((M, N), device="cuda", dtype=torch.float16)
+    grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
+    k = _ws_extra_pred_store[grid](x, o, M, N, x.stride(0), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NUM_SMS=NUM_SMS,
+                                   num_warps=4)
+    assert "tt.descriptor_store" not in k.asm["ttir"], (
+        "a non-rectangular store mask must not be auto-TMA store-promoted")
+    cols = torch.arange(N, device="cuda")[None, :]
+    ref = torch.where(cols > 0, x * 2.0, torch.zeros_like(x))
+    torch.testing.assert_close(o, ref, atol=1e-2, rtol=1e-2)
