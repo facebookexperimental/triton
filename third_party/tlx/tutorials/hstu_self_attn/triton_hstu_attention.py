@@ -286,21 +286,6 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                     num_warps=_w,
                 )
             ]
-        # DP off (DP=1): optionally force an exact BLOCK_M/BLOCK_N tile. The
-        # dq-reduce reuse path needs BM=BN=HEAD_DIM=128 so the dp and dq opndD
-        # accumulators are shape-compatible for the REUSE_DP_FOR_DQ reuse group and
-        # the four reuse groups pack to the 512-col TMEM budget -- matching TLX's
-        # BLOCK_M1=BLOCK_N1=128 config. Set HSTU_SELF_AUTOWS_BM (and optionally BN).
-        _bm_force = os.environ.get("HSTU_SELF_AUTOWS_BM")
-        if _bm_force is not None:
-            _bn = int(os.environ.get("HSTU_SELF_AUTOWS_BN", _bm_force))
-            return [
-                triton.Config(
-                    {"BLOCK_M": int(_bm_force), "BLOCK_N": _bn},
-                    num_stages=1,
-                    num_warps=_w,
-                )
-            ]
         # DP off: pick the largest existing tile / most warps.
         cand = [
             c
@@ -886,7 +871,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             other=0.0,
         )
     qk_trans = tl.dot(
-        k, q_trans, allow_tf32=ALLOW_TF32, attrs=({"channels": ["opndD,tmem,1,2"]} if _HSTU_DQ_REUSE else None)
+        k, q_trans, allow_tf32=ALLOW_TF32, attrs=({"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]} if _HSTU_DQ_REUSE else None)
     )
     valid_mask_trans = backward_valid_mask(
         offs_m,
@@ -916,18 +901,22 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             mask=mask_m[:, None],
             other=0.0,
         )
+    # dp (dact_qk_trans) is emitted BEFORE dv: dp and dv are both stage 0 with the
+    # SAME `order`, so the `order` annotation does NOT reorder them -- same-stage
+    # dots keep PROGRAM order. Emitting dp first makes the final-ttgir schedule match
+    # TLX's dp-before-dv body order (dv/dp were the only swapped pair vs TLX).
+    dact_qk_trans = tl.dot(
+        v, tl.trans(do), allow_tf32=ALLOW_TF32, attrs=({"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None)
+    )
     dv += tl.dot(
         act_qk_trans, do, allow_tf32=ALLOW_TF32, attrs=(
-            {"channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]}
+            {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]}
             if _HSTU_DQ_REUSE
             else None
         )
     )
 
     # compute dk and dq
-    dact_qk_trans = tl.dot(
-        v, tl.trans(do), allow_tf32=ALLOW_TF32, attrs=({"channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None)
-    )
     dqk_trans = backward_d_activation(
         dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans
     )
@@ -936,7 +925,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
     dk += tl.dot(
         dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32,
-        attrs=({"channels": ["opndD,tmem,1,10"]} if _HSTU_DQ_REUSE else None),
+        attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]} if _HSTU_DQ_REUSE else None),
     )
     if _HSTU_SELF_DQ_REDUCE and ENABLE_TMA:
         # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
@@ -949,7 +938,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         dq_trans = (
             tl.dot(
                 tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32,
-                attrs=({"channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None),
+                attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None),
             )
             * alpha
         )
