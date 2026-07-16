@@ -1,4 +1,12 @@
-"""Run emitter-generated case2 persistent GEMM on B200 vs torch."""
+"""Run emitter-generated case2 persistent GEMM on B200 vs torch.
+
+The committed generated.py is regenerated from pre_modulo.ttgir with
+TRITON_DATA_PARTITION_N=auto: the A.5 data partition (n=2, m_size=128)
+splits the ttgir's (256,256) accumulator into two (128,256) TMEM groups —
+the only lowerable realization of this BM=256 input (an unpartitioned
+lowering trips "blockM must be 64 or 128"). Descriptor contract follows:
+a/b keep the ttgir's (256,64) load blocks; C is stored per group as
+(128,256) chunks, so c_desc's block is (128,256), NOT (256,256)."""
 
 from __future__ import annotations
 
@@ -19,7 +27,8 @@ def alloc_fn(size: int, alignment: int, stream):
 def main() -> int:
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
-    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+    STORE_M = 128  # m_size = BLOCK_M / applied_n from the A.5 data partition
 
     shapes = [
         # K-heavy square shapes (original 6) — exercise the K-loop pipeline.
@@ -47,7 +56,7 @@ def main() -> int:
         # transpose to [K, N] view first then descriptor on [N, K].
         b_t = b.t().contiguous()  # [N, K]
         b_desc = TensorDescriptor.from_tensor(b_t, [BLOCK_N, BLOCK_K])
-        c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
+        c_desc = TensorDescriptor.from_tensor(c, [STORE_M, BLOCK_N])
 
         grid = (NUM_SMS, )
         # The kernel signature has 18 args from the deduped TensorDescriptor
