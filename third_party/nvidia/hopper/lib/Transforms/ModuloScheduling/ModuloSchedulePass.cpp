@@ -1476,6 +1476,12 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
       LLVM_DEBUG(llvm::dbgs() << "[Step4.6] Reduced SMEM buf" << bestIdx
                               << " to count=" << newDepth << "\n");
     }
+    // computeTotalSmem charges merged buffers through the PhysicalBuffer
+    // cache (count = max over members), so the reduction is invisible to
+    // the loop condition until the cache is rebuilt — without this refresh
+    // the greedy loop over-reduces every candidate to count=1 and then
+    // reports a phantom EXCEEDED.
+    buildPhysicalBuffers(loop);
   }
 
   // TMEM reduction
@@ -1501,6 +1507,8 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     LLVM_DEBUG(llvm::dbgs()
                << "[Step4.6] Reduced TMEM buf" << bestIdx
                << " to count=" << loop.buffers[bestIdx].count << "\n");
+    // Same PhysicalBuffer-cache refresh as the SMEM loop above.
+    buildPhysicalBuffers(loop);
   }
 
   // Recompute II from reduced buffer depths.
