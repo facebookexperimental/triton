@@ -2680,6 +2680,9 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
                                     repCh->getAllocOp()->getResult(0));
           }
           channel->getAllocOp()->erase();
+          // The alloc (and endpoints reached through it) is now dangling; mark
+          // the channel so later reuse-group walks don't deref freed ops.
+          channel->defunct = true;
           continue;
         }
         // Types don't match for SMEM - cannot reinterpret SMEM like TMEM
@@ -2778,6 +2781,9 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
 
       // All users were successfully replaced, safe to erase
       channel->getAllocOp()->erase();
+      // The alloc (and endpoints reached through it) is now dangling; mark the
+      // channel so later reuse-group walks don't deref freed ops.
+      channel->defunct = true;
     }
   }
 }
@@ -3496,14 +3502,25 @@ void insertAsyncComm(
           // reading from the shared buffer before overwriting it.
           //
           // All source ops must be in the same block to establish program
-          // order.
+          // order. Skip defunct channels (alloc folded into a reuse
+          // representative and erased): their endpoints are dangling and
+          // getSrcOp() returns null; the representative covers their space.
           bool allSameBlock = true;
           if (group->channels.size() > 1) {
-            auto *refBlock = group->channels.front()->getSrcOp()->getBlock();
-            allSameBlock =
-                llvm::all_of(group->channels, [refBlock](Channel *ch) {
-                  return ch->getSrcOp()->getBlock() == refBlock;
-                });
+            Block *refBlock = nullptr;
+            for (Channel *ch : group->channels) {
+              if (ch->defunct)
+                continue;
+              Operation *src = ch->getSrcOp();
+              if (!src)
+                continue;
+              if (!refBlock) {
+                refBlock = src->getBlock();
+              } else if (src->getBlock() != refBlock) {
+                allSameBlock = false;
+                break;
+              }
+            }
           }
           // A TMEM reuse group with >= 3 buffers is a temporal, full-overlap
           // reuse of ONE TMEM slot by >= 3 producers (e.g. FA-bwd

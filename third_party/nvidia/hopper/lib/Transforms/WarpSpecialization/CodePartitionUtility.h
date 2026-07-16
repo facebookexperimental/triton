@@ -81,6 +81,14 @@ public:
   DataChannelKind channelKind = DataChannelKind::SMEM;
   unsigned uniqID;
   std::string srcName; // Producer name captured at channel creation
+
+  // Set once this channel's allocOp has been folded into a reuse-group
+  // representative and erased (replaceBufferReuse). The channel's alloc — and
+  // any producer/consumer op reached through it — is then dangling, so
+  // getSrcOp()/getDstOp() must not walk it. Any pass step that iterates reuse
+  // groups after folding (e.g. needAccumCntForReuse) should skip defunct
+  // channels; the representative covers their space.
+  bool defunct = false;
 };
 
 // A few assumptions, a channel can have multiple consumers, but the consumers
