@@ -34,17 +34,46 @@ import triton_hstu_attention as A  # noqa: E402
 import tlx_bw_hstu_attention as T  # noqa: E402
 
 D = 128
-H = 2
+# heads/sparsity are env-driven so they flow to the per-variant perf subprocesses
+# (D102650040 production shape: heads=4, seq=4096, sparsity=0.95, batch=512).
+H = int(os.environ.get("BENCH_HEADS", "2"))
 
 
-def make(L, Z, dtype=torch.bfloat16):
-    t = Z * L
-    g = lambda: torch.randn(t, H, D, device="cuda", dtype=dtype)
+def generate_sparse_seq_len(size, max_seq_len, sparsity, device, generator=None):
+    """Port of generative_recommenders.common.generate_sparse_seq_len (the
+    fbsource HSTU bench / D102650040 shape). `sparsity` is a DENSITY knob --
+    higher => LONGER sequences. Uniform: sparsity>=0.5 -> U[(2s-1)*max, max);
+    sparsity<0.5 -> U[0, 2s*max). Clamped >=1 so every segment is non-empty."""
+    if sparsity == 0.0:
+        return torch.ones(size, device=device, dtype=torch.int64)
+    if sparsity == 1.0:
+        return torch.full((size,), max_seq_len, device=device, dtype=torch.int64)
+    if sparsity >= 0.5:
+        lo, hi = int((2 * sparsity - 1.0) * max_seq_len), max_seq_len
+    else:
+        lo, hi = 0, int(2 * sparsity * max_seq_len)
+    lo, hi = max(lo, 1), max(hi, 2)
+    return torch.randint(lo, hi, (size,), device=device, dtype=torch.int64, generator=generator)
+
+
+def make(L, Z, dtype=torch.bfloat16, sparsity=None, seed=1001):
+    """Build (q,k,v,do,so,asc). Default (sparsity=None) = uniform dense segments
+    (every batch item seq-len = L). sparsity set = jagged variable-length segments
+    (perf-only; torch_ref assumes uniform L). L is the per-item MAX seq-len."""
+    dev = "cuda"
+    if sparsity is None:
+        lens = torch.full((Z,), L, device=dev, dtype=torch.int64)
+    else:
+        gen = torch.Generator(device=dev).manual_seed(seed)
+        lens = generate_sparse_seq_len(Z, L, sparsity, dev, gen)
+    so = torch.zeros(Z + 1, device=dev, dtype=torch.int64)
+    torch.cumsum(lens, 0, out=so[1:])
+    t = int(so[-1])
+    g = lambda: torch.randn(t, H, D, device=dev, dtype=dtype)  # noqa: E731
     q = g().requires_grad_(True)
     k = g().requires_grad_(True)
     v = g().requires_grad_(True)
-    so = torch.arange(0, t + 1, L, device="cuda", dtype=torch.int64)
-    asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
+    asc = torch.tensor(1.0 / L, device=dev, dtype=torch.float32)
     do = g()
     return q, k, v, do, so, asc
 
@@ -158,7 +187,8 @@ def _bench_one(variant, L, Z, nrep):
     Prints a machine-parseable PERF line."""
     import statistics
     torch.manual_seed(0)
-    q, k, v, do, so, asc = make(L, Z)
+    _sp = os.environ.get("BENCH_SPARSITY")
+    q, k, v, do, so, asc = make(L, Z, sparsity=float(_sp) if _sp else None)
     run = run_tlx if variant == "tlx" else run_triton  # triton & autows share triton_hstu_mha
     kw = {"causal": True} if variant == "tlx" else {}
     meta_ws = variant == "autows"
@@ -183,15 +213,18 @@ def _bench_one(variant, L, Z, nrep):
     print(f"PERF {variant} L={L} Z={Z} fwd={fm:.4f} fwd_sd={fsd:.4f} bwd={bm:.4f} bwd_sd={bsd:.4f}")
 
 
-def run_perf(shapes, variants, nrep=1, timeout=1800):
-    """Time each variant's fwd+bwd in its own subprocess and tabulate (speedup vs tlx)."""
+def run_perf(shapes, variants, nrep=1, heads=None, sparsity=None, timeout=3600):
+    """Time each variant's fwd+bwd in its own subprocess and tabulate (speedup vs tlx).
+    heads/sparsity flow to the children via env (BENCH_HEADS / BENCH_SPARSITY)."""
     import re
     import subprocess
 
-    print(f"\n=== Perf (self-attn fwd/bwd latency, nrep={nrep}) "
+    hh = heads if heads is not None else H
+    inp = "uniform-dense" if sparsity is None else f"jagged sparsity={sparsity}"
+    print(f"\n=== Perf (self-attn fwd/bwd latency, nrep={nrep}, heads={hh}, {inp}) "
           f"— each variant in its own process ===")
     for (L, Z) in shapes:
-        print(f"\n  L={L} Z={Z} H={H} D={D} tokens={Z * L}")
+        print(f"\n  maxL={L} Z={Z} H={hh} D={D}")
         hdr = f"  {'variant':<10}{'fwd ms':>10}{'bwd ms':>10}"
         hdr += f"{'fwd sd':>9}{'bwd sd':>9}" if nrep > 1 else f"{'fwd/tlx':>9}{'bwd/tlx':>9}"
         print(hdr)
@@ -199,6 +232,10 @@ def run_perf(shapes, variants, nrep=1, timeout=1800):
         for var in variants:
             env = dict(os.environ)
             env.update(_PERF_ENV[var])
+            if heads is not None:
+                env["BENCH_HEADS"] = str(heads)
+            if sparsity is not None:
+                env["BENCH_SPARSITY"] = str(sparsity)
             try:
                 r = subprocess.run(
                     [sys.executable, os.path.abspath(__file__), "--bench-one", var,
@@ -238,6 +275,9 @@ def main():
                     help="comma subset of autows,tlx,triton (perf)")
     ap.add_argument("--seqlens", default=None, help="comma L list, e.g. 256,512,1024,4096")
     ap.add_argument("--batch", type=int, default=None, help="batch Z (default 2)")
+    ap.add_argument("--heads", type=int, default=None, help="num heads H (perf; default 2)")
+    ap.add_argument("--sparsity", type=float, default=None,
+                    help="jagged density knob (0.95 = D102650040); omit for uniform-dense")
     # hidden per-variant subprocess entry: --bench-one <variant> <L> <Z> <nrep>
     ap.add_argument("--bench-one", nargs=4, default=None, help=argparse.SUPPRESS,
                     metavar=("VARIANT", "L", "Z", "NREP"))
@@ -260,7 +300,7 @@ def main():
         run_accuracy(shapes)
     if do_perf:
         variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-        run_perf(shapes, variants, nrep=args.nrep)
+        run_perf(shapes, variants, nrep=args.nrep, heads=args.heads, sparsity=args.sparsity)
 
 
 if __name__ == "__main__":
