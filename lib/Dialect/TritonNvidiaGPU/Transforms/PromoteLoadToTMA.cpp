@@ -521,33 +521,26 @@ static DecomposedLoad decomposePointer(Value ptr) {
   return result;
 }
 
-// cuTensorMapEncodeTiled requires every box (block) dim to be in [1, 256]
-// elements. The HOST recipe path builds the CUtensorMap with box_dim ==
-// block_shape, and launch.h does NOT clamp or multi-copy-decompose the box
-// (unlike the device AsyncTMACopyGlobalToLocal lowering), so an oversize tile
-// would fail encode at launch.
-//
-// NOTE (conservative): this runs pre-warp-specialization, so ``blockSize`` is
-// the pre-WS tile. WS / 2-CTA / dp only ever SHRINK the tile, so blockSize <=
-// 256 here guarantees the final descriptor box is <= 256 (safe). The converse
-// is imprecise -- a pre-WS tile > 256 that WS later halves to <= 256 would
-// actually be encodable -- but we can't see the final box at this point and the
-// host path can't decompose, so we reject it (the load stays a plain load:
-// correct, just not TMA-accelerated). Supporting oversize tiles on the host
-// path needs box decomposition in launch.h; see
-// PromoteLoadToTMA_box_decompose_design.md.
-static bool blockDimsWithinTMABox(const DecomposedLoad &decomp) {
+// Reject only nonsensical (zero/negative) block dims. The 256-element box cap
+// that cuTensorMapEncodeTiled requires is NOT enforced here anymore: the host
+// recipe carries a getTMABlockShape-clamped box (computed in getAutoTmaRecipes,
+// python/src/ir.cc -- the same clamp the device lowering uses), and the device
+// AsyncTMACopyGlobalToLocal(/LocalToGlobal) lowering multi-copies that clamped
+// box to fill the full-block SMEM tile. So an oversize tile (e.g. BLOCK=512) is
+// promoted with a full-block SMEM result and a <=256 encoded box.
+static bool blockDimsValid(const DecomposedLoad &decomp) {
   for (const DimInfo &dim : decomp.dims)
-    if (dim.blockSize < 1 || dim.blockSize > 256)
+    if (dim.blockSize < 1)
       return false;
   return true;
 }
 
 // Shared TMA-eligibility core for a load/store tile (element type + decomposed
 // pointer): TMA-encodable dtype, rank 1-5, every strided dim's stride is a
-// kernel arg, exactly one contiguous dim, the contiguous (inner) box is a
-// positive multiple of 16 bytes, and every box dim <= 256
-// (cuTensorMapEncodeTiled). Load-/store-specific checks live in the callers.
+// kernel arg, exactly one contiguous dim, and the contiguous (inner) box is a
+// positive multiple of 16 bytes. Block dims > 256 are allowed: the encoded box
+// is getTMABlockShape-clamped and the device lowering multi-copies to fill the
+// tile. Load-/store-specific checks live in the callers.
 static bool isTMAEligibleCommon(Type elemTy, const DecomposedLoad &decomp) {
   if (!getTMADataType(elemTy))
     return false;
@@ -578,8 +571,10 @@ static bool isTMAEligibleCommon(Type elemTy, const DecomposedLoad &decomp) {
   int64_t innerBytes = (int64_t)decomp.dims[contigDim].blockSize * elemBytes;
   if (innerBytes < 16 || innerBytes % 16 != 0)
     return false;
-  // Every box dim must be <= 256 elements (cuTensorMapEncodeTiled).
-  if (!blockDimsWithinTMABox(decomp))
+  // Reject only zero/negative block dims; the >256 box cap is handled at encode
+  // time via a getTMABlockShape-clamped box + device multi-copy (see
+  // blockDimsValid).
+  if (!blockDimsValid(decomp))
     return false;
   return true;
 }
