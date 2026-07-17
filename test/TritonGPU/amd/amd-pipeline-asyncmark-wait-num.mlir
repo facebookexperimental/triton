@@ -58,3 +58,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %result : tensor<16x32xf32, #mma>
   }
 }
+
+// -----
+
+// Complement of the cases above, which check that updateWaits *derives* the
+// count for pipeliner-created, token-carrying waits. A *tokenless* async_wait
+// has an author-supplied num and no token graph to analyze, so leave it as-is.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tokenless_async_wait_preserved
+  // CHECK: ttg.async_wait {num = 5 : i32}
+  tt.func @tokenless_async_wait_preserved() {
+    ttg.async_wait {num = 5 : i32}
+    tt.return
+  }
+}
