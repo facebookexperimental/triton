@@ -6713,9 +6713,8 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
 /// Dense cluster id (rank of distinct cycle, stage 0) per DDG node. Returns an
 /// ordered map (keyed by node idx) so iteration is deterministic across builds
 /// — DenseMap iteration order is not, and this feeds emitted schedule dumps.
-static std::map<unsigned, int>
-listClusters(const ttg::DataDependenceGraph &ddg,
-             const ttg::ListScheduleResult &r) {
+static std::map<unsigned, int> listClusters(const ttg::DataDependenceGraph &ddg,
+                                            const ttg::ListScheduleResult &r) {
   SmallVector<int> cycles;
   for (auto &[idx, c] : r.nodeToCycle)
     cycles.push_back(c);

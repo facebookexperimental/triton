@@ -30,21 +30,37 @@ BUF_DEPTH = tl.constexpr(2)
 
 @triton.jit
 def _pa_decode_partition_kernel(
-    Q,             # [num_tokens, num_q_heads, HEAD_DIM]
-    Kc,            # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
-    Vc,            # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
-    BlockTables,   # [num_seqs, max_pages]
-    CtxLens,       # [num_seqs]
-    Mid,           # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2, HEAD_DIM] (fp32)
-    Lse,           # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2] (fp32)
+    Q,  # [num_tokens, num_q_heads, HEAD_DIM]
+    Kc,  # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
+    Vc,  # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
+    BlockTables,  # [num_seqs, max_pages]
+    CtxLens,  # [num_seqs]
+    Mid,  # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2, HEAD_DIM] (fp32)
+    Lse,  # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2] (fp32)
     sm_scale,
-    num_splits,    # runtime int (== grid dim 2)
-    stride_q_t, stride_q_h, stride_q_d,
-    stride_kc_b, stride_kc_h, stride_kc_p, stride_kc_d,
-    stride_vc_b, stride_vc_h, stride_vc_p, stride_vc_d,
-    stride_bt_s, stride_bt_p,
-    stride_mid_s, stride_mid_h, stride_mid_k, stride_mid_m, stride_mid_d,
-    stride_lse_s, stride_lse_h, stride_lse_k, stride_lse_m,
+    num_splits,  # runtime int (== grid dim 2)
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_kc_b,
+    stride_kc_h,
+    stride_kc_p,
+    stride_kc_d,
+    stride_vc_b,
+    stride_vc_h,
+    stride_vc_p,
+    stride_vc_d,
+    stride_bt_s,
+    stride_bt_p,
+    stride_mid_s,
+    stride_mid_h,
+    stride_mid_k,
+    stride_mid_m,
+    stride_mid_d,
+    stride_lse_s,
+    stride_lse_h,
+    stride_lse_k,
+    stride_lse_m,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
@@ -70,20 +86,16 @@ def _pa_decode_partition_kernel(
     offs_m = tl.arange(0, M_POW2)
 
     # Load Q for this (seq, kv_head): [QLEN_POW2, GROUP_POW2, HEAD_DIM].
-    q_head = kv_head * QUERY_GROUP_SIZE + offs_g          # [GROUP_POW2]
-    q_tok = seq * QLEN + offs_ql                          # [QLEN_POW2]
-    q_ptrs = (
-        Q
-        + q_tok[:, None, None] * stride_q_t
-        + q_head[None, :, None] * stride_q_h
-        + offs_d[None, None, :] * stride_q_d
-    )
+    q_head = kv_head * QUERY_GROUP_SIZE + offs_g  # [GROUP_POW2]
+    q_tok = seq * QLEN + offs_ql  # [QLEN_POW2]
+    q_ptrs = (Q + q_tok[:, None, None] * stride_q_t + q_head[None, :, None] * stride_q_h +
+              offs_d[None, None, :] * stride_q_d)
     q_mask = (offs_ql[:, None, None] < QLEN) & (offs_g[None, :, None] < QUERY_GROUP_SIZE)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
     q = tl.reshape(q, (M_POW2, HEAD_DIM))
 
     QK_SCALE = sm_scale * 1.44269504089  # 1/log(2), for exp2-based softmax
-    m_qpos = offs_m // GROUP_POW2                          # query position per row
+    m_qpos = offs_m // GROUP_POW2  # query position per row
 
     m_i = tl.full([M_POW2], float("-inf"), tl.float32)
     l_i = tl.zeros([M_POW2], tl.float32)
@@ -95,24 +107,20 @@ def _pa_decode_partition_kernel(
     for pidx in tl.range(start_page, end_page):
         slot = (pidx - start_page) % BUF_DEPTH
         physical = tl.load(BlockTables + seq * stride_bt_s + pidx * stride_bt_p)
-        k_ptrs = (
-            Kc + physical * stride_kc_b + kv_head * stride_kc_h
-            + offs_p[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d
-        )
-        v_ptrs = (
-            Vc + physical * stride_vc_b + kv_head * stride_vc_h
-            + offs_p[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d
-        )
+        k_ptrs = (Kc + physical * stride_kc_b + kv_head * stride_kc_h + offs_p[:, None] * stride_kc_p +
+                  offs_d[None, :] * stride_kc_d)
+        v_ptrs = (Vc + physical * stride_vc_b + kv_head * stride_vc_h + offs_p[:, None] * stride_vc_p +
+                  offs_d[None, :] * stride_vc_d)
         tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_buf, slot))
         tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_buf, slot))
         tlx.async_load_commit_group([tok_k, tok_v])
         tlx.async_load_wait_group(0)
 
         kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)))  # [HEAD_DIM, PAGE_SIZE]
-        v = tlx.local_load(tlx.local_view(v_buf, slot))                    # [PAGE_SIZE, HEAD_DIM]
+        v = tlx.local_load(tlx.local_view(v_buf, slot))  # [PAGE_SIZE, HEAD_DIM]
 
-        qk = tl.dot(q, kt)                                                 # [M_POW2, PAGE_SIZE] fp32
-        kt_abs = pidx * PAGE_SIZE + offs_p                                 # absolute key index
+        qk = tl.dot(q, kt)  # [M_POW2, PAGE_SIZE] fp32
+        kt_abs = pidx * PAGE_SIZE + offs_p  # absolute key index
         vis = kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])
         qk = tl.where(vis, qk * QK_SCALE, float("-inf"))
 
@@ -130,10 +138,8 @@ def _pa_decode_partition_kernel(
     o_part = tl.where(has_kv[:, None], acc / tl.where(has_kv[:, None], l_i[:, None], 1.0), 0.0)
     lse_part = tl.where(has_kv, m_i + tl.math.log2(tl.where(has_kv, l_i, 1.0)), float("-inf"))
 
-    mid_ptrs = (
-        Mid + seq * stride_mid_s + kv_head * stride_mid_h + split * stride_mid_k
-        + offs_m[:, None] * stride_mid_m + offs_d[None, :] * stride_mid_d
-    )
+    mid_ptrs = (Mid + seq * stride_mid_s + kv_head * stride_mid_h + split * stride_mid_k +
+                offs_m[:, None] * stride_mid_m + offs_d[None, :] * stride_mid_d)
     tl.store(mid_ptrs, o_part)
     lse_ptrs = Lse + seq * stride_lse_s + kv_head * stride_lse_h + split * stride_lse_k + offs_m * stride_lse_m
     tl.store(lse_ptrs, lse_part)
@@ -141,21 +147,30 @@ def _pa_decode_partition_kernel(
 
 @triton.jit
 def _pa_decode_reduce_kernel(
-    Out,           # [num_tokens, num_q_heads, HEAD_DIM]
-    Mid,           # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2, HEAD_DIM]
-    Lse,           # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2]
+    Out,  # [num_tokens, num_q_heads, HEAD_DIM]
+    Mid,  # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2, HEAD_DIM]
+    Lse,  # [num_seqs, num_kv_heads, NUM_SPLITS, M_POW2]
     num_splits,
-    stride_o_t, stride_o_h, stride_o_d,
-    stride_mid_s, stride_mid_h, stride_mid_k, stride_mid_m, stride_mid_d,
-    stride_lse_s, stride_lse_h, stride_lse_k, stride_lse_m,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_mid_s,
+    stride_mid_h,
+    stride_mid_k,
+    stride_mid_m,
+    stride_mid_d,
+    stride_lse_s,
+    stride_lse_h,
+    stride_lse_k,
+    stride_lse_m,
     HEAD_DIM: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
     GROUP_POW2: tl.constexpr,
     QLEN: tl.constexpr,
     SPLITS_POW2: tl.constexpr,
 ):
-    gt = tl.program_id(0)       # global token = seq * QLEN + qpos
-    qh = tl.program_id(1)       # query head
+    gt = tl.program_id(0)  # global token = seq * QLEN + qpos
+    qh = tl.program_id(1)  # query head
 
     seq = gt // QLEN
     qpos = gt % QLEN
@@ -169,18 +184,20 @@ def _pa_decode_reduce_kernel(
 
     lse = tl.load(
         Lse + seq * stride_lse_s + kv_head * stride_lse_h + offs_k * stride_lse_k + m_row * stride_lse_m,
-        mask=kmask, other=float("-inf"),
+        mask=kmask,
+        other=float("-inf"),
     )
     gmax = tl.max(lse, 0)
     gmax_safe = tl.where(gmax == float("-inf"), 0.0, gmax)
-    w = tl.where(kmask, tl.math.exp2(lse - gmax_safe), 0.0)      # [SPLITS_POW2]
+    w = tl.where(kmask, tl.math.exp2(lse - gmax_safe), 0.0)  # [SPLITS_POW2]
     wsum = tl.sum(w, 0)
 
     o = tl.load(
-        Mid + seq * stride_mid_s + kv_head * stride_mid_h
-        + offs_k[:, None] * stride_mid_k + m_row * stride_mid_m + offs_d[None, :] * stride_mid_d,
-        mask=kmask[:, None], other=0.0,
-    )                                                            # [SPLITS_POW2, HEAD_DIM]
+        Mid + seq * stride_mid_s + kv_head * stride_mid_h + offs_k[:, None] * stride_mid_k + m_row * stride_mid_m +
+        offs_d[None, :] * stride_mid_d,
+        mask=kmask[:, None],
+        other=0.0,
+    )  # [SPLITS_POW2, HEAD_DIM]
     out = tl.sum(o * w[:, None], 0) / tl.where(wsum > 0, wsum, 1.0)
 
     tl.store(Out + gt * stride_o_t + qh * stride_o_h + offs_d * stride_o_d, out.to(Out.dtype.element_ty))
@@ -205,10 +222,10 @@ def get_num_splits(num_seqs, num_kv_heads, max_ctx_len=None, page_size=None, par
 
 
 def pa_decode_tlx(
-    output,        # [num_tokens, num_q_heads, HEAD_DIM]
-    query,         # [num_tokens, num_q_heads, HEAD_DIM]
-    key_cache,     # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
-    value_cache,   # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
+    output,  # [num_tokens, num_q_heads, HEAD_DIM]
+    query,  # [num_tokens, num_q_heads, HEAD_DIM]
+    key_cache,  # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
+    value_cache,  # [num_blocks, num_kv_heads, PAGE_SIZE, HEAD_DIM]
     context_lens,  # [num_seqs] int32
     block_tables,  # [num_seqs, max_pages] int32
     sm_scale,
@@ -237,29 +254,71 @@ def pa_decode_tlx(
 
     grid_p = (num_seqs, num_kv_heads, num_splits)
     _pa_decode_partition_kernel[grid_p](
-        query, key_cache, value_cache, block_tables, context_lens, mid, lse,
-        sm_scale, num_splits,
-        query.stride(0), query.stride(1), query.stride(2),
-        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3),
-        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3),
-        block_tables.stride(0), block_tables.stride(1),
-        mid.stride(0), mid.stride(1), mid.stride(2), mid.stride(3), mid.stride(4),
-        lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
-        HEAD_DIM=head_dim, PAGE_SIZE=page_size,
-        QUERY_GROUP_SIZE=query_group_size, GROUP_POW2=group_pow2,
-        QLEN=query_length, QLEN_POW2=qlen_pow2, M_POW2=m_pow2,
-        num_warps=num_warps, waves_per_eu=waves_per_eu,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lens,
+        mid,
+        lse,
+        sm_scale,
+        num_splits,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        value_cache.stride(3),
+        block_tables.stride(0),
+        block_tables.stride(1),
+        mid.stride(0),
+        mid.stride(1),
+        mid.stride(2),
+        mid.stride(3),
+        mid.stride(4),
+        lse.stride(0),
+        lse.stride(1),
+        lse.stride(2),
+        lse.stride(3),
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=page_size,
+        QUERY_GROUP_SIZE=query_group_size,
+        GROUP_POW2=group_pow2,
+        QLEN=query_length,
+        QLEN_POW2=qlen_pow2,
+        M_POW2=m_pow2,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
 
     grid_r = (num_tokens, num_q_heads)
     _pa_decode_reduce_kernel[grid_r](
-        output, mid, lse, num_splits,
-        output.stride(0), output.stride(1), output.stride(2),
-        mid.stride(0), mid.stride(1), mid.stride(2), mid.stride(3), mid.stride(4),
-        lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3),
+        output,
+        mid,
+        lse,
+        num_splits,
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        mid.stride(0),
+        mid.stride(1),
+        mid.stride(2),
+        mid.stride(3),
+        mid.stride(4),
+        lse.stride(0),
+        lse.stride(1),
+        lse.stride(2),
+        lse.stride(3),
         HEAD_DIM=head_dim,
-        QUERY_GROUP_SIZE=query_group_size, GROUP_POW2=group_pow2,
-        QLEN=query_length, SPLITS_POW2=splits_pow2,
+        QUERY_GROUP_SIZE=query_group_size,
+        GROUP_POW2=group_pow2,
+        QLEN=query_length,
+        SPLITS_POW2=splits_pow2,
     )
     return output
 
@@ -267,9 +326,8 @@ def pa_decode_tlx(
 # Test/benchmark helpers: paged inputs + a dense fp32 reference, consumed by the
 # correctness suite (test_correctness.py) and the perf harness
 # (test_amd_pa_decode_perf.py).
-def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size,
-                 query_length=1, dtype=torch.bfloat16, device="cuda", seed=0,
-                 pool_pages=None):
+def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, query_length=1,
+                 dtype=torch.bfloat16, device="cuda", seed=0, pool_pages=None):
     """Build paged decode inputs. If ``pool_pages`` is set, physical pages are
     drawn from a shared pool of that size (bounds memory for large sweeps); the
     dense reference uses the same ``block_tables`` so correctness is unaffected.
@@ -296,8 +354,8 @@ def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_s
     return query, key_cache, value_cache, context_lens, block_tables
 
 
-def ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale,
-               num_q_heads, num_kv_heads, query_length):
+def ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads, num_kv_heads,
+               query_length):
     """Dense fp32 reference: gather full K/V from the page table, causal over qlen."""
     head_dim = query.shape[-1]
     page_size = key_cache.shape[2]
@@ -309,18 +367,18 @@ def ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_sca
         ctx = int(context_lens[s].item())
         npag = (ctx + page_size - 1) // page_size
         phys = block_tables[s, :npag]
-        k = key_cache[phys].to(torch.float32)      # [npag, kvh, page, d]
+        k = key_cache[phys].to(torch.float32)  # [npag, kvh, page, d]
         v = value_cache[phys].to(torch.float32)
         k = k.permute(1, 0, 2, 3).reshape(num_kv_heads, npag * page_size, head_dim)[:, :ctx]
         v = v.permute(1, 0, 2, 3).reshape(num_kv_heads, npag * page_size, head_dim)[:, :ctx]
         for qpos in range(query_length):
             gt = s * query_length + qpos
-            limit = ctx - query_length + qpos       # inclusive last visible key index
+            limit = ctx - query_length + qpos  # inclusive last visible key index
             for qh in range(num_q_heads):
                 kvh = qh // group
-                q = query[gt, qh].to(torch.float32)         # [d]
+                q = query[gt, qh].to(torch.float32)  # [d]
                 scores = (q[None, :] * k[kvh]).sum(-1) * sm_scale  # [ctx]
-                scores = scores[: limit + 1]
+                scores = scores[:limit + 1]
                 p = torch.softmax(scores, dim=0)
-                out[gt, qh] = (p[:, None] * v[kvh, : limit + 1]).sum(0)
+                out[gt, qh] = (p[:, None] * v[kvh, :limit + 1]).sum(0)
     return out

@@ -11,6 +11,12 @@ on:
 env:
   MAX_JOBS: 16
   TORCH_NIGHTLY_URL: https://download-r2.pytorch.org/whl/nightly/rocm7.2/torch-2.13.0.dev20260513%2Brocm7.2-cp312-cp312-manylinux_2_28_x86_64.whl
+  # torchTLX (TLX-as-Inductor-backend) is exercised by the dedicated torchtlx.yml
+  # workflow against a fresh nightly torch. Keep it off the tritonbench job here:
+  # only "allow"/"force" enable it, so an empty value forces it off regardless of
+  # any environment default, and tritonbench runs against the pinned rocm nightly
+  # wheel above (which may predate the config.triton.tlx_mode knob).
+  TORCHINDUCTOR_TLX_MODE: ""
 
 jobs:
   mi350-meta-triton-test:
@@ -110,6 +116,10 @@ jobs:
           set -eux
           . "${SETUP_SCRIPT}"
           uv pip install pytest
+          # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
+          # and structurally excludes the autoWS suites (test_autows_*.py,
+          # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
+          # which are never collected here and are tested separately.
           pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests

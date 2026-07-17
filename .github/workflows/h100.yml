@@ -120,6 +120,10 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
+          # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
+          # and structurally excludes the autoWS suites (test_autows_*.py,
+          # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
+          # which are never collected here and are tested separately.
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests
