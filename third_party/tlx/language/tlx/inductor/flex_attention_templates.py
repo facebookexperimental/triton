@@ -56,9 +56,10 @@ def append_tlx_flex_attention_choice(
       - "allow":   add TLX candidates alongside the standard template.
       - "force":   drop the standard choices and use only TLX.
 
-    Two warp-specialization shapes are offered as autotuning candidates: a
-    2-MMA-group variant (one per base config) and a single 1-MMA-group variant
-    (fewer barriers, 8 warps).
+    One 2-MMA-group warp-specialization candidate is offered per base config.
+    The kernel body hard-codes NUM_MMA_GROUPS=2 and splits BLOCK_M across the two
+    groups, so only base configs whose per-group tile meets the tcgen05 MMA
+    minimum (M >= 64, i.e. BLOCK_M >= 128) yield a candidate.
 
     ``input_nodes`` is the standard flex-attention forward input list:
     (query, key, value, logsumexp, max_scores, kv_num_blocks, kv_indices,
@@ -110,23 +111,20 @@ def append_tlx_flex_attention_choice(
         )
 
     # 4-task warp specialization, 2 MMA groups: one candidate per base config.
+    # The kernel body hard-codes NUM_MMA_GROUPS=2 and splits BLOCK_M across the
+    # two groups (BLOCK_M_SPLIT = BLOCK_M // 2). The Blackwell tcgen05 MMA
+    # requires M >= 64, so skip base configs whose per-group tile is smaller.
+    NUM_MMA_GROUPS = 2
+    MIN_MMA_M = 64
     for conf in configs:
+        if conf.block_m // NUM_MMA_GROUPS < MIN_MMA_M:
+            continue
         opts = tlx_options()
         opts["num_warps"] = conf.num_warps
         opts["num_stages"] = conf.num_stages
         opts["BLOCK_M"] = conf.block_m
         opts["BLOCK_N"] = conf.block_n
         append(opts)
-
-    # 4-task warp specialization, 1 MMA group (fewer barriers): 8 warps.
-    last_conf = configs[-1]
-    opts = tlx_options()
-    opts["num_warps"] = 8
-    opts["num_stages"] = 1
-    opts["NUM_MMA_GROUPS"] = 1
-    opts["BLOCK_M"] = last_conf.block_m
-    opts["BLOCK_N"] = last_conf.block_n
-    append(opts)
 
 
 def _append_amd_flex_choices(
