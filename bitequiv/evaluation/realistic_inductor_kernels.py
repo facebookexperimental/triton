@@ -2132,7 +2132,34 @@ REALISTIC_KERNELS = (
 
 
 # #########################################################################################
-# ## RUNNABLE M2 HARNESS for GROUP 1 (the six ordered add-reductions A, C, D, E, G, H).   ##
+# ## GROUP 1b — NON-CONTIGUOUS / STRIDED-AXIS REDUCTIONS (the M2 firing targets).         ##
+# #########################################################################################
+# A reduction over a NON-innermost memory axis -- dbias = grad.sum(dim=0), per-channel stats,
+# a matmul-epilogue column sum. Inductor lowers these to a persistent-reduction tile
+# [XBLOCK(kept), R0_BLOCK(reduce)] whose reduce axis is STRIDED in memory (stride = xnumel)
+# while the kept axis is contiguous. Coalescing puts the lanes on the kept axis, so the reduce
+# axis is split across warps and under-parallelized within each warp -- exactly the layout M2
+# rewrites. This is the realistic-Inductor analogue of eval_kernels' sum_2d_col; the body is
+# faithful to the generated `triton_per_fused_sum` (load `x0 + xnumel*r0`, tl.sum(_, 1)),
+# confirmed by round-tripping torch.compile on grad.sum(0) / (A@B).sum(0).
+@triton.jit
+def RED_colsum_dim0(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK: tl.constexpr, R0_BLOCK: tl.constexpr,
+                    ORD: tl.constexpr):
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = xindex < xnumel
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_mask = r0_index < r0_numel
+    x0 = xindex
+    r0_1 = r0_index
+    tmp0 = tl.load(in_ptr0 + (x0 + xnumel * r0_1), xmask & r0_mask, other=0.0)  # kept contiguous, reduce strided
+    tmp3 = tl.sum(tmp0, 1, reduction_ordering=ORD)[:, None].to(tl.float32)
+    tl.store(out_ptr0 + x0, tmp3, xmask)
+
+
+# #########################################################################################
+# ## RUNNABLE M2 HARNESS for GROUP 1 (the six ordered add-reductions A, C, D, E, G, H)     ##
+# ## plus GROUP 1b (the strided-axis reductions I, J that M2 actually fires on).           ##
 # #########################################################################################
 # The GROUP 1 kernels above are made runnable via their ``ORD`` param (B_layernorm_welford_gather
 # and F_cumsum_scan are OUT of M2 scope — welford's combine and tt.scan are not ordered add-
@@ -2143,11 +2170,13 @@ REALISTIC_KERNELS = (
 # merged in — the runnable inner_tree transcriptions were a duplicate of these six GROUP 1 bodies.)
 #
 # Run:  PYTHONPATH=. python -m bitequiv.evaluation.realistic_inductor_kernels [kernels] [num_warps]
-# Findings (H100): all six compile inner_tree + are bit-identical under M2; perf ~1.00x with base
-# ~= ceiling — these are CONTIGUOUS-axis reductions the compiler already parallelizes, so there is
-# no ordered-vs-unordered gap for M2 to close (it correctly inserts nothing). M2's wins need a
-# non-contiguous / outer-axis reduce (see eval_kernels GROUP 2). The only fixes this needed were
-# harness-level (the ORD param + passing xnumel / r0_numel at launch), not pass changes.
+# Findings (H100): the six GROUP 1 kernels compile inner_tree + are bit-identical under M2 but run
+# ~1.00x with base ~= ceiling — they are CONTIGUOUS-axis (dim=-1) reductions the compiler already
+# parallelizes, so there is no ordered-vs-unordered gap for M2 to close (it correctly inserts
+# nothing). GROUP 1b (I_bias_grad_dim0, J_epilogue_colsum_dim0) are the STRIDED-axis analogues
+# Inductor emits for dim-0 / matmul-epilogue reductions: M2 fires on them (adds the operand
+# relayout) and closes most of the gap, bit-identically -- the realistic counterpart to
+# eval_kernels' sum_2d_col. So Suite 2 now exercises both M2 no-op and M2-win paths.
 _DEV = "cuda"
 _ORD = {"inner_tree": tl.ReductionOrdering.INNER_TREE, "unordered": tl.ReductionOrdering.UNORDERED}
 _SUM_LOGSPACE = (-6, 6)  # wide dynamic range: the reduction ORDER decides the result bits.
@@ -2219,8 +2248,27 @@ def _spec_H(nw):
     return H_mean_permute, [ins[0], outs[0]], outs, [X, 256], dict(XBLOCK=8), X // 8
 
 
+# GROUP 1b — strided-axis reductions (M2 firing). Kept axis (xnumel) is contiguous, reduce axis
+# (r0_numel) is strided by xnumel; XBLOCK is the kept tile so the axis is split across warps.
+def _spec_I(nw):
+    # dbias = grad.sum(dim=0): grad [r0=512, x=256] -> dbias[256]. Kept tiled 32-wide (like sum_2d_col).
+    N, M = 256, 512
+    ins = [_adv_nd(N * M, 1)]
+    outs = [torch.empty(N, device=_DEV)]
+    return RED_colsum_dim0, [ins[0], outs[0]], outs, [N, M], dict(XBLOCK=32, R0_BLOCK=512), (N + 31) // 32
+
+
+def _spec_J(nw):
+    # matmul-epilogue / per-channel column sum: [r0=512, x=64] -> [64] (narrow kept, single tile).
+    N, M = 64, 512
+    ins = [_adv_nd(N * M, 1)]
+    outs = [torch.empty(N, device=_DEV)]
+    return RED_colsum_dim0, [ins[0], outs[0]], outs, [N, M], dict(XBLOCK=64, R0_BLOCK=512), 1
+
+
 SPECS = {"A_rms_norm_fwd": _spec_A, "C_rms_norm_bwd_2reduce": _spec_C, "D_masked_global_sum": _spec_D,
-         "E_triu_masked_rowsum": _spec_E, "G_plain_sum_looped": _spec_G, "H_mean_permute": _spec_H}
+         "E_triu_masked_rowsum": _spec_E, "G_plain_sum_looped": _spec_G, "H_mean_permute": _spec_H,
+         "I_bias_grad_dim0": _spec_I, "J_epilogue_colsum_dim0": _spec_J}
 
 
 def _clear():
