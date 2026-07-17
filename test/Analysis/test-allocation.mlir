@@ -1133,4 +1133,41 @@ tt.func @barriers_no_warpspec() {
   ttng.wait_barrier %1, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
   tt.return
 }
+
+// A barrier before a warp_specialize op, then regular (non-barrier) SMEM after
+// it, then a second barrier before the return. Every InitBarrierOp extends its
+// buffer's liveness to the whole function, so all three buffers are disjoint:
+//   - the regular buffer (%1) cannot reuse the first barrier's slot, and
+//   - the second barrier (%2 @ offset 32) does NOT reuse the first barrier's
+//     SMEM (%0 @ offset 16)
+// Without the extension all three have non-overlapping liveness and pack into
+// offset 0 (total 17); with it they are disjoint (total 41).
+// expected-remark @below {{barrier_then_smem_with_warpspec}}
+// expected-remark @below {{size = 41}}
+// expected-remark @below {{scratch offset = 40, size = 1}}
+tt.func @barrier_then_smem_with_warpspec() {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 16, size = 8}}
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %0, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %0, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttg.warp_specialize()
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    ttg.warp_return
+  } : () -> ()
+  // Regular SMEM usage after the WS op (not a barrier).
+  // expected-remark @below {{offset = 0, size = 16}}
+  %1 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
+  "use"(%1) : (!ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) -> ()
+  // A second mbarrier before the return: its slot (offset 32) must be distinct
+  // from the first barrier's (offset 16) -- the first mbar's SMEM is not reused.
+  // expected-remark @below {{offset = 32, size = 8}}
+  %2 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %2, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  tt.return
+}
 }
