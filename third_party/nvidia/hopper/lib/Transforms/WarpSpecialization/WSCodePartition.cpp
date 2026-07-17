@@ -5191,7 +5191,7 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 // zeros the accumulator. Removing the store early (before buffer
 // allocation) prevents the autoWS compiler from creating a
 // cross-partition channel for it.
-void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
+void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
   auto isConstZeroTensor = [](Value v) -> bool {
     auto constOp = v.getDefiningOp<arith::ConstantOp>();
     if (!constOp)
@@ -5311,7 +5311,7 @@ void removeRedundantTmemZeroStores(triton::FuncOp &funcOp) {
   }
 }
 
-void doBufferAllocation(triton::FuncOp &funcOp) {
+void doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
   swapTransposedLocalAllocs(funcOp);
@@ -5718,7 +5718,7 @@ void mergeStagingReuseIntoHost(triton::FuncOp funcOp,
   }
 }
 
-void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers) {
+void doCodePartitionPost(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectPostChannels(channelsOrigin, funcOp);

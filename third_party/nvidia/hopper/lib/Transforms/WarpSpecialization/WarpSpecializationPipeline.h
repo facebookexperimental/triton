@@ -15,14 +15,14 @@
 // declaration that disagrees with its definition (e.g. on return type) is a
 // compile error rather than a silently mismatched forward declaration.
 //
-// NOTE: this header intentionally does NOT change any signature — it only
-// centralizes the existing declarations. Signature normalization (uniform
-// return type / by-value FuncOp) is tracked separately (WS-03).
+// Signatures are normalized (WS-03): every step takes `triton::FuncOp` by value
+// and reports failure via LogicalResult (or returns void when it cannot fail).
+// There is no int/-1 sentinel.
 
 namespace mlir {
 
-// Assigns/normalizes async_task_id across the function. Returns -1 on failure.
-int doTaskIdPropagate(triton::FuncOp &funcOp);
+// Assigns/normalizes async_task_id across the function.
+LogicalResult doTaskIdPropagate(triton::FuncOp funcOp);
 
 // Cross-partition run-once atomic support. Returns failure() when an atomic
 // forces a graceful warp-specialization reject (kernel already de-specialized).
@@ -33,26 +33,26 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
 // algorithm knobs are exercised only by the -nvgpu-test-ws-memory-planner test
 // pass; the production pipeline uses the defaults declared here. Defaults live
 // on this declaration only (not on the definition) so there is one source.
-LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
+LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               StringRef readDecisionFile = "",
                               StringRef writeDecisionFile = "",
                               int smemAllocAlgo = 1, unsigned smemBudget = 0,
                               bool smemCircularReuse = false);
 
-void doBufferAllocation(triton::FuncOp &funcOp);
-void doHoistLoopInvariantTMEMStore(triton::FuncOp &funcOp);
-void removeRedundantTmemZeroStores(triton::FuncOp &funcOp);
-void doCodePartitionPost(triton::FuncOp &funcOp, unsigned numBuffers);
-void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups);
-void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
+void doBufferAllocation(triton::FuncOp funcOp);
+void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
+void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
+void doCodePartitionPost(triton::FuncOp funcOp, unsigned numBuffers);
+void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups);
+void doPingPongPrep(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages);
-void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
+void doPingPongSync(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability);
-void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp);
-void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp);
+void doAnnotateTMAStoreWaits(triton::FuncOp funcOp);
+void doValidateTMAStoreAnnotations(triton::FuncOp funcOp);
 // Best-effort reordering of annotated TMA store waits; never fails (see the
 // definition in WSTMAStoreLowering.cpp).
-void doTMAStoreWaitReorder(triton::FuncOp &funcOp);
+void doTMAStoreWaitReorder(triton::FuncOp funcOp);
 
 } // namespace mlir
 
