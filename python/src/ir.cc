@@ -1,5 +1,6 @@
 #include "ir.h"
 
+#include <algorithm>
 #include <optional>
 #include <pybind11/cast.h>
 #include <pybind11/functional.h>
@@ -317,6 +318,16 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
     // heuristic, so read it via getTMASwizzleMode (parity with
     // getTensorDescMetadata). -1 means "derive host-side from box geometry"
     // (non-NVMMAShared / rank<2).
+    //
+    // block_shape is also the ENCODED box (launch.h box_dim). The full tile can
+    // exceed the 256-element cuTensorMapEncodeTiled cap (e.g. BLOCK=512), so we
+    // clamp it to the SAME box getTMABlockShape produces for the device
+    // lowering (each dim <= 256; contig dim = swizzle element width). The
+    // descriptor_load /store keeps the full-block SMEM result and the device
+    // AsyncTMACopy lowering multi-copies this clamped box to fill it -- single
+    // source of truth with the device path (both call getTMABlockShape on the
+    // same encoding). A trailing min(256) floor covers the 1D / non-NVMMAShared
+    // / no-descriptor fallbacks (idempotent for the getTMABlockShape output).
     std::vector<int> blockShape = getIArr(d, "block_shape");
     int swizzle = -1;
     if (kernelFunc && descArgIdx >= 0 &&
@@ -331,9 +342,16 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
           auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
           if (succeeded(sw))
             swizzle = *sw;
+          auto box = ttng::getTMABlockShape(blockTy, /*packedSize=*/false,
+                                            ttg::TMAMode::Tiled);
+          blockShape.assign(box.begin(), box.end());
         }
       }
     }
+    // Floor every box dim at the 256-element hardware cap (idempotent after the
+    // getTMABlockShape clamp above; handles 1D / non-NVMMAShared descriptors).
+    for (auto &v : blockShape)
+      v = std::min(v, 256);
     r["block_shape"] = blockShape;
     r["swizzle"] = swizzle;
     r["elem_type"] = getReqI(d, "elem_type");
