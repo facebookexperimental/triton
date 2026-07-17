@@ -19,7 +19,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // COUNT-NOT: ttg.local_alloc
   // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 300 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = 3 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   tt.func @circular_model_descriptor_load_mma(
       %desc_k: !tt.tensordesc<tensor<128x128xf16, #shared>>,
@@ -82,7 +82,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // COUNT-NOT: ttg.local_alloc
   // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 301 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = 3 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   tt.func @circular_tutorial_1_1_to_2_2(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
@@ -140,7 +140,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // COUNT-NOT: ttg.local_alloc
   // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 302 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = 3 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   tt.func @circular_tutorial_1_2_to_3_4(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
@@ -199,7 +199,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // COUNT-NOT: ttg.local_alloc
   // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 303 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = 3 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   tt.func @circular_tutorial_1_1_to_2_3(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32
@@ -257,7 +257,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // COUNT-NOT: ttg.local_alloc
   // COUNT-NOT: nvws.semaphore.create
   // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 304 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+  // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = 3 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
   tt.func @circular_tutorial_1_2_to_3_3(%lb: i32, %ub: i32, %step: i32) {
     %c0 = arith.constant 0 : i32

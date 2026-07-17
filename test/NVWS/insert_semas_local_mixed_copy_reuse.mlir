@@ -21,7 +21,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK-NEXT: %[[ONE:.*]] = arith.constant 1 : i32
     // CHECK-NEXT: %[[SLOT1:.*]] = ttg.memdesc_index %[[RING1]][%[[ONE]]]
     // CHECK-NEXT: %[[VIEW1:.*]] = ttg.memdesc_reinterpret %[[SLOT1]] : {{.*}} -> !ttg.memdesc<1x128x64xf16
-    // CHECK-NEXT: %[[ENTRY:.*]] = nvws.semaphore.create %[[BASE]], %[[VIEW0]], %[[VIEW1]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: %[[ENTRY:.*]] = nvws.semaphore.create %[[BASE]], %[[VIEW0]], %[[VIEW1]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: %[[TO_R0:.*]] = nvws.semaphore.create %[[BASE]], %[[VIEW0]], %[[VIEW1]] {pending_count = 1 : i32}
     // CHECK-NEXT: %[[TO_W1:.*]] = nvws.semaphore.create %[[BASE]], %[[VIEW0]], %[[VIEW1]] {pending_count = 1 : i32}
     %slot1 = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 600 : i32, buffer.start = 1 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
@@ -62,7 +62,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // CHECK: %[[LARGE_BASE:.*]] = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 602 : i32} : () -> !ttg.memdesc<1x128x128xf16
     %large = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 602 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK-NEXT: %[[SMALL_VIEW:.*]] = ttg.memdesc_reinterpret %[[LARGE_BASE]] : {{.*}} -> !ttg.memdesc<1x64x64xf16
-    // CHECK-NEXT: %[[SMALL_ENTRY:.*]] = nvws.semaphore.create %[[LARGE_BASE]], %[[SMALL_VIEW]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: %[[SMALL_ENTRY:.*]] = nvws.semaphore.create %[[LARGE_BASE]], %[[SMALL_VIEW]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: %[[SMALL_FULL:.*]] = nvws.semaphore.create %[[LARGE_BASE]], %[[SMALL_VIEW]] {pending_count = 1 : i32}
     %small = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 602 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     %large_value = arith.constant dense<0.0> : tensor<128x128xf16, #blocked>

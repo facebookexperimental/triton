@@ -34,7 +34,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // V3 = {2}->{1} read handoff, V4 = {2}->{1} WAR handoff, V5 =
     // {1}->{0} corrected-value edge, V6 = the unified full semaphore
     // with pending_count = 2.
-    // EMIT: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // EMIT: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // EMIT: [[V3:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // EMIT: [[V4:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // EMIT: [[V5:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>

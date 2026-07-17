@@ -18,7 +18,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // LOWER: ttng.arrive_barrier
   tt.func @direct_descriptor_store_completion(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
     // SEMA: [[V1:%.*]] = ttg.local_alloc {buffer.id = 600 : i32} : () -> !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
-    // SEMA: [[EMPTY:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32}
+    // SEMA: [[EMPTY:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32}
     // SEMA-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32}
     %alloc = ttg.local_alloc {buffer.id = 600 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // SEMA: [[ENTRY:%.*]] = nvws.semaphore.acquire [[EMPTY]]
@@ -65,7 +65,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // These exact-alias members model two consecutive output slices in one
     // depth-2 physical staging allocation.
     // SEMA: [[BASE:%.*]] = ttg.local_alloc
-    // SEMA: [[ENTRY:%.*]] = nvws.semaphore.create [[BASE]], [[BASE]] released = -1
+    // SEMA: [[ENTRY:%.*]] = nvws.semaphore.create [[BASE]], [[BASE]] released = 3
     // SEMA-NEXT: [[COPY_READY:%.*]] = nvws.semaphore.create [[BASE]], [[BASE]]
     // SEMA-NEXT: [[M1_READY:%.*]] = nvws.semaphore.create [[BASE]], [[BASE]]
     // SEMA-NEXT: [[REDUCE_READY:%.*]] = nvws.semaphore.create [[BASE]], [[BASE]]
@@ -119,7 +119,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // SEMA-LABEL: @converted_descriptor_store_completion
   tt.func @converted_descriptor_store_completion(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %i: i32, %lb: i32, %ub: i32, %step: i32) {
     // SEMA: [[V1:%.*]] = ttg.local_alloc {buffer.id = 601 : i32} : () -> !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable>
-    // SEMA: [[EMPTY:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32}
+    // SEMA: [[EMPTY:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32}
     // SEMA-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32}
     %alloc = ttg.local_alloc {buffer.id = 601 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // SEMA: [[ENTRY:%.*]] = nvws.semaphore.acquire [[EMPTY]]

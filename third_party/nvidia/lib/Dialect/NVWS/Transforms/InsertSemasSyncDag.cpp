@@ -1926,113 +1926,6 @@ static int computeNumStages(nvidia_gpu::TMEMAllocOp allocOp,
   return 2;
 }
 
-// Return the first concrete access summarized by a path-invariant region.
-// Multiple child chains represent control-flow alternatives; reject those
-// here rather than choosing one branch and potentially misclassifying the
-// handoff. A loop's zero-trip path has no access and is conservatively allowed:
-// selecting one copy remains safe when the body does not execute.
-static Node *findLinearFirstAccess(Node *node) {
-  if (!node)
-    return nullptr;
-  if (node->kind == Node::Access)
-    return node;
-  if (node->children.size() != 1)
-    return nullptr;
-  for (Node *child = node->children.front(); child; child = child->next) {
-    if (Node *access = findLinearFirstAccess(child))
-      return access;
-    // A retained region touches this group but has no unique first access.
-    // Do not skip it and classify a later sibling as the handoff target.
-    if (child->isRegion())
-      return nullptr;
-  }
-  return nullptr;
-}
-
-// Prove the simple useAccumulator=false form produced for a persistent MMA:
-// either a literal false, or one loop-carried flag initialized to false and
-// unconditionally yielded as true after the first iteration.
-static bool startsWithFreshAccumulatorWrite(
-    nvidia_gpu::MMAv5OpInterface mmaOp) {
-  Value useAccumulator = mmaOp.useAccumulator();
-  if (matchPattern(useAccumulator, m_Zero()))
-    return true;
-
-  auto blockArg = dyn_cast<BlockArgument>(useAccumulator);
-  if (!blockArg)
-    return false;
-  auto loop = dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp());
-  if (!loop)
-    return false;
-  auto iterArgs = loop.getRegionIterArgs();
-  auto it = llvm::find(iterArgs, useAccumulator);
-  if (it == iterArgs.end())
-    return false;
-  unsigned index = std::distance(iterArgs.begin(), it);
-  if (!matchPattern(loop.getInitArgs()[index], m_Zero()))
-    return false;
-  auto yieldOp = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-  return matchPattern(yieldOp.getOperand(index), m_One());
-}
-
-static bool isDirectSingleMemberAccess(Node *node, Value expectedValue) {
-  return node && node->kind == Node::Access && node->touches.size() == 1 &&
-         node->touches.front().member == 0 &&
-         node->touches.front().effect == Effect::W &&
-         node->touches.front().accessValue == expectedValue &&
-         node->touches.front().alias.empty();
-}
-
-static bool hasSingleCopyCompatibleAccesses(const GroupDag &g,
-                                            Node *targetMma) {
-  bool sawTarget = false;
-  for (Node *access : g.nodesOfKind(Node::Access)) {
-    if (access->touches.size() != 1 || access->touches.front().member != 0 ||
-        !access->touches.front().alias.empty())
-      return false;
-    if (auto mmaOp = dyn_cast<nvidia_gpu::MMAv5OpInterface>(access->op)) {
-      if (access != targetMma)
-        return false;
-      sawTarget = true;
-      continue;
-    }
-    if (access->slotEffect && *access->slotEffect == Effect::W &&
-        !isa<nvidia_gpu::TMEMStoreOp>(access->op))
-      return false;
-  }
-  return sawTarget;
-}
-
-// Accumulator multibuffering is unsafe when a cross-owner TMEM store is handed
-// to an MMA that starts with useAccumulator=false. The store
-// releases its current copy, while AssignStagePhase advances the fresh MMA to
-// the next copy.  Select one physical copy before DirectBuilder constructs the
-// semaphore protocol so both operations use the same copy.
-static bool requiresSingleCopyForFreshMmaHandoff(const GroupDag &g,
-                                                 ArrayRef<EdgeRec> edges) {
-  if (!g.isTmem() || g.isCircular() || g.pieceTable.members.size() != 1)
-    return false;
-
-  return llvm::any_of(edges, [&](const EdgeRec &edge) {
-    if (sameOwner(edge.srcOwner, edge.dstOwner))
-      return false;
-    auto storeOp = edge.src && edge.src->kind == Node::Access
-                       ? dyn_cast<nvidia_gpu::TMEMStoreOp>(edge.src->op)
-                       : nvidia_gpu::TMEMStoreOp{};
-    if (!storeOp ||
-        !isDirectSingleMemberAccess(edge.src, storeOp.getDst()))
-      return false;
-    Node *target = findLinearFirstAccess(edge.dst);
-    if (!target)
-      return false;
-    auto mmaOp = dyn_cast<nvidia_gpu::MMAv5OpInterface>(target->op);
-    return mmaOp && sameOwner(target->owner, edge.dstOwner) &&
-           isDirectSingleMemberAccess(target, mmaOp.getAccumulator()) &&
-           startsWithFreshAccumulatorWrite(mmaOp) &&
-           hasSingleCopyCompatibleAccesses(g, target);
-  });
-}
-
 static bool compatibleMixedCopy(const Member &primary, const Member &member) {
   return primary.copies == 1 &&
          primary.type.getEncoding() == member.type.getEncoding() &&
@@ -2056,10 +1949,6 @@ computeBackingCopies(GroupDag &g, ArrayRef<EdgeRec> edges,
       continue;
     }
     int copy = copyAttr.getInt();
-    if (copy < 1) {
-      semaError(m.allocOp) << "planned buffer.copy must be positive";
-      return failure();
-    }
     if (plannedCopy && *plannedCopy != copy && g.isTmem()) {
       semaError(m.allocOp) << "allocs in one planned reuse group have "
                               "inconsistent buffer.copy values";
@@ -2097,17 +1986,6 @@ computeBackingCopies(GroupDag &g, ArrayRef<EdgeRec> edges,
       g.numCopies =
           std::min(g.numCopies, computeNumStages(allocOp, numTmemBlocks));
     }
-  }
-  if (g.numCopies > 1 && requiresSingleCopyForFreshMmaHandoff(g, edges)) {
-    g.numCopies = 1;
-    plannedCopy = 1;
-    Member &member = g.pieceTable.members.front();
-    member.copies = 1;
-    if (member.allocOp->hasAttr(kBufferCopyAttrName))
-      member.allocOp->setAttr(
-          kBufferCopyAttrName,
-          IntegerAttr::get(IntegerType::get(member.allocOp->getContext(), 32),
-                           1));
   }
   if (g.isTmem())
     for (const Member &m : g.pieceTable.members) {
@@ -2549,8 +2427,6 @@ static void assignAliasedEntryReleasedMasks(PhysicalSets &physical,
     return;
 
   int64_t depth = group.numSemaphoreCopies;
-  if (depth > 32)
-    return;
   uint32_t fullMask = nvws::getPhysicalStageMask(depth);
   for (auto indexed : llvm::enumerate(group.semas)) {
     SemaId sid = indexed.index();

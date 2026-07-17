@@ -37,13 +37,17 @@ The implementation separates those concerns into three models:
   - `ACCESS-DAG` describes memory and ownership.
   - `SYNC-DAG` derives the required synchronization edges and builds a
     complete, verified synchronization plan.
-  - `EMIT-IR` materializes that plan without changing it.
+  - `EMIT-IR` materializes that plan, then finalizes the stage protocol for
+    staged TMEM fresh-write handoffs from the emitted token graph.
 
 This distinction is the central design rule:
 
 > SYNC-DAG chooses every acquire, release, token producer, region result,
-> semaphore, schedule, and copy offset. EMIT-IR only renders those
-> choices.
+> semaphore, schedule, and synchronization path. EMIT-IR renders those
+> choices. Its narrow fresh-handoff finalizer may add stage offsets to an
+> immediate token-only relay and replace initial released-stage masks; it does
+> not change edges, token routing, ownership, placement, schedules, or buffer
+> depth.
 
 Before building those models, the shared managed-allocation locality
 validator requires every complete buffer group and its recognized
@@ -287,13 +291,21 @@ without choosing another token or changing the SYNC-DAG plan. Acquires and
 releases placed inside an `if` branch remain in that branch; EMIT-IR does not
 split the conditional or move them across its boundary.
 
+After ordinary rendering, EMIT-IR has one intentional finalization step for a
+non-circular, multi-buffered, single-member TMEM group with a fresh-write
+handoff. It uses AssignStagePhase's emitted-IR fresh-write classifier to replay
+the already-planned acquire/release structure through loops and branches. The
+result may add a stage offset to an immediate token-only relay and replace the
+semaphore creates' initial released-stage masks. The synchronization graph and
+all routing and placement decisions remain sealed.
+
 [↑ Back to contents](#contents)
 
 ## Step documents
 
 1. [ACCESS-DAG: accesses, owners, and boundaries](access-dag.md)
 2. [SYNC-DAG: edges, placement, semaphores, and schedule](sync-dag.md)
-3. [EMIT-IR: materializing the sealed plan](emit-ir.md)
+3. [EMIT-IR: materializing the plan and finalizing staged fresh handoffs](emit-ir.md)
 
 [↑ Back to contents](#contents)
 

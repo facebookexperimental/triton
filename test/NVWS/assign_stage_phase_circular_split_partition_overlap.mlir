@@ -12,8 +12,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   tt.func @reject_split_phase_cross_partition_slot_overlap(
       %lb: i32, %ub: i32, %step: i32) {
     %base = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 307 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<4x1xi32, #shared, #smem, mutable>
-    %sem = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
-    %driver = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
+    %sem = nvws.semaphore.create %base released = 15 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
+    %driver = nvws.semaphore.create %base released = 15 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %zd0 = arith.constant {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} 0 : i32
       %td0 = nvws.semaphore.acquire %driver[%zd0] {loop.cluster = 0 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 1>} : !nvws.semaphore<[!ttg.memdesc<4x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token

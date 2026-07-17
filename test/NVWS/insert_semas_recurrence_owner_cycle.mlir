@@ -34,7 +34,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // PIPE: ttg.local_store
   tt.func @legal_cross_partition_backpressure(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 422 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<4x128x64xf16, #shared, #smem, mutable>
-    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<4x128x64xf16, #shared, #smem, mutable>]>
+    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = 15 {pending_count = 1 : i32} : <[!ttg.memdesc<4x128x64xf16, #shared, #smem, mutable>]>
     // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<4x128x64xf16, #shared, #smem, mutable>]>
     // CHECK-NOT: iter_args
     %a = ttg.local_alloc {buffer.circular, buffer.copy = 4 : i32, buffer.id = 422 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>

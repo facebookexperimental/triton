@@ -11,7 +11,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %backing = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
     // CHECK: [[MBAR:%.*]] = ttg.local_alloc
     // CHECK: ttng.init_barrier
-    %empty = nvws.semaphore.create %backing released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    %empty = nvws.semaphore.create %backing released = 1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
 
     %token = nvws.semaphore.acquire %empty {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %view = nvws.semaphore.buffer %empty, %token {ttg.partition = array<i32: 3>, ttg.warp_specialize.tag = 0 : i32} : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>

@@ -24,7 +24,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst_0 = arith.constant dense<1.000000e+00> : tensor<128x128xf16, #blocked>
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 400 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
     // CHECK: [[V2:%.*]] = ttg.local_alloc {buffer.id = 400 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]], [[V2]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]], [[V2]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.create [[V1]], [[V2]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V6:%.*]] = scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} iter_args([[V5:%.*]] = %{{[-A-Za-z0-9_.$#]+}}) -> (i32)  : i32 {
     %r = scf.for %iv = %lb to %ub step %step iter_args(%i = %c0) -> (i32) : i32 {
@@ -62,7 +62,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %cst1 = arith.constant dense<1.000000e+00> : tensor<128x128xf16, #blocked>
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 401 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
     // CHECK: [[V2:%.*]] = ttg.local_alloc {buffer.id = 401 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]], [[V2]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]], [[V2]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.create [[V1]], [[V2]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V5:%.*]] = nvws.semaphore.create [[V1]], [[V2]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[V6:%.*]] = nvws.semaphore.create [[V1]], [[V2]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>

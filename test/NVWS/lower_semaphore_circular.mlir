@@ -17,7 +17,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %payload_k = "make_k"() {ttg.partition = array<i32: 3>} : () -> tensor<128x128xf16, #blocked>
     %payload_v = "make_v"() {ttg.partition = array<i32: 3>} : () -> tensor<128x128xf16, #blocked>
     %base = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 300 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-    %empty = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+    %empty = nvws.semaphore.create %base released = 3 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     %full = nvws.semaphore.create %base {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %z_k = arith.constant {loop.cluster = 1 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 3>} 0 : i32
@@ -97,7 +97,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %payload_k = "make_k"() {ttg.partition = array<i32: 1>} : () -> tensor<128x128xf16, #blocked>
     %payload_v = "make_v"() {ttg.partition = array<i32: 1>} : () -> tensor<128x128xf16, #blocked>
     %base = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 301 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-    %empty = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+    %empty = nvws.semaphore.create %base released = 3 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     %full = nvws.semaphore.create %base {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %z0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
@@ -175,7 +175,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %payload_k = "make_k"() {ttg.partition = array<i32: 1>} : () -> tensor<128x128xf16, #blocked>
     %payload_v = "make_v"() {ttg.partition = array<i32: 2>} : () -> tensor<128x128xf16, #blocked>
     %base = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 302 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-    %empty = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+    %empty = nvws.semaphore.create %base released = 3 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     %full = nvws.semaphore.create %base {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %z_k = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
@@ -255,7 +255,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %payload_k = "make_k"() {ttg.partition = array<i32: 1>} : () -> tensor<128x128xf16, #blocked>
     %payload_v = "make_v"() {ttg.partition = array<i32: 1>} : () -> tensor<128x128xf16, #blocked>
     %base = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 303 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-    %empty = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+    %empty = nvws.semaphore.create %base released = 3 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     %full = nvws.semaphore.create %base {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %z0 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
@@ -333,7 +333,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %payload_k = "make_k"() {ttg.partition = array<i32: 1>} : () -> tensor<128x128xf16, #blocked>
     %payload_v = "make_v"() {ttg.partition = array<i32: 2>} : () -> tensor<128x128xf16, #blocked>
     %base = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 304 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-    %empty = nvws.semaphore.create %base released = -1 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+    %empty = nvws.semaphore.create %base released = 3 {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     %full = nvws.semaphore.create %base {pending_count = 1 : i32} : !nvws.semaphore<[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     scf.for %i = %lb to %ub step %step : i32 {
       %z_k = arith.constant {ttg.partition = array<i32: 1>} 0 : i32

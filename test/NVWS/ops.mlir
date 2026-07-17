@@ -4,10 +4,10 @@
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @semaphore_create
-  // CHECK: nvws.semaphore.create {{.*}} released = -1
+  // CHECK: nvws.semaphore.create {{.*}} released = 1
   // CHECK: nvws.semaphore.create {{.*}}
   tt.func @semaphore_create(%d : !ttg.memdesc<1x64x16xf16, #shared0, #smem>, %e : !ttg.memdesc<1x16x32xf16, #shared0, #smem>) {
-    %0 = nvws.semaphore.create %d, %e released = -1 : !nvws.semaphore<[!ttg.memdesc<1x64x16xf16, #shared0, #smem>, !ttg.memdesc<1x16x32xf16, #shared0, #smem>]>
+    %0 = nvws.semaphore.create %d, %e released = 1 : !nvws.semaphore<[!ttg.memdesc<1x64x16xf16, #shared0, #smem>, !ttg.memdesc<1x16x32xf16, #shared0, #smem>]>
     %1 = nvws.semaphore.create %d : !nvws.semaphore<[!ttg.memdesc<1x64x16xf16, #shared0, #smem>]>
     tt.return
   }
@@ -27,7 +27,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
   tt.func @semaphore_acquire_buffer(%d : !ttg.memdesc<3x64x16xf16, #shared0, #smem>) {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
-    %0 = nvws.semaphore.create %d released = -1 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>
+    %0 = nvws.semaphore.create %d released = 7 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>
     %mask = nvws.semaphore.create %d released = 5 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]>
     %1 = nvws.semaphore.acquire %0 : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]> -> !ttg.async.token
     %2 = nvws.semaphore.acquire %0[%c1_i32, %c0_i32] : !nvws.semaphore<[!ttg.memdesc<3x64x16xf16, #shared0, #smem>]> -> !ttg.async.token

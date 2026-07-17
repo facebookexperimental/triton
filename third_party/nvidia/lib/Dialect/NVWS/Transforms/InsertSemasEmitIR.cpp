@@ -1,9 +1,9 @@
+#include "AssignStagePhase.h"
 #include "InsertSemas.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "llvm/ADT/BitVector.h"
 
 namespace mlir::triton::nvws_semas {
-
 namespace {
 class SyncDagDumper {
 public:
@@ -507,7 +507,7 @@ static void emitPhysicalIR(EmitCtx &ctx, ArrayRef<const GroupDag *> groups) {
           continue;
         }
         uint32_t releasedMask = s.releasedMask.value_or(
-            entry ? nvws::getAllReleasedMask() : 0);
+            entry ? nvws::getPhysicalStageMask(semaTy.getNumStages()) : 0);
         auto create = nvws::SemaphoreCreateOp::create(
             b, anchor->getLoc(), semaTy, ctx.backing(g), releasedMask);
         create.setPendingCountAttr(b.getI32IntegerAttr(s.count));
@@ -1056,6 +1056,7 @@ static LogicalResult renderChain(EmitCtx &ctx, const GroupDag &g, Node *head,
           n->stageCluster, ctx.semaphore(g, n->sema), ctx.tokenType);
       if (n->stageOffset)
         acq.setStage(materializeI32Before(acq, *n->stageOffset));
+      ctx.nodeOps[n] = acq;
       rs.recordToken(acq.getToken(), ctx.semaphore(g, n->sema),
                      TokenRef{n, n->sema, *n->producedTokenOwner});
       rs.clearViews();
@@ -1076,6 +1077,7 @@ static LogicalResult renderChain(EmitCtx &ctx, const GroupDag &g, Node *head,
           asyncOpsAttr(b.getContext(), n));
       if (n->stageOffset)
         rel.setStage(materializeI32Before(rel, *n->stageOffset));
+      ctx.nodeOps[n] = rel;
       rel.setArriveCountAttr(b.getI32IntegerAttr(n->count));
       lastReal = rel;
       break;
@@ -1102,6 +1104,286 @@ static Value materializeI32Before(Operation *op, int64_t value) {
                                          gpu::getStageCluster(op),
                                          b.getI32IntegerAttr(value));
   return cst.getResult();
+}
+
+static int64_t positiveMod(int64_t value, int64_t modulus) {
+  int64_t remainder = value % modulus;
+  return remainder < 0 ? remainder + modulus : remainder;
+}
+
+// Replay only the staged ownership protocol represented by one GroupDag.  The
+// cursor is modulo the physical depth; `seen` is the set of semaphore stages
+// whose first action is already known on every path reaching that cursor.
+// Structured regions are summarized recursively, without walking unrelated
+// MLIR operations.
+class FreshHandoffReplay {
+  using Seen = SmallVector<uint32_t>;
+  using States = std::map<int64_t, Seen>;
+
+public:
+  FreshHandoffReplay(const GroupDag &group,
+                     const DenseMap<const Node *, bool> &freshWriteAcquires,
+                     DenseMap<const Node *, int64_t> &stageOffsets,
+                     SmallVectorImpl<uint32_t> &releasedMasks)
+      : group(group), fresh(freshWriteAcquires), offsets(stageOffsets),
+        releasedMasks(releasedMasks), depth(group.numSemaphoreCopies),
+        acquireFirst(group.semas.size()), releaseFirst(group.semas.size()) {}
+
+  LogicalResult run() {
+    assignRelayOffsets();
+
+    States states;
+    states.emplace(depth - 1, Seen(group.semas.size(), 0));
+    for (Node *head : group.root->children)
+      states = replayChain(head, std::move(states));
+
+    uint32_t fullMask = nvws::getPhysicalStageMask(depth);
+    releasedMasks.resize(group.semas.size());
+    for (auto indexed : llvm::enumerate(group.semas)) {
+      SemaId sid = indexed.index();
+      uint32_t conflict = acquireFirst[sid] & releaseFirst[sid];
+      if (conflict)
+        return semaError(group.root->op)
+               << "stage " << llvm::countr_zero(conflict)
+               << " of semaphore " << indexed.value().name
+               << " has incompatible first acquire/release actions";
+      uint32_t mask = indexed.value().entryOwner ? fullMask : 0;
+      mask |= acquireFirst[sid];
+      mask &= ~releaseFirst[sid];
+      releasedMasks[sid] = mask & fullMask;
+    }
+    return success();
+  }
+
+private:
+  bool isFresh(const Node *node) const {
+    auto it = fresh.find(node);
+    return it != fresh.end() && it->second;
+  }
+
+  int64_t offsetOf(const Node *node) const {
+    auto it = offsets.find(node);
+    return it == offsets.end() ? node->stageOffset.value_or(0) : it->second;
+  }
+
+  SmallVector<Node *, 2> tokenReleases(const Node *producer) const {
+    SmallVector<Node *, 2> result;
+    for (Node *release : group.nodesOfKind(Node::Release))
+      if (release->tokenSource == producer &&
+          release->scheduleAnchor == producer && release->prev == producer)
+        result.push_back(release);
+    return result;
+  }
+
+  bool hasTokenAccess(const Node *producer) const {
+    return llvm::any_of(group.nodesOfKind(Node::Access), [&](Node *access) {
+      return access->tokenSource == producer;
+    });
+  }
+
+  // An immediate token-only relay does not advance the cursor.  It selects the
+  // stage of its first eventual buffer receiver: successor for a fresh write,
+  // current for a read/update.  Requiring adjacent endpoints ensures the same
+  // relative offset resolves to the same physical stage at both operations.
+  std::optional<int64_t> relayTarget(Node *acquire,
+                                     DenseSet<Node *> &visiting) const {
+    if (!acquire || acquire->kind != Node::Acquire ||
+        !visiting.insert(acquire).second)
+      return std::nullopt;
+    if (isFresh(acquire))
+      return 1;
+    if (hasTokenAccess(acquire))
+      return 0;
+    SmallVector<Node *, 2> releases = tokenReleases(acquire);
+    if (releases.size() != 1 || !releases.front()->sat)
+      return std::nullopt;
+    return relayTarget(releases.front()->sat, visiting);
+  }
+
+  void assignRelayOffsets() {
+    for (Node *acquire : group.nodesOfKind(Node::Acquire)) {
+      if (isFresh(acquire) || hasTokenAccess(acquire))
+        continue;
+      SmallVector<Node *, 2> releases = tokenReleases(acquire);
+      if (releases.size() != 1)
+        continue;
+      DenseSet<Node *> visiting;
+      std::optional<int64_t> target = relayTarget(acquire, visiting);
+      if (!target || *target == 0)
+        continue;
+      offsets[acquire] = *target;
+      offsets[releases.front()] = *target;
+    }
+  }
+
+  bool mergeStates(States &into, const States &from) const {
+    bool changed = false;
+    for (const auto &[cursor, incoming] : from) {
+      auto [it, inserted] = into.try_emplace(cursor, incoming);
+      if (inserted) {
+        changed = true;
+        continue;
+      }
+      for (auto [known, other] : llvm::zip(it->second, incoming)) {
+        uint32_t merged = known & other;
+        changed |= merged != known;
+        known = merged;
+      }
+    }
+    return changed;
+  }
+
+  void record(Seen &seen, const Node *node, int64_t cursor,
+              bool acquire) {
+    int64_t stage = positiveMod(cursor + offsetOf(node), depth);
+    uint32_t bit = uint32_t(1) << stage;
+    if (!(seen[node->sema] & bit))
+      (acquire ? acquireFirst : releaseFirst)[node->sema] |= bit;
+    seen[node->sema] |= bit;
+  }
+
+  States replayEvent(const Node *node, States states, bool acquire) {
+    States result;
+    for (auto &[cursor, seen] : states) {
+      int64_t eventCursor = cursor;
+      if (acquire && isFresh(node))
+        eventCursor = positiveMod(eventCursor + 1, depth);
+      record(seen, node, eventCursor, acquire);
+      States singleton;
+      singleton.emplace(eventCursor, std::move(seen));
+      mergeStates(result, singleton);
+    }
+    return result;
+  }
+
+  States replayLoop(Node *loop, States inputs) {
+    States closure = inputs;
+    while (true) {
+      States next = replayChain(loop->children.front(), closure);
+      if (!mergeStates(closure, next))
+        return closure;
+    }
+  }
+
+  States replayIf(Node *ifNode, States inputs) {
+    States joined = replayChain(ifNode->children.front(), inputs);
+    States other =
+        replayChain(ifNode->children.back(), std::move(inputs));
+    mergeStates(joined, other);
+    return joined;
+  }
+
+  States replayChain(Node *node, States states) {
+    for (; node; node = node->next) {
+      switch (node->kind) {
+      case Node::Acquire:
+      case Node::Release:
+        states = replayEvent(node, std::move(states),
+                             node->kind == Node::Acquire);
+        break;
+      case Node::For:
+        states = replayLoop(node, std::move(states));
+        break;
+      case Node::If:
+        states = replayIf(node, std::move(states));
+        break;
+      default:
+        break;
+      }
+    }
+    return states;
+  }
+
+  const GroupDag &group;
+  const DenseMap<const Node *, bool> &fresh;
+  DenseMap<const Node *, int64_t> &offsets;
+  SmallVectorImpl<uint32_t> &releasedMasks;
+  int64_t depth;
+  SmallVector<uint32_t> acquireFirst, releaseFirst;
+};
+
+LogicalResult planFreshHandoffProtocol(
+    const GroupDag &group,
+    const DenseMap<const Node *, bool> &freshWriteAcquires,
+    DenseMap<const Node *, int64_t> &stageOffsets,
+    SmallVectorImpl<uint32_t> &releasedMasks) {
+  return FreshHandoffReplay(group, freshWriteAcquires, stageOffsets,
+                            releasedMasks)
+      .run();
+}
+
+static LogicalResult finalizeFreshHandoffProtocols(
+    EmitCtx &ctx, ArrayRef<const GroupDag *> groups) {
+  for (const GroupDag *group : groups) {
+    if (!group->isTmem() || group->isCircular() ||
+        group->pieceTable.members.size() != 1 || group->numCopies <= 1)
+      continue;
+    SmallVector<Value, 4> semaphores;
+    for (const Sema &sema : group->semas)
+      semaphores.push_back(ctx.semaphores.lookup(&sema));
+
+    DenseMap<const Node *, bool> freshWriteAcquires;
+    auto classifyAcquire = [&](Node *node) -> FailureOr<bool> {
+      if (auto it = freshWriteAcquires.find(node);
+          it != freshWriteAcquires.end())
+        return it->second;
+      auto acquire = dyn_cast_or_null<nvws::SemaphoreAcquireOp>(ctx.op(node));
+      if (!acquire)
+        return failure();
+      bool fresh = isFirstUseFreshWriteAfterAcquire(acquire, semaphores);
+      freshWriteAcquires[node] = fresh;
+      return fresh;
+    };
+
+    bool hasFreshHandoff = false;
+    for (Node *release : group->nodesOfKind(Node::Release)) {
+      Node *acquire = release->sat;
+      if (!acquire || acquire->kind != Node::Acquire)
+        continue;
+      FailureOr<bool> fresh = classifyAcquire(acquire);
+      if (failed(fresh))
+        return semaError(ctx.func)
+               << "emitter lost an acquire needed by stage replay";
+      hasFreshHandoff |= *fresh;
+    }
+    if (!hasFreshHandoff)
+      continue;
+
+    for (Node *node : group->nodesOfKind(Node::Acquire))
+      if (failed(classifyAcquire(node)))
+        return semaError(ctx.func)
+               << "emitter lost an acquire needed by stage replay";
+
+    DenseMap<const Node *, int64_t> stageOffsets;
+    SmallVector<uint32_t> releasedMasks;
+    if (failed(planFreshHandoffProtocol(*group, freshWriteAcquires,
+                                        stageOffsets, releasedMasks)))
+      return failure();
+
+    for (auto [node, offset] : stageOffsets) {
+      auto stageOp = dyn_cast_or_null<nvws::SemaphoreStageInterface>(
+          ctx.op(node));
+      if (!stageOp)
+        return semaError(ctx.func)
+               << "emitter lost a relay needed by stage replay";
+      stageOp.setStage(materializeI32Before(stageOp, offset));
+    }
+    if (releasedMasks.size() != group->semas.size())
+      return semaError(ctx.func) << "stage replay produced incomplete masks";
+    for (auto [sid, mask] : llvm::enumerate(releasedMasks)) {
+      auto create = ctx.semaphore(*group, sid)
+                        .getDefiningOp<nvws::SemaphoreCreateOp>();
+      if (!create)
+        return semaError(ctx.func)
+               << "emitter lost a semaphore needed by stage replay";
+      create.removeReleasedMaskAttr();
+      if (mask)
+        create.setReleasedMaskAttr(
+            IntegerAttr::get(IntegerType::get(ctx.func.getContext(), 32),
+                             static_cast<int32_t>(mask)));
+    }
+  }
+  return success();
 }
 static bool precedesInBlock(Operation *before, Operation *after) {
   return before->getBlock() == after->getBlock() &&
@@ -1351,6 +1633,8 @@ LogicalResult emitIR(triton::FuncOp funcOp, ArrayRef<GroupDag> groups,
     if (failed(renderChain(ctx, *group, group->root->children[0], rs)))
       return failure();
   }
+  if (failed(finalizeFreshHandoffProtocols(ctx, activeGroups)))
+    return failure();
   SmallVector<Operation *> aliasOps;
   ctx.func.walk<WalkOrder::PreOrder>([&](Operation *op) {
     if (isSupportedAliasOp(op))

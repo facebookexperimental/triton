@@ -10,7 +10,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @local_if_conditional_only(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 200 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 200 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.acquire [[V2]] : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     // CHECK: [[V6:%.*]] = scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} iter_args([[V5:%.*]] = [[V4]]) -> (!ttg.async.token)  : i32 {
@@ -60,7 +60,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @local_if_conditional_only_else(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 203 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 203 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.acquire [[V2]] : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     // CHECK: [[V6:%.*]] = scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} iter_args([[V5:%.*]] = [[V4]]) -> (!ttg.async.token)  : i32 {
@@ -110,7 +110,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @local_if_consumption_continues_after_join(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 201 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 201 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[JOIN:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>

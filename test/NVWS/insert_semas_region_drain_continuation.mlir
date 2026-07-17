@@ -12,7 +12,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: [[ROOT_WHOLE:%[0-9]+]] = ttg.local_alloc {buffer.id = 9910 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[ROOT_LEFT:%[0-9]+]] = ttg.local_alloc {buffer.id = 9910 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[ROOT_RIGHT:%[0-9]+]] = ttg.local_alloc {buffer.id = 9910 : i32, buffer.offset = 1 : i32}
-    // CHECK-NEXT: [[ROOT_EMPTY:%[0-9]+]] = nvws.semaphore.create [[ROOT_WHOLE]], [[ROOT_LEFT]], [[ROOT_RIGHT]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: [[ROOT_EMPTY:%[0-9]+]] = nvws.semaphore.create [[ROOT_WHOLE]], [[ROOT_LEFT]], [[ROOT_RIGHT]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[ROOT_FULL:%[0-9]+]] = nvws.semaphore.create [[ROOT_WHOLE]], [[ROOT_LEFT]], [[ROOT_RIGHT]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[ROOT_LEFT_READY:%[0-9]+]] = nvws.semaphore.create [[ROOT_WHOLE]], [[ROOT_LEFT]], [[ROOT_RIGHT]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[ROOT_RIGHT_READY:%[0-9]+]] = nvws.semaphore.create [[ROOT_WHOLE]], [[ROOT_LEFT]], [[ROOT_RIGHT]] {pending_count = 1 : i32}
@@ -76,7 +76,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: [[P23_WHOLE:%[0-9]+]] = ttg.local_alloc {buffer.id = 9911 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[P23_LEFT:%[0-9]+]] = ttg.local_alloc {buffer.id = 9911 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[P23_RIGHT:%[0-9]+]] = ttg.local_alloc {buffer.id = 9911 : i32, buffer.offset = 1 : i32}
-    // CHECK-NEXT: [[P23_EMPTY:%[0-9]+]] = nvws.semaphore.create [[P23_WHOLE]], [[P23_LEFT]], [[P23_RIGHT]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: [[P23_EMPTY:%[0-9]+]] = nvws.semaphore.create [[P23_WHOLE]], [[P23_LEFT]], [[P23_RIGHT]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[P23_FULL:%[0-9]+]] = nvws.semaphore.create [[P23_WHOLE]], [[P23_LEFT]], [[P23_RIGHT]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[P23_ROOT_READY:%[0-9]+]] = nvws.semaphore.create [[P23_WHOLE]], [[P23_LEFT]], [[P23_RIGHT]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[P23_THEN_READY:%[0-9]+]] = nvws.semaphore.create [[P23_WHOLE]], [[P23_LEFT]], [[P23_RIGHT]] {pending_count = 1 : i32}
@@ -146,7 +146,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: [[P10_WHOLE:%[0-9]+]] = ttg.local_alloc {buffer.id = 9912 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[P10_LEFT:%[0-9]+]] = ttg.local_alloc {buffer.id = 9912 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[P10_RIGHT:%[0-9]+]] = ttg.local_alloc {buffer.id = 9912 : i32, buffer.offset = 1 : i32}
-    // CHECK-NEXT: [[P10_EMPTY:%[0-9]+]] = nvws.semaphore.create [[P10_WHOLE]], [[P10_LEFT]], [[P10_RIGHT]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: [[P10_EMPTY:%[0-9]+]] = nvws.semaphore.create [[P10_WHOLE]], [[P10_LEFT]], [[P10_RIGHT]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[P10_FULL:%[0-9]+]] = nvws.semaphore.create [[P10_WHOLE]], [[P10_LEFT]], [[P10_RIGHT]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[P10_ROOT_READY:%[0-9]+]] = nvws.semaphore.create [[P10_WHOLE]], [[P10_LEFT]], [[P10_RIGHT]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[P10_THEN_READY:%[0-9]+]] = nvws.semaphore.create [[P10_WHOLE]], [[P10_LEFT]], [[P10_RIGHT]] {pending_count = 1 : i32}

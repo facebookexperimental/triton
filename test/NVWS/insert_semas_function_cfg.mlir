@@ -15,7 +15,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   ^work:
     // CHECK: ^bb2:
     // CHECK: [[BACKING:%.*]] = ttg.local_alloc {buffer.id = 1200 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BACKING]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BACKING]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[FULL:%.*]] = nvws.semaphore.create [[BACKING]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     %alloc = ttg.local_alloc {buffer.id = 1200 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %i = %lb to %ub step %step : i32 {

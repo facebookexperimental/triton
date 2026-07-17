@@ -26,7 +26,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @sequential_ws_loops_shared_buffer(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc {buffer.id = 950 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // CHECK: [[V1:%.*]] = ttg.local_alloc {buffer.id = 950 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[V2:%.*]] = nvws.semaphore.create [[V1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V5:%.*]] = nvws.semaphore.create [[V1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>

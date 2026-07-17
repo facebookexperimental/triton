@@ -13,7 +13,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s1_prefix_for_p1
   tt.func @uniform_hold_s1_prefix_for_p1(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 981 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F3:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F4:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
@@ -63,7 +63,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s2_owner_change_cut
   tt.func @uniform_hold_s2_owner_change_cut(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 982 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F3:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     %alloc = ttg.local_alloc {buffer.id = 982 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -112,7 +112,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s3_trailing_read_after_regain
   tt.func @uniform_hold_s3_trailing_read_after_regain(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 983 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F3:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
@@ -164,7 +164,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s4_prefix_for_p2
   tt.func @uniform_hold_s4_prefix_for_p2(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 984 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F3:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F4:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
@@ -215,7 +215,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s5_ws_body_depth1
   tt.func @uniform_hold_s5_ws_body_depth1(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 985 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %alloc = ttg.local_alloc {buffer.id = 985 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -258,7 +258,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s6_same_owner_trailing_read
   tt.func @uniform_hold_s6_same_owner_trailing_read(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 986 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %alloc = ttg.local_alloc {buffer.id = 986 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -305,7 +305,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s7_cross_owner_store_load
   tt.func @uniform_hold_s7_cross_owner_store_load(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 987 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     %alloc = ttg.local_alloc {buffer.id = 987 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     scf.for %i0 = %lb to %ub step %step : i32 {
@@ -338,7 +338,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s8_if_prefix_region
   tt.func @uniform_hold_s8_if_prefix_region(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 988 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %alloc = ttg.local_alloc {buffer.id = 988 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -382,7 +382,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s9_if_inside_inner_loop
   tt.func @uniform_hold_s9_if_inside_inner_loop(%lb: i32, %ub: i32, %step: i32, %cond: i1) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 989 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[T0:%.*]] = nvws.semaphore.acquire [[EMPTY]] {ttg.partition = array<i32: 1>, ttg.warp_specialize.tag = 0 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %alloc = ttg.local_alloc {buffer.id = 989 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -432,7 +432,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @uniform_hold_s10_fanout_multi_consumer
   tt.func @uniform_hold_s10_fanout_multi_consumer(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 990 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F3:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[F4:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
