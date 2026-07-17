@@ -36,6 +36,7 @@
 #PARTITIONED_SHARED_PADDED = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 1, partitionLayout = #PADDED_SHARED_0_16x32}>
 
 #smem = #ttg.shared_memory
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 
@@ -1111,6 +1112,25 @@ tt.func @partitioned_shared_padded_alloc() {
   // expected-remark @below {{offset = 2112, size = 1052}}
   // expected-remark @below {{offset = 3168, size = 1052}}
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #PARTITIONED_SHARED_PADDED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// Two mbarriers with non-overlapping SSA liveness and NO warp_specialize. Each
+// has an InitBarrierOp in its forward slice, so the SMEM allocator extends both
+// to the whole function -> they must get DISTINCT offsets, unlike plain buffers
+// which reuse the slot (cf. @nonoverlapping_liveness_in_default_region above).
+// expected-remark @below {{barriers_no_warpspec}}
+// expected-remark @below {{size = 24}}
+tt.func @barriers_no_warpspec() {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 0, size = 8}}
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %0, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %0, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  // expected-remark @below {{offset = 16, size = 8}}
+  %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %1, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
   tt.return
 }
 }
