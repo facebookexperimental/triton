@@ -1,15 +1,12 @@
-"""Grouped GEMM for AMD gfx950 (MI350/MI355): Naive correctness baseline
-
-Many independent FP16 GEMMs (one per group, variable M/N/K) fused into a single
-persistent launch.
-
-The input is per-group pointer tables and flat size/stride arrays. Layout is
-standard A[M,K] x B[K,N] (K contiguous in A, N contiguous in B), tl.dot(a, b),
-FP32 accumulate, FP16 output.
+"""Grouped GEMM for AMD gfx950: v0's compiler-pipelined loop + column-major B.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+os.environ.setdefault("TRITON_DISABLE_POST_MISCHED", "1")
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -19,76 +16,55 @@ def num_sms():
 
 
 @triton.jit
-def grouped_gemm_naive_kernel(
-    # Per-group base pointers (int64 data pointers indexed by group number)
+def grouped_gemm_v4_kernel(
     group_a_ptrs,
     group_b_ptrs,
     group_c_ptrs,
-    # Flat [group_size, 3] of <M, N, K> per group
-    group_gemm_sizes,
-    # Flat [group_size, 3] of <lda, ldb, ldc> (row strides) per group
-    g_lds,
-    # Number of gemms
+    group_gemm_sizes,  # [group_size, 3] of <M, N, K>
+    g_lds,  # [group_size, 3] of <lda, ldb, ldc>; ldb is B's N-stride (== K for col-major)
     group_size,
-    # Number of persistent programs
     NUM_SM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    # Which global output tile we are computing
     tile_idx = tl.program_id(0)
-
-    # The global tile id for where the current group begins
     last_problem_end = 0
 
     for g in range(group_size):
-        # Load gemm sizes
         gm = tl.load(group_gemm_sizes + g * 3)
         gn = tl.load(group_gemm_sizes + g * 3 + 1)
         gk = tl.load(group_gemm_sizes + g * 3 + 2)
 
-        # How many tiles are necessary to compute this specific gemm
         num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
         num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
         num_tiles = num_m_tiles * num_n_tiles
 
-        # This program owns the tiles where tile_idx lies within this group's
-        # tiles in the range [last_problem_end, +num_tiles)
         while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
-            # Load strides
             lda = tl.load(g_lds + g * 3)
-            ldb = tl.load(g_lds + g * 3 + 1)
+            ldb = tl.load(g_lds + g * 3 + 1)  # B N-stride (== K for column-major B)
             ldc = tl.load(g_lds + g * 3 + 2)
 
-            # Get base pointers
             a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16))
             b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16))
             c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16))
 
-            # Get group-relative tile index
             tile_idx_in_gemm = tile_idx - last_problem_end
-
-            # Which tile we are within this gemm along the m axis
             tile_m_idx = tile_idx_in_gemm // num_n_tiles
-
-            # Which tile we are within this gemm along the n axis
             tile_n_idx = tile_idx_in_gemm % num_n_tiles
 
-            # Row offsets for a
+            # A rows and B columns are wrapped. N-wrap is safe now: N is B's outer
+            # (non-contiguous) dim, so it can't produce an out-of-tensor vector read.
             offs_am = tl.multiple_of((tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
+            offs_bn = (tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn
+            # K is the contiguous dim (of both A and column-major B) -> hint it.
+            offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
-            # Column offsets for b
-            offs_bn = tl.max_contiguous(
-                tl.multiple_of((tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn, BLOCK_SIZE_N),
-                BLOCK_SIZE_N)
-
-            # Offsets into k reduction dimension
-            offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-            # Calculate pointers into a and b
+            # A: [BLOCK_M, BLOCK_K], K contiguous on axis 1.
             a_ptrs = a_ptr + offs_am[:, None] * lda + offs_k[None, :]
-            b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]
+            # B (column-major): [BLOCK_K, BLOCK_N], K contiguous on axis 0 (stride 1),
+            # N strided by ldb on axis 1. Fed straight to tl.dot as the [K, N] operand.
+            b_ptrs = b_ptr + offs_k[:, None] + offs_bn[None, :] * ldb
 
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
@@ -98,28 +74,25 @@ def grouped_gemm_naive_kernel(
                 tl.multiple_of(a_ptrs, [16, 16])
                 tl.multiple_of(b_ptrs, [16, 16])
 
-                # k_start = kk * BLOCK_SIZE_K
-
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs)
 
                 accumulator += tl.dot(a, b)
 
-                # Move to next k tile
-                a_ptrs += BLOCK_SIZE_K
-                b_ptrs += BLOCK_SIZE_K * ldb
+                a_ptrs += BLOCK_SIZE_K  # A: advance K (stride 1)
+                b_ptrs += BLOCK_SIZE_K  # B col-major: advance K (stride 1)
 
+            # Peel the partial last K-tile; re-materialize offsets (don't carry the
+            # advanced pointers) to keep register pressure down
             if k_full_chunk_iters * BLOCK_SIZE_K < gk:
                 k_start = k_full_chunk_iters * BLOCK_SIZE_K
 
                 offs_am_2 = tl.multiple_of((tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
-                offs_bn_2 = tl.max_contiguous(
-                    tl.multiple_of((tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn, BLOCK_SIZE_N),
-                    BLOCK_SIZE_N)
-                offs_k_2 = tl.arange(0, BLOCK_SIZE_K)
+                offs_bn_2 = (tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn
+                offs_k_2 = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
                 a_ptrs_2 = a_ptr + offs_am_2[:, None] * lda + (k_start + offs_k_2[None, :])
-                b_ptrs_2 = b_ptr + (k_start + offs_k_2[:, None]) * ldb + offs_bn_2[None, :]
+                b_ptrs_2 = b_ptr + (k_start + offs_k_2[:, None]) + offs_bn_2[None, :] * ldb
 
                 tl.multiple_of(a_ptrs_2, [16, 16])
                 tl.multiple_of(b_ptrs_2, [16, 16])
@@ -131,14 +104,12 @@ def grouped_gemm_naive_kernel(
 
             c = accumulator.to(tl.float16)
 
-            # Write back to GMEM
             offs_cm = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
             offs_cn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             c_ptrs = c_ptr + ldc * offs_cm[:, None] + offs_cn[None, :]
             c_mask = (offs_cm[:, None] < gm) & (offs_cn[None, :] < gn)
             tl.store(c_ptrs, c, mask=c_mask)
 
-            # Program p owns tiles p, p+NUM_SM, p+2*NUM_SM, and so on
             tile_idx += NUM_SM
 
         last_problem_end = last_problem_end + num_tiles
@@ -147,15 +118,16 @@ def grouped_gemm_naive_kernel(
 _BLOCK_M = 256
 _BLOCK_N = 256
 _BLOCK_K = 64
+_NUM_WARPS = 8
 
 
-def grouped_gemm(group_A, group_B, group_C=None):
-    """Compute [A_i @ B_i for each group i] in one persistent launch.
+def grouped_gemm(group_A, group_B, config=None):
+    """group_A[i]: fp16 [M, K] row-major. group_B[i]: fp16 [K, N] COLUMN-major (K contiguous)."""
+    BM = (config or {}).get("BLOCK_SIZE_M", _BLOCK_M)
+    BN = (config or {}).get("BLOCK_SIZE_N", _BLOCK_N)
+    BK = (config or {}).get("BLOCK_SIZE_K", _BLOCK_K)
+    W = (config or {}).get("num_warps", _NUM_WARPS)
 
-    group_A[i]: [M_i, K_i] fp16, row-major (K contiguous).
-    group_B[i]: [K_i, N_i] fp16, row-major (N contiguous).
-    Returns a list of [M_i, N_i] fp16 outputs.
-    """
     group_size = len(group_A)
     assert len(group_B) == group_size
 
@@ -163,16 +135,17 @@ def grouped_gemm(group_A, group_B, group_C=None):
     out = []
     for i in range(group_size):
         A, B = group_A[i], group_B[i]
-        assert A.shape[1] == B.shape[0], f"K mismatch group {i}: {A.shape} x {B.shape}"
         M, K = A.shape
-        _, N = B.shape
-        C = group_C[i] if group_C is not None else torch.empty((M, N), device=DEVICE, dtype=A.dtype)
+        Kb, N = B.shape
+        assert K == Kb, f"K mismatch group {i}: {A.shape} x {B.shape}"
+        assert B.stride(0) == 1, "B must be column-major [K, N] (K contiguous, stride(0)==1)"
+        C = torch.empty((M, N), device=DEVICE, dtype=A.dtype)
         out.append(C)
         A_addrs.append(A.data_ptr())
         B_addrs.append(B.data_ptr())
         C_addrs.append(C.data_ptr())
         g_sizes += [M, N, K]
-        g_lds += [A.stride(0), B.stride(0), C.stride(0)]
+        g_lds += [A.stride(0), B.stride(1), C.stride(0)]  # lda, ldb(=B N-stride==K), ldc
 
     d_a_ptrs = torch.tensor(A_addrs, device=DEVICE)
     d_b_ptrs = torch.tensor(B_addrs, device=DEVICE)
@@ -182,7 +155,7 @@ def grouped_gemm(group_A, group_B, group_C=None):
 
     NUM_SM = num_sms()
     grid = (NUM_SM, )
-    grouped_gemm_naive_kernel[grid](
+    grouped_gemm_v4_kernel[grid](
         d_a_ptrs,
         d_b_ptrs,
         d_c_ptrs,
@@ -190,56 +163,57 @@ def grouped_gemm(group_A, group_B, group_C=None):
         d_g_lds,
         group_size,
         NUM_SM=NUM_SM,
-        BLOCK_SIZE_M=_BLOCK_M,
-        BLOCK_SIZE_N=_BLOCK_N,
-        BLOCK_SIZE_K=_BLOCK_K,
-        num_warps=8,
+        BLOCK_SIZE_M=BM,
+        BLOCK_SIZE_N=BN,
+        BLOCK_SIZE_K=BK,
+        num_warps=W,
         matrix_instr_nonkdim=16,
     )
     return out
 
 
-def _make_groups(m_list, n_list, k_list):
+def _rand_groups(shape_spec, seed=0):
+    """A[M,K] row-major; B[K,N] column-major (K contiguous) via a [N,K].t() view."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
     group_A, group_B = [], []
-    for M, N, K in zip(m_list, n_list, k_list):
-        group_A.append(torch.randn((M, K), device=DEVICE, dtype=torch.float16))
-        group_B.append(torch.randn((K, N), device=DEVICE, dtype=torch.float16))
+    for (M, N, K) in shape_spec:
+        group_A.append(torch.randn((M, K), device=DEVICE, dtype=torch.float16, generator=g))
+        Bt = torch.randn((N, K), device=DEVICE, dtype=torch.float16, generator=g)
+        group_B.append(Bt.t())  # [K,N] view, stride (1, K)
     return group_A, group_B
 
 
-def _check(m_list, n_list, k_list, label):
-    group_A, group_B = _make_groups(m_list, n_list, k_list)
-    tri = grouped_gemm(group_A, group_B)
-    ref = [a @ b for a, b in zip(group_A, group_B)]
-    for i, (r, t) in enumerate(zip(ref, tri)):
-        torch.testing.assert_close(t, r, atol=1e-2, rtol=1e-2)
-    print(f"  [PASS] {label} ({len(m_list)} groups)")
+def _check(shape_spec, label):
+    group_A, group_B = _rand_groups(shape_spec)
+    group_C = grouped_gemm(group_A, group_B)
+    for i, (A, B) in enumerate(zip(group_A, group_B)):
+        torch.testing.assert_close(group_C[i], torch.matmul(A, B), atol=1e-2, rtol=1e-2)
+    print(f"  [PASS] {label} ({len(shape_spec)} groups)")
 
 
 def test_op():
-    # Ragged: distinct M, N, K per group
-    _check([1024, 512, 256, 128], [1024, 512, 256, 128], [1024, 512, 256, 128], "ragged M/N/K")
-    # Ragged-M only
-    _check([4096, 2048, 1000, 333], [4096] * 4, [4096] * 4, "ragged-M (MoE-style)")
-    # 16 equal 4096^3 groups
-    _check([4096] * 16, [4096] * 16, [4096] * 16, "fixed 16x4096^3")
+    _check([(1024, 1024, 1024), (512, 512, 512), (256, 256, 256), (128, 128, 128)], "ragged M=N=K")
+    _check([(4096, 4096, 4096), (2048, 4096, 4096), (1000, 4096, 4096), (333, 4096, 4096)], "ragged-M")
+    _check([(512, 300, 4000), (333, 1000, 1500), (128, 128, 100), (256, 704, 320)], "k/n-unaligned")
+    _check([(1, 64, 64), (7, 7, 7), (33, 128, 50)], "tiny")
     print("test_op: all correctness checks passed")
 
 
 def _bench():
 
-    def tflops(ms, m_list, n_list, k_list):
-        flops = sum(2 * m * n * k for m, n, k in zip(m_list, n_list, k_list))
-        return flops * 1e-12 / (ms * 1e-3)
+    def tflops(ms, total_flops):
+        return total_flops * 1e-12 / (ms * 1e-3)
 
-    m_list = n_list = k_list = [4096] * 16
-    group_A, group_B = _make_groups(m_list, n_list, k_list)
+    n = 16
+    spec = [(4096, 4096, 4096)] * n
+    group_A, group_B = _rand_groups(spec)
+    total_flops = sum(2 * M * N * K for (M, N, K) in spec)
 
     ms = triton.testing.do_bench(lambda: grouped_gemm(group_A, group_B), rep=100)
-    print(f"  v0 grouped GEMM : {tflops(ms, m_list, n_list, k_list):7.1f} TFLOPS ({ms:.3f} ms)")
+    print(f"  v4 grouped GEMM : {tflops(ms, total_flops):7.1f} TFLOPS ({ms:.3f} ms)")
 
-    ms_torch = triton.testing.do_bench(lambda: [a @ b for a, b in zip(group_A, group_B)], rep=100)
-    print(f"  torch loop      : {tflops(ms_torch, m_list, n_list, k_list):7.1f} TFLOPS ({ms_torch:.3f} ms)")
+    ms_torch = triton.testing.do_bench(lambda: [group_A[i] @ group_B[i] for i in range(n)], rep=100)
+    print(f"  torch loop      : {tflops(ms_torch, total_flops):7.1f} TFLOPS ({ms_torch:.3f} ms)")
 
 
 if __name__ == "__main__":

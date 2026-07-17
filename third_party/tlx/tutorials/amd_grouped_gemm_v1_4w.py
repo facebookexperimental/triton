@@ -128,6 +128,8 @@ def grouped_gemm_kernel(
 
             offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
+            b_offs = offs_k[:, None] * stride_bk + b_base_off
+
             # The warp-pipelined GEMM only runs when there are at least NUM_BUFFERS
             # full K-tiles. Groups with fewer full tiles take the small-k path in
             # the else block
@@ -136,12 +138,14 @@ def grouped_gemm_kernel(
                 for i in tl.static_range(0, NUM_BUFFERS):
                     k_start = i * BLOCK_SIZE_K
                     a_offs = a_base_off + (k_start + offs_k[None, :])  # stride_ak = 1
-                    b_offs = b_base_off + (k_start + offs_k[:, None]) * stride_bk
 
                     # GR i
                     tok_a = tlx.async_load(a_ptr + a_offs, smemA[i], cache_modifier=".ca",
                                            eviction_policy="evict_first")
-                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i], cache_modifier=".ca", eviction_policy="evict_last")
+
+                    b_pref_ptr = b_ptr + k_start * stride_bk
+                    tok_b = tlx.buffer_load_to_local(smemB[i], b_pref_ptr, b_offs, mask=offs_n[None, :] < gn,
+                                                     cache_modifier=".ca")
 
                     tlx.async_load_commit_group([tok_a, tok_b])
 
@@ -167,11 +171,13 @@ def grouped_gemm_kernel(
                     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
                     a_offs = a_base_off + (k_prefetch + offs_k[None, :])
-                    b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
+
                     tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
                                            eviction_policy="evict_first")
-                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf], mask=offs_n[None, :] < gn,
-                                           cache_modifier=".ca", eviction_policy="evict_last")
+
+                    b_pref_ptr = b_ptr + k_prefetch * stride_bk
+                    tok_b = tlx.buffer_load_to_local(smemB[prefetch_buf], b_pref_ptr, b_offs, mask=offs_n[None, :] < gn,
+                                                     cache_modifier=".ca")
                     tlx.async_load_commit_group([tok_a, tok_b])
 
                     a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
@@ -186,11 +192,12 @@ def grouped_gemm_kernel(
                     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
                     a_offs = a_base_off + (k_prefetch + offs_k[None, :])
-                    b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base_off
                     tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
                                            eviction_policy="evict_first")
-                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf], mask=offs_n[None, :] < gn,
-                                           cache_modifier=".ca", eviction_policy="evict_last")
+
+                    b_pref_ptr = b_ptr + k_prefetch * stride_bk
+                    tok_b = tlx.buffer_load_to_local(smemB[prefetch_buf], b_pref_ptr, b_offs, mask=offs_n[None, :] < gn,
+                                                     cache_modifier=".ca")
                     tlx.async_load_commit_group([tok_a, tok_b])
 
                     a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
@@ -241,7 +248,8 @@ def grouped_gemm_kernel(
 
                     tok_a = tlx.async_load(a_ptr + a_offs, smemA[i], cache_modifier=".ca",
                                            eviction_policy="evict_first")
-                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i], cache_modifier=".ca", eviction_policy="evict_last")
+                    tok_b = tlx.async_load(b_ptr + b_offs, smemB[i], mask=offs_n[None, :] < gn, cache_modifier=".ca",
+                                           eviction_policy="evict_last")
 
                     tlx.async_load_commit_group([tok_a, tok_b])
 
@@ -263,7 +271,8 @@ def grouped_gemm_kernel(
                 b_offs = (k_start + offs_k[:, None]) * stride_bk + b_base_off
 
                 a_tile = tl.load(a_ptr + a_offs, mask=offs_k[None, :] < gk - k_start, other=0.0)
-                b_tile = tl.load(b_ptr + b_offs, mask=offs_k[:, None] < gk - k_start, other=0.0)
+                b_tile = tl.load(b_ptr + b_offs, mask=(offs_k[:, None] < gk - k_start) & (offs_n[None, :] < gn),
+                                 other=0.0)
 
                 acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
