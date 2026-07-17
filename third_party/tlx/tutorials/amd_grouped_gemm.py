@@ -1,27 +1,22 @@
-"""Grouped GEMM for AMD gfx950 (MI350/MI355): column-major B, mask-free hot loop.
+"""AMD TLX grouped GEMM for gfx950.
 
-Design vs v1_4w_switched:
-  * B is stored **column-major [K, N]** (K contiguous) == row-major [N, K].
-    This makes N the *outer* (non-contiguous) dimension of B, so we can WRAP N
-    with `% gn` exactly like we already wrap M for A -- no N-masking, no
-    `buffer_load_to_local`, no branch, no v_cndmask, and B gets the compact LDS
-    layout (so bigger tiles fit).
-  * B is loaded **symmetric to A**: both are [outer, K] tiles with K on the
-    innermost (contiguous) axis -> plain coalesced `async_load` into
-    smemB=[BLOCK_N,BLOCK_K]. The transpose to the [K,N] operand MFMA needs is
-    done for free on the LDS read via `tlx.local_load(tlx.local_trans(smemB))`
-    (folded into the shared-memory layout -- no shuffles, no explicit transpose),
-    so the dot is a plain `tl.dot(a_tile, b_tile)`.
+Storage (both operands row-major with K, the contraction dim, innermost):
+  A[i]: [M, K] row-major.
+  B[i]: [N, K] row-major, handed to the kernel as a [K, N] .t() view
+        (logically column-major [K, N]), the natural weight layout.
 
-Constraint: gn must be >= 16. The `tl.multiple_of(gn, 16)` hint enables wide
-vectorized C stores (worth ~110 TFLOPS at 4096^3); it degrades correctness only
-for gn < 16 (a degenerate case). Unaligned gn >= 16 (e.g. 300, 1000) is correct.
-  * K (now B's contiguous dim) is handled by the usual peel: the hot loop runs
-    only full K-tiles; the partial last K-tile is peeled into a cold `tl.load`
-    that masks on K. So the hot loop carries **no masking at all**.
+With K contiguous for both A and B, the A and B tiles can load identically
+as [outer, K] tiles via plain coalesced `async_load`. The transpose to the
+[K, N] B operand MFMA wants is folded into the LDS read
+(`tlx.local_load(tlx.local_trans(smemB))`), so the dot stays `tl.dot(a, b)`.
 
-Host layout: group_B[i] is a column-major [K, N] tensor (K contiguous), i.e. a
-`.t()` view of an [N, K] row-major buffer -- the natural weight layout.
+The hot loop is mask-free. M is the outer axis of A and N is the outer axis
+of B, so both dimensions are wrapped with a modulo to prevent out of bounds
+reads. Garbage rows and columns are discarded at the final store to C. The
+hot loop runs full K-tiles that it can load with wide `async_load` instructions.
+The partial last K-tile (if it exists) is a cold masked `tl.load`. The only
+constraint is that gn >= 8. The `tl.multiple_of(gn, 8) enables wide C stores.
+Only gn < 8 is affected. Unaligned gn >= 8 (e.g. 300, 1000) is still correct.
 """
 import os
 
@@ -54,54 +49,90 @@ def chiplet_transform_chunked(pid, num_workgroups, num_xcds: tl.constexpr, chunk
 
 
 @triton.jit
-def grouped_gemm_kernel(group_a_ptrs, group_b_ptrs, group_c_ptrs,
-                        # [group_size, 3] of <M, N, K>
-                        group_gemm_sizes,
-                        # [group_size, 3] of <lda, ldb, ldc>
-                        g_lds, group_size, NUM_SM: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
-                        BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr, NUM_XCDS: tl.constexpr,
-                        XCD_CHUNK: tl.constexpr, NUM_BUFFERS: tl.constexpr):
+def grouped_gemm_kernel(
+        # device tensor of matrices pointers
+        group_a_ptrs, group_b_ptrs, group_c_ptrs,
+        # device tensor of gemm sizes. its shape is [group_size, 3]
+        # dim 0 is group_size, dim 1 is the values of <M, N, K> of each gemm
+        group_gemm_sizes,
+        # device tensor of leading dimension sizes. its shape is [group_size, 3]
+        # dim 0 is group_size, dim 1 is the values of <lda, ldb, ldc> of each gemm
+        g_lds,
+        # number of gemms
+        group_size,
+        # number of virtual SM
+        NUM_SM: tl.constexpr,
+        # tile sizes
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        # how many tiles along M to group by
+        GROUP_SIZE_M: tl.constexpr, NUM_XCDS: tl.constexpr, XCD_CHUNK: tl.constexpr, NUM_BUFFERS: tl.constexpr):
     pid = tl.program_id(0)
+
+    # Program id after L2 remapping
     pid = chiplet_transform_chunked(pid, NUM_SM, NUM_XCDS, XCD_CHUNK)
 
-    # LDS ring buffers. Both A and B are [outer, K] tiles (K innermost/contiguous)
+    # LDS ring buffers reused throughout the entire program.
+    # Both A and B are [outer, K] tiles (K innermost/contiguous)
     smemA = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS)
     smemB = tlx.local_alloc((BLOCK_SIZE_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS)
 
+    # Which global output tile we are computing
     tile_idx = pid
+
+    # The global tile id for where the current group begins
     last_problem_end = 0
 
     for g in range(group_size):
+        # Load base pointers
         a_ptr = tl.multiple_of(tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
         b_ptr = tl.multiple_of(tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
         c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16))
 
+        # Load gemm sizes
         gm = tl.load(group_gemm_sizes + g * 3)
         gn = tl.load(group_gemm_sizes + g * 3 + 1)
         gn = tl.multiple_of(gn, 16)
         gk = tl.load(group_gemm_sizes + g * 3 + 2)
 
+        # Load strides
         stride_am = tl.load(g_lds + g * 3)  # A row stride
         stride_bn = tl.multiple_of(tl.load(g_lds + g * 3 + 1), 16)  # B N-stride
         stride_cm = tl.load(g_lds + g * 3 + 2)  # C row stride
 
+        # How many tiles are necessary to compute this specific gemm
         num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
         num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
         num_tiles = num_m_tiles * num_n_tiles
 
+        # How many K-tile iterations we have where each tile is full BLOCK_SIZE_K size
         k_full_chunk_iters = gk // BLOCK_SIZE_K
 
+        # This program owns the tiles where tile_idx lies within this group's
+        # tiles in the range [last_problem_end, +num_tiles)
         while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
+            # GROUP_SIZE_M swizzle within this group's tile grid
+            # Which tile we own relative to the current gemm
             local = tile_idx - last_problem_end
+
+            # How many tiles are in the swizzle group
             num_pid_in_group = GROUP_SIZE_M * num_n_tiles
+
+            # Which swizzle group the tile is in
             group_id = local // num_pid_in_group
+
             first_pid_m = group_id * GROUP_SIZE_M
+
+            # Last group might have num rows less than GROUP_SIZE_M because
+            # GROUP_SIZE_M does not evenly divide gm
             group_size_m = min(num_m_tiles - first_pid_m, GROUP_SIZE_M)
+
+            # Ensure that consecutive PIDs are assigned tiles along m dimension in
+            # groups of size GROUP_SIZE_M
             pid_m = first_pid_m + ((local % num_pid_in_group) % group_size_m)
             pid_n = (local % num_pid_in_group) // group_size_m
 
-            # A rows and B columns are wrapped to keep all reads in bound and keep
-            # the the K-contiguous vectorized load. The garbage from wrapped lanes
+            # A rows and B columns are wrapped to keep all reads in bound and maintain
+            # vectorized loads along the K dimension. The garbage from wrapped lanes
             # is dropped by the masked C store
             offs_am = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
             offs_bn = tl.multiple_of((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn, BLOCK_SIZE_N)
@@ -109,40 +140,56 @@ def grouped_gemm_kernel(group_a_ptrs, group_b_ptrs, group_c_ptrs,
             # K is the contiguous/innermost axis of both A and B tiles
             offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
+            # Compute base offsets for A and B without K indexing
             a_base_off = offs_am[:, None] * stride_am  # [BLOCK_M, 1]
             b_base_off = offs_bn[:, None] * stride_bn  # [BLOCK_N, 1]
 
+            # Create accumulator register array
             acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+            # If we have enough K-iterations for a prologue, hot loop, and epilogue
+            # pipeline, we run it. Otherwise we run a simpler small-K pipeline
             if k_full_chunk_iters >= NUM_BUFFERS:
                 # Prologue: async-copy the first NUM_BUFFERS K-tiles
                 for pi in tl.static_range(0, NUM_BUFFERS):
                     k_start = pi * BLOCK_SIZE_K
                     a_offs = a_base_off + (k_start + offs_k[None, :])
                     b_offs = b_base_off + (k_start + offs_k[None, :])
+
+                    # GR i
                     tok_a = tlx.async_load(a_ptr + a_offs, smemA[pi], cache_modifier=".ca",
                                            eviction_policy="evict_first")
                     tok_b = tlx.async_load(b_ptr + b_offs, smemB[pi], cache_modifier=".ca",
                                            eviction_policy="evict_last")
+
                     tlx.async_load_commit_group([tok_a, tok_b])
 
+                # # Make GR0 and GR1 finish
                 tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
 
+                # LR 0
                 a_tile = tlx.local_load(smemA[0])
                 b_tile = tlx.local_load(tlx.local_trans(smemB[0]))
 
+                # Number of iterations for the hot loop
                 n_steady = k_full_chunk_iters - NUM_BUFFERS
 
                 for i in tl.range(0, n_steady, disallow_acc_multi_buffer=True):
-                    # K-tile i
+                    # # Index within the multibuffered circular SMEM where we are storing the global prefetch
                     prefetch_buf = i % NUM_BUFFERS
+
+                    # Index within the multibuffered circular SMEM where we will load from to transfer into regs
                     next_buf = (i + 1) % NUM_BUFFERS
+
+                    # Which tile we need to prefetch globally along the k dim
                     k_prefetch = (i + NUM_BUFFERS) * BLOCK_SIZE_K
 
+                    # Execute MFMA with the data we already have loaded into registers
                     with tlx.warp_pipeline_stage("mfma", priority=0):
                         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
                     with tlx.warp_pipeline_stage("mem", priority=1):
+                        # Perform global prefetching (GR i + NUM_BUFFERS)
                         a_offs = a_base_off + (k_prefetch + offs_k[None, :])
                         b_offs = b_base_off + (k_prefetch + offs_k[None, :])
                         tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
@@ -151,15 +198,18 @@ def grouped_gemm_kernel(group_a_ptrs, group_b_ptrs, group_c_ptrs,
                                                eviction_policy="evict_last")
                         tlx.async_load_commit_group([tok_a, tok_b])
 
+                        # Perform local prefetching (LR i + 1)
                         a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
                         b_tile = tlx.local_load(tlx.local_trans(smemB[next_buf]), relaxed=True)
 
+                    # Most recently committed buffers (GR i + NUM_BUFFERS) can be in flight
                     tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
 
                 # Epilogue: drain the last NUM_BUFFERS K-tiles
                 acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
                 tlx.async_load_wait_group(0)
 
+                # Finish final set of LRs and MFMAs
                 for i in tl.static_range(0, NUM_BUFFERS - 1):
                     buf = (k_full_chunk_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
                     a_tile = tlx.local_load(smemA[buf])
@@ -193,6 +243,7 @@ def grouped_gemm_kernel(group_a_ptrs, group_b_ptrs, group_c_ptrs,
                 b_tile = tl.load(b_ptr + b_offs_t, mask=offs_k[:, None] < gk - k_start, other=0.0)
                 acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
+            # Store to C and mask out OOB rows and columns
             c = acc.to(c_ptr.dtype.element_ty)
             offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -200,11 +251,13 @@ def grouped_gemm_kernel(group_a_ptrs, group_b_ptrs, group_c_ptrs,
             c_mask = (offs_cm[:, None] < gm) & (offs_cn[None, :] < gn)
             tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".cs")
 
+            # Program p owns tiles p, p+NUM_SM, p+2*NUM_SM, and so on
             tile_idx += NUM_SM
 
         last_problem_end = last_problem_end + num_tiles
 
 
+# Best config
 _CONFIG = {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
