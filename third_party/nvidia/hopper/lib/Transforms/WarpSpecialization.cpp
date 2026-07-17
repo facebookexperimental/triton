@@ -231,9 +231,7 @@ public:
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
-    if (failed(doMemoryPlanner(funcOp, numStages, /*readDecisionFile=*/"",
-                               /*writeDecisionFile=*/"",
-                               /*smemAllocAlgo=*/1, smemBudget))) {
+    if (failed(doMemoryPlanner(funcOp, numStages, smemBudget))) {
       signalPassFailure();
       return;
     }
