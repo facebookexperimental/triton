@@ -423,7 +423,7 @@ waits/arrives intact produces **ALL PASS** with 0.0 error.
 |----------|------|---------|
 | `insertAsyncComm` | `WSCodePartition.cpp` | Main sync insertion (~950 lines) |
 | `desyncTCGen5MMAOp` | `WSCodePartition.cpp` | Make MMA async with barriers |
-| `createTokenPost` | `WSCodePartition.cpp` | Allocate tokens and barriers |
+| `createToken` | `WSCodePartition.cpp` | Allocate tokens and barriers |
 | `consumerReleaseHeuristic` | `WSCodePartition.cpp` | Find optimal consumer release point |
 | `ProducerIsGen5` | `WSCodePartition.cpp` | Check if producer traces to gen5 MMA |
 | `fuseTcgen05CommitBarriers` | `CodePartitionUtility.cpp` | Fuse redundant commits (see [Barrier Fusion](BarrierFusion.md)) |

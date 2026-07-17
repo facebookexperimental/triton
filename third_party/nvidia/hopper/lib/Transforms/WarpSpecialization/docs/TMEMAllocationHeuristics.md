@@ -12,13 +12,13 @@ visualization, see [MemoryPlannerVisualization.md](MemoryPlannerVisualization.md
 
 The decision of what goes in TMEM vs SMEM is **not made by the memory planner**.
 It is determined earlier in the pipeline during channel collection
-(`collectPostChannels`). Channels are tagged at creation time based on the
+(`collectAllocChannels`). Channels are tagged at creation time based on the
 operations involved:
 
 | Channel Kind | Created For |
 |-------------|------------|
-| `TMEMPost` | `TMEMAllocOp` used by `TCGen5MMAOp`, MMA operand A/B via `TMEMStoreOp`, operand D (accumulator) |
-| `SMEMPost` | `LocalAllocOp`, TMA loads (`AsyncTMACopyGlobalToLocalOp`, `DescriptorLoadOp`), `LocalStoreOp` |
+| `TMEMAlloc` | `TMEMAllocOp` used by `TCGen5MMAOp`, MMA operand A/B via `TMEMStoreOp`, operand D (accumulator) |
+| `SMEMAlloc` | `LocalAllocOp`, TMA loads (`AsyncTMACopyGlobalToLocalOp`, `DescriptorLoadOp`), `LocalStoreOp` |
 
 The memory planner handles each kind independently: SMEM through
 `MemoryPlanner` and TMEM through `MemoryPlannerTmem`.
@@ -28,7 +28,7 @@ The memory planner handles each kind independently: SMEM through
 The top-level function (line 2289) orchestrates five steps:
 
 ```
-Step 1: collectPostChannels      — gather all SMEM and TMEM channels
+Step 1: collectAllocChannels      — gather all SMEM and TMEM channels
 Step 2: SMEM planning            — MemoryPlanner::run() or allocateSmemBuffers()
 Step 3: Visualization dump       — combined DOT graph
 Step 4: TMEM planning            — MemoryPlannerTmem::run()

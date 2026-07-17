@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
 
 // Test: When data partitioning splits the M dimension (factor=2), the subtile
 // operands a0, a1, and b each need separate barrier indices even though they

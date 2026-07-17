@@ -38,8 +38,8 @@ enum class DataChannelKind : int {
   SMEM = 0,
   TMEM = 1,
   REG = 2,
-  SMEMPost = 3,
-  TMEMPost = 4
+  SMEMAlloc = 3,
+  TMEMAlloc = 4
 };
 
 static inline std::string to_string(DataChannelKind k) {
@@ -50,10 +50,10 @@ static inline std::string to_string(DataChannelKind k) {
     return "tmem";
   case DataChannelKind::REG:
     return "reg";
-  case DataChannelKind::SMEMPost:
-    return "smem_post";
-  case DataChannelKind::TMEMPost:
-    return "tmem_post";
+  case DataChannelKind::SMEMAlloc:
+    return "smem_alloc";
+  case DataChannelKind::TMEMAlloc:
+    return "tmem_alloc";
   }
   return "Unknown";
 }
@@ -94,23 +94,23 @@ public:
 // A few assumptions, a channel can have multiple consumers, but the consumers
 // must be in the same region and the taskIds must be the same. We can have
 // a representative consumer in the channel.
-struct ChannelPost : Channel {
+struct AllocChannel : Channel {
 public:
   using Relation = std::pair<int, SmallVector<int>>;
 
   // source can be local_store, consumer can be gen5, ttg.memdesc_trans,
   // local_load
-  ChannelPost(int producer, SmallVector<int> &consumers, Operation *allocOp,
-              unsigned ID)
+  AllocChannel(int producer, SmallVector<int> &consumers, Operation *allocOp,
+               unsigned ID)
       : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, ID),
         allocOp(allocOp) {
-    channelKind = DataChannelKind::SMEMPost;
+    channelKind = DataChannelKind::SMEMAlloc;
   }
 
-  bool operator==(const ChannelPost &c) {
+  bool operator==(const AllocChannel &c) {
     return relation == c.relation && allocOp == c.allocOp;
   }
-  virtual ~ChannelPost() = default;
+  virtual ~AllocChannel() = default;
 
   virtual Operation *getSrcOp();
   virtual Operation *getDstOp();
@@ -122,7 +122,7 @@ public:
   Operation *allocOp;
 
   // Producer op (ttg.local_store / async_tma_copy / the in-body template store
-  // of a ttng.subtiled_region), resolved and cached in createChannelPost at
+  // of a ttng.subtiled_region), resolved and cached in createAllocChannel at
   // channel-creation time, before any buffer rewriting. getSrcOp() returns this
   // when set. Caching is required for subtiled-region producers: when a
   // *sibling* channel that shares the same template store is lowered,
@@ -135,7 +135,7 @@ public:
 
   // For a collapsed both-endpoints-subtiled channel, the per-tile staging
   // allocs of this (producer region, consumer region) pair other than the
-  // representative (allocOp). collectPostChannels records them here instead of
+  // representative (allocOp). collectAllocChannels records them here instead of
   // creating duplicate channels; after the in-body view rewire removes their
   // per-tile positions they become use_empty and are erased in insertAsyncComm.
   // Empty for every non-collapsed channel.
@@ -143,7 +143,7 @@ public:
 
   // True only for the representative of a both-endpoints-subtiled collapse
   // (producer AND consumer in different-task ttng.subtiled_regions), set in
-  // collectPostChannels. This — NOT the broad channelIsSubtiled (which is also
+  // collectAllocChannels. This — NOT the broad channelIsSubtiled (which is also
   // true for a consumer-only-subtiled channel such as an epilogue bias load) —
   // gates the size-1 subtiled reuse-group / in-body slot-rotation machinery at
   // buffer.copy == 1. See channelIsCollapsedBothSubtiled.
@@ -178,31 +178,7 @@ struct CommChannel {
 namespace ttng = ::mlir::triton::nvidia_gpu;
 namespace triton {
 namespace nvidia_gpu {
-struct TmemDataChannel : Channel {
-  ttng::TMEMAllocOp tmemAllocOp;
-  ttng::MMAv5OpInterface tmemMmaOp;
-  Operation *tmemProducerOp;
-
-  TmemDataChannel(int producer, SmallVector<int> &consumers,
-                  ttng::TMEMAllocOp tmemAllocOp,
-                  ttng::MMAv5OpInterface tmemMmaOp, Operation *tmemConsumerOp,
-                  unsigned operandIdx, unsigned numBuffers, unsigned uniqID,
-                  Operation *tmemProducerOp = nullptr)
-      : Channel(producer, consumers, tmemConsumerOp, operandIdx, numBuffers,
-                uniqID),
-        tmemAllocOp(tmemAllocOp), tmemMmaOp(tmemMmaOp),
-        tmemProducerOp(tmemProducerOp ? tmemProducerOp
-                                      : tmemAllocOp.getOperation()) {
-    channelKind = DataChannelKind::TMEM;
-  }
-
-  ttng::TMEMAllocOp getTmemAllocOp() { return tmemAllocOp; }
-  virtual Operation *getAllocOp() { return tmemAllocOp.getOperation(); }
-  ttng::MMAv5OpInterface getMmaOp() { return tmemMmaOp; }
-  virtual Operation *getSrcOp() { return tmemProducerOp; }
-};
-
-struct TmemDataChannelPost : Channel {
+struct TmemAllocChannel : Channel {
   bool isOperandD;
   bool isOperandDNoAcc;
   // When true, this channel is a same-iteration resource-hazard guard:
@@ -223,15 +199,15 @@ struct TmemDataChannelPost : Channel {
 
   // Can be produced by tmem_store or operand D of gen5, consumed by tmem_load
   // or gen5
-  TmemDataChannelPost(int producer, SmallVector<int> &consumers,
-                      Operation *allocOp, bool isOperandD, bool isOperandDNoAcc,
-                      unsigned uniqID)
+  TmemAllocChannel(int producer, SmallVector<int> &consumers,
+                   Operation *allocOp, bool isOperandD, bool isOperandDNoAcc,
+                   unsigned uniqID)
       : Channel(producer, consumers, nullptr, 0 /*operandIdx*/, 0, uniqID),
         isOperandD(isOperandD), isOperandDNoAcc(isOperandDNoAcc),
         allocOp(allocOp) {
     assert(consumers.size() == 1 &&
-           "TmemDataChannelPost must have a single consumer partition");
-    channelKind = DataChannelKind::TMEMPost;
+           "TmemAllocChannel must have a single consumer partition");
+    channelKind = DataChannelKind::TMEMAlloc;
   }
 
   virtual Operation *getSrcOp();
@@ -282,8 +258,8 @@ void getReuseChannels(ReuseGroup *gruop, Operation *regionOp,
 // even at size 1.
 bool channelIsSubtiled(Channel *ch);
 // Narrow form of channelIsSubtiled: true only for the representative of a
-// both-endpoints-subtiled collapse (ChannelPost::isCollapsedBothSubtiled). Used
-// to extend the subtiled reuse-group / in-body rotation machinery to
+// both-endpoints-subtiled collapse (AllocChannel::isCollapsedBothSubtiled).
+// Used to extend the subtiled reuse-group / in-body rotation machinery to
 // buffer.copy == 1 without misfiring on consumer-only-subtiled channels.
 bool channelIsCollapsedBothSubtiled(Channel *ch);
 
@@ -302,16 +278,6 @@ void appendAccumCntsForOps(SmallVector<Operation *> &taskTopOps,
 
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels);
-void collectRegionsWithChannelsPost(const SmallVector<Channel *> &channels,
-                                    DenseSet<Operation *> &regionsWithChannels);
-void insertAsyncCopy(
-    triton::FuncOp funcOp,
-    const DenseMap<Channel *, SmallVector<Channel *>>
-        &channelsGroupedByProducers,
-    const DenseMap<Channel *, Value> &bufferMap,
-    DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
-    bool isPost = false);
 
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
@@ -336,16 +302,15 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             Operation *headConsumer,
                             Operation *headConsumerSameLevel,
                             ArrayRef<int> additionalConsumerTaskIds = {},
-                            bool isPost = false,
                             DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);
 // Same-task SMEM records are useful for memory-planner bookkeeping, but code
 // partitioning should only consume cross-partition communication channels.
-void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp,
-                         bool includeSameTaskSmemChannels = true);
+void collectAllocChannels(SmallVector<std::unique_ptr<Channel>> &channels,
+                          triton::FuncOp &funcOp,
+                          bool includeSameTaskSmemChannels = true);
 
 /// Generate a combined DOT graph showing key ops and channels side by side.
 /// Left subgraph: Key operations with control flow structure.
@@ -365,7 +330,7 @@ void dumpTmemBufferLiveness(
     SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
     DenseMap<Operation *, Interval<size_t>> &allocToIntervals,
     DenseMap<Operation *, triton::nvidia_gpu::TMemAllocation> &allocToSize,
-    DenseMap<Operation *, triton::nvidia_gpu::TmemDataChannelPost *>
+    DenseMap<Operation *, triton::nvidia_gpu::TmemAllocChannel *>
         &allocToChannel,
     SmallVector<Channel *> &channels, llvm::raw_ostream &os);
 
@@ -437,7 +402,7 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel);
 // its logical slice. Packed sibling slices can be clobbered by such a producer,
 // so the owner needs back-edges to sibling consumers that are live across the
 // repeated overwrite. Detection: the channel is the representative (its alloc
-// has no `buffer.offset`) and is a `TmemDataChannelPost` with
+// has no `buffer.offset`) and is a `TmemAllocChannel` with
 // `isOperandDNoAcc`.
 bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh);
 void invalidateWarpSpecializeBarriers(triton::FuncOp funcOp);

@@ -66,7 +66,7 @@ channel machinery provide synchronization:
 
 The producer→consumer synchronization is **not** hand-synthesized. Because the
 `local_store` (owner) and `local_load` (all partitions) form an ordinary
-cross-partition SMEM dependency, `doCodePartitionPost` turns it into (N) SMEM
+cross-partition SMEM dependency, `doCodePartition` turns it into (N) SMEM
 channels with the correct full/empty mbarriers and phase — i.e. the broadcast is
 expressed in terms of an existing, tested AutoWS channel rather than a bespoke
 handshake.

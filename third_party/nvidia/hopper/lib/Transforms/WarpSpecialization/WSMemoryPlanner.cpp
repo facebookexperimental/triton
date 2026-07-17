@@ -89,7 +89,7 @@ protected:
   }
 
   /// Get the channel kind this planner handles.
-  /// @return DataChannelKind::SMEMPost or DataChannelKind::TMEMPost
+  /// @return DataChannelKind::SMEMAlloc or DataChannelKind::TMEMAlloc
   virtual DataChannelKind getChannelKind() const = 0;
 
   /// Compute the liveness interval for a value.
@@ -178,7 +178,7 @@ static Operation *findOriginalLoadOp(Value value) {
 /// stored into the channel's SMEM buffer. Returns nullptr if the channel has
 /// no valid source or the source can't be traced to a load.
 static Operation *findOriginalLoadForChannel(Channel *ch) {
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
     return nullptr;
   Operation *srcOp = ch->getSrcOp();
   if (!srcOp)
@@ -216,8 +216,8 @@ static Channel *findChannelForOp(Operation *op,
     if (alloc == op) {
       // Skip guard channels (isSameIterGuard) — they are auxiliary
       // synchronization channels and should not influence memory planning.
-      if (ch->channelKind == DataChannelKind::TMEMPost) {
-        auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      if (ch->channelKind == DataChannelKind::TMEMAlloc) {
+        auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ch);
         if (tmemCh->isSameIterGuard)
           continue;
       }
@@ -450,7 +450,7 @@ public:
 
 protected:
   DataChannelKind getChannelKind() const override {
-    return DataChannelKind::SMEMPost;
+    return DataChannelKind::SMEMAlloc;
   }
 
   Interval<size_t> computeLivenessInterval(Value value) override {
@@ -526,9 +526,9 @@ private:
   OperationListT livenessForSmemChannel(Value value) {
     Operation *alloc = value.getDefiningOp();
     Channel *ch = findChannelForAlloc(value, *channels);
-    ChannelPost *TheCh = nullptr;
-    if (ch && ch->channelKind == DataChannelKind::SMEMPost) {
-      TheCh = static_cast<ChannelPost *>(ch);
+    AllocChannel *TheCh = nullptr;
+    if (ch && ch->channelKind == DataChannelKind::SMEMAlloc) {
+      TheCh = static_cast<AllocChannel *>(ch);
     }
     std::vector<Operation *> liveOps;
     DenseSet<Operation *> users;
@@ -1146,8 +1146,8 @@ static DenseMap<Operation *, ChannelAnnotation> buildAllocToAnnotationMap(
 static bool isInnermostSmemChannel(Operation *alloc,
                                    SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost) {
-    LDBG("isInnermostSmemChannel: alloc has no SMEMPost channel");
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc) {
+    LDBG("isInnermostSmemChannel: alloc has no SMEMAlloc channel");
     LLVM_DEBUG(alloc->dump());
     return false;
   }
@@ -1198,10 +1198,10 @@ static bool isInnermostSmemChannel(Operation *alloc,
 static bool isSmemTMAChannel(Operation *alloc,
                              SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
     return false;
-  auto *chPost = static_cast<ChannelPost *>(ch);
-  Operation *srcOp = chPost->getSrcOp();
+  auto *chAlloc = static_cast<AllocChannel *>(ch);
+  Operation *srcOp = chAlloc->getSrcOp();
   if (!srcOp)
     return false;
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
@@ -1249,7 +1249,7 @@ static bool isSmemCrossStage(Operation *alloc,
 static unsigned getSmemCrossStageDepth(Operation *alloc,
                                        SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
     return 1;
 
   Operation *srcOp = ch->getSrcOp();
@@ -1287,7 +1287,7 @@ static unsigned getSmemCrossStageDepth(Operation *alloc,
 static bool isSmemLiveAcrossInnerLoop(Operation *alloc,
                                       SmallVector<Channel *> &channels) {
   Channel *ch = findChannelForOp(alloc, channels);
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
     return false;
 
   SmallVector<Operation *> dstOps;
@@ -2361,7 +2361,7 @@ static unsigned allocateSmemBuffers(
 /// @param TheCh The TMEM data channel post to get users for
 /// @param users Output set to collect all user operations
 /// @return success() if users were collected, failure() if TheCh is null
-static LogicalResult getAllTmemUsers(ttng::TmemDataChannelPost *TheCh,
+static LogicalResult getAllTmemUsers(ttng::TmemAllocChannel *TheCh,
                                      DenseSet<Operation *> &users) {
   if (!TheCh) {
     return failure();
@@ -2397,11 +2397,10 @@ OperationListT livenessForTmemChannel(Value value,
   std::vector<Operation *> liveOps;
   // Find the channel for value in channels.
   Channel *ch = findChannelForAlloc(value, channels);
-  if (!ch || ch->channelKind != DataChannelKind::TMEMPost) {
+  if (!ch || ch->channelKind != DataChannelKind::TMEMAlloc) {
     return liveOps;
   }
-  ttng::TmemDataChannelPost *TheCh =
-      static_cast<ttng::TmemDataChannelPost *>(ch);
+  ttng::TmemAllocChannel *TheCh = static_cast<ttng::TmemAllocChannel *>(ch);
   DenseSet<Operation *> users;
   if (failed(getAllTmemUsers(TheCh, users))) {
     return liveOps;
@@ -2433,7 +2432,7 @@ public:
 
 protected:
   DataChannelKind getChannelKind() const override {
-    return DataChannelKind::TMEMPost;
+    return DataChannelKind::TMEMAlloc;
   }
 
   Interval<size_t> computeLivenessInterval(Value value) override {
@@ -2452,7 +2451,7 @@ private:
   BufferRangeMapT bufferRange;
 
   SmallVector<BufferT *> buffers;
-  DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
+  DenseMap<Operation *, ttng::TmemAllocChannel *> allocToChannel;
 
   /// Check whether dstOp is in the forward SSA slice of srcOp,
   /// i.e. dstOp transitively uses a result of srcOp.  Also follows
@@ -2592,10 +2591,10 @@ public:
                              << liveInterval.end());
       LDBG("tmem allocSize: " << allocSize.numCols << " " << allocSize.numRows);
 
-      ttng::TmemDataChannelPost *TheCh = nullptr;
+      ttng::TmemAllocChannel *TheCh = nullptr;
       Channel *chBase = findChannelForAlloc(alloc, *channels);
-      if (chBase && chBase->channelKind == DataChannelKind::TMEMPost) {
-        TheCh = static_cast<ttng::TmemDataChannelPost *>(chBase);
+      if (chBase && chBase->channelKind == DataChannelKind::TMEMAlloc) {
+        TheCh = static_cast<ttng::TmemAllocChannel *>(chBase);
       }
       allocToIntervals[alloc.getOperation()] = liveInterval;
       allocToSize.insert(
@@ -2608,13 +2607,13 @@ public:
     sort(allocs, [&](ttng::TMEMAllocOp a, ttng::TMEMAllocOp b) {
       Channel *aChBase = findChannelForAlloc(a, *channels);
       Channel *bChBase = findChannelForAlloc(b, *channels);
-      ttng::TmemDataChannelPost *aCh = nullptr;
-      ttng::TmemDataChannelPost *bCh = nullptr;
-      if (aChBase && aChBase->channelKind == DataChannelKind::TMEMPost) {
-        aCh = static_cast<ttng::TmemDataChannelPost *>(aChBase);
+      ttng::TmemAllocChannel *aCh = nullptr;
+      ttng::TmemAllocChannel *bCh = nullptr;
+      if (aChBase && aChBase->channelKind == DataChannelKind::TMEMAlloc) {
+        aCh = static_cast<ttng::TmemAllocChannel *>(aChBase);
       }
-      if (bChBase && bChBase->channelKind == DataChannelKind::TMEMPost) {
-        bCh = static_cast<ttng::TmemDataChannelPost *>(bChBase);
+      if (bChBase && bChBase->channelKind == DataChannelKind::TMEMAlloc) {
+        bCh = static_cast<ttng::TmemAllocChannel *>(bChBase);
       }
       // Handle null channels - put them at the end
       if (!aCh && !bCh)
@@ -2960,7 +2959,7 @@ public:
       // TODO: Remove this restriction once buffer index constraints are
       // tested for TMEM allocs that are not loop-carried MMA accumulators.
       // Currently only allocs with a loop-carried acc token have correct
-      // multi-buffer index logic in createBufferPost.
+      // multi-buffer index logic in createBufferForAllocs.
       bool hasLoopCarriedMMA = false;
       for (auto *user : alloc.getResult().getUsers()) {
         if (auto forOp = user->getParentOfType<scf::ForOp>()) {
@@ -3340,7 +3339,7 @@ public:
 
   FailureOr<unsigned> allocateTMemAllocs2(
       SmallVector<ttng::TMEMAllocOp> &allocs, SmallVector<BufferT *> &buffers,
-      DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
+      DenseMap<Operation *, ttng::TmemAllocChannel *> &allocToChannel,
       DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
       unsigned bufferId,
       const AllocationState &initialState = AllocationState()) {
@@ -3427,7 +3426,7 @@ public:
   FailureOr<unsigned> allocateTMemAllocs(
       SmallVector<triton::nvidia_gpu::TMEMAllocOp> &allocs,
       SmallVector<BufferT *> &buffers,
-      DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
+      DenseMap<Operation *, ttng::TmemAllocChannel *> &allocToChannel,
       DenseMap<Operation *, size_t> &operationId, Operation *ctrlOp,
       unsigned bufferId) {
     auto alongDependencyChain = [&](Operation *src, Operation *dst,
@@ -3455,9 +3454,9 @@ public:
     };
     auto getCombinedTasks = [&](BufferT *alloc) -> SmallVector<AsyncTaskId> {
       Channel *chBase = findChannelForOp(alloc->owner, *channels);
-      ttng::TmemDataChannelPost *TheCh = nullptr;
-      if (chBase && chBase->channelKind == DataChannelKind::TMEMPost) {
-        TheCh = static_cast<ttng::TmemDataChannelPost *>(chBase);
+      ttng::TmemAllocChannel *TheCh = nullptr;
+      if (chBase && chBase->channelKind == DataChannelKind::TMEMAlloc) {
+        TheCh = static_cast<ttng::TmemAllocChannel *>(chBase);
       }
       SmallVector<AsyncTaskId> combinedTasks;
       if (!TheCh) {
@@ -4060,14 +4059,14 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
-  collectPostChannels(channelsOrigin, funcOp);
+  collectAllocChannels(channelsOrigin, funcOp);
   SmallVector<Channel *> channels;
   for (const auto &c : channelsOrigin) {
     // Skip guard channels (isSameIterGuard) — they are auxiliary
     // synchronization channels used by the code partition pass and
     // should not influence memory planning decisions.
-    if (c->channelKind == DataChannelKind::TMEMPost) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(c.get());
+    if (c->channelKind == DataChannelKind::TMEMAlloc) {
+      auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(c.get());
       if (tmemCh->isSameIterGuard)
         continue;
     }
@@ -4082,9 +4081,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                                       << " " << ch->uniqID << " ");
       ch->getAllocOp()->dump();
     });
-    if (ch->channelKind == DataChannelKind::TMEMPost) {
-      ttng::TmemDataChannelPost *TheCh =
-          static_cast<ttng::TmemDataChannelPost *>(ch);
+    if (ch->channelKind == DataChannelKind::TMEMAlloc) {
+      ttng::TmemAllocChannel *TheCh = static_cast<ttng::TmemAllocChannel *>(ch);
       LDBG("channel type TMEM" << TheCh->isOperandD << " "
                                << TheCh->isOperandDNoAcc);
     }

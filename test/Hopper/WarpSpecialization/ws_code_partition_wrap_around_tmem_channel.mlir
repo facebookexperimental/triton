@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=4 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=4" | FileCheck %s
 
 // Test: In a warp-specialized persistent GEMM, three ops in separate partitions
 // share the same TMEM accumulator buffer:

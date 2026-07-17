@@ -149,7 +149,7 @@ static AsyncTaskId getOwnerPartition(scf::WhileOp whileOp,
 // the atomic once in the owner partition, splat its scalar result into a 1-CTA
 // SMEM slot, and read it back (+ tt.unsplat) in every partition, rewiring the
 // while's loop-carried tile id to the broadcast value. The producer→consumer
-// synchronization is left to `doCodePartitionPost`, which already turns a
+// synchronization is left to `doCodePartition`, which already turns a
 // cross-partition `local_store`→`local_load` into (N) SMEM channels with the
 // correct full/empty mbarriers and phase — i.e. the broadcast is expressed in
 // terms of an existing, tested AutoWS channel rather than a bespoke handshake.
@@ -283,7 +283,7 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
 // Broadcast a scalar produced in `owner` to every partition through a
 // function-scope SMEM slot (splat -> local_store in owner; local_load ->
 // unsplat in all partitions). Mirrors the atomic case; the store/load edge
-// becomes SMEM channels in doCodePartitionPost. `b`'s insertion point must be
+// becomes SMEM channels in doCodePartition. `b`'s insertion point must be
 // after the scalar's producer.
 static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
                                         OpBuilderWithAsyncTaskIds &b,

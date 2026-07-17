@@ -166,7 +166,7 @@ functions handle the wait ops after the memory planner:
 doMemoryPlanner
   → doAnnotateTMAStoreWaits      ← annotate waits with buffer count
   → doValidateTMAStoreAnnotations ← safety check
-  → doCodePartitionPost
+  → doCodePartition
   → ...
   → scheduleLoops                 ← SWP assigns pipeline stages
   → cleanupWarpSpecializedLoops   ← prune dead loop-carried values
@@ -297,7 +297,7 @@ how TMA stores fit into the WS memory lowering pipeline.
 
 ## Code Partition: Realizing `allocation.reuseTarget`
 
-**File**: `WSCodePartition.cpp::doCodePartitionPost`
+**File**: `WSCodePartition.cpp::doCodePartition`
 
 The planner's `allocation.reuseTarget = N` annotation is a SMEM-accounting
 hint. To actually realize the SMEM overlap in the emitted kernel, two
@@ -352,7 +352,7 @@ coverage: `test_bwd_tmem_dsT_reuse_3group_persistent`.
 `insertAsyncComm`, whose cleanup sweep (`removeTokenfNotUsed`) erases any token
 alloc currently lacking users — the freshly-created reuse token only gains uses
 once the acquire/release are inserted. This is enforced as "Step 7.5" — running
-between `createTokenPost` (Step 7) and `insertAsyncComm` (Step 8). See commit
+between `createToken` (Step 7) and `insertAsyncComm` (Step 8). See commit
 `c67893c25` for the related ordering bug-fix.
 
 ### Step 2: Reinterpret Staging Alloc into Host Alloc

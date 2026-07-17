@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
 
 // Regression test for whole-allocation overwrite with packed TMEM reuse,
 // exercised by the FA-fwd-persistent TMEM aliasing race.

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s
 
 // Regression test for the persistent FA-bwd dv/dk staging SMEM cross-tile race
 // (bug #9 in .llms/rules/partition-scheduler-bugs.md / D109859261).
