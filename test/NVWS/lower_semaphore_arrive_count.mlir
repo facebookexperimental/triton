@@ -17,7 +17,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
     // CHECK: [[MBAR:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64
     // CHECK-COUNT-2: ttng.init_barrier %{{.*}}, 2
-    %sem = nvws.semaphore.create %buf released = -1 {pending_count = 2 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
+    %sem = nvws.semaphore.create %buf released = 3 {pending_count = 2 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     %view = nvws.semaphore.buffer %sem, %tok {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     %v = ttg.local_load %view {ttg.partition = array<i32: 0>} : !ttg.memdesc<1xi32, #shared, #smem, mutable> -> !elt
@@ -34,7 +34,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     %buf2 = ttg.local_alloc : () -> !ttg.memdesc<2x1xi32, #shared, #smem, mutable>
     // CHECK: [[MBAR3:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x1xi64
     // CHECK-COUNT-2: ttng.init_barrier %{{.*}}, 3
-    %sem2 = nvws.semaphore.create %buf2 released = -1 {pending_count = 3 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
+    %sem2 = nvws.semaphore.create %buf2 released = 3 {pending_count = 3 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>
     %tok2 = nvws.semaphore.acquire %sem2 {ttg.partition = array<i32: 0>} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]> -> !ttg.async.token
     // CHECK: ttng.arrive_barrier {{.*}}, 2 {ttg.partition = array<i32: 0>}
     nvws.semaphore.release %sem2, %tok2 [#nvws.async_op<none>] {ttg.partition = array<i32: 0>, arrive_count = 2 : i32} : !nvws.semaphore<[!ttg.memdesc<2x1xi32, #shared, #smem, mutable>]>, !ttg.async.token

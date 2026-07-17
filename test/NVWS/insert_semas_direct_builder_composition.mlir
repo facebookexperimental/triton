@@ -10,7 +10,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @branch_pass_with_outstanding_completion(
       %cond: i1, %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[PASS_BASE:%[0-9]+]] = ttg.local_alloc {buffer.id = 10100 : i32}
-    // CHECK: [[LOOP_SEMA:%[0-9]+]] = nvws.semaphore.create [[PASS_BASE]] released = -1 {pending_count = 1 : i32}
+    // CHECK: [[LOOP_SEMA:%[0-9]+]] = nvws.semaphore.create [[PASS_BASE]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[TO_0:%[0-9]+]] = nvws.semaphore.create [[PASS_BASE]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[TO_1_THEN:%[0-9]+]] = nvws.semaphore.create [[PASS_BASE]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[TO_1_ELSE:%[0-9]+]] = nvws.semaphore.create [[PASS_BASE]] {pending_count = 1 : i32}
@@ -83,7 +83,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @conditional_fanout_restores_boundary_owner(
       %cond: i1, %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[BASE:%[0-9]+]] = ttg.local_alloc {buffer.id = 10105 : i32}
-    // CHECK-NEXT: [[ENTRY:%[0-9]+]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 2 : i32}
+    // CHECK-NEXT: [[ENTRY:%[0-9]+]] = nvws.semaphore.create [[BASE]] released = 1 {pending_count = 2 : i32}
     // CHECK-NEXT: [[THEN_TO_ONE:%[0-9]+]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[THEN_TO_TWO:%[0-9]+]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[ELSE_TO_ONE:%[0-9]+]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32}
@@ -149,7 +149,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @nested_same_owner_reuses_outer_token(
       %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[REUSE_BASE:%[0-9]+]] = ttg.local_alloc {buffer.id = 10101 : i32}
-    // CHECK: [[OUTER_ENTRY:%[0-9]+]] = nvws.semaphore.create [[REUSE_BASE]] released = -1 {pending_count = 1 : i32}
+    // CHECK: [[OUTER_ENTRY:%[0-9]+]] = nvws.semaphore.create [[REUSE_BASE]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[TO_ZERO:%[0-9]+]] = nvws.semaphore.create [[REUSE_BASE]] {pending_count = 1 : i32}
     // CHECK-NOT: nvws.semaphore.create
     %buf = ttg.local_alloc {buffer.id = 10101 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
@@ -194,7 +194,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @conditional_completion_is_later_edge_source(
       %cond: i1, %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[SOURCE_BASE:%[0-9]+]] = ttg.local_alloc {buffer.id = 10102 : i32}
-    // CHECK: [[SOURCE_ENTRY:%[0-9]+]] = nvws.semaphore.create [[SOURCE_BASE]] released = -1
+    // CHECK: [[SOURCE_ENTRY:%[0-9]+]] = nvws.semaphore.create [[SOURCE_BASE]] released = 1
     %buf = ttg.local_alloc {buffer.id = 10102 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     %x = "value"() : () -> !one
     scf.for %i = %lb to %ub step %step : i32 {
@@ -245,7 +245,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @conditional_alternatives_normalize_counts(
       %cond: i1, %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[COUNT_BASE:%[0-9]+]] = ttg.local_alloc {buffer.id = 10103 : i32}
-    // CHECK: [[COUNT_ENTRY:%[0-9]+]] = nvws.semaphore.create [[COUNT_BASE]] released = -1 {pending_count = 1 : i32}
+    // CHECK: [[COUNT_ENTRY:%[0-9]+]] = nvws.semaphore.create [[COUNT_BASE]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[COUNT_TO_ZERO:%[0-9]+]] = nvws.semaphore.create [[COUNT_BASE]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[THEN_TO_ONE:%[0-9]+]] = nvws.semaphore.create [[COUNT_BASE]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[THEN_TO_TWO:%[0-9]+]] = nvws.semaphore.create [[COUNT_BASE]] {pending_count = 1 : i32}
@@ -326,8 +326,8 @@ module attributes {"ttg.num-warps" = 4 : i32} {
     // CHECK: [[MIXED_WHOLE:%[0-9]+]] = ttg.local_alloc {buffer.id = 10104 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[MIXED_LEFT:%[0-9]+]] = ttg.local_alloc {buffer.id = 10104 : i32, buffer.offset = 0 : i32}
     // CHECK-NEXT: [[MIXED_RIGHT:%[0-9]+]] = ttg.local_alloc {buffer.id = 10104 : i32, buffer.offset = 1 : i32}
-    // CHECK-NEXT: [[MIXED_ENTRY_0:%[0-9]+]] = nvws.semaphore.create [[MIXED_WHOLE]], [[MIXED_LEFT]], [[MIXED_RIGHT]] released = -1
-    // CHECK-NEXT: [[MIXED_ENTRY_1:%[0-9]+]] = nvws.semaphore.create [[MIXED_WHOLE]], [[MIXED_LEFT]], [[MIXED_RIGHT]] released = -1
+    // CHECK-NEXT: [[MIXED_ENTRY_0:%[0-9]+]] = nvws.semaphore.create [[MIXED_WHOLE]], [[MIXED_LEFT]], [[MIXED_RIGHT]] released = 1
+    // CHECK-NEXT: [[MIXED_ENTRY_1:%[0-9]+]] = nvws.semaphore.create [[MIXED_WHOLE]], [[MIXED_LEFT]], [[MIXED_RIGHT]] released = 1
     // CHECK-NEXT: [[MIXED_JOIN:%[0-9]+]] = nvws.semaphore.create [[MIXED_WHOLE]], [[MIXED_LEFT]], [[MIXED_RIGHT]] {pending_count = 2 : i32}
     %whole = ttg.local_alloc {buffer.id = 10104 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<2xi32, #shared, #smem, mutable>
     %left = ttg.local_alloc {buffer.id = 10104 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>

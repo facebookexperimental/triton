@@ -23,7 +23,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %a = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 700 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // CHECK: [[V2:%.*]] = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 700 : i32} : () -> !ttg.memdesc<3x256x64xf16, #shared, #smem, mutable>
     %b = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 700 : i32} : () -> !ttg.memdesc<256x64xf16, #shared, #smem, mutable>
-    // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]], [[V2]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<3x256x64xf16, #shared, #smem, mutable>]>
+    // CHECK: [[V3:%.*]] = nvws.semaphore.create [[V1]], [[V2]] released = 7 {pending_count = 1 : i32} : <[!ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<3x256x64xf16, #shared, #smem, mutable>]>
     // CHECK: [[V4:%.*]] = nvws.semaphore.create [[V1]], [[V2]] {pending_count = 1 : i32} : <[!ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<3x256x64xf16, #shared, #smem, mutable>]>
     %r = scf.for %iv = %c0 to %c1 step %c1 iter_args(%flag = %false) -> (i1) : i32 {
       // CHECK: [[V5:%.*]] = nvws.semaphore.acquire [[V3]] {loop.cluster = 2 : i32, loop.stage = 0 : i32, ttg.partition = array<i32: 2>} : <[!ttg.memdesc<3x128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<3x256x64xf16, #shared, #smem, mutable>]> -> !ttg.async.token

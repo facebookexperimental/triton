@@ -9,7 +9,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @local_no_buffer_id
   tt.func @local_no_buffer_id(%lb: i32, %ub: i32, %step: i32) {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
-    // CHECK: [[V1:%.*]] = nvws.semaphore.create %{{[-A-Za-z0-9_.$#]+}} released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[V1:%.*]] = nvws.semaphore.create %{{[-A-Za-z0-9_.$#]+}} released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[V2:%.*]] = nvws.semaphore.create %{{[-A-Za-z0-9_.$#]+}} {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}}  : i32 {
     scf.for %i = %lb to %ub step %step : i32 {

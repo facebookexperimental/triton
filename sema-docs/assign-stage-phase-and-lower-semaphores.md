@@ -49,13 +49,13 @@ verification rejects shared-buffer semaphores whose ordered lists differ. For
 example:
 
 ```text
-%empty = nvws.semaphore.create %a, %b released = -1
+%empty = nvws.semaphore.create %a, %b released = 1
 %full  = nvws.semaphore.create %a, %b
 ```
 
 The optional `released` value is an i32 stage mask. Bit `i` set to one means
 physical stage `i` begins released; a zero bit means it begins blocked. An
-omitted mask is zero. `released = -1` is the legacy all-stages-released state.
+omitted mask is zero.
 
 Both semaphores belong to the group keyed by `%a`. The shared-buffer invariant
 additionally guarantees that both contain the complete ordered list
@@ -139,9 +139,8 @@ state.phases[key] = ~released_mask
 ```
 
 An omitted released mask is zero, so every buffer stage starts with phase 1.
-`released = -1` produces phase zero for every stage. Other masks initialize
-each stage independently; for example, `released = 5` produces phase mask
-`-6`, with physical stages 0 and 2 released and stage 1 blocked.
+Masks initialize each stage independently; for example, `released = 5` starts
+physical stages 0 and 2 released and stage 1 blocked.
 The `i32` representation supports at most 32 physical buffer stages;
 `AssignStagePhase` rejects a deeper semaphore group before rewriting it.
 

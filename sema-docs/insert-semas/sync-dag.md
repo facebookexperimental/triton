@@ -4379,15 +4379,15 @@ Some semaphores start released for one owner. The released-stage mask lets the
 first acquire of each selected physical stage run before a release executes:
 
 ```text
-starts released       semaphore.create ... released = -1
-starts blocked        semaphore.create ...
+selected stages released    semaphore.create ... released = stageMask
+all stages blocked          semaphore.create ...
 ```
 
 Every acquire has the semaphore's `pending_count`. A released mask changes
 only the initial phase of each stage; it does not partially satisfy a pending
 count, and no initial release or arrival operations are emitted.
 
-The legacy entry state releases every physical stage. For a non-circular,
+The default entry state releases every physical stage. For a non-circular,
 authored multi-member ring whose buffer and semaphore depths already match,
 SYNC-DAG can refine that state. It replays the ring's one direct entry acquire
 and loop-closing release for one complete stage orbit. For each physical stage,
@@ -4399,16 +4399,23 @@ first event is release  -> released-mask bit 0
 ```
 
 The replay uses the canonical ASP cursor ordinal plus the final authored stage
-offset. Full masks remain the legacy `released = -1`; mixed masks are stored on
-`Sema::releasedMask`. For example, two advances on a depth-3 ring produce
-acquire stages `0,2,1` and release stages `1,0,2`, so the initial mask is
-`0b101 = 5`. Two advances on a depth-5 ring similarly produce `0b10101 = 21`.
+offset. The emitter derives a full physical-stage mask from `entryOwner`;
+mixed masks are stored on `Sema::releasedMask`. For example, two advances on a
+depth-3 ring produce acquire stages `0,2,1` and release stages `1,0,2`, so the
+initial mask is `0b101 = 5`. Two advances on a depth-5 ring similarly produce
+`0b10101 = 21`.
 
 The refinement deliberately excludes circular groups, auto-expanded
 semaphore rings, nested or ambiguous control flow, and entry channels with
-multiple acquire/release sites. Those retain the legacy entry state. A later
+multiple acquire/release sites. Those retain the default entry state. A later
 acquire of any stage waits for new arrivals. The token belongs to the owner
 that performs the acquire.
+
+After synchronization IR has been rendered, EMIT-IR performs a separate
+[fresh-write handoff finalization](emit-ir.md#fresh-write-handoff-finalization)
+for eligible staged, single-member TMEM groups. That replay can handle the
+already-planned loop and branch structure, author an immediate token-only relay
+offset, and compute the initial released-stage masks for that separate path.
 
 [↑ Back to contents](#contents)
 
@@ -4439,8 +4446,8 @@ LowerSemaphore will actually use.
 ### Buffer copies
 
 The pass chooses the group buffer-copy count after it removes unnecessary
-synchronization edges. Every explicit `buffer.copy` must be positive. Members
-of one group must either all provide `buffer.copy` or all omit it.
+synchronization edges. Members of one group must either all provide
+`buffer.copy` or all omit it.
 
 TMEM members sharing one `buffer.id` must provide the same explicit copy
 count. The supported bridge-to-InsertSemas form with different ordinary SMEM

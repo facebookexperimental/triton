@@ -49,17 +49,13 @@
 
 namespace mlir::triton::nvws {
 
-inline constexpr uint32_t getAllReleasedMask() {
-  return ~uint32_t(0);
-}
-
 inline uint32_t getPhysicalStageMask(unsigned depth) {
-  return depth >= 32 ? getAllReleasedMask() : (uint32_t(1) << depth) - 1;
+  return static_cast<uint32_t>((uint64_t(1) << depth) - 1);
 }
 
 inline uint32_t resizeReleasedMask(uint32_t mask, unsigned oldDepth,
                                    unsigned newDepth) {
-  if (!mask || mask == getAllReleasedMask() || oldDepth == newDepth)
+  if (!mask || oldDepth == newDepth)
     return mask;
   uint32_t resized = 0;
   for (unsigned stage = 0; stage < newDepth; ++stage)

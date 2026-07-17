@@ -86,19 +86,19 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     // The single-buffer Q/K/V SMEM allocs each get a true(EMPTY)/false(FULL)
     // semaphore pair (pending_count = 1).
     // CHECK:           [[Q0:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK:           [[Q0_E:%.*]] = nvws.semaphore.create [[Q0]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK:           [[Q0_E:%.*]] = nvws.semaphore.create [[Q0]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK:           [[Q0_F:%.*]] = nvws.semaphore.create [[Q0]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     %q0_0 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK:           [[Q1:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK:           [[Q1_E:%.*]] = nvws.semaphore.create [[Q1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK:           [[Q1_E:%.*]] = nvws.semaphore.create [[Q1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK:           [[Q1_F:%.*]] = nvws.semaphore.create [[Q1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     %q0_1 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK:           [[K:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK:           [[K_E:%.*]] = nvws.semaphore.create [[K]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK:           [[K_E:%.*]] = nvws.semaphore.create [[K]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK:           [[K_F:%.*]] = nvws.semaphore.create [[K]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     %k = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK:           [[V:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK:           [[V_E:%.*]] = nvws.semaphore.create [[V]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK:           [[V_E:%.*]] = nvws.semaphore.create [[V]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK:           [[V_F:%.*]] = nvws.semaphore.create [[V]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     %v = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
@@ -107,8 +107,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     // form one multi-member semaphore group: two released gates (pending_count =
     // 2) plus five false(FULL) phases (pending_count = 1).
     // CHECK:           [[R4:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK:           [[R4_IN:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} released = -1 {pending_count = 2 : i32} : <[{{.*}}]>
-    // CHECK:           [[R4_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} released = -1 {pending_count = 2 : i32} : <[{{.*}}]>
+    // CHECK:           [[R4_IN:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} released = 1 {pending_count = 2 : i32} : <[{{.*}}]>
+    // CHECK:           [[R4_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} released = 1 {pending_count = 2 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F1:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F2:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R4_F3:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R4]], %{{.*}} {pending_count = 1 : i32} : <[{{.*}}]>
@@ -122,8 +122,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     // multi-member group: two released gates (pending_count = 2) plus five
     // false(FULL) semaphores (pending_count = 1).
     // CHECK:           [[R5:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK:           [[R5_IN:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} released = -1 {pending_count = 2 : i32} : <[{{.*}}]>
-    // CHECK:           [[R5_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} released = -1 {pending_count = 2 : i32} : <[{{.*}}]>
+    // CHECK:           [[R5_IN:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} released = 1 {pending_count = 2 : i32} : <[{{.*}}]>
+    // CHECK:           [[R5_E:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} released = 1 {pending_count = 2 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F1:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F2:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} {pending_count = 1 : i32} : <[{{.*}}]>
     // CHECK:           [[R5_F3:%.*]] = nvws.semaphore.create %{{.*}}, %{{.*}}, %{{.*}}, [[R5]], %{{.*}} {pending_count = 1 : i32} : <[{{.*}}]>
@@ -133,21 +133,21 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %offsetkv_y_18 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32, buffer.offset = 65 : i32} : () -> !ttg.memdesc<128x1xf32, #tmem, #ttng.tensor_memory, mutable>
     // Epilogue-store SMEM scratch (%3,%4) each get a true/false pair.
     // CHECK:           [[O0:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK:           [[O0_E:%.*]] = nvws.semaphore.create [[O0]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK:           [[O0_E:%.*]] = nvws.semaphore.create [[O0]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK:           [[O0_F:%.*]] = nvws.semaphore.create [[O0]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     %3 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK:           [[O1:%.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK:           [[O1_E:%.*]] = nvws.semaphore.create [[O1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK:           [[O1_E:%.*]] = nvws.semaphore.create [[O1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK:           [[O1_F:%.*]] = nvws.semaphore.create [[O1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     %4 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
 
     // The two per-iteration acc TMEM allocs (buffer.id 2/3) are hoisted to
     // single-component 1x buffers with a true/false pair each.
     // CHECK:           [[ACC0:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK:           [[ACC0_E:%.*]] = nvws.semaphore.create [[ACC0]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    // CHECK:           [[ACC0_E:%.*]] = nvws.semaphore.create [[ACC0]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
     // CHECK:           [[ACC0_F:%.*]] = nvws.semaphore.create [[ACC0]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
     // CHECK:           [[ACC1:%.*]] = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK:           [[ACC1_E:%.*]] = nvws.semaphore.create [[ACC1]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
+    // CHECK:           [[ACC1_E:%.*]] = nvws.semaphore.create [[ACC1]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
     // CHECK:           [[ACC1_F:%.*]] = nvws.semaphore.create [[ACC1]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>]>
 
     // Initial outer-gate acquires for R4/R5 (partition 1), followed by the two

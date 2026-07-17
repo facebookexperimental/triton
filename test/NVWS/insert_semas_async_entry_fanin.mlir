@@ -13,7 +13,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
       %desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
       %lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 1701 : i32}
-    // CHECK: [[OUTER_EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32}
+    // CHECK: [[OUTER_EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32}
     // CHECK: [[INNER_READY:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 2 : i32}
     %alloc = ttg.local_alloc {buffer.id = 1701 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK: scf.for %{{[-A-Za-z0-9_.$#]+}} = %{{[-A-Za-z0-9_.$#]+}} to %{{[-A-Za-z0-9_.$#]+}} step %{{[-A-Za-z0-9_.$#]+}} : i32 {

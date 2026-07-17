@@ -28,7 +28,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // serialize the {0}->{1}->{2}->{0} chain.
     // CHECK: [[A:%.*]] = ttg.local_alloc {buffer.id = 500 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>
     // CHECK: [[B:%.*]] = ttg.local_alloc {buffer.id = 500 : i32, buffer.offset = 64 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[A]], [[B]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[A]], [[B]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[F01:%.*]] = nvws.semaphore.create [[A]], [[B]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[F12:%.*]] = nvws.semaphore.create [[A]], [[B]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[F20:%.*]] = nvws.semaphore.create [[A]], [[B]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
@@ -94,7 +94,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @stable_producer_row_and_foreign_war(%lb: i32, %ub: i32,
                                                 %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 991 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[READY:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[WAR:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 2 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // No pre-loop seed acquire and no token iter_arg: EMPTY is created
@@ -147,7 +147,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   tt.func @region_resets_producer_row_to_enter(%lb: i32, %ub: i32,
                                                 %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc {buffer.id = 992 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // {2}'s turn semaphore is created before {1}'s; {0} hands off to [[R1]].
     // CHECK: [[R2:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
     // CHECK: [[R1:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x1xi32, #shared, #smem, mutable>]>
@@ -207,7 +207,7 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
     // their waves — the reduction must keep both reader acquires. The
     // EMPTY semaphore fans out (pending_count = 2) to two FULL sems.
     // CHECK: [[BUF:%.*]] = ttg.local_alloc {buffer.id = 501 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BUF]] released = -1 {pending_count = 2 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[BUF]] released = 1 {pending_count = 2 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[F1:%.*]] = nvws.semaphore.create [[BUF]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[BUF]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>]>
     // No pre-loop seed acquire and no token iter_arg: the producer acquires

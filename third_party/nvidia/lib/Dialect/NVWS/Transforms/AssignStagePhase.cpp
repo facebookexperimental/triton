@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "AssignStagePhase.h"
 #include "InsertSemas.h"
 #include "Utilities.h"
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
@@ -157,6 +158,10 @@ struct AssignStagePhase {
     computeSharedPhaseLanePartitions();
     validateCircularPartitionSlotOwnership();
     analyzeStageCopies(semaOps.front());
+  }
+
+  explicit AssignStagePhase(ArrayRef<Value> semaphores) {
+    groupSemaphores.insert(semaphores.begin(), semaphores.end());
   }
 
   unsigned getSemaphoreOrder(Value semaphore) const {
@@ -2101,6 +2106,12 @@ LogicalResult assignStagePhase(triton::FuncOp funcOp) {
 // ----------------------------------------------------------------------------
 
 } // anonymous namespace
+
+bool nvws_semas::isFirstUseFreshWriteAfterAcquire(
+    SemaphoreAcquireOp acquireOp, ArrayRef<Value> semaphores) {
+  return AssignStagePhase(semaphores)
+      .isFirstUseFreshWriteAfterAcquire(acquireOp);
+}
 
 class NVWSAssignStagePhase
     : public impl::NVWSAssignStagePhaseBase<NVWSAssignStagePhase> {

@@ -33,7 +33,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %true = arith.constant true
     %acc, %tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // CHECK: [[ALLOC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[HELD:%.*]] = nvws.semaphore.acquire [[EMPTY]]
     // CHECK-NEXT: [[INIT_BUF:%.*]] = nvws.semaphore.buffer [[EMPTY]], [[HELD]]

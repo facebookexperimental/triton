@@ -12,7 +12,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: tt.func @staged_tokenless_cross_stage_pou
   tt.func @staged_tokenless_cross_stage_pou(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[ALLOC:%.*]] = ttg.local_alloc
-    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]] released = 1 {pending_count = 1 : i32}
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[ALLOC]] {pending_count = 1 : i32}
     %alloc = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 991 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     // The cross-iteration EMPTY edge goes from stage 1 to stage 0.  POU keeps

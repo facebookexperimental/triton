@@ -10,8 +10,33 @@ namespace mlir::triton {
 namespace {
 using namespace nvws_semas;
 
+static LogicalResult validateDepth(Operation *op, StringRef name,
+                                   int64_t depth) {
+  if (depth >= 1 && depth <= 32)
+    return success();
+  semaError(op) << name << " must be in [1, 32], got " << depth;
+  return failure();
+}
+
+static LogicalResult validateDepths(triton::FuncOp funcOp, int numStages) {
+  if (failed(validateDepth(funcOp, "num-stages", numStages)))
+    return failure();
+  WalkResult result = funcOp.walk([&](Operation *op) {
+    auto copies = op->getAttrOfType<IntegerAttr>(kBufferCopyAttrName);
+    if (!copies)
+      return WalkResult::advance();
+    if (succeeded(validateDepth(op, "buffer.copy", copies.getInt())))
+      return WalkResult::advance();
+    return WalkResult::interrupt();
+  });
+  return success(!result.wasInterrupted());
+}
+
 LogicalResult runOnFunction(triton::FuncOp funcOp, bool useMetaPartitioner,
                             int lowerSemaphoreNumStages) {
+  if (failed(validateDepths(funcOp, lowerSemaphoreNumStages)))
+    return failure();
+
   auto walkResult = funcOp.walk([&](scf::ForOp forOp) {
     if (forOp->hasAttr(triton::kWarpSpecializeAttrName))
       return WalkResult::interrupt();

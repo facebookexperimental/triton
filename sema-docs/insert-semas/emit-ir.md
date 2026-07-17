@@ -4,7 +4,7 @@
 
 ## Contents
 
-- [Contract: materialize a sealed plan](#contract-materialize-a-sealed-plan)
+- [Contract: materialize and finalize the plan](#contract-materialize-and-finalize-the-plan)
 - [Running example: semaphore DAG to MLIR](#running-example-semaphore-dag-to-mlir)
 - [Emission order](#emission-order)
 - [Backing and semaphore creates](#backing-and-semaphore-creates)
@@ -24,6 +24,7 @@
   - [An `if` result](#an-if-result)
   - [Several groups threading tokens through one region](#several-groups-threading-tokens-through-one-region)
 - [Schedule, offsets, and partition metadata](#schedule-offsets-and-partition-metadata)
+- [Fresh-write handoff finalization](#fresh-write-handoff-finalization)
 - [Cleanup](#cleanup)
 - [Emitted-IR verification](#emitted-ir-verification)
   - [Exact cached-view reuse](#exact-cached-view-reuse)
@@ -33,7 +34,7 @@
 - [Output contract](#output-contract)
 - [Code map](#code-map)
 
-## Contract: materialize a sealed plan
+## Contract: materialize and finalize the plan
 
 EMIT-IR receives finalized `GroupDag`s. A planned group has backing storage to
 materialize. An active group also has semaphores and a synchronization chain
@@ -47,12 +48,20 @@ to render. SYNC-DAG has already fixed:
 - every token producer's owner;
 - every release's matching acquire and source/completion anchor;
 - every `RegionFlow` and exact path result;
-- partition requirements, schedules, recurrence distances, and copy offsets.
+- partition requirements, schedules, recurrence distances, and ordinary copy
+  offsets.
 
 The emitter allocates physical objects, rewrites structured-control-flow
 signatures, renders those nodes, and verifies the result. It does not choose
-acquire placement, infer an owner token, revise the sealed plan, or move
-synchronization across a structured-control-flow boundary.
+acquire placement, infer an owner token, revise synchronization topology, or
+move synchronization across a structured-control-flow boundary.
+
+There is one narrow post-render exception. For an eligible staged TMEM group,
+the emitted token graph is required to classify whether an acquire's first
+buffer use is a fresh write. EMIT-IR uses that result to finalize immediate
+token-only relay offsets and initial released-stage masks. This does not add or
+remove synchronization nodes or change routing, ownership, placement,
+schedules, or buffer depth.
 
 The central invariant is:
 
@@ -89,15 +98,15 @@ cleanup removes dead originals:
 %base = ttg.local_alloc
   : !ttg.memdesc<1x1xi32, ...>
 
-%empty = nvws.semaphore.create %base released = -1
+%empty = nvws.semaphore.create %base released = 1
   {pending_count = 1}
 %full = nvws.semaphore.create %base
   {pending_count = 1}
 ```
 
-`released = -1` means every physical stage of the entry semaphore begins
-released. Omitting `released` means every stage begins blocked. The body is
-then rendered in the same order as the symbolic chain:
+The entry semaphore's only physical stage begins released. Omitting `released`
+means every stage begins blocked. The body is then rendered in the same order
+as the symbolic chain:
 
 ```text
 scf.for ... {
@@ -235,18 +244,22 @@ by SYNC-DAG.
 
 ### Entry state
 
-`Sema::entryOwner` supplies the legacy default released-stage mask, while an
+`Sema::entryOwner` supplies the default full physical-stage mask, while an
 explicit `Sema::releasedMask` computed by SYNC-DAG overrides that default:
 
 ```text
 releasedMask present -> semaphore.create ... released = releasedMask
-entryOwner present   -> semaphore.create ... released = -1
+entryOwner present   -> semaphore.create ... released = physicalStageMask
 otherwise            -> semaphore.create ...
 ```
 
 An explicit zero mask is printed as an omitted `released` clause. Creates for
 entry semaphores are emitted before the others. The create's `pending_count` is
 the uniform count already proved during semaphore assignment.
+
+For an eligible fresh-handoff group, the
+[fresh-write handoff finalizer](#fresh-write-handoff-finalization) replaces
+this provisional create-time state with the initial state computed by replay.
 
 [↑ Back to contents](#contents)
 
@@ -523,13 +536,63 @@ R m0 slot 0 -> release Shandoff with stageOffset=+1
 W m1 slot 1 -> acquire Shandoff at its selected slot
 ```
 
-The emitter transcribes `+1`; it does not replay the slot schedule.
+For this SYNC-DAG-authored alias handoff, the emitter transcribes `+1`. The
+separate finalizer below replays only an eligible staged fresh-write protocol
+after all synchronization IR has been rendered.
 
 For a structured operation that already carries partition metadata,
 `requiredParts` extends its partition set when generated synchronization needs
 additional owners inside it. Signature rewriting also extends
 `ttg.partition.outputs` for every new token result and gives terminators the
 region partition metadata when absent.
+
+[↑ Back to contents](#contents)
+
+## Fresh-write handoff finalization
+
+`finalizeFreshHandoffProtocols` runs after every active `GroupDag` has been
+rendered. It considers only a non-circular TMEM group with one member and more
+than one backing copy. The group is replayed only when a planned release
+satisfies an acquire whose first emitted buffer use is a fresh write according
+to `isFirstUseFreshWriteAfterAcquire`, the same classifier used by
+AssignStagePhase.
+
+This ordering matters because freshness is a property of the emitted acquire,
+its token flow through structured control flow, and its first buffer use. It is
+not inferred again from operation identity in EMIT-IR.
+
+The finalizer applies these rules over the existing symbolic acquire/release
+structure:
+
+```text
+fresh-write acquire     advance cursor once, then use that stage
+read/update acquire     use the current cursor without advancing
+token-only relay        use the stage selected by its eventual receiver
+```
+
+An immediate token-only relay is an acquire followed directly by its token
+release, with no buffer access in between. If its eventual receiver is a fresh
+write, both ends of that relay receive stage offset `+1`; if the receiver is a
+read or update, no relay offset is added. Offsets select a stage but never
+advance the cursor. Only a fresh-write acquire advances it.
+
+`FreshHandoffReplay` starts the cursor at `D - 1`, walks acquire and release
+nodes in program structure, computes loop closure to a fixed point, and joins
+the possible cursor states of `if` branches. For each semaphore and physical
+stage visited by replay, its first action determines the bootstrap state:
+
+```text
+first action is acquire    released-mask bit 1
+first action is release    released-mask bit 0
+```
+
+If the same semaphore stage can have an acquire first on one replayed path and
+a release first on another, finalization reports an incompatible-first-action
+error. Otherwise it finalizes the initial released-stage mask.
+
+The replay does not change semaphore counts, pending counts, buffer-copy
+depth, synchronization edges, token sources, owners, schedules, or structured
+placement.
 
 [↑ Back to contents](#contents)
 
@@ -619,7 +682,11 @@ After EMIT-IR succeeds:
   semaphore;
 - every structured path supplies its planned region result or exact
   pass-through;
-- schedules, counts, stage offsets, and backing offsets match SYNC-DAG;
+- schedules, counts, and backing offsets match SYNC-DAG;
+- stage offsets match SYNC-DAG except for immediate token-only relay offsets
+  finalized by staged fresh-handoff replay;
+- released-stage masks contain the final replayed physical masks for eligible
+  staged fresh-handoff groups;
 - partition-marked token and view consumers agree with their acquire or
   materialization partition sets; and
 - old group allocations and legacy token plumbing no longer define the active
@@ -638,6 +705,8 @@ After EMIT-IR succeeds:
 - Views and accesses: `getView`, `renderAccess`
 - Structured control flow: `renderPlainLoop`, `renderCarriedLoop`,
   `renderRegion`
+- Fresh-handoff finalization: `finalizeFreshHandoffProtocols`,
+  `planFreshHandoffProtocol`, `FreshHandoffReplay`
 - Chain materialization: `renderChain`
 - Locality proof: `verifyTokenLocality`
 - Full emitted checks: `verifyEmittedIR`

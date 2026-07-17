@@ -15,10 +15,10 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // static cluster edges.
   // CHECK-LABEL: tt.func @slack_zero_delay_edge_is_not_projected
   // CHECK: [[Q_BACKING:%.*]] = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 430 : i32}
-  // CHECK: [[Q_EMPTY:%.*]] = nvws.semaphore.create [[Q_BACKING]] released = -1
+  // CHECK: [[Q_EMPTY:%.*]] = nvws.semaphore.create [[Q_BACKING]] released = 1
   // CHECK: [[Q_FULL:%.*]] = nvws.semaphore.create [[Q_BACKING]]
   // CHECK: [[P_BACKING:%.*]] = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 431 : i32}
-  // CHECK: [[P_EMPTY:%.*]] = nvws.semaphore.create [[P_BACKING]] released = -1
+  // CHECK: [[P_EMPTY:%.*]] = nvws.semaphore.create [[P_BACKING]] released = 1
   // CHECK: [[P_FULL:%.*]] = nvws.semaphore.create [[P_BACKING]]
   // CHECK: scf.for
   // CHECK: [[Q_WRITE_BUF:%.*]] = nvws.semaphore.buffer [[Q_EMPTY]], %{{.*}} {loop.cluster = 1 : i32, loop.stage = 2 : i32, ttg.partition = array<i32: 2>}

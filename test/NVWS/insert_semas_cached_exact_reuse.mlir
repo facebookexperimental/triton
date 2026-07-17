@@ -15,7 +15,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // DAG: |- r  S1  {0} [none]
   tt.func @cached_exact_reuse_after_release(%lb: i32, %ub: i32, %step: i32) {
     // IR: [[BASE:%[-A-Za-z0-9_.$#]+]] = ttg.local_alloc {buffer.id = 9820 : i32} : () -> !ttg.memdesc<1x1xi32, #shared, #smem, mutable>
-    // IR: [[ENTRY:%[-A-Za-z0-9_.$#]+]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32}
+    // IR: [[ENTRY:%[-A-Za-z0-9_.$#]+]] = nvws.semaphore.create [[BASE]] released = 1 {pending_count = 1 : i32}
     // IR: [[FULL:%[-A-Za-z0-9_.$#]+]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32}
     %buf = ttg.local_alloc {buffer.id = 9820 : i32} : () -> !ttg.memdesc<1xi32, #shared, #smem, mutable>
     %value = "producer"() {ttg.partition = array<i32: 1>} : () -> !ty

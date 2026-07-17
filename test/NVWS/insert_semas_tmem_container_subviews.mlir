@@ -39,7 +39,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
     // One EMPTY semaphore (pending=3) and three FULL semaphores (pending=1),
     // all over the single collapsed resourceKey of four memdesc members.
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]], [[M3]] released = -1 {pending_count = 3 : i32} : <[!ttg.memdesc<2x128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]], [[M3]] released = 3 {pending_count = 3 : i32} : <[!ttg.memdesc<2x128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>]>
     // CHECK: [[F0:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]], [[M3]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>]>
     // CHECK: [[F1:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]], [[M3]] {pending_count = 1 : i32}
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]], [[M3]] {pending_count = 1 : i32}
@@ -147,7 +147,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
     // One EMPTY semaphore (pending=2) and three FULL semaphores (pending=1)
     // over the single collapsed resourceKey of three memdesc members.
-    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]] released = -1 {pending_count = 2 : i32} : <[!ttg.memdesc<2x128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>]>
+    // CHECK: [[EMPTY:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]] released = 3 {pending_count = 2 : i32} : <[!ttg.memdesc<2x128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>]>
     // CHECK: [[F0:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x128xf32, #tmem2, #ttng.tensor_memory, mutable>, !ttg.memdesc<2x128x64xf32, #tmem1, #ttng.tensor_memory, mutable>]>
     // CHECK: [[F1:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]] {pending_count = 1 : i32}
     // CHECK: [[F2:%.*]] = nvws.semaphore.create [[ALLOC]], [[M1]], [[M2]] {pending_count = 1 : i32}

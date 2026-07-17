@@ -18,7 +18,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     %start0_payload = "make_start0"() {ttg.partition = array<i32: 1>} : () -> !ty
     %start1 = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 700 : i32, buffer.start = 1 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     // CHECK: [[BASE:%.*]] = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 700 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>
-    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
+    // CHECK-NEXT: [[EMPTY:%.*]] = nvws.semaphore.create [[BASE]] released = 3 {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     // CHECK-NEXT: [[FULL:%.*]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<2x128x128xf16, #shared, #smem, mutable>]>
     %start0 = ttg.local_alloc {buffer.circular, buffer.copy = 2 : i32, buffer.id = 700 : i32, buffer.start = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     scf.for %iv = %lb to %ub step %step : i32 {

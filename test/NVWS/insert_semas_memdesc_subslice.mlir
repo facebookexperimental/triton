@@ -10,7 +10,7 @@ module attributes {"ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: @local_memdesc_subslice_alias
   tt.func @local_memdesc_subslice_alias(%lb: i32, %ub: i32, %step: i32) {
     // CHECK: [[BASE:%[0-9]+]] = ttg.local_alloc {buffer.id = 9920 : i32} : () -> !ttg.memdesc<1x2xi32, #shared, #smem, mutable>
-    // CHECK-NEXT: [[EMPTY:%[0-9]+]] = nvws.semaphore.create [[BASE]] released = -1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]>
+    // CHECK-NEXT: [[EMPTY:%[0-9]+]] = nvws.semaphore.create [[BASE]] released = 1 {pending_count = 1 : i32} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]>
     // CHECK-NEXT: [[FULL:%[0-9]+]] = nvws.semaphore.create [[BASE]] {pending_count = 1 : i32} : <[!ttg.memdesc<1x2xi32, #shared, #smem, mutable>]>
     %alloc = ttg.local_alloc {buffer.id = 9920 : i32} : () -> !ttg.memdesc<2xi32, #shared, #smem, mutable>
     scf.for %i = %lb to %ub step %step : i32 {

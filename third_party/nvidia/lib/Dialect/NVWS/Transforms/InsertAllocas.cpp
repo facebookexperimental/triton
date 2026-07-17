@@ -546,7 +546,7 @@ CommunicationBuffer createCommunicationBuffer(
   auto semaTy = SemaphoreType::get(builder.getContext(), baseTypes);
   auto empty = SemaphoreCreateOp::create(
       builder, loc, semaTy, alloc->getResults(),
-      getAllReleasedMask());
+      getPhysicalStageMask(semaTy.getNumStages()));
   auto full =
       SemaphoreCreateOp::create(builder, loc, semaTy, alloc->getResults());
   return CommunicationBuffer{empty, full, alloc->getResult(0),

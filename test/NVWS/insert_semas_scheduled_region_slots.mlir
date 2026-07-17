@@ -160,11 +160,11 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // SEMA: [[A_BASE:%.*]] = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 901 : i32}
     // SEMA: [[B_BASE:%.*]] = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 901 : i32}
     // SEMA: [[C_BASE:%.*]] = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 901 : i32}
-    // SEMA: [[ENTRY:%.*]] = nvws.semaphore.create [[A_BASE]], [[B_BASE]], [[C_BASE]] released = -1 {pending_count = 1 : i32}
+    // SEMA: [[ENTRY:%.*]] = nvws.semaphore.create [[A_BASE]], [[B_BASE]], [[C_BASE]] released = 7 {pending_count = 1 : i32}
     // SEMA: [[AB_FULL:%.*]] = nvws.semaphore.create [[A_BASE]], [[B_BASE]], [[C_BASE]] {pending_count = 1 : i32}
     // SEMA: [[C_FULL:%.*]] = nvws.semaphore.create [[A_BASE]], [[B_BASE]], [[C_BASE]] {pending_count = 1 : i32}
     // SEMA: [[IF_BACK:%.*]] = nvws.semaphore.create [[A_BASE]], [[B_BASE]], [[C_BASE]] {pending_count = 1 : i32}
-    // ASP: [[ENTRY:%.*]] = nvws.semaphore.create {{.*}} released = -1 {pending_count = 1 : i32}
+    // ASP: [[ENTRY:%.*]] = nvws.semaphore.create {{.*}} released = 7 {pending_count = 1 : i32}
     // ASP: [[AB_FULL:%.*]] = nvws.semaphore.create {{.*}} {pending_count = 1 : i32}
     // ASP: [[C_FULL:%.*]] = nvws.semaphore.create {{.*}} {pending_count = 1 : i32}
     // ASP: [[IF_BACK:%.*]] = nvws.semaphore.create {{.*}} {pending_count = 1 : i32}

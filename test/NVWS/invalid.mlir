@@ -6,7 +6,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
   tt.func @semaphore_release_duplicate_async() {
     %c0_i32 = arith.constant 0 : i32
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
-    %sem = nvws.semaphore.create %buf released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %sem = nvws.semaphore.create %buf released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem[%c0_i32, %c0_i32] : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
     // expected-error @below {{async_ops contains duplicate async kind}}
     nvws.semaphore.release %sem[%c0_i32], %tok [#nvws.async_op<none>, #nvws.async_op<none>] : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>, !ttg.async.token
@@ -22,7 +22,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @semaphore_create_leading_dims_mismatch(%d : !ttg.memdesc<1x1xi32, #shared0, #smem>, %e : !ttg.memdesc<2x1xi32, #shared0, #smem>) {
     // expected-error @below {{Leading dims of sliced semaphore inputs don't match}}
-    %sem = nvws.semaphore.create %d, %e released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem>, !ttg.memdesc<2x1xi32, #shared0, #smem>]>
+    %sem = nvws.semaphore.create %d, %e released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem>, !ttg.memdesc<2x1xi32, #shared0, #smem>]>
     tt.return
   }
 }
@@ -35,7 +35,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @semaphore_create_buffer_used_elsewhere(%d : !ttg.memdesc<1x64x16xf16, #shared0, #smem>) {
     // expected-error @below {{Semaphore buffer is used elsewhere, Semaphore cannot guarantee async safety}}
-    %sem = nvws.semaphore.create %d released = -1 : !nvws.semaphore<[!ttg.memdesc<1x64x16xf16, #shared0, #smem>]>
+    %sem = nvws.semaphore.create %d released = 1 : !nvws.semaphore<[!ttg.memdesc<1x64x16xf16, #shared0, #smem>]>
     %tmp = ttng.tmem_alloc %d : (!ttg.memdesc<1x64x16xf16, #shared0, #smem>) -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
@@ -51,7 +51,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     %a = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
     %b = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
     %c = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
-    %sem0 = nvws.semaphore.create %a, %b released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %sem0 = nvws.semaphore.create %a, %b released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     // expected-error @below {{semaphores sharing a backing buffer must use identical ordered buffer operands}}
     %sem1 = nvws.semaphore.create %a, %c : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem1[%c0_i32, %c0_i32] : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
@@ -71,7 +71,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     %c0_i32 = arith.constant 0 : i32
     %a = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
     %b = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
-    %sem0 = nvws.semaphore.create %a, %b released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %sem0 = nvws.semaphore.create %a, %b released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     // expected-error @below {{semaphores sharing a backing buffer must use identical ordered buffer operands}}
     %sem1 = nvws.semaphore.create %b, %a : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem1[%c0_i32, %c0_i32] : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
@@ -88,7 +88,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @semaphore_buffer_arity_mismatch() {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
-    %sem = nvws.semaphore.create %buf released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %sem = nvws.semaphore.create %buf released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
     // expected-error @below {{Semaphore has different number of arguments than buffer}}
     %views:2 = nvws.semaphore.buffer %sem, %tok : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared0, #smem, mutable>, !ttg.memdesc<1xi32, #shared0, #smem, mutable>
@@ -104,7 +104,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @semaphore_buffer_dimensions_mismatch() {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
-    %sem = nvws.semaphore.create %buf released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %sem = nvws.semaphore.create %buf released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
     // expected-error @below {{Dimensions don't match}}
     %view = nvws.semaphore.buffer %sem, %tok : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<2xi32, #shared0, #smem, mutable>
@@ -120,7 +120,7 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
 module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @semaphore_buffer_result_must_be_mutable() {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<1x1xi32, #shared0, #smem, mutable>
-    %sem = nvws.semaphore.create %buf released = -1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
+    %sem = nvws.semaphore.create %buf released = 1 : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>
     %tok = nvws.semaphore.acquire %sem : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]> -> !ttg.async.token
     // expected-error @below {{Semaphore buffer result memdesc must be mutable}}
     %view = nvws.semaphore.buffer %sem, %tok : !nvws.semaphore<[!ttg.memdesc<1x1xi32, #shared0, #smem, mutable>]>, !ttg.async.token -> !ttg.memdesc<1xi32, #shared0, #smem>

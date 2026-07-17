@@ -22,7 +22,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
     // returns it unchanged; a nonzero loop returns partition 1's final token.
     %acc, %tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // CHECK: [[ACC:%.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<2x128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-    // CHECK-NEXT: [[ROOT:%.*]] = nvws.semaphore.create [[ACC]] released = -1 {pending_count = 1 : i32}
+    // CHECK-NEXT: [[ROOT:%.*]] = nvws.semaphore.create [[ACC]] released = 3 {pending_count = 1 : i32}
     // CHECK-NEXT: [[TO_MMA:%.*]] = nvws.semaphore.create [[ACC]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[TO_ROOT:%.*]] = nvws.semaphore.create [[ACC]] {pending_count = 1 : i32}
     // CHECK-NEXT: [[ROOT_TOKEN:%.*]] = nvws.semaphore.acquire [[ROOT]]

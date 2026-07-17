@@ -49,8 +49,7 @@ def NVWS_SemaphoreCreateOp : NVWS_Op<"semaphore.create", [
   let description = [{
     `released_mask` defines the initial state of each physical buffer stage.
     Bit `i` set to one means stage `i` starts released; a zero bit means it
-    starts blocked. Bits above the semaphore depth are ignored. When the mask
-    is omitted, every stage starts blocked; `released = -1` releases all stages.
+    starts blocked. When the mask is omitted, every stage starts blocked.
   }];
   let arguments = (ins Variadic<TTG_MemDescType>:$buffers,
                        OptionalAttr<I32Attr>:$released_mask,
