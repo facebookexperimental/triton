@@ -251,6 +251,35 @@ void init_triton_tlx_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
            })
+      .def("make_padded_shared_encoding_attr_with_bases",
+           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases, int rank) {
+             // Build #ttg.padded_shared from explicit linear bases ({offset,
+             // block}), so a caller can pin a swizzled layout, not just identity.
+             if (intervals.size() != paddings.size())
+               throw std::runtime_error(
+                   "make_padded_shared_encoding_attr_with_bases: intervals and "
+                   "paddings must have the same length");
+             auto context = self.getBuilder().getContext();
+             llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+             intervalPads.reserve(intervals.size());
+             for (auto [i, p] : llvm::zip(intervals, paddings))
+               intervalPads.emplace_back(i, p);
+             auto kOffset = mlir::StringAttr::get(context, "offset");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             tt::LinearLayout::BasesT bases;
+             bases[kOffset] = offsetBases;
+             bases[kBlock] = blockBases;
+             llvm::SmallVector<mlir::StringAttr> outDimNames;
+             for (int i = 0; i < rank; ++i)
+               outDimNames.push_back(
+                   mlir::StringAttr::get(context, "dim" + llvm::Twine(i)));
+             tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 context, intervalPads, std::move(ll)));
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
