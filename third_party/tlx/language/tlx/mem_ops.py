@@ -134,10 +134,12 @@ def buffer_load_to_local(
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache_modifier: Cache modifier string (default "").
-        offset_layout: Optional distributed (register) layout to pin on the
-            offset tensor (e.g. a tlx.distributed_linear_layout) so the
-            direct-to-LDS write matches a pinned swizzled shared layout on
-            `dest`.
+        offset_layout: Optional override for the distributed (register) layout
+            pinned on the offset tensor (e.g. a tlx.distributed_linear_layout).
+            Leave as None (default): when `dest` carries a user-pinned swizzled
+            shared layout, the matching direct-to-LDS offset layout is inferred
+            from it automatically (tlx-insert-require-layout). Pass an explicit
+            layout only to override that inference.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
 

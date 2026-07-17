@@ -4,7 +4,11 @@
 #include "TargetInfo.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 namespace mlir::triton::AMD {
 namespace {
@@ -144,6 +148,55 @@ fitToValidDirectToLdsVecSize(unsigned maxVecSize, unsigned elemBitwidth,
     maxVecSize /= 2;
   }
   return maxVecSize;
+}
+
+FailureOr<triton::LinearLayout> deducePaddedDirectToLdsRegLayout(
+    const triton::LinearLayout &sharedOffsetLayout, unsigned loadContig,
+    unsigned threadsPerWarp, unsigned numWarps, ArrayRef<int64_t> shape,
+    triton::gpu::CGAEncodingAttr cgaLayout, MLIRContext *ctx) {
+  StringAttr kOffset = StringAttr::get(ctx, "offset");
+  auto rank = shape.size();
+  auto offsetBases = sharedOffsetLayout.getBases().lookup(kOffset);
+
+  int log2LoadContig = llvm::Log2_32(loadContig);
+  int log2ThreadsPerWarp = llvm::Log2_32(threadsPerWarp);
+  int log2NumWarps = llvm::Log2_32(numWarps);
+
+  // Need at least enough offset bases to fill the register + lane slots.
+  if (static_cast<int>(offsetBases.size()) <
+      log2LoadContig + log2ThreadsPerWarp)
+    return failure();
+
+  auto remainingBases = ArrayRef(offsetBases);
+  auto takeN = [&remainingBases](size_t n) {
+    auto take = std::min(remainingBases.size(), n);
+    auto v = remainingBases.take_front(take).vec();
+    remainingBases = remainingBases.drop_front(take);
+    return v;
+  };
+
+  auto regBases = takeN(log2LoadContig);
+  auto laneBases = takeN(log2ThreadsPerWarp);
+  auto warpBases = takeN(log2NumWarps);
+  // Fewer offset bases than warps -> the remaining warps broadcast.
+  warpBases.resize(log2NumWarps, std::vector<int32_t>(rank, 0));
+  llvm::append_range(regBases, remainingBases);
+
+  triton::LinearLayout regLayout(
+      {
+          {StringAttr::get(ctx, "register"), regBases},
+          {StringAttr::get(ctx, "lane"), laneBases},
+          {StringAttr::get(ctx, "warp"), warpBases},
+      },
+      triton::standardOutDimNames(ctx, rank));
+
+  regLayout = triton::gpu::combineCtaCgaWithShape(regLayout, cgaLayout, shape);
+
+  auto regToShared = regLayout.invertAndCompose(sharedOffsetLayout);
+  if (regToShared.getNumConsecutiveInOut() < loadContig)
+    return failure();
+
+  return regLayout;
 }
 
 } // namespace mlir::triton::AMD

@@ -46,6 +46,25 @@ unsigned
 fitToValidDirectToLdsVecSize(unsigned maxVecSize, unsigned elemBitwidth,
                              const triton::AMD::TargetInfo &targetInfo);
 
+// Derive the producer (global-side) register-tensor LinearLayout that makes a
+// direct-to-LDS write into a `padded_shared` LDS layout coalesced, given the
+// per-thread load width `loadContig`. `sharedOffsetLayout` is the padded
+// encoding's linear component (its "offset" bases map LDS offsets -> n-D tensor
+// indices). Offset bases are handed out as: log2(loadContig) register bases,
+// log2(threadsPerWarp) lane bases, log2(numWarps) warp bases, then any leftover
+// as extra register bases -- so each lane writes `loadContig` consecutive LDS
+// elements. Combined with `cgaLayout`/`shape` into a full {reg,lane,warp,block}
+// layout. Fails if the LDS shape is too small or the result cannot reach
+// `loadContig` consecutive elements.
+//
+// This is the base-assignment `tritonamdgpu-coalesce-async-copy` applies to the
+// async_copy pointer tensor, shared here so `amdgpu.buffer_load_to_local` can
+// infer its offset-tensor layout from a pinned padded shared layout.
+FailureOr<triton::LinearLayout> deducePaddedDirectToLdsRegLayout(
+    const triton::LinearLayout &sharedOffsetLayout, unsigned loadContig,
+    unsigned threadsPerWarp, unsigned numWarps, ArrayRef<int64_t> shape,
+    triton::gpu::CGAEncodingAttr cgaLayout, MLIRContext *ctx);
+
 } // namespace mlir::triton::AMD
 
 #endif

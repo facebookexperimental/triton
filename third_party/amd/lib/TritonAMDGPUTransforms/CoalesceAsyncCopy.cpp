@@ -142,55 +142,18 @@ struct CoalesceAsyncCopyWrites
       // 4) Take any remaining bases as additional reg bases
 
       auto *ctx = srcTy.getContext();
-      StringAttr kOffset = StringAttr::get(ctx, "offset");
-
-      auto rank = srcTy.getRank();
-
-      auto offsetBases = sharedLayout.getBases().lookup(kOffset);
-
-      int log2LoadContig = llvm::Log2_32(loadContig);
-      int log2ThreadsPerWarp = llvm::Log2_32(threadsPerWarp);
-      int log2NumWarps = llvm::Log2_32(numWarps);
-
-      if (offsetBases.size() < log2LoadContig + log2ThreadsPerWarp) {
+      auto newRegLayout = triton::AMD::deducePaddedDirectToLdsRegLayout(
+          sharedLayout, loadContig, threadsPerWarp, numWarps, srcTy.getShape(),
+          blockedEnc.getCGALayout(), ctx);
+      if (failed(newRegLayout)) {
         return rewriter.notifyMatchFailure(
-            copyOp, "dst shape is too small. We require at least loadContig * "
-                    "threadsPerWarp elements");
+            copyOp,
+            "could not derive a coalesced direct-to-LDS register layout "
+            "from the linear component of the padded encoding (dst shape "
+            "too small or reg->shared consecutiveness < loadContig)");
       }
 
-      auto remainingBases = ArrayRef(offsetBases);
-      auto takeN = [&remainingBases](size_t n) {
-        auto take = std::min(remainingBases.size(), n);
-        auto v = remainingBases.take_front(take).vec();
-        remainingBases = remainingBases.drop_front(take);
-        return v;
-      };
-
-      auto regBases = takeN(log2LoadContig);
-      auto laneBases = takeN(log2ThreadsPerWarp);
-      auto warpBases = takeN(log2NumWarps);
-      warpBases.resize(log2NumWarps, std::vector<int32_t>(rank, 0));
-      append_range(regBases, remainingBases);
-
-      triton::LinearLayout newRegLayout(
-          {
-              {StringAttr::get(ctx, "register"), regBases},
-              {StringAttr::get(ctx, "lane"), laneBases},
-              {StringAttr::get(ctx, "warp"), warpBases},
-          },
-          triton::standardOutDimNames(ctx, rank));
-
-      newRegLayout = triton::gpu::combineCtaCgaWithShape(
-          newRegLayout, blockedEnc.getCGALayout(), srcTy.getShape());
-
-      auto newRegToShared = newRegLayout.invertAndCompose(sharedLayout);
-      if (newRegToShared.getNumConsecutiveInOut() < loadContig) {
-        return rewriter.notifyMatchFailure(
-            copyOp, "could not coalesce global addresses based on the linear "
-                    "component of the padded encoding");
-      }
-
-      newDistEnc = ttg::LinearEncodingAttr::get(ctx, std::move(newRegLayout));
+      newDistEnc = ttg::LinearEncodingAttr::get(ctx, std::move(*newRegLayout));
     } else {
       assert(false && "Unsupported layout");
     }
