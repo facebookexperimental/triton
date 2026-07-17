@@ -406,7 +406,7 @@ Flash Attention) is consumed by ops in multiple partitions, the correct
 model is a 1-producer to N-consumer channel: one TMA load writes the buffer,
 all consumer partitions read from it. The downstream
 `separateLocalAllocWithSrc` assigns the `local_store` the source op's
-single task ID (the TMA load partition), and `createChannelPost` creates a
+single task ID (the TMA load partition), and `createAllocChannel` creates a
 proper 1-to-N channel. This avoids buffer duplication and the SMEM it costs
 (per-consumer copies pushed FA3 forward over H100's 228KB SMEM limit).
 

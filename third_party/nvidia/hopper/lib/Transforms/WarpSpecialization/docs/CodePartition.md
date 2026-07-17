@@ -7,46 +7,43 @@ This is the largest and most complex file in the WS pipeline.
 
 **File**: `WSCodePartition.cpp`
 
-## Two Pipelines
+## Two Phases (one production flow)
 
-There are two code partitioning pipelines depending on whether buffer
-allocation has already been performed:
+Code partitioning is the second half of a **two-phase flow** that runs the same
+way on Hopper and Blackwell (partitions are assigned earlier, by
+`PartitionSchedulingMeta` on Blackwell or `doTaskPartition` on Hopper):
 
-### `doCodePartition` — Pre-allocated Path
+1. **Buffer-allocation phase** — `doBufferAllocation` discovers channels from raw
+   producers and hoists single-copy allocations (see the pre-pass below and
+   [Buffer Allocation](BufferAllocation.md)).
+2. **Memory-planner phase** — `doMemoryPlanner` decides multi-buffering
+   (`buffer.copy`) and reuse (`buffer.id`).
+3. **Code-partition phase** — `doCodePartition` rediscovers channels from the
+   now-existing allocations, builds multi-buffer arrays, and inserts the
+   synchronization protocol.
 
-Used on Hopper where buffers are created during code partitioning:
+The two phases use two channel representations. The buffer-allocation phase uses
+the raw base `Channel` (anchored on a consumer op + operand index, discovered by
+`collectAsyncChannels`/`createChannel`, kinds `SMEM`/`TMEM`/`REG`). The
+code-partition phase uses `AllocChannel` / `TmemAllocChannel` (anchored on an
+existing `local_alloc` / `tmem_alloc`, kinds `SMEMAlloc`/`TMEMAlloc`). This is a
+**phase** distinction, not a target distinction — production runs
+`doCodePartition` on every architecture.
 
-```
-Step 1: collectAsyncChannels       — discover cross-partition data deps
-Step 2: groupChannels              — group channels by producer and consumer
-Step 3: createBuffer               — allocate SMEM/TMEM for each channel
-Step 4: reorderProducerOps         — interleave producers for better overlap
-Step 5: getTaskTopRegion           — find top-level control flow ops
-Step 6: appendAccumCntsForOps      — add accumulation counter loop args
-Step 7: insertAsyncCopy            — create TMA copies, local copies, etc.
-Step 8: createToken                — create synchronization tokens
-Step 9: insertAsyncComm            — insert ProducerAcquire/ConsumerWait etc.
-Step 10: foldLocalLoads            — eliminate redundant local_load + local_alloc
-Step 11: specializeRegion          — clone ops into WarpSpecializeOp regions
-```
-
-### `doCodePartitionPost` — Post-allocated Path
-
-Used on Blackwell where buffers are pre-allocated by the memory planner:
+### `doCodePartition` — code-partition phase
 
 ```
-Step 1: collectPostChannels        — discover channels from existing allocs
-Step 2: collectRegionsWithChannelsPost — find control flow with channels
+Step 1: collectAllocChannels        — discover channels from existing allocs
+Step 2: collectRegionsWithChannels — find control flow with channels
 Step 3: detect reuse groups        — group channels by buffer.id
 Step 4: appendAccumCntsForOps      — add accumulation counter loop args
-Step 5: createBufferPost           — create multi-buffer arrays for existing allocs
-Step 6: insertAsyncCopy            — create async copies (with TMA fusion)
-Step 7: createTokenPost            — create tokens and barriers
-Step 8: insertAsyncComm            — insert synchronization ops
-Step 9: fuseTcgen05CommitBarriers  — fuse redundant tcgen05_commit ops
-Step 10: cleanupTmemTokens         — replace TMEM op tokens with poison
-Step 11: replaceBufferReuse        — rewrite non-representative allocs
-Step 12: specializeRegion          — clone ops into WarpSpecializeOp regions
+Step 5: createBufferForAllocs           — create multi-buffer arrays for existing allocs
+Step 6: createToken                — create tokens and barriers
+Step 7: insertAsyncComm            — insert sync ops; lower TMA loads (optimizeTMALoads)
+Step 8: fuseTcgen05CommitBarriers  — fuse redundant tcgen05_commit ops
+Step 9: cleanupTmemTokens          — replace TMEM op tokens with poison
+Step 10: replaceBufferReuse        — rewrite non-representative allocs
+Step 11: specializeRegion          — clone ops into WarpSpecializeOp regions
 ```
 
 ## `doBufferAllocation` — Pre-pass
@@ -99,37 +96,14 @@ The core channel creation logic:
 3. For each user in a **different partition** (different `async_task_id`),
    create a `Channel` with the appropriate kind (`SMEM`, `TMEM`, or `REG`).
 
-### `collectPostChannels`
+### `collectAllocChannels`
 
 For the post-allocated path, channels are discovered from existing
 `LocalAllocOp` and `TMEMAllocOp` operations rather than from raw producers.
-Creates `ChannelPost` (SMEM) or `TmemDataChannelPost` (TMEM) objects. Also
+Creates `AllocChannel` (SMEM) or `TmemAllocChannel` (TMEM) objects. Also
 calls `handleOperandD` to create operand D channels for MMA accumulators.
 
-## Channel Grouping
-
-### `groupChannels`
-
-Groups channels along two dimensions:
-
-- **By producer**: Channels with the same `srcOp` are grouped for buffer
-  sharing (one buffer serves multiple consumers of the same producer).
-- **By consumer**: Channels are merged for barrier sharing when their
-  producers are in the same block AND their destination ops have the same
-  task IDs and share a unique actual consumer (`channelCanBeMerged`).
-
-The `orderedChannels` list provides a deterministic iteration order, keyed
-by `getDstOp()`.
-
-## Producer and Epilogue Reordering
-
-### `reorderProducerOps`
-
-Physically reorders producer operations in the IR to interleave producers
-for different consumers. Groups producers by consumer task ID (smaller ID
-= higher priority), sorts each group by number of consumers, then
-interleaves. After reordering, moves backward dependency slices as late as
-possible.
+## Epilogue Reordering
 
 ### `reorderEpilogOps`
 
@@ -146,7 +120,7 @@ consumer-side TMA store sequence.
 
 ## Buffer Creation
 
-### `createBuffer` / `createBufferPost`
+### `createBuffer` / `createBufferForAllocs`
 
 Creates SMEM or TMEM allocations for each channel:
 
@@ -156,12 +130,12 @@ Creates SMEM or TMEM allocations for each channel:
   TMEM based on tensor dimensionality. Selects shared memory encoding
   (`NVMMAShared` for MMA consumers, unswizzled for others, TMA encoding for
   TMA stores).
-- **`createBufferPost`**: For the post-allocated path, groups channels
+- **`createBufferForAllocs`**: For the post-allocated path, groups channels
   sharing the same `allocOp` and creates multi-buffer arrays.
 
 ## Token and Barrier Creation
 
-### `createToken` / `createTokenPost`
+### `createToken`
 
 Creates synchronization tokens for each channel group:
 

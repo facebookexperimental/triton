@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
 
 // Test: Option 3 in-body SMEM-rotation for a MULTI-BUFFERED (numBuffers=3)
 // subtiled-region SMEM reuse group, observed at the code-partition stage (the

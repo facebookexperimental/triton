@@ -20,7 +20,7 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doBufferAllocation
   → doMemoryPlanner
-  → doCodePartitionPost
+  → doCodePartition
   → doPingPongSync       (optional)
   → doTokenLowering
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
@@ -75,7 +75,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
-| `WSCodePartition.cpp` | `doCodePartitionPost` | Creates channels, inserts async copies and barriers |
+| `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
 | `WSLowerMem.cpp` | — | Memory lowering: async copies between global/shared/tensor memory |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
@@ -93,7 +93,7 @@ recognizes the `scf.while` outer loop (same doc).
 |------|-------------|
 | `Utility.h` | `AsyncTaskId` typedef, `OpBuilderWithAsyncTaskIds`, `LoopScheduleInfo`, task ID helpers |
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
-| `CodePartitionUtility.h` | `Channel`, `ChannelPost`, `TmemDataChannel`, `TmemDataChannelPost`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
+| `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
 | `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `buildWSBarrierOrderedRegionRanges`, `injectChannelGraph` — channel graph and ordered-region construction for barrier constraints |
 | `nvidia/hopper/include/Transforms/WSBarrierReorder.h` | `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
@@ -104,7 +104,7 @@ recognizes the `scf.while` outer loop (same doc).
 |------|-----------|
 | **Partition** | A group of operations assigned to run on the same warp group. Identified by a partition ID (integer). |
 | **Async Task** | Synonym for partition. Identified by `async_task_id` attribute on ops. |
-| **Channel** | A producer-consumer data dependency between partitions. Can be SMEM-backed (`ChannelPost`) or TMEM-backed (`TmemDataChannelPost`). |
+| **Channel** | A producer-consumer data dependency between partitions. Can be SMEM-backed (`AllocChannel`) or TMEM-backed (`TmemAllocChannel`). |
 | **Reuse Group** | A set of channels sharing a single physical buffer (`buffer.id`). See [ReuseGroups.md](ReuseGroups.md). |
 | **Multi-buffering** | Allocating N copies of a buffer so the producer can fill copy N+1 while the consumer reads copy N. Controlled by `buffer.copy`. |
 | **Operand D** | The MMA accumulator — the TMEM allocation that both receives MMA output and carries accumulated results across loop iterations. |

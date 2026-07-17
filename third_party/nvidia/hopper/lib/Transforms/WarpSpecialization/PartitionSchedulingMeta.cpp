@@ -42,7 +42,7 @@ inline bool isEpilogueStoreOp(Operation *op) {
 
 // A TMAStoreTokenWaitOp that waits on an async_tma_reduce / descriptor_reduce.
 // Such a wait must live in the SAME partition as its reduce (the reduction
-// partition), not the epilogue-store partition: otherwise doCodePartitionPost
+// partition), not the epilogue-store partition: otherwise doCodePartition
 // clones the reduce into the store partition to satisfy the mis-placed wait,
 // reducing e.g. reduce_dq into global twice (double-count / stale-staging
 // garbage). See T279388065.
@@ -828,7 +828,7 @@ private:
   // async_tma_reduce/descriptor_reduce (categorized TMAReduction -> reduction
   // partition, e.g. the reduce_dq store_reduce), categorize it TMAReduction
   // too. Otherwise it is routed to the epilogue-store partition while the
-  // reduce stays in the reduction partition; doCodePartitionPost then CLONES
+  // reduce stays in the reduction partition; doCodePartition then CLONES
   // the reduce into the store partition to satisfy the mis-placed wait, so the
   // dq is reduced into global twice (double-count / stale-staging garbage).
   // T279388065.
@@ -1622,7 +1622,7 @@ getInitialSchedule(scf::ForOp mainLoop, const SchedulingOptions &schedOpts) {
       loop.walk([&](Operation *op) {
         // A reduce's token_wait belongs in the reduction partition with its
         // reduce (see isReduceTokenWait); do NOT pull it into the epilogue
-        // partition here, or doCodePartitionPost clones the reduce into the
+        // partition here, or doCodePartition clones the reduce into the
         // epilogue to satisfy the wait -> double reduce (T279388065). Phase 5's
         // TMAReduction scheduling places it in the reduction partition.
         if (isEpilogueStoreOp(op) && !isReduceTokenWait(op))
@@ -2439,7 +2439,7 @@ void propagatePartitions(scf::ForOp loop, PartitionSet &schedule,
 /// LocalAllocOp is NOT cloned: a shared SMEM buffer (e.g. K/V in FA) is one
 /// producer feeding N consumer partitions, so cloning would duplicate the
 /// buffer. separateLocalAllocWithSrc instead tags the local_store with the
-/// source op's single task ID, letting createChannelPost build a 1→N channel.
+/// source op's single task ID, letting createAllocChannel build a 1→N channel.
 ///
 /// When a ConvertLayoutOp sits between an ExpandDimsOp/BroadcastOp and its
 /// consumer (e.g., due to upstream layout choices producing different

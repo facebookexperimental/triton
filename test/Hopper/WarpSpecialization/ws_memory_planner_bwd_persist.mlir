@@ -1,5 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>/dev/null | triton-opt --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" 2>&1 | FileCheck %s --check-prefix=CODE-PART
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>/dev/null | triton-opt --nvgpu-test-ws-code-partition="num-buffers=2" 2>&1 | FileCheck %s --check-prefix=CODE-PART
 
 // Test case: Persistent FA BWD with budget-aware SMEM allocation (algo=1)
 // and TMEM backtracking allocation (algo=2) propagated from WS ForOp.

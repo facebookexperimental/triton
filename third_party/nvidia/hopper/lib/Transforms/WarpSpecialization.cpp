@@ -88,7 +88,7 @@ void doGenerateSubtiledRegion(triton::FuncOp funcOp) {
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
   // OptimizeTMemLayouts runs later via add_optimize_tmem_layouts in
   // compiler.py. This avoids transforming bare splits into tmem_subslice
-  // ops that lack async_task_id and would crash createChannelPost.
+  // ops that lack async_task_id and would crash createAllocChannel.
   (void)pm.run(moduleOp);
 }
 
@@ -233,8 +233,7 @@ public:
     doValidateTMAStoreAnnotations(funcOp);
     dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
 
-    doCodePartitionPost(funcOp, numStages);
-    // Label kept as "doCodePartition" for output stability (see WS-15).
+    doCodePartition(funcOp, numStages);
     dumpAfter(moduleOp, "doCodePartition");
 
     if (pingpongAutoWS) {
