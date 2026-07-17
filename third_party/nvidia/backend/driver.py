@@ -19,19 +19,15 @@ from triton.backends.driver import (
 
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
-# Path(s) to the shared data-driven launcher core. driver.c is compiled via a
-# fixed Remote-Execution command that ignores include_dirs, so we inline this
-# header into the driver.c source at build time (see CudaUtils.__init__) rather
-# than relying on an -I path.
-#
-# The first candidate (backend/launch.h) is a vendored copy that ships with the
-# nvidia backend resources (the BUCK glob packages it next to driver.py), so it
-# is present in packaged/buck builds. The second is the canonical source used by
-# C/C++ consumers (cc_library triton_launch_h). Keep the two in sync; the
-# canonical is python/triton/runtime/launch.h.
+# Path to the shared data-driven launcher core. It lives in the nvidia backend
+# dir (next to driver.c / driver.py) and is the canonical source for C/C++
+# consumers (cc_library triton_launch_h). driver.c is compiled via a fixed
+# Remote-Execution command that ignores include_dirs, so we inline this header
+# into the driver.c source at build time (see CudaUtils.__init__) rather than
+# relying on an -I path. In both source and packaged/buck builds the header
+# sits next to this file.
 _launch_h_candidates = [
     os.path.join(dirname, "launch.h"),
-    os.path.join(dirname, "..", "..", "..", "python", "triton", "runtime", "launch.h"),
 ]
 libdevice_dir = os.path.join(dirname, "lib")
 libraries = ["libcuda.so.1"]
@@ -130,7 +126,7 @@ class CudaUtils(object):
         if launch_h_path is None:
             raise FileNotFoundError(f"launch.h not found in any of: {_launch_h_candidates}")
         launch_h_src = Path(launch_h_path).read_text()
-        include_marker = '#include "triton/runtime/launch.h"'
+        include_marker = '#include "nvidia/backend/launch.h"'
         if include_marker not in driver_src:
             raise RuntimeError(f"driver.c must contain the marker {include_marker!r} for "
                                "launch.h inlining, but it was not found")
@@ -457,20 +453,21 @@ class CudaLauncher(object):
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
-        # Compute Level 0 schema — the canonical ABI description for this kernel.
-        from triton.compiler.compiler import make_backend
-
-        backend = make_backend(metadata.target)
-        schema = backend.make_launch_metadata(metadata._asdict(), src)
-
         launcher = triton.runtime.driver.active.utils.launch
 
-        # kernel_signature: derived from Level 0 schema (single source of truth).
-        self.kernel_signature = build_kernel_signature_from_schema(schema)
-
-        # arg_annotations: still needs structural info from src.signature
-        # (tuple grouping is a Python calling convention, not kernel ABI).
+        # kernel_signature + arg_annotations are both derived from the object
+        # signature (src.signature): expand_signature flattens tensordescs, then
+        # make_kernel_signature / annotate_arguments walk the actual argument-type
+        # OBJECTS via isinstance(...). A NamedTuple *is* a tuple, so it flattens
+        # structurally like any other tuple -- no reliance on str(ty). Deriving the
+        # signature from the Level 0 schema's stringified types is a repr blind
+        # spot: a NamedTuple stringifies to a class repr ("Function(fn=...,
+        # captured=...)") rather than a tuple literal, so a string parser silently
+        # mis-flattens it. For every non-NamedTuple case this is byte-identical to
+        # the old schema path (asserted by
+        # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
         expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+        self.kernel_signature = make_kernel_signature(expanded_signature)
         self.arg_annotations = annotate_arguments(expanded_signature)
 
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)

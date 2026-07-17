@@ -187,6 +187,35 @@ When channels share a reuse group (same `buffer.id`), they share a single
 
 See [Reuse Groups](ReuseGroups.md) for more details.
 
+## TMA Staging Buffers: same-partition vs cross-partition
+
+`getStaggeredAccumCnt` (`CodePartitionUtility.cpp`) has a special path for
+early-TMA staging buffers (`buffer.tmaStaging > 0`, e.g. the FA-bwd `dk/dv`
+store-staging, the `dq` reduce-staging, and the FA-fwd `desc_o` output
+staging). These hold S subtiles (the `EPILOGUE_SUBTILE` / `DQ_SUBTILE` stores,
+or the `BLOCK_M`/128 output halves) that rotate through K = `buffer.copy` slots
+of one circular buffer. **The slot/phase rule depends on how the buffer is
+drained, which is determined by whether the channel's producer and consumer are
+in the same warp task:**
+
+| Staging kind | Producer vs consumer task | Drain | Slot/phase from `getStaggeredAccumCnt` |
+|---|---|---|---|
+| **Same-partition** (bwd `dk`/`dv`/`dq`) | same task (e.g. `local_store` and `async_tma_copy`/`async_tma_reduce` both in the store task) | fixed in-flight-count `cp.async.bulk.wait_group(K-1)`, no mbarrier | bare subtile index `theIdx` → `slot = theIdx % K`, repeating every tile |
+| **Cross-partition** (fwd `desc_o`) | different tasks (produced in compute task, TMA-stored in epilogue-store task) | producer/consumer **mbarrier** (full/empty), plus the wait_group for the TMA itself | continuous `accumCnt` (+`theIdx`) → `slot`/`phase` rotate every persistent tile |
+
+Why they differ: the cross-partition mbarrier's empty/full **phase** is derived
+from the same returned count and must keep flipping across persistent tiles, so
+the count must stay continuous; collapsing it to the per-tile `theIdx` pins the
+phase and deadlocks the handshake after the first tile. The same-partition ring
+has no such phase (the wait_group alone gates slot reuse) and instead needs the
+fixed per-tile `theIdx` so same-slot stores stay exactly K apart.
+
+The discriminator is `getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())`.
+The same-partition `theIdx % K` rotation is only correct when **K | S**; that
+invariant is enforced defensively by `increaseFusedEpilogueCopies`
+(see [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md)). The cross-partition
+mbarrier rotation tolerates any K.
+
 ## Key Functions
 
 | Function | Description |

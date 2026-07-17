@@ -28,9 +28,21 @@ flash_attention:
   disabled_devices:
     - hip
 # Device specific tests
+blackwell_attentions_mxfp8:
+  devices:
+    - b200
+  # Inherits the parent op's input shapes (input-0 is N_CTX=128), which triggers
+  # the same AutoWS compiler crash and cross-tile race on the persistent
+  # Blackwell FA path (single-trip inner loop). Run seq>=256 in CI until that is
+  # fixed. See T279315890.
+  extra_args: --seq-len 256
 blackwell_attentions:
   devices:
     - b200
+  # Default input-0 is N_CTX=128, which triggers an AutoWS compiler crash and a
+  # cross-tile race on the persistent Blackwell FA path (single-trip inner
+  # loop). Run seq>=256 in CI until that is fixed. See T279315890.
+  extra_args: --seq-len 256
 nvfp4_gemm:
   devices:
     - b200
@@ -97,3 +109,18 @@ jsd:
   report: true
   disabled_devices:
     - hip
+# torch_tlx_addmm / torch_tlx_mm patch torch._inductor.config.triton.tlx_mode, a knob
+# registered only by the torchTLX inductor shim (scripts/_torchtlx_torch_shim.py), which is
+# NOT on release/3.7.x (the TLX DSL is present but the torchTLX integration is not).
+# tritonbench's has_tlx() gate only checks the DSL, so it enables these backends on the
+# meta-triton wheel, where they then fail with "torch._inductor.config.triton.tlx_mode does
+# not exist". Skip just those backends on the meta-triton channel (triton-main has no DSL, so
+# has_tlx() is False there and they are not enabled).
+addmm:
+  backends: torch_tlx_addmm
+  disabled_channels:
+    - meta-triton
+gemm:
+  backends: torch_tlx_mm
+  disabled_channels:
+    - meta-triton
