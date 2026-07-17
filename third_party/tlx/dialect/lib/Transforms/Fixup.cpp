@@ -221,10 +221,13 @@ public:
     if (!isAMD()) {
       int numWarpSpecializeOps = 0;
       bool hasExclusiveWS = false;
+      bool hasNoEndingClusterSync = false;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
         if (op->hasAttr("tlx.exclusive"))
           hasExclusiveWS = true;
+        if (op->hasAttr("tlx.no_ending_cluster_sync"))
+          hasNoEndingClusterSync = true;
       });
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
@@ -236,6 +239,11 @@ public:
         }
         ttg::setHasSingleWarpSpecialize(mod, /*value=*/true);
       }
+      // `no_ending_cluster_sync`: the user handles the post-warp-specialize
+      // sync, so mark the module to skip the compiler's cluster arrive/wait
+      // before TMEM dealloc.
+      if (hasNoEndingClusterSync)
+        setUserPostWsSyncOnMod(mod, /*value=*/true);
     }
   }
 };
