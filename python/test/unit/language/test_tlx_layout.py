@@ -1,8 +1,11 @@
 import pytest
+import torch
 import triton
 import triton.language as tl
-from triton._internal_testing import is_blackwell, is_cuda
+from triton._internal_testing import is_blackwell, is_cuda, is_hip_cdna4
 import triton.language.extra.tlx as tlx
+
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 # The FA4 "separable" layout for a 128x128 TMEM tile, written purely as
 # shape/stride (a CuTe thread-value layout). The two top-level modes are
@@ -339,3 +342,88 @@ def test_user_shared_layout_in_loop():
     ttgir = kernel.warmup(tlx.swizzled_layout(3, 0, 6, order=[1, 0]), 4, grid=(1, ), num_warps=4).asm["ttgir"]
     assert "#ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 8, order = [1, 0]}>" in ttgir
     _assert_no_layout_residue(ttgir)
+
+
+# ---------------------------------------------------------------------------
+# User-pinned swizzled shared layout (padded_shared_layout_encoding.with_bases)
+# and the offset (register) layout inferred from it for buffer_load_to_local.
+# The constants below are the exact Gluon a16w16 swizzles the intra_wave/a16w16
+# kernel pins (tile [HALF_M=128, BLOCK_K=64]) to clear CDNA4 LDS bank conflicts,
+# so these tests double as documentation of that known-good layout.
+# ---------------------------------------------------------------------------
+
+_A16W16_SHARED_INTERVALS = [(512, 16)]
+_A16W16_SHARED_OFFSET_BASES = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0],
+                               [2, 0], [4, 0], [8, 0]]
+_A16W16_TILE = [128, 64]
+_A16W16_LOAD_REG = [[0, 1], [0, 2], [0, 4], [8, 0]]
+_A16W16_LOAD_LANE = [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]]
+_A16W16_LOAD_WARP = [[1, 0], [2, 0], [4, 0]]
+
+
+def test_with_bases_builds_swizzled_padded_encoding():
+    """`padded_shared_layout_encoding.with_bases` records the explicit linear
+    (offset) component instead of the identity {order, shape}. Pure-Python."""
+    enc = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
+                                                       _A16W16_TILE)
+    assert enc.intervals == [512]
+    assert enc.paddings == [16]
+    assert enc.order == [1, 0]  # reversed(range(rank))
+    assert enc.offset_bases == _A16W16_SHARED_OFFSET_BASES
+    assert enc.block_bases == []
+    assert enc.shape == _A16W16_TILE
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_user_pinned_swizzled_padded_survives_amd():
+    """A user-pinned *swizzled* padded_shared (built with `with_bases`) survives
+    to final TTGIR as #ttg.padded_shared with the explicit {offset = ...} form,
+    not the identity {order, shape}, and leaves no #tlx.user_layout residue."""
+
+    @triton.jit
+    def kernel(PAD: tl.constexpr, M: tl.constexpr, K: tl.constexpr):
+        x = tl.zeros((M, K), tl.float16)
+        buf = tlx.local_alloc((M, K), tl.float16, tl.constexpr(1), layout=PAD)
+        v = tlx.local_view(buf, 0)
+        tlx.local_store(v, x)
+        y = tlx.local_load(v)
+        tlx.local_store(v, y)
+
+    pad = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
+                                                       _A16W16_TILE)
+    ttgir = kernel.warmup(pad, _A16W16_TILE[0], _A16W16_TILE[1], grid=(1, ), num_warps=8).asm["ttgir"]
+    assert "#ttg.padded_shared" in ttgir
+    assert "offset = [" in ttgir  # the explicit bases form, not {order, shape}
+    _assert_no_layout_residue(ttgir)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_buffer_load_to_local_infers_offset_layout_amd():
+    """With only the swizzled shared layout pinned on the alloc (no explicit
+    offset layout), tlx-insert-require-layout infers the matching offset
+    tensor's #linear so the direct-to-LDS load coalesces and lowers to amdgcn.
+    The inferred #linear must equal the hand-derived a16w16 load layout."""
+
+    @triton.jit
+    def kernel(a_ptr, SHARED: tl.constexpr, M: tl.constexpr, K: tl.constexpr, STRIDE_M: tl.constexpr):
+        offs_m = tl.arange(0, M)
+        offs_k = tl.arange(0, K)
+        off = offs_m[:, None] * STRIDE_M + offs_k[None, :]
+        smem = tlx.local_alloc((M, K), tl.float16, tl.constexpr(1), layout=SHARED)
+        tlx.buffer_load_to_local(smem[0], a_ptr, off)
+
+    pad = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
+                                                       _A16W16_TILE)
+    M, K = _A16W16_TILE
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    compiled = kernel.warmup(a, pad, M, K, K, grid=(1, ), num_warps=8)
+    ttgir = compiled.asm["ttgir"]
+    # The offset layout is inferred (not authored) and matches the hand-derived
+    # a16w16 load layout, and the load stays a single direct-to-LDS op.
+    expected = f"register = {_A16W16_LOAD_REG}, lane = {_A16W16_LOAD_LANE}, warp = {_A16W16_LOAD_WARP}"
+    assert "#ttg.linear" in ttgir
+    assert expected in ttgir, f"inferred offset layout mismatch; expected substring:\n{expected}\n\nttgir:\n{ttgir}"
+    assert "amdg.buffer_load_to_local" in ttgir
+    # It lowers all the way to amdgcn (the direct-to-LDS width/alignment
+    # requirements are met by the inferred offset layout).
+    assert compiled.asm.get("amdgcn")

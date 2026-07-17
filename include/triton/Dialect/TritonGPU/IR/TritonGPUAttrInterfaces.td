@@ -48,6 +48,10 @@ def PinnedEncodingTrait : AttrInterface<"PinnedEncodingTrait"> {
   let description = [{
     Marks an encoding as user-pinned: layout optimization must not rewrite it.
   }];
+  let methods = [
+    InterfaceMethod<"Return the concrete layout this wrapper pins.",
+                    "::mlir::Attribute", "getPinnedLayout">,
+  ];
 }
 
 def DistributedEncodingTrait : AttrInterface<"DistributedEncodingTrait"> {
