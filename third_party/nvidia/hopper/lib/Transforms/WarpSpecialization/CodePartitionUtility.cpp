@@ -1257,22 +1257,22 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // Early-TMA *same-partition* staging buffers (buffer.tmaStaging > 0 AND the
   // channel producer and consumer are in the same warp task): the
   // EPILOGUE_SUBTILE / DQ_SUBTILE subtiles (S of them) rotate through the
-  // buffer.copy (= K) slots of one circular SMEM buffer that is both written and
-  // TMA-stored by the *same* task. The drain is a fixed in-flight-count TMA
+  // buffer.copy (= K) slots of one circular SMEM buffer that is both written
+  // and TMA-stored by the *same* task. The drain is a fixed in-flight-count TMA
   // store-wait (cp.async.bulk.wait_group K-1, from can_rotate_by_buffer_count)
   // with NO cross-partition mbarrier, so the slot must be the per-tile subtile
   // index (theIdx % numBuffers), NOT the accumCnt-staggered slot used for
   // loop-carried buffers. Reuse-group members share one accumCnt (the +1-per-
-  // outer-iter loop counter) and add theIdx in [0,S); when S > K those staggered
-  // (slot,phase) ranges of consecutive iterations OVERLAP, so the first subtile
-  // of tile t+1 reuses the slot the last subtile of tile t just stored -- reuse
-  // distance 1, not K -- and wait_group(K-1) leaves that store in flight, so the
-  // new local_store overwrites the slot (or async_tma_reduce reads it) before the
-  // prior TMA store/reduce drained -> wrong dv/dk/dq (T277224987). Depth-1 (one
-  // slot, wait_group(0) = fully serialized) is immune. Mirrors the TLX
-  // reference's `slice_id % DQ_REDUCE_STAGES`. Correctness of this fixed-slot
-  // rotation requires K | S, enforced defensively by
-  // increaseFusedEpilogueCopies in WSMemoryPlanner.cpp.
+  // outer-iter loop counter) and add theIdx in [0,S); when S > K those
+  // staggered (slot,phase) ranges of consecutive iterations OVERLAP, so the
+  // first subtile of tile t+1 reuses the slot the last subtile of tile t just
+  // stored -- reuse distance 1, not K -- and wait_group(K-1) leaves that store
+  // in flight, so the new local_store overwrites the slot (or async_tma_reduce
+  // reads it) before the prior TMA store/reduce drained -> wrong dv/dk/dq
+  // (T277224987). Depth-1 (one slot, wait_group(0) = fully serialized) is
+  // immune. Mirrors the TLX reference's `slice_id % DQ_REDUCE_STAGES`.
+  // Correctness of this fixed-slot rotation requires K | S, enforced
+  // defensively by increaseFusedEpilogueCopies in WSMemoryPlanner.cpp.
   //
   // CROSS-partition staging (producer task != consumer task, e.g. the FA-fwd
   // desc_o output store: produced in the compute task, TMA-stored in the
@@ -1280,8 +1280,9 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // (slot, phase) BOTH derive from this returned count. There the count MUST
   // stay the continuous accumCnt so the empty/full phase keeps flipping across
   // persistent tiles; collapsing it to a constant subtile index pins the phase
-  // and deadlocks the handshake after the first tile (T277224987 fwd regression).
-  // Hence the bare-subtile-index path is gated on same-task staging.
+  // and deadlocks the handshake after the first tile (T277224987 fwd
+  // regression). Hence the bare-subtile-index path is gated on same-task
+  // staging.
   bool isTmaStaging = false;
   if (auto *allocOp = ch->getAllocOp())
     if (auto stagingAttr =
@@ -1309,7 +1310,8 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       return builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
           op->getLoc(), 0);
     return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        op->getLoc(), 0, llvm::cast<IntegerType>(accumCnt.getType()).getWidth());
+        op->getLoc(), 0,
+        llvm::cast<IntegerType>(accumCnt.getType()).getWidth());
   }
   // Stagger the count by the channel's position within the reuse group, so each
   // channel occupies a distinct slot of the shared circular buffer.
