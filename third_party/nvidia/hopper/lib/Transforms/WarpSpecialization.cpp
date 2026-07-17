@@ -127,7 +127,7 @@ public:
     // suffices.
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
-      if (op->getAttrOfType<DenseI32ArrayAttr>("async_task_id") ||
+      if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
           op->getAttrOfType<DenseI32ArrayAttr>(
               triton::gpu::kPartitionAttrName) ||
           (isa<scf::ForOp>(op) &&
