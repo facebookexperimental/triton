@@ -101,37 +101,12 @@ public:
   using impl::NVGPUWarpSpecializationBase<
       NVGPUWarpSpecializationPass>::NVGPUWarpSpecializationBase;
 
-  // Remove the warp_specialize attribute from all loops in the function, plus
-  // any partition metadata that the earlier `tritongpu-partition-scheduling`
-  // pass may have written. The two passes form a pair: when this pass takes
-  // an early-exit and skips warp specialization (e.g. else-block fallback),
-  // leaving `ttg.partition` / `ttg.partition.stages` /
-  // `ttg.warp_specialize.tag` behind on ops + loops produces a half-tagged
-  // state — the downstream `tritongpu-pipeline` pass treats partition-tagged
-  // regions as WS regions and crashes when sibling ops in an scf.if/else aren't
-  // tagged. Stripping everything ensures downstream sees a plain (non-WS) loop.
-  void removeWarpSpecializeAttr(triton::FuncOp funcOp) {
-    auto stripLoop = [](Operation *loop) {
-      loop->removeAttr(mlir::triton::kWarpSpecializeAttrName);
-      loop->removeAttr(mlir::triton::gpu::kPartitionStagesAttrName);
-      loop->removeAttr(mlir::triton::gpu::kWarpSpecializeTagAttrName);
-      loop->removeAttr(kPartitionTypesAttrName);
-    };
-    funcOp->walk([&](scf::ForOp forOp) { stripLoop(forOp); });
-    funcOp->walk([&](scf::WhileOp whileOp) { stripLoop(whileOp); });
-    funcOp->walk([&](Operation *op) {
-      // Strip both the partition id (`ttg.partition`) and the task id
-      // (`async_task_id`). The task id is only present once `doTaskIdPropagate`
-      // has run (e.g. the atomic-broadcast reject path bails after
-      // propagation); for the earlier bail-outs it simply does not exist yet
-      // and this is a no-op. Leaving either behind produces a half-tagged state
-      // that the downstream `tritongpu-pipeline` pass mis-treats as a WS
-      // region. Use the shared helper so the attr name lives in one place.
-      removeAsyncTaskIds(op);
-      op->removeAttr(mlir::triton::gpu::kPartitionAttrName);
-      op->removeAttr(mlir::triton::gpu::kPartitionOutputsAttrName);
-    });
-  }
+  // Reject warp specialization for this function: strip the WS metadata so the
+  // downstream pipeline sees a plain, compilable non-WS kernel. This is the
+  // single reject epilogue shared by the early-exit paths in runOnFuncOp; use
+  // it as `return bailOut(funcOp);`. The canonical WS-metadata set lives in the
+  // shared `removeWarpSpecMetadata` (CodePartitionUtility.h).
+  void bailOut(triton::FuncOp funcOp) { removeWarpSpecMetadata(funcOp); }
 
   // Dump the whole module to llvm::dbgs() after a pipeline step, gated on the
   // `dump-intermediate-steps` pass option. Collapses the identical dump blocks
@@ -146,31 +121,29 @@ public:
   }
 
   void runOnFuncOp(triton::FuncOp funcOp) {
+    // Warp specialization is enabled for this function if any op carries WS
+    // metadata: an `async_task_id` or `ttg.partition` tag, or a loop marked
+    // with the warp-specialize attribute. A single walk with early-out
+    // suffices.
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
-      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
+      if (op->getAttrOfType<DenseI32ArrayAttr>("async_task_id") ||
+          op->getAttrOfType<DenseI32ArrayAttr>(
+              triton::gpu::kPartitionAttrName) ||
+          (isa<scf::ForOp>(op) &&
+           op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
         enabled = true;
-      if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
-              triton::gpu::kPartitionAttrName))
-        enabled = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
     });
-    if (!enabled) {
-      SmallVector<scf::ForOp> loops;
-      funcOp->walk([&](scf::ForOp forOp) {
-        if (forOp->hasAttr(mlir::triton::kWarpSpecializeAttrName))
-          loops.push_back(forOp);
-      });
-      if (!loops.empty())
-        enabled = true;
-    }
     if (!enabled)
       return;
 
     int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
     if (numWarps < 4) {
       LDBG("Warp specialization requires at least 4 warps. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      return bailOut(funcOp);
     }
 
     // FIXME: skip warpspec if there is else block. Need to improve
@@ -186,8 +159,7 @@ public:
     });
     if (hasElse) {
       LDBG("Warp specialization does not support else blocks. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      return bailOut(funcOp);
     }
 
     OpBuilder builder(funcOp);
@@ -209,15 +181,14 @@ public:
     // run the claim once in the owner/producer partition and broadcast the
     // loop-carried result(s) to every partition through SMEM, or gracefully
     // bail out of warp specialization (unsupported shape). On a reject we strip
-    // all WS metadata via removeWarpSpecializeAttr (which also clears the
+    // all WS metadata via removeWarpSpecMetadata (which also clears the
     // `async_task_id`s that doTaskIdPropagate materialized above) so downstream
     // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
     // from the `tile-prefetch-depth` pass option (a Python knob), not an env
     // var.
     if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth))) {
       LDBG("Dynamic tile broadcast rejected warp specialization. Skipping.");
-      removeWarpSpecializeAttr(funcOp);
-      return;
+      return bailOut(funcOp);
     }
     dumpAfter(moduleOp, "doDynamicTileBroadcast");
 

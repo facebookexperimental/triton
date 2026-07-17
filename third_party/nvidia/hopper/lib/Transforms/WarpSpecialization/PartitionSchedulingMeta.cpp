@@ -4,6 +4,7 @@
 #include "mlir/IR/Iterators.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -109,20 +110,6 @@ inline Operation *getAccumulatorBuffer(Operation *op) {
     return nullptr;
   }
   return nullptr;
-}
-
-/// Strip all warp specialization annotations from a function.
-/// Removes partition attributes from ops and tt.warp_specialize from loops.
-static void dropWarpSpec(triton::FuncOp funcOp) {
-  funcOp->walk([](scf::ForOp forOp) {
-    forOp->removeAttr(triton::kWarpSpecializeAttrName);
-    forOp->removeAttr(kPartitionStagesAttrName);
-    forOp->removeAttr(kWarpSpecializeTagAttrName);
-  });
-  funcOp->walk([](Operation *op) {
-    op->removeAttr(kPartitionAttrName);
-    op->removeAttr(kPartitionOutputsAttrName);
-  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -2982,7 +2969,7 @@ void PartitionSchedulingMeta::runOnOperation() {
 
       if (estimatedTotal > kMaxWarps) {
         LDBG("Warp budget exceeded. Skipping warp specialization.");
-        dropWarpSpec(funcOp);
+        removeWarpSpecMetadata(funcOp);
         return;
       }
 

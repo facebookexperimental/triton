@@ -4,6 +4,7 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Partition.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -25,6 +26,13 @@ namespace tt = mlir::triton;
 // (WSMemoryPlanner) share one source of truth for the name.
 constexpr llvm::StringLiteral kAtomicBroadcastCopiesAttrName =
     "ttg.atomic_broadcast_copies";
+
+// Strip every warp-specialization metadata attribute that AutoWS stamps on
+// ops/loops. Every graceful-reject path must call this so the downstream
+// tritongpu-pipeline pass sees a plain, compilable non-WS kernel; a leftover WS
+// attribute produces the "half-tagged" state the pipeliner crashes on. This is
+// the single canonical set consumed by all reject paths.
+void removeWarpSpecMetadata(triton::FuncOp funcOp);
 
 enum class DataChannelKind : int {
   SMEM = 0,

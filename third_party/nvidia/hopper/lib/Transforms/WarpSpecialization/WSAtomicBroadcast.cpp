@@ -396,7 +396,7 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // (run once in the owner/producer partition + broadcast the loop-carried
 // result(s) to all partitions), or reject. Returns failure() to force a
 // graceful warp-specialization reject; the caller strips WS metadata via
-// removeWarpSpecializeAttr (which clears both partition ids and
+// removeWarpSpecMetadata (which clears both partition ids and
 // async_task_ids), leaving the kernel unspecialized-but-compilable — one source
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,

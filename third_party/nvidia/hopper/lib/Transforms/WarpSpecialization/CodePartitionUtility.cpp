@@ -18,6 +18,28 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+void removeWarpSpecMetadata(triton::FuncOp funcOp) {
+  // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is
+  // a no-op when the attribute is absent, so a single walk over every op
+  // (rather than separate loop/op passes) is correct and covers scf.for and
+  // scf.while uniformly. Adding a new WS metadata attribute means adding it
+  // here once.
+  static const StringRef kWSMetadataAttrs[] = {
+      tt::kWarpSpecializeAttrName,
+      ttg::kPartitionAttrName,
+      ttg::kPartitionOutputsAttrName,
+      ttg::kPartitionStagesAttrName,
+      ttg::kWarpSpecializeTagAttrName,
+      kPartitionTypesAttrName,
+      kAsyncTaskIdAttrName,
+      kAtomicBroadcastCopiesAttrName,
+  };
+  funcOp->walk([&](Operation *op) {
+    for (StringRef name : kWSMetadataAttrs)
+      op->removeAttr(name);
+  });
+}
+
 // Check whether two channels belong to the same consumer group.
 // Mirrors the merge conditions in insertAsyncComm (WSCodePartition.cpp):
 //   same getDstOp(), same consumer task IDs, same full consumer set.
