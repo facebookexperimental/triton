@@ -4051,12 +4051,12 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
   return success();
 }
 
-// Default arguments are declared in WarpSpecializationPipeline.h (the single
-// declaration site); they must not be repeated on the definition.
+// The default argument for `options` is declared in
+// WarpSpecializationPipeline.h (the single declaration site); it must not be
+// repeated on the definition.
 LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
-                              StringRef readDecisionFile,
-                              StringRef writeDecisionFile, int smemAllocAlgo,
-                              unsigned smemBudget, bool smemCircularReuse) {
+                              unsigned smemBudget,
+                              const MemoryPlannerOptions &options) {
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -4092,8 +4092,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
 
   // If a read decision file is provided, apply decisions from file instead of
   // running the planner.
-  if (!readDecisionFile.empty()) {
-    if (failed(readDecisionsFromFile(channels, readDecisionFile))) {
+  if (!options.readDecisionFile.empty()) {
+    if (failed(readDecisionsFromFile(channels, options.readDecisionFile))) {
       return failure();
     }
     LDBG("Skipping memory planner - using decisions from file");
@@ -4107,9 +4107,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   // Check for per-loop SMEM allocation attributes on the WS ForOp.
   // These override the pass-level defaults, following the same pattern
   // as tt.tmem_alloc_algo.
-  int effectiveSmemAllocAlgo = smemAllocAlgo;
+  int effectiveSmemAllocAlgo = options.smemAllocAlgo;
   unsigned effectiveSmemBudget = smemBudget;
-  bool effectiveSmemCircularReuse = smemCircularReuse;
+  bool effectiveSmemCircularReuse = options.smemCircularReuse;
   bool hasSmemAllocAlgoAttr = false;
   funcOp->walk([&](scf::ForOp forOp) {
     if (!forOp->hasAttr("tt.warp_specialize"))
@@ -4202,8 +4202,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
   }
 
   // If a write decision file is provided, serialize decisions to file.
-  if (!writeDecisionFile.empty()) {
-    if (failed(writeDecisionsToFile(channels, writeDecisionFile))) {
+  if (!options.writeDecisionFile.empty()) {
+    if (failed(writeDecisionsToFile(channels, options.writeDecisionFile))) {
       return failure();
     }
   }
@@ -4223,9 +4223,12 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
-      if (failed(doMemoryPlanner(funcOp, numBuffers, readDecisionFile,
-                                 writeDecisionFile, smemAllocAlgo, smemBudget,
-                                 smemCircularReuse)))
+      MemoryPlannerOptions options;
+      options.readDecisionFile = readDecisionFile;
+      options.writeDecisionFile = writeDecisionFile;
+      options.smemAllocAlgo = smemAllocAlgo;
+      options.smemCircularReuse = smemCircularReuse;
+      if (failed(doMemoryPlanner(funcOp, numBuffers, smemBudget, options)))
         signalPassFailure();
     }
   }

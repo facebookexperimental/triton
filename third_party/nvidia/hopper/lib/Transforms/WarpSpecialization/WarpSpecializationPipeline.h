@@ -29,15 +29,25 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp);
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
                                      int tilePrefetchDepth);
 
-// Plans SMEM/TMEM allocation (multi-buffering, liveness). The decision-file and
-// algorithm knobs are exercised only by the -nvgpu-test-ws-memory-planner test
-// pass; the production pipeline uses the defaults declared here. Defaults live
-// on this declaration only (not on the definition) so there is one source.
+// Test-only knobs for doMemoryPlanner. The production pipeline uses the
+// defaults; only the -nvgpu-test-ws-memory-planner pass varies them:
+// decision-file I/O to snapshot/replay planner decisions, an alternate SMEM
+// allocation algorithm, and circular SMEM reuse. Grouped into a struct so the
+// production entry point advertises only the parameters it actually uses
+// (WS-10).
+struct MemoryPlannerOptions {
+  StringRef readDecisionFile = "";
+  StringRef writeDecisionFile = "";
+  int smemAllocAlgo = 1;
+  bool smemCircularReuse = false;
+};
+
+// Plans SMEM/TMEM allocation (multi-buffering, liveness). Production passes
+// only numBuffers and smemBudget; the test-only knobs default via
+// MemoryPlannerOptions.
 LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
-                              StringRef readDecisionFile = "",
-                              StringRef writeDecisionFile = "",
-                              int smemAllocAlgo = 1, unsigned smemBudget = 0,
-                              bool smemCircularReuse = false);
+                              unsigned smemBudget,
+                              const MemoryPlannerOptions &options = {});
 
 void doBufferAllocation(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
