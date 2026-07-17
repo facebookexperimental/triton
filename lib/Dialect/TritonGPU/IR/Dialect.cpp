@@ -210,6 +210,16 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
           dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
     return getOrder(partitionedLayout.getPartitionLayout(), shape);
   }
+  // Unwrap a user-pinned wrapper (PinnedEncodingTrait) and recurse into its
+  // concrete shared layout.
+  if (auto pinned = dyn_cast<PinnedEncodingTrait>(layout)) {
+    auto inner =
+        dyn_cast_or_null<SharedEncodingTrait>(pinned.getPinnedLayout());
+    if (!inner)
+      llvm::report_fatal_error("getOrder: pinned shared encoding does not wrap "
+                               "a SharedEncodingTrait");
+    return getOrder(inner, shape);
+  }
   llvm::report_fatal_error("Unimplemented usage of getOrder for MemDescType");
   return {};
 }
