@@ -585,10 +585,14 @@ void freeTMAlloc(LLVM::LLVMFuncOp func, Value alloc, size_t size, Value pred,
       // even in WS mode because the WS lowering inserts matching cluster
       // arrives for the non-default warps right before their warp_return
       // (gated by the cluster_sync_kernel_cleanup mod attr set below).
-      NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
-      NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
-      // mark mod attr so that WS lowering is aware of this cluster sync point
-      tlx::setClusterSyncKernelCleanupOnMod(func, true);
+      if (!tlx::hasUserPostWsSync(func)) {
+        // if user declares they'll handle the post WS sync, compiler skips it.
+        // Otherwise, compiler inserts a cluster sync here
+        NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
+        NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));
+        // mark mod attr so that WS lowering is aware of this cluster sync point
+        tlx::setClusterSyncKernelCleanupOnMod(func, true);
+      }
     } else if (twoCTAs && !hasWarpSpecialize) {
       NVVM::ClusterArriveOp::create(b, loc, UnitAttr::get(ctx));
       NVVM::ClusterWaitOp::create(b, loc, UnitAttr::get(ctx));

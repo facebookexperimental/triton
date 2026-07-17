@@ -557,14 +557,17 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
 
     ptx = kernel.asm["ptx"]
     assert ptx.count("fence.mbarrier_init.release.cluster") == 1
-    # Verify ordering: fences → cluster sync → tmem alloc
+    # Verify ordering: fences → cluster sync → tmem alloc. The entry-block arrive
+    # is relaxed; the cleanup arrive before tmem dealloc stays non-relaxed.
     fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
-    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned")
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.relaxed.aligned")
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
     assert fence_mbar_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
-    # 2 cluster syncs: 1 for init (before tmem alloc, after bar init), 1 for cleanup (before tmem dealloc)
-    assert ptx.count("barrier.cluster.arrive.aligned") == 2
+    # 2 cluster syncs: 1 relaxed init (before tmem alloc) + 1 non-relaxed cleanup
+    # (before tmem dealloc)
+    assert ptx.count("barrier.cluster.arrive.relaxed.aligned") == 1
+    assert ptx.count("barrier.cluster.arrive.aligned") == 1
     assert ptx.count("barrier.cluster.wait.aligned") == 2
     assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
@@ -575,9 +578,15 @@ def test_async_dot_blackwell_2cta_tma(device, A_TMEM, SAMPLE_M):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_async_dot_blackwell_2cta_tma_ws(device):
+@pytest.mark.parametrize("no_ending_cluster_sync", [False, True])
+def test_async_dot_blackwell_2cta_tma_ws(device, no_ending_cluster_sync):
     """
     Test 2cta collective D = A*B for 1 tile.
+
+    Also covers tlx.async_tasks(no_ending_cluster_sync=...): a 2-CTA async dot
+    triggers TLX paired-CTA mode, so the compiler normally inserts a cluster
+    arrive/wait before TMEM dealloc. With no_ending_cluster_sync=True the user
+    declares they handle that sync, and the compiler skips those cleanup arrives.
     """
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
@@ -603,6 +612,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         M: tl.constexpr,
         N: tl.constexpr,
         K: tl.constexpr,
+        NO_ENDING: tl.constexpr,
     ):
         # difference from 1cta
         cluster_cta_rank = tlx.cluster_cta_rank()
@@ -632,7 +642,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         buffers = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
         acc_tmem = tlx.local_view(buffers, 0)
 
-        with tlx.async_tasks():
+        with tlx.async_tasks(no_ending_cluster_sync=NO_ENDING):
             with tlx.async_task("default"):  # epilogue consumer
                 tlx.barrier_wait(tmem_full_bars[0], phase=0)
 
@@ -679,6 +689,7 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
         "M": M,
         "N": N,
         "K": K,
+        "NO_ENDING": no_ending_cluster_sync,
     }
     kernel = tcgen5_dot_kernel2cta_tma_ws[(M // BLOCK_M, N // BLOCK_N)](
         x,
@@ -711,21 +722,29 @@ def test_async_dot_blackwell_2cta_tma_ws(device):
     #   barrier.cluster.wait.aligned
     #   tcgen05.alloc.cta_group::2      (tmem alloc after cluster sync)
     fence_mbar_pos = ptx.index("fence.mbarrier_init.release.cluster")
-    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.aligned", fence_mbar_pos)
+    cluster_arrive_pos = ptx.index("barrier.cluster.arrive.relaxed.aligned", fence_mbar_pos)
     cluster_wait_pos = ptx.index("barrier.cluster.wait.aligned")
     tmem_alloc_pos = ptx.index("tcgen05.alloc.cta_group::2")
     assert fence_mbar_pos < cluster_arrive_pos < cluster_wait_pos < tmem_alloc_pos
-    # 6 cluster arrives: 1 init (default) + 1 init (non-default) +
-    #   1 cleanup (default, before tmem dealloc) + 3 cleanup (non-default warps MMA/producer/idle, per partition end)
-    # 2 cluster waits: 1 init (default) + 1 cleanup (default, before tmem dealloc)
-    assert ptx.count("barrier.cluster.arrive.aligned") == 6
-    assert ptx.count("barrier.cluster.wait.aligned") == 2
+    # The 2 relaxed init arrives (default + non-default) are emitted regardless.
+    assert ptx.count("barrier.cluster.arrive.relaxed.aligned") == 2
     assert ptx.count("tcgen05.dealloc.cta_group::2") == 1
     assert ptx.count("mapa.shared::cluster") == 1  # address mapping for remote_view
     assert ptx.count("tcgen05.mma.cta_group::2") == 8  # BK=128 divided into steps of 16
 
-    ref_out = torch.matmul(x, y)
-    torch.testing.assert_close(z, ref_out)
+    if no_ending_cluster_sync:
+        # The user declares they handle the post-WS sync, so the compiler emits
+        # no non-relaxed cluster arrive before TMEM dealloc (default + the
+        # non-default per-partition-end cleanups are all skipped). This kernel
+        # does not add its own sync, so correctness is not checked here.
+        assert ptx.count("barrier.cluster.arrive.aligned") == 0
+    else:
+        # 4 non-relaxed cleanup arrives: 1 default (before tmem dealloc) + 3
+        # non-default warps (MMA/producer/idle) at partition end.
+        assert ptx.count("barrier.cluster.arrive.aligned") == 4
+        assert ptx.count("barrier.cluster.wait.aligned") == 2
+        ref_out = torch.matmul(x, y)
+        torch.testing.assert_close(z, ref_out)
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
