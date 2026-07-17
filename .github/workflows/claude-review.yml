@@ -4,23 +4,52 @@ on:
   issue_comment:
     types: [created]
 
+# #4: one review per PR at a time; a newer `/claude review` cancels the older run.
+concurrency:
+  group: claude-review-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   review:
+    # #1: restrict who can spend API budget — only the PR must be a real PR, the
+    # comment must contain the trigger, AND the commenter must be a maintainer
+    # (owner/member/collaborator). Stops external accounts from burning tokens.
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '/claude review')
+      contains(github.event.comment.body, '/claude review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
+    # #3: cap wall-clock so a hung `claude` call can't bill 6h of minutes/tokens.
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: write
     steps:
+      # #7: immediate feedback so the commenter knows the run started.
+      - name: Acknowledge trigger
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes --silent || true
+
+      # #2: detect a missing key up front so we can skip cleanly instead of
+      # posting auth-error output that looks like a real (green) review.
+      - name: Check API key is configured
+        id: key
+        run: echo "present=${{ secrets.ANTHROPIC_API_KEY != '' }}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
-        uses: actions/checkout@v4
+        # #9: pinned to an immutable patch tag. TODO: swap for a commit SHA
+        # (verify the SHA on github.com) for full supply-chain hardening.
+        uses: actions/checkout@v4.2.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1 # #8: diff comes from `gh pr diff` (API); no history needed.
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        # #9: see note above re: SHA-pinning.
+        uses: actions/setup-python@v5.2.0
         with:
           python-version: "3.12"
 
@@ -28,9 +57,14 @@ jobs:
         run: pip install pyyaml
 
       - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
+        # #6: pin point for the CLI — set CLAUDE_CODE_VERSION to a known-good
+        # version to avoid a surprise breaking release. Defaults to latest.
+        env:
+          CLAUDE_CODE_VERSION: "" # e.g. "1.2.3"
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:-latest}"
 
       - name: Get PR diff
+        if: steps.key.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -38,6 +72,7 @@ jobs:
           gh pr diff "$PR_NUMBER" > /tmp/pr-diff.patch
 
       - name: Run reviewers
+        if: steps.key.outputs.present == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REVIEW_MODE: plain
@@ -45,26 +80,45 @@ jobs:
           chmod +x .claude/reviewers/run-review.sh
           .claude/reviewers/run-review.sh /tmp/pr-diff.patch > /tmp/review-output.txt 2>&1
 
+      # #5: post even when "Run reviewers" failed (but not on cancellation), so a
+      # failed review surfaces to the PR instead of silently producing nothing.
       - name: Post review comment
+        if: ${{ !cancelled() && steps.key.outputs.present == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ github.event.issue.number }}"
-          # Truncate if too long for a GH comment (max ~65536 chars)
+          if [[ ! -s /tmp/review-output.txt ]]; then
+            echo "(no output — reviewers failed before producing results; see workflow logs)" \
+              > /tmp/review-output.txt
+          fi
+          # Truncate if too long for a GH comment (max ~65536 chars).
           head -c 60000 /tmp/review-output.txt > /tmp/review-truncated.txt
-          # Build comment body
+          # #10: keep results in a fenced ```text block — preserves run-review.sh's
+          # per-reviewer dividers and prevents diff/review content from injecting
+          # markdown or @-mentions into the PR thread.
           {
             echo '## Claude PR Review'
             echo ''
             echo '<details>'
             echo '<summary>Review results (click to expand)</summary>'
             echo ''
-            echo '```'
+            echo '```text'
             cat /tmp/review-truncated.txt
             echo '```'
             echo ''
             echo '</details>'
             echo ''
-            echo '*Triggered by `/claude review` — running in plain mode (no GPU).*'
+            echo '*Triggered by `/claude review` — plain mode (no GPU).*'
           } > /tmp/review-comment.md
           gh pr comment "$PR_NUMBER" --body-file /tmp/review-comment.md
+
+      # #2 (cont.): if the key is absent, tell the commenter instead of running.
+      - name: Note missing API key
+        if: steps.key.outputs.present != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.issue.number }}"
+          gh pr comment "$PR_NUMBER" --body \
+            ':warning: `/claude review` is enabled, but `ANTHROPIC_API_KEY` is not set in repository secrets. A maintainer needs to add it before reviews can run.'
