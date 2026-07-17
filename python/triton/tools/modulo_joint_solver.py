@@ -86,6 +86,75 @@ def _recmii_rerank_enabled():
     return os.environ.get("TRITON_MODULO_RECMII_RERANK", "1") == "1"
 
 
+def _intrawg_async_reader_pairs(nodes_by_id, edges, cluster_of):
+    """(src_cluster, dst_cluster) pairs that must NOT share a warp group.
+
+    LEGALITY (2026-07-16, case9b joint-partition wedge): an ASYNC producer's
+    software reader (CUDA/SFU consumer of an MMA/TMA result) handshakes
+    through a depth-1 mbarrier parity wait that EVERY warp of the reader's
+    group executes. PTX defines mbarrier parity tests only for the current
+    and the immediately preceding phase, so a straggler warp that falls a
+    full generation behind its group aliases the parity and the kernel
+    wedges (measured ~1/300 launches at 4096 after a small-shape bench).
+    Single-warp groups execute waits warp-uniformly and are safe — every
+    handwritten TLX Blackwell kernel keeps MMAs in 1-warp tasks — but the
+    emitter's default task can launch wider than scheduled, so the reader
+    must simply live in a different warp group than the async producer.
+    MMA→MMA consumers are exempt: TC-only groups are sized single-warp.
+
+    Covers ALL distances: the emitter derives the intra-WG handshake from
+    operand references, so a loop-carried MMA→tmem_load edge (case3's
+    acc-correction read) lands in the same wedge-prone protocol when the
+    pair shares a group.
+    """
+    out = set()
+    for e in edges:
+        src = nodes_by_id.get(e["src"])
+        dst = nodes_by_id.get(e["dst"])
+        if src is None or dst is None:
+            continue
+        if src["pipeline"] not in ("TMA", "TC", "MFMA"):
+            continue
+        if dst["pipeline"] not in ("CUDA", "SFU"):
+            continue
+        ci = cluster_of.get(e["src"])
+        cj = cluster_of.get(e["dst"])
+        if ci is None or cj is None or ci == cj:
+            continue
+        out.add((ci, cj))
+    return out
+
+
+def _mem_resident_srcs(prob):
+    """Nodes whose result is MEMORY-resident: they produce an SMEM/TMEM
+    buffer, so consumers read the buffer, not a register copy. A long
+    producer→consumer span costs no register lifetime, and pricing it in
+    the reg-pressure term (1024/cycle) dwarfs the 102400 ring-depth reward
+    — on case4 FA-bwd the v2 re-solve compressed the K-tile ring from the
+    schedule's depth 3 to depth 2 for exactly this reason (0.92x of the
+    heuristic draw on hardware). Excluding these sources confines the
+    reg-pressure term to values that actually live in the register file.
+
+    MEASURED VERDICT (2026-07-16, case4 B200 hot-L2 @N=16384): the ring
+    depth is NOT the 8% — a hand-patched depth-3 variant of the compressed
+    kernel is cycle-identical to depth-2 (268.6 TF both), and enabling
+    this exclusion made placement WORSE (254.5 TF vs modulo's 292.3): with
+    the compression pressure gone the solver drifts to longer spans that
+    serialize the softmax WG's waits. The case4 gap lives in stream-order
+    placement geometry the objective cannot see (same finding as the
+    RecMII saga's layout-vs-draw residual). Kept as an A/B probe.
+    Experimental, default OFF: TRITON_MODULO_MEM_RESIDENT_SPANS=1 enables.
+    """
+    if os.environ.get("TRITON_MODULO_MEM_RESIDENT_SPANS", "0") != "1":
+        return set()
+    out = set()
+    for b in prob.get("buffers", []) or []:
+        p = b.get("producer", b.get("alloc_node"))
+        if p is not None:
+            out.add(p)
+    return out
+
+
 def _has_full_graph(prob):
     """The re-ranker needs the full dependence graph: plain (non-cross)
     edges and buffers with ring counts — shipped by the C++ side since the
@@ -480,7 +549,10 @@ def solve_at_ii(prob, ii, time_limit_s, hint=None):
     # better objective).
     max_stage = model.NewIntVar(0, max_stages - 1, "max_stage")
     model.AddMaxEquality(max_stage, stage)
-    reg_pressure = sum(cycle[e["dst"]] - cycle[e["src"]] for e in edges if e["distance"] == 0)
+    mem_srcs = _mem_resident_srcs(prob)
+    reg_pressure = sum(cycle[e["dst"]] - cycle[e["src"]]
+                       for e in edges
+                       if e["distance"] == 0 and e["src"] not in mem_srcs)
     # Recurrence-chain criticality (SolverMigrationNotes, step 3): for each
     # loop-carried back edge (u -> v, distance > 0), cycle[u] - cycle[v] is
     # the scheduled span of the recurrence circuit's forward chain.
@@ -620,6 +692,14 @@ def solve_partition(prob):
             model.Add(wg[key[0]] != wg[key[1]]).OnlyEnforceIf(s.Not())
             same_cache[key] = s
         return same_cache[key]
+
+    # LEGALITY: async results read by software (see _intrawg_async_reader_pairs).
+    cluster_of_v1 = {}
+    for c in clusters:
+        for nid in c["nodes"]:
+            cluster_of_v1[nid] = cindex[c["id"]]
+    for ci, cj in _intrawg_async_reader_pairs(nodes, prob["edges"], cluster_of_v1):
+        model.Add(same_wg(ci, cj) == 0)
 
     terms = []
 
@@ -939,6 +1019,10 @@ def solve_joint(prob):
             same_cache[key] = s
         return same_cache[key]
 
+    # LEGALITY: async results read by software (see _intrawg_async_reader_pairs).
+    for ci, cj in _intrawg_async_reader_pairs(node_by_id, edges, cluster_of):
+        model.Add(same_wg(ci, cj) == 0)
+
     # Dependences, with the cross-WG hand-off as a conditional hard latency.
     # Distance-0 edges get a STRICT +1 floor: half the ScheduleLoop-level
     # edges carry latency 0/1 (issue-order semantics, not the DDG's
@@ -1118,7 +1202,10 @@ def solve_joint(prob):
     # charge.
     max_stage = model.NewIntVar(0, max_stages - 1, "max_stage")
     model.AddMaxEquality(max_stage, list(stage.values()))
-    reg_pressure = sum(cycle[e["dst"]] - cycle[e["src"]] for e in edges if e["distance"] == 0)
+    mem_srcs = _mem_resident_srcs(prob)
+    reg_pressure = sum(cycle[e["dst"]] - cycle[e["src"]]
+                       for e in edges
+                       if e["distance"] == 0 and e["src"] not in mem_srcs)
     rec_span = sum(cycle[e["src"]] - cycle[e["dst"]] for e in edges if e["distance"] > 0 and e["src"] != e["dst"])
     model.Minimize(10240000 * max_stage - 102400 * sum(depth_vars) + 8192 * rec_span + 1024 * reg_pressure +
                    smem_total + sum(terms) + 512 * residual - used_wgs)

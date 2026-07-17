@@ -170,6 +170,9 @@ def _load_perf_harness():
     path = TESTING_DIR / "perf_regression" / "perf_harness.py"
     spec = importlib.util.spec_from_file_location("perf_harness", path)
     mod = importlib.util.module_from_spec(spec)
+    # dataclasses resolves cls.__module__ through sys.modules at class
+    # creation — exec without registration breaks perf_harness's @dataclass.
+    sys.modules["perf_harness"] = mod
     spec.loader.exec_module(mod)
     return mod
 
