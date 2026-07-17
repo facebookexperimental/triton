@@ -150,7 +150,7 @@ fitToValidDirectToLdsVecSize(unsigned maxVecSize, unsigned elemBitwidth,
   return maxVecSize;
 }
 
-FailureOr<triton::LinearLayout> deducePaddedDirectToLdsRegLayout(
+FailureOr<triton::LinearLayout> deduceRegLayoutFromPaddedShared(
     const triton::LinearLayout &sharedOffsetLayout, unsigned loadContig,
     unsigned threadsPerWarp, unsigned numWarps, ArrayRef<int64_t> shape,
     triton::gpu::CGAEncodingAttr cgaLayout, MLIRContext *ctx) {

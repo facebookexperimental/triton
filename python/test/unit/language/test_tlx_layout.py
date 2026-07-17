@@ -345,12 +345,11 @@ def test_user_shared_layout_in_loop():
 
 
 # ---------------------------------------------------------------------------
-# User-pinned swizzled shared + linear (offset) layouts:
-# padded_shared_layout_encoding.with_bases, distributed_linear_layout, and
-# buffer_load_to_local(offset_layout=...). The constants below are the exact
-# Gluon a16w16 swizzles the intra_wave/a16w16 kernel pins (tile [HALF_M=128,
-# BLOCK_K=64]) to clear CDNA4 LDS bank conflicts, so these tests double as
-# documentation of that known-good layout.
+# User-pinned swizzled shared layout (padded_shared_layout_encoding.with_bases)
+# and the offset (register) layout inferred from it for buffer_load_to_local.
+# The constants below are the exact Gluon a16w16 swizzles the intra_wave/a16w16
+# kernel pins (tile [HALF_M=128, BLOCK_K=64]) to clear CDNA4 LDS bank conflicts,
+# so these tests double as documentation of that known-good layout.
 # ---------------------------------------------------------------------------
 
 _A16W16_SHARED_INTERVALS = [(512, 16)]
@@ -373,19 +372,6 @@ def test_with_bases_builds_swizzled_padded_encoding():
     assert enc.offset_bases == _A16W16_SHARED_OFFSET_BASES
     assert enc.block_bases == []
     assert enc.shape == _A16W16_TILE
-
-
-def test_distributed_linear_layout_construction():
-    """`distributed_linear_layout` keeps the explicit reg/lane/warp bases (the
-    Gluon DistributedLinearLayout analogue). Pure-Python."""
-    layout = tlx.distributed_linear_layout(reg_bases=_A16W16_LOAD_REG, lane_bases=_A16W16_LOAD_LANE,
-                                           warp_bases=_A16W16_LOAD_WARP, shape=_A16W16_TILE)
-    assert layout.reg_bases == _A16W16_LOAD_REG
-    assert layout.lane_bases == _A16W16_LOAD_LANE
-    assert layout.warp_bases == _A16W16_LOAD_WARP
-    assert layout.block_bases == []
-    assert layout.shape == _A16W16_TILE
-    assert "distributed_linear_layout" in repr(layout)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
@@ -412,33 +398,32 @@ def test_user_pinned_swizzled_padded_survives_amd():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_buffer_load_to_local_offset_layout_amd():
-    """buffer_load_to_local(offset_layout=distributed_linear_layout(...)) pins
-    the offset tensor's #linear so the direct-to-LDS load matches the pinned
-    swizzled shared layout and lowers all the way to amdgcn."""
+def test_buffer_load_to_local_infers_offset_layout_amd():
+    """With only the swizzled shared layout pinned on the alloc (no explicit
+    offset layout), tlx-insert-require-layout infers the matching offset
+    tensor's #linear so the direct-to-LDS load coalesces and lowers to amdgcn.
+    The inferred #linear must equal the hand-derived a16w16 load layout."""
 
     @triton.jit
-    def kernel(a_ptr, SHARED: tl.constexpr, LOAD: tl.constexpr, M: tl.constexpr, K: tl.constexpr,
-               STRIDE_M: tl.constexpr):
+    def kernel(a_ptr, SHARED: tl.constexpr, M: tl.constexpr, K: tl.constexpr, STRIDE_M: tl.constexpr):
         offs_m = tl.arange(0, M)
         offs_k = tl.arange(0, K)
         off = offs_m[:, None] * STRIDE_M + offs_k[None, :]
         smem = tlx.local_alloc((M, K), tl.float16, tl.constexpr(1), layout=SHARED)
-        tlx.buffer_load_to_local(smem[0], a_ptr, off, offset_layout=LOAD)
+        tlx.buffer_load_to_local(smem[0], a_ptr, off)
 
     pad = tlx.padded_shared_layout_encoding.with_bases(_A16W16_SHARED_INTERVALS, _A16W16_SHARED_OFFSET_BASES,
                                                        _A16W16_TILE)
-    load = tlx.distributed_linear_layout(reg_bases=_A16W16_LOAD_REG, lane_bases=_A16W16_LOAD_LANE,
-                                         warp_bases=_A16W16_LOAD_WARP, shape=_A16W16_TILE)
     M, K = _A16W16_TILE
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    compiled = kernel.warmup(a, pad, load, M, K, K, grid=(1, ), num_warps=8)
+    compiled = kernel.warmup(a, pad, M, K, K, grid=(1, ), num_warps=8)
     ttgir = compiled.asm["ttgir"]
-    # The offset tensor is pinned to the given #linear (so the direct-to-LDS
-    # write can match the swizzled shared layout), and the load stays a single
-    # direct-to-LDS `amdg.buffer_load_to_local`.
+    # The offset layout is inferred (not authored) and matches the hand-derived
+    # a16w16 load layout, and the load stays a single direct-to-LDS op.
+    expected = f"register = {_A16W16_LOAD_REG}, lane = {_A16W16_LOAD_LANE}, warp = {_A16W16_LOAD_WARP}"
     assert "#ttg.linear" in ttgir
+    assert expected in ttgir, f"inferred offset layout mismatch; expected substring:\n{expected}\n\nttgir:\n{ttgir}"
     assert "amdg.buffer_load_to_local" in ttgir
     # It lowers all the way to amdgcn (the direct-to-LDS width/alignment
-    # requirements are met by the pinned offset layout).
+    # requirements are met by the inferred offset layout).
     assert compiled.asm.get("amdgcn")

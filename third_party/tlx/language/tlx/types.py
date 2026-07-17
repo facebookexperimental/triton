@@ -511,45 +511,6 @@ def _flat_to_coord(flat, tensor_shape):
     return coord
 
 
-class distributed_linear_layout(layout_encoding):
-    """A user-specified distributed (register) layout given by **explicit linear
-    bases** — the direct analogue of Gluon's ``gl.DistributedLinearLayout``.
-
-    ``reg_bases`` / ``lane_bases`` / ``warp_bases`` are each a list of per-dim
-    base vectors (one per bit of register / lane / warp index), e.g.
-    ``reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]]``. ``block_bases`` is usually
-    ``[]`` (single CTA). Unlike :class:`layout` (CuTe shape/stride), this lets you
-    transcribe an explicit ``#ttg.linear`` layout verbatim — useful to pin the
-    offset-tensor layout of an AMD ``buffer_load_to_local`` so its direct-to-LDS
-    write matches a pinned swizzled shared layout.
-    """
-
-    def __init__(self, reg_bases, lane_bases, warp_bases, shape, block_bases=None):
-        super().__init__()
-        self.reg_bases = [[int(x) for x in b] for b in reg_bases]
-        self.lane_bases = [[int(x) for x in b] for b in lane_bases]
-        self.warp_bases = [[int(x) for x in b] for b in warp_bases]
-        self.block_bases = [[int(x) for x in b] for b in (block_bases or [])]
-        self.shape = [int(s) for s in shape]
-        rank = len(self.shape)
-        assert rank > 0, "shape must be non-empty"
-        for name, bases in (("reg_bases", self.reg_bases), ("lane_bases", self.lane_bases),
-                            ("warp_bases", self.warp_bases), ("block_bases", self.block_bases)):
-            for b in bases:
-                assert len(b) == rank, \
-                    f"each {name} vector must have length rank={rank}, got {len(b)}: {b}"
-
-    def to_ir(self, builder: ir.builder, shape=None, element_type: tl.dtype = None):
-        if shape is not None and list(shape) != self.shape:
-            raise ValueError(f"distributed_linear_layout was built for shape {self.shape} "
-                             f"but applied to a tensor of shape {list(shape)}")
-        return builder.make_linear_encoding_attr(self.reg_bases, self.lane_bases, self.warp_bases, self.shape)
-
-    def __repr__(self):
-        return (f"distributed_linear_layout(reg={self.reg_bases}, lane={self.lane_bases}, "
-                f"warp={self.warp_bases}, shape={self.shape})")
-
-
 class layout(layout_encoding):
     """
     A user-specified distributed (register) layout — one of the two families of

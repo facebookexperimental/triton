@@ -37,9 +37,8 @@ def TLX_SharedEncodingTrait : AttrInterface<"SharedEncodingTrait"> {
 def TLX_DeclareSharedEncodingMethods : DeclareAttrInterfaceMethods<
   TLX_SharedEncodingTrait, ["getAlignment"]>;
 
-// Mirror of ttg::PinnedEncodingTrait so a TLX attribute can advertise itself as
-// user-pinned to core TritonGPU passes. Must stay in sync with the core def
-// (same cppNamespace + methods) so both resolve to the same interface.
+// Mirror of ttg::PinnedEncodingTrait so a TLX attribute can
+// advertise itself as user-pinned to core TritonGPU passes.
 def TLX_PinnedEncodingTrait : AttrInterface<"PinnedEncodingTrait"> {
   let cppNamespace = "::mlir::triton::gpu";
   let methods = [

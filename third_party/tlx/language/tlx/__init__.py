@@ -68,7 +68,6 @@ from .types import (
     clc_response,
     clc_response_type,
     CLCPipelineContext,
-    distributed_linear_layout,
     DummyRegisterLayoutEncoding,
     layout_encoding,
     mbarrier,

@@ -465,9 +465,6 @@ static bool isFedByAsyncLdsProducer(Value memdesc) {
 
 // True if the alloc feeding this memdesc carries a user-pinned encoding
 // (#tlx.user_layout / any PinnedEncodingTrait) -- an explicit author choice.
-// Skip it: don't synthesize a require_layout that would override the pinned
-// layout, and avoid querying it before tlx-propagate-layout retires the
-// wrapper.
 static bool isUserPinnedMemDesc(Value memdesc) {
   Value root = findMemDescRoot(memdesc);
   if (auto ty = dyn_cast<ttg::MemDescType>(root.getType()))
@@ -502,20 +499,10 @@ static amdgpu::BufferLoadToLocalOp findBufferProducer(Value memdesc) {
   return nullptr;
 }
 
-// Infer and pin the offset-tensor register layout for a `buffer_load_to_local`
-// whose destination is a *user-pinned* padded_shared layout.
-//
-// A gfx9 direct-to-LDS write is coalesced only when the offset tensor's #linear
-// layout matches the (possibly swizzled) LDS layout. Rather than make the
-// author hand-write that layout (an explicit `offset_layout=`), derive it from
-// the pinned padded encoding with the same base-assignment the async-copy
-// coalescer applies to the async_copy pointer tensor
-// (deducePaddedDirectToLdsRegLayout).
-//
-// Idempotent / opt-out: skips ops whose offsets are already anchored by a
-// require_layout (the author pinned an explicit offset_layout, or we already
-// ran). Only fires for user-pinned padded dsts; the non-pinned path keeps using
-// the identity-order synthesis in computeSharedEncFromDotEnc.
+// For a buffer_load_to_local into a user-pinned padded_shared dst, derive and
+// pin the offset tensor's #linear so the direct-to-LDS write is coalesced (via
+// deduceRegLayoutFromPaddedShared), sparing the author from hand-writing it.
+// Idempotent; only fires for user-pinned padded dsts.
 static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
                                           triton::ModuleAxisInfoAnalysis &axis,
                                           OpBuilder &builder) {
@@ -559,18 +546,18 @@ static void pinInferredBufferOffsetLayout(amdgpu::BufferLoadToLocalOp buf,
   unsigned threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(mod);
   unsigned numWarps = ttg::lookupNumWarps(buf);
 
-  auto regLayout = triton::AMD::deducePaddedDirectToLdsRegLayout(
+  auto regLayout = triton::AMD::deduceRegLayoutFromPaddedShared(
       paddedEnc.getLinearComponent(), loadContig, threadsPerWarp, numWarps,
       offsetsTy.getShape(), ttg::getCGALayout(offsetsTy.getEncoding()), ctx);
   if (failed(regLayout)) {
     buf->emitRemark() << "could not infer a coalesced direct-to-LDS offset "
-                         "layout from the pinned padded shared layout; pin an "
-                         "explicit offset_layout= or check the shared layout";
+                         "layout from the pinned padded shared layout; check "
+                         "that the pinned shared layout is directly loadable";
     return;
   }
 
-  // Pin it (wrap as #tlx.user_layout) exactly like an explicit offset_layout=,
-  // so the downstream layout passes anchor it and never rewrite it.
+  // Pin it (wrap as #tlx.user_layout) so the downstream layout passes anchor it
+  // and never rewrite it.
   auto linearEnc = ttg::LinearEncodingAttr::get(ctx, std::move(*regLayout));
   auto newOffsetsTy =
       RankedTensorType::get(offsetsTy.getShape(), offsetsTy.getElementType(),

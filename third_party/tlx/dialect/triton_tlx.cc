@@ -97,35 +97,28 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
            })
-      .def(
-          "create_require_layout",
-          [](TritonOpBuilder &self, Value &v, Attribute &encoding,
-             bool pinned) -> Value {
-            Type newType;
-            if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
-              // consider allocation type for subslice
-              SmallVector<int64_t> allocShape(type.getAllocShape());
-              if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
-                allocShape.assign(type.getShape().begin(),
-                                  type.getShape().end());
-              newType = ttg::MemDescType::get(
-                  type.getShape(), type.getElementType(), encoding,
-                  type.getMemorySpace(), type.getMutableMemory(), allocShape);
-              return self.create<tlx::RequireLayoutOp>(newType, v);
-            } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-              // pinned -> wrap as #tlx.user_layout (anchored; layout passes never
-              // rewrite it); otherwise wrap as #tlx.no_verify_layout.
-              Attribute tensorEncoding =
-                  pinned ? tlx::wrapUserLayout(encoding)
-                         : tlx::wrapNoVerifyLayout(encoding);
-              newType = RankedTensorType::get(
-                  type.getShape(), type.getElementType(), tensorEncoding);
-              return self.create<tlx::RequireLayoutOp>(newType, v);
-            } else {
-              throw std::runtime_error("Unsupported type");
-            }
-          },
-          py::arg("v"), py::arg("encoding"), py::arg("pinned") = false)
+      .def("create_require_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             Type newType;
+             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+               // consider allocation type for subslice
+               SmallVector<int64_t> allocShape(type.getAllocShape());
+               if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+                 allocShape.assign(type.getShape().begin(),
+                                   type.getShape().end());
+               newType = ttg::MemDescType::get(
+                   type.getShape(), type.getElementType(), encoding,
+                   type.getMemorySpace(), type.getMutableMemory(), allocShape);
+               return self.create<tlx::RequireLayoutOp>(newType, v);
+             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+               Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
+               newType = RankedTensorType::get(
+                   type.getShape(), type.getElementType(), tensorEncoding);
+               return self.create<tlx::RequireLayoutOp>(newType, v);
+             } else {
+               throw std::runtime_error("Unsupported type");
+             }
+           })
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
