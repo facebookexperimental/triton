@@ -12,7 +12,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -34,7 +34,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -68,7 +68,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -107,7 +107,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %2 = ttg.memdesc_index %0[%c1_i32] : !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK: fence.mbarrier_init.release.cluster
-    // CHECK-NEXT: nvvm.cluster.arrive {aligned}
+    // CHECK-NEXT: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK-NEXT: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %2, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -147,7 +147,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     // The second init is for a local-only barrier, but cluster sync should
     // still be placed after it (i.e., after the last init).
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -231,7 +231,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %1, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -276,7 +276,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -301,7 +301,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
@@ -367,7 +367,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: tcgen05.cp
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
@@ -423,7 +423,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     // CHECK: mbarrier.init.shared::cta.b64
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: tcgen05.mma
     ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
@@ -489,7 +489,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable> -> !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
     // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive {aligned}
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK: nvvm.cluster.wait {aligned}
     // CHECK: tcgen05.mma
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared_bar, #ttg.shared_memory, mutable>
@@ -551,7 +551,7 @@ module attributes {tlx.enable_paired_cta_mma = true, "ttg.num-ctas" = 1 : i32, "
   // CHECK-LABEL: @reorder_multiple_bar_inits_before_tcgen5_alloc
   // CHECK: mbarrier.init.shared::cta.b64
   // CHECK: mbarrier.init.shared::cta.b64
-  // CHECK: nvvm.cluster.arrive {aligned}
+  // CHECK: nvvm.cluster.arrive.relaxed {aligned}
   // CHECK: nvvm.cluster.wait {aligned}
   // CHECK: ttng.tcgen5_global_alloc
   tt.func public @reorder_multiple_bar_inits_before_tcgen5_alloc() attributes {noinline = false} {

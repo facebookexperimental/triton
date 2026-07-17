@@ -747,9 +747,10 @@ Examples: how mbarriers are communicated in warp specialization
 
 #### async_tasks Parameters
 
-| Parameter   | Description                                                                                           |
-|-------------|-------------------------------------------------------------------------------------------------------|
-| `exclusive` | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False. |
+| Parameter                | Description                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
+| `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
 
 #### async_task Parameters
 
