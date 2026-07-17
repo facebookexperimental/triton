@@ -24,6 +24,19 @@
 
 namespace mlir {
 
+// A GPU is Blackwell-class (sm_100+) when its major compute capability is >= 10
+// (capability is encoded as major*10 + minor, e.g. 90 for Hopper, 100 for
+// Blackwell).
+static bool capabilityIsBlackwell(int capability) {
+  return capability / 10 > 9;
+}
+
+// Warp-group split for warp specialization: one producer (load) group plus N
+// consumer (compute) groups. Blackwell needs fewer groups than Hopper because
+// its MMA is issued by a single warp.
+static constexpr unsigned kNumWarpGroupsBlackwell = 2;
+static constexpr unsigned kNumWarpGroupsHopper = 3;
+
 // Helper to get printing flags with location info enabled
 static OpPrintingFlags getOpPrintingFlagsWithLoc() {
   OpPrintingFlags flags;
@@ -180,8 +193,9 @@ public:
     OpBuilder builder(funcOp);
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
     // FIXME: skip data partitioning for Blackwell.
-    bool ForBlackWell = (capability / 10) > 9;
-    unsigned numWarpGroups = ForBlackWell ? 2 : 3;
+    bool isBlackwell = capabilityIsBlackwell(capability);
+    unsigned numWarpGroups =
+        isBlackwell ? kNumWarpGroupsBlackwell : kNumWarpGroupsHopper;
 
     if (failed(doTaskIdPropagate(funcOp))) {
       signalPassFailure();
@@ -258,7 +272,9 @@ public:
     }
 
     doLowerSubtiledRegionsWithNVWSOps(funcOp);
-    doTokenLowering(funcOp, numWarpGroups - 1);
+    // One producer (load) group; the remaining groups are consumers.
+    unsigned numConsumerGroups = numWarpGroups - 1;
+    doTokenLowering(funcOp, numConsumerGroups);
     invalidateWarpSpecializeBarriers(funcOp);
     dumpAfter(moduleOp, "doTokenLowering");
 
