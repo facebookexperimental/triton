@@ -1,30 +1,19 @@
-"""8-wave warp-pipeline FP16/BF16 GEMM — TLX port of the Gluon `inter_wave/a16w16`.
+"""8-wave inter-wave warp-pipelined FP16/BF16 GEMM for gfx950 (CDNA4).
 
-This is a TLX (instead of Gluon) recreation of ROCm/gfx950-gluon-tutorials
-`kernels/gemm/inter_wave/a16w16`. It takes the 4-wave `a16w16/v9` hot loop and
-runs it with 8 warps (2 waves/SIMD) using wave-level `warp_pipeline_stage`
-scheduling. The 256x256 output tile is sliced into a 2x2 grid of [128x128]
-quadrants, each operand half-tile living in its OWN double-buffered LDS
-allocation (smemA_top/bot, smemB_left/right). K is unrolled 2x → 8 regions.
+Runs a 256x256 output tile on 8 warps (2 waves/SIMD). Key ideas:
 
-The counter-intuitive bit (see the reference README): because the two co-resident
-wave groups run a full stage apart, each `async_load_wait_group` is hoisted to
-*before* its mfma cluster, so the LDS producer→consumer hazard (which spans two
-stages across the two groups) is closed a stage early.
+  * 2x2 quadrant tiling: the tile is split into four [128x128] quadrants, and
+    each operand half-tile gets its OWN double-buffered LDS allocation
+    (smem_a_top/bot, smem_b_left/right) so the four MFMAs stay independent.
+  * Inter-wave software pipeline: the two co-resident wave groups run a full
+    stage apart, so each `async_load_wait_group` is hoisted *before* its MFMA
+    cluster -- closing the LDS producer->consumer hazard a stage early and
+    keeping N load groups in flight to overlap loads with MFMAs.
+  * Swizzled LDS layout pinned via `padded_shared_layout_encoding.with_bases`
+    to make the direct-to-LDS loads bank-conflict-free on CDNA4.
 
-STATUS / PERF
--------------
-Correctness matches torch on all shapes. On gfx950 (MI350), fp16, do_bench,
-4096x4096xK, this kernel matches / slightly beats rocBLAS:
-
-    M     N     K       rocBLAS   this kernel
-    4096  4096  4096    ~1113T    ~1154T
-    4096  4096  8192    ~1210T    ~1185T
-    4096  4096  16384   ~1211T    ~1204T
-
-The hand-scheduled hot loop emits tokenless `async_wait {num=N}` to keep N load
-groups in flight across the two co-resident wave groups, so loads overlap the
-MFMAs and the one-stage-apart overlap the design relies on materializes.
+Adapted from ROCm/gfx950-gluon-tutorials `kernels/gemm/inter_wave/a16w16`
+(the 4-wave `a16w16/v9` hot loop, run here on 8 warps via `warp_pipeline_stage`).
 """
 
 import os
@@ -45,7 +34,7 @@ NUM_WARPS = 8
 GROUP_SIZE_M = 4
 NUM_XCDS = 8
 
-MIN_K = 4 * BLOCK_K
+MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
 
 
@@ -56,7 +45,7 @@ def a16w16_8wave(
     c_ptr,
     M,
     N,
-    K: tl.constexpr,
+    K,
     stride_am,
     stride_ak,
     stride_bk,
@@ -152,7 +141,15 @@ def a16w16_8wave(
     acc_tr = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
     acc_br = tl.zeros((HALF_M, HALF_N), dtype=tl.float32)
 
-    iterMax: tl.constexpr = K // BLOCK_K
+    # The pipeline consumes K in pairs of BLOCK_K tiles (prologue prefetches 2,
+    # the loop 2/iter, the epilogue drains 2), so it covers only an EVEN number of
+    # whole K-tiles: n_pipe. Any leftover -- an odd whole tile and/or a partial
+    # final tile (K not a multiple of BLOCK_K) -- is handled by the masked scalar
+    # tail after the epilogue. K is a runtime arg (not constexpr) so distinct K
+    # values reuse one compile; n_pipe even keeps the epilogue's buffer parity
+    # fixed (reads buffer 0 first (l_idx) then buffer 1 (g_idx), constexpr below).
+    n_full = K // BLOCK_K
+    n_pipe = (n_full // 2) * 2
 
     # ── Prologue: prefetch K-steps 0,1 into buffers 0,1 (8 commits) ──
     tlx.buffer_load_to_local(smem_b_left[0], b_ptr, b_left_off + kb)
@@ -181,7 +178,7 @@ def a16w16_8wave(
     a_top = tlx.local_load(smem_a_top[0], relaxed=True)
 
     # ── Main loop (2x unrolled): 8 (mfma + local_load + async refill) regions ──
-    for k in tl.range(0, iterMax - 2, 2, num_stages=1):
+    for k in tl.range(0, n_pipe - 2, 2, num_stages=1):
         # --- sub-iter 0 (buffer 0) ---
         tlx.async_load_wait_group(5)
         with tlx.warp_pipeline_stage("mfma", priority=0):
@@ -250,11 +247,11 @@ def a16w16_8wave(
             ka += BLOCK_K * stride_ak * 2
             kb += BLOCK_K * stride_bk * 2
 
-    # ── Epilogue: last 2 K-steps, drain, 4-quadrant store ──
-    # iter iterMax-2
+    # ── Epilogue: last 2 pipelined K-steps, drain LDS loads ──
+    # iter n_pipe-2
     acc_tl = tl.dot(a_top, b_left, acc_tl)
     tlx.async_load_wait_group(5)
-    l_idx = (iterMax - 2) % 2
+    l_idx: tl.constexpr = 0  # (n_pipe - 2) % 2, always 0 since n_pipe is even
     a_bot = tlx.local_load(tlx.local_view(smem_a_bot, l_idx), relaxed=True)
 
     acc_bl = tl.dot(a_bot, b_left, acc_bl)
@@ -263,14 +260,14 @@ def a16w16_8wave(
 
     acc_tr = tl.dot(a_top, b_right, acc_tr)
     tlx.async_load_wait_group(3)
-    g_idx = 1 - l_idx
+    g_idx: tl.constexpr = 1  # 1 - l_idx
     b_left = tlx.local_load(tlx.local_view(smem_b_left, g_idx), relaxed=True)
 
     acc_br = tl.dot(a_bot, b_right, acc_br)
     tlx.async_load_wait_group(2)
     a_top = tlx.local_load(tlx.local_view(smem_a_top, g_idx), relaxed=True)
 
-    # iter iterMax-1: finish ALL four mfmas before converting/storing so the dot
+    # iter n_pipe-1: finish ALL four mfmas before the tail/store so the dot
     # operands die and the store phase holds only the four f32 accumulators.
     acc_tl = tl.dot(a_top, b_left, acc_tl)
     tlx.async_load_wait_group(1)
@@ -282,6 +279,29 @@ def a16w16_8wave(
 
     acc_tr = tl.dot(a_top, b_right, acc_tr)
     acc_br = tl.dot(a_bot, b_right, acc_br)
+
+    # ── Masked scalar tail: K columns past the pipelined region (an odd leftover
+    # tile and/or a partial final tile). Plain masked tl.load + tl.dot -- no LDS,
+    # no pipeline. The K-mask zeros the missing contraction elements (they add 0
+    # to C = sum_k A*B), so this is correct for arbitrary K. Runs 0-2 iterations;
+    # the whole-tile even hot path (n_pipe*BLOCK_K == K) skips it entirely.
+    offs_am_bot = offs_am + HALF_M
+    offs_bn_right = offs_bn + HALF_N
+    for kk in tl.range(n_pipe * BLOCK_K, K, BLOCK_K, num_stages=1):
+        offs_kt = kk + offs_k
+        k_mask = offs_kt < K
+        a_top_t = tl.load(a_ptr + offs_am[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                          mask=(offs_am[:, None] < M) & k_mask[None, :], other=0.0)
+        a_bot_t = tl.load(a_ptr + offs_am_bot[:, None] * stride_am + offs_kt[None, :] * stride_ak,
+                          mask=(offs_am_bot[:, None] < M) & k_mask[None, :], other=0.0)
+        b_left_t = tl.load(b_ptr + offs_kt[:, None] * stride_bk + offs_bn[None, :] * stride_bn,
+                           mask=k_mask[:, None] & (offs_bn[None, :] < N), other=0.0)
+        b_right_t = tl.load(b_ptr + offs_kt[:, None] * stride_bk + offs_bn_right[None, :] * stride_bn,
+                            mask=k_mask[:, None] & (offs_bn_right[None, :] < N), other=0.0)
+        acc_tl = tl.dot(a_top_t, b_left_t, acc_tl)
+        acc_bl = tl.dot(a_bot_t, b_left_t, acc_bl)
+        acc_tr = tl.dot(a_top_t, b_right_t, acc_tr)
+        acc_br = tl.dot(a_bot_t, b_right_t, acc_br)
 
     offs_cm_top = pid_m * BLOCK_M + tl.arange(0, HALF_M)
     offs_cm_bot = offs_cm_top + HALF_M
@@ -307,6 +327,13 @@ def matmul(a, b):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     M, K = a.shape
     K, N = b.shape
+    # The pipeline needs at least 2 whole K-tiles (it prefetches 2 up front); any
+    # K beyond that -- odd tile count and/or a partial final tile -- is handled by
+    # the kernel's masked scalar tail. K must still be a multiple of 16: the
+    # pinned swizzled LDS layout coalesces the direct-to-LDS loads over 16-element
+    # groups, so the K-major strides (stride_am, stride_bn = K) must be 16-aligned.
+    assert K >= 2 * BLOCK_K, f"K={K} must be at least {2 * BLOCK_K}"
+    assert K % 16 == 0, f"K={K} must be a multiple of 16 (swizzled-layout coalescing)"
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
     a16w16_8wave[(GRID_MN, )](
