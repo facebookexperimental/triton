@@ -4053,7 +4053,7 @@ LogicalResult readDecisionsFromFile(SmallVector<Channel *> &channels,
 
 // Default arguments are declared in WarpSpecializationPipeline.h (the single
 // declaration site); they must not be repeated on the definition.
-LogicalResult doMemoryPlanner(triton::FuncOp &funcOp, unsigned numBuffers,
+LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               StringRef readDecisionFile,
                               StringRef writeDecisionFile, int smemAllocAlgo,
                               unsigned smemBudget, bool smemCircularReuse) {

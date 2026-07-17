@@ -42,7 +42,7 @@ static LogicalResult cleanupWarpSpecializedLoops(Operation *op) {
   return applyPatternsGreedily(op, std::move(patterns));
 }
 
-void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
+void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp funcOp) {
   namespace ttng = triton::nvidia_gpu;
   namespace nvws = triton::nvws;
   SmallVector<ttng::SubtiledRegionOp> toInline;
@@ -60,7 +60,7 @@ void doLowerSubtiledRegionsWithNVWSOps(triton::FuncOp &funcOp) {
     ttng::lowerSubtiledRegion(op);
 }
 
-void doLowerRemainingSubtiledRegions(triton::FuncOp &funcOp) {
+void doLowerRemainingSubtiledRegions(triton::FuncOp funcOp) {
   namespace ttng = triton::nvidia_gpu;
   SmallVector<ttng::SubtiledRegionOp> remaining;
   funcOp.walk([&](ttng::SubtiledRegionOp op) { remaining.push_back(op); });
@@ -68,7 +68,7 @@ void doLowerRemainingSubtiledRegions(triton::FuncOp &funcOp) {
     ttng::lowerSubtiledRegion(op);
 }
 
-void doGenerateSubtiledRegion(triton::FuncOp &funcOp) {
+void doGenerateSubtiledRegion(triton::FuncOp funcOp) {
   auto moduleOp = funcOp->getParentOfType<ModuleOp>();
   PassManager pm(moduleOp.getContext());
   pm.addPass(triton::nvidia_gpu::
@@ -183,8 +183,7 @@ public:
     bool ForBlackWell = (capability / 10) > 9;
     unsigned numWarpGroups = ForBlackWell ? 2 : 3;
 
-    int retCode = doTaskIdPropagate(funcOp);
-    if (retCode == -1) {
+    if (failed(doTaskIdPropagate(funcOp))) {
       signalPassFailure();
       return;
     }
