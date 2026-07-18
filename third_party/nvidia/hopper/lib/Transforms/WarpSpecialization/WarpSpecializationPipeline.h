@@ -32,14 +32,15 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
 // Test-only knobs for doMemoryPlanner. The production pipeline uses the
 // defaults; only the -nvgpu-test-ws-memory-planner pass varies them:
 // decision-file I/O to snapshot/replay planner decisions, an alternate SMEM
-// allocation algorithm, and circular SMEM reuse. Grouped into a struct so the
-// production entry point advertises only the parameters it actually uses
-// (WS-10).
+// allocation algorithm, circular SMEM reuse, and the plan-space search.
+// Grouped into a struct so the production entry point advertises only the
+// parameters it actually uses (WS-10).
 struct MemoryPlannerOptions {
   StringRef readDecisionFile = "";
   StringRef writeDecisionFile = "";
   int smemAllocAlgo = 1;
   bool smemCircularReuse = false;
+  bool smemPlanSearch = false;
 };
 
 // Plans SMEM/TMEM allocation (multi-buffering, liveness). Production passes
