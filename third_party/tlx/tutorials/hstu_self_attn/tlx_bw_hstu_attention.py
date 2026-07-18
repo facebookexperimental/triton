@@ -5191,7 +5191,7 @@ def tlx_hstu_attention_bwd(
         torch.cuda.current_device()
     ).multi_processor_count
 
-    use_persistent = True
+    use_persistent = os.environ.get("HSTU_TLX_PERSISTENT", "1") == "1"
     if use_persistent:
         grid = lambda meta: (  # noqa E731
             H * Z * triton.cdiv(max_seq_len, meta["BLOCK_N1"]),
