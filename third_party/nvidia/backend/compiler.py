@@ -974,6 +974,9 @@ class CUDABackend(BaseBackend):
         # that any local loads eliminated by TMA lowering do not inflate them.
         if capability // 10 >= 9 and knobs.nvidia.use_meta_ws:
             passes.ttgpuir.add_optimize_partition_warps(pm)
+        # Run after all TMEM and warp-layout rewrites so the physical
+        # per-warp footprints used for aliased-TMEM WAR detection are final.
+        nvidia.passes.ttnvgpuir.add_insert_tmem_alias_war_barrier(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
         passes.common.add_sccp(pm)

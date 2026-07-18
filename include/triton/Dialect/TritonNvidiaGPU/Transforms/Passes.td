@@ -242,6 +242,28 @@ def TritonNvidiaGPUPruneUnusedBarriersPass
   ];
 }
 
+def TritonNvidiaGPUInsertTMemAliasWARBarrierPass
+    : Pass<"triton-nvidia-gpu-insert-tmem-alias-war-barrier", "mlir::ModuleOp"> {
+  let summary = "Insert intra-task barriers for aliased-TMEM write-after-read hazards";
+
+  let description = [{
+    In a warp-specialized task, a TMEM region read (tcgen05.ld) then overwritten
+    by an aliased store (tcgen05.st) into the same TMEM root can race across
+    warps. This pass compares the accesses in physical TMEM row/32-bit-column
+    coordinates, including constant view offsets, and inserts a task-scoped
+    ttg.barrier for a cross-warp overlap when the same basic block has no
+    intervening full-task synchronization. A ttg.barrier or a named bar.sync
+    whose thread count covers the whole task is sufficient; partial named
+    barriers and producer/consumer mbarriers are not. Existing synchronization
+    is preserved and no duplicate barrier is inserted.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-cta", "mlir::ModuleOp"> {
   let summary = "Verify legal and consistent two_ctas usage across matmuls";
 
