@@ -1164,10 +1164,20 @@ class buffered_tensor_type(tl.block_type):
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
+        layout_handle = self.layout.to_ir(builder)
+        # An explicit, user-pinned shared layout (tlx.local_alloc(layout=...)) is
+        # wrapped as #tlx.user_layout<...> so layout propagation respects it. The
+        # pin is marked on the layout object by local_alloc; wrap here so the same
+        # wrapper appears wherever this type is reconstructed -- e.g. a @triton.jit
+        # callee's param rebuilt from this type, or a subview's result -- keeping
+        # tt.call operand/param and memdesc subview encodings consistent. The
+        # wrapper is stripped later by tlx-resolve-placeholder-layouts.
+        if getattr(self.layout, "_tlx_user_pinned", False):
+            layout_handle = builder.make_user_layout_attr(layout_handle)
         return builder.get_memdesc_type(
             shape,
             self.element_ty.to_ir(builder),
-            self.layout.to_ir(builder),
+            layout_handle,
             self.storage.value,
         )
 
