@@ -519,15 +519,17 @@ void init_triton_tlx_ir(py::module &&m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding must be TMEM compatible. For the user-pinned case,
-            // wrap with #tlx.user_layout so generic layout passes treat it as a
-            // hard anchor (same mechanism as the SMEM local_load path), keeping
-            // the inner no-verify wrapper for inlining. resolve-placeholder-
-            // layouts strips the nested no-verify (keeping the user-layout
-            // marker) once inlining is done.
+            // layoutEncoding already carries an inner no_verify (from
+            // make_linear_encoding_attr). Strip it, wrap with #tlx.user_layout
+            // (the hard anchor), then a single outer #tlx.no_verify_layout, so
+            // the encoding is exactly no_verify<user_layout<L>> -- no-verify
+            // outermost (deferred for verifiers keyed off the top-level attr,
+            // e.g. TritonGPU verifyTensorLayout), user-layout inside.
+            // resolve-placeholder-layouts strips the no-verify (keeping the
+            // user-layout marker) once inlining is done and num-warps is set.
             Attribute tensorEncoding =
-                userLayout ? tlx::wrapUserLayout(
-                                 tlx::wrapNoVerifyLayout(layoutEncoding))
+                userLayout ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(
+                                 tlx::unwrapNoVerifyLayout(layoutEncoding)))
                            : tlx::wrapNoVerifyLayout(layoutEncoding);
             auto newType = RankedTensorType::get(subViewType.getShape(),
                                                  subViewType.getElementType(),
