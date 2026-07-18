@@ -229,13 +229,31 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto newShape = newType.getShape();
   auto blockN = newShape[shape.size() - 1];
 
+  // The subslice below is taken from the representative (allocOp) in *its*
+  // column units, and `offset` is likewise expressed in the representative's
+  // columns (that is how the memory planner assigns buffer.offset). When the
+  // reuser has a narrower element type than the representative — e.g. an f16
+  // reuser packed inside an f32 owner — two reuser elements share one 32-bit
+  // TMEM column, so the reuser only occupies `blockN / 2` of the owner's
+  // columns (see the `oldElemTyWidth == elemTyWidth * 2` subslice branch
+  // below). Validate against that same physical width; using the logical
+  // `blockN` here spuriously rejects a spatially-packed reuser at a non-zero
+  // offset (e.g. offset=64, blockN=128, oldBlockN=128 → 192 > 128) even though
+  // the subslice [64, 64+64) fits the owner exactly.
+  auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
+  auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
+  int64_t sliceCols = blockN;
+  if (oldElemTyWidth == elemTyWidth * 2)
+    sliceCols = blockN / 2;
+
   // Validate the allocation is valid before attempting to create subslice
-  if (oldBlockN < blockN || oldBlockN % blockN != 0 ||
-      (offset + blockN) > oldBlockN) {
+  if (oldBlockN < sliceCols || oldBlockN % sliceCols != 0 ||
+      (offset + sliceCols) > oldBlockN) {
     // Cannot use this TMEM allocation - return nullptr to signal failure
     // Caller should try another TMEM allocation or fall back to SMEM
     LDBG("TMEM allocation validation failed: oldBlockN="
-         << oldBlockN << ", blockN=" << blockN << ", offset=" << offset);
+         << oldBlockN << ", blockN=" << blockN << ", sliceCols=" << sliceCols
+         << ", offset=" << offset);
     return nullptr;
   }
 
@@ -246,8 +264,6 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto tmemDesc = createTMEMDesc(builder, newType, newShape[shape.size() - 2],
                                  newShape[shape.size() - 1]);
   // slice from oldBlockN to blockN
-  auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
-  auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
   if (oldElemTyWidth == elemTyWidth * 2) {
     auto subSlice = ttng::TMEMSubSliceOp::create(
         builder, allocOp->getLoc(), allocResult, offset, blockN / 2);
