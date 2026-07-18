@@ -588,6 +588,29 @@ static bool getBackwardSliceToPartition(Value v,
             return false;
         }
       }
+      // Also capture stores that write this accumulator (e.g. the pre-loop
+      // zero-init store of an in-place MMA accumulator) so they get sliced
+      // per-partition. Without this, a loop-carried accumulator whose init
+      // store is not sliced keeps a single full-tile token thread: the sliced
+      // MMAs then share the original full accumulator's loop-carried token,
+      // which keeps the full pre-slice TMEM tile alive (dead data, live token)
+      // and doubles TMEM. Slicing the store gives each partition its own
+      // init/token so the full tile becomes dead and is cleaned up.
+      for (Operation *user : tmemAllocOp.getResult().getUsers()) {
+        auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
+        if (!storeOp || storeOp.getDst() != tmemAllocOp.getResult())
+          continue;
+        if (!partitionScheme.ops.insert(storeOp)) {
+          if (!isControlFlowOp(storeOp) &&
+              partitionScheme.opPartitionDims[storeOp] != currentDim)
+            return false;
+          continue;
+        }
+        partitionScheme.opPartitionDims[storeOp] = currentDim;
+        if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
+                                         currentDim))
+          return false;
+      }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
@@ -1443,12 +1466,23 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
     assert(newSrc && "TMEMStoreOp src not found in mappings; was it "
                      "backward-sliced in getSliceToPartition?");
+    bool remappedSrc = false;
     if (newSrc.getType() != newSrcType) {
       auto cvtOp =
           ConvertLayoutOp::create(builder, op->getLoc(), newSrcType, newSrc);
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
+      remappedSrc = true;
     }
     newOp = cloneAndSetResultType(op);
+    // The tmem-layout conversion above is private to this store. Restore the
+    // src's natural sliced mapping so other partitioned users of a shared src
+    // (e.g. a splat constant reused by the elementwise/activation chain, as in
+    // HSTU where the accumulator zero-init and the SiLU share one 0.0 constant)
+    // are not rewired to this store's converted layout.
+    if (remappedSrc) {
+      mappings.map(tmemStOp.getSrc(), newSrc);
+      reverseMappings.map(newSrc, tmemStOp.getSrc());
+    }
   } else if (auto tmemCopyOp = dyn_cast<nvidia_gpu::TMEMCopyOp>(op)) {
     sliceOp(tmemCopyOp.getDst(), offset, mappings, reverseMappings,
             partitionScheme);
