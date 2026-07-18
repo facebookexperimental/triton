@@ -104,18 +104,18 @@ def rel_l2(a, b):
     return (torch.norm(a.float() - b.float()) / (torch.norm(b.float()) + 1e-12)).item()
 
 
-def run_triton(q, k, v, so, L, asc):
+def run_triton(q, k, v, so, L, asc, num_targets=None):
     return A.triton_hstu_mha(
         max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, num_targets=None, max_attn_len=0, contextual_seq_len=0,
+        attn_scale=asc, num_targets=num_targets, max_attn_len=0, contextual_seq_len=0,
         enable_tma=True,
     )
 
 
-def run_tlx(q, k, v, so, L, asc, causal=True):
+def run_tlx(q, k, v, so, L, asc, causal=True, num_targets=None):
     return T.tlx_bw_hstu_mha(
         max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, num_softmax_heads=0, num_targets=None,
+        attn_scale=asc, num_softmax_heads=0, num_targets=num_targets,
         max_attn_len=0, contextual_seq_len=0, causal=causal,
     )
 
@@ -191,6 +191,15 @@ def _bench_one(variant, L, Z, nrep):
     q, k, v, do, so, asc = make(L, Z, sparsity=float(_sp) if _sp else None)
     run = run_tlx if variant == "tlx" else run_triton  # triton & autows share triton_hstu_mha
     kw = {"causal": True} if variant == "tlx" else {}
+    # Optional targets (BENCH_TARGET_SIZE>0): per-batch target counts like the
+    # fbsource HSTU bench, clamped to each jagged seq-len. Setting this exercises
+    # the num_targets/target-masking path (the autoWS compile trigger).
+    _ts = int(os.environ.get("BENCH_TARGET_SIZE", "0"))
+    if _ts > 0:
+        lens = so[1:] - so[:-1]
+        lo = 1 if _ts < 400 else _ts // 2
+        nt = torch.randint(lo, _ts + 1, (Z,), device=so.device, dtype=torch.int64)
+        kw["num_targets"] = torch.minimum(nt, lens)
     meta_ws = variant == "autows"
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = meta_ws
