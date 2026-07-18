@@ -84,46 +84,6 @@ public:
     return success();
   }
 
-  LogicalResult insertInvalBarrier(ModuleOp &mod) {
-    auto hasInvalBarrierOp = mod.walk([&](Operation *op) {
-                                  if (isa<ttng::InvalBarrierOp>(op)) {
-                                    return WalkResult::interrupt();
-                                  }
-                                  return WalkResult::advance();
-                                })
-                                 .wasInterrupted();
-    if (hasInvalBarrierOp) {
-      return mod.emitError() << "InvalBarrierOp unexpectedly found. Unable to "
-                                "auto insert InvalBarrierOp.";
-    }
-
-    SetVector<triton::FuncOp> funcOps;
-    mod.walk([&](triton::FuncOp op) { funcOps.insert(op); });
-    for (auto funcOp : funcOps) {
-      DominanceInfo domInfo(funcOp);
-
-      // Find all barrier init ops in the func
-      std::vector<Value> barriers;
-      funcOp.walk(
-          [&](ttng::InitBarrierOp op) { barriers.push_back(op.getAlloc()); });
-      // todo: consider removing all the inval op that's located right before
-      // return in a later pass to save a few cycles.
-      // Insert InvalBarrierOp before returnOp of
-      // entry funcOp
-      funcOp.walk([&](triton::ReturnOp op) {
-        OpBuilder builder(op); // Insert *before* returnOp
-        Location loc = op.getLoc();
-        for (auto barrier : barriers) {
-          if (domInfo.properlyDominates(barrier, op)) {
-            ttng::InvalBarrierOp::create(builder, loc, barrier);
-          }
-        }
-      });
-    }
-
-    return success();
-  }
-
   bool isAMD() const {
     // target is set up as f"hip:{options.arch}"
     return (target.getValue().find("hip:") == 0);
@@ -149,11 +109,6 @@ public:
             .wasInterrupted();
 
     if (failed(verifyModule(mod, hasTLXTwoCTAs))) {
-      return signalPassFailure();
-    }
-
-    // InvalBarrierOp insertion is not needed for AMD
-    if (!isAMD() && failed(insertInvalBarrier(mod))) {
       return signalPassFailure();
     }
 
