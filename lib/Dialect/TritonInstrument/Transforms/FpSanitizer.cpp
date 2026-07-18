@@ -533,7 +533,6 @@ struct PayloadMixConfig {
 PayloadMixConfig getPayloadMixConfig(FloatType floatTy) {
   unsigned bitWidth = floatTy.getWidth();
   assert(bitWidth > 1 && bitWidth <= 64);
-  uint64_t fullMask = getLowBitsMask(bitWidth);
   uint64_t signMask = uint64_t{1} << (bitWidth - 1);
   uint64_t magMask = signMask - 1;
 
@@ -1211,7 +1210,6 @@ struct DotScaleConfig {
 
 Value loadScaleSlice(PatternRewriter &rewriter, Location loc, bool isLhs,
                      const DotScaleConfig &scale, Value tileIdx, Value kI32) {
-  auto i32Ty = rewriter.getI32Type();
   Value ptr = isLhs ? scale.aScalePtr : scale.bScalePtr;
   int64_t sFactor = isLhs ? scale.aScaleFactor : scale.bScaleFactor;
   int64_t sStride = isLhs ? scale.aScaleStride : scale.bScaleStride;
@@ -2043,9 +2041,6 @@ struct TMEMCopyPattern : public OpRewritePattern<ttng::TMEMCopyOp> {
 
     createGlobalScratchBarrier(rewriter, loc);
 
-    if (Value barrier = op.getBarrier()) {
-      ttng::ArriveBarrierOp::create(rewriter, loc, barrier, 1, Value());
-    }
     rewriter.eraseOp(op);
     return success();
   }

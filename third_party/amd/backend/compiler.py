@@ -308,6 +308,7 @@ class HIPBackend(BaseBackend):
 
         use_async_copy = is_async_copy_enabled(options.arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
+        amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
 
         # E4: when TRITON_ENABLE_AMD_MODULO is set, the AMD modulo scheduler
         # replaces schedule-loops — it builds the DDG (TritonGPUModuloCore) with

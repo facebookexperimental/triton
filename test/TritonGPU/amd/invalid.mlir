@@ -209,22 +209,22 @@ module attributes {"ttg.num-ctas" = 4 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @interval_not_matching_innermost_block_dimension(
-    %tensorDesc: !tt.tensordesc<tensor<128x64xf16>>,
+    %tensorDesc: !tt.tensordesc<128x64xf16>,
     %memDesc: !ttg.memdesc<128x64xf16, #shared_32, #smem, mutable>
   ) {
     %c0_i32 = arith.constant 0 : i32
     // expected-error @+1 {{TDM store padding is only supported when padding interval equals the innermost block dimension}}
-    amdg.async_tdm_copy_local_to_global %tensorDesc[%c0_i32, %c0_i32] from %memDesc: !ttg.memdesc<128x64xf16, #shared_32, #smem, mutable> -> !tt.tensordesc<tensor<128x64xf16>>
+    amdg.async_tdm_copy_local_to_global %tensorDesc[%c0_i32, %c0_i32] from %memDesc: !ttg.memdesc<128x64xf16, #shared_32, #smem, mutable> -> !tt.tensordesc<128x64xf16>
     tt.return
   }
 
   tt.func public @tdm_store_two_padding_intervals(
-    %tensorDesc: !tt.tensordesc<tensor<128x64xf16>>,
+    %tensorDesc: !tt.tensordesc<128x64xf16>,
     %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable>
   ) {
     %c0_i32 = arith.constant 0 : i32
     // expected-error @+1 {{TDM store only supports single interval paddings}}
-    amdg.async_tdm_copy_local_to_global %tensorDesc[%c0_i32, %c0_i32] from %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable> -> !tt.tensordesc<tensor<128x64xf16>>
+    amdg.async_tdm_copy_local_to_global %tensorDesc[%c0_i32, %c0_i32] from %memDesc: !ttg.memdesc<128x64xf16, #shared_2_intervals, #smem, mutable> -> !tt.tensordesc<128x64xf16>
     tt.return
   }
 }
@@ -241,13 +241,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func @tdm_gather_invalid_lane_distribution(
     %memDesc: !ttg.memdesc<32x128xf16, #shared_gather, #smem_gather, mutable>,
-    %tensorDesc: !tt.tensordesc<tensor<32x128xf16>>,
+    %tensorDesc: !tt.tensordesc<32x128xf16>,
     %row_indices: tensor<32xi32, #slice_lane_dist>,
     %pred: i32
   ) {
     %c0_i32 = arith.constant 0 : i32
     // expected-error @+1 {{index layout distributes values across lanes}}
-    %token = amdg.async_tdm_gather %tensorDesc[%row_indices, %c0_i32] to %memDesc, pred = %pred : tensor<32xi32, #slice_lane_dist>, !ttg.memdesc<32x128xf16, #shared_gather, #smem_gather, mutable> -> !tt.tensordesc<tensor<32x128xf16>>
+    %token = amdg.async_tdm_gather %tensorDesc[%row_indices, %c0_i32] to %memDesc, pred = %pred : tensor<32xi32, #slice_lane_dist>, !ttg.memdesc<32x128xf16, #shared_gather, #smem_gather, mutable> -> !tt.tensordesc<32x128xf16>
     tt.return
   }
 }
@@ -261,24 +261,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 #smem_scatter = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @scatter_interval_not_matching_innermost_block_dimension(
-    %tensorDesc: !tt.tensordesc<tensor<8x64xf16>>,
+    %tensorDesc: !tt.tensordesc<8x64xf16>,
     %memDesc: !ttg.memdesc<8x64xf16, #shared_scatter_32, #smem_scatter, mutable>,
     %row_indices: tensor<8xi32>
   ) {
     %c0_i32 = arith.constant 0 : i32
     // expected-error @+1 {{TDM scatter padding is only supported when padding interval equals the innermost block dimension}}
-    amdg.async_tdm_scatter %tensorDesc[%row_indices, %c0_i32] from %memDesc : tensor<8xi32>, !ttg.memdesc<8x64xf16, #shared_scatter_32, #smem_scatter, mutable> -> !tt.tensordesc<tensor<8x64xf16>>
+    amdg.async_tdm_scatter %tensorDesc[%row_indices, %c0_i32] from %memDesc : tensor<8xi32>, !ttg.memdesc<8x64xf16, #shared_scatter_32, #smem_scatter, mutable> -> !tt.tensordesc<8x64xf16>
     tt.return
   }
 
   tt.func public @scatter_two_padding_intervals(
-    %tensorDesc: !tt.tensordesc<tensor<8x64xf16>>,
+    %tensorDesc: !tt.tensordesc<8x64xf16>,
     %memDesc: !ttg.memdesc<8x64xf16, #shared_scatter_2_intervals, #smem_scatter, mutable>,
     %row_indices: tensor<8xi32>
   ) {
     %c0_i32 = arith.constant 0 : i32
     // expected-error @+1 {{TDM scatter only supports single interval paddings}}
-    amdg.async_tdm_scatter %tensorDesc[%row_indices, %c0_i32] from %memDesc : tensor<8xi32>, !ttg.memdesc<8x64xf16, #shared_scatter_2_intervals, #smem_scatter, mutable> -> !tt.tensordesc<tensor<8x64xf16>>
+    amdg.async_tdm_scatter %tensorDesc[%row_indices, %c0_i32] from %memDesc : tensor<8xi32>, !ttg.memdesc<8x64xf16, #shared_scatter_2_intervals, #smem_scatter, mutable> -> !tt.tensordesc<8x64xf16>
     tt.return
   }
 }

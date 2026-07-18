@@ -5,7 +5,7 @@
   "args": [
    {
     "name": "a_desc",
-    "type": "!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"
+    "type": "!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
    },
    {
     "name": "a_desc_0",
@@ -25,7 +25,7 @@
    },
    {
     "name": "b_desc",
-    "type": "!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"
+    "type": "!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
    },
    {
     "name": "b_desc_0",
@@ -45,7 +45,7 @@
    },
    {
     "name": "c_desc",
-    "type": "!tt.tensordesc<tensor<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"
+    "type": "!tt.tensordesc<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"
    },
    {
     "name": "c_desc_0",

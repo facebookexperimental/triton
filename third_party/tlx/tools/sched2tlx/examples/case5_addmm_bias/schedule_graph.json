@@ -4,10 +4,10 @@
   "kernel": {
     "name": "addmm_persistent_2d_bias",
     "args": [
-      {"name": "arg0", "type": "!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"},
-      {"name": "arg1", "type": "!tt.tensordesc<tensor<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"},
-      {"name": "arg2", "type": "!tt.tensordesc<tensor<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"},
-      {"name": "arg3", "type": "!tt.tensordesc<tensor<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"},
+      {"name": "arg0", "type": "!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"},
+      {"name": "arg1", "type": "!tt.tensordesc<64x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"},
+      {"name": "arg2", "type": "!tt.tensordesc<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"},
+      {"name": "arg3", "type": "!tt.tensordesc<128x128xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"},
       {"name": "arg4", "type": "i32"},
       {"name": "arg5", "type": "i32"},
       {"name": "arg6", "type": "i32"}

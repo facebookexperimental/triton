@@ -1192,7 +1192,9 @@ public:
 
       // Synthesized host-side descriptor; its block type is the memory-order
       // tile.
-      auto descTy = tt::TensorDescType::get(ctx, descTileTy);
+      auto descTy = tt::TensorDescType::get(descTileTy.getShape(),
+                                            descTileTy.getElementType(),
+                                            descTileTy.getEncoding());
       unsigned descArgIdx = kernelFunc.getNumArguments();
       auto argAttrs =
           b.getDictionaryAttr({b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});
@@ -1307,7 +1309,8 @@ public:
       Type elemTy = valTy.getElementType();
       Location loc = storeOp.getLoc();
 
-      auto descTy = tt::TensorDescType::get(ctx, valTy);
+      auto descTy = tt::TensorDescType::get(
+          valTy.getShape(), valTy.getElementType(), valTy.getEncoding());
       unsigned descArgIdx = kernelFunc.getNumArguments();
       auto argAttrs =
           b.getDictionaryAttr({b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});

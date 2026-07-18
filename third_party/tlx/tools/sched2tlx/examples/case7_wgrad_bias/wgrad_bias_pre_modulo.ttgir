@@ -36,10 +36,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %num_ni_2 = arith.divsi %num_ni, %c128_i32 : i32 loc(#loc67)
     %num_tiles = arith.muli %num_ko_1, %num_ni_2 : i32 loc(#loc48)
     %dout_desc = arith.extsi %K_out : i32 to i64 loc(#loc49)
-    %dout_desc_3 = tt.make_tensor_descriptor %DOUT, [%M, %K_out], [%dout_desc, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16, #shared>> loc(#loc49)
+    %dout_desc_3 = tt.make_tensor_descriptor %DOUT, [%M, %K_out], [%dout_desc, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16, #shared> loc(#loc49)
     %act_desc = arith.extsi %N_in : i32 to i64 loc(#loc50)
-    %act_desc_4 = tt.make_tensor_descriptor %ACT, [%M, %N_in], [%act_desc, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16, #shared>> loc(#loc50)
-    %dw_desc = tt.make_tensor_descriptor %DW, [%K_out, %N_in], [%act_desc, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>> loc(#loc51)
+    %act_desc_4 = tt.make_tensor_descriptor %ACT, [%M, %N_in], [%act_desc, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16, #shared> loc(#loc50)
+    %dw_desc = tt.make_tensor_descriptor %DW, [%K_out, %N_in], [%act_desc, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x128xf16, #shared> loc(#loc51)
     scf.for %tile = %pid to %num_tiles step %num_programs  : i32 {
       %pid_ko = arith.divsi %tile, %num_ni_2 : i32 loc(#loc52)
       %pid_ni = arith.remsi %tile, %num_ni_2 : i32 loc(#loc53)
@@ -48,8 +48,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %acc, %acc_5 = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) loc(#loc56)
       %acc_6 = ttng.tmem_store %cst_0, %acc[%acc_5], %true : tensor<128x128xf32, #linear> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc56)
       %db:3 = scf.for %db_9 = %c0_i32 to %M step %c64_i32 iter_args(%arg9 = %cst, %arg10 = %false, %acc_10 = %acc_6) -> (tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>>, i1, !ttg.async.token)  : i32 {
-        %a = tt.descriptor_load %dout_desc_3[%db_9, %off_ko] : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked> loc(#loc58)
-        %b = tt.descriptor_load %act_desc_4[%db_9, %off_ni] : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked> loc(#loc59)
+        %a = tt.descriptor_load %dout_desc_3[%db_9, %off_ko] : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked> loc(#loc58)
+        %b = tt.descriptor_load %act_desc_4[%db_9, %off_ni] : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked> loc(#loc59)
         %b_11 = ttg.local_alloc %b : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem> loc(#loc59)
         %acc_12 = ttg.local_alloc %a : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem> loc(#loc60)
         %acc_13 = ttg.memdesc_trans %acc_12 {order = array<i32: 1, 0>} : !ttg.memdesc<64x128xf16, #shared, #smem> -> !ttg.memdesc<128x64xf16, #shared1, #smem> loc(#loc60)
@@ -66,7 +66,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %acc_7, %acc_8 = ttng.tmem_load %acc[%db#2] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear> loc(#loc56)
       %0 = arith.truncf %acc_7 : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear> loc(#loc28)
       %1 = ttg.convert_layout %0 : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked> loc(#loc29)
-      tt.descriptor_store %dw_desc[%off_ko, %off_ni], %1 : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked> loc(#loc29)
+      tt.descriptor_store %dw_desc[%off_ko, %off_ni], %1 : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked> loc(#loc29)
       %2 = arith.cmpi eq, %pid_ni, %c0_i32 : i32 loc(#loc30)
       scf.if %2 {
         %3 = tt.addptr %DB, %off_ko : !tt.ptr<f32>, i32 loc(#loc32)
