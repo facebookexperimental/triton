@@ -4,10 +4,20 @@
 //
 // When HEAD_DIM=64, dk/dv/dq are 128x64 while qkT/dpT remain 128x128.
 // The memory planner assigns dq as a sub-allocation within one of the
-// 128x128 tmem buffers (buffer ID and offset may vary).
+// 128x128 tmem buffers. There are two equal-priority reuse owners: qkT
+// (buffer.id 7, which dv already occupies at columns 0-63) and dpT
+// (buffer.id 8, otherwise free). Reusing id 7 forces dq to column offset 64;
+// reusing id 8 gives column offset 0. Both are legal per the op-id liveness
+// model, but the offset-64 packing aliases a co-live region at runtime and
+// corrupts dq. The tie used to be broken by DenseMap<BufferT*> iteration order
+// in tryAllocate (WSMemoryPlanner.cpp), so the pick — and thus dq correctness —
+// depended on pointer addresses (a Heisenbug: correct under IR dumping, wrong
+// otherwise). tryAllocate now orders reuse candidates deterministically,
+// preferring the tightest packing (lowest column offset), so dq deterministically
+// lands in buffer.id 8 at offset 0. Pin that exact placement here.
 //
 // CHECK-LABEL: tt.func public @_attn_bwd
-// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32, buffer.offset = {{[0-9]+}} : i32}
+// CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 // CHECK: %dpT, %dpT_1 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
 // CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 // CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
