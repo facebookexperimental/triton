@@ -36,6 +36,7 @@
 #PARTITIONED_SHARED_PADDED = #ttg.partitioned_shared<{numPartitions = 4, numGroups = 1, partitionDim = 1, partitionLayout = #PADDED_SHARED_0_16x32}>
 
 #smem = #ttg.shared_memory
+#barrier = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
 
@@ -1111,6 +1112,62 @@ tt.func @partitioned_shared_padded_alloc() {
   // expected-remark @below {{offset = 2112, size = 1052}}
   // expected-remark @below {{offset = 3168, size = 1052}}
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x32xf16, #PARTITIONED_SHARED_PADDED, #ttg.shared_memory, mutable>
+  tt.return
+}
+
+// Two mbarriers with non-overlapping SSA liveness and NO warp_specialize. Each
+// has an InitBarrierOp in its forward slice, so the SMEM allocator extends both
+// to the whole function -> they must get DISTINCT offsets, unlike plain buffers
+// which reuse the slot (cf. @nonoverlapping_liveness_in_default_region above).
+// expected-remark @below {{barriers_no_warpspec}}
+// expected-remark @below {{size = 24}}
+tt.func @barriers_no_warpspec() {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 0, size = 8}}
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %0, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %0, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  // expected-remark @below {{offset = 16, size = 8}}
+  %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %1, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  tt.return
+}
+
+// A barrier before a warp_specialize op, then regular (non-barrier) SMEM after
+// it, then a second barrier before the return. Every InitBarrierOp extends its
+// buffer's liveness to the whole function, so all three buffers are disjoint:
+//   - the regular buffer (%1) cannot reuse the first barrier's slot, and
+//   - the second barrier (%2 @ offset 32) does NOT reuse the first barrier's
+//     SMEM (%0 @ offset 16)
+// Without the extension all three have non-overlapping liveness and pack into
+// offset 0 (total 17); with it they are disjoint (total 41).
+// expected-remark @below {{barrier_then_smem_with_warpspec}}
+// expected-remark @below {{size = 41}}
+// expected-remark @below {{scratch offset = 40, size = 1}}
+tt.func @barrier_then_smem_with_warpspec() {
+  %c0 = arith.constant 0 : i32
+  // expected-remark @below {{offset = 16, size = 8}}
+  %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %0, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %0, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttg.warp_specialize()
+  default {
+    ttg.warp_yield
+  }
+  partition0() num_warps(1) {
+    ttg.warp_return
+  } : () -> ()
+  // Regular SMEM usage after the WS op (not a barrier).
+  // expected-remark @below {{offset = 0, size = 16}}
+  %1 = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>
+  "use"(%1) : (!ttg.memdesc<2xi64, #A_SHARED_1D, #smem, mutable>) -> ()
+  // A second mbarrier before the return: its slot (offset 32) must be distinct
+  // from the first barrier's (offset 16) -- the first mbar's SMEM is not reused.
+  // expected-remark @below {{offset = 32, size = 8}}
+  %2 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.init_barrier %2, 1 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
+  ttng.wait_barrier %2, %c0 : !ttg.memdesc<1xi64, #barrier, #smem, mutable>
   tt.return
 }
 }
