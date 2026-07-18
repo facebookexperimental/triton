@@ -334,7 +334,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // The headline capability: pin a *swizzled* padded_shared given as an explicit
 // {offset = ..., block = ...} linear component (row/col-permuted bases), NOT the
 // identity {order, shape} form above. This is the form `with_bases` emits, and
-// mirrors the Gluon a16w16 LDS layout (cf. the intra_wave/a16w16 kernel's
+// mirrors the Gluon a16w16 LDS layout (cf. the inter_wave/a16w16 kernel's
 // `a_shared`) that drops CDNA4 LDS bank conflicts to zero. Like the identity
 // case it must survive InsertRequireLayout untouched -- no synthesized memdesc
 // require_layout -- with getOrder unwrapping the pinned wrapper rather than
