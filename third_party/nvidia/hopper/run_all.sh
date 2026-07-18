@@ -61,5 +61,11 @@ pytest third_party/tlx/tutorials/fused_attention_ws_device_tma.py
 echo "Verifying correctness of HSTU cross-attention bwd (reduce_dq) autoWS kernel"
 pytest third_party/tlx/tutorials/test_cross_attention_bwd_autows.py
 
+echo "Verifying correctness of HSTU self-attention fwd autoWS kernel"
+pytest third_party/tlx/tutorials/test_self_attention_autows.py
+
+echo "Verifying correctness of HSTU self-attention bwd (plain Triton vs TLX vs torch)"
+pytest third_party/tlx/tutorials/test_self_attention_bwd.py
+
 echo "run for Hopper or Blackwell"
 pytest python/tutorials/fused-attention-ws-device-tma-hopper-or-blackwell.py
