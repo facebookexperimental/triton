@@ -1164,20 +1164,39 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
                 if uih_end < start_m:
                     high = seq_len_q - n_targets
-        offset = low
-        # single loop compute
-        if offset > 0:
-            if not ENABLE_TMA:
-                K_block_ptr = tl.advance(K_block_ptr, (0, offset))
-                V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
-        end_n = low
-        for start_n in tl.range(
-            low,
-            high,
-            BLOCK_N,
+        # Folded single-ForOp KV loop (option A): visit the uih blocks
+        # [low, high) and then the target diagonal block [start_m, start_m+BLOCK_M)
+        # in ONE loop, so the PV accumulator lives in a single WS scope / single
+        # TMEM tile -- mirrors TLX's single GEMM loop; removes the scf.if operand-D
+        # round-trip AND the cross-loop SMEM reuse group. The iteration index is
+        # remapped to the exact same start_n set the previous two loops visited, so
+        # results are unchanged (no extra/gap blocks, no new masking assumptions).
+        uih_lo = low
+        uih_hi = high
+        n_uih = (uih_hi - uih_lo + BLOCK_N - 1) // BLOCK_N
+        n_tgt = 0
+        tgt_lo = uih_hi
+        if HAS_NUM_TARGETS:
+            has_tgt = uih_end < start_m
+            n_tgt = tl.where(has_tgt, (BLOCK_M + BLOCK_N - 1) // BLOCK_N, 0)
+            tgt_lo = start_m
+        n_iters = n_uih + n_tgt
+        ptr_pos = 0  # non-TMA: absolute key position the K/V block ptrs point at
+        for it in tl.range(
+            0,
+            n_iters,
             warp_specialize=_HSTU_SELF_AUTOWS,
             data_partition_factor=_HSTU_SELF_DP,
         ):
+            is_tgt = it >= n_uih
+            blk = tl.where(is_tgt, it - n_uih, it)
+            start_n = tl.where(is_tgt, tgt_lo + blk * BLOCK_N, uih_lo + blk * BLOCK_N)
+            if not ENABLE_TMA:
+                adv = (start_n - ptr_pos).to(tl.int32)
+                if adv != 0:
+                    K_block_ptr = tl.advance(K_block_ptr, (0, adv))
+                    V_block_ptr = tl.advance(V_block_ptr, (adv, 0))
+                ptr_pos = start_n
             acc = _hstu_attn_fwd_one_block_0(
                 start_n=start_n,
                 seq_len_q=seq_len_q,
@@ -1213,62 +1232,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 BLOCK_N=BLOCK_N,
                 ENABLE_TMA=ENABLE_TMA,
             )
-            if not ENABLE_TMA:
-                K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-                V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-            end_n += BLOCK_N
-        if HAS_NUM_TARGETS:
-            if uih_end < start_m:
-                low = start_m
-                high = start_m + BLOCK_M
-                offset = (low - end_n).to(tl.int32)
-                # single loop compute
-                if offset > 0:
-                    if not ENABLE_TMA:
-                        K_block_ptr = tl.advance(K_block_ptr, (0, offset))
-                        V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
-                end_n = low
-                for start_n in tl.range(low, high, BLOCK_N, num_stages=0):
-                    acc = _hstu_attn_fwd_one_block_0(
-                        start_n=start_n,
-                        seq_len_q=seq_len_q,
-                        seq_len_kv=seq_len_kv,
-                        offs_m=offs_m,
-                        offs_n=offs_n + start_n,
-                        off_h=off_h,
-                        q=q,
-                        K=K,
-                        V=V,
-                        acc=acc,
-                        K_block_ptr=K_block_ptr,
-                        V_block_ptr=V_block_ptr,
-                        device_desc_k=device_desc_k,
-                        device_desc_v=device_desc_v,
-                        offset_kh=off_h * stride_kh,
-                        offset_vh=off_h * stride_vh,
-                        seq_start_q=seq_start_q,
-                        seq_start_kv=seq_start_kv,
-                        alpha=alpha,
-                        scale=scale,
-                        num_targets=num_targets,
-                        max_attn_len=max_attn_len,
-                        contextual_seq_len=contextual_seq_len,
-                        n_targets=n_targets,
-                        uih_end=uih_end,
-                        HAS_NUM_TARGETS=HAS_NUM_TARGETS,
-                        HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
-                        HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-                        ALLOW_TF32=ALLOW_TF32,
-                        BLOCK_D_Q=BLOCK_D_Q,
-                        BLOCK_D_V=BLOCK_D_V,
-                        BLOCK_N=BLOCK_N,
-                        ENABLE_TMA=ENABLE_TMA,
-                    )
-                    if not ENABLE_TMA:
-                        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-                        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-                    end_n += BLOCK_N
-
         if not ENABLE_TMA:
             # rematerialize offsets to save registers
             start_m = pid * BLOCK_M
