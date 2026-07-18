@@ -3919,6 +3919,11 @@ class range(base_value):
         (``TRITON_USE_LIST_SCHEDULE=1``), select which ranked schedule variant
         (0 = best) to apply to this loop. May be a ``tl.constexpr`` so it becomes
         part of the compilation key and can be swept by ``@triton.autotune``.
+    :param mem_plan_pick: When the WS memory-plan search is enabled
+        (``TRITON_WS_SMEM_PLAN_SEARCH=1``, ``TRITON_WS_MEM_PLAN_TOPK=K``), select
+        which ranked allocation plan (0 = cost-best) to apply. May be a
+        ``tl.constexpr`` so it is part of the compilation key and can be swept by
+        ``@triton.autotune`` (a native alternative to ``TRITON_WS_MEM_PLAN_PICK``).
 
         Note that warp specialization is only supported on Blackwell GPUs and
         only works on simple matmul loops. Support for arbitrary loops will be
@@ -3939,6 +3944,7 @@ class range(base_value):
         disable_licm=False,
         data_partition_factor=None,
         list_schedule_pick=None,
+        mem_plan_pick=None,
         merge_epilogue=False,
         merge_epilogue_to_computation=False,
         merge_correction=False,
@@ -3966,6 +3972,10 @@ class range(base_value):
         # May be a tl.constexpr so it participates in the compile key and can be
         # swept by @triton.autotune. Consumed by nvgpu-list-schedule.
         self.list_schedule_pick = list_schedule_pick
+        # Rank into the memory planner's top-K allocation plans (0 = cost-best),
+        # a tl.constexpr the autotuner can sweep. Consumed by the WS memory
+        # planner (doMemoryPlanner). Pairs with TRITON_WS_MEM_PLAN_TOPK.
+        self.mem_plan_pick = mem_plan_pick
         self.merge_epilogue = merge_epilogue
         self.merge_epilogue_to_computation = merge_epilogue_to_computation
         self.merge_correction = merge_correction

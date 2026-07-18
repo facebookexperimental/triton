@@ -40,10 +40,21 @@ ensuring globally unique `buffer.id` values.
 
 ## TMEM Allocation Overview
 
-TMEM on Blackwell has **512 rows** and a configurable number of columns. Each
-`TMEMAllocOp` requires a contiguous block of rows and columns. The planner's
-job is to assign `(rowOffset, colOffset)` to each allocation, minimizing total
-row usage while respecting liveness constraints.
+TMEM on Blackwell is **128 physical rows** — 2 row groups of 64 lanes each — by
+**512 columns**. A 128-row allocation occupies both row groups; a 64-row
+allocation occupies one (`getTmemAllocSizes` returns 64 rows for the
+single-16×col-block-per-warp layout, 128 otherwise). Two 64-row allocs in
+different row groups can share the same columns.
+
+Each `TMEMAllocOp` requires a contiguous block of rows and columns. The planner
+assigns `(rowOffset, colOffset)` to each allocation, packing along the **column**
+axis (≤512) while respecting liveness constraints.
+
+> Note: the greedy algorithm (algo 1) predates this 2D model and uses a coarser
+> bound — it stacks allocations in a single "row" budget capped at 512 (a legacy
+> over-approximation, **not** the physical 128-row count). The backtracking
+> algorithm (algo 2) models the true 128×512, 2-row-group grid. In both cases
+> the downstream TMEM allocator is the exact feasibility backstop.
 
 Key output attributes set on each `TMEMAllocOp`:
 - `buffer.id` — groups allocations that share physical space
@@ -130,8 +141,10 @@ For each candidate allocation:
      already reusing the same owner at the computed column offset
 
 3. **`allocateNewSpace`** (fallback): If no reuse is possible, allocate new
-   row space at the maximum row offset so far. Enforces the **512-row limit**
-   (line 1966).
+   row space at the maximum row offset so far. Enforces a **512 stacked-row
+   limit** — a coarse legacy bound (sum of `rowSize` lane-counts ≤ 512), not
+   the physical 128-row geometry; the downstream TMEM allocator is the exact
+   backstop.
 
 ### Column Reuse (Subslicing)
 
@@ -154,15 +167,27 @@ level. Each TMEM allocation has exactly one copy.
 
 A more sophisticated algorithm using recursive backtracking search.
 
-### Data Structures
+### Data Structures (2D model)
+
+TMEM is modeled as its true geometry: 2 row groups of 64 lanes × 512 columns
+(`kRowGroupSize = 64`, `kNumRowGroups = 2`, `kMaxTMemCols = 512`).
 
 ```cpp
+struct OwnerPlacement {
+  size_t colStart; // starting column
+  int rowGroup;    // 0, 1, or -1 = both row groups (128-row owner)
+};
+
 struct AllocationState {
-  DenseMap<BufferT *, std::pair<BufferT *, size_t>> assignment;  // buf → (owner, colOffset)
-  DenseSet<BufferT *> owners;                                    // set of space owners
-  size_t usedRows = 0;                                           // total rows consumed
+  DenseMap<BufferT *, std::pair<BufferT *, size_t>> assignment;  // reuser → (owner, colOffset)
+  DenseMap<BufferT *, OwnerPlacement> owners;                    // owner → 2D placement
+  SmallVector<std::pair<size_t, size_t>, 8> rowGroupCols[kNumRowGroups]; // occupied column intervals per row group
 };
 ```
+
+A new owner is placed by `findPlacements` (a 128-row owner needs the same
+column gap free in **both** row groups; a 64-row owner needs one group) using
+`findFirstGap` (first 4-column-aligned gap not exceeding `kMaxTMemCols`).
 
 ### `hasPotentialReuse`
 
@@ -204,10 +229,10 @@ tryAllocate(allocs, idx, state, maxRows, ctrlOp):
       // backtrack
       remove buf from state
 
-  // Fallback: allocate new row space
-  if state.usedRows + buf.rowSize <= maxRows:
-    make buf an owner in state
-    if tryAllocate(allocs, idx+1, state, maxRows):
+  // Fallback: place buf as a new owner at a free 2D slot
+  for placement in findPlacements(buf, state):   // (rowGroup, colStart)
+    add buf as owner at placement
+    if tryAllocate(allocs, idx+1, state):
       return true
     // backtrack
     remove buf from owners

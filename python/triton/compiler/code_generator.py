@@ -1329,6 +1329,7 @@ class CodeGenerator(ast.NodeVisitor):
         disallow_acc_multi_buffer = False
         data_partition_factor = None
         list_schedule_pick = None
+        mem_plan_pick = None
         merge_epilogue = False
         merge_epilogue_to_computation = False
         merge_correction = False
@@ -1354,6 +1355,7 @@ class CodeGenerator(ast.NodeVisitor):
             disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
             data_partition_factor = iterator.data_partition_factor
             list_schedule_pick = iterator.list_schedule_pick
+            mem_plan_pick = iterator.mem_plan_pick
             merge_epilogue = iterator.merge_epilogue
             merge_epilogue_to_computation = iterator.merge_epilogue_to_computation
             merge_correction = iterator.merge_correction
@@ -1434,6 +1436,11 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr(
                     "tt.list_schedule_pick",
                     self.builder.get_int32_attr(_unwrap_if_constexpr(list_schedule_pick)),
+                )
+            if _unwrap_if_constexpr(mem_plan_pick) is not None:
+                for_op.set_attr(
+                    "tt.mem_plan_pick",
+                    self.builder.get_int32_attr(_unwrap_if_constexpr(mem_plan_pick)),
                 )
             if disallow_acc_multi_buffer:
                 for_op.set_attr("tt.disallow_acc_multi_buffer", self.builder.get_unit_attr())
