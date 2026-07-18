@@ -658,7 +658,7 @@ def test_user_shared_layout_in_loop():
 # ---------------------------------------------------------------------------
 # User-pinned swizzled shared layout (padded_shared_layout_encoding.with_bases)
 # and the offset (register) layout inferred from it for buffer_load_to_local.
-# The constants below are the exact Gluon a16w16 swizzles the intra_wave/a16w16
+# The constants below are the exact Gluon a16w16 swizzles the inter_wave/a16w16
 # kernel pins (tile [HALF_M=128, BLOCK_K=64]) to clear CDNA4 LDS bank conflicts,
 # so these tests double as documentation of that known-good layout.
 # ---------------------------------------------------------------------------
