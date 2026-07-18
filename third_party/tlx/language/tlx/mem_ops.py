@@ -365,6 +365,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         # respects it (does not retag the buffer to satisfy a consumer). The
         # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
         if not getattr(layout, "_tlx_default", False):
+            layout._tlx_user_pinned = True
             layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
 
     alias_handle = None
