@@ -142,6 +142,34 @@ def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::Module
   ];
 }
 
+def NVGPUVerifyWSBarriers : Pass<"nvgpu-verify-ws-barriers", "mlir::ModuleOp"> {
+  let summary = "statically detect autoWS mbarrier deadlocks and cross-partition races";
+
+  let description = [{
+    Verify-style pass (module is not mutated) that consumes post-code-partition /
+    post-pipeline-expander autoWS IR and statically detects mbarrier deadlocks
+    (cross-partition wait/arrive cycles under the mbarrier phase model) and
+    cross-partition races (missing/degenerate backward reuse edges, column-packed
+    aliasing, under-buffered reuse groups). See
+    lib/Transforms/WarpSpecialization/docs/WSAliasingCoverage.proposal.md.
+
+    Goal 1: barrier -> reuse group (buffer.id) is assumed given, carried as a
+    `buffer.id` attribute on each `ttng.init_barrier`.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
+  let options = [
+    Option<"checkKind", "check",
+           "std::string", /*default*/"\"all\"",
+           "which checks to run: deadlock | race | all">,
+    Option<"emitCoverageTable", "emit-coverage-table",
+           "bool", /*default*/"false",
+           "print the per-reuse-group coverage table">
+  ];
+}
+
 def NVGPUTestPingPongSync : Pass<"nvgpu-test-ping-pong-sync", "mlir::ModuleOp"> {
   let summary = "test ping pong sync";
 

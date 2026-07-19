@@ -30,6 +30,7 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSBuffer.cpp
   WarpSpecialization/WSHoistTMEMStore.cpp
   WarpSpecialization/WSCodePartition.cpp
+  WarpSpecialization/WSVerifyBarriers.cpp
   WarpSpecialization/WSDataPartition.cpp
   WarpSpecialization/WSLowerMem.cpp
   WarpSpecialization/WSLowerToken.cpp
