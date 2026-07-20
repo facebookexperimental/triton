@@ -6582,7 +6582,7 @@ def test_tlx_wave_converter_keeps_redistribute_scratch_internal_in_loop(tmp_path
 #dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 8}>
 """
     local_func = """
-  tt.func public @converter_looped_direct_dot_scratch_token(
+  tt.func public @converter_looped_direct_dot_internal_scratch(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %c0 = arith.constant 0 : index
@@ -6626,14 +6626,9 @@ def test_tlx_wave_converter_keeps_redistribute_scratch_internal_in_loop(tmp_path
 
     wave = output.emitted_module.text
     (for_line, ) = [line for line in wave.splitlines() if "scf.for" in line]
-    assert "!wave.mem.token" in for_line
-    assert all("!wave.mem.token" in line for line in wave.splitlines() if "scf.yield" in line)
+    assert "!wave.mem.token" not in for_line
+    assert all("!wave.mem.token" not in line for line in wave.splitlines() if "scf.yield" in line)
     assert wave.count("wave.redistribute") == 2
-    assert all(
-        " after " in line
-        for line in wave.splitlines()
-        if "wave.redistribute" in line
-    )
     assert "waveamd.mma" in wave
     _run_wave_verify(wave)
     _run_waveamd_to_machine(wave)
