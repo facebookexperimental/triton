@@ -106,14 +106,35 @@ def _intrawg_async_reader_pairs(nodes_by_id, edges, cluster_of):
     operand references, so a loop-carried MMA→tmem_load edge (case3's
     acc-correction read) lands in the same wedge-prone protocol when the
     pair shares a group.
+
+    Scope is TENSOR-CORE producers only. Intra-WG TMA-load→consumer flow
+    goes through the emitter's dedicated load-buffer protocol
+    (_derive_intrawg_async_consumers), which committed kernels exercise
+    (case5's outer-loop bias load) and which has never wedged; forbidding
+    it forces case4's m/D loads out of the softmax group and the auto-pick
+    degrades from the 6-WG hardware-best family to an 8-WG split
+    (measured: 179.8 vs 268.6 TF at N=16384).
+
+    KNOWN case4 interaction (2026-07-20): the constraint does NOT exclude
+    the 6-WG hardware-best layout (fixed-assignment: feasible, combined
+    2471.7 — byte-identical to the saga-era score), but it redirects the
+    K-best enumeration onto an 8-WG variant that _recmii_augmented
+    under-prices (rec_cycles 1762.86, EQUAL to HWBEST's, vs ~180 TF on
+    hardware = 0.62x), and cp_obj prefers splits (892 < 1012) — so the
+    auto-pick degrades until that evaluator gap is priced. Disable with
+    TRITON_MODULO_INTRAWG_ASYNC_LEGALITY=0 for A/B ONLY: the emitter
+    still hard-errors on the hazard, so disabling trades a wedge-free
+    guarantee for a possible generation-time error, never a hang.
     """
+    if os.environ.get("TRITON_MODULO_INTRAWG_ASYNC_LEGALITY", "1") != "1":
+        return set()
     out = set()
     for e in edges:
         src = nodes_by_id.get(e["src"])
         dst = nodes_by_id.get(e["dst"])
         if src is None or dst is None:
             continue
-        if src["pipeline"] not in ("TMA", "TC", "MFMA"):
+        if src["pipeline"] not in ("TC", "MFMA"):
             continue
         if dst["pipeline"] not in ("CUDA", "SFU"):
             continue
