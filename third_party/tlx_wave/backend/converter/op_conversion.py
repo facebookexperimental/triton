@@ -3198,21 +3198,13 @@ def _convert_buffer_load_to_local(
             target_ir.EVENT_DOMAIN_DMA_COMPLETION,
         )
     base_target_id = _single_source_target(builder, fields["base_value_id"], op)
-    source_issue_dependency_target_ids = tuple(
+    source_issue_dependency_target_ids = tuple(dict.fromkeys(
         conversion_input.async_issue_dependency_target_ids_by_op.get(
             op.index,
             (),
         )
-    )
-    lds_release_dependency_target_ids = _publish_lds_release_frontier(
-        builder,
-        conversion_input,
-        op,
-    )
-    issue_dependency_target_ids = tuple(dict.fromkeys((
-        *source_issue_dependency_target_ids,
-        *lds_release_dependency_target_ids,
-    )))
+    ))
+    issue_dependency_target_ids = source_issue_dependency_target_ids
     destination_target_id = _single_source_target(
         builder,
         fields["memdesc_value_id"],
@@ -3379,9 +3371,6 @@ def _convert_buffer_load_to_local(
                 "source_issue_dependency_count": len(
                     source_issue_dependency_target_ids
                 ),
-                "lds_release_dependency_count": len(
-                    lds_release_dependency_target_ids
-                ),
             },
             fact_ids=(range_fact.fact_id, ),
             fact_target_ids=(base_target_id, ),
@@ -3528,9 +3517,6 @@ def _convert_buffer_load_to_local(
             "issue_dependency_count": len(issue_dependency_target_ids),
             "source_issue_dependency_count": len(
                 source_issue_dependency_target_ids
-            ),
-            "lds_release_dependency_count": len(
-                lds_release_dependency_target_ids
             ),
         },
         fact_ids=(range_fact.fact_id, ),
@@ -4820,88 +4806,6 @@ def _declare_lds_completion(
         completion_target_id,
     )
     return (completion_target_id, )
-
-
-def _publish_lds_release_frontier(builder, conversion_input, op):
-    """Turn a per-wave LDS completion frontier into a reusable CTA epoch.
-
-    A direct-to-LDS request may overwrite bytes read by another wave.  Waiting
-    for each issuing wave's own DS operations is therefore insufficient: the
-    issue edge must consume a workgroup-published release event.  Publish a
-    live frontier once and replace every key that names it, so sibling DMA
-    packets and operations share the same release event.
-    """
-    frontier_target_ids = builder.protocol_frontier_target_ids()
-    if not frontier_target_ids:
-        return ()
-    if all(
-        builder.values[int(target_id)].event_domain
-        == target_ir.EVENT_DOMAIN_LDS_RELEASED
-        for target_id in frontier_target_ids
-    ):
-        return frontier_target_ids
-    publication_mode = (
-        "workgroup" if conversion_input.num_warps > 1 else "wave_local"
-    )
-    release_operand_ids = frontier_target_ids
-    if publication_mode == "workgroup":
-        raw_frontier_target_ids = tuple(
-            int(target_id)
-            for target_id in frontier_target_ids
-            if builder.values[int(target_id)].event_domain
-            != target_ir.EVENT_DOMAIN_LDS_RELEASED
-        )
-        released_target_ids = tuple(
-            int(target_id)
-            for target_id in frontier_target_ids
-            if builder.values[int(target_id)].event_domain
-            == target_ir.EVENT_DOMAIN_LDS_RELEASED
-        )
-        if raw_frontier_target_ids:
-            issue_target_id = _declare_protocol_token(
-                builder,
-                event_domain=target_ir.EVENT_DOMAIN_LDS_ISSUE,
-                debug_name=f"lds_issue_{op.index}",
-            )
-            builder.add_op(
-                "issue_token",
-                operands=raw_frontier_target_ids,
-                results=(issue_target_id, ),
-                attrs={
-                    "input_count": len(raw_frontier_target_ids),
-                    "projection_domain": target_ir.EVENT_DOMAIN_LDS_ISSUE,
-                    "projection_provenance": "lds_release_publication",
-                },
-                source_op_index=op.index,
-            )
-            release_operand_ids = (*released_target_ids, issue_target_id)
-        else:
-            release_operand_ids = released_target_ids
-    released_target_id = _declare_protocol_token(
-        builder,
-        event_domain=target_ir.EVENT_DOMAIN_LDS_RELEASED,
-        debug_name=f"lds_release_{op.index}",
-    )
-    builder.add_op(
-        "lds_release",
-        operands=release_operand_ids,
-        results=(released_target_id, ),
-        attrs={
-            "dependency_count": len(release_operand_ids),
-            "publication_mode": publication_mode,
-            "publication_provenance": "async_dma_reuse",
-        },
-        source_op_index=op.index,
-    )
-    for source_value_id, target_ids in tuple(
-        builder.protocol_frontiers.items()
-    ):
-        if target_ids:
-            builder.set_protocol_frontier(
-                source_value_id,
-                (released_target_id, ),
-            )
-    return (released_target_id, )
 
 
 def _convert_local_load(builder, conversion_input, type_layout_program, op):
