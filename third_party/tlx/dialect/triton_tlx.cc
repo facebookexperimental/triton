@@ -260,7 +260,8 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<std::vector<int32_t>> offsetBases,
               std::vector<std::vector<int32_t>> blockBases, int rank) {
              // Build #ttg.padded_shared from explicit linear bases ({offset,
-             // block}), so a caller can pin a swizzled layout, not just identity.
+             // block}), so a caller can pin a swizzled layout, not just
+             // identity.
              if (intervals.size() != paddings.size())
                throw std::runtime_error(
                    "make_padded_shared_encoding_attr_with_bases: intervals and "
