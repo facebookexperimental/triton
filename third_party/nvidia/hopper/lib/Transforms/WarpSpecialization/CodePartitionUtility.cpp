@@ -3858,8 +3858,8 @@ collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
 //    d. Has the same expected arrival count (init count).
 //
 // 3. For each subgroup, update the barriers based on the consumer's location.
-//    a. With the same async task id, eliminate all but the first barrier.
-//    b. With different async task ids, use the same allocation.
+//    a. With the same partition id, eliminate all but the first barrier.
+//    b. With different partition ids, use the same allocation.
 //
 // 4. Cleanup the code to remove the unused barriers.
 //

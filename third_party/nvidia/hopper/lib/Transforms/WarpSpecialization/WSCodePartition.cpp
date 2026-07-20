@@ -302,8 +302,8 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       auto producerTaskIds = getWSPartitionIds(producerOp);
       if (producerTaskIds.empty() || producerTaskIds.size() > 1) {
         LLVM_DEBUG({
-          LDBG(" ignoring ops without async task id or with multiple task "
-               "ids: ");
+          LDBG(" ignoring ops without a partition id or with multiple "
+               "partition ids: ");
           producerOp->dump();
         });
         return;
@@ -2094,7 +2094,7 @@ DenseMap<Channel *, Value> createBufferForAllocs(
 // generate a wait on the specific MMA's A/B barrier (from the final iteration)
 // + arrive on the D barrier for per-MMA completion tracking.
 //
-// The caller must set the builder's insertion point, async task IDs, and loop
+// The caller must set the builder's insertion point, partition IDs, and loop
 // schedule info before calling this function.
 //
 // Returns true if the replacement was performed, false if the MMA doesn't have

@@ -231,7 +231,7 @@ accumulator, typically a `4x…xf32 #tmem` alloc):
 2. Look for an `ttng.tmem_store` of a constant-zero tensor (`arith.constant
    dense<0.0…>`) into that same accumulator.
 3. If both exist, check whether the store and the MMA are in **different
-   partitions** (compare `async_task_id` / the `ttg.partition.types` region).
+   partitions** (compare `ttg.partition` / the `ttg.partition.types` region).
 4. **Flag a cross-tile race/hang** when the redundant zero-store exists in a
    different partition AND the enclosing structure is a persistent loop
    (`scf.for` or `scf.while`). The correct IR has the store removed entirely —
@@ -457,7 +457,7 @@ Include:
 6. **Check for merged barriers** -- multiple buffers sharing the same `buffer.id`
    with a single `barrier_expect` whose size is the sum of individual buffer sizes.
 7. **Look for loc metadata** (e.g., `loc("a_desc")`, `loc("K")`) to name buffers.
-8. **Check async_task_id attributes** on ops to determine partition membership
+8. **Check `ttg.partition` attributes** on ops to determine partition membership
    when analyzing pre-code-partition IR.
 9. **Identify backwards-direction barriers** in persistent kernels (outer tile
    loops). Check whether downstream partitions produce tokens or release barriers
@@ -496,7 +496,7 @@ See `EXAMPLES.md` in this skill directory for two fully worked example reports:
 2. **Hopper matmul with two consumers** -- `@matmul_kernel_two_consumers` from
    `ws_code_partition.mlir`. Demonstrates legacy producer/consumer barriers,
    shared SMEM buffers consumed by multiple partitions, and pre-code-partition
-   `async_task_id` analysis.
+   `ttg.partition` analysis.
 
 ## Reference Files
 

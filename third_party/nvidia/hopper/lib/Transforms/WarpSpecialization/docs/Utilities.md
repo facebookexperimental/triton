@@ -10,7 +10,7 @@ the AutoWS pipeline.
 | `Utility.h` | `WSPartitionId` typedef, `OpBuilderWithPartitionIds`, `LoopScheduleInfo`, partition ID helpers, location utilities |
 | `Utility.cpp` | Implementation of partition ID manipulation functions |
 
-## Async Task ID Management
+## Partition ID Management
 
 ### Type
 
