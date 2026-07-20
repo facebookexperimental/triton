@@ -31,3 +31,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %1#0 : tensor<64x2xf32, #blocked>
   }
 }
+
+// -----
+
+// Multiple rematerializations of the same region result must remain live in
+// the cache while the region is rewritten.
+
+// CHECK-LABEL: @if_result_multi_encoding_cache
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.return
+#remat_blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#remat_blocked2 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+#remat_blocked3 = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @if_result_multi_encoding_cache(%arg0: i1) -> (tensor<32xf32, #remat_blocked2>, tensor<32xf32, #remat_blocked3>) {
+    %cst = arith.constant dense<1.000000e+00> : tensor<32xf32, #remat_blocked1>
+    %cst_0 = arith.constant dense<3.000000e+00> : tensor<32xf32, #remat_blocked1>
+    %0 = scf.if %arg0 -> (tensor<32xf32, #remat_blocked1>) {
+      scf.yield %cst_0 : tensor<32xf32, #remat_blocked1>
+    } else {
+      scf.yield %cst : tensor<32xf32, #remat_blocked1>
+    }
+    %1 = ttg.convert_layout %0 : tensor<32xf32, #remat_blocked1> -> tensor<32xf32, #remat_blocked2>
+    %2 = ttg.convert_layout %0 : tensor<32xf32, #remat_blocked1> -> tensor<32xf32, #remat_blocked3>
+    tt.return %1, %2 : tensor<32xf32, #remat_blocked2>, tensor<32xf32, #remat_blocked3>
+  }
+}

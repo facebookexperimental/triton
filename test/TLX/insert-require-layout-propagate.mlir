@@ -140,9 +140,10 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // Test 3: local_load inside scf.if branches.
 // When all predecessors can agree, the TLX pipeline should rewrite the
 // branch-carried values to the final dot encodings and remove the need for a
-// downstream conversion on the scf.if results. For comparison, the upstream
-// remove-layout-conversions pass still leaves both dot operand converts after
-// the scf.if.
+// downstream conversion on the scf.if results. Current remove-layout-
+// conversions can also propagate this complete two-way branch when explicit
+// TLX local-memory semantics are enabled; keep that behavior covered by the
+// second RUN line.
 
 #blocked_2 = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #mma_2 = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
@@ -151,10 +152,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #smem_2 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
   // UPSTREAM-LABEL: @local_load_through_scf_if
-  // UPSTREAM: %[[IF_RESULT:.*]]:2 = scf.if {{.*}} -> (tensor<64x32xf16, #blocked>, tensor<32x64xf16, #blocked>)
-  // UPSTREAM: %[[A_CVT:.*]] = ttg.convert_layout %[[IF_RESULT]]#0 : tensor<64x32xf16, #blocked> -> tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>
-  // UPSTREAM: %[[B_CVT:.*]] = ttg.convert_layout %[[IF_RESULT]]#1 : tensor<32x64xf16, #blocked> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>
-  // UPSTREAM: tt.dot %[[A_CVT]], %[[B_CVT]], %{{.*}}
+  // UPSTREAM: %[[IF_RESULT:.*]]:2 = scf.if {{.*}} -> (tensor<64x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 4}>>, tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 4}>>)
+  // UPSTREAM-NOT: ttg.convert_layout %[[IF_RESULT]]
+  // UPSTREAM: tt.dot %[[IF_RESULT]]#0, %[[IF_RESULT]]#1, %{{.*}}
   // CHECK-LABEL: @local_load_through_scf_if
   tt.func public @local_load_through_scf_if(%arg0: !tt.ptr<f16>, %cond: i1) -> tensor<64x64xf32, #mma_2> {
     %c0_i32 = arith.constant 0 : i32

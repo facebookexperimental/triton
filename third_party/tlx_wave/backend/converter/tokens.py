@@ -820,7 +820,14 @@ def _token_fields(source_program, op):
 
 
 def _global_async_copy_fields(op):
-    segments = _operand_segments(op, 4, (1, 1, 1 if len(op.operands) > 2 else 0, 0))
+    # Current TTGIR also has optional bulk-size and barrier operands. They do
+    # not change the ordinary async-copy token protocol, but they are separate
+    # structural segments and must be included when locating mask/other.
+    segments = _operand_segments(
+        op,
+        6,
+        (1, 1, 1 if len(op.operands) > 2 else 0, 0, 0, 0),
+    )
     _require_operand_count(op, segments)
     mask_index = int(segments[0]) + int(segments[1])
     other_index = mask_index + int(segments[2])
