@@ -1,4 +1,5 @@
 // RUN: triton-opt -split-input-file --tlx-propagate-layout %s | FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout --cse %s | FileCheck %s --check-prefix=HOIST
 
 // Test that residual tensor require/release ops lower to convert_layout ops
 // after propagation.
@@ -207,5 +208,47 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
       scf.yield %a_next, %b_next, %dot : tensor<32x32xf16, #blocked_wmma>, tensor<32x32xf16, #blocked_wmma>, tensor<32x32xf32, #mma_wmma>
     }
     tt.return %result#2 : tensor<32x32xf32, #mma_wmma>
+  }
+}
+
+// -----
+// A fallback in the parent block is unconditional, so materialize its layout
+// conversion next to the source.  This lets CSE reuse it in a nested region and
+// prevents conversion scratch from overlapping unrelated local allocations.
+
+#blocked_early = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [4, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_early = #ttg.amd_mfma<{version = 3, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
+#dot_early = #ttg.dot_op<{opIdx = 0, parent = #mma_early, kWidth = 4}>
+#shared_early = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem_early = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @materialize_parent_fallback_near_source
+  // HOIST-LABEL: @materialize_parent_fallback_near_source
+  tt.func public @materialize_parent_fallback_near_source(
+      %src: tensor<64x32xf16, #blocked_early>, %cond: i1)
+      -> (tensor<64x32xf16, #dot_early>, tensor<64x32xf16, #blocked_early>) {
+    // CHECK: %[[EARLY:.*]] = ttg.convert_layout %{{.*}}
+    // CHECK-NEXT: %[[UNRELATED:.*]] = ttg.local_alloc
+    // HOIST: %[[EARLY:.*]] = ttg.convert_layout %{{.*}}
+    // HOIST-NEXT: %[[UNRELATED:.*]] = ttg.local_alloc
+    %unrelated = ttg.local_alloc : () -> !ttg.memdesc<1x64x32xf16, #shared_early, #smem_early, mutable>
+    %c0_i32 = arith.constant 0 : i32
+    %unrelated_slice = ttg.memdesc_index %unrelated[%c0_i32] : !ttg.memdesc<1x64x32xf16, #shared_early, #smem_early, mutable> -> !ttg.memdesc<64x32xf16, #shared_early, #smem_early, mutable>
+    %unrelated_value = ttg.local_load %unrelated_slice : !ttg.memdesc<64x32xf16, #shared_early, #smem_early, mutable> -> tensor<64x32xf16, #blocked_early>
+    %zero = arith.constant dense<0.000000e+00> : tensor<64x32xf16, #dot_early>
+    %conditional = scf.if %cond -> tensor<64x32xf16, #dot_early> {
+      // CHECK: ttg.convert_layout %{{.*}}
+      %tmp = ttg.local_alloc %src : (tensor<64x32xf16, #blocked_early>) -> !ttg.memdesc<64x32xf16, #shared_early, #smem_early>
+      %converted = ttg.local_load %tmp : !ttg.memdesc<64x32xf16, #shared_early, #smem_early> -> tensor<64x32xf16, #dot_early>
+      scf.yield %converted : tensor<64x32xf16, #dot_early>
+    } else {
+      scf.yield %zero : tensor<64x32xf16, #dot_early>
+    }
+    %tmp = ttg.local_alloc %src : (tensor<64x32xf16, #blocked_early>) -> !ttg.memdesc<64x32xf16, #shared_early, #smem_early>
+    %converted = ttg.local_load %tmp : !ttg.memdesc<64x32xf16, #shared_early, #smem_early> -> tensor<64x32xf16, #dot_early>
+    %result = arith.addf %conditional, %converted : tensor<64x32xf16, #dot_early>
+    // HOIST-NOT: ttg.convert_layout
+    tt.return %result, %unrelated_value : tensor<64x32xf16, #dot_early>, tensor<64x32xf16, #blocked_early>
   }
 }

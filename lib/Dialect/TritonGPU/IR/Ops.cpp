@@ -680,39 +680,38 @@ LogicalResult MemDescReinterpretOp::verify() {
   auto oldType = getSrc().getType();
   auto newType = getType();
 
-  if (oldType.getMemorySpace() != newType.getMemorySpace())
-    return emitError("source and destination memory space must match");
-  if (oldType.getMutableMemory() != newType.getMutableMemory())
-    return emitError("source and result must have the same mutability");
-
-  // Padded layout creates some "holes". The hole patterns of the source and
-  // the destination layouts must be equal.
+  // Padded layouts create holes in the allocation. Both views must describe
+  // the same hole pattern unless a dialect-specific alias lowering has
+  // explicitly established that the two layouts share backing storage.
   auto srcEnc = oldType.getEncoding();
   auto dstEnc = newType.getEncoding();
   if (isPaddedEncoding(srcEnc) != isPaddedEncoding(dstEnc))
     return emitError(
         "cannot reinterpret between padded and non-padded layouts");
-
   if (isPaddedEncoding(srcEnc)) {
     auto getPadPattern = [](MemDescType ty) {
       auto enc = getPaddedEncoding(ty.getEncoding());
-      auto elmtSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
+      auto elementBytes = ty.getElementType().getIntOrFloatBitWidth() / 8;
       llvm::MapVector<int32_t, int32_t> pattern;
-
       for (auto [interval, padding] :
-           llvm::zip_equal(enc.getIntervals(), enc.getPaddings())) {
-        pattern.insert({interval * elmtSize, padding * elmtSize});
-      }
+           llvm::zip_equal(enc.getIntervals(), enc.getPaddings()))
+        pattern.insert({interval * elementBytes, padding * elementBytes});
       return pattern;
     };
-
-    auto srcPat = getPadPattern(oldType);
-    auto dstPat = getPadPattern(newType);
-    if (srcPat.size() != dstPat.size() ||
-        !std::equal(srcPat.begin(), srcPat.end(), dstPat.begin())) {
+    auto srcPattern = getPadPattern(oldType);
+    auto dstPattern = getPadPattern(newType);
+    if ((srcPattern.size() != dstPattern.size() ||
+         !std::equal(srcPattern.begin(), srcPattern.end(),
+                     dstPattern.begin())) &&
+        !(*this)->hasAttr("tlx.allow_different_padding_pattern"))
       return emitError("cannot reinterpret with different padding pattern");
-    }
   }
+
+  if (oldType.getMemorySpace() != newType.getMemorySpace())
+    return emitError("source and destination memory space must match");
+  if (oldType.getMutableMemory() != newType.getMutableMemory())
+    return emitError("source and result must have the same mutability");
+
   auto isSubview = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
     return ty.getShape().take_back(rank) != ty.getAllocShape().take_back(rank);
@@ -721,6 +720,7 @@ LogicalResult MemDescReinterpretOp::verify() {
       (isSubview(oldType) || isSubview(newType)))
     return emitError("source and result must not be subviews; reinterpret the "
                      "parent descriptor and then take a subview");
+
   assert((isa<SharedMemorySpaceAttr, nvidia_gpu::TensorMemorySpaceAttr>(
               oldType.getMemorySpace()) &&
           "expected shared or tensor memory"));
@@ -763,30 +763,27 @@ LogicalResult MemDescReinterpretOp::verify() {
     }
   }
 
-  auto kBlock = StringAttr::get(getContext(), "block");
-  auto getNumBroadcastCTADims = [kBlock](MemDescType ty) {
+  auto toPhysicalLayout = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
     auto shape = ty.getAllocShape().take_back(rank);
     auto encoding = ty.getEncoding();
-    // Padded layouts are not representable via toLinearLayout; use the
-    // padded-aware conversion so the verifier does not assert on them.
-    LinearLayout layout = isPaddedEncoding(encoding)
-                              ? paddedLinearLayout(shape, encoding)
-                              : toLinearLayout(shape, encoding);
-    auto freeVariableMask = layout.getFreeVariableMasks().lookup(kBlock);
+    return isPaddedEncoding(encoding) ? paddedLinearLayout(shape, encoding)
+                                      : toLinearLayout(shape, encoding);
+  };
+
+  auto kBlock = StringAttr::get(getContext(), "block");
+  auto getNumBroadcastCTADims = [&](MemDescType ty) {
+    auto freeVariableMask =
+        toPhysicalLayout(ty).getFreeVariableMasks().lookup(kBlock);
     return llvm::popcount<uint32_t>(freeVariableMask);
   };
   if (getNumBroadcastCTADims(oldType) != getNumBroadcastCTADims(newType))
     return emitError(
         "source and result must have the same number of broadcast CTA dims");
 
-  auto getViewNumBits = [](MemDescType ty) {
+  auto getViewNumBits = [&](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
-    auto shape = ty.getAllocShape().take_back(rank);
-    auto encoding = ty.getEncoding();
-    LinearLayout layout = isPaddedEncoding(encoding)
-                              ? paddedLinearLayout(shape, encoding)
-                              : toLinearLayout(shape, encoding);
+    auto layout = toPhysicalLayout(ty);
     int64_t numLayoutCopies = 1;
     for (int64_t dim : ty.getAllocShape().drop_back(rank))
       numLayoutCopies *= dim;

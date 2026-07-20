@@ -138,3 +138,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
     tt.return
   }
 }
+
+// -----
+
+// Explicit TLX local-memory reads are structural: a following linear layout
+// requirement must be folded into local_load, including through rank-changing
+// reshape and transpose chains that feed an MMA.  Anchoring the initial blocked
+// loads here would leave shared-memory convert_layout traffic on every dot
+// operand.
+
+// CHECK-LABEL: @explicit_local_load_to_dot
+// CHECK: %[[A_LOAD:.*]] = ttg.local_load %{{.*}} : {{.*}} -> tensor<1x1x2x1x16x32xf16, #[[$A_LOAD_LAYOUT:.*]]>
+// CHECK-NEXT: %[[A:.*]] = tt.reshape %[[A_LOAD]] : tensor<1x1x2x1x16x32xf16, #[[$A_LOAD_LAYOUT]]> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA:.*]], kWidth = 8}>>
+// CHECK: %[[B_LOAD:.*]] = ttg.local_load %{{.*}} : {{.*}} -> tensor<1x1x4x1x32x16xf16, #[[$B_LOAD_LAYOUT:.*]]>
+// CHECK-NEXT: %[[B_TRANS:.*]] = tt.trans %[[B_LOAD]] {order = array<i32: 0, 1, 4, 3, 2, 5>} : tensor<1x1x4x1x32x16xf16, #[[$B_LOAD_LAYOUT]]> -> tensor<1x1x32x1x4x16xf16, #[[$B_TRANS_LAYOUT:.*]]>
+// CHECK-NEXT: %[[B:.*]] = tt.reshape %[[B_TRANS]] : tensor<1x1x32x1x4x16xf16, #[[$B_TRANS_LAYOUT]]> -> tensor<32x64xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA]], kWidth = 8}>>
+// CHECK-NOT: ttg.convert_layout
+// CHECK: tt.dot %[[A]], %[[B]], %{{.*}}
+
+#explicit_blocked_a = #ttg.blocked<{sizePerThread = [1, 1, 1, 1, 1, 1], threadsPerWarp = [1, 1, 1, 1, 2, 32], warpsPerCTA = [1, 1, 1, 1, 8, 1], order = [5, 4, 3, 2, 1, 0]}>
+#explicit_blocked_b = #ttg.blocked<{sizePerThread = [1, 1, 1, 1, 1, 1], threadsPerWarp = [1, 1, 1, 1, 4, 16], warpsPerCTA = [1, 1, 1, 1, 8, 1], order = [5, 4, 3, 2, 1, 0]}>
+#explicit_linear_a = #ttg.linear<{register = [[0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 2], [0, 0, 0, 0, 0, 4]], lane = [[0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 2, 0], [0, 0, 0, 0, 4, 0], [0, 0, 0, 0, 8, 0], [0, 0, 0, 0, 0, 8], [0, 0, 0, 0, 0, 16]], warp = [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0]], block = []}>
+#explicit_linear_a_flat = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8], [0, 16]], warp = [[0, 0], [0, 0], [16, 0]], block = []}>
+#explicit_linear_b = #ttg.linear<{register = [[0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 2, 0], [0, 0, 0, 0, 4, 0]], lane = [[0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 2], [0, 0, 0, 0, 0, 4], [0, 0, 0, 0, 0, 8], [0, 0, 0, 0, 8, 0], [0, 0, 0, 0, 16, 0]], warp = [[0, 0, 1, 0, 0, 0], [0, 0, 2, 0, 0, 0], [0, 0, 0, 0, 0, 0]], block = []}>
+#explicit_linear_b_trans = #ttg.linear<{register = [[0, 0, 1, 0, 0, 0], [0, 0, 2, 0, 0, 0], [0, 0, 4, 0, 0, 0]], lane = [[0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 2], [0, 0, 0, 0, 0, 4], [0, 0, 0, 0, 0, 8], [0, 0, 8, 0, 0, 0], [0, 0, 16, 0, 0, 0]], warp = [[0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 2, 0], [0, 0, 0, 0, 0, 0]], block = []}>
+#explicit_linear_b_flat = #ttg.linear<{register = [[1, 0], [2, 0], [4, 0]], lane = [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0], [16, 0]], warp = [[0, 16], [0, 32], [0, 0]], block = []}>
+#explicit_mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#explicit_dot_a = #ttg.dot_op<{opIdx = 0, parent = #explicit_mma, kWidth = 8}>
+#explicit_dot_b = #ttg.dot_op<{opIdx = 1, parent = #explicit_mma, kWidth = 8}>
+#explicit_shared_a = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 8, order = [5, 4, 3, 2, 1, 0]}>
+#explicit_shared_b = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 8, order = [4, 5, 3, 2, 1, 0]}>
+#explicit_smem = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @explicit_local_load_to_dot(
+      %a_buf: !ttg.memdesc<1x1x2x1x16x32xf16, #explicit_shared_a, #explicit_smem, mutable, 2x2x2x8x16x32>,
+      %b_buf: !ttg.memdesc<1x1x4x1x32x16xf16, #explicit_shared_b, #explicit_smem, mutable, 2x2x4x4x32x16>) -> tensor<32x64xf32, #explicit_mma> {
+    %acc = arith.constant dense<0.000000e+00> : tensor<32x64xf32, #explicit_mma>
+    %a_load = ttg.local_load %a_buf : !ttg.memdesc<1x1x2x1x16x32xf16, #explicit_shared_a, #explicit_smem, mutable, 2x2x2x8x16x32> -> tensor<1x1x2x1x16x32xf16, #explicit_blocked_a>
+    %a_linear = ttg.convert_layout %a_load : tensor<1x1x2x1x16x32xf16, #explicit_blocked_a> -> tensor<1x1x2x1x16x32xf16, #explicit_linear_a>
+    %a_reshape = tt.reshape %a_linear : tensor<1x1x2x1x16x32xf16, #explicit_linear_a> -> tensor<32x32xf16, #explicit_linear_a_flat>
+    %a = ttg.convert_layout %a_reshape : tensor<32x32xf16, #explicit_linear_a_flat> -> tensor<32x32xf16, #explicit_dot_a>
+    %b_load = ttg.local_load %b_buf : !ttg.memdesc<1x1x4x1x32x16xf16, #explicit_shared_b, #explicit_smem, mutable, 2x2x4x4x32x16> -> tensor<1x1x4x1x32x16xf16, #explicit_blocked_b>
+    %b_linear = ttg.convert_layout %b_load : tensor<1x1x4x1x32x16xf16, #explicit_blocked_b> -> tensor<1x1x4x1x32x16xf16, #explicit_linear_b>
+    %b_trans = tt.trans %b_linear {order = array<i32: 0, 1, 4, 3, 2, 5>} : tensor<1x1x4x1x32x16xf16, #explicit_linear_b> -> tensor<1x1x32x1x4x16xf16, #explicit_linear_b_trans>
+    %b_reshape = tt.reshape %b_trans : tensor<1x1x32x1x4x16xf16, #explicit_linear_b_trans> -> tensor<32x64xf16, #explicit_linear_b_flat>
+    %b = ttg.convert_layout %b_reshape : tensor<32x64xf16, #explicit_linear_b_flat> -> tensor<32x64xf16, #explicit_dot_b>
+    %result = tt.dot %a, %b, %acc : tensor<32x32xf16, #explicit_dot_a> * tensor<32x64xf16, #explicit_dot_b> -> tensor<32x64xf32, #explicit_mma>
+    tt.return %result : tensor<32x64xf32, #explicit_mma>
+  }
+}

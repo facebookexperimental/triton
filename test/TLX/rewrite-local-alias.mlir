@@ -27,7 +27,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable>
 
     // CHECK-NOT: tlx.local_alias
-    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
+    // CHECK: %[[$TMEM_WIDE:.*]] = ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<2x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
+    // CHECK: %[[$TMEM_SLOT:.*]] = ttg.memdesc_index %[[$TMEM_WIDE]][%{{.*}}] : !ttg.memdesc<2x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_SLOT]] : !ttg.memdesc<64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
     %result_0 = tlx.local_alias %result : !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     %result_1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     ttg.warp_specialize(%0, %result_0, %1, %2, %result_1, %result)
