@@ -3382,6 +3382,11 @@ def _region_uses_scratch_memory(state, region_id):
             if current_op.kind == "layout_convert":
                 attrs = target_ir.attrs_dict(current_op)
                 if (
+                    attrs.get("mode") == "redistribute"
+                    and bool(attrs.get("cross_wave", False))
+                ):
+                    return True
+                if (
                     attrs.get("mode") in _SCRATCH_LAYOUT_CONVERT_MODES
                     and int(attrs.get("scratch_allocation_bytes", 0)) > 0
                 ):
@@ -8878,11 +8883,15 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
     result_id = _single_result(op)
     source_type = state.target_program.values[op.operands[0]].type
     result_type = state.target_program.values[result_id].type
-    if bool(attrs.get("cross_wave", False)):
+    cross_wave = bool(attrs.get("cross_wave", False))
+    scratch_dependency = None
+    if cross_wave:
         # The bridge owns dependencies from existing LDS accesses. Wave owns
         # only the scratch exchange introduced while lowering redistribution.
         released = _release_dead_local_memory_before_redistribute(state, op)
-        _scratch_write_dependency(state, extra_tokens=released)
+        scratch_dependency = _scratch_write_dependency(
+            state, extra_tokens=released
+        )
     lane_width = int(result_type.lane_width or source_type.lane_width or 64)
     mask_payload = result_type.representation in {"mask", "mask_tuple"}
     element_type = (
@@ -8987,7 +8996,7 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
         if "block" in out_names
         else block
     )
-    redistributed = state.builder.redistribute(
+    redistribution = state.builder.redistribute(
         source_packet,
         result_packet_type,
         blocks=int(attrs.get("block_count", 1)),
@@ -8995,7 +9004,14 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
         source_block=source_block,
         source_item=source_lane + lane_width * source_warp,
         source_slot=source_slot,
+        after=scratch_dependency,
+        with_completion=cross_wave,
     )
+    if cross_wave:
+        redistributed, scratch_completion = redistribution
+        _record_scratch_read_tokens(state, (scratch_completion,))
+    else:
+        redistributed = redistribution
     result_count = int(attrs["result_component_count"])
     result_registers = int(attrs["result_registers_per_component"])
     result_chunk_type = (
