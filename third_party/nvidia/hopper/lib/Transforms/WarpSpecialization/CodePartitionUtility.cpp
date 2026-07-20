@@ -12,6 +12,7 @@
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttnvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-utility"
@@ -131,7 +132,7 @@ Operation *AllocChannel::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (isa<ttg::LocalStoreOp>(user))
+    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
@@ -155,7 +156,7 @@ static void getAllConsumers(AllocChannel *ch,
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (!isa<ttg::LocalStoreOp>(user) &&
+    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user) &&
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
@@ -1631,8 +1632,8 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Load operations
-  if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp, ttg::LocalLoadOp>(
-          op))
+  if (isa<tt::DescriptorLoadOp, ttnvws::DescriptorLoadOp, tt::LoadOp,
+          ttng::TMEMLoadOp, ttg::LocalLoadOp>(op))
     return true;
 
   // Store operations
@@ -1740,6 +1741,11 @@ static std::string getKeyOpDescription(Operation *op) {
   if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
        << formatOutput(loadOp.getResult());
+    return result;
+  }
+  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+    ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
+       << formatInput(loadOp.getResult());
     return result;
   }
   if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
@@ -1960,8 +1966,8 @@ static std::string getKeyOpLabel(Operation *op) {
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
     label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
-  } else if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
-                 ttg::LocalLoadOp>(op)) {
+  } else if (isa<tt::DescriptorLoadOp, ttnvws::DescriptorLoadOp, tt::LoadOp,
+                 ttng::TMEMLoadOp, ttg::LocalLoadOp>(op)) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
     label += outputName + " = " + opName + "(" + inputs + ")";
@@ -3355,7 +3361,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
         // Alloc associated with operand D can have multiple producers.
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp>(user)) {
+      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user)) {
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {

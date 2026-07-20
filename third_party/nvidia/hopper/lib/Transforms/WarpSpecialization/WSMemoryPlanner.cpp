@@ -8,6 +8,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -32,6 +33,8 @@
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+namespace ttnvws = mlir::triton::nvws;
 
 // Environment variable to dump DOT files: TRITON_DUMP_WS_GRAPHS
 // When set to a directory path, dumps visualization files there.
@@ -188,6 +191,8 @@ static Operation *findOriginalLoadForChannel(Channel *ch) {
   Operation *srcOp = ch->getSrcOp();
   if (!srcOp)
     return nullptr;
+  if (isa<ttnvws::DescriptorLoadOp>(srcOp))
+    return srcOp;
   if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp))
     return findOriginalLoadOp(storeOp.getSrc());
   return nullptr;
@@ -1211,12 +1216,7 @@ static bool isSmemTMAChannel(Operation *alloc,
     return false;
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
     return true;
-  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
-    Value stored = storeOp.getSrc();
-    if (auto *defOp = stored.getDefiningOp())
-      return isa<tt::DescriptorLoadOp>(defOp);
-  }
-  return false;
+  return isa<ttnvws::DescriptorLoadOp>(srcOp);
 }
 
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
@@ -4778,10 +4778,10 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   auto cost = wsplan::createLatencyCostModel(model, getModuloII(funcOp));
   auto copies = wsplan::createGreedyCopySolver();
   wsplan::Budget budget;
-  // Coarse over-approximation, not a physical row count: this pre-gate sums each
-  // block's row footprint, but the real allocator (allocateTMemAllocs2) packs
-  // blocks along columns across 2 row groups of 64. 512 keeps the gate loose;
-  // exact feasibility is enforced by the downstream allocator.
+  // Coarse over-approximation, not a physical row count: this pre-gate sums
+  // each block's row footprint, but the real allocator (allocateTMemAllocs2)
+  // packs blocks along columns across 2 row groups of 64. 512 keeps the gate
+  // loose; exact feasibility is enforced by the downstream allocator.
   budget.tmemRows = 512;
   budget.tmemCols = 512;
 
@@ -5016,6 +5016,10 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
+      if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+        signalPassFailure();
+        return;
+      }
       MemoryPlannerOptions options;
       options.readDecisionFile = readDecisionFile;
       options.writeDecisionFile = writeDecisionFile;

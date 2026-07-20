@@ -13,6 +13,7 @@ normalizes `local_alloc` ops for downstream code partitioning passes.
 ```
 doTaskIdPropagate       ← assigns async_task_id to all ops
   → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
+  → doConvertDescriptorLoadsToNVWS
   → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
   → doCodePartition ← inserts accumCnts, async copies, sync ops
 ```
@@ -99,6 +100,14 @@ alloc's, which also carries consumer partitions from backward propagation.
 This models a 1-producer to N-consumer channel — one TMA load writes the
 shared buffer and every consumer partition reads it — instead of duplicating
 the buffer per consumer.
+
+After buffer allocation, `doConvertDescriptorLoadsToNVWS` replaces every
+`tt.descriptor_load` with a buffer-writing `nvws.descriptor_load`. A load whose
+only user is `local_store` writes directly to that store's allocation. Other
+loads, including bias loads followed by arithmetic, receive a descriptor-layout
+SMEM allocation and a `local_load` preserving the original tensor uses. This
+makes their transfer buffers visible to memory planning. No unconverted
+descriptor load is allowed past this point.
 
 ## Key Distinction
 

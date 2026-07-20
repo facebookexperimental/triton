@@ -19,6 +19,7 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doDataPartition      (via nvgpu-ws-data-partition when requested)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doBufferAllocation
+  → doConvertDescriptorLoadsToNVWS
   → doMemoryPlanner
   → doCodePartition
   → doPingPongSync       (optional)
@@ -77,7 +78,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
-| `WSLowerMem.cpp` | — | Memory lowering: async copies between global/shared/tensor memory |
+| `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `optimizeTMALoads` | Converts `tt.descriptor_load` to buffered `nvws.descriptor_load` before planning, then lowers it to async TMA copies after planning |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
 | `WSTMAStoreLowering.cpp` | `doTMAStoreLowering` | Pre-pass lowering of `tt.descriptor_store` for WS visibility |

@@ -142,10 +142,7 @@ int getTxCount(Operation *descOp) {
     }
   };
   auto [tensorType, desc] = getTensorTypeAndDesc(descOp);
-  auto encoding = getEncodingFromDescriptor(descOp, tensorType, desc);
-  auto shapePerCTA = getShapePerCTA(encoding, tensorType.getShape());
-  return product(shapePerCTA) *
-         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+  return getDescriptorLoadBytes(descOp, tensorType, desc);
 }
 
 void createNVWSDescriptorLoadOp(OpBuilder &builder, Operation *ttDescLoadOp,

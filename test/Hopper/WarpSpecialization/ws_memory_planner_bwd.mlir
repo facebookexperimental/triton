@@ -44,23 +44,23 @@
 // SMEM allocations
 // CHECK: %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32}
 // CHECK: %q = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 2 : i32}
-// CHECK: %k_42 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
-// CHECK: %v_43 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
+// CHECK: %k_41 = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 3 : i32}
+// CHECK: %v = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
 //
 // TMEM allocations: qkT owns buffer 7
-// CHECK: %qkT, %qkT_44 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
+// CHECK: %qkT, %qkT_42 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
 //
 // TMEM allocation: dv_45 (f32 accumulator) owns buffer 6
-// CHECK: %dv_45, %dv_46 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
+// CHECK: %dv_43, %dv_44 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 6 : i32}
 //
 // TMEM allocation: dpT owns buffer 8
-// CHECK: %dpT, %dpT_47 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
+// CHECK: %dpT, %dpT_45 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
 //
 // TMEM allocation: dk owns buffer 5
-// CHECK: %dk, %dk_48 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
+// CHECK: %dk, %dk_46 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
 // TMEM allocation: dq reuses dpT (buffer.id=8, buffer.offset=0) — key verification
-// CHECK: %dq, %dq_49 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
+// CHECK: %dq, %dq_47 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 
 // FLOOR: warning: cross-stage SMEM buffer requires buffer.copy=2, exceeding configured num-buffers=1; enforcing the correctness floor
 // FLOOR-LABEL: tt.func public @_attn_bwd

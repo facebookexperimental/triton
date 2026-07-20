@@ -51,6 +51,7 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
                               const MemoryPlannerOptions &options = {});
 
 void doBufferAllocation(triton::FuncOp funcOp);
+LogicalResult doConvertDescriptorLoadsToNVWS(triton::FuncOp funcOp);
 void doHoistLoopInvariantTMEMStore(triton::FuncOp funcOp);
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp);
 void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers);

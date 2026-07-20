@@ -756,19 +756,12 @@ static Operation *ProducerIsGen5(Operation *producerOp) {
   return nullptr;
 }
 
-// Return the TMA descriptor load feeding this allocation-backed channel's
-// local_store producer. Channel collection must never expose a descriptor_load
-// directly because buffer allocation stages it through local_store.
+// Return the buffered TMA descriptor load producing this allocation-backed
+// channel.
 static Operation *findTMAProducer(Channel *ch) {
   Operation *producerOp = ch->getSrcOp();
-  assert(!isa<tt::DescriptorLoadOp>(producerOp) &&
-         "allocation-backed TMA channel must be staged through local_store");
-  if (auto ls = dyn_cast<ttg::LocalStoreOp>(producerOp)) {
-    Operation *def = ls.getSrc().getDefiningOp();
-    if (def && isa<tt::DescriptorLoadOp>(def))
-      return def;
-  }
-  return nullptr;
+  return dyn_cast_or_null<ttnvws::DescriptorLoadOp>(producerOp) ? producerOp
+                                                                : nullptr;
 }
 
 // Handle buffer index and phase computation for operations outside loops
@@ -2747,14 +2740,12 @@ void insertAsyncComm(
     }
     builder.setAsynTaskIdsFromArray(asyncTasksPC);
 
-    SmallVector<tt::DescriptorLoadOp> tmaLoads;
-    SmallVector<Value> buffers;
+    SmallVector<ttnvws::DescriptorLoadOp> tmaLoads;
     // Go through all channels in this channel group.
     for (auto &c : kv.second) {
       if (auto *tmaLoadOp = findTMAProducer(c)) {
-        auto tmaLoad = cast<tt::DescriptorLoadOp>(tmaLoadOp);
+        auto tmaLoad = cast<ttnvws::DescriptorLoadOp>(tmaLoadOp);
         tmaLoads.push_back(tmaLoad);
-        buffers.push_back(bufferMap.find(c)->second);
       }
     }
 
@@ -4402,7 +4393,7 @@ void insertAsyncComm(
               funcOp.getContext(), masterChannel->relation.first,
               WSBarrierAttr::kDirectionForward)
               .build(funcOp.getContext());
-      optimizeTMALoads(builder, tmaLoads, buffers, *commChannel.producerBarrier,
+      optimizeTMALoads(builder, tmaLoads, *commChannel.producerBarrier,
                        bufferIdx, bufferIdx, phase, tmaHeadProducer,
                        headConsumer, consumerWaitPoint,
                        additionalConsumerTaskIds, waitConstraints);
@@ -5617,8 +5608,29 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     // Disable code partitioning when numBuffers is 0.
-    if (numBuffers > 0)
+    if (numBuffers > 0) {
+      bool descriptorBuffersArePlanned = true;
+      funcOp.walk([&](tt::DescriptorLoadOp load) {
+        if (!load->hasOneUse()) {
+          descriptorBuffersArePlanned = false;
+          return;
+        }
+        Operation *user = *load->getUsers().begin();
+        Operation *alloc = nullptr;
+        if (auto store = dyn_cast<ttg::LocalStoreOp>(user))
+          alloc = store.getDst().getDefiningOp();
+        else if (auto localAlloc = dyn_cast<ttg::LocalAllocOp>(user))
+          alloc = localAlloc;
+        if (!alloc || !alloc->hasAttr("buffer.id"))
+          descriptorBuffersArePlanned = false;
+      });
+      if (descriptorBuffersArePlanned &&
+          failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+        signalPassFailure();
+        return;
+      }
       doCodePartition(funcOp, numBuffers);
+    }
     // Set NameLoc("accum_cnt") on ForOp block arguments whose corresponding
     // yield operand already has an "accum_cnt" NameLoc. This must be done at
     // the end because earlier steps may replace ForOps and lose block arg locs.

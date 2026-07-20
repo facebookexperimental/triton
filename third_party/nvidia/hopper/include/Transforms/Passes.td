@@ -60,7 +60,8 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
 
   let description = "This pass computes a memory configuration for autoWS";
 
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
   let options = [
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",

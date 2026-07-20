@@ -213,6 +213,12 @@ public:
     doBufferAllocation(funcOp);
     dumpAfter(moduleOp, "doBufferAllocation");
 
+    if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+    dumpAfter(moduleOp, "doConvertDescriptorLoadsToNVWS");
+
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");
 
