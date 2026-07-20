@@ -24,6 +24,7 @@ DEFAULT_MXFP_WARMUP_LAUNCHES = 25
 DEFAULT_MXFP_TIMED_LAUNCHES = 1000
 DEFAULT_MXFP_TIMING_REPEATS = 7
 F16_V10_BASELINE_SHAPE = "8192x8192x8192"
+F16_INTER_WAVE_BASELINE_SHAPE = (8192, 8192, 8192)
 
 
 @dataclass(frozen=True)
@@ -246,6 +247,28 @@ def build_run_specs(args, cache_root):
                 cache_dir,
             )
         )
+
+        script = str(SCRIPT_DIR / "gfx9_gemm/inter_wave/a16w16/bench.py")
+        for backend in ("llvm", "wave"):
+            cache_dir = cache_root / f"f16-inter-wave-{backend}"
+            command = (
+                python,
+                script,
+                "--shape",
+                *(str(dim) for dim in F16_INTER_WAVE_BASELINE_SHAPE),
+                *timing,
+                "--seed",
+                "0",
+            )
+            specs.append(
+                RunSpec(
+                    f"f16-inter-wave-{backend}",
+                    f"f16 inter-wave 8192x8192x8192: {backend.upper()}",
+                    backend,
+                    command,
+                    cache_dir,
+                )
+            )
 
     if "mxfp" in args.sweeps:
         script = str(SCRIPT_DIR / "gfx9_gemm/a4w4/bench.py")
