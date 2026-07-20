@@ -12,6 +12,7 @@ add_triton_library(TritonTransforms
   ReorderBroadcast.cpp
   RewriteTensorDescriptorToPointer.cpp
   SimplifySingleTripWhile.cpp
+  UpliftWhileToFor.cpp
   ArithTypeConversion.cpp
   FunctionTypeConversion.cpp
 
@@ -24,5 +25,6 @@ add_triton_library(TritonTransforms
   MLIRTransformUtils
   MLIRTransforms
   MLIRSCFToControlFlow
+  MLIRSCFTransforms
   TritonIR
 )
