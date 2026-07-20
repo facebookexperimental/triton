@@ -20,18 +20,37 @@
 # makes the perf comparison isolate schedule/partition quality rather than the
 # (per-launch, on-device) tensormap-build cost. `NUM_SMEM_BUFFERS` is kept
 # equal to the generated kernel's ring depth for the same reason.
+import os
+
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 
+# Autotune ONLY the SMEM/TMEM ring depths (the same degrees of freedom the modulo
+# scheduler chooses) so the comparison against the generated kernel is
+# apples-to-apples; BLOCK_M/N/K, num_warps, and everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_SMEM_BUFFERS": 6, "NUM_TMEM_BUFFERS": 1})]
+    return [
+        triton.Config({"NUM_SMEM_BUFFERS": s, "NUM_TMEM_BUFFERS": t})
+        for s in (2, 3, 4, 5, 6)
+        for t in (1, 2)
+    ]
+
+
+@triton.autotune(configs=_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def gemm_kernel(A, B, C, M, N, K,
                 stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
                 BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                NUM_SMEM_BUFFERS: tl.constexpr,  # = generated ring depth (2 from modulo)
-                NUM_TMEM_BUFFERS: tl.constexpr,  # = 1 from modulo
+                NUM_SMEM_BUFFERS: tl.constexpr,  # autotuned (SMEM ring depth)
+                NUM_TMEM_BUFFERS: tl.constexpr,  # autotuned (TMEM acc depth)
                 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -138,8 +157,7 @@ def gemm(a, b):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        NUM_SMEM_BUFFERS=2,
-        NUM_TMEM_BUFFERS=1,
+        # NUM_SMEM_BUFFERS / NUM_TMEM_BUFFERS injected by @triton.autotune.
     )
     return c
 

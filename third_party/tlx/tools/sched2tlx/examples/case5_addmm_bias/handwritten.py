@@ -16,11 +16,30 @@ sub-optimal — that's a modulo cost-model question, not an emitter question.
 
 from __future__ import annotations
 
+import os
+
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
 
+# Autotune ONLY the SMEM/TMEM ring depths (the same degrees of freedom the modulo
+# scheduler chooses) so the comparison against the generated kernel is
+# apples-to-apples; BLOCK_M/N/K, num_warps, and everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_BUFFERS_AB": 5, "NUM_BUFFERS_ACC": 1}, num_warps=4, num_stages=2, num_ctas=1)]
+    return [
+        triton.Config({"NUM_BUFFERS_AB": s, "NUM_BUFFERS_ACC": t}, num_warps=4, num_stages=2, num_ctas=1)
+        for s in (2, 3, 4, 5, 6)
+        for t in (1, 2)
+    ]
+
+
+@triton.autotune(configs=_autotune_configs(), key=["M", "N", "K"])
 @triton.jit
 def addmm_persistent_2d_bias(
     a_desc,
