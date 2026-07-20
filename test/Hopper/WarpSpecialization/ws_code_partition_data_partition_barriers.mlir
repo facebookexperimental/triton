@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
 
 // Test: When data partitioning splits the M dimension (factor=2), the subtile
 // operands a0, a1, and b each need separate barrier indices even though they
@@ -139,11 +139,11 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %1 = ttg.convert_layout %accumulator_40 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked> -> tensor<128x128xf16, #blocked2>
       %2 = ttg.convert_layout %accumulator_41 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked> -> tensor<128x128xf16, #blocked2>
       ttg.local_store %1, %_0 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked2> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      ttng.fence_async_shared {bCluster = false}
+      ttng.fence_async_shared {bCluster = false, ttg.partition = array<i32: 4>}
       %3 = ttng.async_tma_copy_local_to_global %c_desc_or_ptr[%offs_am_c, %offs_bn_c] %_0 {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %3   {ttg.partition = array<i32: 3>} : !ttg.async.token
       ttg.local_store %2, %_1 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked2> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-      ttng.fence_async_shared {bCluster = false}
+      ttng.fence_async_shared {bCluster = false, ttg.partition = array<i32: 4>}
       %4 = ttng.async_tma_copy_local_to_global %c_desc_or_ptr[%0, %offs_bn_c] %_1 {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %4   {ttg.partition = array<i32: 3>} : !ttg.async.token
       scf.yield {ttg.partition = array<i32: 3>} %tile_id_c_27 : i32

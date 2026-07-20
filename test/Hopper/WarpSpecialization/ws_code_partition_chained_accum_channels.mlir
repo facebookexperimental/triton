@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s
 
 // Simplified (no-attention) audit of the chained operand-D accumulator channel
 // behavior in handleOperandD (T278685041). Two MMAv5 ops write the SAME tmem

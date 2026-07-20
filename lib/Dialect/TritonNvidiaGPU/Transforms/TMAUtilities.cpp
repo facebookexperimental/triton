@@ -3,6 +3,8 @@
 #include <triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h>
 #include <triton/Tools/LayoutUtils.h>
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 
@@ -25,6 +27,14 @@ ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
     return sharedEnc;
 
   return ttg::updateEncodingForShape(op, sharedEnc, tensorType);
+}
+
+Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
+  auto indicesType = cast<RankedTensorType>(indices.getType());
+  if (indicesType.getElementType().isInteger(32))
+    return indices;
+  return arith::ExtSIOp::create(
+      builder, loc, indicesType.clone(builder.getI32Type()), indices);
 }
 
 FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {

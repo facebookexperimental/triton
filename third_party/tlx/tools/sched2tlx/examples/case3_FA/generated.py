@@ -41,8 +41,6 @@ def fa_fwd_kernel_nows(
     L0_smem_4 = tlx.local_alloc((128,), tl.float32, 1)
     # inner-loop buf 5: SMEM count=1 (channel for cross-WG hand-off)
     L0_smem_5 = tlx.local_alloc((128, 64), tl.bfloat16, 1)
-    # inner-loop buf 6: SMEM count=1 (channel for cross-WG hand-off)
-    L0_smem_6 = tlx.local_alloc((128, 64), tl.float32, 1)
     acc_tmem = tlx.local_alloc((128, 128), tl.float32, 1, tlx.storage_kind.tmem)
     acc_tmem_4 = tlx.local_alloc((128, 64), tl.float32, 1, tlx.storage_kind.tmem)
     # q_smem_5: function-scope SMEM alloc (e.g., per-tile resident Q tile in non-persistent FA)

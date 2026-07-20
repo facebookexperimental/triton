@@ -12,7 +12,7 @@ that will execute on a dedicated warp group.
 ## Pipeline Context
 
 ```
-doCodePartitionPost     ← channels and barriers created
+doCodePartition     ← channels and barriers created
   → specializeRegion    ← THIS STEP: ops cloned into regions
   → doPingPongSync      ← named barriers inserted within regions
   → doTokenLowering     ← abstract tokens lowered to hardware barriers

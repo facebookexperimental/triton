@@ -453,23 +453,28 @@ class CudaLauncher(object):
         signature = {idx: value for idx, value in src.signature.items()}
         tensordesc_meta = getattr(metadata, "tensordesc_meta", None)
 
-        # Compute Level 0 schema — the canonical ABI description for this kernel.
-        from triton.compiler.compiler import make_backend
-
-        backend = make_backend(metadata.target)
-        schema = backend.make_launch_metadata(metadata._asdict(), src)
-
         launcher = triton.runtime.driver.active.utils.launch
 
-        # kernel_signature: derived from Level 0 schema (single source of truth).
-        self.kernel_signature = build_kernel_signature_from_schema(schema)
-
-        # arg_annotations: still needs structural info from src.signature
-        # (tuple grouping is a Python calling convention, not kernel ABI).
+        # kernel_signature + arg_annotations are both derived from the object
+        # signature (src.signature): expand_signature flattens tensordescs, then
+        # make_kernel_signature / annotate_arguments walk the actual argument-type
+        # OBJECTS via isinstance(...). A NamedTuple *is* a tuple, so it flattens
+        # structurally like any other tuple -- no reliance on str(ty). Deriving the
+        # signature from the Level 0 schema's stringified types is a repr blind
+        # spot: a NamedTuple stringifies to a class repr ("Function(fn=...,
+        # captured=...)") rather than a tuple literal, so a string parser silently
+        # mis-flattens it. For every non-NamedTuple case this is byte-identical to
+        # the old schema path (asserted by
+        # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
         expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+        self.kernel_signature = make_kernel_signature(expanded_signature)
         self.arg_annotations = annotate_arguments(expanded_signature)
 
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
+        # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
+        # launcher builds each CUtensorMap host-side from existing scalar args
+        # via the launch.h recipe core and injects it (no device global scratch).
+        self.auto_tma_recipes = getattr(metadata, "auto_tma_recipes", []) or []
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
         self.profile_scratch_size = metadata.profile_scratch_size
@@ -545,6 +550,7 @@ class CudaLauncher(object):
             profile_scratch,
             self.arg_annotations,
             self.kernel_signature,
+            self.auto_tma_recipes,
             args,
         )
 

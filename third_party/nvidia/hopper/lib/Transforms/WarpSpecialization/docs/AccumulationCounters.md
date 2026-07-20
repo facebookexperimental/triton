@@ -2,8 +2,8 @@
 
 Accumulation counter insertion threads `accumCnt` loop-carried values into
 the IR — `i64` values that track which buffer slot to use in multi-buffered
-pipelines. This runs as part of code partitioning (`doCodePartition` step 6,
-`doCodePartitionPost` step 4), after channels and buffers have been created.
+pipelines. This runs as part of code partitioning (`doCodePartition` step 4),
+after channels and buffers have been created.
 
 **File**: `WSBuffer.cpp`
 **Function**: `appendAccumCntsForOps(taskTopOps, channels, regionsWithChannels, config)`
@@ -11,12 +11,12 @@ pipelines. This runs as part of code partitioning (`doCodePartition` step 6,
 ## Pipeline Context
 
 ```
-doCodePartition / doCodePartitionPost
+doCodePartition
   Step 1-3: channel discovery, grouping, buffer creation
   ...
   → appendAccumCntsForOps  ← THIS: inserts accumCnt loop arguments
   ...
-  → insertAsyncCopy / insertAsyncComm  ← uses accumCnt to index buffers
+  → insertAsyncComm  ← uses accumCnt to index buffers
 ```
 
 ## What Is an Accumulation Counter?
@@ -126,14 +126,14 @@ Two kinds of counters can live on a persistent while:
 
 For ops directly in the after region, `getAccumCount` resolves the counter from
 the while's after-region arguments (no enclosing `scf.for`). In
-`createBufferPost`, operandD/TMEM users (and other channel users) that live
+`createBufferForAllocs`, operandD/TMEM users (and other channel users) that live
 directly in the after region must use `getBufferIdxAndPhase(builder, user, ...)`
 so their buffer slot rotates with the while-carried counter — matching the
 writer's slot — rather than the truly-outside-loop fallback (which would pin the
 slot to 0 and race across persistent iterations).
 
 `scf.while` regions are registered in `regionsWithChannels`
-(`collectRegionsWithChannels` / `collectRegionsWithChannelsPost`), counted by
+(`collectRegionsWithChannels`), counted by
 `getAccumCnts` / `getAccumCntsPreOrder`, and indexed by `getAccumArgIdx` the same
 way `scf.for`/`scf.if` are.
 

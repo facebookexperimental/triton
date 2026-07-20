@@ -14,7 +14,7 @@ normalizes `local_alloc` ops for downstream code partitioning passes.
 doTaskIdPropagate       ← assigns ttg.partition to all ops
   → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
   → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
-  → doCodePartitionPost ← inserts accumCnts, async copies, sync ops
+  → doCodePartition ← inserts accumCnts, async copies, sync ops
 ```
 
 `doBufferAllocation` creates single-copy buffers. Multi-buffering is
@@ -78,9 +78,9 @@ the backing allocation to function entry:
 
 - **Tensor-typed channels** (no existing alloc):
   Call `createLocalAlloc` which creates a new `LocalAllocOp` (SMEM)
-  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100). For
-  post-channels (`isPost=true`), also inserts `LocalStoreOp` after
-  the producer and `LocalLoadOp` before the consumer.
+  or `TMEMAllocOp` (for 1D tensors on Blackwell ≥ cc100), and also
+  inserts a `LocalStoreOp` after the producer and a `LocalLoadOp`
+  before the consumer.
 
 Channels sharing the same producer value share the same buffer.
 
@@ -89,7 +89,7 @@ Channels sharing the same producer value share the same buffer.
 Split any remaining `local_alloc %val` (alloc-with-source) into
 `local_alloc` + `local_store %val`. This normalization exposes
 cross-partition SMEM dependencies as separate store ops, enabling
-downstream `doCodePartition`/`doCodePartitionPost` to detect them
+downstream `doCodePartition`/`doCodePartition` to detect them
 as channels.
 
 The `local_store`'s partition ID determines the producer partition for the
@@ -107,7 +107,7 @@ the buffer per consumer.
 - Async copies or TMA lowering
 - Tokens or synchronization ops (barriers, acquire/release)
 
-Those are handled by `doCodePartition` / `doCodePartitionPost`.
+Those are handled by `doCodePartition` / `doCodePartition`.
 
 ## Key Functions
 

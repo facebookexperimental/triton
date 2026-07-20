@@ -288,6 +288,14 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
+  // A user-pinned result (an encoding carrying PinnedEncodingTrait, e.g. TLX's
+  // #tlx.user_layout) is a hard anchor regardless of the producing op: the user
+  // explicitly chose that layout, so layout optimization must not rewrite it.
+  for (Value result : op->getResults())
+    if (auto rankedTy = dyn_cast<RankedTensorType>(result.getType()))
+      if (isa_and_nonnull<PinnedEncodingTrait>(rankedTy.getEncoding()))
+        return true;
+
   if (isa<DescriptorOpInterface>(op))
     return true;
   if (isa<LoadOp, StoreOp>(op))
@@ -1251,8 +1259,14 @@ static int64_t getByteCount(Value result, int64_t minElementCount = 0,
   return (elementCount * dtypeBitWidth) >> 3;
 }
 
-/// Compute the cost of a ConvertLayoutOp with source \p convertSrc.
-int64_t getConvertCost(Value convertSrc) {
+/// Compute the cost of a ConvertLayoutOp with source \p convertSrc and result
+/// encoding \p resultEncoding.
+int64_t getConvertCost(Value convertSrc, Attribute resultEncoding) {
+  auto srcType = cast<RankedTensorType>(convertSrc.getType());
+  auto resultType = srcType.cloneWithEncoding(resultEncoding);
+  if (cvtReordersRegisters(srcType, resultType))
+    return 0;
+
   // Measure the number of bytes that we're manipulating with the
   // ConvertLayoutOp. We pessimistically assume that we round-trip
   // through shared memory and that we cannot vectorise sub-register
@@ -1306,7 +1320,8 @@ bool isRematBeneficial(ConvertLayoutOp convertOp, const SetVector<Value> &slice,
     // TODO: Handle block arguments.
   }
 
-  int64_t convertLayoutCost = getConvertCost(convertOp.getSrc());
+  int64_t convertLayoutCost =
+      getConvertCost(convertOp.getSrc(), convertOp.getType().getEncoding());
   int64_t rematerialisationCost = newCvtCost;
 
   // Evaluate single-use status for every operation in slice
@@ -1610,7 +1625,8 @@ bool LayoutRematerialization::hoistConvertOnTopOfExtOrBroadcast(
   // takes priority over the upstream perf-cost heuristic (#9194), so force the
   // hoist. Without a budget, keep the upstream cost gate.
   if (smemBudget == 0) {
-    int64_t newCvtCost = getConvertCost(extOrBroadcastOp->getOperand(0));
+    int64_t newCvtCost =
+        getConvertCost(extOrBroadcastOp->getOperand(0), srcEncoding);
     if (!isRematBeneficial(convertOp, slice, newCvtCost))
       return false;
   }
@@ -1910,14 +1926,20 @@ public:
 
     // 5. Apply clean up patterns to remove dead convert and dead code generated
     // by the previous transformations.
-    RewritePatternSet cleanUpPatterns2(context);
-    scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    cleanUpPatterns2.add<PruneLocalStoreOfReshapeConvert>(context);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2)).failed()) {
+    RewritePatternSet convertCleanup(context);
+    ConvertLayoutOp::getCanonicalizationPatterns(convertCleanup, context);
+    convertCleanup.add<PruneLocalStoreOfReshapeConvert>(context);
+    if (applyPatternsGreedily(m, std::move(convertCleanup)).failed()) {
       signalPassFailure();
     }
+
+    RewritePatternSet scfCleanup(context);
+    scf::ForOp::getCanonicalizationPatterns(scfCleanup, context);
+    scf::IfOp::getCanonicalizationPatterns(scfCleanup, context);
+    if (applyPatternsGreedily(m, std::move(scfCleanup)).failed()) {
+      LLVM_DEBUG(DBGS() << "scf cleanup did not converge\n");
+    }
+
     LLVM_DEBUG({
       DBGS() << "Module after final cleanups:\n";
       m.dump();

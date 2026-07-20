@@ -25,7 +25,8 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 
 def is_in_thread_transpose_enabled(arch):
-    return ((arch == "gfx942") if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose)
+    return (arch == "gfx942" or "gfx120" in arch) \
+        if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
 def is_async_copy_enabled(arch):
@@ -34,6 +35,22 @@ def is_async_copy_enabled(arch):
 
 def is_fpsan_supported(arch):
     return arch in ["gfx942", "gfx950", "gfx1250"]
+
+
+def is_consan_supported(arch):
+    return arch in ["gfx1250"]
+
+
+def _parse_llvm_fn_attrs(attrs):
+    if not isinstance(attrs, str):
+        return tuple(attrs)
+    parsed = []
+    for attr in attrs.split(","):
+        name, sep, value = attr.partition("=")
+        name = name.strip()
+        if name:
+            parsed.append((name, value.strip() if sep else ""))
+    return tuple(parsed)
 
 
 @dataclass(frozen=True)
@@ -85,6 +102,11 @@ class HIPOptions:
     # schedule_hint="attention,memory-bound-attention"
     schedule_hint: str = "none"
 
+    # Experimental: intended for development and debugging; may change or be removed without notice.
+    # Comma-separated LLVM function attributes; bare names are emitted as valueless attributes.
+    # Example: llvm_fn_attrs="amdgpu-sched-strategy=iterative-ilp,noinline"
+    llvm_fn_attrs: str | Tuple[Tuple[str, str], ...] = ""
+
     def __post_init__(self):
         gfx_major = int(self.arch[3:-2])  # Drop "gfx" prefix and minor/patch number
         warp_size = 32 if gfx_major >= 10 else 64
@@ -96,6 +118,8 @@ class HIPOptions:
                 f"kpack is deprecated starting from gfx950 and will be removed in later releases. So for now kpack = {self.kpack} will be overwritten to 1 to make transitioning easier."
             )
             object.__setattr__(self, "kpack", 1)
+
+        object.__setattr__(self, 'llvm_fn_attrs', _parse_llvm_fn_attrs(self.llvm_fn_attrs))
 
         default_libdir = Path(__file__).parent / "lib"
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -321,6 +345,9 @@ class HIPBackend(BaseBackend):
         if is_in_thread_transpose_enabled(options.arch):
             amd.passes.ttgpuir.add_in_thread_transpose(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+        # User-pinned register layouts (#tlx.user_layout) anchored the loads
+        # through the layout-optimization passes above; retire the markers now.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
         amd.passes.ttgpuir.add_move_up_prologue_loads(pm)
         if use_block_pingpong and options.num_stages > 1:
             amd.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -508,6 +535,9 @@ class HIPBackend(BaseBackend):
         if knobs.compilation.enable_asan:
             fns[0].add_fn_target_feature("+xnack")
             fns[0].add_fn_asan_attr()
+        for name, value in options.llvm_fn_attrs:
+            fns[0].remove_fn_attr(name)
+            fns[0].add_fn_attr(name, value)
 
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments

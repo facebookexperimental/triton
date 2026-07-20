@@ -1,6 +1,6 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s --check-prefix=TASKID
-// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s --check-prefix=DATAPART
-// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s --check-prefix=CODEPART
+// RUN: triton-opt %s -split-input-file --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s --check-prefix=TASKID
+// RUN: triton-opt %s -split-input-file --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s --check-prefix=DATAPART
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s --check-prefix=CODEPART
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -84,7 +84,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c64 = arith.constant {ttg.partition = array<i32: 0>} 64 : i32
     %acc_init = arith.constant {ttg.partition = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
     %result:2 = scf.while (%acc = %acc_init, %off = %c0, %cond = %true) : (tensor<128x256xf32, #mma>, i32, i1) -> (tensor<128x256xf32, #mma>, i32) {
-      scf.condition(%cond) %acc, %off : tensor<128x256xf32, #mma>, i32
+      scf.condition(%cond) {ttg.partition = array<i32: 0, 1, 2>} %acc, %off : tensor<128x256xf32, #mma>, i32
     } do {
     ^bb0(%acc: tensor<128x256xf32, #mma>, %off: i32):
       %a_ptrs = tt.splat %arg0 {ttg.partition = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
@@ -128,7 +128,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %desc_a = ttng.reinterpret_tensor_descriptor %desc_storage {ttg.partition = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<tensor<128x64xf16>>
     %desc_b = ttng.reinterpret_tensor_descriptor %desc_storage {ttg.partition = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<tensor<64x256xf16>>
     %result:2 = scf.while (%acc = %acc_init, %off = %c0, %cond = %true) : (tensor<128x256xf32, #mma>, i32, i1) -> (tensor<128x256xf32, #mma>, i32) {
-      scf.condition(%cond) %acc, %off : tensor<128x256xf32, #mma>, i32
+      scf.condition(%cond) {ttg.partition = array<i32: 0, 1, 2>} %acc, %off : tensor<128x256xf32, #mma>, i32
     } do {
     ^bb0(%acc: tensor<128x256xf32, #mma>, %off: i32):
       %a = tt.descriptor_load %desc_a[%off, %c0] {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>

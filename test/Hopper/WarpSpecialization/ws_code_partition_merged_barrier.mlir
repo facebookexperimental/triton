@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
 
 // Test: When two SMEM buffers share a reuse group (same buffer.id) and one
 // requires TMA split copies, the code partition pass merges their consumer

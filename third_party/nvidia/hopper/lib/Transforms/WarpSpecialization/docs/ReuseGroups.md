@@ -86,7 +86,7 @@ a given kernel.
 
 ## Formation Algorithm
 
-Reuse groups are formed in `doCodePartitionPost` (`WSCodePartition.cpp`):
+Reuse groups are formed in `doCodePartition` (`WSCodePartition.cpp`):
 
 1. **Group by `buffer.id`**: Iterate over all ordered channels. For each
    channel, look up the `buffer.id` attribute on its `allocOp` and insert the
@@ -107,13 +107,13 @@ Reuse groups are formed in `doCodePartitionPost` (`WSCodePartition.cpp`):
 
 Normally a reuse group needs ≥ 2 channels (two different `allocOp`s that share a
 `buffer.id`). The **both-endpoints-subtiled** epilogue channel is the exception:
-`collectPostChannels` collapses the `numTiles` per-tile staging allocs of one
+`collectAllocChannels` collapses the `numTiles` per-tile staging allocs of one
 (producer `ttng.subtiled_region`, consumer `ttng.subtiled_region`) pair into a
-**single** `ChannelPost` (the per-tile buffers become in-body instances indexed
+**single** `AllocChannel` (the per-tile buffers become in-body instances indexed
 by the builtin `tileIdx`). That lone channel still needs the reuse-group
 machinery — the in-body per-tile slot rotation (`getOrComputeSubtiledSlot` fires
 only for `reuseGrp >= 0`) and the `numTiles` loop-counter stride
-(`getReuseGroupStride`). So `doCodePartitionPost` forms a **size-1** group for it
+(`getReuseGroupStride`). So `doCodePartition` forms a **size-1** group for it
 whenever `channelIsCollapsedBothSubtiled(ch)` — **independent of `buffer.copy`**.
 The `numBuffers > 1` / `getNumBuffers() <= 1` guards that normally gate the reuse
 machinery are relaxed for these channels at **six** sites that must agree:
@@ -126,7 +126,7 @@ or the loop-arg count and accumCnt indices disagree → out-of-bounds
 `getArgument` in `getAccumCount`.
 
 The discriminator is the **narrow** `channelIsCollapsedBothSubtiled`
-(`ChannelPost::isCollapsedBothSubtiled`, set in `collectPostChannels` only when
+(`AllocChannel::isCollapsedBothSubtiled`, set in `collectAllocChannels` only when
 producer AND consumer are in different-task subtiled regions), **not** the broad
 `channelIsSubtiled`. The broad form is also true for a *consumer-only-subtiled*
 channel — e.g. an epilogue **bias** load whose `local_store` sits outside the
@@ -144,8 +144,8 @@ all `numTiles` subtiles share **one** physical staging slot and serialize via th
 alternating barrier phase (later tiles *wait* for the earlier tile's slot
 release — a serialization, not a race). Collapsing to one physical slot is what
 avoids the SMEM `OutOfResources`. The skipped sibling per-tile allocs are
-recorded on the representative `ChannelPost` (`collapsedSiblingAllocs`) in
-`collectPostChannels` and **erased** in `insertAsyncComm` once the in-body view
+recorded on the representative `AllocChannel` (`collapsedSiblingAllocs`) in
+`collectAllocChannels` and **erased** in `insertAsyncComm` once the in-body view
 rewire makes them `use_empty` (asserting if a recorded sibling still has a use —
 a missed collapse). Without that erase the dead sibling alloc (mutable SMEM →
 carries an `Allocate` effect) is double-counted at allocation.
@@ -209,7 +209,7 @@ Key functions:
 Because the memory planner has already committed to aliasing a multi-buffered
 SMEM circular reuse group, code partitioning **validates** the A1 preconditions
 before emitting any `accumCnt` for it. After reuse-group formation (and before
-`appendAccumCntsForOps`), `doCodePartitionPost` calls `verifyReuseGroup1` on
+`appendAccumCntsForOps`), `doCodePartition` calls `verifyReuseGroup1` on
 every multi-buffered group and `report_fatal_error`s if it fails:
 
 - **Multi-buffered** — `channels[0]->getNumBuffers() > 1` (this is also what
@@ -247,7 +247,7 @@ cross-group count accumulation.
 
 ### 2. Token/Barrier Sharing
 
-In `createTokenPost`, the representative channel (first in the group) creates
+In `createToken`, the representative channel (first in the group) creates
 barriers; non-representative channels reuse them. `channelInReuseGroup` looks
 up which group a channel belongs to (returning -1 if none). The `reuseBarrier`
 flag skips groups whose representative has `numBuffers <= 1` (single-buffered
@@ -286,7 +286,7 @@ point at the representative's alloc. It iterates `config->groups` **directly**
 (the source of truth for what must be collapsed) and folds every
 non-representative channel of each group into `channels[0]`. It deliberately
 does **not** iterate the post-merge channel lists: the reuse-group
-consumer-merge in `doCodePartitionPost` removes a non-representative channel
+consumer-merge in `doCodePartition` removes a non-representative channel
 from `orderedChannels` whenever it shares a consumer op with the representative
 (e.g. epilogue subtiles that all feed one `ttng.subtiled_region`). Iterating
 `orderedChannels` would therefore skip those merged-out channels and leave their
@@ -686,8 +686,8 @@ Without the fix (race):              With the fix (per outer tile):
 ```
 
 `isWholeAllocationOverwriteReuseOwner(ownerCh)` returns true when `ownerCh` is the
-representative (its alloc has no `buffer.offset`) and is a `TmemDataChannelPost`
-with `isOperandDNoAcc == true` (set in `createChannelPost` when the producer MMA's
+representative (its alloc has no `buffer.offset`) and is a `TmemAllocChannel`
+with `isOperandDNoAcc == true` (set in `createAllocChannel` when the producer MMA's
 `useAccumulator()` is constant-false). The outer-cadence siblings are collected in
 `fullOverwriteOuterSiblings`; a debug-only assert in the emission step guards
 against silently dropping a required sibling back-edge (the bug class reappearing).
@@ -785,7 +785,7 @@ and only the cross-iteration WAR needs an explicit barrier:
 
 Because each channel still gets **its own per-channel barrier** and `dsT`'s
 consumer (`dk` MMA) lives in a *different task* than the representative's
-consumer, `createTokenPost` allocates a **dedicated gen5 consumer barrier** for
+consumer, `createToken` allocates a **dedicated gen5 consumer barrier** for
 that consumer task — otherwise `dsT`'s consumer-release silently drops and `dk`
 deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
 
@@ -802,10 +802,10 @@ deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
 
 | Attribute | Description | Set by | Read by |
 |-----------|-------------|--------|---------|
-| `buffer.id` | Groups channels that share physical memory | `WSMemoryPlanner` (SMEM + TMEM) | `doCodePartitionPost` (group formation) |
+| `buffer.id` | Groups channels that share physical memory | `WSMemoryPlanner` (SMEM + TMEM) | `doCodePartition` (group formation) |
 | `buffer.copy` | Number of pipeline copies (multi-buffering depth) | `WSMemoryPlanner` | Buffer allocation, `needAccumCntForReuse` |
 | `buffer.offset` | Column offset within the owner's TMEM allocation | `WSMemoryPlanner` (`applyAllocationState`) | `replaceBufferReuse` (TMEM slice offset) |
-| `allocation.shareGroup` | Tags buffers for downstream passes | `doCodePartitionPost` | Downstream passes |
+| `allocation.shareGroup` | Tags buffers for downstream passes | `doCodePartition` | Downstream passes |
 
 ## Key Functions Reference
 
@@ -819,7 +819,7 @@ deadlocks (the `BwdTmemDotAttrsDeadlock` fix).
 | `getBufferIdxAndPhase` | `CodePartitionUtility.cpp` | Compute buffer index with per-channel stagger |
 | `getAccumForReuseGroup` | `WSBuffer.cpp` | Compute `accumCnt` SSA value at a given op |
 | `replaceBufferReuse` | `WSCodePartition.cpp` | Rewrite alloc uses to point at representative |
-| Reuse group formation | `WSCodePartition.cpp` (`doCodePartitionPost`) | Group channels by `buffer.id`, form `ReuseConfig` |
+| Reuse group formation | `WSCodePartition.cpp` (`doCodePartition`) | Group channels by `buffer.id`, form `ReuseConfig` |
 | SMEM `buffer.id` assignment | `WSMemoryPlanner.cpp` | Assign `buffer.id` to SMEM allocs |
 | SMEM circular reuse (Phase 4) | `WSMemoryPlanner.cpp` | Form SMEM reuse pairs, maximize copies |
 | TMEM `applyAllocationState` | `WSMemoryPlanner.cpp` | Assign `buffer.id` + `buffer.offset` to TMEM allocs |

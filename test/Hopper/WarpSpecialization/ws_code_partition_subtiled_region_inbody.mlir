@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
 
 // Test: Option 3 in-body SMEM-rotation for a MULTI-BUFFERED (numBuffers=3)
 // subtiled-region SMEM reuse group, observed at the code-partition stage (the
@@ -96,7 +96,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
             : tensor<128x64xf32, #linear> to tensor<128x64xf16, #linear>
           ttg.local_store %trunc, %t1 {ttg.partition = array<i32: 1>}
             : tensor<128x64xf16, #linear> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-          ttng.subtiled_region_yield
+          ttng.subtiled_region_yield {ttg.partition = array<i32: 1>}
         }
 
       // TMA store SubtiledRegionOp (task 2): async_tma_copy
@@ -116,7 +116,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
             {ttg.partition = array<i32: 2>}
             : !tt.tensordesc<tensor<128x64xf16, #shared>>,
               !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-          ttng.subtiled_region_yield
+          ttng.subtiled_region_yield {ttg.partition = array<i32: 2>}
         }
     } {ttg.partition = array<i32: 0, 1, 2>, tt.warp_specialize,
        tt.separate_epilogue_store = true,

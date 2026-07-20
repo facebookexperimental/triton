@@ -20,7 +20,7 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
   → doBufferAllocation
   → doMemoryPlanner
-  → doCodePartitionPost
+  → doCodePartition
   → doPingPongSync       (optional)
   → doTokenLowering
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
@@ -49,7 +49,7 @@ the emitted register allocation matches the backend warp-group granularity.
 
 A static-persistent kernel's outer (tile) loop may be either an `scf.for` or an
 `scf.while` (e.g. `while tile_id < num_tiles: ... tile_id += NUM_SMS`). Both are
-first-class: warp-group cloning (`SpecializeWhileOp`), partition-id propagation, data
+first-class: warp-group cloning (`SpecializeWhileOp`), task-id propagation, data
 partitioning, and barrier handling all accept `scf::WhileOp`. The cross-tile
 accumulation-counter threading — seeding/carrying `accumCnt` through the while's
 init operands, before/after block args, `scf.condition`, and `scf.yield`,
@@ -68,14 +68,14 @@ recognizes the `scf.while` outer loop (same doc).
 | `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `ttg.partition` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
-| `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes `ttg.partition` |
+| `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
 | `WSDataPartition.cpp` | `doDataPartition` / `nvgpu-ws-data-partition` | Splits ops along M/N dimensions across warp groups |
 | `PingPong.cpp` | `doPingPongPrep` / `doPingPongSync` | Named barrier insertion for ping-pong scheduling |
 | `WSCodePartition.cpp` | `doBufferAllocation` | Channel discovery and SMEM/TMEM allocation hoisting (pre-pass) |
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
-| `WSCodePartition.cpp` | `doCodePartitionPost` | Creates channels, inserts async copies and barriers |
+| `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
 | `WSLowerMem.cpp` | — | Memory lowering: async copies between global/shared/tensor memory |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
@@ -91,9 +91,9 @@ recognizes the `scf.while` outer loop (same doc).
 
 | File | Description |
 |------|-------------|
-| `Utility.h` | `WSPartitionId` typedef, `OpBuilderWithPartitionIds`, `LoopScheduleInfo`, partition ID helpers |
+| `Utility.h` | `WSPartitionId` typedef, `OpBuilderWithPartitionIds`, `LoopScheduleInfo`, task ID helpers |
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
-| `CodePartitionUtility.h` | `Channel`, `ChannelPost`, `TmemDataChannel`, `TmemDataChannelPost`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
+| `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
 | `WSBarrierAnalysis.h` | `WSBarrierAttr`, `buildChannelGraph`, `buildWSBarrierOrderedRegionRanges`, `injectChannelGraph` — channel graph and ordered-region construction for barrier constraints |
 | `nvidia/hopper/include/Transforms/WSBarrierReorder.h` | `canAdvanceWSBarrier`, `canAdvanceWSBarrierArrivePastWait`, `sinkWSArrives`, `raiseWSWaits`, `buildBarrierToMemoryOpMap`, `optimizeWSBarrierLocations` — barrier reordering utilities consumed by `InterleaveTMem` |
@@ -103,8 +103,8 @@ recognizes the `scf.while` outer loop (same doc).
 | Term | Definition |
 |------|-----------|
 | **Partition** | A group of operations assigned to run on the same warp group. Identified by a partition ID (integer). |
-| **Async Task** | Legacy synonym for partition. Identified by the `ttg.partition` attribute on ops. |
-| **Channel** | A producer-consumer data dependency between partitions. Can be SMEM-backed (`ChannelPost`) or TMEM-backed (`TmemDataChannelPost`). |
+| **Async Task** | Synonym for partition. Identified by `ttg.partition` attribute on ops. |
+| **Channel** | A producer-consumer data dependency between partitions. Can be SMEM-backed (`AllocChannel`) or TMEM-backed (`TmemAllocChannel`). |
 | **Reuse Group** | A set of channels sharing a single physical buffer (`buffer.id`). See [ReuseGroups.md](ReuseGroups.md). |
 | **Multi-buffering** | Allocating N copies of a buffer so the producer can fill copy N+1 while the consumer reads copy N. Controlled by `buffer.copy`. |
 | **Operand D** | The MMA accumulator — the TMEM allocation that both receives MMA output and carries accumulated results across loop iterations. |
@@ -127,12 +127,13 @@ recognizes the `scf.while` outer loop (same doc).
 - [Operand D Handling](OperandDHandling.md) — MMA accumulator lifecycle through WS
 - [TMEM Allocation Heuristics](TMEMAllocationHeuristics.md) — TMEM memory planning algorithms
 - [SMEM Allocation Design](SmemAllocationDesign.md) — SMEM budget-aware allocation
+- [Memory Planner Search](MemoryPlannerSearch.md) — high-level guide to the TMEM/SMEM plan-space allocator (heuristics → search → post-pass, module seams, knobs)
 - [Barrier Fusion](BarrierFusion.md) — TMA fusion, tcgen05_commit combining
 - [Barrier Constraints](BarrierConstraints.md) — generic barrier constraints and WSBarrier reordering metadata
 - [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs
 - [Reuse Groups](ReuseGroups.md) — buffer sharing mechanics
 - [Ping-Pong Scheduling](PingPongScheduling.md) — named barrier insertion for expensive ops
-- [Utilities](Utilities.md) — `OpBuilderWithPartitionIds`, partition ID helpers, location utilities
+- [Utilities](Utilities.md) — `OpBuilderWithPartitionIds`, task ID helpers, location utilities
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
 - [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits
 - [Debugging Accuracy / Deadlocks](DebuggingAccuracyAndDeadlocks.md) — triage process for AutoWS wrong-results / hang bugs (tools, skills, methodology)

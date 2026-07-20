@@ -1,5 +1,6 @@
 #include "ir.h"
 
+#include <algorithm>
 #include <optional>
 #include <pybind11/cast.h>
 #include <pybind11/functional.h>
@@ -192,6 +193,11 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
     auto descTy = dyn_cast<TensorDescInterface>(arg.getType());
     if (!descTy)
       continue;
+    // Skip compiler-synthesized auto-TMA descriptors: they have no
+    // user-provided Python arg and are surfaced to the launcher via
+    // getAutoTmaRecipes().
+    if (kernelFunc.getArgAttr(i, "tt.auto_tma"))
+      continue;
 
     bool isIm2Col = isa<ttng::TensorDescIm2ColType>(arg.getType());
     auto blockType = descTy.getBlockType();
@@ -235,6 +241,110 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
       }
     }
     result.append(std::move(metadata));
+  }
+  return result;
+}
+
+// Surfaces compiler-synthesized auto-TMA descriptors (from PromoteLoadToTMA) to
+// the launcher. Each entry says how to build one CUtensorMap on the host from
+// existing scalar kernel args (base ptr / shape / stride), and which kernel
+// param slot (desc_arg_index) receives it.
+py::list getAutoTmaRecipes(ModuleOp &mod) {
+  py::list result;
+  auto arr = mod->getAttrOfType<ArrayAttr>("ttg.auto_tma_recipes");
+  if (!arr)
+    return result;
+  // Locate the kernel FuncOp so we can read the *final* (post-pass) block shape
+  // from each synthetic descriptor arg's type. WS / 2-CTA passes
+  // (Transform2CTALoads, WSDataPartition) halve the host-side tensordesc arg
+  // type in place but do NOT update this module attr, so the attr's block_shape
+  // is stale after data partitioning. Reading the live arg type keeps the
+  // host-built CUtensorMap's box dims in sync (parity with
+  // getTensorDescMetadata for user descriptors). Falls back to the attr's
+  // block_shape if the arg/type can't be resolved.
+  triton::FuncOp kernelFunc;
+  mod.walk([&](triton::FuncOp func) {
+    if (triton::isKernel(func)) {
+      kernelFunc = func;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::skip();
+  });
+  // Required integer recipe fields: raise rather than silently defaulting to 0
+  // for a missing key. A defaulted desc_arg_index=0 would read the swizzle off
+  // the wrong arg, and elem_type=0 / elem_size=0 would build a malformed
+  // CUtensorMap on the launcher side.
+  auto getReqI = [](DictionaryAttr d, StringRef k) -> int {
+    auto a = d.getAs<IntegerAttr>(k);
+    if (!a)
+      throw py::key_error(
+          std::string("auto-TMA recipe: missing required integer key '") +
+          k.str() + "'");
+    return (int)a.getInt();
+  };
+  auto getIArr = [](DictionaryAttr d, StringRef k) -> std::vector<int> {
+    std::vector<int> v;
+    if (auto a = d.getAs<ArrayAttr>(k))
+      for (auto e : a)
+        v.push_back((int)cast<IntegerAttr>(e).getInt());
+    return v;
+  };
+  for (auto attr : arr) {
+    auto d = cast<DictionaryAttr>(attr);
+    py::dict r;
+    int descArgIdx = getReqI(d, "desc_arg_index");
+    r["desc_arg_index"] = descArgIdx;
+    r["base_ptr_arg_index"] = getReqI(d, "base_ptr_arg_index");
+    r["shape_arg_indices"] = getIArr(d, "shape_arg_indices");
+    r["stride_arg_indices"] = getIArr(d, "stride_arg_indices");
+    // block_shape + swizzle: read from the FINAL descriptor arg type.
+    // block_shape reflects WS / 2-CTA halving. swizzle must match the
+    // descriptor's shared encoding (assigned by optimize_descriptor_encoding)
+    // -- a GEMM dot operand's NVMMAShared swizzle differs from a box-geometry
+    // heuristic, so read it via getTMASwizzleMode (parity with
+    // getTensorDescMetadata). -1 means "derive host-side from box geometry"
+    // (non-NVMMAShared / rank<2).
+    //
+    // block_shape is also the ENCODED box (launch.h box_dim). The full tile can
+    // exceed the 256-element cuTensorMapEncodeTiled cap (e.g. BLOCK=512), so we
+    // clamp it to the SAME box getTMABlockShape produces for the device
+    // lowering (each dim <= 256; contig dim = swizzle element width). The
+    // descriptor_load /store keeps the full-block SMEM result and the device
+    // AsyncTMACopy lowering multi-copies this clamped box to fill it -- single
+    // source of truth with the device path (both call getTMABlockShape on the
+    // same encoding). A trailing min(256) floor covers the 1D / non-NVMMAShared
+    // / no-descriptor fallbacks (idempotent for the getTMABlockShape output).
+    std::vector<int> blockShape = getIArr(d, "block_shape");
+    int swizzle = -1;
+    if (kernelFunc && descArgIdx >= 0 &&
+        descArgIdx < (int)kernelFunc.getNumArguments()) {
+      Value descArg = kernelFunc.getArgument(descArgIdx);
+      if (auto descTy = dyn_cast<TensorDescInterface>(descArg.getType())) {
+        auto blockTy = descTy.getBlockType();
+        auto shp = blockTy.getShape();
+        blockShape.assign(shp.begin(), shp.end());
+        if (shp.size() >= 2 &&
+            isa<ttg::NVMMASharedEncodingAttr>(blockTy.getEncoding())) {
+          auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
+          if (succeeded(sw))
+            swizzle = *sw;
+          auto box = ttng::getTMABlockShape(blockTy, /*packedSize=*/false,
+                                            ttg::TMAMode::Tiled);
+          blockShape.assign(box.begin(), box.end());
+        }
+      }
+    }
+    // Floor every box dim at the 256-element hardware cap (idempotent after the
+    // getTMABlockShape clamp above; handles 1D / non-NVMMAShared descriptors).
+    for (auto &v : blockShape)
+      v = std::min(v, 256);
+    r["block_shape"] = blockShape;
+    r["swizzle"] = swizzle;
+    r["elem_type"] = getReqI(d, "elem_type");
+    r["elem_size"] = getReqI(d, "elem_size");
+    r["fp4_padded"] = getReqI(d, "fp4_padded");
+    r["fill_mode"] = getReqI(d, "fill_mode");
+    result.append(std::move(r));
   }
   return result;
 }
@@ -792,6 +902,7 @@ void init_triton_ir(py::module &&m) {
              return py::bool_(ret.getValue());
            })
       .def("get_tensordesc_metadata", getTensorDescMetadata)
+      .def("get_auto_tma_recipes", getAutoTmaRecipes)
       .def("get_cuda_warnings",
            [](ModuleOp &self, int32_t computeCapability) -> py::list {
              py::list result;

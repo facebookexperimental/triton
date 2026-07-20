@@ -49,6 +49,10 @@ class async_task:
 
 class async_tasks:
 
+    def __init__(self, *args, exclusive=False, no_ending_cluster_sync=False, **kwargs):
+        self.exclusive = core._unwrap_if_constexpr(exclusive)
+        self.no_ending_cluster_sync = core._unwrap_if_constexpr(no_ending_cluster_sync)
+
     def __enter__(self):
         return self
 

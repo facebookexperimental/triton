@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
 // Test that the dsT consumer_wait in the Gemm partition (task 1) inherits
 // stage 1 from the actual consumer (dQ/dK MMA), not stage 0 from the
 // memdesc_trans prep op. This prevents an SWP off-by-one barrier deadlock.

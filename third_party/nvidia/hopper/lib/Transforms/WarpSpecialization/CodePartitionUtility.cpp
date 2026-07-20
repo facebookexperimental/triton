@@ -18,15 +18,33 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+void removeWarpSpecMetadata(triton::FuncOp funcOp) {
+  // The canonical set of attributes AutoWS stamps on ops/loops. `removeAttr` is
+  // a no-op when the attribute is absent, so a single walk over every op
+  // (rather than separate loop/op passes) is correct and covers scf.for and
+  // scf.while uniformly. Adding a new WS metadata attribute means adding it
+  // here once.
+  static const StringRef kWSMetadataAttrs[] = {
+      tt::kWarpSpecializeAttrName,     ttg::kPartitionAttrName,
+      ttg::kPartitionOutputsAttrName,  ttg::kPartitionStagesAttrName,
+      ttg::kWarpSpecializeTagAttrName, kPartitionTypesAttrName,
+      kAtomicBroadcastCopiesAttrName,
+  };
+  funcOp->walk([&](Operation *op) {
+    for (StringRef name : kWSMetadataAttrs)
+      op->removeAttr(name);
+  });
+}
+
 // Check whether two channels belong to the same consumer group.
 // Mirrors the merge conditions in insertAsyncComm (WSCodePartition.cpp):
-//   same getDstOp(), same consumer partition IDs, same full consumer set.
+//   same getDstOp(), same consumer task IDs, same full consumer set.
 static bool sameConsumerGroup(Channel *a, Channel *b) {
   if (a->getDstOp() != b->getDstOp())
     return false;
   if (a->relation.second != b->relation.second)
     return false;
-  if (a->channelKind == DataChannelKind::TMEMPost)
+  if (a->channelKind == DataChannelKind::TMEMAlloc)
     return true;
   SmallVector<Operation *> aDsts, bDsts;
   a->getDstOps(aDsts);
@@ -41,8 +59,8 @@ static bool sameConsumerGroup(Channel *a, Channel *b) {
 }
 
 // Helper function to check if a channel is needed between producer and
-// consumers. Returns false if the producer partition ID matches all consumer
-// task IDs (no cross-warp synchronization needed).
+// consumers. Returns false if the producer task ID matches all consumer task
+// IDs (no cross-warp synchronization needed).
 static bool needsChannel(int producer, const SmallVector<int> &consumers) {
   return !llvm::all_of(
       consumers, [producer](int consumerId) { return consumerId == producer; });
@@ -83,7 +101,7 @@ bool hasLoopCarriedAccToken(Operation *tmemAlloc, scf::ForOp forOp) {
   return false;
 }
 
-// After createBufferPost, MemDescIndexOp will be used.
+// After createBufferForAllocs, MemDescIndexOp will be used.
 Operation *skipIdxOp(Operation *op) {
   if (auto idx = dyn_cast<triton::gpu::MemDescIndexOp>(op)) {
     Operation *first = nullptr;
@@ -96,7 +114,7 @@ Operation *skipIdxOp(Operation *op) {
   return op;
 }
 
-Operation *ChannelPost::getSrcOp() {
+Operation *AllocChannel::getSrcOp() {
   // Prefer the producer cached at channel-creation time. This is the only
   // reliable source for a producer inside a ttng.subtiled_region: once a
   // sibling channel (sharing the same in-body template store and per-tile
@@ -126,7 +144,7 @@ Operation *ChannelPost::getSrcOp() {
   return nullptr;
 }
 
-static void getAllConsumers(ChannelPost *ch,
+static void getAllConsumers(AllocChannel *ch,
                             SmallVector<Operation *> &consumers,
                             bool sameBlock = true) {
   for (auto usr : ch->allocOp->getUsers()) {
@@ -201,7 +219,7 @@ bool appearsBefore(Operation *A, Operation *B) {
 // A few assumptions, a channel can have multiple consumers, but the consumers
 // must be in the same region and the taskIds must be the same. We can have
 // a representative consumer in the channel.
-Operation *ChannelPost::getDstOp() {
+Operation *AllocChannel::getDstOp() {
   SmallVector<Operation *> consumers;
   getAllConsumers(this, consumers, false);
   if (consumers.size() == 1)
@@ -215,7 +233,7 @@ Operation *ChannelPost::getDstOp() {
   return head;
 }
 
-Operation *ChannelPost::getDstOpLast() {
+Operation *AllocChannel::getDstOpLast() {
   SmallVector<Operation *> consumers;
   getAllConsumers(this, consumers);
   if (consumers.size() == 1)
@@ -229,7 +247,7 @@ Operation *ChannelPost::getDstOpLast() {
   return tail;
 }
 
-void ChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
+void AllocChannel::getDstOps(SmallVector<Operation *> &dsts) {
   getAllConsumers(this, dsts, false);
 }
 
@@ -243,7 +261,7 @@ static bool isTmemProducer(Operation *allocOp, Operation *user) {
   return false;
 }
 
-static Operation *findTmemStartEnd(ttng::TmemDataChannelPost *ch,
+static Operation *findTmemStartEnd(ttng::TmemAllocChannel *ch,
                                    std::string attrName) {
   for (auto usr : ch->allocOp->getResult(0).getUsers()) {
     Operation *user = skipIdxOp(usr);
@@ -251,8 +269,8 @@ static Operation *findTmemStartEnd(ttng::TmemDataChannelPost *ch,
       continue;
     DenseSet<int> channelIds;
     if (auto attr = user->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-      for (WSPartitionId partitionId : attr.asArrayRef()) {
-        channelIds.insert(partitionId);
+      for (WSPartitionId asyncTaskId : attr.asArrayRef()) {
+        channelIds.insert(asyncTaskId);
       }
       if (channelIds.count(ch->uniqID))
         return user;
@@ -261,7 +279,7 @@ static Operation *findTmemStartEnd(ttng::TmemDataChannelPost *ch,
   return nullptr;
 }
 
-Operation *ttng::TmemDataChannelPost::getSrcOp() {
+Operation *ttng::TmemAllocChannel::getSrcOp() {
   if (isOperandD) { // is inout
     // Find tmem.start for this channel ID.
     return findTmemStartEnd(this, "tmem.start");
@@ -279,7 +297,7 @@ Operation *ttng::TmemDataChannelPost::getSrcOp() {
   return nullptr;
 }
 
-static void getAllConsumers(ttng::TmemDataChannelPost *ch,
+static void getAllConsumers(ttng::TmemAllocChannel *ch,
                             SmallVector<Operation *> &consumers) {
   auto *allocOp = ch->getAllocOp();
   for (auto usr : cast<ttng::TMEMAllocOp>(allocOp).getResult().getUsers()) {
@@ -298,7 +316,7 @@ static void getAllConsumers(ttng::TmemDataChannelPost *ch,
   }
 }
 
-Operation *ttng::TmemDataChannelPost::getDstOp() {
+Operation *ttng::TmemAllocChannel::getDstOp() {
   if (isOperandD) {
     // Find tmem.end for this channel ID.
     return findTmemStartEnd(this, "tmem.end");
@@ -311,7 +329,7 @@ Operation *ttng::TmemDataChannelPost::getDstOp() {
   return consumers.back();
 }
 
-Operation *ttng::TmemDataChannelPost::getDstOpLast() {
+Operation *ttng::TmemAllocChannel::getDstOpLast() {
   assert(!isOperandD);
   SmallVector<Operation *> consumers;
   getAllConsumers(this, consumers);
@@ -326,19 +344,19 @@ Operation *ttng::TmemDataChannelPost::getDstOpLast() {
   return tail;
 }
 
-void ttng::TmemDataChannelPost::getDstOps(SmallVector<Operation *> &dsts) {
+void ttng::TmemAllocChannel::getDstOps(SmallVector<Operation *> &dsts) {
   assert(!isOperandD);
   getAllConsumers(this, dsts);
 }
 
-unsigned ChannelPost::getNumBuffers() {
+unsigned AllocChannel::getNumBuffers() {
   // get buffer.copy
   if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
     return copy.getInt();
   return 1;
 }
 
-unsigned ttng::TmemDataChannelPost::getNumBuffers() {
+unsigned ttng::TmemAllocChannel::getNumBuffers() {
   // get buffer.copy
   if (auto copy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy"))
     return copy.getInt();
@@ -477,12 +495,12 @@ unsigned getAccumArgIdx(Operation *parentForOp, Operation *ctrlOp,
 // that is directly in regionOp and encloses the channel.
 // A channel is "subtiled" when its producer or consumer op lives inside (or is)
 // a ttng.subtiled_region. A collapsed both-endpoints-subtiled channel is the
-// sole member of its reuse group (one ChannelPost per producer/consumer region
+// sole member of its reuse group (one AllocChannel per producer/consumer region
 // pair, with numTiles internal per-tile instances), so it must be treated as a
 // reuse group even at size 1 to get the in-body per-tile slot rotation and the
 // numTiles counter stride.
 bool channelIsSubtiled(Channel *ch) {
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
     return false;
   auto inSubtiled = [](Operation *op) {
     return op && (isa<ttng::SubtiledRegionOp>(op) ||
@@ -493,17 +511,17 @@ bool channelIsSubtiled(Channel *ch) {
 
 // True only for the representative of a both-endpoints-subtiled collapse: its
 // producer AND consumer are in different-task ttng.subtiled_regions, so the
-// numTiles per-tile staging allocs were folded into this one ChannelPost in
-// collectPostChannels (which sets the flag). Unlike channelIsSubtiled, this is
+// numTiles per-tile staging allocs were folded into this one AllocChannel in
+// collectAllocChannels (which sets the flag). Unlike channelIsSubtiled, this is
 // NOT true for a consumer-only-subtiled channel (e.g. an epilogue bias load
 // whose local_store sits outside the region), so it safely gates the size-1
 // subtiled reuse-group / in-body rotation machinery at buffer.copy == 1 without
 // pulling such channels into a degenerate group (which has no per-tile staging
 // buffer to rotate → empty deadPositions assert in insertAsyncComm).
 bool channelIsCollapsedBothSubtiled(Channel *ch) {
-  if (!ch || ch->channelKind != DataChannelKind::SMEMPost)
+  if (!ch || ch->channelKind != DataChannelKind::SMEMAlloc)
     return false;
-  return static_cast<ChannelPost *>(ch)->isCollapsedBothSubtiled;
+  return static_cast<AllocChannel *>(ch)->isCollapsedBothSubtiled;
 }
 
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
@@ -916,8 +934,8 @@ bool verifyReuseGroup2(ReuseGroup *group) {
   // verifying it; the chain confirms the reuse is real and gives
   // `orderReuseGroup2` a reliable early/late ordering (rather than guessing via
   // program order). This mirrors the SMEM path below.
-  if (chA->channelKind == DataChannelKind::TMEMPost &&
-      chB->channelKind == DataChannelKind::TMEMPost) {
+  if (chA->channelKind == DataChannelKind::TMEMAlloc &&
+      chB->channelKind == DataChannelKind::TMEMAlloc) {
     if (!tmemReuseGroupOverlaps(group)) {
       LDBG("verifyReuseGroup2: TMEM channels "
            << chA->uniqID << "/" << chB->uniqID
@@ -1019,7 +1037,7 @@ bool verifyReuseGroupN(ReuseGroup *group) {
   // All channels must be SMEM, single-copy, with producers in the same block.
   Block *commonBlock = nullptr;
   for (auto *ch : group->channels) {
-    if (ch->channelKind != DataChannelKind::SMEMPost) {
+    if (ch->channelKind != DataChannelKind::SMEMAlloc) {
       LDBG("verifyReuseGroupN: channel " << ch->uniqID << " is not SMEM");
       return false;
     }
@@ -1087,8 +1105,7 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
 
   for (auto *consumer : actualConsumers) {
     auto consumerTasks = getWSPartitionIds(consumer);
-    // Check if any partition ID is shared between earlyProducer and this
-    // consumer.
+    // Check if any task ID is shared between earlyProducer and this consumer.
     bool samePartition = false;
     for (auto tid : earlyProducerTasks) {
       if (std::find(consumerTasks.begin(), consumerTasks.end(), tid) !=
@@ -1142,12 +1159,12 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
   Operation *allocOp = ownerCh->getAllocOp();
   if (!allocOp || allocOp->hasAttr("buffer.offset"))
     return false;
-  if (ownerCh->channelKind != DataChannelKind::TMEMPost)
+  if (ownerCh->channelKind != DataChannelKind::TMEMAlloc)
     return false;
   // A `useC=false` MMA producer zeros the whole TMEM allocation before writing.
   // `isOperandDNoAcc` records this whole-allocation overwrite producer shape
-  // (set in createChannelPost when the MMA's useAccumulator is const-false).
-  auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ownerCh);
+  // (set in createAllocChannel when the MMA's useAccumulator is const-false).
+  auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ownerCh);
   return tmemCh->isOperandDNoAcc;
 }
 
@@ -1171,9 +1188,8 @@ bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
     if (ch->getNumBuffers() != 1 || !ch->getSrcOp())
       return false;
   }
-  // Cross-partition: producers span >= 2 distinct producer partition ids.
-  // (Detect by partition id, not block — at doCodePartition every channel is in
-  // one block.)
+  // Cross-partition: producers span >= 2 distinct producer task ids. (Detect by
+  // task id, not block — at doCodePartition every channel is in one block.)
   llvm::DenseSet<int> producerTasks;
   for (auto *ch : group->channels)
     producerTasks.insert(ch->relation.first);
@@ -1217,7 +1233,7 @@ getStaggeredAccumCnt(OpBuilderWithPartitionIds &builder, Operation *op,
   assert(chList.size() >= 1);
 
   // When multiple channels in the reuse group share the same getDstOp() but
-  // belong to different consumer groups (different consumer partition IDs or
+  // belong to different consumer groups (different consumer task IDs or
   // different full consumer sets), getReuseChannels pushes one chList entry
   // per channel. We must find the correct entry by counting how many
   // *distinct consumer groups* with the same getDstOp() appear before ch's
@@ -1364,15 +1380,15 @@ Value getBarrierForPipelineStage(OpBuilderWithPartitionIds &builder,
 
 static void setTmemChannelAttr(Operation *op, int channelId,
                                std::string attrName) {
-  SmallVector<int> partitionIds;
+  SmallVector<int> asyncTaskIds;
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-    for (WSPartitionId partitionId : attr.asArrayRef()) {
-      partitionIds.push_back(partitionId);
+    for (WSPartitionId asyncTaskId : attr.asArrayRef()) {
+      asyncTaskIds.push_back(asyncTaskId);
     }
   }
-  partitionIds.push_back(channelId);
-  SmallVector<int> sortedWSPartitionIds(partitionIds.begin(),
-                                        partitionIds.end());
+  asyncTaskIds.push_back(channelId);
+  SmallVector<int> sortedWSPartitionIds(asyncTaskIds.begin(),
+                                        asyncTaskIds.end());
   sort(sortedWSPartitionIds);
   auto i32Ty = IntegerType::get(op->getContext(), 32);
   auto size = static_cast<int64_t>(sortedWSPartitionIds.size());
@@ -1385,7 +1401,7 @@ static void setTmemChannelAttr(Operation *op, int channelId,
 // consumer. Creates one channel per producer in the currentProds vector.
 // @param currentProds Vector of producer operations
 // @param producerTaskId Task ID of the producers (must all be the same)
-// @param consumerIds Consumer partition IDs
+// @param consumerIds Consumer task IDs
 // @param allocOp The TMEM allocation operation
 // @param consumerOp The consumer operation
 // @param channels Output vector to add created channels to
@@ -1396,7 +1412,7 @@ createChannelsForProducers(SmallVector<Operation *> &currentProds,
                            SmallVector<std::unique_ptr<Channel>> &channels) {
   for (auto *prod : currentProds) {
     auto channelID = channels.size();
-    channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+    channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
         producerTaskId, consumerIds, allocOp, true /*isOperandD*/, true,
         channelID));
     channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
@@ -1433,9 +1449,9 @@ static void dumpChannel(Channel *ch, llvm::raw_ostream &os) {
     dstOp->print(os, OpPrintingFlags().skipRegions());
     os << "\n";
   }
-  // For TmemDataChannelPost, dump additional info
-  if (ch->channelKind == DataChannelKind::TMEMPost) {
-    auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+  // For TmemAllocChannel, dump additional info
+  if (ch->channelKind == DataChannelKind::TMEMAlloc) {
+    auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ch);
     os << "    isOperandD: " << (tmemCh->isOperandD ? "true" : "false") << "\n";
     os << "    isOperandDNoAcc: "
        << (tmemCh->isOperandDNoAcc ? "true" : "false") << "\n";
@@ -2242,10 +2258,10 @@ void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
       if (inChannel) {
         for (auto &ch : channels) {
           if (ch->getSrcOp() == op || ch->getDstOp() == op) {
-            if (ch->channelKind == DataChannelKind::TMEMPost) {
+            if (ch->channelKind == DataChannelKind::TMEMAlloc) {
               borderColor = "red";
               break;
-            } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+            } else if (ch->channelKind == DataChannelKind::SMEMAlloc) {
               borderColor = "darkgreen";
             }
           }
@@ -2295,15 +2311,15 @@ void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
       edgeLabel += "\\n\\\"" + locName + "\\\"";
     }
 
-    if (ch->channelKind == DataChannelKind::TMEMPost) {
+    if (ch->channelKind == DataChannelKind::TMEMAlloc) {
       color = "red";
       edgeLabel += "\\n(TMEM)";
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch.get());
+      auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ch.get());
       if (tmemCh->isOperandD) {
         style = "bold";
         edgeLabel += " [D]";
       }
-    } else if (ch->channelKind == DataChannelKind::SMEMPost) {
+    } else if (ch->channelKind == DataChannelKind::SMEMAlloc) {
       color = "darkgreen";
       edgeLabel += "\\n(SMEM)";
     }
@@ -2322,7 +2338,7 @@ void dumpTmemBufferLiveness(
     SmallVector<ttng::TMEMAllocOp> &allocs,
     DenseMap<Operation *, Interval<size_t>> &allocToIntervals,
     DenseMap<Operation *, ttng::TMemAllocation> &allocToSize,
-    DenseMap<Operation *, ttng::TmemDataChannelPost *> &allocToChannel,
+    DenseMap<Operation *, ttng::TmemAllocChannel *> &allocToChannel,
     SmallVector<Channel *> &channels, llvm::raw_ostream &os) {
   os << "=== TMEM Buffer Liveness Graph ===\n";
   os << "digraph TmemBufferLiveness {\n";
@@ -2341,7 +2357,7 @@ void dumpTmemBufferLiveness(
   // channels)
   DenseMap<Operation *, SmallVector<Channel *>> allocToAllChannels;
   for (auto *ch : channels) {
-    if (ch->channelKind != DataChannelKind::TMEMPost)
+    if (ch->channelKind != DataChannelKind::TMEMAlloc)
       continue;
     Operation *allocOp = ch->getAllocOp();
     if (allocOp)
@@ -2418,7 +2434,7 @@ void dumpTmemBufferLiveness(
     // Count OperandD channels
     int operandDCount = 0;
     for (auto *ch : allocChannels) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ch);
       if (tmemCh->isOperandD)
         operandDCount++;
     }
@@ -2443,7 +2459,7 @@ void dumpTmemBufferLiveness(
     // Create a node for each channel in this alloc
     std::string prevChNode;
     for (auto *ch : allocChannels) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ch);
       std::string chNode = allocNode + "_ch" + std::to_string(ch->uniqID);
 
       // Get src/dst operation IDs if available
@@ -2530,7 +2546,7 @@ void dumpTmemBufferLiveness(
     auto &allocChannels = allocToAllChannels[alloc.getOperation()];
     int operandDCount = 0;
     for (auto *ch : allocChannels) {
-      auto *tmemCh = static_cast<ttng::TmemDataChannelPost *>(ch);
+      auto *tmemCh = static_cast<ttng::TmemAllocChannel *>(ch);
       if (tmemCh->isOperandD)
         operandDCount++;
     }
@@ -2570,7 +2586,7 @@ void dumpSmemBufferLiveness(
   // Find all SMEM channels for each alloc
   DenseMap<Operation *, SmallVector<Channel *>> allocToAllChannels;
   for (auto *ch : channels) {
-    if (ch->channelKind != DataChannelKind::SMEMPost)
+    if (ch->channelKind != DataChannelKind::SMEMAlloc)
       continue;
     Operation *allocOp = ch->getAllocOp();
     if (allocOp)
@@ -2760,7 +2776,7 @@ void dumpSmemBufferLiveness(
 ///     becomes the first producer without needing a prior value
 ///   - TMEMStoreOp inside the loop: Re-initialization within the loop
 ///
-/// For each producer-consumer pair, a TmemDataChannelPost is created to track
+/// For each producer-consumer pair, a TmemAllocChannel is created to track
 /// the data dependency for warp specialization scheduling.
 ///
 /// @param tmemAllocOp The TMEM allocation used as operand D
@@ -2783,7 +2799,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   // Lit test fixtures (e.g. blackwell_fa_fwd_persist_code_partition.mlir,
   // reuse_group_2buffer_fwd.mlir) carry these attributes from a previous
   // WS pipeline run. setTmemChannelAttr only ever appends, so re-running
-  // doCodePartitionPost on already-annotated IR can leave a single op
+  // doCodePartition on already-annotated IR can leave a single op
   // marked with multiple channel ids that refer to channels which no
   // longer exist in the current run. findTmemStartEnd then returns the
   // wrong op for a channel id (whichever is first in user-iteration
@@ -2801,8 +2817,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     return mmaOp->emitError(
         "handleOperandD: MMA operation is not inside a scf.for loop");
   }
-  // Track multiple producers when channels are skipped (same partition IDs).
-  // All producers in the vector must share the exact same partition IDs.
+  // Track multiple producers when channels are skipped (same task IDs).
+  // All producers in the vector must share the exact same task IDs.
   SmallVector<Operation *> currentProds;
   SmallVector<int> channelsToBeUpdate;
 
@@ -2960,8 +2976,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         auto producerTaskIds = getWSPartitionIds(currentProds.front());
         auto consumerIds = getWSPartitionIds(&op);
         if (producerTaskIds.size() != 1) {
-          op.emitError("handleOperandD: expected exactly one producer "
-                       "partition ID, got ")
+          op.emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
         }
@@ -2991,8 +3007,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         // Start a channel from currentProds to op
         auto producerTaskIds = getWSPartitionIds(currentProds.front());
         if (producerTaskIds.size() != 1) {
-          mmaOpT->emitError("handleOperandD: expected exactly one producer "
-                            "partition ID, got ")
+          mmaOpT->emitError(
+              "handleOperandD: expected exactly one producer task ID, got ")
               << producerTaskIds.size();
           return failure();
         }
@@ -3043,11 +3059,11 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
               isFreshOverwriteMMA(currentProds.front()) &&
               isa<ttng::MMAv5OpInterface>(currentProds.back())) {
             auto channelID = channels.size();
-            channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+            channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
                 producerTaskId, consumerIds, tmemAllocOp.getOperation(),
                 /*isOperandD=*/true, /*isOperandDNoAcc=*/false, channelID));
             auto *tmemCh =
-                static_cast<ttng::TmemDataChannelPost *>(channels.back().get());
+                static_cast<ttng::TmemAllocChannel *>(channels.back().get());
             tmemCh->acquireBeforeOp = currentProds.front();
             channels.back()->srcName =
                 getOutermostNameFromLoc(tmemAllocOp->getLoc());
@@ -3066,7 +3082,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
         channelsToBeUpdate.push_back(channels.size());
         auto channelID = channels.size();
         auto consumerIds = getWSPartitionIds(&op);
-        channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+        channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
             -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
             true, channels.size()));
         channels.back()->srcName =
@@ -3118,7 +3134,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
       auto producerTaskIds = getWSPartitionIds(currentProds.front());
       if (producerTaskIds.size() != 1) {
         return loadOp.emitError("handleOperandD: expected exactly one producer "
-                                "partition ID, got ")
+                                "task ID, got ")
                << producerTaskIds.size();
       }
       auto producerTaskId = producerTaskIds.front();
@@ -3183,7 +3199,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
       int lastConsTaskId = lastConsumerIds.front();
       if (needsChannel(lastConsTaskId, firstProdTaskIds)) {
         auto channelID = channels.size();
-        auto guardCh = std::make_unique<ttng::TmemDataChannelPost>(
+        auto guardCh = std::make_unique<ttng::TmemAllocChannel>(
             lastConsTaskId, firstProdTaskIds, tmemAllocOp.getOperation(),
             true /*isOperandD*/, false, channelID);
         guardCh->isSameIterGuard = true;
@@ -3219,8 +3235,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
 //
 // The N per-tile allocs of one logical channel (e.g. %_2/%_1 for numTiles=2)
 // resolve to the SAME (prodRegion, consRegion) pair, which
-// `collectPostChannels` uses to create a single collapsed ChannelPost per pair
-// instead of one channel per alloc.
+// `collectAllocChannels` uses to create a single collapsed AllocChannel per
+// pair instead of one channel per alloc.
 static void getSubtiledChannelEndpoints(Operation *allocOp,
                                         ttng::SubtiledRegionOp &prodRegion,
                                         ttng::SubtiledRegionOp &consRegion) {
@@ -3260,9 +3276,9 @@ static void getSubtiledChannelEndpoints(Operation *allocOp,
   }
 }
 
-static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
-                              SmallVector<std::unique_ptr<Channel>> &channels,
-                              bool includeSameTaskSmemChannels) {
+static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
+                               SmallVector<std::unique_ptr<Channel>> &channels,
+                               bool includeSameTaskSmemChannels) {
   // source can be local_store, consumer can be gen5, ttg.memdesc_trans,
   // local_load Can be produced by tmem_store or gen5, consumed by tmem_load or
   // gen5
@@ -3394,8 +3410,8 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   if (!producerOp)
     return;
   auto producerTaskIds = getWSPartitionIds(producerOp);
-  // Collect consumer partition IDs from all consumers. With data partitioning,
-  // different consumers may have different partition IDs (e.g., K/V buffers
+  // Collect consumer task IDs from all consumers. With data partitioning,
+  // different consumers may have different task IDs (e.g., K/V buffers
   // consumed by multiple computation partitions).
   SmallVector<int> consumerTaskIds;
   DenseSet<int> seenTaskIds;
@@ -3406,15 +3422,15 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     }
   }
 
-  // When a producer has multiple partition IDs (e.g., a shared local_alloc
-  // whose partition ids include both the value producer and the consumers),
-  // select the single producer task that is not co-located with a consumer.
-  // This can happen with data-partitioned computation groups where one producer
-  // feeds multiple consumer partitions. If all producer tasks are co-located
-  // with consumers, no cross-partition channel is needed. If producer has no
-  // partition ID (e.g., an alloc that was hoisted above all partitions or never
-  // assigned), skip channel creation — there is no producer partition to
-  // synchronize with.
+  // When a producer has multiple task IDs (e.g., a shared local_alloc whose
+  // task ids include both the value producer and the consumers), select the
+  // single producer task that is not co-located with a consumer. This can
+  // happen with data-partitioned computation groups where one producer feeds
+  // multiple consumer partitions. If all producer tasks are co-located with
+  // consumers, no cross-partition channel is needed.
+  // If producer has no task ID (e.g., an alloc that was hoisted above
+  // all partitions or never assigned), skip channel creation — there is
+  // no producer partition to synchronize with.
   if (producerTaskIds.empty())
     return;
 
@@ -3435,14 +3451,14 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
     assert(producerTaskIds.size() == 1);
     producerTaskId = producerTaskIds.front();
   }
-  // Remove producer partition id from consumerTaskIds.
+  // Remove producer task id from consumerTaskIds.
   auto iter = std::remove(consumerTaskIds.begin(), consumerTaskIds.end(),
                           producerTaskId);
   consumerTaskIds.erase(iter, consumerTaskIds.end());
 
   if (auto tmemAllocOp = dyn_cast<ttng::TMEMAllocOp>(allocOp)) {
     if (needsChannel(producerTaskId, consumerTaskIds)) {
-      channels.push_back(std::make_unique<ttng::TmemDataChannelPost>(
+      channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
           producerTaskId, consumerTaskIds, allocOp, false, isOperandDNoAcc,
           channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
@@ -3452,10 +3468,10 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
         includeSameTaskSmemChannels ||
         needsChannel(producerTaskId, consumerTaskIds);
     if (shouldCreateSmemChannel) {
-      channels.push_back(std::make_unique<ChannelPost>(
+      channels.push_back(std::make_unique<AllocChannel>(
           producerTaskId, consumerTaskIds, allocOp, channels.size()));
       channels.back()->srcName = getOutermostNameFromLoc(allocOp->getLoc());
-      auto *post = static_cast<ChannelPost *>(channels.back().get());
+      auto *post = static_cast<AllocChannel *>(channels.back().get());
       // Cache the resolved producer op so getSrcOp() survives a sibling
       // subtiled-region channel's lowering. Skip the direct alloc-with-src case
       // (producerOp == allocOp), where getSrcOp() intentionally returns null.
@@ -3465,19 +3481,19 @@ static void createChannelPost(Operation *allocOp, mlir::DominanceInfo &dom,
   }
 }
 
-void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
-                         triton::FuncOp &funcOp,
-                         bool includeSameTaskSmemChannels) {
+void collectAllocChannels(SmallVector<std::unique_ptr<Channel>> &channels,
+                          triton::FuncOp &funcOp,
+                          bool includeSameTaskSmemChannels) {
   mlir::DominanceInfo dom(funcOp);
   // For both-endpoints-subtiled SMEM channels, the N per-tile staging allocs of
   // one logical channel resolve to the SAME (producer subtiled region, consumer
-  // subtiled region) pair. Create a single collapsed ChannelPost per pair (its
+  // subtiled region) pair. Create a single collapsed AllocChannel per pair (its
   // numTiles per-tile buffers are internal instances indexed in-body by the
   // builtin tileIdx); the sibling per-tile allocs are recorded on the
   // representative channel (collapsedSiblingAllocs) so they can be erased once
   // the in-body view rewire makes them dead. The first alloc encountered for a
   // pair becomes the channel's representative.
-  DenseMap<std::pair<Operation *, Operation *>, ChannelPost *>
+  DenseMap<std::pair<Operation *, Operation *>, AllocChannel *>
       seenSubtiledPairs;
   funcOp.walk([&](Operation *op) {
     // FIXME: It is possible that a local_alloc can start a channel, when a
@@ -3511,11 +3527,11 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
         }
         // First alloc for this pair becomes the representative channel.
         size_t before = channels.size();
-        createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
-        ChannelPost *rep = nullptr;
+        createAllocChannel(op, dom, channels, includeSameTaskSmemChannels);
+        AllocChannel *rep = nullptr;
         if (channels.size() > before &&
-            channels.back()->channelKind == DataChannelKind::SMEMPost) {
-          rep = static_cast<ChannelPost *>(channels.back().get());
+            channels.back()->channelKind == DataChannelKind::SMEMAlloc) {
+          rep = static_cast<AllocChannel *>(channels.back().get());
           // Mark the representative so the size-1 subtiled reuse-group /
           // in-body rotation machinery fires for it even at buffer.copy == 1.
           rep->isCollapsedBothSubtiled = true;
@@ -3523,11 +3539,11 @@ void collectPostChannels(SmallVector<std::unique_ptr<Channel>> &channels,
         seenSubtiledPairs[key] = rep;
         return;
       }
-      createChannelPost(op, dom, channels, includeSameTaskSmemChannels);
+      createAllocChannel(op, dom, channels, includeSameTaskSmemChannels);
     }
   });
   LLVM_DEBUG({
-    llvm::dbgs() << "\n[collectPostChannels] Completed channel collection\n";
+    llvm::dbgs() << "\n[collectAllocChannels] Completed channel collection\n";
     dumpAllChannels(channels, llvm::dbgs());
   });
 }
@@ -3718,7 +3734,7 @@ void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
   ttng::TCGen5CommitOp keptCommit = nullptr;
   // Track consumers + waiters we are planning to keep.
   // This is important because if we find two waiters
-  // in the same partition id we need to select the first one
+  // in the same task id we need to select the first one
   // in program order.
   SmallVector<Operation *> processedConsumers;
   SmallVector<ttng::WaitBarrierOp> processedWaiters;
@@ -3746,18 +3762,18 @@ void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
     if (commit != keptCommit) {
       deletedOps.insert(commit);
     }
-    // Check all existing operations for a matching partition id.
+    // Check all existing operations for a matching task id.
     // Within the same task we will pick the earliest by
     // program order.
-    auto taskId = getWSPartitionIds(waiter);
+    auto taskId = waiter->getAttr("ttg.partition");
     bool matched = false;
     bool keptWait = true;
     for (size_t j = 0; j < processedConsumers.size(); j++) {
       auto existingConsumer = processedConsumers[j];
       auto existingWaiter = processedWaiters[j];
-      auto existingTaskID = getWSPartitionIds(existingWaiter);
+      auto existingTaskID = existingWaiter->getAttr("ttg.partition");
       if (taskId == existingTaskID) {
-        // If partition ids match we should delete whichever one comes later
+        // If task ids match we should delete whichever one comes later
         // in program order.
         if (existingWaiter->isBeforeInBlock(waiter)) {
           deletedOps.insert(waiter);
@@ -3775,7 +3791,7 @@ void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
       }
     }
     if (!matched) {
-      // If we only have a new partition ID we must keep the wait.
+      // If we only have a new task ID we must keep the wait.
       processedConsumers.push_back(consumer);
       processedWaiters.push_back(waiter);
     }
@@ -3842,8 +3858,8 @@ collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
 //    d. Has the same expected arrival count (init count).
 //
 // 3. For each subgroup, update the barriers based on the consumer's location.
-//    a. With the same partition id, eliminate all but the first barrier.
-//    b. With different partition ids, use the same allocation.
+//    a. With the same async task id, eliminate all but the first barrier.
+//    b. With different async task ids, use the same allocation.
 //
 // 4. Cleanup the code to remove the unused barriers.
 //

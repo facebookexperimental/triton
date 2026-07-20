@@ -11,7 +11,7 @@ points. This pass materializes them as SMEM-allocated mbarrier arrays.
 ## Pipeline Context
 
 ```
-doCodePartitionPost     ← creates CreateTokenOp, ProducerAcquireOp, etc.
+doCodePartition     ← creates CreateTokenOp, ProducerAcquireOp, etc.
   → specializeRegion    ← clones ops into WarpSpecializeOp regions
   → doPingPongSync      ← inserts named barrier ops
   → doTokenLowering     ← THIS STEP: tokens become hardware barriers
@@ -192,7 +192,7 @@ not reused before the TMA store finishes reading from it.
 
 Token lowering happens **after** barrier fusion. By the time tokens are
 lowered, channels that share barriers (from TMA fusion or channel grouping
-in `doCodePartitionPost`) already share the same `CreateTokenOp`. This means
+in `doCodePartition`) already share the same `CreateTokenOp`. This means
 the lowering naturally produces shared mbarrier allocations for fused
 channels.
 

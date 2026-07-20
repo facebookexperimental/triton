@@ -116,7 +116,7 @@ doMemoryPlanner
 doGenerateSubtiledRegion          ← creates SubtiledRegionOps
 doAnnotateTMAStoreWaits
 doValidateTMAStoreAnnotations
-doCodePartitionPost               ← creates inline NVWS ops in SubtiledRegionOps;
+doCodePartition               ← creates inline NVWS ops in SubtiledRegionOps;
                                     multi-task SubtiledRegionOps lowered here
 doLowerSubtiledRegionsWithNVWSOps ← inlines SubtiledRegionOps with NVWS ops
 doTokenLowering                   ← resolves NVWS ops → hardware barrier ops
@@ -211,7 +211,7 @@ two consumer shapes:
 
 - **Inside→outside** (`separate_epilogue_store=True`, the producer subtiled but
   each subtile's consumer a *flat* op outside): represented as `numTiles` sibling
-  `ChannelPost`s sharing one in-body template producer, each with its own flat
+  `AllocChannel`s sharing one in-body template producer, each with its own flat
   consumer. There are two sub-shapes depending on staging `buffer.copy`:
   - **Multi-buffered** (`buffer.copy > 1`): the siblings are one reuse group over
     one physical multibuffer; the in-body slot rotation (`getOrComputeSubtiledSlot`)
@@ -261,19 +261,19 @@ two consumer shapes:
 - **Both-endpoints-subtiled** (producer subtiled AND consumer subtiled, in
   *different* partitions — the `DATA_PARTITION_FACTOR=2` epilogue): the
   `numTiles` per-tile allocs of one (producer region, consumer region) pair are
-  **collapsed** into a single `ChannelPost` in `collectPostChannels`
+  **collapsed** into a single `AllocChannel` in `collectAllocChannels`
   (`getSubtiledChannelEndpoints` resolves the two regions; the dedup key is the
   region pair, gated on the regions being in different tasks). The collapsed
   channel is the sole member of a degenerate size-1 subtiled reuse group (see
   [Reuse Groups](ReuseGroups.md)), so the in-body slot math above is unchanged.
   This collapse fires for **any `buffer.copy`, including `buffer.copy == 1`** (the
   DP=1 epilogue): the `numBuffers > 1` reuse-group guards are relaxed for channels
-  flagged `ChannelPost::isCollapsedBothSubtiled` (queried via
+  flagged `AllocChannel::isCollapsedBothSubtiled` (queried via
   `channelIsCollapsedBothSubtiled` — the *narrow* predicate, NOT the broad
   `channelIsSubtiled`, which would also match a consumer-only-subtiled bias load),
   the in-body math collapses all subtiles onto one physical slot (`bufferIdx == 0`,
   alternating phase), and the skipped sibling per-tile allocs
-  (`ChannelPost::collapsedSiblingAllocs`) are erased after the rewire. Omitting
+  (`AllocChannel::collapsedSiblingAllocs`) are erased after the rewire. Omitting
   any of this leaves the sibling staging alloc live → SMEM OOM (bug #13).
   Per-data-partition separation of the shared physical staging buffer is done in
   the memory planner (cross-partition staging split). See bug #11.

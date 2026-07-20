@@ -233,6 +233,16 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
           dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
     return getOrder(partitionedLayout.getPartitionLayout(), shape);
   }
+  // Unwrap a user-pinned wrapper (PinnedEncodingTrait) and recurse into its
+  // concrete shared layout.
+  if (auto pinned = dyn_cast<PinnedEncodingTrait>(layout)) {
+    auto inner =
+        dyn_cast_or_null<SharedEncodingTrait>(pinned.getPinnedLayout());
+    if (!inner)
+      llvm::report_fatal_error("getOrder: pinned shared encoding does not wrap "
+                               "a SharedEncodingTrait");
+    return getOrder(inner, shape);
+  }
   llvm::report_fatal_error("Unimplemented usage of getOrder for MemDescType");
   return {};
 }
@@ -2594,6 +2604,23 @@ AMDWmmaEncodingAttr::getRepOrderForOperand(int opIdx) const {
   return getOrderForDotOperand(opIdx, getRank(), /*kContig*/ true);
 }
 
+// Captures the operand-swap for asymmetric isTransposed WMMA
+unsigned AMDWmmaEncodingAttr::getOperandNonKDim(unsigned mDim, unsigned nDim,
+                                                bool isTransposed,
+                                                unsigned opIdx) {
+  // opIdx=0 -> mDim, opIdx=1 -> nDim. Flipped for asymmetric WMMA with
+  // isTransposed=true as we must swap the operands and per-operand layouts
+  // must match the swap.
+  bool isFlip = isTransposed && (mDim != nDim);
+  unsigned eff = isFlip ? (1 - opIdx) : opIdx;
+  return eff == 0 ? mDim : nDim;
+}
+
+unsigned AMDWmmaEncodingAttr::getOperandNonKDim(unsigned opIdx) const {
+  auto mnk = getInstrShape();
+  return getOperandNonKDim(mnk[0], mnk[1], getIsTransposed(), opIdx);
+}
+
 SwizzledSharedEncodingAttr AMDWmmaEncodingAttr::composeSharedLayoutForOperand(
     CGAEncodingAttr cgaLayout, int operandIdx, ArrayRef<int64_t> operandShape,
     ArrayRef<unsigned> sharedOrder, unsigned kWidth, unsigned elemBitWidth,
@@ -4192,8 +4219,11 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
     for (auto &region : op->getRegions()) {
       for (auto &block : region.getBlocks()) {
         for (auto &childOp : block.getOperations()) {
-          if (isa<scf::YieldOp, ub::PoisonOp>(childOp)) {
-            // yield ops and ub.poison do not need partition ids
+          auto localAlloc = dyn_cast<LocalAllocOp>(childOp);
+          if (isa<scf::YieldOp, ub::PoisonOp>(childOp) ||
+              (localAlloc && !localAlloc.getSrc())) {
+            // Terminators, poison values, and source-free shared storage do not
+            // execute partition-specific work.
             continue;
           }
           if (!childOp.hasAttr(kPartitionAttrName))
@@ -4328,6 +4358,16 @@ int triton::gpu::lookupNumWarps(Region *region) {
     return partitions.getParentOp().getPartitionNumWarps()[idx];
   }
   return lookupNumWarps(region->getParentOp());
+}
+
+void triton::gpu::setHasSingleWarpSpecialize(ModuleOp module, bool value) {
+  module->setAttr(AttrSingleWarpSpecializeName,
+                  BoolAttr::get(module.getContext(), value));
+}
+
+bool triton::gpu::hasSingleWarpSpecialize(ModuleOp module) {
+  auto attr = module->getAttrOfType<BoolAttr>(AttrSingleWarpSpecializeName);
+  return attr && attr.getValue();
 }
 
 int triton::gpu::lookupThreadsPerWarp(OpBuilder &rewriter) {

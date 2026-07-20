@@ -763,7 +763,7 @@ Examples: how mbarriers are communicated in warp specialization
 - `tlx.async_tasks` and `tlx.async_task` **[Hopper+]**
 
 ```
-    with tlx.async_tasks
+    with tlx.async_tasks()
         with tlx.async_task("default")
             ...
         with tlx.async_task(num_warps=4)
@@ -774,6 +774,13 @@ Examples: how mbarriers are communicated in warp specialization
 `tlx.async_task("default")` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
+
+#### async_tasks Parameters
+
+| Parameter                | Description                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
+| `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
 
 #### async_task Parameters
 
@@ -1078,6 +1085,11 @@ token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cach
 **Returns**: A `tlx.async_token` that can be used with `tlx.async_load_wait_group()` to synchronize on the completion of the transfer.
 
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
+
+**Requirements.** The direct-to-LDS copy has the following hardware constraints:
+- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
+- **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
 
 ### Example
 

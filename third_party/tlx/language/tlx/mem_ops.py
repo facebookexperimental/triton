@@ -116,6 +116,16 @@ def buffer_load_to_local(
     Directly emits amdg.buffer_load_to_local. The ConvertTritonToTritonGPU pass
     adds tensor encoding, and the AMD backend lowers it to LLVM.
 
+    This lowers to a single direct-to-LDS hardware copy, which fails to lower with
+    a compile-time error unless the following requirements are met:
+    - Each thread's load must reach a supported direct-to-LDS width (32 or 128
+      bits, e.g. 2 or 8 fp16 elements). A smaller vectorization cannot be lowered.
+    - The alignment needed for that width must be statically provable.
+    - If `mask` is given it must be aligned to the vector width: each group of
+      (vector width) consecutive mask values must be identical. The copy moves
+      each lane's whole vector in one transaction, so a mask whose boundary cannot
+      be proven vector-aligned (e.g. `offs < K` for runtime `K`) cannot lower.
+
     Args:
         dest: Destination buffer in shared memory (buffered_tensor).
         ptr: Global memory scalar base pointer.
@@ -351,6 +361,12 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         if not isinstance(layout, tlx.shared_layout_encoding):
             raise TypeError(f"`layout` must be a tlx.shared_layout_encoding, got {type(layout).__name__}")
         layout_handle = layout.to_ir(_semantic.builder)
+        # This is an explicit, user-pinned layout: wrap it so layout propagation
+        # respects it (does not retag the buffer to satisfy a consumer). The
+        # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
+        if not getattr(layout, "_tlx_default", False):
+            layout._tlx_user_pinned = True
+            layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
 
     alias_handle = None
     shared_buffer_handle = None
@@ -859,10 +875,16 @@ def local_load(
         output = _semantic.builder.create_release_layout(load_handle)
         return tl.tensor(output, block_type)
     else:
-        output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         if layout is not None:
+            # Pin the load result to the requested register layout, wrapped as a
+            # user layout so remove-layout-conversions anchors it (won't rewrite
+            # it to a "preferred" layout). Unlike require_layout, this survives
+            # even when the only consumer is layout-flexible.
             enc = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
-            output = _semantic.builder.create_require_layout(output, enc)
+            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None,
+                                                         layoutEncoding=enc)
+        else:
+            output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         result = tl.tensor(output, block_type)
         if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))

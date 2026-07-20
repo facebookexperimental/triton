@@ -1,11 +1,11 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition=num-buffers=2 | FileCheck %s
 
 // Regression test for B-16-F2 / T273493463.
 //
 // A TMA descriptor load feeding multiple consumer tasks needs the replacement
 // local_load to survive in every consumer partition. The fused barrier path
-// already creates waits for each task; the data load must carry the same full
-// consumer partition-id set instead of inheriting only the last extra task.
+// creates waits for each task; the data load must carry the same full consumer
+// task-id set instead of inheriting only the last extra task.
 
 // CHECK-LABEL: @tma_multi_consumer_task_ids
 // CHECK: ttng.wait_barrier {{.*}}ttg.partition = array<i32: 1>
@@ -17,6 +17,7 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tma_multi_consumer_task_ids(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
@@ -28,10 +29,14 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %i0 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : index
     %i1 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 1 : index
     %i4 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 4 : index
+    %buffer = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     scf.for %iv = %i0 to %i4 step %i1 {
       %tile = tt.descriptor_load %desc[%c0, %c0] {ttg.partition = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
-      %consumer0 = arith.addf %tile, %tile {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
-      %consumer1 = arith.subf %tile, %tile {ttg.partition = array<i32: 2>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
+      ttg.local_store %tile, %buffer {ttg.partition = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %local0 = ttg.local_load %buffer {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %consumer0 = arith.addf %local0, %local0 {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
+      %local1 = ttg.local_load %buffer {ttg.partition = array<i32: 2>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %consumer1 = arith.subf %local1, %local1 {ttg.partition = array<i32: 2>, loop.cluster = 2 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>
       tt.store %ptrs0, %consumer0 {ttg.partition = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
       tt.store %ptrs1, %consumer1 {ttg.partition = array<i32: 2>} : tensor<128x64x!tt.ptr<f16>, #blocked>
       scf.yield

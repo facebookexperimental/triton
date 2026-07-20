@@ -10,7 +10,7 @@
 //
 // Under AutoWS the persistent `scf.while` is cloned once per partition. Cloning
 // is correct for the *pure* static update (`tile_id += NUM_SMS`) but wrong for
-// the *side-effecting, non-deterministic* atomic: partition propagation assigns
+// the *side-effecting, non-deterministic* atomic: task-id propagation assigns
 // the atomic (whose result is the loop-carried value used by every partition)
 // to *all* partitions, so each warp group bumps the counter independently, the
 // partitions diverge onto different tiles, and their producer/consumer barriers
@@ -61,7 +61,7 @@ enum class AtomicWSCase {
 };
 
 // The full set of partitions the kernel is being specialized into. Derived from
-// the union of partition ids on the enclosing persistent loop.
+// the union of task ids on the enclosing persistent loop.
 static SmallVector<WSPartitionId> getAllPartitions(scf::WhileOp whileOp) {
   return getWSPartitionIds(whileOp.getOperation());
 }
@@ -150,7 +150,7 @@ static WSPartitionId getOwnerPartition(scf::WhileOp whileOp,
 // the atomic once in the owner partition, splat its scalar result into a 1-CTA
 // SMEM slot, and read it back (+ tt.unsplat) in every partition, rewiring the
 // while's loop-carried tile id to the broadcast value. The producer→consumer
-// synchronization is left to `doCodePartitionPost`, which already turns a
+// synchronization is left to `doCodePartition`, which already turns a
 // cross-partition `local_store`→`local_load` into (N) SMEM channels with the
 // correct full/empty mbarriers and phase — i.e. the broadcast is expressed in
 // terms of an existing, tested AutoWS channel rather than a bespoke handshake.
@@ -214,7 +214,7 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
   OpBuilderWithPartitionIds b(ctx);
 
   // Owner: run the atomic once, then publish its result into the slot.
-  setWSPartitionIds(atomicOp, owner);
+  setWSPartitionIds(atomicOp, {owner});
   b.setPartitionIdsFromArray({owner});
   b.setInsertionPointAfter(atomicOp);
   Value splat = b.createWithPartitionIds<tt::SplatOp>(loc, bcastTy, atomicRes)
@@ -242,7 +242,7 @@ static LogicalResult transformAtomic(triton::FuncOp funcOp,
 // next tile with the token pair `ttng.clc_try_cancel_async` (->
 // !ttg.async.token) + `ttng.clc_read` (token -> {isValid, x, y, z}). Those
 // decoded results are the loop-carried values of the persistent `scf.while` and
-// are used by every partition (loop condition + tile compute), so partition
+// are used by every partition (loop condition + tile compute), so task-id
 // propagation replicates the read to *all* partitions -- which would make each
 // warp group run its own try_cancel, claim a different pending cluster, and
 // diverge -> deadlock. This is the exact analogue of the atomic tile-counter
@@ -284,7 +284,7 @@ static CLCWSCase classifyCLC(ttng::CLCReadOp readOp, scf::WhileOp &whileOut) {
 // Broadcast a scalar produced in `owner` to every partition through a
 // function-scope SMEM slot (splat -> local_store in owner; local_load ->
 // unsplat in all partitions). Mirrors the atomic case; the store/load edge
-// becomes SMEM channels in doCodePartitionPost. `b`'s insertion point must be
+// becomes SMEM channels in doCodePartition. `b`'s insertion point must be
 // after the scalar's producer.
 static Value broadcastScalarThroughSmem(triton::FuncOp funcOp,
                                         OpBuilderWithPartitionIds &b,
@@ -362,8 +362,8 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
   auto yieldOp = whileOp.getYieldOp();
 
   // Run the fetch (issue + read) in the owner partition alone.
-  setWSPartitionIds(issue, owner);
-  setWSPartitionIds(readOp, owner);
+  setWSPartitionIds(issue, {owner});
+  setWSPartitionIds(readOp, {owner});
 
   OpBuilderWithPartitionIds b(ctx);
   b.setInsertionPointAfter(readOp);
@@ -397,8 +397,8 @@ static LogicalResult transformCLC(triton::FuncOp funcOp, ttng::CLCReadOp readOp,
 // (run once in the owner/producer partition + broadcast the loop-carried
 // result(s) to all partitions), or reject. Returns failure() to force a
 // graceful warp-specialization reject; the caller strips WS metadata via
-// removeWarpSpecializeAttr (which clears partition ids), leaving the kernel
-// unspecialized-but-compilable — one source
+// removeWarpSpecMetadata (which clears both partition ids and
+// ttg.partitions), leaving the kernel unspecialized-but-compilable — one source
 // of truth for the reject teardown shared with the other AutoWS bail-outs.
 LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
                                      int tilePrefetchDepth) {

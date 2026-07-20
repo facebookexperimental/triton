@@ -82,6 +82,19 @@ def TritonGPUProxyFenceInsertion : Pass<"triton-nvidia-gpu-proxy-fence-insertion
   ];
 }
 
+def TritonNvidiaGPUFuseTMEMLoadReducePass : Pass<"triton-nvidia-tmem-load-reduce", "mlir::ModuleOp"> {
+  let summary = "Fuse tmem_load and reduce";
+
+  let description = [{
+    Fuse ttng.tmem_load followed by a row reduction into ttng.tmem_load with a
+    reduction op, to generate tcgen05.ld.red.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::ModuleOp"> {
   let summary = "lower to TMA load/store operations";
 
@@ -287,6 +300,25 @@ def TritonNvidiaGPUCLCMaterializePass : Pass<"triton-nvidia-gpu-clc-materialize"
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
     "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect"
+  ];
+}
+
+def TritonNvidiaGPUPromoteLoadToTMAPass : Pass<"triton-nvidia-promote-load-to-tma", "mlir::ModuleOp"> {
+  let summary = "Auto-promote eligible tt.load to a real TMA descriptor_load";
+
+  let description = [{
+    Analyze pointer-arithmetic patterns in tt.load operations. When a masked,
+    block-structured load is TMA-eligible (contiguous innermost dimension, rank
+    1-5, supported element type, >= 16 byte inner dim, zero OOB fill), rewrite it
+    into the explicit-TMA form -- tt.make_tensor_descriptor + tt.descriptor_load
+    -- so the standard nvidia TMA lowering turns it into an asynchronous TMA copy
+    on sm_90+. Non-eligible loads are left unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::arith::ArithDialect"
   ];
 }
 

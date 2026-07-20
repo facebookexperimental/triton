@@ -77,8 +77,8 @@ to their sum, a single barrier wait covers all loads.
 
 ### Where It's Called
 
-`optimizeTMALoads` is called from `insertAsyncCopy` in `WSCodePartition.cpp`
-during the `doCodePartitionPost` pass. It processes groups of channels whose
+`optimizeTMALoads` is called from `insertAsyncComm` in `WSCodePartition.cpp`
+during the `doCodePartition` pass. It processes groups of channels whose
 producers are TMA descriptor loads.
 
 ## tcgen05_commit Barrier Fusion
@@ -119,7 +119,7 @@ they can be fused into a single commit:
 
 ### Where It's Used
 
-`fuseTcgen05CommitBarriers` is called from `doCodePartitionPost` in
+`fuseTcgen05CommitBarriers` is called from `doCodePartition` in
 `WSCodePartition.cpp` after channels and barriers have been created. It is
 also used for operand D synchronization, where `desyncTCGen5MMAOp` (in
 `WSCodePartition.cpp`) adds completion barriers to MMA ops, and the resulting
@@ -133,7 +133,7 @@ Barrier fusion interacts with token lowering. `CreateTokenOp` produces
 abstract synchronization tokens that are lowered to concrete mbarrier
 allocations by `doTokenLowering`. Each token becomes two barrier arrays
 (ready and empty), each with `numBuffers` entries. When channels share
-tokens (from the grouping in `doCodePartitionPost`), they share the
+tokens (from the grouping in `doCodePartition`), they share the
 materialized barriers, which is another form of barrier reduction.
 
 See [Token & Barrier Lowering](TokenBarrierLowering.md) for the full
@@ -197,4 +197,4 @@ A/B barrier, the standard `tcgen05_commit` is emitted as a fallback.
 | **TMA fusion** | Multiple TMA loads to same consumer | Single mbarrier, single `BarrierExpectOp` with summed bytes | `WSLowerMem.cpp::optimizeTMALoads` |
 | **tcgen05_commit** | Multiple commits to same barrier | Single `TCGen5CommitOp` (last one kept) | `CodePartitionUtility.cpp::fuseTcgen05CommitBarriers` |
 | **DP commit replacement** | Per-MMA D-channel commits (when multiple MMAs) | Per-MMA `WaitBarrierOp` + `ArriveBarrierOp` | `WSCodePartition.cpp::replaceCommitWithBarrierSync` |
-| **Token sharing** | Channels grouped by consumer | Shared `CreateTokenOp` → shared barrier pair | `WSCodePartition.cpp::doCodePartitionPost` |
+| **Token sharing** | Channels grouped by consumer | Shared `CreateTokenOp` → shared barrier pair | `WSCodePartition.cpp::doCodePartition` |

@@ -671,7 +671,7 @@ static void handleWarpSpec(ttg::WarpSpecializeOp wsOp, int computeCapability) {
 } // anonymous namespace
 
 /// doPingPongSync pass: Insert pingpong barriers to the IR
-void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
+void doPingPongSync(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability) {
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &bodyOp : block.getOperations()) {
@@ -684,7 +684,7 @@ void doPingPongSync(triton::FuncOp &funcOp, unsigned numWarpGroups,
 }
 
 /// doPingPongPrep pass: Group expensive ops into pingpong regions
-void doPingPongPrep(triton::FuncOp &funcOp, unsigned numWarpGroups,
+void doPingPongPrep(triton::FuncOp funcOp, unsigned numWarpGroups,
                     int capability, int defaultNumStages) {
 
   // Initialize the critical region manager

@@ -12,7 +12,7 @@ insertion logic in `insertAsyncComm` depends on. As a result, the
 **backward channel** (`gen5 → tmem_load`) is silently dropped.
 
 This doc describes the **desired output** at each phase of
-`doCodePartitionPost` for the canonical channel-loop pattern, against
+`doCodePartition` for the canonical channel-loop pattern, against
 which the implementation can be checked.
 
 ## Canonical Input — Channel-Loop Pattern
@@ -154,8 +154,8 @@ consumer / src / dst — verify that channel B has
 
 ### Files
 
-- `WSCodePartition.cpp::doCodePartitionPost` (steps "find top-level
-  ops", `collectRegionsWithChannelsPost`, `bufferIdToChannels`,
+- `WSCodePartition.cpp::doCodePartition` (steps "find top-level
+  ops", `collectRegionsWithChannels`, `bufferIdToChannels`,
   `mergedChannels`).
 
 ### Desired Output
@@ -166,7 +166,7 @@ consumer / src / dst — verify that channel B has
   (F, B, W). The check `allSameAlloc` skips creating a `ReuseGroup`
   (these are lifecycle phases of one buffer, not a reuse group).
 - `channelsGroupedByConsumers` retains all 3 channels separately —
-  `haveMatchingConsumers` returns true for `TMEMPost`, but the dst-op
+  `haveMatchingConsumers` returns true for `TMEMAlloc`, but the dst-op
   equality check fails (F's dst = mma, B's dst = load_in, W's dst =
   mma), so F and W can be considered for merging only if their consumer
   ops match exactly. Recommended: do NOT merge F and W — they have
@@ -183,11 +183,11 @@ LDBG("bufferIdToChannels[" << buf_id << "] size = "
 
 ---
 
-## Phase 3 — Buffer Creation (`createBufferPost`)
+## Phase 3 — Buffer Creation (`createBufferForAllocs`)
 
 ### File
 
-`WSCodePartition.cpp::createBufferPost`.
+`WSCodePartition.cpp::createBufferForAllocs`.
 
 ### Desired Output
 
@@ -201,7 +201,7 @@ LDBG("bufferIdToChannels[" << buf_id << "] size = "
 
 ### Verification
 
-After `createBufferPost`:
+After `createBufferForAllocs`:
 ```
 LDBG("bufferMap[F] = " << bufferMap[F]);
 LDBG("bufferMap[B] = " << bufferMap[B]);
@@ -211,11 +211,11 @@ LDBG("bufferMap[W] = " << bufferMap[W]);
 
 ---
 
-## Phase 4 — Token / Barrier Allocation (`createTokenPost`)
+## Phase 4 — Token / Barrier Allocation (`createToken`)
 
 ### File
 
-`WSCodePartition.cpp::createTokenPost`.
+`WSCodePartition.cpp::createToken`.
 
 ### Desired Output (per channel)
 
@@ -526,9 +526,9 @@ channels, which is the correct cross-partition synchronization shape.
 | Phase | File | Function | Change |
 |-------|------|----------|--------|
 | 1 | `CodePartitionUtility.cpp` | `handleOperandD` | Add channel-loop detection; conditionally skip pre-loop seeding; update `numChannelsCreated`/`firstProducer`/`lastConsumer` in deferred path; emit channel W |
-| 2 | `WSCodePartition.cpp` | `doCodePartitionPost` (region/reuse setup) | None expected; verify F/W don't accidentally merge |
-| 3 | `WSCodePartition.cpp` | `createBufferPost` | None expected |
-| 4 | `WSCodePartition.cpp` | `createTokenPost` | None expected; verify W gets its own token |
+| 2 | `WSCodePartition.cpp` | `doCodePartition` (region/reuse setup) | None expected; verify F/W don't accidentally merge |
+| 3 | `WSCodePartition.cpp` | `createBufferForAllocs` | None expected |
+| 4 | `WSCodePartition.cpp` | `createToken` | None expected; verify W gets its own token |
 | 5 | `WSCodePartition.cpp` | `insertAsyncComm` | None expected (96870473d code already correct once B exists); add assert that `isBackwardOfChannelLoop(B)` succeeds |
 | 6 | `WSCodePartition.cpp` | `specializeRegion` | None expected |
 | 7 | `WSCodePartition.cpp` | `fuseTcgen05CommitBarriers` | None expected |

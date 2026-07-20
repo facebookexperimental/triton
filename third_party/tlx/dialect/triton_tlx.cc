@@ -134,15 +134,37 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &v) -> void {
              self.create<tlx::DumpLayoutOp>(v);
            })
-      .def("create_local_load",
-           [](TritonOpBuilder &self, Value subView,
-              std::optional<Value> asyncToken) -> mlir::Value {
-             auto subViewType = cast<ttg::MemDescType>(subView.getType());
-             auto newType = RankedTensorType::get(subViewType.getShape(),
-                                                  subViewType.getElementType());
-             return self.create<ttg::LocalLoadOp>(newType, subView,
-                                                  asyncToken.value_or(Value()));
-           })
+      .def(
+          "create_local_load",
+          [](TritonOpBuilder &self, Value subView,
+             std::optional<Value> asyncToken,
+             std::optional<Attribute> layoutEncoding) -> mlir::Value {
+            auto subViewType = cast<ttg::MemDescType>(subView.getType());
+            RankedTensorType newType;
+            if (layoutEncoding.has_value()) {
+              // Pin the load result to the requested register layout, wrapped
+              // as a user layout (#tlx.user_layout). The wrapper carries
+              // PinnedEncodingTrait so remove-layout-conversions anchors the
+              // load and never rewrites it to a "preferred" layout; it is
+              // unwrapped to the concrete layout after the layout passes have
+              // run. Keep the inner no-verify wrapper (register encodings
+              // arrive wrapped so they defer tensor verification through
+              // inlining): resolve-placeholder-layouts strips the nested
+              // no-verify (keeping the user-layout marker) once inlining is
+              // done.
+              Attribute enc = tlx::wrapUserLayout(
+                  tlx::wrapNoVerifyLayout(layoutEncoding.value()));
+              newType = RankedTensorType::get(
+                  subViewType.getShape(), subViewType.getElementType(), enc);
+            } else {
+              newType = RankedTensorType::get(subViewType.getShape(),
+                                              subViewType.getElementType());
+            }
+            return self.create<ttg::LocalLoadOp>(newType, subView,
+                                                 asyncToken.value_or(Value()));
+          },
+          py::arg("subView"), py::arg("asyncToken"),
+          py::arg("layoutEncoding") = std::nullopt)
       .def("create_local_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues) -> void {
              self.create<ttg::LocalStoreOp>(regValues, dst);
@@ -206,6 +228,12 @@ void init_triton_tlx_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::SwizzledSharedEncodingAttr::get(
                  context, vectorSize, perPhase, maxPhase, order, CTALayout));
            })
+      .def("make_user_layout_attr",
+           [](TritonOpBuilder &self, Attribute inner) -> Attribute {
+             // Wrap a concrete shared-memory encoding so tlx-propagate-layout
+             // treats it as a user-pinned (do-not-retag) buffer layout.
+             return tlx::wrapUserLayout(inner);
+           })
       .def("make_padded_shared_encoding_attr",
            [](TritonOpBuilder &self, std::vector<unsigned> intervals,
               std::vector<unsigned> paddings, std::vector<unsigned> order,
@@ -225,6 +253,36 @@ void init_triton_tlx_ir(py::module &&m) {
                  makeCGALayout(context, CTAsPerCGA, CTASplitNum, CTAOrder);
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
+           })
+      .def("make_padded_shared_encoding_attr_with_bases",
+           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases, int rank) {
+             // Build #ttg.padded_shared from explicit linear bases ({offset,
+             // block}), so a caller can pin a swizzled layout, not just
+             // identity.
+             if (intervals.size() != paddings.size())
+               throw std::runtime_error(
+                   "make_padded_shared_encoding_attr_with_bases: intervals and "
+                   "paddings must have the same length");
+             auto context = self.getBuilder().getContext();
+             llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+             intervalPads.reserve(intervals.size());
+             for (auto [i, p] : llvm::zip(intervals, paddings))
+               intervalPads.emplace_back(i, p);
+             auto kOffset = mlir::StringAttr::get(context, "offset");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             tt::LinearLayout::BasesT bases;
+             bases[kOffset] = offsetBases;
+             bases[kBlock] = blockBases;
+             llvm::SmallVector<mlir::StringAttr> outDimNames;
+             for (int i = 0; i < rank; ++i)
+               outDimNames.push_back(
+                   mlir::StringAttr::get(context, "dim" + llvm::Twine(i)));
+             tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 context, intervalPads, std::move(ll)));
            })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
@@ -502,8 +560,18 @@ void init_triton_tlx_ir(py::module &&m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding must be TMEM compatible
-            Attribute tensorEncoding = tlx::wrapNoVerifyLayout(layoutEncoding);
+            // layoutEncoding already carries an inner no_verify (from
+            // make_linear_encoding_attr). Strip it, wrap with #tlx.user_layout
+            // (the hard anchor), then a single outer #tlx.no_verify_layout, so
+            // the encoding is exactly no_verify<user_layout<L>> -- no-verify
+            // outermost (deferred for verifiers keyed off the top-level attr,
+            // e.g. TritonGPU verifyTensorLayout), user-layout inside.
+            // resolve-placeholder-layouts strips the no-verify (keeping the
+            // user-layout marker) once inlining is done and num-warps is set.
+            Attribute tensorEncoding =
+                userLayout ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(
+                                 tlx::unwrapNoVerifyLayout(layoutEncoding)))
+                           : tlx::wrapNoVerifyLayout(layoutEncoding);
             auto newType = RankedTensorType::get(subViewType.getShape(),
                                                  subViewType.getElementType(),
                                                  tensorEncoding);
@@ -515,12 +583,6 @@ void init_triton_tlx_ir(py::module &&m) {
                     : ttng::TMEMLoadOp::create(self.getBuilder(),
                                                self.getLastLoc(), newType,
                                                subView);
-            // Mark the result layout as user-specified so layout passes treat
-            // it as a hard anchor and do not rewrite it to a "preferred" TMEM
-            // layout (see TMemLoadReducePattern in OptimizeTMemLayouts).
-            if (userLayout)
-              loadOp->setAttr("tlx.user_layout",
-                              self.getBuilder().getUnitAttr());
             return loadOp;
           },
           py::arg("subView"), py::arg("layoutEncoding"), py::arg("asyncToken"),
@@ -1057,6 +1119,8 @@ void init_triton_tlx_passes(py::module &&m) {
                      tlx::createTLXRewriteLocalAlias);
   ADD_PASS_WRAPPER_0("add_tlx_resolve_placeholder_layouts",
                      tlx::createTLXResolvePlaceholderLayouts);
+  ADD_PASS_WRAPPER_0("add_tlx_finalize_user_layouts",
+                     tlx::createTLXFinalizeUserLayouts);
   ADD_PASS_WRAPPER_0("add_tlx_print_ttgir_to_tlx",
                      tlx::createTLXPrintTTGIRToTLX);
   ADD_PASS_WRAPPER_0("add_tlx_dump_layout", tlx::createTLXDumpLayout);

@@ -210,7 +210,8 @@ class padded_shared_layout_encoding(shared_layout_encoding):
     ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
     """
 
-    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder):
+    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder, offset_bases=None,
+                 block_bases=None):
         super().__init__()
         assert len(intervals) == len(paddings), \
             "intervals and paddings must have the same length"
@@ -221,6 +222,44 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         self.numCTAsPerCGA = list(numCTAsPerCGA)
         self.numCTASplit = list(numCTASplit)
         self.numCTAOrder = list(numCTAOrder)
+        # When set, the layout is built from an explicit linear component
+        # (offset/block bases) instead of the identity {order, shape} form.
+        self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
+        self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
+
+    @staticmethod
+    @constexpr_function
+    def with_bases(interval_padding_pairs, offset_bases, shape, block_bases=None):
+        """Build a padded_shared encoding with an explicit linear component.
+
+        Mirrors ``#ttg.padded_shared<[i:+p, ...] {offset = [...], block = [...]}>``.
+        ``offset_bases`` is a list of per-dim base vectors (one per offset bit),
+        e.g. ``[[0, 1], [0, 2], ..., [16, 0], [1, 0], ...]`` — this lets you pin
+        a swizzled (row/col-permuted) shared layout rather than the identity one.
+        """
+        rank = len(shape)
+        assert rank > 0, "shape must be non-empty"
+        assert len(offset_bases) > 0, "offset_bases must be non-empty"
+        for b in offset_bases:
+            assert len(b) == rank, \
+                f"each offset base vector must have length rank={rank}, got {len(b)}: {b}"
+        for b in (block_bases or []):
+            assert len(b) == rank, \
+                f"each block base vector must have length rank={rank}, got {len(b)}: {b}"
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        enc = padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+            offset_bases=[[int(x) for x in b] for b in offset_bases],
+            block_bases=[[int(x) for x in b] for b in (block_bases or [])],
+        )
+        return enc
 
     @staticmethod
     @constexpr_function
@@ -254,6 +293,14 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
     def to_ir(self, builder: ir.builder) -> None:
+        if self.offset_bases is not None:
+            return builder.make_padded_shared_encoding_attr_with_bases(
+                self.intervals,
+                self.paddings,
+                self.offset_bases,
+                self.block_bases if self.block_bases is not None else [],
+                len(self.shape),
+            )
         return builder.make_padded_shared_encoding_attr(
             self.intervals,
             self.paddings,
@@ -1117,10 +1164,20 @@ class buffered_tensor_type(tl.block_type):
         shape = self.shape
         if self.num >= 1:
             shape = [self.num] + list(shape)
+        layout_handle = self.layout.to_ir(builder)
+        # An explicit, user-pinned shared layout (tlx.local_alloc(layout=...)) is
+        # wrapped as #tlx.user_layout<...> so layout propagation respects it. The
+        # pin is marked on the layout object by local_alloc; wrap here so the same
+        # wrapper appears wherever this type is reconstructed -- e.g. a @triton.jit
+        # callee's param rebuilt from this type, or a subview's result -- keeping
+        # tt.call operand/param and memdesc subview encodings consistent. The
+        # wrapper is stripped later by tlx-resolve-placeholder-layouts.
+        if getattr(self.layout, "_tlx_user_pinned", False):
+            layout_handle = builder.make_user_layout_attr(layout_handle)
         return builder.get_memdesc_type(
             shape,
             self.element_ty.to_ir(builder),
-            self.layout.to_ir(builder),
+            layout_handle,
             self.storage.value,
         )
 

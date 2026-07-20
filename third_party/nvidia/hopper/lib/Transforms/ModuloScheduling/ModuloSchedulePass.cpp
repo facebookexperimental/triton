@@ -726,16 +726,17 @@ static ttg::MemoryKind classifyMemoryKind(Operation *op) {
   return ttg::MemoryKind::Register;
 }
 
-/// Pass A.7-M4: pre-decide subtile factor for a descriptor_store op.
+/// Pass A.7: resolve the epilogue subtile factor S for a descriptor_store.
 ///
-/// Consulted by extractBufferShape so the SMEM staging buffer starts at
-/// (BM, BN/S) and the global SMEM reducer sees the shrunk size upfront —
-/// otherwise the reducer would cut K-loop pipeline depth based on the full
-/// store buffer, even if A.7 would later shrink it.
+/// Precedence: (1) env `TRITON_MODULO_EPILOGUE_SUBTILE` (2|4 force, any other
+/// value disables) overrides everything; (2) otherwise the auto-decision attr
+/// `tt.epilogue_subtile` set by `decideEpilogueSubtiles` from the cost model.
+/// The result is always clamped to legality (BN % S == 0 and BN/S >= 32, the
+/// 64-byte TMA min granularity for fp16).
 ///
-/// Today: env-override only (TRITON_MODULO_EPILOGUE_SUBTILE=2|4). The auto
-/// path (estimate K-loop SMEM + outer c_smem vs budget, pick smallest S that
-/// fits) is a follow-up — env override is enough for the demo.
+/// Consulted by extractBufferShape (shrink staging to (BM, BN/S) before the
+/// SMEM reducer runs), allocateBuffersForLoop (count→2), and
+/// markEpilogueSubtileNodes (emitter annotation) — so all three agree.
 static int getEpilogueSubtileForOp(Operation *op) {
   if (!isa<tt::DescriptorStoreOp>(op))
     return 1;
@@ -744,16 +745,21 @@ static int getEpilogueSubtileForOp(Operation *op) {
   if (!srcTy || srcTy.getRank() < 2)
     return 1;
   int BN = srcTy.getShape()[1];
-  auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
   int S = 0;
-  if (env == "2")
-    S = 2;
-  else if (env == "4")
-    S = 4;
-  // Min sub-tile width: 32 elements = 64 bytes for fp16, which is the
-  // TMA descriptor alignment minimum on Blackwell. The design doc gate
-  // is 64 (better TMA throughput); loosened here so the demo can use
-  // S=4 on the existing BN=128 case2 kernel.
+  auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
+  if (!env.empty()) {
+    // Manual override. "2"/"4" force; any other value (e.g. "0"/"1"/"off")
+    // disables, even if the cost model would have subtiled.
+    if (env == "2")
+      S = 2;
+    else if (env == "4")
+      S = 4;
+    else
+      S = 1;
+  } else if (auto attr =
+                 op->getAttrOfType<IntegerAttr>("tt.epilogue_subtile")) {
+    S = static_cast<int>(attr.getInt());
+  }
   if (S > 1 && BN > 0 && BN % S == 0 && BN / S >= 32)
     return S;
   return 1;
@@ -4206,6 +4212,245 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
                           << loop.crossGroupBarriers.size() << "\n");
 }
 
+/// Pass A.7: mark the epilogue chain so the sched2tlx emitter renders the
+/// subtiled store. For each subtiled `descriptor_store` (S = getEpilogueSubtile
+/// > 1), tag the store plus its register-compute producers (truncf / convert /
+/// casts) up to and including the `tmem_load` accumulator read with
+/// subtileCount = S and nSize = BN/S. The emitter's `_find_subtile_chain` keys
+/// off the FIRST chain node, so the whole chain (not just the store) must be
+/// marked. Buffer shrink + double-buffering are already handled by
+/// extractBufferShape / allocateBuffersForLoop; this only annotates the nodes.
+static void markEpilogueSubtileNodes(ttg::ScheduleLoop &loop) {
+  llvm::DenseMap<Operation *, unsigned> opToNode;
+  for (const auto &n : loop.nodes)
+    if (n.op)
+      opToNode[n.op] = n.id;
+
+  for (auto &storeNode : loop.nodes) {
+    if (!storeNode.op || !isa<tt::DescriptorStoreOp>(storeNode.op))
+      continue;
+    int S = getEpilogueSubtileForOp(storeNode.op);
+    if (S <= 1)
+      continue;
+    auto storeOp = cast<tt::DescriptorStoreOp>(storeNode.op);
+    auto srcTy = dyn_cast<RankedTensorType>(storeOp.getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int subSize = static_cast<int>(srcTy.getShape().back()) / S;
+
+    auto mark = [&](ttg::ScheduleNode &n) {
+      n.subtileCount = S;
+      n.nSize = subSize;
+    };
+    mark(storeNode);
+
+    // Walk the value chain feeding the store, marking register epilogue ops.
+    // Stop at the tmem_load (accumulator read) — mark it but don't recurse
+    // into the TMEM accumulator / MMA upstream.
+    llvm::SmallVector<Value, 4> worklist{storeOp.getSrc()};
+    llvm::DenseSet<Operation *> visited;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      Operation *def = v.getDefiningOp();
+      if (!def || !visited.insert(def).second)
+        continue;
+      auto it = opToNode.find(def);
+      if (it == opToNode.end())
+        continue;
+      mark(loop.nodes[it->second]);
+      // Memory-read boundaries: the TMEM accumulator and any external SMEM
+      // staging (e.g. case5's bias). Mark them (the emitter sub-slices them at
+      // their source) but don't recurse — their producer load stays a full,
+      // once-per-tile load outside the sub-tile loop.
+      if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp, tt::LoadOp>(def))
+        continue;
+      for (Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
+  }
+}
+
+/// True iff the store's value chain is subtileable along N: every op is either
+/// a memory-read boundary (the TMEM accumulator or an external SMEM staging —
+/// the emitter sub-slices those at their source) or an elementwise-along-N
+/// compute op (per-column, so slicing N is exact). This is NOT an op-name
+/// allowlist: it uses the same op predicate `WSDataPartition::sliceOp` uses to
+/// slice ops along a data-partition dimension (the identical transform), so
+/// bias `addf`, scale `mulf`, `math.exp`, casts, etc. all qualify, while a
+/// cross-column op (`tt.reduce`/`tt.trans`/`tt.dot`) correctly disqualifies —
+/// a genuine math constraint, not a missing case.
+static bool isSimpleSubtileableEpilogue(Operation *storeOp) {
+  llvm::SmallVector<Value, 4> worklist{
+      cast<tt::DescriptorStoreOp>(storeOp).getSrc()};
+  llvm::DenseSet<Operation *> seen;
+  while (!worklist.empty()) {
+    Operation *def = worklist.pop_back_val().getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    // Memory-read boundary — sub-sliced at its source (TMEM accumulator via
+    // tlx.subslice, external SMEM staging likewise). Don't recurse past it.
+    if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp, tt::LoadOp>(def))
+      continue;
+    // Elementwise-along-N compute (per-column): subtiling N is exact. Broadcast/
+    // splat/expand_dims would need per-sub-tile shape adjustment the emitter
+    // doesn't do yet, so they're deliberately excluded (correct skip, not a
+    // silent wrong result).
+    if (def->hasTrait<mlir::OpTrait::Elementwise>() ||
+        isa<ttg::ConvertLayoutOp, tt::FpToFpOp>(def)) {
+      for (Value o : def->getOperands())
+        worklist.push_back(o);
+      continue;
+    }
+    return false; // reduce / trans / dot / broadcast / other: not N-subtileable
+  }
+  return true;
+}
+
+/// Estimate the graph's total SMEM (bytes) WITHOUT epilogue subtiling — sum
+/// over all loops of each SMEM buffer's (tile bytes × lifetime count). Mirrors
+/// computeTotalSmem but works pre-allocation (from nodes), so the subtile
+/// decision can run before allocateBuffersForLoop. Used for the capacity
+/// trigger.
+static int64_t estimateGraphSmemBytes(const ttg::ScheduleGraph &graph) {
+  int64_t total = 0;
+  for (const auto &loop : graph.loops)
+    for (const auto &n : loop.nodes) {
+      if (!n.op || classifyMemoryKind(n.op) != ttg::MemoryKind::SMEM)
+        continue;
+      ttg::ScheduleBuffer buf;
+      extractBufferShape(n.op, buf); // full size (no subtile attr set yet)
+      if (buf.shape.empty() || buf.elementBitWidth == 0)
+        continue;
+      int64_t elems = 1;
+      for (auto d : buf.shape)
+        elems *= d;
+      total += elems * (buf.elementBitWidth / 8) *
+               static_cast<int64_t>(computeBufferCount(loop, n.id));
+    }
+  return total;
+}
+
+/// Pass A.7 auto-decision: choose the epilogue subtile factor S and stamp
+/// `tt.epilogue_subtile` on the store op (read by getEpilogueSubtileForOp).
+/// Skipped when the env override is set.
+///
+/// Grounded in the microbenchmark study (users/wl/wlei/modulo_schedule/
+/// latency_model/epi_subtile). Subtiling has TWO independent benefits, gated
+/// separately, and one cost:
+///   COST  — smaller TMA stores move bytes at lower BW (down to ~0.5x in a
+///           memory-bound copy). Only acceptable if hidden behind compute.
+///   PERF (overlap) — the sub-stores hide behind the next tile's MMA. Positive
+///           ONLY when the inner loop is compute-bound (has an MMA); on a
+///           memory-bound loop the store is the critical path and subtiling is
+///           a pure loss. ⇒ gate on tensor-core compute in the inner loop.
+///   SMEM (capacity) — the c_smem staging shrinks BM·BN·count → BM·(BN/S)·2, so
+///           subtiling frees SMEM and can keep the K-pipeline from being cut by
+///           the budget reducer. ⇒ gate on the un-subtiled total exceeding the
+///           SMEM budget; pick the smallest S that fits (least BW penalty).
+/// Pre-reqs for both: persistent loop owning a descriptor_store + an inner-loop
+/// super-node, an emitter-safe chain, and BN/S >= 32 (the granularity floor).
+static void decideEpilogueSubtiles(ttg::ScheduleGraph &graph) {
+  if (!triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE").empty())
+    return; // manual override path — getEpilogueSubtileForOp reads the env.
+
+  auto legal = [](int BN, int s) { return BN % s == 0 && BN / s >= 32; };
+
+  for (auto &loop : graph.loops) {
+    Operation *storeOp = nullptr;
+    unsigned storeNodeId = 0;
+    int innerId = -1;
+    for (const auto &n : loop.nodes) {
+      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
+        storeOp = n.op;
+        storeNodeId = n.id;
+      }
+      if (n.childPipelineId != UINT_MAX)
+        innerId = static_cast<int>(n.childPipelineId);
+    }
+    // Pre-reqs: persistent loop (store + inner super-node) + emitter-safe
+    // chain.
+    if (!storeOp || innerId < 0 || !isSimpleSubtileableEpilogue(storeOp))
+      continue;
+    auto srcTy = dyn_cast<RankedTensorType>(
+        cast<tt::DescriptorStoreOp>(storeOp).getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int BN = static_cast<int>(srcTy.getShape().back());
+
+    const ttg::ScheduleLoop *inner = nullptr;
+    for (const auto &l : graph.loops)
+      if (static_cast<int>(l.id) == innerId)
+        inner = &l;
+    if (!inner)
+      continue;
+
+    // PERF trigger: inner loop has tensor-core compute to overlap the store.
+    bool hasCompute = false;
+    for (const auto &n : inner->nodes)
+      if (n.pipeline == ttg::HWPipeline::TC) {
+        hasCompute = true;
+        break;
+      }
+    // Overlap wants the largest legal S (capped at the validated 4).
+    int sOverlap = 1;
+    if (hasCompute)
+      for (int cand : {4, 2})
+        if (legal(BN, cand)) {
+          sOverlap = cand;
+          break;
+        }
+
+    // SMEM trigger: if the un-subtiled total exceeds budget, subtiling the
+    // store (BM·BN·count → BM·(BN/S)·2) frees SMEM so the reducer need not cut
+    // the K-pipeline. Pick the SMALLEST S that brings the total under budget
+    // (least BW penalty). delta(S) is exact: storeFull - storeSub(S); note S=2
+    // vs a single-buffered store frees nothing (BM·BN·1 == BM·(BN/2)·2), so the
+    // loop naturally escalates to S=4.
+    int sCap = 1;
+    int64_t budget = kSmemBudgetBytes();
+    int64_t fullTotal = estimateGraphSmemBytes(graph);
+    if (fullTotal > budget) {
+      ttg::ScheduleBuffer sbuf;
+      extractBufferShape(storeOp, sbuf); // full BM×BN (no attr yet)
+      int64_t sElems = 1;
+      for (auto d : sbuf.shape)
+        sElems *= d;
+      int64_t eb = sbuf.elementBitWidth / 8;
+      int64_t storeFull =
+          sElems * eb *
+          static_cast<int64_t>(computeBufferCount(loop, storeNodeId));
+      for (int cand : {2, 4}) { // smallest-first: minimize BW penalty
+        if (!legal(BN, cand))
+          continue;
+        int64_t storeSub = (sElems / cand) * eb * 2; // subtile double-buffers
+        if (fullTotal - storeFull + storeSub <= budget) {
+          sCap = cand;
+          break;
+        }
+      }
+      // Still over budget at every legal S → take the largest legal (most
+      // relief) as best effort; the reducer/HW limit is the backstop.
+      if (sCap == 1)
+        for (int cand : {4, 2})
+          if (legal(BN, cand)) {
+            sCap = cand;
+            break;
+          }
+    }
+
+    int S = std::max(sOverlap, sCap);
+    if (S > 1) {
+      storeOp->setAttr(
+          "tt.epilogue_subtile",
+          IntegerAttr::get(IntegerType::get(storeOp->getContext(), 32), S));
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[A.7] auto subtile S=" << S << " (BN=" << BN
+                 << " overlap=" << sOverlap << " capacity=" << sCap
+                 << " smem=" << fullTotal << "/" << budget << ")\n");
+    }
+  }
+}
+
 /// Top-level: build a ScheduleGraph from DDG + schedule result.
 /// Includes Phase 0 (DDG→nodes/edges), Step 2.5 (clusters),
 /// Step 3 (buffer allocation), Step 4.5 (merging), Step 4.6 (budget),
@@ -4222,8 +4467,13 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
   ttg::ScheduleGraph graph;
   buildScheduleLoop(loop, ddg, sched, graph, model);
 
+  // Decide epilogue subtiling from the cost model BEFORE buffer allocation, so
+  // extractBufferShape shrinks the staging buffer ahead of the SMEM reducer.
+  decideEpilogueSubtiles(graph);
+
   for (auto &schedLoop : graph.loops) {
     allocateBuffersForLoop(schedLoop, plan);
+    markEpilogueSubtileNodes(schedLoop);
     mergeNonOverlappingBuffers(schedLoop);
   }
 
@@ -4483,6 +4733,141 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
+/// Whole-nest epilogue warp-group unification (cost-model, storage-class-priced).
+///
+/// A persistent outer loop's epilogue may consume a value V produced by its
+/// inner loop. If V is a REGISTER value, running the epilogue in a warp group
+/// separate from V's producer forces V through an SMEM materialization
+/// round-trip (a local_store in the producer plus a local_load + 2 barriers in
+/// the consumer) — a real cost that scales with bytes(V). Co-locating the
+/// epilogue into the inner producer's warp group removes that hand-off.
+///
+/// The decision is priced by V's storage class, NOT by a "register → same WG"
+/// rule (that would just be pattern matching):
+///   Register V  → co-locating saves the full materialization (~2·bytes),
+///                 which is otherwise pure overhead → co-locate.
+///   TMEM/SMEM V → the consumer needs a barrier to read V regardless of which
+///                 warp group runs the epilogue, so co-location saves ~nothing.
+///                 A GEMM's TMEM accumulator therefore legitimately keeps its
+///                 own epilogue WG → stay separate.
+/// Overlap benefit is left implicit in the loop II/makespan (the epilogue work
+/// is scheduled either way); we price only the hand-off co-location removes.
+///
+/// The decision is expressed by RENUMBERING the epilogue-owning outer warp
+/// group so its id is meaningful across the super-node boundary — no side field:
+///   co-locate → the inner producer's warp-group id (the epilogue now SHARES it,
+///               which is exactly the co-location signal the emitter reads),
+///   separate  → a FRESH id above every id in the nest, guaranteed not to alias
+///               any inner id (so "epilogue wg == an inner wg" unambiguously
+///               means co-located, never a coincidence).
+/// The whole epilogue-owning group is renumbered together, so no intra-outer
+/// edge becomes cross-WG (no spurious barriers on super-node→epilogue or
+/// index-math→store). sched2tlx then just reads the warp-group id.
+static void unifyNestEpilogueWarpGroup(ttg::ScheduleGraph &graph) {
+  for (auto &outer : graph.loops) {
+    // Outer (persistent) loop = owns a descriptor_store AND wraps an inner-loop
+    // super-node.
+    tt::DescriptorStoreOp storeOp;
+    unsigned storeNodeId = 0;
+    scf::ForOp innerFor;
+    int innerId = -1;
+    for (auto &n : outer.nodes) {
+      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
+        storeOp = cast<tt::DescriptorStoreOp>(n.op);
+        storeNodeId = n.id;
+      }
+      if (n.childPipelineId != UINT_MAX && n.op)
+        if (auto f = dyn_cast<scf::ForOp>(n.op)) {
+          innerFor = f;
+          innerId = static_cast<int>(n.childPipelineId);
+        }
+    }
+    if (!storeOp || !innerFor || innerId < 0)
+      continue;
+
+    // The epilogue-owning outer warp group (the group that runs the store).
+    int epiWg = -1;
+    for (auto &n : outer.nodes)
+      if (n.id == storeNodeId) {
+        epiWg = n.warpGroup;
+        break;
+      }
+    if (epiWg < 0)
+      continue;
+
+    // Inner warp-group ids + a fresh id above every id in the whole nest.
+    int freshId = 0;
+    const ttg::ScheduleLoop *innerLoop = nullptr;
+    for (auto &l : graph.loops) {
+      for (auto &n : l.nodes)
+        freshId = std::max(freshId, n.warpGroup + 1);
+      if (static_cast<int>(l.id) == innerId)
+        innerLoop = &l;
+    }
+
+    // Default: SEPARATE — a fresh non-aliasing id.
+    int newWg = freshId;
+
+    // Trace the store's source back to the inner-loop result it consumes. If
+    // that result is a REGISTER tensor, co-locate into its producer partition.
+    int resultIdx = -1;
+    SmallVector<Value> work{storeOp.getSrc()};
+    llvm::SmallPtrSet<Value, 8> seen;
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      if (!seen.insert(v).second)
+        continue;
+      if (auto res = dyn_cast<OpResult>(v))
+        if (res.getOwner() == innerFor.getOperation()) {
+          resultIdx = static_cast<int>(res.getResultNumber());
+          continue;
+        }
+      Operation *def = v.getDefiningOp();
+      if (!def || def == innerFor.getOperation())
+        continue; // block arg / iv, or the inner loop itself.
+      // Only descend ops in the outer loop body — never into the inner loop.
+      if (def->getParentRegion() != innerFor->getParentRegion())
+        continue;
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+
+    if (resultIdx >= 0 && innerLoop) {
+      Value innerResult = innerFor.getResult(resultIdx);
+      if (auto tensorTy = dyn_cast<RankedTensorType>(innerResult.getType())) {
+        int64_t elems = 1;
+        for (auto d : tensorTy.getShape())
+          elems *= d;
+        int64_t bytes = elems * (tensorTy.getElementTypeBitWidth() / 8);
+        auto yield =
+            cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
+        Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
+        int producerWg = -1;
+        if (yieldDef)
+          for (auto &n : innerLoop->nodes)
+            if (n.op == yieldDef && n.warpGroup >= 0) {
+              producerWg = n.warpGroup;
+              break;
+            }
+        if (bytes > 0 && producerWg >= 0) {
+          newWg = producerWg; // co-locate: share the producer's WG id.
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[colocate] outer epilogue → inner WG " << producerWg
+                     << " (register hand-off " << bytes << " B removed)\n");
+        }
+      }
+    }
+
+    if (newWg == epiWg)
+      continue; // already correct.
+
+    // Renumber the WHOLE epilogue-owning group together.
+    for (auto &n : outer.nodes)
+      if (n.warpGroup == epiWg)
+        n.warpGroup = newWg;
+  }
+}
+
 /// Pass B: Per-loop warp-group partition + cross-group barriers. Each
 /// ScheduleLoop gets its own Phase 4 partition run with its own II.
 /// Nested kernels (case2/case5) get inner-partition (e.g., 3-WG GEMM
@@ -4535,6 +4920,13 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       coLocateOperandAllocsWithLoads(schedLoop);
     }
   }
+
+  // Cross-loop reconciliation: now that every loop has warp groups, unify each
+  // outer epilogue's warp-group id with its inner producer (storage-class-priced
+  // hand-off cost model). Runs before barrier insertion so the renumbered ids
+  // drive barrier synthesis and the emitter reads them directly.
+  for (auto &sl : scheduledLoops)
+    unifyNestEpilogueWarpGroup(sl.graph);
 
   // Run barrier insertion per-loop using the now-globally-consistent
   // warp-group IDs. Cross-loop barriers (from Phase 2 edges) are still
@@ -5036,12 +5428,18 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
     if (n.isSuperNode())
       os << ", \"child_pipeline_id\": " << n.childPipelineId
          << ", \"prologue_latency\": " << n.prologueLatency;
-    // Pass A.5 data-partition fields on the (single) MMA bundle node. A.7
-    // subtile fields remain a separate follow-up.
+    // Pass A.5 data-partition fields on the (single) MMA bundle node.
     if (n.partitionCount > 1)
       os << ", \"partition_count\": " << n.partitionCount
          << ", \"partition_dim\": " << n.partitionDim
          << ", \"m_size\": " << n.mSize;
+    // Pass A.7 epilogue-subtile fields — only emitted for marked chain nodes
+    // so non-subtiled dumps stay byte-identical (the emitter defaults the
+    // rest to subtile_count=1).
+    if (n.subtileCount > 1)
+      os << ", \"subtile_index\": " << n.subtileIndex
+         << ", \"subtile_count\": " << n.subtileCount
+         << ", \"n_offset\": " << n.nOffset << ", \"n_size\": " << n.nSize;
     os << "}" << (i + 1 == sl.nodes.size() ? "" : ",") << "\n";
   }
   os << "        ],\n";
@@ -6315,9 +6713,8 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
 /// Dense cluster id (rank of distinct cycle, stage 0) per DDG node. Returns an
 /// ordered map (keyed by node idx) so iteration is deterministic across builds
 /// — DenseMap iteration order is not, and this feeds emitted schedule dumps.
-static std::map<unsigned, int>
-listClusters(const ttg::DataDependenceGraph &ddg,
-             const ttg::ListScheduleResult &r) {
+static std::map<unsigned, int> listClusters(const ttg::DataDependenceGraph &ddg,
+                                            const ttg::ListScheduleResult &r) {
   SmallVector<int> cycles;
   for (auto &[idx, c] : r.nodeToCycle)
     cycles.push_back(c);

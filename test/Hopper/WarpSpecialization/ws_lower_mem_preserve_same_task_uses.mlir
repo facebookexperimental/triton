@@ -1,10 +1,11 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-buffer-allocation '--nvgpu-test-ws-memory-planner=num-buffers=2 smem-budget=200000' '--nvgpu-test-ws-code-partition=num-buffers=2' | FileCheck %s
 
 // Regression test for B-16-F1 / T273493462.
 //
-// A producer load can have both same-task and cross-task consumers. WSLowerMem
-// must only lower the cross-task channel operand through SMEM; the same-task
-// use must stay on the original load result.
+// A producer load can have both same-task and cross-task consumers. The
+// production allocation and code-partition path must only stage the cross-task
+// channel through SMEM; the same-task use must stay on the original load
+// result.
 
 // CHECK-LABEL: @preserve_same_task_load_use
 // CHECK: [[LOAD:%.*]] = tt.load
@@ -16,7 +17,7 @@
 
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 
-module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @preserve_same_task_load_use(%ptr: !tt.ptr<f32>) attributes {noinline = false} {
     %ptrs0 = tt.splat %ptr {ttg.partition = array<i32: 0>} : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>
     %ptrs1 = tt.splat %ptr {ttg.partition = array<i32: 1>} : !tt.ptr<f32> -> tensor<16x!tt.ptr<f32>, #blocked>

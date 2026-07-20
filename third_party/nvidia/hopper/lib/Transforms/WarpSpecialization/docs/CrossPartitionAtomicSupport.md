@@ -18,7 +18,7 @@ while tile_id < num_tiles:
 
 AutoWS clones the persistent `scf.while` once per partition. That is correct for
 the *pure* static update (`tile_id += NUM_SMS`) but **wrong** for the
-side-effecting `tl.atomic_add`: partition-id propagation assigns the atomic (whose
+side-effecting `tl.atomic_add`: task-id propagation assigns the atomic (whose
 result is the loop-carried value used by every partition) to **all** partitions,
 so each warp group bumps the counter independently, diverges onto a different
 tile, and the producer/consumer barriers never match → **runtime deadlock**.
@@ -66,7 +66,7 @@ channel machinery provide synchronization:
 
 The producer→consumer synchronization is **not** hand-synthesized. Because the
 `local_store` (owner) and `local_load` (all partitions) form an ordinary
-cross-partition SMEM dependency, `doCodePartitionPost` turns it into (N) SMEM
+cross-partition SMEM dependency, `doCodePartition` turns it into (N) SMEM
 channels with the correct full/empty mbarriers and phase — i.e. the broadcast is
 expressed in terms of an existing, tested AutoWS channel rather than a bespoke
 handshake.
@@ -74,14 +74,15 @@ handshake.
 ### Case 3 — graceful reject
 
 `doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
-`removeWarpSpecializeAttr(funcOp)`, which strips **both** the partition ids
-(`ttg.partition`) and the partition ids (`ttg.partition`) from every op, plus the WS
+`removeWarpSpecMetadata(funcOp)`, which strips **both** the partition ids
+(`ttg.partition`) and the task ids (`ttg.partition`) from every op, plus the WS
 loop attributes (`tt.warp_specialize`, `ttg.partition.stages`,
-`ttg.partition.types`, `ttg.warp_specialize.tag`) from `scf.for`/`scf.while`
-loops. The kernel is left unspecialized-but-compilable (never a crash/assert).
-This is the same teardown used by the other AutoWS bail-outs (`numWarps < 4`,
-`scf.if` else-block); `removeWarpSpecializeAttr` clears `ttg.partition` too
-because this reject runs *after* propagation, unlike the earlier bail-outs.
+`ttg.partition.types`, `ttg.warp_specialize.tag`). The kernel is left
+unspecialized-but-compilable (never a crash/assert). This is the same teardown —
+one shared helper — used by the other AutoWS bail-outs (`numWarps < 4`, `scf.if`
+else-block) and by `PartitionSchedulingMeta`'s warp-budget reject;
+`removeWarpSpecMetadata` clears `ttg.partition` too because this reject runs
+*after* propagation, unlike the earlier bail-outs.
 
 ## Two supporting fixes this feature required
 
@@ -143,4 +144,4 @@ broadcast (`transformCLC`) is single-stage.
   `EPILOGUE_SUBTILE ∈ {1,2,4}`.
 - LIT: `test/Hopper/WarpSpecialization/ws_atomic_broadcast_transform.mlir`
   (case 2 — exactly one atomic + broadcast) and `ws_atomic_broadcast_reject.mlir`
-  (case 3 — no WS / no partition ids / no partition ids left, atomic preserved).
+  (case 3 — no WS / no partition ids / no task ids left, atomic preserved).

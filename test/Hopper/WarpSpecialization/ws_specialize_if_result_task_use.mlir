@@ -1,4 +1,4 @@
-// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s
 
 // Regression test for B-19-F1 / T273499456.
 //
@@ -31,7 +31,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %zero_vec = arith.constant {ttg.partition = array<i32: 1>} dense<0> : tensor<16xi32, #blocked>
     %alloc = ttg.local_alloc {ttg.partition = array<i32: 0>, buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<16xf32, #shared, #smem, mutable>
     scf.for %iv = %c0 to %c1 step %c1 {
-      %c7_i32 = arith.constant 7 : i32
+      %c7_i32 = arith.constant {ttg.partition = array<i32: 0, 1>} 7 : i32
       %pred = arith.cmpi eq, %c0_i32, %c1_i32 {ttg.partition = array<i32: 0, 1>} : i32
       %selected = scf.if %pred -> (i32) {
         scf.yield {ttg.partition = array<i32: 0, 1>} %c7_i32 : i32

@@ -938,6 +938,14 @@ LogicalResult ReshapeOp::verify() {
 
   Attribute srcEnc = srcTy.getEncoding();
   Attribute dstEnc = dstTy.getEncoding();
+  // If either side carries a TLX placeholder wrapper (#tlx.user_layout /
+  // #tlx.no_verify_layout) -- at the top or nested inside a ttg encoding (e.g.
+  // a slice/expand parent) -- defer all reshape layout verification to
+  // resolve-placeholder-layouts (make_ttgir); the concrete src/dst may not be
+  // consistent yet at this point.
+  if (encodingContainsTlxPlaceholder(srcEnc) ||
+      encodingContainsTlxPlaceholder(dstEnc))
+    return success();
   if (!!srcEnc != !!dstEnc) {
     return emitError("Op requires that either (a) src and dst both have "
                      "encodings, or (b) neither does.");
@@ -1128,6 +1136,12 @@ LogicalResult FpToFpOp::verify() {
 }
 
 //-- BitcastOp --
+OpFoldResult BitcastOp::fold(FoldAdaptor adaptor) {
+  if (getSrc().getType() == getType())
+    return getSrc();
+  return {};
+}
+
 LogicalResult BitcastOp::verify() {
   // Bitcast only allows conversion between types with the same bit width.
   Type dstType = getType();
@@ -1388,9 +1402,8 @@ struct CanonicalizeIntToPtrOfPtrToInt : public OpRewritePattern<IntToPtrOp> {
     auto ptrToIntOp = intToPtrOp.getSrc().getDefiningOp<PtrToIntOp>();
     if (!ptrToIntOp)
       return failure();
-
-    // Replace with the original pointer
-    rewriter.replaceOp(intToPtrOp, ptrToIntOp.getSrc());
+    rewriter.replaceOpWithNewOp<BitcastOp>(intToPtrOp, intToPtrOp.getType(),
+                                           ptrToIntOp.getSrc());
     return success();
   }
 };

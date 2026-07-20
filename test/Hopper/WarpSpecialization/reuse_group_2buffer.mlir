@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
 //
 // Verify that 2-buffer reuse group logic moves the late buffer's (dq)
 // producer_acquire before the early buffer's (dpT) producer.

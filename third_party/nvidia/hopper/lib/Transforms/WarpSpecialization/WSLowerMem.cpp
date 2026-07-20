@@ -34,171 +34,6 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-static bool hasAnyWSPartitionId(Operation *op, ArrayRef<int> taskIds) {
-  auto opTaskIds = getWSPartitionIds(op);
-  return llvm::any_of(opTaskIds, [&](int opTaskId) {
-    return llvm::is_contained(taskIds, opTaskId);
-  });
-}
-
-static unsigned replaceUsesInOp(Value oldValue, Value newValue,
-                                Operation *userOp) {
-  unsigned replacements = 0;
-  for (OpOperand &operand : userOp->getOpOperands()) {
-    if (operand.get() == oldValue) {
-      operand.set(newValue);
-      ++replacements;
-    }
-  }
-  return replacements;
-}
-
-static unsigned replaceUsesForChannel(Value oldValue, Value newValue,
-                                      Channel *channel) {
-  SmallVector<OpOperand *> channelUses;
-  for (OpOperand &use : oldValue.getUses()) {
-    if (hasAnyWSPartitionId(use.getOwner(), channel->relation.second))
-      channelUses.push_back(&use);
-  }
-
-  for (OpOperand *use : channelUses)
-    use->set(newValue);
-
-  if (!channelUses.empty())
-    return channelUses.size();
-
-  return replaceUsesInOp(oldValue, newValue, channel->getDstOp());
-}
-
-static void replaceUsesInTasks(Value oldValue, Value newValue,
-                               ArrayRef<int> taskIds) {
-  SmallVector<OpOperand *> matchingUses;
-  for (OpOperand &use : oldValue.getUses()) {
-    if (hasAnyWSPartitionId(use.getOwner(), taskIds))
-      matchingUses.push_back(&use);
-  }
-
-  for (OpOperand *use : matchingUses)
-    use->set(newValue);
-}
-
-static std::pair<Operation *, Operation *>
-createAsyncCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *c,
-                Operation *op, SmallVector<WSPartitionId> &partitionIdsPC,
-                Value bufferIdx, Value bufferIdxExtract) {
-  auto loadOp = cast<triton::LoadOp>(op);
-  auto buffer = bufferMap.find(c)->second;
-  MLIRContext *context = loadOp->getContext();
-  OpBuilderWithPartitionIds builder(context);
-  builder.setInsertionPoint(loadOp->getParentOp());
-  builder.setPartitionIdsFromArray(partitionIdsPC);
-
-  builder.setInsertionPoint(loadOp);
-  builder.setLoopScheduleInfoFromOp(loadOp);
-  Value loadResult = loadOp.getResult();
-  auto tensorType = dyn_cast<RankedTensorType>(loadResult.getType());
-  if (!tensorType)
-    return {nullptr, nullptr};
-  // Get basic information from tensorType
-  auto order = ttg::getOrderForMemory(tensorType);
-  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
-  auto elemType = tensorType.getElementType();
-
-  // Get shape, layout and type of a slice
-  auto sliceShape = tensorType.getShape();
-  auto sharedLayout =
-      dyn_cast<triton::gpu::MemDescType>(buffer.getType()).getEncoding();
-  auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
-
-  Attribute sharedMemorySpace =
-      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
-  ttg::MemDescType subviewTy =
-      ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
-                            sliceType.getEncoding(), sharedMemorySpace,
-                            /*mutableMemory=*/true);
-  builder.setPartitionIdsFromOp(loadOp);
-  builder.setInsertionPointAfter(loadOp);
-  auto view = builder.createWithPartitionIds<ttg::MemDescIndexOp>(
-      loadOp.getLoc(), subviewTy, buffer, bufferIdx);
-  // Create cp.async
-  Operation *copy =
-      builder.createWithPartitionIds<ttg::AsyncCopyGlobalToLocalOp>(
-          loadOp.getLoc(), loadOp.getPtr(), view, loadOp.getMask(),
-          loadOp.getOther(), loadOp.getCache(), loadOp.getEvict(),
-          loadOp.getIsVolatile());
-
-  // Extract part.
-  builder.setPartitionIdsFromValueUsers(loadResult);
-  builder.setInsertionPoint(c->getDstOp());
-  auto viewLoad = builder.createWithPartitionIds<ttg::MemDescIndexOp>(
-      loadOp.getLoc(), subviewTy, buffer, bufferIdxExtract);
-  auto sharedLoad = builder.createWithPartitionIds<ttg::LocalLoadOp>(
-      loadOp.getLoc(), loadOp.getType(), viewLoad /*,wait->getResult(0)*/);
-  replaceUsesForChannel(loadResult, sharedLoad.getResult(), c);
-  if (loadResult.use_empty())
-    loadOp.erase();
-  return {copy, sharedLoad};
-}
-
-// Create a local copy for a channel that is populated by the producer and
-// accessed by the consumer.
-// For the case where the value shared in (producer, consumer) is in tensor.
-// Global buffer for the channel is already created and passed in bufferMap.
-// This function creates LocalLoad at consumer and LocalStore at producer.
-static std::pair<Operation *, Operation *>
-createLocalCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
-                Value srcBufferIdx, Value dstBufferIdx) {
-  Operation *srcOp = channel->getSrcOp();
-  Operation *dstOp = channel->getDstOp();
-  MLIRContext *context = srcOp->getContext();
-  auto buffer = bufferMap.find(channel)->second;
-
-  Value srcValue = channel->getSrcOperand();
-  auto tensorType = dyn_cast<RankedTensorType>(srcValue.getType());
-  if (!tensorType)
-    return {nullptr, nullptr};
-  // Get basic information from tensorType
-  auto order = ttg::getOrderForMemory(tensorType);
-  auto CGALayout = ttg::getCGALayout(tensorType.getEncoding());
-  auto elemType = tensorType.getElementType();
-
-  // Get shape, layout and type of a slice
-  auto sliceShape = tensorType.getShape();
-  auto sharedLayout =
-      dyn_cast<triton::gpu::MemDescType>(buffer.getType()).getEncoding();
-  auto sliceType = RankedTensorType::get(sliceShape, elemType, sharedLayout);
-
-  Attribute sharedMemorySpace =
-      cast<ttg::MemDescType>(buffer.getType()).getMemorySpace();
-  ttg::MemDescType subviewTy =
-      ttg::MemDescType::get(sliceType.getShape(), sliceType.getElementType(),
-                            sliceType.getEncoding(), sharedMemorySpace,
-                            /*mutableMemory=*/true);
-
-  // Consumer part.
-  OpBuilderWithPartitionIds builder(dstOp);
-  builder.setPartitionIdsFromOp(dstOp);
-  builder.setInsertionPoint(dstOp);
-  builder.setLoopScheduleInfoFromOp(dstOp);
-  auto dstView = builder.createWithPartitionIds<ttg::MemDescIndexOp>(
-      dstOp->getLoc(), subviewTy, buffer, dstBufferIdx);
-  auto sharedLoad = builder.createWithPartitionIds<ttg::LocalLoadOp>(
-      dstOp->getLoc(), srcValue.getType(), dstView);
-  replaceUsesForChannel(srcValue, sharedLoad.getResult(), channel);
-
-  // Producer part. Create local_store for new producers.
-  builder.setPartitionIdsFromArray(channel->relation.first);
-  builder.setInsertionPoint(srcOp->getParentOp());
-  builder.setInsertionPointAfter(srcOp);
-  builder.setLoopScheduleInfoFromOp(srcOp);
-  auto srcView = builder.createWithPartitionIds<ttg::MemDescIndexOp>(
-      srcOp->getLoc(), subviewTy, buffer, srcBufferIdx);
-  // Create local_alloc
-  Operation *copy = builder.createWithPartitionIds<ttg::LocalStoreOp>(
-      srcOp->getLoc(), srcValue, srcView);
-  return {copy, sharedLoad};
-}
-
 Value createBufferView(OpBuilderWithPartitionIds &builder, Value alloc,
                        Value idx) {
   assert(isa<triton::gpu::MemDescType>(alloc.getType()) &&
@@ -214,126 +49,6 @@ Value createBufferView(OpBuilderWithPartitionIds &builder, Value alloc,
       allocDescType.getMemorySpace(), allocDescType.getMutableMemory());
   return triton::gpu::MemDescIndexOp::create(builder, alloc.getLoc(),
                                              viewDescType, alloc, idx);
-}
-
-// For the case where the value shared in (producer, consumer) is in smem.
-static std::pair<Operation *, Operation *>
-createSMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
-               Value srcBufferIdx, Value dstBufferIdx) {
-  Operation *srcOp = channel->getSrcOp();
-  Operation *dstOp = channel->getDstOp();
-  auto buffer = bufferMap.find(channel)->second;
-  Value srcValue = channel->getSrcOperand();
-  auto memDesc = cast<triton::gpu::MemDescType>(srcValue.getType());
-
-  // Replace original smem alloc with smem_store.
-  auto oldAllocOp = cast<ttg::LocalAllocOp>(srcOp);
-  auto newAllocOp = cast<ttg::LocalAllocOp>(buffer.getDefiningOp());
-  OpBuilderWithPartitionIds builder(oldAllocOp);
-  builder.setInsertionPointAfter(oldAllocOp);
-
-  assert(oldAllocOp.getSrc());
-  auto *actualSrc = oldAllocOp.getSrc().getDefiningOp();
-  builder.setLoopScheduleInfoFromOp(actualSrc);
-
-  SmallVector<WSPartitionId> partitionIdsSubView = getWSPartitionIds(actualSrc);
-  for (auto *user : oldAllocOp->getUsers()) {
-    for (auto task : getWSPartitionIds(user))
-      if (!llvm::is_contained(partitionIdsSubView, task))
-        partitionIdsSubView.push_back(task);
-  }
-  builder.setPartitionIdsFromArray(partitionIdsSubView);
-  // Will be used by both produer and consumer.
-  auto srcView = createBufferView(builder, newAllocOp, srcBufferIdx);
-
-  builder.setPartitionIdsFromOp(actualSrc);
-  auto smemStoreOp = builder.createWithPartitionIds<ttg::LocalStoreOp>(
-      oldAllocOp.getLoc(), oldAllocOp.getSrc(), srcView);
-
-  // Consumer will be updated.
-  oldAllocOp->getResult(0).replaceAllUsesWith(srcView);
-  oldAllocOp.erase();
-  // DstOp is the same, srcOp will be auto-adjusted to be the defining op of
-  // srcOpnd.
-  return {smemStoreOp, channel->getDstOp()};
-}
-
-static std::pair<Operation *, Operation *>
-createTMEMCopy(const DenseMap<Channel *, Value> &bufferMap, Channel *channel,
-               Value srcBufferIdx, Value dstBufferIdx) {
-  // Replace original tmem alloc with tmem_store.
-  ttng::TmemDataChannel *tmemChannel =
-      static_cast<ttng::TmemDataChannel *>(channel);
-  auto oldTMemAllocOp = cast<ttng::TMEMAllocOp>(tmemChannel->getAllocOp());
-  auto newTMemAllocOp =
-      cast<ttng::TMEMAllocOp>(bufferMap.find(channel)->second.getDefiningOp());
-  OpBuilderWithPartitionIds builder(oldTMemAllocOp);
-  builder.setInsertionPointAfter(oldTMemAllocOp);
-  builder.setLoopScheduleInfoFromOp(oldTMemAllocOp);
-
-  // A tmemChannel is usually centered around a gen5 dotOp. There are two
-  // cases, one is that the channel is for the accumulator, the other is
-  // the channel is for operand A of the gen5.
-  // Here we replace tmem_alloc with tmem_store when applicable and create a
-  // subView that is used by tmem_store and also all users of tmem_alloc.
-  // Calculate the taskIds for the subView, and tmem_store.
-  // tmemStore's taskId can be the mmaOp's taskId if alloc.getSrc is available
-  // for mmaOp's taskId, otherwise, it should happen in alloc.getsrc.
-  Operation *opForStoreTask = tmemChannel->getMmaOp();
-  if (oldTMemAllocOp.getSrc()) {
-    auto taskIds = getWSPartitionIds(opForStoreTask);
-    assert(taskIds.size() == 1);
-    // Check to see if alloc.getSrc is available for mmaOp's taskId.
-    auto *srcOp = oldTMemAllocOp.getSrc().getDefiningOp();
-    if (!hasWSPartitionId(srcOp, taskIds[0]))
-      opForStoreTask = oldTMemAllocOp.getSrc().getDefiningOp();
-  }
-  // TaskIds for subView should be the union of tmem_store and all users of
-  // tmem_alloc.
-  SmallVector<WSPartitionId> partitionIdsSubView =
-      getWSPartitionIds(opForStoreTask);
-  for (auto *user : oldTMemAllocOp->getUsers()) {
-    for (auto task : getWSPartitionIds(user))
-      if (!llvm::is_contained(partitionIdsSubView, task))
-        partitionIdsSubView.push_back(task);
-  }
-  builder.setPartitionIdsFromArray(partitionIdsSubView);
-
-  auto srcView = createBufferView(builder, newTMemAllocOp, srcBufferIdx);
-  LLVM_DEBUG({
-    LDBG("createTMEMCopy: srcView ");
-    srcView.dump();
-  });
-
-  if (oldTMemAllocOp.getSrc()) {
-    builder.setPartitionIdsFromOp(opForStoreTask);
-    Value vTrue = builder.createWithPartitionIds<arith::ConstantIntOp>(
-        oldTMemAllocOp.getLoc(), 1, 1);
-    // Promote TMEMAlloc to start, create TMEMStore.
-    // auto tokType = builder.getType<AsyncTokenType>();
-    // tokType, srcView, oldTMemAllocOp.getToken()
-    // We used to have token from Alloc, then to other users.
-    // FIXME: Type(), srcView, Value(),
-    // OAI's warpspec does the above.
-    auto tmemStoreOp = builder.createWithPartitionIds<ttng::TMEMStoreOp>(
-        oldTMemAllocOp.getLoc(), Type(), srcView, Value(),
-        oldTMemAllocOp.getSrc(), vTrue);
-    oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
-    if (oldTMemAllocOp.getToken())
-      oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
-    oldTMemAllocOp.erase();
-    tmemChannel->tmemProducerOp = tmemStoreOp;
-    return {tmemStoreOp, channel->getDstOp()};
-  }
-  // Handle the case where there is no value for tmem_alloc.
-  oldTMemAllocOp->getResult(0).replaceAllUsesWith(srcView);
-  if (oldTMemAllocOp.getToken())
-    oldTMemAllocOp.getToken().replaceAllUsesWith(newTMemAllocOp.getToken());
-  oldTMemAllocOp.erase();
-  // We need a new srcOp now that tmemAlloc is erased, the new SrcOp will be
-  // the mmaOp.
-  tmemChannel->tmemProducerOp = tmemChannel->getMmaOp();
-  return {tmemChannel->getMmaOp(), channel->getDstOp()};
 }
 
 static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
@@ -371,13 +86,15 @@ Value getBufferForPipelineStage(OpBuilderWithPartitionIds &builder,
   return desc;
 }
 
-Operation *optimizeTMALoads(
-    OpBuilderWithPartitionIds &builder,
-    SmallVector<tt::DescriptorLoadOp> &tmaLoads, SmallVector<Value> &buffers,
-    Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract, Value phase,
-    Operation *headProducer, Operation *headConsumer,
-    Operation *headConsumerSameLevel, ArrayRef<int> additionalConsumerTaskIds,
-    bool isPost, DictionaryAttr consumerWaitConstraints) {
+Operation *optimizeTMALoads(OpBuilderWithPartitionIds &builder,
+                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
+                            SmallVector<Value> &buffers, Value barrierAlloc,
+                            Value bufferIdx, Value bufferIdxExtract,
+                            Value phase, Operation *headProducer,
+                            Operation *headConsumer,
+                            Operation *headConsumerSameLevel,
+                            ArrayRef<int> additionalConsumerTaskIds,
+                            DictionaryAttr consumerWaitConstraints) {
   auto loc = barrierAlloc.getLoc();
 
   // Compute the total size of the loads.
@@ -414,7 +131,7 @@ Operation *optimizeTMALoads(
 
   // Create a wait_barrier before the first consumer.
   // For data-partitioned channels, shared ops (consBarrier, phase, pred)
-  // need ALL consumer partition IDs so they survive specializeRegion.
+  // need ALL consumer task IDs so they survive specializeRegion.
   builder.setInsertionPoint(headConsumerSameLevel);
   SmallVector<int> consumerTaskIds;
   for (int id : getWSPartitionIds(headConsumer))
@@ -430,7 +147,7 @@ Operation *optimizeTMALoads(
   Value waitPred =
       builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 1);
 
-  // Create one WaitBarrierOp per consumer partition ID.
+  // Create one WaitBarrierOp per consumer task ID.
   builder.setPartitionIdsFromOp(headConsumer);
   builder.createWithPartitionIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
@@ -442,161 +159,23 @@ Operation *optimizeTMALoads(
         /*deps=*/ValueRange{}, consumerWaitConstraints);
   }
 
-  // Convert all the consumers to local_load
+  // Convert all the consumers. The descriptor_load's single user is the
+  // local_store into the pipeline buffer, and the async TMA copy now writes
+  // that buffer directly, so erase both.
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
-    if (isPost) {
-      // consumer is the user of the smem. We can't insert local_load here
-      // and use the result in local_store that is the producer for the smem
-      // channel. descriptor_load has a single user which is local_store.
-      unsigned cnt = 0;
-      Operation *localSt = nullptr;
-      for (auto *usr : tmaLoad->getUsers()) {
-        assert(isa<ttg::LocalStoreOp>(usr));
-        localSt = usr;
-        ++cnt;
-      }
-      assert(cnt == 1);
-      localSt->erase();
-      tmaLoad.erase();
-      continue;
+    unsigned cnt = 0;
+    Operation *localSt = nullptr;
+    for (auto *usr : tmaLoad->getUsers()) {
+      assert(isa<ttg::LocalStoreOp>(usr));
+      localSt = usr;
+      ++cnt;
     }
-    builder.setPartitionIdsFromArray(consumerTaskIds);
-    builder.setLoopScheduleInfoFromOp(tmaLoad);
-    auto pipelineBuffer = getBufferForPipelineStage(
-        builder, tmaLoad.getType(), buffer, bufferIdxExtract, false);
-    auto sharedLoad = builder.createWithPartitionIds<ttg::LocalLoadOp>(
-        loc, tmaLoad.getType(), pipelineBuffer);
-
-    Value loadResult = tmaLoad.getResult();
-    replaceUsesInTasks(loadResult, sharedLoad.getResult(), consumerTaskIds);
-    if (loadResult.use_empty() && additionalConsumerTaskIds.empty())
-      tmaLoad.erase();
+    assert(cnt == 1);
+    localSt->erase();
+    tmaLoad.erase();
   }
   builder.clearLoopScheduleInfo();
   return copy;
-}
-
-// Lower producers for channels. Here channels are grouped in
-// "channelsGroupedByProducers"
-void insertAsyncCopy(
-    triton::FuncOp funcOp,
-    const DenseMap<Channel *, SmallVector<Channel *>>
-        &channelsGroupedByProducers,
-    const DenseMap<Channel *, Value> &bufferMap,
-    DenseMap<Channel *, std::pair<Operation *, Operation *>> &copyOpMap,
-    DenseSet<Operation *> &regionsWithChannels, ReuseConfig *config,
-    bool isPost) {
-  // For each producer op, create a async_copy or local_store from the producer
-  // to the buffer. Create a local_load from the buffer at the dominating
-  // consumer.
-  mlir::DominanceInfo dom(funcOp);
-
-  for (auto kv : channelsGroupedByProducers) {
-    // Finding the dominating channel if possible.
-    std::unordered_set<Channel *> mutuallyNonDominatingChannels;
-    for (auto &c : kv.second) {
-      // check if c is dominating all other previous channels.
-      auto it = mutuallyNonDominatingChannels.begin();
-      while (it != mutuallyNonDominatingChannels.end()) {
-        auto channel = *it;
-        if (dom.properlyDominates(c->getDstOp(), channel->getDstOp())) {
-          it = mutuallyNonDominatingChannels.erase(it);
-        } else if (dom.properlyDominates(channel->getDstOp(), c->getDstOp())) {
-          break;
-        } else {
-          ++it;
-        }
-      }
-      if (it == mutuallyNonDominatingChannels.end())
-        mutuallyNonDominatingChannels.insert(c);
-    }
-
-    assert(mutuallyNonDominatingChannels.size() == 1 &&
-           "conditional consumers not supported");
-    auto domininatingChannel = *mutuallyNonDominatingChannels.begin();
-    auto srcOp = kv.getFirst()->getSrcOp();
-    LLVM_DEBUG({
-      LDBG("insertAsyncCopy handle channel ");
-      srcOp->dump();
-      domininatingChannel->getDstOp()->dump();
-    });
-
-    Value bufferIdx;
-    Value phase = Value();
-    OpBuilderWithPartitionIds builder(srcOp);
-    // Calculate TaskIds for bufferIdx and phase.
-    SmallVector<WSPartitionId> partitionIdsPC = getWSPartitionIds(srcOp);
-    for (auto channel : mutuallyNonDominatingChannels) {
-      // bufferIdx will be used in createTMEMCopy to construct subView
-      // to feed into both tmem_store and users of tmem_alloc. There are cases
-      // where a TMEM channel has srcOp in task 2, dstOp in task 2, while mmaOp
-      // is in task 1.
-      if (channel->channelKind == DataChannelKind::TMEM) {
-        ttng::TmemDataChannel *tmemChannel =
-            static_cast<ttng::TmemDataChannel *>(channel);
-        for (auto task : getWSPartitionIds(tmemChannel->getMmaOp()))
-          if (!llvm::is_contained(partitionIdsPC, task))
-            partitionIdsPC.push_back(task);
-      }
-      for (auto task : getWSPartitionIds(channel->getDstOp()))
-        if (!llvm::is_contained(partitionIdsPC, task))
-          partitionIdsPC.push_back(task);
-    }
-    builder.setPartitionIdsFromArray(partitionIdsPC);
-    builder.clearLoopScheduleInfo();
-
-    if (auto forOp = srcOp->getParentOfType<scf::ForOp>()) {
-      int reuseGrp = channelInReuseGroup(kv.getFirst(), config);
-      LLVM_DEBUG({
-        LDBG("call getBufferIdxAndPhase ");
-        srcOp->dump();
-      });
-      getBufferIdxAndPhase(builder, srcOp, kv.getFirst()->getNumBuffers(),
-                           regionsWithChannels, bufferIdx, phase, config,
-                           reuseGrp, kv.getFirst());
-    } else {
-      // Producer is not in a ForOp, create phase and bufferIdx here which will
-      // be used by both producer and consumers.
-      bufferIdx = builder.createWithPartitionIds<arith::ConstantIntOp>(
-          srcOp->getLoc(), 0, 32);
-    }
-
-    LLVM_DEBUG({
-      LDBG("-- bufferIdx ");
-      bufferIdx.dump();
-    });
-    std::pair<Operation *, Operation *> producerConsumerOps{nullptr, nullptr};
-
-    // No need to create async copy for TMA load which will be handled in
-    // insertAsyncComm.
-    if (isa<tt::DescriptorLoadOp>(srcOp)) {
-      producerConsumerOps = {srcOp, domininatingChannel->getDstOp()};
-    } else if (isa<triton::LoadOp>(srcOp)) {
-      SmallVector<WSPartitionId> partitionIdsPC = getWSPartitionIds(srcOp);
-      partitionIdsPC.append(getWSPartitionIds(domininatingChannel->getDstOp()));
-      // After createAsyncCopy, c->getSrcOp()/headProducer are no longer
-      // valid.
-      producerConsumerOps = createAsyncCopy(
-          bufferMap, domininatingChannel, domininatingChannel->getSrcOp(),
-          partitionIdsPC, bufferIdx, bufferIdx);
-    } else if (domininatingChannel->channelKind == DataChannelKind::TMEM &&
-               !isPost) {
-      producerConsumerOps =
-          createTMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
-    } else if (isa<ttg::LocalAllocOp>(srcOp) && !isPost) {
-      producerConsumerOps =
-          createSMEMCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
-    } else if (!isPost) {
-      assert(!isa<ttg::LocalLoadOp>(srcOp) &&
-             "LocalLoadOp buffer should be reused");
-      producerConsumerOps =
-          createLocalCopy(bufferMap, domininatingChannel, bufferIdx, bufferIdx);
-    }
-
-    for (auto &channel : kv.second) {
-      copyOpMap[channel] = producerConsumerOps;
-    }
-  }
 }
 
 } // namespace mlir
