@@ -254,8 +254,7 @@ static SmallVector<int64_t> getShape(Type type) {
   else if (auto tensorType = dyn_cast<RankedTensorType>(type))
     return {tensorType.getShape().begin(), tensorType.getShape().end()};
   else if (auto tensorDescType = dyn_cast<TensorDescType>(type))
-    return {tensorDescType.getBlockType().getShape().begin(),
-            tensorDescType.getBlockType().getShape().end()};
+    return {tensorDescType.getShape().begin(), tensorDescType.getShape().end()};
   else if (auto ptrType = dyn_cast<PointerType>(type))
     return getShape(ptrType.getPointeeType());
   return {};
@@ -581,12 +580,6 @@ static bool getBackwardSliceToPartition(Value v,
         if (!getBackwardSliceToPartition(copyOp.getSrc(), partitionScheme,
                                          *srcDim))
           return false;
-        if (auto barrier = copyOp.getBarrier()) {
-          if (!getBackwardSliceToPartition(
-                  barrier, partitionScheme,
-                  DataPartitionScheme::noOpPartitionDim))
-            return false;
-        }
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
@@ -639,11 +632,6 @@ static bool getBackwardSliceToPartition(Value v,
       if (!getBackwardSliceToPartition(tmemCopyOp.getDst(), partitionScheme,
                                        currentDim))
         return false;
-      if (auto barrier = tmemCopyOp.getBarrier()) {
-        if (!getBackwardSliceToPartition(barrier, partitionScheme,
-                                         DataPartitionScheme::noOpPartitionDim))
-          return false;
-      }
     } else if (auto reshapeOp = dyn_cast<ReshapeOp>(op)) {
       auto srcShape = getShape(reshapeOp.getSrc());
       auto dstShape = getShape(reshapeOp.getResult());
@@ -1039,7 +1027,6 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
     return true;
 
   // Checking if all dots can be partitioned in the same way
-  int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
   for (auto op : dots) {
     if (partitionScheme.isPartitioned(op) || partitionScheme.isSkipped(op)) {
       continue;
@@ -1318,15 +1305,11 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                                type.getEncoding());
           newV.setType(newType);
         } else if (auto type = dyn_cast<TensorDescType>(v.getType())) {
-          auto blockType = type.getBlockType();
-          SmallVector<int64_t> shape{blockType.getShape().begin(),
-                                     blockType.getShape().end()};
+          SmallVector<int64_t> shape(type.getShape());
           int sliceSize = shape[dim] / numOfPartitions;
           shape[dim] = sliceSize;
-          auto newBlockType = RankedTensorType::get(
-              shape, blockType.getElementType(), blockType.getEncoding());
-          auto newType =
-              TensorDescType::get(builder.getContext(), newBlockType);
+          auto newType = TensorDescType::get(shape, type.getElementType(),
+                                             type.getSharedLayout());
           newV.setType(newType);
         }
       }
@@ -1350,7 +1333,6 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     auto srcTy = mappings.lookupOrNull(tmemLdOp.getSrc()).getType();
     auto type = cast<MemDescType>(srcTy);
-    auto tmem = cast<nvidia_gpu::TensorMemoryEncodingAttr>(type.getEncoding());
 
     RankedTensorType oldRetType = tmemLdOp.getType();
     auto retShapePerCTA = getShapePerCTA(oldRetType);
@@ -1454,8 +1436,6 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
             partitionScheme);
     sliceOp(tmemCopyOp.getSrc(), offset, mappings, reverseMappings,
             partitionScheme);
-    if (auto barrier = tmemCopyOp.getBarrier())
-      sliceOp(barrier, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
   } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     for (Value operand : op->getOperands())
@@ -2559,12 +2539,10 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
       auto bbArg = entryBlock.getArgument(argIndex);
       auto descType = cast<TensorDescType>(bbArg.getType());
-      auto blockType = descType.getBlockType();
-      SmallVector<int64_t> shape(blockType.getShape());
+      SmallVector<int64_t> shape(descType.getShape());
       shape[dim] /= partitionScheme.numPartitions;
-      auto newBlockType = RankedTensorType::get(
-          shape, blockType.getElementType(), blockType.getEncoding());
-      bbArg.setType(TensorDescType::get(funcOp.getContext(), newBlockType));
+      bbArg.setType(TensorDescType::get(shape, descType.getElementType(),
+                                        descType.getSharedLayout()));
     }
     // Update FuncOp signature to match.
     SmallVector<Type> argTys(entryBlock.getArgumentTypes());

@@ -20,7 +20,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-LABEL: @scaled_mma_with_loads
 tt.func public @scaled_mma_with_loads(
   %A_shared: !ttg.memdesc<128x128xf16, #shared, #smem>,
-  %B_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
+  %B_desc: !tt.tensordesc<128x128xf16, #shared>,
   %A_scale_shared: !ttg.memdesc<1x2x32x4x4xi8, #shared_scales, #smem>,
   %B_scale_shared: !ttg.memdesc<1x2x32x4x4xi8, #shared_scales, #smem>,
   %n_tiles: i32
@@ -44,7 +44,7 @@ tt.func public @scaled_mma_with_loads(
     // canonicalization while still requiring the scaled MMA token result to
     // propagate the dependency to tmem_load.
     // CHECK-COUNT-2: ttg.partition = array<i32: 2>
-    %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #load_blocked>
+    %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #load_blocked>
     %B_shared = ttg.local_alloc %B : (tensor<128x128xf16, #load_blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
 
     // Compute partition: tc_gen5_mma_scaled should get partition 1

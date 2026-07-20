@@ -36,8 +36,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["reduction", "epilogue_store", "load"]
 tt.func public @rmsnorm_no_mma(
-  %x_desc: !tt.tensordesc<tensor<64x64xf32, #shared>>,
-  %y_desc: !tt.tensordesc<tensor<64x64xf32, #shared>>,
+  %x_desc: !tt.tensordesc<64x64xf32, #shared>,
+  %y_desc: !tt.tensordesc<64x64xf32, #shared>,
   %n_tiles: i32
 ) {
   %c0_i32 = arith.constant 0 : i32
@@ -46,7 +46,7 @@ tt.func public @rmsnorm_no_mma(
   %eps = arith.constant dense<1.000000e-06> : tensor<64xf32, #slice>
   scf.for %i = %c0_i32 to %n_tiles step %c1_i32 : i32 {
     %offs = arith.muli %i, %c64_i32 : i32
-    %x = tt.descriptor_load %x_desc[%offs, %c0_i32] : !tt.tensordesc<tensor<64x64xf32, #shared>> -> tensor<64x64xf32, #blocked>
+    %x = tt.descriptor_load %x_desc[%offs, %c0_i32] : !tt.tensordesc<64x64xf32, #shared> -> tensor<64x64xf32, #blocked>
     %sq = arith.mulf %x, %x : tensor<64x64xf32, #blocked>
     %r = "tt.reduce"(%sq) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
@@ -59,7 +59,7 @@ tt.func public @rmsnorm_no_mma(
     %rinv_b = tt.broadcast %rinv_e : tensor<64x1xf32, #blocked> -> tensor<64x64xf32, #blocked>
     %norm = arith.mulf %x, %rinv_b : tensor<64x64xf32, #blocked>
     %stage = ttg.local_alloc %norm : (tensor<64x64xf32, #blocked>) -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-    %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<tensor<64x64xf32, #shared>>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+    %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %tok : !ttg.async.token
     scf.yield
   } {tt.warp_specialize, tt.separate_epilogue_store = true, tt.merge_epilogue = true}
@@ -76,8 +76,8 @@ tt.func public @rmsnorm_no_mma(
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["reduction", "epilogue_store", "load"]
 tt.func public @maxnorm_no_mma(
-  %x_desc: !tt.tensordesc<tensor<64x64xf32, #shared>>,
-  %y_desc: !tt.tensordesc<tensor<64x64xf32, #shared>>,
+  %x_desc: !tt.tensordesc<64x64xf32, #shared>,
+  %y_desc: !tt.tensordesc<64x64xf32, #shared>,
   %n_tiles: i32
 ) {
   %c0_i32 = arith.constant 0 : i32
@@ -85,7 +85,7 @@ tt.func public @maxnorm_no_mma(
   %c64_i32 = arith.constant 64 : i32
   scf.for %i = %c0_i32 to %n_tiles step %c1_i32 : i32 {
     %offs = arith.muli %i, %c64_i32 : i32
-    %x = tt.descriptor_load %x_desc[%offs, %c0_i32] : !tt.tensordesc<tensor<64x64xf32, #shared>> -> tensor<64x64xf32, #blocked>
+    %x = tt.descriptor_load %x_desc[%offs, %c0_i32] : !tt.tensordesc<64x64xf32, #shared> -> tensor<64x64xf32, #blocked>
     %m = "tt.reduce"(%x) <{axis = 1 : i32}> ({
     ^bb0(%a: f32, %b: f32):
       %mx = arith.maxnumf %a, %b : f32
@@ -95,7 +95,7 @@ tt.func public @maxnorm_no_mma(
     %m_b = tt.broadcast %m_e : tensor<64x1xf32, #blocked> -> tensor<64x64xf32, #blocked>
     %norm = arith.divf %x, %m_b : tensor<64x64xf32, #blocked>
     %stage = ttg.local_alloc %norm : (tensor<64x64xf32, #blocked>) -> !ttg.memdesc<64x64xf32, #shared, #smem, mutable>
-    %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<tensor<64x64xf32, #shared>>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
+    %tok = ttng.async_tma_copy_local_to_global %y_desc[%offs, %c0_i32] %stage : !tt.tensordesc<64x64xf32, #shared>, !ttg.memdesc<64x64xf32, #shared, #smem, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %tok : !ttg.async.token
     scf.yield
   } {tt.warp_specialize, tt.separate_epilogue_store = true, tt.merge_epilogue = true}

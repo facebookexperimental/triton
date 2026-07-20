@@ -8,8 +8,8 @@
 
 // CHECK-LABEL: @host_tma_dp_store
 // Function signature should show sliced a_desc (256x64 -> 128x64) and c_desc (256x128 -> 128x128):
-// CHECK-SAME: !tt.tensordesc<tensor<128x64xf16
-// CHECK-SAME: !tt.tensordesc<tensor<128x128xf16
+// CHECK-SAME: !tt.tensordesc<128x64xf16
+// CHECK-SAME: !tt.tensordesc<128x128xf16
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -19,11 +19,11 @@
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @host_tma_dp_store(
-      %a_desc: !tt.tensordesc<tensor<256x64xf16, #shared>>,
+      %a_desc: !tt.tensordesc<256x64xf16, #shared>,
       %a_desc_0: i32, %a_desc_1: i32, %a_desc_2: i64, %a_desc_3: i64,
-      %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %b_desc: !tt.tensordesc<128x64xf16, #shared>,
       %b_desc_4: i32, %b_desc_5: i32, %b_desc_6: i64, %b_desc_7: i64,
-      %c_desc: !tt.tensordesc<tensor<256x128xf16, #shared>>,
+      %c_desc: !tt.tensordesc<256x128xf16, #shared>,
       %c_desc_8: i32, %c_desc_9: i32, %c_desc_10: i64, %c_desc_11: i64,
       %M: i32 {tt.divisibility = 16 : i32},
       %N: i32 {tt.divisibility = 16 : i32},
@@ -67,9 +67,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %offs_am_c = arith.muli %11, %c256_i32 : i32
         %offs_bn_c = arith.muli %13, %c128_i32 : i32
         // The original 256x128 descriptor_store should be replaced by two 128x128 stores:
-        // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<tensor<128x128xf16{{.*}}>>, tensor<128x128xf16
-        // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<tensor<128x128xf16{{.*}}>>, tensor<128x128xf16
-        tt.descriptor_store %c_desc[%offs_am_c, %offs_bn_c], %cst : !tt.tensordesc<tensor<256x128xf16, #shared>>, tensor<256x128xf16, #blocked>
+        // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<128x128xf16{{.*}}>, tensor<128x128xf16
+        // CHECK: tt.descriptor_store {{.*}} : !tt.tensordesc<128x128xf16{{.*}}>, tensor<128x128xf16
+        tt.descriptor_store %c_desc[%offs_am_c, %offs_bn_c], %cst : !tt.tensordesc<256x128xf16, #shared>, tensor<256x128xf16, #blocked>
         scf.yield %5 : i32
       } {tt.data_partition_factor = 2 : i32, tt.flatten, tt.smem_alloc_algo = 1 : i32}
     } else {
@@ -102,9 +102,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           scf.yield %offs_am, %offs_bn, %tile_iter : i32, i32, i32
         }
         %offs_k = arith.muli %k_idx_sel, %c64_i32 : i32
-        %a = tt.descriptor_load %a_desc[%load_info#0, %offs_k] : !tt.tensordesc<tensor<256x64xf16, #shared>> -> tensor<256x64xf16, #blocked2>
+        %a = tt.descriptor_load %a_desc[%load_info#0, %offs_k] : !tt.tensordesc<256x64xf16, #shared> -> tensor<256x64xf16, #blocked2>
         %a_smem = ttg.local_alloc %a : (tensor<256x64xf16, #blocked2>) -> !ttg.memdesc<256x64xf16, #shared, #smem>
-        %b = tt.descriptor_load %b_desc[%load_info#1, %offs_k] : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked2>
+        %b = tt.descriptor_load %b_desc[%load_info#1, %offs_k] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked2>
         %b_smem = ttg.local_alloc %b : (tensor<128x64xf16, #blocked2>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
         %b_trans = ttg.memdesc_trans %b_smem {order = array<i32: 1, 0>} : !ttg.memdesc<128x64xf16, #shared, #smem> -> !ttg.memdesc<64x128xf16, #shared1, #smem>
         %mma_tok = ttng.tc_gen5_mma %a_smem, %b_trans, %tmem_acc#0[%acc_tok], %use_acc, %true : !ttg.memdesc<256x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -126,7 +126,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           %loaded:2 = ttng.tmem_load %tmem_acc#0[%mma_tok] : !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<256x128xf32, #blocked1>
           %truncated = arith.truncf %loaded#0 : tensor<256x128xf32, #blocked1> to tensor<256x128xf16, #blocked1>
           %converted = ttg.convert_layout %truncated : tensor<256x128xf16, #blocked1> -> tensor<256x128xf16, #blocked>
-          tt.descriptor_store %c_desc[%store_am, %store_bn], %converted : !tt.tensordesc<tensor<256x128xf16, #shared>>, tensor<256x128xf16, #blocked>
+          tt.descriptor_store %c_desc[%store_am, %store_bn], %converted : !tt.tensordesc<256x128xf16, #shared>, tensor<256x128xf16, #blocked>
           scf.yield %new_store_tile, %loaded#1 : i32, !ttg.async.token
         } else {
           scf.yield %store_tile, %mma_tok : i32, !ttg.async.token

@@ -28,8 +28,8 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %num_programs = tt.get_num_programs x : i32 loc(#loc49)
     %num_tiles_1 = arith.addi %M, %num_tiles : i32 loc(#loc79)
     %num_tiles_2 = arith.divsi %num_tiles_1, %c8_i32 : i32 loc(#loc80)
-    %x_desc = tt.make_tensor_descriptor %X, [%M, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<8x512xf16, #shared>> loc(#loc50)
-    %y_desc = tt.make_tensor_descriptor %Y, [%M, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<8x512xf16, #shared>> loc(#loc51)
+    %x_desc = tt.make_tensor_descriptor %X, [%M, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<8x512xf16, #shared> loc(#loc50)
+    %y_desc = tt.make_tensor_descriptor %Y, [%M, %c512_i32], [%c512_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<8x512xf16, #shared> loc(#loc51)
     %w = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #ttg.slice<{dim = 0, parent = #blocked}>> loc(#loc52)
     %w_3 = tt.splat %W : !tt.ptr<f16> -> tensor<512x!tt.ptr<f16>, #ttg.slice<{dim = 0, parent = #blocked}>> loc(#loc53)
     %w_4 = tt.addptr %w_3, %w : tensor<512x!tt.ptr<f16>, #ttg.slice<{dim = 0, parent = #blocked}>>, tensor<512xi32, #ttg.slice<{dim = 0, parent = #blocked}>> loc(#loc53)
@@ -46,7 +46,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %y_12 = tt.broadcast %y_11 : tensor<1x512xf32, #blocked> -> tensor<8x512xf32, #blocked> loc(#loc61)
     scf.for %tile = %pid to %num_tiles_2 step %num_programs  : i32 {
       %row = arith.muli %tile, %c8_i32 : i32 loc(#loc62)
-      %x = tt.descriptor_load %x_desc[%row, %c0_i32] : !tt.tensordesc<tensor<8x512xf16, #shared>> -> tensor<8x512xf16, #blocked> loc(#loc63)
+      %x = tt.descriptor_load %x_desc[%row, %c0_i32] : !tt.tensordesc<8x512xf16, #shared> -> tensor<8x512xf16, #blocked> loc(#loc63)
       %x_13 = arith.extf %x : tensor<8x512xf16, #blocked> to tensor<8x512xf32, #blocked> loc(#loc64)
       %mu = "tt.reduce"(%x_13) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
       ^bb0(%mu_30: f32 loc(callsite(#loc1 at #loc65)), %mu_31: f32 loc(callsite(#loc1 at #loc65))):
@@ -75,7 +75,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %y_28 = arith.mulf %y_27, %y_9 : tensor<8x512xf32, #blocked> loc(#loc59)
       %y_29 = arith.addf %y_28, %y_12 : tensor<8x512xf32, #blocked> loc(#loc61)
       %0 = arith.truncf %y_29 : tensor<8x512xf32, #blocked> to tensor<8x512xf16, #blocked> loc(#loc38)
-      tt.descriptor_store %y_desc[%row, %c0_i32], %0 : !tt.tensordesc<tensor<8x512xf16, #shared>>, tensor<8x512xf16, #blocked> loc(#loc39)
+      tt.descriptor_store %y_desc[%row, %c0_i32], %0 : !tt.tensordesc<8x512xf16, #shared>, tensor<8x512xf16, #blocked> loc(#loc39)
     } loc(#loc19)
     tt.return loc(#loc40)
   } loc(#loc)
