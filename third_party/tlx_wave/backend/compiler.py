@@ -17,8 +17,8 @@ from .wave_bridge_tools import (
     _wave_pipelines_sha256,
 )
 
-
 _ENABLE_SPLIT_BARRIERS_ENV = "TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS"
+_ENABLE_MULTI_WAVE_SPECIALIZE_ENV = "TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE"
 
 
 def _parse_bool_option(value, *, source):
@@ -45,6 +45,8 @@ class TLXWaveOptions(amd_compiler.HIPOptions):
     # Wave pass is present in the backend pipeline but gated on this function
     # attribute so existing kernels keep the previous full-barrier behavior.
     tlx_wave_enable_split_barriers: bool = False
+    # Selects Wave's opt-in joint multi-wave specialization pipeline.
+    tlx_wave_enable_multi_wave_specialize: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -54,6 +56,14 @@ class TLXWaveOptions(amd_compiler.HIPOptions):
             _parse_bool_option(
                 self.tlx_wave_enable_split_barriers,
                 source="tlx_wave_enable_split_barriers",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tlx_wave_enable_multi_wave_specialize",
+            _parse_bool_option(
+                self.tlx_wave_enable_multi_wave_specialize,
+                source="tlx_wave_enable_multi_wave_specialize",
             ),
         )
 
@@ -89,17 +99,23 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             enable_split_barriers,
             source="tlx_wave_enable_split_barriers",
         )
+        enable_multi_wave_specialize = opts.pop("tlx_wave_enable_multi_wave_specialize", None)
+        if enable_multi_wave_specialize is None:
+            enable_multi_wave_specialize = os.environ.get(_ENABLE_MULTI_WAVE_SPECIALIZE_ENV)
+        enable_multi_wave_specialize = _parse_bool_option(
+            enable_multi_wave_specialize,
+            source="tlx_wave_enable_multi_wave_specialize",
+        )
         opts["backend_name"] = "tlx_wave"
         # Match the AMD/HIP backend contract: matrix_instr_nonkdim=0 leaves
         # Triton's AMD matmul pass free to derive the MFMA shape from the tile.
         # The bridge validates the concrete TTGIR layout before emitting Wave IR.
         hip_options = super().parse_options(opts)
         options = TLXWaveOptions(
-            **{
-                name: getattr(hip_options, name)
-                for name in amd_compiler.HIPOptions.__dataclass_fields__
-            },
+            **{name: getattr(hip_options, name)
+               for name in amd_compiler.HIPOptions.__dataclass_fields__},
             tlx_wave_enable_split_barriers=enable_split_barriers,
+            tlx_wave_enable_multi_wave_specialize=enable_multi_wave_specialize,
         )
         if options.arch not in {"gfx942", "gfx950"}:
             raise ValueError(f"tlx_wave stage-1 scaffold only supports gfx942/gfx950, got {options.arch}")
@@ -187,7 +203,16 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
     @staticmethod
     def make_hsaco(src, metadata, options):
         wave_opt = _wave_opt()
-        hsaco = _compile_wave_module_to_hsaco(src, wave_opt, options.arch)
+        hsaco = _compile_wave_module_to_hsaco(
+            src,
+            wave_opt,
+            options.arch,
+            multi_wave_specialize=getattr(
+                options,
+                "tlx_wave_enable_multi_wave_specialize",
+                False,
+            ),
+        )
         metadata["tlx_wave_binary_stage"] = "wave-compile-kernels"
         metadata["tlx_wave_hsaco_size_bytes"] = len(hsaco)
         return hsaco
@@ -246,6 +271,8 @@ def _populate_staged_converter_metadata(metadata, output, options, wave_opt):
     metadata["tlx_wave_plan_kind"] = "staged-converter"
     metadata["tlx_wave_arch"] = options.arch
     metadata["tlx_wave_enable_split_barriers"] = bool(getattr(options, "tlx_wave_enable_split_barriers", False))
+    metadata["tlx_wave_enable_multi_wave_specialize"] = bool(
+        getattr(options, "tlx_wave_enable_multi_wave_specialize", False))
     metadata["tlx_wave_ttgir_target"] = source_kernel.target
     metadata["tlx_wave_num_ctas"] = int(source_kernel.num_ctas or 1)
     metadata["tlx_wave_num_warps"] = int(source_kernel.num_warps or 1)
