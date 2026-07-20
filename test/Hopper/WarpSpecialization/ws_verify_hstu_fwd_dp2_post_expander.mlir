@@ -1,5 +1,5 @@
 // RUN: triton-opt %s --nvgpu-verify-ws-barriers="emit-coverage-table=true" 2>&1 1>/dev/null | FileCheck %s
-// RUN: triton-opt %s --nvgpu-verify-ws-barriers="report-cycles=true" 2>&1 1>/dev/null | FileCheck %s --check-prefix=CYCLE
+// RUN: triton-opt %s --nvgpu-verify-ws-barriers="report-cycles=true" 2>&1 1>/dev/null | FileCheck %s --check-prefix=CYCLE --allow-empty
 //
 // autoWS barrier verifier fixture: HSTU self-attn forward, data_partition=2,
 // captured AFTER the pipeline expander (SoftwarePipeliner ExpandLoops) from an
@@ -24,16 +24,19 @@
 // Every WS barrier resolves to its reuse group (no unknown-buffer barriers):
 // CHECK-NOT: indeterminate
 //
-// Phase 2: the cross-partition SCC surfaces this kernel's cycle as a CANDIDATE
-// (report-cycles=true). It is a candidate only -- a correct pipelined kernel
-// (verified: HSTU DP=1 fwd) forms the same SCC -- so it emits a remark, never an
-// error, until the phase/pre-arm first-execution filter lands to soundly
-// separate a benign steady-state pipeline SCC from a real deadlock.
-// CYCLE: remark: WS candidate cross-partition mbarrier cycle
+// Phase 2 (report-cycles=true): the cross-partition SCC uses the phase-parity +
+// SSA-dominance first-execution filter. Under that (correct) filter this
+// kernel's first-execution barrier graph is a DAG -- NO first-execution cycle --
+// even though the kernel DEADLOCKS at runtime. That is the key finding: DP=2's
+// deadlock is a STEADY-STATE (cross-iteration) cadence deadlock, not a
+// first-execution cycle, so a first-execution SCC cannot catch it (and, just as
+// importantly, it does not false-positive: the correct HSTU DP=1 fwd is also a
+// DAG). Catching DP=2 needs cross-iteration phase-cadence modeling (future).
+// CYCLE-NOT: candidate cross-partition
 //
-// TODO(deadlock phase): implement the phase/pre-arm first-execution filter so
-// the SCC becomes a sound error, then turn the CYCLE remark into expected-error
-// here and re-enable it in the default deadlock check.
+// TODO(cadence phase): model per-slot phase flips across iterations (which
+// iteration's arrive satisfies which iteration's wait) to detect steady-state
+// cadence deadlocks like this one, then add an expected-error here.
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @_hstu_attn_fwd(%arg0: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg3: !tt.ptr<i8> {tt.divisibility = 16 : i32}, %arg4: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg5: !tt.ptr<i64> {tt.divisibility = 16 : i32}, %arg6: !tt.ptr<bf16> {tt.divisibility = 16 : i32}, %arg7: f32, %arg8: i32 {tt.divisibility = 16 : i32}, %arg9: i32 {tt.divisibility = 16 : i32}, %arg10: i32 {tt.divisibility = 16 : i32}, %arg11: i32 {tt.divisibility = 16 : i32}, %arg12: i32 {tt.divisibility = 16 : i32}, %arg13: i32 {tt.divisibility = 16 : i32}, %arg14: i32 {tt.divisibility = 16 : i32}, %arg15: i32 {tt.divisibility = 16 : i32}, %arg16: i32, %arg17: i32, %arg18: i32, %arg19: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg20: i32 {tt.divisibility = 16 : i32}, %arg21: i32 {tt.divisibility = 16 : i32}, %arg22: i32 {tt.divisibility = 16 : i32}, %arg23: i32 {tt.divisibility = 16 : i32}, %arg24: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {

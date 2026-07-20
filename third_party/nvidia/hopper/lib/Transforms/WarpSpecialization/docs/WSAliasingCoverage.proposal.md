@@ -282,6 +282,25 @@ prevents persistent-loop back-edges from spuriously closing a cycle.
 > aware pre-arm model (per-slot phase flips vs the parities the waits require),
 > which is the next deadlock-phase work item. Condition (i) (no-producer) does
 > not depend on this and ships as a sound default error.
+>
+> **Update (Phase 2b, verified).** The refined filter was implemented:
+> first-execution polled parity (constant / inverted-acquire `xori(_,true)` /
+> accumCnt-derived) combined with an SSA-**dominance** pre-arm (an arrive that
+> dominates the wait; cross-partition arrives in isolated partition regions never
+> dominate, matching the phase model). Result on real post-expander IR: the
+> first-execution barrier graph is a **DAG for both** the correct HSTU DP=1 fwd
+> **and** the deadlocking HSTU DP=2 fwd (0 cross-partition cycles each; 72/51
+> singleton SCCs). So the refined filter removes the DP=1 false positive AND
+> (correctly) finds no first-execution cycle in DP=2 — because **DP=2's deadlock
+> is a steady-state / cross-iteration cadence deadlock, not a first-execution
+> cycle.** A first-execution SCC cannot catch it; doing so requires modeling
+> per-slot phase flips *across iterations* (which iteration's arrive satisfies
+> which iteration's wait) — strictly harder than the first-execution subgraph, and
+> the actual next work item. Net: the SCC ships as the refined,
+> false-positive-free first-execution detector, gated under `report-cycles` (it
+> fires on a genuine first-execution cycle such as the classic idle-acc-init,
+> which on this branch is already fixed and hence unavailable as a
+> post-specialization test case). Condition (i) remains the sound default error.
 
 ---
 

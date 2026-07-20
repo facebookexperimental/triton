@@ -22,15 +22,19 @@
 // (sound, default error).
 //
 // Phase 2 (current): cross-partition SCC over satisfy + program-order edges
-// (design-doc condition iii). IMPORTANT empirical finding: a naive SCC ALSO
-// matches a correct pipelined kernel (verified on the working HSTU DP=1 fwd),
-// because separating a benign steady-state pipeline SCC from a real deadlock
-// requires the phase/pre-arm first-execution filter, which the current
-// walk-order pre-arm heuristic does not fully capture. So the SCC is a
-// CANDIDATE surfacer only: off by default (report-cycles), emits remarks, never
-// errors, until the phase model lands. Parity-cadence (condition ii) and the
-// per-reuse-group Access-Order Graph (race / under-buffering) come in later
-// phases.
+// (design-doc condition iii), with a first-execution filter = phase-parity
+// (constant / inverted-acquire / accumCnt-derived) + SSA-dominance pre-arm.
+// IMPORTANT empirical finding: under this (correct) filter the first-execution
+// barrier graph is a DAG for BOTH the correct HSTU DP=1 fwd AND the deadlocking
+// HSTU DP=2 fwd -- i.e. no first-execution cycle in either. So the filter has no
+// false positive (DP=1 clean) but also cannot catch DP=2, because DP=2's
+// deadlock is a STEADY-STATE / cross-iteration cadence deadlock, not a
+// first-execution cycle. Catching that needs per-slot phase-flip modeling across
+// iterations (the next work item). The SCC therefore ships gated under
+// report-cycles, emitting remarks (never errors); it fires on a genuine
+// first-execution cycle (e.g. the classic idle-acc-init). Parity-cadence
+// (condition ii) and the per-reuse-group Access-Order Graph (race /
+// under-buffering) come in later phases.
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,6 +42,7 @@
 #include "WSBarrierAnalysis.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
@@ -243,8 +248,10 @@ public:
     // which the current walk-order heuristic does not fully capture. So it is
     // off by default and emits remarks, never errors, until the phase model
     // lands.
-    if (reportCycles)
-      runCycleCheck(nodes);
+    if (reportCycles) {
+      DominanceInfo dom(funcOp);
+      runCycleCheck(nodes, dom);
+    }
     LDBG("deadlock check: " << nodes.size() << " BDG nodes, " << numNoProducer
                             << " no-producer deadlocks");
   }
@@ -254,13 +261,60 @@ public:
   // (an entry pre-arm or a same-iteration earlier producer). If the only
   // arrives are program-after (the idle-producer signature), it genuinely
   // blocks.
-  static bool backwardWaitIsPreArmed(const BDGNode &w,
-                                     const SmallVector<BDGNode> &nodes) {
+  // First-execution polled parity of a wait's phase operand (0/1), or -1 if not
+  // statically determinable. init_barrier leaves parity 0, so a wait polling 0
+  // is satisfied at entry (non-blocking first exec); parity 1 needs an arrive.
+  static int firstExecPolledParity(Value phase) {
+    DenseSet<Value> seen;
+    while (phase && seen.insert(phase).second) {
+      if (auto c = phase.getDefiningOp<arith::ConstantOp>()) {
+        if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+          return static_cast<int>(ia.getInt() & 1);
+        return -1;
+      }
+      Operation *def = phase.getDefiningOp();
+      if (!def)
+        return -1; // block arg (loop-carried accumCnt) -> caller decides
+      // Inverted empty/reuse acquire xori(base, true) -> parity 1 first exec.
+      if (auto x = dyn_cast<arith::XOrIOp>(def)) {
+        for (Value o : x.getOperands())
+          if (auto cc = o.getDefiningOp<arith::ConstantOp>())
+            if (auto ia = dyn_cast<IntegerAttr>(cc.getValue()))
+              if (ia.getInt() & 1)
+                return 1;
+        return -1;
+      }
+      if (isa<arith::ExtUIOp, arith::TruncIOp, arith::IndexCastOp>(def)) {
+        phase = def->getOperand(0);
+        continue;
+      }
+      // accumCnt-derived parity (counter starts at 0) is 0 on first execution.
+      if (isa<arith::AndIOp, arith::DivUIOp, arith::RemUIOp, arith::MulIOp,
+              arith::SubIOp, arith::AddIOp>(def))
+        return 0;
+      return -1;
+    }
+    return -1;
+  }
+
+  // A wait blocks on first execution iff the parity it polls differs from the
+  // barrier parity available at entry. Entry parity is contributed by arrives
+  // that DOMINATE the wait (execute before it on every path); cross-partition
+  // arrives (isolated partition regions) never dominate, matching the phase
+  // model's "no cross-partition pre-arm by an arrive op" rule.
+  static bool waitBlocksFirstExec(const BDGNode &w,
+                                  const SmallVector<BDGNode> &nodes,
+                                  DominanceInfo &dom) {
+    Value phase = w.op->getNumOperands() > 1 ? w.op->getOperand(1) : Value();
+    int polled = phase ? firstExecPolledParity(phase) : -1;
+    unsigned domArrives = 0;
     for (const BDGNode &a : nodes)
       if (!a.isWait && a.barrierAlloc == w.barrierAlloc &&
-          a.walkIdx < w.walkIdx)
-        return true;
-    return false;
+          dom.dominates(a.op, w.op))
+        ++domArrives;
+    if (polled < 0)
+      return w.isForward || domArrives == 0;
+    return polled != static_cast<int>(domArrives & 1);
   }
 
   // Condition (iii): a cross-partition cycle in the combined graph of satisfy
@@ -269,7 +323,7 @@ public:
   // that contains a cross-partition satisfy edge is a deadlock. Backward
   // first-acquires only contribute a satisfy edge when not pre-armed (the
   // first-execution subgraph filter that keeps benign pipelines out).
-  void runCycleCheck(const SmallVector<BDGNode> &nodes) {
+  void runCycleCheck(const SmallVector<BDGNode> &nodes, DominanceInfo &dom) {
     unsigned n = nodes.size();
     SmallVector<SmallVector<unsigned>> adj(n);
     DenseSet<std::pair<unsigned, unsigned>> crossSatisfy;
@@ -279,7 +333,7 @@ public:
       const BDGNode &w = nodes[i];
       if (!w.isWait)
         continue;
-      bool blocking = w.isForward || !backwardWaitIsPreArmed(w, nodes);
+      bool blocking = waitBlocksFirstExec(w, nodes, dom);
       if (!blocking)
         continue;
       for (unsigned j = 0; j < n; ++j) {
