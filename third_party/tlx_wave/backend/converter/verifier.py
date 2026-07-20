@@ -131,7 +131,6 @@ def _verify_ops(target_program, fact_program, source_program):
             "token",
             "token_join",
             "issue_token",
-            "lds_release",
             "barrier",
             "buffer_load_to_local",
             "async_commit_group",
@@ -255,23 +254,14 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         expected = {target_ir.EVENT_DOMAIN_LDS_FRONTIER}
         if op.kind == "issue_token":
             projection_domain = attrs.get("projection_domain")
-            if projection_domain not in {
-                target_ir.EVENT_DOMAIN_DMA_ISSUE,
-                target_ir.EVENT_DOMAIN_LDS_ISSUE,
-            }:
+            if projection_domain != target_ir.EVENT_DOMAIN_DMA_ISSUE:
                 fail(
                     "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN",
                     STAGE,
-                    "issue token requires an explicit DMA-issue or "
-                    "LDS-issue projection domain",
+                    "issue token requires an explicit DMA-issue projection domain",
                     target_op_id=op.target_op_id,
                 )
-            expected_provenance = {
-                target_ir.EVENT_DOMAIN_DMA_ISSUE:
-                "partial_wait_retained_group",
-                target_ir.EVENT_DOMAIN_LDS_ISSUE:
-                "lds_release_publication",
-            }[projection_domain]
+            expected_provenance = "partial_wait_retained_group"
             if attrs.get("projection_provenance") != expected_provenance:
                 fail(
                     "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
@@ -281,20 +271,12 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_op_id=op.target_op_id,
                 )
             expected = {projection_domain}
-            allowed_input_domains = (
-                {
-                    target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-                    target_ir.EVENT_DOMAIN_DMA_GROUP,
-                    target_ir.EVENT_DOMAIN_EMPTY,
-                    None,
-                }
-                if projection_domain == target_ir.EVENT_DOMAIN_DMA_ISSUE
-                else {
-                    target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-                    target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-                    target_ir.EVENT_DOMAIN_EMPTY,
-                }
-            )
+            allowed_input_domains = {
+                target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+                target_ir.EVENT_DOMAIN_DMA_GROUP,
+                target_ir.EVENT_DOMAIN_EMPTY,
+                None,
+            }
             for operand in op.operands:
                 require_token(
                     operand,
@@ -322,63 +304,6 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     },
                 )
         require_token(op.results[0], f"{op.kind} result", expected)
-        return
-
-    if op.kind == "lds_release":
-        if len(op.results) != 1 or not op.operands:
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
-                STAGE,
-                "LDS release requires dependencies and one result",
-                target_op_id=op.target_op_id,
-            )
-        dependency_count = int(attrs.get("dependency_count", -1))
-        if dependency_count != len(op.operands):
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
-                STAGE,
-                "LDS release dependency count does not match its operands",
-                target_op_id=op.target_op_id,
-            )
-        publication_mode = attrs.get("publication_mode")
-        allowed_domains = (
-            {
-                target_ir.EVENT_DOMAIN_LDS_ISSUE,
-                target_ir.EVENT_DOMAIN_LDS_RELEASED,
-            }
-            if publication_mode == "workgroup"
-            else {
-                target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-                target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-                target_ir.EVENT_DOMAIN_LDS_RELEASED,
-                target_ir.EVENT_DOMAIN_EMPTY,
-            }
-        )
-        for operand in op.operands:
-            require_token(
-                operand,
-                "LDS release dependency",
-                allowed_domains,
-            )
-        if publication_mode not in {"workgroup", "wave_local"}:
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_PUBLICATION",
-                STAGE,
-                "LDS release requires a valid publication mode",
-                target_op_id=op.target_op_id,
-            )
-        if attrs.get("publication_provenance") != "async_dma_reuse":
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-                STAGE,
-                "LDS release requires async-DMA reuse provenance",
-                target_op_id=op.target_op_id,
-            )
-        require_token(
-            op.results[0],
-            "published LDS release result",
-            {target_ir.EVENT_DOMAIN_LDS_RELEASED},
-        )
         return
 
     if op.kind == "barrier":
@@ -438,12 +363,18 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 "direct-to-LDS completion result",
                 {target_ir.EVENT_DOMAIN_DMA_COMPLETION},
             )
+        if "lds_release_dependency_count" in attrs:
+            fail(
+                "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
+                STAGE,
+                "direct-to-LDS DMA must not carry an LDS-release segment",
+                target_op_id=op.target_op_id,
+            )
         total_issue_count = int(attrs.get("issue_dependency_count", -1))
         source_count = int(attrs.get("source_issue_dependency_count", -1))
-        release_count = int(attrs.get("lds_release_dependency_count", -1))
         if (
-            min(total_issue_count, source_count, release_count) < 0
-            or source_count + release_count != total_issue_count
+            min(total_issue_count, source_count) < 0
+            or source_count != total_issue_count
             or total_issue_count > len(op.operands)
         ):
             fail(
@@ -453,9 +384,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 target_op_id=op.target_op_id,
             )
         dependency_begin = len(op.operands) - total_issue_count
-        source_end = dependency_begin + source_count
-        source_operands = op.operands[dependency_begin:source_end]
-        release_operands = op.operands[source_end:]
+        source_operands = op.operands[dependency_begin:]
         for operand in source_operands:
             require_token(
                 operand,
@@ -465,12 +394,6 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_ir.EVENT_DOMAIN_EMPTY,
                     None,
                 },
-            )
-        for operand in release_operands:
-            require_token(
-                operand,
-                "direct-to-LDS published LDS-release dependency",
-                {target_ir.EVENT_DOMAIN_LDS_RELEASED},
             )
         return
 
