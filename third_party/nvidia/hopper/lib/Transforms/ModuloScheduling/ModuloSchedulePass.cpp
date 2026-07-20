@@ -940,10 +940,12 @@ enumerateDataPartitionCandidates(Operation *op) {
   if (shape.size() != 2)
     return out;
   int64_t bm = shape[0];
-  int64_t minM = 64;
+  // The per-CTA TMEM block granularity along M: a group's accumulator must be a
+  // whole number of these blocks (a ragged M has no valid TMEM tiling).
+  int64_t blockM = 0;
   if (auto tmem = dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding()))
-    minM = std::max<int64_t>(minM, tmem.getBlockM() *
-                                       tmem.getCGALayout().getCTASplitNum()[0]);
+    blockM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
+  int64_t minM = std::max<int64_t>(64, blockM);
 
   // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
   // carries only the write-dep token as an inner-loop iter-arg, so the
@@ -961,11 +963,25 @@ enumerateDataPartitionCandidates(Operation *op) {
     return out;
   }
 
+  // TMEM holds at most kTmemLaneRows rows per CTA. A legal M-split brings each
+  // group's per-CTA M under that limit AND tiles it to whole blockM blocks;
+  // anything else is unallocatable (the TMEM allocator's findFirstFit asserts
+  // in debug / degenerates in release, and the op verifiers only check the
+  // encoding params, not total M). The upper bound has to live HERE, in the
+  // single source of candidates: the auto search filters it via tmemLegalFor,
+  // but the explicit-factor path (addMMAToPlanIfLegal) and the dumped
+  // data_partition_candidates surface both trust this list as-is.
+  constexpr int64_t kTmemLaneRows = 128;
   for (int64_t n = 2; n * minM <= bm; ++n) {
     if (bm % n != 0)
       continue;
+    int64_t mSize = bm / n;
+    if (mSize > kTmemLaneRows)
+      continue;
+    if (blockM > 0 && mSize % blockM != 0)
+      continue;
     out.push_back({op, allocOp.getOperation(), static_cast<unsigned>(n),
-                   static_cast<unsigned>(bm / n)});
+                   static_cast<unsigned>(mSize)});
   }
   return out;
 }
