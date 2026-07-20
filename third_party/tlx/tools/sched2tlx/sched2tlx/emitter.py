@@ -101,7 +101,7 @@ def _parse_tensor_shape(type_str: str) -> tuple[list[int], str] | None:
 
 
 def _parse_desc_block_shape(type_str: str) -> tuple[list[int], str] | None:
-    """Extract block shape from `!tt.tensordesc<tensor<128x64xf16,...>>`."""
+    """Extract block shape from `!tt.tensordesc<128x64xf16,...>`."""
     m = _DESC_TYPE_RE.search(type_str)
     if not m:
         return None

@@ -54,10 +54,10 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // CHECK-DAG: [PassB.1]   {{N[0-9]+}} tt.descriptor_load → wg{{[1-9]}} (MEM)
 
   tt.func public @addmm_persistent_2d_bias(
-      %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-      %b_desc: !tt.tensordesc<tensor<64x128xf16, #shared>>,
-      %bias_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
-      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
+      %a_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %b_desc: !tt.tensordesc<64x128xf16, #shared>,
+      %bias_desc: !tt.tensordesc<128x128xf16, #shared>,
+      %c_desc: !tt.tensordesc<128x128xf16, #shared>,
       %M: i32 {tt.divisibility = 16 : i32},
       %N: i32 {tt.divisibility = 16 : i32},
       %K: i32 {tt.divisibility = 16 : i32}
@@ -97,9 +97,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
           iter_args(%use_acc = %false, %acc_tok_iter = %acc_init_tok)
           -> (i1, !ttg.async.token) : i32 {
         %offs_k = arith.muli %k, %c64_i32 : i32
-        %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+        %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
         %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-        %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked>
+        %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked>
         %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
         %new_tok = ttng.tc_gen5_mma %a_smem, %b_smem, %acc[%acc_tok_iter], %use_acc, %true : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
         scf.yield %true, %new_tok : i1, !ttg.async.token
@@ -113,7 +113,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %offs_om = arith.muli %pid_m_e, %c128_i32 : i32
       %offs_on = arith.muli %pid_n_e, %c128_i32 : i32
 
-      %bias = tt.descriptor_load %bias_desc[%offs_om, %offs_on] : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked1>
+      %bias = tt.descriptor_load %bias_desc[%offs_om, %offs_on] : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #blocked1>
       %bias_f32 = arith.extf %bias : tensor<128x128xf16, #blocked1> to tensor<128x128xf32, #blocked1>
       %bias_lin = ttg.convert_layout %bias_f32 : tensor<128x128xf32, #blocked1> -> tensor<128x128xf32, #linear>
 
@@ -121,7 +121,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %out_with_bias = arith.addf %out, %bias_lin : tensor<128x128xf32, #linear>
       %out_f16 = arith.truncf %out_with_bias : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
       %out_blk = ttg.convert_layout %out_f16 : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked1>
-      tt.descriptor_store %c_desc[%offs_om, %offs_on], %out_blk : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked1>
+      tt.descriptor_store %c_desc[%offs_om, %offs_on], %out_blk : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked1>
 
       scf.yield %tile_id_next : i32
     } {tt.warp_specialize}

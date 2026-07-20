@@ -114,9 +114,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // DATAPART-LABEL: @while_descriptor_data_partition
   // DATAPART: scf.while
-  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
   // DATAPART: arith.addi %{{.*}}, %{{.*}} : i32
-  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   tt.func public @while_descriptor_data_partition(%desc_storage: !tt.ptr<i8>, %out: !tt.ptr<f32>, %bound: i32) {
@@ -125,15 +125,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0 = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
     %c64 = arith.constant {async_task_id = array<i32: 0>} 64 : i32
     %acc_init = arith.constant {async_task_id = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
-    %desc_a = ttng.reinterpret_tensor_descriptor %desc_storage {async_task_id = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<tensor<128x64xf16>>
-    %desc_b = ttng.reinterpret_tensor_descriptor %desc_storage {async_task_id = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<tensor<64x256xf16>>
+    %desc_a = ttng.reinterpret_tensor_descriptor %desc_storage {async_task_id = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<128x64xf16>
+    %desc_b = ttng.reinterpret_tensor_descriptor %desc_storage {async_task_id = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<64x256xf16>
     %result:2 = scf.while (%acc = %acc_init, %off = %c0, %cond = %true) : (tensor<128x256xf32, #mma>, i32, i1) -> (tensor<128x256xf32, #mma>, i32) {
       scf.condition(%cond) %acc, %off : tensor<128x256xf32, #mma>, i32
     } do {
     ^bb0(%acc: tensor<128x256xf32, #mma>, %off: i32):
-      %a = tt.descriptor_load %desc_a[%off, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
+      %a = tt.descriptor_load %desc_a[%off, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
       %a_alloc = ttg.local_alloc %a {async_task_id = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-      %b = tt.descriptor_load %desc_b[%c0, %off] {async_task_id = array<i32: 0>} : !tt.tensordesc<tensor<64x256xf16>> -> tensor<64x256xf16, #blocked1>
+      %b = tt.descriptor_load %desc_b[%c0, %off] {async_task_id = array<i32: 0>} : !tt.tensordesc<64x256xf16> -> tensor<64x256xf16, #blocked1>
       %b_alloc = ttg.local_alloc %b {async_task_id = array<i32: 1, 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
       %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {async_task_id = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
       %new_off = arith.addi %off, %c64 {async_task_id = array<i32: 0>} : i32

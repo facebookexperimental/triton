@@ -116,17 +116,17 @@ tt.func public @flex_attention_data_partition_split(
 
   // Q descriptor and loads for two data partitions
   %desc_q_stride = arith.extsi %stride_qm : i32 to i64
-  %desc_q = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%desc_q_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
-  %q_0_data = tt.descriptor_load %desc_q[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
-  %q_1_data = tt.descriptor_load %desc_q[%c128_i32, %c0_i32] : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+  %desc_q = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%desc_q_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<128x128xbf16, #shared>
+  %q_0_data = tt.descriptor_load %desc_q[%c0_i32, %c0_i32] : !tt.tensordesc<128x128xbf16, #shared> -> tensor<128x128xbf16, #blocked1>
+  %q_1_data = tt.descriptor_load %desc_q[%c128_i32, %c0_i32] : !tt.tensordesc<128x128xbf16, #shared> -> tensor<128x128xbf16, #blocked1>
   %q_0 = ttg.local_alloc %q_0_data : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
   %q_1 = ttg.local_alloc %q_1_data : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
 
   // K/V descriptors
   %desc_k_stride = arith.extsi %stride_kn : i32 to i64
-  %desc_k = tt.make_tensor_descriptor %K, [%KV_LEN, %c128_i32], [%desc_k_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+  %desc_k = tt.make_tensor_descriptor %K, [%KV_LEN, %c128_i32], [%desc_k_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<128x128xbf16, #shared>
   %desc_v_stride = arith.extsi %stride_vn : i32 to i64
-  %desc_v = tt.make_tensor_descriptor %V, [%KV_LEN, %c128_i32], [%desc_v_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<128x128xbf16, #shared>>
+  %desc_v = tt.make_tensor_descriptor %V, [%KV_LEN, %c128_i32], [%desc_v_stride, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<128x128xbf16, #shared>
 
   // QK and ACC TMEM allocations
   %qk_0, %qk_0_tok = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
@@ -160,8 +160,8 @@ tt.func public @flex_attention_data_partition_split(
 
     // Load K and V
     %kv_offset = arith.muli %i, %c128_i32 {loop.cluster = 3 : i32, loop.stage = 0 : i32} : i32
-    %k_data = tt.descriptor_load %desc_k[%kv_offset, %c0_i32] {loop.cluster = 3 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
-    %v_data = tt.descriptor_load %desc_v[%kv_offset, %c0_i32] {loop.cluster = 3 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+    %k_data = tt.descriptor_load %desc_k[%kv_offset, %c0_i32] {loop.cluster = 3 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x128xbf16, #shared> -> tensor<128x128xbf16, #blocked1>
+    %v_data = tt.descriptor_load %desc_v[%kv_offset, %c0_i32] {loop.cluster = 3 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x128xbf16, #shared> -> tensor<128x128xbf16, #blocked1>
     %k_smem = ttg.local_alloc %k_data {loop.cluster = 3 : i32, loop.stage = 0 : i32} : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
     %k_trans = ttg.memdesc_trans %k_smem {loop.cluster = 3 : i32, loop.stage = 0 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared, #smem> -> !ttg.memdesc<128x128xbf16, #shared1, #smem>
     %v_smem = ttg.local_alloc %v_data {loop.cluster = 1 : i32, loop.stage = 1 : i32} : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared, #smem>
