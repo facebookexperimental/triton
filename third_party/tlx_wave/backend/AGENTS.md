@@ -79,6 +79,13 @@ from-scratch converter.
   explicit source async protocol. If that protocol does not order safe slot
   reuse, reject or fix the source program; do not make alias analysis more
   precise to manufacture the missing edge.
+- An explicit full-memory source/compiler barrier may contribute one distinct,
+  completion-free barrier-issue dependency to following memory issuers,
+  including direct-to-LDS DMA. Build it structurally as
+  `issue_token(memory completions) -> barrier -> issue_token(barrier result)`.
+  The raw barrier result and all DMA/LDS completion events remain forbidden as
+  DMA `after` operands. Pure operations and layout conversions must not consume
+  this ordering token.
 - A local load/store must never consume an in-flight async-DMA token through an
   inferred destination dependency. Data readiness comes only from the explicit
   wait associated with the source access (for example an explicit wait token or
@@ -199,6 +206,9 @@ Reject or revise a patch if it:
 - synchronizes an async DMA through an implicit dependency, inferred
   local-memory hazard, destination access, ordinary barrier, or unrelated wait
   instead of exclusively through an explicit `wait_group`;
+- feeds a raw barrier, LDS-completion, or DMA-completion token to direct DMA,
+  or derives a barrier-issue token from anything other than an explicit
+  full-memory source/compiler barrier;
 - queries local-memory alias/access state while emitting a direct-to-LDS DMA,
   or adds a DMA/read/store edge merely because their LDS destinations may
   overlap;
