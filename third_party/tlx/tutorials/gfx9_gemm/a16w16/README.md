@@ -64,6 +64,14 @@ win is the warp pipeline; the grid remap is the finishing polish.
 passes — that scheduler control is the main remaining headroom over the LLVM backend's
 default scheduling.
 
+### Separate Wave-profiled structure
+
+`wave_8wave` is kept outside the v0-v9 tutorial progression. It renders the
+gfx950 Wave profile as a single 256x256 accumulator with double-buffered
+256x64/64x256 LDS tiles and two structural K32 subslices per K64 iteration.
+It intentionally has no warp-pipeline scheduling metadata yet. Run it with
+`python bench.py --version 10 --providers tlx wave`; v9 remains unchanged.
+
 ### Layout inference
 
 From v4 onward the padded shared layout is **inferred by the compiler** from the dot

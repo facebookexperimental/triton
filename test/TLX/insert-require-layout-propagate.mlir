@@ -40,6 +40,51 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 }
 
 // -----
+// Test 7: an explicit source layout is a hard storage contract, including
+// through rank-changing and transposing memdesc views.  The pass may retag the
+// local_load tensor for the dot, but must not insert a memdesc require_layout
+// or replace the source/view encodings.
+
+#blocked_6 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [2, 4], order = [1, 0]}>
+#mma_6 = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 32], isTransposed = true, tilesPerWarp = [8, 4]}>
+#explicit_4d_6 = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 8, order = [3, 1, 0, 2]}>
+#explicit_view_a_6 = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 8], [4, 16], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 32]]}, alignment = 16>
+#explicit_view_b_6 = #ttg.shared_linear<{offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [0, 1], [8, 2], [16, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [32, 0]]}, alignment = 16>
+// CHECK-DAG: #[[$MMA_EXPLICIT:.*]] = #ttg.amd_mfma<{{.*}}tilesPerWarp = [8, 4]{{.*}}>
+// CHECK-DAG: #[[$SHARED_EXPLICIT:.*]] = #ttg.swizzled_shared<{vec = 8, perPhase = 2, maxPhase = 8, order = [3, 1, 0, 2]}>
+// CHECK-DAG: #[[$VIEW_A_EXPLICIT:.*]] = #ttg.shared_linear<{{.*}}alignment = 16>
+// CHECK-DAG: #[[$VIEW_B_EXPLICIT:.*]] = #ttg.shared_linear<{{.*}}alignment = 16>
+#smem_6 = #ttg.shared_memory
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @explicit_layout_through_reshape
+  tt.func public @explicit_layout_through_reshape() -> tensor<256x256xf32, #mma_6> {
+    %c0_i32 = arith.constant 0 : i32
+    %acc = arith.constant dense<0.000000e+00> : tensor<256x256xf32, #mma_6>
+    %alloc_a = ttg.local_alloc {tlx.layout_is_explicit} : () -> !ttg.memdesc<2x16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable>
+    %alloc_b = ttg.local_alloc {tlx.layout_is_explicit} : () -> !ttg.memdesc<2x16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable>
+    // CHECK: %[[A_BUF:.*]] = ttg.memdesc_index %{{.*}}[%{{.*}}] : !ttg.memdesc<2x16x16x2x32xf16, #[[$SHARED_EXPLICIT]], #smem, mutable> -> !ttg.memdesc<16x16x2x32xf16, #[[$SHARED_EXPLICIT]], #smem, mutable>
+    %a_buf = ttg.memdesc_index %alloc_a[%c0_i32] : !ttg.memdesc<2x16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable> -> !ttg.memdesc<16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable>
+    %b_buf = ttg.memdesc_index %alloc_b[%c0_i32] : !ttg.memdesc<2x16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable> -> !ttg.memdesc<16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable>
+    // CHECK: %[[A_VIEW:.*]] = ttg.memdesc_reshape %[[A_BUF]] : !ttg.memdesc<16x16x2x32xf16, #[[$SHARED_EXPLICIT]], #smem, mutable> -> !ttg.memdesc<256x64xf16, #[[$VIEW_A_EXPLICIT]], #smem, mutable>
+    %a_view = ttg.memdesc_reshape %a_buf : !ttg.memdesc<16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable> -> !ttg.memdesc<256x64xf16, #explicit_view_a_6, #smem_6, mutable>
+    %b_view0 = ttg.memdesc_reshape %b_buf : !ttg.memdesc<16x16x2x32xf16, #explicit_4d_6, #smem_6, mutable> -> !ttg.memdesc<256x64xf16, #explicit_view_a_6, #smem_6, mutable>
+    // CHECK: %[[B_VIEW:.*]] = ttg.memdesc_trans %{{.*}} {order = array<i32: 1, 0>} : !ttg.memdesc<256x64xf16, #[[$VIEW_A_EXPLICIT]], #smem, mutable> -> !ttg.memdesc<64x256xf16, #[[$VIEW_B_EXPLICIT]], #smem, mutable>
+    %b_view = ttg.memdesc_trans %b_view0 {order = array<i32: 1, 0>} : !ttg.memdesc<256x64xf16, #explicit_view_a_6, #smem_6, mutable> -> !ttg.memdesc<64x256xf16, #explicit_view_b_6, #smem_6, mutable>
+    %a_slice = ttg.memdesc_subslice %a_view[0, 0] : !ttg.memdesc<256x64xf16, #explicit_view_a_6, #smem_6, mutable> -> !ttg.memdesc<256x32xf16, #explicit_view_a_6, #smem_6, mutable, 256x64>
+    %b_slice = ttg.memdesc_subslice %b_view[0, 0] : !ttg.memdesc<64x256xf16, #explicit_view_b_6, #smem_6, mutable> -> !ttg.memdesc<32x256xf16, #explicit_view_b_6, #smem_6, mutable, 64x256>
+    // CHECK-NOT: tlx.require_layout {{.*}}!ttg.memdesc
+    // CHECK: %[[A_LOAD:.*]] = ttg.local_load %{{.*}} : !ttg.memdesc<256x32xf16, #[[$VIEW_A_EXPLICIT]], #smem, mutable, 256x64> -> tensor<256x32xf16, #ttg.dot_op<{opIdx = 0, parent = #[[$MMA_EXPLICIT]], kWidth = 8}>>
+    %a = ttg.local_load %a_slice : !ttg.memdesc<256x32xf16, #explicit_view_a_6, #smem_6, mutable, 256x64> -> tensor<256x32xf16, #blocked_6>
+    // CHECK: %[[B_LOAD:.*]] = ttg.local_load %{{.*}} : !ttg.memdesc<32x256xf16, #[[$VIEW_B_EXPLICIT]], #smem, mutable, 64x256> -> tensor<32x256xf16, #ttg.dot_op<{opIdx = 1, parent = #[[$MMA_EXPLICIT]], kWidth = 8}>>
+    %b = ttg.local_load %b_slice : !ttg.memdesc<32x256xf16, #explicit_view_b_6, #smem_6, mutable, 64x256> -> tensor<32x256xf16, #blocked_6>
+    %a_dot = ttg.convert_layout %a : tensor<256x32xf16, #blocked_6> -> tensor<256x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_6, kWidth = 8}>>
+    %b_dot = ttg.convert_layout %b : tensor<32x256xf16, #blocked_6> -> tensor<32x256xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_6, kWidth = 8}>>
+    %dot = tt.dot %a_dot, %b_dot, %acc : tensor<256x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_6, kWidth = 8}>> * tensor<32x256xf16, #ttg.dot_op<{opIdx = 1, parent = #mma_6, kWidth = 8}>> -> tensor<256x256xf32, #mma_6>
+    tt.return %dot : tensor<256x256xf32, #mma_6>
+  }
+}
+
+// -----
 // Test 2: local_load feeds scf.for iter_args that eventually reach a dot.
 // The TLX pipeline should rewrite the prologue and loop-body loads and make the
 // loop carry the final dot encodings directly. For comparison, the upstream

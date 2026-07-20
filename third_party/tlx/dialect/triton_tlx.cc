@@ -102,6 +102,66 @@ static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
   return builder.create<tlx::RequireLayoutOp>(concreteType, value);
 }
 
+static void ensureModuleBlockedLayoutContext(TritonOpBuilder &self,
+                                             unsigned threadsPerWarp,
+                                             unsigned numWarps) {
+  auto *block = self.getBuilder().getInsertionBlock();
+  if (!block)
+    return;
+  auto moduleOp = block->getParentOp()->getParentOfType<ModuleOp>();
+  if (!moduleOp)
+    return;
+  Builder b(self.getContext());
+  moduleOp->setAttr(ttg::AttrNumThreadsPerWarp,
+                    b.getI32IntegerAttr(threadsPerWarp));
+  moduleOp->setAttr(ttg::AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
+}
+
+static Type getElementType(Type type) {
+  if (auto rankedType = dyn_cast<RankedTensorType>(type))
+    return rankedType.getElementType();
+  return type;
+}
+
+static Type getLayoutPreservingType(Value src, Type dstType) {
+  auto srcType = src.getType();
+  auto dstElementType = getElementType(dstType);
+  if (auto srcTensorType = dyn_cast<RankedTensorType>(srcType)) {
+    return RankedTensorType::get(srcTensorType.getShape(), dstElementType,
+                                 srcTensorType.getEncoding());
+  }
+  return dstElementType;
+}
+
+static Value createRequireLayout(TritonOpBuilder &self, Value value,
+                                 Attribute encoding,
+                                 bool deferTensorVerification,
+                                 bool pin = false) {
+  Type newType;
+  if (auto type = dyn_cast<ttg::MemDescType>(value.getType())) {
+    // Preserve the allocation shape for subslices. Tensor-memory scales are
+    // the one encoding whose allocation shape is its logical shape.
+    SmallVector<int64_t> allocShape(type.getAllocShape());
+    if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+      allocShape.assign(type.getShape().begin(), type.getShape().end());
+    newType = ttg::MemDescType::get(
+        type.getShape(), type.getElementType(), encoding,
+        type.getMemorySpace(), type.getMutableMemory(), allocShape);
+  } else if (auto type = dyn_cast<RankedTensorType>(value.getType())) {
+    Attribute tensorEncoding = encoding;
+    if (pin)
+      tensorEncoding =
+          tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(tensorEncoding));
+    else if (deferTensorVerification)
+      tensorEncoding = tlx::wrapNoVerifyLayout(tensorEncoding);
+    newType = RankedTensorType::get(type.getShape(), type.getElementType(),
+                                    tensorEncoding);
+  } else {
+    throw std::runtime_error("Unsupported type");
+  }
+  return self.create<tlx::RequireLayoutOp>(newType, value);
+}
+
 void init_triton_tlx_ir(py::module_ &m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -282,6 +342,11 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false,
           py::arg("late_address_compute") = false)
+      .def("create_exact_require_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             return createRequireLayout(self, v, encoding,
+                                        /*deferTensorVerification=*/false);
+           })
       .def(
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -297,6 +362,36 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
           py::arg("scalar"))
+      .def("create_layout_preserving_cast",
+           [](TritonOpBuilder &self, Value &src, Type &dstType,
+              std::optional<tt::RoundingMode> roundingMode,
+              bool bitcast) -> Value {
+             auto resultType = getLayoutPreservingType(src, dstType);
+             auto srcElementType = getElementType(src.getType());
+             auto dstElementType = getElementType(resultType);
+             if (srcElementType == dstElementType)
+               return src;
+             if (bitcast)
+               return self.create<tt::BitcastOp>(resultType, src);
+             if (isa<FloatType>(srcElementType) &&
+                 isa<FloatType>(dstElementType)) {
+               if (roundingMode.has_value()) {
+                 auto roundingAttr = tt::RoundingModeAttr::get(
+                     self.getContext(), roundingMode.value());
+                 return self.create<tt::FpToFpOp>(resultType, src,
+                                                  roundingAttr);
+               }
+               unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
+               unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
+               if (srcWidth > dstWidth)
+                 return self.create<arith::TruncFOp>(resultType, src);
+               if (srcWidth < dstWidth)
+                 return self.create<arith::ExtFOp>(resultType, src);
+               return self.create<tt::BitcastOp>(resultType, src);
+             }
+             throw std::runtime_error(
+                 "Unsupported layout-preserving cast element types");
+           })
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
@@ -452,6 +547,12 @@ void init_triton_tlx_ir(py::module_ &m) {
                     "intervals/paddings size mismatch");
              assert(order.size() == shape.size() &&
                     "order/shape rank mismatch");
+             assert(order.size() == CTAsPerCGA.size() &&
+                    "CTAsPerCGA rank mismatch");
+             assert(order.size() == CTASplitNum.size() &&
+                    "CTASplitNum rank mismatch");
+             assert(order.size() == CTAOrder.size() &&
+                    "CTAOrder rank mismatch");
              auto context = self.getBuilder().getContext();
              llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
              intervalPads.reserve(intervals.size());
@@ -523,6 +624,79 @@ void init_triton_tlx_ir(py::module_ &m) {
              return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
                  context, std::move(ll), alignment));
            })
+      .def("make_blocked_encoding_attr",
+           [](TritonOpBuilder &self, std::vector<unsigned> sizePerThread,
+              std::vector<unsigned> threadsPerWarp,
+              std::vector<unsigned> warpsPerCTA, std::vector<unsigned> order,
+              std::vector<std::vector<int32_t>> cgaBases) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             unsigned rank = order.size();
+             unsigned totalThreadsPerWarp = 1;
+             for (unsigned threads : threadsPerWarp)
+               totalThreadsPerWarp *= threads;
+             unsigned totalWarpsPerCTA = 1;
+             for (unsigned warps : warpsPerCTA)
+               totalWarpsPerCTA *= warps;
+             ensureModuleBlockedLayoutContext(self, totalThreadsPerWarp,
+                                              totalWarpsPerCTA);
+             auto cgaLayout = makeCGALayoutFromBases(ctx, cgaBases, rank);
+             return mlir::cast<Attribute>(ttg::BlockedEncodingAttr::get(
+                 ctx, sizePerThread, threadsPerWarp, warpsPerCTA, order,
+                 cgaLayout));
+           })
+      .def("make_slice_encoding_attr",
+           [](TritonOpBuilder &self, unsigned dim,
+              Attribute parentEncoding) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             auto parent =
+                 mlir::cast<ttg::DistributedEncodingTrait>(parentEncoding);
+             return mlir::cast<Attribute>(
+                 ttg::SliceEncodingAttr::get(ctx, dim, parent));
+           })
+      .def("make_distributed_linear_encoding_attr",
+           [](TritonOpBuilder &self,
+              std::vector<std::vector<int32_t>> regBases,
+              std::vector<std::vector<int32_t>> laneBases,
+              std::vector<std::vector<int32_t>> warpBases,
+              std::vector<std::vector<int32_t>> blockBases,
+              std::vector<int64_t> shape) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(ctx, "register");
+             auto kLane = mlir::StringAttr::get(ctx, "lane");
+             auto kWarp = mlir::StringAttr::get(ctx, "warp");
+             auto kBlock = mlir::StringAttr::get(ctx, "block");
+             auto outDims = tt::standardOutDimPairs(ctx, shape);
+             auto ll = tt::LinearLayout({{kReg, regBases},
+                                         {kLane, laneBases},
+                                         {kWarp, warpBases},
+                                         {kBlock, blockBases}},
+                                        outDims,
+                                        /*requiresSurjective=*/true);
+             if (ttg::isPermutationMatrixLayout(ll))
+               return mlir::cast<Attribute>(
+                   ttg::LinearEncodingAttr::get(ctx, std::move(ll)));
+             return mlir::cast<Attribute>(
+                 ttg::GenericLinearEncodingAttr::get(ctx, std::move(ll)));
+           })
+      .def(
+          "make_padded_shared_encoding_attr_from_offsets",
+          [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+             std::vector<unsigned> paddings,
+             std::vector<std::vector<int32_t>> offsetBases,
+             std::vector<std::vector<int32_t>> blockBases,
+             std::vector<int64_t> shape) -> Attribute {
+            assert(intervals.size() == paddings.size() &&
+                   "intervals/paddings size mismatch");
+            auto ctx = self.getBuilder().getContext();
+            auto rank = shape.size();
+            auto kOffset = mlir::StringAttr::get(ctx, "offset");
+            auto kBlock = mlir::StringAttr::get(ctx, "block");
+            auto outDims = tt::standardOutDimNames(ctx, rank);
+            auto ll = tt::LinearLayout({{kOffset, offsetBases}}, outDims) *
+                      tt::LinearLayout({{kBlock, blockBases}}, outDims);
+            return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                ctx, intervals, paddings, std::move(ll)));
+          })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
@@ -784,6 +958,13 @@ void init_triton_tlx_ir(py::module_ &m) {
                            ttg::GenericLinearEncodingAttr::get(context,
                                                                std::move(ll)));
              return tlx::wrapNoVerifyLayout(encoding);
+           })
+      .def("make_dot_operand_encoding_attr_from_layout",
+           [](TritonOpBuilder &self, unsigned opIdx, Attribute parentEnc,
+              unsigned kWidth) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             return mlir::cast<Attribute>(ttg::DotOperandEncodingAttr::get(
+                 context, opIdx, parentEnc, kWidth));
            })
       .def("make_dummy_register_layout_attr",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
@@ -1120,6 +1301,9 @@ void init_triton_tlx_ir(py::module_ &m) {
           },
           py::arg("desc"), py::arg("addOffsets"), py::arg("setBounds"),
           py::arg("pred").none(), py::arg("clampBounds"))
+      // AMD-only: emit amdgpu.tdm_prefetch — an L2 prefetch hint with no
+      // memdesc. Pred is i1 here (unlike the load's i32 pred); we
+      // truncate from i32 if the caller passed a wider int.
       .def("create_tdm_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
               Value pred, bool speculative) {
@@ -1590,55 +1774,48 @@ void init_triton_tlx_ir(py::module_ &m) {
                  paddingOption);
            })
       // AMD buffer ops
-      .def(
-          "create_buffer_load",
-          [](TritonOpBuilder &self, Value ptr, Value offsets,
-             std::optional<Value> mask, std::optional<Value> other,
-             tt::CacheModifier cache, uint32_t contiguity) -> Value {
-            auto offsetsType = cast<RankedTensorType>(offsets.getType());
-            auto ptrType = cast<tt::PointerType>(ptr.getType());
-            auto resultType = RankedTensorType::get(offsetsType.getShape(),
-                                                    ptrType.getPointeeType(),
-                                                    offsetsType.getEncoding());
-            return self.create<ttag::BufferLoadOp>(
-                resultType, ptr, offsets, Value() /*stride*/, cache,
-                mask.value_or(Value()), other.value_or(Value()), contiguity);
-          },
-          py::arg("ptr"), py::arg("offsets"), py::arg("mask").none(),
-          py::arg("other").none(), py::arg("cache"), py::arg("contiguity"))
-      .def(
-          "create_buffer_store",
-          [](TritonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
-             std::optional<Value> mask, tt::CacheModifier cache) {
-            self.create<ttag::BufferStoreOp>(storedValue, ptr, offsets,
-                                             Value() /*stride*/, cache,
-                                             mask.value_or(Value()));
-          },
-          py::arg("storedValue"), py::arg("ptr"), py::arg("offsets"),
-          py::arg("mask").none(), py::arg("cache"))
-      .def(
-          "create_buffer_atomic_rmw",
-          [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
-             Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-             std::optional<Value> mask, uint32_t contiguity) -> Value {
-            return self.create<ttag::BufferAtomicRMWOp>(
-                value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                sem, scope, mask.value_or(Value()), contiguity);
-          },
-          py::arg("op"), py::arg("ptr"), py::arg("offsets"), py::arg("value"),
-          py::arg("sem"), py::arg("scope"), py::arg("mask").none(),
-          py::arg("contiguity"))
-      .def(
-          "create_buffer_load_to_local",
-          [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
-             std::optional<Value> mask, std::optional<Value> other,
-             tt::CacheModifier cache) -> Value {
-            return self.create<ttag::BufferLoadToLocalOp>(
-                dest, ptr, offsets, mask.value_or(Value()),
-                other.value_or(Value()), Value() /*stride*/, cache);
-          },
-          py::arg("dest"), py::arg("ptr"), py::arg("offsets"),
-          py::arg("mask").none(), py::arg("other").none(), py::arg("cache"))
+      .def("create_buffer_load",
+           [](TritonOpBuilder &self, Value ptr, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other,
+              tt::CacheModifier cache, uint32_t contiguity) -> Value {
+             auto offsetsType = cast<RankedTensorType>(offsets.getType());
+             auto ptrType = cast<tt::PointerType>(ptr.getType());
+             auto resultType = RankedTensorType::get(offsetsType.getShape(),
+                                                     ptrType.getPointeeType(),
+                                                     offsetsType.getEncoding());
+             auto op = self.create<ttag::BufferLoadOp>(
+                 resultType, ptr, offsets, Value() /*stride*/, cache,
+                 mask.value_or(Value()), other.value_or(Value()), contiguity);
+             op->setAttr(tlx::AttrLayoutIsExplicitName,
+                         self.getBuilder().getUnitAttr());
+             return op.getResult();
+           })
+      .def("create_buffer_store",
+           [](TritonOpBuilder &self, Value storedValue, Value ptr,
+              Value offsets, std::optional<Value> mask,
+              tt::CacheModifier cache) {
+             auto op = self.create<ttag::BufferStoreOp>(
+                 storedValue, ptr, offsets, Value() /*stride*/, cache,
+                 mask.value_or(Value()));
+             op->setAttr(tlx::AttrLayoutIsExplicitName,
+                         self.getBuilder().getUnitAttr());
+           })
+      .def("create_buffer_atomic_rmw",
+           [](TritonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
+              Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
+              std::optional<Value> mask, uint32_t contiguity) -> Value {
+             return self.create<ttag::BufferAtomicRMWOp>(
+                 value.getType(), op, ptr, offsets, value, Value() /*stride*/,
+                 sem, scope, mask.value_or(Value()), contiguity);
+           })
+      .def("create_buffer_load_to_local",
+           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other,
+              tt::CacheModifier cache) -> Value {
+             return self.create<ttag::BufferLoadToLocalOp>(
+                 dest, ptr, offsets, mask.value_or(Value()),
+                 other.value_or(Value()), Value() /*stride*/, cache);
+           })
       .def("create_assume_uniform",
            [](TritonOpBuilder &self, Value value) -> Value {
              return self.create<ttag::AssumeUniformOp>(value.getType(), value);

@@ -2,6 +2,7 @@
 
 import argparse
 import concurrent.futures
+from contextlib import contextmanager
 import importlib.util
 import multiprocessing
 import os
@@ -41,11 +42,14 @@ VERSION_MAP = {
     7: "v7_slice",
     8: "v8_warp_pipeline",
     9: "v9_beyond_hotloop",
+    10: "wave_8wave",
+    11: "wave_4wave_specialized",
 }
 
 PROVIDER_LABELS = {
     "rocblas": "rocBLAS",
     "tlx": "TLX",
+    "wave": "Wave",
 }
 
 BENCH_DIR = Path(__file__).resolve().parent
@@ -53,11 +57,13 @@ TILE_M = 256
 TILE_N = 256
 TILE_K = 64
 TWO_STAGE_K = 2 * TILE_K
-TUTORIAL_PROVIDERS = frozenset({"tlx"})
-TWO_STAGE_K_VERSIONS = frozenset(range(5, 10))
+TUTORIAL_PROVIDERS = frozenset({"tlx", "wave"})
+TWO_STAGE_K_VERSIONS = frozenset(range(5, 12))
 UNTILED_K_VERSIONS = frozenset({0, 1})
-GROUPED_PID_VERSIONS = frozenset({"v9_beyond_hotloop"})
-EIGHT_WARP_VERSIONS = frozenset({"v8_warp_pipeline", "v9_beyond_hotloop"})
+WAVE_STRUCTURED_VERSIONS = frozenset({"wave_8wave", "wave_4wave_specialized"})
+GROUPED_PID_VERSIONS = frozenset({"v9_beyond_hotloop", *WAVE_STRUCTURED_VERSIONS})
+EIGHT_WARP_VERSIONS = frozenset({"v8_warp_pipeline", "v9_beyond_hotloop", "wave_8wave"})
+MULTI_WAVE_SPECIALIZED_VERSIONS = frozenset({"wave_4wave_specialized"})
 DEFAULT_COMPILE_WORKERS = max(1, min(8, os.cpu_count() or 1))
 TIMING_MODES = ("triton", "batched")
 DEFAULT_WARMUP_LAUNCHES = 25
@@ -146,12 +152,43 @@ def load_matmul_module(version_dir, suffix):
     return module
 
 
-def provider_defaults(_version):
+def make_driver(provider):
+    if provider == "tlx":
+        from triton.backends.amd import driver as amd_driver
+
+        return amd_driver.HIPDriver()
+    if provider == "wave":
+        from triton.backends.tlx_wave import driver as tlx_wave_driver
+
+        return tlx_wave_driver.TLXWaveDriver()
+    return None
+
+
+@contextmanager
+def active_driver(driver):
+    if driver is None:
+        yield
+        return
+    previous_driver = triton.runtime.driver.active
+    triton.runtime.driver.set_active(driver)
+    try:
+        yield
+    finally:
+        triton.runtime.driver.set_active(previous_driver)
+
+
+def provider_defaults(version):
+    if version in (10, 11):
+        return ["wave"]
+    if version == 9:
+        return ["tlx", "wave"]
     return ["rocblas", "tlx"]
 
 
-def launch_tutorial_matmul(module, version_dir, a, b, out=None):
+def launch_tutorial_matmul(module, version_dir, a, b, out=None, extra_compile_options=None):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    if version_dir in WAVE_STRUCTURED_VERSIONS:
+        assert b.stride(0) == 1, f"{version_dir} expects a K-contiguous transposed-B view"
     M, K = a.shape
     K, N = b.shape
     if out is None:
@@ -164,6 +201,7 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None):
     grid_m = triton.cdiv(M, BLOCK_M)
     grid_n = triton.cdiv(N, BLOCK_N)
     grid_mn = grid_m * grid_n
+    grid = (grid_m, grid_n) if version_dir in WAVE_STRUCTURED_VERSIONS else (grid_mn, )
     compile_kwargs = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_N": BLOCK_N,
@@ -178,9 +216,11 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None):
             "NUM_XCDS": 8,
             "GRID_MN": grid_mn,
         })
+    if extra_compile_options:
+        compile_kwargs.update(extra_compile_options)
 
     kernel = getattr(module, version_dir)
-    kernel[(grid_mn, )](
+    kernel[grid](
         a,
         b,
         out,
@@ -198,10 +238,22 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None):
     return out
 
 
-def provider_matmul(provider, module, version_dir, a, b, out=None):
+def provider_matmul(args, provider, module, version_dir, a, b, out=None):
     if provider == "rocblas":
         return torch.matmul(a, b, out=out)
-    return launch_tutorial_matmul(module, version_dir, a, b, out=out)
+    extra_compile_options = {}
+    if provider == "wave" and args.wave_split_barriers:
+        extra_compile_options["tlx_wave_enable_split_barriers"] = True
+    if provider == "wave" and version_dir in MULTI_WAVE_SPECIALIZED_VERSIONS:
+        extra_compile_options["tlx_wave_enable_multi_wave_specialize"] = True
+    return launch_tutorial_matmul(
+        module,
+        version_dir,
+        a,
+        b,
+        out=out,
+        extra_compile_options=extra_compile_options or None,
+    )
 
 
 def do_bench_batched(
@@ -258,15 +310,16 @@ def benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K):
     module = None
     if provider != "rocblas":
         module = load_matmul_module(version_dir, provider)
+    driver = make_driver(provider)
     cache_dir = compile_cache_dir(args.cache_dir, version_dir, provider, M, N, K)
 
-    with knobs.cache.scope(), knobs.runtime.scope():
+    with active_driver(driver), knobs.cache.scope(), knobs.runtime.scope():
         if cache_dir is not None:
             knobs.cache.dir = str(cache_dir)
         if args.arch is not None:
             knobs.runtime.override_arch = args.arch
         c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-        provider_matmul(provider, module, version_dir, a, b, out=c)
+        provider_matmul(args, provider, module, version_dir, a, b, out=c)
         torch.cuda.synchronize()
         ok = torch.allclose(c, ref, atol=args.atol, rtol=args.rtol)
         max_err = (c - ref).abs().max().item()
@@ -281,7 +334,7 @@ def benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K):
             }
         ms = measure_provider(
             args,
-            lambda: provider_matmul(provider, module, version_dir, a, b, out=c),
+            lambda: provider_matmul(args, provider, module, version_dir, a, b, out=c),
         )
     return {
         "ok": True,
@@ -312,19 +365,21 @@ def compile_cache_dir(cache_root, version_dir, provider, M, N, K):
     return Path(cache_root) / version_dir / provider / f"M{M}_N{N}_K{K}"
 
 
-def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, arch):
+def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, arch, wave_split_barriers=False):
     if provider == "rocblas":
         return shape, provider, 0.0
 
     M, N, K = shape
     module = load_matmul_module(version_dir, f"compile_{provider}")
     kernel = getattr(module, version_dir)
+    driver = make_driver(provider)
     cache_dir = compile_cache_dir(cache_root, version_dir, provider, M, N, K)
     a, b, c = make_mock_inputs(M, N, K, b_layout)
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
     grid_m = triton.cdiv(M, BLOCK_M)
     grid_n = triton.cdiv(N, BLOCK_N)
     grid_mn = grid_m * grid_n
+    grid = (grid_m, grid_n) if version_dir in WAVE_STRUCTURED_VERSIONS else (grid_mn, )
     compile_kwargs = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_N": BLOCK_N,
@@ -332,7 +387,7 @@ def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, a
         "num_warps": 8 if version_dir in EIGHT_WARP_VERSIONS else 4,
         "num_stages": 1,
         "matrix_instr_nonkdim": 16,
-        "grid": (grid_mn, ),
+        "grid": grid,
     }
     if version_dir in GROUPED_PID_VERSIONS:
         compile_kwargs.update({
@@ -340,9 +395,13 @@ def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, a
             "NUM_XCDS": 8,
             "GRID_MN": grid_mn,
         })
+    if provider == "wave" and wave_split_barriers:
+        compile_kwargs["tlx_wave_enable_split_barriers"] = True
+    if provider == "wave" and version_dir in MULTI_WAVE_SPECIALIZED_VERSIONS:
+        compile_kwargs["tlx_wave_enable_multi_wave_specialize"] = True
 
     start = time.monotonic()
-    with knobs.cache.scope(), knobs.runtime.scope():
+    with active_driver(driver), knobs.cache.scope(), knobs.runtime.scope():
         if cache_dir is not None:
             knobs.cache.dir = str(cache_dir)
         if arch is not None:
@@ -372,7 +431,12 @@ def precompile_shapes(args, version_dir, providers, sizes):
     if args.compile_workers == 0:
         return
 
-    jobs = [(provider, shape) for shape in sizes for provider in providers if provider != "rocblas"]
+    jobs = [
+        (provider, shape)
+        for shape in sizes
+        for provider in providers
+        if provider != "rocblas"
+    ]
     if not jobs:
         return
 
@@ -382,13 +446,7 @@ def precompile_shapes(args, version_dir, providers, sizes):
     if workers == 1:
         for provider, shape in jobs:
             compiled_shape, compiled_provider, elapsed = compile_provider_shape(
-                provider,
-                version_dir,
-                shape,
-                args.b_layout,
-                args.cache_dir,
-                args.arch,
-            )
+                provider, version_dir, shape, args.b_layout, args.cache_dir, args.arch, args.wave_split_barriers)
             M, N, K = compiled_shape
             print(f"  compiled {compiled_provider} {M}x{N}x{K} in {elapsed:.1f}s", flush=True)
         return
@@ -404,7 +462,9 @@ def precompile_shapes(args, version_dir, providers, sizes):
                 args.b_layout,
                 args.cache_dir,
                 args.arch,
-            ) for provider, shape in jobs
+                args.wave_split_barriers,
+            )
+            for provider, shape in jobs
         ]
         for future in concurrent.futures.as_completed(futures):
             compiled_shape, compiled_provider, elapsed = future.result()
@@ -415,34 +475,35 @@ def precompile_shapes(args, version_dir, providers, sizes):
 def main():
     parser = argparse.ArgumentParser(description="TLX GEMM benchmark")
     parser.add_argument("--K", type=int, default=None)
-    parser.add_argument("--version", type=int, default=0, choices=range(0, 10))
+    parser.add_argument("--version", type=int, default=0, choices=range(0, 12))
     parser.add_argument(
         "--providers",
         nargs="+",
         choices=tuple(PROVIDER_LABELS),
         default=None,
-        help="providers to benchmark; default: rocblas tlx",
+        help=("providers to benchmark. Defaults to rocblas tlx, except v9 defaults "
+              "to tlx wave and the Wave-derived variants default to wave."),
     )
     parser.add_argument(
         "--shape",
         action="append",
         type=parse_shape,
         default=None,
-        help=("custom shape as MxNxK or M,N,K. Can be repeated. "
-              "The TLX provider requires tutorial tile-compatible shapes."),
+        help=("custom shape as MxNxK or M,N,K. Can be repeated. TLX/Wave "
+              "providers require tutorial tile-compatible shapes."),
     )
     parser.add_argument(
         "--b-layout",
         choices=("transposed", "contiguous"),
         default="transposed",
-        help="layout used for B input; transposed matches the tutorial benchmark",
+        help="layout used for B input; transposed matches the tutorial benchmark.",
     )
     parser.add_argument(
         "--input-mode",
         choices=INPUT_MODES,
         default="normal",
-        help=("input distribution; hpl and rand-int reproduce hipBLASLt seed-zero data, "
-              "and rand-int applies its alternating sign to B"),
+        help=("input distribution; hpl and rand-int reproduce hipBLASLt/Wave "
+              "seed-zero data, and rand-int applies their alternating sign to B"),
     )
     parser.add_argument(
         "--seed",
@@ -492,12 +553,20 @@ def main():
         default=DEFAULT_TIMING_REPEATS,
         help=f"batched timing samples whose median is reported; default: {DEFAULT_TIMING_REPEATS}",
     )
-    # Larger reductions can differ from torch by one or two fp16 ulps. Keep the
-    # default tolerance aligned with that backend-independent drift.
+    # The f16 tutorial reductions can differ from torch by one or two fp16 ulps
+    # on both TLX/LLVM and Wave for larger K. Keep the default tolerance aligned
+    # with the observed backend-independent drift so perf sweeps do not fail
+    # numerically identical TLX/Wave results.
     parser.add_argument("--atol", type=float, default=3e-1)
     parser.add_argument("--rtol", type=float, default=0.0)
     parser.add_argument("--arch", default=None, help="optional Triton runtime arch override")
     parser.add_argument("--cache-dir", default=None, help="optional Triton cache root")
+    parser.add_argument("--wave-opt", default=None, help="optional path to wave-opt")
+    parser.add_argument(
+        "--wave-split-barriers",
+        action="store_true",
+        help="compile Wave provider kernels with tlx_wave_enable_split_barriers=True",
+    )
     parser.add_argument(
         "--compile-workers",
         type=nonnegative_int,
@@ -506,8 +575,11 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.wave_opt:
+        os.environ["TRITON_WAVE_OPT"] = args.wave_opt
+
     version_dir = VERSION_MAP[args.version]
-    providers = list(args.providers) if args.providers is not None else provider_defaults(args.version)
+    providers = (list(args.providers) if args.providers is not None else provider_defaults(args.version))
     sizes = list(args.shape) if args.shape is not None else get_x_vals()
     if args.K:
         sizes = [(m, n, k) for m, n, k in sizes if k == args.K]
@@ -528,11 +600,16 @@ def main():
         timing_summary = (f"batched median, {args.timing_repeats}x"
                           f"{args.timed_launches} timed launches, "
                           f"{args.warmup_launches} warmups/repeat")
-    print(f"\n{version_dir} ({args.b_layout} B, input={args.input_mode}, seed={args.seed}; "
-          f"{timing_summary}):")
+    print(
+        f"\n{version_dir} ({args.b_layout} B, input={args.input_mode}, seed={args.seed}; "
+        f"{timing_summary}):"
+    )
     header = f"{'M':>6s} {'N':>6s} {'K':>6s}"
     for provider in providers:
-        header += f"  {PROVIDER_LABELS[provider]:>17s}"
+        label = PROVIDER_LABELS[provider]
+        header += f"  {label:>17s}"
+    if "tlx" in providers and "wave" in providers:
+        header += f"  {'Wave/TLX':>9s}"
     print(header)
 
     for M, N, K in sizes:
@@ -549,6 +626,7 @@ def main():
         torch.cuda.synchronize()
 
         row = f"{M:6d} {N:6d} {K:6d}"
+        results = {}
         for provider in providers:
             try:
                 result = benchmark_provider(args, provider, version_dir, a, b, ref, M, N, K)
@@ -561,6 +639,7 @@ def main():
                     "tflops": None,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
+            results[provider] = result
             if result["ok"]:
                 row += f"  {result['tflops']:8.1f}T/{result['ms']:6.3f}ms"
             else:
@@ -571,6 +650,9 @@ def main():
                 else:
                     print(f"[{PROVIDER_LABELS[provider]}] M={M} N={N} K={K} failed "
                           f"correctness: max_err={result['max_err']}, bad={result['bad']}")
+        if ("tlx" in results and "wave" in results and results["tlx"]["ok"] and results["wave"]["ok"]):
+            ratio = results["wave"]["tflops"] / results["tlx"]["tflops"]
+            row += f"  {ratio:8.3f}x"
         print(row, flush=True)
 
 

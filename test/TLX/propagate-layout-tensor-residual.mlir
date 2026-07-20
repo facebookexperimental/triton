@@ -19,6 +19,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 }
 
 // -----
+// Test that release_layout is a retaggable structural boundary for a tensor
+// carried through a region.  The dot constraint must stop at the release
+// source, while the release result and every scf.for carrier edge adopt the
+// dot layout together.
+
+#blocked_release_src = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [4, 16], warpsPerCTA = [4, 2], order = [1, 0]}>
+#blocked_release_carrier = #ttg.blocked<{sizePerThread = [1, 2], threadsPerWarp = [16, 4], warpsPerCTA = [2, 4], order = [1, 0]}>
+#mma_release = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 32], isTransposed = true}>
+#dot_release = #ttg.dot_op<{opIdx = 0, parent = #mma_release, kWidth = 8}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @retag_loop_carried_release_result
+  tt.func public @retag_loop_carried_release_result(%arg: tensor<32x32xf16, #blocked_release_src>) -> tensor<32x32xf16, #dot_release> {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    // CHECK: %[[INIT:.*]] = ttg.convert_layout %arg0 : tensor<32x32xf16, #{{.*}}> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>
+    %init = tlx.release_layout %arg : tensor<32x32xf16, #blocked_release_src> -> tensor<32x32xf16, #blocked_release_carrier>
+    // CHECK: scf.for {{.*}} iter_args(%[[FRAG:.*]] = %[[INIT]]) -> (tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>)
+    %result = scf.for %i = %c0_i32 to %c2_i32 step %c1_i32
+        iter_args(%frag = %init)
+        -> tensor<32x32xf16, #blocked_release_carrier> : i32 {
+      // CHECK-NOT: tlx.require_layout
+      %required = tlx.require_layout %frag : tensor<32x32xf16, #blocked_release_carrier> -> tensor<32x32xf16, #dot_release>
+      // CHECK-NOT: tlx.release_layout
+      %released = tlx.release_layout %required : tensor<32x32xf16, #dot_release> -> tensor<32x32xf16, #blocked_release_carrier>
+      // CHECK: scf.yield %[[FRAG]] : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>
+      scf.yield %released : tensor<32x32xf16, #blocked_release_carrier>
+    }
+    %observed = tlx.require_layout %result : tensor<32x32xf16, #blocked_release_carrier> -> tensor<32x32xf16, #dot_release>
+    // CHECK: tt.return %{{.*}} : tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #{{.*}}, kWidth = 8}>>
+    tt.return %observed : tensor<32x32xf16, #dot_release>
+  }
+}
+
+// -----
 // Test that an identity tensor require_layout folds away.
 
 #blocked_req_id = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [1, 0]}>
