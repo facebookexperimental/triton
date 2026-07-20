@@ -1,0 +1,1755 @@
+"""
+AMD Flash Attention Forward — Async DMA Kernels (CDNA4)
+============================================================
+
+Kernel variants (--kernel): async_simple, async_prefetch, persistent, cluster.
+The "cluster" variant is the rotated 4-cluster warp-pipeline kernel; it supports
+only the square anchor (D=128, N a multiple of BLOCK_M=256, >= 4 K/V blocks).
+
+Usage:
+    # Defaults: -b 1 -hq 64 -sq 1024 8192 16384 -d 64 128 -causal false --kernel async_simple
+    python amd-fa-pipelined_test.py
+
+    # Sweep sequence lengths and head dims
+    python amd-fa-pipelined_test.py -sq 512 1024 4096 -d 64 128
+
+    # Both causal modes, multiple batch sizes
+    python amd-fa-pipelined_test.py -b 1 2 -causal true false
+
+    # Multiple kernels
+    python amd-fa-pipelined_test.py --kernel async_simple --dtype fp16
+
+    # Cluster kernel (D=128, N multiple of 256), both causal modes
+    python amd-fa-pipelined_test.py --kernel cluster -d 128 -sq 4096 16384 -causal true false
+
+    # Perf-regression guard for all kernels (incl. cluster)
+    python amd-fa-pipelined_test.py --mode perf_test
+
+    # Bound the parallel precompile phase (0 restores lazy compilation)
+    python amd-fa-pipelined_test.py --mode perf_test --compile-workers 8
+"""
+
+import argparse
+import concurrent.futures
+import math
+import multiprocessing
+import pytest
+import time
+import torch
+import torch.nn.functional as F
+
+import triton
+import triton.language as tl
+import triton.language.extra.tlx as tlx
+from triton.runtime.jit import MockTensor
+
+DEFAULT_COMPILE_WORKERS = max(1, min(8, multiprocessing.cpu_count()))
+
+
+def active_torch_device():
+    return triton.runtime.driver.active.get_active_torch_device()
+
+
+@triton.jit
+def _assume_strides(
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+):
+    tl.assume(stride_qz >= 0)
+    tl.assume(stride_qh >= 0)
+    tl.assume(stride_qm > 0)
+    tl.assume(stride_qk >= 0)
+    tl.assume(stride_kz >= 0)
+    tl.assume(stride_kh >= 0)
+    tl.assume(stride_kn > 0)
+    tl.assume(stride_kk >= 0)
+    tl.assume(stride_vz >= 0)
+    tl.assume(stride_vh >= 0)
+    tl.assume(stride_vn > 0)
+    tl.assume(stride_vk >= 0)
+    tl.assume(stride_oz >= 0)
+    tl.assume(stride_oh >= 0)
+    tl.assume(stride_om > 0)
+    tl.assume(stride_ok >= 0)
+
+
+@triton.jit
+def _attn_fwd_async_simple(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid_m = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    QK_SCALE = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 1)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 1)
+
+    k_base = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    for start_n in tl.range(0, hi, BLOCK_N, num_stages=0):
+        kn = start_n + offs_n
+        k_mask = kn[:, None] < N_CTX
+        v_mask = kn[:, None] < N_CTX
+
+        tok_k = tlx.async_load(k_base + start_n * stride_kn, tlx.local_view(k_buf, 0), mask=k_mask)
+        tok_v = tlx.async_load(v_base + start_n * stride_vn, tlx.local_view(v_buf, 0), mask=v_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        wait_tok = tlx.async_load_wait_group(0)
+        # Transpose K at the memdesc level (metadata-only) so local_load lands
+        # directly in dot_op(opIdx=1) layout — skips the register-shuffle + LDS
+        # round-trip that `tl.dot(q, k_cur.T)` would otherwise emit.
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, 0))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, 0), token=wait_tok, relaxed=True)
+
+        qk = tl.dot(q, kt_cur)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+        qk = tl.where(kn[None, :] < N_CTX, qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        qk = qk * QK_SCALE - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+@triton.jit
+def _attn_fwd_async_prefetch(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """
+    Prefetch flash attention with explicit modulo-scheduled prologue,
+    hot loop (steady state), and epilogue.
+
+    Design notes:
+      * K and V are both double-buffered (2 LDS slots, alternating index
+        i%2).
+      * `local_trans` is applied to K so `local_load` lands directly in
+        dot-operand layout 1, skipping the per-iter ds_write+barrier+
+        ds_read shuffle that `tl.dot(q, k_cur.T)` would emit.
+    Prologue:
+    t = 0
+    [GLDS_KV]
+
+    Steady State (Hot Loop):
+    t = i               t = i+1
+    [LR_KV]
+    [QK, SM0, SM1, PV]  [GLDS_KV],
+    Epilogue:
+                        t = i+1
+                        [LR_KV]
+                        [QK (masked), SM0, SM1, PV]
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    pid_m = tl.program_id(0)
+    pid_hz = tl.program_id(1)
+    off_z = pid_hz // H
+    off_h = pid_hz % H
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    if IS_CAUSAL:
+        hi = min(N_CTX, (pid_m + 1) * BLOCK_M)
+    else:
+        hi = N_CTX
+
+    # K and V: 2 LDS slots each (double-buffered) -- avoids both the
+    # memdesc_trans alias race for K and any single-buf RAW hazards.
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+    n_main = tl.maximum(n_blocks - 1, 0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    """
+    Prologue:
+    t = 0
+    [GLDS_KV]
+    """
+    tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX)
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX)
+    tlx.async_load_commit_group([tok_k0, tok_v0])
+    """
+    Steady State (Hot Loop):
+    t = i               t = i+1
+    [LR_KV]
+    [QK, SM0, SM1, PV]  [GLDS_KV],
+    """
+    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
+        next_off = block_id + BLOCK_N
+        kn = block_id + offs_n
+        next_mask = (next_off + offs_n[:, None]) < N_CTX
+
+        i = block_id // BLOCK_N
+        slot_cur = i % 2
+        slot_nxt = (i + 1) % 2
+
+        # LR_KV_ti
+        wait_tok = tlx.async_load_wait_group(0)
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_cur))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
+
+        # GLDS_KV_t(i+1), prefetch tile i+1 into the *other* slots.
+        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
+        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        # QK_ti
+        qk = tl.dot(q, kt_cur)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] >= kn[None, :], qk, float("-inf"))
+
+        # SM_ti
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+        # PV_ti
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+    """
+    Epilogue:
+    t = i+1
+    [LR_KV]
+    [QK (masked), SM0, SM1, PV]
+    """
+    # Consume tile n_main from slot (n_main % 2).
+    wait_tok = tlx.async_load_wait_group(0)
+    slot_last = n_main % 2
+    kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_last))
+    kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
+    v_cur = tlx.local_load(tlx.local_view(v_buf, slot_last), token=wait_tok, relaxed=True)
+
+    # QK_t(i+1) — with boundary + causal masking
+    kn_last = n_main * BLOCK_N + offs_n
+    qk = tl.dot(q, kt_cur)
+    qk = tl.where(kn_last[None, :] < N_CTX, qk, float("-inf"))
+    if IS_CAUSAL:
+        qk = tl.where(offs_m[:, None] >= kn_last[None, :], qk, float("-inf"))
+
+    # SM0_t(i+1)
+    m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+    p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+    l_ij = tl.sum(p, 1)
+
+    # SM1_t(i+1)
+    alpha = tl.math.exp2(m_i - m_ij)
+    acc = acc * alpha[:, None]
+    l_i = l_i * alpha + l_ij
+    m_i = m_ij
+
+    # PV_t(i+1)
+    acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+    # Store output
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+@triton.jit
+def _async_prefetch_attn_tile(
+    pid_m,
+    q_off,
+    k_off,
+    v_off,
+    o_off,
+    Q,
+    K,
+    V,
+    Out,
+    k_buf,
+    v_buf,
+    stride_qm,
+    stride_qk,
+    stride_kn,
+    stride_kk,
+    stride_vn,
+    stride_vk,
+    stride_om,
+    stride_ok,
+    N_CTX_Q,
+    N_CTX_K,
+    DIAG_OFFSET,
+    QK_SCALE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """
+    Function to compute Compute one output m-tile — causal (peeled mask) or non-causal (full).
+    Using similar algorithm/optimizations to previous async_prefetch, but with additions of:
+
+    - Peeled last iteration of loop to have steady state not need masking or OOB check.
+    - Supports `q_len != kv_len` (cross-attention / decode). Query row `qpos`
+      attends key `kpos` iff `kpos <= qpos + DIAG_OFFSET`, where
+      `DIAG_OFFSET = kv_len - q_len` (bottom-right alignment).
+
+    """
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX_Q,
+                other=0.0)
+
+    if IS_CAUSAL:
+        # Largest key any query in this tile may attend, +1 (exclusive bound).
+        hi = min(N_CTX_K, (pid_m + 1) * BLOCK_M + DIAG_OFFSET)
+    else:
+        hi = N_CTX_K
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    n_blocks = (hi + BLOCK_N - 1) // BLOCK_N
+    if IS_CAUSAL:
+        # Blocks fully below the diagonal for the *smallest* query row in the
+        # tile (conservative: any block we skip masking on is unmasked for every
+        # row). Reduces to (pid_m*BLOCK_M)//BLOCK_N when DIAG_OFFSET == 0.
+        n_unmasked = (pid_m * BLOCK_M + DIAG_OFFSET) // BLOCK_N
+        n_unmasked = tl.maximum(tl.minimum(n_unmasked, n_blocks), 0)
+    elif EVEN_N:
+        # No mask anywhere -> the whole range is the steady-state loop.
+        n_unmasked = n_blocks
+    else:
+        # Only the final ragged block needs a boundary mask.
+        n_unmasked = tl.maximum(n_blocks - 1, 0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    # Prologue: prefetch block 0.
+    tok_k0 = tlx.async_load(k_ptrs, tlx.local_view(k_buf, 0), mask=offs_n[:, None] < N_CTX_K)
+    tok_v0 = tlx.async_load(v_ptrs, tlx.local_view(v_buf, 0), mask=offs_n[:, None] < N_CTX_K)
+    tlx.async_load_commit_group([tok_k0, tok_v0])
+    """
+    Unmasked steady-state loop
+    """
+    for block_id in tl.range(0, n_unmasked * BLOCK_N, BLOCK_N, num_stages=0):
+        next_off = block_id + BLOCK_N
+        i = block_id // BLOCK_N
+        slot_cur = i % 2
+        slot_nxt = (i + 1) % 2
+
+        wait_tok = tlx.async_load_wait_group(0)
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_cur))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
+
+        next_mask = (next_off + offs_n[:, None]) < N_CTX_K
+        tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
+        tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
+        tlx.async_load_commit_group([tok_k, tok_v])
+
+        qk = tl.dot(q, kt_cur)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+    """
+    Masked peeled epilogue
+    """
+    for block_id in tl.range(n_unmasked * BLOCK_N, n_blocks * BLOCK_N, BLOCK_N, num_stages=0):
+        next_off = block_id + BLOCK_N
+        kn = block_id + offs_n
+        i = block_id // BLOCK_N
+        slot_cur = i % 2
+        slot_nxt = (i + 1) % 2
+
+        wait_tok = tlx.async_load_wait_group(0)
+        kt_view = tlx.local_trans(tlx.local_view(k_buf, slot_cur))
+        kt_cur = tlx.local_load(kt_view, token=wait_tok, relaxed=True)
+        v_cur = tlx.local_load(tlx.local_view(v_buf, slot_cur), token=wait_tok, relaxed=True)
+
+        if next_off < hi:
+            next_mask = (next_off + offs_n[:, None]) < N_CTX_K
+            tok_k = tlx.async_load(k_ptrs + next_off * stride_kn, tlx.local_view(k_buf, slot_nxt), mask=next_mask)
+            tok_v = tlx.async_load(v_ptrs + next_off * stride_vn, tlx.local_view(v_buf, slot_nxt), mask=next_mask)
+            tlx.async_load_commit_group([tok_k, tok_v])
+
+        qk = tl.dot(q, kt_cur)
+        if IS_CAUSAL:
+            qk = tl.where(offs_m[:, None] + DIAG_OFFSET >= kn[None, :], qk, float("-inf"))
+        if not EVEN_N:
+            qk = tl.where(kn[None, :] < N_CTX_K, qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * QK_SCALE)
+        p = tl.math.exp2(qk * QK_SCALE - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        acc = acc * alpha[:, None]
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+        acc = tl.dot(p.to(v_cur.dtype), v_cur, acc)
+
+    acc = acc / l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX_Q) & (offs_d[None, :] < HEAD_DIM))
+
+
+@triton.jit
+def _attn_fwd_persistent(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX_Q,
+    N_CTX_K,
+    DIAG_OFFSET,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    EVEN_N: tl.constexpr,
+):
+    """
+    Persistent FA with these key features:
+    1. Aysnc prefetch work tile
+    2. XCD-pinned head-batch dim for improved L2 locality
+    3. zig-zag ordering of output/work tile for each workunit wihtin a WG,
+       for equal work distribution per WG and improved causal performance.
+
+    Ownership hierarchy (coarse -> fine), all derived from one flat `unit` index.
+    Examples use N=1024 causal defaults (BLOCK_M=256 -> 4 tiles/head, 64 heads,
+    8 XCDs, 32 programs/XCD, TILES_PER_UNIT=2 -> units_per_head=2, 16 units/XCD):
+
+    - XCD owns `heads_per_xcd` batch-heads (those with `hz % NUM_XCDS == xcd`),
+      i.e. a flat pile of `units = heads_per_xcd * units_per_head` work-units.
+        e.g. XCD 0 owns heads {0,8,16,...,56} -> 16 units.
+
+    - Local (one of the XCD's `NUM_LOCAL` workgroups) owns
+      a round-robin slice of that pile: units `local, local+NUM_LOCAL, ...`.
+        e.g. WG local=2 owns unit 2 (here 16 units < 32 programs, so local>=16 idle).
+
+    - Unit -> global work-unit id within the whole XCD; `bundle` = which work-unit within a head): `local_head = unit //
+      units_per_head` picks the head (global `pid_hz = xcd + local_head *
+      NUM_XCDS`), and `bundle = unit % units_per_head` picks the tile-group
+      within that head.
+        e.g. unit 2 -> local_head=1 -> head 8, bundle=0.
+
+    - Bundle owns `TILES_PER_UNIT` zig-zag tiles (causal: a {light, heavy} fold
+      pair of constant cost; non-causal: a single tile).
+        e.g. bundle 0 -> zig-zag {0,1} -> tiles {m0, m3} of head 8.
+
+    - Tile = `BLOCK_M` query rows of that head, streamed over its `BLOCK_N`
+      K-blocks (the inner `_async_prefetch_attn_tile` loop) to produce one output tile.
+        e.g. m0 -> rows 0..255, 4 K-blocks; m3 -> rows 768..1023, 16 (sum=20, flat).
+    """
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    # Note since it is persistent, we only launch 1-dim of PIDs (NUM_SMs,).
+    pid = tl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    NUM_LOCAL: tl.constexpr = NUM_SMS // NUM_XCDS
+
+    NUM_BUFFERS: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, NUM_BUFFERS)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, NUM_BUFFERS)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+
+    # Causal: 2-tile {light, heavy} fold bundles (constant cost). Non-causal:
+    # 1-tile units (tiles are already equal-cost, so no bundling is needed).
+    TILES_PER_UNIT: tl.constexpr = 2 if IS_CAUSAL else 1
+
+    # We flattened head and batch dim into a single flat HZ work dim.
+    # Then, we pin specific HZ ids to a XCD for K/V L2 locality.
+    units_per_hz: tl.constexpr = (NUM_M_BLOCKS + TILES_PER_UNIT - 1) // TILES_PER_UNIT
+    hz_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
+    units = hz_per_xcd * units_per_hz
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+        local_hz = unit // units_per_hz  # which head-batch id (quotient)
+        bundle = unit % units_per_hz  # quer_seq/m tiles within head-batch id (remainder)
+        pid_hz = xcd + local_hz * NUM_XCDS  # global head-batch id.
+        if pid_hz < Z * H:
+            off_z = pid_hz // H
+            off_h = pid_hz % H
+            q_off = off_z * stride_qz + off_h * stride_qh
+            k_off = off_z * stride_kz + off_h * stride_kh
+            v_off = off_z * stride_vz + off_h * stride_vh
+            o_off = off_z * stride_oz + off_h * stride_oh
+
+            # Run the bundle's TILES_PER_UNIT consecutive zig-zag tiles.
+            # If causal and TILES_PER_UNIT=2, then head's m-tiles are walked
+            # as `0, N-1, 1, N-2, …`. This interleaves the lightest and heaviest
+            # causal tiles, making each WG do ~same amount of work.
+            for j in tl.static_range(TILES_PER_UNIT):
+                idx = bundle * TILES_PER_UNIT + j
+                if idx < NUM_M_BLOCKS:
+                    half = idx // 2
+                    pid_m = tl.where(idx % 2 == 0, half, NUM_M_BLOCKS - 1 - half)
+                    _async_prefetch_attn_tile(pid_m, q_off, k_off, v_off, o_off, Q, K, V, Out, k_buf, v_buf, stride_qm,
+                                              stride_qk, stride_kn, stride_kk, stride_vn, stride_vk, stride_om,
+                                              stride_ok, N_CTX_Q, N_CTX_K, DIAG_OFFSET, QK_SCALE=QK_SCALE,
+                                              BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, IS_CAUSAL=IS_CAUSAL,
+                                              EVEN_N=EVEN_N)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Rotated 4-cluster warp pipeline (gfx950)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A flash-attention forward built on tlx.warp_pipeline_stage. The hot loop is
+# eight named logical sub-clusters rotated across a depth-4 / 2-slot-LDS software
+# pipeline:
+#
+#   dot_qk  -- Q * K^T MFMA -> qk scores
+#   dot_pv  -- P * V   MFMA -> acc
+#   VEC1    -- softmax numerator      (new row-max + exp2 burst -> p, alpha)
+#   VEC2    -- softmax denominator    (sum p, acc rescale, l_i, p->fp16 cast)
+#   LRK     -- local-read  K  (LDS -> regs)
+#   LRV     -- local-read  V  (LDS -> regs)
+#   ACK     -- async-copy  K  (global -> LDS)
+#   ACV     -- async-copy  V  (global -> LDS)
+#
+# Scope: the square anchor config (BLOCK_M=256, num_warps=8), both non-causal
+# and causal. Causal runs the unmasked rotated pipeline over the below-diagonal
+# region then the masked pipeline over the BLOCK_M/BLOCK_N diagonal band. D=64/256,
+# GQA, and the short-tail fallback are out of scope.
+
+
+@triton.aggregate
+class SoftmaxState:
+    """Running softmax accumulator (acc), denominator (l_i), and row-max (m_i),
+    with the two sub-cluster VEC primitives as methods.
+    """
+    acc: tl.tensor
+    l_i: tl.tensor
+    m_i: tl.tensor
+
+    @triton.jit
+    def create(BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr):
+        return SoftmaxState(
+            tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32),
+            tl.full([BLOCK_M], 1.0, dtype=tl.float32),
+            tl.full([BLOCK_M], float("-inf"), dtype=tl.float32),
+        )
+
+    @triton.jit
+    def _nan_max_combine(a, b):
+        return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+    @triton.jit
+    def _row_max(qk):
+        """Row-max reduction with IEEE-754 NaN propagation (a NaN score reaches the
+        row max instead of being silently dropped). Plain tl.max does not expose
+        propagate_nan, so the reduction is spelled out with a custom combinator.
+
+        NaN-propagating max is less foldable than the plain `v_max3_f32` form and
+        raises register pressure; the non-causal path therefore needs
+        waves_per_eu=2 (see the host wrapper), without which it spills heavily and
+        regresses ~8x.
+        """
+        return tl.reduce(qk, 1, SoftmaxState._nan_max_combine)
+
+    @triton.jit
+    def vec1(self, qk, start_n, offs_m, offs_n, QK_SCALE: tl.constexpr, DIAG_OFFSET: tl.constexpr,
+             MASK_STEPS: tl.constexpr, IS_CAUSAL: tl.constexpr):
+        """VEC1: softmax numerator -- new row-max + exp2 burst.
+
+        From the qk scores produced by dot_qk this iteration, computes the new
+        running max, the unnormalized probabilities p = exp2(qk*scale - m_new),
+        and the rescale factor alpha = exp2(m_i - m_new). p and alpha are carried
+        to the next iteration (consumed by vec2 and dot_pv). This is the expensive
+        transcendental group, paired with the P*V MFMA so exp throughput overlaps
+        the matrix engine. Returns the state with m_i advanced, plus (p, alpha).
+
+        When MASK_STEPS, the scores are scaled and (causal-)masked before the
+        max/exp2; this path is taken only on the diagonal band. The unmasked branch
+        keeps the FMA-friendly form (scale folded into the max/exp2 inputs) so its
+        LLIR is identical to the unmasked-only schedule after DCE. The K-bound mask
+        is omitted: the anchor is square with N_CTX % BLOCK_N == 0 (no ragged tail).
+        The row-max propagates NaNs (see _row_max), matching the reference softmax.
+        """
+        if MASK_STEPS:
+            qk_sm = qk * QK_SCALE
+            if IS_CAUSAL:
+                kn = start_n + offs_n
+                qk_sm = tl.where(offs_m[:, None] + DIAG_OFFSET >= kn[None, :], qk_sm, float("-inf"))
+            m_ij = SoftmaxState._row_max(qk_sm)
+            m_new = tl.maximum(self.m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
+            p = tl.math.exp2(qk_sm - m_new[:, None])
+            alpha = tl.math.exp2(self.m_i - m_new)
+        else:
+            m_ij = SoftmaxState._row_max(qk) * QK_SCALE
+            m_new = tl.maximum(self.m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
+            p = tl.math.exp2(qk * QK_SCALE - m_new[:, None])
+            alpha = tl.math.exp2(self.m_i - m_new)
+        return SoftmaxState(self.acc, self.l_i, m_new), p, alpha
+
+    @triton.jit
+    def vec2(self, p, alpha, out_dtype: tl.constexpr):
+        """VEC2: softmax denominator + accumulator correction.
+
+        Op order matches the reference: row-sum first (l_ij), then accumulator
+        rescale (acc *= alpha), then running-denominator update, then p->fp16 cast.
+        p and alpha were produced by vec1 in the *previous* iteration. Returns the
+        state with acc/l_i advanced, plus the cast p.
+        """
+        l_ij = tl.sum(p, 1)
+        acc = self.acc * alpha[:, None]
+        l_i = self.l_i * alpha + l_ij
+        p_cast = p.to(out_dtype)
+        return SoftmaxState(acc, l_i, self.m_i), p_cast
+
+
+@triton.jit
+def _attn_inner_pipelined(
+    state,
+    q,
+    k_ptrs,
+    v_ptrs,
+    offs_m,
+    offs_n,
+    block_start,
+    block_end,
+    k_buf,
+    v_buf,
+    stride_kn,
+    stride_vn,
+    QK_SCALE: tl.constexpr,
+    DIAG_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BUF_DEPTH: tl.constexpr,
+    MASK_STEPS: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """Rotated 4-cluster pipeline over output tiles [block_start, block_end).
+
+    Requires (block_end - block_start) >= 4. ``MASK_STEPS`` (constexpr) selects
+    causal masking in VEC1; when False the schedule is byte-identical to the
+    unmasked-only version after DCE. ``state`` (a SoftmaxState) is threaded in and
+    out so the caller can chain an unmasked region followed by a masked diagonal
+    band. K and V LDS buffers are owned by the caller and reused across calls.
+    """
+    # -- Prologue: prime the pipeline for output tile block_start ----------
+    # Commit order: K0, V0, K1, (barrier) K2, V1 -> pending {K2, V1}.
+    b0 = block_start
+    tok_k0 = tlx.async_load(k_ptrs + b0 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
+    tok_v0 = tlx.async_load(v_ptrs + b0 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
+    tlx.async_load_commit_group([tok_k0])  # ACK[0]
+    tlx.async_load_commit_group([tok_v0])  # ACV[0]
+    tok_k1 = tlx.async_load(k_ptrs + (b0 + 1) * BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
+    tlx.async_load_commit_group([tok_k1])  # ACK[1]
+
+    wait0 = tlx.async_load_wait_group(2)  # K[0] complete
+    kt0 = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 0)), token=wait0, relaxed=True)  # LRK[0]
+    qk = tl.dot(q, kt0)  # dot_qk[0]
+    state, p_c, alpha_c = state.vec1(qk, b0 * BLOCK_N, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                     IS_CAUSAL)  # VEC1[block_start]
+
+    tl.debug_barrier()  # WAR: LRK[0] ds_read vs K[2] write into slot 0
+    tok_k2 = tlx.async_load(k_ptrs + (b0 + 2) * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
+    tlx.async_load_commit_group([tok_k2])  # ACK[2] (slot 0 reuse)
+    # Pending after the ACK[2] commit, in order: K0, V0, K1, K2. wait_group(1)
+    # drains all but the newest (K2), so K1 is guaranteed complete before this
+    # LDS read; wait_group(2) would leave K1 in flight and race the local_load.
+    wait1 = tlx.async_load_wait_group(1)  # K[1] complete
+    kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 1)), token=wait1, relaxed=True)  # LRK[1]
+    tok_v1 = tlx.async_load(v_ptrs + (b0 + 1) * BLOCK_N * stride_vn, tlx.local_view(v_buf, 1))
+    tlx.async_load_commit_group([tok_v1])  # ACV[1]
+
+    # -- Main loop: output tiles [block_start, block_end-3) ----------------
+    for block_n in tl.range(block_start, block_end - 3, num_stages=0):
+        cur_slot = (block_n - block_start) % BUF_DEPTH
+        nxt_slot = (block_n + 1 - block_start) % BUF_DEPTH
+        ack_n = (block_n + 3) * BLOCK_N
+        acv_n = (block_n + 2) * BLOCK_N
+        ahead_n = (block_n + 1) * BLOCK_N
+
+        # cluster 0 DOT1: dot_qk[i+1] then VEC2[i].
+        with tlx.warp_pipeline_stage("dot1", priority=0):
+            qk = tl.dot(q, kt_dot)  # dot_qk s1 -> qk[i+1]
+            state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2 s0
+
+        tlx.async_load_wait_group(1)  # V[i] complete (for LRV[i])
+
+        # cluster 1 MEM1: LRV[i] then ACK[i+3].
+        with tlx.warp_pipeline_stage("mem1", priority=1):
+            v_dot = tlx.local_load(tlx.local_view(v_buf, cur_slot), relaxed=True)  # LRV s0
+            tok_k = tlx.async_load(k_ptrs + ack_n * stride_kn, tlx.local_view(k_buf, nxt_slot))
+            tlx.async_load_commit_group([tok_k])  # ACK s3
+
+        # cluster 2 DOT2: dot_pv[i] then VEC1[i+1] (exp2 burst lands after PV).
+        with tlx.warp_pipeline_stage("dot2", priority=0):
+            acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv s0
+            state = SoftmaxState(acc, state.l_i, state.m_i)
+            state, p_c, alpha_c = state.vec1(qk, ahead_n, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                             IS_CAUSAL)  # VEC1 s1 -> p[i+1]
+
+        tlx.async_load_wait_group(1)  # K[i+2] complete (for LRK[i+2])
+
+        # cluster 3 MEM2: LRK[i+2] then ACV[i+2].
+        with tlx.warp_pipeline_stage("mem2", priority=1):
+            kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, cur_slot)), relaxed=True)  # LRK s2
+            tok_v = tlx.async_load(v_ptrs + acv_n * stride_vn, tlx.local_view(v_buf, cur_slot))
+            tlx.async_load_commit_group([tok_v])  # ACV s2
+
+    # -- Drain: last 3 output tiles, no OOB global prefetch ----------------
+    nm3 = block_end - 3
+    nm2 = block_end - 2
+    nm1 = block_end - 1
+    s_nm3 = (nm3 - block_start) % BUF_DEPTH
+    s_nm2 = (nm2 - block_start) % BUF_DEPTH
+    s_nm1 = (nm1 - block_start) % BUF_DEPTH
+
+    # output tile n-3 (also issues the final V prefetch, ACV[n-1])
+    qk = tl.dot(q, kt_dot)  # dot_qk[n-2]
+    tlx.async_load_wait_group(2)  # V[n-3] complete
+    v_dot = tlx.local_load(tlx.local_view(v_buf, s_nm3), relaxed=True)  # LRV[n-3]
+    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2[n-3]
+    acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv[n-3]
+    state = SoftmaxState(acc, state.l_i, state.m_i)
+    state, p_c, alpha_c = state.vec1(qk, nm2 * BLOCK_N, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                     IS_CAUSAL)  # VEC1[n-2]
+    tl.debug_barrier()  # WAR: LRV[n-3] vs V[n-1] write
+    tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, s_nm1))
+    tlx.async_load_commit_group([tok_vlast])  # ACV[n-1]
+    tlx.async_load_wait_group(2)  # K[n-1] complete
+    kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, s_nm1)), relaxed=True)  # LRK[n-1]
+
+    # output tile n-2
+    qk = tl.dot(q, kt_dot)  # dot_qk[n-1]
+    tlx.async_load_wait_group(1)  # V[n-2] complete
+    v_dot = tlx.local_load(tlx.local_view(v_buf, s_nm2), relaxed=True)  # LRV[n-2]
+    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2[n-2]
+    acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv[n-2]
+    state = SoftmaxState(acc, state.l_i, state.m_i)
+    state, p_c, alpha_c = state.vec1(qk, nm1 * BLOCK_N, offs_m, offs_n, QK_SCALE, DIAG_OFFSET, MASK_STEPS,
+                                     IS_CAUSAL)  # VEC1[n-1]
+
+    # output tile n-1 (final; no further dot_qk / prefetch)
+    tlx.async_load_wait_group(0)  # V[n-1] complete
+    v_dot = tlx.local_load(tlx.local_view(v_buf, s_nm1), relaxed=True)  # LRV[n-1]
+    state, p_dot = state.vec2(p_c, alpha_c, q.dtype)  # VEC2[n-1]
+    acc = tl.dot(p_dot, v_dot, state.acc)  # dot_pv[n-1]
+    state = SoftmaxState(acc, state.l_i, state.m_i)
+
+    return state
+
+
+@triton.jit
+def _attn_fwd_cluster_pipeline(
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    N_CTX,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """Rotated 4-cluster FA forward. Square anchor: N_CTX % BLOCK_N == 0,
+    BLOCK_M % BLOCK_N == 0, and each block range used is >= 4 tiles.
+
+    Non-causal: one unmasked pipeline over all blocks. Causal: an unmasked
+    pipeline over the full below-diagonal region followed by a masked pipeline
+    over the BLOCK_M/BLOCK_N diagonal band."""
+    _assume_strides(stride_qz, stride_qh, stride_qm, stride_qk, stride_kz, stride_kh, stride_kn, stride_kk, stride_vz,
+                    stride_vh, stride_vn, stride_vk, stride_oz, stride_oh, stride_om, stride_ok)
+
+    # Launch-axis assignment is chosen by IS_CAUSAL (the host grid matches):
+    #  - causal: head on axis 0, m-block on axis 1 -- packs the triangular
+    #    per-tile cost evenly onto CUs (712 vs 580 for m-major; measured on the
+    #    anchor).
+    #  - non-causal: m-block on axis 0 -- every tile is equal cost, and m-major
+    #    scheduling is faster here (1017 vs 897 for head-major; measured).
+    if IS_CAUSAL:
+        off_h = tl.program_id(0)
+        pid_m = tl.program_id(1)
+    else:
+        pid_m = tl.program_id(0)
+        off_h = tl.program_id(1)
+    off_z = tl.program_id(2)
+
+    q_off = off_z * stride_qz + off_h * stride_qh
+    k_off = off_z * stride_kz + off_h * stride_kh
+    v_off = off_z * stride_vz + off_h * stride_vh
+    o_off = off_z * stride_oz + off_h * stride_oh
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(Q + q_off + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk, mask=offs_m[:, None] < N_CTX,
+                other=0.0)
+
+    QK_SCALE: tl.constexpr = sm_scale * 1.44269504089
+    DIAG_OFFSET: tl.constexpr = 0  # square anchor: N_CTX_K == N_CTX_Q
+
+    state = SoftmaxState.create(BLOCK_M, HEAD_DIM)
+
+    # Depth-4 pipeline, 2-slot double-buffered LDS for both K and V.
+    BUF_DEPTH: tl.constexpr = 2
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, BUF_DEPTH)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, BUF_DEPTH)
+
+    k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
+    v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
+
+    n_blocks = N_CTX // BLOCK_N
+
+    if IS_CAUSAL:
+        # Diagonal band is exactly BLOCK_M/BLOCK_N tiles; everything before it is
+        # fully below the diagonal (unmasked). Both ranges run the same deep
+        # rotated pipeline: the unmasked full region on the FMA-friendly path,
+        # then the masked band carrying the causal where(). The band is
+        # BLOCK_M/BLOCK_N tiles (>= 4 since BLOCK_M >=
+        # 4*BLOCK_N for the supported tiles) and the full region is a multiple of
+        # it, so both satisfy the pipeline's >= 4-tile requirement when non-empty.
+        masked_blocks: tl.constexpr = BLOCK_M // BLOCK_N
+        causal_end = (pid_m + 1) * masked_blocks
+        n_full = causal_end - masked_blocks
+        if n_full > 0:
+            state = _attn_inner_pipelined(state, q, k_ptrs, v_ptrs, offs_m, offs_n, 0, n_full, k_buf, v_buf, stride_kn,
+                                          stride_vn, QK_SCALE, DIAG_OFFSET, BLOCK_N, BUF_DEPTH, False, True)
+        state = _attn_inner_pipelined(state, q, k_ptrs, v_ptrs, offs_m, offs_n, n_full, causal_end, k_buf, v_buf,
+                                      stride_kn, stride_vn, QK_SCALE, DIAG_OFFSET, BLOCK_N, BUF_DEPTH, True, True)
+    else:
+        state = _attn_inner_pipelined(state, q, k_ptrs, v_ptrs, offs_m, offs_n, 0, n_blocks, k_buf, v_buf, stride_kn,
+                                      stride_vn, QK_SCALE, DIAG_OFFSET, BLOCK_N, BUF_DEPTH, False, False)
+
+    acc = state.acc / state.l_i[:, None]
+    o_ptrs = Out + o_off + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
+    tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=(offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Host wrapper
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _attention_tensor_args(q, k, v, out):
+    return (
+        q,
+        k,
+        v,
+        out,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+    )
+
+
+def _launch_kernel(kernel, grid, args, compile_kwargs, *, warmup=False):
+    if warmup:
+        return kernel.warmup(*args, grid=grid, **compile_kwargs)
+    return kernel[grid](*args, **compile_kwargs)
+
+
+def flash_attn_async_simple(q, k, v, sm_scale, causal=False, *, out=None, warmup=False, **kw):
+    """Launch with K in original BHND layout — stride_kk=1 avoids alignment issues."""
+    B, H, N_CTX, D = q.shape
+    o = torch.empty_like(q) if out is None else out
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
+    compile_kwargs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "HEAD_DIM": D,
+        "IS_CAUSAL": causal,
+        "num_warps": num_warps,
+        **kw,
+    }
+    _launch_kernel(
+        _attn_fwd_async_simple,
+        grid,
+        (*_attention_tensor_args(q, k, v, o), B, H, N_CTX, sm_scale),
+        compile_kwargs,
+        warmup=warmup,
+    )
+    return o
+
+
+def flash_attn_async_prefetch(q, k, v, sm_scale, causal=False, *, out=None, warmup=False, **kw):
+    """Prefetch FA with modulo-scheduled prologue/hot-loop/epilogue."""
+    B, H, N_CTX, D = q.shape
+    o = torch.empty_like(q) if out is None else out
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    # BLOCK_N=128 wins at D=64 nocausal (more compute per barrier),
+    # but the diagonal masking cost overwhelms that for causal, and at
+    # D=128 it blows the 64KB LDS budget for double-buffered K+V.
+    BLOCK_N = kw.pop("BLOCK_N", 128 if (D <= 64 and not causal) else 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
+    compile_kwargs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "HEAD_DIM": D,
+        "IS_CAUSAL": causal,
+        "num_warps": num_warps,
+        **kw,
+    }
+    _launch_kernel(
+        _attn_fwd_async_prefetch,
+        grid,
+        (*_attention_tensor_args(q, k, v, o), B, H, N_CTX, sm_scale),
+        compile_kwargs,
+        warmup=warmup,
+    )
+    return o
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Kernel registry — add new kernel wrappers here
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def flash_attn_persistent(q, k, v, sm_scale, causal=False, *, out=None, warmup=False, **kw):
+    """persistent FA with workgroup scheduler who is persistent and have a zig-zag tile order.
+
+    FA with a workgroup scheduler who is persistent, XCD-grouped,
+    with constant-cost fold-bundling scheduler (zig-zag tile order + `TILES_PER_UNIT` bundle).
+    Causal uses 2-tile fold bundles non-causal uses 1-tile
+    units (tiles are already equal-cost). A program runs a *variable* number of
+    tiles, not a fixed 2.
+
+    Supports `q_len != kv_len` (cross-attention / decode): the causal diagonal is
+    anchored bottom-right via `DIAG_OFFSET = kv_len - q_len` (matching PyTorch
+    SDPA). Q heads and K/V heads must match (no GQA yet).
+
+    Falls back to the square baseline for partial-block N (`N % BLOCK_N != 0`) to
+    dodge the modulo-decode `iota_range` compiler crash (not perf-critical).
+    """
+    B, H, N_CTX_Q, D = q.shape
+    N_CTX_K = k.shape[2]
+    diag_offset = N_CTX_K - N_CTX_Q
+
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    # Peeled causal + non-causal both prefer BLOCK_N=128 at D<=64 (more compute
+    # per LDS barrier); D=128 must stay 64 for the double-buffered K+V LDS budget.
+    BLOCK_N = kw.pop("BLOCK_N", 128 if D <= 64 else 64)
+    num_warps = kw.pop("num_warps", 4)
+
+    if N_CTX_K % BLOCK_N != 0:
+        # Partial-block kv hits the modulo-decode iota_range compiler crash.
+        # The square baseline only handles q_len == kv_len, so require that here.
+        assert N_CTX_Q == N_CTX_K, ("persistent: partial-block kv_len with "
+                                    "q_len != kv_len is not supported "
+                                    f"(q_len={N_CTX_Q}, kv_len={N_CTX_K}, BLOCK_N={BLOCK_N})")
+        return flash_attn_async_prefetch(q, k, v, sm_scale, causal=causal, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                         num_warps=num_warps, out=out, warmup=warmup, **kw)
+
+    o = torch.empty_like(q) if out is None else out
+    num_m_blocks = triton.cdiv(N_CTX_Q, BLOCK_M)
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    num_sms = kw.pop("NUM_SMS", None)
+    if num_sms is None:
+        cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_sms = (cu_count // num_xcds) * num_xcds
+    grid = (num_sms, )
+    compile_kwargs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "HEAD_DIM": D,
+        "IS_CAUSAL": causal,
+        "NUM_M_BLOCKS": num_m_blocks,
+        "NUM_SMS": num_sms,
+        "NUM_XCDS": num_xcds,
+        "EVEN_N": N_CTX_K % BLOCK_N == 0,
+        "num_warps": num_warps,
+        **kw,
+    }
+    _launch_kernel(
+        _attn_fwd_persistent,
+        grid,
+        (*_attention_tensor_args(q, k, v, o), B, H, N_CTX_Q, N_CTX_K, diag_offset, sm_scale),
+        compile_kwargs,
+        warmup=warmup,
+    )
+    return o
+
+
+def _cluster_default_block_n(causal):
+    """Shape-based BLOCK_N selection (BLOCK_M is fixed at 256, the validated tile).
+
+    Causal prefers BLOCK_N=32 at every measured size -- smaller K/V tiles mean
+    less wasted compute in the triangular masked region and more parallelism. On
+    gfx950 bn32 beats bn64 across the board (e.g. N=8192: 742 vs 601 TFLOPS;
+    N=16384: 746 vs 709). Non-causal prefers BLOCK_N=64 throughout (every tile is
+    full, so the larger tile amortizes the pipeline better).
+    """
+    if causal:
+        return 32
+    return 64
+
+
+def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, *, out=None, warmup=False, **kw):
+    """Rotated 4-cluster warp-pipeline FA forward. Square path: N_CTX % BLOCK_N == 0
+    and N_CTX % BLOCK_M == 0. BLOCK_M is fixed at 256 (the validated tile); BLOCK_N
+    defaults to a shape-based choice (see _cluster_default_block_n) and can be
+    overridden. Both non-causal and causal run the deep rotated pipeline (each
+    block range must be >= 4 K/V blocks)."""
+    B, H, N_CTX, D = q.shape
+    assert k.shape == (B, H, N_CTX, D) and v.shape == (B, H, N_CTX, D)
+
+    # The CDNA4 MFMA tile is 32 rows; each warp owns BLOCK_M // num_warps rows of
+    # the dot, so that ratio must be >= MFMA_M or the warp tiling is invalid and
+    # the kernel silently produces wrong output. Default num_warps to the largest
+    # power of two that keeps >= MFMA_M rows per warp (8 at BLOCK_M=256).
+    MFMA_M = 32
+    BLOCK_M = kw.pop("BLOCK_M", 256)
+    BLOCK_N = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
+    num_warps = kw.pop("num_warps", min(8, max(1, BLOCK_M // MFMA_M)))
+    # waves_per_eu pins the AMDGPU occupancy target (LLVM "amdgpu-waves-per-eu").
+    # The NaN-propagating row-max (see _row_max) raises register pressure: the
+    # non-causal path MUST pin 2 or it spills heavily and regresses ~8x; the causal
+    # path is fastest unconstrained (0). 3 is consistently a large regression.
+    # Defaults are shape-dependent; pass waves_per_eu=... to override.
+    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
+    assert N_CTX % BLOCK_N == 0, f"cluster_pipeline: N_CTX ({N_CTX}) must be a multiple of BLOCK_N ({BLOCK_N})"
+    assert N_CTX % BLOCK_M == 0, f"cluster_pipeline: N_CTX ({N_CTX}) must be a multiple of BLOCK_M ({BLOCK_M})"
+    assert BLOCK_M >= num_warps * MFMA_M, (
+        f"cluster_pipeline: BLOCK_M ({BLOCK_M}) must be >= num_warps ({num_warps}) * MFMA_M ({MFMA_M}); "
+        f"fewer than {MFMA_M} dot rows per warp gives an invalid MFMA tiling")
+    if causal:
+        # Causal splits into a below-diagonal region and a BLOCK_M/BLOCK_N-tile
+        # diagonal band; both run the deep rotated pipeline, whose 4-tile
+        # prologue/drain reads tiles up to block_end-1 and block_start+2. The band
+        # (and the full region, a multiple of it) must therefore be >= 4 tiles.
+        assert BLOCK_M % BLOCK_N == 0, (
+            f"cluster_pipeline causal: BLOCK_M ({BLOCK_M}) must be a multiple of BLOCK_N ({BLOCK_N})")
+        assert BLOCK_M // BLOCK_N >= 4, (
+            f"cluster_pipeline causal: diagonal band BLOCK_M/BLOCK_N ({BLOCK_M // BLOCK_N}) must be >= 4 tiles")
+    else:
+        # Non-causal runs the deep rotated pipeline over all blocks, which needs a >= 4-tile range.
+        assert N_CTX // BLOCK_N >= 4, "cluster_pipeline: need at least 4 K/V blocks for the rotated pipeline"
+
+    o = torch.empty_like(q) if out is None else out
+    m_blocks = triton.cdiv(N_CTX, BLOCK_M)
+    # Axis order must match the in-kernel program_id assignment (causal: head on
+    # axis 0; non-causal: m-block on axis 0).
+    grid = (H, m_blocks, B) if causal else (m_blocks, H, B)
+    compile_kwargs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "HEAD_DIM": D,
+        "IS_CAUSAL": causal,
+        "num_warps": num_warps,
+        "waves_per_eu": waves_per_eu,
+        **kw,
+    }
+    _launch_kernel(
+        _attn_fwd_cluster_pipeline,
+        grid,
+        (*_attention_tensor_args(q, k, v, o), N_CTX, sm_scale),
+        compile_kwargs,
+        warmup=warmup,
+    )
+    return o
+
+
+KERNEL_REGISTRY = {
+    "async_simple": flash_attn_async_simple,
+    "async_prefetch": flash_attn_async_prefetch,
+    "persistent": flash_attn_persistent,
+    "cluster": flash_attn_cluster_pipeline,
+}
+
+
+def get_kernel(name):
+    if name not in KERNEL_REGISTRY:
+        raise ValueError(f"Unknown kernel: {name!r}. "
+                         f"Available: {list(KERNEL_REGISTRY.keys())}")
+    return KERNEL_REGISTRY[name]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Reference, verification, and Misc Utils
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def print_summary_table(results, kernel_names):
+    """Print a markdown-style summary table of benchmark results."""
+    providers = ["Torch SDPA"] + list(kernel_names)
+
+    rows = []
+    for key in sorted(results.keys()):
+        B, H, D, N, causal = key
+        rows.append((f"B={B}, H={H}, D={D}, N={N}, causal={causal}", results[key]))
+
+    cfg_w = max(len("Config"), *(len(lbl) for lbl, _ in rows)) if rows else len("Config")
+    col_w = max(14, *(len(p) for p in providers))
+
+    hdr = f"| {'Config':<{cfg_w}} |" + "".join(f" {p:>{col_w}} |" for p in providers)
+    sep = f"|{'-' * (cfg_w + 2)}|" + "".join(f"{'-' * (col_w + 2)}|" for _ in providers)
+
+    print(f"\n{'=' * len(sep)}")
+    print("Summary (TFLOPS)")
+    print(f"{'=' * len(sep)}")
+    print(hdr)
+    print(sep)
+
+    for label, prov in rows:
+        vals = (f"{prov[p]['tflops']:>{col_w}.1f}" if p in prov else f"{'—':>{col_w}}" for p in providers)
+        print(f"| {label:<{cfg_w}} |" + "".join(f" {v} |" for v in vals))
+
+    print(f"{'=' * len(sep)}\n")
+
+
+def ref_sdpa(q, k, v, sm_scale, causal=False):
+    return F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm_scale)
+
+
+def verify(name, got, ref, atol=2e-2, rtol=2e-2, log=True):
+    diff = (got.float() - ref.float()).abs()
+    ok = torch.allclose(ref, got, atol=atol, rtol=rtol)
+    max_err = diff.max().item()
+    mean_err = diff.mean().item()
+    status = "PASS" if ok else "FAIL"
+    if log:
+        print(f"  {name:<28} {status}  max={max_err:.6f}  mean={mean_err:.6f}")
+    return ok
+
+
+def run_correctness_check(kernel_fn, dtype, causal, B=2, H=4, N=512, D=128):
+    torch.manual_seed(42)
+    device = active_torch_device()
+    q = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    k = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    v = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = ref_sdpa(q, k, v, sm, causal)
+    tag = f"causal={causal} N={N}"
+    out = kernel_fn(q, k, v, sm, causal)
+    return verify(f"{kernel_fn.__name__} [{tag}]", out, ref)
+
+
+# The cluster kernel only handles the square anchor (N % BLOCK_M == 0, >= 4 K/V
+# blocks), so it is excluded from the arbitrary-/small-N sweep below and gets its
+# own block-aligned correctness test (test_fa_cluster_correctness).
+_ARBITRARY_N_KERNELS = [name for name in KERNEL_REGISTRY if name != "cluster"]
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("n_test", [128, 192, 256, 500, 512, 1024])
+@pytest.mark.parametrize("kernel_name", _ARBITRARY_N_KERNELS)
+def test_fa_correctness(kernel_name, causal, n_test, dtype=torch.bfloat16, D=128):
+    kernel_fn = get_kernel(kernel_name)
+    ok = run_correctness_check(kernel_fn, dtype, causal, B=1, H=4, N=n_test, D=D)
+    assert ok, f"Correctness failed: kernel={kernel_name} causal={causal} N={n_test}"
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("N", [512, 1024, 2048], ids=["n512", "n1024", "n2048"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_fa_cluster_correctness(causal, N, dtype, B=1, H=4, D=128):
+    """Cluster kernel vs PyTorch SDPA. N is a multiple of BLOCK_M=256 (>= 256) so
+    the square-anchor constraints hold (>= 4 N-blocks; causal diagonal band = 4
+    tiles)."""
+    ok = run_correctness_check(flash_attn_cluster_pipeline, dtype, causal, B=B, H=H, N=N, D=D)
+    assert ok, f"Correctness failed: cluster causal={causal} N={N} dtype={dtype}"
+
+
+def _ref_bottomright(q, k, v, sm, causal):
+    """Reference for q_len != kv_len: bottom-right causal alignment
+    (key j attends iff j <= i + (kv_len - q_len)) — the decode/KV-cache and
+    FlashAttention convention. Reduces to is_causal when q_len == kv_len."""
+    Lq, Lk = q.shape[2], k.shape[2]
+    if not causal:
+        return F.scaled_dot_product_attention(q, k, v, scale=sm)
+    i = torch.arange(Lq, device=q.device)[:, None]
+    j = torch.arange(Lk, device=q.device)[None, :]
+    bias = torch.zeros(Lq, Lk, device=q.device, dtype=q.dtype).masked_fill(~(j <= i + (Lk - Lq)), float("-inf"))
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=sm)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("q_len,kv_len", [(256, 1024), (1024, 256), (1, 1024), (1024, 1024)],
+                         ids=["cross_qlt", "cross_qgt", "decode", "square"])
+def test_fa_persistent_cross_attention(q_len, kv_len, causal, dtype=torch.bfloat16, D=128):
+    """persistent kernel with q_len != kv_len (cross-attention / decode)."""
+    torch.manual_seed(42)
+    B, H = 1, 8
+    device = active_torch_device()
+    q = torch.randn(B, H, q_len, D, device=device, dtype=dtype)
+    k = torch.randn(B, H, kv_len, D, device=device, dtype=dtype)
+    v = torch.randn(B, H, kv_len, D, device=device, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = _ref_bottomright(q, k, v, sm, causal)
+    out = flash_attn_persistent(q, k, v, sm, causal)
+    valid = ~torch.isnan(ref.float())  # fully-masked rows (q_len > kv_len) are undefined
+    ok = torch.allclose(out.float()[valid], ref.float()[valid], atol=2e-2, rtol=2e-2)
+    assert ok, f"cross-attn failed: q_len={q_len} kv_len={kv_len} causal={causal}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Performance regression guard
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Baseline TFLOPS measured on gfx950/MI350 (bf16, H=64). A kernel must stay
+# within PERF_TOL below its baseline or the perf test fails (catches regressions).
+# Regenerate the numbers with (one run per (B, N) shape, so clocks stay warm):
+#   python amd-fa-pipelined_test.py -b 1 -hq 64 -sq 4096  -d 64 128 -causal true false --kernel async_simple async_prefetch persistent
+#   python amd-fa-pipelined_test.py -b 2 -hq 64 -sq 8192  -d 64 128 -causal true false --kernel async_simple async_prefetch persistent
+#   python amd-fa-pipelined_test.py -b 1 -hq 64 -sq 16384 -d 64 128 -causal true false --kernel async_simple async_prefetch persistent
+# then copy the printed Summary table values here.
+PERF_TOL = 0.15  # allow 15% slack below baseline (run-to-run noise + minor drift)
+
+# (B, N) shapes benchmarked (H=64). N=8192 uses B=2 to exercise a multi-batch shape.
+PERF_CONFIGS = [(1, 4096), (2, 8192), (1, 16384)]
+
+# key: (kernel, B, D, N, causal) -> TFLOPS
+PERF_BASELINE_TFLOPS = {
+    # B=1, N=4096
+    ("async_simple", 1, 64, 4096, False):
+    614,
+    ("async_simple", 1, 64, 4096, True):
+    344,
+    ("async_simple", 1, 128, 4096, False):
+    646,
+    ("async_simple", 1, 128, 4096, True):
+    341,
+    ("async_prefetch", 1, 64, 4096, False):
+    677,
+    ("async_prefetch", 1, 64, 4096, True):
+    334,
+    ("async_prefetch", 1, 128, 4096, False):
+    782,
+    ("async_prefetch", 1, 128, 4096, True):
+    447,
+    ("persistent", 1, 64, 4096, False):
+    695,
+    ("persistent", 1, 64, 4096, True):
+    620,
+    ("persistent", 1, 128, 4096, False):
+    828,
+    ("persistent", 1, 128, 4096, True):
+    697,
+    # B=2, N=8192
+    ("async_simple", 2, 64, 8192, False):
+    668,
+    ("async_simple", 2, 64, 8192, True):
+    380,
+    ("async_simple", 2, 128, 8192, False):
+    704,
+    ("async_simple", 2, 128, 8192, True):
+    372,
+    ("async_prefetch", 2, 64, 8192, False):
+    713,
+    ("async_prefetch", 2, 64, 8192, True):
+    358,
+    ("async_prefetch", 2, 128, 8192, False):
+    833,
+    ("async_prefetch", 2, 128, 8192, True):
+    472,
+    ("persistent", 2, 64, 8192, False):
+    726,
+    ("persistent", 2, 64, 8192, True):
+    694,
+    ("persistent", 2, 128, 8192, False):
+    879,
+    ("persistent", 2, 128, 8192, True):
+    794,
+    # B=1, N=16384
+    ("async_simple", 1, 64, 16384, False):
+    668,
+    ("async_simple", 1, 64, 16384, True):
+    432,
+    ("async_simple", 1, 128, 16384, False):
+    724,
+    ("async_simple", 1, 128, 16384, True):
+    475,
+    ("async_prefetch", 1, 64, 16384, False):
+    732,
+    ("async_prefetch", 1, 64, 16384, True):
+    439,
+    ("async_prefetch", 1, 128, 16384, False):
+    861,
+    ("async_prefetch", 1, 128, 16384, True):
+    544,
+    ("persistent", 1, 64, 16384, False):
+    744,
+    ("persistent", 1, 64, 16384, True):
+    741,
+    ("persistent", 1, 128, 16384, False):
+    894,
+    ("persistent", 1, 128, 16384, True):
+    837,
+    # cluster (D=128 only -- D=64/256 are out of scope for this kernel).
+    # Calibrated to the slower SKU in the CI pool (MI350, not the MI355X dev box):
+    # the cluster kernel is the fastest variant, so its 15% floor is the least
+    # forgiving of the ~18-20% cross-SKU clock gap. Baselines track MI350.
+    ("cluster", 1, 128, 4096, False):
+    780,
+    ("cluster", 1, 128, 4096, True):
+    565,
+    ("cluster", 2, 128, 8192, False):
+    830,
+    ("cluster", 2, 128, 8192, True):
+    638,
+    ("cluster", 1, 128, 16384, False):
+    865,
+    ("cluster", 1, 128, 16384, True):
+    612,
+}
+
+
+def compilation_jobs(args):
+    """Return every launch configuration that the selected run will measure."""
+    if args.mode == "perf_test":
+        jobs = [
+            (kernel_name, B, 64, N, D, causal, "bf16")
+            for kernel_name, B, D, N, causal in sorted(PERF_BASELINE_TFLOPS)
+        ]
+    else:
+        causal_modes = [value.lower() in ("true", "1", "yes") for value in args.causal]
+        jobs = [
+            (kernel_name, B, H, N, D, causal, args.dtype)
+            for kernel_name in args.kernel
+            for B in args.b
+            for H in args.hq
+            for D in args.d
+            for N in args.sq
+            for causal in causal_modes
+        ]
+    return list(dict.fromkeys(jobs))
+
+
+def compile_kernel_config(job, num_sms=None):
+    """Compile one FA launch using mock tensors and the runtime wrapper path."""
+    kernel_name, B, H, N, D, causal, dtype_name = job
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    shape = (B, H, N, D)
+    q = MockTensor(dtype, shape)
+    k = MockTensor(dtype, shape)
+    v = MockTensor(dtype, shape)
+    out = MockTensor(dtype, shape)
+    compile_kwargs = {"out": out, "warmup": True}
+    if kernel_name == "persistent":
+        if num_sms is None:
+            raise ValueError("num_sms is required to precompile persistent FA")
+        compile_kwargs["NUM_SMS"] = num_sms
+    get_kernel(kernel_name)(q, k, v, 1.0 / math.sqrt(D), causal, **compile_kwargs)
+
+
+def compile_kernel_config_worker(job, num_sms):
+    start = time.monotonic()
+    try:
+        compile_kernel_config(job, num_sms)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    else:
+        error = None
+    return job, time.monotonic() - start, error
+
+
+def _compile_job_label(job):
+    kernel_name, B, H, N, D, causal, dtype_name = job
+    mode = "causal" if causal else "nc"
+    return f"{kernel_name} B={B} H={H} D={D} N={N} {mode} {dtype_name}"
+
+
+def precompile_kernels(args):
+    if args.compile_workers == 0:
+        return {}
+    jobs = compilation_jobs(args)
+    if not jobs:
+        return {}
+
+    num_sms = None
+    if any(job[0] == "persistent" for job in jobs):
+        num_xcds = 8
+        cu_count = torch.cuda.get_device_properties(active_torch_device()).multi_processor_count
+        num_sms = (cu_count // num_xcds) * num_xcds
+
+    workers = min(args.compile_workers, len(jobs))
+    print(f"\nPrecompiling {len(jobs)} FA configuration(s) with {workers} worker(s):", flush=True)
+    failures = {}
+
+    def record(result):
+        job, elapsed, error = result
+        label = _compile_job_label(job)
+        if error is None:
+            print(f"  compiled {label} in {elapsed:.1f}s", flush=True)
+            return
+        failures[job] = error
+        indented_error = error.replace("\n", "\n    ")
+        print(f"  [FAIL] {label} in {elapsed:.1f}s\n    {indented_error}", flush=True)
+
+    if workers == 1:
+        for job in jobs:
+            record(compile_kernel_config_worker(job, num_sms))
+        return failures
+
+    context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+        futures = [executor.submit(compile_kernel_config_worker, job, num_sms) for job in jobs]
+        for future in concurrent.futures.as_completed(futures):
+            record(future.result())
+    return failures
+
+
+def measure_tflops(kernel_fn, B, H, N, D, causal, dtype=torch.bfloat16):
+    """Verify correctness then return achieved TFLOPS for one config."""
+    torch.manual_seed(42)
+    device = active_torch_device()
+    q = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    k = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    v = torch.randn(B, H, N, D, device=device, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    fn = lambda: kernel_fn(q, k, v, sm, causal)
+    assert verify("", fn(), ref_sdpa(q, k, v, sm, causal), log=False), "correctness check failed"
+    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    valid_el = N * (N + 1) // 2 if causal else N * N
+    total_flops = 2 * 2.0 * B * H * valid_el * D
+    return total_flops / ms * 1e-9
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("B,N", PERF_CONFIGS, ids=[f"b{b}_n{n}" for b, n in PERF_CONFIGS])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("kernel_name", ["async_simple", "async_prefetch", "persistent"])
+def test_fa_performance(kernel_name, D, B, N, causal):
+    """Guard against perf regressions: achieved TFLOPS must stay within PERF_TOL
+    of the recorded gfx950 baseline (H=64, bf16)."""
+    baseline = PERF_BASELINE_TFLOPS[(kernel_name, B, D, N, causal)]
+    floor = baseline * (1 - PERF_TOL)
+    got = measure_tflops(get_kernel(kernel_name), B, 64, N, D, causal)
+    print(f"  {kernel_name:14s} B={B} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
+          f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    assert got >= floor, (f"perf regression: {kernel_name} B={B} D={D} N={N} causal={causal} -> "
+                          f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("B,N", PERF_CONFIGS, ids=[f"b{b}_n{n}" for b, n in PERF_CONFIGS])
+def test_fa_cluster_performance(B, N, causal):
+    """Perf guard for the cluster kernel (D=128 only -- D=64/256 are out of scope,
+    so it can't ride the generic D=[64,128] test_fa_performance sweep)."""
+    D = 128
+    baseline = PERF_BASELINE_TFLOPS[("cluster", B, D, N, causal)]
+    floor = baseline * (1 - PERF_TOL)
+    got = measure_tflops(flash_attn_cluster_pipeline, B, 64, N, D, causal)
+    print(f"  {'cluster':14s} B={B} D={D:3d} N={N:5d} {'causal' if causal else 'nc':6s} "
+          f"{got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    assert got >= floor, (f"perf regression: cluster B={B} D={D} N={N} causal={causal} -> "
+                          f"{got:.1f} TFLOPS < floor {floor:.1f} (baseline {baseline}, tol {PERF_TOL:.0%})")
+
+
+def run_perf_test(args, compile_failures=None):
+    """CLI entry: run the perf guard over all baseline configs, print a report,
+    and assert every kernel is within PERF_TOL of its baseline."""
+    compile_failures = compile_failures or {}
+    tol = args.perf_tol
+    all_ok = True
+    print(f"\nPerformance regression test (floor = baseline * (1 - {tol:.0%}))")
+    print("-" * 78)
+    for (kernel_name, B, D, N, causal), baseline in sorted(PERF_BASELINE_TFLOPS.items()):
+        floor = baseline * (1 - tol)
+        job = (kernel_name, B, 64, N, D, causal, "bf16")
+        if job in compile_failures:
+            all_ok = False
+            error = compile_failures[job].splitlines()[0]
+            print(f"  [FAIL] {kernel_name:14s} B={B} D={D:3d} N={N:5d} "
+                  f"{'causal' if causal else 'nc':6s} -> PRECOMPILE ERROR ({error})")
+            continue
+        try:
+            got = measure_tflops(get_kernel(kernel_name), B, 64, N, D, causal)
+        except Exception as e:
+            all_ok = False
+            print(f"  [FAIL] {kernel_name:14s} B={B} D={D:3d} N={N:5d} "
+                  f"{'causal' if causal else 'nc':6s} -> ERROR ({e})")
+            continue
+        ok = got >= floor
+        all_ok &= ok
+        print(f"  [{'PASS' if ok else 'FAIL'}] {kernel_name:14s} B={B} D={D:3d} N={N:5d} "
+              f"{'causal' if causal else 'nc':6s} {got:7.1f} TFLOPS (baseline {baseline}, floor {floor:.1f})")
+    print("-" * 78)
+    print("RESULT:", "PASS" if all_ok else "FAIL")
+    assert all_ok
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Benchmark
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def run_benchmark(args, compile_failures=None):
+    compile_failures = compile_failures or {}
+    causal_modes = [s.lower() in ("true", "1", "yes") for s in args.causal]
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+    device = active_torch_device()
+
+    results = {}
+
+    for kernel_name in args.kernel:
+        kernel_fn = get_kernel(kernel_name)
+        for B in args.b:
+            for H in args.hq:
+                for D in args.d:
+                    for N in args.sq:
+                        for causal in causal_modes:
+                            job = (kernel_name, B, H, N, D, causal, args.dtype)
+                            if job in compile_failures:
+                                error = compile_failures[job].splitlines()[0]
+                                causal_str = "causal" if causal else "nc"
+                                print(f"  {kernel_name:20s} D={D} N={N:5d} {causal_str:6s} "
+                                      f"-> SKIPPED (precompile failed: {error})")
+                                continue
+                            torch.manual_seed(42)
+                            q = torch.randn(B, H, N, D, device=device, dtype=dtype)
+                            k = torch.randn(B, H, N, D, device=device, dtype=dtype)
+                            v = torch.randn(B, H, N, D, device=device, dtype=dtype)
+                            sm = 1.0 / math.sqrt(D)
+
+                            if causal:
+                                valid_el = N * (N + 1) // 2
+                            else:
+                                valid_el = N * N
+                            total_flops = 2 * 2.0 * B * H * valid_el * D
+
+                            causal_str = "causal" if causal else "nc"
+                            ref_sdpa_lambda = lambda: F.scaled_dot_product_attention(
+                                q, k, v, is_causal=causal, scale=sm)
+
+                            try:
+                                tlx_sdpa_lambda = lambda: kernel_fn(q, k, v, sm, causal)
+                                ref_out = ref_sdpa_lambda()
+                                tlx_out = tlx_sdpa_lambda()
+                                assert verify("", tlx_out, ref_out, log=False)
+                            except Exception as e:
+                                print(f"  {kernel_name:20s} D={D} N={N:5d} {causal_str:6s} -> SKIPPED ({e})")
+                                continue
+
+                            key = (B, H, D, N, causal)
+                            if key not in results:
+                                results[key] = {}
+
+                            if "Torch SDPA" not in results[key]:
+                                ms = triton.testing.do_bench(ref_sdpa_lambda, warmup=25, rep=100)
+                                tflops = total_flops / ms * 1e-9
+                                results[key]["Torch SDPA"] = {"ms": ms, "tflops": tflops}
+
+                            ms = triton.testing.do_bench(tlx_sdpa_lambda, warmup=25, rep=100)
+                            tflops = total_flops / ms * 1e-9
+                            results[key][kernel_name] = {"ms": ms, "tflops": tflops}
+
+    print_summary_table(results, args.kernel)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def parse_args():
+    p = argparse.ArgumentParser(prog="AMD TLX FA Pipelined")
+    p.add_argument("-b", type=int, nargs="+", default=[1])
+    p.add_argument("-hq", type=int, nargs="+", default=[64])
+    p.add_argument("-sq", type=int, nargs="+", default=[1024, 8192, 16384])
+    p.add_argument("-d", type=int, nargs="+", default=[64, 128])
+    p.add_argument("-causal", type=str, nargs="+", default=["false"],
+                   help="Causal modes to benchmark (e.g. -causal true false)")
+    p.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
+    p.add_argument("--kernel", type=str, nargs="+", default=["async_simple", "async_prefetch", "persistent"],
+                   help="Kernel variants to benchmark")
+    p.add_argument("--mode", choices=["benchmark", "perf_test"], default="benchmark",
+                   help="benchmark: print TFLOPS table; perf_test: assert TFLOPS within PERF_TOL of baseline")
+    p.add_argument("--perf-tol", dest="perf_tol", type=float, default=PERF_TOL,
+                   help="perf_test slack below baseline (e.g. 0.15 = allow 15%% regression)")
+    p.add_argument(
+        "--compile-workers",
+        type=int,
+        default=DEFAULT_COMPILE_WORKERS,
+        help=f"parallel workers for the precompile phase; 0 disables it; default: {DEFAULT_COMPILE_WORKERS}",
+    )
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.compile_workers < 0:
+        raise SystemExit("--compile-workers must be non-negative")
+    compile_failures = precompile_kernels(args)
+    if args.mode == "perf_test":
+        run_perf_test(args, compile_failures)
+    else:
+        run_benchmark(args, compile_failures)

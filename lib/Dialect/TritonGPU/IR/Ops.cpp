@@ -383,11 +383,10 @@ struct CanonicalizeConvertFromConvert
       auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
           op, op->getResult(0).getType(), sharedLoad.getSrc(),
           sharedLoad.getToken());
-      // Preserve backend optimization metadata such as
-      // ttg.amdg.syncedViaAsyncWait. Dropping it here makes the replacement
-      // load conservatively wait for unrelated async LDS writes.
-      for (auto attr : sharedLoad->getDiscardableAttrs())
-        replacement->setDiscardableAttr(attr.getName(), attr.getValue());
+      // The replacement is still the same memory access.  Preserve semantic
+      // annotations carried by the source load (for example AMD async-wait
+      // readiness) when only its result layout changes.
+      replacement->setAttrs(sharedLoad->getAttrs());
 
       return success();
     }
