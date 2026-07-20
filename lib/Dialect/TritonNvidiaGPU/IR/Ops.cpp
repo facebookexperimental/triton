@@ -528,6 +528,8 @@ bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
       elementType.isInteger(64) && !elementType.isSignedInteger();
   bool isF16OrBF16 = elementType.isF16() || elementType.isBF16();
   switch (kind) {
+  case DescriptorReduceKind::NONE:
+    return false;
   case DescriptorReduceKind::ADD:
     return isInt32 || isNotSignedInt64 || elementType.isF32() || isF16OrBF16;
   case DescriptorReduceKind::MIN:
