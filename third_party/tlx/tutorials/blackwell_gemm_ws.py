@@ -1189,7 +1189,7 @@ def matmul_kernel_tma_ws_blackwell(
         tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
                                              arrive_count=EPILOGUE_SUBTILE)
 
-    with tlx.async_tasks():
+    with tlx.async_tasks(exclusive=True, no_ending_cluster_sync=True):
         with tlx.async_task("default"):  # epilogue consumer
             (
                 start_pid,
