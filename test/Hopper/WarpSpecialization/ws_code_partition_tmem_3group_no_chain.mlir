@@ -1,4 +1,4 @@
-// RUN: not --crash triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" 2>&1 | FileCheck %s
+// RUN: not --crash triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" 2>&1 | FileCheck %s
 //
 // A TMEM reuse group with >= 3 buffers must have a unique dependency-chain
 // order over the shared slot, or code partitioning must reject it at compile

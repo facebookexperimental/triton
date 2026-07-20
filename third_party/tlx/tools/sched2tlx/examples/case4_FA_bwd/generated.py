@@ -148,7 +148,7 @@ def fa_bwd_dkdv_5mma(
                 tlx.async_descriptor_load(desc_11, L0_smem_1[buf], [tile_id, 0], L0_smem_1_full[buf])
         # Async task: role=TMA ← inner wg2 (Phase 4 plan)
         with tlx.async_task(num_warps=4, num_regs=152):
-            # Re-materialize function-scope register tensors locally (a 
+            # Re-materialize function-scope register tensors locally (a
             # non-default warp group cannot capture RankedTensorType).
             _wgloc600 = tl.arange(0, 64)
             for tile_id in range(0, N_CTX, 64):

@@ -8,6 +8,14 @@ on:
     # Every 6 hours at :30 past (00:30, 06:30, 12:30, 18:30 UTC).
     - cron: '30 */6 * * *'
 
+# torchTLX (TLX-as-Inductor-backend) is exercised by the dedicated torchtlx.yml
+# workflow against a fresh nightly torch. Keep it off the tritonbench job here:
+# only "allow"/"force" enable it, so an empty value forces it off regardless of
+# any environment default, and tritonbench runs against the pre-provisioned torch
+# (which may predate the config.triton.tlx_mode knob).
+env:
+  TORCHINDUCTOR_TLX_MODE: ""
+
 jobs:
   b200-meta-triton-test:
     if: github.repository_owner == 'facebookexperimental'
@@ -114,6 +122,10 @@ jobs:
         timeout-minutes: 5
         run: |
           . "${SETUP_SCRIPT}"
+          # TLX-only: the test_tlx_*.py glob covers manual TLX (tlx.async_tasks)
+          # and structurally excludes the autoWS suites (test_autows_*.py,
+          # test_warp_specialization.py, test_tutorial09_warp_specialization.py),
+          # which are never collected here and are tested separately.
           python -m pytest python/test/unit/language/test_tlx_*.py -v --junitxml=/tmp/tlx-unit.xml
       - name: Run TLX tutorial correctness tests
         id: run_correctness_tests

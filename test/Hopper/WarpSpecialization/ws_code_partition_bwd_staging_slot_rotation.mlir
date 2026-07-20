@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=2" | FileCheck %s
 
 // Regression test for the early-TMA same-partition staging slot rotation
 // (bug #10/#11 in .llms/rules/partition-scheduler-bugs.md / D110063164,

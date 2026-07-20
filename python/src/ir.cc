@@ -1,5 +1,6 @@
 #include "ir.h"
 
+#include <algorithm>
 #include <optional>
 #include <pybind11/cast.h>
 #include <pybind11/functional.h>
@@ -267,11 +268,14 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
   auto arr = mod->getAttrOfType<ArrayAttr>("ttg.auto_tma_recipes");
   if (!arr)
     return result;
-  // Locate the kernel FuncOp so we can read each synthetic descriptor arg's
-  // shared-encoding swizzle from its final (post-pass) type. The swizzle is
-  // assigned by optimize_descriptor_encoding during TTGIR, so it is only
-  // available off the live arg type (parity with getTensorDescMetadata for user
-  // descriptors). Falls back to no swizzle if the arg/type can't be resolved.
+  // Locate the kernel FuncOp so we can read the *final* (post-pass) block shape
+  // from each synthetic descriptor arg's type. WS / 2-CTA passes
+  // (Transform2CTALoads, WSDataPartition) halve the host-side tensordesc arg
+  // type in place but do NOT update this module attr, so the attr's block_shape
+  // is stale after data partitioning. Reading the live arg type keeps the
+  // host-built CUtensorMap's box dims in sync (parity with
+  // getTensorDescMetadata for user descriptors). Falls back to the attr's
+  // block_shape if the arg/type can't be resolved.
   triton::FuncOp kernelFunc;
   mod.walk([&](triton::FuncOp func) {
     if (triton::isKernel(func)) {
@@ -307,11 +311,23 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
     r["base_ptr_arg_index"] = getReqI(d, "base_ptr_arg_index");
     r["shape_arg_indices"] = getIArr(d, "shape_arg_indices");
     r["stride_arg_indices"] = getIArr(d, "stride_arg_indices");
-    // swizzle: read from the descriptor arg's final shared encoding (assigned
-    // by optimize_descriptor_encoding) -- a GEMM dot operand's NVMMAShared
-    // swizzle differs from a box-geometry heuristic, so read it via
-    // getTMASwizzleMode (parity with getTensorDescMetadata). -1 means "derive
-    // host-side from box geometry" (non-NVMMAShared / rank<2).
+    // block_shape + swizzle: read from the FINAL descriptor arg type.
+    // block_shape reflects WS / 2-CTA halving. swizzle must match the
+    // descriptor's shared encoding (assigned by optimize_descriptor_encoding)
+    // -- a GEMM dot operand's NVMMAShared swizzle differs from a box-geometry
+    // heuristic, so read it via getTMASwizzleMode (parity with
+    // getTensorDescMetadata). -1 means "derive host-side from box geometry"
+    // (non-NVMMAShared / rank<2).
+    //
+    // block_shape is also the ENCODED box (launch.h box_dim). The full tile can
+    // exceed the 256-element cuTensorMapEncodeTiled cap (e.g. BLOCK=512), so we
+    // clamp it to the SAME box getTMABlockShape produces for the device
+    // lowering (each dim <= 256; contig dim = swizzle element width). The
+    // descriptor_load /store keeps the full-block SMEM result and the device
+    // AsyncTMACopy lowering multi-copies this clamped box to fill it -- single
+    // source of truth with the device path (both call getTMABlockShape on the
+    // same encoding). A trailing min(256) floor covers the 1D / non-NVMMAShared
+    // / no-descriptor fallbacks (idempotent for the getTMABlockShape output).
     std::vector<int> blockShape = getIArr(d, "block_shape");
     int swizzle = -1;
     if (kernelFunc && descArgIdx >= 0 &&
@@ -320,14 +336,22 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
       if (auto descTy = dyn_cast<TensorDescInterface>(descArg.getType())) {
         auto blockTy = descTy.getBlockType();
         auto shp = blockTy.getShape();
+        blockShape.assign(shp.begin(), shp.end());
         if (shp.size() >= 2 &&
             isa<ttg::NVMMASharedEncodingAttr>(blockTy.getEncoding())) {
           auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
           if (succeeded(sw))
             swizzle = *sw;
+          auto box = ttng::getTMABlockShape(blockTy, /*packedSize=*/false,
+                                            ttg::TMAMode::Tiled);
+          blockShape.assign(box.begin(), box.end());
         }
       }
     }
+    // Floor every box dim at the 256-element hardware cap (idempotent after the
+    // getTMABlockShape clamp above; handles 1D / non-NVMMAShared descriptors).
+    for (auto &v : blockShape)
+      v = std::min(v, 256);
     r["block_shape"] = blockShape;
     r["swizzle"] = swizzle;
     r["elem_type"] = getReqI(d, "elem_type");

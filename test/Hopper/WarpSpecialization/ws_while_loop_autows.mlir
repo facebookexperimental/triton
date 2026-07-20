@@ -1,6 +1,6 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s --check-prefix=TASKID
 // RUN: triton-opt %s -split-input-file --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s --check-prefix=DATAPART
-// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s --check-prefix=CODEPART
+// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s --check-prefix=CODEPART
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -188,6 +188,56 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %loaded = ttg.local_load %alloc {async_task_id = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
       tt.store %dst, %loaded, %mask {async_task_id = array<i32: 1>} : tensor<16x!tt.ptr<f32>, #blocked>
     } {async_task_id = array<i32: 0, 1>, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32], ttg.partition.types = ["compute", "compute"]}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A CLC (Cluster Launch Control) persistent GEMM whose outer loop is an
+  // scf.while: the loop-carried `is_valid` bit is refreshed each iteration by
+  // `ttng.clc_advance` (hardware work-stealing), exactly as the ClcTileScheduler
+  // emits (`while sched.is_valid(): ...; sched = sched.advance()`). This shows
+  // that data partitioning splits the while-carried accumulator + warp_group_dot
+  // along M across the two consumer warp groups (async_task_id 1, 2) regardless
+  // of how the loop advances -- the `clc_advance` producer op (task 0) is left
+  // intact. (Simplified: uses warp_group_dot to keep the accumulator in
+  // registers; the data-partition mechanics are identical for tc_gen5_mma.)
+  // DATAPART-LABEL: @while_clc_data_partition
+  // DATAPART: scf.while
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // The two consumer warp groups each get an M/2 = 64 slice of the accumulator.
+  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
+  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
+  // The CLC advance (loop-carried valid producer, task 0) is left intact.
+  // DATAPART: ttng.clc_advance
+  tt.func public @while_clc_data_partition(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %out: !tt.ptr<f32>) {
+    %true = arith.constant {async_task_id = array<i32: 0, 1, 2>} true
+    %acc_init = arith.constant {async_task_id = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
+    %result = scf.while (%acc = %acc_init, %valid = %true) : (tensor<128x256xf32, #mma>, i1) -> tensor<128x256xf32, #mma> {
+      scf.condition(%valid) %acc : tensor<128x256xf32, #mma>
+    } do {
+    ^bb0(%acc: tensor<128x256xf32, #mma>):
+      %a_ptrs = tt.splat %arg0 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+      %a = tt.load %a_ptrs {async_task_id = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      %a_alloc = ttg.local_alloc %a {async_task_id = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+      %b_ptrs = tt.splat %arg1 {async_task_id = array<i32: 0>} : !tt.ptr<f16> -> tensor<64x256x!tt.ptr<f16>, #blocked1>
+      %b = tt.load %b_ptrs {async_task_id = array<i32: 0>} : tensor<64x256x!tt.ptr<f16>, #blocked1>
+      %b_alloc = ttg.local_alloc %b {async_task_id = array<i32: 1, 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+      %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {async_task_id = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+      %nvalid, %x, %y, %z = ttng.clc_advance {async_task_id = array<i32: 0>} : i1, i32, i32, i32
+      scf.yield {async_task_id = array<i32: 0, 1, 2>} %dot, %nvalid : tensor<128x256xf32, #mma>, i1
+    }
+    %ptrs = tt.splat %out {async_task_id = array<i32: 1, 2>} : !tt.ptr<f32> -> tensor<128x256x!tt.ptr<f32>, #blocked1>
+    %cvt = ttg.convert_layout %result {async_task_id = array<i32: 1, 2>} : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked1>
+    tt.store %ptrs, %cvt {async_task_id = array<i32: 1, 2>} : tensor<128x256x!tt.ptr<f32>, #blocked1>
     tt.return
   }
 }

@@ -455,20 +455,22 @@ def test_use_name_loc_as_prefix(fresh_triton_cache):
         # CHECK: %arange = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
         arange = tl.arange(0, 16)
         ivar = 0
-        # CHECK: %ivar_[[IV0:.+]]:2 = scf.while (%arange_[[AR0:.+]] = %arange, %ivar_[[IV1:.+]] = %ivar) : (tensor<16xi32>, i32) -> (tensor<16xi32>, i32)
-        # CHECK: %[[COND:.*]] = arith.cmpi slt, %ivar_[[IV1]], %N : i32
-        # CHECK: scf.condition(%[[COND]]) %arange_[[AR0]], %ivar_[[IV1]] : tensor<16xi32>, i32
+        # This loop is provably countable (monotone `ivar += 1` induction against
+        # the loop-invariant bound `ivar < N`), so the `triton-uplift-while-to-for`
+        # pass rewrites it into an equivalent `scf.for` — that way it can benefit
+        # from the for-loop optimization pipeline (software pipelining, etc.) that
+        # doesn't run on `scf.while`. Hence the checked IR below is a for loop
+        # carrying `arange`; the name-loc prefixes are preserved through the uplift.
+        # CHECK: %ivar_[[IV0:.+]] = scf.for %ivar_[[IV1:.+]] = %ivar to %N step %c1_i32 iter_args(%arange_[[AR0:.+]] = %arange) -> (tensor<16xi32>) : i32 {
         while ivar < N:
-            # CHECK: ^bb0(%arange_[[AR0]]: tensor<16xi32> loc("arange"), %ivar_[[IV1]]: i32
-
             # CHECK: %ivar_[[IV2:.+]] = arith.addi %ivar_[[IV1]], %c1_i32 : i32
             ivar += 1
             # CHECK: %arange_[[AR1:.+]] = tt.splat %ivar_[[IV2]] : i32 -> tensor<16xi32>
             # CHECK: %arange_[[AR2:.+]] = arith.muli %arange_[[AR0]], %arange_[[AR1]] : tensor<16xi32>
-            # CHECK: scf.yield %arange_[[AR2]], %ivar_[[IV2]] : tensor<16xi32>, i32
+            # CHECK: scf.yield %arange_[[AR2]] : tensor<16xi32>
             arange *= ivar
 
-        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]]#0 : tensor<16xi32>
+        # CHECK: tt.print ": " {hex = false, isSigned = array<i32: 1>} : %ivar_[[IV0]] : tensor<16xi32>
         tl.device_print("", arange)
 
     h = triton.compile(triton.compiler.ASTSource(fn=kernel_basic_while, signature={"N": "i32"}, constexprs={}))
@@ -501,7 +503,7 @@ def test_line_and_column_numbers(fresh_triton_cache):
 
     @triton.jit
     def kernel_basic(src, N, BLOCK_SIZE: tl.constexpr):
-        # CHECK: #loc = loc("{{.*}}":503:5)
+        # CHECK: #loc = loc("{{.*}}":505:5)
         # CHECK: #loc10 = loc("src"(#loc))
         # CHECK: #loc11 = loc("N"(#loc))
         # CHECK-LABEL:  tt.func public @kernel_basic(
@@ -524,15 +526,15 @@ def test_line_and_column_numbers(fresh_triton_cache):
         # CHECK:          } loc(#loc)
         # CHECK:         } loc(#loc)
 
-        # CHECK: #loc1 = loc({{.*}}:549:20)
+        # CHECK: #loc1 = loc({{.*}}:551:20)
         # CHECK: #loc2 = loc(unknown)
-        # CHECK: #loc3 = loc({{.*}}:544:15)
-        # CHECK: #loc4 = loc({{.*}}:545:18)
-        # CHECK: #loc5 = loc({{.*}}:546:28)
-        # CHECK: #loc6 = loc({{.*}}:546:19)
-        # CHECK: #loc7 = loc({{.*}}:547:30)
-        # CHECK: #loc8 = loc({{.*}}:548:16)
-        # CHECK: #loc9 = loc({{.*}}:550:9)
+        # CHECK: #loc3 = loc({{.*}}:546:15)
+        # CHECK: #loc4 = loc({{.*}}:547:18)
+        # CHECK: #loc5 = loc({{.*}}:548:28)
+        # CHECK: #loc6 = loc({{.*}}:548:19)
+        # CHECK: #loc7 = loc({{.*}}:549:30)
+        # CHECK: #loc8 = loc({{.*}}:550:16)
+        # CHECK: #loc9 = loc({{.*}}:552:9)
         # CHECK: #loc12 = loc("x_plus_1"(#loc1))
         # CHECK: #loc13 = loc("pid"(#loc3))
         # CHECK: #loc14 = loc("offset"(#loc4))

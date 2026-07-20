@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=3" | FileCheck %s
 
 // Test: Option 3 in-body SMEM-rotation for a SINGLE-BUFFERED (buffer.copy = 1)
 // both-endpoints-subtiled SMEM reuse group -- the DP=1 epilogue shape that OOM'd

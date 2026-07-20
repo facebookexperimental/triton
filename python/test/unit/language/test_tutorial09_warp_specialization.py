@@ -340,6 +340,7 @@ def matmul_kernel_tma_clc_persistent_ws_while(
 class _MatmulTileArgs(NamedTuple):
     """Named ``lowering_args`` for the schedule -- the fields ``_unified_num_tiles``
     reads by name to compute the tile count."""
+
     M: tl.tensor
     N: tl.tensor
     BLOCK_SIZE_M: tl.constexpr
@@ -641,8 +642,6 @@ def test_tutorial09_matmul_tma_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma with warp_specialize=True (K-loop based)."""
-    if generate_subtiled_region:
-        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
@@ -752,8 +751,6 @@ def test_tutorial09_matmul_tma_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_tma_persistent with warp_specialize=True for both Flatten values."""
-    if generate_subtiled_region:
-        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
@@ -910,10 +907,14 @@ def test_tutorial09_matmul_tma_static_persistent_while_loop_warp_specialize(EPIL
         )
 
         ttgir = kernel.asm["ttgir"]
-        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        # The static-persistent outer loop is countable (`tile_id < num_tiles`,
+        # `tile_id += NUM_SMS`), so triton-uplift-while-to-for rewrites the
+        # `scf.while` into an `scf.for` at the TTIR stage.
+        assert "scf.for" in ttgir, "Expected countable persistent outer loop to uplift to scf.for"
+        assert "scf.while" not in ttgir, "Expected the countable while to be uplifted away"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         # Blackwell lowers to tcgen5 MMA; Hopper lowers to wgmma (warp_group_dot).
-        assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
+        assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         assert "ttng.clc_" not in ttgir, "Expected static persistent scheduling, not CLC"
 
@@ -988,7 +989,7 @@ def test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize(EPI
         assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         # Blackwell lowers to tcgen5 MMA; Hopper lowers to wgmma (warp_group_dot).
-        assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
+        assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
         assert "ttng.clc_" not in ttgir, "Expected dynamic atomic scheduling, not CLC"
@@ -1147,9 +1148,22 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
         )
 
         ttgir = kernel.asm["ttgir"]
-        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        if SCHEDULE is tl.NonPersistentScheduler:
+            # The non-persistent schedule's outer loop provably runs exactly once
+            # (`_valid` flips True->False), so triton-simplify-single-trip-while
+            # optimizes the `scf.while` away at the TTIR stage.
+            assert "scf.while" not in ttgir, "Expected single-trip outer while to be optimized away"
+        elif SCHEDULE is tl.StaticPersistent1DScheduler:
+            # The static-persistent schedule is a countable loop (`_x < num_tiles`,
+            # `_x += num_programs`); triton-uplift-while-to-for (after LICM hoists
+            # num_tiles out of the before-region) rewrites it into an `scf.for`.
+            assert "scf.while" not in ttgir, "Expected countable static-persistent while to uplift to scf.for"
+        else:
+            # Dynamic (atomic advance) and CLC (hardware valid) are not countable
+            # and stay as `scf.while`.
+            assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
-        assert ("ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir), "Expected an MMA instruction"
+        assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
         # Schedule-specific IR markers confirm the chosen schedule was actually used.
         if SCHEDULE is tl.ClcTileScheduler:
@@ -1199,8 +1213,6 @@ def test_tutorial09_matmul_descriptor_persistent_warp_specialize(
     separate_epilogue_store,
 ):
     """Test matmul_kernel_descriptor_persistent with warp_specialize=True for both Flatten values."""
-    if generate_subtiled_region:
-        pytest.skip("TODO: enable generate_subtiled_region=True")
 
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import importlib
 import sys
 
-import generated
 import torch
 import triton
+
+try:
+    import generated
+except ModuleNotFoundError:  # buck par: module lives under the dotted package
+    generated = importlib.import_module(
+        (__package__ + ".generated") if __package__ else "generated"
+    )
 
 
 def alloc_fn(size, alignment, stream):

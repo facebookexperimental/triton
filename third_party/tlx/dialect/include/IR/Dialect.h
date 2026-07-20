@@ -35,6 +35,7 @@ constexpr static char AttrClusterSyncKernelInitName[] =
     "tlx.cluster_sync_kernel_init";
 constexpr static char AttrClusterSyncKernelCleanupName[] =
     "tlx.cluster_sync_kernel_cleanup";
+constexpr static char AttrUserPostWsSyncName[] = "tlx.user_post_ws_sync";
 
 bool tlxEnablePairedMMA(Operation *op);
 
@@ -54,6 +55,13 @@ void setClusterSyncKernelInitOnMod(Operation *op, bool value);
 
 bool hasClusterSyncKernelCleanup(Operation *op);
 void setClusterSyncKernelCleanupOnMod(Operation *op, bool value);
+
+// `tlx.user_post_ws_sync`: the user provides the post-warp-specialize sync, so
+// the compiler should skip the auto cluster arrive/wait before TMEM dealloc.
+// Propagated from `tlx.async_tasks(no_ending_cluster_sync=True)` in the Fixup
+// pass.
+bool hasUserPostWsSync(Operation *op);
+void setUserPostWsSyncOnMod(Operation *op, bool value);
 
 // Returns true if the kernel uses clusters (clusterDims product > 1).
 // Subsumes tlxEnablePairedMMA: paired CTA MMA always implies clustering.

@@ -739,3 +739,62 @@ def test_store_ws(device):
 
     expected = torch.arange(n_elements, device=device, dtype=torch.float32)
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="single_warp_specialize lowering targets Blackwell")
+def test_single_warp_specialize(device):
+    # A single warp_specialize op (captures the pointers/size): the `default`
+    # warp group computes x + y, one worker warp group computes a + b. Marking
+    # the async_tasks block `exclusive=True` makes the Fixup pass set the
+    # ttg.single-warp-specialize module attribute (after validating there is
+    # exactly one warp_specialize op), which makes the warp-specialize -> LLVM
+    # lowering dispatch worker warps from `wid` (no SMEM state id / switch table)
+    # and reclaim the state SMEM.
+    @triton.jit
+    def add2_ws_kernel(x_ptr, y_ptr, z_ptr, a_ptr, b_ptr, c_ptr, n_elements, BLOCK_SIZE: tl.constexpr,
+                       EXCLUSIVE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        with tlx.async_tasks(exclusive=EXCLUSIVE):
+            with tlx.async_task("default"):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(z_ptr + offs, tl.load(x_ptr + offs, mask=mask) + tl.load(y_ptr + offs, mask=mask), mask=mask)
+            with tlx.async_task(num_warps=4, num_regs=232):
+                offs = block_start + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_elements
+                tl.store(c_ptr + offs, tl.load(a_ptr + offs, mask=mask) + tl.load(b_ptr + offs, mask=mask), mask=mask)
+
+    def run(exclusive):
+        torch.manual_seed(0)
+        n = 98432
+        x, y, a, b = (torch.rand(n, device=device) for _ in range(4))
+        z, c = torch.empty_like(x), torch.empty_like(a)
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]), )
+        compiled = add2_ws_kernel[grid](x, y, z, a, b, c, n, BLOCK_SIZE=1024, EXCLUSIVE=exclusive)
+        # Same result regardless of the dispatch strategy.
+        torch.testing.assert_close(z, x + y, check_dtype=False)
+        torch.testing.assert_close(c, a + b, check_dtype=False)
+        return compiled
+
+    single = run(exclusive=True)
+    multi = run(exclusive=False)
+
+    # The exclusive marker is propagated to the module attribute, and there is
+    # exactly one warp_specialize op (a precondition of the fast path).
+    assert '"ttg.single-warp-specialize" = true' in single.asm["ttgir"]
+    assert single.asm["ttgir"].count("ttg.warp_specialize(") == 1
+    assert "single-warp-specialize" not in multi.asm["ttgir"]
+
+    # The fast path dispatches worker warps from `wid`: no SMEM state-id switch
+    # table. The general path still lowers to a switch.
+    assert "switch" not in single.asm["llir"]
+    assert "switch" in multi.asm["llir"]
+
+    # The worker task requested 232 registers, so the lowering emits register
+    # (setmaxnreg) and barrier instructions in the PTX. The fast path drops the
+    # end-of-region register restoration and the state-id/switch barriers, so it
+    # emits strictly fewer of both than the general (multi-WS) lowering.
+    single_ptx, multi_ptx = single.asm["ptx"], multi.asm["ptx"]
+    assert single_ptx.count("setmaxnreg") < multi_ptx.count("setmaxnreg")
+    assert single_ptx.count("barrier.sync") < multi_ptx.count("barrier.sync")

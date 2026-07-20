@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s
 
 // A TMEM reuse-group channel that ping-pongs through async MMAs must keep its
 // WAR reuse barrier; needExplicitReuseWait must NOT elide it just because the

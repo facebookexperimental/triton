@@ -763,7 +763,7 @@ Examples: how mbarriers are communicated in warp specialization
 - `tlx.async_tasks` and `tlx.async_task` **[Hopper+]**
 
 ```
-    with tlx.async_tasks
+    with tlx.async_tasks()
         with tlx.async_task("default")
             ...
         with tlx.async_task(num_warps=4)
@@ -774,6 +774,13 @@ Examples: how mbarriers are communicated in warp specialization
 `tlx.async_task("default")` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
+
+#### async_tasks Parameters
+
+| Parameter                | Description                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
+| `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
 
 #### async_task Parameters
 
