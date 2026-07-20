@@ -48,6 +48,7 @@ void init_triton_passes_ttir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_loop_unroll", createTritonLoopUnroll);
   ADD_PASS_WRAPPER_0("add_simplify_single_trip_while",
                      createTritonSimplifySingleTripWhile);
+  ADD_PASS_WRAPPER_0("add_uplift_while_to_for", createTritonUpliftWhileToFor);
   ADD_PASS_WRAPPER_0("add_triton_licm", createTritonLoopInvariantCodeMotion);
   ADD_PASS_WRAPPER_0("add_loop_aware_cse", createTritonLoopAwareCSE);
   ADD_PASS_OPTION_WRAPPER_4("add_convert_to_ttgpuir",
