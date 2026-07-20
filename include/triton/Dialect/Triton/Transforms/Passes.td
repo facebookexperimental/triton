@@ -56,6 +56,37 @@ def TritonLoopUnroll : Pass</*cli-arg*/"triton-loop-unroll", /*Op*/"mlir::Module
   let dependentDialects = ["mlir::triton::TritonDialect"];
 }
 
+def TritonSimplifySingleTripWhile : Pass</*cli-arg*/"triton-simplify-single-trip-while", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Replace a provably single-iteration scf.while with its body";
+  let description = [{
+    This pass detects an `scf.while` loop that provably executes its body exactly
+    once and replaces the loop with the straight-line (inlined) body, eliminating
+    the loop overhead and its loop-carried state.
+
+    The current detection targets the "constant-flip" pattern produced by the
+    non-persistent unified tile scheduler: the loop condition is a loop-carried
+    `i1` value that is a constant `true` on entry (the while init) and a constant
+    `false` after the body (the after-region yield). Concretely, the pass fires
+    only when:
+      - the before-region is side-effect-free, and
+      - the `scf.condition` value is directly a before-block argument whose
+        `scf.while` init folds to a constant `true` while the corresponding
+        after-region yield operand folds to a constant `false`.
+
+    The rewrite evaluates the (pure) before-region for the forwarded args, inlines
+    the body once, and (only if the loop has results) evaluates the before-region
+    again on the yielded values to produce them. Broader conditions (computed
+    condition expressions) are not handled and could be added later via constant
+    folding of the condition.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def TritonLoopInvariantCodeMotion : Pass</*cli-arg*/"triton-licm", /*Op*/"mlir::ModuleOp"> {
   let summary = "MLIR's LICM plus hoist load ops out of loops with masks.";
   let description = [{
