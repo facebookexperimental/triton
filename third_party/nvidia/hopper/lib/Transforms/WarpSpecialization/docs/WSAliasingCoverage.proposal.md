@@ -266,6 +266,23 @@ excluded per §3.1); a nontrivial SCC containing >=1 cross-partition satisfy edg
 and >=1 FULL wait is a deadlock cycle. Excluding the free first-acquires is what
 prevents persistent-loop back-edges from spuriously closing a cycle.
 
+> **Empirical implementation finding (Phase 2, verified).** The excluding-free-
+> first-acquires step is load-bearing and *hard*. A first cut of the SCC that
+> used only a walk-order pre-arm heuristic (a backward wait is pre-armed iff some
+> arrive on the same alloc has a smaller pre-order index) reported a cross-
+> partition cycle on **both** the deadlocking HSTU DP=2 fwd **and** the *correct*
+> HSTU DP=1 fwd (which runs fine). The reason is exactly §3.1: a correct
+> pipelined kernel's steady state is itself strongly connected (producer ->
+> consumer -> reuse -> producer), and the walk-order heuristic does not see the
+> prologue/entry pre-arm that breaks the cycle on first execution. So a naive SCC
+> over (satisfy ∪ program-order) is **not** a sound deadlock decider — it matches
+> correct pipelines too. Consequence for the pass: the SCC is shipped as an
+> **off-by-default candidate surfacer** (`report-cycles`, emits remarks, never
+> errors); making it a sound error requires the real phase-parity + prologue-
+> aware pre-arm model (per-slot phase flips vs the parities the waits require),
+> which is the next deadlock-phase work item. Condition (i) (no-producer) does
+> not depend on this and ships as a sound default error.
+
 ---
 
 ## 4. Race analysis

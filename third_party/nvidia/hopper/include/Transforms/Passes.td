@@ -166,7 +166,12 @@ def NVGPUVerifyWSBarriers : Pass<"nvgpu-verify-ws-barriers", "mlir::ModuleOp"> {
            "which checks to run: deadlock | race | all">,
     Option<"emitCoverageTable", "emit-coverage-table",
            "bool", /*default*/"false",
-           "print the per-reuse-group coverage table">
+           "print the per-reuse-group coverage table">,
+    Option<"reportCycles", "report-cycles",
+           "bool", /*default*/"false",
+           "surface cross-partition BDG cycles as candidate remarks (NOT a "
+           "verdict: a naive SCC also matches correct pipelines; sound "
+           "classification needs the phase/pre-arm model -- see the design doc)">
   ];
 }
 
