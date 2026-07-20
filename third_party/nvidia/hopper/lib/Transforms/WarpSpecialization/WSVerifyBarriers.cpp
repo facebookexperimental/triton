@@ -153,6 +153,82 @@ static std::optional<int> resolveDataBufferId(Value v) {
   return std::nullopt;
 }
 
+// True if `v` is a loop iter-arg carrying the WS accumulation counter (tagged
+// NameLoc("accum_cnt") by code partitioning).
+static bool isAccumCnt(Value v) {
+  auto ba = dyn_cast<BlockArgument>(v);
+  if (!ba)
+    return false;
+  if (auto nl = dyn_cast<NameLoc>(ba.getLoc()))
+    return nl.getName().getValue() == "accum_cnt";
+  return false;
+}
+
+// Print a compact symbolic form of a barrier index/phase operand in terms of
+// the loop accumCnt (e.g. "accumCnt % 1", "(accumCnt / 1) & 1", "NOT(accumCnt &
+// 1)", or a constant). This is how the mbarrier slot/phase relates to the loop
+// counter -- exactly the phase-model view the deadlock reasoning needs.
+static std::string describeAccumExpr(Value v, int depth = 0) {
+  if (!v)
+    return "?";
+  if (isAccumCnt(v))
+    return "accumCnt";
+  if (auto ba = dyn_cast<BlockArgument>(v))
+    return "%arg" + std::to_string(ba.getArgNumber());
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return "?";
+  if (auto c = dyn_cast<arith::ConstantOp>(def)) {
+    if (auto ia = dyn_cast<IntegerAttr>(c.getValue()))
+      return std::to_string(ia.getInt());
+    return "const";
+  }
+  if (depth > 8)
+    return "...";
+  auto A = [&](unsigned i) {
+    return describeAccumExpr(def->getOperand(i), depth + 1);
+  };
+  if (isa<arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp, arith::IndexCastOp>(
+          def))
+    return A(0);
+  if (isa<arith::RemUIOp>(def))
+    return "(" + A(0) + " % " + A(1) + ")";
+  if (isa<arith::DivUIOp>(def))
+    return "(" + A(0) + " / " + A(1) + ")";
+  if (isa<arith::AndIOp>(def))
+    return "(" + A(0) + " & " + A(1) + ")";
+  if (isa<arith::AddIOp>(def))
+    return "(" + A(0) + " + " + A(1) + ")";
+  if (isa<arith::SubIOp>(def))
+    return "(" + A(0) + " - " + A(1) + ")";
+  if (isa<arith::MulIOp>(def))
+    return "(" + A(0) + " * " + A(1) + ")";
+  if (auto x = dyn_cast<arith::XOrIOp>(def)) {
+    for (unsigned i = 0; i < 2; ++i)
+      if (auto cc = x.getOperand(i).getDefiningOp<arith::ConstantOp>())
+        if (auto ia = dyn_cast<IntegerAttr>(cc.getValue()))
+          if (ia.getInt() & 1)
+            return "NOT(" + A(1 - i) + ")";
+    return A(0) + " ^ " + A(1);
+  }
+  return def->getName().getStringRef().str();
+}
+
+// The slot-index operand of a barrier op's group-barrier operand: barriers are
+// referenced as `memdesc_index %alloc[%idx]`; return %idx (or null).
+static Value barrierSlotIndex(Operation *op,
+                              const DenseSet<Operation *> &group) {
+  for (Value o : op->getOperands()) {
+    Operation *ba = resolveBarrierAlloc(o);
+    if (ba && group.count(ba)) {
+      if (auto idx = o.getDefiningOp<triton::gpu::MemDescIndexOp>())
+        return idx->getOperand(1);
+      return Value();
+    }
+  }
+  return Value();
+}
+
 // A wait-side barrier endpoint (consumes a phase, does not produce one).
 static bool isWaitOp(Operation *op) {
   return isa<ttng::WaitBarrierOp, triton::nvws::ConsumerWaitOp,
@@ -190,6 +266,15 @@ struct BDGNode {
   // (pre-order walk position). Used by the cross-partition SCC (condition iii).
   int partition;
   unsigned walkIdx;
+  // Recovered slot index and (waits only) phase, as SSA values -- their form in
+  // terms of the loop accumCnt is rendered by describeAccumExpr(). slotIdx is
+  // the `memdesc_index %barAlloc[%idx]` index; phase is the wait's phase
+  // operand. firstExecParity is the phase parity polled on the first execution
+  // (0/1) or -1 if not statically determinable. These are the single source of
+  // truth for both the dump and the phase-model checks.
+  Value slotIdx;
+  Value phase;
+  int firstExecParity;
 };
 
 // Single async_task_id of an op, or -1 if absent/ambiguous.
@@ -265,6 +350,23 @@ public:
     llvm::errs() << "==== ops for reuse group buffer.id=" << bid << " in @"
                  << funcOp.getName() << " (" << groupBarriers.size()
                  << " guarding barriers) ====\n";
+
+    // Loop accumCnt(s): the WS accumulation counters that drive every barrier
+    // slot/phase. Show each loop's accumCnt iter-arg, its entry value, and its
+    // per-iteration update.
+    funcOp.walk([&](scf::ForOp forOp) {
+      for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
+        if (!isAccumCnt(arg))
+          continue;
+        Value init = forOp.getInitArgs()[i];
+        Value next = forOp.getBody()->getTerminator()->getOperand(i);
+        llvm::errs() << "  [accumCnt] loop@"
+                     << "for  init=" << describeAccumExpr(init)
+                     << "  next=" << describeAccumExpr(next)
+                     << "  (bufferIdx = accumCnt % numBuffers, phase = "
+                        "(accumCnt / numBuffers) & 1)\n";
+      }
+    });
     funcOp.walk([&](Operation *op) {
       std::string role;
       if (isa<triton::gpu::LocalAllocOp, ttng::TMEMAllocOp>(op))
@@ -312,7 +414,16 @@ public:
         }
       if (role.empty())
         return;
-      llvm::errs() << "  [" << role << "] task=" << getSingleTask(op) << "  ";
+      llvm::errs() << "  [" << role << "] task=" << getSingleTask(op);
+      // For barrier endpoints, show how the slot index and (for waits) the
+      // phase relate to the loop accumCnt.
+      if (isWaitOp(op) || isArriveOp(op)) {
+        if (Value slot = barrierSlotIndex(op, groupBarriers))
+          llvm::errs() << "  idx=" << describeAccumExpr(slot);
+        if (isa<ttng::WaitBarrierOp>(op) && op->getNumOperands() > 1)
+          llvm::errs() << "  phase=" << describeAccumExpr(op->getOperand(1));
+      }
+      llvm::errs() << "  ";
       op->print(llvm::errs(), flags);
       llvm::errs() << "\n";
     });
@@ -344,8 +455,18 @@ public:
           continue;
         std::optional<bool> bwd = isWSBarrierBackwardEndpoint(op);
         bool isForward = bwd.has_value() && !*bwd;
-        nodes.push_back(
-            {op, alloc, wait, isForward, getSingleTask(op), walk++});
+        // Recover slot index (from memdesc_index %alloc[%idx]) and, for waits,
+        // the phase operand + its first-execution polled parity.
+        Value slotIdx;
+        if (auto mi = operand.getDefiningOp<triton::gpu::MemDescIndexOp>())
+          slotIdx = mi->getOperand(1);
+        Value phase =
+            (wait && isa<ttng::WaitBarrierOp>(op) && op->getNumOperands() > 1)
+                ? op->getOperand(1)
+                : Value();
+        int firstExecParity = phase ? firstExecPolledParity(phase) : -1;
+        nodes.push_back({op, alloc, wait, isForward, getSingleTask(op), walk++,
+                         slotIdx, phase, firstExecParity});
         if (!wait)
           hasArrive[alloc] = true;
         else
@@ -433,8 +554,7 @@ public:
   static bool waitBlocksFirstExec(const BDGNode &w,
                                   const SmallVector<BDGNode> &nodes,
                                   DominanceInfo &dom) {
-    Value phase = w.op->getNumOperands() > 1 ? w.op->getOperand(1) : Value();
-    int polled = phase ? firstExecPolledParity(phase) : -1;
+    int polled = w.firstExecParity; // recovered at node-build time
     unsigned domArrives = 0;
     for (const BDGNode &a : nodes)
       if (!a.isWait && a.barrierAlloc == w.barrierAlloc &&
