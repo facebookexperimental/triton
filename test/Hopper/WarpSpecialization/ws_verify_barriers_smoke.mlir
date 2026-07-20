@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-verify-ws-barriers -verify-diagnostics
+// RUN: triton-opt %s --nvgpu-verify-ws-barriers="emit-coverage-table=true" -verify-diagnostics
 //
 // Phase-0 smoke test for the autoWS barrier verifier
 // (--nvgpu-verify-ws-barriers). Goal 1: the barrier -> reuse group mapping is

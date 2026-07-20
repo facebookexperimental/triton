@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-verify-ws-barriers 2>&1 1>/dev/null | FileCheck %s
+// RUN: triton-opt %s --nvgpu-verify-ws-barriers="emit-coverage-table=true" 2>&1 1>/dev/null | FileCheck %s
 //
 // autoWS barrier verifier fixture: HSTU self-attn forward, data_partition=2,
 // captured AFTER the pipeline expander (SoftwarePipeliner ExpandLoops) from an
