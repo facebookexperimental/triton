@@ -1,0 +1,122 @@
+name: Nightly fbtriton
+# Selects the newest commit on main whose four required checks are all green
+# (latest-verdict, SHA-keyed, trigger-agnostic), builds a shrunk wheel matrix,
+# and publishes it to the rolling 'nightly' GitHub Release behind a GitHub Pages
+# PEP 503 index. No PyPI, no PAT.
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      signal_repo:
+        description: "Read CI check-runs from this repo (blank = this repo). For fork testing, set to facebookexperimental/triton."
+        required: false
+        default: ""
+
+# Top-level defaults to read-all so the `build` job satisfies wheels_fb's own
+# `permissions: read-all` (a reusable workflow cannot request more than its caller).
+# Jobs that need writes narrow their scope explicitly below.
+permissions: read-all
+
+concurrency:
+  group: nightly-fbtriton
+  cancel-in-progress: false
+
+jobs:
+  select:
+    # Scheduled runs only fire on the upstream repo; manual dispatch works anywhere
+    # (e.g. a fork, for end-to-end testing).
+    if: github.event_name == 'workflow_dispatch' || github.repository_owner == 'facebookexperimental'
+    runs-on: ubuntu-latest
+    outputs:
+      sha:     ${{ steps.pick.outputs.sha }}
+      version: ${{ steps.pick.outputs.version }}   # derived here: <base>.dev<date>
+      status:  ${{ steps.pick.outputs.status }}    # 'ship' | 'noop' | 'nogreen'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Pick commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRITON_SIGNAL_REPO: ${{ inputs.signal_repo }}
+        run: python3 .github/scripts/nightly_run.py
+
+  build:
+    needs: select
+    if: needs.select.outputs.status == 'ship'
+    uses: ./.github/workflows/wheels_fb.yml
+    with:
+      ref:     ${{ needs.select.outputs.sha }}
+      version: ${{ needs.select.outputs.version }}
+      pythons: '["cp312","cp313"]'
+      arches:  '["x86_64","aarch64"]'
+
+  publish:
+    needs: [select, build]
+    # Per-repo Releases/Pages: a fork publishes only to its own. The select
+    # guard already blocks forks on schedule, so this fires on upstream schedule
+    # or on a deliberate dispatch (incl. a fork building its own nightly).
+    if: needs.select.outputs.status == 'ship'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create/update the rolling Release + assets
+      pages: write
+      id-token: write
+      actions: read      # download-artifact
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - name: Ensure rolling 'nightly' release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view nightly || gh release create nightly --title "fbtriton nightly" --notes "Rolling nightly wheels." --latest=false
+      - name: Upload wheels + latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload nightly dist/*.whl --clobber
+          printf '{"commit":"%s","version":"%s"}\n' \
+            "${{ needs.select.outputs.sha }}" "${{ needs.select.outputs.version }}" > latest.json
+          gh release upload nightly latest.json --clobber
+      - name: Prune assets older than retention window
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly_prune.py 30
+      - name: Generate simple index from current assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly_build_index.py public/nightly/simple
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  report-nogreen:
+    needs: select
+    if: needs.select.outputs.status == 'nogreen'
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: "Nightly fbtriton: no green commit in the last 100 commits"
+      normalized_failure_id: "nightly-fbtriton-nogreen"
+      workflow_name: "Nightly fbtriton"
+      job_name: "select"
+      run_url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      ref: "refs/heads/main"
+      sha: "${{ github.sha }}"
+      event_name: "schedule"
+      run_attempt: "${{ github.run_attempt }}"
+      summary: "No commit in the walked window had all four required checks green as of the cut."
