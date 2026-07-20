@@ -14,6 +14,12 @@ namespace mlir {
 
 typedef int AsyncTaskId;
 
+// Attribute name carrying an op's async task (partition) id list. This is the
+// single home for the name; see `removeWarpSpecMetadata`
+// (CodePartitionUtility.h) for the full set of WS-metadata attributes stripped
+// on a graceful reject.
+constexpr static char kAsyncTaskIdAttrName[] = "async_task_id";
+
 // Retrieves the async task ids of the given operation.
 SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op);
 

@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1 post-channel-creation=1" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s
 //
 // Regression for T278685041: a two-MMA chained accumulator sharing one operand-D
 // TMEM tile. The HSTU reduce_dq compute fold coalesces the dv and dk_attn dots

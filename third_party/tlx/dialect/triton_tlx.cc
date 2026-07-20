@@ -254,6 +254,35 @@ void init_triton_tlx_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, order, shape, CTALayout));
            })
+      .def("make_padded_shared_encoding_attr_with_bases",
+           [](TritonOpBuilder &self, std::vector<unsigned> intervals,
+              std::vector<unsigned> paddings,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases, int rank) {
+             // Build #ttg.padded_shared from explicit linear bases ({offset,
+             // block}), so a caller can pin a swizzled layout, not just identity.
+             if (intervals.size() != paddings.size())
+               throw std::runtime_error(
+                   "make_padded_shared_encoding_attr_with_bases: intervals and "
+                   "paddings must have the same length");
+             auto context = self.getBuilder().getContext();
+             llvm::SmallVector<std::pair<unsigned, unsigned>> intervalPads;
+             intervalPads.reserve(intervals.size());
+             for (auto [i, p] : llvm::zip(intervals, paddings))
+               intervalPads.emplace_back(i, p);
+             auto kOffset = mlir::StringAttr::get(context, "offset");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             tt::LinearLayout::BasesT bases;
+             bases[kOffset] = offsetBases;
+             bases[kBlock] = blockBases;
+             llvm::SmallVector<mlir::StringAttr> outDimNames;
+             for (int i = 0; i < rank; ++i)
+               outDimNames.push_back(
+                   mlir::StringAttr::get(context, "dim" + llvm::Twine(i)));
+             tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
+             return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
+                 context, intervalPads, std::move(ll)));
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
@@ -530,15 +559,17 @@ void init_triton_tlx_ir(py::module &&m) {
              std::optional<Value> asyncToken, bool userLayout) -> mlir::Value {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
 
-            // layoutEncoding must be TMEM compatible. For the user-pinned case,
-            // wrap with #tlx.user_layout so generic layout passes treat it as a
-            // hard anchor (same mechanism as the SMEM local_load path), keeping
-            // the inner no-verify wrapper for inlining. resolve-placeholder-
-            // layouts strips the nested no-verify (keeping the user-layout
-            // marker) once inlining is done.
+            // layoutEncoding already carries an inner no_verify (from
+            // make_linear_encoding_attr). Strip it, wrap with #tlx.user_layout
+            // (the hard anchor), then a single outer #tlx.no_verify_layout, so
+            // the encoding is exactly no_verify<user_layout<L>> -- no-verify
+            // outermost (deferred for verifiers keyed off the top-level attr,
+            // e.g. TritonGPU verifyTensorLayout), user-layout inside.
+            // resolve-placeholder-layouts strips the no-verify (keeping the
+            // user-layout marker) once inlining is done and num-warps is set.
             Attribute tensorEncoding =
-                userLayout ? tlx::wrapUserLayout(
-                                 tlx::wrapNoVerifyLayout(layoutEncoding))
+                userLayout ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(
+                                 tlx::unwrapNoVerifyLayout(layoutEncoding)))
                            : tlx::wrapNoVerifyLayout(layoutEncoding);
             auto newType = RankedTensorType::get(subViewType.getShape(),
                                                  subViewType.getElementType(),

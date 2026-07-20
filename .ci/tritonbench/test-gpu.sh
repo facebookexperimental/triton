@@ -20,6 +20,10 @@ fi
 python -c "import torch; print('torch version: ', torch.__version__); print('torch location: ', torch.__file__)"
 python -c "import triton; print('triton version: ', triton.__version__); print('triton location: ', triton.__file__)"
 
+# The pinned OSS PyTorch nightly does not yet include the torchTLX Inductor
+# config and template hook required by the MI350 TritonBench backend.
+python scripts/_torchtlx_torch_shim.py
+
 # workaround: disable inductor subprocess compilation to avoid
 # "Could not find an active GPU backend" in subprocess workers
 export TORCHINDUCTOR_COMPILE_THREADS=1

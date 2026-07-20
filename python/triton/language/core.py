@@ -7,7 +7,7 @@ from enum import Enum
 from functools import partial, wraps, cached_property
 import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple, TYPE_CHECKING
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import builtins
 from .. import knobs
 from ..runtime.jit import JITCallable
@@ -3870,7 +3870,48 @@ class static_range(base_value):
         raise RuntimeError("static_range can only be used in @triton.jit'd functions")
 
 
-class range(base_value):
+def _loop_attr(ir_name, kind):
+    """Metadata tag for an AutoWS loop option: the IR attribute name it lowers to
+    and the emission ``kind`` (see ``_apply_loop_options`` in the code generator).
+    ``kind`` is one of ``"int32"``, ``"unit"``, ``"bool"``, ``"bool_opt"``, ``"licm"``.
+    """
+    return {"loop_attr": (ir_name, kind)}
+
+
+@dataclass(eq=False, kw_only=True)
+class AutoWSLoopOptions(base_value):
+    """Compiler loop annotations shared by ``tl.range`` (``for`` loops) and
+    ``tl.condition`` (``while`` loops).
+
+    These are the single source of truth for the AutoWS / pipelining knobs: both
+    loop front-ends inherit this dataclass, so they stay in lockstep (adding an
+    option is one new field), and the code generator emits them identically onto
+    ``scf.for`` and ``scf.while``. See ``tl.range`` for the per-option docs.
+    """
+    num_stages: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.num_stages", "int32"))
+    loop_unroll_factor: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.loop_unroll_factor", "int32"))
+    disallow_acc_multi_buffer: bool = field(default=False, metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
+    flatten: bool = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
+    warp_specialize: bool = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
+    multi_cta: bool = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
+    disable_licm: bool = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
+    data_partition_factor: Optional[constexpr] = field(default=None,
+                                                       metadata=_loop_attr("tt.data_partition_factor", "int32"))
+    list_schedule_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.list_schedule_pick", "int32"))
+    mem_plan_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.mem_plan_pick", "int32"))
+    merge_epilogue: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue", "bool"))
+    merge_epilogue_to_computation: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation",
+                                                                                   "bool"))
+    merge_correction: bool = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
+    separate_epilogue_store: bool = field(default=False, metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
+    tmem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
+    smem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
+    smem_budget: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
+    smem_circular_reuse: Optional[bool] = field(default=None, metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
+
+
+@dataclass(eq=False)
+class range(AutoWSLoopOptions):
     """
     Iterator that counts upward forever.
 
@@ -3919,65 +3960,31 @@ class range(base_value):
         (``TRITON_USE_LIST_SCHEDULE=1``), select which ranked schedule variant
         (0 = best) to apply to this loop. May be a ``tl.constexpr`` so it becomes
         part of the compilation key and can be swept by ``@triton.autotune``.
+    :param mem_plan_pick: Rank into the WS memory planner's top-K allocation
+        plans (0 = cost-best) to apply to this loop, gated by
+        ``TRITON_WS_MEM_PLAN_TOPK``. May be a ``tl.constexpr`` so it becomes part
+        of the compilation key and can be swept by ``@triton.autotune``.
 
         Note that warp specialization is only supported on Blackwell GPUs and
         only works on simple matmul loops. Support for arbitrary loops will be
         expanded over time.
     """
 
-    def __init__(
-        self,
-        arg1,
-        arg2=None,
-        step=None,
-        num_stages=None,
-        loop_unroll_factor=None,
-        disallow_acc_multi_buffer=False,
-        flatten=False,
-        warp_specialize=False,
-        multi_cta=False,
-        disable_licm=False,
-        data_partition_factor=None,
-        list_schedule_pick=None,
-        merge_epilogue=False,
-        merge_epilogue_to_computation=False,
-        merge_correction=False,
-        separate_epilogue_store=False,
-        tmem_alloc_algo=None,
-        smem_alloc_algo=None,
-        smem_budget=None,
-        smem_circular_reuse=None,
-    ):
-        if step is None:
+    # Loop bounds are the iterator's own (positional) fields; the AutoWS options
+    # are inherited (keyword-only) from AutoWSLoopOptions.
+    arg1: typing.Any
+    arg2: typing.Any = None
+    step: typing.Any = None
+
+    def __post_init__(self):
+        if self.step is None:
             self.step = constexpr(1)
-        else:
-            self.step = step
-        if arg2 is None:
+        if self.arg2 is None:
             self.start = constexpr(0)
-            self.end = arg1
+            self.end = self.arg1
         else:
-            self.start = arg1
-            self.end = arg2
-        self.num_stages = num_stages
-        self.loop_unroll_factor = loop_unroll_factor
-        self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
-        self.data_partition_factor = data_partition_factor
-        # Rank of the list-schedule variant to apply to THIS loop (0 = best).
-        # May be a tl.constexpr so it participates in the compile key and can be
-        # swept by @triton.autotune. Consumed by nvgpu-list-schedule.
-        self.list_schedule_pick = list_schedule_pick
-        self.merge_epilogue = merge_epilogue
-        self.merge_epilogue_to_computation = merge_epilogue_to_computation
-        self.merge_correction = merge_correction
-        self.separate_epilogue_store = separate_epilogue_store
-        self.tmem_alloc_algo = tmem_alloc_algo
-        self.smem_alloc_algo = smem_alloc_algo
-        self.smem_budget = smem_budget
-        self.smem_circular_reuse = smem_circular_reuse
-        self.flatten = flatten
-        self.warp_specialize = warp_specialize
-        self.multi_cta = multi_cta
-        self.disable_licm = disable_licm
+            self.start = self.arg1
+            self.end = self.arg2
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")
@@ -3986,27 +3993,28 @@ class range(base_value):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")
 
 
-class condition(base_value):
+@dataclass(eq=False)
+class condition(AutoWSLoopOptions):
     """
-    While loop condition wrapper.
+    While loop condition wrapper -- the ``while``-loop analogue of ``tl.range``.
 
     .. highlight:: python
     .. code-block:: python
 
         @triton.jit
         def kernel(...):
-            while tl.condition(c, disable_licm)
+            while tl.condition(c, warp_specialize=True, num_stages=3):
                 ...
-    :note: This is a special wrapper used to annotate while loops in the context of
-        :code:`triton.jit` functions. It allows user to pass extra attributes to the compiler.
-    :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
-        code outside the loop. This is often useful to avoid creating long liveranges
-        within a loop.
-    """
 
-    def __init__(self, arg1, disable_licm=False):
-        self.condition = arg1
-        self.disable_licm = disable_licm
+    :note: This is a special wrapper used to annotate while loops in the context of
+        :code:`triton.jit` functions. It accepts the same keyword-only AutoWS /
+        pipelining options as :code:`tl.range` (see there for the per-option docs);
+        they are attached to the generated :code:`scf.while` and, when the loop is
+        countable, carried onto the :code:`scf.for` it is uplifted to.
+    """
+    # The while condition value is the wrapper's own (positional) field; the
+    # AutoWS options are inherited (keyword-only) from AutoWSLoopOptions.
+    condition: typing.Any
 
 
 # -----------------------

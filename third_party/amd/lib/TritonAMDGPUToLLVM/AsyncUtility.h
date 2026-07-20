@@ -46,6 +46,16 @@ unsigned
 fitToValidDirectToLdsVecSize(unsigned maxVecSize, unsigned elemBitwidth,
                              const triton::AMD::TargetInfo &targetInfo);
 
+// Given a `padded_shared` layout's linear component (`sharedOffsetLayout`),
+// derive the register-tensor layout whose direct-to-LDS write into it is
+// coalesced: each lane writes `loadContig` consecutive LDS elements. Fails if
+// the shape is too small or that contiguity is unreachable. Shared by the
+// async-copy coalescer and buffer_load_to_local offset-layout inference.
+FailureOr<triton::LinearLayout> deduceRegLayoutFromPaddedShared(
+    const triton::LinearLayout &sharedOffsetLayout, unsigned loadContig,
+    unsigned threadsPerWarp, unsigned numWarps, ArrayRef<int64_t> shape,
+    triton::gpu::CGAEncodingAttr cgaLayout, MLIRContext *ctx);
+
 } // namespace mlir::triton::AMD
 
 #endif

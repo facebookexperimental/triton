@@ -59,7 +59,22 @@ LogicalResult delegateInferredLayout(
   Attribute unwrappedResultLayout;
   if (failed(infer(delegate, unwrappedSrcLayout, unwrappedResultLayout)))
     return failure();
-  resultLayout = wrapNoVerifyLayout(unwrappedResultLayout);
+  // Re-apply only the TLX wrappers the source actually had (user_layout inside,
+  // no_verify outside), so re-inference after resolve-placeholder-layouts --
+  // which strips no_verify from operands -- stays consistent with the op's
+  // stored result type instead of unconditionally re-adding no_verify.
+  Attribute afterNoVerify = unwrapNoVerifyLayout(srcLayout);
+  bool hadUserLayout = unwrapUserLayout(afterNoVerify) != afterNoVerify;
+  // no_verify may be the top wrapper (TMEM pin: no_verify<user_layout<L>>) or
+  // nested under user_layout (SMEM pin: user_layout<no_verify<L>>); check both
+  // so the deferred placeholder is not silently downgraded to a plain anchor.
+  bool hadNoVerify = hasNoVerifyLayout(srcLayout) ||
+                     hasNoVerifyLayout(unwrapUserLayout(srcLayout));
+  if (hadUserLayout)
+    unwrappedResultLayout = wrapUserLayout(unwrappedResultLayout);
+  if (hadNoVerify)
+    unwrappedResultLayout = wrapNoVerifyLayout(unwrappedResultLayout);
+  resultLayout = unwrappedResultLayout;
   return success();
 }
 
@@ -78,35 +93,70 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
-  // reduce/expand_dims produce or consume a `slice` encoding whose parent is
-  // the full-tensor encoding. Keep any TLX wrapper on the slice's *parent*
-  // (matching ReduceOp/ExpandDimsOp's own result inference) rather than
-  // wrapping the whole slice, which would produce `no_verify<slice<parent=L>>`
-  // where the IR has `slice<parent=no_verify<L>>` and fail the op verifier. So
-  // we locate the concrete dialect from the unwrapped encoding but delegate
-  // with the *wrapped* operand and do not re-wrap the result.
+  // reduce/expand_dims produce or consume a `slice` encoding whose parent is the
+  // full-tensor encoding. The TLX wrapper must stay on the slice's *parent*
+  // (standard inference: slice<parent=user_layout<L>>) so the result is
+  // structurally stable across resolve-placeholder-layouts (which strips
+  // no_verify) and matches the op's own inference on both sides.
+  //
+  // When the operand carries the deferred no_verify pin, additionally keep
+  // no_verify as the *outermost* wrapper of the result (peel only the outer
+  // no_verify, run the standard inference on the user_layout<L> anchor, then
+  // re-wrap): a build-time reduce_op.verify() runs before ttg.num-warps is set,
+  // and a top-level no_verify makes it skip verifyTensorLayout. After resolve
+  // strips no_verify from both operand and result, re-inference falls into the
+  // plain branch and produces the same slice<parent=...> -- so they stay
+  // consistent.
+  template <typename InferFn>
+  LogicalResult inferSliceLike(Attribute operandEncoding,
+                               Attribute &resultEncoding, InferFn infer) const {
+    // Strip #tlx.no_verify_layout at *every* nesting level (top, under a
+    // user_layout wrapper, or inside a ttg encoding's parent), keeping
+    // user_layout / concrete encodings intact. This yields the "anchor" the
+    // standard inference runs on (so user_layout stays on the slice's parent),
+    // and tells us whether the operand carried the deferred pin at all.
+    mlir::AttrTypeReplacer stripper;
+    stripper.addReplacement(
+        [](NoVerifyLayoutAttr w) -> Attribute { return w.getLayout(); });
+    Attribute anchor = stripper.replace(operandEncoding);
+    bool deferred = anchor != operandEncoding;
+    const triton::DialectInferLayoutInterface *delegate =
+        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(anchor));
+    if (!delegate)
+      return failure();
+    Attribute result;
+    if (failed(infer(delegate, anchor, result)))
+      return failure();
+    // Re-wrap no_verify as the outermost wrapper so a build-time verify (before
+    // ttg.num-warps is set) skips verifyTensorLayout. After resolve strips
+    // no_verify from operand and result alike, re-inference takes the plain
+    // branch and produces the same slice<parent=...>, so they stay consistent.
+    resultEncoding = deferred ? wrapNoVerifyLayout(result) : result;
+    return success();
+  }
+
   LogicalResult
   inferReduceOpEncoding(Attribute operandEncoding, unsigned axis,
                         Attribute &resultEncoding,
                         std::optional<Location> loc) const override {
-    const triton::DialectInferLayoutInterface *delegate =
-        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(operandEncoding));
-    if (!delegate)
-      return failure();
-    return delegate->inferReduceOpEncoding(operandEncoding, axis,
-                                           resultEncoding, loc);
+    return inferSliceLike(
+        operandEncoding, resultEncoding,
+        [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
+            Attribute &result) {
+          return delegate->inferReduceOpEncoding(enc, axis, result, loc);
+        });
   }
 
   LogicalResult
   inferExpandDimsOpEncoding(Attribute operandEncoding, unsigned axis,
                             Attribute &resultEncoding,
                             std::optional<Location> loc) const override {
-    const triton::DialectInferLayoutInterface *delegate =
-        getInferLayoutInterfaceFor(unwrapTlxLayoutWrappers(operandEncoding));
-    if (!delegate)
-      return failure();
-    return delegate->inferExpandDimsOpEncoding(operandEncoding, axis,
-                                               resultEncoding, loc);
+    return inferSliceLike(
+        operandEncoding, resultEncoding,
+        [&](const triton::DialectInferLayoutInterface *delegate, Attribute enc,
+            Attribute &result) {
+          return delegate->inferExpandDimsOpEncoding(enc, axis, result, loc);
+        });
   }
 
   LogicalResult inferDotOpEncoding(Attribute operandEncoding, unsigned opIdx,
@@ -272,7 +322,14 @@ Attribute mlir::triton::tlx::unwrapNoVerifyLayout(Attribute layout) {
 }
 
 bool mlir::triton::tlx::hasNoVerifyLayout(Attribute layout) {
-  return isa_and_nonnull<NoVerifyLayoutAttr>(layout);
+  if (!layout)
+    return false;
+  if (isa<NoVerifyLayoutAttr>(layout))
+    return true;
+  bool found = false;
+  layout.walkImmediateSubElements(
+      [&](Attribute sub) { found |= hasNoVerifyLayout(sub); }, [](Type) {});
+  return found;
 }
 
 //-- UserLayoutAttr --
@@ -380,6 +437,25 @@ void mlir::triton::tlx::setClusterSyncKernelCleanupOnMod(Operation *op,
   assert(module != nullptr && "expecting op nested in a module for setting "
                               "cluster sync kernel cleanup marker");
   module->setAttr(AttrClusterSyncKernelCleanupName,
+                  BoolAttr::get(module->getContext(), value));
+}
+
+bool mlir::triton::tlx::hasUserPostWsSync(Operation *op) {
+  assert(op != nullptr &&
+         "expecting nonnull op for checking user post-WS sync");
+  auto module = getModuleOp(op);
+  assert(module != nullptr && "expecting op nested in a module for checking "
+                              "user post-WS sync marker");
+  auto attr = module->getAttrOfType<BoolAttr>(AttrUserPostWsSyncName);
+  return attr != nullptr && attr.getValue();
+}
+
+void mlir::triton::tlx::setUserPostWsSyncOnMod(Operation *op, bool value) {
+  assert(op != nullptr && "expecting nonnull op for setting user post-WS sync");
+  auto module = getModuleOp(op);
+  assert(module != nullptr && "expecting op nested in a module for setting "
+                              "user post-WS sync marker");
+  module->setAttr(AttrUserPostWsSyncName,
                   BoolAttr::get(module->getContext(), value));
 }
 

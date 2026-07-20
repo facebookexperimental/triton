@@ -74,6 +74,9 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
     Option<"smemCircularReuse", "smem-circular-reuse",
            "bool", /*default*/"false",
            "Enable circular buffer reuse for SMEM allocation">,
+    Option<"smemPlanSearch", "smem-plan-search",
+           "bool", /*default*/"false",
+           "Allocate SMEM via the plan-space beam search (default off)">,
     Option<"readDecisionFile", "read-decision-file",
            "std::string", /*default*/"\"\"",
            "path to JSON file containing buffer decisions to apply">,
@@ -132,10 +135,7 @@ def NVGPUTestWSCodePartition: Pass<"nvgpu-test-ws-code-partition", "mlir::Module
            "number of warp groups for warp specialization">,
     Option<"requestedRegisters", "requested-registers",
            "int32_t", /*default*/"232",
-           "number of register requested for computation group">,
-    Option<"postChannelCreation", "post-channel-creation",
-           "int32_t", /*default*/"0",
-           "running post channel creation">
+           "number of register requested for computation group">
   ];
 }
 

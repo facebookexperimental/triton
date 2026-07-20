@@ -444,11 +444,13 @@ private:
         minId = 0;
         maxId = operationId.size();
       }
-      // For barriers used in warp specialization (InitBarrierOp), extend
-      // liveness to the entire function. Barriers are initialized at the
-      // start and may be used across multiple sequential warp-specialized
-      // loops. Without this, two barriers in different loops could get the
-      // same allocation offset, causing corruption when both are initialized.
+      // For barriers, extend liveness to the entire function. By default,
+      // SMEM based mbarriers (on NV GPU) need to be invalidated before reusing.
+      // If bar inval op is not explicitly inserted, it should be assumed that
+      // the bar is alive until kernel end. Without this lifetime extension, a
+      // later bar could think an earlier bar was dead since the last explicit
+      // reference to it and reuse the buffer, causing corruption when
+      // performing bar init again on this mem location.
       if (hasOpOfAnyTypeInForwardSlice<ttng::InitBarrierOp>(defOp)) {
         minId = 0;
         maxId = operationId.size();

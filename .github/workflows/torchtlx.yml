@@ -38,9 +38,13 @@ jobs:
       - name: Install nightly PyTorch
         run: |
           . "${SETUP_SCRIPT}"
-          # Install nightly torch first: it pulls its own pytorch-triton, which
-          # the fork Triton install below overrides.
-          uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+          # torchTLX plugs into the newest Inductor internals (config.triton.tlx_mode,
+          # template/fusion hooks), so force the freshest floating nightly wheel:
+          # drop any pre-provisioned torch first, then install the latest --pre
+          # nightly (--upgrade defeats a cached-version match). It pulls its own
+          # pytorch-triton, which the fork Triton install below overrides.
+          uv pip uninstall torch pytorch-triton || true
+          uv pip install --pre --upgrade torch --index-url https://download.pytorch.org/whl/nightly/cu128
       - name: Compile Triton
         run: |
           . "${SETUP_SCRIPT}"
@@ -99,9 +103,12 @@ jobs:
         working-directory: tritonbench
         run: |
           set -eux
+          # torchTLX needs the newest Inductor internals (config.triton.tlx_mode,
+          # template/fusion hooks), so it must run against the freshest torch.
           # Omitting --install-torch-wheel makes setup-env.sh fall back to
-          # --install-torch-nightly (latest rocm nightly torch, floating);
-          # --custom-triton installs the fork Triton on top.
+          # --install-torch-nightly (latest rocm nightly torch, floating) rather
+          # than the pinned wheel the other mi350 jobs use; --custom-triton then
+          # installs the fork Triton on top.
           bash ./.ci/tritonbench/setup-env.sh --hip --custom-triton "${GITHUB_WORKSPACE}"
       - name: Run TorchTLX template + fusion tests
         id: run_torchtlx_tests
