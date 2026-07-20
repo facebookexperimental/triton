@@ -127,6 +127,8 @@ def _verify_ops(target_program, fact_program, source_program):
         _verify_provenance_only_target_ids(op, value_count)
         if op.kind in {"buffer_load_to_local", "buffer_load", "buffer_store"}:
             _verify_memory_edges(op, target_program)
+        if op.kind in target_ir.MEMORY_ISSUER_OP_KINDS:
+            _verify_memory_issue_order(op, target_program)
         if op.kind in {
             "token",
             "token_join",
@@ -195,6 +197,192 @@ def _verify_ops(target_program, fact_program, source_program):
     _verify_region_op_ids(target_program, op_count)
 
 
+def _verify_memory_issue_order(op, target_program):
+    attrs = _attrs_dict(op)
+    dependency_count = int(
+        attrs.get("barrier_order_dependency_count", 0)
+    )
+    if dependency_count not in {0, 1} or dependency_count > len(op.operands):
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_SEGMENT",
+            STAGE,
+            "memory operation has a malformed barrier-order operand segment",
+            target_op_id=op.target_op_id,
+        )
+    barrier_issue_operands = tuple(
+        int(operand) for operand in op.operands[-dependency_count:]
+    ) if dependency_count else ()
+    for operand in barrier_issue_operands:
+        value = target_program.values[operand]
+        if (
+            value.type.representation != "token"
+            or value.event_domain != target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+        ):
+            fail(
+                "TLXW_VERIFY_BARRIER_ORDER_DOMAIN",
+                STAGE,
+                "memory barrier-order dependency must be a completion-free "
+                "full-barrier issue token",
+                target_op_id=op.target_op_id,
+                target_value_id=operand,
+            )
+        producer = _target_value_producer(target_program, operand)
+        _require_precedes_in_same_region(target_program, producer, op)
+
+    ordinary_operands = (
+        op.operands[:-dependency_count]
+        if dependency_count else op.operands
+    )
+    hidden_barrier_operands = tuple(
+        int(operand)
+        for operand in ordinary_operands
+        if target_program.values[int(operand)].event_domain
+        == target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+    )
+    if hidden_barrier_operands:
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_SEGMENT",
+            STAGE,
+            "full-barrier issue tokens must use the dedicated final operand segment",
+            target_op_id=op.target_op_id,
+            target_value_id=hidden_barrier_operands[0],
+        )
+
+    result_count = int(attrs.get("issue_order_result_count", 0))
+    if result_count not in {0, 1} or result_count > len(op.results):
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_RESULT",
+            STAGE,
+            "memory operation has a malformed issue-order result segment",
+            target_op_id=op.target_op_id,
+        )
+    if op.kind == "buffer_load_to_local" and result_count:
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_RESULT",
+            STAGE,
+            "direct DMA must reuse its explicit completion token for issue projection",
+            target_op_id=op.target_op_id,
+        )
+    if not result_count:
+        return
+    result_id = int(op.results[-1])
+    result = target_program.values[result_id]
+    if (
+        result.type.representation != "token"
+        or result.event_domain != target_ir.EVENT_DOMAIN_MEMORY_COMPLETION
+    ):
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_RESULT",
+            STAGE,
+            "synthetic memory issue-order result must carry raw memory completion",
+            target_op_id=op.target_op_id,
+            target_value_id=result_id,
+        )
+    if op.kind in {"local_load", "local_load_mma_payload", "local_store"}:
+        completion_count = int(attrs.get("completion_result_count", 0))
+        if completion_count < result_count:
+            fail(
+                "TLXW_VERIFY_BARRIER_ORDER_RESULT",
+                STAGE,
+                "local issue-order result must belong to the completion segment",
+                target_op_id=op.target_op_id,
+            )
+
+
+def _verify_issue_projection_structure(op, target_program, projection_domain):
+    if projection_domain == target_ir.EVENT_DOMAIN_DMA_ISSUE:
+        return
+    if projection_domain == target_ir.EVENT_DOMAIN_MEMORY_ISSUE:
+        for operand in op.operands:
+            producer = _target_value_producer(target_program, operand)
+            if producer.kind not in target_ir.MEMORY_ISSUER_OP_KINDS:
+                fail(
+                    "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
+                    STAGE,
+                    "pre-barrier issue projection must come from memory issuers",
+                    target_op_id=op.target_op_id,
+                    target_value_id=int(operand),
+                )
+            _require_precedes_in_same_region(target_program, producer, op)
+        return
+    if projection_domain == target_ir.EVENT_DOMAIN_BARRIER_ISSUE:
+        if len(op.operands) != 1:
+            fail(
+                "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
+                STAGE,
+                "post-barrier issue projection requires one full-barrier result",
+                target_op_id=op.target_op_id,
+            )
+        producer = _target_value_producer(target_program, op.operands[0])
+        attrs = _attrs_dict(producer)
+        if (
+            producer.kind != "barrier"
+            or int(attrs.get("address_space", 0)) != 31
+        ):
+            fail(
+                "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
+                STAGE,
+                "post-barrier issue projection must come from an explicit "
+                "full-memory barrier",
+                target_op_id=op.target_op_id,
+                target_value_id=int(op.operands[0]),
+            )
+        _require_precedes_in_same_region(target_program, producer, op)
+
+
+def _target_value_producer(target_program, target_value_id):
+    producers = tuple(
+        op for op in target_program.ops
+        if int(target_value_id) in op.results
+    )
+    if len(producers) != 1:
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
+            STAGE,
+            "barrier-order token must have exactly one target producer",
+            target_value_id=int(target_value_id),
+        )
+    return producers[0]
+
+
+def _require_precedes_in_same_region(target_program, producer, consumer):
+    producer_position = _target_op_region_position(
+        target_program,
+        producer.target_op_id,
+    )
+    consumer_position = _target_op_region_position(
+        target_program,
+        consumer.target_op_id,
+    )
+    if (
+        producer_position[0] != consumer_position[0]
+        or producer_position[1] >= consumer_position[1]
+    ):
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
+            STAGE,
+            "barrier-order dependency must be produced earlier in the same region",
+            target_op_id=consumer.target_op_id,
+        )
+
+
+def _target_op_region_position(target_program, target_op_id):
+    positions = tuple(
+        (int(region.target_region_id), position)
+        for region in target_program.regions
+        for position, op_id in enumerate(region.op_ids)
+        if int(op_id) == int(target_op_id)
+    )
+    if len(positions) != 1:
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
+            STAGE,
+            "barrier-order operation must belong to exactly one target region",
+            target_op_id=int(target_op_id),
+        )
+    return positions[0]
+
+
 def _verify_async_protocol_op(op, target_program, source_program=None):
     attrs = _attrs_dict(op)
 
@@ -254,14 +442,21 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         expected = {target_ir.EVENT_DOMAIN_LDS_FRONTIER}
         if op.kind == "issue_token":
             projection_domain = attrs.get("projection_domain")
-            if projection_domain != target_ir.EVENT_DOMAIN_DMA_ISSUE:
+            expected_provenance = {
+                target_ir.EVENT_DOMAIN_DMA_ISSUE:
+                "partial_wait_retained_group",
+                target_ir.EVENT_DOMAIN_MEMORY_ISSUE:
+                "full_barrier_predecessors",
+                target_ir.EVENT_DOMAIN_BARRIER_ISSUE:
+                "full_barrier_successors",
+            }.get(projection_domain)
+            if expected_provenance is None:
                 fail(
                     "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN",
                     STAGE,
-                    "issue token requires an explicit DMA-issue projection domain",
+                    "issue token requires an explicit supported projection domain",
                     target_op_id=op.target_op_id,
                 )
-            expected_provenance = "partial_wait_retained_group"
             if attrs.get("projection_provenance") != expected_provenance:
                 fail(
                     "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
@@ -272,17 +467,32 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 )
             expected = {projection_domain}
             allowed_input_domains = {
-                target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-                target_ir.EVENT_DOMAIN_DMA_GROUP,
-                target_ir.EVENT_DOMAIN_EMPTY,
-                None,
-            }
+                target_ir.EVENT_DOMAIN_DMA_ISSUE: {
+                    target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+                    target_ir.EVENT_DOMAIN_DMA_GROUP,
+                    target_ir.EVENT_DOMAIN_EMPTY,
+                    None,
+                },
+                target_ir.EVENT_DOMAIN_MEMORY_ISSUE: {
+                    target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+                    target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+                    target_ir.EVENT_DOMAIN_LDS_COMPLETION,
+                },
+                target_ir.EVENT_DOMAIN_BARRIER_ISSUE: {
+                    target_ir.EVENT_DOMAIN_FULL_BARRIER,
+                },
+            }[projection_domain]
             for operand in op.operands:
                 require_token(
                     operand,
                     f"{projection_domain} projection operand",
                     allowed_input_domains,
                 )
+            _verify_issue_projection_structure(
+                op,
+                target_program,
+                projection_domain,
+            )
         else:
             result_domain = attrs.get("event_domain")
             if result_domain != target_ir.EVENT_DOMAIN_LDS_FRONTIER:
@@ -300,6 +510,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                         target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                         target_ir.EVENT_DOMAIN_LDS_FRONTIER,
                         target_ir.EVENT_DOMAIN_LDS_RELEASED,
+                        target_ir.EVENT_DOMAIN_FULL_BARRIER,
                         target_ir.EVENT_DOMAIN_EMPTY,
                     },
                 )
@@ -308,30 +519,46 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
 
     if op.kind == "barrier":
         dependency_count = int(attrs.get("dependency_count", -1))
-        if dependency_count != len(op.operands):
+        issue_dependency_count = int(
+            attrs.get("barrier_order_dependency_count", 0)
+        )
+        if (
+            dependency_count < 0
+            or issue_dependency_count not in {0, 1}
+            or dependency_count + issue_dependency_count != len(op.operands)
+        ):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
                 STAGE,
                 "barrier dependency count does not match its operands",
                 target_op_id=op.target_op_id,
             )
-        if not op.operands:
-            if op.results:
+        completion_operands = op.operands[:dependency_count]
+        issue_operands = op.operands[dependency_count:]
+        is_full_memory = int(attrs.get("address_space", 0)) == 31
+        if len(op.results) > 1:
+            fail(
+                "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
+                STAGE,
+                "barrier may publish at most one token result",
+                target_op_id=op.target_op_id,
+            )
+        if not completion_operands:
+            if op.results and not is_full_memory:
                 fail(
                     "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
                     STAGE,
                     "dependency-free barrier must not publish an LDS result",
                     target_op_id=op.target_op_id,
                 )
-            return
-        if len(op.results) != 1:
+        elif not op.results:
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
                 STAGE,
                 "LDS-dependent barrier requires one publication result",
                 target_op_id=op.target_op_id,
             )
-        for operand in op.operands:
+        for operand in completion_operands:
             require_token(
                 operand,
                 "barrier LDS dependency",
@@ -339,14 +566,32 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                     target_ir.EVENT_DOMAIN_LDS_FRONTIER,
                     target_ir.EVENT_DOMAIN_LDS_RELEASED,
+                    target_ir.EVENT_DOMAIN_FULL_BARRIER,
                     target_ir.EVENT_DOMAIN_EMPTY,
                 },
             )
-        require_token(
-            op.results[0],
-            "barrier LDS publication result",
-            {target_ir.EVENT_DOMAIN_LDS_RELEASED},
-        )
+        for operand in issue_operands:
+            require_token(
+                operand,
+                "barrier issue-order dependency",
+                {
+                    target_ir.EVENT_DOMAIN_MEMORY_ISSUE,
+                    target_ir.EVENT_DOMAIN_BARRIER_ISSUE,
+                },
+            )
+            producer = _target_value_producer(target_program, operand)
+            _require_precedes_in_same_region(target_program, producer, op)
+        if op.results:
+            allowed_result_domains = {target_ir.EVENT_DOMAIN_LDS_RELEASED}
+            if is_full_memory:
+                allowed_result_domains.add(
+                    target_ir.EVENT_DOMAIN_FULL_BARRIER
+                )
+            require_token(
+                op.results[0],
+                "barrier publication result",
+                allowed_result_domains,
+            )
         return
 
     if op.kind == "buffer_load_to_local":
@@ -372,10 +617,12 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             )
         total_issue_count = int(attrs.get("issue_dependency_count", -1))
         source_count = int(attrs.get("source_issue_dependency_count", -1))
+        barrier_count = int(attrs.get("barrier_order_dependency_count", 0))
         if (
             min(total_issue_count, source_count) < 0
             or source_count != total_issue_count
-            or total_issue_count > len(op.operands)
+            or barrier_count not in {0, 1}
+            or total_issue_count + barrier_count > len(op.operands)
         ):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
@@ -383,8 +630,12 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 "direct-to-LDS issue segments are malformed",
                 target_op_id=op.target_op_id,
             )
-        dependency_begin = len(op.operands) - total_issue_count
-        source_operands = op.operands[dependency_begin:]
+        dependency_begin = (
+            len(op.operands) - total_issue_count - barrier_count
+        )
+        source_operands = op.operands[
+            dependency_begin:dependency_begin + total_issue_count
+        ]
         for operand in source_operands:
             require_token(
                 operand,
@@ -466,6 +717,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                     target_ir.EVENT_DOMAIN_LDS_FRONTIER,
                     target_ir.EVENT_DOMAIN_LDS_RELEASED,
+                    target_ir.EVENT_DOMAIN_FULL_BARRIER,
                     target_ir.EVENT_DOMAIN_EMPTY,
                 },
             )
@@ -543,14 +795,20 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         {target_ir.EVENT_DOMAIN_LDS_COMPLETION},
     )
     readiness_count = int(attrs.get("readiness_dependency_count", -1))
-    if readiness_count <= 0 or readiness_count > len(op.operands):
+    barrier_count = int(attrs.get("barrier_order_dependency_count", 0))
+    if (
+        readiness_count <= 0
+        or readiness_count + barrier_count > len(op.operands)
+    ):
         fail(
             "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
             STAGE,
             "tracked LDS access requires an explicit readiness segment",
             target_op_id=op.target_op_id,
         )
-    for operand in op.operands[-readiness_count:]:
+    readiness_end = len(op.operands) - barrier_count
+    readiness_begin = readiness_end - readiness_count
+    for operand in op.operands[readiness_begin:readiness_end]:
         require_token(
             operand,
             "tracked LDS readiness dependency",

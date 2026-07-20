@@ -23,8 +23,9 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave import compiler as tlx_wave_compiler
     from triton.backends.tlx_wave import driver as tlx_wave_driver
     from triton.backends.tlx_wave import wave_bridge_tools
-    from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
+    from triton.backends.tlx_wave.converter import barrier_order as converter_barrier_order
     from triton.backends.tlx_wave.converter import canonicalize as converter_canonicalize
+    from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
     from triton.backends.tlx_wave.converter import domains as converter_domains
     from triton.backends.tlx_wave.converter import emission as converter_emission
     from triton.backends.tlx_wave.converter import facts as converter_facts
@@ -43,8 +44,9 @@ else:
     tlx_wave_compiler = None
     tlx_wave_driver = None
     wave_bridge_tools = None
-    converter_diagnostics = None
+    converter_barrier_order = None
     converter_canonicalize = None
+    converter_diagnostics = None
     converter_domains = None
     converter_emission = None
     converter_facts = None
@@ -2881,14 +2883,13 @@ def test_tlx_wave_converter_lowers_converted_warp_pipeline_primitives(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "barrier_scope,address_space,expected_sched_barriers",
-    [("local", 1, 0), ("all", 31, 1)],
+    "barrier_scope,address_space",
+    [("local", 1), ("all", 31)],
 )
 def test_tlx_wave_converter_pipeline_lowers_explicit_cta_barrier(
     tmp_path,
     barrier_scope,
     address_space,
-    expected_sched_barriers,
 ):
     local_func = f"""
   tt.func public @converter_explicit_barrier() attributes {{noinline = false}} {{
@@ -2908,12 +2909,186 @@ def test_tlx_wave_converter_pipeline_lowers_explicit_cta_barrier(
     }
     wave = output.emitted_module.text
     assert wave.count("wave.barrier") == 1
-    assert wave.count("wave.sched_barrier") == expected_sched_barriers
-    if expected_sched_barriers:
-        assert wave.index("wave.barrier") < wave.index("wave.sched_barrier")
+    assert "wave.sched_barrier" not in wave
     machine = _run_waveamd_to_machine(wave)
     assert machine.count("waveamdmachine.s_barrier") == 1
-    assert machine.count("waveamdmachine.sched_barrier") == expected_sched_barriers
+    assert "waveamdmachine.sched_barrier" not in machine
+    del ctx
+
+
+def test_tlx_wave_full_barrier_orders_memory_issue_without_blocking_redistribute(
+    tmp_path,
+):
+    preamble = """
+#source = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#result = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_full_barrier_issue_order() attributes {noinline = false} {
+    %source_alloc = ttg.local_alloc : () -> !ttg.memdesc<8x8xi32, #shared, #smem, mutable>
+    %result_alloc = ttg.local_alloc : () -> !ttg.memdesc<8x8xi32, #shared, #smem, mutable>
+    %loaded = ttg.local_load %source_alloc : !ttg.memdesc<8x8xi32, #shared, #smem, mutable> -> tensor<8x8xi32, #source>
+    ttg.barrier all
+    %converted = ttg.convert_layout %loaded : tensor<8x8xi32, #source> -> tensor<8x8xi32, #result>
+    ttg.local_store %converted, %result_alloc : tensor<8x8xi32, #result> -> !ttg.memdesc<8x8xi32, #shared, #smem, mutable>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_op, ) = [
+        op for op in output.target_program.ops if op.kind == "local_load"
+    ]
+    (barrier_op, ) = [
+        op for op in output.target_program.ops if op.kind == "barrier"
+    ]
+    (convert_op, ) = [
+        op for op in output.target_program.ops if op.kind == "layout_convert"
+    ]
+    (store_op, ) = [
+        op for op in output.target_program.ops if op.kind == "local_store"
+    ]
+    issue_ops = [
+        op for op in output.target_program.ops if op.kind == "issue_token"
+    ]
+    assert len(issue_ops) == 2
+    pre_issue = next(
+        op for op in issue_ops
+        if converter_target_ir.attrs_dict(op)["projection_domain"]
+        == converter_target_ir.EVENT_DOMAIN_MEMORY_ISSUE
+    )
+    post_issue = next(
+        op for op in issue_ops
+        if converter_target_ir.attrs_dict(op)["projection_domain"]
+        == converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+    )
+    assert pre_issue.operands == (load_op.results[-1], )
+    assert barrier_op.operands[-1] == pre_issue.results[0]
+    assert post_issue.operands == barrier_op.results
+    assert store_op.operands[-1] == post_issue.results[0]
+    assert converter_target_ir.attrs_dict(store_op)[
+        "barrier_order_dependency_count"
+    ] == 1
+    assert post_issue.results[0] not in convert_op.operands
+    assert converter_target_ir.attrs_dict(convert_op)["mode"] == "redistribute"
+
+    wave = output.emitted_module.text
+    assert wave.count("wave.issue_token") == 2
+    assert "wave.sched_barrier" not in wave
+    assert wave.count("wave.redistribute") == 1
+    _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.issue_token") == 2
+    assert "waveamdmachine.sched_barrier" not in machine
+    del ctx
+
+
+def test_tlx_wave_full_barrier_orders_generic_and_buffer_memory_siblings(
+    tmp_path,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_full_barrier_global_issue_order(
+      %generic_src: !tt.ptr<f32>,
+      %generic_dst: !tt.ptr<f32>,
+      %buffer_src: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %buffer_dst: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %generic_src_base = tt.splat %generic_src : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %generic_dst_base = tt.splat %generic_dst : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>, #blocked>
+    %generic_src_ptr = tt.addptr %generic_src_base, %range : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %generic_dst_ptr = tt.addptr %generic_dst_base, %range : tensor<64x!tt.ptr<f32>, #blocked>, tensor<64xi32, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    %other = arith.constant dense<0.000000e+00> : tensor<64xf32, #blocked>
+    %generic_loaded = tt.load %generic_src_ptr, %mask, %other : tensor<64x!tt.ptr<f32>, #blocked>
+    %buffer_loaded = amdg.buffer_load %buffer_src[%range], %mask, %other {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    ttg.barrier all
+    %sum = arith.addf %generic_loaded, %buffer_loaded : tensor<64xf32, #blocked>
+    tt.store %generic_dst_ptr, %sum, %mask : tensor<64x!tt.ptr<f32>, #blocked>
+    amdg.buffer_store %sum, %buffer_dst[%range], %mask {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    ttg.barrier all
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    loads = [
+        op for op in output.target_program.ops
+        if op.kind in {"load", "buffer_load"}
+    ]
+    stores = [
+        op for op in output.target_program.ops
+        if op.kind in {"store", "buffer_store"}
+    ]
+    assert len(loads) == len(stores) == 2
+    assert all(
+        converter_target_ir.attrs_dict(op)["issue_order_result_count"] == 1
+        for op in (*loads, *stores)
+    )
+    assert all(
+        output.target_program.values[op.results[-1]].event_domain
+        == converter_target_ir.EVENT_DOMAIN_MEMORY_COMPLETION
+        for op in (*loads, *stores)
+    )
+    store_epochs = {op.operands[-1] for op in stores}
+    assert len(store_epochs) == 1
+    (store_epoch, ) = store_epochs
+    assert output.target_program.values[store_epoch].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+    )
+    assert all(
+        converter_target_ir.attrs_dict(op)[
+            "barrier_order_dependency_count"
+        ] == 1
+        for op in stores
+    )
+    memory_issue_ops = [
+        op for op in output.target_program.ops
+        if op.kind == "issue_token"
+        and converter_target_ir.attrs_dict(op)["projection_domain"]
+        == converter_target_ir.EVENT_DOMAIN_MEMORY_ISSUE
+    ]
+    assert len(memory_issue_ops) == 2
+    assert set(memory_issue_ops[0].operands) == {
+        op.results[-1] for op in loads
+    }
+    assert set(memory_issue_ops[1].operands) == {
+        op.results[-1] for op in stores
+    }
+    (sum_op, ) = [
+        op for op in output.target_program.ops
+        if op.kind == "float_binary"
+    ]
+    assert store_epoch not in sum_op.operands
+
+    wave = output.emitted_module.text
+    assert wave.count("wave.issue_token") == 3
+    assert "wave.sched_barrier" not in wave
+    assert wave.count("wave.barrier") == 2
+    _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.issue_token") == 3
+    assert "waveamdmachine.sched_barrier" not in machine
     del ctx
 
 
@@ -3844,6 +4019,54 @@ def test_tlx_wave_converter_verifier_rejects_lds_completion_as_dma_issue():
         converter_verifier.verify_target_program(builder.build())
 
     assert exc_info.value.code == "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN"
+
+
+def test_tlx_wave_converter_verifier_rejects_unproven_barrier_issue_projection():
+    builder = converter_target_ir.TargetBuilder()
+    token_type = converter_target_ir.TargetType("token", "token")
+    raw_barrier = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_FULL_BARRIER,
+    )
+    barrier_issue = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE,
+    )
+    builder.add_op(
+        "issue_token",
+        operands=(raw_barrier, ),
+        results=(barrier_issue, ),
+        attrs={
+            "input_count": 1,
+            "projection_domain": (
+                converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+            ),
+            "projection_provenance": "full_barrier_successors",
+        },
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE"
+
+
+def test_tlx_wave_converter_verifier_rejects_raw_barrier_memory_dependency():
+    builder = converter_target_ir.TargetBuilder()
+    raw_barrier = builder.add_value(
+        converter_target_ir.TargetType("token", "token"),
+        event_domain=converter_target_ir.EVENT_DOMAIN_FULL_BARRIER,
+    )
+    builder.add_op(
+        "store",
+        operands=(raw_barrier, ),
+        attrs={"barrier_order_dependency_count": 1},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_BARRIER_ORDER_DOMAIN"
 
 
 def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
@@ -7322,9 +7545,8 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_circular_refill(
         for match in re.finditer(r"wave\.sched_barrier", loop_body[:dma_index])
     ]
     assert len(barrier_indices) == 2
-    assert len(sched_barrier_indices) == 1
+    assert not sched_barrier_indices
     assert barrier_indices[0] < load_index < barrier_indices[1] < dma_index
-    assert barrier_indices[1] < sched_barrier_indices[0] < dma_index
     assert all(op.kind != "lds_release" for op in output.target_program.ops)
     dma_ops = [
         op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
@@ -7334,7 +7556,23 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_circular_refill(
     body_dma_attrs = converter_target_ir.attrs_dict(body_dma)
     assert body_dma_attrs["issue_dependency_count"] == 0
     assert body_dma_attrs["source_issue_dependency_count"] == 0
+    assert body_dma_attrs["barrier_order_dependency_count"] == 1
     assert "lds_release_dependency_count" not in body_dma_attrs
+    order_token_id = body_dma.operands[-1]
+    assert output.target_program.values[order_token_id].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+    )
+    order_projection = _target_value_producer(
+        output.target_program,
+        order_token_id,
+        kind="issue_token",
+    )
+    full_barrier = _target_value_producer(
+        output.target_program,
+        order_projection.operands[0],
+        kind="barrier",
+    )
+    assert converter_target_ir.attrs_dict(full_barrier)["address_space"] == 31
     _run_wave_verify(wave)
     if slot_count == 2:
         machine = _run_waveamd_to_machine(wave)
@@ -7370,16 +7608,31 @@ def test_tlx_wave_converter_pipeline_does_not_infer_dma_dependency_from_circular
         for match in re.finditer(r"wave\.sched_barrier", loop_body[:dma_index])
     ]
     assert len(barrier_indices) == 2
-    assert len(sched_barrier_indices) == 1
+    assert not sched_barrier_indices
     assert barrier_indices[0] < load_index < barrier_indices[1] < dma_index
-    assert barrier_indices[1] < sched_barrier_indices[0] < dma_index
     dma_ops = [
         op for op in output.target_program.ops if op.kind == "buffer_load_to_local"
     ]
     dma_attrs = converter_target_ir.attrs_dict(dma_ops[-1])
     assert dma_attrs["issue_dependency_count"] == 0
     assert dma_attrs["source_issue_dependency_count"] == 0
+    assert dma_attrs["barrier_order_dependency_count"] == 1
     assert "lds_release_dependency_count" not in dma_attrs
+    order_token_id = dma_ops[-1].operands[-1]
+    assert output.target_program.values[order_token_id].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+    )
+    order_projection = _target_value_producer(
+        output.target_program,
+        order_token_id,
+        kind="issue_token",
+    )
+    full_barrier = _target_value_producer(
+        output.target_program,
+        order_projection.operands[0],
+        kind="barrier",
+    )
+    assert converter_target_ir.attrs_dict(full_barrier)["address_space"] == 31
     assert all(op.kind != "lds_release" for op in output.target_program.ops)
     _run_wave_verify(wave)
     del ctx
@@ -14382,12 +14635,31 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(
         if "wave.sched_barrier" in line
     ]
     assert len(barrier_indices) == 1
-    assert len(sched_barrier_indices) == 2
-    assert sched_barrier_indices[0] < barrier_indices[0] < sched_barrier_indices[1] < refill_index
+    assert len(sched_barrier_indices) == 1
+    assert sched_barrier_indices[0] < barrier_indices[0] < refill_index
     barrier_lines = [lines[index] for index in barrier_indices]
     assert len(barrier_lines) == 1
     release_token = _ssa_result_name(barrier_lines[0])
     assert f"after {release_token}" not in lines[refill_index]
+    assert converter_target_ir.attrs_dict(dma_ops[-1])[
+        "barrier_order_dependency_count"
+    ] == 1
+    order_token_id = dma_ops[-1].operands[-1]
+    assert output.target_program.values[order_token_id].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE
+    )
+    order_projection = _target_value_producer(
+        output.target_program,
+        order_token_id,
+        kind="issue_token",
+    )
+    full_barrier = _target_value_producer(
+        output.target_program,
+        order_projection.operands[0],
+        kind="barrier",
+    )
+    assert order_projection.operands == full_barrier.results
+    assert converter_target_ir.attrs_dict(full_barrier)["address_space"] == 31
     _run_wave_verify(wave)
     del ctx
 
@@ -15317,6 +15589,9 @@ def _convert_ttgir_to_wave_keep_dead(
         token_program,
     )
     target_program = converter_canonicalize.canonicalize_target_program(target_program)
+    target_program = converter_barrier_order.thread_full_barrier_issue_order(
+        target_program
+    )
     if verify:
         converter_verifier.verify_target_program(
             target_program,

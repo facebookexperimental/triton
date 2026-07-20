@@ -28,6 +28,10 @@ PROVENANCE_ONLY_TARGET_IDS_ATTR = "provenance_only_target_ids"
 EVENT_DOMAIN_DMA_COMPLETION = "dma_completion"
 EVENT_DOMAIN_DMA_GROUP = "dma_group"
 EVENT_DOMAIN_DMA_ISSUE = "dma_issue"
+EVENT_DOMAIN_MEMORY_COMPLETION = "memory_completion"
+EVENT_DOMAIN_MEMORY_ISSUE = "memory_issue"
+EVENT_DOMAIN_FULL_BARRIER = "full_barrier"
+EVENT_DOMAIN_BARRIER_ISSUE = "barrier_issue"
 EVENT_DOMAIN_LDS_COMPLETION = "lds_completion"
 EVENT_DOMAIN_LDS_FRONTIER = "lds_frontier"
 EVENT_DOMAIN_LDS_RELEASED = "lds_released"
@@ -38,12 +42,32 @@ EVENT_DOMAINS = frozenset({
     EVENT_DOMAIN_DMA_COMPLETION,
     EVENT_DOMAIN_DMA_GROUP,
     EVENT_DOMAIN_DMA_ISSUE,
+    EVENT_DOMAIN_MEMORY_COMPLETION,
+    EVENT_DOMAIN_MEMORY_ISSUE,
+    EVENT_DOMAIN_FULL_BARRIER,
+    EVENT_DOMAIN_BARRIER_ISSUE,
     EVENT_DOMAIN_LDS_COMPLETION,
     EVENT_DOMAIN_LDS_FRONTIER,
     EVENT_DOMAIN_LDS_RELEASED,
     EVENT_DOMAIN_WORKGROUP_READY,
     EVENT_DOMAIN_WAVE_LOCAL_READY,
     EVENT_DOMAIN_EMPTY,
+})
+
+# Target operations that issue real memory instructions and therefore
+# participate in the completion-free ordering frontier around an explicit
+# full-memory barrier.  High-level value transforms such as layout_convert and
+# reduction are deliberately absent even when their eventual implementation
+# may use private scratch memory.
+MEMORY_ISSUER_OP_KINDS = frozenset({
+    "buffer_load",
+    "buffer_load_to_local",
+    "buffer_store",
+    "load",
+    "local_load",
+    "local_load_mma_payload",
+    "local_store",
+    "store",
 })
 
 
