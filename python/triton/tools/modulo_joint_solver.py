@@ -347,11 +347,13 @@ def _recmii_augmented(prob, amap):
     for nid, w in wg_of.items():
         if w is not None and nid in nodes:
             bodies.setdefault(w, []).append(nid)
+    wrap_ends = {}
     for w, nids in bodies.items():
         nids.sort(key=lambda i: (nodes[i]["cycle"], topo.get(i, 0)))
         for a, b in zip(nids, nids[1:]):
             E.append((a, b, dur[a], 0))
         E.append((nids[-1], nids[0], dur[nids[-1]], 1))
+        wrap_ends[w] = (nids[-1], nids[0])
 
     covered = set()
     for b in prob["buffers"]:
@@ -365,6 +367,30 @@ def _recmii_augmented(prob, amap):
             E.append((m, p, int(nodes[m].get("latency", 0)) + _RECMII_HS, d))
             covered.add((p, m))
 
+    # Depth-1 back-edge for register-channel handoffs. The back-edge must
+    # land on the channel's REAL producer, not on a glue hop: the C++
+    # serialization routes an async load's value through NONE bookkeeping
+    # nodes (load → glue → consumer), and a back-edge into the glue models
+    # only a lat-0 recycle — the producer's latency never enters any cycle,
+    # so a loads-split partition (case4's H1-class 8-WG, ~0.62x of
+    # hardware-best) evaluated EQUAL to the best layout. Dereference
+    # through same-WG NONE predecessors to the value producer so the
+    # channel recycle threads its latency (the "depth-1 channels chain TMA
+    # latency through the consumer body" mechanism, 2026-07-11 calibration).
+    def _deref_producer(nid):
+        cur = nid
+        for _ in range(4):
+            n = nodes.get(cur)
+            if n is None or n.get("pipeline") != "NONE":
+                return cur
+            ps = [p for p in preds.get(cur, []) if wg_of.get(p) == wg_of.get(cur)]
+            if len(ps) != 1:
+                return cur
+            cur = ps[0]
+        return cur
+
+    chan_stall = {}
+    stalled = set()
     for e in prob["edges"]:
         u, v = e["src"], e["dst"]
         if int(e["distance"]) != 0:
@@ -374,7 +400,27 @@ def _recmii_augmented(prob, amap):
             continue
         if (u, v) in covered or (v, u) in covered:
             continue
-        E.append((v, u, _RECMII_HS, 1))
+        ur = _deref_producer(u)
+        E.append((v, ur, _RECMII_HS, 1))
+        # Depth-1 channel STREAM STALL: the consumer's wait executes in its
+        # WG's in-order stream, and at ring depth 1 the producer cannot run
+        # ahead (its slot is recycled once per iteration), so each iteration
+        # the stream is blocked for ~the producer's result latency + the
+        # handshake. This serializes ADDITIVELY with whatever recurrence
+        # already paces that stream — a sum a max-cycle-ratio over simple
+        # cycles cannot express (visiting the producer costs an extra
+        # distance, so the detour LOWERS the ratio). Charge it as weight on
+        # the consumer WG's wrap edge, which the stream-paced recurrence
+        # cycles traverse. One charge per (producer, consumer-WG): the
+        # emitter dedups same-value waits to the first consumer.
+        lat_u = int(nodes.get(ur, {}).get("latency", 0))
+        if lat_u > 0 and (ur, wv) not in stalled:
+            stalled.add((ur, wv))
+            chan_stall[wv] = chan_stall.get(wv, 0) + lat_u + _RECMII_HS
+    for w, stall in chan_stall.items():
+        if w in wrap_ends:
+            last, first = wrap_ends[w]
+            E.append((last, first, dur[last] + stall, 1))
 
     # Max cycle ratio: binary search on lambda; a positive cycle under
     # weights (w - lambda*dist) means the ratio exceeds lambda.
@@ -656,7 +702,7 @@ def _mod_overlap(a_start, a_dur, b_start, b_dur, ii):
     return total
 
 
-def solve_partition(prob):
+def solve_partition(prob, fixed_assign=None):
     """Joint-formulation v1 (SolverMigrationNotes step 3): warp-group
     assignment as a constraint problem AGAINST the committed schedule
     (cycles held fixed — the Twill-style re-solve at the schedule's II).
@@ -855,12 +901,27 @@ def solve_partition(prob):
     # Tie-break: prefer MORE warp groups on ties (kPerWGTieBreak analog).
     model.Minimize(sum(terms) - used_wgs)
 
+    if fixed_assign is not None:
+        # Arbitration probe: score ONE given cluster→WG assignment under this
+        # objective. Relabel to first-use order so the symmetry-breaking
+        # prefix constraints (wg[0]==0, wg[i] <= prefix_max+1) admit it.
+        vec0 = [fixed_assign[c["id"]] for c in clusters]
+        relab: dict = {}
+        for w0 in vec0:
+            if w0 not in relab:
+                relab[w0] = len(relab)
+        for i in range(ncl):
+            model.Add(wg[i] == relab[vec0[i]])
+
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(prob.get("time_limit_s", 20.0))
     solver.parameters.num_workers = 8
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return {"status": "error", "message": f"partition solve status {status}"}
+
+    if fixed_assign is not None:
+        return {"status": "ok", "objective": solver.ObjectiveValue()}
 
     def _sol(sv):
         return (
@@ -952,6 +1013,53 @@ def solve_partition(prob):
                for i in range(ncl)},
         "used_wgs": uw,
         "objective": obj,
+    }
+
+
+def _arbitrate_v2(prob, v2_amap):
+    """Rerank arbitration for a successful v2 solve (2026-07-20).
+
+    v2's raw objective margin on the partition frontier can sit far below
+    hardware resolution (case4: 0.12% in-model between layouts 1.6x apart
+    on silicon), so a feasible v2 result no longer short-circuits the
+    recurrence rerank. Score v2's ASSIGNMENT with the same combined metric
+    the v1 pool uses — fixed-assignment v1 objective at the committed
+    cycles + 2*max(0, RecMII_aug - II) — and yield to the v1 rerank winner
+    only when it strictly beats v2's. Ties keep v2: its re-solved cycles
+    carry reordering wins the committed-cycle metric cannot see.
+
+    Returns the v1-winner response (with COMMITTED cycles, so the C++
+    write-back is a no-op) when v1 wins, else None (keep v2).
+    """
+    if not (_recmii_rerank_enabled() and _has_full_graph(prob)):
+        return None
+    v1 = solve_partition(prob)
+    if v1.get("status") != "ok" or "combined" not in v1:
+        return None
+    probe = solve_partition(prob, fixed_assign=v2_amap)
+    if probe.get("status") != "ok":
+        # v2's assignment is infeasible under the committed-cycle model
+        # (e.g. channel SMEM at committed depths) — trust the v1 winner.
+        cp2 = None
+    else:
+        cp2 = probe["objective"]
+    rec2 = _recmii_augmented(prob, v2_amap)
+    if cp2 is not None and rec2 is not None:
+        combined2 = cp2 + 2.0 * max(0.0, rec2 - prob["ii"])
+        if v1["combined"] >= combined2:
+            return None  # tie or v2 better: keep v2
+    committed = {str(nd["id"]): int(nd["cycle"]) for nd in prob["nodes"]}
+    return {
+        "status": "ok",
+        "wg": v1["wg"],
+        "cycles": committed,
+        "used_wgs": v1["used_wgs"],
+        "objective": v1["objective"],
+        "arbitrated": {
+            "v2_cp": cp2,
+            "v2_rec": rec2,
+            "v1_combined": v1["combined"],
+        },
     }
 
 
@@ -1237,10 +1345,14 @@ def solve_joint(prob):
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return {"status": "error", "message": f"joint solve status {status}"}
+    v2_amap = {c["id"]: solver.Value(wg[i]) for i, c in enumerate(clusters)}
+    arb = _arbitrate_v2(prob, v2_amap)
+    if arb is not None:
+        return arb
     return {
         "status": "ok",
-        "wg": {str(c["id"]): solver.Value(wg[i])
-               for i, c in enumerate(clusters)},
+        "wg": {str(cid): w
+               for cid, w in v2_amap.items()},
         "cycles": {str(nd["id"]): solver.Value(cycle[nd["id"]])
                    for nd in nodes},
         "used_wgs": solver.Value(used_wgs),
