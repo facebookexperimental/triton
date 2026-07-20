@@ -6042,6 +6042,16 @@ def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
             "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
         },
         {
+            "id": "wave_8wave_multi_wave_specialize",
+            "version_dir": "wave_8wave",
+            "function_name": "wave_8wave",
+            "num_warps": 8,
+            "expected_dma_load_lds": 24,
+            "b_strides": (1, 256),
+            "compile_options": {"tlx_wave_enable_multi_wave_specialize": True},
+            "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
+        },
+        {
             "id": "v9_beyond_hotloop_grouped_pid_multi_n",
             "version_dir": "v9_beyond_hotloop",
             "function_name": "v9_beyond_hotloop",
@@ -6086,6 +6096,11 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
     assert compiled.metadata.tlx_wave_launch_shared_bytes == 0
     assert compiled.metadata.tlx_wave_lds_size_bytes == 0
     assert compiled.metadata.tlx_wave_num_mmas > 0
+    assert compiled.metadata.tlx_wave_enable_multi_wave_specialize is bool(
+        case.get("compile_options", {}).get(
+            "tlx_wave_enable_multi_wave_specialize",
+            False,
+        ))
     if "expected_dma_load_lds" in case:
         assert (compiled.metadata.tlx_wave_num_dma_load_lds == case["expected_dma_load_lds"])
     else:
@@ -6193,8 +6208,8 @@ def test_tlx_wave_runtime_gfx950_v9_e2e(tmp_path, case_name, b_layout, m, n, k):
     torch.testing.assert_close(got, expected, atol=1e-1, rtol=0)
 
 
-@pytest.mark.parametrize("backend", ["llvm", "wave"])
-def test_tlx_wave_runtime_gfx950_wave_8wave_e2e(tmp_path, backend):
+@pytest.mark.parametrize("backend", ["llvm", "wave", "wave-multi-wave"])
+def test_tlx_wave_runtime_gfx950_wave_8wave_e2e(tmp_path, monkeypatch, backend):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
         pytest.skip(f"requires physical gfx950 hardware for wave_8wave e2e, got {arch}")
@@ -6209,6 +6224,10 @@ def test_tlx_wave_runtime_gfx950_wave_8wave_e2e(tmp_path, backend):
     a = torch.randn((m, k), device=device, dtype=torch.float16)
     b = torch.randn((n, k), device=device, dtype=torch.float16).T
 
+    if backend == "wave-multi-wave":
+        monkeypatch.setenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", "1")
+    else:
+        monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", raising=False)
     driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
     with (
             driver_context(),
@@ -15561,12 +15580,14 @@ def _tlx_wave_options(
     arch="gfx950",
     warp_size=64,
     tlx_wave_enable_split_barriers=False,
+    tlx_wave_enable_multi_wave_specialize=False,
     waves_per_eu=0,
 ):
     return SimpleNamespace(
         arch=arch,
         warp_size=warp_size,
         tlx_wave_enable_split_barriers=tlx_wave_enable_split_barriers,
+        tlx_wave_enable_multi_wave_specialize=tlx_wave_enable_multi_wave_specialize,
         waves_per_eu=waves_per_eu,
     )
 
@@ -15617,10 +15638,13 @@ def _convert_ttgir_to_wave_keep_dead(
 def test_tlx_wave_backend_defaults_and_accepts_mfma_options(monkeypatch):
     backend = make_backend(GFX950_WAVE)
     monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS", raising=False)
+    monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", raising=False)
 
-    assert backend.parse_options({}).matrix_instr_nonkdim == 0
+    default_options = backend.parse_options({})
+    assert default_options.matrix_instr_nonkdim == 0
     assert not hasattr(backend.parse_options({}), "tlx_wave_schedule_max_region_ops")
-    assert backend.parse_options({}).tlx_wave_enable_split_barriers is False
+    assert default_options.tlx_wave_enable_split_barriers is False
+    assert default_options.tlx_wave_enable_multi_wave_specialize is False
     assert backend.parse_options({"matrix_instr_nonkdim": 32}).matrix_instr_nonkdim == 32
     assert backend.parse_options({"tlx_wave_enable_split_barriers": True}).tlx_wave_enable_split_barriers is True
     assert backend.parse_options({"tlx_wave_enable_split_barriers": "off"}).tlx_wave_enable_split_barriers is False
@@ -15629,10 +15653,39 @@ def test_tlx_wave_backend_defaults_and_accepts_mfma_options(monkeypatch):
     assert backend.parse_options({"tlx_wave_enable_split_barriers": False}).tlx_wave_enable_split_barriers is False
     with pytest.raises(ValueError, match="tlx_wave_enable_split_barriers"):
         backend.parse_options({"tlx_wave_enable_split_barriers": "maybe"})
+    enabled_multi_wave = backend.parse_options({"tlx_wave_enable_multi_wave_specialize": True})
+    disabled_multi_wave = backend.parse_options({"tlx_wave_enable_multi_wave_specialize": "off"})
+    assert enabled_multi_wave.tlx_wave_enable_multi_wave_specialize is True
+    assert disabled_multi_wave.tlx_wave_enable_multi_wave_specialize is False
+    assert enabled_multi_wave.hash() != default_options.hash()
+    monkeypatch.setenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", "1")
+    assert backend.parse_options({}).tlx_wave_enable_multi_wave_specialize is True
+    explicit_disabled_multi_wave = backend.parse_options({"tlx_wave_enable_multi_wave_specialize": False})
+    assert explicit_disabled_multi_wave.tlx_wave_enable_multi_wave_specialize is False
+    with pytest.raises(ValueError, match="tlx_wave_enable_multi_wave_specialize"):
+        backend.parse_options({"tlx_wave_enable_multi_wave_specialize": "maybe"})
     with pytest.warns(UserWarning, match="kpack is deprecated"):
         assert backend.parse_options({"kpack": 2}).kpack == 1
     assert make_backend(GFX942_WAVE).parse_options({}).matrix_instr_nonkdim == 0
     assert make_backend(GFX942_WAVE).parse_options({"kpack": 2}).kpack == 2
+
+
+def test_tlx_wave_multi_wave_specialize_selects_wave_pipeline():
+    wave_opt = wave_bridge_tools._wave_opt()
+    default_pipeline = wave_bridge_tools._wave_hsaco_pipeline_args(
+        wave_opt,
+        "gfx950",
+    )[0]
+    specialized_pipeline = wave_bridge_tools._wave_hsaco_pipeline_args(
+        wave_opt,
+        "gfx950",
+        multi_wave_specialize=True,
+    )[0]
+
+    assert "entry-point=compile_kernels" in default_pipeline
+    assert "waveamd_backend_multi_wave" not in default_pipeline
+    assert "entry-point=waveamd_backend_multi_wave" in specialized_pipeline
+    assert "wave-compile-kernels" in specialized_pipeline
 
 
 def _parse_ttgir(
@@ -15725,10 +15778,18 @@ def _run_wave_canonicalize(wave_artifact):
     return result.stdout
 
 
-def _run_wave_compile_kernels(wave_artifact):
+def _run_wave_compile_kernels(wave_artifact, *, multi_wave_specialize=False):
     wave_opt = wave_bridge_tools._wave_opt()
     result = subprocess.run(
-        [wave_opt, "-", *wave_bridge_tools._wave_hsaco_pipeline_args(wave_opt, "gfx950")],
+        [
+            wave_opt,
+            "-",
+            *wave_bridge_tools._wave_hsaco_pipeline_args(
+                wave_opt,
+                "gfx950",
+                multi_wave_specialize=multi_wave_specialize,
+            ),
+        ],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
