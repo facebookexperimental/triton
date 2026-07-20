@@ -171,7 +171,12 @@ def NVGPUVerifyWSBarriers : Pass<"nvgpu-verify-ws-barriers", "mlir::ModuleOp"> {
            "bool", /*default*/"false",
            "surface cross-partition BDG cycles as candidate remarks (NOT a "
            "verdict: a naive SCC also matches correct pipelines; sound "
-           "classification needs the phase/pre-arm model -- see the design doc)">
+           "classification needs the phase/pre-arm model -- see the design doc)">,
+    Option<"dumpBufferId", "dump-buffer-id",
+           "int32_t", /*default*/"-1",
+           "debug: dump every op related to this reuse group (buffer.id) -- the "
+           "data alloc(s), their writers/readers, and the barriers guarding it "
+           "with their waits/arrives (partition + direction). -1 disables">
   ];
 }
 

@@ -26,11 +26,11 @@
 // (constant / inverted-acquire / accumCnt-derived) + SSA-dominance pre-arm.
 // IMPORTANT empirical finding: under this (correct) filter the first-execution
 // barrier graph is a DAG for BOTH the correct HSTU DP=1 fwd AND the deadlocking
-// HSTU DP=2 fwd -- i.e. no first-execution cycle in either. So the filter has no
-// false positive (DP=1 clean) but also cannot catch DP=2, because DP=2's
+// HSTU DP=2 fwd -- i.e. no first-execution cycle in either. So the filter has
+// no false positive (DP=1 clean) but also cannot catch DP=2, because DP=2's
 // deadlock is a STEADY-STATE / cross-iteration cadence deadlock, not a
-// first-execution cycle. Catching that needs per-slot phase-flip modeling across
-// iterations (the next work item). The SCC therefore ships gated under
+// first-execution cycle. Catching that needs per-slot phase-flip modeling
+// across iterations (the next work item). The SCC therefore ships gated under
 // report-cycles, emitting remarks (never errors); it fires on a genuine
 // first-execution cycle (e.g. the classic idle-acc-init). Parity-cadence
 // (condition ii) and the per-reuse-group Access-Order Graph (race /
@@ -43,6 +43,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Pass/Pass.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
@@ -119,10 +120,55 @@ static Operation *resolveBarrierAlloc(Value v) {
   return nullptr;
 }
 
+// Resolve a memdesc value to the buffer.id of the DATA alloc backing it
+// (ttg.local_alloc / ttng.tmem_alloc), walking memdesc views and
+// warp_specialize partition captures. Returns nullopt if not backed by a
+// buffer.id'd alloc.
+static std::optional<int> resolveDataBufferId(Value v) {
+  DenseSet<Value> seen;
+  while (v && seen.insert(v).second) {
+    if (Operation *def = v.getDefiningOp()) {
+      if (isa<triton::gpu::LocalAllocOp, ttng::TMEMAllocOp>(def)) {
+        if (auto id = def->getAttrOfType<IntegerAttr>("buffer.id"))
+          return static_cast<int>(id.getInt());
+        return std::nullopt;
+      }
+      if (isa<triton::gpu::MemDescIndexOp, triton::gpu::MemDescReinterpretOp,
+              triton::gpu::MemDescTransOp>(def)) {
+        v = def->getOperand(0);
+        continue;
+      }
+      return std::nullopt;
+    }
+    if (auto ba = dyn_cast<BlockArgument>(v)) {
+      if (auto parts =
+              dyn_cast_or_null<triton::gpu::WarpSpecializePartitionsOp>(
+                  ba.getOwner()->getParentOp())) {
+        v = parts.getExplicitCaptures()[ba.getArgNumber()];
+        continue;
+      }
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 // A wait-side barrier endpoint (consumes a phase, does not produce one).
 static bool isWaitOp(Operation *op) {
   return isa<ttng::WaitBarrierOp, triton::nvws::ConsumerWaitOp,
              triton::nvws::ProducerAcquireOp>(op);
+}
+
+// An arrive-side barrier endpoint (produces a phase). Allowlist: ops that
+// merely FORWARD a barrier as a capture/iter-arg (warp_specialize, scf loops)
+// or index it are NOT arrives and must be excluded, else they register phantom
+// producers.
+static bool isArriveOp(Operation *op) {
+  return isa<ttng::ArriveBarrierOp, ttng::TCGen5CommitOp,
+             ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncCopyMbarrierArriveOp,
+             ttng::BarrierExpectOp, ttng::MMAv5OpInterface,
+             triton::nvws::ProducerCommitOp, triton::nvws::ConsumerReleaseOp>(
+      op);
 }
 
 // Ops that only reference a barrier without being a wait or an arrive.
@@ -161,6 +207,9 @@ public:
       NVGPUVerifyWSBarriersPass>::NVGPUVerifyWSBarriersBase;
 
   void runOnFuncOp(triton::FuncOp funcOp) {
+    if (dumpBufferId >= 0)
+      dumpBufferGroup(funcOp, dumpBufferId);
+
     // Phase 0: collect the given barrier -> buffer.id mapping and report it,
     // grouped by reuse group. This establishes the input contract the later
     // BDG / AOG phases consume.
@@ -197,6 +246,79 @@ public:
       runDeadlockChecks(funcOp);
   }
 
+  // Debug helper (--dump-buffer-id=N): print every op related to reuse group N
+  // -- the data alloc(s) with buffer.id==N, their writers/readers, the barriers
+  // guarding N (init_barrier buffer.id==N), and the wait/arrive ops driving
+  // those barriers -- each tagged with partition (async_task_id) and role, in
+  // program (walk) order. Intended for debugging a specific reuse group, e.g.
+  // the O accumulator (id 6/7) the DP=2 deadlock is on.
+  void dumpBufferGroup(triton::FuncOp funcOp, int bid) {
+    DenseSet<Operation *> groupBarriers;
+    funcOp.walk([&](ttng::InitBarrierOp init) {
+      if (auto id = getGuardedBufferId(init))
+        if (*id == bid)
+          if (Operation *b = resolveBarrierAlloc(init.getAlloc()))
+            groupBarriers.insert(b);
+    });
+
+    auto flags = OpPrintingFlags().skipRegions();
+    llvm::errs() << "==== ops for reuse group buffer.id=" << bid << " in @"
+                 << funcOp.getName() << " (" << groupBarriers.size()
+                 << " guarding barriers) ====\n";
+    funcOp.walk([&](Operation *op) {
+      std::string role;
+      if (isa<triton::gpu::LocalAllocOp, ttng::TMEMAllocOp>(op))
+        if (auto id = op->getAttrOfType<IntegerAttr>("buffer.id"))
+          if (id.getInt() == bid)
+            role = "alloc";
+      if (role.empty())
+        if (auto init = dyn_cast<ttng::InitBarrierOp>(op)) {
+          Operation *b = resolveBarrierAlloc(init.getAlloc());
+          if (b && groupBarriers.count(b))
+            role = "init-barrier";
+        }
+      if (role.empty() && (isWaitOp(op) || isArriveOp(op)))
+        for (Value o : op->getOperands()) {
+          Operation *ba = resolveBarrierAlloc(o);
+          if (ba && groupBarriers.count(ba)) {
+            if (isWaitOp(op)) {
+              auto bwd = isWSBarrierBackwardEndpoint(op);
+              role = bwd.value_or(false) ? "wait(bwd)" : "wait(fwd)";
+            } else {
+              role = "arrive";
+            }
+            break;
+          }
+        }
+      if (role.empty() && !isBarrierStructuralOp(op) &&
+          !isa<triton::gpu::WarpSpecializeOp,
+               triton::gpu::WarpSpecializePartitionsOp>(op))
+        for (Value o : op->getOperands()) {
+          auto id = resolveDataBufferId(o);
+          if (id && *id == bid) {
+            if (isa<ttng::TMEMStoreOp, triton::gpu::LocalStoreOp>(op))
+              role = "write";
+            else if (isa<ttng::TMEMLoadOp, triton::gpu::LocalLoadOp>(op))
+              role = "read";
+            else if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op))
+              role = resolveDataBufferId(mma.getAccumulator()) ==
+                             std::optional<int>(bid)
+                         ? "mma-write(acc)"
+                         : "mma-read";
+            else
+              role = "data-use";
+            break;
+          }
+        }
+      if (role.empty())
+        return;
+      llvm::errs() << "  [" << role << "] task=" << getSingleTask(op) << "  ";
+      op->print(llvm::errs(), flags);
+      llvm::errs() << "\n";
+    });
+    llvm::errs() << "==== end buffer.id=" << bid << " ====\n";
+  }
+
   // Phase 1: build the BDG and run the no-producer deadlock check (condition
   // (i) of the design doc). Later phases add parity-cadence and the
   // cross-partition SCC on top of this same node set.
@@ -209,6 +331,12 @@ public:
       if (isBarrierStructuralOp(op))
         return;
       bool wait = isWaitOp(op);
+      // Only real endpoints become nodes. Ops that merely forward a barrier as
+      // a capture/iter-arg (warp_specialize, scf loops) are neither wait nor
+      // arrive and must be skipped -- otherwise they register phantom producers
+      // that mask condition (i).
+      if (!wait && !isArriveOp(op))
+        return;
       DenseSet<Operation *> allocsForThisOp;
       for (Value operand : op->getOperands()) {
         Operation *alloc = resolveBarrierAlloc(operand);

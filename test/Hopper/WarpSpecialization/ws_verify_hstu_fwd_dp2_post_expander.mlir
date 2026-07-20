@@ -1,5 +1,16 @@
 // RUN: triton-opt %s --nvgpu-verify-ws-barriers="emit-coverage-table=true" 2>&1 1>/dev/null | FileCheck %s
 // RUN: triton-opt %s --nvgpu-verify-ws-barriers="report-cycles=true" 2>&1 1>/dev/null | FileCheck %s --check-prefix=CYCLE --allow-empty
+// RUN: triton-opt %s --nvgpu-verify-ws-barriers="dump-buffer-id=6" 2>&1 1>/dev/null | FileCheck %s --check-prefix=DUMP
+//
+// The --dump-buffer-id=6 debug helper prints every op tied to the O accumulator
+// (id 6) the deadlock is on: the alloc, the gemm MMA that writes it + its
+// tc_gen5_commit (task 1), and the epilogue forward-wait + tmem_load drain +
+// reuse arrive (task 0).
+// DUMP: ops for reuse group buffer.id=6
+// DUMP-DAG: [alloc] {{.*}}ttng.tmem_alloc
+// DUMP-DAG: [mma-write(acc)] task=1 {{.*}}ttng.tc_gen5_mma
+// DUMP-DAG: [arrive] task=1 {{.*}}ttng.tc_gen5_commit
+// DUMP-DAG: [read] task=0 {{.*}}ttng.tmem_load
 //
 // autoWS barrier verifier fixture: HSTU self-attn forward, data_partition=2,
 // captured AFTER the pipeline expander (SoftwarePipeliner ExpandLoops) from an

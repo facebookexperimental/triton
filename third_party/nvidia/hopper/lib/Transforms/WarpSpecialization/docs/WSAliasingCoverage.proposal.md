@@ -558,16 +558,17 @@ and emit **indeterminate**, never silently drop.
   - in-tree invariant hook from `doCodePartitionPost`/post-pipeline under
     `TRITON_VERIFY_WS_BARRIERS`, reusing `WSBarrierAnalysis.h` +
     `CodePartitionUtility.h` structures.
-  - `--dump-reuse-group=<buffer.id>` — focused per-reuse-group report (extends the
-    existing `dumpTmemBufferLiveness` / `dumpSmemBufferLiveness` /
-    `dumpCombinedGraph` helpers): owner + packed siblings, `buffer.copy`, every
-    writer (op, partition, extent, slot/phase expr, prologue instances), every
-    reader (op, partition, slot/phase, iteration offset from its writer), the BDG
-    edges touching the buffer, `requiredDepth` vs `buffer.copy`, the required
-    access-order edges and whether each is covered, and the verdict. This is the
-    barrier-viz skill's Section 4 + coverage table made executable and scoped to
-    one group — e.g. dump the `(qk, p)` group and read off "reuse distance 3 vs
-    copy 1".
+  - `--dump-buffer-id=<buffer.id>` (**implemented**) — focused per-reuse-group
+    dump: the data alloc(s) with that `buffer.id`, their writers/readers
+    (write / read / mma-write(acc) / mma-read), the barriers guarding the group
+    (`init_barrier buffer.id==N`), and the wait/arrive ops driving those barriers
+    (wait(fwd) / wait(bwd) / arrive) — each tagged with partition (async_task_id)
+    and role, in program order. E.g. `--dump-buffer-id=6` on the HSTU DP=2 fixture
+    prints the O accumulator's gemm MMA-write + tc_gen5_commit (task 1) and the
+    epilogue forward-wait + tmem_load drain + reuse arrive (task 0). Future work
+    extends it to the full coverage table (owner + packed siblings, `buffer.copy`,
+    slot/phase exprs, `requiredDepth` vs `buffer.copy`, AOG edge coverage — the
+    barrier-viz skill's Section 4 made executable).
 - **Inputs:** post-expander TTGIR (barriers, `async_task_id`, `buffer.*`
   present). Handles both NVWS token IR and lowered TTNG barrier IR
   (`isWSBarrierEndpoint`).
