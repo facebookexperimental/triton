@@ -43,6 +43,29 @@ tt.func @countable_with_carry(%lb: i32, %ub: i32, %step: i32, %acc0: i32) -> i32
 
 // -----
 
+// The AutoWS / pipelining annotations attached to the while (by tl.condition)
+// are transferred onto the uplifted scf.for, so a scheduler-driven persistent
+// while loop gets the same warp-specialization / pipelining as a hand-written
+// for loop.
+// CHECK-LABEL: @countable_carries_attrs
+// CHECK-NOT: scf.while
+// CHECK: scf.for
+// CHECK: tt.warp_specialize
+tt.func @countable_carries_attrs(%lb: i32, %ub: i32, %step: i32, %ptr: !tt.ptr<i32>) {
+  scf.while (%i = %lb) : (i32) -> i32 {
+    %c = arith.cmpi slt, %i, %ub : i32
+    scf.condition(%c) %i : i32
+  } do {
+  ^bb0(%i: i32):
+    tt.store %ptr, %i : !tt.ptr<i32>
+    %n = arith.addi %i, %step : i32
+    scf.yield %n : i32
+  } attributes {tt.warp_specialize, tt.num_stages = 3 : i32, tt.data_partition_factor = 2 : i32}
+  tt.return
+}
+
+// -----
+
 // Negative: the induction var is advanced by an atomic (the dynamic
 // work-stealing scheduler), not a loop-invariant `addi` step, so the loop is not
 // countable and must be preserved.
