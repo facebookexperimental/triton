@@ -139,6 +139,7 @@ def emit_wave_module(
     fact_program=None,
     *,
     enable_split_barriers=False,
+    enable_multi_wave_specialization=False,
     waves_per_eu=0,
 ):
     dsl, ir = _load_wave_dsl()
@@ -160,6 +161,7 @@ def emit_wave_module(
                         ir,
                         kernel,
                         enable_split_barriers=enable_split_barriers,
+                        enable_multi_wave_specialization=enable_multi_wave_specialization,
                         waves_per_eu=waves_per_eu,
                     ),
             ) as builder:
@@ -12841,6 +12843,7 @@ def _function_attrs(
     kernel,
     *,
     enable_split_barriers=False,
+    enable_multi_wave_specialization=False,
     waves_per_eu=0,
 ):
     num_warps = _kernel_num_warps(kernel)
@@ -12863,6 +12866,8 @@ def _function_attrs(
     }
     if enable_split_barriers:
         attrs["waveamdmachine.enable_split_barriers"] = ir.UnitAttr.get()
+    if enable_multi_wave_specialization:
+        attrs["waveamdmachine.enable_multi_wave_specialization"] = ir.UnitAttr.get()
     return attrs
 
 

@@ -5577,6 +5577,27 @@ def test_tlx_wave_backend_wave_stage_emits_split_barrier_attr(tmp_path):
     del ctx
 
 
+def test_tlx_wave_backend_wave_stage_emits_multi_wave_specialization_attr(tmp_path):
+    local_func = """
+  tt.func public @backend_wave_multi_wave_specialization() attributes {noinline = false} {
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8)
+    metadata = {}
+
+    wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
+        mod,
+        metadata,
+        _tlx_wave_options(tlx_wave_enable_multi_wave_specialize=True),
+    )
+
+    assert "waveamdmachine.enable_multi_wave_specialization" in wave_artifact
+    assert metadata["tlx_wave_enable_multi_wave_specialize"] is True
+    _run_wave_verify(wave_artifact)
+    del ctx
+
+
 def test_tlx_wave_backend_wave_stage_keeps_fixed_lds_out_of_launch_shared(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -15670,22 +15691,15 @@ def test_tlx_wave_backend_defaults_and_accepts_mfma_options(monkeypatch):
     assert make_backend(GFX942_WAVE).parse_options({"kpack": 2}).kpack == 2
 
 
-def test_tlx_wave_multi_wave_specialize_selects_wave_pipeline():
+def test_tlx_wave_uses_standard_wave_pipeline():
     wave_opt = wave_bridge_tools._wave_opt()
-    default_pipeline = wave_bridge_tools._wave_hsaco_pipeline_args(
+    pipeline = wave_bridge_tools._wave_hsaco_pipeline_args(
         wave_opt,
         "gfx950",
-    )[0]
-    specialized_pipeline = wave_bridge_tools._wave_hsaco_pipeline_args(
-        wave_opt,
-        "gfx950",
-        multi_wave_specialize=True,
     )[0]
 
-    assert "entry-point=compile_kernels" in default_pipeline
-    assert "waveamd_backend_multi_wave" not in default_pipeline
-    assert "entry-point=waveamd_backend_multi_wave" in specialized_pipeline
-    assert "wave-compile-kernels" in specialized_pipeline
+    assert "entry-point=compile_kernels" in pipeline
+    assert "waveamd_backend_multi_wave" not in pipeline
 
 
 def _parse_ttgir(
@@ -15778,7 +15792,7 @@ def _run_wave_canonicalize(wave_artifact):
     return result.stdout
 
 
-def _run_wave_compile_kernels(wave_artifact, *, multi_wave_specialize=False):
+def _run_wave_compile_kernels(wave_artifact):
     wave_opt = wave_bridge_tools._wave_opt()
     result = subprocess.run(
         [
@@ -15787,7 +15801,6 @@ def _run_wave_compile_kernels(wave_artifact, *, multi_wave_specialize=False):
             *wave_bridge_tools._wave_hsaco_pipeline_args(
                 wave_opt,
                 "gfx950",
-                multi_wave_specialize=multi_wave_specialize,
             ),
         ],
         input=wave_artifact,

@@ -45,7 +45,7 @@ class TLXWaveOptions(amd_compiler.HIPOptions):
     # Wave pass is present in the backend pipeline but gated on this function
     # attribute so existing kernels keep the previous full-barrier behavior.
     tlx_wave_enable_split_barriers: bool = False
-    # Selects Wave's opt-in joint multi-wave specialization pipeline.
+    # Marks the kernel for Wave's opt-in joint multi-wave specialization.
     tlx_wave_enable_multi_wave_specialize: bool = False
 
     def __post_init__(self):
@@ -190,6 +190,11 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         output = converter_pipeline.convert_ttgir_to_wave(
             src,
             enable_split_barriers=getattr(options, "tlx_wave_enable_split_barriers", False),
+            enable_multi_wave_specialization=getattr(
+                options,
+                "tlx_wave_enable_multi_wave_specialize",
+                False,
+            ),
             waves_per_eu=getattr(options, "waves_per_eu", 0),
         )
         _validate_staged_converter_output(output, options)
@@ -207,11 +212,6 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             src,
             wave_opt,
             options.arch,
-            multi_wave_specialize=getattr(
-                options,
-                "tlx_wave_enable_multi_wave_specialize",
-                False,
-            ),
         )
         metadata["tlx_wave_binary_stage"] = "wave-compile-kernels"
         metadata["tlx_wave_hsaco_size_bytes"] = len(hsaco)
