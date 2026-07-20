@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from . import barrier_order
 from . import canonicalize
 from . import emission
 from . import facts
@@ -41,6 +42,9 @@ def convert_ttgir_to_wave(
         token_program,
     )
     target_program = canonicalize.canonicalize_target_program(target_program)
+    target_program = barrier_order.thread_full_barrier_issue_order(
+        target_program
+    )
     if verify:
         verifier.verify_target_program(
             target_program,
