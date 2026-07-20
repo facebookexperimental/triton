@@ -1443,12 +1443,21 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
     assert(newSrc && "TMEMStoreOp src not found in mappings; was it "
                      "backward-sliced in getSliceToPartition?");
+    // The TMEM store needs its source in a TMEM-compatible layout, but that
+    // requirement is local to this store: the source value may be shared with
+    // other consumers (e.g. an arith.constant feeding both the store and a
+    // downstream elementwise chain) that expect the original sliced encoding.
+    // Convert only for this store and restore the shared mapping afterwards, so
+    // remapping tmemStOp.getSrc() below does not force the TMEM-compatible
+    // layout onto every other user of the value.
+    Value prevSrcMapping = newSrc;
     if (newSrc.getType() != newSrcType) {
       auto cvtOp =
           ConvertLayoutOp::create(builder, op->getLoc(), newSrcType, newSrc);
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
     }
     newOp = cloneAndSetResultType(op);
+    mappings.map(tmemStOp.getSrc(), prevSrcMapping);
   } else if (auto tmemCopyOp = dyn_cast<nvidia_gpu::TMEMCopyOp>(op)) {
     sliceOp(tmemCopyOp.getDst(), offset, mappings, reverseMappings,
             partitionScheme);
