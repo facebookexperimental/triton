@@ -25,6 +25,7 @@ _MMA_PACKET_REPRESENTATIONS = frozenset({
     "simd_packet_tuple",
 })
 _COMPARE_SELECT_MASK_BUDGET_DWORDS = 8
+_FULL_MEMORY_BARRIER_ADDRESS_SPACE = 31
 
 
 @dataclass(frozen=True)
@@ -2273,11 +2274,20 @@ def _emit_set_priority(state, op):
 
 
 def _emit_barrier(state, op):
+    attrs = target_ir.attrs_dict(op)
     tokens = tuple(
         _require_value(state, target_value_id, op)
         for target_value_id in op.operands
     )
     barrier_token = _emit_cta_barrier(state, *tokens)
+    # A full-memory CTA barrier is also a structural boundary for later memory
+    # issue.  Its token orders explicit consumers, while the scheduling cut
+    # prevents an otherwise-independent operation from being hoisted to the
+    # pre-barrier epoch without turning the barrier into that operation's data
+    # dependency. Local-memory publication is represented by explicit tokens
+    # and retains legal issue overlap across the physical rendezvous.
+    if int(attrs.get("address_space", 0)) == _FULL_MEMORY_BARRIER_ADDRESS_SPACE:
+        state.builder.sched_barrier()
     if op.results:
         state.values[_single_result(op)] = barrier_token
         roots = _local_memory_roots_for_token_values(state, op.operands)
@@ -7142,27 +7152,6 @@ def _emit_issue_token(state, op):
     state.values[_single_result(op)] = state.builder.issue_token(*tokens)
 
 
-def _emit_lds_release(state, op):
-    attrs = target_ir.attrs_dict(op)
-    tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in op.operands
-    )
-    publication_mode = attrs.get("publication_mode")
-    if publication_mode == "workgroup":
-        token = _emit_cta_barrier(state, *tokens)
-    elif publication_mode == "wave_local":
-        token = state.builder.after(*tokens) if tokens else state.builder.token()
-    else:
-        fail(
-            "TLXW_EMIT_LDS_RELEASE_MODE",
-            STAGE,
-            f"unsupported LDS release publication mode {publication_mode}",
-            target_op_id=op.target_op_id,
-        )
-    state.values[_single_result(op)] = token
-
-
 def _join_memory_tokens(state, tokens):
     tokens = _unique_tokens(tokens)
     if not tokens:
@@ -11122,7 +11111,6 @@ _TARGET_EMITTERS = {
     "token": _emit_token,
     "token_join": _emit_token_join,
     "issue_token": _emit_issue_token,
-    "lds_release": _emit_lds_release,
     "async_commit_group": _emit_async_commit_group,
     "async_wait": _emit_async_wait,
     "return": _emit_return,
