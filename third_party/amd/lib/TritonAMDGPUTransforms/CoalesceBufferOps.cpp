@@ -125,6 +125,11 @@ public:
       auto bufOp = dyn_cast<triton::amdgpu::BufferOpInterface>(op);
       if (!bufOp)
         return;
+      // TLX buffer_store is a low-level AMD buffer op with user-controlled
+      // value/offset layouts.  Do not replace those explicit layouts with an
+      // AxisInfo-derived coalesced layout.
+      if (op->hasAttr("tlx.layout_is_explicit"))
+        return;
       // Determine the tensor type whose distributed layout drives coalescing.
       //  - buffer_load / buffer_store: the register data tensor (result for
       //    loads, first tensor operand for stores).
