@@ -87,6 +87,42 @@ def TritonSimplifySingleTripWhile : Pass</*cli-arg*/"triton-simplify-single-trip
   ];
 }
 
+def TritonUpliftWhileToFor : Pass</*cli-arg*/"triton-uplift-while-to-for", /*Op*/"mlir::ModuleOp"> {
+  let summary = "Convert a countable scf.while into an scf.for";
+  let description = [{
+    This pass rewrites a provably countable `scf.while` loop into the equivalent
+    `scf.for` loop, so the loop exposes a real trip count to downstream
+    optimizations (software pipelining, warp-specialization scheduling, loop
+    unrolling).
+
+    It reuses MLIR's `scf::populateUpliftWhileToForPatterns`, which fires only
+    when the loop is a counting loop:
+      - the before-region is a single `arith.cmpi` (`slt`/`sgt`) comparing a
+        loop-carried induction variable against a bound that dominates the loop,
+        and
+      - the after-region increments that induction variable via `arith.addi`
+        with a loop-invariant step.
+
+    This targets the loop produced by the static-persistent unified tile
+    scheduler (`_x < num_tiles`, `_x += num_programs`) and the hand-written
+    static-persistent kernels. It intentionally leaves loops it cannot prove
+    countable unchanged: the dynamic schedule (induction var advanced by an
+    atomic, not `addi`) and the CLC schedule (condition is a hardware `i1`, not a
+    `cmpi`). The non-persistent single-trip while is handled separately by
+    `triton-simplify-single-trip-while`.
+
+    The bound must dominate the loop for the pattern to match, so this pass is
+    scheduled after LICM has hoisted any loop-invariant bound computation
+    (e.g. `num_tiles`) out of the before-region.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
 def TritonLoopInvariantCodeMotion : Pass</*cli-arg*/"triton-licm", /*Op*/"mlir::ModuleOp"> {
   let summary = "MLIR's LICM plus hoist load ops out of loops with masks.";
   let description = [{

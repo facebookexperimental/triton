@@ -256,6 +256,8 @@ class HIPBackend(BaseBackend):
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
+        passes.ttir.add_uplift_while_to_for(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
