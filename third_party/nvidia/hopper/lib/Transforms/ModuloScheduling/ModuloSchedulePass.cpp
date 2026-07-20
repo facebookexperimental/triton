@@ -5501,6 +5501,17 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
 // unpartitioned). External tooling can re-run the pass with
 // TRITON_DATA_PARTITION_N=<n> per candidate and compare the resulting
 // schedules.
+//
+// Walks sl.graph.loops.front() per ScheduledLoop, matching the loops section
+// of the document (writeScheduleGraphDoc), so loop_id here == loop_id there.
+// This relies on the single-loop-per-graph shape (ScheduleGraph.loops size 1)
+// that fbsource beta produces; it does NOT drop any MMA candidate even when a
+// graph carries a nested child, because the orchestrator schedules every
+// MMA-bearing loop as its own "Inner" ScheduledLoop entry (see the hasMMA path
+// in runOnOperation), which the outer loop over scheduledLoops covers. If a
+// graph ever holds an MMA in a non-front loop with no separate entry, both
+// sections would need to iterate all sl.graph.loops together to keep loop_id
+// consistent.
 void jsonDumpDataPartitionCandidates(llvm::raw_ostream &os,
                                      ArrayRef<ScheduledLoop> scheduledLoops) {
   os << "  \"data_partition_candidates\": [";
