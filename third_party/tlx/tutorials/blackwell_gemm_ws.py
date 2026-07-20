@@ -698,7 +698,7 @@ def _process_tile_epilogue_inner(
     tmem_read_phase,
 ):
     """Process epilogue for a single tile."""
-    mn_tile_id = tile_id % num_mn_tiles
+    mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
     pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
     offs_bn = pid_n * BLOCK_SIZE_N
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
@@ -890,7 +890,12 @@ def _process_tile_mma_inner(
 
     # Remaining K iterations with use_acc=True
     for _ in range(1, local_k_tiles):
-        buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
+        # Advance the ring buffer incrementally (avoids the non-power-of-2
+        # divide/modulo of get_bufidx_phase in the hot K-loop).
+        buf += 1
+        if buf == NUM_SMEM_BUFFERS:
+            buf = 0
+            phase ^= 1
 
         # wait for current phase(round) of load for this buf
         tlx.barrier_wait(B_smem_full_bars[buf], phase)
@@ -965,11 +970,12 @@ def _process_tile_producer_inner(
     smem_accum_cnt,
     NUM_CTAS,
     cluster_cta_rank,
+    SPLIT_K: tl.constexpr,
     A_ROW_MAJOR: tl.constexpr = True,
     B_ROW_MAJOR: tl.constexpr = True,
 ):
     """Process TMA loads for a single tile with all subtiles over [k_tile_start, k_tile_end)."""
-    mn_tile_id = tile_id % num_mn_tiles
+    mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
     pid_m, pid_n = _compute_pid(mn_tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
     dsize: tl.constexpr = tlx.size_of(tlx.dtype_of(b_desc))
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
@@ -978,10 +984,12 @@ def _process_tile_producer_inner(
 
     local_k_tiles = k_tile_end - k_tile_start
 
+    # Ring-buffer index tracked incrementally (avoids the non-power-of-2
+    # divide/modulo of get_bufidx_phase in the hot K-loop).
+    buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
     # Iterate along K dimension for this split's range
     for k_idx in range(0, local_k_tiles):
         k = k_tile_start + k_idx
-        buf, phase = get_bufidx_phase(smem_accum_cnt, NUM_SMEM_BUFFERS)
         offs_k = k * BLOCK_SIZE_K
 
         offs_am = pid_m * BLOCK_SIZE_M
@@ -1044,6 +1052,10 @@ def _process_tile_producer_inner(
                 )
 
         smem_accum_cnt += 1
+        buf += 1
+        if buf == NUM_SMEM_BUFFERS:
+            buf = 0
+            phase ^= 1
 
     return smem_accum_cnt
 
@@ -1241,11 +1253,17 @@ def matmul_kernel_tma_ws_blackwell(
                 # Skip tiles whose split has zero K-tiles (last split
                 # can be empty when cdiv(k_tiles_total, SPLIT_K) * (SPLIT_K-1)
                 # >= k_tiles_total).
-                split_id = tile_id // num_mn_tiles
-                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
-                k_tile_start = split_id * k_tiles_per_split
-                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
-                if k_tile_end > k_tile_start:
+                if SPLIT_K == 1:
+                    # Fast path: one split covers all K-tiles; avoids the
+                    # runtime-divisor `tile_id // num_mn_tiles` division.
+                    k_tile_start = 0
+                    k_tile_end = k_tiles_total
+                else:
+                    split_id = tile_id // num_mn_tiles
+                    k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                    k_tile_start = split_id * k_tiles_per_split
+                    k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                if SPLIT_K == 1 or k_tile_end > k_tile_start:
                     cur_tmem_buf, tmem_read_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                     _process_tile_epilogue_inner(
                         tile_id=tile_id,
@@ -1300,13 +1318,19 @@ def matmul_kernel_tma_ws_blackwell(
 
             while tile_id < num_tiles:
                 # Compute K range for this split
-                split_id = tile_id // num_mn_tiles
-                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
-                k_tile_start = split_id * k_tiles_per_split
-                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                if SPLIT_K == 1:
+                    # Fast path: one split covers all K-tiles; avoids the
+                    # runtime-divisor `tile_id // num_mn_tiles` division.
+                    k_tile_start = 0
+                    k_tile_end = k_tiles_total
+                else:
+                    split_id = tile_id // num_mn_tiles
+                    k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                    k_tile_start = split_id * k_tiles_per_split
+                    k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
 
                 # Skip tiles whose split has zero K-tiles
-                if k_tile_end > k_tile_start:
+                if SPLIT_K == 1 or k_tile_end > k_tile_start:
                     cur_tmem_buf, tmem_write_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
                     smem_accum_cnt = _process_tile_mma_inner(
                         k_tile_start=k_tile_start,
@@ -1360,13 +1384,19 @@ def matmul_kernel_tma_ws_blackwell(
 
             while tile_id < num_tiles:
                 # Compute K range for this split
-                split_id = tile_id // num_mn_tiles
-                k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
-                k_tile_start = split_id * k_tiles_per_split
-                k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
+                if SPLIT_K == 1:
+                    # Fast path: one split covers all K-tiles; avoids the
+                    # runtime-divisor `tile_id // num_mn_tiles` division.
+                    k_tile_start = 0
+                    k_tile_end = k_tiles_total
+                else:
+                    split_id = tile_id // num_mn_tiles
+                    k_tiles_per_split = tl.cdiv(k_tiles_total, SPLIT_K)
+                    k_tile_start = split_id * k_tiles_per_split
+                    k_tile_end = min(k_tile_start + k_tiles_per_split, k_tiles_total)
 
                 # Skip tiles whose split has zero K-tiles
-                if k_tile_end > k_tile_start:
+                if SPLIT_K == 1 or k_tile_end > k_tile_start:
                     smem_accum_cnt = _process_tile_producer_inner(
                         tile_id=tile_id,
                         num_pid_in_group=num_pid_in_group,
@@ -1390,6 +1420,7 @@ def matmul_kernel_tma_ws_blackwell(
                         smem_accum_cnt=smem_accum_cnt,
                         NUM_CTAS=NUM_CTAS,
                         cluster_cta_rank=cluster_cta_rank,
+                        SPLIT_K=SPLIT_K,
                         A_ROW_MAJOR=A_ROW_MAJOR,
                         B_ROW_MAJOR=B_ROW_MAJOR,
                     )
