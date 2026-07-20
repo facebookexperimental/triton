@@ -26,8 +26,8 @@
 // Two independent per-partition staging multibuffers (distinct buffer.id), each
 // 128x64xf16 -- the cross-partition reuse-group split. These are hoisted to
 // function entry, before the ttg.warp_specialize op.
-// CHECK-DAG: ttg.local_alloc {{.*}}buffer.id = 3 : i32{{.*}} : () -> !ttg.memdesc<{{[0-9]+}}x128x64xf16, #shared
-// CHECK-DAG: ttg.local_alloc {{.*}}buffer.id = 4 : i32{{.*}} : () -> !ttg.memdesc<{{[0-9]+}}x128x64xf16, #shared
+// CHECK-DAG: ttg.local_alloc {allocation.shareGroup = 0 : i32, {{.*}}buffer.id = 0 : i32{{.*}}} : () -> !ttg.memdesc<{{[0-9]+}}x128x64xf16, #shared
+// CHECK-DAG: ttg.local_alloc {allocation.shareGroup = 1 : i32, {{.*}}buffer.id = 1 : i32{{.*}}} : () -> !ttg.memdesc<{{[0-9]+}}x128x64xf16, #shared
 // CHECK: ttg.warp_specialize
 //
 // All four epilogue subtile stores (2 data partitions x 2 subtiles) are

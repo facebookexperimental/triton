@@ -169,7 +169,8 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
 
   let description = "This pass creates buffers for each async task channel.";
 
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUTestWSHoistTMEMStore : Pass<"nvgpu-test-ws-hoist-tmem-store", "mlir::ModuleOp"> {

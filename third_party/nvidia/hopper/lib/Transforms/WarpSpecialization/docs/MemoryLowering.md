@@ -22,10 +22,11 @@ memory.
 In the current pipeline there is no single `insertAsyncCopy`
 dispatcher. Copies are materialized by two mechanisms:
 
-- **`doConvertDescriptorLoadsToNVWS`** — runs after buffer allocation and
-  before memory planning. It converts every tensor-producing
-  `tt.descriptor_load` into `nvws.descriptor_load`, whose destination is an
-  explicit SMEM memdesc and whose `txCount` is the CTA-local transfer size.
+- **`doConvertDescriptorLoadsToNVWS`** — runs before buffer allocation, after
+  AutoWS has passed its final eligibility bailout. It converts every
+  tensor-producing `tt.descriptor_load` into `nvws.descriptor_load`, whose
+  destination is an explicit SMEM memdesc and whose `txCount` is the CTA-local
+  transfer size.
 - **`optimizeTMALoads`** — for buffered NVWS descriptor-load producers. Called from
   `insertAsyncComm` (`WSCodePartition.cpp`) during the code-partition phase.
   Emits `barrier_expect` + `AsyncTMACopyGlobalToLocalOp`. The copy uses the

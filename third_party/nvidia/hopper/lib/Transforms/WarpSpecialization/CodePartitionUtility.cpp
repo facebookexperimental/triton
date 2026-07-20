@@ -1744,6 +1744,7 @@ static std::string getKeyOpDescription(Operation *op) {
     return result;
   }
   if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+    // NVWS "result" is the destination memdesc operand, not an SSA result.
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
        << formatInput(loadOp.getResult());
     return result;
@@ -3424,9 +3425,16 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
   SmallVector<int> consumerTaskIds;
   DenseSet<int> seenTaskIds;
   for (auto *consumer : consumers) {
-    for (int id : getAsyncTaskIds(consumer)) {
-      if (seenTaskIds.insert(id).second)
-        consumerTaskIds.push_back(id);
+    SmallVector<Operation *> taskOwners = {consumer};
+    // A memdesc view can carry boundary task IDs that do not all consume the
+    // buffer. Descriptor channels synchronize with the terminal consumers.
+    if (isa<ttnvws::DescriptorLoadOp>(producerOp))
+      taskOwners = getActualConsumers(consumer);
+    for (Operation *taskOwner : taskOwners) {
+      for (int id : getAsyncTaskIds(taskOwner)) {
+        if (seenTaskIds.insert(id).second)
+          consumerTaskIds.push_back(id);
+      }
     }
   }
 

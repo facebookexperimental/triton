@@ -208,16 +208,19 @@ public:
     // persistent kernels.
     removeRedundantTmemZeroStores(funcOp);
 
-    // Canonicalize the SMEM/TEM buffers.
-    // Create buffers for register channels.
-    doBufferAllocation(funcOp);
-    dumpAfter(moduleOp, "doBufferAllocation");
-
     if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
       signalPassFailure();
       return;
     }
     dumpAfter(moduleOp, "doConvertDescriptorLoadsToNVWS");
+
+    // Canonicalize the SMEM/TEM buffers.
+    // Create buffers for register channels.
+    if (failed(doBufferAllocation(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+    dumpAfter(moduleOp, "doBufferAllocation");
 
     doHoistLoopInvariantTMEMStore(funcOp);
     dumpAfter(moduleOp, "doHoistLoopInvariantTMEMStore");

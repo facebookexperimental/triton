@@ -4847,7 +4847,44 @@ void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
   }
 }
 
-void doBufferAllocation(triton::FuncOp funcOp) {
+static LogicalResult hoistDescriptorLoadBuffers(triton::FuncOp funcOp) {
+  SmallVector<ttg::LocalAllocOp> buffers;
+  DenseSet<Operation *> seen;
+  WalkResult result = funcOp.walk([&](ttnvws::DescriptorLoadOp load) {
+    Value buffer = load.getResult();
+    while (Operation *def = buffer.getDefiningOp()) {
+      if (!isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp, ttg::MemDescTransOp,
+               ttg::MemDescReshapeOp, ttg::MemDescReinterpretOp>(def))
+        break;
+      buffer = def->getOperand(0);
+    }
+    auto alloc = buffer.getDefiningOp<ttg::LocalAllocOp>();
+    if (!alloc) {
+      load.emitError("expected descriptor load destination to be backed by "
+                     "ttg.local_alloc before buffer hoisting");
+      return WalkResult::interrupt();
+    }
+    if (!isa<triton::FuncOp>(alloc->getParentOp()) && seen.insert(alloc).second)
+      buffers.push_back(alloc);
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return failure();
+
+  OpBuilderWithAsyncTaskIds builder(funcOp.getContext());
+  Operation *lastHoistedAlloc = nullptr;
+  for (ttg::LocalAllocOp alloc : buffers) {
+    if (lastHoistedAlloc)
+      builder.setInsertionPointAfter(lastHoistedAlloc);
+    else
+      builder.setInsertionPointToStart(&funcOp.getBody().front());
+    Value buffer = hoistLocalAlloc(builder, alloc);
+    lastHoistedAlloc = buffer.getDefiningOp();
+  }
+  return success();
+}
+
+LogicalResult doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0: Swap transposed local_alloc + memdesc_trans patterns so that
   // allocs that share the same source value can also share a buffer.
   swapTransposedLocalAllocs(funcOp);
@@ -4855,6 +4892,12 @@ void doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0.5: Merge duplicate local_allocs with same src and layout.
   // This must be done after swapTransposedLocalAllocs which normalizes layouts.
   mergeDuplicateLocalAllocs(funcOp);
+
+  // Step 0.75: Descriptor loads already write explicit SMEM buffers. Hoist
+  // those destinations before discovering the remaining tensor channels so
+  // memory planning sees the canonical allocation from the outset.
+  if (failed(hoistDescriptorLoadBuffers(funcOp)))
+    return failure();
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
@@ -4874,6 +4917,7 @@ void doBufferAllocation(triton::FuncOp funcOp) {
   // Step 4: Split remaining local_alloc with tensor source into
   // local_alloc + local_store for downstream channel detection.
   separateLocalAllocWithSrc(funcOp);
+  return success();
 }
 
 // ── mergeStagingReuseIntoHost ───────────────────────────────────────────
@@ -5678,7 +5722,16 @@ public:
   using impl::NVGPUTestWSBufferAllocationBase<
       NVGPUTestWSBufferAllocationPass>::NVGPUTestWSBufferAllocationBase;
 
-  void runOnFuncOp(triton::FuncOp funcOp) { doBufferAllocation(funcOp); }
+  void runOnFuncOp(triton::FuncOp funcOp) {
+    if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+    if (failed(doBufferAllocation(funcOp))) {
+      signalPassFailure();
+      return;
+    }
+  }
 
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });

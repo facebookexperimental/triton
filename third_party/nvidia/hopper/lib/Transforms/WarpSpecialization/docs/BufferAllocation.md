@@ -12,8 +12,8 @@ normalizes `local_alloc` ops for downstream code partitioning passes.
 
 ```
 doTaskIdPropagate       ← assigns async_task_id to all ops
-  → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
   → doConvertDescriptorLoadsToNVWS
+  → doBufferAllocation  ← THIS STEP: channels + alloc hoisting
   → doMemoryPlanner     ← decides multi-buffering (buffer.copy)
   → doCodePartition ← inserts accumCnts, async copies, sync ops
 ```
@@ -44,6 +44,14 @@ source that already use `#shared` layout.
 After layout normalization, merge `LocalAllocOp`s that have the same
 source value and the same `MemDescType` — replace duplicates with the
 first alloc.
+
+### Step 0.75: `hoistDescriptorLoadBuffers`
+
+Descriptor conversion has already replaced every `tt.descriptor_load` with a
+buffer-writing `nvws.descriptor_load`. Trace each NVWS destination through
+memdesc views to its backing `local_alloc` and hoist nested allocations to
+function scope. This makes descriptor buffers canonical before remaining
+tensor channels are discovered and before memory planning.
 
 ### Step 1: `collectAsyncChannels`
 
@@ -101,7 +109,7 @@ This models a 1-producer to N-consumer channel — one TMA load writes the
 shared buffer and every consumer partition reads it — instead of duplicating
 the buffer per consumer.
 
-After buffer allocation, `doConvertDescriptorLoadsToNVWS` replaces every
+Before buffer allocation, `doConvertDescriptorLoadsToNVWS` replaces every
 `tt.descriptor_load` with a buffer-writing `nvws.descriptor_load`. A load whose
 only user is `local_store` writes directly to that store's allocation. Other
 loads, including bias loads followed by arithmetic, receive a descriptor-layout
@@ -125,6 +133,7 @@ Those are handled by `doCodePartition` / `doCodePartition`.
 | `doBufferAllocation` | `WSCodePartition.cpp` | Entry point |
 | `swapTransposedLocalAllocs` | `WSCodePartition.cpp` | Layout normalization for buffer sharing |
 | `mergeDuplicateLocalAllocs` | `WSCodePartition.cpp` | Dedup same-source allocs |
+| `hoistDescriptorLoadBuffers` | `WSCodePartition.cpp` | Hoist explicit NVWS descriptor destinations |
 | `collectAsyncChannels` | `WSCodePartition.cpp` | Channel discovery |
 | `reorderEpilogOps` | `WSCodePartition.cpp` | Epilogue store reordering |
 | `createBuffer` | `WSCodePartition.cpp` | Buffer creation / hoisting |
