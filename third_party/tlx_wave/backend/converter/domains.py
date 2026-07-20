@@ -106,7 +106,6 @@ LOWERING_DOMAINS = (
             "token",
             "token_join",
             "issue_token",
-            "lds_release",
             "async_commit_group",
             "async_wait",
         ),
