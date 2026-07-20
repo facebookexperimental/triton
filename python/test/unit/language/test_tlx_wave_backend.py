@@ -6614,11 +6614,17 @@ def test_tlx_wave_converter_keeps_redistribute_scratch_internal_in_loop(tmp_path
 
     wave = output.emitted_module.text
     (for_line, ) = [line for line in wave.splitlines() if "scf.for" in line]
-    assert "!wave.mem.token" not in for_line
-    assert all("!wave.mem.token" not in line for line in wave.splitlines() if "scf.yield" in line)
+    assert "!wave.mem.token" in for_line
+    assert all("!wave.mem.token" in line for line in wave.splitlines() if "scf.yield" in line)
     assert wave.count("wave.redistribute") == 2
+    assert all(
+        " after " in line
+        for line in wave.splitlines()
+        if "wave.redistribute" in line
+    )
     assert "waveamd.mma" in wave
     _run_wave_verify(wave)
+    _run_waveamd_to_machine(wave)
     del ctx
 
 
