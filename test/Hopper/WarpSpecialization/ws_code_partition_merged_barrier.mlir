@@ -29,6 +29,7 @@
 // CHECK: tt.descriptor_store
 // CHECK: tt.descriptor_store
 // CHECK-NOT: tt.descriptor_load
+// CHECK-NOT: nvws.descriptor_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
