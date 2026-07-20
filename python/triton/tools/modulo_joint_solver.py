@@ -356,9 +356,11 @@ def _recmii_augmented(prob, amap):
         wrap_ends[w] = (nids[-1], nids[0])
 
     covered = set()
+    buf_cnt = {}
     for b in prob["buffers"]:
         p = b["producer"]
         cnt = max(1, int(b.get("count", 1)))
+        buf_cnt[p] = max(buf_cnt.get(p, 1), cnt)
         for cons in b.get("consumers", []):
             m = cons["node"]
             if m not in nodes or nodes[m].get("pipeline") != "TC":
@@ -401,6 +403,14 @@ def _recmii_augmented(prob, amap):
         if (u, v) in covered or (v, u) in covered:
             continue
         ur = _deref_producer(u)
+        if buf_cnt.get(ur, 1) >= 2:
+            # Ring depth >= 2: the producer runs ahead behind its buffer and
+            # the consumer's wait is absorbed by the ring — keep the legacy
+            # depth-1 recycle edge on the immediate src only (case6/case7's
+            # deep load channels re-priced as stalls drove their picks into
+            # merged layouts at 0.52-0.55x of hardware, 2026-07-20 A/B).
+            E.append((v, u, _RECMII_HS, 1))
+            continue
         E.append((v, ur, _RECMII_HS, 1))
         # Depth-1 channel STREAM STALL: the consumer's wait executes in its
         # WG's in-order stream, and at ring depth 1 the producer cannot run
@@ -982,7 +992,17 @@ def solve_partition(prob, fixed_assign=None):
             excess = max(0.0, rec - ii) if rec is not None else 0.0
             scored.append((obj + 2.0 * excess, rec, vec, obj, uw))
         scored.sort(key=lambda t: t[0])
-        combined, rec, vec, obj, uw = scored[0]
+        # Within the models' resolution band, prefer MORE warp groups — the
+        # same tie direction the cp objective already encodes (-used_wgs).
+        # The combined score cannot distinguish layouts closer than its
+        # blind spots (case7: merging the reduce into a loader WG scores 10%
+        # "better" than the full split yet runs at 0.54x on hardware), and
+        # across the corpus the hardware-validated committed kernels are the
+        # pipeline-parallel splits, so close calls resolve toward them.
+        margin = float(os.environ.get("TRITON_MODULO_ARBITRATION_MARGIN", "0.15"))
+        band = [s for s in scored if s[0] <= scored[0][0] * (1.0 + margin)]
+        band.sort(key=lambda t: (-t[4], t[0]))
+        combined, rec, vec, obj, uw = band[0]
         return {
             "status":
             "ok",
@@ -1046,8 +1066,16 @@ def _arbitrate_v2(prob, v2_amap):
     rec2 = _recmii_augmented(prob, v2_amap)
     if cp2 is not None and rec2 is not None:
         combined2 = cp2 + 2.0 * max(0.0, rec2 - prob["ii"])
-        if v1["combined"] >= combined2:
-            return None  # tie or v2 better: keep v2
+        # Decisive-margin gate: both models carry known blind spots, so the
+        # arbitration is a safety net for GROSS v2 mistakes, not a referee
+        # for close calls. Override only when v1's winner beats v2's
+        # assignment by more than the models' resolution — case4's bad
+        # split loses by ~60% (override fires), while on case7 v1 itself
+        # mis-prefers merging the reduce into a loader WG by ~10% (0.54x on
+        # hardware if trusted; the margin keeps v2's full split).
+        margin = float(os.environ.get("TRITON_MODULO_ARBITRATION_MARGIN", "0.15"))
+        if v1["combined"] >= combined2 * (1.0 - margin):
+            return None  # close call or v2 better: keep v2
     committed = {str(nd["id"]): int(nd["cycle"]) for nd in prob["nodes"]}
     return {
         "status": "ok",
