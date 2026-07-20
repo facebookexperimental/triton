@@ -295,6 +295,11 @@ class HIPBackend(BaseBackend):
         # to create the require_layout before tlx.local_local.
         # This layout will then be propagated to the tlx.local_alloc
         amd.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack)
+        # Local aliases are structural memory views and may intentionally use
+        # different-rank encodings over the same storage.  Rewrite them to
+        # memdesc views before layout propagation so a consumer's register
+        # layout cannot leak back through the alias to the backing allocation.
+        tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)
         tlx.tlx_passes.add_tlx_insert_require_layout(pm)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         tlx.tlx_passes.add_tlx_rewrite_local_alias(pm)

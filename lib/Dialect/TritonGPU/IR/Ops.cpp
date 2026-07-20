@@ -370,9 +370,13 @@ struct CanonicalizeConvertFromConvert
       // We insert at the point of the original op as there could be ops with
       // memory side-effects between the LocalLoad op and the ConvertLayout op
       rewriter.setInsertionPoint(arg);
-      rewriter.replaceOpWithNewOp<LocalLoadOp>(op, op->getResult(0).getType(),
-                                               sharedLoad.getSrc(),
-                                               sharedLoad.getToken());
+      auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
+          op, op->getResult(0).getType(), sharedLoad.getSrc(),
+          sharedLoad.getToken());
+      // The replacement is still the same memory access.  Preserve semantic
+      // annotations carried by the source load (for example AMD async-wait
+      // readiness) when only its result layout changes.
+      replacement->setAttrs(sharedLoad->getAttrs());
 
       return success();
     }

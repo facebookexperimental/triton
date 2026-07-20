@@ -5,8 +5,11 @@
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/GenericSwizzling.h"
+#include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/MathExtras.h"
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -25,6 +28,170 @@ mlir::MLIRContext *getLinearLayoutContext() {
     return ctx.release().ptr();
   }();
   return py::cast<mlir::MLIRContext *>(py::handle(ctxObject));
+}
+
+mlir::triton::gpu::LocalMemOpTile
+makeLocalMemOpTile(const std::vector<int32_t> &laneContig,
+                   const std::vector<int32_t> &laneAddr) {
+  mlir::triton::gpu::LocalMemOpTile tile;
+  tile.laneContig.append(laneContig.begin(), laneContig.end());
+  tile.laneAddr.append(laneAddr.begin(), laneAddr.end());
+  return tile;
+}
+
+LinearLayout canonicalizeDistributedInputs(const LinearLayout &layout) {
+  auto *ctx = layout.getInDimNames().begin()->getContext();
+  auto original = layout.getBases();
+  LinearLayout::BasesT bases;
+  for (llvm::StringRef name : {"register", "lane", "warp", "block"}) {
+    auto dim = mlir::StringAttr::get(ctx, name);
+    auto it = original.find(dim);
+    bases[dim] =
+        it == original.end() ? std::vector<std::vector<int32_t>>{} : it->second;
+  }
+  for (const auto &[dim, dimBases] : original)
+    if (!bases.contains(dim))
+      bases[dim] = dimBases;
+  return LinearLayout(std::move(bases), layout.getOutDims(),
+                      layout.isSurjective());
+}
+
+std::vector<int32_t>
+registerOrder(const mlir::triton::ColumnAction &permutation,
+              mlir::StringAttr kReg, int32_t registerCount) {
+  auto identity = LinearLayout::identity1D(registerCount, kReg, kReg);
+  auto permuted = permutation.apply(identity);
+  std::vector<int32_t> order;
+  order.reserve(registerCount);
+  for (int32_t reg = 0; reg < registerCount; ++reg) {
+    auto result = permuted.apply({{kReg, reg}});
+    order.push_back(result.front().second);
+  }
+  return order;
+}
+
+struct VectorizedLayoutPlan {
+  LinearLayout layout;
+  std::vector<int32_t> registerOrder;
+  int32_t vectorElements;
+};
+
+VectorizedLayoutPlan vectorizeLayout(const LinearLayout &layout,
+                                     int32_t bitwidth) {
+  auto *ctx = layout.getInDimNames().begin()->getContext();
+  auto kReg = mlir::StringAttr::get(ctx, "register");
+  auto [vectorElements, permutation] =
+      mlir::triton::largestVectorisation(ctx, layout, bitwidth);
+  return {
+      permutation.apply(layout),
+      registerOrder(permutation, kReg, layout.getInDimSize(kReg)),
+      vectorElements,
+  };
+}
+
+py::dict optimalSwizzledLdStPlan(const LinearLayout &src,
+                                 const LinearLayout &dst, int32_t bitwidth,
+                                 int32_t numBanks,
+                                 const std::vector<int32_t> &srcLaneContig,
+                                 const std::vector<int32_t> &srcLaneAddr,
+                                 const std::vector<int32_t> &dstLaneContig,
+                                 const std::vector<int32_t> &dstLaneAddr) {
+  if (bitwidth <= 0 || bitwidth > 128 || 128 % bitwidth != 0)
+    throw std::invalid_argument("bitwidth must be a positive divisor of 128");
+  if (numBanks <= 0 || !llvm::isPowerOf2_32(numBanks))
+    throw std::invalid_argument("num_banks must be a positive power of two");
+  auto srcLayout = canonicalizeDistributedInputs(src);
+  auto dstLayout = canonicalizeDistributedInputs(dst);
+  if (!mlir::triton::actionRemoveBroadcastedRegs(srcLayout).isIdentity() ||
+      !mlir::triton::actionRemoveBroadcastedRegs(dstLayout).isIdentity())
+    throw std::invalid_argument(
+        "optimal swizzled ld/st plans require non-broadcast register "
+        "layouts");
+
+  auto srcTile = makeLocalMemOpTile(srcLaneContig, srcLaneAddr);
+  auto dstTile = makeLocalMemOpTile(dstLaneContig, dstLaneAddr);
+  auto smem = mlir::triton::gpu::optimalSwizzlingLdSt(
+      srcLayout, dstLayout, bitwidth, numBanks, srcTile, dstTile);
+  auto [readBankConflicts, writeBankConflicts] =
+      mlir::triton::gpu::bankConflictsLdSt(srcLayout, dstLayout, smem, bitwidth,
+                                           numBanks, srcTile, dstTile);
+
+  auto *ctx = srcLayout.getInDimNames().begin()->getContext();
+  auto kReg = mlir::StringAttr::get(ctx, "register");
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+  auto kReps = mlir::StringAttr::get(ctx, "reps");
+  auto kOffset = mlir::StringAttr::get(ctx, "offset");
+  int32_t repetitions = smem.getInDimSize(kReps);
+  auto reps = LinearLayout::identity1D(repetitions, kReg, kReps);
+
+  auto totalStore = srcLayout.invertAndCompose(smem);
+  auto totalLoad = mlir::triton::invertAndComposeBlockLocal(smem, dstLayout);
+  auto storePermutation =
+      mlir::triton::regPermForDivide(totalStore, reps, /*left=*/false);
+  auto loadPermutation =
+      mlir::triton::regPermForDivide(totalLoad, reps, /*left=*/false);
+  if (!storePermutation || !loadPermutation)
+    throw std::runtime_error(
+        "optimal swizzle did not produce separable repetition layouts");
+
+  auto outerStoreOrder =
+      registerOrder(*storePermutation, kReg, totalStore.getInDimSize(kReg));
+  auto outerLoadOrder =
+      registerOrder(*loadPermutation, kReg, totalLoad.getInDimSize(kReg));
+  totalStore = storePermutation->apply(totalStore);
+  totalLoad = loadPermutation->apply(totalLoad);
+
+  auto maybeStore = divideRight(totalStore, reps);
+  auto maybeLoad = divideRight(totalLoad, reps);
+  if (!maybeStore || !maybeLoad)
+    throw std::runtime_error(
+        "optimal swizzle repetition layouts could not be divided");
+  auto store = *maybeStore;
+  auto load = *maybeLoad;
+  int32_t storeBlocks = store.getInDimSize(kBlock);
+  int32_t loadBlocks = load.getInDimSize(kBlock);
+  store =
+      store.reshapeOuts({{kOffset, store.getTotalOutDimSize() / storeBlocks},
+                         {kBlock, storeBlocks}});
+  load = load.reshapeOuts({{kOffset, load.getTotalOutDimSize() / loadBlocks},
+                           {kBlock, loadBlocks}});
+
+  auto vectorStore = vectorizeLayout(store, bitwidth);
+  auto vectorLoad = vectorizeLayout(load, bitwidth);
+  int32_t storeTileSize = vectorStore.layout.getInDimSize(kReg);
+  int32_t loadTileSize = vectorLoad.layout.getInDimSize(kReg);
+  if (store.getOutDimSize(kOffset) != load.getOutDimSize(kOffset) ||
+      static_cast<int32_t>(outerStoreOrder.size()) !=
+          storeTileSize * repetitions ||
+      static_cast<int32_t>(outerLoadOrder.size()) != loadTileSize * repetitions)
+    throw std::runtime_error(
+        "optimal swizzle produced inconsistent repetition tile sizes");
+
+  std::vector<int32_t> storeRegisters;
+  std::vector<int32_t> loadRegisters;
+  storeRegisters.reserve(outerStoreOrder.size());
+  loadRegisters.reserve(outerLoadOrder.size());
+  for (int32_t rep = 0; rep < repetitions; ++rep) {
+    for (int32_t reg : vectorStore.registerOrder)
+      storeRegisters.push_back(outerStoreOrder[rep * storeTileSize + reg]);
+    for (int32_t reg : vectorLoad.registerOrder)
+      loadRegisters.push_back(outerLoadOrder[rep * loadTileSize + reg]);
+  }
+
+  py::dict result;
+  result["store_layout"] = py::cast(vectorStore.layout);
+  result["load_layout"] = py::cast(vectorLoad.layout);
+  result["store_registers"] = py::cast(storeRegisters);
+  result["load_registers"] = py::cast(loadRegisters);
+  result["store_vector_elements"] = vectorStore.vectorElements;
+  result["load_vector_elements"] = vectorLoad.vectorElements;
+  result["store_tile_size"] = storeTileSize;
+  result["load_tile_size"] = loadTileSize;
+  result["repetitions"] = repetitions;
+  result["scratch_elements"] = store.getOutDimSize(kOffset);
+  result["read_bank_conflicts"] = readBankConflicts;
+  result["write_bank_conflicts"] = writeBankConflicts;
+  return result;
 }
 
 } // namespace
@@ -220,4 +387,19 @@ void init_linear_layout(py::module &&m) {
         }
         return result;
       });
+
+  m.def(
+      "get_vec_bitwidth_ld_st",
+      [](const LinearLayout &src, const LinearLayout &dst, int32_t bitwidth) {
+        return mlir::triton::gpu::getVecBitwidthLdSt(
+            canonicalizeDistributedInputs(src),
+            canonicalizeDistributedInputs(dst), bitwidth);
+      },
+      py::arg("src"), py::arg("dst"), py::arg("bitwidth"));
+  m.def("optimal_swizzled_ldst_plan", &optimalSwizzledLdStPlan, py::arg("src"),
+        py::arg("dst"), py::arg("bitwidth"), py::arg("num_banks") = 32,
+        py::arg("src_lane_contig") = std::vector<int32_t>{},
+        py::arg("src_lane_addr") = std::vector<int32_t>{},
+        py::arg("dst_lane_contig") = std::vector<int32_t>{},
+        py::arg("dst_lane_addr") = std::vector<int32_t>{});
 }

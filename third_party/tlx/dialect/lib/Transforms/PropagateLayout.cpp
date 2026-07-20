@@ -166,9 +166,15 @@ static bool isRetaggableTensorProducerValue(Value value) {
     return false;
 
   Operation *definingOp = value.getDefiningOp();
+  // release_layout is a structural boundary: backward propagation must stop
+  // at its source, but its result is explicitly allowed to adopt the layout
+  // selected by downstream consumers.  This is particularly important for
+  // region-carried tensors, where the release result and block argument must
+  // be retagged together to keep RegionBranchOpInterface edges type-correct.
   // Sparse dataflow handles the RegionBranchOpInterface edge consistency; if
   // all incoming values agree, retagging the region result is safe.
-  return isa_and_nonnull<ttg::LocalLoadOp, RegionBranchOpInterface>(definingOp);
+  return isa_and_nonnull<ttg::LocalLoadOp, tlx::ReleaseLayoutOp,
+                         RegionBranchOpInterface>(definingOp);
 }
 
 static Type getTensorCandidateType(Value value, DataFlowSolver &solver,

@@ -425,6 +425,20 @@ static Value findMemDescRoot(Value memdesc) {
   return root;
 }
 
+// An explicit local_alloc layout is a source-level storage contract.  Layout
+// selection for such an allocation has already happened before this pass; the
+// dot-consumer walk may retag the register result of local_load, but it must
+// not replace the shared-memory encoding behind an arbitrary chain of views.
+//
+// Keep this marker check at the allocation root so reshape, transpose,
+// subslice, index, and require-layout aliases all observe the same contract.
+static bool hasExplicitLocalAllocLayout(Value memdesc) {
+  Value root = findMemDescRoot(memdesc);
+  Operation *def = root.getDefiningOp();
+  return def && isa<ttg::LocalAllocOp>(def) &&
+         def->hasAttr("tlx.layout_is_explicit");
+}
+
 template <typename... ProducerOps>
 static bool isFedByAnyMemDescUser(Value memdesc) {
   llvm::SetVector<Value> worklist;
@@ -1025,7 +1039,16 @@ LogicalResult insertRequireLayout(ModuleOp m) {
 
     LDBG("local_load needs dot encoding: " << dotEnc);
 
-    // Insert RequireLayoutOp for the memdesc-side dot layout. For explicit
+    // An explicit local_alloc layout is already the memdesc-side requirement.
+    // Preserve it through all structural views.  Tensor layout propagation
+    // below remains responsible for retagging the local_load result to the dot
+    // operand encoding.
+    if (hasExplicitLocalAllocLayout(localLoadOp->getOperand(0))) {
+      LDBG("Preserving explicit local_alloc layout for dot-fed local_load");
+      return;
+    }
+
+    // Insert RequireLayoutOp for an inferred memdesc-side dot layout. For
     // async direct-to-LDS producers, prefer AMD's padded shared layout when it
     // is applicable and fall back to the dot-derived swizzled layout.
     bool useAsyncCopy = isFedByAsyncLdsProducer(localLoadOp->getOperand(0));
