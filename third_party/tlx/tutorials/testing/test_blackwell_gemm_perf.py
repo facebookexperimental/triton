@@ -37,10 +37,9 @@ ref_lib = "cuBLAS"
 # (a "fixed-frequency" architectural test). For that test type CUTLASS says to
 # fill inputs with ZEROS (low entropy -> low power -> the locked clock is not
 # power-throttled). Use --fill uniform for a "fixed-power" test (no clock lock).
-WARMUP_S = 3.0     # >= 3 s of continuous execution so clocks/power settle
-REP_S = 2.0        # timed window; yields ~1000-4000 iters depending on kernel
-COOLDOWN_S = 1.0   # idle between (provider, shape) cells
-
+WARMUP_S = 3.0  # >= 3 s of continuous execution so clocks/power settle
+REP_S = 2.0  # timed window; yields ~1000-4000 iters depending on kernel
+COOLDOWN_S = 1.0  # idle between (provider, shape) cells
 """
 This script is used for benchmarking the performance of TLX tutorial kernels.
 It's recommended to run with `third_party/tlx/denoise.sh third_party/tlx/tutorials/testing/test_blackwell_gemm_perf.py`
@@ -85,8 +84,7 @@ class GpuMonitor:
         while not self._stop.is_set():
             try:
                 out = subprocess.check_output(
-                    ["nvidia-smi", f"--query-gpu={self.QUERY}",
-                     "--format=csv,noheader,nounits", "-i", self.gpu],
+                    ["nvidia-smi", f"--query-gpu={self.QUERY}", "--format=csv,noheader,nounits", "-i", self.gpu],
                     stderr=subprocess.DEVNULL, timeout=1.0).decode().strip()
                 parts = [p.strip() for p in out.split(",")]
                 self.sm_clocks.append(float(parts[0]))
@@ -108,13 +106,13 @@ class GpuMonitor:
             self._thread.join(timeout=2.0)
 
     def summary(self):
+
         def stats(xs):
             if not xs:
                 return (float("nan"), float("nan"), float("nan"))
             return (min(xs), statistics.mean(xs), max(xs))
 
-        active = sorted(t for t in self.throttles
-                        if t and t not in ("Not Active", ""))
+        active = sorted(t for t in self.throttles if t and t not in ("Not Active", ""))
         return {
             "sm_clock": stats(self.sm_clocks),
             "power": stats(self.powers),
@@ -238,8 +236,7 @@ def create_benchmark(versions, dtype=torch.float16, fill="zeros"):
             f"clk[min/mean/max]={sm[0]:.0f}/{sm[1]:.0f}/{sm[2]:.0f}MHz "
             f"pwr={pw[0]:.0f}/{pw[1]:.0f}/{pw[2]:.0f}W "
             f"throttle={mon['throttle'] or 'none'} "
-            f"-> {tflops(med):.1f} TFLOPS",
-            flush=True)
+            f"-> {tflops(med):.1f} TFLOPS", flush=True)
 
         time.sleep(COOLDOWN_S)  # cooldown before next cell
         return tflops(med), tflops(hi_t), tflops(lo_t)
