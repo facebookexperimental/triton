@@ -748,6 +748,7 @@ class CUDABackend(BaseBackend):
         if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)

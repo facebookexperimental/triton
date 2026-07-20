@@ -11,6 +11,7 @@ add_triton_library(TritonTransforms
   LoopUnroll.cpp
   ReorderBroadcast.cpp
   RewriteTensorDescriptorToPointer.cpp
+  SimplifySingleTripWhile.cpp
   ArithTypeConversion.cpp
   FunctionTypeConversion.cpp
 
