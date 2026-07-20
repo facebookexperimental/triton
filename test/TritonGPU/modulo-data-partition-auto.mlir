@@ -15,7 +15,10 @@
 // legality term (case2's BM=256).
 //===----------------------------------------------------------------------===//
 
-// --- Candidate surface: the N=2 split is legal and reported, not applied ---
+// --- Candidate surface: the N=2 split is legal and reported, not applied.
+// --- This run also guards the dump-mode self-trigger: TRITON_MODULO_DUMP_SCHEDULE
+// --- is set but no TRITON_DATA_PARTITION_N, and the baseline (128 rows) is
+// --- TLX-legal, so the self-trigger must NOT fire — applied_n stays 1. ---
 // SURFACE: "op_kind": "ttng.tc_gen5_mma", "dim": 0, "applied_n": 1, "factors": [{"n": 2, "m_size": 64}]
 
 // --- Under auto: same dump — the search ran and kept N=1. Non-vacuous by

@@ -40,17 +40,22 @@ def make_inputs(shape):
     M, N, K = shape
     a = torch.randn(M, K, device="cuda", dtype=torch.float16)
     b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    # Separate output buffers per kernel: the harness compares gen vs hw
+    # (rel_gen_vs_hw), so they must NOT alias — one shared `c` makes hw_call
+    # overwrite gen's output and the comparison degenerate to _rel(c, c) == 0.
     c = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float16)
+    c_hw = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float16)
     b_t = b.t().contiguous()  # [N, K] so TMA loads [offs_bn, offs_k]
-    # Reference (handwritten.py) descriptor set — 128-tile contract.
+    # Reference (handwritten.py) descriptor set — 128-tile contract, writes c_hw.
     a_desc = TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
     b_desc = TensorDescriptor.from_tensor(b_t, [BLOCK_N, BLOCK_K])
-    c_desc = TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
-    # Generated-kernel descriptor set — partitioned 256-tile contract.
+    c_desc = TensorDescriptor.from_tensor(c_hw, [BLOCK_M, BLOCK_N])
+    # Generated-kernel descriptor set — partitioned 256-tile contract, writes c.
     a_desc_gen = TensorDescriptor.from_tensor(a, [GEN_BLOCK_M, GEN_BLOCK_K])
     b_desc_gen = TensorDescriptor.from_tensor(b_t, [GEN_BLOCK_N, GEN_BLOCK_K])
     c_desc_gen = TensorDescriptor.from_tensor(c, [GEN_STORE_M, GEN_BLOCK_N])
-    return {"a": a, "b": b, "c": c, "a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc,
+    return {"a": a, "b": b, "c": c, "c_hw": c_hw,
+            "a_desc": a_desc, "b_desc": b_desc, "c_desc": c_desc,
             "a_desc_gen": a_desc_gen, "b_desc_gen": b_desc_gen, "c_desc_gen": c_desc_gen,
             "M": M, "N": N, "K": K}
 
@@ -73,7 +78,7 @@ def hw_call(handwritten, inputs):
         NUM_SMS=nsms, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS, num_warps=4, num_ctas=1, num_stages=2,
     )
-    return inputs["c"]
+    return inputs["c_hw"]
 
 
 def metric(shape):

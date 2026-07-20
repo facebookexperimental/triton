@@ -1,19 +1,21 @@
 // RUN: env TRITON_DATA_PARTITION_N=auto TRITON_MODULO_DUMP_SCHEDULE=%t.json triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -o /dev/null && FileCheck %s --check-prefix=ATTR < %t.json
 
 //===----------------------------------------------------------------------===//
-// Test: an explicit per-loop tt.data_partition_factor attr bypasses the
-// TRITON_DATA_PARTITION_N=auto search.
+// Test: an explicit per-loop tt.data_partition_factor attr wins over the
+// TRITON_DATA_PARTITION_N=auto search, per-MMA.
 //
 // Same kernel as modulo-data-partition-auto.mlir, where the auto search
 // keeps N=1 (all score terms tie). Here the loop carries
-// tt.data_partition_factor = 2, so under env=auto the classic user-resolved
-// path must win and apply N=2 — and the search must never run.
+// tt.data_partition_factor = 2. The search now runs (an attr no longer
+// disables it module-wide), but it resolves each MMA on its own terms: a
+// pinned MMA keeps its factor in every variant AND in the baseline, so the
+// search can only ever return N=2 for it.
 //===----------------------------------------------------------------------===//
 
-// This check is a true behavioral differential: on this kernel the auto
-// search keeps N=1 (see modulo-data-partition-auto.mlir), so applied_n = 2
-// can only come from the classic user-resolved path — i.e. the attr
-// actually bypassed the search.
+// This check is a true behavioral differential: on this kernel the un-pinned
+// auto search keeps N=1 (see modulo-data-partition-auto.mlir), so applied_n = 2
+// can only come from the pin winning — i.e. the attr overrode the search for
+// this MMA.
 // ATTR: "op_kind": "ttng.tc_gen5_mma", "dim": 0, "applied_n": 2, "factors": [{"n": 2, "m_size": 64}]
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>

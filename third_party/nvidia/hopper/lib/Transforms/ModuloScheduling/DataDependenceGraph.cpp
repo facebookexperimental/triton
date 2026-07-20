@@ -46,8 +46,9 @@ void DataDependenceGraph::addEdge(unsigned src, unsigned dst, int latency,
   nodes[dst].preds.push_back(src);
 }
 
-DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
-                                               const LatencyModel &model) {
+DataDependenceGraph DataDependenceGraph::build(
+    scf::ForOp loop, const LatencyModel &model,
+    const llvm::DenseMap<Operation *, DataPartitionInfo> &partition) {
   DataDependenceGraph ddg;
 
   // Phase 1: Create nodes for every op in the loop body (except terminator).
@@ -59,7 +60,12 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     // is the inner loop's total execution time (II × trip_count), and
     // its pipeline is NONE (handles its own internal pipelining).
     if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
-      auto innerDDG = DataDependenceGraph::build(innerLoop, model);
+      auto innerDDG = DataDependenceGraph::build(innerLoop, model, partition);
+      // Pass A.5: the inner MMA may be partitioned; apply the split before
+      // scheduling so the super-node's innerII is the partitioned II, not the
+      // unpartitioned one (which would dilute the outer loop's cost and could
+      // hide a variant that only schedules once the inner MMA is split).
+      innerDDG.applyDataPartition(partition);
       auto innerSched = runModuloScheduling(innerDDG);
 
       DDGNode node;
