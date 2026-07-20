@@ -684,7 +684,9 @@ class CUDABackend(BaseBackend):
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
         # optimize TTGIR
-        passes.ttgpuir.add_coalesce(pm)
+        ptx_version = get_ptx_version_from_options(opt, capability)
+        max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
+        passes.ttgpuir.add_coalesce(pm, max_vec_bits)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         # Storage alias lowering runs after layout propagation so the backing
         # TMEM allocation is materialized with the resolved 2-CTA storage format.
