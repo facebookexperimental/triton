@@ -562,8 +562,16 @@ and emit **indeterminate**, never silently drop.
     dump: the data alloc(s) with that `buffer.id`, their writers/readers
     (write / read / mma-write(acc) / mma-read), the barriers guarding the group
     (`init_barrier buffer.id==N`), and the wait/arrive ops driving those barriers
-    (wait(fwd) / wait(bwd) / arrive) — each tagged with partition (async_task_id)
-    and role, in program order. E.g. `--dump-buffer-id=6` on the HSTU DP=2 fixture
+    (wait(fwd) / wait(bwd) / arrive) — each tagged with partition (async_task_id),
+    **control region `r#M`** (numbered `for`/`if`/`while`/partition regions, with
+    a legend) and, for barrier ops, the **guarding barrier `bar#N`** it drives, in
+    program order. For barrier endpoints it also prints `idx=`/`phase=` as
+    accumCnt expressions (`describeAccumExpr`): an **in-loop** single-buffered
+    barrier shows `phase = accumCnt & 1` (toggles each iteration); a **post-loop**
+    or non-accumCnt-driven op shows a constant (e.g. the O accumulator's data-ready
+    handshake, whose commit/wait are post-loop → `phase=0/1` constant while its
+    MMA-write is in the `for` region). An `[accumCnt]` line summarizes each loop's
+    counter (init + per-iteration update). E.g. `--dump-buffer-id=6` on the HSTU DP=2 fixture
     prints the O accumulator's gemm MMA-write + tc_gen5_commit (task 1) and the
     epilogue forward-wait + tmem_load drain + reuse arrive (task 0). Future work
     extends it to the full coverage table (owner + packed siblings, `buffer.copy`,

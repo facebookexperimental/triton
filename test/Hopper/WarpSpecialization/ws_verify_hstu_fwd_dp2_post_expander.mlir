@@ -7,10 +7,14 @@
 // tc_gen5_commit (task 1), and the epilogue forward-wait + tmem_load drain +
 // reuse arrive (task 0).
 // DUMP: ops for reuse group buffer.id=6
+// Each op is tagged with its control region (r#) and barrier ops with bar#.
 // DUMP-DAG: [alloc] {{.*}}ttng.tmem_alloc
-// DUMP-DAG: [mma-write(acc)] task=1 {{.*}}ttng.tc_gen5_mma
-// DUMP-DAG: [arrive] task=1 {{.*}}ttng.tc_gen5_commit
-// DUMP-DAG: [read] task=0 {{.*}}ttng.tmem_load
+// DUMP-DAG: [mma-write(acc)] r#{{[0-9]+}} task=1 {{.*}}ttng.tc_gen5_mma
+// DUMP-DAG: [arrive] r#{{[0-9]+}} task=1 bar#{{[0-9]+}} {{.*}}ttng.tc_gen5_commit
+// DUMP-DAG: [read] r#{{[0-9]+}} task=0 {{.*}}ttng.tmem_load
+// The acc data-ready wait is post-loop (an if region, not the KV for) -> its
+// phase is a constant, not accumCnt-derived:
+// DUMP-DAG: [wait(fwd)] r#{{[0-9]+}} task=1 bar#{{[0-9]+}} idx=0 phase=1 {{.*}}ttng.wait_barrier
 //
 // autoWS barrier verifier fixture: HSTU self-attn forward, data_partition=2,
 // captured AFTER the pipeline expander (SoftwarePipeliner ExpandLoops) from an

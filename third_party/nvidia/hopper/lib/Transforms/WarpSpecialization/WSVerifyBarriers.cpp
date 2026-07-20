@@ -338,18 +338,79 @@ public:
   // program (walk) order. Intended for debugging a specific reuse group, e.g.
   // the O accumulator (id 6/7) the DP=2 deadlock is on.
   void dumpBufferGroup(triton::FuncOp funcOp, int bid) {
+    // Number the guarding barriers (bar#N) in init order.
     DenseSet<Operation *> groupBarriers;
+    DenseMap<Operation *, int> barIndex;
+    SmallVector<Operation *> barOrder;
     funcOp.walk([&](ttng::InitBarrierOp init) {
       if (auto id = getGuardedBufferId(init))
         if (*id == bid)
           if (Operation *b = resolveBarrierAlloc(init.getAlloc()))
-            groupBarriers.insert(b);
+            if (groupBarriers.insert(b).second) {
+              barIndex[b] = barOrder.size();
+              barOrder.push_back(b);
+            }
     });
+
+    // Number the control regions (r#M): scf.for/if/while bodies and
+    // warp_specialize default/partition regions, in pre-order.
+    DenseMap<Region *, int> regionId;
+    SmallVector<std::string> regionLabel;
+    auto addRegion = [&](Region *r, StringRef kind) {
+      if (r && !regionId.count(r)) {
+        regionId[r] = regionLabel.size();
+        regionLabel.push_back(kind.str());
+      }
+    };
+    funcOp.walk([&](Operation *op) {
+      if (isa<scf::ForOp>(op))
+        addRegion(&op->getRegion(0), "for");
+      else if (isa<scf::IfOp>(op)) {
+        addRegion(&op->getRegion(0), "if-then");
+        if (op->getNumRegions() > 1)
+          addRegion(&op->getRegion(1), "if-else");
+      } else if (isa<scf::WhileOp>(op)) {
+        addRegion(&op->getRegion(0), "while-before");
+        addRegion(&op->getRegion(1), "while-after");
+      } else if (isa<triton::gpu::WarpSpecializeOp>(op)) {
+        addRegion(&op->getRegion(0), "ws-default");
+      } else if (isa<triton::gpu::WarpSpecializePartitionsOp>(op)) {
+        for (auto [i, reg] : llvm::enumerate(op->getRegions()))
+          addRegion(&reg, ("partition" + std::to_string(i)));
+      }
+    });
+    auto ctrlRegionOf = [&](Operation *op) -> int {
+      for (Region *r = op->getParentRegion(); r;) {
+        auto it = regionId.find(r);
+        if (it != regionId.end())
+          return it->second;
+        Operation *p = r->getParentOp();
+        r = p ? p->getParentRegion() : nullptr;
+      }
+      return -1;
+    };
+    auto barOf = [&](Operation *op) -> int {
+      if (auto init = dyn_cast<ttng::InitBarrierOp>(op)) {
+        auto it = barIndex.find(resolveBarrierAlloc(init.getAlloc()));
+        return it == barIndex.end() ? -1 : it->second;
+      }
+      for (Value o : op->getOperands()) {
+        auto it = barIndex.find(resolveBarrierAlloc(o));
+        if (it != barIndex.end())
+          return it->second;
+      }
+      return -1;
+    };
 
     auto flags = OpPrintingFlags().skipRegions();
     llvm::errs() << "==== ops for reuse group buffer.id=" << bid << " in @"
                  << funcOp.getName() << " (" << groupBarriers.size()
                  << " guarding barriers) ====\n";
+    // Legends.
+    llvm::errs() << "  regions:";
+    for (auto [i, lbl] : llvm::enumerate(regionLabel))
+      llvm::errs() << " r#" << i << "=" << lbl;
+    llvm::errs() << "\n";
 
     // Loop accumCnt(s): the WS accumulation counters that drive every barrier
     // slot/phase. Show each loop's accumCnt iter-arg, its entry value, and its
@@ -414,14 +475,24 @@ public:
         }
       if (role.empty())
         return;
-      llvm::errs() << "  [" << role << "] task=" << getSingleTask(op);
+      int rr = ctrlRegionOf(op);
+      llvm::errs() << "  [" << role << "] r#" << (rr < 0 ? -1 : rr)
+                   << " task=" << getSingleTask(op);
+      // Which guarding barrier this op drives.
+      if (isWaitOp(op) || isArriveOp(op) || isa<ttng::InitBarrierOp>(op)) {
+        int bn = barOf(op);
+        if (bn >= 0)
+          llvm::errs() << " bar#" << bn;
+      }
       // For barrier endpoints, show how the slot index and (for waits) the
-      // phase relate to the loop accumCnt.
+      // phase relate to the loop accumCnt. Inside a loop a single-buffered
+      // barrier's phase is accumCnt & 1 (toggles each iteration); constant here
+      // means the op is post-loop / not accumCnt-driven.
       if (isWaitOp(op) || isArriveOp(op)) {
         if (Value slot = barrierSlotIndex(op, groupBarriers))
-          llvm::errs() << "  idx=" << describeAccumExpr(slot);
+          llvm::errs() << " idx=" << describeAccumExpr(slot);
         if (isa<ttng::WaitBarrierOp>(op) && op->getNumOperands() > 1)
-          llvm::errs() << "  phase=" << describeAccumExpr(op->getOperand(1));
+          llvm::errs() << " phase=" << describeAccumExpr(op->getOperand(1));
       }
       llvm::errs() << "  ";
       op->print(llvm::errs(), flags);

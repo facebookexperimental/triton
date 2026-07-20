@@ -32,7 +32,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 }
 
 // CHECK: ops for reuse group buffer.id=0
-// The arrive's slot and the wait's slot+phase are shown relative to the loop
-// counter (%arg1 here; "accumCnt" on real-pipeline IR):
-// CHECK: [arrive]{{.*}}idx=(%arg{{[0-9]+}} % 2){{.*}}arrive_barrier
-// CHECK: [wait(fwd)]{{.*}}idx=(%arg{{[0-9]+}} % 2){{.*}}phase=((%arg{{[0-9]+}} / 2) & 1){{.*}}wait_barrier
+// The loop body is control region r#0 (a for). The arrive/wait live in it and
+// their slot+phase are shown relative to the loop counter (%arg1 here;
+// "accumCnt" on real-pipeline IR). Being in-loop, the phase is accumCnt-derived
+// (toggles), not a constant; both ops reference the same guarding barrier bar#0.
+// CHECK: regions: r#0=for
+// CHECK: [arrive] r#0 {{.*}}bar#0 idx=(%arg{{[0-9]+}} % 2){{.*}}arrive_barrier
+// CHECK: [wait(fwd)] r#0 {{.*}}bar#0 idx=(%arg{{[0-9]+}} % 2) phase=((%arg{{[0-9]+}} / 2) & 1){{.*}}wait_barrier
