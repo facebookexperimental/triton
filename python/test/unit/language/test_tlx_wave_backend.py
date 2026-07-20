@@ -673,7 +673,7 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         wave_split_barriers=False,
     )
 
-    v9_spec, v10_spec = runner.build_run_specs(args, tmp_path)
+    v9_spec, v10_spec, inter_wave_llvm_spec, inter_wave_wave_spec = runner.build_run_specs(args, tmp_path)
     assert v9_spec.name == "f16"
     assert v10_spec.name == "f16-v10"
     command = v9_spec.command
@@ -710,6 +710,18 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         assert v10_command[v10_command.index(option) + 1] == expected
     providers_index = v10_command.index("--providers")
     assert v10_command[providers_index + 1:providers_index + 3] == ("tlx", "wave")
+
+    assert inter_wave_llvm_spec.name == "f16-inter-wave-llvm"
+    assert inter_wave_llvm_spec.backend == "llvm"
+    assert inter_wave_wave_spec.name == "f16-inter-wave-wave"
+    assert inter_wave_wave_spec.backend == "wave"
+    for spec in (inter_wave_llvm_spec, inter_wave_wave_spec):
+        assert spec.command[1].endswith("gfx9_gemm/inter_wave/a16w16/bench.py")
+        shape_index = spec.command.index("--shape")
+        assert spec.command[shape_index + 1:shape_index + 4] == ("8192", "8192", "8192")
+        assert spec.command[spec.command.index("--rep") + 1] == "31"
+        assert spec.command[spec.command.index("--warmup") + 1] == "7"
+        assert spec.command[spec.command.index("--seed") + 1] == "0"
 
 
 def test_tlx_perf_sweep_forwards_mxfp_batched_timing_options(tmp_path):
