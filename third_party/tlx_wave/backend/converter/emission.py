@@ -25,7 +25,6 @@ _MMA_PACKET_REPRESENTATIONS = frozenset({
     "simd_packet_tuple",
 })
 _COMPARE_SELECT_MASK_BUDGET_DWORDS = 8
-_FULL_MEMORY_BARRIER_ADDRESS_SPACE = 31
 
 
 @dataclass(frozen=True)
@@ -2086,7 +2085,12 @@ def _local_load_ready_async_write_roots(state, op, attrs):
     LDS hazards remain in the ordinary access state and are still honored.
     """
     readiness_count = int(attrs.get("readiness_dependency_count", 0))
+    barrier_order_count = int(
+        attrs.get("barrier_order_dependency_count", 0)
+    )
     dependency_ids = tuple(int(target_id) for target_id in op.operands[1:])
+    if barrier_order_count:
+        dependency_ids = dependency_ids[:-barrier_order_count]
     if readiness_count <= 0:
         return frozenset()
     if readiness_count > len(dependency_ids):
@@ -2274,20 +2278,11 @@ def _emit_set_priority(state, op):
 
 
 def _emit_barrier(state, op):
-    attrs = target_ir.attrs_dict(op)
     tokens = tuple(
         _require_value(state, target_value_id, op)
         for target_value_id in op.operands
     )
     barrier_token = _emit_cta_barrier(state, *tokens)
-    # A full-memory CTA barrier is also a structural boundary for later memory
-    # issue.  Its token orders explicit consumers, while the scheduling cut
-    # prevents an otherwise-independent operation from being hoisted to the
-    # pre-barrier epoch without turning the barrier into that operation's data
-    # dependency. Local-memory publication is represented by explicit tokens
-    # and retains legal issue overlap across the physical rendezvous.
-    if int(attrs.get("address_space", 0)) == _FULL_MEMORY_BARRIER_ADDRESS_SPACE:
-        state.builder.sched_barrier()
     if op.results:
         state.values[_single_result(op)] = barrier_token
         roots = _local_memory_roots_for_token_values(state, op.operands)
@@ -6256,7 +6251,15 @@ def _local_access_offset_range(attrs, shape):
 
 def _emit_buffer_load_to_local(state, op):
     attrs = target_ir.attrs_dict(op)
-    issue_dependency_count = int(attrs.get("issue_dependency_count", 0))
+    source_issue_dependency_count = int(
+        attrs.get("issue_dependency_count", 0)
+    )
+    barrier_order_dependency_count = int(
+        attrs.get("barrier_order_dependency_count", 0)
+    )
+    issue_dependency_count = (
+        source_issue_dependency_count + barrier_order_dependency_count
+    )
     if attrs["mode"] == "dma_packet_lds":
         has_mask = bool(attrs.get("has_mask", False))
         mask_operand_count = int(has_mask)
@@ -7159,6 +7162,46 @@ def _join_memory_tokens(state, tokens):
     if len(tokens) == 1:
         return tokens[0]
     return state.builder.join(*tokens)
+
+
+def _barrier_order_dependency(state, op, ordinary_operand_count):
+    attrs = target_ir.attrs_dict(op)
+    count = int(attrs.get("barrier_order_dependency_count", 0))
+    if count not in {0, 1} or len(op.operands) != int(ordinary_operand_count) + count:
+        fail(
+            "TLXW_EMIT_BARRIER_ORDER_SEGMENT",
+            STAGE,
+            "memory barrier-order operand segment is malformed",
+            target_op_id=op.target_op_id,
+        )
+    if not count:
+        return None
+    return _require_value(state, op.operands[-1], op)
+
+
+def _issue_order_result_ids(op):
+    attrs = target_ir.attrs_dict(op)
+    count = int(attrs.get("issue_order_result_count", 0))
+    if count not in {0, 1} or count > len(op.results):
+        fail(
+            "TLXW_EMIT_ISSUE_ORDER_RESULT",
+            STAGE,
+            "memory issue-order result segment is malformed",
+            target_op_id=op.target_op_id,
+        )
+    if not count:
+        return tuple(int(result_id) for result_id in op.results), ()
+    return (
+        tuple(int(result_id) for result_id in op.results[:-1]),
+        (int(op.results[-1]), ),
+    )
+
+
+def _finish_issue_order_result(state, op, tokens):
+    _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
+    if not issue_result_ids:
+        return
+    state.values[issue_result_ids[0]] = _join_memory_tokens(state, tokens)
 
 
 def _memory_dependency_token(state, tokens):
@@ -9423,13 +9466,14 @@ def _emit_buffer_store(state, op):
     has_mask = bool(attrs["has_mask"])
     mask_operand_count = int(has_mask)
     expected_operand_count = 3 + mask_operand_count
-    if len(op.operands) != expected_operand_count:
-        fail(
-            "TLXW_EMIT_OPERAND_COUNT",
-            STAGE,
-            f"expected {expected_operand_count} operands, got {len(op.operands)}",
-            target_op_id=op.target_op_id,
-        )
+    dependency = _barrier_order_dependency(
+        state,
+        op,
+        expected_operand_count,
+    )
+    _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
+    capture_token = bool(issue_result_ids)
+    tokens = []
     value = _require_value(state, op.operands[0], op)
     source_base = _require_value(state, op.operands[1], op)
     offsets = _require_value(state, op.operands[2], op)
@@ -9590,7 +9634,7 @@ def _emit_buffer_store(state, op):
             mask_component, mask_supported = packet_mask(index, packet_elements)
             if mask_supported:
                 packet_offset_component = store_offset_components[index]
-                _emit_buffer_store_vector_packet(
+                token = _emit_buffer_store_vector_packet(
                     state,
                     op,
                     attrs,
@@ -9603,7 +9647,11 @@ def _emit_buffer_store(state, op):
                     element_type,
                     lane_width,
                     mask_mode,
+                    dependency=dependency,
+                    capture_token=capture_token,
                 )
+                if token is not None:
+                    tokens.append(token)
                 index += packet_elements
                 continue
 
@@ -9673,7 +9721,7 @@ def _emit_buffer_store(state, op):
                 )
                 if mask_supported:
                     packet_offset_component = store_offset_components[index]
-                    _emit_buffer_store_vector_payload_packet(
+                    token = _emit_buffer_store_vector_payload_packet(
                         state,
                         op,
                         attrs,
@@ -9687,7 +9735,11 @@ def _emit_buffer_store(state, op):
                         element_type,
                         lane_width,
                         mask_mode,
+                        dependency=dependency,
+                        capture_token=capture_token,
                     )
+                    if token is not None:
+                        tokens.append(token)
                     index += vector_packet_components
                     continue
             value_scalar_type = state.dsl.simd_type(value_element_type, lane_width)
@@ -9701,7 +9753,7 @@ def _emit_buffer_store(state, op):
                     access_index + element_index
                 ]
                 scalar_mask = component_mask(access_index + element_index)
-                _emit_buffer_store_component(
+                token = _emit_buffer_store_component(
                     state,
                     op,
                     attrs,
@@ -9711,13 +9763,17 @@ def _emit_buffer_store(state, op):
                     scalar_offset,
                     scalar_mask,
                     mask_mode,
+                    dependency=dependency,
+                    capture_token=capture_token,
                 )
+                if token is not None:
+                    tokens.append(token)
             index += 1
             continue
 
         offset_component = store_offset_components[index]
         mask_component = component_mask(access_index)
-        _emit_buffer_store_component(
+        token = _emit_buffer_store_component(
             state,
             op,
             attrs,
@@ -9727,8 +9783,13 @@ def _emit_buffer_store(state, op):
             offset_component,
             mask_component,
             mask_mode,
+            dependency=dependency,
+            capture_token=capture_token,
         )
+        if token is not None:
+            tokens.append(token)
         index += 1
+    _finish_issue_order_result(state, op, tokens)
 
 
 def _buffer_store_packet_elements(
@@ -9976,6 +10037,7 @@ def _emit_buffer_store_vector_packet(
     mask_mode,
     *,
     dependency=None,
+    capture_token=False,
 ):
     cache = _direct_buffer_store_cache_attr(state, attrs, op)
     packet_elements = int(packet_elements)
@@ -10008,6 +10070,13 @@ def _emit_buffer_store_vector_packet(
             f"unsupported buffer_store mask mode {mask_mode}",
             target_op_id=op.target_op_id,
         )
+    if capture_token:
+        return _emit_masked_token_region(
+            state,
+            mask_component,
+            dependency or state.builder.token(),
+            emit_store,
+        )
     return _emit_masked_effect_region(state, mask_component, emit_store)
 
 
@@ -10027,6 +10096,7 @@ def _emit_buffer_store_vector_payload_packet(
     mask_mode,
     *,
     dependency=None,
+    capture_token=False,
 ):
     cache = _direct_buffer_store_cache_attr(state, attrs, op)
     packet_components = int(packet_components)
@@ -10064,6 +10134,13 @@ def _emit_buffer_store_vector_payload_packet(
             f"unsupported buffer_store mask mode {mask_mode}",
             target_op_id=op.target_op_id,
         )
+    if capture_token:
+        return _emit_masked_token_region(
+            state,
+            mask_component,
+            dependency or state.builder.token(),
+            emit_store,
+        )
     return _emit_masked_effect_region(state, mask_component, emit_store)
 
 
@@ -10079,6 +10156,7 @@ def _emit_buffer_store_component(
     mask_mode,
     *,
     dependency=None,
+    capture_token=False,
 ):
     cache = _direct_buffer_store_cache_attr(state, attrs, op)
 
@@ -10101,6 +10179,13 @@ def _emit_buffer_store_component(
             STAGE,
             f"unsupported buffer_store mask mode {mask_mode}",
             target_op_id=op.target_op_id,
+        )
+    if capture_token:
+        return _emit_masked_token_region(
+            state,
+            mask_component,
+            dependency or state.builder.token(),
+            emit_store,
         )
     return _emit_masked_effect_region(state, mask_component, emit_store)
 
@@ -10159,13 +10244,7 @@ def _emit_buffer_load(state, op):
         + mask_operand_count
         + other_operand_count
     )
-    if len(op.operands) != operand_count:
-        fail(
-            "TLXW_EMIT_OPERAND_COUNT",
-            STAGE,
-            f"expected {operand_count} operands, got {len(op.operands)}",
-            target_op_id=op.target_op_id,
-        )
+    dependency = _barrier_order_dependency(state, op, operand_count)
     source_base = _require_value(state, op.operands[0], op)
     offsets = _require_value(state, op.operands[1], op)
     operand_index = 2
@@ -10220,7 +10299,15 @@ def _emit_buffer_load(state, op):
             "buffer_load other requires a mask",
             target_op_id=op.target_op_id,
         )
-    result_id = _single_result(op)
+    data_result_ids, _issue_result_ids = _issue_order_result_ids(op)
+    if len(data_result_ids) != 1:
+        fail(
+            "TLXW_EMIT_ISSUE_ORDER_RESULT",
+            STAGE,
+            "buffer_load requires one data result",
+            target_op_id=op.target_op_id,
+        )
+    result_id = data_result_ids[0]
     target_type = state.target_program.values[result_id].type
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     lane_width = int(attrs["lane_width"])
@@ -10232,7 +10319,7 @@ def _emit_buffer_load(state, op):
     )
     load_offset_components = offset_components
     if attrs.get("result_value_mode") in {"mma_packet_payload", "register_vector_payload"}:
-        state.values[result_id] = _emit_buffer_load_mma_packet_payload(
+        payload, tokens = _emit_buffer_load_mma_packet_payload(
             state,
             op,
             attrs,
@@ -10245,7 +10332,10 @@ def _emit_buffer_load(state, op):
             lane_width,
             access_component_count,
             mask_mode,
+            dependency,
         )
+        state.values[result_id] = payload
+        _finish_issue_order_result(state, op, tokens)
         return
     result_type = _wave_type(state.dsl, target_type)
     packet_elements = _buffer_load_packet_elements(attrs)
@@ -10273,6 +10363,7 @@ def _emit_buffer_load(state, op):
     )
     loaded_components = []
     loaded_packets = []
+    tokens = []
     index = 0
     while index < component_count:
         if _can_vectorize_buffer_load_packet(
@@ -10296,29 +10387,33 @@ def _emit_buffer_load(state, op):
                 result_type,
                 lane_width,
                 mask_mode,
+                dependency=dependency,
                 preserve_packet=preserve_packets,
                 preserve_raw_packet=preserve_raw_layout_packets,
             )
             loaded_values, loaded_token = loaded_packet
+            tokens.append(loaded_token)
             if preserve_packets:
                 loaded_packets.extend(loaded_values)
             else:
                 loaded_components.extend(loaded_values)
             index += packet_elements
             continue
-        loaded_components.append(
-            _emit_buffer_load_scalar_component(
-                state,
-                op,
-                attrs,
-                index,
-                buffer_base,
-                load_offset_components,
-                mask_components,
-                other_components,
-                result_type,
-                mask_mode,
-            ))
+        loaded, loaded_token = _emit_buffer_load_scalar_component(
+            state,
+            op,
+            attrs,
+            index,
+            buffer_base,
+            load_offset_components,
+            mask_components,
+            other_components,
+            result_type,
+            mask_mode,
+            dependency=dependency,
+        )
+        loaded_components.append(loaded)
+        tokens.append(loaded_token)
         index += 1
     if preserve_raw_layout_packets:
         state.values[result_id] = _RawLayoutVectorPacketPayload(
@@ -10335,6 +10430,7 @@ def _emit_buffer_load(state, op):
         )
     else:
         state.values[result_id] = _pack_components(tuple(loaded_components))
+    _finish_issue_order_result(state, op, tokens)
 
 
 def _require_buffer_load_raw_layout_packets(
@@ -10461,6 +10557,7 @@ def _emit_buffer_load_mma_packet_payload(
     lane_width,
     access_component_count,
     mask_mode,
+    dependency,
 ):
     result_value_mode = attrs.get("result_value_mode")
     if (result_value_mode == "mma_packet_payload"
@@ -10527,6 +10624,7 @@ def _emit_buffer_load_mma_packet_payload(
         width=int(lane_width),
     )
     payloads = []
+    tokens = []
     for component in range(component_count):
         index = component * registers
         if _can_vectorize_buffer_load_packet(
@@ -10537,7 +10635,7 @@ def _emit_buffer_load_mma_packet_payload(
             mask_components,
             other_components,
         ):
-            loaded_values, _token = _emit_buffer_load_vector_packet(
+            loaded_values, token = _emit_buffer_load_vector_packet(
                 state,
                 op,
                 attrs,
@@ -10550,12 +10648,15 @@ def _emit_buffer_load_mma_packet_payload(
                 scalar_component_type,
                 lane_width,
                 mask_mode,
+                dependency=dependency,
                 preserve_packet=True,
             )
             payloads.extend(loaded_values)
+            tokens.append(token)
             continue
-        elements = tuple(
-            _emit_buffer_load_scalar_component(
+        elements = []
+        for element in range(registers):
+            loaded, token = _emit_buffer_load_scalar_component(
                 state,
                 op,
                 attrs,
@@ -10566,11 +10667,12 @@ def _emit_buffer_load_mma_packet_payload(
                 other_components,
                 scalar_component_type,
                 mask_mode,
+                dependency=dependency,
             )
-            for element in range(registers)
-        )
-        payloads.append(state.dsl.wave.PackOp(payload_type, elements).result)
-    return _pack_components(tuple(payloads))
+            elements.append(loaded)
+            tokens.append(token)
+        payloads.append(state.dsl.wave.PackOp(payload_type, tuple(elements)).result)
+    return _pack_components(tuple(payloads)), tuple(tokens)
 
 
 def _buffer_load_packet_elements(attrs):
@@ -10646,6 +10748,8 @@ def _emit_buffer_load_scalar_component(
     other_components,
     result_type,
     mask_mode,
+    *,
+    dependency=None,
 ):
     cache = _direct_buffer_load_cache_attr(state, attrs, op)
     offset_component = offset_components[int(index)]
@@ -10663,12 +10767,12 @@ def _emit_buffer_load_scalar_component(
             int(attrs["lane_width"]),
             int(attrs["element_byte_width"]),
             int(attrs["element_byte_width"]) * 8,
+            dependency=dependency,
             cache=cache,
         )
 
     if mask_components is None:
-        loaded, _token = emit_active_load()
-        return loaded
+        return emit_active_load()
     if mask_mode != "exec_where":
         fail(
             "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
@@ -10692,15 +10796,15 @@ def _emit_buffer_load_scalar_component(
             attrs["element_type"],
             op,
         )
-    loaded, _token = _emit_masked_memory_value_region(
+    loaded, token = _emit_masked_memory_value_region(
         state,
         mask_components[int(index)],
         result_type,
         result_fallback,
-        None,
+        dependency,
         emit_active_load,
     )
-    return loaded
+    return loaded, token
 
 
 def _emit_buffer_load_vector_packet(
@@ -10717,6 +10821,7 @@ def _emit_buffer_load_vector_packet(
     lane_width,
     mask_mode,
     *,
+    dependency=None,
     preserve_packet=False,
     preserve_raw_packet=False,
 ):
@@ -10752,6 +10857,7 @@ def _emit_buffer_load_vector_packet(
             lane_width,
             int(attrs["element_byte_width"]),
             packet_element_bit_width,
+            dependency=dependency,
             cache=cache,
         )
 
@@ -10787,7 +10893,7 @@ def _emit_buffer_load_vector_packet(
             packet_mask,
             load_type,
             inactive_value,
-            None,
+            dependency,
             emit_active_load,
         )
     if preserve_packet:
@@ -10818,7 +10924,8 @@ def _zero_vector_simd_value(
 def _emit_store(state, op):
     attrs = target_ir.attrs_dict(op)
     operand_count = 3 if attrs["has_mask"] else 2
-    operands = _operand_values(state, op, operand_count)
+    dependency = _barrier_order_dependency(state, op, operand_count)
+    operands = _operand_values(state, op, len(op.operands))[:operand_count]
     ptrs, values = operands[:2]
     masks = operands[2] if attrs["has_mask"] else None
     component_count = int(attrs["component_count"])
@@ -10851,9 +10958,16 @@ def _emit_store(state, op):
             target_op_id=op.target_op_id,
         )
     mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
+    _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
+    capture_token = bool(issue_result_ids)
+    tokens = []
     for index, (ptr_component, value_component) in enumerate(zip(ptr_components, value_components)):
         if mask_components is None:
-            state.builder.store(value_component, ptr_component)
+            tokens.append(state.builder.store(
+                value_component,
+                ptr_component,
+                after=dependency,
+            ))
             continue
         if mask_mode != "exec_where":
             fail(
@@ -10862,20 +10976,32 @@ def _emit_store(state, op):
                 f"unsupported store mask mode {mask_mode}",
                 target_op_id=op.target_op_id,
             )
-        _emit_masked_effect_region(
-            state,
-            mask_components[index],
-            lambda value_component=value_component, ptr_component=ptr_component: state.builder.store(
-                value_component,
-                ptr_component,
-            ),
+        emit_store = lambda value_component=value_component, ptr_component=ptr_component: state.builder.store(
+            value_component,
+            ptr_component,
+            after=dependency,
         )
+        if capture_token:
+            tokens.append(_emit_masked_token_region(
+                state,
+                mask_components[index],
+                dependency or state.builder.token(),
+                emit_store,
+            ))
+        else:
+            _emit_masked_effect_region(
+                state,
+                mask_components[index],
+                emit_store,
+            )
+    _finish_issue_order_result(state, op, tokens)
 
 
 def _emit_load(state, op):
     attrs = target_ir.attrs_dict(op)
     operand_count = 1 + int(bool(attrs["has_mask"])) + int(bool(attrs["has_other"]))
-    operands = _operand_values(state, op, operand_count)
+    dependency = _barrier_order_dependency(state, op, operand_count)
+    operands = _operand_values(state, op, len(op.operands))[:operand_count]
     ptrs = operands[0]
     operand_index = 1
     masks = None
@@ -10921,13 +11047,26 @@ def _emit_load(state, op):
             "load other requires a mask",
             target_op_id=op.target_op_id,
         )
-    result_id = _single_result(op)
+    data_result_ids, _issue_result_ids = _issue_order_result_ids(op)
+    if len(data_result_ids) != 1:
+        fail(
+            "TLXW_EMIT_ISSUE_ORDER_RESULT",
+            STAGE,
+            "load requires one data result",
+            target_op_id=op.target_op_id,
+        )
+    result_id = data_result_ids[0]
     result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
     mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
     loaded_components = []
+    tokens = []
     for index, ptr_component in enumerate(ptr_components):
         if mask_components is None:
-            loaded, _token = state.builder.load(ptr_component, result_type)
+            loaded, token = state.builder.load(
+                ptr_component,
+                result_type,
+                after=dependency,
+            )
         else:
             if mask_mode != "exec_where":
                 fail(
@@ -10938,7 +11077,11 @@ def _emit_load(state, op):
                 )
 
             def emit_active_load(ptr_component=ptr_component):
-                return state.builder.load(ptr_component, result_type)
+                return state.builder.load(
+                    ptr_component,
+                    result_type,
+                    after=dependency,
+                )
 
             other_component = (None if other_components is None else other_components[index])
             fallback = (
@@ -10951,16 +11094,18 @@ def _emit_load(state, op):
                     op,
                 )
             )
-            loaded, _token = _emit_masked_memory_value_region(
+            loaded, token = _emit_masked_memory_value_region(
                 state,
                 mask_components[index],
                 result_type,
                 fallback,
-                None,
+                dependency,
                 emit_active_load,
             )
         loaded_components.append(loaded)
+        tokens.append(token)
     state.values[result_id] = _pack_components(tuple(loaded_components))
+    _finish_issue_order_result(state, op, tokens)
 
 
 def _memory_simd_component(state, value, element_type, lane_width, op, splat_cache):
