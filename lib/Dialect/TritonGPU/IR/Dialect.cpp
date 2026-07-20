@@ -1208,15 +1208,8 @@ basesPerDimImpl(const LinearLayout::BasesT &namedBases, StringAttr dimName,
   return ret;
 }
 
-SmallVector<unsigned>
-LinearEncodingAttr::basesPerDim(StringAttr dimName, bool skipBroadcast) const {
-  const auto &ll = getLinearLayout();
-  auto rank = ll.getNumOutDims();
-  return basesPerDimImpl(ll.getBases(), dimName, rank, skipBroadcast);
-}
-
 CGAEncodingAttr linearToCGAEncodingAttr(const LinearLayout &ll,
-                        ArrayRef<unsigned> cgaLogicalShape) {
+                                        ArrayRef<unsigned> cgaLogicalShape) {
   // Compute the shapePerCTA
   auto shape = ll.getOutDims();
   for (int i = 0; i < shape.size(); ++i) {

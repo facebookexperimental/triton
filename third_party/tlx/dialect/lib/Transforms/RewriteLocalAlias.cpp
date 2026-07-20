@@ -1,6 +1,8 @@
 #include "IR/Dialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -21,6 +23,100 @@ namespace tlx {
 #define GEN_PASS_DEF_TLXREWRITELOCALALIAS
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
+
+namespace {
+
+static ttg::MemDescReinterpretOp createAliasReinterpret(OpBuilder &builder,
+                                                        Location loc,
+                                                        ttg::MemDescType type,
+                                                        Value source) {
+  auto op = ttg::MemDescReinterpretOp::create(builder, loc, type, source);
+  auto sourceType = cast<ttg::MemDescType>(source.getType());
+  if (ttg::isPaddedEncoding(sourceType.getEncoding()) ||
+      ttg::isPaddedEncoding(type.getEncoding()))
+    op->setAttr("tlx.allow_different_padding_pattern", builder.getUnitAttr());
+  return op;
+}
+
+// Total logical storage bits for a memdesc view. This deliberately mirrors
+// MemDescReinterpretOp::verify so aliases are constructed from physical
+// storage sizes rather than logical tensor element counts.
+int64_t getMemDescStorageBits(ttg::MemDescType ty) {
+  auto rank = cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank();
+  auto shape = ty.getAllocShape().take_back(rank);
+  LinearLayout layout = ttg::isPaddedEncoding(ty.getEncoding())
+                            ? ttg::paddedLinearLayout(shape, ty.getEncoding())
+                            : ttg::toLinearLayout(shape, ty.getEncoding());
+  int64_t numLayoutCopies = 1;
+  for (int64_t dim : ty.getAllocShape().drop_back(rank))
+    numLayoutCopies *= dim;
+  auto *ctx = ty.getContext();
+  bool isSharedMemory = isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace());
+  auto dim = StringAttr::get(ctx, isSharedMemory ? "offset" : "col");
+  return numLayoutCopies * layout.getInDimSize(dim) *
+         ty.getElementTypeBitWidth();
+}
+
+// Produce a descriptor of dstTy that views base's backing allocation. A
+// smaller alias cannot be represented by a size-changing reinterpret, so
+// reinterpret the whole allocation as repeated destination-layout slots and
+// select slot zero structurally with memdesc_index.
+FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
+                               Location loc, Value base,
+                               ttg::MemDescType dstTy) {
+  auto srcTy = cast<ttg::MemDescType>(base.getType());
+  int64_t srcBits = getMemDescStorageBits(srcTy);
+  int64_t dstBits = getMemDescStorageBits(dstTy);
+
+  if (srcBits == dstBits)
+    return createAliasReinterpret(builder, loc, dstTy, base).getResult();
+
+  if (srcBits < dstBits || srcBits % dstBits != 0)
+    return errorOp->emitError()
+           << "TLXRewriteLocalAlias cannot view a " << srcBits
+           << "-bit allocation as a " << dstBits << "-bit alias";
+  int64_t ratio = srcBits / dstBits;
+  unsigned encRank =
+      cast<ttg::LayoutEncodingTrait>(dstTy.getEncoding()).getRank();
+  int64_t dstRank = dstTy.getRank();
+  assert((dstRank == static_cast<int64_t>(encRank) ||
+          dstRank == static_cast<int64_t>(encRank) + 1) &&
+         "MemDescType rank must equal encoding rank or be one greater");
+  int64_t dstBatch =
+      dstRank == static_cast<int64_t>(encRank) + 1 ? dstTy.getShape()[0] : 1;
+  if (dstBatch != 1)
+    return errorOp->emitError()
+           << "TLXRewriteLocalAlias cannot shrink a size-mismatched alias "
+              "with leading batch dim "
+           << dstBatch << " (only unit batch dim is supported)";
+
+  auto layoutShape = dstTy.getShape().take_back(encRank);
+  SmallVector<int64_t> intermediateShape;
+  intermediateShape.reserve(encRank + 1);
+  intermediateShape.push_back(ratio);
+  intermediateShape.append(layoutShape.begin(), layoutShape.end());
+  auto intermediateTy = ttg::MemDescType::get(
+      intermediateShape, dstTy.getElementType(), dstTy.getEncoding(),
+      dstTy.getMemorySpace(), dstTy.getMutableMemory(), intermediateShape);
+  Value intermediate =
+      createAliasReinterpret(builder, loc, intermediateTy, base).getResult();
+
+  SmallVector<int64_t> slotShape(layoutShape.begin(), layoutShape.end());
+  auto slotTy = ttg::MemDescType::get(
+      slotShape, dstTy.getElementType(), dstTy.getEncoding(),
+      dstTy.getMemorySpace(), dstTy.getMutableMemory(), slotShape);
+  Value zero = arith::ConstantIntOp::create(builder, loc, /*value=*/0,
+                                            /*width=*/32);
+  Value slot =
+      ttg::MemDescIndexOp::create(builder, loc, slotTy, intermediate, zero)
+          .getResult();
+
+  if (dstRank == static_cast<int64_t>(encRank))
+    return slot;
+  return Value(createAliasReinterpret(builder, loc, dstTy, slot).getResult());
+}
+
+} // namespace
 
 LogicalResult rewriteLocalAlias(ModuleOp m) {
   // Build a closure of all local_alloc and local_alias ops that share the same
@@ -164,11 +260,12 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       builder.setInsertionPoint(baseAllocOp);
       auto baseAllocType =
           dyn_cast<ttg::MemDescType>(baseAllocOp->getResult(0).getType());
-      auto newAllocToBaseAllocOp = ttg::MemDescReinterpretOp::create(
-          builder, baseAllocOp->getLoc(), baseAllocType,
-          newAllocOp->getResult(0));
-      baseAllocOp->getResult(0).replaceAllUsesWith(
-          newAllocToBaseAllocOp.getResult());
+      FailureOr<Value> newAllocToBaseAlloc =
+          emitAliasView(builder, baseAllocOp, baseAllocOp->getLoc(),
+                        newAllocOp->getResult(0), baseAllocType);
+      if (failed(newAllocToBaseAlloc))
+        return failure();
+      baseAllocOp->getResult(0).replaceAllUsesWith(*newAllocToBaseAlloc);
       baseAllocOp->erase();
       baseAllocOp = newAllocOp;
     }
@@ -182,10 +279,13 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
         aliasOp->dump();
       });
       builder.setInsertionPoint(aliasOp);
-      auto aliasType = aliasOp.getResult().getType();
-      auto baseAllocToAliasOp = ttg::MemDescReinterpretOp::create(
-          builder, baseAllocOp->getLoc(), aliasType, baseAllocOp->getResult(0));
-      aliasOp.getResult().replaceAllUsesWith(baseAllocToAliasOp.getResult());
+      auto aliasType = cast<ttg::MemDescType>(aliasOp.getResult().getType());
+      FailureOr<Value> baseAllocToAlias =
+          emitAliasView(builder, aliasOp, baseAllocOp->getLoc(),
+                        baseAllocOp->getResult(0), aliasType);
+      if (failed(baseAllocToAlias))
+        return failure();
+      aliasOp.getResult().replaceAllUsesWith(*baseAllocToAlias);
       aliasOp->erase();
     }
   }

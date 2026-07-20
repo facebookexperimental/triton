@@ -96,6 +96,30 @@ static Type getLayoutPreservingType(Value src, Type dstType) {
   return dstElementType;
 }
 
+static Value createRequireLayout(TritonOpBuilder &self, Value value,
+                                 Attribute encoding,
+                                 bool deferTensorVerification) {
+  Type newType;
+  if (auto type = dyn_cast<ttg::MemDescType>(value.getType())) {
+    // Preserve the allocation shape for subslices. Tensor-memory scales are
+    // the one encoding whose allocation shape is its logical shape.
+    SmallVector<int64_t> allocShape(type.getAllocShape());
+    if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+      allocShape.assign(type.getShape().begin(), type.getShape().end());
+    newType = ttg::MemDescType::get(
+        type.getShape(), type.getElementType(), encoding,
+        type.getMemorySpace(), type.getMutableMemory(), allocShape);
+  } else if (auto type = dyn_cast<RankedTensorType>(value.getType())) {
+    Attribute tensorEncoding =
+        deferTensorVerification ? tlx::wrapNoVerifyLayout(encoding) : encoding;
+    newType = RankedTensorType::get(type.getShape(), type.getElementType(),
+                                    tensorEncoding);
+  } else {
+    throw std::runtime_error("Unsupported type");
+  }
+  return self.create<tlx::RequireLayoutOp>(newType, value);
+}
+
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -142,25 +166,13 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_require_layout",
            [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
-             Type newType;
-             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
-               // consider allocation type for subslice
-               SmallVector<int64_t> allocShape(type.getAllocShape());
-               if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
-                 allocShape.assign(type.getShape().begin(),
-                                   type.getShape().end());
-               newType = ttg::MemDescType::get(
-                   type.getShape(), type.getElementType(), encoding,
-                   type.getMemorySpace(), type.getMutableMemory(), allocShape);
-               return self.create<tlx::RequireLayoutOp>(newType, v);
-             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
-               newType = RankedTensorType::get(
-                   type.getShape(), type.getElementType(), tensorEncoding);
-               return self.create<tlx::RequireLayoutOp>(newType, v);
-             } else {
-               throw std::runtime_error("Unsupported type");
-             }
+             return createRequireLayout(self, v, encoding,
+                                        /*deferTensorVerification=*/true);
+           })
+      .def("create_exact_require_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             return createRequireLayout(self, v, encoding,
+                                        /*deferTensorVerification=*/false);
            })
       .def("create_layout_preserving_cast",
            [](TritonOpBuilder &self, Value &src, Type &dstType,

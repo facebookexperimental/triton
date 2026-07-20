@@ -36,6 +36,34 @@ bool squareSublayoutIsIdentity(const LinearLayout &ll,
       ll, dimNames, [](int b, int32_t basis) { return basis == (1 << b); });
 }
 
+LinearLayout invertAndComposeBlockLocal(const LinearLayout &A,
+                                        const LinearLayout &B) {
+  auto cvt = B.invertAndCompose(A);
+  assert(!cvt.getInDimNames().empty());
+  auto kBlock =
+      StringAttr::get(cvt.getInDimNames().begin()->getContext(), "block");
+  if (!A.hasInDim(kBlock) || !B.hasInDim(kBlock))
+    return cvt;
+  assert(A.getInDimSize(kBlock) == B.getInDimSize(kBlock));
+
+  // A zero block basis does not affect A's outputs, so force that output
+  // coordinate to equal the corresponding input block bit. This does not
+  // change the composition.
+  auto bases = cvt.getBases();
+  int blockOutIdx = cvt.getOutDimIndex(kBlock);
+  for (auto [i, aBlockBasis] : llvm::enumerate(A.getBases().at(kBlock))) {
+    if (!llvm::all_of(aBlockBasis, [](int32_t basis) { return basis == 0; }))
+      continue;
+    int blockBit = 1 << i;
+    for (auto &inDimBases : llvm::make_second_range(bases))
+      for (auto &basis : inDimBases)
+        basis[blockOutIdx] &= ~blockBit;
+    bases[kBlock][i][blockOutIdx] |= blockBit;
+  }
+  return LinearLayout(std::move(bases), cvt.getOutDims(),
+                      /*requireSurjective=*/false);
+}
+
 LinearLayout
 ensureLayoutNotLargerThan(const LinearLayout &layout,
                           const llvm::SmallDenseMap<StringAttr, int64_t> &shape,
@@ -53,8 +81,8 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
 
   for (auto outDim : llvm::enumerate(layout.getOutDimNames())) {
     auto outDimName = outDim.value();
-    // actualSize/desiredSize are the true (possibly NPOT) sizes; span/
-    // shrinkTarget are their pow2-rounded counterparts used for basis counting.
+    // actualSize/desiredSize are the true (possibly NPOT) sizes, while
+    // shrinkTarget is the pow2-rounded bound used for basis filtering.
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
     if (actualSize <= desiredSize) {
@@ -67,37 +95,22 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
         llvm::isPowerOf2_32(desiredSize)
             ? desiredSize
             : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    // Count the shrink against the pow2 basis span, not the NPOT out-dim size
-    // (else a basis terminates early). Identity for pow2 actualSize.
-    int32_t span = llvm::isPowerOf2_32(actualSize)
-                       ? actualSize
-                       : static_cast<int32_t>(llvm::NextPowerOf2(actualSize));
-    assert(span % shrinkTarget == 0);
-    // <inDimName, basisIdx, outValue>
-    std::vector<std::tuple<StringAttr, int, int>> sortedBases;
-    for (auto [inDimName, basis] : bases) {
-      for (size_t basisIdx = 0; basisIdx < basis.size(); basisIdx++) {
-        auto outValue = basis[basisIdx][outDim.index()];
-        if (outValue == 0) {
+    // Every remaining basis must fit in the shrunken codomain. Filtering by
+    // value, rather than by the number of bases to remove, also handles
+    // generic linear layouts with duplicate or dependent bases.
+    for (auto &[inDimName, inDimBases] : bases) {
+      for (auto [basisIdx, basis] : llvm::enumerate(inDimBases)) {
+        auto outValue = basis[outDim.index()];
+        if (outValue == 0)
           continue;
-        }
         assert(llvm::isPowerOf2_32(outValue));
-        sortedBases.emplace_back(inDimName, basisIdx, outValue);
+        if (outValue < shrinkTarget)
+          continue;
+        if (!broadcastRegisters && inDimName == kRegister)
+          broadcastedDims.insert(basisIdx);
+        else
+          basis[outDim.index()] = 0;
       }
-    }
-    // From the largest basis to the smallest.
-    llvm::sort(sortedBases,
-               [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
-    for (auto [inDimName, basisIdx, outValue] : sortedBases) {
-      if (span <= shrinkTarget) {
-        break;
-      }
-      if (!broadcastRegisters && inDimName == kRegister) {
-        broadcastedDims.insert(basisIdx);
-      } else {
-        bases[inDimName][basisIdx][outDim.index()] = 0;
-      }
-      span >>= 1;
     }
   }
   if (!broadcastRegisters) {
@@ -159,8 +172,6 @@ LinearLayout ensureLayoutNotSmallerThan(
         llvm::isPowerOf2_32(desiredSize)
             ? desiredSize
             : static_cast<int32_t>(llvm::NextPowerOf2(desiredSize));
-    if (actualSize >= growTarget)
-      continue;
     assert(growTarget % actualSize == 0);
     ret *= LinearLayout::identity1D(growTarget / actualSize, kDim, outDimName);
     assert(ret.getOutDimSize(outDimName) >= desiredSize);

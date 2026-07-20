@@ -24,6 +24,11 @@ static int __builtin_ctzll(unsigned long long x) {
 
 #endif
 
+using namespace mlir;
+using namespace mlir::triton;
+
+namespace {
+
 void printBasis(const llvm::SmallVector<int32_t> &basis,
                 const std::string &name) {
   llvm::errs() << name << ": ";
@@ -31,11 +36,6 @@ void printBasis(const llvm::SmallVector<int32_t> &basis,
     llvm::errs() << b << " ";
   llvm::errs() << "\n";
 }
-
-using namespace mlir;
-using namespace mlir::triton;
-
-namespace {
 
 // Goes from bases of the form [[1], [2], [4], [8]] to [1, 2, 4, 8]
 SmallVector<int32_t> flatten(const LinearLayout &ll, StringAttr dim) {
@@ -46,6 +46,10 @@ SmallVector<int32_t> flatten(const LinearLayout &ll, StringAttr dim) {
     vec.push_back(ll.getBasis(dim, i, outDim));
   return vec;
 };
+
+SmallVector<int32_t> flattenIfPresent(const LinearLayout &ll, StringAttr dim) {
+  return ll.hasInDim(dim) ? flatten(ll, dim) : SmallVector<int32_t>{};
+}
 
 SmallVector<int32_t> removeZeros(ArrayRef<int32_t> vec) {
   SmallVector<int32_t> result;
@@ -133,12 +137,14 @@ LinearLayout buildReps(MLIRContext *ctx, const LinearLayout &src,
     }
   }
 
-  auto smemReps = LinearLayout({{kVec, smem.getBases().lookup(kVec)},
-                                {kBank, smem.getBases().lookup(kBank)},
-                                {kSegment, unflatten(to_vector(segment))},
-                                {kBlock, smem.getBases().lookup(kBlock)},
-                                {kReps, unflatten(to_vector(reps))}},
-                               smem.getOutDims(),
+  LinearLayout::BasesT bases;
+  bases[kVec] = smem.getBases().lookup(kVec);
+  bases[kBank] = smem.getBases().lookup(kBank);
+  bases[kSegment] = unflatten(to_vector(segment));
+  if (smem.hasInDim(kBlock))
+    bases[kBlock] = smem.getBases().lookup(kBlock);
+  bases[kReps] = unflatten(to_vector(reps));
+  auto smemReps = LinearLayout(std::move(bases), smem.getOutDims(),
                                /*requireSurjective=*/true);
   return smemReps;
 }
@@ -216,9 +222,6 @@ SmallVector<int32_t> complementBasis(ArrayRef<int32_t> basis, int32_t dim) {
 
   return comp;
 }
-} // namespace
-
-namespace mlir::triton::gpu {
 
 SmallVector<int32_t> intersectionBasis(ArrayRef<int32_t> b1,
                                        ArrayRef<int32_t> b2, int32_t dim) {
@@ -244,6 +247,10 @@ SmallVector<int32_t> intersectionBasis(ArrayRef<int32_t> b1,
     return nullspaceBasis(joint, dim);
   }
 }
+
+} // namespace
+
+namespace mlir::triton::gpu {
 
 std::pair<int, int> bankConflicts(ArrayRef<int32_t> tileSrc,
                                   ArrayRef<int32_t> tileDst,
@@ -342,7 +349,7 @@ int bankConflictsMemDesc(const LinearLayout &reg, const LinearLayout &smem,
       .first;
 }
 
-std::optional<SmallVector<int32_t>> optimalSwizzlingTile(
+static std::optional<SmallVector<int32_t>> optimalSwizzlingTile(
     const LinearLayout &a, const LinearLayout &b, int32_t nRegA, int32_t nRegB,
     ArrayRef<int32_t> laneIdTileA, ArrayRef<int32_t> laneIdTileB) {
   // For now se just implement the .v4 variants for all the instructions
@@ -469,7 +476,7 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
       computeSegment(bankSrc, bankDst, nonZeroBlockBases, dim, lenSbasis);
 
   // The bank is the complement of the union of the vector and the start of the
-  // segments
+  // segments and the block bases
   SmallVector<int32_t> unionBasis;
   unionBasis.append(vbasis.begin(), vbasis.end());
   unionBasis.append(sbasis.begin(), sbasis.end());
@@ -486,11 +493,14 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   StringAttr blockAttr = StringAttr::get(ctx, "block");
 
   // src has just 1 outDim
-  LinearLayout basis1D({{vecAttr, unflatten(vbasis)},
-                        {bankAttr, unflatten(bbasis)},
-                        {segAttr, unflatten(sbasis)},
-                        {blockAttr, unflatten(nonZeroBlockBases)}},
-                       src.getOutDims(), /*requireSurjective=*/true);
+  LinearLayout::BasesT bases;
+  bases[vecAttr] = unflatten(vbasis);
+  bases[bankAttr] = unflatten(bbasis);
+  bases[segAttr] = unflatten(sbasis);
+  if (src.hasInDim(blockAttr))
+    bases[blockAttr] = unflatten(blockBases);
+  LinearLayout basis1D(std::move(bases), src.getOutDims(),
+                       /*requireSurjective=*/true);
   basis1D = buildReps(ctx, src, dst, basis1D, leaveReps);
 
   return basis1D.reshapeOuts(outDims);
@@ -504,8 +514,7 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
   auto kBlock = StringAttr::get(ctx, "block");
   auto regSrc = flatten(srcFlat, kReg);
   auto regDst = flatten(dstFlat, kReg);
-  auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
-                                                      : SmallVector<int32_t>{};
+  auto blockSrc = flattenIfPresent(srcFlat, kBlock);
   auto dim = srcFlat.getTotalOutDimSizeLog2();
   SmallVector<int32_t> vbasis = intersectionBasis(regSrc, regDst, dim);
   // Restrict the vectorisation to the maximum we can use
@@ -610,8 +619,7 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
   auto regDst = flatten(dstFlat, kReg);
   auto laneSrc = flatten(srcFlat, kLane);
   auto laneDst = flatten(dstFlat, kLane);
-  auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
-                                                      : SmallVector<int32_t>{};
+  auto blockSrc = flattenIfPresent(srcFlat, kBlock);
 
   auto [vbasis, srcFillsBank] = getVecBasisLdSt(srcFlat, dstFlat, bitwidth);
   auto vecSize = 1 << vbasis.size();
@@ -729,9 +737,7 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   auto regDst = flatten(dstFlat, kReg);
   auto laneSrc = flatten(srcFlat, kLane);
   auto laneDst = flatten(dstFlat, kLane);
-  auto blockBases = srcFlat.getBases().contains(kBlock)
-                        ? flatten(srcFlat, kBlock)
-                        : SmallVector<int32_t>{};
+  auto blockBases = flattenIfPresent(srcFlat, kBlock);
   // Get the associated src/dst tiles for each instruction if they exist
   SmallVector<std::tuple<std::pair<int32_t, int32_t>, SmallVector<int32_t>,
                          SmallVector<int32_t>, SmallVector<int32_t>, int32_t>>
