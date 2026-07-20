@@ -45,6 +45,14 @@ if(NOT TRITON_CACHE_PATH)
   message(FATAL_ERROR "TRITON_CACHE_PATH must be set or derivable from TRITON_HOME/HOME/USERPROFILE/HOMEPATH.")
 endif()
 
+if("tlx_wave" IN_LIST TRITON_CODEGEN_BACKENDS)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wave/build_tools/build_llvm.py")
+    message(FATAL_ERROR
+      "tlx_wave requires the third_party/wave submodule. "
+      "Run `git submodule update --init --recursive third_party/wave`.")
+  endif()
+endif()
+
 set(TRITON_BUILD_HELPER_COMMON_ARGS --triton-cache-path "${TRITON_CACHE_PATH}")
 if("${TRITON_OFFLINE_BUILD}")
   list(APPEND TRITON_BUILD_HELPER_COMMON_ARGS --triton-offline-build)
@@ -314,6 +322,12 @@ if(TRITON_BUILD_PYTHON_MODULE)
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
+  if(NOT "nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvidia/include)
+    include_directories(${CMAKE_CURRENT_BINARY_DIR}/third_party/nvidia/include)
+    add_subdirectory(third_party/nvidia/include)
+    add_subdirectory(third_party/nvidia/lib)
+  endif()
 
   if (TRITON_BUILD_PROTON)
     add_subdirectory(third_party/proton)
@@ -356,6 +370,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRNVVMToLLVMIRTranslation
     MLIRGPUToNVVMTransforms
     MLIRIR
+    MLIRControlFlowToSCF
     MLIRControlFlowToLLVM
     MLIRPass
     MLIRTransforms
@@ -372,13 +387,20 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
     # LLVM
     LLVMPasses
-    LLVMNVPTXCodeGen
     LLVMAMDGPUCodeGen
     LLVMAMDGPUAsmParser
 
     Python3::Module
     pybind11::headers
   )
+  if("nvidia" IN_LIST TRITON_CODEGEN_BACKENDS)
+    if(NOT "NVPTX" IN_LIST LLVM_TARGETS_TO_BUILD)
+      message(FATAL_ERROR
+        "The Nvidia backend requires LLVM to be built with the NVPTX target. "
+        "Rebuild LLVM with NVPTX or configure without the nvidia backend.")
+    endif()
+    list(APPEND TRITON_LIBRARIES LLVMNVPTXCodeGen)
+  endif()
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
      CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64
      CMAKE_OSX_ARCHITECTURES MATCHES "arm64")  # also macOS arm64

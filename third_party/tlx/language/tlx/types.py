@@ -31,6 +31,156 @@ class layout_encoding:
         raise NotImplementedError(f"{self.__class__.__name__}.to_ir() must be overridden in subclasses")
 
 
+class blocked_layout_encoding(layout_encoding):
+
+    def __init__(self, size_per_thread, threads_per_warp, warps_per_cta, order, cga_bases=None):
+        super().__init__()
+        self.size_per_thread = list(size_per_thread)
+        self.threads_per_warp = list(threads_per_warp)
+        self.warps_per_cta = list(warps_per_cta)
+        self.order = list(order)
+        self.cga_bases = [] if cga_bases is None else [list(base) for base in cga_bases]
+
+    @staticmethod
+    @constexpr_function
+    def make(size_per_thread, threads_per_warp, warps_per_cta, order, cga_bases=None):
+        return blocked_layout_encoding(size_per_thread, threads_per_warp, warps_per_cta, order, cga_bases)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_blocked_encoding_attr(
+            self.size_per_thread,
+            self.threads_per_warp,
+            self.warps_per_cta,
+            self.order,
+            self.cga_bases,
+        )
+
+    def __repr__(self):
+        return (f"blocked_layout_encoding<{self.size_per_thread}, {self.threads_per_warp}, "
+                f"{self.warps_per_cta}, {self.order}, {self.cga_bases}>")
+
+
+class slice_layout_encoding(layout_encoding):
+
+    def __init__(self, dim, parent):
+        super().__init__()
+        if not isinstance(parent, layout_encoding):
+            raise TypeError(f"`parent` must be a layout_encoding, got {type(parent).__name__}")
+        self.dim = int(dim)
+        self.parent = parent
+
+    @staticmethod
+    @constexpr_function
+    def make(dim, parent):
+        return slice_layout_encoding(dim, parent)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_slice_encoding_attr(self.dim, self.parent.to_ir(builder))
+
+    def __repr__(self):
+        return f"slice_layout_encoding<{self.dim}, {self.parent}>"
+
+
+class distributed_linear_layout_encoding(layout_encoding):
+
+    def __init__(self, reg_bases, lane_bases, warp_bases, block_bases, shape):
+        super().__init__()
+        self.reg_bases = [list(base) for base in reg_bases]
+        self.lane_bases = [list(base) for base in lane_bases]
+        self.warp_bases = [list(base) for base in warp_bases]
+        self.block_bases = [list(base) for base in block_bases]
+        self.shape = list(shape)
+
+    @staticmethod
+    @constexpr_function
+    def make(reg_bases, lane_bases, warp_bases, block_bases, shape):
+        return distributed_linear_layout_encoding(reg_bases, lane_bases, warp_bases, block_bases, shape)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_distributed_linear_encoding_attr(
+            self.reg_bases,
+            self.lane_bases,
+            self.warp_bases,
+            self.block_bases,
+            [int(s) for s in self.shape],
+        )
+
+    def __repr__(self):
+        return (f"distributed_linear_layout_encoding<{self.reg_bases}, {self.lane_bases}, "
+                f"{self.warp_bases}, {self.block_bases}, {self.shape}>")
+
+
+class amd_mfma_layout_encoding(layout_encoding):
+
+    def __init__(self,
+                 version,
+                 instr_shape,
+                 transposed,
+                 warps_per_cta,
+                 element_bitwidth=32,
+                 tiles_per_warp=None,
+                 cga_bases=None):
+        super().__init__()
+        self.version = int(version)
+        self.instr_shape = list(instr_shape)
+        self.transposed = bool(transposed)
+        self.warps_per_cta = list(warps_per_cta)
+        self.element_bitwidth = int(element_bitwidth)
+        self.tiles_per_warp = [1] * len(self.warps_per_cta) if tiles_per_warp is None else list(tiles_per_warp)
+        self.cga_bases = [] if cga_bases is None else [list(base) for base in cga_bases]
+
+    @staticmethod
+    @constexpr_function
+    def make(version,
+             instr_shape,
+             transposed,
+             warps_per_cta,
+             element_bitwidth=32,
+             tiles_per_warp=None,
+             cga_bases=None):
+        return amd_mfma_layout_encoding(version, instr_shape, transposed, warps_per_cta, element_bitwidth,
+                                        tiles_per_warp, cga_bases)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_amd_mfma_encoding_attr(
+            self.version,
+            self.warps_per_cta,
+            self.instr_shape,
+            self.transposed,
+            self.cga_bases,
+            self.tiles_per_warp,
+            self.element_bitwidth,
+        )
+
+    def __repr__(self):
+        return (f"amd_mfma_layout_encoding<{self.version}, {self.instr_shape}, {self.transposed}, "
+                f"{self.warps_per_cta}, {self.element_bitwidth}, {self.tiles_per_warp}, {self.cga_bases}>")
+
+
+class dot_operand_layout_encoding(layout_encoding):
+
+    def __init__(self, operand_index, parent, k_width):
+        super().__init__()
+        self.operand_index = int(operand_index)
+        self.parent = parent
+        self.k_width = int(k_width)
+
+    @staticmethod
+    @constexpr_function
+    def make(operand_index, parent, k_width):
+        return dot_operand_layout_encoding(operand_index, parent, k_width)
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_dot_operand_encoding_attr_from_layout(
+            self.operand_index,
+            self.parent.to_ir(builder),
+            self.k_width,
+        )
+
+    def __repr__(self):
+        return f"dot_operand_layout_encoding<{self.operand_index}, {self.parent}, {self.k_width}>"
+
+
 class shared_layout_encoding(layout_encoding):
 
     def __init__(self):
@@ -80,6 +230,21 @@ class swizzled_shared_layout_encoding(shared_layout_encoding):
             numCTAsPerCGA=[1] * rank,
             numCTASplit=[1] * rank,
             numCTAOrder=list(reversed(range(rank))),
+        )
+
+    @staticmethod
+    @constexpr_function
+    def with_order(order, vectorSize=1, perPhase=1, maxPhase=1):
+        rank = len(order)
+        return swizzled_shared_layout_encoding(
+            vectorSize=vectorSize,
+            perPhase=perPhase,
+            maxPhase=maxPhase,
+            order=list(order),
+            numCTAs=[1] * rank,
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=[1] * rank,
         )
 
     # Create a new layout that is a permutation of the given layout.
@@ -210,8 +375,18 @@ class padded_shared_layout_encoding(shared_layout_encoding):
     ``padded_shared<[interval_0:+pad_0, ...] {order = ..., shape = ...}>``.
     """
 
-    def __init__(self, intervals, paddings, order, shape, numCTAsPerCGA, numCTASplit, numCTAOrder, offset_bases=None,
-                 block_bases=None):
+    def __init__(
+        self,
+        intervals,
+        paddings,
+        order,
+        shape,
+        numCTAsPerCGA,
+        numCTASplit,
+        numCTAOrder,
+        offset_bases=None,
+        block_bases=None,
+    ):
         super().__init__()
         assert len(intervals) == len(paddings), \
             "intervals and paddings must have the same length"
@@ -225,7 +400,7 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         # When set, the layout is built from an explicit linear component
         # (offset/block bases) instead of the identity {order, shape} form.
         self.offset_bases = None if offset_bases is None else [list(b) for b in offset_bases]
-        self.block_bases = None if block_bases is None else [list(b) for b in block_bases]
+        self.block_bases = [] if block_bases is None else [list(b) for b in block_bases]
 
     @staticmethod
     @constexpr_function
@@ -279,9 +454,31 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             numCTAOrder=list(range(rank)),
         )
 
+    @staticmethod
+    @constexpr_function
+    def with_offsets(interval_padding_pairs, offset_bases, block_bases, shape):
+        intervals = [int(p[0]) for p in interval_padding_pairs]
+        paddings = [int(p[1]) for p in interval_padding_pairs]
+        rank = len(shape)
+        return padded_shared_layout_encoding(
+            intervals=intervals,
+            paddings=paddings,
+            order=list(reversed(range(rank))),
+            shape=list(shape),
+            numCTAsPerCGA=[1] * rank,
+            numCTASplit=[1] * rank,
+            numCTAOrder=list(range(rank)),
+            offset_bases=[list(base) for base in offset_bases],
+            block_bases=[list(base) for base in block_bases],
+        )
+
     def make_permute(self, dims):
         permuted_order = [self.order[d] for d in dims]
         permuted_shape = [self.shape[d] for d in dims]
+        permuted_offset_bases = None
+        if self.offset_bases is not None:
+            permuted_offset_bases = [[basis[d] for d in dims] for basis in self.offset_bases]
+        permuted_block_bases = [[basis[d] for d in dims] for basis in self.block_bases]
         return padded_shared_layout_encoding(
             intervals=self.intervals,
             paddings=self.paddings,
@@ -290,16 +487,18 @@ class padded_shared_layout_encoding(shared_layout_encoding):
             numCTAsPerCGA=self.numCTAsPerCGA,
             numCTASplit=self.numCTASplit,
             numCTAOrder=self.numCTAOrder,
+            offset_bases=permuted_offset_bases,
+            block_bases=permuted_block_bases,
         )
 
     def to_ir(self, builder: ir.builder) -> None:
         if self.offset_bases is not None:
-            return builder.make_padded_shared_encoding_attr_with_bases(
+            return builder.make_padded_shared_encoding_attr_from_offsets(
                 self.intervals,
                 self.paddings,
                 self.offset_bases,
-                self.block_bases if self.block_bases is not None else [],
-                len(self.shape),
+                self.block_bases,
+                [int(s) for s in self.shape],
             )
         return builder.make_padded_shared_encoding_attr(
             self.intervals,

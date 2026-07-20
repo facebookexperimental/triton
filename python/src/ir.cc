@@ -15,6 +15,7 @@
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
@@ -38,6 +39,7 @@
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/PluginUtils.h"
 #include "triton/Tools/Sys/Dump.h"
 #include "triton/Tools/Sys/GetEnv.h"
@@ -362,6 +364,93 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
   return result;
 }
 
+std::vector<int64_t> toInt64Vector(ArrayRef<int64_t> values) {
+  return std::vector<int64_t>(values.begin(), values.end());
+}
+
+template <typename T> std::vector<int64_t> toInt64Vector(ArrayRef<T> values) {
+  std::vector<int64_t> result;
+  result.reserve(values.size());
+  for (T value : values)
+    result.push_back(static_cast<int64_t>(value));
+  return result;
+}
+
+template <typename Range>
+std::vector<std::vector<int64_t>> toNestedInt64Vector(Range &&values) {
+  std::vector<std::vector<int64_t>> result;
+  result.reserve(values.size());
+  for (const auto &basis : values) {
+    std::vector<int64_t> converted;
+    converted.reserve(basis.size());
+    for (auto value : basis)
+      converted.push_back(static_cast<int64_t>(value));
+    result.push_back(std::move(converted));
+  }
+  return result;
+}
+
+template <typename Range>
+std::vector<std::string> toStringVector(Range values) {
+  std::vector<std::string> result;
+  for (StringAttr value : values)
+    result.push_back(value.str());
+  return result;
+}
+
+py::object getLinearEncodingBases(Attribute attr, StringRef name) {
+  if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(attr)) {
+    auto dim = StringAttr::get(attr.getContext(), name);
+    return py::cast(
+        toNestedInt64Vector(linear.getLinearLayout().getBases().lookup(dim)));
+  }
+  return py::none();
+}
+
+py::object printAttribute(Attribute attr) {
+  if (!attr)
+    return py::none();
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  attr.print(os);
+  return py::str(str.c_str(), str.size());
+}
+
+py::object attributeToPython(Attribute attr) {
+  if (!attr)
+    return py::none();
+  if (auto boolAttr = dyn_cast<BoolAttr>(attr))
+    return py::bool_(boolAttr.getValue());
+  if (auto stringAttr = dyn_cast<StringAttr>(attr))
+    return py::str(stringAttr.getValue().data(), stringAttr.getValue().size());
+  if (auto integerAttr = dyn_cast<IntegerAttr>(attr)) {
+    if (integerAttr.getType().isInteger(1))
+      return py::bool_(!integerAttr.getValue().isZero());
+    return py::int_(integerAttr.getInt());
+  }
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+    return py::float_(floatAttr.getValueAsDouble());
+  if (auto arrayAttr = dyn_cast<ArrayAttr>(attr)) {
+    py::list values;
+    for (Attribute value : arrayAttr)
+      values.append(attributeToPython(value));
+    return std::move(values);
+  }
+  if (isa<UnitAttr>(attr))
+    return py::str("unit");
+  return printAttribute(attr);
+}
+
+py::dict operationAttrsToPython(Operation &op) {
+  py::dict attrs;
+  for (NamedAttribute attr : op.getAttrs()) {
+    StringRef name = attr.getName().getValue();
+    attrs[py::str(name.data(), name.size())] =
+        attributeToPython(attr.getValue());
+  }
+  return attrs;
+}
+
 } // namespace ir
 
 /*****************************************************************************/
@@ -499,6 +588,75 @@ void init_triton_ir(py::module &&m) {
       .def("is_integer",
            [](Type &self, unsigned width) { return self.isInteger(width); })
       .def("is_fp16", &Type::isF16)
+      .def("is_bf16", &Type::isBF16)
+      .def("is_fp32", &Type::isF32)
+      .def("is_fp64", &Type::isF64)
+      .def("is_index", &Type::isIndex)
+      .def("is_ptr", [](Type &self) { return isa<PointerType>(self); })
+      .def("is_ranked_tensor",
+           [](Type &self) { return isa<RankedTensorType>(self); })
+      .def("is_memdesc", [](Type &self) { return isa<ttg::MemDescType>(self); })
+      .def("is_async_token",
+           [](Type &self) { return isa<ttg::AsyncTokenType>(self); })
+      .def("get_shape",
+           [](Type &self) -> py::object {
+             if (auto tensorType = dyn_cast<RankedTensorType>(self))
+               return py::cast(toInt64Vector(tensorType.getShape()));
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::cast(toInt64Vector(memDescType.getShape()));
+             return py::none();
+           })
+      .def("get_element_type",
+           [](Type &self) -> py::object {
+             if (auto tensorType = dyn_cast<RankedTensorType>(self))
+               return py::cast(tensorType.getElementType());
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::cast(memDescType.getElementType());
+             return py::none();
+           })
+      .def("get_pointee_type",
+           [](Type &self) -> py::object {
+             if (auto ptrType = dyn_cast<PointerType>(self))
+               return py::cast(ptrType.getPointeeType());
+             return py::none();
+           })
+      .def("get_encoding",
+           [](Type &self) -> py::object {
+             Attribute encoding;
+             if (auto tensorType = dyn_cast<RankedTensorType>(self))
+               encoding = tensorType.getEncoding();
+             else if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               encoding = memDescType.getEncoding();
+             if (!encoding)
+               return py::none();
+             return py::cast(encoding);
+           })
+      .def("get_memory_space",
+           [](Type &self) -> py::object {
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self)) {
+               if (Attribute memorySpace = memDescType.getMemorySpace())
+                 return py::cast(memorySpace);
+             }
+             return py::none();
+           })
+      .def("get_mutable_memory",
+           [](Type &self) -> py::object {
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::bool_(memDescType.getMutableMemory());
+             return py::none();
+           })
+      .def("get_alloc_shape",
+           [](Type &self) -> py::object {
+             if (auto memDescType = dyn_cast<ttg::MemDescType>(self))
+               return py::cast(toInt64Vector(memDescType.getAllocShape()));
+             return py::none();
+           })
+      .def("get_address_space",
+           [](Type &self) -> py::object {
+             if (auto ptrType = dyn_cast<PointerType>(self))
+               return py::int_(ptrType.getAddressSpace());
+             return py::none();
+           })
       .def("__eq__",
            [](Type &self, py::object &other) {
              Type *other_ty = py::cast<Type *>(other);
@@ -599,6 +757,16 @@ void init_triton_ir(py::module &&m) {
       .def("get_parent_region", &Region::getParentRegion, ret::reference)
       .def("size", [](Region &self) { return self.getBlocks().size(); })
       .def("empty", &Region::empty)
+      .def(
+          "get_block",
+          [](Region &self, unsigned index) -> Block & {
+            if (index >= self.getBlocks().size())
+              throw py::index_error("Region block index out of range");
+            auto it = self.begin();
+            std::advance(it, index);
+            return *it;
+          },
+          ret::reference)
       .def("id", [](Region &self) { return (uint64_t)&self; })
       .def("push_back",
            [](Region &self, Block *block) { self.push_back(block); })
@@ -625,6 +793,18 @@ void init_triton_ir(py::module &&m) {
                                  Location loc) { self.addArgument(ty, loc); })
       .def("get_num_arguments", &Block::getNumArguments)
       .def("get_argument", &Block::getArgument)
+      .def("get_num_operations",
+           [](Block &self) { return self.getOperations().size(); })
+      .def(
+          "get_operation",
+          [](Block &self, unsigned index) -> Operation & {
+            if (index >= self.getOperations().size())
+              throw py::index_error("Block operation index out of range");
+            auto it = self.begin();
+            std::advance(it, index);
+            return *it;
+          },
+          ret::reference)
       .def("dump", &Block::dump)
       .def("move_before",
            [](Block &self, Block &dst) { self.moveBefore(&dst); })
@@ -676,13 +856,242 @@ void init_triton_ir(py::module &&m) {
       .def("id", [](Block &self) { return (uint64_t)&self; });
 
   py::class_<Attribute>(m, "attribute", py::module_local())
-      .def("__str__",
+      .def("is_dot_operand_encoding",
            [](Attribute &self) {
-             std::string str;
-             llvm::raw_string_ostream os(str);
-             self.print(os);
-             return os.str();
+             return isa<ttg::DotOperandEncodingAttr>(self);
            })
+      .def("get_dot_operand_op_idx",
+           [](Attribute &self) -> py::object {
+             if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
+               return py::int_(dotOp.getOpIdx());
+             return py::none();
+           })
+      .def("get_dot_operand_k_width",
+           [](Attribute &self) -> py::object {
+             if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
+               return py::int_(dotOp.getKWidth());
+             return py::none();
+           })
+      .def("get_dot_operand_parent",
+           [](Attribute &self) -> py::object {
+             if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(self))
+               return py::cast(dotOp.getParent());
+             return py::none();
+           })
+      .def("is_slice_encoding",
+           [](Attribute &self) { return isa<ttg::SliceEncodingAttr>(self); })
+      .def("get_slice_dim",
+           [](Attribute &self) -> py::object {
+             if (auto slice = dyn_cast<ttg::SliceEncodingAttr>(self))
+               return py::int_(slice.getDim());
+             return py::none();
+           })
+      .def("get_slice_parent",
+           [](Attribute &self) -> py::object {
+             if (auto slice = dyn_cast<ttg::SliceEncodingAttr>(self)) {
+               Attribute parent = slice.getParent();
+               return py::cast(parent);
+             }
+             return py::none();
+           })
+      .def("is_amd_mfma_encoding",
+           [](Attribute &self) { return isa<ttg::AMDMfmaEncodingAttr>(self); })
+      .def("get_amd_mfma_version",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::int_(mfma.getVersion());
+             return py::none();
+           })
+      .def("get_amd_mfma_warps_per_cta",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::cast(toInt64Vector(mfma.getWarpsPerCTA()));
+             return py::none();
+           })
+      .def("get_amd_mfma_instr_shape",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::cast(toInt64Vector(mfma.getInstrShape()));
+             return py::none();
+           })
+      .def("get_amd_mfma_is_transposed",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::bool_(mfma.getIsTransposed());
+             return py::none();
+           })
+      .def("get_amd_mfma_tiles_per_warp",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::cast(toInt64Vector(mfma.getTilesPerWarp()));
+             return py::none();
+           })
+      .def("get_amd_mfma_element_bit_width",
+           [](Attribute &self) -> py::object {
+             if (auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(self))
+               return py::int_(mfma.getElementBitWidth());
+             return py::none();
+           })
+      .def("is_blocked_encoding",
+           [](Attribute &self) { return isa<ttg::BlockedEncodingAttr>(self); })
+      .def("get_blocked_size_per_thread",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getSizePerThread()));
+             return py::none();
+           })
+      .def("get_blocked_threads_per_warp",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getThreadsPerWarp()));
+             return py::none();
+           })
+      .def("get_blocked_warps_per_cta",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getWarpsPerCTA()));
+             return py::none();
+           })
+      .def("get_blocked_order",
+           [](Attribute &self) -> py::object {
+             if (auto blocked = dyn_cast<ttg::BlockedEncodingAttr>(self))
+               return py::cast(toInt64Vector(blocked.getOrder()));
+             return py::none();
+           })
+      .def("is_linear_encoding",
+           [](Attribute &self) { return isa<ttg::LinearEncodingTrait>(self); })
+      .def("get_linear_register_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "register");
+           })
+      .def("get_linear_lane_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "lane");
+           })
+      .def("get_linear_warp_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "warp");
+           })
+      .def("get_linear_block_bases",
+           [](Attribute &self) -> py::object {
+             return getLinearEncodingBases(self, "block");
+           })
+      .def("get_linear_in_dim_names",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::cast(
+                   toStringVector(linear.getLinearLayout().getInDimNames()));
+             return py::none();
+           })
+      .def("get_linear_out_dim_names",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::cast(
+                   toStringVector(linear.getLinearLayout().getOutDimNames()));
+             return py::none();
+           })
+      .def("get_linear_num_in_dims",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::int_(linear.getLinearLayout().getNumInDims());
+             return py::none();
+           })
+      .def("get_linear_num_out_dims",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
+               return py::int_(linear.getLinearLayout().getNumOutDims());
+             return py::none();
+           })
+      .def("is_swizzled_shared_encoding",
+           [](Attribute &self) {
+             return isa<ttg::SwizzledSharedEncodingAttr>(self);
+           })
+      .def("get_swizzled_shared_vec",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::int_(swizzled.getVec());
+             return py::none();
+           })
+      .def("get_swizzled_shared_per_phase",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::int_(swizzled.getPerPhase());
+             return py::none();
+           })
+      .def("get_swizzled_shared_max_phase",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::int_(swizzled.getMaxPhase());
+             return py::none();
+           })
+      .def("get_swizzled_shared_order",
+           [](Attribute &self) -> py::object {
+             if (auto swizzled =
+                     dyn_cast<ttg::SwizzledSharedEncodingAttr>(self))
+               return py::cast(toInt64Vector(swizzled.getOrder()));
+             return py::none();
+           })
+      .def("is_shared_linear_encoding",
+           [](Attribute &self) {
+             return isa<ttg::SharedLinearEncodingAttr>(self);
+           })
+      .def("get_shared_linear_layout",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::SharedLinearEncodingAttr>(self))
+               return py::cast(LinearLayout(linear.getLinearLayout()));
+             return py::none();
+           })
+      .def("get_shared_linear_order",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::SharedLinearEncodingAttr>(self))
+               return py::cast(
+                   toInt64Vector(ArrayRef<unsigned>(linear.getOrder())));
+             return py::none();
+           })
+      .def("get_shared_linear_alignment",
+           [](Attribute &self) -> py::object {
+             if (auto linear = dyn_cast<ttg::SharedLinearEncodingAttr>(self))
+               return py::int_(linear.getAlignment());
+             return py::none();
+           })
+      .def("is_padded_shared_encoding",
+           [](Attribute &self) {
+             return static_cast<bool>(ttg::getPaddedEncoding(self));
+           })
+      .def("get_padded_shared_intervals",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(toInt64Vector(padded.getIntervals()));
+             return py::none();
+           })
+      .def("get_padded_shared_paddings",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(toInt64Vector(padded.getPaddings()));
+             return py::none();
+           })
+      .def("get_padded_shared_order",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(
+                   toInt64Vector(ArrayRef<unsigned>(padded.getOrder())));
+             return py::none();
+           })
+      .def("get_padded_shared_linear_component",
+           [](Attribute &self) -> py::object {
+             if (auto padded = ttg::getPaddedEncoding(self))
+               return py::cast(LinearLayout(padded.getLinearComponent()));
+             return py::none();
+           })
+      .def("__str__", [](Attribute &self) {
+        std::string str;
+        llvm::raw_string_ostream os(str);
+        self.print(os);
+        return os.str();
+      })
       .def("__eq__",
            [](Attribute &self, Attribute &other) { return self == other; });
   py::class_<IntegerAttr, Attribute>(m, "integer_attr", py::module_local());
@@ -703,6 +1112,8 @@ void init_triton_ir(py::module &&m) {
                throw pybind11::index_error("Op result index out of range");
              return self->getResult(idx);
            })
+      .def("get_attrs",
+           [](OpState &self) { return operationAttrsToPython(*self); })
       .def(
           "get_region",
           [](OpState &self, unsigned idx) -> Region & {
@@ -777,6 +1188,8 @@ void init_triton_ir(py::module &&m) {
       .def("get_num_regions", &Operation::getNumRegions)
       .def("get_region", &Operation::getRegion, ret::reference)
       .def("get_block", &Operation::getBlock, ret::reference)
+      .def("get_attrs",
+           [](Operation &self) { return operationAttrsToPython(self); })
       .def("get_str_attr",
            [](Operation &self, const std::string &name) -> py::object {
              auto ret = self.getAttrOfType<StringAttr>(name);
@@ -791,6 +1204,16 @@ void init_triton_ir(py::module &&m) {
                return py::none();
              return py::int_(ret.getInt());
            })
+      .def("get_int_array_attr",
+           [](Operation &self, const std::string &name) -> py::object {
+             auto ret = self.getAttrOfType<DenseI32ArrayAttr>(name);
+             if (!ret)
+               return py::none();
+             py::list values;
+             for (int32_t value : ret.asArrayRef())
+               values.append(py::int_(value));
+             return std::move(values);
+           })
       .def("get_constant_value",
            [](Operation &self) -> py::object {
              auto constOp = dyn_cast<arith::ConstantOp>(self);
@@ -802,10 +1225,20 @@ void init_triton_ir(py::module &&m) {
              if (auto intAttr = dyn_cast<IntegerAttr>(attr))
                return py::int_(intAttr.getValue().getSExtValue());
 
+             if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+               return py::float_(floatAttr.getValueAsDouble());
+
              if (auto denseAttr = dyn_cast<DenseIntElementsAttr>(attr)) {
                if (denseAttr.isSplat())
                  return py::int_(
                      denseAttr.getSplatValue<APInt>().getSExtValue());
+               return py::none();
+             }
+
+             if (auto denseAttr = dyn_cast<DenseFPElementsAttr>(attr)) {
+               if (denseAttr.isSplat())
+                 return py::float_(
+                     denseAttr.getSplatValue<APFloat>().convertToDouble());
                return py::none();
              }
 

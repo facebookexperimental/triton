@@ -33,6 +33,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// An explicit tiles-per-warp grouping participates in warp-grid planning.  A
+// A wide 8-wave GEMM tile needs the [2, 4] warp grid when each warp owns eight
+// contiguous M instructions and one N instruction.  The same grouping is used
+// by a 256x64 quarter tile when matrix-instruction-size=16.
+#blocked_explicit_tiles = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [4, 2], order = [1, 0]}>
+#dot_explicit_tiles_a = #ttg.dot_op<{opIdx = 0, parent = #blocked_explicit_tiles}>
+#dot_explicit_tiles_b = #ttg.dot_op<{opIdx = 1, parent = #blocked_explicit_tiles}>
+// MFMA16: [[$explicit_tiles_mma:#.*]] = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 32], isTransposed = true, tilesPerWarp = [8, 1]}>
+// MFMA16-LABEL: mfma_fp16_explicit_tiles_per_warp
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @mfma_fp16_explicit_tiles_per_warp(
+      %arg0: tensor<512x32xf16, #dot_explicit_tiles_a>,
+      %arg1: tensor<32x128xf16, #dot_explicit_tiles_b>,
+      %init: tensor<512x128xf32, #blocked_explicit_tiles>) -> tensor<512x128xf32, #blocked_explicit_tiles> {
+    // MFMA16: tt.dot {{.*}} -> tensor<512x128xf32, [[$explicit_tiles_mma]]>
+    %result = tt.dot %arg0, %arg1, %init {amdg.mma_tiles_per_warp = array<i32: 8, 1>} : tensor<512x32xf16, #dot_explicit_tiles_a> * tensor<32x128xf16, #dot_explicit_tiles_b> -> tensor<512x128xf32, #blocked_explicit_tiles>
+    tt.return %result : tensor<512x128xf32, #blocked_explicit_tiles>
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked2 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>

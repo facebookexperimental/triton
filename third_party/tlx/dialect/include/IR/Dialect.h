@@ -36,6 +36,7 @@ constexpr static char AttrClusterSyncKernelInitName[] =
 constexpr static char AttrClusterSyncKernelCleanupName[] =
     "tlx.cluster_sync_kernel_cleanup";
 constexpr static char AttrUserPostWsSyncName[] = "tlx.user_post_ws_sync";
+constexpr static char AttrLayoutIsExplicitName[] = "tlx.layout_is_explicit";
 
 bool tlxEnablePairedMMA(Operation *op);
 

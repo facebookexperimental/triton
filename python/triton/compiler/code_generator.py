@@ -1869,6 +1869,24 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
         module=module,
         is_gluon=fn.is_gluon(),
     )
+    # Explicit distributed layouts may be consumed while generating a helper
+    # function, before the backend's TTIR pipeline has stamped launch metadata
+    # on the module.  Seed the execution shape needed to validate those layouts
+    # so callees do not incorrectly fall back to wave32 or an unknown warp
+    # count.  The backend remains responsible for complete target setup.
+    if module is None and hasattr(options, "warp_size"):
+        generator.module.set_attr(
+            "ttg.num-warps",
+            generator.builder.get_int32_attr(options.num_warps),
+        )
+        generator.module.set_attr(
+            "ttg.num-ctas",
+            generator.builder.get_int32_attr(options.num_ctas),
+        )
+        generator.module.set_attr(
+            "ttg.threads-per-warp",
+            generator.builder.get_int32_attr(options.warp_size),
+        )
     generator.visit(fn.parse())
     module = generator.module
     # module takes ownership of the context
