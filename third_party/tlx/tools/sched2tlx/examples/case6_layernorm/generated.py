@@ -27,20 +27,20 @@ def layernorm_fwd_nows(
     ext_9 = tl.load((B + range_7))[None, :].to(tl.float32)
 
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
-    # inner-loop buf 0: SMEM count=1 (modulo lifetime [1915..1915], II=594)
+    # inner-loop buf 0: SMEM count=1 (modulo lifetime [2357..2357], II=534)
     L0_smem_0 = tlx.local_alloc((8, 512), tl.float16, 1)
     # inner-loop buf 1: SMEM count=2 (channel for cross-WG hand-off)
     L0_smem_1 = tlx.local_alloc((8, 512), tl.float16, 2)
-    # inner-loop buf 2: SMEM count=1 (channel for cross-WG hand-off)
-    L0_smem_2 = tlx.local_alloc((8, 512), tl.float16, 1)
+    # inner-loop buf 2: SMEM count=2 (channel for cross-WG hand-off)
+    L0_smem_2 = tlx.local_alloc((8, 512), tl.float16, 2)
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
     # L0_smem_1: N1→N2  tt.descriptor_load→arith.extf  cyc1→cyc749  forward  buf=1  kind=mbarrier
     L0_smem_1_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     L0_smem_1_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
-    # sem1_b2: N21→N22  arith.truncf→tt.descriptor_store  cyc1889→cyc1915  forward  buf=2  kind=mbarrier
-    sem1_b2_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-    sem1_b2_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    # sem1_b2: N21→N22  arith.truncf→tt.descriptor_store  cyc2331→cyc2357  forward  buf=2  kind=mbarrier
+    sem1_b2_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
+    sem1_b2_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     with tlx.async_tasks():
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -86,17 +86,17 @@ def layernorm_fwd_nows(
                 mulf_27 = (mulf_26 * _wgloc601)
                 addf_28 = (mulf_27 + _wgloc602)
                 trunc_29 = addf_28.to(tl.float16)
-                tlx.barrier_wait(sem1_b2_empty[0], ((_it & 1) ^ 1))
-                tlx.local_store(L0_smem_2[0], trunc_29)
+                tlx.barrier_wait(sem1_b2_empty[(_it % 2)], (((_it // 2) & 1) ^ 1))
+                tlx.local_store(L0_smem_2[(_it % 2)], trunc_29)
                 tlx.fence_async_shared()
-                tlx.barrier_arrive(sem1_b2_full[0], 1)
+                tlx.barrier_arrive(sem1_b2_full[(_it % 2)], 1)
         # Async task: role=TMA ← inner wg2 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             for tile_id in range(pid_0, div_4, nprog_0):
                 _it = (tile_id - pid_0) // nprog_0
-                buf = _it % 1
-                phase = (_it // 1) & 1
-                tlx.barrier_wait(sem1_b2_full[0], (_it & 1))
-                tlx.async_descriptor_store(y_desc, L0_smem_2[0], [(tile_id * 8), 0])
+                buf = _it % 2
+                phase = (_it // 2) & 1
+                tlx.barrier_wait(sem1_b2_full[(_it % 2)], ((_it // 2) & 1))
+                tlx.async_descriptor_store(y_desc, L0_smem_2[(_it % 2)], [(tile_id * 8), 0])
                 tlx.async_descriptor_store_wait(0)
-                tlx.barrier_arrive(sem1_b2_empty[0], 1)
+                tlx.barrier_arrive(sem1_b2_empty[(_it % 2)], 1)
