@@ -664,6 +664,15 @@ bool isExpensiveLocalLoad(Operation *op) {
   auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op);
   if (!localLoad)
     return false;
+  // TLX kernels with explicit local-memory accesses use local_load as a
+  // structural read whose register layout is selected by an adjacent layout
+  // requirement.  Treating those reads as anchors prevents
+  // RemoveLayoutConversions from folding that requirement into the load and
+  // introduces a redundant shared-memory layout conversion.  Keep the
+  // upstream cost heuristic for inferred Triton local-memory traffic.
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (mod->hasAttr("tlx.has_explicit_local_mem_access"))
+    return false;
   auto resultType = dyn_cast<RankedTensorType>(localLoad.getResult().getType());
   if (!resultType)
     return false;
@@ -671,7 +680,6 @@ bool isExpensiveLocalLoad(Operation *op) {
   if (resultType.getNumElements() == 1)
     return false;
   // Tensor has more threads than elements - cheap due to sharing
-  auto mod = op->getParentOfType<ModuleOp>();
   int numWarps = triton::gpu::lookupNumWarps(op);
   int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
   if (resultType.getNumElements() < numWarps * threadsPerWarp)

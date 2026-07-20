@@ -394,7 +394,8 @@ def _set_amd_mma_tiles_per_warp(result, tiles_per_warp, semantic):
 
 
 @tl.builtin
-def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None, out_dtype=None,
+def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None,
+        out_dtype=tl.float32,
         tiles_per_warp: tl.constexpr = None, _semantic=None):
     """Thin wrapper around :func:`triton.language.dot` with an optional AMD
     per-wave tile-ownership hint.
@@ -404,8 +405,16 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     matmul layout selection and does not expose an MFMA/WMMA fragment type at
     the TLX operation boundary.
     """
-    result = tl.dot(input, other, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype,
-                    _semantic=_semantic)
+    result = tl.dot(
+        input,
+        other,
+        acc=acc,
+        input_precision=input_precision,
+        allow_tf32=allow_tf32,
+        max_num_imprecise_acc=max_num_imprecise_acc,
+        out_dtype=out_dtype,
+        _semantic=_semantic,
+    )
     return _set_amd_mma_tiles_per_warp(result, tiles_per_warp, _semantic)
 
 
