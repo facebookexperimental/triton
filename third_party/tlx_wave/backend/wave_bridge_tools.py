@@ -12,6 +12,7 @@ _WAVE_PIPELINE_FILE = "pipelines.mlir"
 _WAVE_PIPELINE_REL = Path("share") / "wave-mlir" / "pipelines" / _WAVE_PIPELINE_FILE
 _WAVE_PIPELINE_SOURCE = (Path("third_party") / "wave" / "lib" / "Target" / "Wave" / "pipelines" / _WAVE_PIPELINE_FILE)
 _WAVE_MACHINE_PIPELINE_ENTRY = "waveamd_backend"
+_WAVE_MULTI_WAVE_MACHINE_PIPELINE_ENTRY = "waveamd_backend_multi_wave"
 _WAVE_HSACO_PIPELINE_ENTRY = "compile_kernels"
 
 
@@ -180,7 +181,7 @@ def _wave_pipelines_sha256():
     return _file_sha256(_wave_pipelines_mlir(wave_opt))
 
 
-def _wave_transform_pipeline(entry_point, wave_opt=None, chip=None):
+def _wave_transform_pipeline(entry_point, wave_opt=None, chip=None, trailing_passes=()):
     pipelines = _wave_pipelines_mlir(wave_opt)
     passes = []
     if chip:
@@ -190,15 +191,26 @@ def _wave_transform_pipeline(entry_point, wave_opt=None, chip=None):
         f"transform-preload-library{{transform-library-paths={pipelines}}}",
         f"transform-interpreter{{entry-point={entry_point}}}",
     ])
+    passes.extend(trailing_passes)
     return ("builtin.module(" + ",".join(passes) + ")")
 
 
-def _wave_machine_pipeline_args(wave_opt=None, chip=None):
-    return (f"--pass-pipeline={_wave_transform_pipeline(_WAVE_MACHINE_PIPELINE_ENTRY, wave_opt, chip)}", )
+def _wave_machine_pipeline_args(wave_opt=None, chip=None, multi_wave_specialize=False):
+    entry_point = (_WAVE_MULTI_WAVE_MACHINE_PIPELINE_ENTRY if multi_wave_specialize else _WAVE_MACHINE_PIPELINE_ENTRY)
+    return (f"--pass-pipeline={_wave_transform_pipeline(entry_point, wave_opt, chip)}", )
 
 
-def _wave_hsaco_pipeline_args(wave_opt=None, chip=None):
-    return (f"--pass-pipeline={_wave_transform_pipeline(_WAVE_HSACO_PIPELINE_ENTRY, wave_opt, chip)}", )
+def _wave_hsaco_pipeline_args(wave_opt=None, chip=None, multi_wave_specialize=False):
+    if not multi_wave_specialize:
+        pipeline = _wave_transform_pipeline(_WAVE_HSACO_PIPELINE_ENTRY, wave_opt, chip)
+    else:
+        pipeline = _wave_transform_pipeline(
+            _WAVE_MULTI_WAVE_MACHINE_PIPELINE_ENTRY,
+            wave_opt,
+            chip,
+            trailing_passes=("wave-compile-kernels", ),
+        )
+    return (f"--pass-pipeline={pipeline}", )
 
 
 def _verify_wave_module(wave_text, wave_opt):
@@ -215,9 +227,23 @@ def _verify_wave_module(wave_text, wave_opt):
         raise RuntimeError(f"tlx_wave generated Wave module failed wave-opt verification: {detail}")
 
 
-def _compile_wave_module_to_hsaco(wave_text, wave_opt, chip):
+def _compile_wave_module_to_hsaco(
+    wave_text,
+    wave_opt,
+    chip,
+    *,
+    multi_wave_specialize=False,
+):
     result = subprocess.run(
-        [wave_opt, "-", *_wave_hsaco_pipeline_args(wave_opt, chip)],
+        [
+            wave_opt,
+            "-",
+            *_wave_hsaco_pipeline_args(
+                wave_opt,
+                chip,
+                multi_wave_specialize=multi_wave_specialize,
+            ),
+        ],
         input=wave_text,
         text=True,
         stdout=subprocess.PIPE,
