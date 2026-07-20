@@ -274,7 +274,7 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         emuTF32 = False
-        passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_coalesce(pm, 128)
         if knobs.amd.use_buffer_ops:
             amd.passes.ttgpuir.add_coalesce_buffer_ops(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0)
