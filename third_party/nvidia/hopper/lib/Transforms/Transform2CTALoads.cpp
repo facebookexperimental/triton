@@ -213,11 +213,10 @@ struct Transform2CTALoads
     }
 
     MLIRContext *ctx = mma.getContext();
-    auto elemType = descType.getBlockType().getElementType();
-    auto blockEncoding = descType.getBlockType().getEncoding();
-    auto halfBlockType =
-        RankedTensorType::get(newBlockShape, elemType, blockEncoding);
-    auto newDescType = tt::TensorDescType::get(ctx, halfBlockType);
+    auto elemType = descType.getElementType();
+    auto sharedLayout = descType.getSharedLayout();
+    auto newDescType =
+        tt::TensorDescType::get(newBlockShape, elemType, sharedLayout);
 
     // --- Step 1: Create half-width descriptor ---
     Value newDesc;

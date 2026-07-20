@@ -15,6 +15,18 @@ Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:
 While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.
 
 
+## Nightly builds (fbtriton)
+
+Nightly `.dev` wheels are published to a self-managed index (not PyPI):
+
+    pip install --pre fbtriton \
+      --index-url https://facebookexperimental.github.io/triton/nightly/simple/
+
+Each nightly is built from the newest `main` commit whose GPU/CI checks are all
+green. `triton.__version__` reports `3.8.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies
+are retained for ~30 days. Formal releases remain on PyPI (`pip install fbtriton`).
+
+
 ## Gluon support
 
 [Gluon](https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon)

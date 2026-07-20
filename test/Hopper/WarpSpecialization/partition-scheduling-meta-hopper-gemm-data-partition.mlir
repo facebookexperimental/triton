@@ -40,9 +40,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threa
 // --- Partition types: computation partitions before load ---
 // CHECK: partition.types = ["computation", "computation", "load"
 tt.func public @hopper_data_partitioned_gemm(
-    %a_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
-    %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-    %c_desc: !tt.tensordesc<tensor<64x128xf16, #shared>>,
+    %a_desc: !tt.tensordesc<64x64xf16, #shared>,
+    %b_desc: !tt.tensordesc<128x64xf16, #shared>,
+    %c_desc: !tt.tensordesc<64x128xf16, #shared>,
     %M: i32 {tt.divisibility = 16 : i32},
     %N: i32 {tt.divisibility = 16 : i32},
     %K: i32 {tt.divisibility = 16 : i32}
@@ -86,9 +86,9 @@ tt.func public @hopper_data_partitioned_gemm(
         iter_args(%acc0 = %cst, %acc1 = %cst) -> (tensor<64x128xf32, #mma>, tensor<64x128xf32, #mma>) : i32 {
       %offs_k = arith.muli %ki, %c64_i32 {loop.cluster = 1 : i32, loop.stage = 0 : i32} : i32
 
-      %a0 = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<64x64xf16, #shared>> -> tensor<64x64xf16, #blocked>
-      %a1 = tt.descriptor_load %a_desc[%offs_am_1, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<64x64xf16, #shared>> -> tensor<64x64xf16, #blocked>
-      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      %a0 = tt.descriptor_load %a_desc[%offs_am, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<64x64xf16, #shared> -> tensor<64x64xf16, #blocked>
+      %a1 = tt.descriptor_load %a_desc[%offs_am_1, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<64x64xf16, #shared> -> tensor<64x64xf16, #blocked>
+      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] {loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
 
       %a0_smem = ttg.local_alloc %a0 {loop.cluster = 0 : i32, loop.stage = 1 : i32} : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
       %a1_smem = ttg.local_alloc %a1 {loop.cluster = 0 : i32, loop.stage = 1 : i32} : (tensor<64x64xf16, #blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
@@ -120,10 +120,10 @@ tt.func public @hopper_data_partitioned_gemm(
     %c0_cvt = ttg.convert_layout %c0_f16 : tensor<64x128xf16, #mma> -> tensor<64x128xf16, #blocked1>
     %c1_cvt = ttg.convert_layout %c1_f16 : tensor<64x128xf16, #mma> -> tensor<64x128xf16, #blocked1>
     %c0_smem = ttg.local_alloc %c0_cvt : (tensor<64x128xf16, #blocked1>) -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
-    %store_tok0 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %c0_smem : !tt.tensordesc<tensor<64x128xf16, #shared>>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %store_tok0 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c, %offs_bn_c] %c0_smem : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %store_tok0 : !ttg.async.token
     %c1_smem = ttg.local_alloc %c1_cvt : (tensor<64x128xf16, #blocked1>) -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
-    %store_tok1 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c_1, %offs_bn_c] %c1_smem : !tt.tensordesc<tensor<64x128xf16, #shared>>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
+    %store_tok1 = ttng.async_tma_copy_local_to_global %c_desc[%offs_am_c_1, %offs_bn_c] %c1_smem : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %store_tok1 : !ttg.async.token
 
     scf.yield %tile_id_c_next : i32
