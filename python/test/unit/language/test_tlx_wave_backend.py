@@ -5709,6 +5709,7 @@ def test_tlx_wave_backend_wave_stage_emits_split_barrier_attr(tmp_path):
     )
 
     assert "waveamdmachine.enable_split_barriers" in wave_artifact
+    assert "waveamdmachine.enable_multi_wave_specialization" not in wave_artifact
     assert metadata["tlx_wave_enable_split_barriers"] is True
     _run_wave_verify(wave_artifact)
     del ctx
@@ -5727,6 +5728,77 @@ def test_tlx_wave_backend_wave_stage_emits_multi_wave_specialization_attr(tmp_pa
         mod,
         metadata,
         _tlx_wave_options(tlx_wave_enable_multi_wave_specialize=True),
+    )
+
+    assert "waveamdmachine.enable_multi_wave_specialization" in wave_artifact
+    assert "waveamdmachine.enable_split_barriers" not in wave_artifact
+    assert metadata["tlx_wave_enable_multi_wave_specialize"] is True
+    _run_wave_verify(wave_artifact)
+    del ctx
+
+
+@pytest.mark.parametrize(
+    "source_attr,kernel_field,wave_attr,other_wave_attr",
+    [
+        (
+            "tlx_wave.enable_split_barriers",
+            "enable_split_barriers",
+            "waveamdmachine.enable_split_barriers",
+            "waveamdmachine.enable_multi_wave_specialization",
+        ),
+        (
+            "tlx_wave.enable_multi_wave_specialization",
+            "enable_multi_wave_specialization",
+            "waveamdmachine.enable_multi_wave_specialization",
+            "waveamdmachine.enable_split_barriers",
+        ),
+    ],
+)
+def test_tlx_wave_converter_carries_function_policy_attr(
+    tmp_path,
+    source_attr,
+    kernel_field,
+    wave_attr,
+    other_wave_attr,
+):
+    local_func = f"""
+  tt.func public @backend_wave_function_policy() attributes {{
+    noinline = false,
+    {source_attr} = true
+  }} {{
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert getattr(output.source_program.kernel, kernel_field) is True
+    assert getattr(output.target_program.kernel, kernel_field) is True
+    assert wave_attr in output.emitted_module.text
+    assert other_wave_attr not in output.emitted_module.text
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_backend_honors_function_specialization_without_global_option(
+    tmp_path,
+):
+    local_func = """
+  tt.func public @backend_wave_function_specialization() attributes {
+    noinline = false,
+    tlx_wave.enable_multi_wave_specialization = true
+  } {
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8)
+    metadata = {}
+
+    wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
+        mod,
+        metadata,
+        _tlx_wave_options(),
     )
 
     assert "waveamdmachine.enable_multi_wave_specialization" in wave_artifact
@@ -6274,6 +6346,7 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
     case,
 ):
     compiled = _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case)
+    ttgir_artifact = _asm_text(compiled, "ttgir")
     wave_artifact = _asm_text(compiled, "wave")
     hsaco = compiled.asm["hsaco"]
 
@@ -6292,11 +6365,22 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
     assert compiled.metadata.tlx_wave_launch_shared_bytes == 0
     assert compiled.metadata.tlx_wave_lds_size_bytes == 0
     assert compiled.metadata.tlx_wave_num_mmas > 0
-    assert compiled.metadata.tlx_wave_enable_multi_wave_specialize is bool(
+    enable_multi_wave_specialization = bool(
         case.get("compile_options", {}).get(
             "tlx_wave_enable_multi_wave_specialize",
             False,
-        ))
+        )
+    )
+    assert (
+        "tlx_wave.enable_multi_wave_specialization" in ttgir_artifact
+    ) is enable_multi_wave_specialization
+    assert (
+        "waveamdmachine.enable_multi_wave_specialization" in wave_artifact
+    ) is enable_multi_wave_specialization
+    assert (
+        compiled.metadata.tlx_wave_enable_multi_wave_specialize
+        is enable_multi_wave_specialization
+    )
     if "expected_dma_load_lds" in case:
         assert (compiled.metadata.tlx_wave_num_dma_load_lds == case["expected_dma_load_lds"])
     else:
@@ -6448,7 +6532,6 @@ def test_tlx_wave_runtime_gfx950_wave_8wave_e2e(tmp_path, monkeypatch, backend):
 @pytest.mark.parametrize("backend", ["llvm", "wave"])
 def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
     tmp_path,
-    monkeypatch,
     backend,
 ):
     torch, arch = _require_tlx_wave_runtime_target()
@@ -6457,6 +6540,9 @@ def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
     tutorial = _load_tlx_gfx9_gemm_module(
         "wave_4wave_specialized",
         f"_tlx_wave_4wave_specialized_runtime_{backend}",
+    )
+    bench = _load_tlx_gfx9_gemm_bench_module(
+        f"_tlx_wave_4wave_specialized_bench_{backend}"
     )
 
     m, n, k = 256, 256, 256
@@ -6467,10 +6553,11 @@ def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
     expected = torch.matmul(a, b)
     torch.cuda.synchronize()
 
-    if backend == "wave":
-        monkeypatch.setenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", "1")
-    else:
-        monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", raising=False)
+    compile_options = (
+        {"tlx_wave_enable_multi_wave_specialize": True}
+        if backend == "wave"
+        else None
+    )
     driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
     with (
             driver_context(),
@@ -6482,7 +6569,13 @@ def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
         # Repeated launches cover the independently reused A/B LDS epochs; a
         # missing workgroup rendezvous manifests as a nondeterministic race.
         for _ in range(3):
-            got = tutorial.matmul(a, b)
+            got = bench.launch_tutorial_matmul(
+                tutorial,
+                "wave_4wave_specialized",
+                a,
+                b,
+                extra_compile_options=compile_options,
+            )
             torch.cuda.synchronize()
             torch.testing.assert_close(got, expected, atol=3e-1, rtol=0)
 
@@ -15932,7 +16025,6 @@ def _convert_ttgir_to_wave_keep_dead(
     *,
     kernel_name=None,
     verify=True,
-    enable_split_barriers=False,
 ):
     source_program = converter_source_import.import_source_program(mod, kernel_name=kernel_name)
     type_layout_program = converter_types.convert_source_program(source_program)
@@ -15958,7 +16050,6 @@ def _convert_ttgir_to_wave_keep_dead(
     emitted_module = converter_emission.emit_wave_module(
         target_program,
         fact_program,
-        enable_split_barriers=enable_split_barriers,
     )
     return converter_pipeline.ConversionOutput(
         source_program,

@@ -126,6 +126,8 @@ class TargetKernel:
     threads_per_warp: int | None = None
     noinline: bool | None = None
     arg_target_ids: tuple[int, ...] = ()
+    enable_split_barriers: bool = False
+    enable_multi_wave_specialization: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,8 @@ class TargetBuilder:
             self.kernel.threads_per_warp,
             self.kernel.noinline,
             tuple(int(value_id) for value_id in target_value_ids),
+            self.kernel.enable_split_barriers,
+            self.kernel.enable_multi_wave_specialization,
         )
 
     def add_region(self, *, block_arg_ids=()):
