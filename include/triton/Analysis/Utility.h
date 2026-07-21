@@ -3,6 +3,7 @@
 
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -24,6 +25,22 @@ inline bool isZeroConst(Value v) {
 
 class ReduceOpHelper {
 public:
+  enum class InThreadVectorizeOpKind {
+    None,
+    AddF,
+    MulF,
+    MinNumF,
+    MaxNumF,
+    MinimumF,
+    MaximumF,
+    AddI,
+    MulI,
+    MinSI,
+    MaxSI,
+    MinUI,
+    MaxUI,
+  };
+
   explicit ReduceOpHelper(triton::ReduceOp op)
       : op(op.getOperation()), axis(op.getAxis()) {
     auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
@@ -56,6 +73,10 @@ public:
 
   unsigned getInterWarpSizeWithUniqueData();
 
+  bool isAssociative();
+
+  unsigned getScratchSizeInBytes();
+
   unsigned getIntraWarpSizeWithUniqueData();
 
   // Number of register groups along the reduction axis that must be kept
@@ -65,13 +86,35 @@ public:
   // The shape of the shared memory space needed for the reduction.
   SmallVector<unsigned> getScratchRepShape();
 
-  SmallVector<unsigned> getOrderWithAxisAtBeginning();
-
-  unsigned getScratchSizeInBytes();
-
   bool isReduceWithinCTA();
 
-  bool isAssociative();
+  InThreadVectorizeOpKind
+  getInThreadVectorizeOpKind(unsigned axisPack,
+                             bool supportBitwidth16Elementwise,
+                             bool supportBitwidth32Elementwise);
+
+  static Value createInThreadVectorizedCombineOp(OpBuilder &builder,
+                                                 Location loc,
+                                                 InThreadVectorizeOpKind kind,
+                                                 Value lhs, Value rhs);
+
+  static triton::ColumnAction
+  moveAxisBasesToFront(const triton::LinearLayout &layout, int axis,
+                       bool isVectorized = false);
+
+  static triton::LinearLayout reducedRegLaneLayout(RankedTensorType srcTy,
+                                                   int axis);
+
+  static triton::LinearLayout getInterLayout(const triton::LinearLayout &layout,
+                                             int axis);
+
+  static triton::LinearLayout
+  zeroBasesAlongDimAndReorder(const triton::LinearLayout &layout, int axis,
+                              StringAttr dim);
+
+  SmallVector<unsigned> getOrderWithAxisAtBeginning();
+
+  RankedTensorType getSrcTy() { return srcTy; }
 
 private:
   triton::ReduceOp op;
@@ -413,8 +456,8 @@ protected:
 // Create a basic DataFlowSolver with constant and dead code analysis included.
 std::unique_ptr<DataFlowSolver> createDataFlowSolver();
 
-bool isCvtWarpSync(const triton::LinearLayout &srcLayout,
-                   const triton::LinearLayout &dstLayout);
+bool isCvtDimSync(const triton::LinearLayout &srcLayout,
+                  const triton::LinearLayout &dstLayout, StringAttr dim);
 
 } // namespace mlir
 
