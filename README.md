@@ -793,6 +793,7 @@ Examples: how mbarriers are communicated in warp specialization
 |--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
 | `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
+| `mbarrier_try_wait_suspend_ns` | On Blackwell, use the four-operand `mbarrier.try_wait.parity` form with this suspend hint for waits in the kernel. `None` is unspecified, `0` explicitly disables the hint, and positive values enable it. If multiple `async_tasks` regions specify a value, the minimum explicit value is used module-wide. Default to None. |
 
 #### async_task Parameters
 

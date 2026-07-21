@@ -261,6 +261,17 @@ while !done:
 - ***tlx.barrier_wait(bar, phase)***
   Wait until the *bar*’s phase has moved ahead of the *phase* argument.
 
+  On Blackwell (compute capability 100 or newer), waits inside
+  `tlx.async_tasks(mbarrier_try_wait_suspend_ns=N)` use the four-operand
+  `mbarrier.try_wait.parity` form. The suspend hint lets ptxas emit
+  `NANOSLEEP.SYNCS`, allowing a waiting warp to yield instead of busy-spinning.
+
+  `None` leaves the policy unspecified and does not participate when a kernel
+  contains multiple `async_tasks` regions. An explicit `0` disables the fused
+  suspend hint. Positive values are combined module-wide by selecting the
+  minimum explicit value. If no region specifies a value, waits use the default
+  busy-spin lowering.
+
 - ***tlx.barrier_arrive(bar, arrive_count=1)***
   Performs an arrive operation on *bar*, by decrementing *arrive_count*
   from the *bar*’s arrival count. The phase of *bar* is flipped if

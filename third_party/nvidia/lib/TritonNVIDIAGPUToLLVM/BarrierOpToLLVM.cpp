@@ -31,6 +31,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.h"
 
 #include "Utility.h"
 
@@ -289,6 +290,14 @@ struct WaitBarrierOpConversion
       pred = b.and_(pred, *leaderPred);
 
     bool predicated = pred && !matchPattern(pred, m_NonZero());
+    int suspendNs = 0;
+    if (targetInfo->getComputeCapability() >= 100) {
+      auto mod = op->getParentOfType<ModuleOp>();
+      if (auto attr = mod->getAttrOfType<IntegerAttr>(
+              "tlx.mbarrier_try_wait_suspend_ns"))
+        suspendNs = attr.getInt();
+    }
+    bool useSuspendHint = suspendNs > 0;
     std::string ptx;
     if (targetInfo->getComputeCapability() < 90) {
       if (!predicated) {
@@ -315,23 +324,30 @@ struct WaitBarrierOpConversion
 )";
       }
     } else {
+      // SM90+ polls with try_wait in a spin loop. Blackwell can opt into the
+      // four-operand form, whose suspend hint lowers to NANOSLEEP.SYNCS.
+      std::string tryWait = useSuspendHint
+                                ? "\tmbarrier.try_wait.parity.shared::cta.b64 "
+                                  "complete, [$0], $1, $2;\n"
+                                : "\tmbarrier.try_wait.parity.shared::cta.b64 "
+                                  "complete, [$0], $1;\n";
       if (!predicated) {
-        ptx = R"(
+        ptx = std::string(R"(
 {
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1;
-	@!complete bra.uni waitLoop;
+)") + tryWait +
+              R"(	@!complete bra.uni waitLoop;
 }
 )";
       } else {
-        ptx = R"(
-{
-	@!$2 bra.uni skipWait;
+        std::string predOperand = useSuspendHint ? "$3" : "$2";
+        ptx = std::string("\n{\n\t@!") + predOperand +
+              R"( bra.uni skipWait;
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1;
-	@!complete bra.uni waitLoop;
+)" + tryWait +
+              R"(	@!complete bra.uni waitLoop;
 	skipWait:
 }
 )";
@@ -339,9 +355,11 @@ struct WaitBarrierOpConversion
     }
     ::mlir::triton::PTXBuilder ptxBuilder;
     auto &waitLoop = *ptxBuilder.create(ptx);
-    SmallVector<::mlir::triton::PTXBuilder::Operand *, 3> operands = {
+    SmallVector<::mlir::triton::PTXBuilder::Operand *, 4> operands = {
         ptxBuilder.newOperand(smemObj.getBase(), "r"),
         ptxBuilder.newOperand(adaptor.getPhase(), "r")};
+    if (useSuspendHint)
+      operands.push_back(ptxBuilder.newOperand(b.i32_val(suspendNs), "r"));
     if (predicated)
       operands.push_back(ptxBuilder.newOperand(pred, "b"));
 
