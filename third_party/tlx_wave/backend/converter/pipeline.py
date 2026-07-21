@@ -29,8 +29,6 @@ def convert_ttgir_to_wave(
     kernel_name=None,
     verify=True,
     compiler_membar_barriers=(),
-    enable_split_barriers=False,
-    enable_multi_wave_specialization=False,
     waves_per_eu=0,
 ):
     source_program = source_import.import_source_program(
@@ -65,8 +63,6 @@ def convert_ttgir_to_wave(
     emitted_module = emission.emit_wave_module(
         target_program,
         fact_program,
-        enable_split_barriers=enable_split_barriers,
-        enable_multi_wave_specialization=enable_multi_wave_specialization,
         waves_per_eu=waves_per_eu,
     )
     return ConversionOutput(
