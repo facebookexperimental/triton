@@ -23,6 +23,13 @@ AGENT_TEMPLATE_DIR="$REPO_ROOT/.claude/debug_helper/agents"
 SUBAGENT_TEMPLATE_DIR="$AGENT_TEMPLATE_DIR/subagents"
 WRAPPER_AGENT_TEMPLATE="$AGENT_TEMPLATE_DIR/wrapper.md"
 
+# GPU-aware scheduling: investigations whose template declares
+# `<!-- debug_helper: needs_gpu=true -->` are serialized against this lock so two
+# GPU-bound investigations never contend for the device when the wrapper launches
+# every investigation in parallel. Static (non-GPU) investigations ignore it.
+GPU_LOCK_DIR="${TMPDIR:-/tmp}/debug_helper"
+GPU_LOCK_FILE="$GPU_LOCK_DIR/gpu.lock"
+
 CLAUDE_SKIP_FLAG="--dangerously-skip-permissions"
 CODEX_SKIP_FLAG="--dangerously-bypass-approvals-and-sandbox"
 
@@ -51,6 +58,17 @@ list_investigations() {
             basename "$template_path" .md
         done \
         | sort
+}
+
+# GPU-aware scheduling helper: succeeds when an investigation opts in via a
+# `<!-- debug_helper: needs_gpu=true -->` marker in its template (conventionally
+# the first line). Runtime GPU investigations (cutracer_*, compute_sanitizer) set
+# it so the scheduler serializes them; static IR investigations omit it.
+investigation_needs_gpu() {
+    local investigation="$1"
+    local template_path="$SUBAGENT_TEMPLATE_DIR/$investigation.md"
+    [[ -f "$template_path" ]] || return 1
+    grep -qiE '<!--[[:space:]]*debug_helper:[[:space:]]*needs_gpu=true[[:space:]]*-->' "$template_path"
 }
 
 skip_flag_for_llm() {
@@ -362,8 +380,33 @@ run_template_subagent() {
 
     subagent_prompt "$subagent_name" "$ir_path" "$subagent_dir" "$context_file" >"$prompt_file"
 
+    local needs_gpu=0
+    if investigation_needs_gpu "$subagent_name"; then
+        needs_gpu=1
+    fi
+
     set +e
-    run_llm_print "$llm" "$prompt_file" "$llm_output"
+    if [[ $needs_gpu -eq 1 ]] && command -v flock >/dev/null 2>&1; then
+        mkdir -p "$GPU_LOCK_DIR"
+        log_line "$out_dir/run.log" "$subagent_name needs a GPU; serializing on $GPU_LOCK_FILE"
+        # Serialize GPU-bound investigations across the parallel --run-subagent
+        # processes the wrapper spawns. flock blocks until the lock frees; fd 9
+        # closes when the subshell exits, releasing it even if the run fails. If
+        # flock fails to acquire (e.g. interrupted), fall back to an unserialized
+        # run with the same warning as the no-flock branch rather than silently
+        # defeating serialization.
+        (
+            if ! flock 9; then
+                log_line "$out_dir/run.log" "$subagent_name needs a GPU but failed to acquire $GPU_LOCK_FILE; running without GPU serialization"
+            fi
+            run_llm_print "$llm" "$prompt_file" "$llm_output"
+        ) 9>"$GPU_LOCK_FILE"
+    else
+        if [[ $needs_gpu -eq 1 ]]; then
+            log_line "$out_dir/run.log" "$subagent_name needs a GPU but flock is unavailable; running without GPU serialization"
+        fi
+        run_llm_print "$llm" "$prompt_file" "$llm_output"
+    fi
     local rc=$?
     set -e
 
