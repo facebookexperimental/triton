@@ -126,8 +126,17 @@ public:
     Value mask = stOp.getMask();
     auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
     auto valType = dyn_cast<RankedTensorType>(val.getType());
-    if (!ptrType || !valType ||
-        !isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
+    if (!ptrType || !valType)
+      return mlir::failure();
+    // Respect a user-pinned store layout (PinnedEncodingTrait, e.g. TLX's
+    // #tlx.user_layout): the author chose this store layout deliberately (like a
+    // Gluon convert_layout before the store), so do not rewrite it to the MMA
+    // accumulator layout. Mirrors Coalesce / RemoveLayoutConversions /
+    // OptimizeTMemLayouts, which already anchor on this trait (D112032532).
+    if (isa_and_nonnull<triton::gpu::PinnedEncodingTrait>(valType.getEncoding()) ||
+        isa_and_nonnull<triton::gpu::PinnedEncodingTrait>(ptrType.getEncoding()))
+      return mlir::failure();
+    if (!isa<triton::gpu::BlockedEncodingAttr>(ptrType.getEncoding()) ||
         !isa<triton::gpu::BlockedEncodingAttr>(valType.getEncoding()))
       return mlir::failure();
 

@@ -135,13 +135,36 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
             &getContext(), resultType.getShape(), sizePerThread, order,
             numWarps, threadsPerWarp, CGALayout);
       } else {
-        auto tensorType = cast<RankedTensorType>(ptr.getType());
-        CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
-        SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
-        auto layout = buildCoalescedEncoding(axisInfoAnalysis, curr, numWarps,
-                                             threadsPerWarp, cgaLayout,
-                                             shapePerCTA, maxVecBits);
-        layoutMap[curr] = layout;
+        // Respect a user-pinned store value layout. A tt.store has no result to
+        // carry a PinnedEncodingTrait, so the pin (TLX #tlx.user_layout, e.g.
+        // from local_load(layout=)) rides on the value operand. When present,
+        // store in that peeled concrete layout instead of a freshly-coalesced
+        // one: convertDistributedOpEncoding then converts ptr/mask to match, and
+        // the value's bridging convert folds away -- so the user's chosen store
+        // layout survives to codegen (and AMD OptimizeEpilogue leaves it alone
+        // since it is no longer a #blocked store).
+        Attribute pinned;
+        if (auto store = dyn_cast<triton::StoreOp>(curr)) {
+          if (auto vt =
+                  dyn_cast<RankedTensorType>(store.getValue().getType())) {
+            if (isa_and_nonnull<PinnedEncodingTrait>(vt.getEncoding())) {
+              Attribute concrete = triton::unwrapTlxWrappers(vt.getEncoding());
+              if (isa_and_nonnull<DistributedEncodingTrait>(concrete))
+                pinned = concrete;
+            }
+          }
+        }
+        if (pinned) {
+          layoutMap[curr] = pinned;
+        } else {
+          auto tensorType = cast<RankedTensorType>(ptr.getType());
+          CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
+          SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
+          auto layout = buildCoalescedEncoding(axisInfoAnalysis, curr, numWarps,
+                                               threadsPerWarp, cgaLayout,
+                                               shapePerCTA, maxVecBits);
+          layoutMap[curr] = layout;
+        }
       }
     });
 

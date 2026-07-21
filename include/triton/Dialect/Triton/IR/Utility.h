@@ -214,6 +214,15 @@ bool encodingContainsTlxPlaceholder(Attribute attr);
 // skipping verification entirely.
 Attribute unwrapTlxWrappers(Attribute attr);
 
+// Type comparator for op verifiers (e.g. tt.store's ptr/value/mask
+// TypesMatchWith): equal if `a == b`, or *deferred* (returns true) if either
+// type carries a TLX placeholder encoding (#tlx.user_layout / #tlx.no_verify) --
+// the concrete layouts are only reconciled later by resolve-placeholder-layouts
+// (make_ttgir). Mirrors the placeholder-deferral D112454240 added to
+// ReshapeOp::verify / verifySameEncoding, extended here to TypesMatchWith
+// constraints. A real (non-placeholder) mismatch still fails.
+bool tlxAwareTypesEqual(Type a, Type b);
+
 // If the value "anchor" is compared against a statically-computed bound, return
 // inclusive lower and upper bounds lb <= anchor <= ub. Depending on the
 // comparison operator, one of the bounds is a computed one while the other is

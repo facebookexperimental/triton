@@ -36,24 +36,33 @@ LogicalResult OpTrait::impl::verifyEquivalentTensorType(Type typeA,
 }
 
 static LogicalResult verifySameEncoding(Type typeA, Type typeB) {
-  auto getEncoding = [=](Type type) -> Attribute {
-    Attribute ret;
-    if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
-      ret = tensorType.getEncoding();
-    }
-    // Peel any TLX placeholder wrapper(s) (#tlx.user_layout / no_verify) and
-    // verify the underlying concrete layout, rather than skipping verification.
-    // The wrapper itself is retired later by resolve-placeholder-layouts; a
-    // still-null inner (unresolved) is accepted by the null short-circuit
-    // below.
-    ret = triton::unwrapTlxWrappers(ret);
-    return ret;
+  auto getRawEncoding = [=](Type type) -> Attribute {
+    if (auto tensorType = dyn_cast<RankedTensorType>(type))
+      return tensorType.getEncoding();
+    return {};
   };
-  auto encodingA = getEncoding(typeA);
-  auto encodingB = getEncoding(typeB);
+  Attribute rawA = getRawEncoding(typeA);
+  Attribute rawB = getRawEncoding(typeB);
+  // Peel any TLX placeholder wrapper(s) (#tlx.user_layout / no_verify) and
+  // verify the underlying concrete layout, rather than skipping verification.
+  // The wrapper itself is retired later by resolve-placeholder-layouts; a
+  // still-null inner (unresolved) is accepted by the null short-circuit below.
+  Attribute encodingA = triton::unwrapTlxWrappers(rawA);
+  Attribute encodingB = triton::unwrapTlxWrappers(rawB);
   if (!encodingA || !encodingB)
     return success();
-  return encodingA == encodingB ? success() : failure();
+  if (encodingA == encodingB)
+    return success();
+  // Concrete layouts differ. Defer (accept) if either operand still carries a
+  // TLX placeholder wrapper: a user-pinned operand (e.g. a tl.store value pinned
+  // via local_load(layout=)) can legitimately mismatch a peer operand here until
+  // the pin is propagated to the peers and the wrappers retired later in
+  // make_ttgir (tlx-propagate-layout / tlx-finalize-user-layouts). A genuine
+  // (both-concrete) mismatch still fails.
+  if (triton::encodingContainsTlxPlaceholder(rawA) ||
+      triton::encodingContainsTlxPlaceholder(rawB))
+    return success();
+  return failure();
 }
 
 LogicalResult OpTrait::impl::verifySameOperandsEncoding(Operation *op) {

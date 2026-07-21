@@ -157,3 +157,18 @@ Attribute tt::unwrapTlxWrappers(Attribute attr) {
   }
   return attr;
 }
+
+bool tt::tlxAwareTypesEqual(Type a, Type b) {
+  if (a == b)
+    return true;
+  // Defer (accept) if either type carries a TLX placeholder encoding: a pinned
+  // store value (#tlx.user_layout / no_verify) can legitimately meet a still
+  // concrete/absent ptr or mask encoding here; the concrete layouts are
+  // reconciled later by resolve-placeholder-layouts (make_ttgir). A genuine
+  // (non-placeholder) mismatch still fails.
+  auto hasPlaceholder = [](Type t) {
+    auto rt = dyn_cast<RankedTensorType>(t);
+    return rt && encodingContainsTlxPlaceholder(rt.getEncoding());
+  };
+  return hasPlaceholder(a) || hasPlaceholder(b);
+}

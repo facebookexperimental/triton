@@ -288,10 +288,11 @@ def TT_StoreOp : TT_Op<"store", [
   SameLoadStoreOperandsShape,
   SameLoadStoreOperandsEncoding,
   TypesMatchWith<"value type matches ptr type", "ptr", "value",
-                 "getPointeeType($_self)">,
+                 "getPointeeType($_self)",
+                 "mlir::triton::tlxAwareTypesEqual">,
   TypesMatchWith<"mask type matches ptr type", "ptr", "mask",
                  "getI1SameShape(getPointeeType($_self))",
-                 "($_op.getOperands().size() <= 2) || std::equal_to<>()">
+                 "($_op.getOperands().size() <= 2) || mlir::triton::tlxAwareTypesEqual">
 ]> {
     let summary = "Store through a pointer or tensor of pointers";
 

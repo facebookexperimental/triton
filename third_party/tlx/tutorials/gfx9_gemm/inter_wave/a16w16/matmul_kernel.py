@@ -44,6 +44,19 @@ NUM_XCDS = 8
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
 
+# Coalesced SIMD (register) layout for the fp16 epilogue store of a [HALF_M, HALF_N]
+# = [128, 128] quadrant (num_warps=8, warp_size=64): each thread holds 8 contiguous
+# N elements (fp16 -> 128-bit buffer_store_dwordx4). Applied via local_load(layout=)
+# after staging the accumulator through LDS -- a *surviving* user-pinned layout
+# (#tlx.user_layout) that resolves to concrete #linear, so AMD OptimizeEpilogue
+# leaves the store alone (it only rewrites #blocked stores) and we keep the wide
+# coalesced store instead of the narrow MMA-accumulator (dwordx2) store.
+# thread = (16 N-lane, 4 M-lane, 8 M-warp); value = (8 N-reg, 4 M-reg); flat = m*128+n.
+_C_STORE_SIMD_LAYOUT = tlx.layout(
+    shape=((16, 4, 8), (8, 4)),
+    stride=((8, 128, 512), (1, 4096)),
+)
+
 
 @triton.jit
 def a16w16_8wave(
@@ -341,16 +354,34 @@ def a16w16_8wave(
     n_right = offs_cn_right[None, :] < N
 
     if SPLIT_K == 1:
-        # Direct store to C -- exact no-op vs the champion kernel.
+        # Stage each quadrant of the accumulator through LDS (reusing the now-free
+        # a/b buffers) and read it back in the explicit coalesced SIMD layout via
+        # local_load(layout=) -- a surviving #tlx.user_layout pin. The store then
+        # resolves to #linear (coalesced dwordx4) and AMD OptimizeEpilogue leaves it
+        # alone. One debug_barrier covers the store->load hazard for all quadrants.
         et = c_ptr.dtype.element_ty
-        tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], acc_tl.to(et),
-                 mask=m_top & n_left)
-        tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :], acc_bl.to(et),
-                 mask=m_bot & n_left)
-        tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :], acc_tr.to(et),
-                 mask=m_top & n_right)
-        tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :], acc_br.to(et),
-                 mask=m_bot & n_right)
+        L: tl.constexpr = _C_STORE_SIMD_LAYOUT
+        # Fresh staging buffers (no reuse=): the main-loop buffers are dead by the
+        # epilogue, so the shared-memory allocator overlaps these with them via
+        # liveness. Explicit reuse= (local_alias) tripped RewriteLocalAlias when
+        # mixing the padded A/B layouts with the swizzled staging layout.
+        cs_tl = tlx.local_alloc((HALF_M, HALF_N), tl.float16, 1)
+        cs_bl = tlx.local_alloc((HALF_M, HALF_N), tl.float16, 1)
+        cs_tr = tlx.local_alloc((HALF_M, HALF_N), tl.float16, 1)
+        cs_br = tlx.local_alloc((HALF_M, HALF_N), tl.float16, 1)
+        tlx.local_store(tlx.local_view(cs_tl, 0), acc_tl.to(et))
+        tlx.local_store(tlx.local_view(cs_bl, 0), acc_bl.to(et))
+        tlx.local_store(tlx.local_view(cs_tr, 0), acc_tr.to(et))
+        tlx.local_store(tlx.local_view(cs_br, 0), acc_br.to(et))
+        tl.debug_barrier()
+        tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
+                 tlx.local_load(tlx.local_view(cs_tl, 0), layout=L), mask=m_top & n_left)
+        tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
+                 tlx.local_load(tlx.local_view(cs_bl, 0), layout=L), mask=m_bot & n_left)
+        tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
+                 tlx.local_load(tlx.local_view(cs_tr, 0), layout=L), mask=m_top & n_right)
+        tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
+                 tlx.local_load(tlx.local_view(cs_br, 0), layout=L), mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the

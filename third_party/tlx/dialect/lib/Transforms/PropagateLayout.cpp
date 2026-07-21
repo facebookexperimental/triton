@@ -4,6 +4,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "tlx/dialect/include/Analysis/LayoutPropagation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
@@ -63,6 +64,79 @@ public:
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
         releaseLayoutOp, releaseLayoutOp.getType(), releaseLayoutOp.getSrc());
     return success();
+  }
+};
+
+// Reconcile a tt.store whose *value* is pinned to a user register layout
+// (#tlx.user_layout / no_verify, e.g. from local_load(layout=)) but whose ptr /
+// mask operands still carry a different (default #blocked) encoding. The store's
+// SameLoadStoreOperandsEncoding trait requires all operands share one encoding;
+// convert_to_ttgpuir assigns the pin only to the value, so we insert a
+// convert_layout on the peer operands to the value's peeled concrete layout.
+// Runs before unwrapUserLayoutEncodings retires the wrapper, so the peers are in
+// place by the time the value becomes concrete. Without this the store is
+// silently rewritten by AMD OptimizeEpilogue (to the narrow MMA-accumulator
+// store) or fails verification once the pin is retired.
+class ReconcilePinnedStoreOperands
+    : public mlir::OpRewritePattern<triton::StoreOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(triton::StoreOp storeOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    Value value = storeOp.getValue();
+    auto valType = dyn_cast<RankedTensorType>(value.getType());
+    if (!valType)
+      return failure();
+    Attribute valEnc = valType.getEncoding();
+    // Only act on a value carrying a user register-layout pin.
+    if (!triton::encodingContainsTlxPlaceholder(valEnc))
+      return failure();
+    Attribute concrete = triton::unwrapTlxWrappers(valEnc);
+    if (!concrete || triton::encodingContainsTlxPlaceholder(concrete))
+      return failure();
+
+    // The value must be produced by an op we can retag (e.g. the pinned
+    // local_load); a bare block argument we cannot retire here.
+    Operation *valDef = value.getDefiningOp();
+    if (!valDef)
+      return failure();
+
+    bool changed = false;
+    auto reconcile = [&](Value operand, unsigned idx) {
+      if (!operand)
+        return;
+      auto opType = dyn_cast<RankedTensorType>(operand.getType());
+      if (!opType || opType.getEncoding() == concrete)
+        return;
+      auto newType = RankedTensorType::get(opType.getShape(),
+                                           opType.getElementType(), concrete);
+      Value cvt = ttg::ConvertLayoutOp::create(rewriter, operand.getLoc(),
+                                               newType, operand);
+      storeOp.setOperand(idx, cvt);
+      changed = true;
+    };
+    // Operand order: ptr(0), value(1), mask(2) (mask optional).
+    reconcile(storeOp.getPtr(), 0);
+    if (storeOp.getMask())
+      reconcile(storeOp.getMask(), 2);
+
+    // Retire the value's register pin to its concrete layout now. The pin's
+    // purpose (staying a non-#blocked layout so AMD OptimizeEpilogue leaves the
+    // store alone) is served equally by the concrete #linear; retiring it here,
+    // rather than later in tlx-finalize-user-layouts, keeps every intervening
+    // pass (e.g. tlx-rewrite-local-alias, which computes a linear layout) from
+    // tripping over the still-wrapped placeholder encoding.
+    auto concreteValType = RankedTensorType::get(
+        valType.getShape(), valType.getElementType(), concrete);
+    if (value.getType() != concreteValType) {
+      rewriter.modifyOpInPlace(valDef,
+                               [&]() { value.setType(concreteValType); });
+      changed = true;
+    }
+
+    return changed ? success() : failure();
   }
 };
 
@@ -550,6 +624,7 @@ public:
     RewritePatternSet patterns(context);
     patterns.add<RequireLayoutPattern>(context);
     patterns.add<ReleaseLayoutPattern>(context);
+    patterns.add<ReconcilePinnedStoreOperands>(context);
     patterns.add<FoldRetaggedLocalAllocLoad>(context);
     patterns.add<FoldLocalAllocLoadFallback>(context);
 
