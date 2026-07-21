@@ -946,6 +946,30 @@ def local_store(
 
 
 @tl.builtin
+def assert_same_layout(
+    lhs,
+    rhs,
+    _semantic=None,
+) -> None:
+    """Statically assert that two final layouts are equivalent.
+
+    ``rhs`` may be another register/buffer value or a constant TLX layout. The
+    comparison runs after TTGIR layout propagation and compares LinearLayouts.
+    """
+    rhs = tl._unwrap_if_constexpr(rhs)
+    if isinstance(rhs, (tl.tensor, tlx.buffered_tensor)):
+        _semantic.builder.create_assert_same_layout(lhs.handle, rhs.handle)
+        return
+    if not isinstance(rhs, tlx.layout_encoding):
+        raise TypeError("`rhs` must be a TLX tensor/buffer value or layout encoding")
+    if isinstance(rhs, tlx.layout):
+        expected_encoding = rhs.to_ir(_semantic.builder, lhs.type.shape, lhs.type.element_ty)
+    else:
+        expected_encoding = rhs.to_ir(_semantic.builder)
+    _semantic.builder.create_assert_same_layout_expected(lhs.handle, expected_encoding)
+
+
+@tl.builtin
 def dump_layout(
     x,
     _semantic=None,
