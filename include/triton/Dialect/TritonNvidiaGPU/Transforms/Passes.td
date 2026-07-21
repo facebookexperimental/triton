@@ -107,6 +107,14 @@ def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::M
   ];
 }
 
+def TritonNvidiaGPUTMAMulticastPass : Pass<"triton-nvidia-plan-tma-multicast", "mlir::ModuleOp"> {
+  let summary = "Plan compiler-selected TMA multicast groups";
+  let description = [{
+    Annotates eligible descriptor loads with cluster axes across which their
+    source tile is statically invariant.
+  }];
+}
+
 def TritonNvidiaGPUTMAStoreBufferReusePass
     : Pass<"triton-nvidia-tma-store-buffer-reuse", "mlir::ModuleOp"> {
   let summary = "Reuse SMEM buffers across sequential TMA stores";
