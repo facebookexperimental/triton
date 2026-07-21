@@ -32,8 +32,14 @@ def make_inputs(shape):
 
 
 def gen_call(generated, inputs):
-    generated.layernorm_fwd_nows[(_num_sms(),)](
-        inputs["x"], inputs["w"], inputs["b"], inputs["y"], inputs["M"], EPS, num_warps=4
+    # Launch hints emitted by the modulo pass for memory-bound kernels
+    # (absent → legacy launch: 1x-SMS grid, register file auto-fill).
+    grid = _num_sms() * getattr(generated, "RECOMMENDED_GRID_MULTIPLIER", 1)
+    kw = {"num_warps": 4}
+    if (mreg := getattr(generated, "RECOMMENDED_MAXNREG", None)) is not None:
+        kw["maxnreg"] = mreg
+    generated.layernorm_fwd_nows[(grid,)](
+        inputs["x"], inputs["w"], inputs["b"], inputs["y"], inputs["M"], EPS, **kw
     )
     return inputs["y"]
 

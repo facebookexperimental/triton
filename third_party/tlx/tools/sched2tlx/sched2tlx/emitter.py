@@ -6226,6 +6226,23 @@ def emit(graph: ScheduleGraph) -> str:
     lines += "import triton"
     lines += "import triton.language as tl"
     lines += "import triton.language.extra.tlx as tlx"
+    if graph.launch_hints:
+        # Memory-bound WS kernel: without a maxnreg cap the WS lowering
+        # requests the full register file and pins residency at 1 CTA/SM.
+        # Launchers should pass maxnreg=RECOMMENDED_MAXNREG and scale the
+        # persistent grid by RECOMMENDED_GRID_MULTIPLIER x NUM_SMS so
+        # multiple CTAs co-reside and hide HBM latency.
+        lines += ""
+        lines += "# Launch hints from the modulo pass (memory-bound kernel)."
+        lines += f"RECOMMENDED_MAXNREG = {graph.launch_hints['maxnreg']}"
+        lines += (f"RECOMMENDED_GRID_MULTIPLIER = "
+                  f"{graph.launch_hints['grid_multiplier']}")
+        # The derivation is trusted to ±1 CTA/SM: candidates bracket the
+        # recommendation so a sweep harness can measure and pick instead of
+        # betting on the closed form. Each entry: {"occupancy", "maxnreg",
+        # "grid_multiplier"}.
+        if cands := graph.launch_hints.get("occupancy_candidates"):
+            lines += f"RECOMMENDED_OCC_CANDIDATES = {cands!r}"
     lines += ""
     _kernel_sig_lines(graph, lines)
 

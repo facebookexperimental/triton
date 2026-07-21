@@ -2400,6 +2400,54 @@ constexpr int kMaxCTAsPerSM = 32;
 constexpr int64_t kSmemPerSMBytes = 228 * 1024;
 constexpr int64_t kReservedSmemPerCTABytes = 1024;
 
+// ── Co-residency the schedule is BUILT FOR ────────────────────────────────
+//
+// The register file belongs to the SM, not to a CTA. AllocateWarpGroups'
+// default hands ONE CTA the whole file (regs/thread = 64K / total_warps /
+// 32) — right for a TC-bound kernel, where one CTA should own the SM, and
+// wrong for a memory-bound one, which needs several co-resident CTAs
+// interleaving their TMA waits to cover HBM latency.
+//
+// The register terms below are therefore parameterized by a CTA-per-SM
+// target rather than assuming the whole file. `occ == 1` reproduces the
+// auto-fill arithmetic exactly and is the default, so the pre-occupancy
+// pipeline is unchanged; the memory-bound launch path (jsonDumpLaunchHints)
+// is the only caller that asks for more today.
+constexpr int kThreadsPerWarp = 32;
+
+/// Explicit co-residency target from TRITON_MODULO_OCCUPANCY, or 0 when the
+/// user has not asked for one (callers then pick their own default).
+static int occupancyTargetOverride() {
+  auto env = triton::tools::getStrEnv("TRITON_MODULO_OCCUPANCY");
+  if (env.empty())
+    return 0;
+  int v = std::atoi(env.c_str());
+  if (v < 1)
+    return 0; // malformed / non-positive parses to "no override"
+  return std::min(v, kMaxCTAsPerSM);
+}
+
+/// The co-residency the COST MODEL prices. Default 1 == auto-fill, which is
+/// what AllocateWarpGroups does absent an explicit ttg.maxnreg.
+static int modelOccupancyTarget() {
+  int o = occupancyTargetOverride();
+  return o > 0 ? o : 1;
+}
+
+/// One CTA's share of the register file at co-residency `occ`.
+static int regSupplyPerCTA(int occ) {
+  return kBlackwellSMRegs / std::max(occ, 1);
+}
+
+/// regs/thread that fits `occ` CTAs of `ctaWarps` warps each. Mirrors
+/// AllocateWarpGroups' rounding (multiple of 8) and the hardware floor; at
+/// occ == 1 it returns exactly what its auto-fill computes.
+static int maxnregForOccupancy(int occ, int ctaWarps, int threadsPerWarp) {
+  int perThread = regSupplyPerCTA(occ) /
+                  std::max(ctaWarps * std::max(threadsPerWarp, 1), 1);
+  return std::max(24, perThread / 8 * 8);
+}
+
 // Hard penalty for candidates that cannot launch at all: predicted SMEM
 // (committed buffers + synthesized cross-WG channels) past the per-block
 // optin limit fails with OutOfResources at kernel load, and > 64 warps/CTA
@@ -3061,7 +3109,18 @@ computeSecondOrderTerms(const ttg::ScheduleLoop &loop,
   // cuda_occupancy.h, sm_100): per-SM capacity divided by the CTA's SMEM
   // plus the driver's per-CTA reservation — NOT the per-block optin limit.
   int coResWarps = kMaxWarpsPerSM / std::max(ctaWarps, 1);
-  int coResRegs = kBlackwellSMRegs / std::max(totalRegs, 1);
+  // The register bound counts what the CTA OCCUPIES, not what it asks for:
+  // AllocateWarpGroups hands an uncapped CTA the whole file whatever its
+  // demand (so the register side admits exactly 1), and a capped one
+  // exactly maxnreg × threads. Using the demand (`totalRegs`) here would
+  // report 2+ resident CTAs for a thrifty kernel that auto-fill in fact
+  // pins at 1.
+  int occ = modelOccupancyTarget();
+  int allocRegsPerCTA =
+      (occ <= 1) ? kBlackwellSMRegs
+                 : maxnregForOccupancy(occ, ctaWarps, kThreadsPerWarp) *
+                       ctaWarps * kThreadsPerWarp;
+  int coResRegs = kBlackwellSMRegs / std::max(allocRegsPerCTA, 1);
   int coResSmem = static_cast<int>(
       kSmemPerSMBytes /
       std::max<int64_t>(t.totalSmemBytes + kReservedSmemPerCTABytes, 1));
@@ -3510,7 +3569,11 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // When the request exceeds the SM budget, the default WG absorbs up to
   // kDefaultSlack regs; only the residual hurts the bottleneck compute WG
   // (and that's where 3-9× perf collapses observed in perf_sweep.py).
-  int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
+  // The supply is the CTA's SHARE of the file, not the whole file: at the
+  // default target of 1 CTA/SM this is kBlackwellSMRegs (auto-fill), and
+  // asking for co-residency shrinks it proportionally.
+  int deficit =
+      std::max(0, totalRegs - regSupplyPerCTA(modelOccupancyTarget()));
   int residual = std::max(0, deficit - kDefaultSlack);
   // Channel-SMEM capacity + co-residency (see computeSecondOrderTerms).
   auto so = computeSecondOrderTerms(loop, nodeToWg, totalRegs, explicitWarps,
@@ -3604,7 +3667,11 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
                           ms + barCost + rtPerWg.lookup(static_cast<int>(wgi)));
     totalRegs += wgFootprint(wgWarps);
   }
-  int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
+  // The supply is the CTA's SHARE of the file, not the whole file: at the
+  // default target of 1 CTA/SM this is kBlackwellSMRegs (auto-fill), and
+  // asking for co-residency shrinks it proportionally.
+  int deficit =
+      std::max(0, totalRegs - regSupplyPerCTA(modelOccupancyTarget()));
   int residual = std::max(0, deficit - kDefaultSlack);
   // Channel-SMEM capacity + co-residency, same terms as scoreCandidate.
   auto so = computeSecondOrderTerms(loop, nodeToWg, totalRegs, explicitWarps,
@@ -5610,6 +5677,296 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
+// The CTA warp layout and memory-boundness of a scheduled module — the facts
+// both the launch hints and the ttg.maxnreg attribute are derived from, so
+// the two cannot disagree about the same kernel.
+struct ModuleOccupancyFacts {
+  bool valid = false; // memory-bound AND warp-specialized
+  int totalWarps = 0; // as AllocateWarpGroups will see it
+};
+
+// memory_bound — the module contains no MMA op and at least one loop
+//                schedules a TMA node; >= 2 modulo warp groups exist.
+// total_warps  — mirrors AllocateWarpGroups' CTA warp layout: the default
+//                warp group (module ttg.num-warps) plus every other modulo
+//                WG padded to a whole 4-warp group.
+static ModuleOccupancyFacts
+computeModuleOccupancyFacts(ModuleOp moduleOp,
+                            ArrayRef<ScheduledLoop> scheduledLoops) {
+  ModuleOccupancyFacts f;
+  bool anyMMA = false;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::WarpGroupDotOp,
+            tt::DotOp>(op))
+      anyMMA = true;
+  });
+  if (anyMMA)
+    return f;
+
+  bool anyTMA = false;
+  std::map<int, int> wgMaxMinWarps;
+  for (const auto &sl : scheduledLoops) {
+    for (const auto &loop : sl.graph.loops) {
+      for (const auto &n : loop.nodes) {
+        if (n.pipeline == ttg::HWPipeline::TMA)
+          anyTMA = true;
+        if (n.warpGroup >= 0) {
+          int &mw = wgMaxMinWarps[n.warpGroup];
+          mw = std::max(mw, std::max(n.minWarps, 1));
+        }
+      }
+    }
+  }
+  if (!anyTMA || wgMaxMinWarps.size() < 2)
+    return f;
+
+  auto snapWarps = [](int m) {
+    if (m <= 1)
+      return 1;
+    if (m <= 2)
+      return 2;
+    if (m <= 4)
+      return 4;
+    return 8;
+  };
+  int baseWarps = 4;
+  if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+    baseWarps = attr.getInt();
+  // The emitter maps the first >= 4-warp WG onto the default async_task; all
+  // other WGs become explicit tasks, each padded to whole 4-warp groups by
+  // AllocateWarpGroups.
+  int defaultWg = -1;
+  for (const auto &[wg, mw] : wgMaxMinWarps) {
+    if (snapWarps(mw) >= 4) {
+      defaultWg = wg;
+      break;
+    }
+  }
+  int totalWarps = baseWarps;
+  for (const auto &[wg, mw] : wgMaxMinWarps) {
+    if (wg == defaultWg)
+      continue;
+    totalWarps += (snapWarps(mw) + 3) / 4 * 4;
+  }
+  f.valid = true;
+  f.totalWarps = totalWarps;
+  return f;
+}
+
+// ── Derived launch occupancy ───────────────────────────────────────────────
+//
+// The launch-side co-residency target is DERIVED, not hardcoded: it is the
+// CUDA occupancy calculator's min-over-resources arithmetic with one new,
+// device-level leg — HBM bandwidth:
+//
+//   occ_hbm = ceil(B_sm × L_mem / bytesPerIter)         (Little's law)
+//
+// A lone CTA's TMA round-trips serialize on the loop's recurrence, so it
+// delivers at most bytesPerIter / L_mem bytes per cycle; occ_hbm co-resident
+// CTAs are needed before the SM's fair share of HBM bandwidth (B_sm) is
+// covered, and past that point extra CTAs buy nothing (bandwidth is
+// saturated) while their register/SMEM shares keep shrinking. The static
+// legs (SMEM, TMEM, warps, the maxnreg hardware floor) cap what the SM can
+// admit at all.
+//
+// Validated on case6 (LayerNorm, B200, M=262144): predicted single-CTA
+// bandwidth 16384 B / 1294 cyc = 12.7 B/cyc vs 11.7 measured (3161 GB/s /
+// 148 SMs / 1.83 GHz) — a prediction, not a fit — and the derived target
+// ceil(29.5 × 1294 / 16384) = 3 matches the measured optimum of the occ
+// sweep (best GB/s per occ at M=262144: 1→3161, 2→5731, 3→6153, 4→5749).
+//
+// STILL MISSING (deliberately): a real per-WG register demand model.
+// `regsForWarpCount` is a warp-count bucket calibrated on FA that
+// over-charges a thrifty kernel like LayerNorm by ~3x, so the PRICING side
+// (`modelOccupancyTarget()`) stays at 1 and partition ranking is unchanged —
+// pricing candidates at occ=3 under the bucket flips case6 from its (good)
+// 3-WG shape to a 2-WG one. The derivation below runs only after the
+// partition is committed, and feeds only the launch path.
+
+// One SM's fair share of peak HBM bandwidth, in bytes per SM cycle: 8 TB/s
+// over 148 SMs at 1.83 GHz (B200 — the same device constants as the TC peak
+// in NVLatencyModel.cpp). Peak rather than achievable-STREAM, deliberately:
+// occ_hbm takes a ceil, so B_sm acts as the knee's upper bracket — on case6
+// the peak-derived target (3) measured 7% above the STREAM-derived one (2).
+// TRITON_MODULO_HBM_BPC (bytes/cycle/SM) overrides without a rebuild.
+constexpr double kHBMBytesPerCyclePerSM = 8.0e12 / (148 * 1.83e9); // ~29.5
+
+static double hbmBytesPerCyclePerSM() {
+  auto env = triton::tools::getStrEnv("TRITON_MODULO_HBM_BPC");
+  if (!env.empty()) {
+    double v = std::atof(env.c_str());
+    if (v > 0.0)
+      return v;
+  }
+  return kHBMBytesPerCyclePerSM;
+}
+
+/// Everything the launch paths need to know about co-residency. `occ` is the
+/// final target (env override applied); the legs are kept for logging and
+/// the JSON dump. A leg of 0 means "not applicable" (e.g. no TMEM used).
+struct OccupancyDerivation {
+  ModuleOccupancyFacts facts;
+  int occ = 1;        // final target, >= 1
+  int derivedOcc = 1; // pre-override, min(occHbm, admitCap)
+  int admitCap = 1;   // min over static resource legs
+  int occHbm = 0, occSmem = 0, occTmem = 0, occWarps = 0, occRegFit = 0;
+  int64_t bytesPerIter = 0; // HBM-leg inputs of the binding (min-occ) loop
+  int64_t memLatency = 0;
+};
+
+/// Derive the co-residency target for a memory-bound WS module. Runs after
+/// the schedule converges (buffers, channels and warp groups committed), so
+/// every leg reads the kernel that will actually launch.
+static OccupancyDerivation
+deriveOccupancy(ModuleOp moduleOp, ArrayRef<ScheduledLoop> scheduledLoops) {
+  OccupancyDerivation d;
+  d.facts = computeModuleOccupancyFacts(moduleOp, scheduledLoops);
+  if (!d.facts.valid)
+    return d;
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+
+  // HBM leg, per loop with TMA traffic; a module-level launch decision must
+  // satisfy every loop, so take the min (the least memory-hungry loop bounds
+  // how much co-residency provably pays). frequencyMultiplier scales bytes
+  // and latency alike, so flat-view nodes keep the per-iteration ratio.
+  int occHbm = std::numeric_limits<int>::max();
+  for (const auto &sl : scheduledLoops) {
+    for (const auto &loop : sl.graph.loops) {
+      int64_t bytes = 0, lat = 0;
+      for (const auto &n : loop.nodes) {
+        if (n.pipeline != ttg::HWPipeline::TMA || !n.op)
+          continue;
+        int64_t freq = std::max(n.frequencyMultiplier, 1);
+        bytes += ttg::getTMATransferBytes(n.op) * freq;
+        lat += static_cast<int64_t>(std::max(n.latency, 0)) * freq;
+      }
+      if (bytes <= 0 || lat <= 0)
+        continue;
+      int occLoop = static_cast<int>(std::ceil(
+          hbmBytesPerCyclePerSM() * static_cast<double>(lat) / bytes));
+      occLoop = std::max(occLoop, 1);
+      if (occLoop < occHbm) {
+        occHbm = occLoop;
+        d.bytesPerIter = bytes;
+        d.memLatency = lat;
+      }
+    }
+  }
+  if (occHbm == std::numeric_limits<int>::max())
+    return d; // TMA nodes with no readable tile geometry — stay at 1
+  d.occHbm = occHbm;
+
+  // Static resource legs. SMEM/TMEM take the max over loops: loops execute
+  // sequentially and share one static allocation arena, so the module's
+  // footprint is its largest loop's, not the sum.
+  int64_t smem = 0, tmem = 0;
+  for (const auto &sl : scheduledLoops) {
+    for (const auto &loop : sl.graph.loops) {
+      smem = std::max(smem, computeTotalSmem(loop));
+      tmem = std::max(tmem, computeTotalTmem(loop));
+    }
+  }
+  d.occSmem = static_cast<int>(
+      kSmemPerSMBytes / std::max<int64_t>(smem + kReservedSmemPerCTABytes, 1));
+  if (tmem > 0)
+    d.occTmem = static_cast<int>(kTmemBudgetBytes / std::max<int64_t>(tmem, 1));
+  d.occWarps = kMaxWarpsPerSM / std::max(d.facts.totalWarps, 1);
+  // Below 24 regs/thread maxnreg cannot shrink a CTA any further, so the
+  // register file admits at most this many whatever we request.
+  d.occRegFit =
+      kBlackwellSMRegs / std::max(24 * d.facts.totalWarps * threadsPerWarp, 1);
+
+  d.admitCap = std::min({d.occSmem, d.occWarps, d.occRegFit, kMaxCTAsPerSM});
+  if (d.occTmem > 0)
+    d.admitCap = std::min(d.admitCap, d.occTmem);
+  d.admitCap = std::max(d.admitCap, 1);
+
+  d.derivedOcc = std::max(std::min(d.occHbm, d.admitCap), 1);
+  int o = occupancyTargetOverride();
+  d.occ = o > 0 ? o : d.derivedOcc;
+  LDBG("occupancy: derived="
+       << d.derivedOcc << " (hbm=" << d.occHbm << " smem=" << d.occSmem
+       << " tmem=" << d.occTmem << " warps=" << d.occWarps
+       << " regfit=" << d.occRegFit << ") bytes/iter=" << d.bytesPerIter
+       << " memLat=" << d.memLatency << " -> target=" << d.occ);
+  return d;
+}
+
+// Launch hints for memory-bound warp-specialized kernels (occupancy).
+//
+// Without a maxnreg cap, AllocateWarpGroups auto-fills the full 64K register
+// file (regs/thread = 64K / total_warps / 32), which pins co-residency at
+// 1 CTA/SM. That is right for TC-bound kernels (one CTA should own the SM)
+// but exactly wrong for memory-bound ones, which need several co-resident
+// CTAs interleaving their TMA waits to cover HBM latency.
+//
+// The in-tree path gets the same decision as a ttg.maxnreg module attribute
+// (see setModuleMaxnreg); these hints are the sched2tlx transport, where the
+// emitter forwards them as RECOMMENDED_* module constants in the generated
+// kernel and launchers pass maxnreg= and scale the grid.
+//
+// grid_multiplier = occ + 1: occ waves fill the derived co-residency, one
+// extra wave load-balances the tail (occ sweep on case6, M=262144: gm=occ+1
+// is the measured optimum at occ=2 and occ=3; larger multipliers lose).
+//
+// The static derivation is only trusted to ±1 (B_sm is a peak constant, and
+// case6 sits ~16% above a ceil boundary), so alongside the single
+// recommendation the dump carries occupancy_candidates — {occ-1, occ, occ+1}
+// clamped to what the SM admits — for a launch-side harness to measure and
+// pick from. A spurious co-residency ask is then rejected empirically,
+// never committed.
+void jsonDumpLaunchHints(llvm::raw_ostream &os, ModuleOp moduleOp,
+                         ArrayRef<ScheduledLoop> scheduledLoops) {
+  OccupancyDerivation d = deriveOccupancy(moduleOp, scheduledLoops);
+  if (!d.facts.valid || d.occ <= 1)
+    return;
+  int totalWarps = d.facts.totalWarps;
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+  int maxnreg = maxnregForOccupancy(d.occ, totalWarps, threadsPerWarp);
+
+  os << "  \"launch_hints\": {\"memory_bound\": true, \"total_warps\": "
+     << totalWarps << ", \"maxnreg\": " << maxnreg
+     << ", \"grid_multiplier\": " << d.occ + 1 << ", \"occupancy\": " << d.occ
+     << ", \"occupancy_candidates\": [";
+  bool first = true;
+  for (int occ = std::max(d.occ - 1, 1); occ <= std::min(d.occ + 1, d.admitCap);
+       ++occ) {
+    if (!first)
+      os << ", ";
+    first = false;
+    os << "{\"occupancy\": " << occ << ", \"maxnreg\": "
+       << maxnregForOccupancy(occ, totalWarps, threadsPerWarp)
+       << ", \"grid_multiplier\": " << (occ == 1 ? 1 : occ + 1) << "}";
+  }
+  os << "]},\n";
+}
+
+// The in-tree counterpart of the launch hints. sched2tlx receives the
+// decision as JSON and re-emits a kernel; the in-tree pipeline has no such
+// hand-off, so the same decision has to reach AllocateWarpGroups as the
+// ttg.maxnreg module attribute it already honors (absent it, its auto-fill
+// hands the CTA the whole register file and pins co-residency at 1).
+//
+// Never overrides an existing value: ttg.maxnreg is user-facing (JITFunction
+// maxnreg=), and a caller who pinned it outranks this heuristic.
+static void setModuleMaxnreg(ModuleOp moduleOp,
+                             ArrayRef<ScheduledLoop> scheduledLoops) {
+  if (moduleOp->getAttrOfType<IntegerAttr>(ttg::AttrMaxRegistersName))
+    return;
+  OccupancyDerivation d = deriveOccupancy(moduleOp, scheduledLoops);
+  if (!d.facts.valid)
+    return;
+  if (d.occ <= 1)
+    return; // auto-fill already computes exactly this
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+  int maxnreg = maxnregForOccupancy(d.occ, d.facts.totalWarps, threadsPerWarp);
+  moduleOp->setAttr(ttg::AttrMaxRegistersName,
+                    Builder(moduleOp.getContext()).getI32IntegerAttr(maxnreg));
+  LDBG("occupancy: set " << ttg::AttrMaxRegistersName << "=" << maxnreg
+                         << " (target " << d.occ << " CTAs/SM, totalWarps "
+                         << d.facts.totalWarps << ")");
+}
+
 // Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
 // Factored out so both the single-graph dumper and the multi-variant dumper
 // (top-N autotuning) can reuse it — each variant is a self-contained doc.
@@ -5628,6 +5985,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
     os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
+  jsonDumpLaunchHints(os, moduleOp, scheduledLoops);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
@@ -6069,6 +6427,12 @@ struct ModuloSchedulePass
 
       LDBG("DDG changed by transformation — re-scheduling");
     } // end iterative loop
+
+    // The schedule (and hence the CTA's warp layout) is final: publish the
+    // register cap it was built for so AllocateWarpGroups stops auto-filling
+    // the whole register file. No-op unless this module is a memory-bound WS
+    // kernel asking for co-residency > 1.
+    setModuleMaxnreg(moduleOp, scheduledLoops);
 
     // ================================================================
     // Lower-or-emit phase. Runs ONCE after convergence so the iteration

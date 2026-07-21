@@ -29,6 +29,12 @@ enum class HWPipeline {
 /// Return a human-readable name for a pipeline.
 llvm::StringRef getPipelineName(HWPipeline pipeline);
 
+/// Total bytes moved by a TMA descriptor op (from its tile geometry — the
+/// same geometry the TMA latency tables are keyed on), or 0 for non-TMA /
+/// shapeless ops. Used by the occupancy derivation to compute a loop's
+/// bytes-per-iteration.
+int64_t getTMATransferBytes(Operation *op);
+
 /// Latency info for a single operation.
 ///
 /// The two fields play DISTINCT roles in modulo scheduling. Always use the

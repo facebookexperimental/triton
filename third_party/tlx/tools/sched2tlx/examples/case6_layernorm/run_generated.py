@@ -26,6 +26,13 @@ def main() -> int:
     eps = 1e-5
     NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
+    # Launch hints emitted by the modulo pass for memory-bound kernels
+    # (absent → legacy launch: 1x-SMS grid, register file auto-fill).
+    grid = NUM_SMS * getattr(generated, "RECOMMENDED_GRID_MULTIPLIER", 1)
+    launch_kw = {"num_warps": 4}
+    if (mreg := getattr(generated, "RECOMMENDED_MAXNREG", None)) is not None:
+        launch_kw["maxnreg"] = mreg
+
     failed = 0
     for M in [4096, 16384, 65536]:
         x = torch.randn(M, N, device="cuda", dtype=torch.float16)
@@ -33,7 +40,7 @@ def main() -> int:
         b = torch.randn(N, device="cuda", dtype=torch.float16)
         y = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float16)
 
-        generated.layernorm_fwd_nows[(NUM_SMS, )](x, w, b, y, M, eps, num_warps=4)
+        generated.layernorm_fwd_nows[(grid, )](x, w, b, y, M, eps, **launch_kw)
 
         ref = F.layer_norm(x.float(), (N, ), w.float(), b.float(), eps)
         err = (y.float() - ref).abs().max().item()

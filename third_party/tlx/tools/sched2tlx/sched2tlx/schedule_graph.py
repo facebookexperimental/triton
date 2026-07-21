@@ -232,6 +232,13 @@ class ScheduleGraph:
     kernel: Kernel
     ops: dict[str, Op]
     loops: list[Loop]
+    # Optional launch hints from the modulo pass (present only for
+    # memory-bound WS kernels): {"memory_bound": true, "maxnreg": N,
+    # "grid_multiplier": M, "total_warps": W, "occupancy": O,
+    # "occupancy_candidates": [{"occupancy", "maxnreg", "grid_multiplier"},
+    # ...]}. maxnreg/grid_multiplier are the derived-occupancy pick; the
+    # candidates bracket it (±1 CTA/SM) for a sweep harness. See SCHEMA.md.
+    launch_hints: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -366,4 +373,5 @@ def load_graph(path: str | Path) -> ScheduleGraph:
                 schedule=_to_schedule_loop(L["schedule_loop"]),
             ) for L in data.get("loops", [])
         ],
+        launch_hints=data.get("launch_hints"),
     )
