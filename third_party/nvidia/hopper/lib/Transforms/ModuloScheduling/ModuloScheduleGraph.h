@@ -43,6 +43,11 @@ struct ScheduleBuffer {
   llvm::SmallVector<int64_t, 4> shape; // e.g., {128, 64}
   unsigned elementBitWidth{16};        // e.g., 16 for f16
   unsigned count{1};                   // number of buffers (from stageDiff + 1)
+  // Depth the schedule's lifetime analysis asked for, snapshotted before any
+  // SMEM-budget reduction ever decrements `count`. count < requestedCount
+  // means this ring runs shallower than the schedule wants — the A.5 auto
+  // search uses the gap (in bytes) as its SMEM-pressure tie-breaker.
+  unsigned requestedCount{1};
 
   // For data buffers: index of the corresponding BARRIER buffer (UINT_MAX if
   // none) For barrier buffers: index of the data buffer this barrier guards

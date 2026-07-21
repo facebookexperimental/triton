@@ -82,7 +82,7 @@ _DTYPE_ALT = (
     r"|f8e4m3|f8e5m2|f16|f32|f64|i1|i8|i16|i32|i64)"
 )
 _TENSOR_TYPE_RE = re.compile(rf"tensor<([0-9x]+)x({_DTYPE_ALT})\b")
-_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<tensor<([0-9x]+)x({_DTYPE_ALT})\b")
+_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<(?:tensor<)?([0-9x]+)x({_DTYPE_ALT})\b")
 # `!ttg.memdesc<128x128xbf16, ...>` — used for hoisted SMEM/TMEM allocs.
 _MEMDESC_TYPE_RE = re.compile(rf"!ttg\.memdesc<([0-9x]+)x({_DTYPE_ALT})\b")
 
@@ -5471,9 +5471,15 @@ def _emit_outer_epilogue_partitioned(
             tlx.async_descriptor_store_wait(0)
         tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
 
-    c_desc stays (BM, BN) so the launcher's `c_desc.block_shape = (BM, BN)`
-    contract is unchanged; c_smem is shrunk to (m_size, BN) at its alloc
-    site since only one group's tile is staged at a time.
+    The partition CHANGES the launcher's C descriptor contract: each
+    async_descriptor_store copies a (m_size, BN) c_smem box, and TMA
+    requires the descriptor block to equal the copied box, so the host
+    must build `c_desc.block_shape = (m_size, BN)` — NOT the ttgir's
+    (BM, BN). A/B load descriptors keep their ttgir blocks (loads are
+    not split; the MMA slices the full A tile per group). c_smem is
+    shrunk to (m_size, BN) at its alloc site since only one group's
+    tile is staged at a time. See case2's run_generated.py/bench_spec.py
+    for the contract in fixture form.
     """
     lines += (
         f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size}, per-group c_smem)"
