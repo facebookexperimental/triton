@@ -17,6 +17,8 @@ Pragmatic simplifications vs the tutorial (keep it a clean 1-CTA base):
     no dQ/dK post-scale.
 """
 
+import os
+
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
@@ -29,6 +31,29 @@ def get_bufidx_phase(i, n: tl.constexpr):
     return i % n, (i // n) & 1
 
 
+# To keep the comparison against the generated kernel apples-to-apples, we
+# autotune ONLY the SMEM Q ring depth (the
+# same degree of freedom the modulo scheduler chooses); the TMEM buffers are
+# single-buffered with storage-aliasing, and BLOCK_M/N, HEAD_DIM, num_warps, and
+# everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    # NOTE: depth 2 is the FA default — case4 wasn't in the logged autotune run, so this
+    # is the conservative default, not a measured winner.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_BUFFERS_Q": 2}, num_warps=4, num_stages=1, num_ctas=1)]
+    return [
+        triton.Config({"NUM_BUFFERS_Q": s}, num_warps=4, num_stages=1, num_ctas=1)
+        for s in (2, 3, 4, 5, 6)
+    ]
+
+
+# dQ is accumulated via tl.atomic_add across N-tiles; autotune re-runs the
+# kernel per config, so dQ must be re-zeroed before each trial or configs
+# accumulate into it and corrupt the result.
+@triton.autotune(configs=_autotune_configs(), key=["N_CTX"], reset_to_zero=["dQ"])
 @triton.jit
 def fa_bwd_dkdv_ws(
     Q,
