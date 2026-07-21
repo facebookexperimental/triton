@@ -270,6 +270,11 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
     arriveBarrier.getPredMutable().assign(mask);
     return op;
   }
+  // Cluster barriers are collective and cannot be predicated. Static
+  // multicast candidates have CTA-uniform loop control, so every cluster
+  // member executes the same pipelined prologue and epilogue barriers.
+  if (isa<ttng::ClusterBarrierOp>(op))
+    return op;
   if (auto commit = dyn_cast<ttng::TCGen5CommitOp>(op)) {
     rewriter.setInsertionPoint(commit);
     Value mask = pred;
@@ -474,28 +479,72 @@ DenseMap<Operation *, int> mlir::triton::deserializeLatencies(Operation *op) {
 }
 
 Value mlir::triton::createScalarAlloc(ImplicitLocOpBuilder &rewriter, Type type,
-                                      unsigned numBuffers) {
+                                      unsigned numBuffers,
+                                      ttg::CGAEncodingAttr cgaLayout) {
   MLIRContext *ctx = rewriter.getContext();
   unsigned numCTAs = triton::gpu::TritonGPUDialect::getNumCTAs(
       rewriter.getBlock()->getParentOp()->getParentOfType<ModuleOp>());
   Attribute sharedMemorySpace =
       ttg::SharedMemorySpaceAttr::get(rewriter.getContext());
-  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  auto barrierCGALayout =
+      cgaLayout ? cgaLayout : ttg::CGAEncodingAttr::get1DLayout(ctx, numCTAs);
+  unsigned numSlots = product(barrierCGALayout.getCTASplitNum());
   auto barrierEncoding =
       ttg::SwizzledSharedEncodingAttr::get(ctx, 1, 1, 1, {0}, barrierCGALayout);
   ttg::MemDescType memDescType = ttg::MemDescType::get(
-      {numBuffers, numCTAs}, type, barrierEncoding, sharedMemorySpace,
+      {numBuffers, numSlots}, type, barrierEncoding, sharedMemorySpace,
       /*mutableMemory=*/true);
   return ttg::LocalAllocOp::create(rewriter, memDescType, Value());
 }
 
+ttg::CGAEncodingAttr
+mlir::triton::getTMAMulticastBarrierLayout(Operation *op,
+                                           DenseI32ArrayAttr multicastAxes) {
+  if (!multicastAxes)
+    multicastAxes = op->getAttrOfType<DenseI32ArrayAttr>("tt.multicast_axes");
+  if (!multicastAxes)
+    return {};
+
+  auto module = op->getParentOfType<ModuleOp>();
+  auto dims = ttg::TritonGPUDialect::getClusterDims(module);
+  llvm::SmallBitVector broadcastAxes(3);
+  for (int32_t axis : multicastAxes.asArrayRef())
+    broadcastAxes.set(axis);
+
+  auto *ctx = op->getContext();
+  auto kBlock = StringAttr::get(ctx, "block");
+  // Build a CGA layout that maps each CTA's block id to a barrier slot. The
+  // block id is the linearized cluster coordinate with x varying fastest, so we
+  // walk the cluster dims in x,y,z order and emit one basis vector per bit of
+  // each dim -- the same bit order the hardware uses to index CTAs in a CGA.
+  // Broadcast (multicast) axes contribute a zero basis vector, collapsing every
+  // CTA along that axis onto the same slot (they share one barrier).
+  // Non-broadcast axes get sequential `groupBit`s, so the surviving axes are
+  // packed densely into the low bits of the slot index, partitioning the
+  // cluster into one barrier per multicast group.
+  LinearLayout::BasesT bases;
+  unsigned groupBit = 0;
+  for (unsigned axis = 0; axis < 3; ++axis) {
+    assert(llvm::isPowerOf2_32(dims[axis]));
+    for (unsigned bit = 0; bit < llvm::Log2_32(dims[axis]); ++bit) {
+      std::vector<int32_t> basis(1, 0);
+      if (!broadcastAxes.test(axis))
+        basis[0] = 1u << groupBit++;
+      bases[kBlock].push_back(std::move(basis));
+    }
+  }
+  return ttg::CGAEncodingAttr::get(
+      ctx, LinearLayout(std::move(bases), standardOutDimNames(ctx, 1)));
+}
+
 // Create an allocation and init the mbarriers.
 Value mlir::triton::createBarrierAlloc(Operation *op, int numBarriers,
-                                       int arriveCount) {
+                                       int arriveCount,
+                                       ttg::CGAEncodingAttr cgaLayout) {
   ImplicitLocOpBuilder rewriter(op->getLoc(), op);
 
-  Value barrierAlloc =
-      createScalarAlloc(rewriter, rewriter.getI64Type(), numBarriers);
+  Value barrierAlloc = createScalarAlloc(rewriter, rewriter.getI64Type(),
+                                         numBarriers, cgaLayout);
   for (unsigned i = 0; i < numBarriers; i++) {
     Value barrierView = createSingleBufferView(rewriter, barrierAlloc, i);
     ttng::InitBarrierOp::create(rewriter, barrierView, arriveCount);

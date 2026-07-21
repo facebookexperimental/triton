@@ -332,7 +332,9 @@ void PipelinedLoadGroup::allocateAref(scf::ForOp &loop, int numStages) {
 
   // Share the same set of barriers all loads in the group.
   emptyBars = createBarrierAlloc(loop, numStages, arriveCount);
-  readyBars = createBarrierAlloc(loop, numStages, /*arriveCount=*/1);
+  auto barrierCGALayout = getTMAMulticastBarrierLayout(loads.front().loadOp);
+  readyBars =
+      createBarrierAlloc(loop, numStages, /*arriveCount=*/1, barrierCGALayout);
   // All buffers are initially in the empty state.
   PartitionBuilder b(getLoc(), loop);
   for (auto i : llvm::seq(numStages)) {
@@ -348,9 +350,17 @@ static void lowerTMACopy(PartitionBuilder &b, Partition &loadPartition,
                          Value barrier, Value view) {
   Value truePred = b.boolCst(true);
   if (auto load = dyn_cast<DescriptorLoadOp>(op)) {
-    b.createInto<ttng::AsyncTMACopyGlobalToLocalOp>(
+    // Multicast copy: only the leader CTA issues the TMA and writes directly
+    // into every peer's shared memory. Rendezvous all cluster members first so
+    // no peer's target buffer is overwritten before that peer has reached this
+    // pipeline stage.
+    if (load->hasAttr("tt.multicast_axes"))
+      b.createInto<ttng::ClusterBarrierOp>(loadPartition, stageCluster);
+    auto copy = b.createInto<ttng::AsyncTMACopyGlobalToLocalOp>(
         loadPartition, stageCluster, load.getDesc(), load.getIndices(), barrier,
         view, truePred);
+    if (Attribute axes = load->getAttr("tt.multicast_axes"))
+      copy->setAttr("tt.multicast_axes", axes);
   } else {
     auto gather = cast<DescriptorGatherOp>(op);
     b.createInto<ttng::AsyncTMAGatherOp>(
@@ -393,6 +403,8 @@ LogicalResult PipelinedLoadGroup::lowerLoads(PartitionSet &partitions,
     StageCluster userStageCluster = getStageCluster(liveBeforeOp);
     b.createInto<ttng::WaitBarrierOp>(userPartition, userStageCluster,
                                       curLoadBar, phase);
+    if (firstLoad->loadOp->hasAttr("tt.multicast_axes"))
+      b.createInto<ttng::ClusterBarrierOp>(userPartition, userStageCluster);
 
     SmallVector<Operation *> liveUntilOps;
     for (PipelinedLoad &load : loads) {
@@ -866,8 +878,26 @@ LogicalResult lowerLoops(scf::ForOp &loop, MutableArrayRef<PipelinedLoad> loads,
     liveBeforeGroups[load.liveBeforeOps].push_back(std::move(load));
   }
   SmallVector<PipelinedLoadGroup> loadGroups;
-  for (auto &loads : llvm::make_second_range(liveBeforeGroups))
-    loadGroups.push_back({std::move(loads)});
+  // Loads sharing a first-user group can still legitimately target different
+  // multicast axes -- e.g. the two operands of one MMA broadcast along opposite
+  // cluster dims -- so this is not an invariant violation to assert on. Each
+  // distinct axis set needs its own barrier CGA layout, so sub-partition the
+  // group by `tt.multicast_axes` before allocating barriers. The linear scan is
+  // fine here: an operand group holds only a handful of loads.
+  for (auto &loads : llvm::make_second_range(liveBeforeGroups)) {
+    SmallVector<PipelinedLoadGroup> axisGroups;
+    for (PipelinedLoad &load : loads) {
+      Attribute axes = load.loadOp->getAttr("tt.multicast_axes");
+      auto group = llvm::find_if(axisGroups, [&](PipelinedLoadGroup &group) {
+        return group.loads.front().loadOp->getAttr("tt.multicast_axes") == axes;
+      });
+      if (group == axisGroups.end())
+        axisGroups.push_back({{std::move(load)}});
+      else
+        group->loads.push_back(std::move(load));
+    }
+    llvm::append_range(loadGroups, std::move(axisGroups));
+  }
 
   // Multi-buffer and lower the loads.
   for (PipelinedLoadGroup &group : loadGroups)

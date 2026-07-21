@@ -27,7 +27,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 65536 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tmem_layout_cta_mismatch() {
-    // expected-error @+1 {{Layout has 1 CTAs per CGA, but the context requires 2 CTAs per CGA.}}
+    // expected-error @+1 {{Layout has 1 CTAs per CGA, but the context requires either 2 logical or 2 physical CTAs per CGA.}}
     %0 = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     tt.return
   }
@@ -350,49 +350,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 // NOTE: beta intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
-// inside ttg.warp_specialize (beta's autows/TLX pipelines place them there and the
-// conversion lowers them with all-warps wrapping). Only ttng.cluster_barrier is
-// rejected. The arrive/wait warp-specialize invalid cases from upstream #9456 are
-// therefore omitted here.
+// / ttng.cluster_barrier inside ttg.warp_specialize -- beta's autows/TLX pipelines
+// place them there (e.g. LoadMMASpecialization, WSLowerMem) and the conversion lowers
+// them with all-warps wrapping (see lowerClusterSyncForAllWarps). The arrive/wait/
+// barrier warp-specialize invalid cases from upstream #9456 are therefore omitted
+// here. The only remaining verifier constraint is a multi-CTA cluster requirement.
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
   tt.func @cluster_barrier_invalid() {
-    // expected-error @below {{requires ttg.num-ctas > 1}}
+    // expected-error @below {{requires a multi-CTA cluster}}
     ttng.cluster_barrier
-    tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
-  tt.func @cluster_barrier_in_default_region_invalid() {
-    ttg.warp_specialize()
-    default {
-      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
-      ttng.cluster_barrier
-      ttg.warp_yield
-    }
-    partition0() num_warps(4) {
-      ttg.warp_return
-    } : () -> ()
-    tt.return
-  }
-}
-
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
-  tt.func @cluster_barrier_in_partition_invalid() {
-    ttg.warp_specialize()
-    default {
-      ttg.warp_yield
-    }
-    partition0() num_warps(4) {
-      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
-      ttng.cluster_barrier
-      ttg.warp_return
-    } : () -> ()
     tt.return
   }
 }

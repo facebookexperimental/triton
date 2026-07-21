@@ -1834,7 +1834,7 @@ SmallVector<Value> getTiedArgs(Operation *op, int resultIdx) {
 
 LogicalResult verifyBarrierType(Operation *op,
                                 mlir::triton::gpu::MemDescType barrierType) {
-  auto numCTAs = triton::gpu::lookupNumCTAs(op);
+  auto numCTAs = triton::gpu::lookupPhysicalNumCTAs(op);
   if (!(barrierType.getElementType().isInteger(64) &&
         barrierType.getRank() == 1 && barrierType.getShape()[0] <= numCTAs))
     return op->emitOpError("barrier allocation must be a descriptor of "

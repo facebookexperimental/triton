@@ -240,14 +240,33 @@ LogicalResult ClusterWaitOp::verify() {
 
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
-  // ClusterBarrierOp is backend-inserted (not emitted by beta lowering, which
-  // has no TargetInfo::clusterBarrier creator), so the full upstream check
-  // applies; it never runs on real beta IR.
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+  // FB: the upstream #9456 "cannot be used inside `ttg.warp_specialize`"
+  // restriction is intentionally NOT enforced here. AutoWS legitimately places
+  // ttng.cluster_barrier inside ttg.warp_specialize partitions (see
+  // LoadMMASpecialization / WSLowerMem), and ClusterBarrierOpConversion lowers
+  // it via lowerClusterSyncForAllWarps so every warp of the region participates
+  // in the cluster arrive/wait. NOTE: this is only safely demonstrated for
+  // AutoWS-generated code, where the pass guarantees the barrier appears in
+  // every warp group -- it is NOT validated for Gluon or TLX (manual WS) code
+  // paths. A cluster_barrier placed in only some warp groups would deadlock;
+  // that placement correctness is the producer's responsibility, not something
+  // this verifier can cheaply check. There is no compile-time backstop for the
+  // manual-WS paths -- a misplacement surfaces only as a runtime cluster hang
+  // (e.g. under compute-sanitizer synccheck), so the safety net is testing, not
+  // verification.
+  //
+  // Unlike the physical-CTA count used by the barrier-layout verifiers (see
+  // lookupPhysicalNumCTAs), this legality check is not gated on
+  // `ttg.ctas-per-cga`: a cluster_barrier is meaningful whenever a real
+  // multi-CTA cluster exists, so take the cluster dims directly and fall back
+  // to the logical count when the module does not declare cluster dims.
+  auto module = getOperation()->getParentOfType<ModuleOp>();
+  auto dims = triton::gpu::TritonGPUDialect::getClusterDims(module);
+  int numCTAs = dims[0] * dims[1] * dims[2];
+  if (numCTAs == 1)
+    numCTAs = triton::gpu::lookupNumCTAs(getOperation());
   if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
-  if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
-    return emitOpError("cannot be used inside `ttg.warp_specialize`");
+    return emitOpError("requires a multi-CTA cluster");
   return success();
 }
 

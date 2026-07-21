@@ -1,0 +1,37 @@
+digraph block_size_footprints {
+  graph [bgcolor="white", pad="0.3", nodesep="0.35", ranksep="0.4"];
+  node [shape=plain, fontname="DejaVu Sans"];
+
+  title [label=<<B>Fixed CTA tile: BLOCK_M = 128, BLOCK_N = 128, BLOCK_K = 64, FP16</B><BR/><FONT POINT-SIZE="11">Each cell is one CTA output tile; dimensions label the cluster macro-tile</FONT>>];
+
+  natural [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="8" COLOR="#52606d">
+      <TR><TD BORDER="0" COLSPAN="2"><B>Natural B-multicast layouts</B></TD></TR>
+      <TR><TD BGCOLOR="#d9eaf7"><B>2 x 1</B><BR/>2 CTA rows<BR/><FONT POINT-SIZE="10">256 x 128 output<BR/>B reuse 2x</FONT></TD><TD BGCOLOR="#c8e0f1"><B>4 x 1</B><BR/>4 CTA rows<BR/><FONT POINT-SIZE="10">512 x 128 output<BR/>B reuse 4x</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9" COLSPAN="2"><B>8 x 1</B><BR/>8 CTA rows = one full GROUP_M band<BR/><FONT POINT-SIZE="10">1024 x 128 output | B reuse 8x</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  balanced [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="8" COLOR="#52606d">
+      <TR><TD BORDER="0" COLSPAN="2"><B>Rectangular A+B multicast layouts</B></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>2 x 2</B><BR/>4 CTAs<BR/><FONT POINT-SIZE="10">256 x 256 output<BR/>A 2x | B 2x</FONT></TD><TD BGCOLOR="#e8f0d8"><B>2 x 4</B><BR/>8 CTAs<BR/><FONT POINT-SIZE="10">256 x 512 output<BR/>A 4x | B 2x</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dcebd3" COLSPAN="2"><B>4 x 2</B><BR/>8 CTAs<BR/><FONT POINT-SIZE="10">512 x 256 output | A 2x | B 4x</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  storage [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="7" COLOR="#52606d" BGCOLOR="#f5f6f7">
+      <TR><TD><B>Per CTA, per stage</B></TD></TR>
+      <TR><TD>A = 128 x 64 x 2 B = 16 KiB</TD></TR>
+      <TR><TD>B = 64 x 128 x 2 B = 16 KiB</TD></TR>
+      <TR><TD><B>32 KiB remains allocated in every recipient CTA</B></TD></TR>
+    </TABLE>
+  >];
+
+  { rank=same; natural; balanced; }
+  title -> natural [style=invis];
+  natural -> balanced [style=invis];
+  natural -> storage [style=invis];
+  balanced -> storage [style=invis];
+}
