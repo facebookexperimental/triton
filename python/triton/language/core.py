@@ -1538,15 +1538,22 @@ class tensor_descriptor_base(base_value):
         return str(self.type)
 
     @builtin
-    def load(self, offsets: Sequence[constexpr | tensor], latency=None, _semantic=None) -> tensor:
+    def load(self, offsets: Sequence[constexpr | tensor], latency=None, multicast=None, _semantic=None) -> tensor:
         """Load a block from the descriptor starting at the given element offsets.
 
         Values outside of the tensor bounds will be filled with zeros.
 
+        :param offsets: the offsets to load from
+        :param multicast: whether this load may use TMA multicast. ``None``
+            inherits the kernel-level setting. ``True`` grants the compiler
+            permission to use multicast when it can prove a legal recipient
+            group; it does not guarantee multicast emission. See
+            :doc:`the TMA multicast design </design/triton_tma_multicast>`.
         :note: Offset must be a multiple of 16-bytes
         """
         latency = _unwrap_if_constexpr(latency)
-        return _semantic.descriptor_load(self, offsets, "", "", latency)
+        multicast = _unwrap_if_constexpr(multicast)
+        return _semantic.descriptor_load(self, offsets, "", "", latency, multicast)
 
     @builtin
     def store(
@@ -2667,7 +2674,7 @@ def _experimental_reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype, _s
 
 
 @builtin
-def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _semantic=None):
+def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, multicast=None, _semantic=None):
     """
     Experimental feature to access TMA descriptors loads. This is an escape hatch to easily exercise TTGIR operations.
     This will be removed in the future and shouldn't be used in production code.
@@ -2675,7 +2682,7 @@ def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _semantic
     This loads a tensor of data based on the descriptor and offsets.
     """
     desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, shape, dtype, _semantic=_semantic)
-    return desc.load(offsets, _semantic=_semantic)
+    return desc.load(offsets, multicast=multicast, _semantic=_semantic)
 
 
 @builtin
@@ -2692,10 +2699,10 @@ def _experimental_descriptor_store(desc_pointer, value, offsets, store_reduce=""
 
 
 @builtin
-def load_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[constexpr | tensor],
+def load_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[constexpr | tensor], multicast=None,
                            _semantic=None) -> tensor:
     """Load a block of data from a tensor descriptor."""
-    return desc.load(offsets, _semantic=_semantic)
+    return desc.load(offsets, multicast=multicast, _semantic=_semantic)
 
 
 @builtin

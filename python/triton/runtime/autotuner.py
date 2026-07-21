@@ -1016,6 +1016,8 @@ class Config:
         required, this is a hint: the driver may use a smaller cluster if resources are constrained.
         Maps to CU_LAUNCH_ATTRIBUTE_PREFERRED_CLUSTER_DIMENSION. The per dim grid size must be divisible by this per dim cluster size.
     :type preferred_ctas_per_cga: tuple[int, int, int]
+    :ivar multicast: default policy for compiler-selected TMA multicast loads.
+    :type multicast: bool
     """
 
     @staticmethod
@@ -1043,6 +1045,7 @@ class Config:
         early_tma_store_lowering=None,
         generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
+        multicast=False,
         auto_tma=None,
     ):
         self.kwargs = kwargs
@@ -1061,6 +1064,7 @@ class Config:
         self.early_tma_store_lowering = early_tma_store_lowering
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
+        self.multicast = multicast
         # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
@@ -1080,6 +1084,7 @@ class Config:
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
+        self.multicast = state.get("multicast", False)
         self.auto_tma = state.get("auto_tma", None)
 
     def all_kwargs(self):
@@ -1100,6 +1105,7 @@ class Config:
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
                     ("generate_subtiled_region", self.generate_subtiled_region),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
+                    ("multicast", self.multicast),
                     ("auto_tma", self.auto_tma),
                 ) if v is not None
             },
@@ -1120,6 +1126,7 @@ class Config:
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
         res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
+        res.append(f"multicast: {self.multicast}")
         res.append(f"auto_tma: {self.auto_tma}")
         return ", ".join(res)
 
