@@ -1944,17 +1944,7 @@ def _broadcast_component_sources(type_layout_program, op):
                     warp=warp,
                 )
                 key = (int(warp), int(lane), tuple(int(coord) for coord in coords))
-                existing = source_by_thread_coord.get(key)
-                if existing is not None and int(existing) != int(source_component):
-                    fail(
-                        "TLXW_OP_BROADCAST",
-                        STAGE,
-                        "tt.broadcast source layout maps multiple components to "
-                        "one thread coordinate",
-                        source_op_index=op.index,
-                        source_value_id=operand.value_id,
-                    )
-                source_by_thread_coord[key] = int(source_component)
+                source_by_thread_coord.setdefault(key, []).append(int(source_component))
 
     component_sources = []
     for result_register in result_registers:
@@ -1969,8 +1959,8 @@ def _broadcast_component_sources(type_layout_program, op):
                 )
                 source_coords = tuple(0 if int(source_extent) == 1 else int(coord)
                                       for source_extent, coord in zip(operand_layout.shape, result_coords))
-                source_register = source_by_thread_coord.get((int(warp), int(lane), source_coords))
-                if source_register is None:
+                source_components = source_by_thread_coord.get((int(warp), int(lane), source_coords))
+                if not source_components:
                     fail(
                         "TLXW_OP_BROADCAST",
                         STAGE,
@@ -1979,7 +1969,11 @@ def _broadcast_component_sources(type_layout_program, op):
                         source_op_index=op.index,
                         source_value_id=result.value_id,
                     )
-                source_registers.add(int(source_register))
+                # Shape application can leave replicated register slots in an
+                # explicit linear layout.  They name the same logical tensor
+                # element, so use the canonical lowest component just as the
+                # register-payload broadcast path does above.
+                source_registers.add(min(int(component) for component in source_components))
         if len(source_registers) != 1:
             fail(
                 "TLXW_OP_BROADCAST",
@@ -6788,14 +6782,17 @@ def _convert_barrier(builder, conversion_input, op):
                 debug_name=f"barrier_lds_release_{op.index}",
             ),
         )
+    attrs = {
+        "address_space": int(op.attrs.get("addrSpace", 0)),
+        "dependency_count": len(dependency_target_ids),
+    }
+    if bool(op.attrs.get("tlx.compiler_membar_barrier", False)):
+        attrs["compiler_membar_barrier"] = True
     builder.add_op(
         "barrier",
         operands=dependency_target_ids,
         results=result_target_ids,
-        attrs={
-            "address_space": int(op.attrs.get("addrSpace", 0)),
-            "dependency_count": len(dependency_target_ids),
-        },
+        attrs=attrs,
         source_op_index=op.index,
     )
     if not result_target_ids:
@@ -8277,13 +8274,13 @@ def _buffer_load_to_local_packet_plan(
         return None
     shape = tuple(int(dim) for dim in memdesc.shape)
     view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
-    # Packet DMA destination offsets are expressed relative to the complete
-    # logical memdesc.  A subslice is still fully supported through the
-    # coordinate-based scalarized path below, which applies its origin before
-    # the parent allocation's physical layout.  Do not claim the packet path
-    # until it carries the same structural view mapping.
-    if (tuple(int(dim) for dim in view.physical_shape) != shape
-            or any(int(origin) for origin in view.logical_origin)):
+    physical_shape = tuple(int(dim) for dim in view.physical_shape)
+    logical_origin = tuple(int(origin) for origin in view.logical_origin)
+    if (len(shape) != len(physical_shape)
+            or len(shape) != len(logical_origin)
+            or any(int(origin) < 0 or int(origin) + int(extent) > int(physical_extent)
+                   for origin, extent, physical_extent in zip(
+                       logical_origin, shape, physical_shape))):
         return None
     if tuple(affine.shape) != shape or not shape:
         return None
@@ -8301,9 +8298,12 @@ def _buffer_load_to_local_packet_plan(
     layout = (None if layout_id is None else type_layout_program.layouts[int(layout_id)])
     packet_order = _shared_layout_physical_order(
         layout,
-        shape,
+        physical_shape,
         op,
         diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+    )
+    identity_view = (
+        physical_shape == shape and not any(int(origin) for origin in logical_origin)
     )
     for packet_bytes in packet_byte_candidates:
         packet_elements = int(packet_bytes) // int(memdesc.element_byte_width)
@@ -8313,8 +8313,35 @@ def _buffer_load_to_local_packet_plan(
             continue
         component_count = total_elements // elements_per_cta_packet
         try:
-            physical_linear_bases = _packet_physical_linear_component_bases(layout, shape, op)
+            physical_linear_bases = _packet_physical_linear_component_bases(
+                layout,
+                physical_shape,
+                op,
+            )
             if physical_linear_bases is not None:
+                identity_bases = layouts.identity_offset_bases(
+                    physical_shape,
+                    packet_order,
+                )
+                if (
+                    not identity_view
+                    and tuple(physical_linear_bases) == tuple(identity_bases)
+                ):
+                    # Padded encodings expose their order shorthand as a
+                    # synthesized linearComponent.  Prove that it is exactly
+                    # the ordered identity map before restricting a view with
+                    # the structural coordinate path below.  Keep complete
+                    # memdescs on the physical-linear path so an op-level
+                    # contiguity contract can justify narrow packets even when
+                    # affine axis facts do not recover source contiguity.
+                    physical_linear_bases = None
+            if physical_linear_bases is not None:
+                # A restricted view of a non-identity linear component is not
+                # generally a contiguous physical-linear interval.  Keep that
+                # case on the proven fallback until the restriction itself is
+                # represented as a linear relation.
+                if not identity_view:
+                    continue
                 if _packet_physical_linear_source_is_contiguous(
                         affine,
                         shape,
@@ -8361,6 +8388,8 @@ def _buffer_load_to_local_packet_plan(
                     _packet_destination_offsets(
                         layout,
                         shape,
+                        physical_shape,
+                        logical_origin,
                         packet_order,
                         component_count,
                         elements_per_cta_packet,
@@ -10248,6 +10277,8 @@ def _affine_static_signature_delta_is_unit(start, current, expected_delta):
 def _packet_destination_offsets(
     layout,
     shape,
+    physical_shape,
+    logical_origin,
     packet_order,
     component_count,
     elements_per_cta_packet,
@@ -10265,6 +10296,8 @@ def _packet_destination_offsets(
             _packet_physical_component_offset(
                 layout,
                 shape,
+                physical_shape,
+                logical_origin,
                 packet_order,
                 component_linear + wave * int(elements_per_wave_packet),
                 elements_per_wave_packet,
@@ -10482,82 +10515,61 @@ def _bit_linear_wave_offset_coefficients(deltas):
 def _packet_physical_component_offset(
     layout,
     shape,
+    physical_shape,
+    logical_origin,
     packet_order,
     ordered_linear_start,
     lane_width,
     op,
 ):
-    default_order = _default_physical_order(shape)
-    if layout is None or layout.kind == "none":
-        if tuple(packet_order) != default_order:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "dense packet DMA destination must use row-major physical order",
-                source_op_index=op.index,
-                source_value_id=layout.value_id if layout is not None else None,
-            )
-        return int(ordered_linear_start)
-    if layout.kind in {"linear", "generic_linear"}:
+    shape = tuple(int(dim) for dim in shape)
+    physical_shape = tuple(int(dim) for dim in physical_shape)
+    logical_origin = tuple(int(value) for value in logical_origin)
+    linear_start = int(ordered_linear_start)
+    linear_end = linear_start + int(lane_width) - 1
+    start_coords = _ordered_coords_from_linear(linear_start, shape, packet_order)
+    end_coords = _ordered_coords_from_linear(linear_end, shape, packet_order)
+    physical_start_coords = tuple(
+        int(origin) + int(coord)
+        for origin, coord in zip(logical_origin, start_coords)
+    )
+    physical_end_coords = tuple(
+        int(origin) + int(coord)
+        for origin, coord in zip(logical_origin, end_coords)
+    )
+    source_value_id = None if layout is None else layout.value_id
+    start_record = layouts.shared_physical_offset(
+        layout,
+        physical_shape,
+        physical_start_coords,
+        1,
+        stage=STAGE,
+        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
+    end_record = layouts.shared_physical_offset(
+        layout,
+        physical_shape,
+        physical_end_coords,
+        1,
+        stage=STAGE,
+        diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
+    if int(end_record.element_offset) - int(start_record.element_offset) != int(lane_width) - 1:
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
-            "shared linear packet DMA destination requires a physical "
-            "linearComponent query",
+            "packet DMA destination is not physically contiguous across the component",
             source_op_index=op.index,
-            source_value_id=layout.value_id,
+            source_value_id=source_value_id,
         )
-    if layout.kind == "swizzled_shared":
-        _require_identity_swizzled(layout, op)
-        if tuple(packet_order) != default_order:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "identity swizzled packet DMA destination must use row-major "
-                "physical order",
-                source_op_index=op.index,
-                source_value_id=layout.value_id,
-            )
-        return int(ordered_linear_start)
-    if layout.kind == "padded_shared":
-        intervals, _paddings = layouts.padded_shared_parameters(
-            layout,
-            stage=STAGE,
-            diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-        linear_start = int(ordered_linear_start)
-        linear_end = linear_start + int(lane_width) - 1
-        for interval in intervals:
-            if linear_start // int(interval) != linear_end // int(interval):
-                fail(
-                    "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                    STAGE,
-                    "packet DMA destination component crosses a padded LDS interval",
-                    source_op_index=op.index,
-                    source_value_id=layout.value_id,
-                )
-        coords = _ordered_coords_from_linear(linear_start, shape, packet_order)
-        record = layouts.shared_physical_offset(
-            layout,
-            shape,
-            coords,
-            1,
-            stage=STAGE,
-            diagnostic="TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-            source_op_index=op.index,
-            source_value_id=layout.value_id,
-        )
-        return int(record.element_offset)
-    fail(
-        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        STAGE,
-        f"amdg.buffer_load_to_local destination layout {layout.kind} "
-        "is not converted yet",
-        source_op_index=op.index,
-        source_value_id=layout.value_id,
-    )
+    # memdesc_subslice is an address-preserving view in target IR.  Its
+    # logical origin therefore remains part of the component offset from the
+    # indexed/allocation base rather than being subtracted here.
+    return int(start_record.element_offset)
 
 
 def _dma_packet_byte_candidates(element_byte_width, *, include_narrow=True):
