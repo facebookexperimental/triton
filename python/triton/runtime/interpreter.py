@@ -725,7 +725,7 @@ class InterpreterBuilder:
         return desc
 
     def create_descriptor_load(self, desc: TensorDescHandle, indices: List[TensorHandle], cache_modifier,
-                               eviction_policy):
+                               eviction_policy, multicast=None):
         assert isinstance(desc, TensorDescHandle)
         ptrs, mask = desc.materialize_pointers(indices)
         dtype_tt = ptrs.get_element_ty()

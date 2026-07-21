@@ -167,6 +167,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUFuseTMEMLoadReducePass);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
+  ADD_PASS_WRAPPER_0("add_tma_multicast",
+                     ttng::createTritonNvidiaGPUTMAMulticastPass);
   ADD_PASS_WRAPPER_0("add_promote_load_to_tma",
                      ttng::createTritonNvidiaGPUPromoteLoadToTMAPass);
   ADD_PASS_WRAPPER_0("add_tma_store_buffer_reuse",

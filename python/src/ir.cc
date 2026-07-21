@@ -1719,12 +1719,16 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_descriptor_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
-              CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy) -> Value {
+              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+              std::optional<bool> multicast) -> Value {
              auto descTy = cast<triton::TensorDescType>(desc.getType());
              auto resTy = descTy.getSignlessBlockType();
-             return self.create<DescriptorLoadOp>(
+             auto op = self.create<DescriptorLoadOp>(
                  resTy, desc, indices, cacheModifier, evictionPolicy);
+             if (multicast)
+               op->setAttr("tt.multicast",
+                           self.getBuilder().getBoolAttr(*multicast));
+             return op;
            })
       .def("create_descriptor_gather",
            [](TritonOpBuilder &self, Value desc, Value x_indices, Value y_index,
