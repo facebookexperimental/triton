@@ -939,8 +939,8 @@ LogicalResult ReshapeOp::verify() {
   Attribute srcEnc = srcTy.getEncoding();
   Attribute dstEnc = dstTy.getEncoding();
   // If either side carries a TLX placeholder wrapper (#tlx.user_layout /
-  // #tlx.no_verify_layout) -- at the top or nested inside a ttg encoding (e.g. a
-  // slice/expand parent) -- defer all reshape layout verification to
+  // #tlx.no_verify_layout) -- at the top or nested inside a ttg encoding (e.g.
+  // a slice/expand parent) -- defer all reshape layout verification to
   // resolve-placeholder-layouts (make_ttgir); the concrete src/dst may not be
   // consistent yet at this point.
   if (encodingContainsTlxPlaceholder(srcEnc) ||

@@ -4778,10 +4778,10 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   auto cost = wsplan::createLatencyCostModel(model, getModuloII(funcOp));
   auto copies = wsplan::createGreedyCopySolver();
   wsplan::Budget budget;
-  // Coarse over-approximation, not a physical row count: this pre-gate sums each
-  // block's row footprint, but the real allocator (allocateTMemAllocs2) packs
-  // blocks along columns across 2 row groups of 64. 512 keeps the gate loose;
-  // exact feasibility is enforced by the downstream allocator.
+  // Coarse over-approximation, not a physical row count: this pre-gate sums
+  // each block's row footprint, but the real allocator (allocateTMemAllocs2)
+  // packs blocks along columns across 2 row groups of 64. 512 keeps the gate
+  // loose; exact feasibility is enforced by the downstream allocator.
   budget.tmemRows = 512;
   budget.tmemCols = 512;
 
