@@ -225,6 +225,10 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         source_program.kernel.num_warps,
         source_program.kernel.threads_per_warp,
         source_program.kernel.noinline,
+        enable_split_barriers=source_program.kernel.enable_split_barriers,
+        enable_multi_wave_specialization=(
+            source_program.kernel.enable_multi_wave_specialization
+        ),
     )
     return ConversionInput(
         kernel,
