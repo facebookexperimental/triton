@@ -26,6 +26,13 @@
 
     # re-order program ID for better L2 performance
     pid = tl.program_id(0).to(INDEX_DTYPE)
+{% if SPLIT_K > 1 %}
+    # split-K: grid is grid_mn * SPLIT_K; each program owns one (tile, split) and
+    # reduces only its K-slice. Partials go to the fp32 split_k_ws workspace and are
+    # summed (+ bias) by _reduce_k_kernel (emitted after this kernel by the plumbing).
+    split_id = (pid % SPLIT_K).to(INDEX_DTYPE)
+    pid = pid // SPLIT_K
+{% endif %}
     grid_m = (M + BLOCK_M - 1) // BLOCK_M
     grid_n = (N + BLOCK_N - 1) // BLOCK_N
 
@@ -62,6 +69,21 @@
     b_base = offs_n[:, None] * stride_bn          # B as (BLOCK_N, BLOCK_K): n is the row of the [N,K] view
 
     K_ITERS = tl.cdiv(K, BLOCK_K)
+{% if SPLIT_K > 1 %}
+    # this split's contiguous K-iteration range [k_lo, k_lo + n_iters). BALANCED
+    # partition: the first `rem` splits get (base + 1) iters, the rest get `base`.
+    # This keeps every split within +-1 iter of the others, so n_iters stays > NUM_BUFFERS
+    # for all splits (the heuristic guards base > NUM_BUFFERS). A ceil-then-remainder
+    # split would instead leave the LAST split with as little as 1 iter, underflowing
+    # the prologue/drain and double-counting K-tiles.
+    base = K_ITERS // SPLIT_K
+    rem = K_ITERS - base * SPLIT_K
+    k_lo = split_id * base + tl.minimum(split_id, rem)
+    n_iters = base + (split_id < rem).to(INDEX_DTYPE)
+{% else %}
+    k_lo = 0
+    n_iters = K_ITERS
+{% endif %}
 
     smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
     smemB = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)   # holds Bᵀ tile
@@ -71,7 +93,7 @@
     # One group/iter means the wait counts tiles directly (no *2), and it lets the wait live at the
     # loop tail (below), which is what makes the pipeline race-free across all NUM_BUFFERS (incl. 2).
     for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
-        k_start = i * BLOCK_K
+        k_start = (k_lo + i) * BLOCK_K
         a_offs = a_base + (k_start + offs_k[None, :]) * stride_ak
         b_offs = b_base + (k_start + offs_k[None, :]) * stride_bk
         # int32 cast is lossless: the heuristic only emits this template when offsets fit int32.
@@ -85,12 +107,12 @@
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
 
-    for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+    for tile_id in tl.range(0, n_iters - NUM_BUFFERS):
         # buffer indices MUST be int32: local_view feeds them to the block-ptr index check, which
         # rejects int64. tile_id is int64 when K (-> K_ITERS) is symbolic (dynamic shapes).
         prefetch_buf = (tile_id % NUM_BUFFERS).to(tl.int32)
         next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
-        k_prefetch = (tile_id + NUM_BUFFERS) * BLOCK_K
+        k_prefetch = (k_lo + tile_id + NUM_BUFFERS) * BLOCK_K
 
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
@@ -117,7 +139,7 @@
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
     tlx.async_load_wait_group(0)
     for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
-        buf = ((K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)   # int32 buffer index
+        buf = ((n_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)   # int32 buffer index
         a_tile = tlx.local_load(tlx.local_view(smemA, buf))
         b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
@@ -129,5 +151,17 @@
     idx_n = rn[None, :]
     mask = (idx_m < M) & (idx_n < N)
 
+{% if SPLIT_K > 1 %}
+    # split-K: write this split's fp32 partial to workspace[(split_id*M + m), n].
+    # _reduce_k_kernel (emitted after this kernel) sums the SPLIT_K partials, adds bias,
+    # casts, and stores the final output. store_output (and its bias epilogue) is bypassed,
+    # so bias is applied in the reduction step (see registry _tlx_emit_post_kernel_code).
+    # Referencing output_ptr() keeps out_ptr0 in the kernel signature (the autotuning
+    # harness passes `out` positionally); the real output is written by _reduce_k_kernel.
+    keep_out_ptr = {{output_ptr()}}  # noqa: F841
+    ws_off = split_id * (M * N) + idx_m * N + idx_n
+    tl.store(split_k_ws + ws_off, acc, mask=mask)
+{% else %}
     # inductor generates a suffix (bias add via epilogue_fn + prefix_args, cast, store)
     {{store_output(("idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}
+{% endif %}
