@@ -17,11 +17,11 @@
 #shared_b = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @hoist_preserves_producer_order(
-      %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared_a>>,
-      %b_desc: !tt.tensordesc<tensor<64x128xf16, #shared_b>>) {
+      %a_desc: !tt.tensordesc<128x64xf16, #shared_a>,
+      %b_desc: !tt.tensordesc<64x128xf16, #shared_b>) {
     %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
-    %a = tt.descriptor_load %a_desc[%c0, %c0] {async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16, #shared_a>> -> tensor<128x64xf16, #blocked_a>
-    %b = tt.descriptor_load %b_desc[%c0, %c0] {async_task_id = array<i32: 1>} : !tt.tensordesc<tensor<64x128xf16, #shared_b>> -> tensor<64x128xf16, #blocked_b>
+    %a = tt.descriptor_load %a_desc[%c0, %c0] {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared_a> -> tensor<128x64xf16, #blocked_a>
+    %b = tt.descriptor_load %b_desc[%c0, %c0] {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared_b> -> tensor<64x128xf16, #blocked_b>
     %a_use = arith.addf %a, %a {async_task_id = array<i32: 0>} : tensor<128x64xf16, #blocked_a>
     %b_use = arith.addf %b, %b {async_task_id = array<i32: 0>} : tensor<64x128xf16, #blocked_b>
     tt.return

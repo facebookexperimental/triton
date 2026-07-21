@@ -15,6 +15,18 @@ Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:
 While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.
 
 
+## Nightly builds (fbtriton)
+
+Nightly `.dev` wheels are published to a self-managed index (not PyPI):
+
+    pip install --pre fbtriton \
+      --index-url https://facebookexperimental.github.io/triton/nightly/simple/
+
+Each nightly is built from the newest `main` commit whose GPU/CI checks are all
+green. `triton.__version__` reports `3.8.0.dev<YYYYMMDD>+fb.git<hash>`. Nightlies
+are retained for ~30 days. Formal releases remain on PyPI (`pip install fbtriton`).
+
+
 ## Gluon support
 
 [Gluon](https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon)
@@ -781,6 +793,7 @@ Examples: how mbarriers are communicated in warp specialization
 |--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
 | `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
+| `mbarrier_try_wait_suspend_ns` | On Blackwell, use the four-operand `mbarrier.try_wait.parity` form with this suspend hint for waits in the kernel. `None` is unspecified, `0` explicitly disables the hint, and positive values enable it. If multiple `async_tasks` regions specify a value, the minimum explicit value is used module-wide. Default to None. |
 
 #### async_task Parameters
 

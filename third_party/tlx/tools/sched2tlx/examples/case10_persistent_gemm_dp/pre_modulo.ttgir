@@ -13,7 +13,7 @@
 #loc35 = loc("N"(#loc))
 #loc36 = loc("K"(#loc))
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @matmul_kernel_tma_persistent_simple(%a_desc: !tt.tensordesc<tensor<256x64xf16, #shared>> loc("a_desc"(#loc)), %a_desc_0: i32 loc("a_desc"(#loc)), %a_desc_1: i32 loc("a_desc"(#loc)), %a_desc_2: i64 loc("a_desc"(#loc)), %a_desc_3: i64 loc("a_desc"(#loc)), %b_desc: !tt.tensordesc<tensor<256x64xf16, #shared>> loc("b_desc"(#loc)), %b_desc_4: i32 loc("b_desc"(#loc)), %b_desc_5: i32 loc("b_desc"(#loc)), %b_desc_6: i64 loc("b_desc"(#loc)), %b_desc_7: i64 loc("b_desc"(#loc)), %c_desc: !tt.tensordesc<tensor<256x256xf16, #shared>> loc("c_desc"(#loc)), %c_desc_8: i32 loc("c_desc"(#loc)), %c_desc_9: i32 loc("c_desc"(#loc)), %c_desc_10: i64 loc("c_desc"(#loc)), %c_desc_11: i64 loc("c_desc"(#loc)), %M: i32 {tt.divisibility = 16 : i32} loc("M"(#loc)), %N: i32 {tt.divisibility = 16 : i32} loc("N"(#loc)), %K: i32 {tt.divisibility = 16 : i32} loc("K"(#loc))) attributes {noinline = false} {
+  tt.func public @matmul_kernel_tma_persistent_simple(%a_desc: !tt.tensordesc<256x64xf16, #shared> loc("a_desc"(#loc)), %a_desc_0: i32 loc("a_desc"(#loc)), %a_desc_1: i32 loc("a_desc"(#loc)), %a_desc_2: i64 loc("a_desc"(#loc)), %a_desc_3: i64 loc("a_desc"(#loc)), %b_desc: !tt.tensordesc<256x64xf16, #shared> loc("b_desc"(#loc)), %b_desc_4: i32 loc("b_desc"(#loc)), %b_desc_5: i32 loc("b_desc"(#loc)), %b_desc_6: i64 loc("b_desc"(#loc)), %b_desc_7: i64 loc("b_desc"(#loc)), %c_desc: !tt.tensordesc<256x256xf16, #shared> loc("c_desc"(#loc)), %c_desc_8: i32 loc("c_desc"(#loc)), %c_desc_9: i32 loc("c_desc"(#loc)), %c_desc_10: i64 loc("c_desc"(#loc)), %c_desc_11: i64 loc("c_desc"(#loc)), %M: i32 {tt.divisibility = 16 : i32} loc("M"(#loc)), %N: i32 {tt.divisibility = 16 : i32} loc("N"(#loc)), %K: i32 {tt.divisibility = 16 : i32} loc("K"(#loc))) attributes {noinline = false} {
     %0 = ub.poison : !ttg.async.token loc(#loc)
     %false = arith.constant false loc(#loc1)
     %true = arith.constant true loc(#loc1)
@@ -43,9 +43,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttng.tmem_store %cst, %accumulator, %true : tensor<256x256xf32, #linear> -> !ttg.memdesc<256x256xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc48)
       %accumulator_18:2 = scf.for %accumulator_21 = %c0_i32 to %k_tiles_15 step %c1_i32 iter_args(%arg21 = %false, %accumulator_22 = %0) -> (i1, !ttg.async.token)  : i32 {
         %offs_k = arith.muli %accumulator_21, %c64_i32 : i32 loc(#loc50)
-        %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<256x64xf16, #shared>> -> tensor<256x64xf16, #blocked> loc(#loc51)
+        %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<256x64xf16, #shared> -> tensor<256x64xf16, #blocked> loc(#loc51)
         %a_23 = ttg.local_alloc %a : (tensor<256x64xf16, #blocked>) -> !ttg.memdesc<256x64xf16, #shared, #smem> loc(#loc51)
-        %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] : !tt.tensordesc<tensor<256x64xf16, #shared>> -> tensor<256x64xf16, #blocked> loc(#loc52)
+        %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] : !tt.tensordesc<256x64xf16, #shared> -> tensor<256x64xf16, #blocked> loc(#loc52)
         %arg2 = ttg.local_alloc %b : (tensor<256x64xf16, #blocked>) -> !ttg.memdesc<256x64xf16, #shared, #smem> loc(#loc53)
         %arg2_24 = ttg.memdesc_trans %arg2 {order = array<i32: 1, 0>} : !ttg.memdesc<256x64xf16, #shared, #smem> -> !ttg.memdesc<64x256xf16, #shared1, #smem> loc(#loc53)
         ttng.tc_gen5_mma %a_23, %arg2_24, %accumulator, %arg21, %true : !ttg.memdesc<256x64xf16, #shared, #smem>, !ttg.memdesc<64x256xf16, #shared1, #smem>, !ttg.memdesc<256x256xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc48)
@@ -59,7 +59,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %1 = arith.muli %pid_m_c, %c256_i32 : i32 loc(#loc26)
       %2 = arith.muli %pid_n_c, %c256_i32 : i32 loc(#loc27)
       %3 = ttg.convert_layout %c : tensor<256x256xf16, #linear> -> tensor<256x256xf16, #blocked1> loc(#loc28)
-      tt.descriptor_store %c_desc[%1, %2], %3 : !tt.tensordesc<tensor<256x256xf16, #shared>>, tensor<256x256xf16, #blocked1> loc(#loc28)
+      tt.descriptor_store %c_desc[%1, %2], %3 : !tt.tensordesc<256x256xf16, #shared>, tensor<256x256xf16, #blocked1> loc(#loc28)
       scf.yield %tile_id_c_19 : i32 loc(#loc29)
     } {tt.warp_specialize} loc(#loc43)
     tt.return loc(#loc30)

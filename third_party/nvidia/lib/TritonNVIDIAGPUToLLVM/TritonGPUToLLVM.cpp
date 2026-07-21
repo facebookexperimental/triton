@@ -373,17 +373,6 @@ private:
         bars.insert(tcgen5CommitOp.getBarrier());
         return bars;
       }
-    } else if (auto tmemCopyOp = llvm::dyn_cast<ttng::TMEMCopyOp>(op)) {
-      // case 2 for gen5 commit: a commit inline ptx is generated for a tmem cp
-      // op if it has a barrier arg. If the mod is in 2cta mode, the commit op
-      // can multicast bar signals.
-      if (auto bar = tmemCopyOp.getBarrier()) {
-        if (tlx::tlxEnablePairedMMA(op)) {
-          llvm::SetVector<Value> bars;
-          bars.insert(bar);
-          return bars;
-        }
-      }
     } else if (llvm::isa<ttng::MMAv5OpInterface>(op)) {
       // case 3 for gen5 commit: a commit inline ptx will be generated for each
       // barrier on the gen5 MMA op. If the mod is in 2cta mode, the commit op
@@ -519,7 +508,7 @@ bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
     return true;
 
   // wait_barrier will never run ahead of the load it's waiting on
-  if (isa<ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMAGatherOp>(before) &&
+  if (isa<ttng::TMALoadLikeOpInterface>(before) &&
       isa<ttng::WaitBarrierOp>(after))
     return true;
 

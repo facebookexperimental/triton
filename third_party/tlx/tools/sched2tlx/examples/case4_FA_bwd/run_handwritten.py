@@ -82,10 +82,7 @@ def run(BH, N_CTX, HEAD_DIM=128, BLOCK_M=128, BLOCK_N=128, NUM_BUFFERS_Q=2):
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,
-        NUM_BUFFERS_Q,
-        num_warps=4,
-        num_ctas=1,
-        num_stages=1,
+        # NUM_BUFFERS_Q + num_warps/num_stages/num_ctas injected by @triton.autotune.
     )
     torch.cuda.synchronize()
 

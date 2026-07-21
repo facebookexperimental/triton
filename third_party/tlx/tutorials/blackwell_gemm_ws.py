@@ -1157,6 +1157,7 @@ def matmul_kernel_tma_ws_blackwell(
     SPLIT_K: tl.constexpr,
     INTERLEAVE_EPILOGUE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    NUM_CLC_STAGES: tl.constexpr = 1,
     A_ROW_MAJOR: tl.constexpr = True,
     B_ROW_MAJOR: tl.constexpr = True,
     USE_WARP_BARRIER: tl.constexpr = False,
@@ -1224,7 +1225,14 @@ def matmul_kernel_tma_ws_blackwell(
         tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
                                              arrive_count=EPILOGUE_SUBTILE)
 
-    with tlx.async_tasks(exclusive=True, no_ending_cluster_sync=True):
+    # Each of the three async tasks consumes CLC responses on both cluster CTAs.
+    clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
+
+    with tlx.async_tasks(
+        exclusive=True,
+        no_ending_cluster_sync=True,
+        mbarrier_try_wait_suspend_ns=50000,
+    ):
         with tlx.async_task("default"):  # epilogue consumer
             (
                 start_pid,
@@ -1248,11 +1256,14 @@ def matmul_kernel_tma_ws_blackwell(
 
             tmem_accum_cnt = 0
             tile_id = start_pid
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
 
-            while tile_id < num_tiles:
-                # Skip tiles whose split has zero K-tiles (last split
-                # can be empty when cdiv(k_tiles_total, SPLIT_K) * (SPLIT_K-1)
-                # >= k_tiles_total).
+            while tile_id != -1:
+                # Prefetch the next dynamically claimed tile while processing
+                # the current tile to cover the persistent-loop boundary.
+                tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_producer ^= 1
                 if SPLIT_K == 1:
                     # Fast path: one split covers all K-tiles; avoids the
                     # runtime-divisor `tile_id // num_mn_tiles` division.
@@ -1289,7 +1300,8 @@ def matmul_kernel_tma_ws_blackwell(
                         tmem_read_phase=tmem_read_phase,
                     )
                     tmem_accum_cnt += 1
-                tile_id += NUM_SMS
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             (
@@ -1315,8 +1327,9 @@ def matmul_kernel_tma_ws_blackwell(
             tmem_accum_cnt = 0
             smem_accum_cnt = 0
             tile_id = start_pid
+            clc_phase_consumer = 0
 
-            while tile_id < num_tiles:
+            while tile_id != -1:
                 # Compute K range for this split
                 if SPLIT_K == 1:
                     # Fast path: one split covers all K-tiles; avoids the
@@ -1356,7 +1369,8 @@ def matmul_kernel_tma_ws_blackwell(
                         B_ROW_MAJOR=B_ROW_MAJOR,
                     )
                     tmem_accum_cnt += 1
-                tile_id += NUM_SMS
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             (
@@ -1381,8 +1395,9 @@ def matmul_kernel_tma_ws_blackwell(
 
             smem_accum_cnt = 0
             tile_id = start_pid
+            clc_phase_consumer = 0
 
-            while tile_id < num_tiles:
+            while tile_id != -1:
                 # Compute K range for this split
                 if SPLIT_K == 1:
                     # Fast path: one split covers all K-tiles; avoids the
@@ -1424,7 +1439,8 @@ def matmul_kernel_tma_ws_blackwell(
                         A_ROW_MAJOR=A_ROW_MAJOR,
                         B_ROW_MAJOR=B_ROW_MAJOR,
                     )
-                tile_id += NUM_SMS
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_consumer ^= 1
 
 
 def matmul(a, b, config=None):
@@ -1511,7 +1527,7 @@ def matmul(a, b, config=None):
         num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
         num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
         total_tiles = num_pid_m * num_pid_n * split_k
-        grid = (min(NUM_SMS, total_tiles), )
+        grid = (total_tiles, )
         matmul_kernel_tma_ws_blackwell.fn[grid](
             a_desc,
             b_desc,
@@ -1554,7 +1570,7 @@ def matmul(a, b, config=None):
             num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
             mn_tiles = num_pid_m * num_pid_n
             total_tiles = mn_tiles * META["SPLIT_K"]
-            return (min(NUM_SMS, total_tiles), )
+            return (total_tiles, )
 
         matmul_kernel_tma_ws_blackwell[grid](
             a_desc,

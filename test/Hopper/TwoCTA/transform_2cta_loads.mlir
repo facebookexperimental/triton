@@ -8,8 +8,8 @@
 
 // CHECK-LABEL: @matmul_2cta_transform_loads
 // Two make_tensor_descriptor ops: original A and cloned half-width B
-// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16>>
-// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<tensor<64x64xf16>>
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
+// CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<64x64xf16>
 // CTA offset computation inside the loop
 // CHECK: %[[CTA_ID:.*]] = nvg.cluster_id
 // CHECK: %[[C2:.*]] = arith.constant 2 : i32
@@ -18,7 +18,7 @@
 // CHECK: %[[OFF:.*]] = arith.muli %[[MOD]], %[[HALF]]
 // CHECK: arith.addi %{{.*}}, %[[OFF]]
 // Half-width B load and alloc
-// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>>
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x64xf16>
 // CHECK: ttg.local_alloc %{{.*}} : {{.*}} -> !ttg.memdesc<64x64xf16
 // MMA with two_ctas and half-width B
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
@@ -51,19 +51,19 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %offs_bn = arith.muli %pid, %c128_i32 : i32
 
     // A descriptor: 128x64 block
-    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16>>
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
     // B descriptor: 64x128 block (pass should clone this with 64x64)
-    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16>>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
 
     %accumulator = scf.for %k = %c0_i32 to %c1_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked>) : i32 {
       %offs_k = arith.muli %k, %c64_i32 : i32
 
       // A load (not modified)
-      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked1>
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked1>
       %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
 
       // B load (should be transformed to half-width with CTA offset)
-      %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1>
+      %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked1>
       %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked1>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
 
       %acc_layout = ttg.convert_layout %acc : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked3>
@@ -89,14 +89,14 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // transform the load, same as device-side but without cloning MakeTensorDescOp.
 // CHECK-LABEL: @matmul_2cta_host_tma
 // The function argument type should be updated to half-width
-// CHECK-SAME: !tt.tensordesc<tensor<64x64xf16>>
+// CHECK-SAME: !tt.tensordesc<64x64xf16>
 // CTA offset computation
 // CHECK: %[[CTA_ID:.*]] = nvg.cluster_id
 // CHECK: arith.remsi
 // CHECK: arith.muli
 // CHECK: arith.addi
 // Half-width B load
-// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>>
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x64xf16>
 // CHECK: ttg.local_alloc %{{.*}} : {{.*}} -> !ttg.memdesc<64x64xf16
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
 
@@ -109,8 +109,8 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @matmul_2cta_host_tma(
-      %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
-      %b_desc: !tt.tensordesc<tensor<64x128xf16>>) attributes {noinline = false} {
+      %a_desc: !tt.tensordesc<128x64xf16>,
+      %b_desc: !tt.tensordesc<64x128xf16>) attributes {noinline = false} {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -125,11 +125,11 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %accumulator = scf.for %k = %c0_i32 to %c1_i32 step %c1_i32 iter_args(%acc = %cst) -> (tensor<128x128xf32, #blocked_h>) : i32 {
       %offs_k = arith.muli %k, %c64_i32 : i32
 
-      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked1_h>
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked1_h>
       %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_h>) -> !ttg.memdesc<128x64xf16, #shared_h, #smem_h>
 
       // Host-side B descriptor — pass should update the func arg type to half-width
-      %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1_h>
+      %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked1_h>
       %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked1_h>) -> !ttg.memdesc<64x128xf16, #shared_h, #smem_h>
 
       %acc_layout = ttg.convert_layout %acc : tensor<128x128xf32, #blocked_h> -> tensor<128x128xf32, #blocked3_h>
@@ -153,10 +153,10 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 // the same original block shape. The descriptor argument must be halved once,
 // not once per MMA user.
 // CHECK-LABEL: @matmul_2cta_host_tma_reused_desc
-// CHECK-SAME: !tt.tensordesc<tensor<64x64xf16>>
+// CHECK-SAME: !tt.tensordesc<64x64xf16>
 // CHECK-NOT: tensor<64x32xf16>
-// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
-// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
 
@@ -169,21 +169,21 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @matmul_2cta_host_tma_reused_desc(
-      %a_desc: !tt.tensordesc<tensor<128x64xf16>>,
-      %b_desc: !tt.tensordesc<tensor<64x128xf16>>) attributes {noinline = false} {
+      %a_desc: !tt.tensordesc<128x64xf16>,
+      %b_desc: !tt.tensordesc<64x128xf16>) attributes {noinline = false} {
     %true = arith.constant true
     %c0_i32 = arith.constant 0 : i32
     %c64_i32 = arith.constant 64 : i32
     %c128_i32 = arith.constant 128 : i32
     %cst = arith.constant dense<0.000000e+00> : tensor<128x128xf32, #blocked_r>
 
-    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked1_r>
+    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked1_r>
     %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_r>) -> !ttg.memdesc<128x64xf16, #shared_r, #smem_r>
 
-    %b0 = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1_r>
+    %b0 = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked1_r>
     %b0_smem = ttg.local_alloc %b0 : (tensor<64x128xf16, #blocked1_r>) -> !ttg.memdesc<64x128xf16, #shared_r, #smem_r>
 
-    %b1 = tt.descriptor_load %b_desc[%c64_i32, %c128_i32] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked1_r>
+    %b1 = tt.descriptor_load %b_desc[%c64_i32, %c128_i32] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked1_r>
     %b1_smem = ttg.local_alloc %b1 : (tensor<64x128xf16, #blocked1_r>) -> !ttg.memdesc<64x128xf16, #shared_r, #smem_r>
 
     %acc_layout0 = ttg.convert_layout %cst : tensor<128x128xf32, #blocked_r> -> tensor<128x128xf32, #blocked3_r>
@@ -230,13 +230,13 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %pid = tt.get_program_id x : i32
     %offs = arith.muli %pid, %c128_i32 : i32
 
-    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x64xf16>>
-    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16>>
+    %a_desc = tt.make_tensor_descriptor %a_ptr, [%M, %K], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
+    %b_desc = tt.make_tensor_descriptor %b_ptr, [%K, %N], [%cN_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16>
 
-    %a = tt.descriptor_load %a_desc[%offs, %c0_i32] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked1_b>
+    %a = tt.descriptor_load %a_desc[%offs, %c0_i32] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked1_b>
     %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_b>) -> !ttg.memdesc<128x64xf16, #shared_b, #smem_b>
 
-    %b = tt.descriptor_load %b_desc[%c0_i32, %offs] : !tt.tensordesc<tensor<64x128xf16>> -> tensor<64x128xf16, #blocked2_b>
+    %b = tt.descriptor_load %b_desc[%c0_i32, %offs] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked2_b>
     %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked2_b>) -> !ttg.memdesc<64x128xf16, #shared_b, #smem_b>
 
     %acc_layout = ttg.convert_layout %cst : tensor<128x128xf32, #blocked_b> -> tensor<128x128xf32, #blocked3_b>

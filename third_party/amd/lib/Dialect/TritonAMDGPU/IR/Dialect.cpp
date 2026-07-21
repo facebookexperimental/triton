@@ -613,7 +613,7 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   auto smemTy = getResult().getType();
 
   // Check that every dimension of the block shape is <= 2^16
-  auto blockShape = tensorDescTy.getBlockType().getShape();
+  auto blockShape = tensorDescTy.getShape();
   auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
   if (failed(verifyResult))
     return verifyResult;
@@ -650,6 +650,14 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   Type elementType = smemTy.getElementType();
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
   if (paddedEnc) {
+    auto descPaddedEnc = llvm::dyn_cast_or_null<gpu::PaddedSharedEncodingAttr>(
+        tensorDescTy.getSharedLayout());
+    if (descPaddedEnc &&
+        descPaddedEnc.getIntervals() != paddedEnc.getIntervals() &&
+        descPaddedEnc.getPaddings() != paddedEnc.getPaddings()) {
+      return emitOpError(
+          "Interval/Padding mismatch between descriptor and allocation");
+    }
     unsigned dwordSize = 32;
     for (auto [interval, padding] :
          llvm::zip(paddedEnc.getIntervals(), paddedEnc.getPaddings())) {
@@ -681,7 +689,7 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   auto smemTy = getSrc().getType();
 
   // Check that every dimension of the block shape is <= 2^16
-  auto blockShape = tensorDescTy.getBlockType().getShape();
+  auto blockShape = tensorDescTy.getShape();
   auto verifyResult = verifyTDMBlockSize(getOperation(), blockShape);
   if (failed(verifyResult))
     return verifyResult;
@@ -694,6 +702,15 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   auto paddedEnc =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
   if (paddedEnc) {
+    // Check if descriptor has a compatible padded encoding
+    auto descPaddedEnc = llvm::dyn_cast_or_null<gpu::PaddedSharedEncodingAttr>(
+        tensorDescTy.getSharedLayout());
+    if (descPaddedEnc &&
+        descPaddedEnc.getIntervals() != paddedEnc.getIntervals() &&
+        descPaddedEnc.getPaddings() != paddedEnc.getPaddings()) {
+      return emitOpError(
+          "Interval/Padding mismatch between descriptor and allocation");
+    }
     // Check if we can apply the padding workaround, see the lowering to LLVM
     // for more details.
     auto intervals = paddedEnc.getIntervals();
@@ -720,7 +737,7 @@ LogicalResult AsyncTDMScatterOp::verify() {
   auto smemTy = getSrc().getType();
 
   // TDM scatter mode only supports 2D tensors
-  auto blockShape = tensorDescTy.getBlockType().getShape();
+  auto blockShape = tensorDescTy.getShape();
   if (blockShape.size() != 2)
     return emitOpError("TDM scatter only supports 2D tensors, got ")
            << blockShape.size() << "D";
@@ -782,7 +799,7 @@ LogicalResult AsyncTDMGatherOp::verify() {
   auto smemTy = getDst().getType();
 
   // TDM gather mode only supports 2D tensors
-  auto blockShape = tensorDescTy.getBlockType().getShape();
+  auto blockShape = tensorDescTy.getShape();
   if (blockShape.size() != 2)
     return emitOpError("TDM gather only supports 2D tensors, got ")
            << blockShape.size() << "D";
@@ -898,9 +915,8 @@ LogicalResult TDMPrefetchOp::inferReturnTypes(
   }
 
   auto descType = cast<triton::TensorDescType>(ad.getDesc().getType());
-  auto blockType = descType.getBlockType();
-  auto blockShape = blockType.getShape();
-  auto elementType = blockType.getElementType();
+  auto blockShape = descType.getShape();
+  auto elementType = descType.getElementType();
 
   // Lookup the module to get the number of threads per warp, number of warps
   // and number of CTAs

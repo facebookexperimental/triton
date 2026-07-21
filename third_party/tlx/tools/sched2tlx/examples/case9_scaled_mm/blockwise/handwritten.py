@@ -17,6 +17,8 @@
 # NUM_SMEM_BUFFERS / NUM_ACC_BUFFERS / GROUP_SIZE_M / num_warps are @triton.autotune-
 # managed (keyed on M, N, K, SCALE_MODE).
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -32,21 +34,30 @@ PROMO_REGS = tl.constexpr(256)
 
 
 def _autotune_configs():
-    # Autotune the pure IN-KERNEL knobs (no effect on host-side TMA descriptors or
-    # grid, so no pre_hook needed). EPI_SUB / NUM_CTAS stay fixed at their proven
-    # optima (EPI_SUB=2, NUM_CTAS=1). NUM_PROMO_WARPS must equal the launch num_warps.
-    # Curated list centred on the square-GEMM optimum (4/4/8/8) + diversity for other
-    # shapes; keep small to bound first-call benchmarking cost.
-    specs = [(4, 4, 8, 8),  # proven optimum for square (e.g. 4096^3)
-             (4, 4, 1, 8),  # GSM=1: better L2 for tall/skinny M
-             (4, 4, 16, 8),  # GSM=16: wide-N shapes
-             (4, 3, 8, 8),  # shallower acc pipeline
-             (3, 4, 8, 8),  # shallower A/B pipeline (frees SMEM)
-             (2, 2, 1, 4),  # small-shape: fewer buffers/warps
-             ]
+    # Autotune ONLY the SMEM/TMEM ring
+    # depths (NUM_SMEM_BUFFERS / NUM_ACC_BUFFERS) — the same knobs the modulo
+    # scheduler chooses. Everything else stays FIXED at its proven square-GEMM
+    # optimum: GROUP_SIZE_M=8, NUM_PROMO_WARPS=num_warps=8, EPI_SUB=2, NUM_CTAS=1.
+    GSM, NW = 8, 8
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [
+            triton.Config(
+                {"NUM_SMEM_BUFFERS": 5, "NUM_ACC_BUFFERS": 3,
+                 "GROUP_SIZE_M": 8, "NUM_PROMO_WARPS": 8},
+                num_warps=8, num_stages=1,
+            )
+        ]
     return [
-        triton.Config({"NUM_SMEM_BUFFERS": nsmem, "NUM_ACC_BUFFERS": nacc, "GROUP_SIZE_M": gsm, "NUM_PROMO_WARPS": nw},
-                      num_warps=nw, num_stages=1) for (nsmem, nacc, gsm, nw) in specs
+        triton.Config(
+            {"NUM_SMEM_BUFFERS": nsmem, "NUM_ACC_BUFFERS": nacc,
+             "GROUP_SIZE_M": GSM, "NUM_PROMO_WARPS": NW},
+            num_warps=NW, num_stages=1,
+        )
+        for nsmem in (2, 3, 4, 5, 6)
+        for nacc in (2, 3, 4)
     ]
 
 

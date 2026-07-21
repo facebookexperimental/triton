@@ -129,7 +129,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978030112"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_977939344"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_978036848": {
@@ -143,7 +143,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978036848"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_977939344"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_978038288": {
@@ -164,7 +164,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978038288"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_978038560"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<64x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<64x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_978041456": {
@@ -178,7 +178,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978041456"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_978038560"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<64x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<64x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_978042112": {
@@ -192,7 +192,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978042112"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_978038560"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<64x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<64x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_977701680": {
@@ -605,7 +605,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978086784"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_977939344"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_978087216": {
@@ -619,7 +619,7 @@
       "kind": "tt.make_tensor_descriptor",
       "scope": "function",
       "operands": [{"op": "op_978087216"}, {"arg": "N_CTX"}, {"const": 64, "type": "i32"}, {"op": "op_977939344"}, {"const": 1, "type": "i64"}],
-      "result_types": ["!tt.tensordesc<tensor<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>>"],
+      "result_types": ["!tt.tensordesc<128x64xf16, #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>>"],
       "attributes": {"operandSegmentSizes": [1, 2, 2, 0], "padding": 1}
     },
     "op_978102592": {

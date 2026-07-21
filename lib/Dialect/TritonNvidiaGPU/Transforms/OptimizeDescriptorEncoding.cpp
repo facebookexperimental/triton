@@ -309,8 +309,8 @@ TensorDescType getTensorDescTypeWithEncoding(Operation *op,
                                              Attribute encoding) {
   auto sharedEnc = cast<triton::gpu::SharedEncodingTrait>(encoding);
   encoding = ttg::updateEncodingForShape(op, sharedEnc, existingTy);
-  auto blockTy = existingTy.cloneWithEncoding(encoding);
-  return TensorDescType::get(existingTy.getContext(), blockTy);
+  return TensorDescType::get(existingTy.getShape(), existingTy.getElementType(),
+                             encoding);
 }
 
 //===----------------------------------------------------------------------===//

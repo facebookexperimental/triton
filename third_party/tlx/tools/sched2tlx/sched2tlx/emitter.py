@@ -82,7 +82,7 @@ _DTYPE_ALT = (
     r"|f8e4m3|f8e5m2|f16|f32|f64|i1|i8|i16|i32|i64)"
 )
 _TENSOR_TYPE_RE = re.compile(rf"tensor<([0-9x]+)x({_DTYPE_ALT})\b")
-_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<tensor<([0-9x]+)x({_DTYPE_ALT})\b")
+_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<(?:tensor<)?([0-9x]+)x({_DTYPE_ALT})\b")
 # `!ttg.memdesc<128x128xbf16, ...>` — used for hoisted SMEM/TMEM allocs.
 _MEMDESC_TYPE_RE = re.compile(rf"!ttg\.memdesc<([0-9x]+)x({_DTYPE_ALT})\b")
 
@@ -101,7 +101,7 @@ def _parse_tensor_shape(type_str: str) -> tuple[list[int], str] | None:
 
 
 def _parse_desc_block_shape(type_str: str) -> tuple[list[int], str] | None:
-    """Extract block shape from `!tt.tensordesc<tensor<128x64xf16,...>>`."""
+    """Extract block shape from `!tt.tensordesc<128x64xf16,...>`."""
     m = _DESC_TYPE_RE.search(type_str)
     if not m:
         return None
