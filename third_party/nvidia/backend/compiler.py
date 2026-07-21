@@ -878,7 +878,7 @@ class CUDABackend(BaseBackend):
             # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
             # async-token form and hoist the issue for compute/CLC overlap. This
             # runs before warp specialization; the token is materialized into the
-            # completion mbarrier after WS (add_clc_materialize below).
+            # completion/reuse mbarriers after WS (add_clc_materialize below).
             nvidia.passes.ttnvgpuir.add_clc_split(pm)
             nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
@@ -943,8 +943,8 @@ class CUDABackend(BaseBackend):
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             # CLC tile scheduler (Stage 4): materialize the async-token form into
-            # the response buffer + completion mbarrier (single-CTA only). Runs
-            # after warp specialization.
+            # the response buffer + completion mbarrier. Explicit clusters also
+            # get a reuse rendezvous. Runs after warp specialization.
             nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.

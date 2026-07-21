@@ -10,14 +10,17 @@
 //   Stage 4 (clc-materialize):  token form -> response buffer + completion
 //                               mbarrier + low-level try_cancel/expect (issue)
 //                               and wait/load/decode (read), with a
-//                               loop-carried, per-iteration-toggled phase.
+//                               loop-carried phase. Explicit clusters also get
+//                               an empty barrier that guards response reuse.
 //
 // Stage 3 (AutoWS handling) is intentionally NOT here; it lands in a follow-up
-// branch and slots between Stage 2 and Stage 4. Single-CTA only for now
-// (multi-cluster / multi-CTA is rejected in clc-materialize).
+// branch and slots between Stage 2 and Stage 4. The CUDA-style ctas_per_cga
+// path is supported because it keeps num-ctas == 1 and assigns a distinct
+// program id to each CTA. Triton's num-ctas > 1 path remains unsupported.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -40,6 +43,13 @@ namespace {
 // A CLC response is 16 bytes; the low-level ops require a rank-1 memdesc of
 // exactly 2 x i64 (see verifyCLCResultMemdesc).
 constexpr int kClcResponseBytes = 16;
+
+int getExplicitClusterSize(ModuleOp mod) {
+  if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1)
+    return 1;
+  auto dims = ttg::TritonGPUDialect::getClusterDims(mod);
+  return dims[0] * dims[1] * dims[2];
+}
 
 Value createClcResponseAlloc(OpBuilder &b, Location loc) {
   MLIRContext *ctx = b.getContext();
@@ -101,14 +111,17 @@ struct CLCHoistPass
 };
 
 //===--------------------------------------------------------------------===//
-// Stage 4 - materialize the token form into mbarrier ops (single-CTA).
+// Stage 4 - materialize the token form into mbarrier ops.
 //===--------------------------------------------------------------------===//
 struct CLCMaterializePass
     : public impl::TritonNvidiaGPUCLCMaterializePassBase<CLCMaterializePass> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    // Single-CTA only for now: reject multi-cluster / multi-CTA.
+    // Triton's num-ctas path gives one program id to the whole cluster. CLC
+    // currently supports either a single CTA or the CUDA-style ctas_per_cga
+    // path, where num-ctas stays 1 and ttg.cluster-dim-* describes the physical
+    // cluster whose CTAs each have their own program id.
     if (ttg::TritonGPUDialect::getNumCTAs(mod) != 1) {
       bool hasCLC = false;
       mod.walk([&](Operation *op) {
@@ -116,9 +129,9 @@ struct CLCMaterializePass
           hasCLC = true;
       });
       if (hasCLC) {
-        mod.emitError("CLC tile scheduler currently supports a single CTA only "
-                      "(num-ctas == 1); multi-cluster / multi-CTA is not yet "
-                      "implemented");
+        mod.emitError("CLC tile scheduler does not support Triton's num-ctas "
+                      "cluster semantics; use num-ctas == 1, optionally with "
+                      "explicit ctas_per_cga cluster dimensions");
         return signalPassFailure();
       }
       return;
@@ -145,6 +158,7 @@ struct CLCMaterializePass
     Location loc = read.getLoc();
     OpBuilder b(whileOp);
     Type i32 = b.getI32Type();
+    int clusterSize = getExplicitClusterSize(read->getParentOfType<ModuleOp>());
 
     // Loop-carried phase, initialized to 0.
     Value zero =
@@ -155,10 +169,17 @@ struct CLCMaterializePass
 
     // Response buffer + completion mbarrier, allocated before the loop. The
     // barrier ops take a single-buffer view of the (1-deep) barrier allocation.
+    // Explicit clusters also use a second barrier to rendezvous before reuse.
     b.setInsertionPoint(newLoop);
     Value resp = createClcResponseAlloc(b, loc);
     Value barAlloc = createBarrierAlloc(newLoop, /*numBarriers=*/1);
     Value bar = createSingleBufferView(b, barAlloc, 0);
+    Value emptyBar;
+    if (clusterSize > 1) {
+      Value emptyBarAlloc =
+          createBarrierAlloc(newLoop, /*numBarriers=*/1, clusterSize);
+      emptyBar = createSingleBufferView(b, emptyBarAlloc, 0);
+    }
 
     // Forward the phase from the before-region into the after-region and read
     // it back as the wait phase.
@@ -169,25 +190,54 @@ struct CLCMaterializePass
     condOp.getArgsMutable().append(phaseBefore);
 
     // Materialize the issue: barrier_expect + clc_try_cancel.
-    {
-      OpBuilder ib(issue);
-      Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
-                                                /*width=*/1);
-      BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
-      CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
+    OpBuilder ib(issue);
+    if (emptyBar) {
+      // The first wait passes immediately because an initialized mbarrier has
+      // phase 0. Later waits block until every CTA has consumed the previous
+      // multicast response and arrived on the lead CTA's empty barrier.
+      Value rank =
+          mlir::triton::nvgpu::ClusterCTAIdOp::create(ib, issue.getLoc(), i32);
+      Value zero = arith::ConstantIntOp::create(ib, issue.getLoc(), 0, 32);
+      Value isLeader = arith::CmpIOp::create(
+          ib, issue.getLoc(), arith::CmpIPredicate::eq, rank, zero);
+      Value one = arith::ConstantIntOp::create(ib, issue.getLoc(), 1, 32);
+      Value emptyPhase =
+          arith::XOrIOp::create(ib, issue.getLoc(), phaseAfter, one);
+      WaitBarrierOp::create(ib, issue.getLoc(), emptyBar, emptyPhase, isLeader);
     }
+    Value pred = arith::ConstantIntOp::create(ib, issue.getLoc(), /*value=*/1,
+                                              /*width=*/1);
+    BarrierExpectOp::create(ib, issue.getLoc(), bar, kClcResponseBytes, pred);
+    CLCTryCancelOp::create(ib, issue.getLoc(), resp, bar);
 
     // Materialize the read: wait_barrier + clc_load_result + decode.
-    {
-      OpBuilder rb(read);
-      WaitBarrierOp::create(rb, loc, bar, phaseAfter);
-      Value clcResult = CLCLoadResultOp::create(rb, loc, resp);
-      Value isValid = CLCIsCanceledOp::create(rb, loc, clcResult);
-      Value x = CLCGetProgramIdOp::create(rb, loc, clcResult, 0);
-      Value y = CLCGetProgramIdOp::create(rb, loc, clcResult, 1);
-      Value z = CLCGetProgramIdOp::create(rb, loc, clcResult, 2);
-      read->replaceAllUsesWith(ValueRange{isValid, x, y, z});
+    OpBuilder rb(read);
+    WaitBarrierOp::create(rb, loc, bar, phaseAfter);
+    Value clcResult = CLCLoadResultOp::create(rb, loc, resp);
+    Value isValid = CLCIsCanceledOp::create(rb, loc, clcResult);
+    Value x = CLCGetProgramIdOp::create(rb, loc, clcResult, 0);
+    Value y = CLCGetProgramIdOp::create(rb, loc, clcResult, 1);
+    Value z = CLCGetProgramIdOp::create(rb, loc, clcResult, 2);
+    if (emptyBar) {
+      // Remote mbarrier waits are illegal, so all CTAs arrive on rank zero's
+      // empty barrier and only rank zero waits on its local view above. Skip
+      // the final arrival when cancellation failed because the loop exits and
+      // the response storage will not be reused.
+      // TODO: Represent this response-buffer release with an explicit op that
+      // links resp and emptyBar, then let ProxyFenceInsertion place the fence.
+      FenceAsyncSharedOp::create(rb, loc, /*bCluster=*/false);
+      Value zero = arith::ConstantIntOp::create(rb, loc, 0, 32);
+      auto emptyBarTy = cast<ttg::MemDescType>(emptyBar.getType());
+      auto remoteBarTy = ttg::MemDescType::get(
+          emptyBarTy.getShape(), emptyBarTy.getElementType(),
+          emptyBarTy.getEncoding(),
+          SharedClusterMemorySpaceAttr::get(rb.getContext()),
+          emptyBarTy.getMutableMemory(), emptyBarTy.getAllocShape());
+      Value remoteEmptyBar =
+          MapToRemoteBufferOp::create(rb, loc, remoteBarTy, emptyBar, zero);
+      ArriveBarrierOp::create(rb, loc, remoteEmptyBar, /*count=*/1, isValid);
     }
+    read->replaceAllUsesWith(ValueRange{isValid, x, y, z});
     read->erase();
     issue->erase();
 

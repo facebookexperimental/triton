@@ -182,13 +182,19 @@ _attach_tile_id(DynamicPersistent1DScheduler)
 class ClcTileScheduler(TileScheduler):
     """Cluster Launch Control (Blackwell SM100+) dynamic persistent schedule.
 
-    The grid is over-subscribed (one cluster per tile); a program that finishes
-    early cancels a pending cluster and steals its tile. The scheduler carries the
-    *decoded* current tile ``(is_valid, x, y, z)``: the seed is this program's
-    static launch id, and every later tile comes from a single high-level
+    The grid is over-subscribed with one CTA per logical tile. With
+    ``ctas_per_cga``, PTX groups adjacent CTA coordinates into indivisible
+    clusters: one request atomically cancels a pending cluster, and each member
+    derives its program id from the returned first CTA coordinate plus its local
+    cluster coordinate. The scheduler carries the *decoded* current tile
+    ``(is_valid, x, y, z)``: the seed is this program's static launch id, and
+    every later tile comes from a single high-level
     ``ttng.clc_advance`` op (the response buffer, mbarrier, phase, and issue/wait
     overlap are all materialized by a later compiler lowering pass). ``num_tiles_fn``
-    / ``tile_counter`` are ignored -- CLC termination is hardware-driven.
+    / ``tile_counter`` are ignored -- CLC termination is hardware-driven. Grid
+    dimensions and logical tile geometry must be divisible by
+    ``ctas_per_cga``; inactive padded CTAs are unsupported, and all members must
+    reach ``advance`` uniformly.
     """
     _valid: tl.tensor
     _x: tl.tensor

@@ -350,6 +350,14 @@ private:
       llvm::SetVector<Value> bars;
       bars.insert(asyncCLCTryCancelOp.getMbarAlloc());
       return bars;
+    } else if (auto clcTryCancelOp = llvm::dyn_cast<ttng::CLCTryCancelOp>(op)) {
+      // The core Triton CLC scheduler also multicasts its response and
+      // completion signal when an explicit physical cluster is configured.
+      // All CTAs must finish initializing their local completion barriers
+      // before the lead CTA can issue the request.
+      llvm::SetVector<Value> bars;
+      bars.insert(clcTryCancelOp.getMbarrier());
+      return bars;
     } else if (auto tcgen5CommitOp = llvm::dyn_cast<ttng::TCGen5CommitOp>(op)) {
       // As of now, there're only three sources to have a tcgen05.commit
       // instruction:
