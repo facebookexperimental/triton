@@ -850,7 +850,9 @@ def _process_tile_mma_inner(
     if NUM_MMA_GROUPS == 1:
         tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase ^ 1)
 
-    # wait for current phase(round) of load for this buf
+    # In the single-group path B_smem_full_bars aliases A_smem_full_bars, so
+    # this one wait covers both TMA loads. Multi-group waits on B here and each
+    # A subtile below.
     tlx.barrier_wait(B_smem_full_bars[buf], phase)
 
     # Process first K iteration (peeled) with use_acc=False
@@ -859,10 +861,10 @@ def _process_tile_mma_inner(
         a_buf = group_id * NUM_SMEM_BUFFERS + buf
         acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
-        # Wait for this A subtile buffer to be loaded
-        tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
-
         if NUM_MMA_GROUPS > 1:
+            # Wait for this A subtile buffer to be loaded.
+            tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+
             cur_barrier_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
             tlx.barrier_wait(tmem_empty_bars[cur_barrier_idx], tmem_write_phase ^ 1)
 
@@ -897,7 +899,7 @@ def _process_tile_mma_inner(
             buf = 0
             phase ^= 1
 
-        # wait for current phase(round) of load for this buf
+        # In the single-group path this aliases the combined A/B full barrier.
         tlx.barrier_wait(B_smem_full_bars[buf], phase)
 
         # Process all subtiles for this K iteration
@@ -906,8 +908,9 @@ def _process_tile_mma_inner(
             a_buf = group_id * NUM_SMEM_BUFFERS + buf
             acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
-            # Wait for this A subtile buffer to be loaded
-            tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+            if NUM_MMA_GROUPS > 1:
+                # Wait for this A subtile buffer to be loaded.
+                tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
 
             # CTA0 waits for CTA0 and CTA1 to finish loading A and B before issuing dot op
             if NUM_CTAS == 2:
@@ -995,16 +998,16 @@ def _process_tile_producer_inner(
         offs_am = pid_m * BLOCK_SIZE_M
         if NUM_MMA_GROUPS == 1:
             tlx.barrier_wait(A_smem_empty_bars[buf], phase ^ 1)
-            tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
+            # Both TMA loads contribute bytes to the same full barrier.
+            a_expected_bytes: tl.constexpr = dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K
+            tlx.barrier_expect_bytes(A_smem_full_bars[buf], expected_bytes + a_expected_bytes)
             if not B_ROW_MAJOR:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
+                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], A_smem_full_bars[buf],
                                           eviction_policy="evict_last")
             else:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
+                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], A_smem_full_bars[buf],
                                           eviction_policy="evict_last")
 
-            tlx.barrier_wait(A_smem_empty_bars[buf], phase ^ 1)
-            tlx.barrier_expect_bytes(A_smem_full_bars[buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
             if not A_ROW_MAJOR:
                 tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_k, offs_am], A_smem_full_bars[buf],
                                           eviction_policy="evict_last")
@@ -1032,7 +1035,6 @@ def _process_tile_producer_inner(
                 tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
                                           eviction_policy="evict_last")
 
-            tlx.barrier_wait(A_smem_empty_bars[a1_buf], phase ^ 1)
             tlx.barrier_expect_bytes(A_smem_full_bars[a1_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
             if not A_ROW_MAJOR:
                 tlx.async_descriptor_load(
@@ -1215,7 +1217,11 @@ def matmul_kernel_tma_ws_blackwell(
     # NUM_SMEM_BUFFERS barriers per subtile for synchronization
     A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    if NUM_MMA_GROUPS == 1:
+        # A and B TMA loads share the same transaction-byte-counted barrier.
+        B_smem_full_bars = A_smem_full_bars
+    else:
+        B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
     if USE_WARP_BARRIER:
