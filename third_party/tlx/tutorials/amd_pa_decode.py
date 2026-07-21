@@ -63,6 +63,9 @@ def _pa_decode_partition_kernel(
     stride_lse_m,
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PAGES_PER_TILE: tl.constexpr,
+    BUFFER_DEPTH: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
     GROUP_POW2: tl.constexpr,
     QLEN: tl.constexpr,
@@ -83,6 +86,7 @@ def _pa_decode_partition_kernel(
     offs_g = tl.arange(0, GROUP_POW2)
     offs_ql = tl.arange(0, QLEN_POW2)
     offs_p = tl.arange(0, PAGE_SIZE)
+    offs_n = tl.arange(0, BLOCK_N)
     offs_m = tl.arange(0, M_POW2)
 
     # Load Q for this (seq, kv_head): [QLEN_POW2, GROUP_POW2, HEAD_DIM].
@@ -101,27 +105,45 @@ def _pa_decode_partition_kernel(
     l_i = tl.zeros([M_POW2], tl.float32)
     acc = tl.zeros([M_POW2, HEAD_DIM], tl.float32)
 
-    k_buf = tlx.local_alloc((PAGE_SIZE, HEAD_DIM), Kc.dtype.element_ty, BUF_DEPTH)
-    v_buf = tlx.local_alloc((PAGE_SIZE, HEAD_DIM), Vc.dtype.element_ty, BUF_DEPTH)
+    k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), Kc.dtype.element_ty, BUFFER_DEPTH)
+    v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), Vc.dtype.element_ty, BUFFER_DEPTH)
 
-    for pidx in tl.range(start_page, end_page):
-        slot = (pidx - start_page) % BUF_DEPTH
-        physical = tl.load(BlockTables + seq * stride_bt_s + pidx * stride_bt_p)
-        k_ptrs = (Kc + physical * stride_kc_b + kv_head * stride_kc_h + offs_p[:, None] * stride_kc_p +
-                  offs_d[None, :] * stride_kc_d)
-        v_ptrs = (Vc + physical * stride_vc_b + kv_head * stride_vc_h + offs_p[:, None] * stride_vc_p +
-                  offs_d[None, :] * stride_vc_d)
-        tok_k = tlx.async_load(k_ptrs, tlx.local_view(k_buf, slot))
-        tok_v = tlx.async_load(v_ptrs, tlx.local_view(v_buf, slot))
-        tlx.async_load_commit_group([tok_k, tok_v])
-        tlx.async_load_wait_group(0)
+    for pidx in tl.range(start_page, end_page, PAGES_PER_TILE):
+        slot = ((pidx - start_page) // PAGES_PER_TILE) % BUFFER_DEPTH
+        k_view = tlx.local_view(k_buf, slot)
+        v_view = tlx.local_view(v_buf, slot)
+        if PAGES_PER_TILE == 4:
+            logical_page = pidx + offs_n // PAGE_SIZE
+            safe_page = tl.minimum(logical_page, end_page - 1)
+            physical = tl.load(BlockTables + seq * stride_bt_s + safe_page * stride_bt_p)
+            page_row = offs_n % PAGE_SIZE
+            k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
+                      page_row[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
+            v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
+                      page_row[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
+            tlx.local_store(k_view, tl.load(k_ptrs))
+            tlx.local_store(v_view, tl.load(v_ptrs))
+            tl.debug_barrier()
+            kt = tlx.local_load(tlx.local_trans(k_view))
+            v = tlx.local_load(v_view)
+        else:
+            physical = tl.load(BlockTables + seq * stride_bt_s + pidx * stride_bt_p)
+            k_ptrs = (Kc + physical * stride_kc_b + kv_head * stride_kc_h + offs_p[:, None] * stride_kc_p +
+                      offs_d[None, :] * stride_kc_d)
+            v_ptrs = (Vc + physical * stride_vc_b + kv_head * stride_vc_h + offs_p[:, None] * stride_vc_p +
+                      offs_d[None, :] * stride_vc_d)
+            tok_k = tlx.async_load(k_ptrs, k_view)
+            tok_v = tlx.async_load(v_ptrs, v_view)
+            tlx.async_load_commit_group([tok_k, tok_v])
+            wait_tok = tlx.async_load_wait_group(0)
+            kt = tlx.local_load(tlx.local_trans(k_view), token=wait_tok)
+            v = tlx.local_load(v_view, token=wait_tok)
 
-        kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)))  # [HEAD_DIM, PAGE_SIZE]
-        v = tlx.local_load(tlx.local_view(v_buf, slot))  # [PAGE_SIZE, HEAD_DIM]
-
-        qk = tl.dot(q, kt)  # [M_POW2, PAGE_SIZE] fp32
-        kt_abs = pidx * PAGE_SIZE + offs_p  # absolute key index
-        vis = kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])
+        qk = tl.dot(q, kt)  # [M_POW2, BLOCK_N] fp32
+        kt_abs = pidx * PAGE_SIZE + offs_n  # absolute key index
+        split_end_token = end_page * PAGE_SIZE
+        vis = ((kt_abs[None, :] < split_end_token) &
+               (kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])))
         qk = tl.where(vis, qk * QK_SCALE, float("-inf"))
 
         m_ij = tl.max(qk, 1)
@@ -287,6 +309,9 @@ def pa_decode_tlx(
         lse.stride(3),
         HEAD_DIM=head_dim,
         PAGE_SIZE=page_size,
+        BLOCK_N=64 if page_size == 16 else page_size,
+        PAGES_PER_TILE=4 if page_size == 16 else 1,
+        BUFFER_DEPTH=1 if page_size == 16 else BUF_DEPTH,
         QUERY_GROUP_SIZE=query_group_size,
         GROUP_POW2=group_pow2,
         QLEN=query_length,
