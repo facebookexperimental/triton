@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
@@ -1024,6 +1025,16 @@ void init_triton_tlx_ir(py::module &&m) {
              threadId = self.create<arith::IndexCastOp>(
                  self.getBuilder().getI32Type(), threadId);
              return threadId;
+           })
+      .def("create_workgroup_barrier",
+           [](TritonOpBuilder &self) -> void {
+             // Fenced full-workgroup barrier, matching the AMD warp-pipeline
+             // emitClusterBarrier(needLocal=true): a local (LDS-fenced) barrier
+             // bracketed by SchedBarrier(0) guards so the instruction scheduler
+             // cannot hoist ops across the ping-pong cluster border.
+             self.create<ROCDL::SchedBarrier>(0);
+             self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
+             self.create<ROCDL::SchedBarrier>(0);
            })
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
