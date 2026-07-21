@@ -1530,15 +1530,6 @@ def padded_shared_parameters(
     source_op_index=None,
     source_value_id=None,
 ):
-    if tuple(layout.properties.get("order", ())) not in {(0, 1), (1, 0), (0, ), ()}:
-        _shared_layout_fail(
-            diagnostic,
-            stage,
-            f"unsupported padded shared order; {padded_shared_description(layout)}",
-            layout=layout,
-            source_op_index=source_op_index,
-            source_value_id=source_value_id,
-        )
     intervals = tuple(int(value) for value in layout.properties.get("intervals", ()))
     paddings = tuple(int(value) for value in layout.properties.get("paddings", ()))
     if len(intervals) != len(paddings):
@@ -1816,11 +1807,9 @@ def _linear_encoding_layout(
                     source_op_index=source_op_index,
                     source_value_id=source_value_id,
                 )
-    construction_shape = tuple(
-        max(int(shape[dim]), _minimum_linear_basis_extent(bases, dim)) for dim in range(rank))
-    linear = LinearLayout.from_bases(bases, out_dims, list(construction_shape), False)
-    return _ensure_layout_matches_shape(
-        linear,
+    return _linear_layout_from_bases_for_shape(
+        bases,
+        out_dims,
         shape,
         stage=stage,
         source_op_index=source_op_index,
@@ -1836,6 +1825,36 @@ def _minimum_linear_basis_extent(bases, dim):
             if value:
                 extent = max(extent, 1 << int(value).bit_length())
     return extent
+
+
+def _linear_layout_from_bases_for_shape(
+    bases,
+    out_dims,
+    shape,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    """Construct an explicit map before applying its tensor shape.
+
+    Triton may retain a parent encoding on broadcasted tensors whose singleton
+    dimensions are smaller than the encoding's bases.  LinearLayout validates
+    bases at construction time, so build the unshaped map at the minimum legal
+    extent and then apply the tensor shape in the same way as
+    combineCtaCgaWithShape.
+    """
+    shape = tuple(int(size) for size in shape)
+    construction_shape = tuple(
+        max(shape[dim], _minimum_linear_basis_extent(bases, dim)) for dim in range(len(shape)))
+    linear = LinearLayout.from_bases(bases, list(out_dims), list(construction_shape), False)
+    return _ensure_layout_matches_shape(
+        linear,
+        shape,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
 
 
 def _slice_linear_layout(
@@ -1897,7 +1916,14 @@ def _slice_linear_layout(
             basis = tuple(int(value) for value in basis)
             projected.append([basis[parent_dim_to_basis_index[parent_dim]] for parent_dim in kept_parent_dims])
         bases.append((in_dim, projected))
-    return LinearLayout.from_bases(bases, out_dims, list(shape), False)
+    return _linear_layout_from_bases_for_shape(
+        bases,
+        out_dims,
+        shape,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
 
 
 def _project_explicit_linear_slice_layout(
@@ -1931,7 +1957,14 @@ def _project_explicit_linear_slice_layout(
                 continue
             projected.append(projected_basis)
         bases.append((in_dim, projected))
-    return LinearLayout.from_bases(bases, out_dims, list(shape), False)
+    return _linear_layout_from_bases_for_shape(
+        bases,
+        out_dims,
+        shape,
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
 
 
 def _mfma_linear_layout(

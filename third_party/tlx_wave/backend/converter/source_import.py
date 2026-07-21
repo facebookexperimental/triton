@@ -16,7 +16,13 @@ from .source_ir import (
 STAGE = "import"
 
 
-def import_source_program(mod, kernel_name=None):
+def import_source_program(
+    mod,
+    kernel_name=None,
+    *,
+    compiler_membar_barriers=(),
+):
+    compiler_membar_barriers = frozenset(compiler_membar_barriers)
     kernel_name = _resolve_kernel_name(mod, kernel_name)
     fn = mod.get_function(kernel_name)
     if fn is None:
@@ -67,6 +73,7 @@ def import_source_program(mod, kernel_name=None):
         values,
         parent_op_index=None,
         region_index=None,
+        compiler_membar_barriers=compiler_membar_barriers,
     )
 
     kernel = KernelInfo(
@@ -129,6 +136,7 @@ def _collect_region(
     *,
     parent_op_index,
     region_index,
+    compiler_membar_barriers,
 ):
     region_id = len(regions)
     regions.append(None)
@@ -171,13 +179,17 @@ def _collect_region(
                     values,
                     parent_op_index=op_index,
                     region_index=child_index,
+                    compiler_membar_barriers=compiler_membar_barriers,
                 ) for child_index in range(op.get_num_regions()))
+            attrs = _source_attrs(op)
+            if op in compiler_membar_barriers:
+                attrs["tlx.compiler_membar_barrier"] = True
             source_op = SourceOp(
                 op_index,
                 op.get_name(),
                 tuple(_value_id(op.get_operand(i)) for i in range(op.get_num_operands())),
                 tuple(_value_id(op.get_result(i)) for i in range(op.get_num_results())),
-                _source_attrs(op),
+                attrs,
                 child_region_ids,
                 region_id,
                 parent_op_index,

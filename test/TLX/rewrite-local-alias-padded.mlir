@@ -18,6 +18,25 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
 
 // -----
 
+#padded_pinned = #ttg.padded_shared<[512:+8] {order = [1, 0], shape = [32, 512]}>
+#user_padded = #tlx.user_layout<#padded_pinned>
+#smem2 = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // A layout pin is propagation metadata; it must not hide the wrapped
+  // layout's physical padding from alias sizing or reinterpret verification.
+  // CHECK-LABEL: @pinned_padded_alias
+  tt.func public @pinned_padded_alias() {
+    // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x32x512xf16, #[[$PINNED:.*]], #smem, mutable>
+    %a = ttg.local_alloc : () -> !ttg.memdesc<2x32x512xf16, #user_padded, #smem2, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[ALLOC]] {tlx.allow_different_padding_pattern} : !ttg.memdesc<2x32x512xf16, #[[$PINNED]], #smem, mutable> -> !ttg.memdesc<2x32x512xf16, #[[$PINNED]], #smem, mutable>
+    %alias = tlx.local_alias %a : !ttg.memdesc<2x32x512xf16, #user_padded, #smem2, mutable> -> !ttg.memdesc<2x32x512xf16, #user_padded, #smem2, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #padded_a_small = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
 #padded_c_small = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [32, 32]}>
 #smem1 = #ttg.shared_memory
