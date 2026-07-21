@@ -53,6 +53,27 @@ static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
                                                CTAOrder);
 }
 
+// Construct a CGA layout from Gluon's explicit block bases.  AMD MFMA layouts
+// carry this linear component even for a single CTA; dropping it silently
+// changes the ownership contract when a caller supplies a multi-CTA layout.
+static ttg::CGAEncodingAttr
+makeCGALayoutFromBases(mlir::MLIRContext *ctx,
+                       const std::vector<std::vector<int32_t>> &cgaBases,
+                       unsigned rank) {
+  if (cgaBases.empty())
+    return ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
+  for (const auto &basis : cgaBases)
+    if (basis.size() != rank)
+      throw std::runtime_error(
+          "make_amd_mfma_encoding_attr: cga layout basis rank mismatch");
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+  tt::LinearLayout::BasesT bases;
+  bases[kBlock] = cgaBases;
+  auto outDims = tt::standardOutDimNames(ctx, rank);
+  return ttg::CGAEncodingAttr::get(ctx,
+                                   tt::LinearLayout(std::move(bases), outDims));
+}
+
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -134,6 +155,68 @@ void init_triton_tlx_ir(py::module &&m) {
             }
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false)
+      .def("create_convert_layout",
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+             auto srcType = dyn_cast<RankedTensorType>(v.getType());
+             if (!srcType)
+               throw std::runtime_error(
+                   "create_convert_layout expects a ranked tensor");
+             // TLX register layouts are wrapped in no_verify while the AMD
+             // pass establishes the target's 64-lane module context. Keep the
+             // wrapper on this result until placeholder/layout resolution;
+             // unwrapping here makes the early verifier interpret the layout
+             // with Triton's 32-lane default and reject a valid CDNA4 target.
+             auto targetEncoding = encoding;
+             auto resultType = RankedTensorType::get(
+                 srcType.getShape(), srcType.getElementType(), targetEncoding);
+             return self.create<ttg::ConvertLayoutOp>(resultType, v);
+           })
+      .def("create_cast_with_layout",
+           [](TritonOpBuilder &self, Value &v,
+              Type &targetElementType) -> Value {
+             auto srcType = dyn_cast<RankedTensorType>(v.getType());
+             if (!srcType)
+               throw std::runtime_error(
+                   "create_cast_with_layout expects a ranked tensor");
+             auto srcFloat = dyn_cast<FloatType>(srcType.getElementType());
+             auto dstFloat = dyn_cast<FloatType>(targetElementType);
+             if (!srcFloat || !dstFloat)
+               throw std::runtime_error(
+                   "create_cast_with_layout expects floating-point types");
+             auto resultType = RankedTensorType::get(
+                 srcType.getShape(), targetElementType, srcType.getEncoding());
+             if (srcFloat == dstFloat)
+               return v;
+             if (srcFloat.getWidth() < dstFloat.getWidth())
+               return self.create<arith::ExtFOp>(resultType, v);
+             if (srcFloat.getWidth() > dstFloat.getWidth())
+               return self.create<arith::TruncFOp>(resultType, v);
+
+             // BF16 and FP16 are both 16-bit, but they are not bit-compatible.
+             // Route the equal-width conversion through F32 so the result is a
+             // real floating-point conversion while retaining the source
+             // register ownership on both intermediate tensors.
+             auto f32Type = self.getBuilder().getF32Type();
+             auto widenedType = RankedTensorType::get(
+                 srcType.getShape(), f32Type, srcType.getEncoding());
+             auto widened = self.create<arith::ExtFOp>(widenedType, v);
+             return self.create<arith::TruncFOp>(resultType, widened);
+           })
+      .def(
+          "create_splat_with_layout",
+          [](TritonOpBuilder &self, std::vector<int64_t> shape,
+             Type &elementType, Attribute &encoding, Value &scalar) -> Value {
+            // Constants created with an explicit MFMA/dot layout are a
+            // genuine layout anchor, not a late metadata retag.  Defer the
+            // normal tensor-layout verifier until placeholder resolution,
+            // matching the existing TLX require/local-load APIs.
+            Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
+            auto resultType =
+                RankedTensorType::get(shape, elementType, tensorEncoding);
+            return self.createOrFold<tt::SplatOp>(resultType, scalar);
+          },
+          py::arg("shape"), py::arg("elementType"), py::arg("encoding"),
+          py::arg("scalar"))
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
@@ -165,6 +248,21 @@ void init_triton_tlx_ir(py::module &&m) {
             auto subViewType = cast<ttg::MemDescType>(subView.getType());
             RankedTensorType newType;
             if (layoutEncoding.has_value()) {
+              // CDNA MFMA dot operands are concrete hardware encodings.  Keep
+              // them bare so tt.dot's verifier sees DotOperandEncodingAttr
+              // directly; wrapping one in #tlx.user_layout would hide the
+              // operand parent and make the dot unverifiable during TTIR.
+              bool isAmdMfmaDot = false;
+              if (auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(
+                      layoutEncoding.value()))
+                isAmdMfmaDot = isa<ttg::AMDMfmaEncodingAttr>(dot.getParent());
+              if (isAmdMfmaDot) {
+                newType = RankedTensorType::get(subViewType.getShape(),
+                                                subViewType.getElementType(),
+                                                layoutEncoding.value());
+                return self.create<ttg::LocalLoadOp>(
+                    newType, subView, asyncToken.value_or(Value()));
+              }
               // Pin the load result to the requested register layout, wrapped
               // as a user layout (#tlx.user_layout). The wrapper carries
               // PinnedEncodingTrait so remove-layout-conversions anchors the
@@ -307,6 +405,37 @@ void init_triton_tlx_ir(py::module &&m) {
              return mlir::cast<Attribute>(ttg::PaddedSharedEncodingAttr::get(
                  context, intervalPads, std::move(ll)));
            })
+      .def("make_shared_linear_encoding_attr",
+           [](TritonOpBuilder &self,
+              std::vector<std::vector<int32_t>> offsetBases,
+              std::vector<std::vector<int32_t>> blockBases,
+              unsigned alignment) {
+             if (offsetBases.empty() || offsetBases.front().empty())
+               throw std::runtime_error("make_shared_linear_encoding_attr: "
+                                        "offset bases must be non-empty");
+             const size_t rank = offsetBases.front().size();
+             for (const auto &basis : offsetBases)
+               if (basis.size() != rank)
+                 throw std::runtime_error("make_shared_linear_encoding_attr: "
+                                          "offset basis rank mismatch");
+             for (const auto &basis : blockBases)
+               if (basis.size() != rank)
+                 throw std::runtime_error("make_shared_linear_encoding_attr: "
+                                          "block basis rank mismatch");
+             auto context = self.getBuilder().getContext();
+             auto kOffset = mlir::StringAttr::get(context, "offset");
+             auto kBlock = mlir::StringAttr::get(context, "block");
+             llvm::SmallVector<mlir::StringAttr> outDimNames;
+             for (size_t i = 0; i < rank; ++i)
+               outDimNames.push_back(
+                   mlir::StringAttr::get(context, "dim" + llvm::Twine(i)));
+             tt::LinearLayout::BasesT bases;
+             bases[kOffset] = std::move(offsetBases);
+             bases[kBlock] = std::move(blockBases);
+             tt::LinearLayout ll(std::move(bases), std::move(outDimNames));
+             return mlir::cast<Attribute>(ttg::SharedLinearEncodingAttr::get(
+                 context, std::move(ll), alignment));
+           })
       .def("make_tensor_memory_encoding_attr",
            [](TritonOpBuilder &self, unsigned blockM, unsigned blockN,
               unsigned colStride, unsigned CTASplitM, unsigned CTASplitN,
@@ -394,6 +523,33 @@ void init_triton_tlx_ir(py::module &&m) {
                     "dot operand parent must be a distributed layout");
              return tlx::wrapNoVerifyLayout(ttg::DotOperandEncodingAttr::get(
                  context, opIdx, parent, eltType));
+           })
+      .def("make_dot_operand_encoding_attr_with_type",
+           [](TritonOpBuilder &self, unsigned opIdx, Attribute parentEnc,
+              unsigned kWidth) -> Attribute {
+             auto context = self.getBuilder().getContext();
+             auto parent = tlx::unwrapNoVerifyLayout(parentEnc);
+             assert(isa<ttg::DistributedEncodingTrait>(parent) &&
+                    "dot operand parent must be a distributed layout");
+             return mlir::cast<Attribute>(ttg::DotOperandEncodingAttr::get(
+                 context, opIdx, parent, kWidth));
+           })
+      .def("make_amd_mfma_encoding_attr",
+           [](TritonOpBuilder &self, unsigned version,
+              std::vector<unsigned> warpsPerCta,
+              std::vector<unsigned> instrShape, bool transposed,
+              std::vector<std::vector<int32_t>> cgaBases,
+              std::vector<unsigned> tilesPerWarp,
+              unsigned elementBitWidth) -> Attribute {
+             if (warpsPerCta.empty() || instrShape.size() != 3)
+               throw std::runtime_error("make_amd_mfma_encoding_attr: invalid "
+                                        "rank or instruction shape");
+             auto context = self.getBuilder().getContext();
+             auto cgaLayout =
+                 makeCGALayoutFromBases(context, cgaBases, warpsPerCta.size());
+             return mlir::cast<Attribute>(ttg::AMDMfmaEncodingAttr::get(
+                 context, version, warpsPerCta, instrShape, transposed,
+                 cgaLayout, tilesPerWarp, elementBitWidth));
            })
       .def("make_linear_encoding_attr",
            [](TritonOpBuilder &self, std::vector<std::vector<int>> regBases,
@@ -728,18 +884,22 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int64_t> shape) -> mlir::Value {
              return self.create<ttg::MemDescReshapeOp>(src, shape);
            })
-      .def("create_memdesc_reinterpret",
-           [](TritonOpBuilder &self, Value &src, Type &newElementType,
-              std::vector<int64_t> newShape) -> mlir::Value {
-             auto oldType = cast<ttg::MemDescType>(src.getType());
-             assert(oldType && "Expect MemDescType for src");
-             auto encoding = oldType.getEncoding();
+      .def(
+          "create_memdesc_reinterpret",
+          [](TritonOpBuilder &self, Value &src, Type &newElementType,
+             std::vector<int64_t> newShape,
+             std::optional<Attribute> newEncoding) -> mlir::Value {
+            auto oldType = cast<ttg::MemDescType>(src.getType());
+            assert(oldType && "Expect MemDescType for src");
+            auto encoding = newEncoding.value_or(oldType.getEncoding());
 
-             auto newType = ttg::MemDescType::get(
-                 newShape, newElementType, encoding, oldType.getMemorySpace(),
-                 oldType.getMutableMemory());
-             return self.create<ttg::MemDescReinterpretOp>(newType, src);
-           })
+            auto newType = ttg::MemDescType::get(
+                newShape, newElementType, encoding, oldType.getMemorySpace(),
+                oldType.getMutableMemory());
+            return self.create<ttg::MemDescReinterpretOp>(newType, src);
+          },
+          py::arg("src"), py::arg("newElementType"), py::arg("newShape"),
+          py::arg("newEncoding") = std::nullopt)
       .def("get_memdesc_type",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,

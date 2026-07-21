@@ -7,6 +7,15 @@ import triton.language.extra.tlx as tlx
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+
+def test_amd_mfma_tiles_per_warp_uses_warp_rank():
+    """MFMA tile factors follow Gluon's two-axis warp configuration."""
+    default = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1])
+    tiled = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1], tiles_per_warp=[2, 2])
+    assert default.tiles_per_warp == [1, 1]
+    assert tiled.tiles_per_warp == [2, 2]
+
+
 # The FA4 "separable" layout for a 128x128 TMEM tile, written purely as
 # shape/stride (a CuTe thread-value layout). The two top-level modes are
 # (thread, value); strides are flat row-major offsets into the tile
@@ -89,6 +98,117 @@ def _pinned_fma_helper(a, b, c):
 # forward softmax kernel's pinned QK layout).
 def _row_per_thread_layout():
     return tlx.layout(shape=((32, 4), (128, )), stride=((128, 4096), (1, )))
+
+
+def _cdna4_qdo_layout():
+    # The BM16/D128 direct-to-LDS ownership used by the exact FA kernel: 256
+    # threads (four 64-lane warps) each own eight contiguous BF16 values.
+    return tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 64, 1024, 512, 128, 256), (1, 2, 4)),
+    )
+
+
+def _cdna4_qdo_alt_layout():
+    # Same tile cardinality as _cdna4_qdo_layout, with the final two lane
+    # bases exchanged. This is intentionally non-trivial so a conversion
+    # cannot be folded as an identity.
+    return tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
+        stride=((8, 16, 32, 64, 512, 1024, 128, 256), (1, 2, 4)),
+    )
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need CDNA4")
+def test_convert_layout_emits_real_register_conversion():
+    """TLX convert_layout must create a physical ttg.convert_layout.
+
+    ``require_layout`` only changes the metadata on a value and is therefore
+    unsuitable for an output epilogue that needs a different lane ownership.
+    This test keeps that distinction explicit: the target layout must survive
+    TTIR lowering as a real conversion operation.
+    """
+
+    @triton.jit
+    def kernel(ptr, LAYOUT: tl.constexpr, SINK: tl.constexpr):
+        rows = tl.arange(0, 16)[:, None]
+        cols = tl.arange(0, 128)[None, :]
+        offsets = rows * 128 + cols
+        value = tl.load(ptr + offsets)
+        value = tlx.require_layout(value, LAYOUT)
+        converted = tlx.convert_layout(value, SINK)
+        # Stores consume an ordinary unresolved Triton block; explicitly
+        # release the converted ownership at that boundary.
+        tl.store(ptr + offsets, tlx.release_layout(converted))
+
+    compiled = kernel.warmup(torch.empty((16, 128), device=DEVICE, dtype=torch.bfloat16), _cdna4_qdo_layout(),
+                             _cdna4_qdo_alt_layout(), grid=(1, ), num_warps=4)
+    assert "ttg.convert_layout" in compiled.asm["ttir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need CDNA4")
+def test_convert_layout_accepts_mfma_cast_epilogue_on_cdna4():
+    """A cast MFMA accumulator can feed the physical output conversion."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1])
+    vector = tlx.layout(
+        shape=((2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 2048, 4096, 128, 256), (1, 2, 4, 1024, 512, 8192, 16384)),
+    )
+
+    @triton.jit
+    def kernel(ptr, MMA: tl.constexpr, VECTOR: tl.constexpr):
+        acc = tlx.zeros((256, 128), tl.float32, layout=MMA)
+        rows = tl.arange(0, 256)[:, None]
+        cols = tl.arange(0, 128)[None, :]
+        value = tlx.require_layout(tl.load(ptr + rows * 128 + cols), MMA)
+        value = tlx.require_layout(tlx.release_layout(value).to(tl.float32), MMA)
+        cast = tlx.cast_layout(value + acc, tl.bfloat16)
+        out = tlx.convert_layout(cast, VECTOR)
+        tl.store(ptr + tl.arange(0, 256)[:, None] * 128 + tl.arange(0, 128)[None, :], tlx.release_layout(out))
+
+    compiled = kernel.warmup(torch.empty((256, 128), device=DEVICE, dtype=torch.bfloat16), mma, vector, grid=(1, ),
+                             num_warps=4)
+    assert "ttg.convert_layout" in compiled.asm["ttir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need CDNA4")
+def test_cast_layout_accepts_equal_width_float_types_on_cdna4():
+    """Equal-width BF16/FP16 casts preserve the explicit register layout."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [4, 1])
+
+    @triton.jit
+    def kernel(src_bf16, src_f16, dst_same_bf16, dst_from_f16, dst_same_f16, MMA: tl.constexpr):
+        rows = tl.arange(0, 256)[:, None]
+        cols = tl.arange(0, 128)[None, :]
+        offsets = rows * 128 + cols
+        bf16 = tlx.require_layout(tl.load(src_bf16 + offsets), MMA)
+        f16 = tlx.require_layout(tl.load(src_f16 + offsets), MMA)
+        same_bf16 = tlx.cast_layout(bf16, tl.bfloat16)
+        from_f16 = tlx.cast_layout(f16, tl.bfloat16)
+        same_f16 = tlx.cast_layout(f16, tl.float16)
+        tl.store(dst_same_bf16 + offsets, tlx.release_layout(same_bf16))
+        tl.store(dst_from_f16 + offsets, tlx.release_layout(from_f16))
+        tl.store(dst_same_f16 + offsets, tlx.release_layout(same_f16))
+
+    numel = 256 * 128
+    values = torch.linspace(-1.0, 1.0, numel, device=DEVICE, dtype=torch.float32)
+    src_bf16 = values.reshape(256, 128).to(torch.bfloat16)
+    src_f16 = (values * 0.75 + 0.125).reshape(256, 128).to(torch.float16)
+    dst_same_bf16 = torch.full_like(src_bf16, float("nan"))
+    dst_from_f16 = torch.full_like(src_bf16, float("nan"))
+    dst_same_f16 = torch.full_like(src_f16, float("nan"))
+    kernel[(1, )](
+        src_bf16,
+        src_f16,
+        dst_same_bf16,
+        dst_from_f16,
+        dst_same_f16,
+        mma,
+        num_warps=4,
+    )
+    torch.testing.assert_close(dst_same_bf16, src_bf16, atol=0, rtol=0)
+    torch.testing.assert_close(dst_from_f16, src_f16.to(torch.bfloat16), atol=0, rtol=0)
+    torch.testing.assert_close(dst_same_f16, src_f16, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
@@ -683,6 +803,235 @@ def test_with_bases_builds_swizzled_padded_encoding():
     assert enc.offset_bases == _A16W16_SHARED_OFFSET_BASES
     assert enc.block_bases == []
     assert enc.shape == _A16W16_TILE
+
+
+def test_shared_linear_layout_records_gluon_k_tile_mapping():
+    """TLX exposes Gluon's explicit row-major shared-memory mapping."""
+    bases = [
+        [0, 1],
+        [0, 2],
+        [0, 4],
+        [0, 8],
+        [1, 0],
+        [2, 0],
+        [4, 0],
+        [8, 0],
+        [0, 16],
+        [0, 32],
+        [0, 64],
+        [16, 0],
+        [32, 0],
+    ]
+    layout = tlx.shared_linear_layout_encoding(offset_bases=bases, block_bases=[], alignment=16)
+    assert layout.offset_bases == bases
+    assert layout.block_bases == []
+    assert layout.alignment == 16
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_shared_linear_layout_lowers_on_cdna4():
+    """The Gluon K-tile mapping lowers to a native shared_linear attribute."""
+    bases = [
+        [0, 1],
+        [0, 2],
+        [0, 4],
+        [0, 8],
+        [1, 0],
+        [2, 0],
+        [4, 0],
+        [8, 0],
+        [0, 16],
+        [0, 32],
+        [0, 64],
+        [16, 0],
+        [32, 0],
+    ]
+    layout = tlx.shared_linear_layout_encoding(bases, [], 16)
+
+    @triton.jit
+    def kernel(PAD: tl.constexpr):
+        buf = tlx.local_alloc((64, 128), tl.bfloat16, 1, layout=PAD)
+        view = tlx.local_view(buf, 0)
+        x = tlx.local_load(view)
+        tlx.local_store(view, x)
+
+    ttgir = kernel.warmup(layout, grid=(1, ), num_warps=4).asm["ttgir"]
+    assert "#ttg.shared_linear" in ttgir
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_shared_linear_raw_physical_stage_compiles_on_cdna4():
+    """A row-major rank-3 physical image can be written by direct-to-LDS."""
+    raw_bases = [
+        [0, 0, 1],
+        [0, 0, 2],
+        [0, 0, 4],
+        [0, 1, 0],
+        [0, 2, 0],
+        [0, 4, 0],
+        [0, 8, 0],
+        [1, 0, 0],
+        [2, 0, 0],
+        [4, 0, 0],
+        [8, 0, 0],
+        [16, 0, 0],
+        [32, 0, 0],
+        [64, 0, 0],
+        [128, 0, 0],
+    ]
+    raw_layout = tlx.shared_linear_layout_encoding(raw_bases, [], 16)
+    k_layout = tlx.shared_linear_layout_encoding([
+        [0, 1],
+        [0, 2],
+        [0, 4],
+        [0, 8],
+        [0, 64],
+        [1, 0],
+        [2, 0],
+        [4, 0],
+        [8, 64],
+        [0, 16],
+        [0, 32],
+        [16, 0],
+        [32, 0],
+        [64, 0],
+        [128, 0],
+    ], [], 16)
+    raw_async_layout = tlx.layout(
+        # 256 threads cover the N dimension (six lane bits plus two warp
+        # bits), while each thread owns 128 values: seven register bits for
+        # Dgroup/V.  The final value mode is the N bit at 128.
+        shape=((64, 4), (8, 8, 2)),
+        stride=((8, 512), (1, 2048, 16384)),
+    )
+
+    @triton.jit
+    def kernel(X, Y, RAW: tl.constexpr, K_LAYOUT: tl.constexpr):
+        rows = tl.arange(0, 256)
+        groups = tl.arange(0, 16)
+        values = tl.arange(0, 8)
+        offsets = (rows[:, None, None] * 128 + groups[None, :, None] * 8 + values[None, None, :])
+        mask = rows[:, None, None] < 256
+        mask = tl.broadcast_to(mask, offsets.shape)
+        offsets = tlx.require_layout(offsets, raw_async_layout)
+        mask = tlx.require_layout(mask, raw_async_layout)
+        buf = tlx.local_alloc((256, 16, 8), tl.bfloat16, 1, layout=RAW)
+        token = tlx.buffer_load_to_local(
+            tlx.local_view(buf, 0), X, offsets,
+            # Every row is valid in this compiler probe, so no fallback value
+            # is needed; a scalar `other` would otherwise carry a default
+            # register layout that the AMD verifier correctly rejects.
+            mask=mask)
+        tlx.async_load_commit_group([token])
+        wait = tlx.async_load_wait_group(0)
+        # The rank-3 physical image is reinterpreted as the rank-2 K tile
+        # without copying; this is the descriptor half of Gluon's
+        # direct-to-LDS transpose-read staging.
+        k_view = tlx.local_reinterpret(tlx.local_view(buf, 0), tl.bfloat16, [256, 128], layout=K_LAYOUT)
+        x = tlx.local_load(k_view, token=wait)
+        x = tl.sum(x.to(tl.float32), axis=1)
+        tl.store(Y + rows, x)
+
+    x = torch.zeros((256 * 128, ), device=DEVICE, dtype=torch.bfloat16)
+    y = torch.zeros((256, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(x, y, raw_layout, k_layout, grid=(1, ), num_warps=4)
+    assert "#ttg.shared_linear" in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_amd_mfma_layout_anchors_and_releases_on_cdna4():
+    """The Gluon MFMA/dot layout handles lower even outside a dot body.
+
+    This is a compiler/API probe, not a performance claim: the FA pipeline
+    keeps the generic register layout until TLX can form compatible C and
+    transposed dS operands for the full dot chain.
+    """
+    shared = tlx.padded_shared_layout_encoding.with_bases(
+        [(1024, 32)],
+        [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ],
+        [256, 128],
+    )
+    mma = tlx.amd_mfma_layout(4, [16, 16, 32], True, [4, 1])
+    dot0 = tlx.dot_operand_layout(0, mma, 8)
+
+    @triton.jit
+    def kernel(X, Y, SHARED: tl.constexpr, DOT0: tl.constexpr, MMA: tl.constexpr):
+        buf = tlx.local_alloc((256, 128), tl.bfloat16, 1, layout=SHARED)
+        view = tlx.local_view(buf, 0)
+        tlx.local_store(view, tl.zeros((256, 128), tl.bfloat16))
+        x = tlx.local_load(view, layout=DOT0)
+        x = tlx.release_layout(x)
+        rows = tl.arange(0, 256)
+        cols = tl.arange(0, 128)
+        tl.store(Y + rows[:, None] * 128 + cols[None, :], x)
+        acc = tlx.zeros((256, 16), tl.float32, layout=MMA)
+        acc = tlx.release_layout(acc)
+        cols_acc = tl.arange(0, 16)
+        tl.store(Y + 256 * 128 + rows[:, None] * 16 + cols_acc[None, :], acc)
+
+    x = torch.zeros((256 * 128, ), device=DEVICE, dtype=torch.bfloat16)
+    y = torch.zeros((256 * 128 + 256 * 16, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(x, y, shared, dot0, mma, grid=(1, ), num_warps=4)
+    ttir = compiled.asm["ttir"]
+    ttgir = compiled.asm["ttgir"]
+    # The final AMD layout cleanup is allowed to release both layouts at the
+    # store boundary; the constructor/anchor contract is visible in TTIR.
+    assert "#ttg.amd_mfma" in ttir
+    assert "#ttg.dot_op" in ttir
+    assert "#tlx.user_layout" not in ttgir
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_tlx_mfma_preserves_explicit_accumulator_layout_on_cdna4():
+    """The TLX MFMA wrapper must keep the concrete accumulator layout live.
+
+    Standard ``tl.dot`` returns an unresolved block tensor even when its
+    accumulator is explicitly pinned.  The AMD MFMA builtin instead mirrors
+    Gluon's ``gl.amd.mfma`` contract and returns the accumulator's layout, so
+    the score dot can feed elementwise operations without an unresolved
+    blocked-to-MFMA materialization.
+    """
+    mma = tlx.amd_mfma_layout(4, [16, 16, 32], True, [4, 1])
+    dot0 = tlx.dot_operand_layout(0, mma, 8)
+    dot1 = tlx.dot_operand_layout(1, mma, 8)
+    shared = tlx.swizzled_shared_layout_encoding.make_default(2)
+
+    @triton.jit
+    def kernel(X, Y, SHARED: tl.constexpr, DOT0: tl.constexpr, DOT1: tl.constexpr, MMA: tl.constexpr):
+        a_buf = tlx.local_alloc((256, 128), tl.bfloat16, 1, layout=SHARED)
+        b_buf = tlx.local_alloc((128, 16), tl.bfloat16, 1, layout=SHARED)
+        tlx.local_store(tlx.local_view(a_buf, 0), tl.zeros((256, 128), tl.bfloat16))
+        tlx.local_store(tlx.local_view(b_buf, 0), tl.zeros((128, 16), tl.bfloat16))
+        a = tlx.local_load(tlx.local_view(a_buf, 0), layout=DOT0)
+        b = tlx.local_load(tlx.local_view(b_buf, 0), layout=DOT1)
+        acc = tlx.zeros((256, 16), tl.float32, layout=MMA)
+        out = tlx.mfma(a, b, acc)
+        out = tlx.release_layout(out)
+        rows = tl.arange(0, 256)
+        cols = tl.arange(0, 16)
+        tl.store(Y + rows[:, None] * 16 + cols[None, :], out)
+
+    x = torch.zeros((256 * 128, ), device=DEVICE, dtype=torch.bfloat16)
+    y = torch.zeros((256 * 16, ), device=DEVICE, dtype=torch.float32)
+    compiled = kernel.warmup(x, y, shared, dot0, dot1, mma, grid=(1, ), num_warps=4)
+    assert "#ttg.amd_mfma" in compiled.asm["ttir"]
+    assert "#tlx.no_verify_layout" not in compiled.asm["ttgir"]
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")

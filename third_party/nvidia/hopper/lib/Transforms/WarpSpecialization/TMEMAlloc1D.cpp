@@ -197,10 +197,9 @@ LogicalResult generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
   return success();
 }
 
-ttg::MemDescReinterpretOp
-sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
-                          Operation *allocOp, Operation *newAlloc,
-                          Operation *user, int offset) {
+Operation *sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+                                     Operation *allocOp, Operation *newAlloc,
+                                     Operation *user, int offset) {
   // This function is TMEM-specific - verify both allocations are TMEM
   if (!isa<ttng::TMEMAllocOp>(allocOp)) {
     LDBG("sliceAndReinterpretMDTMEM called with non-TMEM allocOp");
@@ -229,45 +228,118 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto newShape = newType.getShape();
   auto blockN = newShape[shape.size() - 1];
 
-  // Validate the allocation is valid before attempting to create subslice
-  if (oldBlockN < blockN || oldBlockN % blockN != 0 ||
-      (offset + blockN) > oldBlockN) {
-    // Cannot use this TMEM allocation - return nullptr to signal failure
-    // Caller should try another TMEM allocation or fall back to SMEM
-    LDBG("TMEM allocation validation failed: oldBlockN="
-         << oldBlockN << ", blockN=" << blockN << ", offset=" << offset);
-    return nullptr;
-  }
-
-  // We convert from allocOp's type to another allocOp's type.
-  // When the data type is different, we need to construct another TMEMDesc. For
-  // example from 128x128xf32 to 128x128xbf16, we subslice to 128x64xf32, then
-  // reinterpret to 128x64xbf16.
-  auto tmemDesc = createTMEMDesc(builder, newType, newShape[shape.size() - 2],
-                                 newShape[shape.size() - 1]);
-  // slice from oldBlockN to blockN
+  // The source allocation is measured in its physical TMEM columns.  A
+  // narrower destination element type consumes fewer source columns, matching
+  // the subslice width below.
   auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
   auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
+  int64_t sliceCols = blockN;
   if (oldElemTyWidth == elemTyWidth * 2) {
-    auto subSlice = ttng::TMEMSubSliceOp::create(
-        builder, allocOp->getLoc(), allocResult, offset, blockN / 2);
-    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
-                                             tmemDesc, subSlice);
-  } else if (elemTyWidth == oldElemTyWidth) {
-    auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
-                                                 allocResult, offset, blockN);
-    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
-                                             tmemDesc, subSlice);
-  } else {
+    sliceCols = blockN / 2;
+  } else if (elemTyWidth != oldElemTyWidth) {
     // Unsupported element type conversion
     return nullptr;
   }
+
+  // Validate the allocation before materializing the parent view and subslice.
+  if (sliceCols <= 0 || oldBlockN < sliceCols || oldBlockN % sliceCols != 0 ||
+      (offset + sliceCols) > oldBlockN) {
+    LDBG("TMEM allocation validation failed: oldBlockN="
+         << oldBlockN << ", blockN=" << blockN << ", sliceCols=" << sliceCols
+         << ", offset=" << offset);
+    return nullptr;
+  }
+
+  // Reinterpret the complete representative allocation first.  Reinterpreting
+  // the subslice directly hides its offset in the source type and is rejected
+  // by MemDescReinterpretOp's parent-only verifier rule.  For f16 packed in an
+  // f32 allocation, the parent destination is twice as wide in logical
+  // elements and the subslice offset is converted to those units.
+  int64_t parentBlockN = oldBlockN;
+  int64_t subsliceOffset = offset;
+  if (oldElemTyWidth == elemTyWidth * 2) {
+    subsliceOffset *= 2;
+  }
+  // Keep the destination tile's blockN/colStride encoding while extending its
+  // logical shape for the parent view.  Passing parentBlockN to
+  // createTMEMDesc would also enlarge the encoding blockN, which changes the
+  // physical footprint instead of merely exposing the full parent.
+  auto newTmemEncoding =
+      cast<ttng::TensorMemoryEncodingAttr>(newType.getEncoding());
+  auto getStorageBits = [](ttg::MemDescType ty) {
+    auto rank = cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank();
+    auto shape = ty.getAllocShape().take_back(rank);
+    auto layout = ttg::toLinearLayout(shape, ty.getEncoding());
+    int64_t copies = 1;
+    for (int64_t dim : ty.getAllocShape().drop_back(rank))
+      copies *= dim;
+    auto col = StringAttr::get(ty.getContext(), "col");
+    return copies * layout.getInDimSize(col) * ty.getElementTypeBitWidth();
+  };
+
+  auto makeParentDesc = [&](int64_t width) {
+    auto parentEncoding = ttng::TensorMemoryEncodingAttr::get(
+        builder.getContext(), newTmemEncoding.getBlockM(),
+        newTmemEncoding.getBlockN(), newTmemEncoding.getColStride(),
+        newTmemEncoding.getCGALayout(), newTmemEncoding.getTwoCTAs(),
+        newTmemEncoding.getCtaMode());
+    SmallVector<int64_t> parentShape(newShape);
+    parentShape.back() = width;
+    return ttg::MemDescType::get(parentShape, newType.getElementType(),
+                                 parentEncoding, newType.getMemorySpace(),
+                                 newType.getMutableMemory(), parentShape);
+  };
+
+  // The destination encoding may use a different packing convention (for
+  // example an f16 LHS intentionally using colStride=1).  Choose the smallest
+  // parent logical width that has exactly the representative's physical
+  // footprint under that encoding; this is the descriptor that can safely be
+  // reinterpreted before taking the requested view.
+  auto sourceStorageBits = getStorageBits(allocType);
+  ttg::MemDescType parentDesc;
+  for (int64_t width = parentBlockN; width <= oldBlockN * 16; width *= 2) {
+    auto candidate = makeParentDesc(width);
+    if (getStorageBits(candidate) == sourceStorageBits) {
+      parentBlockN = width;
+      parentDesc = candidate;
+      break;
+    }
+  }
+  if (!parentDesc) {
+    LDBG("unable to construct a same-footprint TMEM parent view");
+    return nullptr;
+  }
+  Value parent = allocResult;
+  if (parentDesc != allocType) {
+    parent = ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
+                                               parentDesc, allocResult);
+    // Keep the scheduling metadata carried by the original index user on the
+    // parent view.  The final subslice below gets the same metadata as well.
+    parent.getDefiningOp()->setAttrs(user->getAttrDictionary());
+  }
+
+  // `user` indexes away a leading multibuffer dimension.  Indexing a subslice
+  // is rejected by MemDescIndexOp, so index the reinterpreted parent instead,
+  // widen the temporary index result to the parent width, and subslice that
+  // rank-reduced value.  External users continue to see the requested target
+  // tile after the replacement below.
+  auto parentIndexType = ttg::MemDescType::get(
+      parentDesc.getShape().drop_front(), parentDesc.getElementType(),
+      parentDesc.getEncoding(), parentDesc.getMemorySpace(),
+      parentDesc.getMutableMemory(), parentDesc.getAllocShape().drop_front());
+  user->getOpOperand(0).set(parent);
+  user->getResult(0).setType(parentIndexType);
+  builder.setInsertionPointAfter(user);
+  auto subSlice = ttng::TMEMSubSliceOp::create(
+      builder, allocOp->getLoc(), user->getResult(0), subsliceOffset, blockN);
+  subSlice->setAttrs(user->getAttrDictionary());
+  user->getResult(0).replaceAllUsesExcept(subSlice.getResult(),
+                                          subSlice.getOperation());
+  return subSlice.getOperation();
 }
 
-ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
-                                                        Operation *allocOp,
-                                                        int offset,
-                                                        size_t blockN) {
+Operation *sliceAndReinterpretTMEMBuffer(OpBuilder &builder, Operation *allocOp,
+                                         int offset, size_t blockN) {
   auto allocResult = allocOp->getResult(0);
   auto allocType = cast<ttg::MemDescType>(allocResult.getType());
   auto shape = allocType.getShape();
@@ -283,12 +355,11 @@ ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
     return nullptr;
   }
 
-  auto tmemDesc =
-      createTMEMDesc(builder, allocType, shape[shape.size() - 2], 1);
+  // The allocation is already the parent descriptor.  Form the subview
+  // directly; reinterpreting a sliced descriptor is invalid.
   auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
                                                allocResult, offset, blockN);
-  return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(), tmemDesc,
-                                           subSlice);
+  return subSlice.getOperation();
 }
 
 ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
