@@ -155,6 +155,13 @@ class DynamicPersistent1DScheduler(_CountingTileScheduler):
     are distributed by demand rather than a fixed stride. The host allocates
     ``tile_counter`` (a 1-element int32 device tensor) initialized to the number of
     launched programs. ``is_valid`` is the count-based one from ``_CountingTileScheduler``.
+
+    TODO: Multi-CTA scheduling must claim one cluster-level work item and
+    expand it with the static cluster-local coordinate. Independent per-CTA
+    atomic claims cannot establish the shared tile identity required by TMA
+    multicast. This is not required by the current multicast support: there the
+    shared tile identity is supplied statically by a 2D grid launch (see
+    test_tutorial09_tma_multicast_gemm_variants), so this dynamic path is unused.
     """
     _x: tl.tensor
     _y: tl.tensor
@@ -189,6 +196,13 @@ class ClcTileScheduler(TileScheduler):
     ``ttng.clc_advance`` op (the response buffer, mbarrier, phase, and issue/wait
     overlap are all materialized by a later compiler lowering pass). ``num_tiles_fn``
     / ``tile_counter`` are ignored -- CLC termination is hardware-driven.
+
+    TODO: Add multi-CTA materialization that distributes one CLC base work item
+    to the cluster and expands it with the static cluster-local coordinate.
+    The current lowering intentionally remains single-CTA. TMA multicast does
+    not depend on this yet -- it relies on a static 2D grid launch to establish
+    the shared cluster-level tile identity (see
+    test_tutorial09_tma_multicast_gemm_variants).
     """
     _valid: tl.tensor
     _x: tl.tensor
