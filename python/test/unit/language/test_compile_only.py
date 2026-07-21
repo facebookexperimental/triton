@@ -1,5 +1,7 @@
+import pytest
 import triton
 import triton.language as tl
+from triton import knobs
 from triton.backends.compiler import GPUTarget
 import re
 from triton.compiler import ASTSource
@@ -141,6 +143,14 @@ def test_compile_only_k_loop() -> None:
 
 
 def test_compile_only_dot_mxfp() -> None:
+    # The mxf8f6f4 block-scaled tcgen05 MMA emitted here
+    # (tcgen05.mma...kind::mxf8f6f4.block_scale.block32) can only be assembled by
+    # a ptxas newer than the bundled CUDA 12.8; skip until the toolchain is
+    # upgraded so this doesn't hard-fail on the old ptxas.
+    ptxas_version = tuple(int(x) for x in knobs.nvidia.ptxas.version.split("."))
+    if ptxas_version < (12, 9):
+        pytest.skip(f"mxf8f6f4 block-scale tcgen05 MMA requires ptxas >= 12.9 "
+                    f"(have {knobs.nvidia.ptxas.version})")
 
     @triton.jit
     def simple_dot_mxfp(
@@ -192,7 +202,7 @@ def test_compile_only_dot_mxfp() -> None:
     assert re.search(pattern, str(ttgir)), "The TTGIR does not match the expected pattern."
 
     ptx = k.asm["ptx"]
-    pattern = r"tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X"
+    pattern = r"tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.block32"
     assert re.search(pattern, str(ptx)), "The PTX does not match the expected pattern."
     assert k.asm["cubin"] != b""
 

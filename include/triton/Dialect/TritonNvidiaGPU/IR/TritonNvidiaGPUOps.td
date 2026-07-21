@@ -485,6 +485,14 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
     of at least 1, and decreasing the pending arrival count of the mbarrier by
     the specific count.
 
+    When `ctaMask` is non-zero, the arrive is multicast across the cluster.
+    Each bit set in the mask identifies a CTA ID dimension to multicast
+    along. CTA IDs `a` and `b` belong to the same equivalence class iff
+    `a & ~ctaMask == b & ~ctaMask`; all CTAs in a class multicast to each
+    other. Multicast requires `numCTAs > 1`, `0 < ctaMask <= numCTAs - 1`,
+    and the barrier must have the identity CGA layout `[[1], [2], ...]`. The
+    default value of `ctaMask` is 0 (no multicast).
+
     The operation accepts an optional predicate.
 
     Example:
@@ -492,12 +500,14 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
     ```mlir
     ttng.arrive_barrier %barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     ttng.arrive_barrier %barrier, 1, %pred : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.arrive_barrier %barrier, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #shared, #smem, mutable>
     ```
   }];
 
   let arguments = (ins
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$alloc,
     I32Attr:$count,
+    DefaultValuedOptionalAttr<I32Attr, "0">:$ctaMask,
     Optional<I1>:$pred,
     UnitAttr:$perThread,
     OptionalAttr<DictionaryAttr>:$constraints
@@ -509,18 +519,30 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
 
   let builders = [
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred), [{
-      return build($_builder, $_state, alloc, count, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "uint32_t":$ctaMask,
+                   "Value":$pred), [{
+      return build($_builder, $_state, alloc, count, ctaMask, pred, /*perThread=*/false, /*constraints=*/DictionaryAttr());
     }]>,
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, /*pred=*/Value(), perThread, /*constraints=*/DictionaryAttr());
     }]>,
     OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred, "bool":$perThread), [{
-      return build($_builder, $_state, alloc, count, pred, perThread, /*constraints=*/DictionaryAttr());
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, /*constraints=*/DictionaryAttr());
+    }]>,
+    OpBuilder<(ins "Value":$alloc, "uint32_t":$count, "Value":$pred,
+                   "bool":$perThread, "DictionaryAttr":$constraints), [{
+      return build($_builder, $_state, alloc, count, /*ctaMask=*/0u, pred, perThread, constraints);
     }]>
   ];
+
+  let extraClassDeclaration = [{
+    bool isMulticast() { return getCtaMask() != 0; }
+  }];
 
   let hasVerifier = 1;
 }
