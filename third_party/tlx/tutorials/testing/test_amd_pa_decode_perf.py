@@ -19,8 +19,8 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 NUM_KV_HEADS = 8
 QUERY_GROUP_SIZE = 8
 NUM_Q_HEADS = NUM_KV_HEADS * QUERY_GROUP_SIZE
-HEAD_DIM = 128
-PAGE_SIZE = 64
+HEAD_DIM = 64
+PAGE_SIZE = 16
 
 DECODE_METHODS = ("tlx", "aiter")
 DEFAULT_DECODE_VERSIONS = list(DECODE_METHODS)
