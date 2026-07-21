@@ -407,8 +407,14 @@ private:
     }
 
     bool hasRemoteBar = false;
-    // Find if we have a remote bar
+    bool hasMulticastArrive = false;
+    // Find if we have a remote bar or multicast arrive.
     mod.walk([&](Operation *op) {
+      if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
+          arrive && arrive.isMulticast()) {
+        hasMulticastArrive = true;
+        return WalkResult::interrupt();
+      }
       SetVector<Operation *> ops;
       auto remoteBar = getRemoteBarrier(op);
       if (remoteBar.has_value()) {
@@ -417,10 +423,10 @@ private:
       }
       return WalkResult::advance();
     });
-
-    // If we have remote mbar/SMEM access, or if we have 2cta TMEM allocation,
-    // we need a cluster sync after mbar init and before TMEM alloc
-    bool shouldInsert = hasRemoteBar || tlx::tlxEnablePairedMMA(mod);
+    // If we have remote mbar/SMEM access, a multicast arrive, or 2cta TMEM
+    // allocation, we need a cluster sync after mbar init and before use.
+    bool shouldInsert = hasRemoteBar || hasMulticastArrive ||
+                        tlx::tlxEnablePairedMMA(mod);
     if (!shouldInsert) {
       return success();
     }

@@ -85,6 +85,12 @@ inline bool is2CTA(Operation *op) {
   return is2CTA(op->getParentOfType<ModuleOp>());
 }
 
+// Returns the required ordering of repeated TMEM scale blocks for one
+// tcgen05 scaled-MMA operand.
+TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(
+    Operation *op, bool isA, ScaleDotElemType aType, ScaleDotElemType bType,
+    Type aScaleElemType, Type bScaleElemType);
+
 struct TensorMemory : public SideEffects::Resource::Base<TensorMemory> {
   StringRef getName() const final { return "<TensorMemory>"; }
   SideEffects::Resource *getParent() const override { return nullptr; }
