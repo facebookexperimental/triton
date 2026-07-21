@@ -21,6 +21,18 @@ _ENABLE_SPLIT_BARRIERS_ENV = "TRITON_TLX_WAVE_ENABLE_SPLIT_BARRIERS"
 _ENABLE_MULTI_WAVE_SPECIALIZE_ENV = "TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE"
 
 
+def _barrier_ops(mod):
+    barriers = []
+
+    def visit(op):
+        if op.get_name() in {"ttg.barrier", "rocdl.s.barrier"}:
+            barriers.append(op)
+        return True
+
+    mod.walk(visit)
+    return tuple(barriers)
+
+
 def _parse_bool_option(value, *, source):
     if value is None or value == "":
         return False
@@ -184,11 +196,17 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         # TTGIR.  These barriers include issue rendezvous between cross-wave
         # direct-to-LDS epochs; they do not complete an async DMA group, which
         # remains the sole responsibility of ttg.async_wait.
+        existing_barriers = frozenset(_barrier_ops(src))
         allocation = passes.analysis.allocation(src)
         passes.analysis.membar(allocation).run()
+        compiler_membar_barriers = tuple(
+            op for op in _barrier_ops(src)
+            if op not in existing_barriers
+        )
 
         output = converter_pipeline.convert_ttgir_to_wave(
             src,
+            compiler_membar_barriers=compiler_membar_barriers,
             enable_split_barriers=getattr(options, "tlx_wave_enable_split_barriers", False),
             enable_multi_wave_specialization=getattr(
                 options,

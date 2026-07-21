@@ -24,6 +24,7 @@ DEFAULT_MXFP_WARMUP_LAUNCHES = 25
 DEFAULT_MXFP_TIMED_LAUNCHES = 1000
 DEFAULT_MXFP_TIMING_REPEATS = 7
 F16_V10_BASELINE_SHAPE = "8192x8192x8192"
+F16_V11_BASELINE_SHAPE = "8192x8192x8192"
 F16_INTER_WAVE_BASELINE_SHAPE = (8192, 8192, 8192)
 
 
@@ -242,6 +243,49 @@ def build_run_specs(args, cache_root):
             RunSpec(
                 "f16-v10",
                 "f16 v10 8192x8192x8192 baseline: LLVM vs Wave",
+                "both",
+                command,
+                cache_dir,
+            )
+        )
+
+        # The four-wave variant is the specialized counterpart of the v10
+        # eight-wave baseline.  Keep the shape, inputs, timing, and provider
+        # pair identical so its result is directly comparable in every sweep.
+        cache_dir = cache_root / "f16-v11"
+        command = (
+            python,
+            str(SCRIPT_DIR / "gfx9_gemm/a16w16/bench.py"),
+            "--version",
+            "11",
+            "--providers",
+            "tlx",
+            "wave",
+            "--shape",
+            F16_V11_BASELINE_SHAPE,
+            *timing,
+            *workers,
+            "--input-mode",
+            "rand-int",
+            "--seed",
+            "0",
+            "--timing-mode",
+            "batched",
+            "--warmup-launches",
+            str(args.f16_warmup_launches),
+            "--timed-launches",
+            str(args.f16_timed_launches),
+            "--timing-repeats",
+            str(args.f16_timing_repeats),
+            "--cache-dir",
+            str(cache_dir),
+        )
+        if args.wave_split_barriers:
+            command += ("--wave-split-barriers", )
+        specs.append(
+            RunSpec(
+                "f16-v11",
+                "f16 v11 specialized 4-wave 8192x8192x8192: LLVM vs Wave",
                 "both",
                 command,
                 cache_dir,
