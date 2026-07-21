@@ -2371,7 +2371,8 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
           LDBG("replace users for channel user ");
           user->dump();
         });
-        user->replaceUsesOfWith(channel->getAllocOp()->getResult(0), reinter);
+        user->replaceUsesOfWith(channel->getAllocOp()->getResult(0),
+                                reinter->getResult(0));
         LLVM_DEBUG({
           LDBG("replace users for channel user after replacing ");
           user->dump();

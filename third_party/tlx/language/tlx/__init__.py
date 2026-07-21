@@ -29,6 +29,10 @@ from .mem_ops import (
     async_descriptor_load,
     buffer_load,
     buffer_load_to_local,
+    convert_layout,
+    cast_layout,
+    zeros,
+    release_layout,
     buffer_store,
     async_descriptor_prefetch_tensor,
     async_descriptor_store,
@@ -61,7 +65,7 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, require_layout, tcgen05_commit
+from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, mfma, require_layout, tcgen05_commit
 from .types import (
     async_token,
     buffered_tensor,
@@ -75,6 +79,9 @@ from .types import (
     mbarrier_type,
     nv_mma_shared_layout_encoding,
     padded_shared_layout_encoding,
+    shared_linear_layout_encoding,
+    amd_mfma_layout,
+    dot_operand_layout,
     reuse_group,
     reuse_group_ir_type,
     reuse_group_type,
@@ -115,6 +122,9 @@ __all__ = [
     "swizzled_layout",
     "swizzled_shared_layout_encoding",
     "padded_shared_layout_encoding",
+    "shared_linear_layout_encoding",
+    "amd_mfma_layout",
+    "dot_operand_layout",
     "tensor_memory_layout_encoding",
     "TMemCTAMode",
     "nv_mma_shared_layout_encoding",
@@ -139,6 +149,10 @@ __all__ = [
     "async_store",
     "buffer_load",
     "buffer_load_to_local",
+    "convert_layout",
+    "cast_layout",
+    "zeros",
+    "release_layout",
     "buffer_store",
     "local_alloc",
     "local_view",
@@ -185,6 +199,7 @@ __all__ = [
     "named_barrier_wait",
     "named_barrier_arrive",
     # mma_ops
+    "mfma",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",
