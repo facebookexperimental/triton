@@ -620,8 +620,7 @@ public:
         if (auto attr = op->getAttrOfType<IntegerAttr>(
                 "tlx.mbarrier_try_wait_suspend_ns")) {
           int32_t value = attr.getInt();
-          if (!mbarrierTryWaitSuspendNs ||
-              value < *mbarrierTryWaitSuspendNs)
+          if (!mbarrierTryWaitSuspendNs || value < *mbarrierTryWaitSuspendNs)
             mbarrierTryWaitSuspendNs = value;
         }
       });
