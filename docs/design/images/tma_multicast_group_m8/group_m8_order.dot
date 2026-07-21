@@ -1,0 +1,33 @@
+digraph group_m8_order {
+  graph [bgcolor="white", pad="0.25", nodesep="0.15", ranksep="0.2"];
+  node [shape=plain, fontname="DejaVu Sans"];
+
+  diagram [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#52606d">
+      <TR>
+        <TD BORDER="0"></TD>
+        <TD BGCOLOR="#d9eaf7"><B>N0 / B0</B></TD>
+        <TD BGCOLOR="#d9eaf7"><B>N1 / B1</B></TD>
+        <TD BGCOLOR="#d9eaf7"><B>N2 / B2</B></TD>
+        <TD BGCOLOR="#d9eaf7"><B>N3 / B3</B></TD>
+      </TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M0 / A0</B></TD><TD>pid 0<BR/><FONT POINT-SIZE="10">A0 + B0</FONT></TD><TD>pid 8<BR/><FONT POINT-SIZE="10">A0 + B1</FONT></TD><TD>pid 16<BR/><FONT POINT-SIZE="10">A0 + B2</FONT></TD><TD>pid 24<BR/><FONT POINT-SIZE="10">A0 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M1 / A1</B></TD><TD>pid 1<BR/><FONT POINT-SIZE="10">A1 + B0</FONT></TD><TD>pid 9<BR/><FONT POINT-SIZE="10">A1 + B1</FONT></TD><TD>pid 17<BR/><FONT POINT-SIZE="10">A1 + B2</FONT></TD><TD>pid 25<BR/><FONT POINT-SIZE="10">A1 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M2 / A2</B></TD><TD>pid 2<BR/><FONT POINT-SIZE="10">A2 + B0</FONT></TD><TD>pid 10<BR/><FONT POINT-SIZE="10">A2 + B1</FONT></TD><TD>pid 18<BR/><FONT POINT-SIZE="10">A2 + B2</FONT></TD><TD>pid 26<BR/><FONT POINT-SIZE="10">A2 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M3 / A3</B></TD><TD>pid 3<BR/><FONT POINT-SIZE="10">A3 + B0</FONT></TD><TD>pid 11<BR/><FONT POINT-SIZE="10">A3 + B1</FONT></TD><TD>pid 19<BR/><FONT POINT-SIZE="10">A3 + B2</FONT></TD><TD>pid 27<BR/><FONT POINT-SIZE="10">A3 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M4 / A4</B></TD><TD>pid 4<BR/><FONT POINT-SIZE="10">A4 + B0</FONT></TD><TD>pid 12<BR/><FONT POINT-SIZE="10">A4 + B1</FONT></TD><TD>pid 20<BR/><FONT POINT-SIZE="10">A4 + B2</FONT></TD><TD>pid 28<BR/><FONT POINT-SIZE="10">A4 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M5 / A5</B></TD><TD>pid 5<BR/><FONT POINT-SIZE="10">A5 + B0</FONT></TD><TD>pid 13<BR/><FONT POINT-SIZE="10">A5 + B1</FONT></TD><TD>pid 21<BR/><FONT POINT-SIZE="10">A5 + B2</FONT></TD><TD>pid 29<BR/><FONT POINT-SIZE="10">A5 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M6 / A6</B></TD><TD>pid 6<BR/><FONT POINT-SIZE="10">A6 + B0</FONT></TD><TD>pid 14<BR/><FONT POINT-SIZE="10">A6 + B1</FONT></TD><TD>pid 22<BR/><FONT POINT-SIZE="10">A6 + B2</FONT></TD><TD>pid 30<BR/><FONT POINT-SIZE="10">A6 + B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>M7 / A7</B></TD><TD>pid 7<BR/><FONT POINT-SIZE="10">A7 + B0</FONT></TD><TD>pid 15<BR/><FONT POINT-SIZE="10">A7 + B1</FONT></TD><TD>pid 23<BR/><FONT POINT-SIZE="10">A7 + B2</FONT></TD><TD>pid 31<BR/><FONT POINT-SIZE="10">A7 + B3</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  caption [label=<
+    <TABLE BORDER="0" CELLBORDER="0" CELLPADDING="6">
+      <TR><TD><B>GROUP_M = 8, M-fast ordering</B></TD></TR>
+      <TR><TD><FONT COLOR="#2878a8">A column shares B</FONT>  |  <FONT COLOR="#31823f">A row shares A</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  caption -> diagram [style=invis];
+}

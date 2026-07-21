@@ -1352,6 +1352,52 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       pred = b.and_(pred, b.icmp_eq(ctaIdInGroup, b.i32_val(0)));
     }
 
+    // Standard Triton compiler-selected multicast records the physical cluster
+    // axes across which this load's source tile is invariant.  Derive a mask
+    // and one leader for every cluster-local rank.  TLX's explicit mask operand
+    // remains authoritative when present.
+    if (auto axesAttr =
+            op->getAttrOfType<DenseI32ArrayAttr>("tt.multicast_axes");
+        axesAttr && !op.getMulticastTargets()) {
+      auto module = op->getParentOfType<ModuleOp>();
+      auto dims = ttg::TritonGPUDialect::getClusterDims(module);
+      llvm::SmallBitVector axes(3);
+      for (int32_t axis : axesAttr.asArrayRef())
+        axes.set(axis);
+      auto coordinates = [&](unsigned rank) {
+        SmallVector<unsigned, 3> coord(3);
+        coord[0] = rank % dims[0];
+        rank /= dims[0];
+        coord[1] = rank % dims[1];
+        coord[2] = rank / dims[1];
+        return coord;
+      };
+      unsigned clusterSize = dims[0] * dims[1] * dims[2];
+      Value plannedMask = b.i32_val(0);
+      Value isLeader = b.icmp_eq(ctaId, b.i32_val(0));
+      for (unsigned rank = 0; rank < clusterSize; ++rank) {
+        auto source = coordinates(rank);
+        uint16_t mask = 0;
+        for (unsigned candidate = 0; candidate < clusterSize; ++candidate) {
+          auto target = coordinates(candidate);
+          bool sameGroup = true;
+          for (unsigned axis = 0; axis < 3; ++axis)
+            if (!axes.test(axis) && source[axis] != target[axis])
+              sameGroup = false;
+          if (sameGroup)
+            mask |= uint16_t(1u << candidate);
+        }
+        unsigned leader = llvm::countr_zero(static_cast<unsigned>(mask));
+        Value isRank = b.icmp_eq(ctaId, b.i32_val(rank));
+        plannedMask = b.select(isRank, b.i32_val(mask), plannedMask);
+        isLeader =
+            b.select(isRank, b.icmp_eq(ctaId, b.i32_val(leader)), isLeader);
+      }
+      multicastMask = plannedMask;
+      multicast = true;
+      pred = b.and_(pred, isLeader);
+    }
+
     uint32_t barrierMask =
         toLinearLayout(barrierTy).getFreeVariableMasks().lookup(kBlock);
     // We emit a cluster-level barrier when the barrier mask is set.
@@ -1395,7 +1441,8 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       // the cluster -- a cluster barrier (#9510), multicast, or a 2-CTA group;
       // otherwise it is CTA-local. The barrier component keys on the barrier
       // layout (not the SMEM layout), matching #9510.
-      auto multicastMask = op.getMulticastTargets();
+      if (Value explicitMask = op.getMulticastTargets())
+        multicastMask = explicitMask;
       bool clusterScope = clusterBarrier || multicast ||
                           multicastMask != nullptr || op.getTwoCta();
       std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +

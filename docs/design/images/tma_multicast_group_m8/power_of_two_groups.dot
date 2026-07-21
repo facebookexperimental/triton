@@ -1,0 +1,53 @@
+digraph power_of_two_groups {
+  graph [bgcolor="white", pad="0.3", nodesep="0.35", ranksep="0.25"];
+  node [shape=plain, fontname="DejaVu Sans"];
+
+  title [label=<<B>Natural multicast groups under GROUP_M = 8</B><BR/><FONT POINT-SIZE="11">Consecutive ranks stay at N0, so only B0 is shared</FONT>>];
+
+  p1 [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#52606d">
+      <TR><TD BORDER="0"><B>1 CTA</B></TD></TR>
+      <TR><TD BGCOLOR="#e7f1f8">rank 0<BR/><FONT POINT-SIZE="10">A0 + B0</FONT></TD></TR>
+      <TR><TD BORDER="0"><FONT POINT-SIZE="10">1 A load + 1 B load</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  p2 [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#52606d">
+      <TR><TD BORDER="0"><B>2 CTAs</B></TD></TR>
+      <TR><TD BGCOLOR="#d9eaf7">rank 0<BR/><FONT POINT-SIZE="10">A0 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#d9eaf7">rank 1<BR/><FONT POINT-SIZE="10">A1 + B0</FONT></TD></TR>
+      <TR><TD BORDER="0"><FONT POINT-SIZE="10">2 A loads + 1 B load</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  p4 [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#52606d">
+      <TR><TD BORDER="0"><B>4 CTAs</B></TD></TR>
+      <TR><TD BGCOLOR="#c8e0f1">rank 0<BR/><FONT POINT-SIZE="10">A0 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#c8e0f1">rank 1<BR/><FONT POINT-SIZE="10">A1 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#c8e0f1">rank 2<BR/><FONT POINT-SIZE="10">A2 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#c8e0f1">rank 3<BR/><FONT POINT-SIZE="10">A3 + B0</FONT></TD></TR>
+      <TR><TD BORDER="0"><FONT POINT-SIZE="10">4 A loads + 1 B load</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  p8 [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="10" COLOR="#52606d">
+      <TR><TD BORDER="0"><B>8 CTAs</B></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 0<BR/><FONT POINT-SIZE="10">A0 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 1<BR/><FONT POINT-SIZE="10">A1 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 2<BR/><FONT POINT-SIZE="10">A2 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 3<BR/><FONT POINT-SIZE="10">A3 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 4<BR/><FONT POINT-SIZE="10">A4 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 5<BR/><FONT POINT-SIZE="10">A5 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 6<BR/><FONT POINT-SIZE="10">A6 + B0</FONT></TD></TR>
+      <TR><TD BGCOLOR="#afd2e9">rank 7<BR/><FONT POINT-SIZE="10">A7 + B0</FONT></TD></TR>
+      <TR><TD BORDER="0"><FONT POINT-SIZE="10">8 A loads + 1 B load</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  { rank=same; p1; p2; p4; p8; }
+  title -> p2 [style=invis];
+  p1 -> p2 -> p4 -> p8 [style=invis];
+}

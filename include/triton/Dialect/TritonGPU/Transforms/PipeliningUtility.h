@@ -116,9 +116,14 @@ DenseMap<Operation *, int> deserializeLatencies(Operation *op);
 
 // Create an allocation for multibuffered scalars.
 Value createScalarAlloc(ImplicitLocOpBuilder &rewriter, Type type,
-                        unsigned numBuffers);
+                        unsigned numBuffers,
+                        gpu::CGAEncodingAttr cgaLayout = {});
+gpu::CGAEncodingAttr
+getTMAMulticastBarrierLayout(Operation *op,
+                             DenseI32ArrayAttr multicastAxes = {});
 // Create an allocation and init the mbarriers.
-Value createBarrierAlloc(Operation *op, int numBarriers, int arriveCount = 1);
+Value createBarrierAlloc(Operation *op, int numBarriers, int arriveCount = 1,
+                         gpu::CGAEncodingAttr cgaLayout = {});
 // Create an allocation that can hold distance number of tensor shapes.
 Value createAlloc(Operation *insertBefore, RankedTensorType ty, Location loc,
                   gpu::SharedEncodingTrait sharedEnc, unsigned distance);

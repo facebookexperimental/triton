@@ -240,14 +240,24 @@ LogicalResult ClusterWaitOp::verify() {
 
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
-  // ClusterBarrierOp is backend-inserted (not emitted by beta lowering, which
-  // has no TargetInfo::clusterBarrier creator), so the full upstream check
-  // applies; it never runs on real beta IR.
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+  // FB: the upstream #9456 "cannot be used inside `ttg.warp_specialize`"
+  // restriction is intentionally NOT enforced here. AutoWS legitimately places
+  // ttng.cluster_barrier inside ttg.warp_specialize partitions (see
+  // LoadMMASpecialization / WSLowerMem), and ClusterBarrierOpConversion lowers
+  // it via lowerClusterSyncForAllWarps so every warp of the region participates
+  // in the cluster arrive/wait. NOTE: this is only safely demonstrated for
+  // AutoWS-generated code, where the pass guarantees the barrier appears in
+  // every warp group -- it is NOT validated for Gluon or TLX (manual WS) code
+  // paths. A cluster_barrier placed in only some warp groups would deadlock;
+  // that placement correctness is the producer's responsibility, not something
+  // this verifier can cheaply check.
+  auto module = getOperation()->getParentOfType<ModuleOp>();
+  auto dims = triton::gpu::TritonGPUDialect::getClusterDims(module);
+  int numCTAs = dims[0] * dims[1] * dims[2];
+  if (numCTAs == 1)
+    numCTAs = triton::gpu::lookupNumCTAs(getOperation());
   if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
-  if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
-    return emitOpError("cannot be used inside `ttg.warp_specialize`");
+    return emitOpError("requires a multi-CTA cluster");
   return success();
 }
 

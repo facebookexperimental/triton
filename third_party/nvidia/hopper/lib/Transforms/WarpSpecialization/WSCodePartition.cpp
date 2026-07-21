@@ -703,7 +703,8 @@ getTaskTopRegion(triton::FuncOp funcOp,
 // Create an allocation to hold the mbarriers.
 static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
                                 StringRef srcName = "",
-                                unsigned arriveCount = 1) {
+                                unsigned arriveCount = 1,
+                                ttg::CGAEncodingAttr cgaLayout = {}) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -713,16 +714,20 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
   if (!srcName.empty())
     loc = NameLoc::get(StringAttr::get(context, srcName), loc);
   auto numCTAs = triton::gpu::lookupNumCTAs(funcOp);
-  auto barrierCGALayout = ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
+  auto barrierCGALayout =
+      cgaLayout ? cgaLayout
+                : ttg::CGAEncodingAttr::get1DLayout(context, numCTAs);
+  auto numBarrierSlots = product(barrierCGALayout.getCTASplitNum());
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCGALayout);
   Type barrierMemDescType =
-      ttg::MemDescType::get({distance, numCTAs}, builder.getI64Type(),
+      ttg::MemDescType::get({distance, numBarrierSlots}, builder.getI64Type(),
                             barrierEncoding, sharedMemorySpace,
                             /*mutableMemory=*/true);
   Type singleBarrierMemDescType =
-      ttg::MemDescType::get({numCTAs}, builder.getI64Type(), barrierEncoding,
-                            sharedMemorySpace, /*mutableMemory=*/true);
+      ttg::MemDescType::get({numBarrierSlots}, builder.getI64Type(),
+                            barrierEncoding, sharedMemorySpace,
+                            /*mutableMemory=*/true);
   Value barrierAlloc = mlir::triton::gpu::LocalAllocOp::create(
       builder, loc, barrierMemDescType, Value());
   barrierAlloc.getDefiningOp()->setAttr(kWarpSpecializeGeneratedBarrierAttrName,
@@ -1087,26 +1092,39 @@ void createToken(
 
     // Pre-allocate TMA barrier if any channel in the group has a TMA producer.
     // Also check all channels in the reuse group, not just the consumer group.
-    bool hasTMAProducer = false;
+    SetVector<Operation *> tmaProducerOps;
+    auto collectTMAProducer = [&](Channel *candidate) {
+      if (Operation *load = findTMAProducer(candidate))
+        tmaProducerOps.insert(load);
+    };
     // First check channels grouped by consumer
-    for (auto *c : it->second) {
-      if (findTMAProducer(c)) {
-        hasTMAProducer = true;
-        break;
-      }
-    }
+    for (auto *c : it->second)
+      collectTMAProducer(c);
     // Also check all channels in the reuse group (if applicable)
-    if (!hasTMAProducer && reuseGrp >= 0) {
-      for (auto *c : config->getGroup(reuseGrp)->channels) {
-        if (findTMAProducer(c)) {
-          hasTMAProducer = true;
-          break;
-        }
+    if (reuseGrp >= 0)
+      for (auto *c : config->getGroup(reuseGrp)->channels)
+        collectTMAProducer(c);
+    if (!tmaProducerOps.empty()) {
+      SmallVector<tt::DescriptorLoadOp> tmaProducers =
+          llvm::map_to_vector(tmaProducerOps, [](Operation *load) {
+            return cast<tt::DescriptorLoadOp>(load);
+          });
+      Attribute multicastAxes =
+          tmaProducers.front()->getAttr("tt.multicast_axes");
+      bool compatible = llvm::all_of(tmaProducers, [&](auto load) {
+        return load->getAttr("tt.multicast_axes") == multicastAxes;
+      });
+      if (!compatible) {
+        for (auto load : tmaProducers)
+          load->removeAttr("tt.multicast_axes");
+        multicastAxes = {};
       }
-    }
-    if (hasTMAProducer) {
-      commChannel.producerBarrier = createBarrierAlloc(
-          funcOp, channel->getNumBuffers(), channel->srcName);
+      auto barrierCGALayout = getTMAMulticastBarrierLayout(
+          tmaProducers.front(),
+          dyn_cast_or_null<DenseI32ArrayAttr>(multicastAxes));
+      commChannel.producerBarrier =
+          createBarrierAlloc(funcOp, channel->getNumBuffers(), channel->srcName,
+                             /*arriveCount=*/1, barrierCGALayout);
     }
     // If channel is from an MMAv5 op, pre-allocate the inline barrier used by
     // its commit path.
