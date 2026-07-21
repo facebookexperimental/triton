@@ -4741,6 +4741,11 @@ PaddedSharedEncodingAttr triton::gpu::getPaddedEncoding(Attribute encoding) {
     return padded;
   if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
     return dyn_cast<PaddedSharedEncodingAttr>(partitioned.getPartitionLayout());
+  // User-facing dialects may wrap a concrete layout to pin it through layout
+  // propagation.  Padding is a physical-storage property of the wrapped
+  // layout, so queries must look through any generic pinned encoding.
+  if (auto pinned = dyn_cast<PinnedEncodingTrait>(encoding))
+    return getPaddedEncoding(pinned.getPinnedLayout());
   return nullptr;
 }
 

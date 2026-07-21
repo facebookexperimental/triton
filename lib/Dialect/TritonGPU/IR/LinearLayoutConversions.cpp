@@ -1313,6 +1313,12 @@ LinearLayout paddedLinearLayout(ArrayRef<int64_t> shape, Attribute encoding) {
   assert(isPaddedEncoding(encoding) &&
          "expected padded encoding or partitioned wrapping padded");
 
+  // A pinned layout is structurally transparent to physical address
+  // calculation.  Keep the marker for propagation, but recurse through it
+  // when materializing the padded linear component.
+  if (auto pinned = dyn_cast<PinnedEncodingTrait>(encoding))
+    return paddedLinearLayout(shape, pinned.getPinnedLayout());
+
   if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(encoding)) {
     return padded.getLinearComponent();
   }

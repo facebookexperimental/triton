@@ -675,7 +675,7 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         wave_split_barriers=False,
     )
 
-    v9_spec, v10_spec, inter_wave_llvm_spec, inter_wave_wave_spec = runner.build_run_specs(args, tmp_path)
+    v9_spec, v10_spec, v11_spec, inter_wave_llvm_spec, inter_wave_wave_spec = runner.build_run_specs(args, tmp_path)
     assert v9_spec.name == "f16"
     assert v10_spec.name == "f16-v10"
     command = v9_spec.command
@@ -712,6 +712,26 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         assert v10_command[v10_command.index(option) + 1] == expected
     providers_index = v10_command.index("--providers")
     assert v10_command[providers_index + 1:providers_index + 3] == ("tlx", "wave")
+
+    assert v11_spec.name == "f16-v11"
+    v11_command = v11_spec.command
+    v11_expected_options = {
+        "--version": "11",
+        "--shape": "8192x8192x8192",
+        "--rep": "31",
+        "--warmup": "7",
+        "--compile-workers": "2",
+        "--input-mode": "rand-int",
+        "--seed": "0",
+        "--timing-mode": "batched",
+        "--warmup-launches": "11",
+        "--timed-launches": "101",
+        "--timing-repeats": "3",
+    }
+    for option, expected in v11_expected_options.items():
+        assert v11_command[v11_command.index(option) + 1] == expected
+    providers_index = v11_command.index("--providers")
+    assert v11_command[providers_index + 1:providers_index + 3] == ("tlx", "wave")
 
     assert inter_wave_llvm_spec.name == "f16-inter-wave-llvm"
     assert inter_wave_llvm_spec.backend == "llvm"
@@ -3291,6 +3311,123 @@ def test_tlx_wave_converter_does_not_hoist_async_wait_before_regular_local_load(
     ]
 
 
+def test_tlx_wave_converter_eliminates_dma_only_compiler_membar():
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_op(
+        "buffer_load_to_local",
+        attrs={"mode": "dma_packet_lds"},
+    )
+    builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": True,
+            "dependency_count": 0,
+        },
+    )
+    builder.add_op(
+        "buffer_load_to_local",
+        attrs={"mode": "dma_packet_lds"},
+    )
+
+    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(
+        builder.build()
+    )
+
+    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
+        "buffer_load_to_local",
+        "buffer_load_to_local",
+    ]
+
+
+@pytest.mark.parametrize(
+    "predecessor_kind,predecessor_attrs",
+    [
+        ("local_load", {}),
+        ("local_load_mma_payload", {}),
+        ("local_store", {}),
+        ("buffer_load_to_local", {"mode": "scalarized_load_store"}),
+    ],
+)
+def test_tlx_wave_converter_retains_compiler_membar_after_synchronous_lds(
+    predecessor_kind,
+    predecessor_attrs,
+):
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_op(predecessor_kind, attrs=predecessor_attrs)
+    builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": True,
+            "dependency_count": 0,
+        },
+    )
+
+    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(
+        builder.build()
+    )
+
+    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
+        predecessor_kind,
+        "barrier",
+    ]
+
+
+def test_tlx_wave_converter_preserves_explicit_dma_epoch_barrier():
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_op(
+        "buffer_load_to_local",
+        attrs={"mode": "dma_packet_lds"},
+    )
+    builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": False,
+            "dependency_count": 0,
+        },
+    )
+
+    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(
+        builder.build()
+    )
+
+    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
+        "buffer_load_to_local",
+        "barrier",
+    ]
+
+
+def test_tlx_wave_converter_ignores_pure_structural_region_for_dma_membar():
+    builder = converter_target_ir.TargetBuilder()
+    nested_region = builder.add_region()
+    with builder.insertion_region(nested_region):
+        builder.add_op("binary", attrs={"operation": "addi"})
+    builder.add_op("if", region_ids=(nested_region, ))
+    builder.add_op(
+        "buffer_load_to_local",
+        attrs={"mode": "dma_packet_lds"},
+    )
+    builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": True,
+            "dependency_count": 0,
+        },
+    )
+
+    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(
+        builder.build()
+    )
+
+    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
+        "if",
+        "buffer_load_to_local",
+    ]
+
+
 @pytest.mark.parametrize("keep_shared_range", (False, True))
 def test_tlx_wave_converter_eliminates_replaced_provenance_slices(
     keep_shared_range,
@@ -5772,6 +5909,7 @@ def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
     assert not hasattr(bench, "DEVICE")
     assert bench.provider_defaults(9) == ["tlx", "wave"]
     assert bench.provider_defaults(10) == ["wave"]
+    assert bench.provider_defaults(11) == ["wave"]
     assert bench.provider_defaults(0) == ["rocblas", "tlx"]
     assert bench.parse_shape("128x256x64") == (128, 256, 64)
     assert bench.parse_shape("128,256,64") == (128, 256, 64)
@@ -5887,6 +6025,34 @@ def test_tlx_gfx9_gemm_bench_launch_reuses_output():
     assert result is out
     assert call["args"][2] is out
     assert call["grid"] == (1, )
+
+
+def test_tlx_gfx9_gemm_bench_enables_four_wave_specialization_only_for_wave():
+    torch = pytest.importorskip("torch")
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_wave_test_gfx9_bench_four_wave")
+    calls = []
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+
+            def launch(*args, **kwargs):
+                calls.append((grid, args, kwargs))
+
+            return launch
+
+    module = SimpleNamespace(wave_4wave_specialized=FakeKernel())
+    a = torch.empty((256, 128), dtype=torch.float16)
+    b = torch.empty((256, 128), dtype=torch.float16).T
+    args = SimpleNamespace(wave_split_barriers=False)
+
+    bench.provider_matmul(args, "wave", module, "wave_4wave_specialized", a, b)
+    bench.provider_matmul(args, "tlx", module, "wave_4wave_specialized", a, b)
+
+    assert [call[0] for call in calls] == [(1, 1), (1, 1)]
+    assert calls[0][2]["num_warps"] == 4
+    assert calls[0][2]["tlx_wave_enable_multi_wave_specialize"] is True
+    assert "tlx_wave_enable_multi_wave_specialize" not in calls[1][2]
 
 
 def test_tlx_gfx9_gemm_bench_batched_timing_uses_one_event_span_per_repeat():
@@ -6073,6 +6239,15 @@ def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
             "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
         },
         {
+            "version_dir": "wave_4wave_specialized",
+            "function_name": "wave_4wave_specialized",
+            "num_warps": 4,
+            "expected_dma_load_lds": 48,
+            "b_strides": (1, 256),
+            "compile_options": {"tlx_wave_enable_multi_wave_specialize": True},
+            "extra_meta": {"GROUP_SIZE_M": 4, "NUM_XCDS": 8, "GRID_MN": 1},
+        },
+        {
             "id": "v9_beyond_hotloop_grouped_pid_multi_n",
             "version_dir": "v9_beyond_hotloop",
             "function_name": "v9_beyond_hotloop",
@@ -6128,9 +6303,14 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
         assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
     if case["version_dir"] == "v9_beyond_hotloop":
         assert "layout_convert" not in wave_artifact
-    if case["version_dir"] == "wave_8wave":
+    if case["version_dir"] in {"wave_8wave", "wave_4wave_specialized"}:
         assert "wave.sched_barrier" not in wave_artifact
         assert "memdesc_subslice" not in wave_artifact
+    if case["version_dir"] == "wave_4wave_specialized":
+        # Match the five structural rendezvous in Wave's specialized kernel:
+        # initial publication, independent A/B reuse, steady-state
+        # publication, and final publication.
+        assert wave_artifact.count("wave.barrier") == 5
     if case.get("id") == "v9_beyond_hotloop_transposed_b":
         barrier_lines = [
             line for line in wave_artifact.splitlines()
@@ -6263,6 +6443,48 @@ def test_tlx_wave_runtime_gfx950_wave_8wave_e2e(tmp_path, monkeypatch, backend):
     expected = torch.matmul(a, b)
     torch.cuda.synchronize()
     torch.testing.assert_close(got, expected, atol=3e-1, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["llvm", "wave"])
+def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
+    tmp_path,
+    monkeypatch,
+    backend,
+):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for specialized 4-wave e2e, got {arch}")
+    tutorial = _load_tlx_gfx9_gemm_module(
+        "wave_4wave_specialized",
+        f"_tlx_wave_4wave_specialized_runtime_{backend}",
+    )
+
+    m, n, k = 256, 256, 256
+    device = torch.device("cuda")
+    torch.manual_seed(23)
+    a = torch.randn((m, k), device=device, dtype=torch.float16)
+    b = torch.randn((n, k), device=device, dtype=torch.float16).T
+    expected = torch.matmul(a, b)
+    torch.cuda.synchronize()
+
+    if backend == "wave":
+        monkeypatch.setenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", "1")
+    else:
+        monkeypatch.delenv("TRITON_TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZE", raising=False)
+    driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
+    with (
+            driver_context(),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-wave-4wave-specialized-runtime-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        # Repeated launches cover the independently reused A/B LDS epochs; a
+        # missing workgroup rendezvous manifests as a nondeterministic race.
+        for _ in range(3):
+            got = tutorial.matmul(a, b)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(got, expected, atol=3e-1, rtol=0)
 
 
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
@@ -8010,6 +8232,47 @@ def test_tlx_wave_converter_scalarizes_async_copy_into_memdesc_subslice(tmp_path
     del ctx
 
 
+def test_tlx_wave_converter_packetizes_padded_dma_into_memdesc_subslice(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.padded_shared<[512:+8] {order = [0], shape = [4096]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_padded_subslice_dma(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<4096xf16, #shared, #smem, mutable>
+    %view = ttg.memdesc_subslice %alloc[2048] : !ttg.memdesc<4096xf16, #shared, #smem, mutable> -> !ttg.memdesc<2048xf16, #shared, #smem, mutable, 4096>
+    %range = tt.make_range {end = 2048 : i32, start = 0 : i32} : tensor<2048xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] into %view : <f16>[tensor<2048xi32, #blocked>] -> <2048xf16, #shared, #smem, mutable, 4096>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (copy_op, ) = [
+        op for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(copy_op)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["component_count"] == 1
+    # The view starts after four padded 512-element lines in the parent
+    # allocation: 2048 + 4 * 8 = 2080 f16 elements.
+    assert attrs["destination_component_offsets"] == (2080, )
+    assert attrs["destination_wave_count"] == 4
+    assert attrs["destination_wave_stride_dwords"] == 260
+    wave = output.emitted_module.text
+    assert wave.count("waveamd.dma_load_lds") == 1
+    assert "wave.read_first" in wave
+    _run_wave_verify(wave)
+    del ctx
+
+
 def test_tlx_wave_converter_rejects_out_of_bounds_memdesc_subslice():
     parent_type = converter_source_ir.SourceType(
         raw="parent",
@@ -9535,6 +9798,26 @@ def test_tlx_wave_converter_lowers_slice_of_explicit_linear_layout(tmp_path):
     del ctx
 
 
+def test_tlx_wave_explicit_linear_slice_restricts_replicated_bases():
+    linear = converter_layouts._project_explicit_linear_slice_layout(
+        (1, ),
+        {
+            "register_bases": ((1, 0), (2, 0), (4, 0), (0, 1), (0, 0)),
+            "lane_bases": (),
+            "warp_bases": (),
+            "block_bases": (),
+        },
+        1,
+        stage="test",
+        source_op_index=0,
+        source_value_id=0,
+    )
+
+    # Shape restriction preserves one canonical replicated register slot and
+    # removes bases that no longer name distinct elements of the slice.
+    assert converter_layouts.linear_layout_bases(linear, "register") == ((0, ), )
+
+
 def test_tlx_wave_converter_lowers_bit_affine_linear_make_range(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [], lane = [[32], [16], [8], [4], [2], [1]], warp = [], block = []}>
@@ -9655,6 +9938,37 @@ def test_tlx_wave_layout_query_records_padded_physical_offset():
     assert empty_attrs["destination_physical_offset_plan"] == "padded_linear"
     assert empty_attrs["destination_physical_intervals"] == ()
     assert empty_attrs["destination_physical_paddings"] == ()
+
+
+def test_tlx_wave_layout_query_supports_high_rank_padded_order():
+    layout = converter_layouts.LayoutMap(
+        0,
+        7,
+        "padded_shared",
+        (2, 2, 2, 8, 16, 32),
+        "f16",
+        1,
+        64,
+        {
+            "intervals": (512, ),
+            "order": (5, 1, 3, 4, 2, 0),
+            "paddings": (8, ),
+        },
+    )
+
+    record = converter_layouts.shared_physical_offset(
+        layout,
+        layout.shape,
+        (0, 0, 0, 0, 1, 0),
+        2,
+        stage="test",
+        diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
+    )
+
+    assert record.order == (5, 1, 3, 4, 2, 0)
+    assert record.logical_linear_offset == 512
+    assert record.element_offset == 520
+    assert record.byte_offset == 1040
 
 
 def test_tlx_wave_layout_query_records_transposed_padded_physical_offset():

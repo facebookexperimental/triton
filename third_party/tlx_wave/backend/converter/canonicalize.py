@@ -11,6 +11,133 @@ def canonicalize_target_program(target_program):
     return _share_div_rem_pairs(target_program)
 
 
+def eliminate_redundant_compiler_membar_barriers(target_program):
+    """Remove compiler LDS rendezvous that follow only async DMA issues.
+
+    AMD membar sees storage aliases before the bridge resolves structural
+    memdesc views, so it can conservatively put a local barrier between
+    independent direct-to-LDS issues.  Such a barrier cannot complete a DMA;
+    readiness remains exclusive to an explicit async wait.  Keep every
+    pre-existing source barrier and every membar barrier that follows a
+    synchronous LDS access, while dropping only compiler-created barriers in
+    DMA-only epochs.
+    """
+    synchronous_lds_regions = _synchronous_lds_region_ids(target_program)
+    regions = tuple(
+        _eliminate_redundant_compiler_membar_barriers_in_region(
+            target_program,
+            region,
+            synchronous_lds_regions,
+        )
+        for region in target_program.regions
+    )
+    if regions == target_program.regions:
+        return target_program
+    return target_ir.TargetProgram(
+        target_program.values,
+        target_program.ops,
+        regions,
+        dict(target_program.source_value_targets),
+        dict(target_program.erased_source_values),
+        target_program.kernel,
+    )
+
+
+def _eliminate_redundant_compiler_membar_barriers_in_region(
+    target_program,
+    region,
+    synchronous_lds_regions,
+):
+    # A nested region may observe a synchronous LDS frontier from a loop
+    # backedge or branch predecessor.  Start conservatively; a workgroup wait
+    # or retained barrier establishes a new, known rendezvous epoch.
+    has_synchronous_lds_predecessor = region.target_region_id != 0
+    retained_op_ids = []
+    for op_id in region.op_ids:
+        op = target_program.ops[int(op_id)]
+        attrs = target_ir.attrs_dict(op)
+
+        if op.kind == "barrier":
+            is_redundant_dma_only_membar = (
+                bool(attrs.get("compiler_membar_barrier", False))
+                and int(attrs.get("address_space", 0)) == 1
+                and not op.operands
+                and not has_synchronous_lds_predecessor
+            )
+            if not is_redundant_dma_only_membar:
+                retained_op_ids.append(op_id)
+                has_synchronous_lds_predecessor = False
+            continue
+
+        retained_op_ids.append(op_id)
+        if (
+            op.kind == "async_wait"
+            and attrs.get("publication_mode") == "workgroup"
+        ):
+            has_synchronous_lds_predecessor = False
+            continue
+        if op.kind in {
+            "local_load",
+            "local_load_mma_payload",
+            "local_store",
+        }:
+            has_synchronous_lds_predecessor = True
+            continue
+        if (
+            op.kind == "buffer_load_to_local"
+            and attrs.get("mode") == "scalarized_load_store"
+        ):
+            has_synchronous_lds_predecessor = True
+            continue
+        if op.kind == "cond_barrier" or any(
+            int(region_id) in synchronous_lds_regions
+            for region_id in op.region_ids
+        ):
+            has_synchronous_lds_predecessor = True
+
+    return target_ir.TargetRegion(
+        region.target_region_id,
+        tuple(retained_op_ids),
+        region.block_arg_ids,
+        region.yield_value_ids,
+    )
+
+
+def _synchronous_lds_region_ids(target_program):
+    synchronous = set()
+    changed = True
+    while changed:
+        changed = False
+        for region in target_program.regions:
+            if region.target_region_id in synchronous:
+                continue
+            if any(
+                _is_synchronous_lds_op(target_program.ops[int(op_id)])
+                or any(
+                    int(nested_region_id) in synchronous
+                    for nested_region_id in
+                    target_program.ops[int(op_id)].region_ids
+                )
+                for op_id in region.op_ids
+            ):
+                synchronous.add(region.target_region_id)
+                changed = True
+    return frozenset(synchronous)
+
+
+def _is_synchronous_lds_op(op):
+    if op.kind in {
+        "local_load",
+        "local_load_mma_payload",
+        "local_store",
+    }:
+        return True
+    return (
+        op.kind == "buffer_load_to_local"
+        and target_ir.attrs_dict(op).get("mode") == "scalarized_load_store"
+    )
+
+
 def eliminate_dead_target_ops(target_program):
     producer_by_result = {}
     for op in target_program.ops:

@@ -27,6 +27,7 @@ VERSION_MAP = {
     8: "v8_warp_pipeline",
     9: "v9_beyond_hotloop",
     10: "wave_8wave",
+    11: "wave_4wave_specialized",
 }
 
 PROVIDER_LABELS = {
@@ -41,8 +42,12 @@ TILE_N = 256
 TILE_K = 64
 TWO_STAGE_K = 2 * TILE_K
 TUTORIAL_PROVIDERS = frozenset({"tlx", "wave"})
-TWO_STAGE_K_VERSIONS = frozenset(range(5, 11))
+TWO_STAGE_K_VERSIONS = frozenset(range(5, 12))
 UNTILED_K_VERSIONS = frozenset({0, 1})
+WAVE_STRUCTURED_VERSIONS = frozenset({"wave_8wave", "wave_4wave_specialized"})
+GROUPED_PID_VERSIONS = frozenset({"v9_beyond_hotloop", *WAVE_STRUCTURED_VERSIONS})
+EIGHT_WARP_VERSIONS = frozenset({"v8_warp_pipeline", "v9_beyond_hotloop", "wave_8wave"})
+MULTI_WAVE_SPECIALIZED_VERSIONS = frozenset({"wave_4wave_specialized"})
 DEFAULT_COMPILE_WORKERS = max(1, min(8, os.cpu_count() or 1))
 INPUT_MODES = ("normal", "hpl", "rand-int", "zero", "ones")
 TIMING_MODES = ("triton", "batched")
@@ -163,7 +168,7 @@ def active_driver(driver):
 
 
 def provider_defaults(version):
-    if version == 10:
+    if version in (10, 11):
         return ["wave"]
     if version == 9:
         return ["tlx", "wave"]
@@ -248,8 +253,8 @@ def make_inputs(M, N, K, device, b_layout, input_mode="normal", seed=DEFAULT_INP
 
 def launch_tutorial_matmul(module, version_dir, a, b, out=None, extra_compile_options=None):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    if version_dir == "wave_8wave":
-        assert b.stride(0) == 1, "wave_8wave expects a K-contiguous transposed-B view"
+    if version_dir in WAVE_STRUCTURED_VERSIONS:
+        assert b.stride(0) == 1, f"{version_dir} expects a K-contiguous transposed-B view"
     M, K = a.shape
     K, N = b.shape
     if out is None:
@@ -262,16 +267,16 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None, extra_compile_op
     grid_m = triton.cdiv(M, BLOCK_M)
     grid_n = triton.cdiv(N, BLOCK_N)
     grid_mn = grid_m * grid_n
-    grid = (grid_m, grid_n) if version_dir == "wave_8wave" else (grid_mn, )
+    grid = (grid_m, grid_n) if version_dir in WAVE_STRUCTURED_VERSIONS else (grid_mn, )
     compile_kwargs = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_N": BLOCK_N,
         "BLOCK_K": BLOCK_K,
-        "num_warps": 8 if version_dir in ("v8_warp_pipeline", "v9_beyond_hotloop", "wave_8wave") else 4,
+        "num_warps": 8 if version_dir in EIGHT_WARP_VERSIONS else 4,
         "num_stages": 1,
         "matrix_instr_nonkdim": 16,
     }
-    if version_dir in {"v9_beyond_hotloop", "wave_8wave"}:
+    if version_dir in GROUPED_PID_VERSIONS:
         compile_kwargs.update({
             "GROUP_SIZE_M": 4,
             "NUM_XCDS": 8,
@@ -302,16 +307,18 @@ def launch_tutorial_matmul(module, version_dir, a, b, out=None, extra_compile_op
 def provider_matmul(args, provider, module, version_dir, a, b, out=None):
     if provider == "rocblas":
         return torch.matmul(a, b, out=out)
-    extra_compile_options = None
+    extra_compile_options = {}
     if provider == "wave" and args.wave_split_barriers:
-        extra_compile_options = {"tlx_wave_enable_split_barriers": True}
+        extra_compile_options["tlx_wave_enable_split_barriers"] = True
+    if provider == "wave" and version_dir in MULTI_WAVE_SPECIALIZED_VERSIONS:
+        extra_compile_options["tlx_wave_enable_multi_wave_specialize"] = True
     return launch_tutorial_matmul(
         module,
         version_dir,
         a,
         b,
         out=out,
-        extra_compile_options=extra_compile_options,
+        extra_compile_options=extra_compile_options or None,
     )
 
 
@@ -438,17 +445,17 @@ def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, a
     grid_m = triton.cdiv(M, BLOCK_M)
     grid_n = triton.cdiv(N, BLOCK_N)
     grid_mn = grid_m * grid_n
-    grid = (grid_m, grid_n) if version_dir == "wave_8wave" else (grid_mn, )
+    grid = (grid_m, grid_n) if version_dir in WAVE_STRUCTURED_VERSIONS else (grid_mn, )
     compile_kwargs = {
         "BLOCK_M": BLOCK_M,
         "BLOCK_N": BLOCK_N,
         "BLOCK_K": BLOCK_K,
-        "num_warps": 8 if version_dir in ("v8_warp_pipeline", "v9_beyond_hotloop", "wave_8wave") else 4,
+        "num_warps": 8 if version_dir in EIGHT_WARP_VERSIONS else 4,
         "num_stages": 1,
         "matrix_instr_nonkdim": 16,
         "grid": grid,
     }
-    if version_dir in {"v9_beyond_hotloop", "wave_8wave"}:
+    if version_dir in GROUPED_PID_VERSIONS:
         compile_kwargs.update({
             "GROUP_SIZE_M": 4,
             "NUM_XCDS": 8,
@@ -456,6 +463,8 @@ def compile_provider_shape(provider, version_dir, shape, b_layout, cache_root, a
         })
     if provider == "wave" and wave_split_barriers:
         compile_kwargs["tlx_wave_enable_split_barriers"] = True
+    if provider == "wave" and version_dir in MULTI_WAVE_SPECIALIZED_VERSIONS:
+        compile_kwargs["tlx_wave_enable_multi_wave_specialize"] = True
 
     start = time.monotonic()
     with active_driver(driver), knobs.cache.scope(), knobs.runtime.scope():
@@ -532,14 +541,14 @@ def precompile_shapes(args, version_dir, providers, sizes):
 def main():
     parser = argparse.ArgumentParser(description="TLX GEMM benchmark")
     parser.add_argument("--K", type=int, default=None)
-    parser.add_argument("--version", type=int, default=0, choices=range(0, 11))
+    parser.add_argument("--version", type=int, default=0, choices=range(0, 12))
     parser.add_argument(
         "--providers",
         nargs="+",
         choices=tuple(PROVIDER_LABELS),
         default=None,
         help=("providers to benchmark. Defaults to rocblas tlx, except v9 defaults "
-              "to tlx wave and the Wave-specific wave_8wave variant defaults to wave."),
+              "to tlx wave and the Wave-derived variants default to wave."),
     )
     parser.add_argument(
         "--shape",
