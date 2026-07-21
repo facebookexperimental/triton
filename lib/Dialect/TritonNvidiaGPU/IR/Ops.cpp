@@ -528,8 +528,6 @@ bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
       elementType.isInteger(64) && !elementType.isSignedInteger();
   bool isF16OrBF16 = elementType.isF16() || elementType.isBF16();
   switch (kind) {
-  case DescriptorReduceKind::NONE:
-    return false;
   case DescriptorReduceKind::ADD:
     return isInt32 || isNotSignedInt64 || elementType.isF32() || isF16OrBF16;
   case DescriptorReduceKind::MIN:
@@ -542,8 +540,10 @@ bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
   case DescriptorReduceKind::INC:
   case DescriptorReduceKind::DEC:
     return false;
+  case DescriptorReduceKind::NONE:
+    break;
   }
-  llvm_unreachable("unknown descriptor reduce kind");
+  llvm_unreachable("unexpected reduce kind for async_tma_reduce");
 }
 
 // -- AsyncTMACopyGlobalToLocalOp --
