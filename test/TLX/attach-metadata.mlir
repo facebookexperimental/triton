@@ -93,6 +93,25 @@ module {
   }
 }
 
+// -----
+
+// A suspend hint on tlx.async_tasks is propagated from warp_specialize to the
+// module so waits introduced by later warp-specialization passes also see it.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.mbarrier_try_wait_suspend_ns = 50000 : i32
+module {
+  tt.func @kernel_mbarrier_try_wait_suspend() {
+    ttg.warp_specialize() attributes {tlx.mbarrier_try_wait_suspend_ns = 50000 : i32}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
 
 // -----
 

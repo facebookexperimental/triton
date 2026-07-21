@@ -1228,7 +1228,11 @@ def matmul_kernel_tma_ws_blackwell(
     # Each of the three async tasks consumes CLC responses on both cluster CTAs.
     clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
 
-    with tlx.async_tasks(exclusive=True, no_ending_cluster_sync=True):
+    with tlx.async_tasks(
+        exclusive=True,
+        no_ending_cluster_sync=True,
+        mbarrier_try_wait_suspend_ns=50000,
+    ):
         with tlx.async_task("default"):  # epilogue consumer
             (
                 start_pid,
