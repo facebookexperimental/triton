@@ -327,8 +327,8 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       LDBG("channel [" << i << "]  " << to_string(channel->channelKind));
       LDBG("producer op: " << channel->relation.first);
       channel->getSrcOp()->dump();
-      for (auto &asyncTaskId : channel->relation.second)
-        LDBG("consumer: " << asyncTaskId);
+      for (auto &partitionId : channel->relation.second)
+        LDBG("consumer: " << partitionId);
       channel->getDstOp()->dump();
       LDBG("numBuffers: " << channel->getNumBuffers() << "\n");
     }
@@ -348,11 +348,11 @@ static Operation *getUniqueActualConsumer(Operation *consumerOp,
   // Check to see if there is only one consumer with the specific taskId.
   Operation *uniqOp = nullptr;
   for (auto *op : consumers) {
-    SmallVector<WSPartitionId> asyncTasks = getWSPartitionIds(op);
-    assert(asyncTasks.size() > 0);
-    if (asyncTasks.size() > 1)
+    SmallVector<WSPartitionId> partitions = getWSPartitionIds(op);
+    assert(partitions.size() > 0);
+    if (partitions.size() > 1)
       return consumerOp;
-    if (asyncTasks[0] == taskId) {
+    if (partitions[0] == taskId) {
       if (uniqOp)
         return consumerOp;
       uniqOp = op;
@@ -657,12 +657,12 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
 
 // Find top-level ops which contain at least one channel. If a channel's
 // getSrcOp() and getDstOp() belong to the inner loop, the outer loop will be
-// part of asyncTaskOps.
+// part of partitionOps.
 SmallVector<Operation *>
 getTaskTopRegion(triton::FuncOp funcOp,
                  const SmallVector<Channel *> &channels) {
-  SmallVector<Operation *> asyncTaskOps;
-  auto isAsyncTaskTopOp = [&](Operation *taskTopOp) -> bool {
+  SmallVector<Operation *> partitionOps;
+  auto isPartitionTopOp = [&](Operation *taskTopOp) -> bool {
     for (auto c : channels) {
       Operation *producer = c->getSrcOp(), *consumer = c->getDstOp();
       while (producer && !isa<triton::FuncOp>(producer->getParentOp())) {
@@ -685,19 +685,19 @@ getTaskTopRegion(triton::FuncOp funcOp,
       // taskId, continue.
       if (getWSPartitionIds(op).size() == 1)
         continue;
-      if (isAsyncTaskTopOp(op))
-        asyncTaskOps.push_back(op);
+      if (isPartitionTopOp(op))
+        partitionOps.push_back(op);
     }
   }
 
   LLVM_DEBUG({
     LDBG("\nTop Task Bodies");
-    for (auto op : asyncTaskOps) {
+    for (auto op : partitionOps) {
       LDBG("\nTask Body:");
       op->dump();
     }
   });
-  return asyncTaskOps;
+  return partitionOps;
 }
 
 // Create an allocation to hold the mbarriers.
@@ -1047,11 +1047,11 @@ void createToken(
           for (auto *dst : dstOps) {
             auto consumers = getActualConsumers(dst);
             for (auto *t : consumers) {
-              SmallVector<WSPartitionId> asyncTasks = getWSPartitionIds(t);
-              if (asyncTasks.empty())
+              SmallVector<WSPartitionId> partitions = getWSPartitionIds(t);
+              if (partitions.empty())
                 continue;
-              if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                            consumerWSPartitionId) != asyncTasks.end()) {
+              if (std::find(partitions.begin(), partitions.end(),
+                            consumerWSPartitionId) != partitions.end()) {
                 actualConsumers.insert(t);
                 if (!isa<ttng::TCGen5MMAOp>(t))
                   useGen5Barrier = false;
@@ -1154,12 +1154,12 @@ void createToken(
         for (auto *dst : dstOps) {
           auto consumers = getActualConsumers(dst);
           for (auto *t : consumers) {
-            SmallVector<WSPartitionId> asyncTasks = getWSPartitionIds(t);
+            SmallVector<WSPartitionId> partitions = getWSPartitionIds(t);
 
             // Handle operations that belong to multiple tasks (e.g., boundary
             // ops) Only include if this consumer belongs to the task we're
             // processing
-            if (asyncTasks.empty()) {
+            if (partitions.empty()) {
               LLVM_DEBUG({
                 LDBG("Skipping operation with no async tasks");
                 t->dump();
@@ -1167,8 +1167,8 @@ void createToken(
               continue;
             }
 
-            if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                          consumerWSPartitionId) != asyncTasks.end()) {
+            if (std::find(partitions.begin(), partitions.end(),
+                          consumerWSPartitionId) != partitions.end()) {
               actualConsumers.insert(t);
               // XXX: Op can have multiple async tasks
 
@@ -2504,8 +2504,8 @@ void insertAsyncComm(
     }
 
     for (auto &op : reverse(c->getBlock()->getOperations())) {
-      auto asyncTasks = getWSPartitionIds(&op);
-      if (asyncTasks.size() == 1 && asyncTasks[0] == consumerWSPartitionId)
+      auto partitions = getWSPartitionIds(&op);
+      if (partitions.size() == 1 && partitions[0] == consumerWSPartitionId)
         return &op;
     }
 
@@ -2735,12 +2735,12 @@ void insertAsyncComm(
     auto &commChannel = tokenIt->second;
     auto masterChannel = kv.first;
 
-    SmallVector<WSPartitionId> asyncTaskP;
-    asyncTaskP.push_back(masterChannel->relation.first);
-    SmallVector<WSPartitionId> &asyncTaskC = masterChannel->relation.second;
-    SmallVector<WSPartitionId> asyncTasksPC = asyncTaskP;
-    asyncTasksPC.insert(asyncTasksPC.end(), asyncTaskC.begin(),
-                        asyncTaskC.end());
+    SmallVector<WSPartitionId> partitionP;
+    partitionP.push_back(masterChannel->relation.first);
+    SmallVector<WSPartitionId> &partitionC = masterChannel->relation.second;
+    SmallVector<WSPartitionId> partitionsPC = partitionP;
+    partitionsPC.insert(partitionsPC.end(), partitionC.begin(),
+                        partitionC.end());
 
     OpBuilderWithPartitionIds builder(headProducer->getContext());
     if (auto funcOp = dyn_cast<triton::FuncOp>(headProducer->getParentOp())) {
@@ -2748,7 +2748,7 @@ void insertAsyncComm(
     } else {
       builder.setInsertionPoint(headProducer->getParentOp());
     }
-    builder.setPartitionIdsFromArray(asyncTasksPC);
+    builder.setPartitionIdsFromArray(partitionsPC);
 
     SmallVector<tt::DescriptorLoadOp> tmaLoads;
     SmallVector<Value> buffers;
@@ -3619,12 +3619,12 @@ void insertAsyncComm(
         // filter with consumerTaskId
         DenseSet<Operation *> filteredOps;
         for (auto *tCon : actualConsumerOps) {
-          SmallVector<WSPartitionId> asyncTasks = getWSPartitionIds(tCon);
+          SmallVector<WSPartitionId> partitions = getWSPartitionIds(tCon);
 
           // Handle operations that belong to multiple tasks (e.g., boundary
           // ops) Only include if this consumer belongs to the task we're
           // processing
-          if (asyncTasks.empty()) {
+          if (partitions.empty()) {
             LLVM_DEBUG({
               LDBG("Skipping operation with no async tasks");
               tCon->dump();
@@ -3632,8 +3632,8 @@ void insertAsyncComm(
             continue;
           }
 
-          if (std::find(asyncTasks.begin(), asyncTasks.end(), consumerTaskId) !=
-              asyncTasks.end()) {
+          if (std::find(partitions.begin(), partitions.end(), consumerTaskId) !=
+              partitions.end()) {
             filteredOps.insert(tCon);
             // XXX: Op can have multiple async tasks
           }
@@ -3644,9 +3644,9 @@ void insertAsyncComm(
         if (!mmaOp)
           continue;
         // Assume a single task for mmaOp.
-        SmallVector<WSPartitionId> asyncTasksMma =
+        SmallVector<WSPartitionId> partitionsMma =
             getWSPartitionIds(mmaOp.getOperation());
-        assert(asyncTasksMma.size() == 1 && asyncTasksMma[0] == consumerTaskId);
+        assert(partitionsMma.size() == 1 && partitionsMma[0] == consumerTaskId);
         LLVM_DEBUG({
           LDBG("unique actual consumer is MMAv5 op " << masterChannel->uniqID
                                                      << " ");
@@ -5192,9 +5192,9 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 2: find top-level ops that contain a channel, also create new ForOps
   // by adding phase and bufferIdx to the original ForOps, erase the original
   // ForOps.
-  SmallVector<Operation *> asyncTaskTopOps = getTaskTopRegion(funcOp, channels);
+  SmallVector<Operation *> partitionTopOps = getTaskTopRegion(funcOp, channels);
   SmallVector<Operation *> opList;
-  for (auto &op : asyncTaskTopOps) {
+  for (auto &op : partitionTopOps) {
     if (auto origIfOp = dyn_cast<scf::IfOp>(op)) {
       opList.push_back(op);
     }
@@ -5363,7 +5363,7 @@ void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
           "in the same basic block");
   }
 
-  appendAccumCntsForOps(asyncTaskTopOps, channels, regionsWithChannels,
+  appendAccumCntsForOps(partitionTopOps, channels, regionsWithChannels,
                         &config);
   LLVM_DEBUG({
     LDBG("\n\nafter appendAccumCntsForOps");

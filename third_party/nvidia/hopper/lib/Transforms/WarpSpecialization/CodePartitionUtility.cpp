@@ -269,8 +269,8 @@ static Operation *findTmemStartEnd(ttng::TmemAllocChannel *ch,
       continue;
     DenseSet<int> channelIds;
     if (auto attr = user->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-      for (WSPartitionId asyncTaskId : attr.asArrayRef()) {
-        channelIds.insert(asyncTaskId);
+      for (WSPartitionId partitionId : attr.asArrayRef()) {
+        channelIds.insert(partitionId);
       }
       if (channelIds.count(ch->uniqID))
         return user;
@@ -1380,15 +1380,15 @@ Value getBarrierForPipelineStage(OpBuilderWithPartitionIds &builder,
 
 static void setTmemChannelAttr(Operation *op, int channelId,
                                std::string attrName) {
-  SmallVector<int> asyncTaskIds;
+  SmallVector<int> partitionIds;
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-    for (WSPartitionId asyncTaskId : attr.asArrayRef()) {
-      asyncTaskIds.push_back(asyncTaskId);
+    for (WSPartitionId partitionId : attr.asArrayRef()) {
+      partitionIds.push_back(partitionId);
     }
   }
-  asyncTaskIds.push_back(channelId);
-  SmallVector<int> sortedWSPartitionIds(asyncTaskIds.begin(),
-                                        asyncTaskIds.end());
+  partitionIds.push_back(channelId);
+  SmallVector<int> sortedWSPartitionIds(partitionIds.begin(),
+                                        partitionIds.end());
   sort(sortedWSPartitionIds);
   auto i32Ty = IntegerType::get(op->getContext(), 32);
   auto size = static_cast<int64_t>(sortedWSPartitionIds.size());

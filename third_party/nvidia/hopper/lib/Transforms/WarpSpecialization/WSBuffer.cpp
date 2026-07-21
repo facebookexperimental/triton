@@ -895,10 +895,10 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
 
   // origForOp is erased in createNewLoop. Make sure taskTopOps is updated with
   // the newForOp.
-  auto asyncTaskLoopForItr =
+  auto partitionLoopForItr =
       std::find(taskTopOps.begin(), taskTopOps.end(), origForOp.getOperation());
-  if (asyncTaskLoopForItr != taskTopOps.end()) {
-    *asyncTaskLoopForItr = newForOp.getOperation();
+  if (partitionLoopForItr != taskTopOps.end()) {
+    *partitionLoopForItr = newForOp.getOperation();
   }
   auto tmpIter3 =
       std::find(regionsWithChannels.begin(), regionsWithChannels.end(),
@@ -1146,10 +1146,10 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   scf::WhileOp newWhileOp = createNewWhileLoop(origWhileOp, initialAccums);
 
   // Update bookkeeping references from origWhileOp to newWhileOp.
-  auto asyncTaskItr = std::find(taskTopOps.begin(), taskTopOps.end(),
+  auto partitionItr = std::find(taskTopOps.begin(), taskTopOps.end(),
                                 origWhileOp.getOperation());
-  if (asyncTaskItr != taskTopOps.end())
-    *asyncTaskItr = newWhileOp.getOperation();
+  if (partitionItr != taskTopOps.end())
+    *partitionItr = newWhileOp.getOperation();
   if (regionsWithChannels.contains(origWhileOp.getOperation())) {
     regionsWithChannels.erase(origWhileOp.getOperation());
     regionsWithChannels.insert(newWhileOp.getOperation());

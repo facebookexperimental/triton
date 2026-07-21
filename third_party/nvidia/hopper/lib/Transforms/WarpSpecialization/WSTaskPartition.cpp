@@ -24,12 +24,12 @@ void doTaskPartition(triton::FuncOp &funcOp, unsigned numWarpGroups) {
     return;
 
   // Bail out in the presence of user annotations.
-  DenseSet<int> allAsyncTasks;
+  DenseSet<int> allPartitions;
   funcOp->walk([&](Operation *op) {
-    allAsyncTasks.insert_range(getWSPartitionIds(op));
+    allPartitions.insert_range(getWSPartitionIds(op));
   });
 
-  if (!allAsyncTasks.empty())
+  if (!allPartitions.empty())
     return;
 
   SmallVector<LoopLikeOpInterface> loops;
