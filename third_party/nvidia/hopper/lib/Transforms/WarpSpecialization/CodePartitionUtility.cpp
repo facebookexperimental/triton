@@ -1370,10 +1370,10 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx) {
   ttg::MemDescType allocType = cast<ttg::MemDescType>(barrierAlloc.getType());
-  ttg::MemDescType barrierTy =
-      ttg::MemDescType::get({1}, builder.getI64Type(), allocType.getEncoding(),
-                            allocType.getMemorySpace(),
-                            /*mutableMemory=*/true);
+  SmallVector<int64_t> barrierShape(allocType.getShape().drop_front());
+  ttg::MemDescType barrierTy = ttg::MemDescType::get(
+      barrierShape, builder.getI64Type(), allocType.getEncoding(),
+      allocType.getMemorySpace(), /*mutableMemory=*/true);
 
   // Create barrierForTMA from barrierAlloc.
   auto output = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(

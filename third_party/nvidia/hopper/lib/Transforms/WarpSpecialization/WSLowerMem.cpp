@@ -122,11 +122,15 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   for (auto [tmaLoad, buffer] : zip(tmaLoads, buffers)) {
     builder.setInsertionPoint(tmaLoad);
     builder.setLoopScheduleInfoFromOp(tmaLoad);
+    if (tmaLoad->hasAttr("tt.multicast_axes"))
+      builder.createWithAsyncTaskIds<ttng::ClusterBarrierOp>(loc);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
     copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
         pipelineBuffer, pred);
+    if (Attribute axes = tmaLoad->getAttr("tt.multicast_axes"))
+      copy->setAttr("tt.multicast_axes", axes);
   }
 
   // Create a wait_barrier before the first consumer.
@@ -148,15 +152,21 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
       builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
 
   // Create one WaitBarrierOp per consumer task ID.
+  bool hasMulticast = llvm::any_of(
+      tmaLoads, [](auto load) { return load->hasAttr("tt.multicast_axes"); });
   builder.setAsyncTaskIdsFromOp(headConsumer);
   builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
+  if (hasMulticast)
+    builder.createWithAsyncTaskIds<ttng::ClusterBarrierOp>(loc);
   for (int extraTaskId : additionalConsumerTaskIds) {
     builder.setAsynTaskIdsFromArray({extraTaskId});
     builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
+    if (hasMulticast)
+      builder.createWithAsyncTaskIds<ttng::ClusterBarrierOp>(loc);
   }
 
   // Convert all the consumers. The descriptor_load's single user is the

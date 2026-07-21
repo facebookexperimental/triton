@@ -40,9 +40,13 @@ using namespace mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = mlir::triton::nvidia_gpu;
 
-namespace ttg = mlir::triton::gpu;
-
 namespace {
+
+static unsigned getBarrierNumCTAs(ttg::MemDescType barrierTy) {
+  auto cgaLayout = ttg::getCGALayout(barrierTy.getEncoding());
+  auto kBlock = StringAttr::get(barrierTy.getContext(), "block");
+  return cgaLayout.getLinearLayout().getInDimSize(kBlock);
+}
 Value getElectWarp0OrThread0(const NVIDIA::TargetInfo &targetInfo,
                              TritonLLVMOpBuilder &b) {
   if (targetInfo.getComputeCapability() >= 90) {
@@ -146,7 +150,7 @@ struct InitBarrierOpConversion
             LLVM::NVIDIA::getLeaderCTAPredicate(loc, rewriter, barrierTy))
       pred = b.and_(pred, *leaderPred);
 
-    auto numCTAs = triton::gpu::lookupNumCTAs(op);
+    auto numCTAs = getBarrierNumCTAs(barrierTy);
     auto initCount = op.getCount();
     // The lead barrier accounts for all arrives from CTAs that broadcast into
     // the same barrier.
@@ -222,8 +226,18 @@ struct BarrierExpectConversion
         typeConverter->convertType(barrierTy.getElementType()), rewriter);
     // If several CTAs cast to the same barrier, that barrier will receive all
     // the bytes from its broadcast group
-    auto numCTAs = triton::gpu::lookupNumCTAs(rewriter);
-    auto expectedBytes = op.getSize() * (numCTAs / barrierTy.getNumElements());
+    auto numCTAs = getBarrierNumCTAs(barrierTy);
+    auto module = op->getParentOfType<ModuleOp>();
+    auto physicalClusters = module->getAttrOfType<BoolAttr>("ttg.ctas-per-cga");
+    // In physical-cluster (multicast) mode only the leader CTA issues the TMA
+    // copy and broadcasts into its group's shared memory, so each barrier slot
+    // expects the bytes from exactly one arrival -> multiplier 1. Without
+    // physical clusters, every CTA sharing the barrier contributes, so scale by
+    // the number of CTAs per barrier element.
+    unsigned byteMultiplier = physicalClusters && physicalClusters.getValue()
+                                  ? 1
+                                  : numCTAs / barrierTy.getNumElements();
+    auto expectedBytes = op.getSize() * byteMultiplier;
 
     auto id = getThreadId(rewriter, loc);
     Value basePred = b.icmp_eq(id, b.i32_val(0));
@@ -287,7 +301,7 @@ struct WaitBarrierOpConversion
     auto pred = adaptor.getPred();
     if (auto leaderPred =
             LLVM::NVIDIA::getLeaderCTAPredicate(loc, rewriter, barrierTy))
-      pred = b.and_(pred, *leaderPred);
+      pred = pred ? b.and_(pred, *leaderPred) : *leaderPred;
 
     bool predicated = pred && !matchPattern(pred, m_NonZero());
     int suspendNs = 0;

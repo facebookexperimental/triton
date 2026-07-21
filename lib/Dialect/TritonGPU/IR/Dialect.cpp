@@ -3653,10 +3653,21 @@ struct TritonGPUVerifyTensorLayoutInterface
 
     int moduleCTAsPerCGA = lookupNumCTAs(op);
     int layoutCTAsPerCGA = getNumCTAs(layout);
-    if (layoutCTAsPerCGA != moduleCTAsPerCGA) {
+    int physicalCTAsPerCGA = moduleCTAsPerCGA;
+    if (auto module = op->getParentOfType<ModuleOp>()) {
+      auto physicalClusters =
+          module->getAttrOfType<BoolAttr>("ttg.ctas-per-cga");
+      if (physicalClusters && physicalClusters.getValue()) {
+        auto dims = TritonGPUDialect::getClusterDims(module);
+        physicalCTAsPerCGA = dims[0] * dims[1] * dims[2];
+      }
+    }
+    if (layoutCTAsPerCGA != moduleCTAsPerCGA &&
+        layoutCTAsPerCGA != physicalCTAsPerCGA) {
       return makeErr() << layout << ".\nLayout has " << layoutCTAsPerCGA
-                       << " CTAs per CGA, but the context requires "
-                       << moduleCTAsPerCGA << " CTAs per CGA.";
+                       << " CTAs per CGA, but the context requires either "
+                       << moduleCTAsPerCGA << " logical or "
+                       << physicalCTAsPerCGA << " physical CTAs per CGA.";
     }
     return success();
   }
