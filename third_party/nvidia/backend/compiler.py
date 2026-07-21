@@ -799,6 +799,10 @@ class CUDABackend(BaseBackend):
                 "ttg.cluster-dim-z",
                 ir.builder(mod.context).get_int32_attr(opt.cluster_dims[2]),
             )
+        mod.set_attr("ttg.multicast", ir.builder(mod.context).get_bool_attr(opt.multicast))
+        mod.set_attr("ttg.use-meta-ws", ir.builder(mod.context).get_bool_attr(knobs.nvidia.use_meta_ws))
+        if opt.ctas_per_cga is not None:
+            mod.set_attr("ttg.ctas-per-cga", ir.builder(mod.context).get_bool_attr(True))
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = capability // 10 >= 8
@@ -837,6 +841,7 @@ class CUDABackend(BaseBackend):
                 and opt.ctas_per_cga is not None):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.ttnvgpuir.add_tma_multicast(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
