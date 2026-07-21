@@ -153,7 +153,8 @@ public:
     if (failed(desc))
       return failure();
 
-    return DotOpMmaSmemLoader{*desc, baseSrcb128, ll};
+    Value baseb128 = b.zext(i64_ty, b.and_(baseSrcb128, b.i32_val(0x7FFF)));
+    return DotOpMmaSmemLoader{*desc, baseb128, ll};
   }
 
   Value smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
@@ -177,11 +178,11 @@ public:
     int32_t smemByteOffsetb128 = smemByteOffsetb8 >> 4;
     // Compute the base address at runtime to prevent LLVM from folding the
     // per-tile offset into a unique 64-bit constant. This produces a short
-    // dependency chain (add→and→zext→add) that helps hide WGMMA latency.
-    Value fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
-    Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x3FFF));
-    Value addr64 = tb.zext(i64_ty, addrMasked);
-    Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
+    // dependency chain that helps hide WGMMA latency.
+    Value fullAddrb128 =
+        tb.add(baseSrcb128, tb.int_val(64, smemByteOffsetb128));
+    Value addrMasked = tb.and_(fullAddrb128, tb.int_val(64, 0x7FFF));
+    Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addrMasked);
     return descVal;
   }
   MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
