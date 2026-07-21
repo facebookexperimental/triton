@@ -193,7 +193,7 @@ void init_triton_tlx_ir(py::module &&m) {
            })
       .def("create_tmem_copy",
            [](TritonOpBuilder &self, Value src, Value dst) {
-             self.create<ttng::TMEMCopyOp>(src, dst, /*barrier=*/Value());
+             self.create<ttng::TMEMCopyOp>(src, dst);
            })
       .def("create_remote_store",
            [](TritonOpBuilder &self, Value &dst, Value &regValues,

@@ -251,10 +251,13 @@ class HIPBackend(BaseBackend):
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
+        passes.ttir.add_uplift_while_to_for(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
@@ -275,7 +278,7 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         emuTF32 = False
-        passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_coalesce(pm, 128)
         if knobs.amd.use_buffer_ops:
             amd.passes.ttgpuir.add_coalesce_buffer_ops(pm)
             passes.ttgpuir.add_remove_layout_conversions(pm, 0)
@@ -308,6 +311,7 @@ class HIPBackend(BaseBackend):
 
         use_async_copy = is_async_copy_enabled(options.arch)
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch, use_async_copy)
+        amd.passes.ttgpuir.add_optimize_descriptor_encoding(pm)
 
         # E4: when TRITON_ENABLE_AMD_MODULO is set, the AMD modulo scheduler
         # replaces schedule-loops — it builds the DDG (TritonGPUModuloCore) with

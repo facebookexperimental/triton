@@ -20,8 +20,8 @@
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 16], warpsPerCTA = [1, 4], order = [1, 0]}>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tma_split_copy_separate_buffer_id(
-      %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-      %b_desc: !tt.tensordesc<tensor<64x128xf16, #shared>>) {
+      %a_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %b_desc: !tt.tensordesc<64x128xf16, #shared>) {
     // A: inner dim fits swizzle (64 elems × 2B = 128B = swizzle) → no split
     %A_smem = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     // B: inner dim exceeds swizzle (128 elems × 2B = 256B > 128B swizzle) → split
@@ -31,9 +31,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %c10 = arith.constant 10 : i32
     scf.for %iv = %c0 to %c10 step %c1 : i32 {
       // Producer task 1: TMA loads into SMEM
-      %a = tt.descriptor_load %a_desc[%c0, %c0] {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      %a = tt.descriptor_load %a_desc[%c0, %c0] {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
       ttg.local_store %a, %A_smem {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %b = tt.descriptor_load %b_desc[%c0, %c0] {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked>
+      %b = tt.descriptor_load %b_desc[%c0, %c0] {ttg.partition = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked>
       ttg.local_store %b, %B_smem {ttg.partition = array<i32: 1>} : tensor<64x128xf16, #blocked> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
       // Consumer task 0: reads from SMEM
       %a_val = ttg.local_load %A_smem {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>

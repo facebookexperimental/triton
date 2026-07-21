@@ -65,7 +65,8 @@ recognizes the `scf.while` outer loop (same doc).
 |------|----------------|-------------|
 | `WarpSpecialization.cpp` | `NVGPUWarpSpecialization` | Top-level pipeline orchestration |
 | `SinkBroadcast.cpp` | `nvgpu-sink-broadcast` | Pre-partition peephole that sinks `tt.broadcast` producer chains to elementwise users |
-| `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes) |
+| `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes). See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) covers extending it to `scf.while` (in progress) |
+| (frontend) | `tl.range` / `tl.condition` → `tt.*` loop attrs | The user-facing AutoWS/pipelining annotations, their IR attributes and consumers, and what works on `scf.while` today: [AutoWSAnnotations.md](AutoWSAnnotations.md) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `ttg.partition` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |

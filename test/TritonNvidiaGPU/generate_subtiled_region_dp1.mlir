@@ -27,7 +27,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @dp1_epilogue_subtile(
       %tmem_buf: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
       %smem0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %smem1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %off0: i32, %off1: i32, %off2: i32) {
@@ -72,7 +72,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @dp1_epilogue_subtile_in_loop(
       %tmem_buf: !ttg.memdesc<128x128xf32, #tmemb, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #sharedb>>,
+      %desc: !tt.tensordesc<128x64xf16, #sharedb>,
       %smem0: !ttg.memdesc<128x64xf16, #sharedb, #smemb, mutable>,
       %smem1: !ttg.memdesc<128x64xf16, #sharedb, #smemb, mutable>,
       %off0: i32, %off1: i32, %off2: i32,

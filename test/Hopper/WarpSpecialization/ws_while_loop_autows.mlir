@@ -114,9 +114,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   // DATAPART-LABEL: @while_descriptor_data_partition
   // DATAPART: scf.while
-  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
   // DATAPART: arith.addi %{{.*}}, %{{.*}} : i32
-  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<tensor<64x64xf16>> -> tensor<64x64xf16
+  // DATAPART: tt.descriptor_load {{.*}} : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
   tt.func public @while_descriptor_data_partition(%desc_storage: !tt.ptr<i8>, %out: !tt.ptr<f32>, %bound: i32) {
@@ -125,15 +125,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c0 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : i32
     %c64 = arith.constant {ttg.partition = array<i32: 0>} 64 : i32
     %acc_init = arith.constant {ttg.partition = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
-    %desc_a = ttng.reinterpret_tensor_descriptor %desc_storage {ttg.partition = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<tensor<128x64xf16>>
-    %desc_b = ttng.reinterpret_tensor_descriptor %desc_storage {ttg.partition = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<tensor<64x256xf16>>
+    %desc_a = ttng.reinterpret_tensor_descriptor %desc_storage {ttg.partition = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<128x64xf16>
+    %desc_b = ttng.reinterpret_tensor_descriptor %desc_storage {ttg.partition = array<i32: 0>} : !tt.ptr<i8> to !tt.tensordesc<64x256xf16>
     %result:2 = scf.while (%acc = %acc_init, %off = %c0, %cond = %true) : (tensor<128x256xf32, #mma>, i32, i1) -> (tensor<128x256xf32, #mma>, i32) {
       scf.condition(%cond) {ttg.partition = array<i32: 0, 1, 2>} %acc, %off : tensor<128x256xf32, #mma>, i32
     } do {
     ^bb0(%acc: tensor<128x256xf32, #mma>, %off: i32):
-      %a = tt.descriptor_load %desc_a[%off, %c0] {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
+      %a = tt.descriptor_load %desc_a[%off, %c0] {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
       %a_alloc = ttg.local_alloc %a {ttg.partition = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-      %b = tt.descriptor_load %desc_b[%c0, %off] {ttg.partition = array<i32: 0>} : !tt.tensordesc<tensor<64x256xf16>> -> tensor<64x256xf16, #blocked1>
+      %b = tt.descriptor_load %desc_b[%c0, %off] {ttg.partition = array<i32: 0>} : !tt.tensordesc<64x256xf16> -> tensor<64x256xf16, #blocked1>
       %b_alloc = ttg.local_alloc %b {ttg.partition = array<i32: 1, 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
       %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {ttg.partition = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
       %new_off = arith.addi %off, %c64 {ttg.partition = array<i32: 0>} : i32
@@ -188,6 +188,56 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %loaded = ttg.local_load %alloc {ttg.partition = array<i32: 1>} : !ttg.memdesc<16xf32, #shared, #smem, mutable> -> tensor<16xf32, #blocked>
       tt.store %dst, %loaded, %mask {ttg.partition = array<i32: 1>} : tensor<16x!tt.ptr<f32>, #blocked>
     } {ttg.partition = array<i32: 0, 1>, tt.warp_specialize, ttg.partition.stages = [0 : i32, 0 : i32], ttg.partition.types = ["compute", "compute"]}
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A CLC (Cluster Launch Control) persistent GEMM whose outer loop is an
+  // scf.while: the loop-carried `is_valid` bit is refreshed each iteration by
+  // `ttng.clc_advance` (hardware work-stealing), exactly as the ClcTileScheduler
+  // emits (`while sched.is_valid(): ...; sched = sched.advance()`). This shows
+  // that data partitioning splits the while-carried accumulator + warp_group_dot
+  // along M across the two consumer warp groups (partition 1, 2) regardless
+  // of how the loop advances -- the `clc_advance` producer op (partition 0) is left
+  // intact. (Simplified: uses warp_group_dot to keep the accumulator in
+  // registers; the data-partition mechanics are identical for tc_gen5_mma.)
+  // DATAPART-LABEL: @while_clc_data_partition
+  // DATAPART: scf.while
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // DATAPART: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>
+  // The two consumer warp groups each get an M/2 = 64 slice of the accumulator.
+  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
+  // DATAPART: ttng.warp_group_dot {{.*}} -> tensor<64x256xf32
+  // The CLC advance (loop-carried valid producer, partition 0) is left intact.
+  // DATAPART: ttng.clc_advance
+  tt.func public @while_clc_data_partition(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %out: !tt.ptr<f32>) {
+    %true = arith.constant {ttg.partition = array<i32: 0, 1, 2>} true
+    %acc_init = arith.constant {ttg.partition = array<i32: 1, 2>} dense<0.000000e+00> : tensor<128x256xf32, #mma>
+    %result = scf.while (%acc = %acc_init, %valid = %true) : (tensor<128x256xf32, #mma>, i1) -> tensor<128x256xf32, #mma> {
+      scf.condition(%valid) %acc : tensor<128x256xf32, #mma>
+    } do {
+    ^bb0(%acc: tensor<128x256xf32, #mma>):
+      %a_ptrs = tt.splat %arg0 {ttg.partition = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+      %a = tt.load %a_ptrs {ttg.partition = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      %a_alloc = ttg.local_alloc %a {ttg.partition = array<i32: 1, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+      %b_ptrs = tt.splat %arg1 {ttg.partition = array<i32: 0>} : !tt.ptr<f16> -> tensor<64x256x!tt.ptr<f16>, #blocked1>
+      %b = tt.load %b_ptrs {ttg.partition = array<i32: 0>} : tensor<64x256x!tt.ptr<f16>, #blocked1>
+      %b_alloc = ttg.local_alloc %b {ttg.partition = array<i32: 1, 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+      %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {ttg.partition = array<i32: 1, 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+      %nvalid, %x, %y, %z = ttng.clc_advance {ttg.partition = array<i32: 0>} : i1, i32, i32, i32
+      scf.yield {ttg.partition = array<i32: 0, 1, 2>} %dot, %nvalid : tensor<128x256xf32, #mma>, i1
+    }
+    %ptrs = tt.splat %out {ttg.partition = array<i32: 1, 2>} : !tt.ptr<f32> -> tensor<128x256x!tt.ptr<f32>, #blocked1>
+    %cvt = ttg.convert_layout %result {ttg.partition = array<i32: 1, 2>} : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked1>
+    tt.store %ptrs, %cvt {ttg.partition = array<i32: 1, 2>} : tensor<128x256x!tt.ptr<f32>, #blocked1>
     tt.return
   }
 }

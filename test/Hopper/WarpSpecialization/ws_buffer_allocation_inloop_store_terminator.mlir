@@ -32,7 +32,7 @@
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reorder_epilog_inloop_store(%x_desc: !tt.tensordesc<tensor<64x128xbf16, #shared>>, %w_desc: !tt.tensordesc<tensor<64x128xbf16, #shared>>, %out_ptr: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+  tt.func public @reorder_epilog_inloop_store(%x_desc: !tt.tensordesc<64x128xbf16, #shared>, %w_desc: !tt.tensordesc<64x128xbf16, #shared>, %out_ptr: !tt.ptr<bf16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %true = arith.constant {ttg.partition = array<i32: 0, 2>} true
     %c0_i32 = arith.constant {ttg.partition = array<i32: 1>} 0 : i32
     %c152_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 152 : i32
@@ -41,9 +41,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %optr = tt.splat %out_ptr {ttg.partition = array<i32: 0>} : !tt.ptr<bf16> -> tensor<64x64x!tt.ptr<bf16>, #blocked>
     %acc, %acc_tok = ttng.tmem_alloc {ttg.partition = array<i32: 0, 2>} : () -> (!ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %r = scf.for %arg = %start_pid to %c18432_i32 step %c152_i32 iter_args(%tok = %acc_tok) -> (!ttg.async.token)  : i32 {
-      %x = tt.descriptor_load %x_desc[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<64x128xbf16, #shared>> -> tensor<64x128xbf16, #blocked1>
+      %x = tt.descriptor_load %x_desc[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<64x128xbf16, #shared> -> tensor<64x128xbf16, #blocked1>
       %xs = ttg.local_alloc %x {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : (tensor<64x128xbf16, #blocked1>) -> !ttg.memdesc<64x128xbf16, #shared, #smem>
-      %w = tt.descriptor_load %w_desc[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<64x128xbf16, #shared>> -> tensor<64x128xbf16, #blocked1>
+      %w = tt.descriptor_load %w_desc[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<64x128xbf16, #shared> -> tensor<64x128xbf16, #blocked1>
       %ws = ttg.local_alloc %w {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : (tensor<64x128xbf16, #blocked1>) -> !ttg.memdesc<64x128xbf16, #shared, #smem>
       %wt = ttg.memdesc_trans %ws {ttg.partition = array<i32: 2>, loop.cluster = 1 : i32, loop.stage = 0 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<64x128xbf16, #shared, #smem> -> !ttg.memdesc<128x64xbf16, #shared1, #smem>
       %mma_tok = ttng.tc_gen5_mma %xs, %wt, %acc[%tok], %true, %true {ttg.partition = array<i32: 2>, loop.cluster = 1 : i32, loop.stage = 0 : i32, tt.self_latency = 0 : i32} : !ttg.memdesc<64x128xbf16, #shared, #smem>, !ttg.memdesc<128x64xbf16, #shared1, #smem>, !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>

@@ -20,7 +20,7 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tma_multi_consumer_task_ids(%desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
+  tt.func public @tma_multi_consumer_task_ids(%desc: !tt.tensordesc<128x64xf16, #shared>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
     %c0 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : i32
     %c1 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 1 : i32
     %c4 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 4 : i32
@@ -31,7 +31,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %i4 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 4 : index
     %buffer = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     scf.for %iv = %i0 to %i4 step %i1 {
-      %tile = tt.descriptor_load %desc[%c0, %c0] {ttg.partition = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      %tile = tt.descriptor_load %desc[%c0, %c0] {ttg.partition = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
       ttg.local_store %tile, %buffer {ttg.partition = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %local0 = ttg.local_load %buffer {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
       %consumer0 = arith.addf %local0, %local0 {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked>

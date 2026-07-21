@@ -610,13 +610,23 @@ public:
       int numWarpSpecializeOps = 0;
       bool hasExclusiveWS = false;
       bool hasNoEndingClusterSync = false;
+      std::optional<int32_t> mbarrierTryWaitSuspendNs;
       mod.walk([&](ttg::WarpSpecializeOp op) {
         ++numWarpSpecializeOps;
         if (op->hasAttr("tlx.exclusive"))
           hasExclusiveWS = true;
         if (op->hasAttr("tlx.no_ending_cluster_sync"))
           hasNoEndingClusterSync = true;
+        if (auto attr = op->getAttrOfType<IntegerAttr>(
+                "tlx.mbarrier_try_wait_suspend_ns")) {
+          int32_t value = attr.getInt();
+          if (!mbarrierTryWaitSuspendNs || value < *mbarrierTryWaitSuspendNs)
+            mbarrierTryWaitSuspendNs = value;
+        }
       });
+      if (mbarrierTryWaitSuspendNs)
+        mod->setAttr("tlx.mbarrier_try_wait_suspend_ns",
+                     b.getI32IntegerAttr(*mbarrierTryWaitSuspendNs));
       if (hasExclusiveWS) {
         if (numWarpSpecializeOps != 1) {
           mod.emitError()

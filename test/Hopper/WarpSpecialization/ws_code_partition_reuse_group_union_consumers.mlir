@@ -50,7 +50,7 @@
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reuse_group_union_consumers(%a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
+  tt.func public @reuse_group_union_consumers(%a_desc: !tt.tensordesc<128x64xf16, #shared>, %b_desc: !tt.tensordesc<128x64xf16, #shared>, %out0: !tt.ptr<f16>, %out1: !tt.ptr<f16>) attributes {noinline = false} {
     %a = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %b = ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %c0 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : i32
@@ -59,9 +59,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %ptrs0 = tt.splat %out0 {ttg.partition = array<i32: 0>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
     %ptrs1 = tt.splat %out1 {ttg.partition = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
     scf.for %iv = %c0 to %c4 step %c1 : i32 {
-      %a_tile = tt.descriptor_load %a_desc[%c0, %c0] {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      %a_tile = tt.descriptor_load %a_desc[%c0, %c0] {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
       ttg.local_store %a_tile, %a {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %b_tile = tt.descriptor_load %b_desc[%c0, %c0] {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked>
+      %b_tile = tt.descriptor_load %b_desc[%c0, %c0] {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
       ttg.local_store %b_tile, %b {ttg.partition = array<i32: 2>, loop.cluster = 0 : i32, loop.stage = 0 : i32} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
       %b0 = ttg.local_load %b {ttg.partition = array<i32: 0>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
       tt.store %ptrs0, %b0 {ttg.partition = array<i32: 0>} : tensor<128x64x!tt.ptr<f16>, #blocked>

@@ -202,8 +202,8 @@ into two M partitions:
 %acc1, %tok1 = ttng.tmem_alloc
   : () -> (!ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
 
-%a0 = tt.descriptor_load ... : !tt.tensordesc<tensor<128x128xf8E4M3FN, ...>>
-%a1 = tt.descriptor_load ... : !tt.tensordesc<tensor<128x128xf8E4M3FN, ...>>
+%a0 = tt.descriptor_load ... : !tt.tensordesc<128x128xf8E4M3FN, ...>
+%a1 = tt.descriptor_load ... : !tt.tensordesc<128x128xf8E4M3FN, ...>
 
 %a_scale0 = ttng.tmem_alloc %scale0
   : (tensor<128x4xi8, ...>) -> !ttg.memdesc<128x4xi8, #tmem_scales, #ttng.tensor_memory>

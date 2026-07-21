@@ -30,7 +30,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @multi_task_with_memory_store(
       %tmem_buf: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
       %off0: i32, %off1: i32, %off2: i32) {
     // Pre-hoisted SMEM allocations (empty, no data).
     %smem0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
@@ -44,12 +44,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Chain 0 (from lhs): truncf{3} → local_store{3} → async_tma_copy{4}
     %trunc0 = arith.truncf %lhs {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #blocked2d> to tensor<128x64xf16, #blocked2d>
     ttg.local_store %trunc0, %smem0 {ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked2d> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {ttg.partition = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {ttg.partition = array<i32: 4>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 
     // Chain 1 (from rhs): truncf{3} → local_store{3} → async_tma_copy{4}
     %trunc1 = arith.truncf %rhs {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #blocked2d> to tensor<128x64xf16, #blocked2d>
     ttg.local_store %trunc1, %smem1 {ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked2d> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {ttg.partition = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {ttg.partition = array<i32: 4>} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 
     tt.return
   }
@@ -175,7 +175,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @identity_insertion_addi(
       %tmem_buf: !ttg.memdesc<128x128xf32, #tmem4, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared4>>,
+      %desc: !tt.tensordesc<128x64xf16, #shared4>,
       %off_row: i32, %off_col: i32, %c64: i32) {
     %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x128xf32, #tmem4, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked_full4>
     %reshaped = tt.reshape %loaded#0 : tensor<128x128xf32, #blocked_full4> -> tensor<128x2x64xf32, #blocked3d4>
@@ -184,12 +184,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // Chain 0 (lhs): truncf → store at [off_row, off_col]
     %trunc0 = arith.truncf %lhs : tensor<128x64xf32, #blocked2d4> to tensor<128x64xf16, #blocked2d4>
-    tt.descriptor_store %desc[%off_row, %off_col], %trunc0 : !tt.tensordesc<tensor<128x64xf16, #shared4>>, tensor<128x64xf16, #blocked2d4>
+    tt.descriptor_store %desc[%off_row, %off_col], %trunc0 : !tt.tensordesc<128x64xf16, #shared4>, tensor<128x64xf16, #blocked2d4>
 
     // Chain 1 (rhs): truncf → addi offset → store at [off_row, off_col + 64]
     %trunc1 = arith.truncf %rhs : tensor<128x64xf32, #blocked2d4> to tensor<128x64xf16, #blocked2d4>
     %off_col2 = arith.addi %off_col, %c64 : i32
-    tt.descriptor_store %desc[%off_row, %off_col2], %trunc1 : !tt.tensordesc<tensor<128x64xf16, #shared4>>, tensor<128x64xf16, #blocked2d4>
+    tt.descriptor_store %desc[%off_row, %off_col2], %trunc1 : !tt.tensordesc<128x64xf16, #shared4>, tensor<128x64xf16, #blocked2d4>
 
     tt.return
   }
@@ -227,8 +227,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @identity_descriptor_store_epilogue(
       %tmem_buf: !ttg.memdesc<128x256xf32, #tmem5, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared5>>,
-      %bias_desc: !tt.tensordesc<tensor<128x128xf16, #shared5>>,
+      %c_desc: !tt.tensordesc<128x128xf16, #shared5>,
+      %bias_desc: !tt.tensordesc<128x128xf16, #shared5>,
       %off_m: i32, %off_n: i32, %c128: i32) {
     %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x256xf32, #tmem5, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full5>
     %reshaped = tt.reshape %loaded#0 : tensor<128x256xf32, #blocked_full5> -> tensor<128x2x128xf32, #blocked3d5>
@@ -237,20 +237,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // Chain 0 (lhs): cvt → bias_load → extf → addf → truncf → store
     %cvt0 = ttg.convert_layout %lhs : tensor<128x128xf32, #blocked2d5> -> tensor<128x128xf32, #blocked2d5>
-    %bias0 = tt.descriptor_load %bias_desc[%off_m, %off_n] : !tt.tensordesc<tensor<128x128xf16, #shared5>> -> tensor<128x128xf16, #blocked2d5>
+    %bias0 = tt.descriptor_load %bias_desc[%off_m, %off_n] : !tt.tensordesc<128x128xf16, #shared5> -> tensor<128x128xf16, #blocked2d5>
     %bias0_f32 = arith.extf %bias0 : tensor<128x128xf16, #blocked2d5> to tensor<128x128xf32, #blocked2d5>
     %acc0 = arith.addf %cvt0, %bias0_f32 : tensor<128x128xf32, #blocked2d5>
     %c0 = arith.truncf %acc0 : tensor<128x128xf32, #blocked2d5> to tensor<128x128xf16, #blocked2d5>
-    tt.descriptor_store %c_desc[%off_m, %off_n], %c0 : !tt.tensordesc<tensor<128x128xf16, #shared5>>, tensor<128x128xf16, #blocked2d5>
+    tt.descriptor_store %c_desc[%off_m, %off_n], %c0 : !tt.tensordesc<128x128xf16, #shared5>, tensor<128x128xf16, #blocked2d5>
 
     // Chain 1 (rhs): cvt → addi(offset) → bias_load → extf → addf → truncf → store
     %cvt1 = ttg.convert_layout %rhs : tensor<128x128xf32, #blocked2d5> -> tensor<128x128xf32, #blocked2d5>
     %off_n2 = arith.addi %off_n, %c128 : i32
-    %bias1 = tt.descriptor_load %bias_desc[%off_m, %off_n2] : !tt.tensordesc<tensor<128x128xf16, #shared5>> -> tensor<128x128xf16, #blocked2d5>
+    %bias1 = tt.descriptor_load %bias_desc[%off_m, %off_n2] : !tt.tensordesc<128x128xf16, #shared5> -> tensor<128x128xf16, #blocked2d5>
     %bias1_f32 = arith.extf %bias1 : tensor<128x128xf16, #blocked2d5> to tensor<128x128xf32, #blocked2d5>
     %acc1 = arith.addf %cvt1, %bias1_f32 : tensor<128x128xf32, #blocked2d5>
     %c1 = arith.truncf %acc1 : tensor<128x128xf32, #blocked2d5> to tensor<128x128xf16, #blocked2d5>
-    tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 : !tt.tensordesc<tensor<128x128xf16, #shared5>>, tensor<128x128xf16, #blocked2d5>
+    tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 : !tt.tensordesc<128x128xf16, #shared5>, tensor<128x128xf16, #blocked2d5>
 
     tt.return
   }
@@ -312,8 +312,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @multi_task_addmm_descriptor_store(
       %tmem_buf: !ttg.memdesc<128x256xf32, #tmem5mt, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared5mt>>,
-      %bias_desc: !tt.tensordesc<tensor<128x128xf16, #shared5mt>>,
+      %c_desc: !tt.tensordesc<128x128xf16, #shared5mt>,
+      %bias_desc: !tt.tensordesc<128x128xf16, #shared5mt>,
       %off_m: i32, %off_n: i32, %c128: i32) {
     %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] {ttg.partition = array<i32: 2>} : !ttg.memdesc<128x256xf32, #tmem5mt, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full5mt>
     %reshaped = tt.reshape %loaded#0 {ttg.partition = array<i32: 2>} : tensor<128x256xf32, #blocked_full5mt> -> tensor<128x2x128xf32, #blocked3d5mt>
@@ -322,20 +322,20 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // Chain 0 (lhs): cvt{2} → bias_load{3} → extf{2} → addf{2} → truncf{2} → store{1}
     %cvt0 = ttg.convert_layout %lhs {ttg.partition = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> -> tensor<128x128xf32, #blocked2d5mt>
-    %bias0 = tt.descriptor_load %bias_desc[%off_m, %off_n] {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>> -> tensor<128x128xf16, #blocked2d5mt>
+    %bias0 = tt.descriptor_load %bias_desc[%off_m, %off_n] {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared5mt> -> tensor<128x128xf16, #blocked2d5mt>
     %bias0_f32 = arith.extf %bias0 {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked2d5mt> to tensor<128x128xf32, #blocked2d5mt>
     %acc0 = arith.addf %cvt0, %bias0_f32 {ttg.partition = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt>
     %c0 = arith.truncf %acc0 {ttg.partition = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> to tensor<128x128xf16, #blocked2d5mt>
-    tt.descriptor_store %c_desc[%off_m, %off_n], %c0 {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>>, tensor<128x128xf16, #blocked2d5mt>
+    tt.descriptor_store %c_desc[%off_m, %off_n], %c0 {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x128xf16, #shared5mt>, tensor<128x128xf16, #blocked2d5mt>
 
     // Chain 1 (rhs): cvt{2} → addi{3} → bias_load{3} → extf{2} → addf{2} → truncf{2} → store{1}
     %cvt1 = ttg.convert_layout %rhs {ttg.partition = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> -> tensor<128x128xf32, #blocked2d5mt>
     %off_n2 = arith.addi %off_n, %c128 {ttg.partition = array<i32: 3>} : i32
-    %bias1 = tt.descriptor_load %bias_desc[%off_m, %off_n2] {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>> -> tensor<128x128xf16, #blocked2d5mt>
+    %bias1 = tt.descriptor_load %bias_desc[%off_m, %off_n2] {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared5mt> -> tensor<128x128xf16, #blocked2d5mt>
     %bias1_f32 = arith.extf %bias1 {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #blocked2d5mt> to tensor<128x128xf32, #blocked2d5mt>
     %acc1 = arith.addf %cvt1, %bias1_f32 {ttg.partition = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt>
     %c1 = arith.truncf %acc1 {ttg.partition = array<i32: 2>} : tensor<128x128xf32, #blocked2d5mt> to tensor<128x128xf16, #blocked2d5mt>
-    tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared5mt>>, tensor<128x128xf16, #blocked2d5mt>
+    tt.descriptor_store %c_desc[%off_m, %off_n2], %c1 {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x128xf16, #shared5mt>, tensor<128x128xf16, #blocked2d5mt>
 
     tt.return
   }
@@ -371,7 +371,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @identity_plus_multi_task_tma_store(
       %tmem_buf: !ttg.memdesc<128x256xf32, #tmem6, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %c_desc: !tt.tensordesc<tensor<128x128xf16, #shared6>>,
+      %c_desc: !tt.tensordesc<128x128xf16, #shared6>,
       %off_m: i32, %off_n: i32, %c128: i32) {
     // Pre-hoisted SMEM allocations.
     %smem0 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
@@ -385,14 +385,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Chain 0 (lhs): truncf{4} → local_store{4} → async_tma_copy{3} → wait{3}
     %trunc0 = arith.truncf %lhs {ttg.partition = array<i32: 4>} : tensor<128x128xf32, #blocked2d6> to tensor<128x128xf16, #blocked2d6>
     ttg.local_store %trunc0, %smem0 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked2d6> -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
-    %tok0 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n] %smem0 {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared6>>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
+    %tok0 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n] %smem0 {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared6>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %tok0 {ttg.partition = array<i32: 3>} : !ttg.async.token
 
     // Chain 1 (rhs): truncf{4} → addi{4} → local_store{4} → async_tma_copy{3} → wait{3}
     %trunc1 = arith.truncf %rhs {ttg.partition = array<i32: 4>} : tensor<128x128xf32, #blocked2d6> to tensor<128x128xf16, #blocked2d6>
     %off_n2 = arith.addi %off_n, %c128 {ttg.partition = array<i32: 4>} : i32
     ttg.local_store %trunc1, %smem1 {ttg.partition = array<i32: 4>} : tensor<128x128xf16, #blocked2d6> -> !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable>
-    %tok1 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n2] %smem1 {ttg.partition = array<i32: 3>} : !tt.tensordesc<tensor<128x128xf16, #shared6>>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
+    %tok1 = ttng.async_tma_copy_local_to_global %c_desc[%off_m, %off_n2] %smem1 {ttg.partition = array<i32: 3>} : !tt.tensordesc<128x128xf16, #shared6>, !ttg.memdesc<128x128xf16, #shared6, #smem6, mutable> -> !ttg.async.token
     ttng.async_tma_store_token_wait %tok1 {ttg.partition = array<i32: 3>} : !ttg.async.token
 
     tt.return
@@ -430,7 +430,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @four_tile_nested_split(
       %tmem_buf: !ttg.memdesc<128x256xf32, #tmem7, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %c_desc: !tt.tensordesc<tensor<128x64xf16, #shared7>>,
+      %c_desc: !tt.tensordesc<128x64xf16, #shared7>,
       %off_m: i32, %off_n: i32, %c64: i32, %c128: i32, %c192: i32) {
     %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] : !ttg.memdesc<128x256xf32, #tmem7, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_full7>
     %reshaped = tt.reshape %loaded#0 : tensor<128x256xf32, #blocked_full7> -> tensor<128x2x128xf32, #blocked3d7>
@@ -446,19 +446,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %acc10, %acc11 = tt.split %rhs_t : tensor<128x64x2xf32, #blocked3d_perm7b> -> tensor<128x64xf32, #blocked2d7b>
 
     %c00 = arith.truncf %acc00 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
-    tt.descriptor_store %c_desc[%off_m, %off_n], %c00 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+    tt.descriptor_store %c_desc[%off_m, %off_n], %c00 : !tt.tensordesc<128x64xf16, #shared7>, tensor<128x64xf16, #blocked2d7b>
 
     %c01 = arith.truncf %acc01 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
     %off1 = arith.addi %off_n, %c64 : i32
-    tt.descriptor_store %c_desc[%off_m, %off1], %c01 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+    tt.descriptor_store %c_desc[%off_m, %off1], %c01 : !tt.tensordesc<128x64xf16, #shared7>, tensor<128x64xf16, #blocked2d7b>
 
     %c10 = arith.truncf %acc10 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
     %off2 = arith.addi %off_n, %c128 : i32
-    tt.descriptor_store %c_desc[%off_m, %off2], %c10 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+    tt.descriptor_store %c_desc[%off_m, %off2], %c10 : !tt.tensordesc<128x64xf16, #shared7>, tensor<128x64xf16, #blocked2d7b>
 
     %c11 = arith.truncf %acc11 : tensor<128x64xf32, #blocked2d7b> to tensor<128x64xf16, #blocked2d7b>
     %off3 = arith.addi %off_n, %c192 : i32
-    tt.descriptor_store %c_desc[%off_m, %off3], %c11 : !tt.tensordesc<tensor<128x64xf16, #shared7>>, tensor<128x64xf16, #blocked2d7b>
+    tt.descriptor_store %c_desc[%off_m, %off3], %c11 : !tt.tensordesc<128x64xf16, #shared7>, tensor<128x64xf16, #blocked2d7b>
 
     tt.return
   }

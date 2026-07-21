@@ -26,7 +26,7 @@
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @reuse_war_async(%desc_k: !tt.tensordesc<tensor<128x128xf16, #shared>>, %desc_v: !tt.tensordesc<tensor<128x128xf16, #shared>>) attributes {noinline = false} {
+  tt.func public @reuse_war_async(%desc_k: !tt.tensordesc<128x128xf16, #shared>, %desc_v: !tt.tensordesc<128x128xf16, #shared>) attributes {noinline = false} {
     %c0_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : i32
     %c128_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 128 : i32
     %c1024_i32 = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 1024 : i32
@@ -42,15 +42,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // TMEM reuse group (shared buffer.id): the QK result (owner) and P (reuser at offset 0).
     %qk, %qk_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %p = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 6 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
-    %qload = tt.descriptor_load %desc_k[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>} : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked1>
+    %qload = tt.descriptor_load %desc_k[%c0_i32, %c0_i32] {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #blocked1>
     ttg.local_store %qload, %q {ttg.partition = array<i32: 1>} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     scf.for %t = %c0_i32 to %c128_i32 step %c128_i32  : i32 {
       %r:4 = scf.for %i = %c0_i32 to %c1024_i32 step %c128_i32 iter_args(%off = %c0_i32, %uc = %false, %qkt = %qk_tok, %at = %acc_tok) -> (i32, i1, !ttg.async.token, !ttg.async.token)  : i32 {
         // load K (stage 0) and V (stage 1) into SMEM
-        %kl = tt.descriptor_load %desc_k[%off, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked1>
+        %kl = tt.descriptor_load %desc_k[%off, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #blocked1>
         ttg.local_store %kl, %k {ttg.partition = array<i32: 1>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
         %kt = ttg.memdesc_trans %k {ttg.partition = array<i32: 2>, loop.cluster = 1 : i32, loop.stage = 0 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>
-        %vl = tt.descriptor_load %desc_v[%off, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked1>
+        %vl = tt.descriptor_load %desc_v[%off, %c0_i32] {ttg.partition = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #blocked1>
         ttg.local_store %vl, %v {ttg.partition = array<i32: 1>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
         // QK MMA: writes the reuse owner (operand D, useC=false => full overwrite), stage 0.
         %qkmma = ttng.tc_gen5_mma %q, %kt, %qk[%qkt], %false, %true {ttg.partition = array<i32: 2>, loop.cluster = 1 : i32, loop.stage = 0 : i32, tt.autows = "{\22stage\22: \220\22, \22order\22: \220\22, \22channels\22: [\22opndB,smem,2,0\22]}", tt.self_latency = 0 : i32} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>

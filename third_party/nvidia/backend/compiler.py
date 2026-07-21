@@ -748,9 +748,13 @@ class CUDABackend(BaseBackend):
         if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
+        passes.ttir.add_triton_licm(pm)
+        passes.ttir.add_uplift_while_to_for(pm)
+        passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
@@ -804,7 +808,9 @@ class CUDABackend(BaseBackend):
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
         # optimize TTGIR
-        passes.ttgpuir.add_coalesce(pm)
+        ptx_version = get_ptx_version_from_options(opt, capability)
+        max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
+        passes.ttgpuir.add_coalesce(pm, max_vec_bits)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         # Storage alias lowering runs after layout propagation so the backing
         # TMEM allocation is materialized with the resolved 2-CTA storage format.

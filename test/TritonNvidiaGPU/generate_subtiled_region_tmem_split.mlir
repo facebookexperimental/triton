@@ -33,7 +33,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   tt.func @multi_task_setup_tmem_split_optimized(
       %tmem_buf: !ttg.memdesc<128x128xf32, #tmem2, #ttng.tensor_memory, mutable>,
       %acc_tok: !ttg.async.token,
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared2>>,
+      %desc: !tt.tensordesc<128x64xf16, #shared2>,
       %off0: i32, %off1: i32, %off2: i32) {
     // Pre-hoisted SMEM allocations.
     %smem0 = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
@@ -46,11 +46,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     %trunc0 = arith.truncf %lhs {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
     ttg.local_store %trunc0, %smem0 {ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {ttg.partition = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared2>>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    ttng.async_tma_copy_local_to_global %desc[%off0, %off1] %smem0 {ttg.partition = array<i32: 4>} : !tt.tensordesc<128x64xf16, #shared2>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
 
     %trunc1 = arith.truncf %rhs {ttg.partition = array<i32: 3>} : tensor<128x64xf32, #blocked2d2> to tensor<128x64xf16, #blocked2d2>
     ttg.local_store %trunc1, %smem1 {ttg.partition = array<i32: 3>} : tensor<128x64xf16, #blocked2d2> -> !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
-    ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {ttg.partition = array<i32: 4>} : !tt.tensordesc<tensor<128x64xf16, #shared2>>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
+    ttng.async_tma_copy_local_to_global %desc[%off0, %off2] %smem1 {ttg.partition = array<i32: 4>} : !tt.tensordesc<128x64xf16, #shared2>, !ttg.memdesc<128x64xf16, #shared2, #smem2, mutable>
 
     tt.return
   }

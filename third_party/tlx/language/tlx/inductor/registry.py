@@ -1146,11 +1146,17 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
     """
 
     # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
+    # BLOCK_N=256 tiles mirror the amd_addmm_glu tutorial winners for the M=1024
+    # regime; on gfx950 they beat the BLOCK_N<=128 tiles on large-N shapes (e.g.
+    # 1024x22272x1024 reaches ~98% of rocBLAS, up from ~92%). LDS: (128x256x64,NB2)
+    # = 96KB, (128x256x32,NB3) = 72KB -- both fit gfx950 (256x256x64 does not).
     WARPPIPE_CONFIGS = [
         (64, 64, 128, 8, 8, 3),
         (64, 64, 64, 8, 8, 3),
         (128, 128, 64, 8, 8, 2),
         (64, 128, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 2),
+        (128, 256, 32, 8, 8, 3),
     ]
 
     def adjust_kernel_inputs(

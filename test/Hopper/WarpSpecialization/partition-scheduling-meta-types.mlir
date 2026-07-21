@@ -34,7 +34,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // --- Post-loop: use → no partition annotation (unregistered dialect op) ---
 tt.func public @simple_gemm_partition_types(
   %A_shared: !ttg.memdesc<128x64xf16, #shared, #smem>,
-  %B_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
+  %B_desc: !tt.tensordesc<64x64xf16, #shared>,
   %n_tiles: i32
 ) {
   %true = arith.constant true
@@ -47,7 +47,7 @@ tt.func public @simple_gemm_partition_types(
     %acc = %zero
   ) -> (tensor<128x64xf32, #blocked>) : i32 {
     // Load B
-    %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<tensor<64x64xf16, #shared>> -> tensor<64x64xf16, #load_blocked>
+    %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<64x64xf16, #shared> -> tensor<64x64xf16, #load_blocked>
     %B_shared = ttg.local_alloc %B : (tensor<64x64xf16, #load_blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
     %B_trans = ttg.memdesc_trans %B_shared {order = array<i32: 1, 0>} : !ttg.memdesc<64x64xf16, #shared, #smem> -> !ttg.memdesc<64x64xf16, #shared_T, #smem>
 

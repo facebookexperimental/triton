@@ -30,7 +30,7 @@
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @tma_store_local_store_order(%c_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>) attributes {noinline = false} {
+  tt.func public @tma_store_local_store_order(%c_desc: !tt.tensordesc<128x128xf16, #shared>) attributes {noinline = false} {
     %c0_i32 = arith.constant {ttg.partition = array<i32: 0, 2>} 0 : i32
     %c128_i32 = arith.constant {ttg.partition = array<i32: 0, 2>} 128 : i32
     %acc0 = arith.constant {ttg.partition = array<i32: 0>} dense<0.000000e+00> : tensor<128x256xf32, #linear1>
@@ -47,14 +47,14 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %c0_b = arith.truncf %out1_lhs {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
     %c0_a_store = ttg.convert_layout %c0_a {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
     %c0_b_store = ttg.convert_layout %c0_b {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
-    tt.descriptor_store %c_desc[%c0_i32, %c0_i32], %c0_a_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
-    tt.descriptor_store %c_desc[%row1, %c0_i32], %c0_b_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+    tt.descriptor_store %c_desc[%c0_i32, %c0_i32], %c0_a_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked>
+    tt.descriptor_store %c_desc[%row1, %c0_i32], %c0_b_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked>
     %c1_a = arith.truncf %out0_rhs {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
     %c1_b = arith.truncf %out1_rhs {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #linear> to tensor<128x128xf16, #linear>
     %c1_a_store = ttg.convert_layout %c1_a {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
     %c1_b_store = ttg.convert_layout %c1_b {ttg.partition = array<i32: 2>} : tensor<128x128xf16, #linear> -> tensor<128x128xf16, #blocked>
-    tt.descriptor_store %c_desc[%c0_i32, %col1], %c1_a_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
-    tt.descriptor_store %c_desc[%row1, %col1], %c1_b_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+    tt.descriptor_store %c_desc[%c0_i32, %col1], %c1_a_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked>
+    tt.descriptor_store %c_desc[%row1, %col1], %c1_b_store {ttg.partition = array<i32: 2>} : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked>
     tt.return
   }
 }
