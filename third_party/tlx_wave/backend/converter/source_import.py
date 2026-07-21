@@ -11,6 +11,8 @@ from .source_ir import (
     SourceRegion,
     SourceType,
     SourceValue,
+    TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR,
+    TLX_WAVE_ENABLE_SPLIT_BARRIERS_ATTR,
 )
 
 STAGE = "import"
@@ -84,6 +86,12 @@ def import_source_program(
         _module_int_attr(mod, "ttg.threads-per-warp"),
         func_op.get_bool_attr("noinline"),
         tuple(_value_id(fn.args(index)) for index in range(fn.get_num_args())),
+        bool(func_op.get_bool_attr(TLX_WAVE_ENABLE_SPLIT_BARRIERS_ATTR)),
+        bool(
+            func_op.get_bool_attr(
+                TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR
+            )
+        ),
     )
     return SourceProgram(
         kernel,
