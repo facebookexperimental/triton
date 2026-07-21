@@ -64,6 +64,15 @@ Step 4:   separateLocalAllocWithSrc   — split local_alloc(src) → alloc + sto
 
 ## Channel Discovery
 
+## Compiler-Selected TMA Multicast
+
+The initial standard Triton multicast planner does not annotate loads when Meta
+warp specialization is enabled. A cluster rendezvous must involve every CTA,
+while a Meta WS memory channel executes in selected task partitions; treating a
+partition-local rendezvous as a full-CTA collective can deadlock. Such loads
+therefore retain the existing per-CTA TMA behavior until the schedule models a
+task-wide cluster rendezvous explicitly.
+
 ### `collectAsyncChannels`
 
 Walks the function to find all cross-partition data dependencies:

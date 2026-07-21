@@ -83,6 +83,15 @@ int lookupThreadsPerWarp(OpBuilder &rewriter);
 int lookupNumCTAs(OpBuilder &rewriter);
 int lookupNumCTAs(Operation *op);
 
+// Number of CTAs that physically share a CGA. This is the logical
+// `ttg.num-ctas` unless the module opted into physical clustering via the
+// `ttg.ctas-per-cga` attribute (compiler-selected TMA multicast), in which case
+// the cluster spans the product of the `ttg.cluster-dim-{x,y,z}` dims even
+// though `ttg.num-ctas` stays 1. Keep the three barrier/layout verifiers that
+// need the physical count (CGA layout verification, `verifyBarrierType`,
+// `ClusterBarrierOp::verify`) in sync by routing through here.
+int lookupPhysicalNumCTAs(Operation *op);
+
 // Record/query whether the module contains exactly one `ttg.warp_specialize`
 // op via the `ttg.single-warp-specialize` module attribute. `hasSingle...`
 // returns false when the attribute is absent.

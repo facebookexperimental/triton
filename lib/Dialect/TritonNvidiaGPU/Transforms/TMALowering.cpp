@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
@@ -36,14 +37,21 @@ lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
       sharedMemorySpace, /*mutableMemory=*/true);
   auto alloc =
       gpu::LocalAllocOp::create(rewriter, loc, memDescType).getResult();
-  auto numCTAs = gpu::lookupNumCTAs(op);
-  auto barrierCGALayout =
-      gpu::CGAEncodingAttr::get1DLayout(tensorType.getContext(), numCTAs);
+  auto multicastAxes =
+      op->getAttrOfType<DenseI32ArrayAttr>("tt.multicast_axes");
+  auto barrierCGALayout = getTMAMulticastBarrierLayout(op, multicastAxes);
+  if (!barrierCGALayout) {
+    auto numCTAs = gpu::lookupNumCTAs(op);
+    barrierCGALayout =
+        gpu::CGAEncodingAttr::get1DLayout(tensorType.getContext(), numCTAs);
+  }
+  auto numBarrierSlots = product(barrierCGALayout.getCTASplitNum());
   auto barrierEncoding = gpu::SwizzledSharedEncodingAttr::get(
       tensorType.getContext(), 1, 1, 1, {0}, barrierCGALayout);
   gpu::MemDescType barrierMemDescType =
-      gpu::MemDescType::get({numCTAs}, rewriter.getI64Type(), barrierEncoding,
-                            sharedMemorySpace, /*mutableMemory=*/true);
+      gpu::MemDescType::get({numBarrierSlots}, rewriter.getI64Type(),
+                            barrierEncoding, sharedMemorySpace,
+                            /*mutableMemory=*/true);
   Value barrierAlloc =
       gpu::LocalAllocOp::create(rewriter, loc, barrierMemDescType);
   InitBarrierOp::create(rewriter, loc, barrierAlloc, 1);
@@ -56,6 +64,8 @@ lowerTMALoad(Operation *op, RankedTensorType tensorType, Value desc,
   createLoad(desc, barrierAlloc, alloc, pred);
   Value phase = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
   WaitBarrierOp::create(rewriter, loc, barrierAlloc, phase);
+  if (multicastAxes)
+    ClusterBarrierOp::create(rewriter, loc);
   InvalBarrierOp::create(rewriter, loc, barrierAlloc);
   replaceUsesWithLocalLoad(rewriter, op->getResult(0), alloc);
   op->erase();
@@ -69,9 +79,17 @@ public:
                                 PatternRewriter &rewriter) const override {
     auto createLoad = [&](Value desc, Value barrierAlloc, Value alloc,
                           Value pred) {
-      triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp::create(
+      // Multicast copy: only the leader CTA issues the TMA and writes directly
+      // into every peer's shared memory. Rendezvous all cluster members first
+      // so no peer's target buffer is overwritten before that peer has reached
+      // this pipeline stage.
+      if (op->hasAttr("tt.multicast_axes"))
+        triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, op.getLoc());
+      auto copy = triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp::create(
           rewriter, op.getLoc(), desc, op.getIndices(), barrierAlloc, alloc,
           pred);
+      if (Attribute axes = op->getAttr("tt.multicast_axes"))
+        copy->setAttr("tt.multicast_axes", axes);
     };
     lowerTMALoad(op, op.getType(), op.getDesc(), createLoad, rewriter);
     return success();

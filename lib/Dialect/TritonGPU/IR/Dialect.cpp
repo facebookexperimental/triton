@@ -3653,10 +3653,15 @@ struct TritonGPUVerifyTensorLayoutInterface
 
     int moduleCTAsPerCGA = lookupNumCTAs(op);
     int layoutCTAsPerCGA = getNumCTAs(layout);
-    if (layoutCTAsPerCGA != moduleCTAsPerCGA) {
+    // Under compiler-selected TMA multicast the layout is sized to the physical
+    // cluster while `ttg.num-ctas` stays 1, so accept either count.
+    int physicalCTAsPerCGA = lookupPhysicalNumCTAs(op);
+    if (layoutCTAsPerCGA != moduleCTAsPerCGA &&
+        layoutCTAsPerCGA != physicalCTAsPerCGA) {
       return makeErr() << layout << ".\nLayout has " << layoutCTAsPerCGA
-                       << " CTAs per CGA, but the context requires "
-                       << moduleCTAsPerCGA << " CTAs per CGA.";
+                       << " CTAs per CGA, but the context requires either "
+                       << moduleCTAsPerCGA << " logical or "
+                       << physicalCTAsPerCGA << " physical CTAs per CGA.";
     }
     return success();
   }
@@ -4395,6 +4400,18 @@ int triton::gpu::lookupNumCTAs(OpBuilder &rewriter) {
       rewriter.getInsertionBlock()->getParentOp()->getParentOfType<ModuleOp>();
   assert(op && "cannot check number of CTAs outside of module");
   return triton::gpu::TritonGPUDialect::getNumCTAs(cast<ModuleOp>(op));
+}
+
+int triton::gpu::lookupPhysicalNumCTAs(Operation *op) {
+  int numCTAs = lookupNumCTAs(op);
+  if (auto module = op->getParentOfType<ModuleOp>()) {
+    auto physicalClusters = module->getAttrOfType<BoolAttr>("ttg.ctas-per-cga");
+    if (physicalClusters && physicalClusters.getValue()) {
+      auto dims = TritonGPUDialect::getClusterDims(module);
+      numCTAs = dims[0] * dims[1] * dims[2];
+    }
+  }
+  return numCTAs;
 }
 
 bool triton::gpu::areLayoutsEquivalent(ArrayRef<int64_t> shape,
