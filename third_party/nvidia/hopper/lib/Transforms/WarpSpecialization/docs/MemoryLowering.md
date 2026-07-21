@@ -22,12 +22,18 @@ memory.
 In the current pipeline there is no single `insertAsyncCopy`
 dispatcher. Copies are materialized by two mechanisms:
 
-- **`optimizeTMALoads`** — for TMA descriptor-load producers. Called from
+- **`doConvertDescriptorLoadsToNVWS`** — runs before buffer allocation, after
+  AutoWS has passed its final eligibility bailout. It converts every
+  tensor-producing `tt.descriptor_load` into `nvws.descriptor_load`, whose
+  destination is an explicit SMEM memdesc and whose `txCount` is the CTA-local
+  transfer size.
+- **`optimizeTMALoads`** — for buffered NVWS descriptor-load producers. Called from
   `insertAsyncComm` (`WSCodePartition.cpp`) during the code-partition phase.
-  Emits `barrier_expect` + `AsyncTMACopyGlobalToLocalOp` writing directly into
-  the pipeline SMEM buffer, and a `wait_barrier` before the consumers (the
-  descriptor_load's single `local_store` user and the descriptor_load itself are
-  erased, since the async copy writes the buffer directly). See below.
+  Emits `barrier_expect` + `AsyncTMACopyGlobalToLocalOp`. The copy uses the
+  planner-rewritten NVWS destination allocation and rebuilds its stage view
+  with the fused barrier's buffer index, followed by a `wait_barrier` before
+  the consumers. The NVWS operation is then erased; there is no tensor-result
+  or `local_store` cleanup path. See below.
 - **`createLocalAlloc`** — for non-TMA (register/plain-load) producers. Called
   from `createBuffer` during the buffer-allocation phase; it creates the SMEM (or
   1D-TMEM) buffer and inserts the producer-side `LocalStoreOp` + consumer-side
@@ -55,8 +61,8 @@ loads for the same MMA), they are fused onto a single barrier:
    grouped together.
 2. **Shared barrier**: A single pair of barriers (ready + empty) is allocated
    for the group.
-3. **Combined expect**: One `BarrierExpectOp` is emitted with the total byte
-   count across all loads.
+3. **Combined expect**: One `BarrierExpectOp` is emitted with the sum of the
+   NVWS loads' `txCount` attributes.
 4. **Multiple copies, one wait**: Each `AsyncTMACopyGlobalToLocalOp` references
    the shared barrier. The consumer issues a single `WaitBarrierOp`.
 

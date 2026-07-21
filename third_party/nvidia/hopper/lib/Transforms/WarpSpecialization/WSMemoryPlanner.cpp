@@ -8,6 +8,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -32,6 +33,8 @@
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+namespace ttnvws = mlir::triton::nvws;
 
 // Environment variable to dump DOT files: TRITON_DUMP_WS_GRAPHS
 // When set to a directory path, dumps visualization files there.
@@ -188,6 +191,8 @@ static Operation *findOriginalLoadForChannel(Channel *ch) {
   Operation *srcOp = ch->getSrcOp();
   if (!srcOp)
     return nullptr;
+  if (isa<ttnvws::DescriptorLoadOp>(srcOp))
+    return srcOp;
   if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp))
     return findOriginalLoadOp(storeOp.getSrc());
   return nullptr;
@@ -1211,12 +1216,7 @@ static bool isSmemTMAChannel(Operation *alloc,
     return false;
   if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(srcOp))
     return true;
-  if (auto storeOp = dyn_cast<ttg::LocalStoreOp>(srcOp)) {
-    Value stored = storeOp.getSrc();
-    if (auto *defOp = stored.getDefiningOp())
-      return isa<tt::DescriptorLoadOp>(defOp);
-  }
-  return false;
+  return isa<ttnvws::DescriptorLoadOp>(srcOp);
 }
 
 /// Helper to read the loop.stage attribute from an op. Returns -1 if absent.
@@ -1727,6 +1727,69 @@ static bool areReuseEncodingsCompatible(const WSBuffer &candidate,
          candTy.getElementType() == tgtTy.getElementType();
 }
 
+static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
+  SmallVector<Operation *, 16> worklist;
+  DenseSet<Operation *> visited;
+  auto enqueueUsers = [&](Operation *op) {
+    for (Value result : op->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        if (visited.insert(user).second)
+          worklist.push_back(user);
+      }
+    }
+    if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp>(op)) {
+      for (Value operand : op->getOperands()) {
+        if (!isa<ttg::MemDescType>(operand.getType()))
+          continue;
+        for (Operation *user : operand.getUsers()) {
+          if (user != op && visited.insert(user).second)
+            worklist.push_back(user);
+        }
+      }
+    }
+  };
+
+  enqueueUsers(srcOp);
+  while (!worklist.empty()) {
+    Operation *op = worklist.pop_back_val();
+    if (op == dstOp)
+      return true;
+    enqueueUsers(op);
+  }
+  return false;
+}
+
+static bool isOrderedDescriptorReuseTarget(const WSBuffer &candidate,
+                                           const WSBuffer &target,
+                                           SmallVector<Channel *> &channels) {
+  if (candidate.tmaStaging == 0)
+    return false;
+
+  Channel *targetChannel = findChannelForOp(target.allocOp, channels);
+  Channel *candidateChannel = findChannelForOp(candidate.allocOp, channels);
+  if (!targetChannel || !candidateChannel ||
+      !isa<ttnvws::DescriptorLoadOp>(targetChannel->getSrcOp()))
+    return false;
+
+  Operation *candidateProducer = getLogicalProducerOp(candidateChannel);
+  if (!candidateProducer)
+    return false;
+
+  SmallVector<Operation *> targetConsumers;
+  targetChannel->getDstOps(targetConsumers);
+  if (targetConsumers.empty()) {
+    if (Operation *consumer = targetChannel->getDstOp())
+      targetConsumers.push_back(consumer);
+  }
+  for (Operation *consumer : targetConsumers) {
+    for (Operation *actualConsumer : getActualConsumers(consumer)) {
+      if (isDataDependent(actualConsumer, candidateProducer))
+        return true;
+    }
+  }
+  return false;
+}
+
 /// Find an allocated buffer that a non-innermost candidate can reuse.
 /// The candidate must NOT be innermost (partition-unaware liveness is
 /// inaccurate within the inner loop). Can scan allocated innermost buffers
@@ -1794,7 +1857,15 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     }
 
     auto order = getLastConsumerOrderDetailed(buf, channels, numClusters);
-    int effectiveOrder = order.linearOrder < 0 ? INT_MAX : order.linearOrder;
+    int effectiveOrder = order.linearOrder;
+    if (effectiveOrder < 0) {
+      if (!isOrderedDescriptorReuseTarget(candidate, buf, channels))
+        effectiveOrder = INT_MAX;
+      else
+        // Sort a dependency-ordered, unstaged descriptor target after every
+        // target with an explicit pipeline order, but keep it selectable.
+        effectiveOrder = INT_MAX - 1;
+    }
     LDBG("  findReuseCandidate: target bufferId="
          << buf.bufferId << " size=" << buf.sizeBytes << "*" << buf.numCopies
          << " lastConsumerOrder=" << order.linearOrder
@@ -2989,41 +3060,6 @@ private:
 
   SmallVector<BufferT *> buffers;
   DenseMap<Operation *, ttng::TmemAllocChannel *> allocToChannel;
-
-  /// Check whether dstOp is in the forward SSA slice of srcOp,
-  /// i.e. dstOp transitively uses a result of srcOp.  Also follows
-  /// memory dependencies (local_store, tmem_store).
-  static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
-    SmallVector<Operation *, 16> worklist;
-    DenseSet<Operation *> visited;
-    auto enqueueUsers = [&](Operation *op) {
-      for (Value result : op->getResults()) {
-        for (Operation *user : result.getUsers()) {
-          if (visited.insert(user).second)
-            worklist.push_back(user);
-        }
-      }
-      if (isa<triton::gpu::LocalStoreOp>(op) ||
-          isa<triton::nvidia_gpu::TMEMStoreOp>(op)) {
-        for (Value operand : op->getOperands()) {
-          if (isa<triton::gpu::MemDescType>(operand.getType())) {
-            for (Operation *user : operand.getUsers()) {
-              if (user != op && visited.insert(user).second)
-                worklist.push_back(user);
-            }
-          }
-        }
-      }
-    };
-    enqueueUsers(srcOp);
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      if (op == dstOp)
-        return true;
-      enqueueUsers(op);
-    }
-    return false;
-  }
 
   /// Look up the BufferT for a given alloc operation.
   BufferT *getBuffer(Operation *candAlloc) {
@@ -5016,6 +5052,10 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     if (numBuffers >= 1 || !readDecisionFile.empty()) {
+      if (failed(doConvertDescriptorLoadsToNVWS(funcOp))) {
+        signalPassFailure();
+        return;
+      }
       MemoryPlannerOptions options;
       options.readDecisionFile = readDecisionFile;
       options.writeDecisionFile = writeDecisionFile;

@@ -15,6 +15,8 @@
 // CHECK-SAME: 64x256xf16
 // CHECK: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = 0 : i32}
 // CHECK-SAME: 128x64xf16
+// CHECK-COUNT-2: nvws.descriptor_load
+// CHECK-NOT: tt.descriptor_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 256], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>

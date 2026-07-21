@@ -9,12 +9,11 @@
 // CHECK-LABEL: @swap_transposed_alloc
 //
 // After buffer allocation, the dsT alloc is swapped to non-transposed #shared
-// layout and hoisted above the loop. The first two allocs are the original
-// k_smem/q_smem buffers; dsT remains after them because hoisting preserves
-// producer order.
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
-// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
+// layout and hoisted above the loop. Descriptor conversion now precedes
+// hoisting, so the cross-partition dsT/dq buffer is placed before the
+// descriptor destination buffers.
 // CHECK: %[[B0:.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
+// CHECK: ttg.local_alloc : () -> !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>
 //
 // Inside the loop, memdesc_trans goes from #shared (non-transposed) to #shared1
 // (transposed), confirming the swap happened:

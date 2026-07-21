@@ -60,7 +60,8 @@ def NVGPUTestWSMemoryPlanner : Pass<"nvgpu-test-ws-memory-planner", "mlir::Modul
 
   let description = "This pass computes a memory configuration for autoWS";
 
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
   let options = [
     Option<"numBuffers", "num-buffers",
            "int32_t", /*default*/"0",
@@ -168,7 +169,8 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
 
   let description = "This pass creates buffers for each async task channel.";
 
-  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvws::NVWSDialect"];
 }
 
 def NVGPUTestWSHoistTMEMStore : Pass<"nvgpu-test-ws-hoist-tmem-store", "mlir::ModuleOp"> {

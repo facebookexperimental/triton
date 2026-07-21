@@ -153,7 +153,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttg.memdesc_trans
 // CHECK: ttng.warp_group_dot
 // CHECK: partition1
-// CHECK: ttg.local_load
+// CHECK-NOT: ttg.local_load
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

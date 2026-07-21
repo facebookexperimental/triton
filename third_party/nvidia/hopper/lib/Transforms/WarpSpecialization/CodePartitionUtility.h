@@ -1,6 +1,7 @@
 #ifndef NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 #define NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -294,15 +295,14 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
-                            SmallVector<Value> &buffers, Value barrierAlloc,
-                            Value bufferIdx, Value bufferIdxExtract,
-                            Value phase, Operation *headProducer,
-                            Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds = {},
-                            DictionaryAttr consumerWaitConstraints = {});
+Operation *
+optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                 SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
+                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
+                 Value phase, Operation *headProducer, Operation *headConsumer,
+                 Operation *headConsumerSameLevel,
+                 ArrayRef<int> additionalConsumerTaskIds = {},
+                 DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);

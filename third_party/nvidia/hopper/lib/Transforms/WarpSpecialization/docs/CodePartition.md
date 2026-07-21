@@ -56,6 +56,7 @@ See [Buffer Allocation](BufferAllocation.md) for details.
 ```
 Step 0:   swapTransposedLocalAllocs   — normalize transposed alloc layouts
 Step 0.5: mergeDuplicateLocalAllocs   — deduplicate allocs with same source
+Step 0.75: hoistDescriptorLoadBuffers — hoist pre-converted NVWS destinations
 Step 1:   collectAsyncChannels        — discover channels
 Step 2:   reorderEpilogOps            — interleave epilogue stores
 Step 3:   createBuffer                — allocate buffers (single copy)

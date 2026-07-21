@@ -4,6 +4,7 @@
 #include <triton/Tools/LayoutUtils.h>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
@@ -27,6 +28,20 @@ ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
     return sharedEnc;
 
   return ttg::updateEncodingForShape(op, sharedEnc, tensorType);
+}
+
+int64_t getDescriptorLoadBytes(Operation *op, RankedTensorType tensorType,
+                               Value desc) {
+  auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
+  auto shapePerCTA = ttg::getShapePerCTA(encoding, tensorType.getShape());
+  return product(shapePerCTA) *
+         getIntOrFloatOrPtrBitWidth(tensorType.getElementType()) / 8;
+}
+
+int64_t getDescriptorLoadBytes(ttg::MemDescType memDescType) {
+  auto shapePerCTA = ttg::getShapePerCTA(memDescType);
+  return product(shapePerCTA) *
+         getIntOrFloatOrPtrBitWidth(memDescType.getElementType()) / 8;
 }
 
 Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
