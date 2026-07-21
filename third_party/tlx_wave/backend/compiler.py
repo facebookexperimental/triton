@@ -9,6 +9,10 @@ import triton.backends.amd.compiler as amd_compiler
 from triton.backends.compiler import GPUTarget, Language
 
 from .converter import pipeline as converter_pipeline
+from .converter.source_ir import (
+    TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR,
+    TLX_WAVE_ENABLE_SPLIT_BARRIERS_ATTR,
+)
 from .wave_bridge_tools import (
     _compile_wave_module_to_hsaco,
     _verify_wave_module,
@@ -31,6 +35,41 @@ def _barrier_ops(mod):
 
     mod.walk(visit)
     return tuple(barriers)
+
+
+def _stamp_kernel_policy_attrs(mod, options):
+    flags = (
+        (
+            TLX_WAVE_ENABLE_SPLIT_BARRIERS_ATTR,
+            bool(getattr(options, "tlx_wave_enable_split_barriers", False)),
+        ),
+        (
+            TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR,
+            bool(
+                getattr(options, "tlx_wave_enable_multi_wave_specialize", False)
+            ),
+        ),
+    )
+    if not any(enabled for _name, enabled in flags):
+        return
+    public_names = []
+
+    def visit(op):
+        if (
+            op.get_name() == "tt.func"
+            and op.get_str_attr("sym_visibility") == "public"
+        ):
+            public_names.append(op.get_str_attr("sym_name"))
+        return True
+
+    mod.walk(visit)
+    if len(public_names) != 1:
+        return
+    fn = mod.get_function(public_names[0])
+    builder = ir.builder(mod.context)
+    for name, enabled in flags:
+        if enabled:
+            fn.set_attr(name, builder.get_bool_attr(True))
 
 
 def _parse_bool_option(value, *, source):
@@ -177,6 +216,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "tlx_wave.make_ttgir_post_cf_lift")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        _stamp_kernel_policy_attrs(mod, options)
         return mod
 
     @staticmethod
@@ -203,16 +243,11 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             op for op in _barrier_ops(src)
             if op not in existing_barriers
         )
+        _stamp_kernel_policy_attrs(src, options)
 
         output = converter_pipeline.convert_ttgir_to_wave(
             src,
             compiler_membar_barriers=compiler_membar_barriers,
-            enable_split_barriers=getattr(options, "tlx_wave_enable_split_barriers", False),
-            enable_multi_wave_specialization=getattr(
-                options,
-                "tlx_wave_enable_multi_wave_specialize",
-                False,
-            ),
             waves_per_eu=getattr(options, "waves_per_eu", 0),
         )
         _validate_staged_converter_output(output, options)
@@ -288,9 +323,12 @@ def _populate_staged_converter_metadata(metadata, output, options, wave_opt):
     metadata["tlx_wave_emit_api"] = "structural-python"
     metadata["tlx_wave_plan_kind"] = "staged-converter"
     metadata["tlx_wave_arch"] = options.arch
-    metadata["tlx_wave_enable_split_barriers"] = bool(getattr(options, "tlx_wave_enable_split_barriers", False))
+    metadata["tlx_wave_enable_split_barriers"] = bool(
+        target_program.kernel.enable_split_barriers
+    )
     metadata["tlx_wave_enable_multi_wave_specialize"] = bool(
-        getattr(options, "tlx_wave_enable_multi_wave_specialize", False))
+        target_program.kernel.enable_multi_wave_specialization
+    )
     metadata["tlx_wave_ttgir_target"] = source_kernel.target
     metadata["tlx_wave_num_ctas"] = int(source_kernel.num_ctas or 1)
     metadata["tlx_wave_num_warps"] = int(source_kernel.num_warps or 1)

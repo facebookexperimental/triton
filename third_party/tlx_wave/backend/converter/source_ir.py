@@ -3,6 +3,12 @@
 from dataclasses import dataclass, field
 
 
+TLX_WAVE_ENABLE_SPLIT_BARRIERS_ATTR = "tlx_wave.enable_split_barriers"
+TLX_WAVE_ENABLE_MULTI_WAVE_SPECIALIZATION_ATTR = (
+    "tlx_wave.enable_multi_wave_specialization"
+)
+
+
 @dataclass(frozen=True)
 class SourceType:
     raw: str
@@ -63,6 +69,8 @@ class KernelInfo:
     threads_per_warp: int | None = None
     noinline: bool | None = None
     arg_ids: tuple[int, ...] = ()
+    enable_split_barriers: bool = False
+    enable_multi_wave_specialization: bool = False
 
 
 @dataclass(frozen=True)
