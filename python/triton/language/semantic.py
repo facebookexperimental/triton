@@ -1100,17 +1100,20 @@ class TritonSemantic(Generic[TensorTy]):
         return tl.tensor_descriptor_base(handle, block_ty)
 
     def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str, eviction_policy: str,
-                        latency: Optional[int]) -> TensorTy:
+                        latency: Optional[int], multicast: Optional[bool] = None) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base)
         ndim = len(desc.block_shape)
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
         offsets = self._convert_to_ir_values(offsets, require_i64=False)
+        if multicast is not None and not isinstance(multicast, bool):
+            raise TypeError(f"multicast must be a constexpr bool or None, got {multicast}")
         x = self.builder.create_descriptor_load(
             desc.handle,
             offsets,
             self._str_to_load_cache_modifier(cache_modifier),
             self._str_to_eviction_policy(eviction_policy),
+            multicast,
         )
         if latency is not None:
             if not isinstance(latency, int) or latency < 0:

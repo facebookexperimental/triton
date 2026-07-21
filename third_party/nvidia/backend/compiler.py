@@ -199,6 +199,7 @@ class CUDAOptions:
     instrumentation_mode: str = ""
     early_tma_store_lowering: Optional[None] = None
     generate_subtiled_region: bool = False
+    multicast: bool = False
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
     # TRITON_AUTO_TMA knob when left at the default in make_ttir.
     auto_tma: bool = False

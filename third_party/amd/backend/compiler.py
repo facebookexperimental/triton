@@ -74,6 +74,7 @@ class HIPOptions:
     enable_fp_fusion: bool = True
     launch_cooperative_grid: bool = False
     launch_cluster: bool = False  # No-op placeholder
+    multicast: bool = False  # No-op placeholder (TMA multicast is NVIDIA-only)
     matrix_instr_nonkdim: int = 0
     kpack: int = 1
     allow_flush_denorm: bool = False
