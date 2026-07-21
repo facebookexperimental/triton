@@ -275,3 +275,24 @@ tt.func @async_copy_with_padding_different_vec(%input: tensor<256x!tt.ptr<f32>, 
   tt.return
 }
 }
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.padded_shared<[16:+2] {order = [0], shape = [256]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.target" = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+// A padded dst whose per-thread width collapses below a supported direct-to-LDS
+// bitwidth (here 16-bit) cannot be lowered as a direct-to-LDS copy on CDNA. Instead
+// of leaving an op that fails to legalize later, fall back to a synchronous
+// tt.load + ttg.local_store (Membar adds the LDS barrier).
+// CHECK-LABEL: async_copy_fp16_padded_unsupported_vec
+tt.func @async_copy_fp16_padded_unsupported_vec(%input: tensor<256x!tt.ptr<f16>, #blocked>,
+    %view: !ttg.memdesc<256xf16, #shared, #smem, mutable>) {
+  // CHECK-NOT: ttg.async_copy_global_to_local
+  // CHECK: %[[V:.*]] = tt.load %{{.*}} : tensor<256x!tt.ptr<f16>, #blocked>
+  // CHECK: ttg.local_store %[[V]], %{{.*}} : tensor<256xf16, #blocked> -> !ttg.memdesc<256xf16, #shared, #smem, mutable>
+  %token = ttg.async_copy_global_to_local %input, %view : tensor<256x!tt.ptr<f16>, #blocked> -> <256xf16, #shared, #smem, mutable>
+  tt.return
+}
+}
