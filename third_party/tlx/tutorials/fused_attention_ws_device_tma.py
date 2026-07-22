@@ -654,23 +654,20 @@ _BWD_DOT_ATTRS_SCHED = FrozenDotAttrs({
 # planner reproduces _BWD_DOT_ATTRS_BM64_TMEM's packing ([dpT,dsT],[ppT,qkT])
 # without the hand-pinned buffer ids.
 _BWD_DOT_ATTRS_BM64_MEMTYPE = FrozenDotAttrs({
-    "qkT": {"stage": "0", "order": "0"},
-    "dpT": {"stage": "0", "order": "2"},
-    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem"]},  # ppT -> tmem
+    "qkT": {"stage": "0", "order": "0"}, "dpT": {"stage": "0", "order": "2"}, "dv":
+    {"stage": "0", "order": "2", "channels": ["opndA,tmem"]},  # ppT -> tmem
     "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem"]},  # dsT^T -> smem
     "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem"]},  # dsT -> tmem
 })
 
 # BM128 memtype-only variant (same intent as _BWD_DOT_ATTRS_BM64_MEMTYPE but for
-# BLOCK_M1=128). PromoteLHSToTMem promotes dsT to TMEM, but at BM128 the planner
-# cannot yet form the tight {dpT,dq,dsT} reuse group that the hand-pinned
-# _BWD_DOT_ATTRS_TMEM config achieves, so it OOBs TMEM. Kept as a motivating case
-# for the memory-planner search-space work (see test_bwd_bm128_memtype_only_xfail
-# and task T279873316).
+# BLOCK_M1=128). PromoteLHSToTMem promotes dsT to TMEM; the planner forms the
+# tight {dpT,dq,dsT} reuse group that the hand-pinned _BWD_DOT_ATTRS_TMEM config
+# expresses via the repairUnsafeReuseGroups post-pass (see
+# test_bwd_bm128_memtype_only and task T279873316).
 _BWD_DOT_ATTRS_BM128_MEMTYPE = FrozenDotAttrs({
-    "qkT": {"stage": "0", "order": "0"},
-    "dpT": {"stage": "0", "order": "2"},
-    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem"]},  # ppT -> tmem
+    "qkT": {"stage": "0", "order": "0"}, "dpT": {"stage": "0", "order": "2"}, "dv":
+    {"stage": "0", "order": "2", "channels": ["opndA,tmem"]},  # ppT -> tmem
     "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem"]},  # dsT^T -> smem
     "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem"]},  # dsT -> tmem
 })
@@ -1856,8 +1853,8 @@ def test_bwd_tmem_plan_pick_enumeration():
     import tempfile
     idx = next(i for i, c in enumerate(configs_bwd_persist)
                if c.kwargs.get("BLOCK_M1") == 64 and c.kwargs.get("BWD_DOT_ATTRS") is _BWD_DOT_ATTRS_SCHED)
-    keys = ("TRITON_WS_MEM_PLAN_TOPK", "TRITON_WS_MEM_PLAN_PICK",
-            "TRITON_WS_MEM_PLAN_TOPK_DUMP", "TRITON_ALWAYS_COMPILE")
+    keys = ("TRITON_WS_MEM_PLAN_TOPK", "TRITON_WS_MEM_PLAN_PICK", "TRITON_WS_MEM_PLAN_TOPK_DUMP",
+            "TRITON_ALWAYS_COMPILE")
     saved = {k: os.environ.get(k) for k in keys}
     with tempfile.TemporaryDirectory() as td:
         dump = os.path.join(td, "plans.json")
@@ -1871,9 +1868,18 @@ def test_bwd_tmem_plan_pick_enumeration():
             # run fresh here rather than hit a cached kernel from the parametrized
             # sweep above.
             test_op(
-                Z=4, H=8, N_CTX=512, HEAD_DIM=64, causal=False, mode="bwd",
-                baseVariant="ws", provider="triton-fp16", SUBTILING=False,
-                VECT_MUL=0, FADD2_REDUCE=False, bwd_config_idx=idx,
+                Z=4,
+                H=8,
+                N_CTX=512,
+                HEAD_DIM=64,
+                causal=False,
+                mode="bwd",
+                baseVariant="ws",
+                provider="triton-fp16",
+                SUBTILING=False,
+                VECT_MUL=0,
+                FADD2_REDUCE=False,
+                bwd_config_idx=idx,
             )
             tmem_plans = 0
             if os.path.exists(dump):
@@ -1902,39 +1908,56 @@ def test_bwd_memtype_only_annotation():
                if c.kwargs.get("BWD_DOT_ATTRS") is _BWD_DOT_ATTRS_BM64_MEMTYPE)
     for hd in (64, 128):
         test_op(
-            Z=8, H=16, N_CTX=1024, HEAD_DIM=hd, causal=False, mode="bwd",
-            baseVariant="ws", provider="triton-fp16", SUBTILING=False,
-            VECT_MUL=0, FADD2_REDUCE=False, bwd_config_idx=idx,
+            Z=8,
+            H=16,
+            N_CTX=1024,
+            HEAD_DIM=hd,
+            causal=False,
+            mode="bwd",
+            baseVariant="ws",
+            provider="triton-fp16",
+            SUBTILING=False,
+            VECT_MUL=0,
+            FADD2_REDUCE=False,
+            bwd_config_idx=idx,
         )
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
-@pytest.mark.xfail(strict=False, reason="Memory-planner search-space gap (T279873316): "
-                   "BM128 memtype-only promotes dsT to TMEM, but the planner cannot form "
-                   "the tight {dpT,dq,dsT} reuse group that hand _BWD_DOT_ATTRS_TMEM pins, "
-                   "so it OOBs TMEM. dq (accumulator) and the tmem dsT (dk operand) relate "
-                   "only through a common ancestor, which the planner's data-dependency "
-                   "reuse check rejects; a naive same-partition relaxation is unsafe (op-id "
-                   "liveness underestimates qkT's lifetime via pT). Expected to pass once "
-                   "the planner learns to form the group safely.")
-def test_bwd_bm128_memtype_only_xfail():
-    # Motivating case kept for the memory-planner search-space work. Builds a
-    # BM128 memtype-only config (opndA,tmem on dv/dk, opndA,smem on dq — no
-    # copies/id) and runs the bwd; currently OOBs TMEM (xfail). Appends the config
-    # transiently so it is not swept by the parametrized test_op matrix.
+def test_bwd_bm128_memtype_only():
+    # Memory-planner N-way TMEM reuse gate (T279873316). BM128 memtype-only
+    # config (opndA,tmem on dv/dk, opndA,smem on dq — no copies/id): the planner
+    # must form the tight {dpT,dq,dsT} reuse group that the hand-pinned
+    # _BWD_DOT_ATTRS_TMEM config expresses. First-fit lands dsT in the
+    # unorderable {qkT,ppT,dsT}; the repairUnsafeReuseGroups post-pass relocates
+    # dsT into {dpT,dq} -> {dpT,dsT,dq}, leaving {qkT,ppT}, so this now passes.
+    # Appended transiently so it is not swept by the parametrized test_op matrix.
     cfg = triton.Config(
         {
-            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128,
-            "EPILOGUE_SUBTILE": 2, "DQ_SUBTILE": 4, "SMEM_BUDGET": 220000,
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "SMEM_BUDGET": 220000,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM128_MEMTYPE,
-        },
-        num_warps=4, num_stages=2, pre_hook=_bwd_host_descriptor_pre_hook)
+        }, num_warps=4, num_stages=2, pre_hook=_bwd_host_descriptor_pre_hook)
     configs_bwd_persist.append(cfg)
     try:
         test_op(
-            Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="bwd",
-            baseVariant="ws", provider="triton-fp16", SUBTILING=False,
-            VECT_MUL=0, FADD2_REDUCE=False, bwd_config_idx=len(configs_bwd_persist) - 1,
+            Z=8,
+            H=16,
+            N_CTX=1024,
+            HEAD_DIM=128,
+            causal=False,
+            mode="bwd",
+            baseVariant="ws",
+            provider="triton-fp16",
+            SUBTILING=False,
+            VECT_MUL=0,
+            FADD2_REDUCE=False,
+            bwd_config_idx=len(configs_bwd_persist) - 1,
         )
     finally:
         configs_bwd_persist.pop()
