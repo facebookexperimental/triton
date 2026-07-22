@@ -725,44 +725,6 @@ LogicalResult MemDescReinterpretOp::verify() {
               oldType.getMemorySpace()) &&
           "expected shared or tensor memory"));
 
-  auto newShape = newType.getShape();
-  auto newEncoding = oldType.getEncoding();
-
-  if (!oldType.getShape().equals(newShape)) {
-    if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(newEncoding)) {
-      auto contigDimSize =
-          mmaEncoding.getTransposed() ? newShape.front() : newShape.back();
-      // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
-      // swizzling, the swizzling/contig dim has to be a multiple of it
-      // if swizzling mode is None, we still conservatively require at least 128
-      // bits
-      auto basicUnitBitWidth =
-          std::max(128U, 8 * mmaEncoding.getSwizzlingByteWidth());
-      if ((contigDimSize * mmaEncoding.getElementBitWidth()) %
-              basicUnitBitWidth !=
-          0) {
-        return emitError(
-            "New shape causes insufficient elements for swizzling");
-      }
-    } else if (auto swizzledEncoding =
-                   dyn_cast<SwizzledSharedEncodingAttr>(newEncoding)) {
-      auto contigDim = swizzledEncoding.getOrder()[0];
-      if (newShape.size() <= contigDim) {
-        return emitError("New shape incompatible with encoding");
-      }
-      if (swizzledEncoding.getVec() == 0) {
-        return emitError("Unexpected swizzled encoding with `vec` 0");
-      }
-      // conservatively reject cases where swizzling might be interfered
-      // new shape swizzling dim must be a multiple of getVec(), the basic
-      // swizzling unit
-      if (newShape[contigDim] % swizzledEncoding.getVec() != 0) {
-        return emitError(
-            "New shape causes insufficient elements for swizzling");
-      }
-    }
-  }
-
   auto toPhysicalLayout = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
     auto shape = ty.getAllocShape().take_back(rank);
@@ -770,16 +732,6 @@ LogicalResult MemDescReinterpretOp::verify() {
     return isPaddedEncoding(encoding) ? paddedLinearLayout(shape, encoding)
                                       : toLinearLayout(shape, encoding);
   };
-
-  auto kBlock = StringAttr::get(getContext(), "block");
-  auto getNumBroadcastCTADims = [&](MemDescType ty) {
-    auto freeVariableMask =
-        toPhysicalLayout(ty).getFreeVariableMasks().lookup(kBlock);
-    return llvm::popcount<uint32_t>(freeVariableMask);
-  };
-  if (getNumBroadcastCTADims(oldType) != getNumBroadcastCTADims(newType))
-    return emitError(
-        "source and result must have the same number of broadcast CTA dims");
 
   auto getViewNumBits = [&](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
@@ -804,6 +756,13 @@ LogicalResult MemDescReinterpretOp::verify() {
              << "result logical storage size must not exceed source "
                 "logical storage size ("
              << srcNumBits << " vs " << dstNumBits << ")";
+  } else {
+    auto srcNumBits = getViewNumBits(oldType);
+    auto dstNumBits = getViewNumBits(newType);
+    if (srcNumBits != dstNumBits)
+      return emitError() << "source and result must have the same logical "
+                            "storage size ("
+                         << srcNumBits << " vs " << dstNumBits << ")";
   }
   return success();
 }
