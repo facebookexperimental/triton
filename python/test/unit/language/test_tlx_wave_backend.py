@@ -288,6 +288,26 @@ def _load_tlx_gfx9_gemm_bench_module(module_name="_tlx_wave_test_gfx9_bench"):
     return module
 
 
+def _load_tlx_gfx9_inter_wave_bench_module(module_name="_tlx_wave_test_gfx9_inter_wave_bench"):
+    repo_root = Path(__file__).resolve().parents[4]
+    bench_dir = repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "inter_wave" / "a16w16"
+    bench_path = bench_dir / "bench.py"
+    before_path = list(sys.path)
+    previous_kernel_module = sys.modules.pop("matmul_kernel", None)
+    try:
+        sys.path.insert(0, str(bench_dir))
+        spec = importlib.util.spec_from_file_location(module_name, bench_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = before_path
+        if previous_kernel_module is None:
+            sys.modules.pop("matmul_kernel", None)
+        else:
+            sys.modules["matmul_kernel"] = previous_kernel_module
+
+
 def _load_tlx_gfx9_a4w4_module(module_name="_tlx_wave_test_gfx9_a4w4"):
     repo_root = Path(__file__).resolve().parents[4]
     kernel_path = repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "a4w4" / "matmul_kernel.py"
@@ -700,7 +720,7 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         "--warmup": "7",
         "--compile-workers": "2",
         "--input-mode": "rand-int",
-        "--seed": "0",
+        "--seed": "5",
         "--timing-mode": "batched",
         "--warmup-launches": "11",
         "--timed-launches": "101",
@@ -720,7 +740,7 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         "--warmup": "7",
         "--compile-workers": "2",
         "--input-mode": "rand-int",
-        "--seed": "0",
+        "--seed": "5",
         "--timing-mode": "batched",
         "--warmup-launches": "11",
         "--timed-launches": "101",
@@ -741,7 +761,8 @@ def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
         assert spec.command[shape_index + 1:shape_index + 4] == ("8192", "8192", "8192")
         assert spec.command[spec.command.index("--rep") + 1] == "31"
         assert spec.command[spec.command.index("--warmup") + 1] == "7"
-        assert spec.command[spec.command.index("--seed") + 1] == "0"
+        assert spec.command[spec.command.index("--input-mode") + 1] == "rand-int"
+        assert spec.command[spec.command.index("--seed") + 1] == "5"
 
 
 def test_tlx_perf_sweep_forwards_mxfp_batched_timing_options(tmp_path):
@@ -5905,6 +5926,8 @@ def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
 def test_tlx_gfx9_gemm_bench_input_modes_are_deterministic():
     torch = pytest.importorskip("torch")
     bench = _load_tlx_gfx9_gemm_bench_module("_tlx_wave_test_gfx9_bench_inputs")
+    inter_wave = _load_tlx_gfx9_inter_wave_bench_module("_tlx_wave_test_gfx9_inter_wave_bench_inputs")
+    assert inter_wave.INPUT_MODES == bench.INPUT_MODES
     normal_seed_zero = None
 
     for input_mode in bench.INPUT_MODES:
@@ -5928,6 +5951,17 @@ def test_tlx_gfx9_gemm_bench_input_modes_are_deterministic():
         )
         torch.testing.assert_close(a, repeat_a)
         torch.testing.assert_close(b, repeat_b)
+        inter_wave_a, inter_wave_b = inter_wave.make_inputs(
+            2,
+            4,
+            8,
+            torch.device("cpu"),
+            "transposed",
+            input_mode=input_mode,
+            seed=0,
+        )
+        torch.testing.assert_close(inter_wave_a, a)
+        torch.testing.assert_close(inter_wave_b, b)
         assert b.shape == (8, 4)
         assert b.stride() == (1, 8)
         if input_mode == "normal":
