@@ -142,6 +142,10 @@ private:
   }
 };
 
+/// Returns true if `op` synchronizes local memory accesses for membar-style
+/// analyses.
+bool containsLocalBarrier(Operation *op);
+
 //===----------------------------------------------------------------------===//
 // Shared Memory Barrier Analysis
 //===----------------------------------------------------------------------===//

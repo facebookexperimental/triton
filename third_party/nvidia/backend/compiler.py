@@ -37,6 +37,8 @@ def min_dot_size(target: GPUTarget):
             return (1, 1, 32)
         elif lhs_bitwidth == 64:
             return (1, 1, 4)
+        elif lhs_bitwidth == 32:
+            return (1, 1, 8)
         else:
             return (1, 1, 16)
 
@@ -1091,6 +1093,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
+        nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)

@@ -862,6 +862,31 @@ LogicalResult AsyncTDMGatherOp::verify() {
   return success();
 }
 
+// -- UpdateTensorDescriptorOp --
+LogicalResult UpdateTensorDescriptorOp::verify() {
+  auto descTy = getDesc().getType();
+  size_t rank = descTy.getBlockType().getRank();
+
+  if (!getAddOffsets().empty() && getAddOffsets().size() != rank)
+    return emitOpError("expected ")
+           << rank << " add_offsets to match descriptor rank, got "
+           << getAddOffsets().size();
+
+  if (!getSetBounds().empty() && getSetBounds().size() != rank)
+    return emitOpError("expected ")
+           << rank << " set_bounds to match descriptor rank, got "
+           << getSetBounds().size();
+
+  // At least one mutation parameter must be provided -- a no-op update is
+  // either a user mistake or should be folded by canonicalizer.
+  if (getAddOffsets().empty() && getSetBounds().empty() && !getDest() &&
+      !getPred() && !getBarrier())
+    return emitOpError("must provide at least one of add_offsets, set_bounds, "
+                       "dest, pred, or barrier");
+
+  return success();
+}
+
 // -- InitBarrierOp --
 LogicalResult InitBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))

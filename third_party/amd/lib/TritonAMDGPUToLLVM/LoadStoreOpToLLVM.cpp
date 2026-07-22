@@ -1268,11 +1268,15 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
         cast<triton::gpu::SharedEncodingTrait>(encoding), shapePerCTA);
     bool isRowMajor = sharedOrder[0] == (sharedOrder.size() - 1);
 
+    auto cacheMod = op.getCache();
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        cacheMod, /*isLoad*/ true, targetInfo);
+
     mlir::LLVM::AMD::emitTDMLoadStore(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, numWarps,
         padInterval, padAmount, offset, dstPtrs, op.getPred(), multicastMask,
         elementType, barrierPtr, /*isLoad=*/true, sharedLayout, encoding, ctaId,
-        isRowMajor);
+        isRowMajor, auxBits);
 
     rewriter.eraseOp(op);
     return success();
@@ -1350,12 +1354,16 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
         shapePerCTA);
     bool isRowMajor = sharedOrder[0] == (sharedOrder.size() - 1);
 
+    auto cacheMod = op.getCache();
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        cacheMod, /*isLoad*/ false, targetInfo);
+
     Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
     mlir::LLVM::AMD::emitTDMLoadStore(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, numWarps,
         padInterval, padAmount, offset, srcPtrs, pred,
         /*multicastMask=*/{}, elementType, barrierPtr,
-        /*isLoad=*/false, sharedLayout, encoding, ctaId, isRowMajor);
+        /*isLoad=*/false, sharedLayout, encoding, ctaId, isRowMajor, auxBits);
 
     rewriter.eraseOp(op);
     return success();

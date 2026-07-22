@@ -487,6 +487,8 @@ class TritonSemantic(Generic[TensorTy]):
         input_sca_ty = input.type.scalar
         if input_sca_ty.is_ptr():
             raise ValueError("wrong type argument to unary minus (" + input_sca_ty.__repr__() + ")")
+        if input_sca_ty.is_floating():
+            return self.tensor(self.builder.create_fneg(input.handle), input.type)
         _0 = self.tensor(self.builder.get_null_value(input_sca_ty.to_ir(self.builder)), input_sca_ty)
         return self.sub(_0, input, True)
 
@@ -1728,11 +1730,11 @@ class TritonSemantic(Generic[TensorTy]):
 
         def _to_scale_handle(scale):
             if isinstance(scale, tl.tensor) and scale.numel.value != 1:
-                return scale.handle
+                return scale.type.shape
             return None
 
-        return ir.deduce_scale_factor(lhs.handle, _to_scale_handle(lhs_scale), self._str_to_fp_type(lhs_format),
-                                      lhs_k_pack, rhs.handle, _to_scale_handle(rhs_scale),
+        return ir.deduce_scale_factor(lhs.type.shape, _to_scale_handle(lhs_scale), self._str_to_fp_type(lhs_format),
+                                      lhs_k_pack, rhs.type.shape, _to_scale_handle(rhs_scale),
                                       self._str_to_fp_type(rhs_format), rhs_k_pack)
 
     def verify_scaled_shape(self, M, N, K, lhs_scale, rhs_scale, scale_factor):
