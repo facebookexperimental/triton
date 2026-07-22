@@ -41,6 +41,7 @@ add_triton_library(TritonAMDGPUToLLVM
     MLIRReconcileUnrealizedCasts
     TritonGPUToLLVM
     TritonAMDGPUIR
+    TritonAMDAnalysis
     LLVMCore
     LLVMPasses
     LLVMSupport

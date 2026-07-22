@@ -151,11 +151,78 @@ struct MakeTensorDescOpConversion
     return success();
   }
 };
+
+struct UpdateTensorDescriptorOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::UpdateTensorDescriptorOp> {
+  using ConvertOpToLLVMPattern<
+      triton::amdgpu::UpdateTensorDescriptorOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::UpdateTensorDescriptorOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto tensorDescTy = op.getDesc().getType();
+    auto blockTy = tensorDescTy.getBlockType();
+    Type elementType =
+        getTypeConverter()->convertType(blockTy.getElementType());
+    SmallVector<int64_t> blockShape = to_vector(blockTy.getShape());
+
+    if (blockShape.size() != 2) {
+      return rewriter.notifyMatchFailure(
+          op, "UpdateTensorDescriptorOp lowering currently supports 2D only");
+    }
+
+    // Unpack the input descriptor into vector groups (group0: <4 x i32>,
+    // group1: <8 x i32> for 2D).
+    SmallVector<Value> groups =
+        mlir::LLVM::AMD::unpackTDMDescriptor(rewriter, loc, adaptor.getDesc());
+    assert(groups.size() == 2 && "2D descriptor expects 2 vector groups");
+    Value group0 = groups[0];
+    Value group1 = groups[1];
+
+    SmallVector<Value> addOffsets = llvm::to_vector(adaptor.getAddOffsets());
+    SmallVector<Value> setBounds = llvm::to_vector(adaptor.getSetBounds());
+
+    Value destPtr;
+    if (op.getDest()) {
+      auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getDest(), elementType, rewriter);
+      destPtr = smemObj.getBase();
+    }
+    Value barrierPtr;
+    if (op.getBarrier()) {
+      auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getBarrier(),
+          getTypeConverter()->convertType(
+              op.getBarrier().getType().getElementType()),
+          rewriter);
+      barrierPtr = smemObj.getBase();
+    }
+    Value pred = adaptor.getPred();
+
+    mlir::LLVM::AMD::updateTensorDescriptor(
+        rewriter, loc, elementType, blockShape, group0, group1, addOffsets,
+        setBounds, destPtr, pred, barrierPtr);
+
+    // Re-pack the mutated groups back into the flat MLIR struct that
+    // matches convertTensorDescType / the host-side TDMDescriptor ABI.
+    SmallVector<Value> mutated = {group0, group1};
+    SmallVector<Value> scalars =
+        mlir::LLVM::AMD::scalarizeTDMDescriptor(rewriter, loc, mutated);
+    Value newDesc = packLLElements(loc, getTypeConverter(), scalars, rewriter,
+                                   tensorDescTy);
+
+    rewriter.replaceOp(op, newDesc);
+    return success();
+  }
+};
 } // namespace
 
 void mlir::triton::AMD::populateTensorPtrOpsToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
   patterns.add<MakeTensorDescOpConversion>(typeConverter, benefit);
+  patterns.add<UpdateTensorDescriptorOpConversion>(typeConverter, benefit);
   return;
 }
