@@ -5,6 +5,7 @@ add_triton_library(TritonNvidiaGPUTransforms
   FenceInsertion.cpp
   FuseTMemLoadReduce.cpp
   GenerateSubtiledRegion.cpp
+  InsertTMemAliasWARBarrier.cpp
   InterleaveTMem.cpp
   MMALowering.cpp
   OptimizeDescriptorEncoding.cpp

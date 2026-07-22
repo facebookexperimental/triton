@@ -271,10 +271,9 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
   return info;
 }
 
-FailureOr<TMemLdStEncodingInfo>
-computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
-                            int maxnreg,
-                            std::function<InFlightDiagnostic()> emitError) {
+FailureOr<LinearLayout>
+computeTMemLdStPhysicalLayout(RankedTensorType regTy, MemDescType memTy,
+                              std::function<InFlightDiagnostic()> emitError) {
   auto memLayout = toLinearLayout(memTy);
   auto regLayout = toLinearLayout(regTy);
   auto *ctx = regTy.getContext();
@@ -313,9 +312,20 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
   cvt = LinearLayout(std::move(bases), cvt.getOutDims(),
                      /*isSurjective=*/cvt.isSurjective());
 
+  return cvt;
+}
+
+FailureOr<TMemLdStEncodingInfo>
+computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
+                            int maxnreg,
+                            std::function<InFlightDiagnostic()> emitError) {
+  auto cvt = computeTMemLdStPhysicalLayout(regTy, memTy, emitError);
+  if (failed(cvt))
+    return failure();
+
   bool isScales = isa<TensorMemoryScalesEncodingAttr>(memTy.getEncoding());
   int bitwidth = memTy.getElementTypeBitWidth();
-  return lowerTMemLdSt(cvt, maxnreg, bitwidth, isScales, emitError);
+  return lowerTMemLdSt(*cvt, maxnreg, bitwidth, isScales, emitError);
 }
 
 bool supportsTMemLoadReduce(RankedTensorType regTy, MemDescType memTy,
