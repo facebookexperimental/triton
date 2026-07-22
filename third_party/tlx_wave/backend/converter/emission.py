@@ -6,7 +6,6 @@ import sys
 import warnings
 
 from .diagnostics import fail
-from . import coordinates
 from . import domains
 from . import target_ir
 
@@ -1386,17 +1385,6 @@ def _linearize_coordinates(state, coords, shape, lane_width):
     return result
 
 
-def _linearize_coordinates_expr(state, coords, shape):
-    result = state.dsl.sym_ctx.int_(0)
-    for dim, coord in enumerate(coords):
-        stride = _product(shape[dim + 1:])
-        term = coord
-        if int(stride) != 1:
-            term = term * int(stride)
-        result = result + term
-    return result
-
-
 def _linearize_coordinates_with_order(state, coords, shape, order, lane_width):
     if len(coords) != len(shape):
         fail(
@@ -1897,14 +1885,6 @@ def _local_memory_roots(state, target_value_id):
     return frozenset({int(target_value_id)})
 
 
-def _local_memory_dependency_token(state, target_value_id, extra_tokens=()):
-    roots = _local_memory_roots(state, target_value_id)
-    dependency_roots = _local_memory_dependency_roots(state, roots)
-    tokens = [state.local_memory_tokens[root] for root in sorted(dependency_roots) if root in state.local_memory_tokens]
-    tokens.extend(tuple(extra_tokens))
-    return _memory_dependency_token(state, tokens)
-
-
 def _local_dma_issue_dependency_token(state, issue_dependencies):
     # Async direct-to-LDS issues are ordered by explicit async-token operands.
     # Local readers synchronize through local-memory tokens after async_wait.
@@ -2289,12 +2269,6 @@ def _sync_pending_local_memory_accesses(state, extra_tokens=(), roots=None):
     return barrier_token
 
 
-def _set_local_memory_token(state, target_value_id, token):
-    for root in _local_memory_roots(state, target_value_id):
-        state.local_memory_tokens[int(root)] = token
-        state.local_memory_pending_accesses.pop(int(root), None)
-
-
 def _set_local_memory_roots_token(state, roots, token):
     for root in roots:
         state.local_memory_tokens[int(root)] = token
@@ -2352,16 +2326,6 @@ def _record_local_memory_access_token(state, roots, token):
         if any(existing is token for existing in tokens):
             continue
         state.local_memory_access_tokens[dependency_root] = (*tokens, token)
-
-
-def _local_memory_allocation_roots(state, roots):
-    return tuple(
-        sorted({
-            int(dependency_root)
-            for root in roots
-            for dependency_root in _local_memory_dependency_roots(state, (root, ))
-            if int(dependency_root) in state.local_memory_allocations
-        }))
 
 
 def _record_local_memory_read_token(state, roots, token):
@@ -3214,7 +3178,6 @@ def _carried_local_memory_pending_access(state, root, implicit_root_accesses, ou
 
 _SCRATCH_LAYOUT_CONVERT_MODES = frozenset({
     "cta_exchange_register_remap",
-    "dot_operand_vector_payload",
     "mfma_vector_register_remap",
 })
 
@@ -5140,28 +5103,6 @@ def _emit_symbolic_contiguous_scatter(
     )
 
 
-def _emit_contiguous_store(
-    state,
-    value,
-    offset,
-    base,
-    lane_width,
-    *,
-    dependency=None,
-    cache=None,
-):
-    ptr = state.builder.ptr_add(
-        base,
-        _simd_offset_value(state, offset, lane_width),
-    )
-    return state.builder.store(
-        value,
-        ptr,
-        after=dependency,
-        cache=cache,
-    )
-
-
 def _emit_symbolic_contiguous_gather(
     state,
     offset,
@@ -7054,16 +6995,6 @@ def _release_dead_local_memory_before_redistribute(state, op):
     return tuple(released_tokens)
 
 
-def _record_scratch_read_tokens(state, tokens):
-    tokens = _unique_tokens(tokens)
-    if not tokens:
-        state.scratch_token = state.builder.token()
-        state.scratch_token_needs_write_barrier = False
-        return
-    state.scratch_token = _join_memory_tokens(state, tokens)
-    state.scratch_token_needs_write_barrier = True
-
-
 def _unique_tokens(tokens):
     unique = []
     seen = set()
@@ -8147,12 +8078,6 @@ def _dense_tile_base_elements(shape, tile_offsets):
         element_offset += int(tile_offsets[dim]) * stride
         stride *= int(shape[dim])
     return int(element_offset)
-
-
-def _add_optional_offset(state, base, offset):
-    if offset is None:
-        return base
-    return state.builder.binary(state.dsl.BinaryKind.AddI, base, offset)
 
 
 def _emit_mma_packet_constant(state, op):
@@ -9740,26 +9665,6 @@ def _emit_masked_token_region(state, condition, inactive_token, emit_body):
     return where.results[0]
 
 
-def _emit_masked_value_region(
-    state,
-    condition,
-    result_type,
-    inactive_value,
-    emit_body,
-):
-    if not isinstance(condition, (tuple, list)) and _is_scalar_i1_value(state, condition):
-        with state.builder.if_(condition, [result_type], otherwise=True) as ifop:
-            state.builder.yield_([emit_body()])
-            with ifop.otherwise():
-                state.builder.yield_([inactive_value])
-        return ifop.results[0]
-    with state.builder.where(condition, [result_type]) as where:
-        state.builder.yield_([emit_body()])
-    with where.otherwise():
-        state.builder.yield_([inactive_value])
-    return where.results[0]
-
-
 def _emit_masked_memory_value_region(
     state,
     condition,
@@ -9931,44 +9836,6 @@ def _require_numeric_literal(literal, op):
 
 def _is_float_element(element_type):
     return element_type in {"f16", "bf16", "f32", "f64"}
-
-
-def _packet_coordinate_values(
-    state,
-    component,
-    lane,
-    component_thread_count,
-    packet_elements,
-    shape,
-    packet_order,
-):
-    linear = _simd_binary_const(
-        state,
-        "muli",
-        lane,
-        int(packet_elements),
-        int(state.dsl.SimdType(lane.type).width),
-        nsw=_LAYOUT_MATH_NSW,
-    )
-    constant = int(component) * int(component_thread_count) * int(packet_elements)
-    if constant:
-        linear = _simd_binary_const(
-            state,
-            "addi",
-            linear,
-            constant,
-            int(state.dsl.SimdType(lane.type).width),
-            nsw=_LAYOUT_MATH_NSW,
-        )
-    lane_width = int(state.dsl.SimdType(lane.type).width)
-    coords = [None] * len(shape)
-    remainder = linear
-    for dim in packet_order:
-        extent = int(shape[int(dim)])
-        coord = _simd_binary_const(state, "remui", remainder, extent, lane_width)
-        coords[int(dim)] = coord
-        remainder = _simd_binary_const(state, "divui", remainder, extent, lane_width)
-    return tuple(coords)
 
 
 def _packet_source_offset_index_expr(
@@ -10220,35 +10087,6 @@ def _packet_destination_wave_coordinate_value(
     )
     state.wave_offset_i32_cache[cache_key] = wave_first
     return wave_first
-
-
-def _scalar_bit_affine_offset(state, value, base, coefficients):
-    offset = None
-    if int(base):
-        offset = state.builder.constant(state.dsl.i32(), int(base))
-    for bit, coefficient in enumerate(coefficients):
-        coefficient = int(coefficient)
-        if coefficient == 0:
-            continue
-        bit_value = _scalar_binary_const_i32(state, "divui", value, 1 << bit)
-        bit_value = _scalar_binary_const_i32(state, "remui", bit_value, 2)
-        if coefficient != 1:
-            bit_value = _scalar_binary_const_i32(
-                state,
-                "muli",
-                bit_value,
-                coefficient,
-                nsw=_LAYOUT_MATH_NSW,
-            )
-        offset = _combine_optional_i32_offsets(
-            state,
-            offset,
-            bit_value,
-            nsw=_LAYOUT_MATH_NSW,
-        )
-    if offset is None:
-        return state.builder.constant(state.dsl.i32(), 0)
-    return offset
 
 
 def _affine_offset_value(
@@ -10820,262 +10658,6 @@ def _simd_offset_value(state, value, lane_width):
     return state.builder.splat(value, value.type, int(lane_width))
 
 
-def _simd_i32_from_lane_plan(state, plan, lane_values, lane_width):
-    lane_width = int(lane_width)
-    plan = tuple(plan)
-    lane_values = tuple(int(value) for value in lane_values)
-    if not plan:
-        fail(
-            "TLXW_EMIT_LAYOUT_REMAP",
-            STAGE,
-            "lane-value SIMD materialization plan must not be empty",
-        )
-    if (len(lane_values) != lane_width or any(value < 0 or value >= lane_width for value in lane_values)):
-        fail(
-            "TLXW_EMIT_LAYOUT_REMAP",
-            STAGE,
-            "lane-value SIMD materialization plan contains invalid lanes",
-        )
-    kind = str(plan[0])
-    if kind == "bit_affine":
-        coefficient_count = max(0, lane_width.bit_length() - 1)
-        if (lane_width <= 0 or lane_width & (lane_width - 1) or len(plan) != coefficient_count + 2):
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-value bit-affine plan does not match the wave width",
-            )
-        base = int(plan[1])
-        coefficients = tuple(int(value) for value in plan[2:])
-        planned_values = tuple(base + sum(coefficient
-                                          for bit, coefficient in enumerate(coefficients)
-                                          if lane & (1 << bit))
-                               for lane in range(lane_width))
-        if planned_values != lane_values:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-value bit-affine plan does not match its source map",
-            )
-        lane_id = state.builder.lane_id(state.dsl.i32(), lane_width)
-        return _bit_affine_thread_offset(
-            state,
-            lane_id,
-            base,
-            coefficients,
-            lane_width,
-        )
-    if kind == "explicit":
-        if tuple(int(value) for value in plan[1:]) != lane_values:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "explicit lane-value plan does not match its source map",
-            )
-        return _simd_i32_from_lane_values(state, lane_values, lane_width)
-    fail(
-        "TLXW_EMIT_LAYOUT_REMAP",
-        STAGE,
-        f"unsupported lane-value SIMD materialization plan {kind!r}",
-    )
-
-
-def _simd_i1_mask_from_lane_plan(state, plan, lanes, lane_width):
-    lane_width = int(lane_width)
-    plan = tuple(plan)
-    lanes = tuple(sorted({int(lane) for lane in lanes}))
-    if not plan:
-        fail(
-            "TLXW_EMIT_LAYOUT_REMAP",
-            STAGE,
-            "lane-mask materialization plan must not be empty",
-        )
-    if not lanes or any(lane < 0 or lane >= lane_width for lane in lanes):
-        fail(
-            "TLXW_EMIT_LAYOUT_REMAP",
-            STAGE,
-            "lane-mask materialization plan contains invalid lanes",
-        )
-
-    kind = str(plan[0])
-    if kind == "all":
-        if len(plan) != 1 or lanes != tuple(range(lane_width)):
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "all-lanes mask plan does not match its lane set",
-            )
-        payload = _simd_i32_constant(state, lane_width, 1)
-        return _lane_mask_from_i32_payload(state, payload, lane_width)
-
-    lane_id = state.builder.lane_id(state.dsl.i32(), lane_width)
-    if kind == "lane_bit":
-        if len(plan) != 3:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-bit mask plan is malformed",
-            )
-        bit = int(plan[1])
-        value = int(plan[2])
-        if bit < 0 or bit >= max(0, lane_width.bit_length() - 1) or value not in (0, 1):
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-bit mask plan does not match the wave width",
-            )
-        planned_lanes = tuple(lane for lane in range(lane_width) if ((lane >> bit) & 1) == value)
-        if planned_lanes != lanes:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-bit mask plan does not match its lane set",
-            )
-        payload = _simd_binary_const(
-            state,
-            "shrui",
-            lane_id,
-            bit,
-            lane_width,
-        )
-        payload = _simd_binary_const(
-            state,
-            "andi",
-            payload,
-            1,
-            lane_width,
-        )
-        if not value:
-            payload = _simd_binary_const(
-                state,
-                "xori",
-                payload,
-                1,
-                lane_width,
-            )
-        return _lane_mask_from_i32_payload(state, payload, lane_width)
-
-    if kind == "range":
-        if len(plan) != 3:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-range mask plan is malformed",
-            )
-        begin = int(plan[1])
-        end = int(plan[2])
-        if not 0 <= begin < end <= lane_width or lanes != tuple(range(begin, end)):
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "lane-range mask plan does not match its lane set",
-            )
-        payload = _static_lane_membership_i32_payload(
-            state,
-            lane_id,
-            lanes,
-            lane_width,
-        )
-        return _lane_mask_from_i32_payload(state, payload, lane_width)
-
-    if kind == "explicit":
-        if tuple(int(lane) for lane in plan[1:]) != lanes:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                "explicit lane-mask plan does not match its lane set",
-            )
-        payload = _static_lane_membership_i32_payload(
-            state,
-            lane_id,
-            lanes,
-            lane_width,
-        )
-        return _lane_mask_from_i32_payload(state, payload, lane_width)
-    fail(
-        "TLXW_EMIT_LAYOUT_REMAP",
-        STAGE,
-        f"unsupported lane-mask materialization plan {kind!r}",
-    )
-
-
-def _static_lane_membership_i32_payload(state, lane_id, lanes, lane_width):
-    """Materialize a static lane set as durable 0/1 VGPR data.
-
-    Wave masks lower to condition-code state.  Keeping a static mask live over
-    a structured loop makes that state unnecessarily fragile and also lets CSE
-    merge predicates from otherwise independent layout remaps.  A compact
-    lane-bit lookup keeps the invariant representation in ordinary SIMD data;
-    callers materialize a mask only at the selection point.
-    """
-    lane_width = int(lane_width)
-    if lane_width <= 0 or lane_width > 64:
-        fail(
-            "TLXW_EMIT_LAYOUT_REMAP",
-            STAGE,
-            "static lane membership supports wave widths from 1 through 64",
-        )
-    lane_set = frozenset(int(lane) for lane in lanes)
-    words = []
-    for word_index in range((lane_width + 31) // 32):
-        word = sum(1 << (lane - 32 * word_index)
-                   for lane in lane_set
-                   if 32 * word_index <= lane < 32 * (word_index + 1))
-        if word >= 1 << 31:
-            word -= 1 << 32
-        words.append(word)
-
-    selected_word = _simd_i32_constant(state, lane_width, words[0])
-    if len(words) == 2:
-        high_word = _simd_i32_constant(state, lane_width, words[1])
-        word_index = _simd_binary_const(
-            state,
-            "shrui",
-            lane_id,
-            5,
-            lane_width,
-        )
-        word_mask = state.builder.binary(
-            state.dsl.BinaryKind.SubI,
-            _simd_i32_constant(state, lane_width, 0),
-            word_index,
-        )
-        word_delta = state.builder.binary(
-            state.dsl.BinaryKind.XOrI,
-            selected_word,
-            high_word,
-        )
-        selected_word = state.builder.binary(
-            state.dsl.BinaryKind.XOrI,
-            selected_word,
-            state.builder.binary(
-                state.dsl.BinaryKind.AndI,
-                word_delta,
-                word_mask,
-            ),
-        )
-
-    bit_index = _simd_binary_const(
-        state,
-        "andi",
-        lane_id,
-        31,
-        lane_width,
-    )
-    shifted = state.builder.binary(
-        state.dsl.BinaryKind.ShRUI,
-        selected_word,
-        bit_index,
-    )
-    return _simd_binary_const(
-        state,
-        "andi",
-        shifted,
-        1,
-        lane_width,
-    )
-
-
 def _lane_mask_from_i32_payload(state, payload, lane_width):
     one = _simd_i32_constant(state, lane_width, 1)
     phase = state.lane_mask_loop_phase
@@ -11097,34 +10679,6 @@ def _lane_mask_from_i32_payload(state, payload, lane_width):
     payload = state.builder.binary(state.dsl.BinaryKind.AddI, payload, nonce)
     one = state.builder.binary(state.dsl.BinaryKind.AddI, one, nonce)
     return _cmpi(state, "eq", payload, one)
-
-
-def _simd_i32_from_lane_values(state, lane_values, lane_width):
-    lane_width = int(lane_width)
-    lane_values = tuple(int(value) for value in lane_values)
-    if len(lane_values) != lane_width:
-        fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
-            STAGE,
-            "lane-value SIMD constant map must match lane width",
-        )
-    result = _simd_i32_constant(state, lane_width, lane_values[0])
-    lane_id = state.builder.lane_id(state.dsl.i32(), lane_width)
-    for lane_index, value in enumerate(lane_values[1:], start=1):
-        if value == lane_values[0]:
-            continue
-        is_lane = _cmpi(
-            state,
-            "eq",
-            lane_id,
-            _simd_i32_constant(state, lane_width, lane_index),
-        )
-        result = state.builder.select(
-            is_lane,
-            _simd_i32_constant(state, lane_width, value),
-            result,
-        )
-    return result
 
 
 def _is_simd_i32_value(state, value):
@@ -11187,21 +10741,6 @@ def _i32_payload_to_mask(state, component, lane_width):
 def _mask_payload_component(state, component, lane_width):
     del state, lane_width
     return component
-
-
-def _materialize_mask_payload(state, payload, lane_width):
-    reused = []
-    components = tuple(
-        _reuse_component_result(
-            reused,
-            (component, ),
-            lambda component=component: _mask_payload_component(
-                state,
-                component,
-                lane_width,
-            ),
-        ) for component in payload.components)
-    return _I32MaskPayload(components)
 
 
 def _broadcast_components(state, values, count, op):
