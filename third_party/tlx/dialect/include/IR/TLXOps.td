@@ -322,7 +322,7 @@ def TLX_AssertSameLayoutExpectedOp : TLX_Op<"assert_same_layout_expected", []> {
 
   let results = (outs);
 
-  let assemblyFormat = "$src `,` $expected `,` attr-dict `:` type($src)";
+  let assemblyFormat = "$src attr-dict `:` type($src)";
 }
 
 def TLX_DumpLayoutOp : TLX_Op<"dump_layout", []> {

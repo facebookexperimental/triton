@@ -261,9 +261,12 @@ public:
     bool assertionFailed = false;
     auto compare = [&](Operation *op, ttg::TensorOrMemDesc lhsType,
                        ttg::TensorOrMemDesc rhsType) {
-      LinearLayout lhs = ttg::toLinearLayout(lhsType);
-      LinearLayout rhs = ttg::toLinearLayout(rhsType);
-      if (lhs != rhs) {
+      auto lhsEncoding = cast<ttg::LayoutEncodingTrait>(lhsType.getEncoding());
+      auto rhsEncoding = cast<ttg::LayoutEncodingTrait>(rhsType.getEncoding());
+      if (!ttg::areLayoutsEquivalent(lhsType.getShape(), lhsEncoding,
+                                     rhsEncoding)) {
+        LinearLayout lhs = ttg::toLinearLayout(lhsType);
+        LinearLayout rhs = ttg::toLinearLayout(rhsType);
         op->emitError() << "layout assertion failed: LinearLayouts differ\n"
                         << "lhs: " << lhs.toString() << "\n"
                         << "rhs: " << rhs.toString();
