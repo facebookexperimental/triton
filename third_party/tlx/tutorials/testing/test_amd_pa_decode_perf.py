@@ -22,8 +22,17 @@ NUM_Q_HEADS = NUM_KV_HEADS * QUERY_GROUP_SIZE
 HEAD_DIM = 64
 PAGE_SIZE = 16
 
+def _check_aiter_available():
+    try:
+        import aiter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+_AITER_AVAILABLE = _check_aiter_available()
 DECODE_METHODS = ("tlx", "aiter")
-DEFAULT_DECODE_VERSIONS = list(DECODE_METHODS)
+DEFAULT_DECODE_VERSIONS = [v for v in DECODE_METHODS if v != "aiter" or _AITER_AVAILABLE]
 
 
 def _pack_aiter_kv_cache(key_cache, value_cache):
@@ -46,7 +55,11 @@ def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, max_conte
             out, q, kc, vc, ctx, bt, sm_scale, query_length=qlen, max_context_len=max_context_len
         )
 
-    from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+    try:
+        from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+    except Exception as e:
+        print(f"[aiter] skipped: {e}")
+        return None
 
     kc, vc = _pack_aiter_kv_cache(kc, vc)
     num_seqs = q.shape[0] // qlen
@@ -112,6 +125,8 @@ def create_benchmark(versions, qlen):
                                            query_length=qlen, device=DEVICE, pool_pages=pool)
         out = torch.empty_like(q)
         fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, N_CTX)
+        if fn is None:
+            return float("nan"), float("nan"), float("nan")
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=100, rep=200)
 
