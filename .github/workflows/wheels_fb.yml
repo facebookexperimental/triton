@@ -15,6 +15,14 @@ name: Wheels (fbtriton)
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      ref:      { type: string, required: false, default: "" }
+      # Caller-provided clean version to pin (e.g. nightly '3.8.0.dev20260717').
+      # The version *scheme* is decided by the caller; this workflow only applies it.
+      version:  { type: string, required: false, default: "" }
+      # Optional ABI-matrix overrides; default to the full fork matrix.
+      pythons:  { type: string, required: false, default: '["cp310","cp311","cp312","cp313","cp314"]' }
+      arches:   { type: string, required: false, default: '["x86_64","aarch64"]' }
   pull_request:
     paths:
       - .github/workflows/wheels_fb.yml
@@ -32,12 +40,26 @@ jobs:
       # ABIs/arches work and which break.
       fail-fast: false
       matrix:
-        python: [cp310, cp311, cp312, cp313, cp314]
-        arch: [x86_64, aarch64]
+        python: ${{ fromJSON(inputs.pythons || '["cp310","cp311","cp312","cp313","cp314"]') }}
+        arch:   ${{ fromJSON(inputs.arches  || '["x86_64","aarch64"]') }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      # Apply the caller-provided version: pin the clean wheel version and stamp
+      # the short commit hash into the runtime __version__ (HEAD is the
+      # checked-out target commit). Generic — the version scheme is the caller's.
+      - name: Pin version + runtime __version__ (workflow_call builds)
+        if: ${{ inputs.version != '' }}
+        run: |
+          short="$(git rev-parse --short=8 HEAD)"
+          sed -i "s:^TRITON_VERSION = .*:TRITON_VERSION = '${{ inputs.version }}':" setup.py
+          sed -i "s:^__version__ = .*:__version__ = '${{ inputs.version }}+fb.git${short}':" python/triton/__init__.py
+          grep '^TRITON_VERSION' setup.py
+          grep '^__version__' python/triton/__init__.py
 
       # Tag-triggered builds (via publish.yml) need a clean PEP 440 version
       # (no +gitHASH suffix) for PyPI. Bypass setup.py's dynamic version

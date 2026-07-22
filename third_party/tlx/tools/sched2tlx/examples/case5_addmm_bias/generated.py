@@ -53,7 +53,7 @@ def addmm_persistent_2d_bias(
     outer_load_12_smem_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     outer_load_12_smem_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     with tlx.async_tasks():
-        # Async task: role=default ← outer wg0 (Phase 4 plan)
+        # Async task: role=default ← outer wg3 (Phase 4 plan)
         with tlx.async_task("default"):
             tmem_accum_cnt = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.

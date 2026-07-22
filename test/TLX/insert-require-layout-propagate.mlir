@@ -275,7 +275,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #smem_6 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_full_tile_subslice_dot
-  tt.func public @tdm_full_tile_subslice_dot(%desc: !tt.tensordesc<tensor<32x128xf16>>, %m: i32, %k: i32, %p: i32)
+  tt.func public @tdm_full_tile_subslice_dot(%desc: !tt.tensordesc<32x128xf16>, %m: i32, %k: i32, %p: i32)
       -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_6, kWidth = 8}>> {
     %c0 = arith.constant 0 : i32
     // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #[[$PADDED_A]], #smem, mutable>
@@ -283,7 +283,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     // CHECK: %[[BUF:.*]] = ttg.memdesc_index %[[ALLOC]][%{{.*}}] : !ttg.memdesc<2x32x128xf16, #[[$PADDED_A]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #[[$PADDED_A]], #smem, mutable>
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x32x128xf16, #shared_6, #smem_6, mutable> -> !ttg.memdesc<32x128xf16, #shared_6, #smem_6, mutable>
     // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF]]
-    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<tensor<32x128xf16>> -> !ttg.memdesc<32x128xf16, #shared_6, #smem_6, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #shared_6, #smem_6, mutable>
     // CHECK: %[[SUB:.*]] = ttg.memdesc_subslice %[[BUF]][0, 0] : !ttg.memdesc<32x128xf16, #[[$PADDED_A]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_A]], #smem, mutable, 32x128>
     %sub = ttg.memdesc_subslice %buf[0, 0] : !ttg.memdesc<32x128xf16, #shared_6, #smem_6, mutable> -> !ttg.memdesc<32x32xf16, #shared_6, #smem_6, mutable, 32x128>
     // CHECK: ttg.local_load %[[SUB]] : !ttg.memdesc<32x32xf16, #[[$PADDED_A]], #smem, mutable, 32x128> -> tensor<32x32xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>
@@ -305,7 +305,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #smem_7 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_full_tile_subslices_feed_dot
-  tt.func public @tdm_full_tile_subslices_feed_dot(%desc_a: !tt.tensordesc<tensor<32x128xf16>>, %desc_b: !tt.tensordesc<tensor<128x32xf16>>, %m: i32, %n: i32, %k: i32, %p: i32)
+  tt.func public @tdm_full_tile_subslices_feed_dot(%desc_a: !tt.tensordesc<32x128xf16>, %desc_b: !tt.tensordesc<128x32xf16>, %m: i32, %n: i32, %k: i32, %p: i32)
       -> tensor<32x32xf32, #mma_7> {
     %c0 = arith.constant 0 : i32
     %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma_7>
@@ -318,9 +318,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     // CHECK: %[[BUF_B:.*]] = ttg.memdesc_index %[[ALLOC_B]][%{{.*}}] : !ttg.memdesc<2x128x32xf16, #[[$PADDED_B_SUB]], #smem, mutable> -> !ttg.memdesc<128x32xf16, #[[$PADDED_B_SUB]], #smem, mutable>
     %buf_b = ttg.memdesc_index %alloc_b[%c0] : !ttg.memdesc<2x128x32xf16, #shared_7, #smem_7, mutable> -> !ttg.memdesc<128x32xf16, #shared_7, #smem_7, mutable>
     // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF_A]]
-    %tok_a = amdg.async_tdm_copy_global_to_local %desc_a[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<tensor<32x128xf16>> -> !ttg.memdesc<32x128xf16, #shared_7, #smem_7, mutable>
+    %tok_a = amdg.async_tdm_copy_global_to_local %desc_a[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #shared_7, #smem_7, mutable>
     // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF_B]]
-    %tok_b = amdg.async_tdm_copy_global_to_local %desc_b[%k, %n] into %buf_b, pred = %p : !tt.tensordesc<tensor<128x32xf16>> -> !ttg.memdesc<128x32xf16, #shared_7, #smem_7, mutable>
+    %tok_b = amdg.async_tdm_copy_global_to_local %desc_b[%k, %n] into %buf_b, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_7, #smem_7, mutable>
     // CHECK: %[[SUB_A:.*]] = ttg.memdesc_subslice %[[BUF_A]][0, 32] : !ttg.memdesc<32x128xf16, #[[$PADDED_A_SUB]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_A_SUB]], #smem, mutable, 32x128>
     %sub_a = ttg.memdesc_subslice %buf_a[0, 32] : !ttg.memdesc<32x128xf16, #shared_7, #smem_7, mutable> -> !ttg.memdesc<32x32xf16, #shared_7, #smem_7, mutable, 32x128>
     // CHECK: %[[SUB_B:.*]] = ttg.memdesc_subslice %[[BUF_B]][32, 0] : !ttg.memdesc<128x32xf16, #[[$PADDED_B_SUB]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_B_SUB]], #smem, mutable, 128x32>
@@ -349,7 +349,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #smem_8 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_transposed_b_subslice_trans_feed_dot
-  tt.func public @tdm_transposed_b_subslice_trans_feed_dot(%desc_a: !tt.tensordesc<tensor<32x128xf16>>, %desc_b: !tt.tensordesc<tensor<32x128xf16>>, %m: i32, %n: i32, %k: i32, %p: i32)
+  tt.func public @tdm_transposed_b_subslice_trans_feed_dot(%desc_a: !tt.tensordesc<32x128xf16>, %desc_b: !tt.tensordesc<32x128xf16>, %m: i32, %n: i32, %k: i32, %p: i32)
       -> tensor<32x32xf32, #mma_8> {
     %c0 = arith.constant 0 : i32
     %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #mma_8>
@@ -361,9 +361,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %buf_a = ttg.memdesc_index %alloc_a[%c0] : !ttg.memdesc<2x32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
     // CHECK: %[[BUF_B:.*]] = ttg.memdesc_index %[[ALLOC_B]][%{{.*}}] : !ttg.memdesc<2x32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable>
     %buf_b = ttg.memdesc_index %alloc_b[%c0] : !ttg.memdesc<2x32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
-    %tok_a = amdg.async_tdm_copy_global_to_local %desc_a[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<tensor<32x128xf16>> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
+    %tok_a = amdg.async_tdm_copy_global_to_local %desc_a[%m, %k] into %buf_a, pred = %p : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
     // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF_B]]
-    %tok_b = amdg.async_tdm_copy_global_to_local %desc_b[%n, %k] into %buf_b, pred = %p : !tt.tensordesc<tensor<32x128xf16>> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
+    %tok_b = amdg.async_tdm_copy_global_to_local %desc_b[%n, %k] into %buf_b, pred = %p : !tt.tensordesc<32x128xf16> -> !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable>
     // CHECK: %[[SUB_A:.*]] = ttg.memdesc_subslice %[[BUF_A]][0, 64] : !ttg.memdesc<32x128xf16, #[[$PADDED_A_TRANS]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_A_TRANS]], #smem, mutable, 32x128>
     %sub_a = ttg.memdesc_subslice %buf_a[0, 64] : !ttg.memdesc<32x128xf16, #shared_8, #smem_8, mutable> -> !ttg.memdesc<32x32xf16, #shared_8, #smem_8, mutable, 32x128>
     // CHECK: %[[SUB_B:.*]] = ttg.memdesc_subslice %[[BUF_B]][0, 64] : !ttg.memdesc<32x128xf16, #[[$PADDED_B_TRANS]], #smem, mutable> -> !ttg.memdesc<32x32xf16, #[[$PADDED_B_TRANS]], #smem, mutable, 32x128>
@@ -395,7 +395,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 #smem_9 = #ttg.shared_memory
 module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @tdm_full_tile_reshape_dot
-  tt.func public @tdm_full_tile_reshape_dot(%desc: !tt.tensordesc<tensor<128x32xf16>>, %m: i32, %k: i32, %p: i32)
+  tt.func public @tdm_full_tile_reshape_dot(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %p: i32)
       -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_9, kWidth = 8}>> {
     %c0 = arith.constant 0 : i32
     // CHECK: %[[ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<2x128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable>
@@ -403,7 +403,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     // CHECK: %[[BUF:.*]] = ttg.memdesc_index %[[ALLOC]][%{{.*}}] : !ttg.memdesc<2x128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable> -> !ttg.memdesc<128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable>
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared_9, #smem_9, mutable> -> !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable>
     // CHECK: amdg.async_tdm_copy_global_to_local %{{.*}} into %[[BUF]]
-    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<tensor<128x32xf16>> -> !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable>
+    %tok = amdg.async_tdm_copy_global_to_local %desc[%m, %k] into %buf, pred = %p : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable>
     // CHECK: %[[RESHAPE:.*]] = ttg.memdesc_reshape %[[BUF]] : !ttg.memdesc<128x32xf16, #[[$PADDED_RESHAPE]], #smem, mutable> -> !ttg.memdesc<32x128xf16, #{{.*}}, #smem, mutable>
     %reshape = ttg.memdesc_reshape %buf : !ttg.memdesc<128x32xf16, #shared_9, #smem_9, mutable> -> !ttg.memdesc<32x128xf16, #shared_9, #smem_9, mutable>
     // CHECK: ttg.local_load %[[RESHAPE]] : !ttg.memdesc<32x128xf16, #{{.*}}, #smem, mutable> -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 8}>>

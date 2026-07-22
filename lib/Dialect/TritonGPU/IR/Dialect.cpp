@@ -78,6 +78,13 @@ unsigned getTotalElemsPerThread(Attribute layout, ArrayRef<int64_t> shape) {
       .getTotalElemsPerThread(shape);
 }
 
+unsigned getUniqueElemsPerThread(Attribute layout, ArrayRef<int64_t> shape) {
+  auto kReg = StringAttr::get(layout.getContext(), "register");
+  auto strippedLayout =
+      toLinearLayout(shape, layout).removeZeroBasesAlongDim(kReg);
+  return strippedLayout.getInDimSize(kReg);
+}
+
 SmallVector<unsigned> getElemsPerThread(Attribute layout,
                                         ArrayRef<int64_t> shape) {
   return toLinearEncoding(cast<DistributedEncodingTrait>(layout), shape)
@@ -97,6 +104,14 @@ unsigned getTotalElemsPerThread(Type type) {
   auto tensorType = cast<RankedTensorType>(type);
   return getTotalElemsPerThread(tensorType.getEncoding(),
                                 tensorType.getShape());
+}
+
+unsigned getUniqueElemsPerThread(Type type) {
+  if (type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type))
+    return 1;
+  auto tensorType = cast<RankedTensorType>(type);
+  return getUniqueElemsPerThread(tensorType.getEncoding(),
+                                 tensorType.getShape());
 }
 
 FailureOr<RankedTensorType>
@@ -232,6 +247,16 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
   if (auto partitionedLayout =
           dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
     return getOrder(partitionedLayout.getPartitionLayout(), shape);
+  }
+  // Unwrap a user-pinned wrapper (PinnedEncodingTrait) and recurse into its
+  // concrete shared layout.
+  if (auto pinned = dyn_cast<PinnedEncodingTrait>(layout)) {
+    auto inner =
+        dyn_cast_or_null<SharedEncodingTrait>(pinned.getPinnedLayout());
+    if (!inner)
+      llvm::report_fatal_error("getOrder: pinned shared encoding does not wrap "
+                               "a SharedEncodingTrait");
+    return getOrder(inner, shape);
   }
   llvm::report_fatal_error("Unimplemented usage of getOrder for MemDescType");
   return {};
@@ -433,26 +458,13 @@ SmallVector<unsigned> orderPerDimImpl(const LinearLayout &ll,
   return order.takeVector();
 }
 
-static int64_t getNumNonBroadcastRegisters(ArrayRef<int64_t> shape,
-                                           Attribute encoding) {
-  auto kReg = StringAttr::get(encoding.getContext(), "register");
-  auto strippedLayout =
-      toLinearLayout(shape, encoding).removeZeroBasesAlongDim(kReg);
-  return strippedLayout.getInDimSize(kReg);
-}
-
-static int64_t getNumNonBroadcastRegisters(RankedTensorType tensorType) {
-  return getNumNonBroadcastRegisters(tensorType.getShape(),
-                                     tensorType.getEncoding());
-}
-
 bool isLegalCatEncoding(CatOp cat, Attribute targetEncoding) {
   // Cat lowering concatenates the operands' unique register values. So the
   // number of unique register values in the result must be equal to those in
   // the operands.
-  int64_t operandRegs = getNumNonBroadcastRegisters(cat.getLhs().getType()) * 2;
+  int64_t operandRegs = getUniqueElemsPerThread(cat.getLhs().getType()) * 2;
   int64_t resultRegs =
-      getNumNonBroadcastRegisters(cat.getType().getShape(), targetEncoding);
+      getUniqueElemsPerThread(targetEncoding, cat.getType().getShape());
   return resultRegs == operandRegs;
 }
 
@@ -1470,7 +1482,6 @@ void AMDMfmaEncodingAttr::print(AsmPrinter &printer) const {
 
   maybePrintCGALayout(printer, getCGALayout());
 
-  auto tilesPerWarp = getTilesPerWarp();
   if (!hasUnitTilesPerWarp())
     printer << ", tilesPerWarp = [" << getTilesPerWarp() << "]";
 
@@ -3100,9 +3111,8 @@ struct TritonGPUInferLayoutInterface
 
   LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
     auto cat = cast<CatOp>(op);
-    int64_t operandRegs =
-        getNumNonBroadcastRegisters(cat.getLhs().getType()) * 2;
-    int64_t resultRegs = getNumNonBroadcastRegisters(cat.getType());
+    int64_t operandRegs = getUniqueElemsPerThread(cat.getLhs().getType()) * 2;
+    int64_t resultRegs = getUniqueElemsPerThread(cat.getType());
     if (resultRegs != operandRegs) {
       return op->emitError("tt.cat result encoding requires ")
              << resultRegs
@@ -4347,6 +4357,16 @@ int triton::gpu::lookupNumWarps(Region *region) {
   return lookupNumWarps(region->getParentOp());
 }
 
+void triton::gpu::setHasSingleWarpSpecialize(ModuleOp module, bool value) {
+  module->setAttr(AttrSingleWarpSpecializeName,
+                  BoolAttr::get(module.getContext(), value));
+}
+
+bool triton::gpu::hasSingleWarpSpecialize(ModuleOp module) {
+  auto attr = module->getAttrOfType<BoolAttr>(AttrSingleWarpSpecializeName);
+  return attr && attr.getValue();
+}
+
 int triton::gpu::lookupThreadsPerWarp(OpBuilder &rewriter) {
   assert(rewriter.getInsertionBlock() && "expected an insertion point");
   Operation *op =
@@ -4387,12 +4407,10 @@ bool triton::gpu::areLayoutsEquivalent(ArrayRef<int64_t> shape,
 }
 
 bool triton::gpu::isInnermostContiguous(MemDescType type, unsigned numElems) {
-  ArrayRef<int64_t> shape = type.getShape();
   Attribute enc = type.getEncoding();
   MLIRContext *ctx = enc.getContext();
 
   LinearLayout actual = toLinearLayout(type);
-  StringAttr fastestIn = *actual.getInDimNames().begin();
 
   // Flatten actual outs in reverse order to produce a row-major flattening
   // of the layout
@@ -4585,6 +4603,8 @@ std::optional<int> triton::gpu::getWarpSpecializeTag(Operation *op) {
 }
 
 PaddedSharedEncodingAttr triton::gpu::getPaddedEncoding(Attribute encoding) {
+  if (!encoding)
+    return nullptr;
   if (auto padded = dyn_cast<PaddedSharedEncodingAttr>(encoding))
     return padded;
   if (auto partitioned = dyn_cast<PartitionedSharedEncodingAttr>(encoding))

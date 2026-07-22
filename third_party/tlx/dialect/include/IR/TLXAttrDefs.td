@@ -37,10 +37,14 @@ def TLX_SharedEncodingTrait : AttrInterface<"SharedEncodingTrait"> {
 def TLX_DeclareSharedEncodingMethods : DeclareAttrInterfaceMethods<
   TLX_SharedEncodingTrait, ["getAlignment"]>;
 
-// Mirror of ttg::PinnedEncodingTrait (marker, no methods) so a TLX attribute can
+// Mirror of ttg::PinnedEncodingTrait so a TLX attribute can
 // advertise itself as user-pinned to core TritonGPU passes.
 def TLX_PinnedEncodingTrait : AttrInterface<"PinnedEncodingTrait"> {
   let cppNamespace = "::mlir::triton::gpu";
+  let methods = [
+    InterfaceMethod<"Return the concrete layout this wrapper pins.",
+                    "::mlir::Attribute", "getPinnedLayout">,
+  ];
 }
 
 def TLX_DistributedEncodingTrait : AttrInterface<"DistributedEncodingTrait"> {
@@ -189,6 +193,7 @@ def TLX_UserLayoutAttr
   let extraClassDeclaration = [{
     SmallVector<unsigned> getRepOrder() const;
     ::mlir::triton::LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+    ::mlir::Attribute getPinnedLayout() const { return getLayout(); }
   }];
 
   let genVerifyDecl = 1;

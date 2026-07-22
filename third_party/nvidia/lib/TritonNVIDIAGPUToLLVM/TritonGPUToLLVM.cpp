@@ -186,6 +186,7 @@ struct ConvertTritonGPUToLLVM
                                                         benefit);
     mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter, patterns,
                                                         targetInfo);
+    mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns);
     mlir::triton::populateGSanToLLVMPatterns(typeConverter, patterns,
                                              axisInfoAnalysis, targetInfo);
 
@@ -350,6 +351,14 @@ private:
       llvm::SetVector<Value> bars;
       bars.insert(asyncCLCTryCancelOp.getMbarAlloc());
       return bars;
+    } else if (auto clcTryCancelOp = llvm::dyn_cast<ttng::CLCTryCancelOp>(op)) {
+      // The core Triton CLC scheduler also multicasts its response and
+      // completion signal when an explicit physical cluster is configured.
+      // All CTAs must finish initializing their local completion barriers
+      // before the lead CTA can issue the request.
+      llvm::SetVector<Value> bars;
+      bars.insert(clcTryCancelOp.getMbarrier());
+      return bars;
     } else if (auto tcgen5CommitOp = llvm::dyn_cast<ttng::TCGen5CommitOp>(op)) {
       // As of now, there're only three sources to have a tcgen05.commit
       // instruction:
@@ -372,17 +381,6 @@ private:
         llvm::SetVector<Value> bars;
         bars.insert(tcgen5CommitOp.getBarrier());
         return bars;
-      }
-    } else if (auto tmemCopyOp = llvm::dyn_cast<ttng::TMEMCopyOp>(op)) {
-      // case 2 for gen5 commit: a commit inline ptx is generated for a tmem cp
-      // op if it has a barrier arg. If the mod is in 2cta mode, the commit op
-      // can multicast bar signals.
-      if (auto bar = tmemCopyOp.getBarrier()) {
-        if (tlx::tlxEnablePairedMMA(op)) {
-          llvm::SetVector<Value> bars;
-          bars.insert(bar);
-          return bars;
-        }
       }
     } else if (llvm::isa<ttng::MMAv5OpInterface>(op)) {
       // case 3 for gen5 commit: a commit inline ptx will be generated for each
@@ -481,7 +479,7 @@ private:
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
-                                  /*relaxed*/ false);
+                                  /*relaxed*/ true);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
     // mark mod attr so that WS lowering is aware of this cluster sync point
     tlx::setClusterSyncKernelInitOnMod(mod, true);
@@ -519,7 +517,7 @@ bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
     return true;
 
   // wait_barrier will never run ahead of the load it's waiting on
-  if (isa<ttng::AsyncTMACopyGlobalToLocalOp, ttng::AsyncTMAGatherOp>(before) &&
+  if (isa<ttng::TMALoadLikeOpInterface>(before) &&
       isa<ttng::WaitBarrierOp>(after))
     return true;
 

@@ -29,9 +29,9 @@ recomputing it each iteration is free.
 
 The schedulers are ``@tl._aggregate`` value types, so instances flow through
 ``@triton.jit`` kernels (including the persistent ``scf.while`` loop-carried
-state). ``TileScheduler`` is a plain base holding the shared ``is_valid`` body;
-each concrete class re-declares its own fields (``@_aggregate`` reads only a
-class's own annotations) and gets the ``tile_id`` accessor attached below.
+state). The base schedulers are zero-field aggregates holding shared behavior;
+each concrete class declares its state and gets the ``tile_id`` accessor
+attached below.
 """
 import triton.language.core as tl
 from triton.language.core import builtin
@@ -46,6 +46,7 @@ __all__ = [
 ]
 
 
+@tl._aggregate
 class TileScheduler:
     """Base tile-scheduler contract.
 
@@ -71,6 +72,7 @@ class TileScheduler:
         return False
 
 
+@tl._aggregate
 class _CountingTileScheduler(TileScheduler):
     """Base for count-limited persistent schedules (static / dynamic).
 
@@ -182,13 +184,19 @@ _attach_tile_id(DynamicPersistent1DScheduler)
 class ClcTileScheduler(TileScheduler):
     """Cluster Launch Control (Blackwell SM100+) dynamic persistent schedule.
 
-    The grid is over-subscribed (one cluster per tile); a program that finishes
-    early cancels a pending cluster and steals its tile. The scheduler carries the
-    *decoded* current tile ``(is_valid, x, y, z)``: the seed is this program's
-    static launch id, and every later tile comes from a single high-level
+    The grid is over-subscribed with one CTA per logical tile. With
+    ``ctas_per_cga``, PTX groups adjacent CTA coordinates into indivisible
+    clusters: one request atomically cancels a pending cluster, and each member
+    derives its program id from the returned first CTA coordinate plus its local
+    cluster coordinate. The scheduler carries the *decoded* current tile
+    ``(is_valid, x, y, z)``: the seed is this program's static launch id, and
+    every later tile comes from a single high-level
     ``ttng.clc_advance`` op (the response buffer, mbarrier, phase, and issue/wait
     overlap are all materialized by a later compiler lowering pass). ``num_tiles_fn``
-    / ``tile_counter`` are ignored -- CLC termination is hardware-driven.
+    / ``tile_counter`` are ignored -- CLC termination is hardware-driven. Grid
+    dimensions and logical tile geometry must be divisible by
+    ``ctas_per_cga``; inactive padded CTAs are unsupported, and all members must
+    reach ``advance`` uniformly.
     """
     _valid: tl.tensor
     _x: tl.tensor

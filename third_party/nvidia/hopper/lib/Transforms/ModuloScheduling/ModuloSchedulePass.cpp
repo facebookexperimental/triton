@@ -7,6 +7,10 @@
 // attributes for downstream pipelining passes.
 
 #include <cmath>
+#include <set>
+#include <tuple>
+
+#include "mlir/IR/Diagnostics.h"
 
 #include "DataDependenceGraph.h"
 #include "LatencyModel.h"
@@ -645,11 +649,12 @@ static void computeClusterIds(ttg::ScheduleLoop &loop) {
 
 /// Build a ScheduleLoop for a loop. For super-nodes (nested loops), builds
 /// its own DDG and schedule recursively — works at any nesting depth.
-static unsigned buildScheduleLoop(scf::ForOp loop,
-                                  const ttg::DataDependenceGraph &ddg,
-                                  const ttg::ModuloScheduleResult &sched,
-                                  ttg::ScheduleGraph &graph,
-                                  const ttg::LatencyModel &model) {
+static unsigned buildScheduleLoop(
+    scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
+    const ttg::ModuloScheduleResult &sched, ttg::ScheduleGraph &graph,
+    const ttg::LatencyModel &model,
+    const llvm::DenseMap<Operation *, ttg::DataPartitionInfo> &partition =
+        llvm::DenseMap<Operation *, ttg::DataPartitionInfo>()) {
   unsigned loopId = graph.addLoop(loop);
   auto &schedLoop = graph.getLoop(loopId);
   schedLoop.II = sched.II;
@@ -689,12 +694,16 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
 
     if (ddgNode.isSuperNode) {
       if (auto innerLoop = dyn_cast<scf::ForOp>(ddgNode.op)) {
-        auto childDDG = ttg::DataDependenceGraph::build(innerLoop, model);
+        // Pass A.5: build and schedule the child under the same partition so
+        // its dumped II / ScheduleNodes match the partitioned inner MMA.
+        auto childDDG =
+            ttg::DataDependenceGraph::build(innerLoop, model, partition);
+        childDDG.applyDataPartition(partition);
         if (childDDG.getNumNodes() > 0) {
           auto childSched = ttg::runModuloScheduling(childDDG);
           if (succeeded(childSched)) {
-            unsigned childId = buildScheduleLoop(innerLoop, childDDG,
-                                                 *childSched, graph, model);
+            unsigned childId = buildScheduleLoop(
+                innerLoop, childDDG, *childSched, graph, model, partition);
             sn.childPipelineId = childId;
             sn.prologueLatency = graph.getLoop(childId).prologueLatency;
           }
@@ -748,16 +757,17 @@ static ttg::MemoryKind classifyMemoryKind(Operation *op) {
   return ttg::MemoryKind::Register;
 }
 
-/// Pass A.7-M4: pre-decide subtile factor for a descriptor_store op.
+/// Pass A.7: resolve the epilogue subtile factor S for a descriptor_store.
 ///
-/// Consulted by extractBufferShape so the SMEM staging buffer starts at
-/// (BM, BN/S) and the global SMEM reducer sees the shrunk size upfront —
-/// otherwise the reducer would cut K-loop pipeline depth based on the full
-/// store buffer, even if A.7 would later shrink it.
+/// Precedence: (1) env `TRITON_MODULO_EPILOGUE_SUBTILE` (2|4 force, any other
+/// value disables) overrides everything; (2) otherwise the auto-decision attr
+/// `tt.epilogue_subtile` set by `decideEpilogueSubtiles` from the cost model.
+/// The result is always clamped to legality (BN % S == 0 and BN/S >= 32, the
+/// 64-byte TMA min granularity for fp16).
 ///
-/// Today: env-override only (TRITON_MODULO_EPILOGUE_SUBTILE=2|4). The auto
-/// path (estimate K-loop SMEM + outer c_smem vs budget, pick smallest S that
-/// fits) is a follow-up — env override is enough for the demo.
+/// Consulted by extractBufferShape (shrink staging to (BM, BN/S) before the
+/// SMEM reducer runs), allocateBuffersForLoop (count→2), and
+/// markEpilogueSubtileNodes (emitter annotation) — so all three agree.
 static int getEpilogueSubtileForOp(Operation *op) {
   if (!isa<tt::DescriptorStoreOp>(op))
     return 1;
@@ -766,16 +776,21 @@ static int getEpilogueSubtileForOp(Operation *op) {
   if (!srcTy || srcTy.getRank() < 2)
     return 1;
   int BN = srcTy.getShape()[1];
-  auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
   int S = 0;
-  if (env == "2")
-    S = 2;
-  else if (env == "4")
-    S = 4;
-  // Min sub-tile width: 32 elements = 64 bytes for fp16, which is the
-  // TMA descriptor alignment minimum on Blackwell. The design doc gate
-  // is 64 (better TMA throughput); loosened here so the demo can use
-  // S=4 on the existing BN=128 case2 kernel.
+  auto env = triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE");
+  if (!env.empty()) {
+    // Manual override. "2"/"4" force; any other value (e.g. "0"/"1"/"off")
+    // disables, even if the cost model would have subtiled.
+    if (env == "2")
+      S = 2;
+    else if (env == "4")
+      S = 4;
+    else
+      S = 1;
+  } else if (auto attr =
+                 op->getAttrOfType<IntegerAttr>("tt.epilogue_subtile")) {
+    S = static_cast<int>(attr.getInt());
+  }
   if (S > 1 && BN > 0 && BN % S == 0 && BN / S >= 32)
     return S;
   return 1;
@@ -887,9 +902,11 @@ static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
 
 // Which MMA bundles to partition and the matching TMEM accumulator allocs to
 // tag, computed once per module. `mmaInfo` keys the (inner-loop) MMA node — it
-// becomes a partition bundle with xN occupancy; `accInfo` keys the (outer-loop)
-// tmem_alloc whose ScheduleBuffer carries partition_count for the emitter's
-// per-group accumulator split.
+// becomes a partition bundle occupying max(full-tile occupancy, N x issue
+// cost): an M-split conserves MAC area, so only the per-sub-MMA issue floor
+// scales with N (see DataDependenceGraph::applyDataPartition). `accInfo` keys
+// the (outer-loop) tmem_alloc whose ScheduleBuffer carries partition_count for
+// the emitter's per-group accumulator split.
 struct DataPartitionPlan {
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> mmaInfo;
   llvm::DenseMap<Operation *, ttg::DataPartitionInfo> accInfo;
@@ -919,69 +936,129 @@ static unsigned resolveDataPartitionFactor(Operation *mma, int optionFactor) {
   return 1;
 }
 
+// One legal way to M-split an MMA's accumulator: factor `n`, per-group tile
+// height `mSize`, and the TMEMAllocOp the accumulator traces to.
+struct DataPartitionCandidate {
+  Operation *mma = nullptr;
+  Operation *allocOp = nullptr;
+  unsigned n = 1;
+  unsigned mSize = 0;
+};
+
+// Enumerate every legal A.5 M-split (dim 0) of `op`'s accumulator: any N with
+// BM % N == 0 and BM/N >= max(64, TMEM blockM constraint), accumulator
+// traceable to a TMEMAllocOp. Single source of legality for both the planner
+// (which applies the user-resolved N) and the schedule-graph dump (which
+// lists every candidate so external tooling can compare splits).
+static SmallVector<DataPartitionCandidate>
+enumerateDataPartitionCandidates(Operation *op) {
+  SmallVector<DataPartitionCandidate> out;
+  Value acc;
+  if (auto m = dyn_cast<ttng::TCGen5MMAOp>(op))
+    acc = m.getAccumulator();
+  else if (auto m = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
+    acc = m.getAccumulator();
+  else
+    return out;
+
+  auto accTy = dyn_cast<ttg::MemDescType>(acc.getType());
+  if (!accTy)
+    return out;
+  auto shape = ttg::getShapePerCTA(accTy);
+  if (shape.size() != 2)
+    return out;
+  int64_t bm = shape[0];
+  // The per-CTA TMEM block granularity along M: a group's accumulator must be a
+  // whole number of these blocks (a ragged M has no valid TMEM tiling).
+  int64_t blockM = 0;
+  if (auto tmem = dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding()))
+    blockM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
+  int64_t minM = std::max<int64_t>(64, blockM);
+
+  // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
+  // carries only the write-dep token as an inner-loop iter-arg, so the
+  // memdesc usually resolves to the outer alloc directly; peel a loop-carried
+  // memdesc iter-arg defensively.
+  Value root = acc;
+  if (auto ba = dyn_cast<BlockArgument>(root)) {
+    if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp()))
+      if (OpOperand *init = forOp.getTiedLoopInit(ba))
+        root = init->get();
+  }
+  auto allocOp = root.getDefiningOp<ttng::TMEMAllocOp>();
+  if (!allocOp) {
+    LDBG("[A.5] skip MMA: accumulator TMEMAllocOp not found");
+    return out;
+  }
+
+  // TMEM holds at most kTmemLaneRows rows per CTA. A legal M-split brings each
+  // group's per-CTA M under that limit AND tiles it to whole blockM blocks;
+  // anything else is unallocatable (the TMEM allocator's findFirstFit asserts
+  // in debug / degenerates in release, and the op verifiers only check the
+  // encoding params, not total M). The upper bound has to live HERE, in the
+  // single source of candidates: the auto search filters it via tmemLegalFor,
+  // but the explicit-factor path (addMMAToPlanIfLegal) and the dumped
+  // data_partition_candidates surface both trust this list as-is.
+  constexpr int64_t kTmemLaneRows = 128;
+  for (int64_t n = 2; n * minM <= bm; ++n) {
+    if (bm % n != 0)
+      continue;
+    int64_t mSize = bm / n;
+    if (mSize > kTmemLaneRows)
+      continue;
+    if (blockM > 0 && mSize % blockM != 0)
+      continue;
+    out.push_back({op, allocOp.getOperation(), static_cast<unsigned>(n),
+                   static_cast<unsigned>(mSize)});
+  }
+  return out;
+}
+
 // Phase 1a: build the data-partition plan. M-split (dim 0) of each tc_gen5_mma
 // accumulator by factor N, when legal: BM % N == 0, BM/N >= 64, and the sliced
 // M still satisfies the TMEM blockM constraint. A/B SMEM operands stay shared
 // (untagged) — the emitter slices the full-A tile per group itself.
+// Add `op` to `plan` with factor N when N is one of its legal splits.
+static void addMMAToPlanIfLegal(Operation *op, unsigned N,
+                                DataPartitionPlan &plan) {
+  for (const auto &c : enumerateDataPartitionCandidates(op)) {
+    if (c.n != N)
+      continue;
+    ttg::DataPartitionInfo info{c.n, /*dim=*/0u, c.mSize};
+    plan.mmaInfo[op] = info;
+    plan.accInfo[c.allocOp] = info;
+    LDBG("[A.5] partition MMA N=" << c.n << " mSize=" << c.mSize);
+    return;
+  }
+  LDBG("[A.5] skip MMA: no legal M-split for N=" << N);
+}
+
 static DataPartitionPlan computeDataPartitionPlan(ModuleOp moduleOp,
                                                   int optionFactor) {
   DataPartitionPlan plan;
   moduleOp.walk([&](Operation *op) {
-    Value acc;
-    if (auto m = dyn_cast<ttng::TCGen5MMAOp>(op))
-      acc = m.getAccumulator();
-    else if (auto m = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
-      acc = m.getAccumulator();
-    else
+    if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
       return;
-
     unsigned N = resolveDataPartitionFactor(op, optionFactor);
-    if (N <= 1)
-      return;
+    if (N > 1)
+      addMMAToPlanIfLegal(op, N, plan);
+  });
+  return plan;
+}
 
-    auto accTy = dyn_cast<ttg::MemDescType>(acc.getType());
-    if (!accTy)
+// A search-variant plan for the A.5 auto search: an MMA pinned by an explicit
+// `tt.data_partition_factor` attr keeps that factor; every other MMA gets the
+// searched `N` where it is a legal split. This is per-MMA, so a module that
+// pins one loop and auto-searches the rest resolves each MMA on its own terms
+// (the old whole-module behavior forced N=1 on the un-pinned loops).
+static DataPartitionPlan computeDataPartitionPlanForN(ModuleOp moduleOp,
+                                                      unsigned N) {
+  DataPartitionPlan plan;
+  moduleOp.walk([&](Operation *op) {
+    if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
       return;
-    auto shape = ttg::getShapePerCTA(accTy);
-    if (shape.size() != 2)
-      return;
-    int64_t bm = shape[0];
-    if (bm % static_cast<int64_t>(N) != 0)
-      return;
-    int64_t mSize = bm / static_cast<int64_t>(N);
-    if (mSize < 64) {
-      LDBG("[A.5] skip MMA: sliced M " << mSize << " < 64");
-      return;
-    }
-    if (auto tmem =
-            dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding())) {
-      int64_t minM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
-      if (mSize < minM) {
-        LDBG("[A.5] skip MMA: sliced M " << mSize << " < TMEM blockM " << minM);
-        return;
-      }
-    }
-
-    // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
-    // carries only the write-dep token as an inner-loop iter-arg, so the
-    // memdesc usually resolves to the outer alloc directly; peel a loop-carried
-    // memdesc iter-arg defensively.
-    Value root = acc;
-    if (auto ba = dyn_cast<BlockArgument>(root)) {
-      if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp()))
-        if (OpOperand *init = forOp.getTiedLoopInit(ba))
-          root = init->get();
-    }
-    auto allocOp = root.getDefiningOp<ttng::TMEMAllocOp>();
-    if (!allocOp) {
-      LDBG("[A.5] skip MMA: accumulator TMEMAllocOp not found");
-      return;
-    }
-
-    ttg::DataPartitionInfo info{N, /*dim=*/0u, static_cast<unsigned>(mSize)};
-    plan.mmaInfo[op] = info;
-    plan.accInfo[allocOp.getOperation()] = info;
-    LDBG("[A.5] partition MMA N=" << N << " mSize=" << mSize);
+    unsigned pinned = resolveDataPartitionFactor(op, /*optionFactor=*/0);
+    addMMAToPlanIfLegal(op, pinned > 1 ? pinned : N, plan);
   });
   return plan;
 }
@@ -1052,6 +1129,12 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
     }
 
     buf.count = computeBufferCount(loop, node.id);
+    // Snapshot the pure lifetime-demanded depth NOW, before the A.5 depth-2
+    // floor and A.7 subtile bump below inflate `count`. The A.5 auto-search's
+    // SMEM-shortfall term is (requestedCount - reduced count) x bytes; sourcing
+    // requestedCount post-floor would book phantom shortfall against exactly
+    // the partitioned variants the floor applies to.
+    buf.requestedCount = buf.count;
     if (loopHasPartMMA && kind == ttg::MemoryKind::SMEM) {
       // Restrict the depth-2 floor to SMEM rings actually consumed by the
       // partitioned MMA (walking through transparent memdesc views). Other
@@ -4313,26 +4396,26 @@ static constexpr int kReplicatedWarpGroup = -2;
 /// (`arith.muli → tt.descriptor_load`) and case3's `sem0_full`
 /// (`arith.addi → tt.descriptor_load`). Mirrors Meta's
 /// `TaskIdBackwardPropagation` (`isScalarArithOrMath`) treatment.
+/// Scalar arith/math on the CUDA pipe gets demoted to infra after
+/// partitioning (replicated into each consumer WG, no cross-WG hand-off).
+/// Tensor-result arith/math is real compute (extf, mulf, addf, truncf, ...)
+/// — those ARE anchors.
+static bool isDemotableScalarArith(const ttg::ScheduleNode &node) {
+  if (!node.op || node.pipeline != ttg::HWPipeline::CUDA)
+    return false;
+  StringRef dialect = node.op->getDialect()->getNamespace();
+  if (dialect != "arith" && dialect != "math")
+    return false;
+  for (auto t : node.op->getResultTypes())
+    if (isa<RankedTensorType>(t))
+      return false;
+  return true;
+}
+
 static void demoteScalarArithToInfra(ttg::ScheduleLoop &loop) {
   for (auto &node : loop.nodes) {
-    if (!node.op)
-      continue;
-    if (node.pipeline != ttg::HWPipeline::CUDA)
-      continue;
-    StringRef dialect = node.op->getDialect()->getNamespace();
-    if (dialect != "arith" && dialect != "math")
-      continue;
-    // Tensor-result arith/math is real compute (extf, mulf, addf,
-    // truncf, ...) — those ARE anchors.
-    bool isScalar = true;
-    for (auto t : node.op->getResultTypes())
-      if (isa<RankedTensorType>(t)) {
-        isScalar = false;
-        break;
-      }
-    if (!isScalar)
-      continue;
-    node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
+    if (isDemotableScalarArith(node))
+      node.warpGroup = -1; // hand off to propagateWarpGroupToInfraOps
   }
 }
 
@@ -4537,6 +4620,245 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
                           << loop.crossGroupBarriers.size() << "\n");
 }
 
+/// Pass A.7: mark the epilogue chain so the sched2tlx emitter renders the
+/// subtiled store. For each subtiled `descriptor_store` (S = getEpilogueSubtile
+/// > 1), tag the store plus its register-compute producers (truncf / convert /
+/// casts) up to and including the `tmem_load` accumulator read with
+/// subtileCount = S and nSize = BN/S. The emitter's `_find_subtile_chain` keys
+/// off the FIRST chain node, so the whole chain (not just the store) must be
+/// marked. Buffer shrink + double-buffering are already handled by
+/// extractBufferShape / allocateBuffersForLoop; this only annotates the nodes.
+static void markEpilogueSubtileNodes(ttg::ScheduleLoop &loop) {
+  llvm::DenseMap<Operation *, unsigned> opToNode;
+  for (const auto &n : loop.nodes)
+    if (n.op)
+      opToNode[n.op] = n.id;
+
+  for (auto &storeNode : loop.nodes) {
+    if (!storeNode.op || !isa<tt::DescriptorStoreOp>(storeNode.op))
+      continue;
+    int S = getEpilogueSubtileForOp(storeNode.op);
+    if (S <= 1)
+      continue;
+    auto storeOp = cast<tt::DescriptorStoreOp>(storeNode.op);
+    auto srcTy = dyn_cast<RankedTensorType>(storeOp.getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int subSize = static_cast<int>(srcTy.getShape().back()) / S;
+
+    auto mark = [&](ttg::ScheduleNode &n) {
+      n.subtileCount = S;
+      n.nSize = subSize;
+    };
+    mark(storeNode);
+
+    // Walk the value chain feeding the store, marking register epilogue ops.
+    // Stop at the tmem_load (accumulator read) — mark it but don't recurse
+    // into the TMEM accumulator / MMA upstream.
+    llvm::SmallVector<Value, 4> worklist{storeOp.getSrc()};
+    llvm::DenseSet<Operation *> visited;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      Operation *def = v.getDefiningOp();
+      if (!def || !visited.insert(def).second)
+        continue;
+      auto it = opToNode.find(def);
+      if (it == opToNode.end())
+        continue;
+      mark(loop.nodes[it->second]);
+      // Memory-read boundaries: the TMEM accumulator and any external SMEM
+      // staging (e.g. case5's bias). Mark them (the emitter sub-slices them at
+      // their source) but don't recurse — their producer load stays a full,
+      // once-per-tile load outside the sub-tile loop.
+      if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp, tt::LoadOp>(def))
+        continue;
+      for (Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
+  }
+}
+
+/// True iff the store's value chain is subtileable along N: every op is either
+/// a memory-read boundary (the TMEM accumulator or an external SMEM staging —
+/// the emitter sub-slices those at their source) or an elementwise-along-N
+/// compute op (per-column, so slicing N is exact). This is NOT an op-name
+/// allowlist: it uses the same op predicate `WSDataPartition::sliceOp` uses to
+/// slice ops along a data-partition dimension (the identical transform), so
+/// bias `addf`, scale `mulf`, `math.exp`, casts, etc. all qualify, while a
+/// cross-column op (`tt.reduce`/`tt.trans`/`tt.dot`) correctly disqualifies —
+/// a genuine math constraint, not a missing case.
+static bool isSimpleSubtileableEpilogue(Operation *storeOp) {
+  llvm::SmallVector<Value, 4> worklist{
+      cast<tt::DescriptorStoreOp>(storeOp).getSrc()};
+  llvm::DenseSet<Operation *> seen;
+  while (!worklist.empty()) {
+    Operation *def = worklist.pop_back_val().getDefiningOp();
+    if (!def || !seen.insert(def).second)
+      continue;
+    // Memory-read boundary — sub-sliced at its source (TMEM accumulator via
+    // tlx.subslice, external SMEM staging likewise). Don't recurse past it.
+    if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp, tt::LoadOp>(def))
+      continue;
+    // Elementwise-along-N compute (per-column): subtiling N is exact. Broadcast/
+    // splat/expand_dims would need per-sub-tile shape adjustment the emitter
+    // doesn't do yet, so they're deliberately excluded (correct skip, not a
+    // silent wrong result).
+    if (def->hasTrait<mlir::OpTrait::Elementwise>() ||
+        isa<ttg::ConvertLayoutOp, tt::FpToFpOp>(def)) {
+      for (Value o : def->getOperands())
+        worklist.push_back(o);
+      continue;
+    }
+    return false; // reduce / trans / dot / broadcast / other: not N-subtileable
+  }
+  return true;
+}
+
+/// Estimate the graph's total SMEM (bytes) WITHOUT epilogue subtiling — sum
+/// over all loops of each SMEM buffer's (tile bytes × lifetime count). Mirrors
+/// computeTotalSmem but works pre-allocation (from nodes), so the subtile
+/// decision can run before allocateBuffersForLoop. Used for the capacity
+/// trigger.
+static int64_t estimateGraphSmemBytes(const ttg::ScheduleGraph &graph) {
+  int64_t total = 0;
+  for (const auto &loop : graph.loops)
+    for (const auto &n : loop.nodes) {
+      if (!n.op || classifyMemoryKind(n.op) != ttg::MemoryKind::SMEM)
+        continue;
+      ttg::ScheduleBuffer buf;
+      extractBufferShape(n.op, buf); // full size (no subtile attr set yet)
+      if (buf.shape.empty() || buf.elementBitWidth == 0)
+        continue;
+      int64_t elems = 1;
+      for (auto d : buf.shape)
+        elems *= d;
+      total += elems * (buf.elementBitWidth / 8) *
+               static_cast<int64_t>(computeBufferCount(loop, n.id));
+    }
+  return total;
+}
+
+/// Pass A.7 auto-decision: choose the epilogue subtile factor S and stamp
+/// `tt.epilogue_subtile` on the store op (read by getEpilogueSubtileForOp).
+/// Skipped when the env override is set.
+///
+/// Grounded in the microbenchmark study (users/wl/wlei/modulo_schedule/
+/// latency_model/epi_subtile). Subtiling has TWO independent benefits, gated
+/// separately, and one cost:
+///   COST  — smaller TMA stores move bytes at lower BW (down to ~0.5x in a
+///           memory-bound copy). Only acceptable if hidden behind compute.
+///   PERF (overlap) — the sub-stores hide behind the next tile's MMA. Positive
+///           ONLY when the inner loop is compute-bound (has an MMA); on a
+///           memory-bound loop the store is the critical path and subtiling is
+///           a pure loss. ⇒ gate on tensor-core compute in the inner loop.
+///   SMEM (capacity) — the c_smem staging shrinks BM·BN·count → BM·(BN/S)·2, so
+///           subtiling frees SMEM and can keep the K-pipeline from being cut by
+///           the budget reducer. ⇒ gate on the un-subtiled total exceeding the
+///           SMEM budget; pick the smallest S that fits (least BW penalty).
+/// Pre-reqs for both: persistent loop owning a descriptor_store + an inner-loop
+/// super-node, an emitter-safe chain, and BN/S >= 32 (the granularity floor).
+static void decideEpilogueSubtiles(ttg::ScheduleGraph &graph) {
+  if (!triton::tools::getStrEnv("TRITON_MODULO_EPILOGUE_SUBTILE").empty())
+    return; // manual override path — getEpilogueSubtileForOp reads the env.
+
+  auto legal = [](int BN, int s) { return BN % s == 0 && BN / s >= 32; };
+
+  for (auto &loop : graph.loops) {
+    Operation *storeOp = nullptr;
+    unsigned storeNodeId = 0;
+    int innerId = -1;
+    for (const auto &n : loop.nodes) {
+      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
+        storeOp = n.op;
+        storeNodeId = n.id;
+      }
+      if (n.childPipelineId != UINT_MAX)
+        innerId = static_cast<int>(n.childPipelineId);
+    }
+    // Pre-reqs: persistent loop (store + inner super-node) + emitter-safe
+    // chain.
+    if (!storeOp || innerId < 0 || !isSimpleSubtileableEpilogue(storeOp))
+      continue;
+    auto srcTy = dyn_cast<RankedTensorType>(
+        cast<tt::DescriptorStoreOp>(storeOp).getSrc().getType());
+    if (!srcTy || srcTy.getRank() < 2)
+      continue;
+    int BN = static_cast<int>(srcTy.getShape().back());
+
+    const ttg::ScheduleLoop *inner = nullptr;
+    for (const auto &l : graph.loops)
+      if (static_cast<int>(l.id) == innerId)
+        inner = &l;
+    if (!inner)
+      continue;
+
+    // PERF trigger: inner loop has tensor-core compute to overlap the store.
+    bool hasCompute = false;
+    for (const auto &n : inner->nodes)
+      if (n.pipeline == ttg::HWPipeline::TC) {
+        hasCompute = true;
+        break;
+      }
+    // Overlap wants the largest legal S (capped at the validated 4).
+    int sOverlap = 1;
+    if (hasCompute)
+      for (int cand : {4, 2})
+        if (legal(BN, cand)) {
+          sOverlap = cand;
+          break;
+        }
+
+    // SMEM trigger: if the un-subtiled total exceeds budget, subtiling the
+    // store (BM·BN·count → BM·(BN/S)·2) frees SMEM so the reducer need not cut
+    // the K-pipeline. Pick the SMALLEST S that brings the total under budget
+    // (least BW penalty). delta(S) is exact: storeFull - storeSub(S); note S=2
+    // vs a single-buffered store frees nothing (BM·BN·1 == BM·(BN/2)·2), so the
+    // loop naturally escalates to S=4.
+    int sCap = 1;
+    int64_t budget = kSmemBudgetBytes();
+    int64_t fullTotal = estimateGraphSmemBytes(graph);
+    if (fullTotal > budget) {
+      ttg::ScheduleBuffer sbuf;
+      extractBufferShape(storeOp, sbuf); // full BM×BN (no attr yet)
+      int64_t sElems = 1;
+      for (auto d : sbuf.shape)
+        sElems *= d;
+      int64_t eb = sbuf.elementBitWidth / 8;
+      int64_t storeFull =
+          sElems * eb *
+          static_cast<int64_t>(computeBufferCount(loop, storeNodeId));
+      for (int cand : {2, 4}) { // smallest-first: minimize BW penalty
+        if (!legal(BN, cand))
+          continue;
+        int64_t storeSub = (sElems / cand) * eb * 2; // subtile double-buffers
+        if (fullTotal - storeFull + storeSub <= budget) {
+          sCap = cand;
+          break;
+        }
+      }
+      // Still over budget at every legal S → take the largest legal (most
+      // relief) as best effort; the reducer/HW limit is the backstop.
+      if (sCap == 1)
+        for (int cand : {4, 2})
+          if (legal(BN, cand)) {
+            sCap = cand;
+            break;
+          }
+    }
+
+    int S = std::max(sOverlap, sCap);
+    if (S > 1) {
+      storeOp->setAttr(
+          "tt.epilogue_subtile",
+          IntegerAttr::get(IntegerType::get(storeOp->getContext(), 32), S));
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[A.7] auto subtile S=" << S << " (BN=" << BN
+                 << " overlap=" << sOverlap << " capacity=" << sCap
+                 << " smem=" << fullTotal << "/" << budget << ")\n");
+    }
+  }
+}
+
 /// Top-level: build a ScheduleGraph from DDG + schedule result.
 /// Includes Phase 0 (DDG→nodes/edges), Step 2.5 (clusters),
 /// Step 3 (buffer allocation), Step 4.5 (merging), Step 4.6 (budget),
@@ -4551,10 +4873,15 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
                    const ttg::LatencyModel &model,
                    const DataPartitionPlan &plan) {
   ttg::ScheduleGraph graph;
-  buildScheduleLoop(loop, ddg, sched, graph, model);
+  buildScheduleLoop(loop, ddg, sched, graph, model, plan.mmaInfo);
+
+  // Decide epilogue subtiling from the cost model BEFORE buffer allocation, so
+  // extractBufferShape shrinks the staging buffer ahead of the SMEM reducer.
+  decideEpilogueSubtiles(graph);
 
   for (auto &schedLoop : graph.loops) {
     allocateBuffersForLoop(schedLoop, plan);
+    markEpilogueSubtileNodes(schedLoop);
     mergeNonOverlappingBuffers(schedLoop);
   }
 
@@ -4635,12 +4962,14 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
                 triton::ModuleAxisInfoAnalysis &axisInfo, StringRef label,
                 const DataPartitionPlan &plan,
                 bool printScheduleGraph = false) {
-  auto ddg = ttg::DataDependenceGraph::build(loop, model);
+  // Pass A.5: thread the partition into build() so any inner super-node's
+  // innerII is computed from the PARTITIONED inner schedule; then tag this
+  // loop's own MMA bundle(s) so II/ResMII and the dumped ScheduleNode reflect
+  // the N hardware issues. No-op when this loop has no partitioned MMA.
+  auto ddg = ttg::DataDependenceGraph::build(loop, model, plan.mmaInfo);
   if (ddg.getNumNodes() == 0)
     return std::nullopt;
 
-  // Pass A.5: tag the partitioned MMA bundle(s) so II/ResMII and the dumped
-  // ScheduleNode reflect the N hardware issues. No-op when this loop has none.
   ddg.applyDataPartition(plan.mmaInfo);
 
   LDBG(label << " DDG: " << ddg.getNumNodes() << " nodes, "
@@ -4814,6 +5143,141 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
+/// Whole-nest epilogue warp-group unification (cost-model, storage-class-priced).
+///
+/// A persistent outer loop's epilogue may consume a value V produced by its
+/// inner loop. If V is a REGISTER value, running the epilogue in a warp group
+/// separate from V's producer forces V through an SMEM materialization
+/// round-trip (a local_store in the producer plus a local_load + 2 barriers in
+/// the consumer) — a real cost that scales with bytes(V). Co-locating the
+/// epilogue into the inner producer's warp group removes that hand-off.
+///
+/// The decision is priced by V's storage class, NOT by a "register → same WG"
+/// rule (that would just be pattern matching):
+///   Register V  → co-locating saves the full materialization (~2·bytes),
+///                 which is otherwise pure overhead → co-locate.
+///   TMEM/SMEM V → the consumer needs a barrier to read V regardless of which
+///                 warp group runs the epilogue, so co-location saves ~nothing.
+///                 A GEMM's TMEM accumulator therefore legitimately keeps its
+///                 own epilogue WG → stay separate.
+/// Overlap benefit is left implicit in the loop II/makespan (the epilogue work
+/// is scheduled either way); we price only the hand-off co-location removes.
+///
+/// The decision is expressed by RENUMBERING the epilogue-owning outer warp
+/// group so its id is meaningful across the super-node boundary — no side field:
+///   co-locate → the inner producer's warp-group id (the epilogue now SHARES it,
+///               which is exactly the co-location signal the emitter reads),
+///   separate  → a FRESH id above every id in the nest, guaranteed not to alias
+///               any inner id (so "epilogue wg == an inner wg" unambiguously
+///               means co-located, never a coincidence).
+/// The whole epilogue-owning group is renumbered together, so no intra-outer
+/// edge becomes cross-WG (no spurious barriers on super-node→epilogue or
+/// index-math→store). sched2tlx then just reads the warp-group id.
+static void unifyNestEpilogueWarpGroup(ttg::ScheduleGraph &graph) {
+  for (auto &outer : graph.loops) {
+    // Outer (persistent) loop = owns a descriptor_store AND wraps an inner-loop
+    // super-node.
+    tt::DescriptorStoreOp storeOp;
+    unsigned storeNodeId = 0;
+    scf::ForOp innerFor;
+    int innerId = -1;
+    for (auto &n : outer.nodes) {
+      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
+        storeOp = cast<tt::DescriptorStoreOp>(n.op);
+        storeNodeId = n.id;
+      }
+      if (n.childPipelineId != UINT_MAX && n.op)
+        if (auto f = dyn_cast<scf::ForOp>(n.op)) {
+          innerFor = f;
+          innerId = static_cast<int>(n.childPipelineId);
+        }
+    }
+    if (!storeOp || !innerFor || innerId < 0)
+      continue;
+
+    // The epilogue-owning outer warp group (the group that runs the store).
+    int epiWg = -1;
+    for (auto &n : outer.nodes)
+      if (n.id == storeNodeId) {
+        epiWg = n.warpGroup;
+        break;
+      }
+    if (epiWg < 0)
+      continue;
+
+    // Inner warp-group ids + a fresh id above every id in the whole nest.
+    int freshId = 0;
+    const ttg::ScheduleLoop *innerLoop = nullptr;
+    for (auto &l : graph.loops) {
+      for (auto &n : l.nodes)
+        freshId = std::max(freshId, n.warpGroup + 1);
+      if (static_cast<int>(l.id) == innerId)
+        innerLoop = &l;
+    }
+
+    // Default: SEPARATE — a fresh non-aliasing id.
+    int newWg = freshId;
+
+    // Trace the store's source back to the inner-loop result it consumes. If
+    // that result is a REGISTER tensor, co-locate into its producer partition.
+    int resultIdx = -1;
+    SmallVector<Value> work{storeOp.getSrc()};
+    llvm::SmallPtrSet<Value, 8> seen;
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      if (!seen.insert(v).second)
+        continue;
+      if (auto res = dyn_cast<OpResult>(v))
+        if (res.getOwner() == innerFor.getOperation()) {
+          resultIdx = static_cast<int>(res.getResultNumber());
+          continue;
+        }
+      Operation *def = v.getDefiningOp();
+      if (!def || def == innerFor.getOperation())
+        continue; // block arg / iv, or the inner loop itself.
+      // Only descend ops in the outer loop body — never into the inner loop.
+      if (def->getParentRegion() != innerFor->getParentRegion())
+        continue;
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+
+    if (resultIdx >= 0 && innerLoop) {
+      Value innerResult = innerFor.getResult(resultIdx);
+      if (auto tensorTy = dyn_cast<RankedTensorType>(innerResult.getType())) {
+        int64_t elems = 1;
+        for (auto d : tensorTy.getShape())
+          elems *= d;
+        int64_t bytes = elems * (tensorTy.getElementTypeBitWidth() / 8);
+        auto yield =
+            cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
+        Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
+        int producerWg = -1;
+        if (yieldDef)
+          for (auto &n : innerLoop->nodes)
+            if (n.op == yieldDef && n.warpGroup >= 0) {
+              producerWg = n.warpGroup;
+              break;
+            }
+        if (bytes > 0 && producerWg >= 0) {
+          newWg = producerWg; // co-locate: share the producer's WG id.
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[colocate] outer epilogue → inner WG " << producerWg
+                     << " (register hand-off " << bytes << " B removed)\n");
+        }
+      }
+    }
+
+    if (newWg == epiWg)
+      continue; // already correct.
+
+    // Renumber the WHOLE epilogue-owning group together.
+    for (auto &n : outer.nodes)
+      if (n.warpGroup == epiWg)
+        n.warpGroup = newWg;
+  }
+}
+
 /// Pass B: Per-loop warp-group partition + cross-group barriers. Each
 /// ScheduleLoop gets its own Phase 4 partition run with its own II.
 /// Nested kernels (case2/case5) get inner-partition (e.g., 3-WG GEMM
@@ -4867,6 +5331,13 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       commitWgWidthRegs(schedLoop);
     }
   }
+
+  // Cross-loop reconciliation: now that every loop has warp groups, unify each
+  // outer epilogue's warp-group id with its inner producer (storage-class-priced
+  // hand-off cost model). Runs before barrier insertion so the renumbered ids
+  // drive barrier synthesis and the emitter reads them directly.
+  for (auto &sl : scheduledLoops)
+    unifyNestEpilogueWarpGroup(sl.graph);
 
   // Run barrier insertion per-loop using the now-globally-consistent
   // warp-group IDs. Cross-loop barriers (from Phase 2 edges) are still
@@ -4983,6 +5454,211 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
   llvm::stable_sort(
       result, [](const auto &a, const auto &b) { return a.depth > b.depth; });
   return result;
+}
+
+// ── Pass A.5 auto search ─────────────────────────────────────────────────────
+// Picks the data-partition factor by solving each candidate variant with the
+// same scheduler and comparing on the model, instead of requiring the user to
+// name N. Triggered by TRITON_DATA_PARTITION_N=auto (all targets) or, in
+// sched2tlx dump mode, self-triggered when the baseline is TLX-illegal (see
+// dataPartitionAutoSearch). The candidate set comes from
+// enumerateDataPartitionCandidates (a handful of divisors of BM), so the
+// whole search is a few extra in-process schedule runs.
+//
+// Score, lexicographic:
+//   1. TMEM legality — this is the TLX `local_alloc` lane constraint of the
+//      sched2tlx target, NOT a universal one: TLX allocates a tcgen05
+//      accumulator as at most kTmemLanes rows, so a per-CTA, per-group M above
+//      the lane count cannot be lowered there and a split that brings it under
+//      wins outright (this is what makes BM=256 configs lowerable). The in-tree
+//      TTGIR allocator instead folds tall M into TMEM columns, so this term is
+//      scoped to the dump/TLX path (the self-trigger only fires in dump mode;
+//      an explicit env override that reaches in-tree is the user's choice).
+//      Judged straight off the candidate surface (per-CTA bm = n x m_size from
+//      enumerateDataPartitionCandidates), so it covers function-scope
+//      accumulators (flat kernels, which never become ScheduleBuffers) and
+//      never touches non-accumulator TMEM (MMA-scaled scale allocs fold rows
+//      into columns and are exempt);
+//   2. loops scheduled (a variant that fails to schedule a loop loses);
+//   3. sum of loop IIs (steady-state throughput; after the occupancy
+//      de-bias in applyDataPartition an M-split conserves MAC area, so
+//      this usually ties);
+//   4. SMEM shortfall in bytes — how far the budget reducers cut buffer
+//      rings below their lifetime-demanded depths (requestedCount vs
+//      count): a shrunk epilogue staging tile frees SMEM that lets
+//      operand rings reach full depth.
+// Ties keep the incumbent, so the baseline (N=1) wins unless a split is a
+// strict improvement.
+// TLX local_alloc geometry: it lays a tcgen05 accumulator out as at most 128
+// lanes (rows) x 512 columns per CTA, so a per-CTA M above this cannot be
+// lowered through local_alloc and needs an M-split. (The in-tree TTGIR path
+// folds tall M into columns instead — this bound is the TLX target's, used
+// only on the dump/self-trigger path; see the score doc above.)
+constexpr int64_t kTmemLanes = 128;
+
+// Does any partitionable accumulator exceed the TLX lane limit at baseline
+// (un-split), i.e. is the M-split the only way this module lowers on the TLX
+// target? Skips tt.autows-pinned MMAs (user-tuned, not our realization).
+static bool baselineExceedsTmemLanes(ModuleOp moduleOp) {
+  bool illegal = false;
+  moduleOp.walk([&](Operation *op) {
+    if (op->hasAttr("tt.autows"))
+      return;
+    for (const auto &c : enumerateDataPartitionCandidates(op)) {
+      // Every candidate of an op shares the same baseline BM = n * mSize.
+      if (static_cast<int64_t>(c.n) * c.mSize > kTmemLanes)
+        illegal = true;
+      break;
+    }
+  });
+  return illegal;
+}
+
+static bool dataPartitionAutoSearch(ModuleOp moduleOp, int optionFactor) {
+  if (optionFactor > 1)
+    return false; // explicit pass option wins
+  // Explicit `TRITON_DATA_PARTITION_N=auto` opts every target into the search
+  // (an override that also covers in-tree compiles). Per-loop
+  // tt.data_partition_factor attrs no longer disable it — the search resolves
+  // each MMA on its own terms (pinned MMAs keep their factor; see
+  // computeDataPartitionPlanForN), so a mixed pinned/auto module works.
+  if (triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") == "auto")
+    return true;
+  // Self-trigger only while producing a sched2tlx dump AND only when the
+  // baseline cannot be lowered as-is on the TLX target (an accumulator taller
+  // than the local_alloc lane limit) — there the split is not an optimization
+  // but the only lowerable realization, so it should not depend on a debug
+  // env. In-tree compiles (no dump) fold tall M into TMEM columns and are left
+  // untouched.
+  if (!triton::tools::getStrEnv("TRITON_MODULO_DUMP_SCHEDULE").empty())
+    return baselineExceedsTmemLanes(moduleOp);
+  return false;
+}
+
+static DataPartitionPlan
+searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
+                        triton::ModuleAxisInfoAnalysis &axisInfo) {
+  // Baseline respects explicit pins: an MMA with tt.data_partition_factor keeps
+  // that factor even before the search (the user asked for it); every other MMA
+  // is N=1. Variants (computeDataPartitionPlanForN) layer the searched N onto
+  // only the un-pinned MMAs, so a pinned MMA never re-enters the search.
+  DataPartitionPlan baseline = computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
+  std::set<unsigned> factors;
+  // Per-MMA per-CTA accumulator height, off the candidate surface (every
+  // candidate has mSize = bm / n, so bm = n * mSize). This is the basis of
+  // the TMEM-legality score term — deliberately NOT derived from
+  // ScheduleBuffers, which only exist for allocs inside a scheduled loop
+  // body (a flat kernel's function-scope accumulator would be invisible).
+  // Skip tt.autows-pinned MMAs: they live in loops the evaluate() loop and the
+  // real orchestrator both skip (hasExistingAnnotation), so no plan here ever
+  // realizes their split — crediting a variant with "fixing" them would be
+  // fictitious and could drag a partition onto an unrelated healthy loop.
+  SmallVector<std::pair<Operation *, int64_t>> accRows;
+  moduleOp.walk([&](Operation *op) {
+    if (op->hasAttr("tt.autows"))
+      return;
+    auto cands = enumerateDataPartitionCandidates(op);
+    if (cands.empty())
+      return;
+    accRows.push_back(
+        {op, static_cast<int64_t>(cands.front().n) * cands.front().mSize});
+    for (const auto &c : cands)
+      factors.insert(c.n);
+  });
+  if (factors.empty())
+    return baseline;
+
+  auto tmemLegalFor = [&](const DataPartitionPlan &plan) {
+    for (const auto &[op, bm] : accRows) {
+      int64_t rows = bm;
+      if (auto it = plan.mmaInfo.find(op); it != plan.mmaInfo.end())
+        rows = it->second.mSize;
+      if (rows > kTmemLanes)
+        return false;
+    }
+    return true;
+  };
+
+  auto candidates = collectCandidates(moduleOp);
+  // Deeper nests are rejected by the main pass; don't search them.
+  for (const auto &c : candidates)
+    if (c.depth >= 2)
+      return baseline;
+
+  // The evaluations below re-run DDG construction once per variant; swallow
+  // warnings/remarks (e.g. the dynamic trip-count note) so each diagnostic
+  // reaches the user once — from the real scheduling run — not once per
+  // variant. Errors still propagate.
+  ScopedDiagnosticHandler quietWarnings(
+      moduleOp.getContext(), [](Diagnostic &diag) {
+        return success(diag.getSeverity() == DiagnosticSeverity::Warning ||
+                       diag.getSeverity() == DiagnosticSeverity::Remark);
+      });
+
+  struct Score {
+    bool tmemLegal = true;
+    size_t scheduled = 0;
+    int64_t iiSum = 0;
+    int64_t shortfallBytes = 0;
+  };
+  auto evaluate = [&](const DataPartitionPlan &plan) {
+    Score sc;
+    sc.tmemLegal = tmemLegalFor(plan);
+    SmallVector<ScheduledLoop, 2> sls;
+    for (const auto &c : candidates) {
+      if (c.hasExistingAnnotation)
+        continue;
+      if (c.hasInnerLoop)
+        scheduleAndRecord(c.op, "Outer", /*isOuter=*/true, model, axisInfo,
+                          plan, /*printScheduleGraph=*/false, sls);
+      else if (c.hasMMA || c.hasTMA)
+        scheduleAndRecord(c.op, "Inner", /*isOuter=*/false, model, axisInfo,
+                          plan, /*printScheduleGraph=*/false, sls);
+    }
+    sc.scheduled = sls.size();
+    for (const auto &sl : sls) {
+      for (const auto &loop : sl.graph.loops) {
+        sc.iiSum += std::max(loop.II, 0);
+        for (const auto &buf : loop.buffers)
+          if (buf.kind == ttg::MemoryKind::SMEM &&
+              buf.requestedCount > buf.count)
+            sc.shortfallBytes +=
+                static_cast<int64_t>(buf.requestedCount - buf.count) *
+                buf.sizeBytes();
+      }
+    }
+    return sc;
+  };
+
+  Score best = evaluate(baseline);
+  DataPartitionPlan bestPlan = baseline;
+  unsigned bestN = 1;
+  LDBG("[A.5-auto] baseline: tmemLegal="
+       << best.tmemLegal << " scheduled=" << best.scheduled << " iiSum="
+       << best.iiSum << " shortfall=" << best.shortfallBytes << "B");
+  // No variant cap: the candidate set is already bounded by BM's divisor
+  // structure (bm % n == 0 with bm/n >= minM leaves a handful of factors).
+  for (unsigned n : factors) {
+    DataPartitionPlan plan = computeDataPartitionPlanForN(moduleOp, n);
+    if (plan.mmaInfo.empty())
+      continue;
+    Score sc = evaluate(plan);
+    LDBG("[A.5-auto] N=" << n << ": tmemLegal=" << sc.tmemLegal << " scheduled="
+                         << sc.scheduled << " iiSum=" << sc.iiSum
+                         << " shortfall=" << sc.shortfallBytes << "B");
+    auto key = [](const Score &x) {
+      return std::make_tuple(!x.tmemLegal, -static_cast<int64_t>(x.scheduled),
+                             x.iiSum, x.shortfallBytes);
+    };
+    bool better = key(sc) < key(best);
+    if (better) {
+      best = sc;
+      bestPlan = std::move(plan);
+      bestN = n;
+    }
+  }
+  LDBG("[A.5-auto] picked N=" << bestN);
+  return bestPlan;
 }
 
 // ============================================================================
@@ -5368,12 +6044,18 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
     if (n.isSuperNode())
       os << ", \"child_pipeline_id\": " << n.childPipelineId
          << ", \"prologue_latency\": " << n.prologueLatency;
-    // Pass A.5 data-partition fields on the (single) MMA bundle node. A.7
-    // subtile fields remain a separate follow-up.
+    // Pass A.5 data-partition fields on the (single) MMA bundle node.
     if (n.partitionCount > 1)
       os << ", \"partition_count\": " << n.partitionCount
          << ", \"partition_dim\": " << n.partitionDim
          << ", \"m_size\": " << n.mSize;
+    // Pass A.7 epilogue-subtile fields — only emitted for marked chain nodes
+    // so non-subtiled dumps stay byte-identical (the emitter defaults the
+    // rest to subtile_count=1).
+    if (n.subtileCount > 1)
+      os << ", \"subtile_index\": " << n.subtileIndex
+         << ", \"subtile_count\": " << n.subtileCount
+         << ", \"n_offset\": " << n.nOffset << ", \"n_size\": " << n.nSize;
     os << "}" << (i + 1 == sl.nodes.size() ? "" : ",") << "\n";
   }
   os << "        ],\n";
@@ -5559,6 +6241,54 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
   os << "  },\n";
 }
 
+// Pass A.5 candidate surface: every legal M-split (loop, MMA node, N,
+// m_size) plus the factor actually applied in THIS dump (applied_n; 1 =
+// unpartitioned). External tooling can re-run the pass with
+// TRITON_DATA_PARTITION_N=<n> per candidate and compare the resulting
+// schedules.
+//
+// Walks sl.graph.loops.front() per ScheduledLoop, matching the loops section
+// of the document (writeScheduleGraphDoc), so loop_id here == loop_id there.
+// This relies on the single-loop-per-graph shape (ScheduleGraph.loops size 1)
+// that fbsource beta produces; it does NOT drop any MMA candidate even when a
+// graph carries a nested child, because the orchestrator schedules every
+// MMA-bearing loop as its own "Inner" ScheduledLoop entry (see the hasMMA path
+// in runOnOperation), which the outer loop over scheduledLoops covers. If a
+// graph ever holds an MMA in a non-front loop with no separate entry, both
+// sections would need to iterate all sl.graph.loops together to keep loop_id
+// consistent.
+void jsonDumpDataPartitionCandidates(llvm::raw_ostream &os,
+                                     ArrayRef<ScheduledLoop> scheduledLoops) {
+  os << "  \"data_partition_candidates\": [";
+  bool first = true;
+  for (size_t li = 0; li < scheduledLoops.size(); ++li) {
+    const auto &sl = scheduledLoops[li];
+    if (sl.graph.loops.empty())
+      continue;
+    for (const auto &n : sl.graph.loops.front().nodes) {
+      if (!n.op)
+        continue;
+      auto cands = enumerateDataPartitionCandidates(n.op);
+      if (cands.empty())
+        continue;
+      os << (first ? "\n" : ",\n");
+      first = false;
+      os << "    {\"loop_id\": " << li << ", \"node_id\": " << n.id
+         << ", \"op_kind\": \"" << jsonEscape(n.op->getName().getStringRef())
+         << "\", \"dim\": 0, \"applied_n\": "
+         << (n.partitionCount > 1 ? n.partitionCount : 1) << ", \"factors\": [";
+      for (size_t i = 0; i < cands.size(); ++i) {
+        if (i)
+          os << ", ";
+        os << "{\"n\": " << cands[i].n << ", \"m_size\": " << cands[i].mSize
+           << "}";
+      }
+      os << "]}";
+    }
+  }
+  os << (first ? "" : "\n  ") << "],\n";
+}
+
 // Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
 // Factored out so both the single-graph dumper and the multi-variant dumper
 // (top-N autotuning) can reuse it — each variant is a self-contained doc.
@@ -5577,6 +6307,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
     os << "  \"variant_id\": " << variantId << ",\n";
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
+  jsonDumpDataPartitionCandidates(os, scheduledLoops);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
@@ -5900,8 +6631,13 @@ struct ModuloSchedulePass
     // Pass A.5: compute the data-partition plan once (module-stable). Threaded
     // into per-loop scheduling so the inner-loop MMA bundle and the outer-loop
     // TMEM accumulator buffer are both tagged for the emitter.
+    // TRITON_DATA_PARTITION_N=auto searches the candidate factors with the
+    // scheduler itself; otherwise the factor is user-resolved (option > attr
+    // > env), 1 = off.
     DataPartitionPlan partitionPlan =
-        computeDataPartitionPlan(moduleOp, dataPartitionFactor);
+        dataPartitionAutoSearch(moduleOp, dataPartitionFactor)
+            ? searchDataPartitionPlan(moduleOp, model, axisInfoAnalysis)
+            : computeDataPartitionPlan(moduleOp, dataPartitionFactor);
 
     // ================================================================
     // Iterative scheduling loop (design doc Pass A orchestrator)

@@ -15,62 +15,25 @@ memory.
 | `WSTMAStoreLowering.cpp` | Pre-pass: TMA store lowering for WS visibility |
 | `TMEMAlloc1D.cpp` | Special case: 1D tensor communication via TMEM |
 
-## Entry Point: `insertAsyncCopy`
+## Entry Points
 
 **File**: `WSLowerMem.cpp`
 
-`insertAsyncCopy` is the main dispatcher, called from `doCodePartitionPost`
-in `WSCodePartition.cpp`. It groups channels by producer operation and
-calls the appropriate copy creation function based on the channel type.
+In the current pipeline there is no single `insertAsyncCopy`
+dispatcher. Copies are materialized by two mechanisms:
 
-## Copy Types
+- **`optimizeTMALoads`** — for TMA descriptor-load producers. Called from
+  `insertAsyncComm` (`WSCodePartition.cpp`) during the code-partition phase.
+  Emits `barrier_expect` + `AsyncTMACopyGlobalToLocalOp` writing directly into
+  the pipeline SMEM buffer, and a `wait_barrier` before the consumers (the
+  descriptor_load's single `local_store` user and the descriptor_load itself are
+  erased, since the async copy writes the buffer directly). See below.
+- **`createLocalAlloc`** — for non-TMA (register/plain-load) producers. Called
+  from `createBuffer` during the buffer-allocation phase; it creates the SMEM (or
+  1D-TMEM) buffer and inserts the producer-side `LocalStoreOp` + consumer-side
+  `LocalLoadOp`.
 
-### 1. `createAsyncCopy` — Global-to-Local TMA Copy
-
-For `tt::LoadOp` producers (global memory loads not using TMA descriptors):
-
-**Producer side**:
-- Allocates an SMEM buffer (`LocalAllocOp`)
-- Creates `AsyncCopyGlobalToLocalOp` to copy from global to shared memory
-- The copy is asynchronous — the producer continues after initiating it
-
-**Consumer side**:
-- `LocalLoadOp` reads from the SMEM buffer
-- A barrier wait ensures the copy has completed before reading
-
-### 2. `createLocalCopy` — Register-to-SMEM Copy
-
-For channels where the source value is in registers:
-
-**Producer side**:
-- `LocalStoreOp` writes the register value into an SMEM buffer
-
-**Consumer side**:
-- `LocalLoadOp` reads from the SMEM buffer
-
-This is used for non-TMA data that needs to cross partition boundaries
-(e.g., intermediate computation results).
-
-### 3. `createSMEMCopy` — SMEM Buffer Replacement
-
-For channels where the source is already a `LocalAllocOp` in shared memory:
-
-Instead of creating a new allocation, the existing alloc is replaced with a
-store into the multi-buffered allocation managed by the memory planner. The
-consumer reads from the same multi-buffered buffer at the appropriate slot.
-
-### 4. `createTMEMCopy` — Tensor Memory Copy
-
-For TMEM channels (Blackwell only):
-
-**Producer side**:
-- `TMEMStoreOp` writes the value into the TMEM allocation
-
-**Consumer side**:
-- References to the old `TMEMAllocOp` are replaced with a buffer subview
-  (`MemDescIndexOp`) into the multi-buffered TMEM allocation
-
-### 5. `createBufferView` — Multi-Buffer Indexing
+### `createBufferView` — Multi-Buffer Indexing
 
 A shared helper that creates `MemDescIndexOp` subviews into multi-buffered
 allocations. Given an accumulation counter (`accumCnt`), it computes:

@@ -14,6 +14,14 @@
 namespace mlir::LLVM::AMD {
 namespace {
 
+Value vecGet(TritonLLVMOpBuilder &b, Value vec, int idx) {
+  return b.extract_element(vec, b.i32_val(idx));
+}
+
+Value vecSet(TritonLLVMOpBuilder &b, Value vec, int idx, Value val) {
+  return b.insert_element(vec, val, b.i32_val(idx));
+}
+
 // Helper to decode a value spanning two 32-bit words
 static Value decode48BitValue(RewriterBase &rewriter, TritonLLVMOpBuilder &b,
                               ArrayRef<Value> group, int startIdx) {
@@ -127,10 +135,140 @@ SmallVector<Value> TDMDescriptor::getAllGroups() const {
   return result;
 }
 
+SmallVector<Value> unpackTDMDescriptor(RewriterBase &rewriter, Location loc,
+                                       Value descStruct) {
+  auto scalars = unpackLLElements(loc, descStruct, rewriter);
+  assert((scalars.size() == 12 || scalars.size() == 20) &&
+         "TDM descriptor must be 12 (2D) or 20 (3D-5D) i32 scalars");
+  SmallVector<Value> groups;
+  groups.push_back(packLLVector(
+      loc, SmallVector<Value>(scalars.begin(), scalars.begin() + 4), rewriter));
+  groups.push_back(packLLVector(
+      loc, SmallVector<Value>(scalars.begin() + 4, scalars.begin() + 12),
+      rewriter));
+  if (scalars.size() == 20) {
+    groups.push_back(packLLVector(
+        loc, SmallVector<Value>(scalars.begin() + 12, scalars.begin() + 16),
+        rewriter));
+    groups.push_back(packLLVector(
+        loc, SmallVector<Value>(scalars.begin() + 16, scalars.begin() + 20),
+        rewriter));
+  }
+  return groups;
+}
+
+SmallVector<Value> scalarizeTDMDescriptor(RewriterBase &rewriter, Location loc,
+                                          ArrayRef<Value> vectors) {
+  assert((vectors.size() == 2 || vectors.size() == 4) &&
+         "TDM descriptor must be 2 (2D) or 4 (3D-5D) vector groups");
+  SmallVector<Value> scalars;
+  for (Value vec : vectors) {
+    auto unpacked = unpackLLVector(loc, vec, rewriter);
+    scalars.append(unpacked.begin(), unpacked.end());
+  }
+  return scalars;
+}
+
 // Swap the trailing two dimensions of a vector for TDM operations.
 template <typename T> void swapTrailingDims(SmallVector<T> &vec) {
   assert(vec.size() >= 2 && "need at least 2 dims to swap");
   std::swap(vec[vec.size() - 2], vec[vec.size() - 1]);
+}
+
+void updateTensorDescriptor(RewriterBase &rewriter, Location loc,
+                            Type elementType, ArrayRef<int64_t> blockShape,
+                            Value &group0, Value &group1,
+                            ArrayRef<Value> addOffsets,
+                            ArrayRef<Value> setBounds, Value dest, Value pred,
+                            Value barrier) {
+  size_t numDims = blockShape.size();
+  assert(numDims == 2 && "updateTensorDescriptor currently supports 2D");
+
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value v16 = b.i32_val(16);
+
+  // ---- add_offsets: bump global_addr ----
+  if (!addOffsets.empty()) {
+    auto elementBitWidth = elementType.getIntOrFloatBitWidth();
+    Value elemSize = b.i64_val(elementBitWidth / 8);
+
+    // Decode current 48-bit global_addr from group0[2:3] (valid bit masked).
+    Value addrLo = vecGet(b, group0, 2);
+    Value addrHi = b.and_(vecGet(b, group0, 3), b.i32_val(0x7FFFFFFF));
+    Value addr = b.or_(b.zext(i64_ty, addrLo),
+                       b.shl(b.zext(i64_ty, addrHi), b.i64_val(32)));
+
+    // Byte delta:
+    //   addOffsets[1] (innermost, stride 1) +
+    //   addOffsets[0] * tensor_dim0_stride (from group1[5]),
+    // all scaled by element size.  Promote to i64 before the multiply so
+    // addOffsets[0] * stride0 doesn't overflow i32 for large tensors.
+    // Offsets are signed (advancing backward is allowed) so sext; stride is
+    // unsigned so zext.
+    Value stride0 = vecGet(b, group1, 5);
+    Value off0_64 = b.sext(i64_ty, addOffsets[0]);
+    Value off1_64 = b.sext(i64_ty, addOffsets[1]);
+    Value stride0_64 = b.zext(i64_ty, stride0);
+    Value deltaElem = b.add(off1_64, b.mul(off0_64, stride0_64));
+    Value byteDelta = b.mul(deltaElem, elemSize);
+    addr = b.add(addr, byteDelta);
+
+    // Re-pack, restoring the valid bit in group0[3] bit 31.
+    Value newLo = b.trunc(i32_ty, addr);
+    Value newHi = b.trunc(i32_ty, b.lshr(addr, b.i64_val(32)));
+    newHi = b.or_(newHi, b.i32_val(1 << 31));
+    group0 = vecSet(b, group0, 2, newLo);
+    group0 = vecSet(b, group0, 3, newHi);
+  }
+
+  // ---- set_bounds: absolute rewrite of tensor_dim ----
+  // tensor_dim_inner (setBounds[1] for 2D) spans
+  //   group1[1] hi-16 | group1[2] lo-16
+  // tensor_dim_outer (setBounds[0]) spans
+  //   group1[2] hi-16 | group1[3] lo-16
+  if (!setBounds.empty()) {
+    auto stampDim = [&](int loDword, int hiDword, Value newDim) {
+      // loDword: keep lo-16, replace hi-16 with (newDim & 0xFFFF) << 16
+      Value loHi = b.shl(b.and_(newDim, b.i32_val(0xFFFF)), v16);
+      Value g_lo = b.or_(
+          b.and_(vecGet(b, group1, loDword), b.i32_val(0x0000FFFF)), loHi);
+      group1 = vecSet(b, group1, loDword, g_lo);
+      // hiDword: keep hi-16, replace lo-16 with (newDim >> 16) & 0xFFFF
+      Value hiLo = b.and_(b.lshr(newDim, v16), b.i32_val(0xFFFF));
+      Value g_hi = b.or_(
+          b.and_(vecGet(b, group1, hiDword), b.i32_val(0xFFFF0000)), hiLo);
+      group1 = vecSet(b, group1, hiDword, g_hi);
+    };
+    stampDim(/*loDword=*/1, /*hiDword=*/2, setBounds[1]); // inner
+    stampDim(/*loDword=*/2, /*hiDword=*/3, setBounds[0]); // outer
+  }
+
+  // ---- dest: rewrite lds_addr in group0[1] ----
+  if (dest) {
+    Value ldsAddr = b.ptrtoint(i32_ty, dest);
+    group0 = vecSet(b, group0, 1, ldsAddr);
+  }
+
+  // ---- pred: rewrite group0[0] ----
+  if (pred) {
+    // Note: this clobbers any mode bits stored in group0[0] (gather/scatter
+    // mode bit in bit 31, index-size bit in bit 30).  TODO: Gather/scatter
+    // mutation is not yet supported here; a future revision should preserve
+    // them.
+    group0 = vecSet(b, group0, 0, pred);
+  }
+
+  // ---- barrier: enable bit (group1[0] bit 18) + addr (group1[1] lo-16) ----
+  if (barrier) {
+    Value g1_0 = vecGet(b, group1, 0);
+    Value g1_1 = vecGet(b, group1, 1);
+    g1_0 = b.or_(g1_0, b.shl(b.i32_val(1), b.i32_val(18)));
+    g1_1 = b.or_(b.and_(g1_1, b.i32_val(0xFFFF0000)),
+                 b.and_(b.lshr(b.ptrtoint(i32_ty, barrier), b.i32_val(3)),
+                        b.i32_val(0x0000FFFF)));
+    group1 = vecSet(b, group1, 0, g1_0);
+    group1 = vecSet(b, group1, 1, g1_1);
+  }
 }
 
 // Decode a full TDM descriptor from all 4 group vectors for 3D-5D tensors
@@ -240,7 +378,6 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   assert(blockShape.size() == tensorStride.size() &&
          blockShape.size() == numDims &&
          "Block/tensor/stride dim count must all be equal.");
-  auto ctx = rewriter.getContext();
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   if (!isRowMajor) {
@@ -252,8 +389,6 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
   // Define common values for better readability
   Value v16 = b.i32_val(16);
   Value v32 = b.i64_val(32);
-  Value mask16 = b.i32_val(0xFFFF);
-  Value mask31 = b.i32_val(0x7FFFFFFF);
 
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
   auto elementSizeInBytes = elementBitWidth / 8;
@@ -954,16 +1089,15 @@ static int64_t computePerPartitionSliceStride(
 
 // Emit a single TDM intrinsic (load or store) for the given block shape.
 // This handles both the 2D (d2 intrinsic) and >2D (full intrinsic) cases.
-static void
-emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
-                 const LLVMTypeConverter *typeConverter, ArrayRef<Value> desc,
-                 size_t numDims, Type elementType,
-                 SmallVector<int64_t> effectiveBlockShape, int numWarps,
-                 unsigned padInterval, unsigned padAmount,
-                 SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs,
-                 Value pred, Value multicastMask, Value barrier,
-                 const triton::LinearLayout &instrSharedLayout, Value ctaId,
-                 bool isLoad, bool isRowMajor, ArrayRef<unsigned> warpsPerCTA) {
+static void emitTDMIntrinsic(
+    RewriterBase &rewriter, Location loc,
+    const LLVMTypeConverter *typeConverter, ArrayRef<Value> desc,
+    size_t numDims, Type elementType, SmallVector<int64_t> effectiveBlockShape,
+    int numWarps, unsigned padInterval, unsigned padAmount,
+    SmallVector<Value> globalOffset, ArrayRef<Value> instrDstPtrs, Value pred,
+    Value multicastMask, Value barrier,
+    const triton::LinearLayout &instrSharedLayout, Value ctaId, bool isLoad,
+    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA, int32_t auxBits) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
   Value group4Zero = LLVM::ZeroOp::create(rewriter, loc, v8i32Ty);
@@ -990,7 +1124,7 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
                                        : "llvm.amdgcn.tensor.store.from.lds";
     LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, intrinsicName, {},
-        {group0, group1, group2, group3, group4Zero, b.i32_val(0)});
+        {group0, group1, group2, group3, group4Zero, b.i32_val(auxBits)});
   } else {
     auto group0Vec = SmallVector<Value>(desc.begin(), desc.begin() + 4);
     auto group1Vec = SmallVector<Value>(desc.begin() + 4, desc.end());
@@ -1009,9 +1143,9 @@ emitTDMIntrinsic(RewriterBase &rewriter, Location loc,
 
     const char *intrinsicName = isLoad ? "llvm.amdgcn.tensor.load.to.lds"
                                        : "llvm.amdgcn.tensor.store.from.lds";
-    LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, intrinsicName, {},
-        {group0, group1, group2Zero, group3Zero, group4Zero, b.i32_val(0)});
+    LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsicName, {},
+                                    {group0, group1, group2Zero, group3Zero,
+                                     group4Zero, b.i32_val(auxBits)});
   }
 }
 
@@ -1031,7 +1165,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       Value pred, Value multicastMask, Type elementType,
                       Value barrierPtr, bool isLoad,
                       const triton::LinearLayout &sharedLayout,
-                      Attribute encoding, Value ctaId, bool isRowMajor) {
+                      Attribute encoding, Value ctaId, bool isRowMajor,
+                      int32_t auxBits) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   size_t numDims = blockShape.size();
   assert(numDims <= 5);
@@ -1048,7 +1183,7 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                      to_vector(blockShape), numWarps, padInterval, padAmount,
                      to_vector(offset), dstPtrs, pred, multicastMask,
                      barrierPtr, sharedLayout, ctaId, isLoad, isRowMajor,
-                     warpsPerCTA);
+                     warpsPerCTA, auxBits);
     return;
   }
 
@@ -1112,7 +1247,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
     emitTDMIntrinsic(rewriter, loc, typeConverter, desc, numDims, elementType,
                      effectiveBlockShape, numWarps, padInterval, padAmount,
                      globalOffset, instrDstPtrs, pred, multicastMask, barrier,
-                     sliceLayout, ctaId, isLoad, isRowMajor, warpsPerCTA);
+                     sliceLayout, ctaId, isLoad, isRowMajor, warpsPerCTA,
+                     auxBits);
   }
 }
 

@@ -1,29 +1,18 @@
+#include "TritonAMDGPUTransforms/Passes.h" // IWYU pragma: keep
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/Verifier.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "third_party/amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/TypeSwitch.h"
-#include <deque>
-#include <optional>
-
-#include <memory>
 
 using namespace mlir;
 using namespace triton;
@@ -43,21 +32,11 @@ public:
     Attribute sharedMemorySpace = triton::gpu::SharedMemorySpaceAttr::get(ctx);
     auto loc = op.getLoc();
     auto tensorType = op.getResult().getType();
-
-    // Very important. For a shared layout to "work" the main thing we need is
-    // the order (all the rest is about swizzling). We need to get the order
-    // somewhere.
-    SmallVector<unsigned> order = getOrder(tensorType);
-    if (auto blockedLayout =
-            dyn_cast<BlockedEncodingAttr>(tensorType.getEncoding())) {
-      order = llvm::to_vector(blockedLayout.getOrder());
+    auto encoding = getEncodingFromDescriptor(op, tensorType, op.getDesc());
+    if (!encoding) {
+      op.emitError() << "Could not create encoding for descriptor load";
+      return failure();
     }
-
-    auto cgaLayout = getCGALayout(tensorType.getEncoding());
-    // At this point, we don't have any information about how this load is used.
-    // Hence, we cannot set padding information
-    Attribute encoding = SwizzledSharedEncodingAttr::get(
-        tensorType.getContext(), 1, 1, 1, order, cgaLayout);
 
     // given this descriptor and the encoding, the framework should be able to
     // compute the LDS size.
@@ -87,16 +66,11 @@ public:
     Value desc = op.getDesc();
     mlir::TypedValue<RankedTensorType> src = op.getSrc();
     auto tensorType = src.getType();
-
-    SmallVector<unsigned> order = getOrder(tensorType);
-    if (auto blockedLayout =
-            dyn_cast<BlockedEncodingAttr>(tensorType.getEncoding())) {
-      order = llvm::to_vector(blockedLayout.getOrder());
+    auto encoding = getEncodingFromDescriptor(op, tensorType, desc);
+    if (!encoding) {
+      op.emitError() << "Could not create encoding for descriptor store";
+      return failure();
     }
-
-    auto cgaLayout = getCGALayout(tensorType.getEncoding());
-    Attribute encoding = SwizzledSharedEncodingAttr::get(
-        tensorType.getContext(), 1, 1, 1, order, cgaLayout);
 
     MemDescType memDescType =
         MemDescType::get(tensorType.getShape(), tensorType.getElementType(),

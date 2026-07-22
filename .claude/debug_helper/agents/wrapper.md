@@ -31,6 +31,12 @@ After the user answers:
 3. Launch every listed investigation in parallel. For each investigation name,
    run:
    `{{SCRIPT_PATH}} --run-subagent <investigation> {{LLM}} <ir-path> <output-dir>`
+   Launching them all at once is safe: GPU-bound investigations (those whose
+   template is tagged `needs_gpu`, e.g. `cutracer_data_race`, `cutracer_deadlock`,
+   `compute_sanitizer`) are serialized against a shared lock inside
+   `debug_helper.sh`, so at most one runs on the GPU at a time while static
+   investigations proceed concurrently. Expect the GPU ones to finish one after
+   another, not simultaneously.
 4. Poll each investigation's `<output-dir>/<investigation>/insights.log` and
    `status.json` periodically. Report only meaningful new `INSIGHT:` lines or
    actionable failures; do not emit generic heartbeat messages.

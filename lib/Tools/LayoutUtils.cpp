@@ -142,10 +142,18 @@ LinearLayout ensureLayoutNotSmallerThan(
   for (StringAttr outDimName : layout.getOutDimNames()) {
     int32_t actualSize = layout.getOutDimSize(outDimName);
     int32_t desiredSize = shape.lookup(outDimName);
-    // actualSize is always pow2, so grow to the next pow2 >= an NPOT
-    // desiredSize (else desiredSize/actualSize floors, e.g. 192/128 == 1, and
-    // the register dim never grows, dropping real elements). A later
-    // ensureLayoutNotLargerThan clamps to the true NPOT size. Pow2: no-op.
+    // Already covers the shape. This also handles a modular NPOT actualSize
+    // (e.g. re-lowering an already-built modular LinearEncodingAttr whose
+    // out-dim equals the shape): such a layout needs no growth, and the
+    // pow2 grow path below does not apply to it. Symmetric with
+    // ensureLayoutNotLargerThan's true-size early-exit.
+    if (actualSize >= desiredSize)
+      continue;
+    // Only a pow2 layout can still be too small here; grow it to the next
+    // pow2 >= an NPOT desiredSize (else desiredSize/actualSize floors, e.g.
+    // 192/128 == 1, and the register dim never grows, dropping real
+    // elements). A later ensureLayoutNotLargerThan clamps to the true NPOT
+    // size. Pow2: no-op.
     assert(llvm::isPowerOf2_32(actualSize));
     int32_t growTarget =
         llvm::isPowerOf2_32(desiredSize)
@@ -253,7 +261,6 @@ std::optional<ColumnAction> regPermForDivide(const LinearLayout &A,
   auto multiplyByTileSize =
       [&](ArrayRef<int32_t> bBasis) -> std::vector<int32_t> {
     std::vector<int32_t> result;
-    size_t idx = 0;
     assert(bBasis.size() == A.getNumOutDims());
     for (auto [dim, b] : llvm::zip(A.getOutDimNames(), bBasis)) {
       result.push_back(b << log2QuotSize.lookup(dim));

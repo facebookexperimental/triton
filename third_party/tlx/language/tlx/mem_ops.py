@@ -365,6 +365,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         # respects it (does not retag the buffer to satisfy a consumer). The
         # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
         if not getattr(layout, "_tlx_default", False):
+            layout._tlx_user_pinned = True
             layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
 
     alias_handle = None
@@ -942,6 +943,30 @@ def local_store(
         return tl.tensor(_semantic.builder.create_tmem_store(dst.handle, src_handle), tl.void)
 
     return tl.tensor(_semantic.builder.create_local_store(dst.handle, src.handle), tl.void)
+
+
+@tl.builtin
+def assert_same_layout(
+    lhs,
+    rhs,
+    _semantic=None,
+) -> None:
+    """Statically assert that two final layouts are equivalent.
+
+    ``rhs`` may be another register/buffer value or a constant TLX layout. The
+    comparison runs after TTGIR layout propagation and compares LinearLayouts.
+    """
+    rhs = tl._unwrap_if_constexpr(rhs)
+    if isinstance(rhs, (tl.tensor, tlx.buffered_tensor)):
+        _semantic.builder.create_assert_same_layout(lhs.handle, rhs.handle)
+        return
+    if not isinstance(rhs, tlx.layout_encoding):
+        raise TypeError("`rhs` must be a TLX tensor/buffer value or layout encoding")
+    if isinstance(rhs, tlx.layout):
+        expected_encoding = rhs.to_ir(_semantic.builder, lhs.type.shape, lhs.type.element_ty)
+    else:
+        expected_encoding = rhs.to_ir(_semantic.builder)
+    _semantic.builder.create_assert_same_layout_expected(lhs.handle, expected_encoding)
 
 
 @tl.builtin

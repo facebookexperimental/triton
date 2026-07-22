@@ -128,7 +128,6 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     return mlir::emitError(module.getLoc(),
                            "module missing 'ttg.total-num-warps' attribute");
   }
-  unsigned totalNumThreads = totalNumWarpsAttr.getInt() * threadsPerWarp;
 
   // Determine how many registers the worker warps can surrender before they
   // begin execution.
@@ -190,7 +189,7 @@ static LogicalResult lowerWarpSpecialize(LLVM::LLVMFuncOp func,
     // predicate here to select only non default warps
     PTXBuilder ptxBuilder;
     auto clusterArriveOp =
-        *ptxBuilder.create("@!$0 barrier.cluster.arrive.aligned;");
+        *ptxBuilder.create("@!$0 barrier.cluster.arrive.relaxed.aligned;");
     clusterArriveOp({ptxBuilder.newOperand(isDefault, "b")},
                     /*onlyAttachMLIRArgs=*/true);
     auto voidTy = void_ty(ctx);

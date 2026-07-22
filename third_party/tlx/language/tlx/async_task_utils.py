@@ -49,6 +49,21 @@ class async_task:
 
 class async_tasks:
 
+    def __init__(
+        self,
+        *args,
+        exclusive=False,
+        no_ending_cluster_sync=False,
+        mbarrier_try_wait_suspend_ns=None,
+        **kwargs,
+    ):
+        self.exclusive = core._unwrap_if_constexpr(exclusive)
+        self.no_ending_cluster_sync = core._unwrap_if_constexpr(no_ending_cluster_sync)
+        self.mbarrier_try_wait_suspend_ns = core._unwrap_if_constexpr(mbarrier_try_wait_suspend_ns)
+        if self.mbarrier_try_wait_suspend_ns is not None:
+            if not isinstance(self.mbarrier_try_wait_suspend_ns, int) or self.mbarrier_try_wait_suspend_ns < 0:
+                raise ValueError("mbarrier_try_wait_suspend_ns must be a non-negative integer")
+
     def __enter__(self):
         return self
 

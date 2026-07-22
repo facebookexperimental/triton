@@ -22,13 +22,6 @@ using namespace mlir::triton::gpu;
 using namespace mlir::triton::nvidia_gpu;
 using namespace mlir::triton::NVIDIA;
 
-// The maximum number of tensor memory registers that can be accessed
-// by a single message regardless of shape or repetitions
-static constexpr int largestTmemLoadStore = 128;
-// The maximum number of thread registers that can be populated by
-// multiple messages
-static constexpr int maxRegisters = 256;
-
 namespace {
 
 struct TMemCopyAtom {
@@ -533,7 +526,6 @@ struct TensorMemoryLoadOpConversion
   matchAndRewrite(triton::nvidia_gpu::TMEMLoadOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    auto ctx = op.getContext();
     auto llvmElemTy =
         getTypeConverter()->convertType(op.getSrc().getType().getElementType());
     auto tmemBase = adaptor.getSrc();
@@ -589,7 +581,6 @@ struct TensorMemoryStoreOpConversion
   matchAndRewrite(triton::nvidia_gpu::TMEMStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    auto ctx = op.getContext();
     auto llvmElemTy =
         getTypeConverter()->convertType(op.getDst().getType().getElementType());
 
@@ -597,7 +588,6 @@ struct TensorMemoryStoreOpConversion
     Value pred = adaptor.getPred();
     auto memTy = cast<MemDescType>(op.getDst().getType());
     auto regTy = cast<RankedTensorType>(op.getSrc().getType());
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
 
     SmallVector<Value> srcValues =
         unpackLLElements(loc, adaptor.getSrc(), rewriter);
@@ -605,12 +595,6 @@ struct TensorMemoryStoreOpConversion
     lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase, maxnreg, pred,
                            llvmElemTy, srcValues);
     NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
-
-    // Emit a barrier to ensure all threads have finished writing to tensor
-    // memory before any use of the tensor memory.
-    // Can be AddrSpace::TensorWrite if we emit
-    // NVVM::Tcgen05WaitKind::STORE during barrier lowering
-    b.barrier(triton::gpu::AddrSpace::None);
 
     rewriter.eraseOp(op);
     return success();
@@ -626,7 +610,6 @@ struct TensorMemoryAllocOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto ctx = op.getContext();
     Value base = nvgpu::TensorMemoryBaseAddress::create(rewriter, loc);
     Value baseInt = b.ptrtoint(i32_ty, base);
     int colOffset = cast<IntegerAttr>(op->getAttr("tensor_memory_col_offset"))
@@ -639,7 +622,6 @@ struct TensorMemoryAllocOpConversion
     SmallVector<unsigned> order(op.getType().getRank());
     std::iota(order.begin(), order.end(), 0);
     std::reverse(order.begin(), order.end());
-    auto shape = op.getType().getShape();
 
     if (op.getSrc()) {
       auto regTy = cast<RankedTensorType>(op.getSrc().getType());
@@ -652,11 +634,6 @@ struct TensorMemoryAllocOpConversion
       lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, ptr, maxnreg,
                              b.i1_val(true), llvmElemTy, srcValues);
       NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
-      // Emit a barrier to ensure all threads have finished writing to tensor
-      // memory before any use of the tensor memory.
-      // Can be AddrSpace::TensorWrite if we emit
-      // NVVM::Tcgen05WaitKind::STORE during barrier lowering
-      b.barrier(triton::gpu::AddrSpace::None);
     }
     // Cast to address space 3 as the shared memory object uses 3.
     // TODO: clean this up and use either a int or ptr address space 6
@@ -666,43 +643,6 @@ struct TensorMemoryAllocOpConversion
     return success();
   }
 };
-
-static void createCommit(ConversionPatternRewriter &rewriter, Location loc,
-                         Value barrier, Value pred, bool twoCTAs) {
-  PTXBuilder ptxBuilder;
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  SmallVector<PTXBuilder::Operand *> ptxOperands;
-  auto *predOperand = ptxBuilder.newOperand(pred, "b");
-  ptxOperands.push_back(predOperand);
-  auto *barrierOperand = ptxBuilder.newOperand(barrier, "l");
-  ptxOperands.push_back(barrierOperand);
-  std::string opcode;
-  if (twoCTAs) {
-    // .multicast::cluster and mask 0x3 means the completion of UTCMMA.2CTA will
-    // be broadcasted into CTAid 0 and 1
-    // If there're more than 2 CTAs in a cluster, it should be CTAid x and x+1
-    // where x is even
-    Value clusterCTARank = triton::nvgpu::ClusterCTAIdOp::create(
-        rewriter, loc, rewriter.getI32Type());
-    // mask the least bit
-    Value leaderCTARank = b.and_(clusterCTARank, b.i32_val(~1));
-    // "3 << leaderCTARank" means " (1<<leaderCTARank) | (1 << (leaderCTARank +
-    // 1))"
-    Value mask = b.shl(b.i32_val(3), leaderCTARank);
-    auto *ctaMask = ptxBuilder.newOperand(mask, "h");
-    ptxOperands.push_back(ctaMask);
-    opcode = "@$0 "
-             "tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::"
-             "cluster.multicast::cluster.b64 [$1], $2;";
-  } else {
-    opcode = "@$0 "
-             "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::"
-             "cluster.b64 [$1];";
-  }
-  auto &barrierOp = *ptxBuilder.create(opcode);
-  barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
-  ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
-}
 
 static void createTcgen05Cp(ConversionPatternRewriter &rewriter, Location loc,
                             Value tmem_address, Value src_desc, Value pred,
@@ -933,12 +873,6 @@ struct TensorMemoryCopyOpConversion
         return failure();
     }
 
-    if (op.getBarrier()) {
-      auto barrier = LLVM::getSharedMemoryObjectFromStruct(
-          op.getLoc(), adaptor.getBarrier(), i64_ty, rewriter);
-      createCommit(rewriter, loc, barrier.getBase(), pred, twoCTAs);
-    }
-
     rewriter.eraseOp(op);
     return success();
   }
@@ -956,7 +890,6 @@ struct MemDescIndexOpConversion
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getResult().getType();
-    auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
 
     if (!isa<triton::nvidia_gpu::TensorMemoryEncodingAttr,
              triton::nvidia_gpu::TensorMemoryScalesEncodingAttr>(

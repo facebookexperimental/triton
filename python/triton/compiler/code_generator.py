@@ -7,7 +7,7 @@ import inspect
 import re
 import warnings
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import ModuleType
 from typing import Any, Callable, Dict, Optional, Tuple, Type, Union, Iterable, List
 
@@ -1234,6 +1234,37 @@ class CodeGenerator(ast.NodeVisitor):
         return self.visit_compound_statement(node.body)
         # Facebook ends
 
+    def _apply_loop_options(self, loop_op, opts):
+        """Emit the AutoWS/pipelining loop attributes carried by an
+        ``AutoWSLoopOptions`` (``tl.range`` or ``tl.condition``) onto ``loop_op``
+        (an ``scf.for`` or ``scf.while``). The kwarg->attribute contract lives in
+        the ``AutoWSLoopOptions`` field metadata, so ``for`` and ``while`` loops
+        stay identical."""
+        b = self.builder
+        for f in fields(opts):
+            meta = f.metadata.get("loop_attr")
+            if meta is None:
+                continue
+            ir_name, kind = meta
+            value = _unwrap_if_constexpr(getattr(opts, f.name))
+            if kind == "int32":
+                if value is not None:
+                    loop_op.set_attr(ir_name, b.get_int32_attr(value))
+            elif kind == "unit":
+                if value:
+                    loop_op.set_attr(ir_name, b.get_unit_attr())
+            elif kind == "bool":
+                if value:
+                    loop_op.set_attr(ir_name, b.get_bool_attr(True))
+            elif kind == "bool_opt":
+                if value is not None:
+                    loop_op.set_attr(ir_name, b.get_bool_attr(value))
+            elif kind == "licm":
+                if value:
+                    loop_op.set_attr(ir_name, b.get_disable_loop_licm_attr())
+            else:
+                raise ValueError(f"unknown loop_attr kind {kind!r}")
+
     def visit_While(self, node):
         with enter_sub_region(self) as sr:
             liveins, insert_block = sr
@@ -1255,11 +1286,7 @@ class CodeGenerator(ast.NodeVisitor):
                 self._maybe_set_loc_to_name(val, name)
             cond = self.visit(node.test)
             if isinstance(cond, language.condition):
-                if cond.disable_licm:
-                    while_op.set_attr(
-                        "llvm.loop_annotation",
-                        self.builder.get_disable_loop_licm_attr(),
-                    )
+                self._apply_loop_options(while_op, cond)
                 cond = cond.condition
             self.builder.set_insertion_point_to_end(before_block)
             # create ConditionOp: e.g., scf.condition(%cond) %arg0, %arg1, ...
@@ -1324,23 +1351,9 @@ class CodeGenerator(ast.NodeVisitor):
                 for stmt in node.orelse:
                     ast.NodeVisitor.generic_visit(self, stmt)
             return
-        num_stages = None
-        loop_unroll_factor = None
-        disallow_acc_multi_buffer = False
-        data_partition_factor = None
-        list_schedule_pick = None
-        merge_epilogue = False
-        merge_epilogue_to_computation = False
-        merge_correction = False
-        separate_epilogue_store = False
-        tmem_alloc_algo = None
-        smem_alloc_algo = None
-        smem_budget = None
-        smem_circular_reuse = None
-        flatten = False
-        warp_specialize = False
-        multi_cta = False
-        disable_licm = False
+        # The tl.range object carries the AutoWS/pipelining loop options (shared
+        # with tl.condition via AutoWSLoopOptions); builtin range has none.
+        loop_options = None
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
@@ -1349,23 +1362,7 @@ class CodeGenerator(ast.NodeVisitor):
             lb = iterator.start
             ub = iterator.end
             step = iterator.step
-            num_stages = iterator.num_stages
-            loop_unroll_factor = iterator.loop_unroll_factor
-            disallow_acc_multi_buffer = iterator.disallow_acc_multi_buffer
-            data_partition_factor = iterator.data_partition_factor
-            list_schedule_pick = iterator.list_schedule_pick
-            merge_epilogue = iterator.merge_epilogue
-            merge_epilogue_to_computation = iterator.merge_epilogue_to_computation
-            merge_correction = iterator.merge_correction
-            separate_epilogue_store = iterator.separate_epilogue_store
-            tmem_alloc_algo = iterator.tmem_alloc_algo
-            smem_alloc_algo = iterator.smem_alloc_algo
-            smem_budget = iterator.smem_budget
-            smem_circular_reuse = iterator.smem_circular_reuse
-            flatten = iterator.flatten
-            warp_specialize = iterator.warp_specialize
-            multi_cta = iterator.multi_cta
-            disable_licm = iterator.disable_licm
+            loop_options = iterator
         elif IteratorClass is range:
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1418,52 +1415,8 @@ class CodeGenerator(ast.NodeVisitor):
             # create ForOp
             self._set_insertion_point_and_loc(ip, last_loc)
             for_op = self.builder.create_for_op(lb, ub, step, init_handles)
-            if _unwrap_if_constexpr(num_stages) is not None:
-                for_op.set_attr("tt.num_stages", self.builder.get_int32_attr(num_stages))
-            if _unwrap_if_constexpr(loop_unroll_factor) is not None:
-                for_op.set_attr(
-                    "tt.loop_unroll_factor",
-                    self.builder.get_int32_attr(loop_unroll_factor),
-                )
-            if _unwrap_if_constexpr(data_partition_factor) is not None:
-                for_op.set_attr(
-                    "tt.data_partition_factor",
-                    self.builder.get_int32_attr(data_partition_factor),
-                )
-            if _unwrap_if_constexpr(list_schedule_pick) is not None:
-                for_op.set_attr(
-                    "tt.list_schedule_pick",
-                    self.builder.get_int32_attr(_unwrap_if_constexpr(list_schedule_pick)),
-                )
-            if disallow_acc_multi_buffer:
-                for_op.set_attr("tt.disallow_acc_multi_buffer", self.builder.get_unit_attr())
-            if flatten:
-                for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
-            if warp_specialize:
-                for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
-            if multi_cta:
-                for_op.set_attr("tt.multi_cta", self.builder.get_unit_attr())
-            if merge_epilogue:
-                for_op.set_attr("tt.merge_epilogue", self.builder.get_bool_attr(True))
-            if merge_correction:
-                for_op.set_attr("tt.merge_correction", self.builder.get_bool_attr(True))
-            if merge_epilogue_to_computation:
-                for_op.set_attr("tt.merge_epilogue_to_computation", self.builder.get_bool_attr(True))
-            if separate_epilogue_store:
-                for_op.set_attr("tt.separate_epilogue_store", self.builder.get_bool_attr(True))
-            if tmem_alloc_algo is not None:
-                for_op.set_attr("tt.tmem_alloc_algo", self.builder.get_int32_attr(tmem_alloc_algo))
-            if smem_alloc_algo is not None:
-                for_op.set_attr("tt.smem_alloc_algo", self.builder.get_int32_attr(smem_alloc_algo))
-            if smem_budget is not None:
-                for_op.set_attr("tt.smem_budget", self.builder.get_int32_attr(smem_budget))
-            if smem_circular_reuse is not None:
-                for_op.set_attr(
-                    "tt.smem_circular_reuse",
-                    self.builder.get_bool_attr(smem_circular_reuse),
-                )
-            if disable_licm:
-                for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
+            if loop_options is not None:
+                self._apply_loop_options(for_op, loop_options)
 
             self.scf_stack.append(node)
             for_op_body = for_op.get_body(0)

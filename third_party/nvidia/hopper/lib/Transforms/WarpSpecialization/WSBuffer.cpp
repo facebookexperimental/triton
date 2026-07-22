@@ -278,7 +278,7 @@ static int64_t getReuseGroupStride(ReuseGroup *group) {
     // Only SMEM(-post) channels participate in subtiled reuse. Skip TMEM(-post)
     // channels: they never subtile and getDstOp() can be unsafe on operand-D.
     if (ch->channelKind != DataChannelKind::SMEM &&
-        ch->channelKind != DataChannelKind::SMEMPost)
+        ch->channelKind != DataChannelKind::SMEMAlloc)
       continue;
     if ((sub = enclosingSubtiledOf(ch->getSrcOp())))
       break;
@@ -512,7 +512,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
   } else {
     // Create an empty yield
     auto b = newIfOp.getElseBodyBuilder();
-    auto yieldOp = scf::YieldOp::create(b, ifOp.getLoc());
+    scf::YieldOp::create(b, ifOp.getLoc());
   }
 
   SmallVector<Value> elseYieldOperands = newIfOp.elseYield().getOperands();
@@ -670,32 +670,12 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   return newForOp;
 }
 
-// Here we assume the source and destination ops are in the same region op.
-// Go through channels, and get a set of region ops containing channels.
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels) {
-  for (auto *ch : channels) {
-    auto *dst = ch->getDstOp();
-    auto *pOp = dst->getParentOp();
-    if (!pOp)
-      continue;
-    if (auto forOp = dyn_cast<scf::ForOp>(pOp))
-      regionsWithChannels.insert(pOp);
-    if (auto ifOp = dyn_cast<scf::IfOp>(pOp))
-      regionsWithChannels.insert(pOp);
-    // Channel directly in a persistent scf.while after region.
-    if (auto whileOp = dyn_cast<scf::WhileOp>(pOp))
-      regionsWithChannels.insert(pOp);
-  }
-}
-
-void collectRegionsWithChannelsPost(
-    const SmallVector<Channel *> &channels,
-    DenseSet<Operation *> &regionsWithChannels) {
   for (auto *channel : channels) {
-    if (channel->channelKind == DataChannelKind::TMEMPost) {
-      ttng::TmemDataChannelPost *tmemChannel =
-          static_cast<ttng::TmemDataChannelPost *>(channel);
+    if (channel->channelKind == DataChannelKind::TMEMAlloc) {
+      ttng::TmemAllocChannel *tmemChannel =
+          static_cast<ttng::TmemAllocChannel *>(channel);
       if (tmemChannel->isOperandD) {
         // Go through all dst ops and src ops.
         for (auto user : cast<ttng::TMEMAllocOp>(tmemChannel->allocOp)

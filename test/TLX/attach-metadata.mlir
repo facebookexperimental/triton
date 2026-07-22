@@ -93,6 +93,25 @@ module {
   }
 }
 
+// -----
+
+// A suspend hint on tlx.async_tasks is propagated from warp_specialize to the
+// module so waits introduced by later warp-specialization passes also see it.
+// CHECK: module attributes {
+// CHECK-SAME: tlx.mbarrier_try_wait_suspend_ns = 50000 : i32
+module {
+  tt.func @kernel_mbarrier_try_wait_suspend() {
+    ttg.warp_specialize() attributes {tlx.mbarrier_try_wait_suspend_ns = 50000 : i32}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}
+
 
 // -----
 
@@ -192,6 +211,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
        !ttg.memdesc<128x64xf16, #shared1, #ttg.shared_memory>,
        !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>,
        !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+    tt.return
+  }
+}
+
+// -----
+
+// A `tlx.no_ending_cluster_sync` marker on the warp_specialize op is propagated
+// to the `tlx.user_post_ws_sync` module attribute (NVIDIA target).
+// CHECK: module attributes {
+// CHECK-SAME: tlx.user_post_ws_sync = true
+module {
+  tt.func @kernel_no_ending_cluster_sync() {
+    ttg.warp_specialize() attributes {tlx.no_ending_cluster_sync}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
     tt.return
   }
 }
