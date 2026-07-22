@@ -1112,6 +1112,24 @@ def test_amd_pa_decode(num_splits, query_length):
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_page64_high_splits():
+    num_kv_heads, group = 2, 4
+    num_q_heads = num_kv_heads * group
+    head_dim, page_size = 64, 64
+    ctx_lens = [65, 257, 513]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE)
+    out = torch.empty_like(query)
+    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_splits=128)
+
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, 1)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
 def test_amd_pa_decode_page16_tile_boundaries():
     num_kv_heads, group = 2, 4
     num_q_heads = num_kv_heads * group
