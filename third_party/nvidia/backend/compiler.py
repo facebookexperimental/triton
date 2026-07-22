@@ -200,6 +200,7 @@ class CUDAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     early_tma_store_lowering: Optional[None] = None
+    tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
     multicast: bool = False
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
@@ -856,6 +857,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+            tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
             nvidia.passes.hopper.add_hopper_warpspec(
                 pm,
                 opt.num_stages,
@@ -865,6 +867,7 @@ class CUDABackend(BaseBackend):
                 smem_budget,
                 generate_subtiled,
                 knobs.nvidia.ws_tile_prefetch_depth,
+                tma_store_pipelining,
             )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
@@ -930,6 +933,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+                tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
                 nvidia.passes.hopper.add_hopper_warpspec(
                     pm,
                     opt.num_stages,
@@ -939,6 +943,7 @@ class CUDABackend(BaseBackend):
                     smem_budget,
                     generate_subtiled,
                     knobs.nvidia.ws_tile_prefetch_depth,
+                    tma_store_pipelining,
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
