@@ -85,6 +85,22 @@ def test_remote_shmem_store(device):
         offset = tl.arange(0, 1) + cluster_cta_rank
         value = tl.load(x + offset) + (cluster_cta_rank + 1) * 100
 
+        # Delay one CTA before it initializes its DSM so a missing cluster
+        # barrier is observable: an early remote store would be overwritten.
+        if cluster_cta_rank == 1:
+            tl.inline_asm_elementwise(
+                "nanosleep.u32 1000000; mov.u32 $0, 0;",
+                "=r",
+                [],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+        local_init_view = tlx.local_view(local_buff, cluster_cta_rank)
+        tlx.local_store(local_init_view, tl.full((1, ), -1.0, tl.float32))
+
+        # Ensure every CTA has entered and initialized its DSM before access.
+        tlx.cluster_barrier()
         tlx.remote_shmem_store(
             dst=remote_store_view,
             src=value,
