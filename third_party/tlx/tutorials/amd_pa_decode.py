@@ -320,7 +320,11 @@ def pa_decode_tlx(
     mid = torch.empty((num_seqs, num_kv_heads, num_splits, m_pow2, head_dim), dtype=torch.float32, device=query.device)
     lse = torch.empty((num_seqs, num_kv_heads, num_splits, m_pow2), dtype=torch.float32, device=query.device)
 
+    # print(f"num_seqs = {num_seqs}, num_kv_heads = {num_kv_heads}, num_splits = {num_splits}")
+    # print(f"q_shape = {query.shape}, k_shape = {key_cache.shape}, v_shape = {value_cache.shape}")
+
     grid_p = (num_seqs, num_kv_heads, num_splits)
+    # print(f"grid = {grid_p}")
     _pa_decode_partition_kernel[grid_p](
         query,
         key_cache,

@@ -20,3 +20,6 @@ paged-decode-performance-bf16-qlen1:
 6   32.0   32768.0                         6.429553                          10.407450           1.618689
 7    8.0  131072.0                         6.206564                           5.119858           0.824910
 ```
+We can see aither has better perf for later batch size, but worse perf for small batch size. MI355 has a peak bandwidth of 8TB/s, seems like something is wrong in the results
+
+

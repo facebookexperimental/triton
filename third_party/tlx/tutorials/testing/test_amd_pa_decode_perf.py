@@ -1,6 +1,7 @@
 import argparse
 import math
 
+import pytest
 import torch
 
 import triton
@@ -8,9 +9,10 @@ import triton
 from triton.language.extra.tlx.tutorials.amd_pa_decode import (
     pa_decode_tlx as _pa_decode_tlx,
     build_inputs as _build_inputs,
+    ref_decode as _ref_decode,
 )
 
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip, is_hip_cdna4
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -31,8 +33,9 @@ def _check_aiter_available():
 
 
 _AITER_AVAILABLE = _check_aiter_available()
-DECODE_METHODS = ("tlx", "aiter")
-DEFAULT_DECODE_VERSIONS = [v for v in DECODE_METHODS if v != "aiter" or _AITER_AVAILABLE]
+DECODE_METHODS = ("tlx", "aiter") if _AITER_AVAILABLE else ("tlx",)
+
+DEFAULT_DECODE_VERSIONS = list(DECODE_METHODS)
 
 
 def _pack_aiter_kv_cache(key_cache, value_cache):
@@ -91,9 +94,7 @@ def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, max_conte
     )
 
 
-def create_benchmark(versions, qlen):
-    line_vals = list(versions)
-    line_names = list(versions)
+def get_x_values():
     # (BATCH, N_CTX)
     x_vals = [
         (1, 8192),
@@ -105,11 +106,18 @@ def create_benchmark(versions, qlen):
         (32, 32768),
         (8, 131072),
     ]
+    
+    return x_vals
+
+
+def create_benchmark(versions, qlen):
+    line_vals = list(versions)
+    line_names = list(versions)
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["BATCH", "N_CTX"],
-            x_vals=x_vals,
+            x_vals=get_x_values(),
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -132,11 +140,33 @@ def create_benchmark(versions, qlen):
 
         # Decode reads the whole KV cache once (K + V, bf16): report effective
         # HBM read bandwidth, the meaningful metric for this memory-bound op.
-        kv_bytes = 2 * BATCH * NUM_KV_HEADS * N_CTX * HEAD_DIM * 2
+        # Use actual tensor sizes: with pool_pages sharing, multiple sequences
+        # map to the same physical pages, so BATCH*N_CTX overcounts HBM bytes.
+        kv_bytes = (kc.numel() + vc.numel()) * kc.element_size()
         tbps = lambda ms: kv_bytes * 1e-12 / (ms * 1e-3)
-        return tbps(ms), tbps(max_ms), tbps(min_ms)
+        return tbps(ms), tbps(min_ms), tbps(max_ms)
 
     return benchmark
+
+@pytest.mark.parametrize("provider", list(DECODE_METHODS))
+@pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
+@pytest.mark.parametrize("batch, n_ctx", get_x_values())
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_correctness(batch, n_ctx, query_length, provider):
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
+    ctx_lens = [n_ctx] * batch
+    query, key_cache, value_cache, context_lens, block_tables = _build_inputs(
+        batch, ctx_lens, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
+        query_length=query_length, device=DEVICE)
+    out = torch.empty_like(query)
+    fn = _make_decode_fn(provider, out, query, key_cache, value_cache, context_lens, block_tables,
+                         sm_scale, query_length, n_ctx)
+    if fn is None:
+        pytest.skip(f"{provider} not available")
+    fn()
+    ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                      NUM_Q_HEADS, NUM_KV_HEADS, query_length)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
