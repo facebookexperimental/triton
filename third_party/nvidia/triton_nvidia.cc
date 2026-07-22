@@ -165,6 +165,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      createTritonGPUProxyFenceInsertionWrapper, int32_t);
   ADD_PASS_WRAPPER_0("add_tmem_load_reduce",
                      ttng::createTritonNvidiaGPUFuseTMEMLoadReducePass);
+  ADD_PASS_WRAPPER_0("add_tmem_barrier_insertion",
+                     ttng::createTritonNvidiaGPUTMemBarrierInsertionPass);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
   ADD_PASS_WRAPPER_0("add_promote_load_to_tma",
@@ -212,9 +214,9 @@ void init_triton_nvidia_passes_nvws(py::module &&m) {
 
 void init_triton_hopper_passes(py::module &&m) {
   // Meta's autoWS
-  ADD_PASS_OPTION_WRAPPER_7("add_hopper_warpspec",
+  ADD_PASS_OPTION_WRAPPER_8("add_hopper_warpspec",
                             mlir::createNVGPUWarpSpecialization, int, int, bool,
-                            bool, int, bool, int);
+                            bool, int, bool, int, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_data_partitioning",
                             mlir::createNVGPUWSDataPartition, int);
   ADD_PASS_WRAPPER_0("add_tma_store_lowering",

@@ -101,7 +101,10 @@ struct ConvertTritonAMDGPUToLLVM
     TritonLLVMConversionTarget convTarget(*context);
 
     // Allocate shared memory and set barrier
-    ModuleAllocation allocation(mod, AMD::AMDAllocationAnalysisScratchSizeFn,
+    auto allocationFn = [&targetInfo](Operation *op) {
+      return AMD::AMDAllocationAnalysisScratchSizeFn(op, targetInfo);
+    };
+    ModuleAllocation allocation(mod, allocationFn,
                                 targetInfo.getSharedMemoryPartitionSize());
 
     if (targetInfo.requiresAliasInfoForAsyncOps())
@@ -243,6 +246,10 @@ struct ConvertTritonAMDGPUToLLVM
     mlir::triton::populatePrintOpToLLVMPattern(typeConverter, patterns,
                                                targetInfo, commonBenefit);
     mlir::ub::populateUBToLLVMConversionPatterns(typeConverter, patterns);
+
+    mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter, patterns,
+                                                        targetInfo);
+    mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns);
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns)))) {
       return signalPassFailure();

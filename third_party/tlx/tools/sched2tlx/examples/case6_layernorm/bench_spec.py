@@ -49,7 +49,7 @@ def hw_call(handwritten, inputs):
     handwritten.layernorm_fwd_tma[(num_persist,)](
         inputs["x"], inputs["w"], inputs["b"], inputs["yh"], inputs["M"], EPS,
         row_stride=inputs["x"].stride(0), N=N, BLOCK_M=BLOCK_M, BLOCK_N=512,
-        NUM_PERSIST=num_persist, num_warps=4,
+        NUM_PERSIST=num_persist,
     )
     return inputs["yh"]
 

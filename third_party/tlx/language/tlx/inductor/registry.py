@@ -1150,12 +1150,16 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
     # regime; on gfx950 they beat the BLOCK_N<=128 tiles on large-N shapes (e.g.
     # 1024x22272x1024 reaches ~98% of rocBLAS, up from ~92%). LDS: (128x256x64,NB2)
     # = 96KB, (128x256x32,NB3) = 72KB -- both fit gfx950 (256x256x64 does not).
+    # (128x256x64,NB3) = 144KB fits gfx950's 160KB (occupancy 1); it is the deeper-
+    # prefetch tile that won the standalone split-K sweep on low-occupancy large-K
+    # (e.g. 1024x6144x22272 at SK=4), which the NB=2 variant alone could not reach.
     WARPPIPE_CONFIGS = [
         (64, 64, 128, 8, 8, 3),
         (64, 64, 64, 8, 8, 3),
         (128, 128, 64, 8, 8, 2),
         (64, 128, 64, 8, 8, 2),
         (128, 256, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 3),
         (128, 256, 32, 8, 8, 3),
     ]
 
@@ -1210,6 +1214,19 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         ):
             return
         num_xcds = _amd_num_xcds()
+        # split-K only helps grids that leave CUs idle. NUM_SMS is the device CU count
+        # (get_num_sms() maps to multi_processor_count = CUs on ROCm; 256 on gfx950/MI350X);
+        # a grid with fewer MN tiles than this is undersaturated and benefits from
+        # partitioning K across extra programs (summed by _reduce_k_kernel).
+        NUM_SMS = get_num_sms()
+        # split-K bypasses store_output's bias epilogue; the reduction re-adds only a
+        # plain bias (i.e. alpha*(A@B) + beta*bias with alpha=beta=1). Restrict split-K
+        # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
+        # returns a plain False, so this stays safe for symbolic scalars.
+        scalars = getattr(kernel_inputs, "_scalars", None) or {}
+        allow_split_k = scalars.get("alpha", 1) == 1 and scalars.get("beta", 1) == 1
+        m_hint = sizevars.optimization_hint(m, fallback=NUM_SMS)
+        n_hint = sizevars.optimization_hint(n, fallback=NUM_SMS)
         for (
             block_m,
             block_n,
@@ -1224,22 +1241,49 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
             # warp-pipeline correctness guard: K_ITERS > NUM_BUFFERS.
             if not sizevars.statically_known_true(sympy.Gt(k, num_buffers * block_k)):
                 continue
-            triton_config = self.triton_config(
-                1,  # num_stages=1: TLX is hand-pipelined; auto software-pipelining must be off
-                num_warps,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
-                BLOCK_K=block_k,
-                GROUP_M=group_m,
-                NUM_BUFFERS=num_buffers,
-                NUM_XCDS=num_xcds,
-                matrix_instr_nonkdim=16,
-                waves_per_eu=0,
-                kpack=get_default_kpack(block_k),
+            # SPLIT_K=1 (plain data-parallel) is always offered. Add split candidates
+            # only for undersaturated grids, and only when each split still runs
+            # K_ITERS/SPLIT_K > NUM_BUFFERS iters (statically checked via k > NB*BK*SK)
+            # so the warp-pipeline prologue/drain stays well-formed.
+            tiles = ((m_hint + block_m - 1) // block_m) * (
+                (n_hint + block_n - 1) // block_n
             )
-            yield self._convert_config_to_template_kwargs(
-                triton_config, m, n, k, out_dtype
-            )
+            split_ks = [1]
+            if allow_split_k and tiles < NUM_SMS:
+                for sk in (2, 4, 8):
+                    # Cap at ~4 waves. For memory-bound large-K the sweet spot is
+                    # often >1 wave (more concurrent HBM requests -> higher effective
+                    # bandwidth); the standalone sweep's winners filled to 300%
+                    # (e.g. 1024x6144x22272 at SK=4 -> 768 wg / 3 waves). A 2-wave cap
+                    # excluded exactly those, so autotune fell back to a slower SK=1.
+                    if tiles * sk > 4 * NUM_SMS:
+                        break
+                    # correctness: the balanced K-partition gives each split
+                    # base = K_ITERS // SK iters; require base > NUM_BUFFERS so every
+                    # split's warp-pipeline prologue/drain is well-formed. Sufficient
+                    # static condition on K: k > (NUM_BUFFERS + 1) * BLOCK_K * SK.
+                    if sizevars.statically_known_true(
+                        sympy.Gt(k, (num_buffers + 1) * block_k * sk)
+                    ):
+                        split_ks.append(sk)
+            for split_k in split_ks:
+                triton_config = self.triton_config(
+                    1,  # num_stages=1: TLX is hand-pipelined; auto software-pipelining must be off
+                    num_warps,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    GROUP_M=group_m,
+                    NUM_BUFFERS=num_buffers,
+                    NUM_XCDS=num_xcds,
+                    SPLIT_K=split_k,
+                    matrix_instr_nonkdim=16,
+                    waves_per_eu=0,
+                    kpack=get_default_kpack(block_k),
+                )
+                yield self._convert_config_to_template_kwargs(
+                    triton_config, m, n, k, out_dtype
+                )
 
 
 @register_template_heuristic(
@@ -1407,9 +1451,14 @@ def _tlx_tt_generate(self, input_nodes, layout, *args, **kwargs):  # type: ignor
         # SPLIT_K > 1 forces TMA_EPILOGUE_STORE=0, so the TMA descriptor
         # workspace (ws_ptr) from TMAWorkspaceMixin is unused.  Replace it
         # with the split-K fp32 partial-results workspace.
+        # UNINITIALIZED (no zero-fill): every valid output element is written exactly
+        # once -- one (tile, split) program per element, masked to [0,M)x[0,N) -- and
+        # _reduce_k_kernel reads with the same mask, so a zeroed workspace is
+        # unnecessary. ZERO_ON_CALL here would re-zero the full SPLIT_K*M*N fp32 buffer
+        # every call (tens of MB), which dominates and erased the split-K win.
         kwargs["workspace_arg"] = WorkspaceArg(
             count=split_k * layout.size[0] * layout.size[1],
-            zero_mode=WorkspaceZeroMode.ZERO_ON_CALL,
+            zero_mode=WorkspaceZeroMode.UNINITIALIZED,
             device=layout.device,
             outer_name=WorkspaceArg.unique_name("split_k_ws_"),
             inner_name="split_k_ws",
@@ -1789,6 +1838,13 @@ def _tlx_render(self, template, kwargs, record_input_dependent_tracked_event=Fal
     # so they're available in the jinja template.
     if getattr(self, "async_tma_store", False):
         self._register_extra_template_env_fns(self.compute_epilogue, self.output_ptr)
+    elif getattr(self, "_tlx_split_k", 1) > 1:
+        # split-K writes partials to split_k_ws and never store_output()s, so the
+        # output arg would be pruned from the kernel signature -- but the autotuning
+        # harness still passes `out` positionally (arg-count mismatch). Expose
+        # output_ptr() so the template can reference it and keep it in the signature;
+        # the real output is written later by _reduce_k_kernel.
+        self._register_extra_template_env_fns(self.output_ptr)
     return _orig_render(self, template, kwargs, record_input_dependent_tracked_event)
 
 
@@ -1817,6 +1873,31 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
         M_expr = pexpr(self.call_sizes[0])
         N_expr = pexpr(self.call_sizes[1])
 
+        # addmm bias is applied by store_output's epilogue in the non-split path, which
+        # split-K bypasses -> it must be re-added in the reduction. For addmm the bias is
+        # the prefix input node (input_nodes[0], prefix_args=1); plain mm has none.
+        bias_name = None
+        stride_bias_m = 0
+        stride_bias_n = 1
+        if getattr(self, "prefix_args", 0) >= 1 and self.input_nodes:
+            bias_node = self.input_nodes[0]
+            bias_name = bias_node.get_name()
+            bsize = bias_node.get_size()
+            bstride = bias_node.get_layout().stride
+            sizevars = V.graph.sizevars
+
+            def _sh(expr):
+                return int(sizevars.optimization_hint(expr, fallback=1))
+
+            if len(bsize) == 1:
+                # [N] bias broadcast over M
+                stride_bias_m, stride_bias_n = 0, _sh(bstride[0])
+            elif len(bsize) == 2:
+                stride_bias_m = 0 if _sh(bsize[0]) == 1 else _sh(bstride[0])
+                stride_bias_n = 0 if _sh(bsize[1]) == 1 else _sh(bstride[1])
+            else:
+                bias_name = None  # unexpected rank; skip (should not happen for addmm)
+
         emit_reduce_k_call(
             wrapper,
             ws_name=self.workspace_arg.outer_name,
@@ -1825,6 +1906,9 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
             N_expr=N_expr,
             split_k=split_k,
             output_triton_dtype=output_triton_dtype,
+            bias_name=bias_name,
+            stride_bias_m=stride_bias_m,
+            stride_bias_n=stride_bias_n,
         )
     _orig_emit_post_kernel(self, wrapper, kernel_name)
 

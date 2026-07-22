@@ -1,0 +1,42 @@
+digraph balanced_groups {
+  graph [bgcolor="white", pad="0.3", nodesep="0.4", ranksep="0.25"];
+  node [shape=plain, fontname="DejaVu Sans"];
+
+  title [label=<<B>Two-dimensional multicast alternatives</B><BR/><FONT POINT-SIZE="11">Rows reuse A; columns reuse B; rank = local_n * CM + local_m</FONT>>];
+
+  p4 [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#52606d">
+      <TR><TD BORDER="0" COLSPAN="3"><B>4 CTAs: 2 x 2</B></TD></TR>
+      <TR><TD BORDER="0"></TD><TD BGCOLOR="#d9eaf7"><B>B0</B></TD><TD BGCOLOR="#d9eaf7"><B>B1</B></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A0</B></TD><TD>rank 0<BR/><FONT POINT-SIZE="9">A0+B0</FONT></TD><TD>rank 2<BR/><FONT POINT-SIZE="9">A0+B1</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A1</B></TD><TD>rank 1<BR/><FONT POINT-SIZE="9">A1+B0</FONT></TD><TD>rank 3<BR/><FONT POINT-SIZE="9">A1+B1</FONT></TD></TR>
+      <TR><TD BORDER="0" COLSPAN="3"><FONT POINT-SIZE="10">A reuse 2x | B reuse 2x<BR/>2 A loads + 2 B loads</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  p8a [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#52606d">
+      <TR><TD BORDER="0" COLSPAN="5"><B>8 CTAs: 2 x 4</B></TD></TR>
+      <TR><TD BORDER="0"></TD><TD BGCOLOR="#d9eaf7"><B>B0</B></TD><TD BGCOLOR="#d9eaf7"><B>B1</B></TD><TD BGCOLOR="#d9eaf7"><B>B2</B></TD><TD BGCOLOR="#d9eaf7"><B>B3</B></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A0</B></TD><TD>0<BR/><FONT POINT-SIZE="9">A0+B0</FONT></TD><TD>2<BR/><FONT POINT-SIZE="9">A0+B1</FONT></TD><TD>4<BR/><FONT POINT-SIZE="9">A0+B2</FONT></TD><TD>6<BR/><FONT POINT-SIZE="9">A0+B3</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A1</B></TD><TD>1<BR/><FONT POINT-SIZE="9">A1+B0</FONT></TD><TD>3<BR/><FONT POINT-SIZE="9">A1+B1</FONT></TD><TD>5<BR/><FONT POINT-SIZE="9">A1+B2</FONT></TD><TD>7<BR/><FONT POINT-SIZE="9">A1+B3</FONT></TD></TR>
+      <TR><TD BORDER="0" COLSPAN="5"><FONT POINT-SIZE="10">A reuse 4x | B reuse 2x<BR/>2 A loads + 4 B loads</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  p8b [label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="9" COLOR="#52606d">
+      <TR><TD BORDER="0" COLSPAN="3"><B>8 CTAs: 4 x 2</B></TD></TR>
+      <TR><TD BORDER="0"></TD><TD BGCOLOR="#d9eaf7"><B>B0</B></TD><TD BGCOLOR="#d9eaf7"><B>B1</B></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A0</B></TD><TD>0<BR/><FONT POINT-SIZE="9">A0+B0</FONT></TD><TD>4<BR/><FONT POINT-SIZE="9">A0+B1</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A1</B></TD><TD>1<BR/><FONT POINT-SIZE="9">A1+B0</FONT></TD><TD>5<BR/><FONT POINT-SIZE="9">A1+B1</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A2</B></TD><TD>2<BR/><FONT POINT-SIZE="9">A2+B0</FONT></TD><TD>6<BR/><FONT POINT-SIZE="9">A2+B1</FONT></TD></TR>
+      <TR><TD BGCOLOR="#dff2df"><B>A3</B></TD><TD>3<BR/><FONT POINT-SIZE="9">A3+B0</FONT></TD><TD>7<BR/><FONT POINT-SIZE="9">A3+B1</FONT></TD></TR>
+      <TR><TD BORDER="0" COLSPAN="3"><FONT POINT-SIZE="10">A reuse 2x | B reuse 4x<BR/>4 A loads + 2 B loads</FONT></TD></TR>
+    </TABLE>
+  >];
+
+  { rank=same; p4; p8a; p8b; }
+  title -> p8a [style=invis];
+  p4 -> p8a -> p8b [style=invis];
+}

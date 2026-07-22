@@ -540,8 +540,10 @@ bool AsyncTMAReduceOp::isSupportedReduceKind(DescriptorReduceKind kind,
   case DescriptorReduceKind::INC:
   case DescriptorReduceKind::DEC:
     return false;
+  case DescriptorReduceKind::NONE:
+    break;
   }
-  llvm_unreachable("unknown descriptor reduce kind");
+  llvm_unreachable("unexpected reduce kind for async_tma_reduce");
 }
 
 // -- AsyncTMACopyGlobalToLocalOp --

@@ -644,11 +644,12 @@ static void computeClusterIds(ttg::ScheduleLoop &loop) {
 
 /// Build a ScheduleLoop for a loop. For super-nodes (nested loops), builds
 /// its own DDG and schedule recursively — works at any nesting depth.
-static unsigned buildScheduleLoop(scf::ForOp loop,
-                                  const ttg::DataDependenceGraph &ddg,
-                                  const ttg::ModuloScheduleResult &sched,
-                                  ttg::ScheduleGraph &graph,
-                                  const ttg::LatencyModel &model) {
+static unsigned buildScheduleLoop(
+    scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
+    const ttg::ModuloScheduleResult &sched, ttg::ScheduleGraph &graph,
+    const ttg::LatencyModel &model,
+    const llvm::DenseMap<Operation *, ttg::DataPartitionInfo> &partition =
+        llvm::DenseMap<Operation *, ttg::DataPartitionInfo>()) {
   unsigned loopId = graph.addLoop(loop);
   auto &schedLoop = graph.getLoop(loopId);
   schedLoop.II = sched.II;
@@ -688,12 +689,16 @@ static unsigned buildScheduleLoop(scf::ForOp loop,
 
     if (ddgNode.isSuperNode) {
       if (auto innerLoop = dyn_cast<scf::ForOp>(ddgNode.op)) {
-        auto childDDG = ttg::DataDependenceGraph::build(innerLoop, model);
+        // Pass A.5: build and schedule the child under the same partition so
+        // its dumped II / ScheduleNodes match the partitioned inner MMA.
+        auto childDDG =
+            ttg::DataDependenceGraph::build(innerLoop, model, partition);
+        childDDG.applyDataPartition(partition);
         if (childDDG.getNumNodes() > 0) {
           auto childSched = ttg::runModuloScheduling(childDDG);
           if (succeeded(childSched)) {
-            unsigned childId = buildScheduleLoop(innerLoop, childDDG,
-                                                 *childSched, graph, model);
+            unsigned childId = buildScheduleLoop(
+                innerLoop, childDDG, *childSched, graph, model, partition);
             sn.childPipelineId = childId;
             sn.prologueLatency = graph.getLoop(childId).prologueLatency;
           }
@@ -958,10 +963,12 @@ enumerateDataPartitionCandidates(Operation *op) {
   if (shape.size() != 2)
     return out;
   int64_t bm = shape[0];
-  int64_t minM = 64;
+  // The per-CTA TMEM block granularity along M: a group's accumulator must be a
+  // whole number of these blocks (a ragged M has no valid TMEM tiling).
+  int64_t blockM = 0;
   if (auto tmem = dyn_cast<ttng::TensorMemoryEncodingAttr>(accTy.getEncoding()))
-    minM = std::max<int64_t>(minM, tmem.getBlockM() *
-                                       tmem.getCGALayout().getCTASplitNum()[0]);
+    blockM = tmem.getBlockM() * tmem.getCGALayout().getCTASplitNum()[0];
+  int64_t minM = std::max<int64_t>(64, blockM);
 
   // Trace the accumulator memdesc to its TMEMAllocOp. The persistent shape
   // carries only the write-dep token as an inner-loop iter-arg, so the
@@ -979,11 +986,25 @@ enumerateDataPartitionCandidates(Operation *op) {
     return out;
   }
 
+  // TMEM holds at most kTmemLaneRows rows per CTA. A legal M-split brings each
+  // group's per-CTA M under that limit AND tiles it to whole blockM blocks;
+  // anything else is unallocatable (the TMEM allocator's findFirstFit asserts
+  // in debug / degenerates in release, and the op verifiers only check the
+  // encoding params, not total M). The upper bound has to live HERE, in the
+  // single source of candidates: the auto search filters it via tmemLegalFor,
+  // but the explicit-factor path (addMMAToPlanIfLegal) and the dumped
+  // data_partition_candidates surface both trust this list as-is.
+  constexpr int64_t kTmemLaneRows = 128;
   for (int64_t n = 2; n * minM <= bm; ++n) {
     if (bm % n != 0)
       continue;
+    int64_t mSize = bm / n;
+    if (mSize > kTmemLaneRows)
+      continue;
+    if (blockM > 0 && mSize % blockM != 0)
+      continue;
     out.push_back({op, allocOp.getOperation(), static_cast<unsigned>(n),
-                   static_cast<unsigned>(bm / n)});
+                   static_cast<unsigned>(mSize)});
   }
   return out;
 }
@@ -1020,15 +1041,19 @@ static DataPartitionPlan computeDataPartitionPlan(ModuleOp moduleOp,
   return plan;
 }
 
-// A uniform-factor plan for the A.5 auto search: every MMA where `N` is a
-// legal split gets it; per-loop `tt.data_partition_factor` attrs are NOT
-// consulted (auto mode is whole-module).
+// A search-variant plan for the A.5 auto search: an MMA pinned by an explicit
+// `tt.data_partition_factor` attr keeps that factor; every other MMA gets the
+// searched `N` where it is a legal split. This is per-MMA, so a module that
+// pins one loop and auto-searches the rest resolves each MMA on its own terms
+// (the old whole-module behavior forced N=1 on the un-pinned loops).
 static DataPartitionPlan computeDataPartitionPlanForN(ModuleOp moduleOp,
                                                       unsigned N) {
   DataPartitionPlan plan;
   moduleOp.walk([&](Operation *op) {
-    if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
-      addMMAToPlanIfLegal(op, N, plan);
+    if (!isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(op))
+      return;
+    unsigned pinned = resolveDataPartitionFactor(op, /*optionFactor=*/0);
+    addMMAToPlanIfLegal(op, pinned > 1 ? pinned : N, plan);
   });
   return plan;
 }
@@ -1099,6 +1124,12 @@ static void allocateBuffersForLoop(ttg::ScheduleLoop &loop,
     }
 
     buf.count = computeBufferCount(loop, node.id);
+    // Snapshot the pure lifetime-demanded depth NOW, before the A.5 depth-2
+    // floor and A.7 subtile bump below inflate `count`. The A.5 auto-search's
+    // SMEM-shortfall term is (requestedCount - reduced count) x bytes; sourcing
+    // requestedCount post-floor would book phantom shortfall against exactly
+    // the partitioned variants the floor applies to.
+    buf.requestedCount = buf.count;
     if (loopHasPartMMA && kind == ttg::MemoryKind::SMEM) {
       // Restrict the depth-2 floor to SMEM rings actually consumed by the
       // partitioned MMA (walking through transparent memdesc views). Other
@@ -4551,7 +4582,7 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
                    const ttg::LatencyModel &model,
                    const DataPartitionPlan &plan) {
   ttg::ScheduleGraph graph;
-  buildScheduleLoop(loop, ddg, sched, graph, model);
+  buildScheduleLoop(loop, ddg, sched, graph, model, plan.mmaInfo);
 
   // Decide epilogue subtiling from the cost model BEFORE buffer allocation, so
   // extractBufferShape shrinks the staging buffer ahead of the SMEM reducer.
@@ -4561,10 +4592,6 @@ buildScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
     allocateBuffersForLoop(schedLoop, plan);
     markEpilogueSubtileNodes(schedLoop);
     mergeNonOverlappingBuffers(schedLoop);
-    // Snapshot the lifetime-demanded depths before any budget reduction
-    // below decrements `count` (A.5 auto-search shortfall scoring).
-    for (auto &buf : schedLoop.buffers)
-      buf.requestedCount = buf.count;
   }
 
   llvm::DenseMap<unsigned, unsigned> parentMap;
@@ -4644,12 +4671,14 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
                 triton::ModuleAxisInfoAnalysis &axisInfo, StringRef label,
                 const DataPartitionPlan &plan,
                 bool printScheduleGraph = false) {
-  auto ddg = ttg::DataDependenceGraph::build(loop, model);
+  // Pass A.5: thread the partition into build() so any inner super-node's
+  // innerII is computed from the PARTITIONED inner schedule; then tag this
+  // loop's own MMA bundle(s) so II/ResMII and the dumped ScheduleNode reflect
+  // the N hardware issues. No-op when this loop has no partitioned MMA.
+  auto ddg = ttg::DataDependenceGraph::build(loop, model, plan.mmaInfo);
   if (ddg.getNumNodes() == 0)
     return std::nullopt;
 
-  // Pass A.5: tag the partitioned MMA bundle(s) so II/ResMII and the dumped
-  // ScheduleNode reflect the N hardware issues. No-op when this loop has none.
   ddg.applyDataPartition(plan.mmaInfo);
 
   LDBG(label << " DDG: " << ddg.getNumNodes() << " nodes, "
@@ -5334,22 +5363,28 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 }
 
 // ── Pass A.5 auto search ─────────────────────────────────────────────────────
-// TRITON_DATA_PARTITION_N=auto: pick the data-partition factor by solving
-// each candidate variant with the same scheduler and comparing on the model,
-// instead of requiring the user to name N. The candidate set comes from
+// Picks the data-partition factor by solving each candidate variant with the
+// same scheduler and comparing on the model, instead of requiring the user to
+// name N. Triggered by TRITON_DATA_PARTITION_N=auto (all targets) or, in
+// sched2tlx dump mode, self-triggered when the baseline is TLX-illegal (see
+// dataPartitionAutoSearch). The candidate set comes from
 // enumerateDataPartitionCandidates (a handful of divisors of BM), so the
 // whole search is a few extra in-process schedule runs.
 //
 // Score, lexicographic:
-//   1. TMEM legality — tcgen05 tensor memory has kTmemLanes lanes per
-//      CTA, so an accumulator whose per-CTA, per-group M exceeds the lane
-//      count cannot be allocated at all; a split that brings it under
-//      wins outright (this is what makes BM=256 configs feasible in the
-//      first place). Judged straight off the candidate surface (per-CTA
-//      bm = n x m_size from enumerateDataPartitionCandidates), so it
-//      covers function-scope accumulators (flat kernels, which never
-//      become ScheduleBuffers) and never touches non-accumulator TMEM
-//      (MMA-scaled scale allocs fold rows into columns and are exempt);
+//   1. TMEM legality — this is the TLX `local_alloc` lane constraint of the
+//      sched2tlx target, NOT a universal one: TLX allocates a tcgen05
+//      accumulator as at most kTmemLanes rows, so a per-CTA, per-group M above
+//      the lane count cannot be lowered there and a split that brings it under
+//      wins outright (this is what makes BM=256 configs lowerable). The in-tree
+//      TTGIR allocator instead folds tall M into TMEM columns, so this term is
+//      scoped to the dump/TLX path (the self-trigger only fires in dump mode;
+//      an explicit env override that reaches in-tree is the user's choice).
+//      Judged straight off the candidate surface (per-CTA bm = n x m_size from
+//      enumerateDataPartitionCandidates), so it covers function-scope
+//      accumulators (flat kernels, which never become ScheduleBuffers) and
+//      never touches non-accumulator TMEM (MMA-scaled scale allocs fold rows
+//      into columns and are exempt);
 //   2. loops scheduled (a variant that fails to schedule a loop loses);
 //   3. sum of loop IIs (steady-state throughput; after the occupancy
 //      de-bias in applyDataPartition an M-split conserves MAC area, so
@@ -5360,40 +5395,75 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
 //      operand rings reach full depth.
 // Ties keep the incumbent, so the baseline (N=1) wins unless a split is a
 // strict improvement.
-// tcgen05 tensor memory geometry: 128 lanes per CTA (an alloc is at most
-// 128 rows x 512 columns). Anything taller cannot be allocated at all.
+// TLX local_alloc geometry: it lays a tcgen05 accumulator out as at most 128
+// lanes (rows) x 512 columns per CTA, so a per-CTA M above this cannot be
+// lowered through local_alloc and needs an M-split. (The in-tree TTGIR path
+// folds tall M into columns instead — this bound is the TLX target's, used
+// only on the dump/self-trigger path; see the score doc above.)
 constexpr int64_t kTmemLanes = 128;
+
+// Does any partitionable accumulator exceed the TLX lane limit at baseline
+// (un-split), i.e. is the M-split the only way this module lowers on the TLX
+// target? Skips tt.autows-pinned MMAs (user-tuned, not our realization).
+static bool baselineExceedsTmemLanes(ModuleOp moduleOp) {
+  bool illegal = false;
+  moduleOp.walk([&](Operation *op) {
+    if (op->hasAttr("tt.autows"))
+      return;
+    for (const auto &c : enumerateDataPartitionCandidates(op)) {
+      // Every candidate of an op shares the same baseline BM = n * mSize.
+      if (static_cast<int64_t>(c.n) * c.mSize > kTmemLanes)
+        illegal = true;
+      break;
+    }
+  });
+  return illegal;
+}
 
 static bool dataPartitionAutoSearch(ModuleOp moduleOp, int optionFactor) {
   if (optionFactor > 1)
     return false; // explicit pass option wins
-  if (triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") != "auto")
-    return false;
-  // Explicit per-loop factors also win: if any loop carries a
-  // tt.data_partition_factor attr, keep the classic user-resolved path
-  // (option > attr > numeric env) instead of searching over it.
-  bool hasExplicitAttr = false;
-  moduleOp.walk([&](scf::ForOp forOp) {
-    if (auto attr =
-            forOp->getAttrOfType<IntegerAttr>("tt.data_partition_factor"))
-      if (attr.getInt() > 1)
-        hasExplicitAttr = true;
-  });
-  return !hasExplicitAttr;
+  // Explicit `TRITON_DATA_PARTITION_N=auto` opts every target into the search
+  // (an override that also covers in-tree compiles). Per-loop
+  // tt.data_partition_factor attrs no longer disable it — the search resolves
+  // each MMA on its own terms (pinned MMAs keep their factor; see
+  // computeDataPartitionPlanForN), so a mixed pinned/auto module works.
+  if (triton::tools::getStrEnv("TRITON_DATA_PARTITION_N") == "auto")
+    return true;
+  // Self-trigger only while producing a sched2tlx dump AND only when the
+  // baseline cannot be lowered as-is on the TLX target (an accumulator taller
+  // than the local_alloc lane limit) — there the split is not an optimization
+  // but the only lowerable realization, so it should not depend on a debug
+  // env. In-tree compiles (no dump) fold tall M into TMEM columns and are left
+  // untouched.
+  if (!triton::tools::getStrEnv("TRITON_MODULO_DUMP_SCHEDULE").empty())
+    return baselineExceedsTmemLanes(moduleOp);
+  return false;
 }
 
 static DataPartitionPlan
 searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
                         triton::ModuleAxisInfoAnalysis &axisInfo) {
-  DataPartitionPlan baseline; // empty plan = N=1 everywhere
+  // Baseline respects explicit pins: an MMA with tt.data_partition_factor keeps
+  // that factor even before the search (the user asked for it); every other MMA
+  // is N=1. Variants (computeDataPartitionPlanForN) layer the searched N onto
+  // only the un-pinned MMAs, so a pinned MMA never re-enters the search.
+  DataPartitionPlan baseline =
+      computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
   std::set<unsigned> factors;
   // Per-MMA per-CTA accumulator height, off the candidate surface (every
   // candidate has mSize = bm / n, so bm = n * mSize). This is the basis of
   // the TMEM-legality score term — deliberately NOT derived from
   // ScheduleBuffers, which only exist for allocs inside a scheduled loop
   // body (a flat kernel's function-scope accumulator would be invisible).
+  // Skip tt.autows-pinned MMAs: they live in loops the evaluate() loop and the
+  // real orchestrator both skip (hasExistingAnnotation), so no plan here ever
+  // realizes their split — crediting a variant with "fixing" them would be
+  // fictitious and could drag a partition onto an unrelated healthy loop.
   SmallVector<std::pair<Operation *, int64_t>> accRows;
   moduleOp.walk([&](Operation *op) {
+    if (op->hasAttr("tt.autows"))
+      return;
     auto cands = enumerateDataPartitionCandidates(op);
     if (cands.empty())
       return;
@@ -6071,6 +6141,17 @@ void jsonDumpOpsTable(llvm::raw_ostream &os, tt::FuncOp kernelFn,
 // unpartitioned). External tooling can re-run the pass with
 // TRITON_DATA_PARTITION_N=<n> per candidate and compare the resulting
 // schedules.
+//
+// Walks sl.graph.loops.front() per ScheduledLoop, matching the loops section
+// of the document (writeScheduleGraphDoc), so loop_id here == loop_id there.
+// This relies on the single-loop-per-graph shape (ScheduleGraph.loops size 1)
+// that fbsource beta produces; it does NOT drop any MMA candidate even when a
+// graph carries a nested child, because the orchestrator schedules every
+// MMA-bearing loop as its own "Inner" ScheduledLoop entry (see the hasMMA path
+// in runOnOperation), which the outer loop over scheduledLoops covers. If a
+// graph ever holds an MMA in a non-front loop with no separate entry, both
+// sections would need to iterate all sl.graph.loops together to keep loop_id
+// consistent.
 void jsonDumpDataPartitionCandidates(llvm::raw_ostream &os,
                                      ArrayRef<ScheduledLoop> scheduledLoops) {
   os << "  \"data_partition_candidates\": [";

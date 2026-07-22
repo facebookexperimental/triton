@@ -394,7 +394,7 @@ def get_cuda_autotune_config():
         for num_ctas in [1, 2]
         for split_k in [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 19, 24]  # pruning selects one optimal SPLIT_K per tile group
         for interleave in [0, 1]
-        for g in [1, 8, 64]
+        for g in [1, 2, 8, 64]
         for uwb in [False, True]
     ]
 
@@ -595,8 +595,11 @@ def preprocess_configs(configs, named_args, **kwargs):
     if pruned_configs:
         IMBALANCE_THRESHOLD = 10  # ratio at which we enforce the rule
         if M > N * IMBALANCE_THRESHOLD:
-            # M >> N: keep only small GROUP_SIZE_M to sweep M
-            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] == 1]
+            # M >> N: keep the smallest GROUP_SIZE_M to sweep M. 2-CTA requires
+            # GROUP_SIZE_M to be a multiple of NUM_CTAS (see the pairing gate
+            # above), so its smallest valid value is NUM_CTAS (2), not 1 —
+            # forcing 1 here would silently prune every 2-CTA config.
+            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] == c.kwargs["NUM_CTAS"]]
         elif N > M * IMBALANCE_THRESHOLD:
             # N >> M: keep only large GROUP_SIZE_M to sweep N
             pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] >= 32]
@@ -696,6 +699,7 @@ def _process_tile_epilogue_inner(
     tmem_empty_bars,
     cur_tmem_buf,
     tmem_read_phase,
+    NUM_CTAS: tl.constexpr,
 ):
     """Process epilogue for a single tile."""
     mn_tile_id = tile_id if SPLIT_K == 1 else tile_id % num_mn_tiles
@@ -727,7 +731,10 @@ def _process_tile_epilogue_inner(
         tlx.barrier_wait(tmem_full_bars[buf_idx_0], tmem_read_phase)
         acc_sub = tlx.local_slice(acc_tmem_0, [0, 0 * slice_size], [BLOCK_M_SPLIT, slice_size])
         result = tlx.local_load(acc_sub)
-        tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
+        if NUM_CTAS == 2:
+            tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
         c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[0]
         tlx.local_store(c_smem, c)
@@ -742,7 +749,10 @@ def _process_tile_epilogue_inner(
         tlx.barrier_wait(tmem_full_bars[buf_idx_1], tmem_read_phase)
         acc_sub = tlx.local_slice(acc_tmem_1, [0, 0 * slice_size], [BLOCK_M_SPLIT, slice_size])
         result = tlx.local_load(acc_sub)
-        tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
+        if NUM_CTAS == 2:
+            tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1, remote_cta_rank=0)
+        else:
+            tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
         c = result.to(tlx.dtype_of(out_desc))
         c_smem = c_smem_buffers[1]
         tlx.local_store(c_smem, c)
@@ -758,7 +768,10 @@ def _process_tile_epilogue_inner(
             # Group 0
             acc_sub = tlx.local_slice(acc_tmem_0, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
             result = tlx.local_load(acc_sub)
-            tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
+            if NUM_CTAS == 2:
+                tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1, remote_cta_rank=0)
+            else:
+                tlx.barrier_arrive(tmem_empty_bars[buf_idx_0], 1)
             c = result.to(tlx.dtype_of(out_desc))
             c_smem = c_smem_buffers[0]
             tlx.async_descriptor_store_wait(1)
@@ -773,7 +786,10 @@ def _process_tile_epilogue_inner(
             # Group 1
             acc_sub = tlx.local_slice(acc_tmem_1, [0, slice_id * slice_size], [BLOCK_M_SPLIT, slice_size])
             result = tlx.local_load(acc_sub)
-            tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
+            if NUM_CTAS == 2:
+                tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1, remote_cta_rank=0)
+            else:
+                tlx.barrier_arrive(tmem_empty_bars[buf_idx_1], 1)
             c = result.to(tlx.dtype_of(out_desc))
             c_smem = c_smem_buffers[1]
             tlx.async_descriptor_store_wait(1)
@@ -801,7 +817,10 @@ def _process_tile_epilogue_inner(
                     [BLOCK_M_SPLIT, slice_size],
                 )
                 result = tlx.local_load(acc_tmem_subslice)
-                tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
+                if NUM_CTAS == 2:
+                    tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1, remote_cta_rank=0)
+                else:
+                    tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
                 c = result.to(tlx.dtype_of(out_desc))
                 c_smem = c_smem_buffers[(group_id * EPILOGUE_SUBTILE + slice_id) % 2]
                 tlx.async_descriptor_store_wait(1)
@@ -836,8 +855,6 @@ def _process_tile_mma_inner(
     tmem_write_phase,
     smem_accum_cnt,
     NUM_CTAS,
-    cta_bars,
-    pred_cta0,
     A_ROW_MAJOR: tl.constexpr = True,
     B_ROW_MAJOR: tl.constexpr = True,
 ):
@@ -850,7 +867,9 @@ def _process_tile_mma_inner(
     if NUM_MMA_GROUPS == 1:
         tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase ^ 1)
 
-    # wait for current phase(round) of load for this buf
+    # In the single-group path B_smem_full_bars aliases A_smem_full_bars, so
+    # this one wait covers both TMA loads. Multi-group waits on B here and each
+    # A subtile below.
     tlx.barrier_wait(B_smem_full_bars[buf], phase)
 
     # Process first K iteration (peeled) with use_acc=False
@@ -859,23 +878,19 @@ def _process_tile_mma_inner(
         a_buf = group_id * NUM_SMEM_BUFFERS + buf
         acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
-        # Wait for this A subtile buffer to be loaded
-        tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
-
         if NUM_MMA_GROUPS > 1:
+            # Wait for this A subtile buffer to be loaded.
+            tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
+
             cur_barrier_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
             tlx.barrier_wait(tmem_empty_bars[cur_barrier_idx], tmem_write_phase ^ 1)
-
-        # CTA0 waits for CTA0 and CTA1 to finish loading A and B before issuing dot op
-        if NUM_CTAS == 2:
-            tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
-            tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
 
         # Transpose SMEM buffers if inputs were column-major
         a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
         b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
 
-        # Perform MMA: use_acc=False for first K iteration (clears accumulator)
+        # Perform MMA: use_acc=False for first K iteration (clears accumulator).
+        # This helper only runs on CTA0 in 2-CTA mode.
         tlx.async_dot(
             a_operand,
             b_operand,
@@ -897,7 +912,7 @@ def _process_tile_mma_inner(
             buf = 0
             phase ^= 1
 
-        # wait for current phase(round) of load for this buf
+        # In the single-group path this aliases the combined A/B full barrier.
         tlx.barrier_wait(B_smem_full_bars[buf], phase)
 
         # Process all subtiles for this K iteration
@@ -906,19 +921,15 @@ def _process_tile_mma_inner(
             a_buf = group_id * NUM_SMEM_BUFFERS + buf
             acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
-            # Wait for this A subtile buffer to be loaded
-            tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
-
-            # CTA0 waits for CTA0 and CTA1 to finish loading A and B before issuing dot op
-            if NUM_CTAS == 2:
-                tlx.barrier_arrive(cta_bars[a_buf], arrive_count=1, remote_cta_rank=0)
-                tlx.barrier_wait(cta_bars[a_buf], phase=phase, pred=pred_cta0)
+            if NUM_MMA_GROUPS > 1:
+                # Wait for this A subtile buffer to be loaded.
+                tlx.barrier_wait(A_smem_full_bars[a_buf], phase)
 
             # Transpose SMEM buffers if inputs were column-major
             a_operand = tlx.local_trans(buffers_A[a_buf]) if not A_ROW_MAJOR else buffers_A[a_buf]
             b_operand = tlx.local_trans(buffers_B[buf]) if not B_ROW_MAJOR else buffers_B[buf]
 
-            # Perform MMA: use_acc=True for remaining K iterations
+            # Perform MMA: use_acc=True for remaining K iterations.
             tlx.async_dot(
                 a_operand,
                 b_operand,
@@ -981,6 +992,8 @@ def _process_tile_producer_inner(
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_SIZE_M // NUM_MMA_GROUPS
     offs_bn = pid_n * BLOCK_SIZE_N + cluster_cta_rank * (BLOCK_SIZE_N // NUM_CTAS)
     expected_bytes: tl.constexpr = dsize * BLOCK_SIZE_N * BLOCK_SIZE_K // NUM_CTAS
+    leader_only_mma: tl.constexpr = NUM_CTAS == 2
+    is_leader = cluster_cta_rank == 0
 
     local_k_tiles = k_tile_end - k_tile_start
 
@@ -995,45 +1008,58 @@ def _process_tile_producer_inner(
         offs_am = pid_m * BLOCK_SIZE_M
         if NUM_MMA_GROUPS == 1:
             tlx.barrier_wait(A_smem_empty_bars[buf], phase ^ 1)
-            tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
-            if not B_ROW_MAJOR:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
-                                          eviction_policy="evict_last")
+            # Both TMA loads contribute bytes to the same full barrier.
+            a_expected_bytes: tl.constexpr = dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K
+            combined_bytes: tl.constexpr = expected_bytes + a_expected_bytes
+            if leader_only_mma:
+                tlx.barrier_expect_bytes(A_smem_full_bars[buf], combined_bytes * NUM_CTAS, pred=is_leader)
             else:
-                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                          eviction_policy="evict_last")
+                tlx.barrier_expect_bytes(A_smem_full_bars[buf], combined_bytes)
+            if not B_ROW_MAJOR:
+                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], A_smem_full_bars[buf],
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
+            else:
+                tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], A_smem_full_bars[buf],
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
 
-            tlx.barrier_wait(A_smem_empty_bars[buf], phase ^ 1)
-            tlx.barrier_expect_bytes(A_smem_full_bars[buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
             if not A_ROW_MAJOR:
                 tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_k, offs_am], A_smem_full_bars[buf],
-                                          eviction_policy="evict_last")
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
             else:
                 tlx.async_descriptor_load(a_desc, buffers_A[buf], [offs_am, offs_k], A_smem_full_bars[buf],
-                                          eviction_policy="evict_last")
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
         else:
             a0_buf = buf
             tlx.barrier_wait(A_smem_empty_bars[a0_buf], phase ^ 1)
-            tlx.barrier_expect_bytes(A_smem_full_bars[a0_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
+            a_expected_bytes: tl.constexpr = dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K
+            if leader_only_mma:
+                tlx.barrier_expect_bytes(A_smem_full_bars[a0_buf], a_expected_bytes * NUM_CTAS, pred=is_leader)
+            else:
+                tlx.barrier_expect_bytes(A_smem_full_bars[a0_buf], a_expected_bytes)
             if not A_ROW_MAJOR:
                 tlx.async_descriptor_load(a_desc, buffers_A[a0_buf], [offs_k, offs_am], A_smem_full_bars[a0_buf],
-                                          eviction_policy="evict_last")
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
             else:
                 tlx.async_descriptor_load(a_desc, buffers_A[a0_buf], [offs_am, offs_k], A_smem_full_bars[a0_buf],
-                                          eviction_policy="evict_last")
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
 
             a1_buf = NUM_SMEM_BUFFERS + buf
             tlx.barrier_wait(A_smem_empty_bars[a1_buf], phase ^ 1)
-            tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
+            if leader_only_mma:
+                tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes * NUM_CTAS, pred=is_leader)
+            else:
+                tlx.barrier_expect_bytes(B_smem_full_bars[buf], expected_bytes)
             if not B_ROW_MAJOR:
                 tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_bn, offs_k], B_smem_full_bars[buf],
-                                          eviction_policy="evict_last")
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
             else:
                 tlx.async_descriptor_load(b_desc, buffers_B[buf], [offs_k, offs_bn], B_smem_full_bars[buf],
-                                          eviction_policy="evict_last")
+                                          eviction_policy="evict_last", two_ctas=leader_only_mma)
 
-            tlx.barrier_wait(A_smem_empty_bars[a1_buf], phase ^ 1)
-            tlx.barrier_expect_bytes(A_smem_full_bars[a1_buf], dsize * BLOCK_M_SPLIT * BLOCK_SIZE_K)
+            if leader_only_mma:
+                tlx.barrier_expect_bytes(A_smem_full_bars[a1_buf], a_expected_bytes * NUM_CTAS, pred=is_leader)
+            else:
+                tlx.barrier_expect_bytes(A_smem_full_bars[a1_buf], a_expected_bytes)
             if not A_ROW_MAJOR:
                 tlx.async_descriptor_load(
                     a_desc,
@@ -1041,6 +1067,7 @@ def _process_tile_producer_inner(
                     [offs_k, offs_am + BLOCK_M_SPLIT],
                     A_smem_full_bars[a1_buf],
                     eviction_policy="evict_last",
+                    two_ctas=leader_only_mma,
                 )
             else:
                 tlx.async_descriptor_load(
@@ -1049,6 +1076,7 @@ def _process_tile_producer_inner(
                     [offs_am + BLOCK_M_SPLIT, offs_k],
                     A_smem_full_bars[a1_buf],
                     eviction_policy="evict_last",
+                    two_ctas=leader_only_mma,
                 )
 
         smem_accum_cnt += 1
@@ -1157,6 +1185,7 @@ def matmul_kernel_tma_ws_blackwell(
     SPLIT_K: tl.constexpr,
     INTERLEAVE_EPILOGUE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    NUM_CLC_STAGES: tl.constexpr = 1,
     A_ROW_MAJOR: tl.constexpr = True,
     B_ROW_MAJOR: tl.constexpr = True,
     USE_WARP_BARRIER: tl.constexpr = False,
@@ -1202,29 +1231,36 @@ def matmul_kernel_tma_ws_blackwell(
     # CTA pairs are placed along M dim
     if NUM_CTAS == 2:
         cluster_cta_rank = tlx.cluster_cta_rank()
-        pred_cta0 = cluster_cta_rank == 0
-        cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS,
-                                      arrive_count=2)  # CTA0 waits for CTA1's data before mma
     else:
         cluster_cta_rank = 0
-        pred_cta0 = False
-        cta_bars = None
 
     # allocate barriers - each subtile needs its own barriers
     # NUM_SMEM_BUFFERS barriers per subtile for synchronization
     A_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     A_smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
-    B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    if NUM_MMA_GROUPS == 1:
+        # A and B TMA loads share the same transaction-byte-counted barrier.
+        B_smem_full_bars = A_smem_full_bars
+    else:
+        B_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1)
     # NUM_TMEM_BUFFERS (overlaps MMA and epilogue)
+    tmem_empty_arrivals: tl.constexpr = EPILOGUE_SUBTILE * NUM_CTAS
     if USE_WARP_BARRIER:
         tmem_empty_bars = tlx.alloc_warp_barrier(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, num_warps=4,
-                                                 num_arrivals=EPILOGUE_SUBTILE)
+                                                 num_arrivals=tmem_empty_arrivals)
     else:
         tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
-                                             arrive_count=EPILOGUE_SUBTILE)
+                                             arrive_count=tmem_empty_arrivals)
 
-    with tlx.async_tasks(exclusive=True, no_ending_cluster_sync=True):
+    # Each of the three async tasks consumes CLC responses on both cluster CTAs.
+    clc_context = tlx.clc_create_context(num_consumers=3 * NUM_CTAS, num_stages=NUM_CLC_STAGES)
+
+    with tlx.async_tasks(
+            exclusive=True,
+            no_ending_cluster_sync=True,
+            mbarrier_try_wait_suspend_ns=50000,
+    ):
         with tlx.async_task("default"):  # epilogue consumer
             (
                 start_pid,
@@ -1248,11 +1284,14 @@ def matmul_kernel_tma_ws_blackwell(
 
             tmem_accum_cnt = 0
             tile_id = start_pid
+            clc_phase_producer = 1
+            clc_phase_consumer = 0
 
-            while tile_id < num_tiles:
-                # Skip tiles whose split has zero K-tiles (last split
-                # can be empty when cdiv(k_tiles_total, SPLIT_K) * (SPLIT_K-1)
-                # >= k_tiles_total).
+            while tile_id != -1:
+                # Prefetch the next dynamically claimed tile while processing
+                # the current tile to cover the persistent-loop boundary.
+                tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_producer ^= 1
                 if SPLIT_K == 1:
                     # Fast path: one split covers all K-tiles; avoids the
                     # runtime-divisor `tile_id // num_mn_tiles` division.
@@ -1287,9 +1326,11 @@ def matmul_kernel_tma_ws_blackwell(
                         tmem_empty_bars=tmem_empty_bars,
                         cur_tmem_buf=cur_tmem_buf,
                         tmem_read_phase=tmem_read_phase,
+                        NUM_CTAS=NUM_CTAS,
                     )
                     tmem_accum_cnt += 1
-                tile_id += NUM_SMS
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # MMA consumer
             (
@@ -1315,8 +1356,9 @@ def matmul_kernel_tma_ws_blackwell(
             tmem_accum_cnt = 0
             smem_accum_cnt = 0
             tile_id = start_pid
+            clc_phase_consumer = 0
 
-            while tile_id < num_tiles:
+            while tile_id != -1:
                 # Compute K range for this split
                 if SPLIT_K == 1:
                     # Fast path: one split covers all K-tiles; avoids the
@@ -1331,32 +1373,44 @@ def matmul_kernel_tma_ws_blackwell(
 
                 # Skip tiles whose split has zero K-tiles
                 if SPLIT_K == 1 or k_tile_end > k_tile_start:
-                    cur_tmem_buf, tmem_write_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
-                    smem_accum_cnt = _process_tile_mma_inner(
-                        k_tile_start=k_tile_start,
-                        k_tile_end=k_tile_end,
-                        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                        NUM_MMA_GROUPS=NUM_MMA_GROUPS,
-                        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-                        buffers_A=buffers_A,
-                        buffers_B=buffers_B,
-                        tmem_buffers=tmem_buffers,
-                        A_smem_full_bars=A_smem_full_bars,
-                        B_smem_full_bars=B_smem_full_bars,
-                        A_smem_empty_bars=A_smem_empty_bars,
-                        tmem_full_bars=tmem_full_bars,
-                        cur_tmem_buf=cur_tmem_buf,
-                        tmem_empty_bars=tmem_empty_bars,
-                        tmem_write_phase=tmem_write_phase,
-                        smem_accum_cnt=smem_accum_cnt,
-                        NUM_CTAS=NUM_CTAS,
-                        cta_bars=cta_bars,
-                        pred_cta0=pred_cta0,
-                        A_ROW_MAJOR=A_ROW_MAJOR,
-                        B_ROW_MAJOR=B_ROW_MAJOR,
-                    )
+                    # In 2-CTA mode, only CTA0 issues the collaborative MMA. CTA1's
+                    # producer still loads its local operand slice, and cta_group::2
+                    # TMA completion routes readiness to CTA0's barriers. Skipping
+                    # the inner MMA loop on CTA1 avoids duplicating its address,
+                    # predicate, and wait bookkeeping.
+                    if NUM_CTAS == 1 or cluster_cta_rank == 0:
+                        cur_tmem_buf, tmem_write_phase = get_bufidx_phase(tmem_accum_cnt, NUM_TMEM_BUFFERS)
+                        smem_accum_cnt = _process_tile_mma_inner(
+                            k_tile_start=k_tile_start,
+                            k_tile_end=k_tile_end,
+                            NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                            NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                            NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
+                            buffers_A=buffers_A,
+                            buffers_B=buffers_B,
+                            tmem_buffers=tmem_buffers,
+                            A_smem_full_bars=A_smem_full_bars,
+                            B_smem_full_bars=B_smem_full_bars,
+                            A_smem_empty_bars=A_smem_empty_bars,
+                            tmem_full_bars=tmem_full_bars,
+                            cur_tmem_buf=cur_tmem_buf,
+                            tmem_empty_bars=tmem_empty_bars,
+                            tmem_write_phase=tmem_write_phase,
+                            smem_accum_cnt=smem_accum_cnt,
+                            NUM_CTAS=NUM_CTAS,
+                            A_ROW_MAJOR=A_ROW_MAJOR,
+                            B_ROW_MAJOR=B_ROW_MAJOR,
+                        )
+                    else:
+                        # Keep CTA1's ring-buffer position aligned with CTA0 so
+                        # subsequent producer/CLC iterations derive identical
+                        # buffer indices and phases, without executing MMA work.
+                        smem_accum_cnt += k_tile_end - k_tile_start
+                    # Both CTAs advance the logical TMEM tile counter because
+                    # their epilogue and CLC tasks consume the same tile stream.
                     tmem_accum_cnt += 1
-                tile_id += NUM_SMS
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_consumer ^= 1
 
         with tlx.async_task(num_warps=1, num_regs=24):  # producer, TMA load
             (
@@ -1381,8 +1435,9 @@ def matmul_kernel_tma_ws_blackwell(
 
             smem_accum_cnt = 0
             tile_id = start_pid
+            clc_phase_consumer = 0
 
-            while tile_id < num_tiles:
+            while tile_id != -1:
                 # Compute K range for this split
                 if SPLIT_K == 1:
                     # Fast path: one split covers all K-tiles; avoids the
@@ -1424,7 +1479,8 @@ def matmul_kernel_tma_ws_blackwell(
                         A_ROW_MAJOR=A_ROW_MAJOR,
                         B_ROW_MAJOR=B_ROW_MAJOR,
                     )
-                tile_id += NUM_SMS
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=NUM_CTAS == 2)
+                clc_phase_consumer ^= 1
 
 
 def matmul(a, b, config=None):
@@ -1511,7 +1567,7 @@ def matmul(a, b, config=None):
         num_pid_n = triton.cdiv(N, config["BLOCK_SIZE_N"])
         num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
         total_tiles = num_pid_m * num_pid_n * split_k
-        grid = (min(NUM_SMS, total_tiles), )
+        grid = (total_tiles, )
         matmul_kernel_tma_ws_blackwell.fn[grid](
             a_desc,
             b_desc,
@@ -1554,7 +1610,7 @@ def matmul(a, b, config=None):
             num_pid_m = (num_pid_m + NUM_CTAS - 1) // NUM_CTAS * NUM_CTAS
             mn_tiles = num_pid_m * num_pid_n
             total_tiles = mn_tiles * META["SPLIT_K"]
-            return (min(NUM_SMS, total_tiles), )
+            return (total_tiles, )
 
         matmul_kernel_tma_ws_blackwell[grid](
             a_desc,

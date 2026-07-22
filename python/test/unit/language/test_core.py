@@ -1018,6 +1018,25 @@ def test_unary_op(dtype_x, expr, num_ctas, device):
     _test_unary(dtype_x, expr, device=device, num_ctas=num_ctas)
 
 
+@triton.jit
+def _neg_signed_zero_kernel(x_ptr, y_ptr):
+    offsets = tl.arange(0, 2)
+    x = tl.load(x_ptr + offsets)
+    tl.store(y_ptr + offsets, -x)
+
+
+@pytest.mark.interpreter
+def test_neg_preserves_signed_zero(device):
+    x = np.array([0.0, -0.0], dtype=np.float32)
+    y = np.empty_like(x)
+    x_tri = to_triton(x, device=device)
+    y_tri = to_triton(y, device=device)
+
+    _neg_signed_zero_kernel[(1, )](x_tri, y_tri)
+
+    np.testing.assert_array_equal(np.signbit(to_numpy(y_tri)), np.array([True, False]))
+
+
 # ----------------
 # test math ops
 # ----------------
@@ -1430,6 +1449,30 @@ def test_noinline(mode, device):
     elif mode == "shared":
         ref = torch.full((16, 16), 16, device=device, dtype=torch.float32)
         assert torch.equal(z, ref + x + y)
+
+
+@triton.jit(noinline=True)
+def noinline_load_block_fn(ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    return tl.load(ptr + offsets)
+
+
+def test_noinline_returns_tensor(device):
+
+    @triton.jit
+    def kernel(X, Y, Z, BLOCK_SIZE: tl.constexpr):
+        x = noinline_load_block_fn(X, BLOCK_SIZE)
+        y = noinline_load_block_fn(Y, BLOCK_SIZE)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        tl.store(Z + offsets, x + y)
+
+    BLOCK_SIZE = 128
+    torch.manual_seed(0)
+    x = torch.randn(BLOCK_SIZE, device=device, dtype=torch.float32)
+    y = torch.randn(BLOCK_SIZE, device=device, dtype=torch.float32)
+    z = torch.empty_like(x)
+    kernel[(1, )](x, y, z, BLOCK_SIZE=BLOCK_SIZE, num_warps=1)
+    assert torch.equal(z, x + y)
 
 
 # ---------------
@@ -4013,7 +4056,8 @@ def test_dot(
             pytest.skip(f"input_precision {input_precision} is not supported in the interpreter")
     else:
         if not is_hip() and K < 16:
-            if in_dtype != 'float64':
+            tf32_n8 = (in_dtype == 'float32' and N == 8 and K == 8 and input_precision == 'tf32')
+            if in_dtype != 'float64' and not tf32_n8:
                 pytest.skip("small dots are supported only on HIP at the moment")
         if is_cuda():
             capability = torch.cuda.get_device_capability()
@@ -4262,15 +4306,16 @@ def test_dot(
                 assert "v_dot2c_f32_bf16" in amdgcn
         return
 
-    # make sure ld/st are vectorized
     ptx = pgm.asm["ptx"]
-
-    if (K > 16 or N > 16 or M > 16) and (M * N // (num_warps * 32) >= 4):
-        # XXX: skip small sizes because they are not vectorized
+    # XXX: skip small sizes because they are not vectorized; with runtime
+    # strides, v4 needs the contiguous dim >= 16 (K for loads, N for stores).
+    enough_work = (M * N // (num_warps * 32) >= 4) and (K > 16 or N > 16 or M > 16)
+    if enough_work and K >= 16:
         if "float64" in in_dtype:
             assert "ld.global.v2.b64" in ptx
         else:
             assert "ld.global.v4" in ptx
+    if enough_work and N >= 16:
         if "float8" in in_dtype:
             assert "st.global.v2" in ptx
         elif "float64" in in_dtype:
@@ -4340,6 +4385,7 @@ def test_dot(
         assert re.search(pattern, ptx, flags=re.DOTALL)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize(
     "M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, num_warps, mma, kpack",
     [(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, 4, mma, kpack)
@@ -4365,6 +4411,8 @@ def test_scaled_dot(
     kpack,
     device,
 ):
+    if is_interpreter() and normal_type != "fp16":
+        pytest.skip("bfloat16 is not supported in the interpreter")
     is_SM120 = False
     if is_cuda():
         cc = torch.cuda.get_device_capability()
@@ -4647,6 +4695,8 @@ def test_scaled_dot(
     if is_hip_rdna3() and mxfp_type == "e4m3" and normal_type == "fp16":
         large_tolerance = True
     if is_SM120:
+        large_tolerance = True
+    if mxfp_type == 'e4m3' and is_interpreter():
         large_tolerance = True
     atol = 2e-4 if large_tolerance else 1e-5
     rtol = 2e-2 if large_tolerance else 1e-2

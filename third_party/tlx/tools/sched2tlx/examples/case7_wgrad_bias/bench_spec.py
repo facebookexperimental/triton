@@ -14,7 +14,6 @@ from __future__ import annotations
 import torch
 
 BLOCK_KO, BLOCK_NI, BLOCK_M = 128, 128, 64
-NUM_SMEM_BUFFERS, NUM_TMEM_BUFFERS = 3, 2
 TOL = 5e-3
 
 # (M, K_out, N_in): M is the GEMM contraction dim (reduced away in dW).
@@ -60,8 +59,6 @@ def hw_call(handwritten, inputs):
         inputs["dout"], inputs["act"], inputs["dw_hw"], inputs["db_hw"],
         inputs["M"], inputs["K_out"], inputs["N_in"],
         BLOCK_KO=BLOCK_KO, BLOCK_NI=BLOCK_NI, BLOCK_M=BLOCK_M,
-        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS, NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-        num_warps=4, num_ctas=1,
     )
     return inputs["dw_hw"]
 

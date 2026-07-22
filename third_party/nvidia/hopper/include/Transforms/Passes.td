@@ -38,7 +38,10 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
     Option<"tilePrefetchDepth", "tile-prefetch-depth",
              "int32_t", /*default*/"1",
              "Number of buffers for the dynamic-persistent tile-id broadcast "
-             "channel (cross-partition run-once atomic support)">
+             "channel (cross-partition run-once atomic support)">,
+    Option<"tmaStorePipelining", "tma-store-pipelining",
+             "bool", /*default*/"true",
+             "Enable TMA store wait annotation, validation, and reordering">
     ];
 }
 

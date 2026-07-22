@@ -95,7 +95,14 @@ inline int pipelineOccupancy(const DDGNode &node) {
 /// Captures both intra-iteration and loop-carried (distance-1) edges.
 class DataDependenceGraph {
 public:
-  static DataDependenceGraph build(scf::ForOp loop, const LatencyModel &model);
+  /// `partition` (Pass A.5) is applied to every inner super-node's DDG before
+  /// it is modulo-scheduled, so the super-node's `innerII` reflects the split
+  /// (an M-partitioned inner MMA is scheduled at its partitioned ResMII, not
+  /// the unpartitioned one). Empty by default = no partitioning.
+  static DataDependenceGraph
+  build(scf::ForOp loop, const LatencyModel &model,
+        const llvm::DenseMap<Operation *, DataPartitionInfo> &partition =
+            llvm::DenseMap<Operation *, DataPartitionInfo>());
 
   llvm::ArrayRef<DDGNode> getNodes() const { return nodes; }
   llvm::ArrayRef<DDGEdge> getEdges() const { return edges; }

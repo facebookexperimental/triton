@@ -796,36 +796,99 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
   return -1;
 }
 
+// Shared reuse-legality primitive (see CodePartitionUtility.h): is `dstOp` in
+// the forward slice of `srcOp`, following SSA results AND memory (store ->
+// buffer -> load)?  This is the single source of truth for "one op's value
+// flows into another", used by both the memory planner (hasPotentialReuse) and
+// code partitioning (hasDependencyChain).  A memory hop is needed for chains
+// that pass through a shared buffer, e.g. dpT -> dsT (stored to smem) -> read
+// by the dq MMA. Climb memdesc view ops (index/subslice/reinterpret/trans) to
+// the underlying buffer value, so different slots/views of one multi-buffered
+// alloc share a root.
+static Value getRootBuffer(Value v) {
+  while (auto *def = v.getDefiningOp()) {
+    if (isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp,
+            ttg::MemDescReinterpretOp, ttg::MemDescTransOp>(def))
+      v = def->getOperand(0);
+    else
+      break;
+  }
+  return v;
+}
+
+bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
+                          bool followBufferReuse) {
+  if (!srcOp || !dstOp)
+    return false;
+  DenseSet<Operation *> visited;
+  SmallVector<Operation *> worklist;
+  auto enqueue = [&](Operation *op) {
+    for (auto result : op->getResults())
+      for (auto *user : result.getUsers())
+        if (visited.insert(user).second)
+          worklist.push_back(user);
+    // A store publishes its value to a buffer; connect it to the buffer's
+    // readers so a dependency that flows through memory is discovered.
+    //
+    // By default (followBufferReuse=false) we only follow the store's *own*
+    // memdesc operand -- the exact slot written. With followBufferReuse we
+    // climb to the root buffer and fan out to readers of ANY view/slot of it,
+    // needed when a value is written to memdesc_index(base, i) and read from
+    // memdesc_index(base, j) (e.g. dsT stored by the softmax partition, read by
+    // the dq MMA through a different subview).
+    //
+    // The wider walk is used ONLY to ORDER an already-decided reuse (code
+    // partitioning's hasDependencyChain). It must NOT gate the memory planner's
+    // packing decision (isDataDependent): fanning across a buffer's whole
+    // lifetime would tie a store to unrelated later readers of a reused slot
+    // and over-form reuse groups (observed: HSTU 2-KV reduce_dq wrong results).
+    if (isa<ttg::LocalStoreOp, ttng::TMEMStoreOp>(op))
+      for (auto operand : op->getOperands())
+        if (isa<ttg::MemDescType>(operand.getType())) {
+          Value buf = followBufferReuse ? getRootBuffer(operand) : operand;
+          for (auto *user : buf.getUsers())
+            if (user != op && visited.insert(user).second)
+              worklist.push_back(user);
+        }
+  };
+  enqueue(srcOp);
+  while (!worklist.empty()) {
+    auto *op = worklist.pop_back_val();
+    if (op == dstOp)
+      return true;
+    enqueue(op);
+  }
+  return false;
+}
+
 // Check whether there is a dependency chain from the consumer of channel A
 // to the producer of channel B: A.dstOp -> ... -> B.srcOp.
-// We check whether B.srcOp is a transitive user of A.dstOp's result.
+//
+// Ordering evidence, in order of soundness:
+//   (1) a real data dependency (SSA or through memory) from A's consumer to B's
+//       producer -- valid ACROSS partitions (a genuine happens-before), OR
+//   (2) program order WITHIN a single partition -- one warp group executes its
+//       ops sequentially, so textual order is a real happens-before there.
+// Program order is NOT used across partitions: distinct async tasks run
+// concurrently, so their relative text position is not a happens-before (and
+// op-id/liveness intervals are likewise meaningless across partitions).
 static bool hasDependencyChain(Channel *A, Channel *B) {
   Operation *aConsumer = A->getDstOp();
   Operation *bProducer = B->getSrcOp();
   if (!aConsumer || !bProducer)
     return false;
 
-  // Walk transitive users of aConsumer's results.
-  DenseSet<Operation *> visited;
-  SmallVector<Operation *> worklist;
-  for (auto result : aConsumer->getResults()) {
-    for (auto *user : result.getUsers())
-      worklist.push_back(user);
-  }
-  while (!worklist.empty()) {
-    auto *op = worklist.pop_back_val();
-    if (!visited.insert(op).second)
-      continue;
-    if (op == bProducer)
-      return true;
-    for (auto result : op->getResults()) {
-      for (auto *user : result.getUsers())
-        worklist.push_back(user);
-    }
-  }
+  // (1) data dependency (SSA or through memory, following buffer reuse across
+  // slots), cross-partition OK.
+  if (dependsThroughMemory(aConsumer, bProducer, /*followBufferReuse=*/true))
+    return true;
 
-  // Also check program order: if both are in the same block and aConsumer
-  // appears before bProducer, there is an implicit dependency via ordering.
+  // (2) program order within the same block (cross-partition included).
+  // NOTE: restricting this to the same partition is UNSOUND -- it drops
+  // legitimate cross-partition program-order reuse edges that real kernels rely
+  // on (regressed FA-bwd previously and HSTU 2-KV reduce_dq: wrong dq). The
+  // cost is that a hand-pinned unorderable group (t_bwd_badgroup) is not
+  // fast-failed here; that is the still-open N-way ordering crux (T279873316).
   if (aConsumer->getBlock() == bProducer->getBlock())
     return appearsBefore(aConsumer, bProducer);
 
@@ -948,7 +1011,8 @@ bool verifyReuseGroup2(ReuseGroup *group) {
     }
     bool chain = hasDependencyChain(chA, chB) || hasDependencyChain(chB, chA);
     LDBG("verifyReuseGroup2: TMEM channels "
-         << chA->uniqID << "/" << chB->uniqID << " overlap=1 chain=" << chain);
+         << chA->uniqID << "/" << chB->uniqID << " (" << chA->srcName << "/"
+         << chB->srcName << ") overlap=1 chain=" << chain);
     return chain;
   }
 
@@ -1150,8 +1214,9 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   }
 
   LDBG("needExplicitReuseWait: explicit wait needed for "
-       << "earlyChannel " << earlyChannel->uniqID << " and lateChannel "
-       << lateChannel->uniqID);
+       << "earlyChannel " << earlyChannel->uniqID << " ("
+       << earlyChannel->srcName << ") and lateChannel " << lateChannel->uniqID
+       << " (" << lateChannel->srcName << ")");
   return true;
 }
 

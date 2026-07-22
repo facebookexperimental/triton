@@ -38,7 +38,7 @@
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.early_tma_store_lowering = true, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @data_partition_shared_const(%x_mm_desc: !tt.tensordesc<tensor<256x64xbf16, #shared>>, %w_desc: !tt.tensordesc<tensor<64x64xbf16, #shared>>, %out_desc: !tt.tensordesc<tensor<256x64xbf16, #shared>>, %M: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+  tt.func public @data_partition_shared_const(%x_mm_desc: !tt.tensordesc<256x64xbf16, #shared>, %w_desc: !tt.tensordesc<64x64xbf16, #shared>, %out_desc: !tt.tensordesc<256x64xbf16, #shared>, %M: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %true = arith.constant true
     %c4_i32 = arith.constant 4 : i32
     %c64_i32 = arith.constant 64 : i32
@@ -50,9 +50,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %offs_k = arith.muli %tile_id, %c64_i32 : i32
       %accumulator, %accumulator_7 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x64xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %accumulator_8 = ttng.tmem_store %cst_0, %accumulator[%accumulator_7], %true : tensor<256x64xf32, #linear> -> !ttg.memdesc<256x64xf32, #tmem, #ttng.tensor_memory, mutable>
-      %x = tt.descriptor_load %x_mm_desc[%offs_k, %offs_k] : !tt.tensordesc<tensor<256x64xbf16, #shared>> -> tensor<256x64xbf16, #blocked>
+      %x = tt.descriptor_load %x_mm_desc[%offs_k, %offs_k] : !tt.tensordesc<256x64xbf16, #shared> -> tensor<256x64xbf16, #blocked>
       %x_20 = ttg.local_alloc %x : (tensor<256x64xbf16, #blocked>) -> !ttg.memdesc<256x64xbf16, #shared, #smem>
-      %w_nk = tt.descriptor_load %w_desc[%offs_k, %offs_k] : !tt.tensordesc<tensor<64x64xbf16, #shared>> -> tensor<64x64xbf16, #blocked>
+      %w_nk = tt.descriptor_load %w_desc[%offs_k, %offs_k] : !tt.tensordesc<64x64xbf16, #shared> -> tensor<64x64xbf16, #blocked>
       %w_21 = ttg.local_alloc %w_nk : (tensor<64x64xbf16, #blocked>) -> !ttg.memdesc<64x64xbf16, #shared, #smem>
       %w_22 = ttg.memdesc_trans %w_21 {order = array<i32: 1, 0>} : !ttg.memdesc<64x64xbf16, #shared, #smem> -> !ttg.memdesc<64x64xbf16, #shared1, #smem>
       %accumulator_23 = ttng.tc_gen5_mma %x_20, %w_22, %accumulator[%accumulator_8], %true, %true : !ttg.memdesc<256x64xbf16, #shared, #smem>, !ttg.memdesc<64x64xbf16, #shared1, #smem>, !ttg.memdesc<256x64xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -60,7 +60,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %gate = arith.subf %cst_0, %accumulator_10 : tensor<256x64xf32, #linear>
       %gate_16 = ttg.convert_layout %gate : tensor<256x64xf32, #linear> -> tensor<256x64xf32, #blocked>
       %0 = arith.truncf %gate_16 : tensor<256x64xf32, #blocked> to tensor<256x64xbf16, #blocked>
-      tt.descriptor_store %out_desc[%offs_k, %offs_k], %0 : !tt.tensordesc<tensor<256x64xbf16, #shared>>, tensor<256x64xbf16, #blocked>
+      tt.descriptor_store %out_desc[%offs_k, %offs_k], %0 : !tt.tensordesc<256x64xbf16, #shared>, tensor<256x64xbf16, #blocked>
     } {tt.data_partition_factor = 2 : i32, tt.separate_epilogue_store = true, tt.smem_alloc_algo = 1 : i32, tt.warp_specialize}
     tt.return
   }

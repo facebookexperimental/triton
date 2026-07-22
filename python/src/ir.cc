@@ -957,16 +957,16 @@ void init_triton_ir(py::module &&m) {
       ret::take_ownership);
 
   m.def("deduce_scale_factor",
-        [](Value &lhs, std::optional<Value> &lhsScale,
-           ScaleDotElemType lhsFormat, bool lhsKPack, Value &rhs,
-           std::optional<Value> &rhsScale, ScaleDotElemType rhsFormat,
-           bool rhsKPack) -> int32_t {
+        [](std::vector<int64_t> &lhs,
+           std::optional<std::vector<int64_t>> &lhsScale,
+           ScaleDotElemType lhsFormat, bool lhsKPack, std::vector<int64_t> &rhs,
+           std::optional<std::vector<int64_t>> &rhsScale,
+           ScaleDotElemType rhsFormat, bool rhsKPack) -> int32_t {
           int32_t scaleFactor = 0;
           std::string errMsg;
-          if (failed(DotScaledOp::deduceScaleFactor(
-                  lhs, lhsScale.value_or(Value()), lhsFormat, lhsKPack, rhs,
-                  rhsScale.value_or(Value()), rhsFormat, rhsKPack, scaleFactor,
-                  errMsg)))
+          if (failed(deduceScaleFactor(lhs, lhsScale, lhsFormat, lhsKPack, rhs,
+                                       rhsScale, rhsFormat, rhsKPack,
+                                       scaleFactor, errMsg)))
             throw std::runtime_error(errMsg);
           return scaleFactor;
         });
@@ -1444,6 +1444,10 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::SubFOp>(lhs, rhs);
            })
+      .def("create_fneg",
+           [](TritonOpBuilder &self, Value &input) -> Value {
+             return self.create<arith::NegFOp>(input);
+           })
       .def("create_mul",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::MulIOp>(lhs, rhs);
@@ -1719,12 +1723,16 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_descriptor_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
-              CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy) -> Value {
+              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+              std::optional<bool> multicast) -> Value {
              auto descTy = cast<triton::TensorDescType>(desc.getType());
              auto resTy = descTy.getSignlessBlockType();
-             return self.create<DescriptorLoadOp>(
+             auto op = self.create<DescriptorLoadOp>(
                  resTy, desc, indices, cacheModifier, evictionPolicy);
+             if (multicast)
+               op->setAttr("tt.multicast",
+                           self.getBuilder().getBoolAttr(*multicast));
+             return op;
            })
       .def("create_descriptor_gather",
            [](TritonOpBuilder &self, Value desc, Value x_indices, Value y_index,
