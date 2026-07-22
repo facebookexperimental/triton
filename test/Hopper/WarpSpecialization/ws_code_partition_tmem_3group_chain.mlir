@@ -1,21 +1,16 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-use-nameloc-as-prefix | FileCheck %s
 //
-// Verify that 2-buffer reuse group logic moves the late buffer's (dq)
-// producer_acquire before the early buffer's (dpT) producer.
-// Before this change, the ordering was:
-//   producer_acquire(dpT) -> dpT MMA -> ... -> producer_acquire(dq) -> dq MMA
-// After this change, the ordering is:
-//   producer_acquire(dq) -> producer_acquire(dpT) -> dpT MMA -> ... -> dq MMA
+// Orderable complement of ws_code_partition_tmem_3group_no_chain.mlir. {dpT, dsT,
+// dq} share one TMEM slot (buffer.id = 8):
+//   dpT (gemm, task1) -> dsT (computation tmem_store, task3) -> dq (gemm, task1)
+// Here the dk MMA (which READS dsT from the shared slot) is emitted BEFORE the dq
+// MMA (which overwrites the slot), so the chain has a UNIQUE order
+// (dpT -> dsT -> dq) and orderReuseGroupChain accepts it. Code partitioning must
+// NOT fatal, and must emit the reuse WAR that hoists dq's producer_acquire onto
+// the shared (dpT) reuse token so dq waits for dsT's consumer before overwriting.
 //
-// dpT and dq share the same buffer.id in a reuse group with buffer.copy=1.
-// dpT's consumer feeds into dq's producer, so dpT is the early channel.
-// dq's producer_acquire must come before dpT's producer to ensure the
-// shared token prevents dq's old data from being overwritten before it
-// is consumed.
-//
+// CHECK-NOT: no unique dependency-chain order
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
-// CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
-// CHECK: %dpT_{{[0-9]+}} = ttng.tc_gen5_mma
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -38,6 +33,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) loc("dq")
     %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %dpT, %dpT_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) loc("dpT")
+    %dsT_t, %dsT_t_tok = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32} : () -> (!ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
     %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %qkT, %qkT_2 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
@@ -146,7 +142,11 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %dsT_101 = arith.mulf %pT_87, %dsT_100 {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked1>
         %dsT_102 = arith.truncf %dsT_101 {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
         ttg.local_store %dsT_102, %dsT {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-        %dk_103 = ttng.tc_gen5_mma %dsT, %q, %dk[%dk_71], %arg20, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, tmem.end = array<i32: 9>, tmem.start = array<i32: 10>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        // computation (task3) materializes dsT into the shared buf8 TMEM slot.
+        ttng.tmem_store %dsT_102, %dsT_t, %true {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
+        // HAZARD: dq (writes buf8) emitted BEFORE dk reads dsT from buf8 -> the
+        // {dpT,dsT,dq} chain has no unique order (dsT and dq are incomparable).
+        %dk_103 = ttng.tc_gen5_mma %dsT_t, %q, %dk[%dk_71], %arg20, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, tmem.end = array<i32: 9>, tmem.start = array<i32: 10>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
         %dq_104 = ttg.memdesc_trans %dsT {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared3, #smem, mutable> loc("dq")
         %dq_105 = ttng.tc_gen5_mma %dq_104, %k, %dq[%dq_72], %false, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf16, #shared3, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc("dq")
         %dq_106, %dq_107 = ttng.tmem_load %dq[%dq_105] {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1> loc("dq")
