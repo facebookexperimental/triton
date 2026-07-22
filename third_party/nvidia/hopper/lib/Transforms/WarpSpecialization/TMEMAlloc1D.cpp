@@ -229,13 +229,37 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto newShape = newType.getShape();
   auto blockN = newShape[shape.size() - 1];
 
+  // The subslice below is taken from the representative (allocOp) in *its*
+  // column units, and `offset` is likewise expressed in the representative's
+  // columns (that is how the memory planner assigns buffer.offset). When the
+  // reuser has a narrower element type than the representative — e.g. an f16
+  // reuser packed inside an f32 owner — two reuser elements share one 32-bit
+  // TMEM column, so the reuser only occupies `blockN / 2` of the owner's
+  // columns (see the `oldElemTyWidth == elemTyWidth * 2` subslice branch
+  // below). Validate against that same physical width; using the logical
+  // `blockN` here spuriously rejects a spatially-packed reuser at a non-zero
+  // offset (e.g. offset=64, blockN=128, oldBlockN=128 → 192 > 128) even though
+  // the subslice [64, 64+64) fits the owner exactly.
+  auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
+  auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
+  // A reuser narrower than the representative packs `colRatio` reuser elements
+  // into one owner column (e.g. two f16 in one f32 column -> colRatio 2), so it
+  // occupies `blockN / colRatio` of the owner's columns. This generalizes the
+  // former f32->f16 (== *2) special case to any integer width ratio; same- or
+  // wider-typed reusers keep colRatio == 1 (validated against the logical
+  // blockN, and rejected below if actually wider).
+  int64_t colRatio =
+      std::max<int64_t>(int64_t(oldElemTyWidth) / int64_t(elemTyWidth), 1);
+  int64_t sliceCols = blockN / colRatio;
+
   // Validate the allocation is valid before attempting to create subslice
-  if (oldBlockN < blockN || oldBlockN % blockN != 0 ||
-      (offset + blockN) > oldBlockN) {
+  if (oldBlockN < sliceCols || oldBlockN % sliceCols != 0 ||
+      (offset + sliceCols) > oldBlockN) {
     // Cannot use this TMEM allocation - return nullptr to signal failure
     // Caller should try another TMEM allocation or fall back to SMEM
     LDBG("TMEM allocation validation failed: oldBlockN="
-         << oldBlockN << ", blockN=" << blockN << ", offset=" << offset);
+         << oldBlockN << ", blockN=" << blockN << ", sliceCols=" << sliceCols
+         << ", offset=" << offset);
     return nullptr;
   }
 
@@ -245,21 +269,19 @@ sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   // reinterpret to 128x64xbf16.
   auto tmemDesc = createTMEMDesc(builder, newType, newShape[shape.size() - 2],
                                  newShape[shape.size() - 1]);
-  // slice from oldBlockN to blockN
-  auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
-  auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
-  if (oldElemTyWidth == elemTyWidth * 2) {
+  // Subslice `sliceCols` owner columns (blockN / colRatio, computed above) and
+  // reinterpret to the reuser's type. Supports any owner element type that is an
+  // integer-width multiple of the reuser's: f32->f16 (colRatio 2), same width
+  // (1), f32->f8 (4), etc. A wider reuser (or a non-integer width ratio) is
+  // unsupported.
+  if (oldElemTyWidth >= elemTyWidth && oldElemTyWidth % elemTyWidth == 0) {
     auto subSlice = ttng::TMEMSubSliceOp::create(
-        builder, allocOp->getLoc(), allocResult, offset, blockN / 2);
-    return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
-                                             tmemDesc, subSlice);
-  } else if (elemTyWidth == oldElemTyWidth) {
-    auto subSlice = ttng::TMEMSubSliceOp::create(builder, allocOp->getLoc(),
-                                                 allocResult, offset, blockN);
+        builder, allocOp->getLoc(), allocResult, offset, sliceCols);
     return ttg::MemDescReinterpretOp::create(builder, allocOp->getLoc(),
                                              tmemDesc, subSlice);
   } else {
-    // Unsupported element type conversion
+    // Unsupported element type conversion (reuser wider than owner, or the
+    // width ratio is not an integer).
     return nullptr;
   }
 }
