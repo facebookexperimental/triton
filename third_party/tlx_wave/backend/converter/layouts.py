@@ -1563,27 +1563,6 @@ def is_identity_swizzled_shared(layout, shape):
             and order == default_physical_order(shape))
 
 
-def require_identity_swizzled_shared(
-    layout,
-    *,
-    stage=STAGE,
-    diagnostic="TLXW_TYPE_UNSUPPORTED_LAYOUT",
-    source_op_index=None,
-    source_value_id=None,
-):
-    props = layout.properties
-    if (int(props.get("vec", 0)) == 1 and int(props.get("per_phase", 0)) == 1 and int(props.get("max_phase", 0)) == 1):
-        return
-    _shared_layout_fail(
-        diagnostic,
-        stage,
-        "swizzled shared layout requires an explicit remap target op",
-        layout=layout,
-        source_op_index=source_op_index,
-        source_value_id=source_value_id,
-    )
-
-
 def swizzled_shared_description(layout):
     props = layout.properties
     return (f"order={tuple(props.get('order', ()))}, "

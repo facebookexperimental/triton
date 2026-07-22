@@ -5166,187 +5166,6 @@ def _convert_structural_tensor_view(builder, type_layout_program, op):
     )
 
 
-def _add_layout_remap_scratch_attrs(attrs, conversion_input, result, op):
-    if attrs.get("mode") not in {
-            "cta_exchange_register_remap",
-            "dot_operand_vector_payload",
-            "mfma_vector_register_remap",
-    }:
-        return attrs
-    if "scratch_element_count" not in attrs:
-        return attrs
-    element_byte_width = conversion_input.value_element_byte_widths.get(result.value_id)
-    if result.type.representation in {"mask", "mask_tuple"}:
-        element_byte_width = 4
-    if element_byte_width is None:
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "CTA exchange layout remap requires a known element byte width",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    scratch_elements = int(attrs["scratch_element_count"])
-    if scratch_elements <= 0:
-        fail(
-            "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-            STAGE,
-            "CTA exchange layout remap produced an empty scratch allocation",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    packet_elements = 1
-    has_physical_plan = attrs.get("scratch_physical_plan") == "optimal_swizzling_ldst"
-    if (not has_physical_plan and attrs.get("mode") == "cta_exchange_register_remap"
-            and result.type.representation not in {
-                "mask",
-                "mask_tuple",
-            }):
-        packet_elements = _cta_exchange_packet_elements(attrs, element_byte_width)
-    source_store_packet_elements = 1
-    if (attrs.get("mode") == "dot_operand_vector_payload" and not has_physical_plan):
-        source_store_packet_elements = _dot_operand_source_store_packet_elements(
-            attrs,
-            element_byte_width,
-        )
-        payload_transpose_load_elements = _dot_operand_payload_transpose_load_elements(
-            attrs,
-            element_byte_width,
-        )
-    else:
-        payload_transpose_load_elements = 1
-    scratch_bytes = _align_to(
-        scratch_elements * int(packet_elements) * int(element_byte_width),
-        16,
-    )
-    result_attrs = {
-        **attrs,
-        "scratch_allocation_bytes": int(scratch_bytes),
-        "scratch_align": 16,
-    }
-    if packet_elements > 1:
-        result_attrs["cta_exchange_packet_elements"] = int(packet_elements)
-    if source_store_packet_elements > 1:
-        result_attrs["source_store_packet_elements"] = int(source_store_packet_elements)
-    if payload_transpose_load_elements > 1:
-        result_attrs["payload_transpose_load_elements"] = int(payload_transpose_load_elements)
-    return result_attrs
-
-
-def _cta_exchange_packet_elements(attrs, element_byte_width):
-    exchange_groups = tuple(attrs.get("exchange_groups", ()))
-    if len(exchange_groups) < 2:
-        return 1
-    max_packet_elements = min(_buffer_max_packet_elements(element_byte_width), len(exchange_groups))
-    for packet_elements in range(max_packet_elements, 1, -1):
-        if not _buffer_packet_payload_is_legal(packet_elements, element_byte_width):
-            continue
-        if layout_remap.cta_exchange_has_packet_group(exchange_groups, packet_elements):
-            return int(packet_elements)
-    return 1
-
-
-def _dot_operand_source_store_packet_elements(attrs, element_byte_width):
-    source_store_bases = tuple(int(value) for value in attrs.get("source_store_bases", ()))
-    source_store_coefficients = tuple(
-        tuple(int(value) for value in coefficients) for coefficients in attrs.get("source_store_coefficients", ()))
-    component_count = int(attrs.get("source_component_count", len(source_store_bases)))
-    if (component_count <= 1 or len(source_store_bases) != component_count
-            or len(source_store_coefficients) != component_count):
-        return 1
-    max_packet_elements = min(
-        component_count,
-        _buffer_max_packet_elements(element_byte_width),
-    )
-    for packet_elements in range(max_packet_elements, 1, -1):
-        if component_count % packet_elements:
-            continue
-        if not _buffer_packet_payload_is_legal(packet_elements, element_byte_width):
-            continue
-        if _dot_operand_source_store_has_packet_tiling(
-                source_store_bases,
-                source_store_coefficients,
-                packet_elements,
-        ):
-            return int(packet_elements)
-    return 1
-
-
-def _dot_operand_source_store_has_packet_tiling(
-    source_store_bases,
-    source_store_coefficients,
-    packet_elements,
-):
-    packet_elements = int(packet_elements)
-    for index in range(0, len(source_store_bases), packet_elements):
-        base = int(source_store_bases[index])
-        coefficients = tuple(int(value) for value in source_store_coefficients[index])
-        for element in range(packet_elements):
-            component = index + element
-            if tuple(int(value) for value in source_store_coefficients[component]) != coefficients:
-                return False
-            if int(source_store_bases[component]) != base + element:
-                return False
-    return True
-
-
-def _dot_operand_payload_transpose_load_elements(attrs, element_byte_width):
-    if bool(attrs.get("payload_vector_contiguous", True)):
-        return 1
-    if int(attrs.get("role", -1)) != 1:
-        return 1
-    if int(element_byte_width) != 2:
-        return 1
-    element_type = attrs.get("element_type")
-    if element_type not in {"bf16", "f16"}:
-        return 1
-    chunk_elements = 4
-    elements_per_lane = int(attrs.get("elements_per_lane", 0))
-    result_count = int(attrs.get("result_component_count", 0))
-    if elements_per_lane <= 0 or elements_per_lane % chunk_elements or result_count <= 0:
-        return 1
-    transpose_bases = tuple(
-        tuple(int(value) for value in bases) for bases in attrs.get("payload_transpose_load_bases", ()))
-    transpose_coefficients = tuple(
-        tuple(tuple(int(value)
-                    for value in coefficients)
-              for coefficients in component_coefficients)
-        for component_coefficients in attrs.get("payload_transpose_load_coefficients", ()))
-    chunks_per_component = elements_per_lane // chunk_elements
-    if len(transpose_bases) != result_count or len(transpose_coefficients) != result_count:
-        return 1
-    for component_bases, component_coefficients in zip(transpose_bases, transpose_coefficients):
-        if len(component_bases) != chunks_per_component or len(component_coefficients) != chunks_per_component:
-            return 1
-    scalar_bases = tuple(tuple(int(value) for value in bases) for bases in attrs.get("payload_scalar_load_bases", ()))
-    scalar_coefficients = tuple(
-        tuple(tuple(int(value)
-                    for value in coefficients)
-              for coefficients in component_coefficients)
-        for component_coefficients in attrs.get("payload_scalar_load_coefficients", ()))
-    if len(scalar_bases) != result_count or len(scalar_coefficients) != result_count:
-        return 1
-    stride = None
-    for component_bases, component_coefficients in zip(scalar_bases, scalar_coefficients):
-        if len(component_bases) != elements_per_lane or len(component_coefficients) != elements_per_lane:
-            return 1
-        for chunk_start in range(0, elements_per_lane, chunk_elements):
-            coefficients = component_coefficients[chunk_start]
-            if any(component_coefficients[chunk_start + element] != coefficients for element in range(chunk_elements)):
-                return 1
-            chunk_stride = component_bases[chunk_start + 1] - component_bases[chunk_start]
-            if chunk_stride <= 0:
-                return 1
-            if stride is None:
-                stride = int(chunk_stride)
-            elif int(chunk_stride) != int(stride):
-                return 1
-            for element in range(chunk_elements):
-                if component_bases[chunk_start + element] != component_bases[chunk_start] + element * int(stride):
-                    return 1
-    return int(chunk_elements)
-
-
 def _same_layout_alias(operand, result, operand_layout, result_layout):
     if int(operand.type.component_count) != int(result.type.component_count):
         return False
@@ -10450,32 +10269,6 @@ def _acc_fragment_shape(instr_shape, op):
     )
 
 
-def _mfma_output_tile_shape(instr_shape, op):
-    if instr_shape in {(16, 16, 32), (16, 16, 128), (32, 32, 16)}:
-        return 32, 32
-    fail(
-        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-        STAGE,
-        f"unsupported MFMA instruction shape {instr_shape}",
-        source_op_index=op.index,
-    )
-
-
-def _mfma_k_dim(instr_shape, op):
-    if instr_shape == (16, 16, 32):
-        return 32
-    if instr_shape == (16, 16, 128):
-        return 128
-    if instr_shape == (32, 32, 16):
-        return 16
-    fail(
-        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-        STAGE,
-        f"unsupported MFMA K dimension for instruction shape {instr_shape}",
-        source_op_index=op.index,
-    )
-
-
 def _has_mma_packet_result(type_layout_program, op):
     for value_id in op.results:
         converted = type_layout_program.values[value_id]
@@ -11941,18 +11734,6 @@ def _default_physical_order(shape):
     return layouts.default_physical_order(shape)
 
 
-def _expand_physical_order(order, rank, layout, op, diagnostic):
-    return layouts.expand_physical_order(
-        order,
-        rank,
-        layout=layout,
-        stage=STAGE,
-        diagnostic=diagnostic,
-        source_op_index=None if op is None else op.index,
-        source_value_id=None if layout is None else layout.value_id,
-    )
-
-
 def _shared_layout_physical_order(
     layout,
     shape,
@@ -11970,43 +11751,8 @@ def _shared_layout_physical_order(
     )
 
 
-def _ordered_linear_offset(shape, coords, order):
-    return layouts.ordered_linear_offset(shape, coords, order)
-
-
 def _ordered_coords_from_linear(linear, shape, order):
     return layouts.ordered_coords_from_linear(linear, shape, order)
-
-
-def _static_swizzled_byte_offset(layout, shape, coords, element_byte_width, op):
-    return _static_shared_byte_offset(
-        layout,
-        shape,
-        coords,
-        element_byte_width,
-        op,
-    )
-
-
-def _static_padded_byte_offset(layout, shape, coords, element_byte_width, op):
-    return _static_shared_byte_offset(
-        layout,
-        shape,
-        coords,
-        element_byte_width,
-        op,
-    )
-
-
-def _swizzled_shared_parameters(layout, shape, op):
-    return layouts.swizzled_shared_parameters(
-        layout,
-        shape,
-        stage=STAGE,
-        diagnostic="TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-        source_op_index=None if op is None else op.index,
-        source_value_id=layout.value_id,
-    )
 
 
 def _padded_shared_parameters(layout, op):
@@ -12017,14 +11763,6 @@ def _padded_shared_parameters(layout, op):
         source_op_index=None if op is None else op.index,
         source_value_id=layout.value_id,
     )
-
-
-def _swizzled_shared_description(layout):
-    return layouts.swizzled_shared_description(layout)
-
-
-def _padded_shared_description(layout):
-    return layouts.padded_shared_description(layout)
 
 
 def _static_delinearize_row_major(linear, shape, op):
@@ -12188,10 +11926,6 @@ def _fragment_component_dword_offsets(
     }
 
 
-def _physical_element_offset(layout, shape, linear, op):
-    return _physical_component_offset(layout, shape, int(linear), 1, op)
-
-
 def _element_stride_to_dwords(
     layout,
     logical_shape,
@@ -12246,101 +11980,6 @@ def _element_stride_to_dwords(
             source_value_id=layout.value_id if layout is not None else None,
         )
     return byte_stride // 4
-
-
-def _physical_component_offset(layout, shape, linear_start, lane_width, op):
-    linear_end = int(linear_start) + int(lane_width) - 1
-    if layout is None or layout.kind in {"none", "swizzled_shared"}:
-        if layout is not None and layout.kind == "swizzled_shared":
-            _require_identity_swizzled(layout, op)
-        return int(linear_start)
-    if layout.kind == "padded_shared":
-        intervals = layout.properties.get("intervals", ())
-        paddings = layout.properties.get("paddings", ())
-        if len(intervals) != 1 or len(paddings) != 1:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "scalarized amdg.buffer_load_to_local supports one "
-                "padded interval",
-                source_op_index=op.index,
-                source_value_id=layout.value_id,
-            )
-        interval = int(intervals[0])
-        padding = int(paddings[0])
-        if interval <= 0:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "padded shared interval must be positive",
-                source_op_index=op.index,
-                source_value_id=layout.value_id,
-            )
-        physical_start = _static_shared_byte_offset_from_linear(
-            layout,
-            shape,
-            int(linear_start),
-            1,
-            op,
-        )
-        physical_end = _static_shared_byte_offset_from_linear(
-            layout,
-            shape,
-            int(linear_end),
-            1,
-            op,
-        )
-        if physical_start is None or physical_end is None:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "scalarized amdg.buffer_load_to_local component exceeds "
-                "local memdesc shape",
-                source_op_index=op.index,
-                source_value_id=layout.value_id,
-            )
-        unpadded_start = _ordered_linear_offset(
-            shape,
-            _static_delinearize_row_major(int(linear_start), shape, op),
-            _shared_layout_physical_order(layout, shape, op),
-        )
-        unpadded_end = _ordered_linear_offset(
-            shape,
-            _static_delinearize_row_major(int(linear_end), shape, op),
-            _shared_layout_physical_order(layout, shape, op),
-        )
-        if unpadded_start // interval != unpadded_end // interval:
-            fail(
-                "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-                STAGE,
-                "scalarized amdg.buffer_load_to_local component crosses "
-                "a padded LDS interval",
-                source_op_index=op.index,
-                source_value_id=layout.value_id,
-            )
-        return int(physical_start)
-    fail(
-        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        STAGE,
-        f"amdg.buffer_load_to_local destination layout {layout.kind} "
-        "is not converted yet",
-        source_op_index=op.index,
-        source_value_id=layout.value_id,
-    )
-
-
-def _require_identity_swizzled(layout, op):
-    props = layout.properties
-    if (int(props.get("vec", 0)) == 1 and int(props.get("per_phase", 0)) == 1 and int(props.get("max_phase", 0)) == 1):
-        return
-    fail(
-        "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-        STAGE,
-        "amdg.buffer_load_to_local swizzled destination requires an "
-        "explicit remap target op",
-        source_op_index=op.index,
-        source_value_id=layout.value_id,
-    )
 
 
 def _constant_literal(value, *, source_op_index=None, element_type=None):
