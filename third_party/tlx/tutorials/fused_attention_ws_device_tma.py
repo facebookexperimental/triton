@@ -648,6 +648,33 @@ _BWD_DOT_ATTRS_SCHED = FrozenDotAttrs({
     "dk": {"stage": "1", "order": "1"},
 })
 
+# Memtype-only variant of _BWD_DOT_ATTRS_BM64_TMEM: the operand-A channels carry
+# ONLY the memory space (no copies/id), so PromoteLHSToTMem still promotes ppT/dsT
+# to TMEM while the memory planner decides the copies/id/reuse-grouping. The
+# planner reproduces _BWD_DOT_ATTRS_BM64_TMEM's packing ([dpT,dsT],[ppT,qkT])
+# without the hand-pinned buffer ids.
+_BWD_DOT_ATTRS_BM64_MEMTYPE = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0"},
+    "dpT": {"stage": "0", "order": "2"},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem"]},  # ppT -> tmem
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem"]},  # dsT^T -> smem
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem"]},  # dsT -> tmem
+})
+
+# BM128 memtype-only variant (same intent as _BWD_DOT_ATTRS_BM64_MEMTYPE but for
+# BLOCK_M1=128). PromoteLHSToTMem promotes dsT to TMEM, but at BM128 the planner
+# cannot yet form the tight {dpT,dq,dsT} reuse group that the hand-pinned
+# _BWD_DOT_ATTRS_TMEM config achieves, so it OOBs TMEM. Kept as a motivating case
+# for the memory-planner search-space work (see test_bwd_bm128_memtype_only_xfail
+# and task T279873316).
+_BWD_DOT_ATTRS_BM128_MEMTYPE = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0"},
+    "dpT": {"stage": "0", "order": "2"},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem"]},  # ppT -> tmem
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem"]},  # dsT^T -> smem
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem"]},  # dsT -> tmem
+})
+
 
 @triton.jit
 def _attn_bwd_dkdv_inner(
@@ -955,6 +982,34 @@ configs_bwd_persist = [
             "EPILOGUE_SUBTILE": 2,
             "DQ_SUBTILE": 4,
             "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(  # BM64, schedule-only attrs (stage/order, no channels) -> memory planner / search decides buffers
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_SCHED,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(  # BM64, memtype-only opndA channels (no copies/id) -> planner decides grouping
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_MEMTYPE,
         },
         num_warps=4,
         num_stages=2,
@@ -1775,6 +1830,114 @@ def test_bwd_early_tma_staging_depth2_persistent():
         bwd_config_idx=0,
         smem_budget=220000,
     )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_tmem_plan_pick_enumeration():
+    # Prototype: top-K TMEM packing enumeration in the WS memory planner
+    # (WSMemoryPlanner.cpp allocateTMemAllocs2). With TRITON_WS_MEM_PLAN_TOPK>1
+    # the backtracking allocator enumerates the DISTINCT feasible TMEM packings
+    # (deduped by physical column layout) instead of returning the first, ranks
+    # them by occupancy, and applies TRITON_WS_MEM_PLAN_PICK. The default
+    # topK=1 / pick=0 path is unchanged (first-fit), so normal compiles are
+    # unaffected.
+    #
+    # Runs the BM64 schedule-only config (_BWD_DOT_ATTRS_SCHED, no channels — the
+    # planner decides the TMEM packing) at HEAD_DIM=64, which admits several
+    # genuinely-distinct packings. Asserts (1) the enumeration surfaces >=2
+    # distinct packings and (2) the occupancy-best pick 0 is correct end-to-end.
+    #
+    # It deliberately does NOT sweep non-default picks: they are legal per the
+    # op-id liveness model but not correctness-guaranteed at runtime (they can
+    # deadlock / miscompile — the same model insufficiency behind the reuse
+    # hazards). The distinct-packing pin lives in
+    # test/Hopper/WarpSpecialization/ws_memory_planner_bwd_hd64.mlir (PICK1).
+    import os
+    import tempfile
+    idx = next(i for i, c in enumerate(configs_bwd_persist)
+               if c.kwargs.get("BLOCK_M1") == 64 and c.kwargs.get("BWD_DOT_ATTRS") is _BWD_DOT_ATTRS_SCHED)
+    keys = ("TRITON_WS_MEM_PLAN_TOPK", "TRITON_WS_MEM_PLAN_PICK",
+            "TRITON_WS_MEM_PLAN_TOPK_DUMP", "TRITON_ALWAYS_COMPILE")
+    saved = {k: os.environ.get(k) for k in keys}
+    with tempfile.TemporaryDirectory() as td:
+        dump = os.path.join(td, "plans.json")
+        try:
+            os.environ["TRITON_WS_MEM_PLAN_TOPK"] = "8"
+            os.environ["TRITON_WS_MEM_PLAN_PICK"] = "0"  # occupancy-best / safe
+            os.environ["TRITON_WS_MEM_PLAN_TOPK_DUMP"] = dump
+            os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+            # N_CTX=512 (with Z=4,H=8) gives a compile key no other test uses, so
+            # the memory planner (and its top-K enumeration/dump) is guaranteed to
+            # run fresh here rather than hit a cached kernel from the parametrized
+            # sweep above.
+            test_op(
+                Z=4, H=8, N_CTX=512, HEAD_DIM=64, causal=False, mode="bwd",
+                baseVariant="ws", provider="triton-fp16", SUBTILING=False,
+                VECT_MUL=0, FADD2_REDUCE=False, bwd_config_idx=idx,
+            )
+            tmem_plans = 0
+            if os.path.exists(dump):
+                with open(dump) as f:
+                    tmem_plans = sum(1 for line in f if '"pool": "tmem"' in line)
+            assert tmem_plans >= 2, f"expected >=2 enumerated TMEM packings, got {tmem_plans}"
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_memtype_only_annotation():
+    # Memtype-only channel annotations ("opndA,tmem" / "opndA,smem", no copies/id):
+    # the annotation controls only the operand memory space (consumed by
+    # PromoteLHSToTMem), while the memory planner decides copies/id/reuse-grouping.
+    # _BWD_DOT_ATTRS_BM64_MEMTYPE marks dv/dk opndA as tmem and dq opndA as smem;
+    # the planner then reproduces _BWD_DOT_ATTRS_BM64_TMEM's packing (dsT reuses
+    # dpT, ppT reuses qkT) with no pinned buffer ids. Assert correctness at both
+    # head dims. (The PromoteLHSToTMem-level pin is in
+    # test/TritonGPU/promote-lhs-to-tmem.mlir: @promote_lhs_opnda_{smem,tmem}.)
+    idx = next(i for i, c in enumerate(configs_bwd_persist)
+               if c.kwargs.get("BWD_DOT_ATTRS") is _BWD_DOT_ATTRS_BM64_MEMTYPE)
+    for hd in (64, 128):
+        test_op(
+            Z=8, H=16, N_CTX=1024, HEAD_DIM=hd, causal=False, mode="bwd",
+            baseVariant="ws", provider="triton-fp16", SUBTILING=False,
+            VECT_MUL=0, FADD2_REDUCE=False, bwd_config_idx=idx,
+        )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+@pytest.mark.xfail(strict=False, reason="Memory-planner search-space gap (T279873316): "
+                   "BM128 memtype-only promotes dsT to TMEM, but the planner cannot form "
+                   "the tight {dpT,dq,dsT} reuse group that hand _BWD_DOT_ATTRS_TMEM pins, "
+                   "so it OOBs TMEM. dq (accumulator) and the tmem dsT (dk operand) relate "
+                   "only through a common ancestor, which the planner's data-dependency "
+                   "reuse check rejects; a naive same-partition relaxation is unsafe (op-id "
+                   "liveness underestimates qkT's lifetime via pT). Expected to pass once "
+                   "the planner learns to form the group safely.")
+def test_bwd_bm128_memtype_only_xfail():
+    # Motivating case kept for the memory-planner search-space work. Builds a
+    # BM128 memtype-only config (opndA,tmem on dv/dk, opndA,smem on dq — no
+    # copies/id) and runs the bwd; currently OOBs TMEM (xfail). Appends the config
+    # transiently so it is not swept by the parametrized test_op matrix.
+    cfg = triton.Config(
+        {
+            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2, "DQ_SUBTILE": 4, "SMEM_BUDGET": 220000,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM128_MEMTYPE,
+        },
+        num_warps=4, num_stages=2, pre_hook=_bwd_host_descriptor_pre_hook)
+    configs_bwd_persist.append(cfg)
+    try:
+        test_op(
+            Z=8, H=16, N_CTX=1024, HEAD_DIM=128, causal=False, mode="bwd",
+            baseVariant="ws", provider="triton-fp16", SUBTILING=False,
+            VECT_MUL=0, FADD2_REDUCE=False, bwd_config_idx=len(configs_bwd_persist) - 1,
+        )
+    finally:
+        configs_bwd_persist.pop()
 
 
 try:
