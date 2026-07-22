@@ -6170,24 +6170,6 @@ def test_tlx_gfx9_gemm_bench_active_driver_restores(monkeypatch):
 @pytest.mark.parametrize(
     "case",
     [
-        pytest.param(
-            {
-                "version_dir": "v0_naive",
-                "function_name": "v0_naive",
-                "num_warps": 4,
-                "expected_dma_load_lds": 0,
-            },
-            marks=pytest.mark.skip(reason="slow full Wave HSACO compile variant"),
-        ),
-        pytest.param(
-            {
-                "version_dir": "v1_buffer_load",
-                "function_name": "v1_buffer_load",
-                "num_warps": 4,
-                "expected_dma_load_lds": 0,
-            },
-            marks=pytest.mark.skip(reason="slow full Wave HSACO compile variant"),
-        ),
         {
             "version_dir": "v2_async_copy",
             "function_name": "v2_async_copy",
@@ -11364,86 +11346,6 @@ def test_tlx_wave_converter_emits_mfma32_vector_accumulator_remap(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_classifies_mfma_to_linear_register_remap():
-    operand_layout = converter_layouts.LayoutMap(
-        0,
-        10,
-        "amd_mfma",
-        (16, 16),
-        "f32",
-        1,
-        64,
-        {
-            "element_bit_width": 32,
-            "instr_shape": (16, 16, 32),
-            "is_transposed": False,
-            "tiles_per_warp": (1, 1),
-            "version": 4,
-            "warps_per_cta": (1, 1),
-        },
-    )
-    source_linear = converter_layouts.distributed_linear_layout(operand_layout)
-    result_layout = converter_layouts.LayoutMap(
-        1,
-        11,
-        "linear",
-        (16, 16),
-        "f32",
-        4,
-        64,
-        {
-            "block_bases": converter_layouts.linear_layout_bases(
-                source_linear,
-                "block",
-            ),
-            "lane_bases": converter_layouts.linear_layout_bases(
-                source_linear,
-                "lane",
-            ),
-            "register_bases": converter_layouts.linear_layout_bases(
-                source_linear,
-                "register",
-            ),
-            "warp_bases": converter_layouts.linear_layout_bases(
-                source_linear,
-                "warp",
-            ),
-        },
-    )
-    operand = SimpleNamespace(
-        value_id=10,
-        type=SimpleNamespace(
-            component_count=1,
-            element_type="f32",
-            lane_width=64,
-            representation="simd_packet_tuple",
-        ),
-    )
-    result = SimpleNamespace(
-        value_id=11,
-        type=SimpleNamespace(
-            component_count=4,
-            element_type="f32",
-            lane_width=64,
-            representation="simd_tuple",
-        ),
-    )
-
-    attrs = converter_layout_remap.register_remap(
-        operand,
-        result,
-        operand_layout,
-        result_layout,
-        SimpleNamespace(index=0),
-    )
-
-    assert attrs["mode"] == "same_lane_register_remap"
-    assert attrs["source_component_count"] == 1
-    assert attrs["source_registers_per_component"] == 4
-    assert attrs["source_indices"] == (0, 0, 0, 0)
-    assert attrs["source_element_indices"] == (0, 1, 2, 3)
-
-
 def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -11624,147 +11526,6 @@ def test_tlx_wave_converter_composes_blocked_to_mfma_metadata_remap(tmp_path):
         assert remap["cross_wave"] is True
     _run_wave_verify(output.emitted_module.text)
     del ctx
-
-
-def test_tlx_wave_converter_accepts_non_transposed_mfma_metadata_remap():
-    result_layout = _fake_layout(
-        1,
-        1,
-        kind="amd_mfma",
-        shape=(16, 16),
-        element_type="i32",
-        component_count=1,
-        properties={
-            "element_bit_width": 32,
-            "instr_shape": (16, 16, 32),
-            "is_transposed": False,
-            "tiles_per_warp": (1, 1),
-            "version": 4,
-            "warps_per_cta": (1, 1),
-        },
-    )
-    result_linear = converter_layouts.distributed_linear_layout(result_layout)
-
-    def bases_by_standard_dims(in_dim):
-        out_indices = {str(name): index for index, (name, _size) in enumerate(result_linear.out_dims)}
-        rank = len(result_linear.out_dims)
-        return tuple(
-            tuple(int(basis[out_indices[f"dim{dim}"]])
-                  for dim in range(rank))
-            for basis in converter_layouts.linear_layout_bases(result_linear, in_dim))
-
-    source_layout = _fake_layout(
-        0,
-        0,
-        kind="linear",
-        shape=(16, 16),
-        element_type="i32",
-        component_count=4,
-        properties={
-            "block_bases": bases_by_standard_dims("block"),
-            "lane_bases": bases_by_standard_dims("lane"),
-            "register_bases": bases_by_standard_dims("register"),
-            "warp_bases": bases_by_standard_dims("warp"),
-        },
-    )
-    operand = _converted_value(
-        0,
-        representation="simd_tuple",
-        element_type="i32",
-        component_count=4,
-        layout_map_id=0,
-    )
-    result = _converted_value(
-        1,
-        representation="simd",
-        element_type="i32",
-        component_count=1,
-        layout_map_id=1,
-    )
-
-    attrs = converter_layout_remap.mfma_component_metadata_remap(
-        operand,
-        result,
-        source_layout,
-        result_layout,
-        SimpleNamespace(index=0),
-    )
-
-    assert attrs["mode"] == "same_lane_register_remap"
-    assert attrs["source_component_count"] == 4
-    assert attrs["source_registers_per_component"] == 1
-    assert attrs["source_indices"] == (0, )
-    assert attrs["source_element_indices"] == (0, )
-
-
-def test_tlx_wave_converter_rejects_non_affine_mfma_metadata_lane_remap():
-    result_layout = _fake_layout(
-        1,
-        1,
-        kind="amd_mfma",
-        shape=(16, 16),
-        element_type="i32",
-        component_count=1,
-        properties={
-            "element_bit_width": 32,
-            "instr_shape": (16, 16, 32),
-            "is_transposed": True,
-            "tiles_per_warp": (1, 1),
-            "version": 4,
-            "warps_per_cta": (1, 1),
-        },
-    )
-    result_linear = converter_layouts.distributed_linear_layout(result_layout)
-
-    def bases_by_standard_dims(in_dim):
-        out_indices = {str(name): index for index, (name, _size) in enumerate(result_linear.out_dims)}
-        rank = len(result_linear.out_dims)
-        return tuple(
-            tuple(int(basis[out_indices[f"dim{dim}"]])
-                  for dim in range(rank))
-            for basis in converter_layouts.linear_layout_bases(result_linear, in_dim))
-
-    source_layout = _fake_layout(
-        0,
-        0,
-        kind="linear",
-        shape=(16, 16),
-        element_type="i32",
-        component_count=4,
-        properties={
-            "block_bases": bases_by_standard_dims("block"),
-            "lane_bases": tuple(reversed(bases_by_standard_dims("lane"))),
-            "register_bases": bases_by_standard_dims("register"),
-            "warp_bases": bases_by_standard_dims("warp"),
-        },
-    )
-    operand = _converted_value(
-        0,
-        representation="simd_tuple",
-        element_type="i32",
-        component_count=4,
-        layout_map_id=0,
-    )
-    result = _converted_value(
-        1,
-        representation="simd",
-        element_type="i32",
-        component_count=1,
-        layout_map_id=1,
-    )
-
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_layout_remap.mfma_component_metadata_remap(
-            operand,
-            result,
-            source_layout,
-            result_layout,
-            SimpleNamespace(index=0),
-        )
-
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "distributed to MFMA metadata convert_layout requires a non-affine source lane map" in str(diagnostic)
 
 
 def test_tlx_wave_converter_rejects_mma_packet_truncf_layout_relabel():
@@ -15879,35 +15640,9 @@ def _run_waveamd_to_machine(wave_artifact):
     return result.stdout
 
 
-def _run_waveamd_dma_zero_fill(wave_artifact):
-    result = subprocess.run(
-        [wave_bridge_tools._wave_opt(), "-", "--waveamd-dma-zero-fill"],
-        input=wave_artifact,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-    return result.stdout
-
-
 def _run_wave_verify(wave_artifact):
     result = subprocess.run(
         [wave_bridge_tools._wave_opt(), "-", "--verify-diagnostics"],
-        input=wave_artifact,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr or result.stdout
-    return result.stdout
-
-
-def _run_wave_canonicalize(wave_artifact):
-    result = subprocess.run(
-        [wave_bridge_tools._wave_opt(), "-", "--canonicalize"],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,

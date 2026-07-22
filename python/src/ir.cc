@@ -390,14 +390,6 @@ std::vector<std::vector<int64_t>> toNestedInt64Vector(Range &&values) {
   return result;
 }
 
-template <typename Range>
-std::vector<std::string> toStringVector(Range values) {
-  std::vector<std::string> result;
-  for (StringAttr value : values)
-    result.push_back(value.str());
-  return result;
-}
-
 py::object getLinearEncodingBases(Attribute attr, StringRef name) {
   if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(attr)) {
     auto dim = StringAttr::get(attr.getContext(), name);
@@ -975,32 +967,6 @@ void init_triton_ir(py::module &&m) {
       .def("get_linear_block_bases",
            [](Attribute &self) -> py::object {
              return getLinearEncodingBases(self, "block");
-           })
-      .def("get_linear_in_dim_names",
-           [](Attribute &self) -> py::object {
-             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
-               return py::cast(
-                   toStringVector(linear.getLinearLayout().getInDimNames()));
-             return py::none();
-           })
-      .def("get_linear_out_dim_names",
-           [](Attribute &self) -> py::object {
-             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
-               return py::cast(
-                   toStringVector(linear.getLinearLayout().getOutDimNames()));
-             return py::none();
-           })
-      .def("get_linear_num_in_dims",
-           [](Attribute &self) -> py::object {
-             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
-               return py::int_(linear.getLinearLayout().getNumInDims());
-             return py::none();
-           })
-      .def("get_linear_num_out_dims",
-           [](Attribute &self) -> py::object {
-             if (auto linear = dyn_cast<ttg::LinearEncodingTrait>(self))
-               return py::int_(linear.getLinearLayout().getNumOutDims());
-             return py::none();
            })
       .def("is_swizzled_shared_encoding",
            [](Attribute &self) {
