@@ -988,6 +988,45 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     tlx.dump_layout(v)                  # -> // cute: _64:_1
     ```
 
+- `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
+
+    Compile-time assertion that two layouts are equivalent after layout
+    propagation and all other TTGIR layout optimizations have completed. Like
+    `tlx.dump_layout`, it emits no device code and is consumed at the end of the
+    TTGIR pipeline.
+
+    `rhs` supports two forms:
+
+    - **Value/value:** `rhs` is another register tensor or shared/tensor-memory
+      buffer. The frontend emits `tlx.assert_same_layout`, whose two operands
+      retain their independently resolved final types.
+    - **Value/layout:** `rhs` is a constant `tlx.layout_encoding`. The frontend
+      lowers the constant to an encoding attribute and emits
+      `tlx.assert_same_layout_expected`. At assertion time, the pass combines
+      that encoding with `lhs`'s shape, element type, and (for buffers) memory
+      properties to construct an expected tensor or memdesc type.
+
+    These are separate internal operations only because an SSA value is an MLIR
+    operand while a constant layout is an MLIR attribute. They share the same
+    comparison path and the same public Python API.
+
+    Before comparison, both final types are converted with
+    `ttg::toLinearLayout`. The assertion compares the resulting
+    `LinearLayout`s, not the original encoding attributes. Consequently,
+    structurally different encodings pass if they describe the same logical
+    mapping. A mismatch reports both normalized LinearLayouts and fails
+    compilation.
+
+    Example:
+
+    ```python
+    x = tlx.local_load(x_buf, layout=REGISTER_LAYOUT)
+    y = tlx.local_load(y_buf, layout=REGISTER_LAYOUT)
+
+    tlx.assert_same_layout(x, y)                # value/value
+    tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout
+    ```
+
 
 ## Buffer Operations (AMD)
 
