@@ -10,15 +10,6 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 
-try:
-    # @manual=//triton:triton
-    import triton.language.extra.tlx as tlx  # type: ignore[attr-defined]
-
-    HAS_TLX = True
-except ImportError:
-    tlx = None
-    HAS_TLX = False
-
 from triton.language.extra.libdevice import (  # @manual=//triton:triton
     fast_dividef,
     fast_expf,
