@@ -78,7 +78,7 @@ class BackendInstaller:
             if is_git_repo():
                 try:
                     subprocess.run(["git", "submodule", "update", "--init", f"{backend_name}"], check=True,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root_dir)
+                                   stdout=subprocess.DEVNULL, cwd=root_dir)
                 except subprocess.CalledProcessError:
                     pass
                 except FileNotFoundError:

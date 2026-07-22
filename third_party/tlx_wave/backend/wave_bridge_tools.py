@@ -78,13 +78,6 @@ def _candidate_wave_pipeline_paths(wave_opt=None):
     yield _repo_root() / _WAVE_PIPELINE_SOURCE
 
 
-def _candidate_wave_opt_paths():
-    yield from _candidate_wave_tool_paths(
-        "wave-opt",
-        override=os.environ.get("TRITON_WAVE_OPT"),
-    )
-
-
 def _existing_paths(candidates):
     seen = set()
     for path in candidates:

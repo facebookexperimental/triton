@@ -167,7 +167,6 @@ LOWERING_DOMAINS = (
 )
 
 DOMAIN_NAMES = tuple(domain.name for domain in LOWERING_DOMAINS)
-_DOMAINS_BY_NAME = {domain.name: domain for domain in LOWERING_DOMAINS}
 
 
 def source_domains_for_op(op_name):
@@ -179,14 +178,6 @@ def target_domain_for_op(op_kind):
         if op_kind in domain.target_ops:
             return domain.name
     return None
-
-
-def source_ops_for_domain(domain_name):
-    return _DOMAINS_BY_NAME[domain_name].source_ops
-
-
-def target_ops_for_domain(domain_name):
-    return _DOMAINS_BY_NAME[domain_name].target_ops
 
 
 def all_source_ops():

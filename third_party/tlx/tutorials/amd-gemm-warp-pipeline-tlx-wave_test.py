@@ -14,24 +14,6 @@ def _load_gfx9_v9_module(module_name="tlx_wave_gfx9_v9_tutorial"):
     return module
 
 
-_TLX_WAVE_STOP_AFTER_WAVE_KEY = "tlx-wave-v9-asm-stop-after-wave-v1"
-
-
-def _tlx_wave_stop_after_wave_hook(self=None, stages=None, options=None, language=None, capability=None):
-    if all(arg is None for arg in (stages, options, language, capability)):
-        return _TLX_WAVE_STOP_AFTER_WAVE_KEY, _TLX_WAVE_STOP_AFTER_WAVE_KEY
-
-    # This tutorial test compares the Wave handoff and text assembly against
-    # the existing AMD backend. Full v9 HSACO assembly is tracked separately
-    # because Wave currently emits a constant-bus-illegal instruction there.
-    def keep_wave_as_test_binary(src, metadata):
-        metadata["tlx_wave_binary_stage"] = "wave-inspection-only"
-        return src
-
-    stages["hsaco"] = keep_wave_as_test_binary
-    return _TLX_WAVE_STOP_AFTER_WAVE_KEY, _TLX_WAVE_STOP_AFTER_WAVE_KEY
-
-
 def _warmup_gfx9_v9_backend(
     tmp_path,
     monkeypatch,
@@ -66,8 +48,6 @@ def _warmup_gfx9_v9_backend(
     with knobs.cache.scope(), knobs.runtime.scope():
         knobs.cache.dir = str(tmp_path / f"triton-cache-v9-{cache_suffix}")
         knobs.runtime.override_arch = "gfx950"
-        if backend_name == "tlx_wave":
-            knobs.runtime.add_stages_inspection_hook = _tlx_wave_stop_after_wave_hook
         triton.runtime.driver._default = None
         triton.runtime.driver._active = None
         try:
