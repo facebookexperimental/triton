@@ -25,13 +25,9 @@ void removeWarpSpecMetadata(triton::FuncOp funcOp) {
   // scf.while uniformly. Adding a new WS metadata attribute means adding it
   // here once.
   static const StringRef kWSMetadataAttrs[] = {
-      tt::kWarpSpecializeAttrName,
-      ttg::kPartitionAttrName,
-      ttg::kPartitionOutputsAttrName,
-      ttg::kPartitionStagesAttrName,
-      ttg::kWarpSpecializeTagAttrName,
-      kPartitionTypesAttrName,
-      kAsyncTaskIdAttrName,
+      tt::kWarpSpecializeAttrName,     ttg::kPartitionAttrName,
+      ttg::kPartitionOutputsAttrName,  ttg::kPartitionStagesAttrName,
+      ttg::kWarpSpecializeTagAttrName, kPartitionTypesAttrName,
       kAtomicBroadcastCopiesAttrName,
   };
   funcOp->walk([&](Operation *op) {
@@ -273,8 +269,8 @@ static Operation *findTmemStartEnd(ttng::TmemAllocChannel *ch,
       continue;
     DenseSet<int> channelIds;
     if (auto attr = user->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-      for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-        channelIds.insert(asyncTaskId);
+      for (WSPartitionId partitionId : attr.asArrayRef()) {
+        channelIds.insert(partitionId);
       }
       if (channelIds.count(ch->uniqID))
         return user;
@@ -312,9 +308,9 @@ static void getAllConsumers(ttng::TmemAllocChannel *ch,
       consumers.push_back(user);
   }
   // assume all consumers are in the same block, with same taskId
-  auto taskIds = getAsyncTaskIds(consumers[0]);
+  auto taskIds = getWSPartitionIds(consumers[0]);
   for (unsigned i = 1; i < consumers.size(); ++i) {
-    auto taskIds2 = getAsyncTaskIds(consumers[i]);
+    auto taskIds2 = getWSPartitionIds(consumers[i]);
     assert(taskIds == taskIds2 &&
            consumers[i]->getBlock() == consumers[0]->getBlock());
   }
@@ -634,7 +630,7 @@ unsigned getReuseAccumArgIdx(Operation *regionOp,
 }
 
 // Compute and return the buffer index and phase for a given accumulate count.
-std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
+std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithPartitionIds &builder,
                                              Location loc, Value accumCnt,
                                              unsigned numBuffers) {
   // ensure type compatibility
@@ -642,31 +638,31 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   if (accumCnt.getType().isIndex()) {
     // accumCnt is index type, create an index constant
     numBuffersVal =
-        builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, numBuffers);
+        builder.createWithPartitionIds<arith::ConstantIndexOp>(loc, numBuffers);
   } else {
     // accumCnt is integer type, create a matching integer constant
     auto intType = llvm::cast<IntegerType>(accumCnt.getType());
-    numBuffersVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    numBuffersVal = builder.createWithPartitionIds<arith::ConstantIntOp>(
         loc, numBuffers, intType.getWidth());
   }
   // Calculate accumCnt / numBuffers
   // initBufferIdx = accumCnt - accumCnt / numBuffers * numBuffers
   // initPhase = (accumCnt / numBuffers) & 1
-  Value bufferIdx = builder.createWithAsyncTaskIds<arith::DivUIOp>(
+  Value bufferIdx = builder.createWithPartitionIds<arith::DivUIOp>(
       loc, accumCnt, numBuffersVal);
-  auto mulOp = builder.createWithAsyncTaskIds<arith::MulIOp>(loc, bufferIdx,
+  auto mulOp = builder.createWithPartitionIds<arith::MulIOp>(loc, bufferIdx,
                                                              numBuffersVal);
   Value initBufferIdx =
-      builder.createWithAsyncTaskIds<arith::SubIOp>(loc, accumCnt, mulOp);
+      builder.createWithPartitionIds<arith::SubIOp>(loc, accumCnt, mulOp);
 
   // Convert to i32 for buffer indexing
   if (initBufferIdx.getType().isIndex()) {
     // For index type, use index_cast to convert to i32
-    initBufferIdx = builder.createWithAsyncTaskIds<arith::IndexCastOp>(
+    initBufferIdx = builder.createWithPartitionIds<arith::IndexCastOp>(
         loc, builder.getI32Type(), initBufferIdx);
   } else {
     // For integer types, truncate to i32
-    initBufferIdx = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+    initBufferIdx = builder.createWithPartitionIds<arith::TruncIOp>(
         loc, builder.getI32Type(), initBufferIdx);
   }
 
@@ -674,28 +670,28 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
   Value one;
   if (bufferIdx.getType().isIndex()) {
     // For index type, create a constant index
-    one = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(loc, 1);
+    one = builder.createWithPartitionIds<arith::ConstantIndexOp>(loc, 1);
   } else if (auto intType = llvm::dyn_cast<IntegerType>(bufferIdx.getType())) {
     // For integer types, create a constant with matching bit width
-    one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    one = builder.createWithPartitionIds<arith::ConstantIntOp>(
         loc, 1, intType.getWidth());
   } else {
     llvm_unreachable("bufferIdx must be either index or integer type");
   }
   bufferIdx =
-      builder.createWithAsyncTaskIds<arith::AndIOp>(loc, bufferIdx, one);
+      builder.createWithPartitionIds<arith::AndIOp>(loc, bufferIdx, one);
 
   // Convert to i1 for phase
   Value initPhase;
   if (bufferIdx.getType().isIndex()) {
     // For index type, first cast to i32, then truncate to i1
-    Value bufferIdxI32 = builder.createWithAsyncTaskIds<arith::IndexCastOp>(
+    Value bufferIdxI32 = builder.createWithPartitionIds<arith::IndexCastOp>(
         loc, builder.getI32Type(), bufferIdx);
-    initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+    initPhase = builder.createWithPartitionIds<arith::TruncIOp>(
         loc, builder.getI1Type(), bufferIdxI32);
   } else {
     // For integer types, truncate to i1
-    initPhase = builder.createWithAsyncTaskIds<arith::TruncIOp>(
+    initPhase = builder.createWithPartitionIds<arith::TruncIOp>(
         loc, builder.getI1Type(), bufferIdx);
   }
   return {initBufferIdx, initPhase};
@@ -716,7 +712,7 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
 //     ThenYield ForC.arg[accumIfB] + 1
 //     ElseYield ForC.arg[accumIfB]
 //   Channel D --> uses ForA.arg[accumForA]
-Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+Value getAccumCount(OpBuilderWithPartitionIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
   auto parentForOp = op->getParentOfType<scf::ForOp>();
@@ -1105,10 +1101,10 @@ bool needExplicitReuseWait(Channel *earlyChannel, Channel *lateChannel) {
   // Get the actual consumer op (e.g., resolve through memdesc_trans).
   auto actualConsumers = getActualConsumers(lateConsumer);
 
-  auto earlyProducerTasks = getAsyncTaskIds(earlyProducer);
+  auto earlyProducerTasks = getWSPartitionIds(earlyProducer);
 
   for (auto *consumer : actualConsumers) {
-    auto consumerTasks = getAsyncTaskIds(consumer);
+    auto consumerTasks = getWSPartitionIds(consumer);
     // Check if any task ID is shared between earlyProducer and this consumer.
     bool samePartition = false;
     for (auto tid : earlyProducerTasks) {
@@ -1174,11 +1170,11 @@ bool isWholeAllocationOverwriteReuseOwner(Channel *ownerCh) {
 
 bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
   // Cross-partition reuse: a single-copy reuse group of >= 3 channels whose
-  // PRODUCERS span more than one partition (async_task_id) AND that admit a
+  // PRODUCERS span more than one partition (ttg.partition) AND that admit a
   // unique total dependency-chain order (channel i's consumer reaches channel
   // i+1's producer). Such a group cannot be handled by the same-block A3 path:
   // its channels share one block at this stage (partitions are still
-  // async_task_id tags pre-specialization, so a block-based test would always
+  // ttg.partition tags pre-specialization, so a block-based test would always
   // see "one block"), but the cross-partition writers need explicit reuse
   // barriers — a same-partition program-order elision is unsound for them.
   //
@@ -1214,7 +1210,7 @@ bool verifyReuseGroupCrossPartition(ReuseGroup *group) {
 // is computed inside the tile body from the op's builtin tileIdx (see
 // insertAsyncComm in WSCodePartition.cpp and docs/SubtileOperator.md).
 static Value
-getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+getStaggeredAccumCnt(OpBuilderWithPartitionIds &builder, Operation *op,
                      const DenseSet<Operation *> &regionsWithChannels,
                      ReuseConfig *config, int reuseGroupIdx, Channel *ch) {
   Value accumCnt =
@@ -1321,7 +1317,8 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     Operation *prodOp = ch->getSrcOp();
     Operation *consOp = ch->getDstOp();
     if (prodOp && consOp)
-      isSameTaskStaging = (getAsyncTaskIds(prodOp) == getAsyncTaskIds(consOp));
+      isSameTaskStaging =
+          (getWSPartitionIds(prodOp) == getWSPartitionIds(consOp));
   }
   if (theIdx == 0) {
     if (!isSameTaskStaging)
@@ -1329,9 +1326,9 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     // Same-partition staging subtile 0 -> slot 0, independent of the outer
     // accumCnt.
     if (accumCnt.getType().isIndex())
-      return builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+      return builder.createWithPartitionIds<arith::ConstantIndexOp>(
           op->getLoc(), 0);
-    return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    return builder.createWithPartitionIds<arith::ConstantIntOp>(
         op->getLoc(), 0,
         llvm::cast<IntegerType>(accumCnt.getType()).getWidth());
   }
@@ -1340,11 +1337,11 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // Create idxVal with the same type as accumCnt to ensure type compatibility.
   Value idxVal;
   if (accumCnt.getType().isIndex()) {
-    idxVal = builder.createWithAsyncTaskIds<arith::ConstantIndexOp>(
+    idxVal = builder.createWithPartitionIds<arith::ConstantIndexOp>(
         op->getLoc(), theIdx);
   } else {
     auto intType = llvm::cast<IntegerType>(accumCnt.getType());
-    idxVal = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    idxVal = builder.createWithPartitionIds<arith::ConstantIntOp>(
         op->getLoc(), theIdx, intType.getWidth());
   }
   // Same-partition staging buffers use the subtile index directly (no accumCnt
@@ -1352,11 +1349,11 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   // producer/consumer mbarrier phase keeps rotating (see comment above).
   if (isSameTaskStaging)
     return idxVal;
-  return builder.createWithAsyncTaskIds<arith::AddIOp>(op->getLoc(), accumCnt,
+  return builder.createWithPartitionIds<arith::AddIOp>(op->getLoc(), accumCnt,
                                                        idxVal);
 }
 
-void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
+void getBufferIdxAndPhase(OpBuilderWithPartitionIds &builder, Operation *op,
                           unsigned numBuffers,
                           const DenseSet<Operation *> &regionsWithChannels,
                           Value &bufferIdx, Value &phase, ReuseConfig *config,
@@ -1367,7 +1364,7 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
       getBufferIdxAndPhase(builder, op->getLoc(), accumCnt, numBuffers);
 }
 
-Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
+Value getBarrierForPipelineStage(OpBuilderWithPartitionIds &builder,
                                  Value barrierAlloc, Value bufferIdx) {
   ttg::MemDescType allocType = cast<ttg::MemDescType>(barrierAlloc.getType());
   ttg::MemDescType barrierTy =
@@ -1376,27 +1373,28 @@ Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                             /*mutableMemory=*/true);
 
   // Create barrierForTMA from barrierAlloc.
-  auto output = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
+  auto output = builder.createWithPartitionIds<ttg::MemDescIndexOp>(
       barrierAlloc.getLoc(), barrierTy, barrierAlloc, bufferIdx);
   return output;
 }
 
 static void setTmemChannelAttr(Operation *op, int channelId,
                                std::string attrName) {
-  SmallVector<int> asyncTaskIds;
+  SmallVector<int> partitionIds;
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(attrName)) {
-    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-      asyncTaskIds.push_back(asyncTaskId);
+    for (WSPartitionId partitionId : attr.asArrayRef()) {
+      partitionIds.push_back(partitionId);
     }
   }
-  asyncTaskIds.push_back(channelId);
-  SmallVector<int> sortedAsyncTaskIds(asyncTaskIds.begin(), asyncTaskIds.end());
-  sort(sortedAsyncTaskIds);
+  partitionIds.push_back(channelId);
+  SmallVector<int> sortedWSPartitionIds(partitionIds.begin(),
+                                        partitionIds.end());
+  sort(sortedWSPartitionIds);
   auto i32Ty = IntegerType::get(op->getContext(), 32);
-  auto size = static_cast<int64_t>(sortedAsyncTaskIds.size());
+  auto size = static_cast<int64_t>(sortedWSPartitionIds.size());
   auto vecTy = VectorType::get(size, i32Ty);
   op->setAttr(attrName,
-              DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
+              DenseI32ArrayAttr::get(op->getContext(), sortedWSPartitionIds));
 }
 
 // Helper function to create channels from multiple producers to a single
@@ -2092,7 +2090,7 @@ static void dumpKeyOpsSubgraph(triton::FuncOp funcOp, llvm::raw_ostream &os,
           // Build label using the new format
           std::string label = getKeyOpLabel(op);
 
-          // Color based on partition number (async_task_id)
+          // Color based on partition number (ttg.partition)
           // Color palette for different partitions
           static const std::vector<std::string> partitionColors = {
               "lightblue",   // Partition 0
@@ -2106,7 +2104,7 @@ static void dumpKeyOpsSubgraph(triton::FuncOp funcOp, llvm::raw_ostream &os,
           };
 
           std::string fillcolor = "white";
-          auto taskIds = getAsyncTaskIds(op);
+          auto taskIds = getWSPartitionIds(op);
           if (!taskIds.empty()) {
             int partitionNum = taskIds.front();
             fillcolor = partitionColors[partitionNum % partitionColors.size()];
@@ -2201,8 +2199,8 @@ void dumpCombinedGraph(SmallVector<std::unique_ptr<Channel>> &channels,
 
     // Check if this is a key operation
     if (isKeyOp(op)) {
-      // Get partition from async_task_id
-      auto taskIds = getAsyncTaskIds(op);
+      // Get partition from ttg.partition
+      auto taskIds = getWSPartitionIds(op);
       if (!taskIds.empty()) {
         int partitionId = taskIds.front();
         auto &ops = partitionOps[partitionId];
@@ -2975,8 +2973,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           return failure();
         }
         // Start a channel from currentProds to op
-        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
-        auto consumerIds = getAsyncTaskIds(&op);
+        auto producerTaskIds = getWSPartitionIds(currentProds.front());
+        auto consumerIds = getWSPartitionIds(&op);
         if (producerTaskIds.size() != 1) {
           op.emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
@@ -3007,7 +3005,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           return failure();
         }
         // Start a channel from currentProds to op
-        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
+        auto producerTaskIds = getWSPartitionIds(currentProds.front());
         if (producerTaskIds.size() != 1) {
           mmaOpT->emitError(
               "handleOperandD: expected exactly one producer task ID, got ")
@@ -3015,7 +3013,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           return failure();
         }
         auto producerTaskId = producerTaskIds.front();
-        auto consumerIds = getAsyncTaskIds(&op);
+        auto consumerIds = getWSPartitionIds(&op);
         if (needsChannel(producerTaskId, consumerIds)) {
           if (!firstProducer)
             firstProducer = currentProds.front();
@@ -3034,7 +3032,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     } else if (auto loadOp = dyn_cast<ttng::TMEMLoadOp>(&op)) {
       if (!currentProds.empty()) {
         // Start a channel from currentProds to op
-        auto producerTaskIds = getAsyncTaskIds(currentProds.front());
+        auto producerTaskIds = getWSPartitionIds(currentProds.front());
         if (producerTaskIds.size() != 1) {
           loadOp.emitError("handleOperandD: expected exactly one producer task "
                            "ID for TMEMLoad, got ")
@@ -3042,7 +3040,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
           return failure();
         }
         auto producerTaskId = producerTaskIds.front();
-        auto consumerIds = getAsyncTaskIds(&op);
+        auto consumerIds = getWSPartitionIds(&op);
         if (needsChannel(producerTaskId, consumerIds)) {
           if (!firstProducer)
             firstProducer = currentProds.front();
@@ -3083,7 +3081,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
       } else {
         channelsToBeUpdate.push_back(channels.size());
         auto channelID = channels.size();
-        auto consumerIds = getAsyncTaskIds(&op);
+        auto consumerIds = getWSPartitionIds(&op);
         channels.push_back(std::make_unique<ttng::TmemAllocChannel>(
             -1, consumerIds, tmemAllocOp.getOperation(), true /*isOperandD*/,
             true, channels.size()));
@@ -3108,7 +3106,7 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
     // For deferred channels, we only have one channel per consumer, so use
     // the last producer in the vector (which should be the most recent).
     auto *lastProd = currentProds.back();
-    channels[idx]->relation.first = getAsyncTaskIds(lastProd).front();
+    channels[idx]->relation.first = getWSPartitionIds(lastProd).front();
     setTmemChannelAttr(lastProd, channels[idx]->uniqID, "tmem.start");
     // Track this channel for the wrap-around / guard logic below. Without
     // this, deferred (back-edge) channels are invisible to the
@@ -3133,14 +3131,14 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
             "handleOperandD: no producer found for TMEMLoad outside loop");
       }
       // Start a channel from currentProds to user
-      auto producerTaskIds = getAsyncTaskIds(currentProds.front());
+      auto producerTaskIds = getWSPartitionIds(currentProds.front());
       if (producerTaskIds.size() != 1) {
         return loadOp.emitError("handleOperandD: expected exactly one producer "
                                 "task ID, got ")
                << producerTaskIds.size();
       }
       auto producerTaskId = producerTaskIds.front();
-      auto consumerIds = getAsyncTaskIds(user);
+      auto consumerIds = getWSPartitionIds(user);
       if (needsChannel(producerTaskId, consumerIds)) {
         if (!firstProducer)
           firstProducer = currentProds.front();
@@ -3168,8 +3166,8 @@ handleOperandD(ttng::TMEMAllocOp tmemAllocOp, ttng::MMAv5OpInterface mmaOp,
   // correction pattern).
   if (numChannelsCreated >= 2 && firstProducer && lastConsumer &&
       firstProducer->getBlock() == lastConsumer->getBlock()) {
-    auto firstProdTaskIds = getAsyncTaskIds(firstProducer);
-    auto lastConsumerIds = getAsyncTaskIds(lastConsumer);
+    auto firstProdTaskIds = getWSPartitionIds(firstProducer);
+    auto lastConsumerIds = getWSPartitionIds(lastConsumer);
     if (firstProdTaskIds.size() == 1) {
       int firstProdTaskId = firstProdTaskIds.front();
       if (needsChannel(firstProdTaskId, lastConsumerIds)) {
@@ -3411,14 +3409,14 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
   // loop), skip creating a channel for this allocation.
   if (!producerOp)
     return;
-  auto producerTaskIds = getAsyncTaskIds(producerOp);
+  auto producerTaskIds = getWSPartitionIds(producerOp);
   // Collect consumer task IDs from all consumers. With data partitioning,
   // different consumers may have different task IDs (e.g., K/V buffers
   // consumed by multiple computation partitions).
   SmallVector<int> consumerTaskIds;
   DenseSet<int> seenTaskIds;
   for (auto *consumer : consumers) {
-    for (int id : getAsyncTaskIds(consumer)) {
+    for (int id : getWSPartitionIds(consumer)) {
       if (seenTaskIds.insert(id).second)
         consumerTaskIds.push_back(id);
     }
@@ -3436,7 +3434,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
   if (producerTaskIds.empty())
     return;
 
-  AsyncTaskId producerTaskId = -1;
+  WSPartitionId producerTaskId = -1;
   if (producerTaskIds.size() > 1) {
     DenseSet<int> consumerTaskIdSet(consumerTaskIds.begin(),
                                     consumerTaskIds.end());
@@ -3514,8 +3512,8 @@ void collectAllocChannels(SmallVector<std::unique_ptr<Channel>> &channels,
       // collapsed (doing so drops a sibling alloc that is never folded -> SMEM
       // OOM).
       if (prodRegion && consRegion &&
-          getAsyncTaskIds(prodRegion.getOperation()) !=
-              getAsyncTaskIds(consRegion.getOperation())) {
+          getWSPartitionIds(prodRegion.getOperation()) !=
+              getWSPartitionIds(consRegion.getOperation())) {
         auto key = std::make_pair(prodRegion.getOperation(),
                                   consRegion.getOperation());
         auto it = seenSubtiledPairs.find(key);
@@ -3767,13 +3765,13 @@ void updateSubgroup(CommitOpSubgroupInfo &subgroup) {
     // Check all existing operations for a matching task id.
     // Within the same task we will pick the earliest by
     // program order.
-    auto taskId = waiter->getAttr("async_task_id");
+    auto taskId = waiter->getAttr("ttg.partition");
     bool matched = false;
     bool keptWait = true;
     for (size_t j = 0; j < processedConsumers.size(); j++) {
       auto existingConsumer = processedConsumers[j];
       auto existingWaiter = processedWaiters[j];
-      auto existingTaskID = existingWaiter->getAttr("async_task_id");
+      auto existingTaskID = existingWaiter->getAttr("ttg.partition");
       if (taskId == existingTaskID) {
         // If task ids match we should delete whichever one comes later
         // in program order.
@@ -3860,8 +3858,8 @@ collectCommitGroup(ttng::TCGen5CommitOp &commitOp,
 //    d. Has the same expected arrival count (init count).
 //
 // 3. For each subgroup, update the barriers based on the consumer's location.
-//    a. With the same async task id, eliminate all but the first barrier.
-//    b. With different async task ids, use the same allocation.
+//    a. With the same partition id, eliminate all but the first barrier.
+//    b. With different partition ids, use the same allocation.
 //
 // 4. Cleanup the code to remove the unused barriers.
 //

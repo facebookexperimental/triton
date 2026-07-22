@@ -17,7 +17,7 @@ namespace mlir {
 // Generate code to reintepret a TMEM buffer operation by converting
 // the N dimension to the given value that must be less the current size.
 ttg::MemDescReinterpretOp
-sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+sliceAndReinterpretMDTMEM(OpBuilderWithPartitionIds &builder,
                           Operation *allocOp, Operation *newAlloc,
                           Operation *user, int offset);
 ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
@@ -33,7 +33,7 @@ ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,
 // 1D TMEM Allocation.
 class TMEM1DAllocator {
 private:
-  OpBuilderWithAsyncTaskIds &builder;
+  OpBuilderWithPartitionIds &builder;
   // Intermediate info to minimize code reuse across functions.
   int numWarps = -1;
   tt::ExpandDimsOp _expandedInput = nullptr;
@@ -45,7 +45,7 @@ private:
   Operation *_allocOp = nullptr;
 
 public:
-  TMEM1DAllocator(OpBuilderWithAsyncTaskIds &builder) : builder(builder) {}
+  TMEM1DAllocator(OpBuilderWithPartitionIds &builder) : builder(builder) {}
 
 private:
   void copyAttrs(Operation *oldOp, Operation *newOp) {
@@ -82,14 +82,14 @@ private:
 
   FailureOr<ttng::TMEMAllocOp> alloc1DTMEMBuffer();
 
-  LogicalResult TMEMStore1D(OpResult producer, AsyncTaskId producerTaskId,
+  LogicalResult TMEMStore1D(OpResult producer, WSPartitionId producerTaskId,
                             Operation *allocOpBuffer);
 
   // Returns the new loaded value as the new producer.
   Value TMEMLoad1D(OpResult producer, Operation *consumer);
 
 public:
-  Value replaceWith1DTMEM(OpResult producer, AsyncTaskId producerTaskId,
+  Value replaceWith1DTMEM(OpResult producer, WSPartitionId producerTaskId,
                           Operation *consumer,
                           Operation *allocOpBuffer = nullptr) {
     this->numWarps = ttg::lookupNumWarps(producer.getDefiningOp());

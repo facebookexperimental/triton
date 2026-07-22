@@ -18,7 +18,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
-#define DEBUG_TYPE "nvgpu-ws-task-id-propagate"
+#define DEBUG_TYPE "nvgpu-ws-partition-id-propagate"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
@@ -29,11 +29,11 @@ namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 
-/// Given a TMEMStoreOp, check its source value for async_task_id.
+/// Given a TMEMStoreOp, check its source value for ttg.partition.
 /// Traverse back through the def chain looking for an operation with
-/// async_task_id set.
-static SmallVector<AsyncTaskId>
-findAsyncIdFromTMEMStoreSource(ttng::TMEMStoreOp storeOp) {
+/// ttg.partition set.
+static SmallVector<WSPartitionId>
+findPartitionIdsFromTMEMStoreSource(ttng::TMEMStoreOp storeOp) {
   Value src = storeOp.getSrc();
   SmallVector<Value> workList;
   DenseSet<Value> visited;
@@ -49,9 +49,9 @@ findAsyncIdFromTMEMStoreSource(ttng::TMEMStoreOp storeOp) {
     if (!defOp)
       continue;
 
-    auto taskIds = getAsyncTaskIds(defOp);
-    if (!taskIds.empty()) {
-      return taskIds;
+    auto partitionIds = getWSPartitionIds(defOp);
+    if (!partitionIds.empty()) {
+      return partitionIds;
     }
 
     // Continue traversing backward through operands
@@ -103,17 +103,17 @@ static ttng::TMEMAllocOp findBaseTMEMAlloc(Value desc) {
   return nullptr;
 }
 
-/// Handle operand D for MMA ops with task_id set.
+/// Handle operand D for MMA ops with ttg.partition set.
 /// This function finds TMEMStoreOp (initialization) before the loop
-/// containing the MMA and assigns async_task_id to it if not already set.
-static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
+/// containing the MMA and assigns ttg.partition to it if not already set.
+static void handleOperandDPartitionPropagation(triton::FuncOp &funcOp) {
   funcOp.walk([&](ttng::MMAv5OpInterface mmaOp) {
-    // Step 1: Check if the MMA op has a task_id set.
-    auto mmaTaskIds = getAsyncTaskIds(mmaOp);
-    if (mmaTaskIds.empty())
+    // Step 1: Check if the MMA op has ttg.partition set.
+    auto mmaPartitionIds = getWSPartitionIds(mmaOp);
+    if (mmaPartitionIds.empty())
       return;
 
-    LDBG("Found MMA op with task_id: " << mmaOp);
+    LDBG("Found MMA op with ttg.partition: " << mmaOp);
 
     // Step 2: Traverse the accumulator operand to find the TMEM alloc.
     Value dOperand = mmaOp.getAccumulator();
@@ -138,106 +138,112 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
       if (loop->isProperAncestor(storeOp) || !appearsBefore(storeOp, loop))
         continue;
 
-      // Find the earliest user with an async task ID to use as the source.
-      Operation *taskIdSource = mmaOp;
+      // Find the earliest user with a partition ID to use as the source.
+      Operation *partitionIdSource = mmaOp;
       for (auto otherUser : dOperand.getUsers()) {
-        if (otherUser == storeOp || otherUser == taskIdSource)
+        if (otherUser == storeOp || otherUser == partitionIdSource)
           continue;
-        auto otherTaskIds = getAsyncTaskIds(otherUser);
-        if (otherTaskIds.empty())
+        auto otherPartitionIds = getWSPartitionIds(otherUser);
+        if (otherPartitionIds.empty())
           continue;
-        // Check if this user is earlier than the current taskIdSource
-        if (!taskIdSource || appearsBefore(otherUser, taskIdSource)) {
-          taskIdSource = otherUser;
+        // Check if this user is earlier than the current partitionIdSource.
+        if (!partitionIdSource || appearsBefore(otherUser, partitionIdSource)) {
+          partitionIdSource = otherUser;
         }
       }
 
-      // Step 4: Check if the TMEMStoreOp already has a task_id
-      auto storeTaskIds = getAsyncTaskIds(storeOp);
-      if (!storeTaskIds.empty()) {
-        LDBG("TMEMStoreOp already has task_id: " << storeOp);
+      // Step 4: Check if the TMEMStoreOp already has ttg.partition.
+      auto storePartitionIds = getWSPartitionIds(storeOp);
+      if (!storePartitionIds.empty()) {
+        LDBG("TMEMStoreOp already has ttg.partition: " << storeOp);
         continue;
       }
 
-      // Step 5: Look for async_id along the initialization value's creation
-      SmallVector<AsyncTaskId> srcAsyncId =
-          findAsyncIdFromTMEMStoreSource(storeOp);
+      // Step 5: Look for ttg.partition along the initialization value's
+      // creation.
+      SmallVector<WSPartitionId> srcPartitionIds =
+          findPartitionIdsFromTMEMStoreSource(storeOp);
 
-      if (!srcAsyncId.empty()) {
-        LDBG("Found async_id from source: assigning to TMEMStoreOp");
-        setAsyncTaskIds(storeOp, srcAsyncId);
+      if (!srcPartitionIds.empty()) {
+        LDBG("Found ttg.partition from source: assigning to TMEMStoreOp");
+        setWSPartitionIds(storeOp, srcPartitionIds);
       } else {
-        // Step 6: If no async_id found, assign the async_id from the earliest
-        // matching user
-        LDBG("No async_id from source, using task_id from earliest user");
-        // Get the task IDs from the earliest matching user
-        auto taskIdsToPropagate = getAsyncTaskIds(taskIdSource);
-        setAsyncTaskIds(storeOp, taskIdsToPropagate);
+        // Step 6: If no source partition is found, assign the partition from
+        // the earliest matching user.
+        LDBG("No ttg.partition from source, using earliest user's partition");
+        // Get the partition IDs from the earliest matching user
+        auto partitionIdsToPropagate = getWSPartitionIds(partitionIdSource);
+        setWSPartitionIds(storeOp, partitionIdsToPropagate);
       }
     }
   });
 }
 
 LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
-  // Compute the min partition to normalize to 0
+  // Compute the min partition to normalize to 0.
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0];
-      assert(idx >= 0);
-      minPartition = std::min(idx, minPartition);
+      for (int64_t idx : attr.asArrayRef()) {
+        assert(idx >= 0);
+        minPartition = std::min(idx, minPartition);
+      }
     }
   });
-  DenseSet<AsyncTaskId> totalTaskIds;
-  // Convert ttg.partition to async_task_id
+  DenseSet<WSPartitionId> totalPartitionIds;
+  // Normalize ttg.partition indices to start at 0, in place. ttg.partition is
+  // the single partition representation for the whole WS pipeline.
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0] - minPartition;
-      totalTaskIds.insert(idx);
-      assert(idx >= 0);
-      setAsyncTaskIds(op, idx);
-      op->removeAttr(ttg::kPartitionAttrName);
+      SmallVector<WSPartitionId> ids;
+      for (int64_t rawIdx : attr.asArrayRef()) {
+        WSPartitionId idx = static_cast<WSPartitionId>(rawIdx - minPartition);
+        assert(idx >= 0);
+        totalPartitionIds.insert(idx);
+        ids.push_back(idx);
+      }
+      setWSPartitionIds(op, ids);
     }
   });
 
-  // Handle operand D for MMA ops - propagate task_id to initialization
+  // Handle operand D for MMA ops - propagate partition IDs to initialization
   // TMEMStoreOps before loops.
-  handleOperandDTaskIdPropagation(funcOp);
+  handleOperandDPartitionPropagation(funcOp);
 
-  // Existing async_task_id anchors also contribute to the global task union.
-  // In async-only inputs there may be no ttg.partition attrs to normalize, but
-  // loops, assumes, and loop bounds still need to be visible to all tasks.
+  // Existing ttg.partition anchors also contribute to the global partition
+  // union. In partition-only inputs there may be no ttg.partition attrs to
+  // normalize, but loops, assumes, and loop bounds still need to be visible to
+  // all partitions.
   funcOp.walk([&](mlir::Operation *op) {
-    for (AsyncTaskId taskId : getAsyncTaskIds(op))
-      totalTaskIds.insert(taskId);
+    for (WSPartitionId partitionId : getWSPartitionIds(op))
+      totalPartitionIds.insert(partitionId);
   });
 
-  std::vector<int> allTasksVec(totalTaskIds.begin(), totalTaskIds.end());
-  ArrayRef<AsyncTaskId> allTasks(allTasksVec);
+  std::vector<int> allPartitionsVec(totalPartitionIds.begin(),
+                                    totalPartitionIds.end());
+  ArrayRef<WSPartitionId> allPartitions(allPartitionsVec);
 
-  // Hack: set async_task_id to all tasks for all assume ops.
+  // Hack: set ttg.partition to all partitions for all assume ops.
   // This is not necesssarily generally desirable because it could
   // force data into multiple partitions. However, for now we will
   // assume this is for the inputs and can state this as needed.
-  funcOp.walk([&](LLVM::AssumeOp op) { setAsyncTaskIds(op, allTasks); });
+  funcOp.walk([&](LLVM::AssumeOp op) { setWSPartitionIds(op, allPartitions); });
 
-  // Mark all loops with all async tasks. We assume DCE can prune any unused
+  // Mark all loops with all partitions. We assume DCE can prune any unused
   // loops. Also propagate to scf.for loop bounds (start, stop, step) since
   // they are outside the loop body.
   funcOp.walk([&](scf::ForOp op) {
-    setAsyncTaskIds(op, allTasks);
+    setWSPartitionIds(op, allPartitions);
     if (auto *defOp = op.getLowerBound().getDefiningOp())
-      addAsyncTaskIds(defOp, allTasks);
+      addWSPartitionIds(defOp, allPartitions);
     if (auto *defOp = op.getUpperBound().getDefiningOp())
-      addAsyncTaskIds(defOp, allTasks);
+      addWSPartitionIds(defOp, allPartitions);
     if (auto *defOp = op.getStep().getDefiningOp())
-      addAsyncTaskIds(defOp, allTasks);
+      addWSPartitionIds(defOp, allPartitions);
   });
-  funcOp.walk([&](scf::WhileOp op) { setAsyncTaskIds(op, allTasks); });
+  funcOp.walk([&](scf::WhileOp op) { setWSPartitionIds(op, allPartitions); });
 
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
@@ -250,13 +256,14 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
     return failure();
 
   funcOp.walk([&](mlir::Operation *op) {
-    auto taskIds = ttg::TaskId::getUninitialized();
+    auto propagatedPartitionIds = ttg::TaskId::getUninitialized();
     // Get the union of the results
     for (auto result : op->getResults()) {
       auto *lattice = solver.lookupState<ttg::TaskIdLattice>(result);
       if (!lattice)
         llvm_unreachable("Lattice not found.");
-      taskIds = taskIds.meet(taskIds, lattice->getValue());
+      propagatedPartitionIds = propagatedPartitionIds.meet(
+          propagatedPartitionIds, lattice->getValue());
     }
     // Get the union of the operands
     if (op->getNumResults() == 0) {
@@ -264,7 +271,8 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
         auto *lattice = solver.lookupState<ttg::TaskIdLattice>(operand);
         if (!lattice)
           llvm_unreachable("Lattice not found.");
-        taskIds = taskIds.meet(taskIds, lattice->getValue());
+        propagatedPartitionIds = propagatedPartitionIds.meet(
+            propagatedPartitionIds, lattice->getValue());
       }
     }
     // TODO(Arda): Ideally front-end should not allow constant ops to be
@@ -273,28 +281,31 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
         isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
         llvm::none_of(op->getResultTypes(),
                       [](Type t) { return isa<RankedTensorType>(t); });
-    bool isAnchor = !isScalarArithOrMath && op->hasAttr("async_task_id");
-    if (!taskIds.isUninitialized() &&
+    bool isAnchor =
+        !isScalarArithOrMath && op->hasAttr(ttg::kPartitionAttrName);
+    if (!propagatedPartitionIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !isAnchor)) {
       // For non-anchor ops with existing annotations, merge the lattice
-      // value with the annotation to preserve the original task assignment.
+      // value with the annotation to preserve the original partition
+      // assignment.
       if (auto existing =
-              op->getAttrOfType<DenseI32ArrayAttr>("async_task_id")) {
-        taskIds = ttg::TaskId::meet(taskIds, ttg::TaskId(existing));
+              op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
+        propagatedPartitionIds =
+            ttg::TaskId::meet(propagatedPartitionIds, ttg::TaskId(existing));
       }
-      op->setAttr("async_task_id", taskIds.getTaskIds());
+      op->setAttr(ttg::kPartitionAttrName, propagatedPartitionIds.getTaskIds());
     }
   });
-  // Re-propagate allTasks to ForOp loop bounds after the solver. The solver
-  // may have overridden constants with a narrower set of tasks. We also do
-  // this before the solver in case the bounds are not constants.
+  // Re-propagate all partitions to ForOp loop bounds after the solver. The
+  // solver may have overridden constants with a narrower set of partitions. We
+  // also do this before the solver in case the bounds are not constants.
   funcOp.walk([&](scf::ForOp op) {
     if (auto *defOp = op.getLowerBound().getDefiningOp())
-      addAsyncTaskIds(defOp, allTasks);
+      addWSPartitionIds(defOp, allPartitions);
     if (auto *defOp = op.getUpperBound().getDefiningOp())
-      addAsyncTaskIds(defOp, allTasks);
+      addWSPartitionIds(defOp, allPartitions);
     if (auto *defOp = op.getStep().getDefiningOp())
-      addAsyncTaskIds(defOp, allTasks);
+      addWSPartitionIds(defOp, allPartitions);
   });
   // The parent operations must have the union of their children's operations.
   // We do this in a separate walk to avoid having a parent operation treated
@@ -316,14 +327,14 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     llvm::DenseSet<Operation *> anchorOps;
     funcOp.walk([&](mlir::Operation *op) {
-      auto asyncTasks = getAsyncTaskIds(op);
-      if (!asyncTasks.empty()) {
-        std::sort(asyncTasks.begin(), asyncTasks.end());
-        setAsyncTaskIds(op, asyncTasks);
+      auto partitionIds = getWSPartitionIds(op);
+      if (!partitionIds.empty()) {
+        std::sort(partitionIds.begin(), partitionIds.end());
+        setWSPartitionIds(op, partitionIds);
         if (!isa<arith::ConstantOp, arith::ConstantIntOp>(op))
           anchorOps.insert(op);
         if (numWarpGroups == 0)
-          op->removeAttr("async_task_id");
+          op->removeAttr(ttg::kPartitionAttrName);
       }
     });
     if (numWarpGroups == 0 || anchorOps.empty())

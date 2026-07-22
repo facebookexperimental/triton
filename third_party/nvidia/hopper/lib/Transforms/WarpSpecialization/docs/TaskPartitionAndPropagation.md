@@ -23,8 +23,8 @@ consumer warp groups.
 
 An extended partition scheduling pass with template-based scheduling for Flash
 Attention and GEMM patterns. This pass runs before the main WS pipeline on
-Blackwell, assigning `ttg.partition` attributes that are later converted to
-`async_task_id` by `WSTaskIdPropagate`.
+Blackwell, assigning `ttg.partition` attributes that are normalized and
+propagated by `WSTaskIdPropagate`.
 
 ### Op Categorizer
 
@@ -89,9 +89,9 @@ A simpler approach using backward slicing from dot/MMA ops. Used on Hopper.
    load ops, and store ops.
 2. For each dot, compute the backward slice of operands A and B.
 3. Any `DescriptorLoadOp`, `DescriptorGatherOp`, or expensive `LoadOp` in the
-   backward slice is a **producer** (task ID 0).
-4. All dots are **consumers** (task IDs 1 through `numWarpGroups - 1`).
-5. All stores get consumer task IDs.
+   backward slice is a **producer** (partition ID 0).
+4. All dots are **consumers** (partition IDs 1 through `numWarpGroups - 1`).
+5. All stores get consumer partition IDs.
 
 **Key point**: only operands A and B are backward-sliced. The dot itself (and
 its accumulator / operand D) always stays in the consumer partition.
@@ -102,7 +102,7 @@ its accumulator / operand D) always stays in the consumer partition.
 - `TaskIdPropagation.cpp` (analysis)
 - `WSTaskIdPropagate.cpp` (materialization)
 
-After anchors are assigned task IDs, many intermediate ops remain unannotated.
+After anchors are assigned partition IDs, many intermediate ops remain unannotated.
 Task ID propagation fills these gaps.
 
 ### Dataflow Analysis
@@ -112,34 +112,34 @@ analysis framework.
 
 **Lattice**: `TaskId` has three states:
 - **Uninitialized**: not yet visited
-- **Known**: a set of task IDs (e.g., `{0, 1}`)
+- **Known**: a set of partition IDs (e.g., `{0, 1}`)
 - **Unknown**: conflicting information
 
-**Meet operation**: union of task ID sets. An op used by tasks `{0, 1}` and
+**Meet operation**: union of partition ID sets. An op used by tasks `{0, 1}` and
 `{1, 2}` gets `{0, 1, 2}`.
 
 **Transfer function** (`visitOperation`):
-- **Anchor ops** (non-scalar ops with `async_task_id`): define partitioning
+- **Anchor ops** (non-scalar ops with `ttg.partition`): define partitioning
   boundaries. Task IDs flow backward to operands but are not overridden.
 - **Non-anchor ops** (including scalar arith/math): standard backward
-  propagation — task IDs flow from results to operands.
-- Scalar arith/math ops are always non-anchors, allowing task IDs to flow
+  propagation — partition IDs flow from results to operands.
+- Scalar arith/math ops are always non-anchors, allowing partition IDs to flow
   through shared address computations.
 
 ### Materialization (`doTaskIdPropagate`)
 
-1. Convert `ttg.partition` → `async_task_id` (normalize indices by subtracting
-   the minimum partition ID).
+1. Normalize `ttg.partition` indices in place by subtracting the minimum
+   partition ID.
 2. Handle operand D initialization: find `TMEMStoreOp` before the loop that
-   writes to the MMA's accumulator, assign it the appropriate task ID.
+   writes to the MMA's accumulator, assign it the appropriate partition ID.
 3. Mark all `scf::ForOp` and `scf::WhileOp` loops with the union of all task
    IDs.
 4. Run the backward dataflow solver.
-5. Materialize: update `async_task_id` on all ops from the solver's lattice.
+5. Materialize: update `ttg.partition` on all ops from the solver's lattice.
 6. `labelParentOps`: ensure parent ops have the union of their children's
-   task IDs.
+   partition IDs.
 
-For `scf.while`, result task IDs propagate through the `scf.condition`
+For `scf.while`, result partition IDs propagate through the `scf.condition`
 forwarded operands because while results are produced by the before-region
 terminator, not by the after-region `scf.yield`. The after-region yield still
 models the backedge to the next iteration's before-region arguments.
@@ -167,11 +167,11 @@ into two M=128 pieces for two consumer groups.
 
 4. **Rewrite**: For each partition offset, clone ops with types adjusted
    (divide `shape[dim]` by `numPartitions`). An op with
-   `async_task_id = [1, 2]` gets split into two copies: one with `[1]` and
+   `ttg.partition = [1, 2]` gets split into two copies: one with `[1]` and
    one with `[2]`.
 
 ### Relationship to Task IDs
 
-Data partitioning operates **after** task ID assignment. The offset parameter
-selects which task ID from the original array. This is how N consumer warp
+Data partitioning operates **after** partition ID assignment. The offset parameter
+selects which partition ID from the original array. This is how N consumer warp
 groups each get their slice of the data.

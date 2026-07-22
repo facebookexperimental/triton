@@ -16,7 +16,7 @@ implementation in:
 ## Motivation
 
 V1 WSBarrier analysis represents each channel by a `channelGraph`: the set of
-foreign task IDs reachable from the destination partition through the channel
+foreign partition IDs reachable from the destination partition through the channel
 graph. This proves simple cases by allowing an arrive to move past a wait only
 when their reachable task sets are disjoint.
 
@@ -37,7 +37,7 @@ The nested `constraints.WSBarrier` dictionary can contain:
 
 | Field | Meaning |
 |-------|---------|
-| `dstTask` | Destination partition for the channel. The source partition is the op's `async_task_id`. |
+| `dstTask` | Destination partition for the channel. The source partition is the op's `ttg.partition`. |
 | `channelGraph` | V1 reachable foreign task set, excluding the source task. |
 | `direction` | Direction for direct TTNG barrier endpoints: `"forward"` for data-ready edges and `"backward"` for resource-reuse edges. NVWS token ops derive this from op type. |
 | `parentId` | Function-local ID for the nearest ordered parent scope. |
@@ -133,7 +133,7 @@ and V2 metadata back to token or direct barrier constraints:
 
 1. Build the V1 partition reachability graph with `buildChannelGraph()`.
 2. Build ordered-region ranges with `buildWSBarrierOrderedRegionRanges()`.
-3. For each WSBarrier endpoint with one `async_task_id` and a valid `dstTask`,
+3. For each WSBarrier endpoint with one `ttg.partition` and a valid `dstTask`,
    inject:
    - `channelGraph`
    - `parentId`

@@ -19,20 +19,20 @@
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @reduce_epilogue_descriptor_store(%input: !tt.tensordesc<128x256xf16, #shared>, %output: !tt.tensordesc<128x256xf16, #shared>) attributes {noinline = false} {
-    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
+    %c0 = arith.constant {ttg.partition = array<i32: 0, 1>} 0 : i32
     %buffer = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x256xf16, #shared, #smem, mutable>
-    %loaded = tt.descriptor_load %input[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x256xf16, #shared> -> tensor<128x256xf16, #blocked>
-    ttg.local_store %loaded, %buffer {async_task_id = array<i32: 0>} : tensor<128x256xf16, #blocked> -> !ttg.memdesc<128x256xf16, #shared, #smem, mutable>
-    %tile = ttg.local_load %buffer {async_task_id = array<i32: 1>} : !ttg.memdesc<128x256xf16, #shared, #smem, mutable> -> tensor<128x256xf16, #blocked>
+    %loaded = tt.descriptor_load %input[%c0, %c0] {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x256xf16, #shared> -> tensor<128x256xf16, #blocked>
+    ttg.local_store %loaded, %buffer {ttg.partition = array<i32: 0>} : tensor<128x256xf16, #blocked> -> !ttg.memdesc<128x256xf16, #shared, #smem, mutable>
+    %tile = ttg.local_load %buffer {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x256xf16, #shared, #smem, mutable> -> tensor<128x256xf16, #blocked>
     %sum = "tt.reduce"(%tile) <{axis = 1 : i32}> ({
     ^bb0(%lhs: f16, %rhs: f16):
-      %next = arith.addf %lhs, %rhs {async_task_id = array<i32: 1>} : f16
-      tt.reduce.return %next {async_task_id = array<i32: 1>} : f16
-    }) {async_task_id = array<i32: 1>} : (tensor<128x256xf16, #blocked>) -> tensor<128xf16, #ttg.slice<{dim = 1, parent = #blocked}>>
-    %expanded = tt.expand_dims %sum {async_task_id = array<i32: 1>, axis = 1 : i32} : tensor<128xf16, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf16, #blocked>
-    %broadcast = tt.broadcast %expanded {async_task_id = array<i32: 1>} : tensor<128x1xf16, #blocked> -> tensor<128x256xf16, #blocked>
-    %result = arith.addf %tile, %broadcast {async_task_id = array<i32: 1>} : tensor<128x256xf16, #blocked>
-    tt.descriptor_store %output[%c0, %c0], %result {async_task_id = array<i32: 1>} : !tt.tensordesc<128x256xf16, #shared>, tensor<128x256xf16, #blocked>
+      %next = arith.addf %lhs, %rhs {ttg.partition = array<i32: 1>} : f16
+      tt.reduce.return %next {ttg.partition = array<i32: 1>} : f16
+    }) {ttg.partition = array<i32: 1>} : (tensor<128x256xf16, #blocked>) -> tensor<128xf16, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %expanded = tt.expand_dims %sum {ttg.partition = array<i32: 1>, axis = 1 : i32} : tensor<128xf16, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<128x1xf16, #blocked>
+    %broadcast = tt.broadcast %expanded {ttg.partition = array<i32: 1>} : tensor<128x1xf16, #blocked> -> tensor<128x256xf16, #blocked>
+    %result = arith.addf %tile, %broadcast {ttg.partition = array<i32: 1>} : tensor<128x256xf16, #blocked>
+    tt.descriptor_store %output[%c0, %c0], %result {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x256xf16, #shared>, tensor<128x256xf16, #blocked>
     tt.return
   }
 }

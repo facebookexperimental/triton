@@ -1,12 +1,12 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-task-partition=num-warp-groups=3 | FileCheck %s
 
 // CHECK-LABEL: @matmul_persistent_tma_ws_cooperative_kernel
-// CHECK: %[[#GA:]] = tt.descriptor_load {{.*}} {async_task_id = array<i32: 0>}
+// CHECK: %[[#GA:]] = tt.descriptor_load {{.*}} {ttg.partition = array<i32: 0>}
 // CHECK: %[[#LA:]] = ttg.local_alloc %[[#GA]]
-// CHECK: %[[#GB:]] = tt.descriptor_load {{.*}} {async_task_id = array<i32: 0>}
+// CHECK: %[[#GB:]] = tt.descriptor_load {{.*}} {ttg.partition = array<i32: 0>}
 // CHECK: %[[#LB:]] = ttg.local_alloc %[[#GB]]
-// CHECK: %[[#C:]] = ttng.warp_group_dot %[[#LA]], %[[#LB]], {{.*}} {async_task_id = array<i32: 1, 2>
-// CHECK: tt.descriptor_store {{.*}} {async_task_id = array<i32: 1, 2>
+// CHECK: %[[#C:]] = ttng.warp_group_dot %[[#LA]], %[[#LB]], {{.*}} {inputPrecision = 0 : i32, ttg.partition = array<i32: 1, 2>
+// CHECK: tt.descriptor_store {{.*}} {ttg.partition = array<i32: 1, 2>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>

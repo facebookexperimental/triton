@@ -38,7 +38,7 @@ tile, and the producer/consumer barriers never match → **runtime deadlock**.
 > `tt.atomic_rmw` and `ttng.clc_read`.
 
 Runs in `WarpSpecialization.cpp::runOnFuncOp` immediately **after**
-`doTaskIdPropagate` (so partitions are materialized as `async_task_id`) and
+`doTaskIdPropagate` (so partitions are materialized as `ttg.partition`) and
 before `doBufferAllocation`. For each `tt.atomic_rmw` it classifies into one of
 three cases:
 
@@ -75,13 +75,13 @@ handshake.
 
 `doDynamicTileBroadcast` returns `failure()`. The caller then calls the canonical
 `removeWarpSpecMetadata(funcOp)`, which strips **both** the partition ids
-(`ttg.partition`) and the task ids (`async_task_id`) from every op, plus the WS
+(`ttg.partition`) and the task ids (`ttg.partition`) from every op, plus the WS
 loop attributes (`tt.warp_specialize`, `ttg.partition.stages`,
 `ttg.partition.types`, `ttg.warp_specialize.tag`). The kernel is left
 unspecialized-but-compilable (never a crash/assert). This is the same teardown —
 one shared helper — used by the other AutoWS bail-outs (`numWarps < 4`, `scf.if`
 else-block) and by `PartitionSchedulingMeta`'s warp-budget reject;
-`removeWarpSpecMetadata` clears `async_task_id` too because this reject runs
+`removeWarpSpecMetadata` clears `ttg.partition` too because this reject runs
 *after* propagation, unlike the earlier bail-outs.
 
 ## Two supporting fixes this feature required

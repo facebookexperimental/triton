@@ -19,7 +19,7 @@ namespace mlir {
 // Standard representation of a WS barrier constraint.
 //
 // The source task is always the partition where the barrier op lives (available
-// from async_task_id). The destination is the partition on the other side of
+// from ttg.partition). The destination is the partition on the other side of
 // the channel that this barrier communicates with.
 //
 // WS barrier metadata is stored under a top-level constraints.WSBarrier key so
@@ -32,8 +32,8 @@ struct WSBarrierAttr {
   static constexpr llvm::StringLiteral kDirectionForward = "forward";
   static constexpr llvm::StringLiteral kDirectionBackward = "backward";
 
-  // Destination task ID — the foreign partition this barrier communicates with.
-  // Set during insertAsyncComm.
+  // Destination partition ID — the foreign partition this barrier communicates
+  // with. Set during insertAsyncComm.
   IntegerAttr dstTask;
 
   // Task IDs reachable from the destination through the channel adjacency
@@ -130,10 +130,10 @@ struct WSBarrierOpRegionInfo {
 
 // Build the WS barrier channel graph for all channels.
 //
-// For each directed (src, dst) task pair, returns the set of foreign task IDs
-// that could interfere with barrier reordering. This is computed as the set of
-// task IDs reachable from dst through the channel adjacency graph, excluding
-// src (the partition where the barrier lives).
+// For each directed (src, dst) task pair, returns the set of foreign partition
+// IDs that could interfere with barrier reordering. This is computed as the set
+// of partition IDs reachable from dst through the channel adjacency graph,
+// excluding src (the partition where the barrier lives).
 //
 // Uses the mapping: default partition = 0, partition p = p + 1.
 //
@@ -442,7 +442,7 @@ buildWSBarrierOrderedRegionRanges(
     auto attr = WSBarrierAttr::parse(constraints);
     if (!attr.dstTask)
       return;
-    auto taskIds = getAsyncTaskIds(op);
+    auto taskIds = getWSPartitionIds(op);
     if (taskIds.size() != 1)
       return;
     auto regionIt = tokenRegionInfo.find(op);

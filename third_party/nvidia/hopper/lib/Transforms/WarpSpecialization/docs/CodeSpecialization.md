@@ -2,7 +2,7 @@
 
 Code specialization is the step that physically separates operations into
 distinct `WarpSpecializeOp` regions — one region per partition. Before this
-step, operations coexist in a single function body with `async_task_id`
+step, operations coexist in a single function body with `ttg.partition`
 annotations. After specialization, each partition has its own isolated region
 that will execute on a dedicated warp group.
 
@@ -29,9 +29,9 @@ A `ttg.WarpSpecializeOp` is created with:
 
 ### Step 2: Collect and Sort Operations
 
-All operations with `async_task_id` attributes are collected and
+All operations with `ttg.partition` attributes are collected and
 topologically sorted. Each operation is then assigned to the appropriate
-region based on its task ID.
+region based on its partition ID.
 
 ### Step 3: Clone Operations
 

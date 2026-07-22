@@ -7,12 +7,13 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
-#define DEBUG_TYPE "task-id-propagation"
+#define DEBUG_TYPE "partition-id-propagation"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
@@ -54,13 +55,13 @@ TaskId TaskId::meet(const TaskId &lhs, const TaskId &rhs) {
   auto context = lhs.getTaskIds().getContext();
   auto lhsTasks = lhs.getTaskIds().asArrayRef();
   auto rhsTasks = rhs.getTaskIds().asArrayRef();
-  // Meet the task ids by merging and deduplicating them
-  SmallVector<AsyncTaskId> result(lhsTasks.begin(), lhsTasks.end());
+  // Meet the partition ids by merging and deduplicating them.
+  SmallVector<WSPartitionId> result(lhsTasks.begin(), lhsTasks.end());
   result.insert(result.end(), rhsTasks.begin(), rhsTasks.end());
   std::sort(result.begin(), result.end());
   result.erase(std::unique(result.begin(), result.end()), result.end());
   auto mergedAndDedupedTaskIds =
-      TaskId(DenseI32ArrayAttr::get(context, ArrayRef<AsyncTaskId>(result)));
+      TaskId(DenseI32ArrayAttr::get(context, ArrayRef<WSPartitionId>(result)));
   return mergedAndDedupedTaskIds;
 }
 
@@ -122,15 +123,14 @@ void TaskIdBackwardPropagation::propagateToParent(Operation *op,
 LogicalResult TaskIdBackwardPropagation::visitOperation(
     Operation *op, ArrayRef<TaskIdLattice *> operands,
     ArrayRef<const TaskIdLattice *> results) {
-  // TODO(Arda): Replace the following with getAsyncTaskIds when we no longer
-  // need to dump the task ids into the IR.
-  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
+  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>(kPartitionAttrName);
 
   // An op is a non-anchor (allows backward propagation to flow through) only
   // if it is a scalar arithmetic/math op. These ops compute shared addresses
-  // or indices used across tasks and need the union of consumer task IDs.
+  // or indices used across tasks and need the union of consumer partition IDs.
   // All other annotated ops (Triton ops, tensor ops, control flow) are anchors
-  // whose task IDs define the computation partition and must not be overridden.
+  // whose partition IDs define the computation partition and must not be
+  // overridden.
   bool isScalarArithOrMath =
       isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
       llvm::none_of(op->getResultTypes(),
@@ -229,8 +229,8 @@ void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   // forwarded into a successor region/block (forwarded operands are meet with
   // their region/block-argument lattices by the framework directly). For the
   // structured scf ops this is the trip-count / condition control operand; we
-  // propagate the union of the op's result task ids into the loop/if body via
-  // its yield(s) so the body computes for every consumer task.
+  // propagate the union of the op's result partition ids into the loop/if body
+  // via its yield(s) so the body computes for every consumer task.
   if (isa<scf::IfOp>(defOp) || isa<scf::ForOp>(defOp) ||
       isa<scf::WhileOp>(defOp)) {
     SmallVector<TaskId> lattices(defOp->getNumResults(),
@@ -270,15 +270,15 @@ void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   // autoWS kernels), or from a loop transform such as
   // tritongpu-fuse-nested-loops. The non-forwarded operand is the branch
   // condition / selector. It must be available on every warp group that
-  // executes either successor, so give it the union of the task ids flowing
-  // into the successor blocks (the forwarded destination operands, whose
-  // lattices the framework has already populated from the block arguments). A
-  // pure control op like `cf.cond_br` has no results, so there is nothing to
-  // back-propagate from results; the successor-operand union is the correct
-  // backward signal. It is empty for a bare early-return guard (successors take
-  // no forwarded operands), which is benign: a task-id-less scalar control op
-  // replicates across partitions. This mirrors how scf.if's condition acquires
-  // the union of its body task ids.
+  // executes either successor, so give it the union of the partition ids
+  // flowing into the successor blocks (the forwarded destination operands,
+  // whose lattices the framework has already populated from the block
+  // arguments). A pure control op like `cf.cond_br` has no results, so there is
+  // nothing to back-propagate from results; the successor-operand union is the
+  // correct backward signal. It is empty for a bare early-return guard
+  // (successors take no forwarded operands), which is benign: a partition-less
+  // scalar control op replicates across partitions. This mirrors how scf.if's
+  // condition acquires the union of its body partition ids.
   if (auto branch = dyn_cast<BranchOpInterface>(defOp)) {
     auto condLattice = getLatticeElement(operand.get());
     for (unsigned i = 0, e = defOp->getNumSuccessors(); i < e; ++i) {
@@ -296,19 +296,19 @@ void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
 
   // RegionBranchOpInterface ops other than the scf ops handled above (e.g. a
   // future ttg.warp_specialize) only reach here for operands not forwarded to
-  // any region; such ops carry no extra control operand needing a task id
+  // any region; such ops carry no extra control operand needing a partition id
   // today, so ignore rather than abort.
   if (isa<RegionBranchOpInterface>(defOp))
     return;
 
   // visitBranchOperand is only invoked for RegionBranchOpInterface /
   // BranchOpInterface ops, all handled above. Anything else is unanticipated at
-  // this stage: fail loudly here (at task-id propagation) so it is easy to
+  // this stage: fail loudly here (at partition propagation) so it is easy to
   // triage, rather than silently dropping propagation -- a missing/wrong
-  // async_task_id would otherwise surface much later as a hard-to-triage
+  // wrong partition would otherwise surface much later as a hard-to-triage
   // warp-specialization miscompile (wrong partition / missing barrier). Extend
   // the handling above when a new branch shape is introduced.
-  llvm_unreachable("Unhandled branch op in task-id propagation");
+  llvm_unreachable("Unhandled branch op in partition propagation");
 }
 
 void TaskIdBackwardPropagation::visitCallOperand(OpOperand &operand) {

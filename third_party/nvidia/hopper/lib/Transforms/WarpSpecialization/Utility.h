@@ -12,89 +12,84 @@
 namespace tt = mlir::triton;
 namespace mlir {
 
-typedef int AsyncTaskId;
+typedef int WSPartitionId;
 
-// Attribute name carrying an op's async task (partition) id list. This is the
-// single home for the name; see `removeWarpSpecMetadata`
-// (CodePartitionUtility.h) for the full set of WS-metadata attributes stripped
-// on a graceful reject.
-constexpr static char kAsyncTaskIdAttrName[] = "async_task_id";
+// Retrieves the partition ids of the given operation.
+SmallVector<WSPartitionId> getWSPartitionIds(Operation *op);
 
-// Retrieves the async task ids of the given operation.
-SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op);
+// Checks if the given operation has the given partition id.
+bool hasWSPartitionId(Operation *op, WSPartitionId partitionId);
 
-// Checks if the given operation has the given async task id.
-bool hasAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId);
+// Sets the partition ids of the given operation.
+void setWSPartitionIds(Operation *op, ArrayRef<WSPartitionId> partitionIds);
+void setWSPartitionIds(Operation *op, WSPartitionId partitionId);
 
-// Sets the async task ids of the given operation.
-void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds);
-
-// Propagate the async task ids of the given operation to its parent ops.
+// Propagate the partition ids of the given operation to its parent ops.
 void labelParentOps(Operation *op);
 
-// Retrieves the async task IDs of all operations nested within the given
+// Retrieves the partition IDs of all operations nested within the given
 // operation, including the operation itself.
-SmallVector<AsyncTaskId> getNestedAsyncTaskIds(Operation *op);
+SmallVector<WSPartitionId> getNestedWSPartitionIds(Operation *op);
 
-// Adds the given async task ids to the given operation.
-void addAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTasks);
+// Adds the given partition ids to the given operation.
+void addWSPartitionIds(Operation *op, ArrayRef<WSPartitionId> partitionIds);
 
-// Removes the given async task id from the given operation.
-void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId);
+// Removes the given partition id from the given operation.
+void removeWSPartitionId(Operation *op, WSPartitionId partitionId);
 
-// Removes all async task ids from the given operation.
-void removeAsyncTaskIds(Operation *op);
+// Removes all partition ids from the given operation.
+void removeWSPartitionIds(Operation *op);
 
 struct LoopScheduleInfo {
   IntegerAttr stage;
   IntegerAttr cluster;
 };
 
-class OpBuilderWithAsyncTaskIds : public OpBuilder {
+class OpBuilderWithPartitionIds : public OpBuilder {
 public:
-  OpBuilderWithAsyncTaskIds(MLIRContext *context) : OpBuilder(context) {}
+  OpBuilderWithPartitionIds(MLIRContext *context) : OpBuilder(context) {}
 
-  explicit OpBuilderWithAsyncTaskIds(Operation *op) : OpBuilder(op) {
-    setAsyncTaskIdsFromOp(op);
+  explicit OpBuilderWithPartitionIds(Operation *op) : OpBuilder(op) {
+    setPartitionIdsFromOp(op);
     setLoopScheduleInfoFromOp(op);
   }
 
-  void setAsynTaskIdsFromArray(ArrayRef<AsyncTaskId> newAsyncTaskIds) {
-    asyncTaskIds = SmallVector<AsyncTaskId>(newAsyncTaskIds.begin(),
-                                            newAsyncTaskIds.end());
+  void setPartitionIdsFromArray(ArrayRef<WSPartitionId> newWSPartitionIds) {
+    partitionIds = SmallVector<WSPartitionId>(newWSPartitionIds.begin(),
+                                              newWSPartitionIds.end());
   }
 
-  void setAsyncTaskIdsFromOp(Operation *op) {
-    setAsynTaskIdsFromArray(mlir::getAsyncTaskIds(op));
+  void setPartitionIdsFromOp(Operation *op) {
+    setPartitionIdsFromArray(mlir::getWSPartitionIds(op));
   }
 
-  void setAsyncTaskIdsFromValueUsers(Value value) {
-    SetVector<AsyncTaskId> asyncTaskIdSet;
+  void setPartitionIdsFromValueUsers(Value value) {
+    SetVector<WSPartitionId> partitionIdSet;
     for (Operation *user : value.getUsers())
-      for (AsyncTaskId asyncTaskId : mlir::getAsyncTaskIds(user))
-        asyncTaskIdSet.insert(asyncTaskId);
-    setAsynTaskIdsFromArray(asyncTaskIdSet.getArrayRef());
+      for (WSPartitionId partitionId : mlir::getWSPartitionIds(user))
+        partitionIdSet.insert(partitionId);
+    setPartitionIdsFromArray(partitionIdSet.getArrayRef());
   }
 
-  SmallVector<AsyncTaskId> getAsyncTaskIds() { return asyncTaskIds; }
+  SmallVector<WSPartitionId> getWSPartitionIds() { return partitionIds; }
 
   template <typename OpTy, typename... Args>
-  OpTy createWithAsyncTaskIds(Args &&...args) {
+  OpTy createWithPartitionIds(Args &&...args) {
     OpTy op = OpTy::create(*this, std::forward<Args>(args)...);
-    if (!asyncTaskIds.empty())
-      setAsyncTaskIds(op, asyncTaskIds);
+    if (!partitionIds.empty())
+      setWSPartitionIds(op, partitionIds);
     setOpLoopScheduleInfo(op);
     return op;
   }
 
   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
-    OpTy op = createWithAsyncTaskIds<OpTy>(std::forward<Args>(args)...);
+    OpTy op = createWithPartitionIds<OpTy>(std::forward<Args>(args)...);
     setOpLoopScheduleInfo(op);
     return op;
   }
 
   // Sets the loop schedule info (loop.stage, loop.cluster) of future
-  // createWithAsyncTaskIds operations based on the `loop.stage` and
+  // createWithPartitionIds operations based on the `loop.stage` and
   // `loop.cluster` attributes of the given operation.
   void setLoopScheduleInfoFromInfo(LoopScheduleInfo newLoopScheduleInfo) {
     loopScheduleInfo = newLoopScheduleInfo;
@@ -114,7 +109,7 @@ public:
   }
 
   // Clears the loop schedule info (loop.stage, loop.cluster) for
-  // future createWithAsyncTaskIds operations.
+  // future createWithPartitionIds operations.
   void clearLoopScheduleInfo() { loopScheduleInfo = {nullptr, nullptr}; }
 
   LoopScheduleInfo getLoopScheduleInfo() { return loopScheduleInfo; }
@@ -129,7 +124,7 @@ private:
     }
   }
 
-  SmallVector<AsyncTaskId> asyncTaskIds;
+  SmallVector<WSPartitionId> partitionIds;
   LoopScheduleInfo loopScheduleInfo = {nullptr, nullptr};
 };
 

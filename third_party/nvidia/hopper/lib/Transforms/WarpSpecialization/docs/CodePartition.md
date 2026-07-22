@@ -68,7 +68,7 @@ Step 4:   separateLocalAllocWithSrc   — split local_alloc(src) → alloc + sto
 
 Walks the function to find all cross-partition data dependencies:
 
-1. For each operation with `async_task_id`, check if it is a **channel anchor
+1. For each operation with `ttg.partition`, check if it is a **channel anchor
    op** (`isChannelAnchorOp`).
 2. If so, call `createChannel` to identify consumers in different partitions.
 
@@ -93,7 +93,7 @@ The core channel creation logic:
    operands feed while results and after-region arguments.
 2. Filter by **dominance**: only consider users properly dominated by the
    producer.
-3. For each user in a **different partition** (different `async_task_id`),
+3. For each user in a **different partition** (different `ttg.partition`),
    create a `Channel` with the appropriate kind (`SMEM`, `TMEM`, or `REG`).
 
 ### `collectAllocChannels`

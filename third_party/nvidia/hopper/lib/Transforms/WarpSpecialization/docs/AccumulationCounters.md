@@ -210,7 +210,7 @@ phase and deadlocks the handshake after the first tile. The same-partition ring
 has no such phase (the wait_group alone gates slot reuse) and instead needs the
 fixed per-tile `theIdx` so same-slot stores stay exactly K apart.
 
-The discriminator is `getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())`.
+The discriminator is `getWSPartitionIds(ch->getSrcOp()) == getWSPartitionIds(ch->getDstOp())`.
 The same-partition `theIdx % K` rotation is only correct when **K | S**; that
 invariant is enforced defensively by `increaseFusedEpilogueCopies`
 (see [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md)). The cross-partition

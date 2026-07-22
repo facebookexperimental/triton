@@ -13,13 +13,13 @@ into two M=128 pieces for two consumer groups.
 
 ```
 doTaskPartition          ← assigns ops to partitions
-  → doTaskIdPropagate   ← propagates task IDs to all ops
+  → doTaskIdPropagate   ← propagates partition IDs to all ops
   → doDataPartition     ← THIS STEP: splits tensor dimensions
   → doPingPongPrep
 ```
 
 Data partitioning is exposed as `nvgpu-ws-data-partition` and is not Hopper
-only. Hopper-style AutoWS typically reaches it after task ID propagation, while
+only. Hopper-style AutoWS typically reaches it after partition ID propagation, while
 Blackwell flows may run it as a separate pass when an explicit data partition
 factor is attached or multiple warp groups require per-consumer slices.
 
@@ -47,12 +47,12 @@ struct DataPartitionScheme {
 ### Step 1: Task ID Fixup (`fixTaskId`)
 
 Before partitioning, ensures all ops in def-use chains carry correct
-`async_task_id` attributes via bidirectional propagation:
+`ttg.partition` attributes via bidirectional propagation:
 
 - **Backward**: If an op uses a value defined by an `arith` op that lacks the
-  consumer's task ID, propagate backward.
+  consumer's partition ID, propagate backward.
 - **Forward**: If a `YieldOp`, `ConditionOp`, `IfOp`, or `WhileOp` has a
-  single-use operand whose defining op has extra task IDs, propagate forward.
+  single-use operand whose defining op has extra partition IDs, propagate forward.
 
 Runs to a fixed point.
 
@@ -62,7 +62,7 @@ Drives partitioning from dot/MMA ops:
 
 1. Collect all `WarpGroupDotOp` operations and all operations implementing
    `MMAv5OpInterface`.
-2. For each dot with multiple `async_task_id` values, determine the partition
+2. For each dot with multiple `ttg.partition` values, determine the partition
    dimension from the accumulator shape:
    - **M dimension** (dim 0): if `shapePerCTA[0] / numPartitions >= 64`
    - **N dimension** (dim 1): if `shapePerCTA[1] / numPartitions >= 128`
@@ -122,7 +122,7 @@ For each partition offset (0 to `numPartitions - 1`):
 
 1. Clone each partitioned op with types adjusted — divide
    `shape[partitionDim]` by `numPartitions`.
-2. An op with `async_task_id = [1, 2]` gets split into two copies: one with
+2. An op with `ttg.partition = [1, 2]` gets split into two copies: one with
    `[1]` and one with `[2]`.
 3. Function arguments with `TensorDescType` have their block type sliced to
    match the partition factor.
@@ -222,8 +222,8 @@ ttng.tc_gen5_mma_scaled %a1, %b, %acc1[%tok1], %a_scale1, %b_scale, ...
 
 ### Interaction with Task IDs
 
-Data partitioning operates **after** task ID assignment. The offset parameter
-selects which task ID from the original array. This is how N consumer warp
+Data partitioning operates **after** partition ID assignment. The offset parameter
+selects which partition ID from the original array. This is how N consumer warp
 groups each get their slice of the data.
 
 ## Regression Tests

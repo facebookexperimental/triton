@@ -126,8 +126,8 @@ static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
                                      Value &endAccumElse,
                                      DenseSet<Operation *> &regionsWithChannels,
                                      ReuseConfig *config,
-                                     OpBuilderWithAsyncTaskIds &ifBuilder,
-                                     OpBuilderWithAsyncTaskIds &elseBuilder) {
+                                     OpBuilderWithPartitionIds &ifBuilder,
+                                     OpBuilderWithPartitionIds &elseBuilder) {
   auto parentForOp = ifOp->getParentOfType<scf::ForOp>();
   auto *op = ifOp.getOperation();
   auto loc = ifOp.getLoc();
@@ -147,15 +147,15 @@ static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
                                                    accumArgId);
     // Either parent[accumCnt] + 1 or parent[accumCnt].
     Value one =
-        ifBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-    endAccum = ifBuilder.createWithAsyncTaskIds<arith::AddIOp>(accumCntLoc(loc),
+        ifBuilder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 64);
+    endAccum = ifBuilder.createWithPartitionIds<arith::AddIOp>(accumCntLoc(loc),
                                                                arg, one);
     endAccumElse = arg;
   } else {
     endAccum =
-        ifBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+        ifBuilder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 64);
     endAccumElse =
-        elseBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64);
+        elseBuilder.createWithPartitionIds<arith::ConstantIntOp>(loc, 0, 64);
   }
   LLVM_DEBUG({
     LDBG("Update yieldOperands ");
@@ -170,8 +170,8 @@ static void generateYieldCntsForIfOp(scf::IfOp ifOp, Value &endAccum,
 static void generateYieldCntsForThenBlock(
     scf::IfOp ifOp, Operation *regionOp, SmallVector<Value> &thenYields,
     SmallVector<Value> &elseYields, DenseSet<Operation *> &regionsWithChannels,
-    ReuseConfig *config, OpBuilderWithAsyncTaskIds &ifBuilder,
-    OpBuilderWithAsyncTaskIds &elseBuilder) {
+    ReuseConfig *config, OpBuilderWithPartitionIds &ifBuilder,
+    OpBuilderWithPartitionIds &elseBuilder) {
   SmallVector<Operation *> preOrderOps;
   getAccumCntsPreOrder(regionOp, regionsWithChannels, preOrderOps);
   if (preOrderOps.empty())
@@ -211,7 +211,7 @@ static void generateYieldCntsForThenBlock(
                                                 << accumArgId << " " << i);
     } else
       elseVal =
-          elseBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64);
+          elseBuilder.createWithPartitionIds<arith::ConstantIntOp>(loc, 0, 64);
     elseYields.push_back(elseVal);
     LLVM_DEBUG({
       LDBG("Update yieldOperands ");
@@ -232,14 +232,14 @@ static void generateYieldCntsForThenBlock(
 static Value generateYieldCntsForForOp(scf::ForOp forOp, unsigned accumArgId) {
   Operation *yieldOp = forOp.getBody()->getTerminator();
   Value arg = forOp.getBody()->getArgument(accumArgId);
-  OpBuilderWithAsyncTaskIds builder(forOp->getContext());
-  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(forOp));
+  OpBuilderWithPartitionIds builder(forOp->getContext());
+  builder.setPartitionIdsFromArray(getNestedWSPartitionIds(forOp));
   builder.setInsertionPoint(yieldOp);
   auto loc = forOp.getLoc();
   // Make sure accumCnt = argValue + 1, increment by 1.
-  Value one = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
+  Value one = builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 64);
   Value endAccum =
-      builder.createWithAsyncTaskIds<arith::AddIOp>(accumCntLoc(loc), arg, one);
+      builder.createWithPartitionIds<arith::AddIOp>(accumCntLoc(loc), arg, one);
   return endAccum;
 }
 
@@ -355,8 +355,8 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     return op->getResult(numRes - tCnts + reuseArgIdx);
   }
   Operation *ctrlOp = op->getParentOp();
-  OpBuilderWithAsyncTaskIds builder(ctrlOp->getContext());
-  auto taskIds = getNestedAsyncTaskIds(ctrlOp);
+  OpBuilderWithPartitionIds builder(ctrlOp->getContext());
+  auto taskIds = getNestedWSPartitionIds(ctrlOp);
   // HACK
 #if 0
   {
@@ -367,7 +367,7 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     }
   }
 #endif
-  builder.setAsynTaskIdsFromArray(taskIds);
+  builder.setPartitionIdsFromArray(taskIds);
   builder.setInsertionPoint(op);
   if (lastRegionIdx >= 0) {
     auto *lastRegionOp = chList[lastRegionIdx];
@@ -380,11 +380,11 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     Value res = lastRegionOp->getResult(numRes - tCnts + reuseArgIdx);
     auto loc = op->getLoc();
     // From the last region op, accumulate till before or after "op".
-    Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    Value lit = builder.createWithPartitionIds<arith::ConstantIntOp>(
         loc,
         (before ? opIdx - lastRegionIdx - 1 : opIdx - lastRegionIdx) * stride,
         64);
-    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+    Value endAccum = builder.createWithPartitionIds<arith::AddIOp>(
         accumCntLoc(loc), res, lit);
     return endAccum;
   }
@@ -397,9 +397,9 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     auto tCnts =
         getAccumCnts(forOp.getOperation(), regionsWithChannels, config);
     Value arg = forOp.getBody()->getArgument(numArgs - tCnts + argIdx);
-    Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    Value lit = builder.createWithPartitionIds<arith::ConstantIntOp>(
         forOp.getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
-    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+    Value endAccum = builder.createWithPartitionIds<arith::AddIOp>(
         accumCntLoc(forOp.getLoc()), arg, lit);
     return endAccum;
   }
@@ -412,9 +412,9 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
     auto tCnts =
         getAccumCnts(whileOp.getOperation(), regionsWithChannels, config);
     Value arg = whileOp.getAfterBody()->getArgument(numArgs - tCnts + argIdx);
-    Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    Value lit = builder.createWithPartitionIds<arith::ConstantIntOp>(
         whileOp.getLoc(), before ? opIdx : opIdx + 1, 64);
-    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+    Value endAccum = builder.createWithPartitionIds<arith::AddIOp>(
         accumCntLoc(whileOp.getLoc()), arg, lit);
     return endAccum;
   }
@@ -426,22 +426,22 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
                      parentChList);
     Value startOfIf = getAccumForReuseGroup(
         ctrlOp, parentChList, regionsWithChannels, config, reuseGroupIdx, true);
-    Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+    Value lit = builder.createWithPartitionIds<arith::ConstantIntOp>(
         ctrlOp->getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
-    Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
+    Value endAccum = builder.createWithPartitionIds<arith::AddIOp>(
         accumCntLoc(ctrlOp->getLoc()), startOfIf, lit);
     return endAccum;
   }
   assert(isa<tt::FuncOp>(ctrlOp));
-  return builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
+  return builder.createWithPartitionIds<arith::ConstantIntOp>(
       op->getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
 }
 
 scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
                       DenseSet<Operation *> &regionsWithChannels,
                       ReuseConfig *config) {
-  OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
-  ifBuilder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(ifOp));
+  OpBuilderWithPartitionIds ifBuilder(ifOp.getContext());
+  ifBuilder.setPartitionIdsFromArray(getNestedWSPartitionIds(ifOp));
   ifBuilder.setInsertionPoint(ifOp);
 
   // Calculate how many accumCnts we will need for this IfOp.
@@ -456,7 +456,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
   assert(numAccumCnts > 0);
   // Create else block since we need to generate accumulated count for then and
   // else.
-  auto newIfOp = ifBuilder.createWithAsyncTaskIds<scf::IfOp>(
+  auto newIfOp = ifBuilder.createWithPartitionIds<scf::IfOp>(
       ifOp.getLoc(), newResultTypes, ifOp.getCondition(), true, true);
 
   // Move the existing blocks to the new if.
@@ -475,7 +475,7 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
   auto loc = ifOp.getLoc();
   auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
     ifBuilder.setInsertionPoint(yield);
-    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(loc, operands);
+    ifBuilder.createWithPartitionIds<scf::YieldOp>(loc, operands);
     yield.erase();
   };
 
@@ -516,8 +516,8 @@ scf::IfOp rewriteIfOp(scf::IfOp ifOp, SmallVector<Operation *> &taskTopOps,
   }
 
   SmallVector<Value> elseYieldOperands = newIfOp.elseYield().getOperands();
-  OpBuilderWithAsyncTaskIds elseBuilder(ifOp.getContext());
-  elseBuilder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(ifOp));
+  OpBuilderWithPartitionIds elseBuilder(ifOp.getContext());
+  elseBuilder.setPartitionIdsFromArray(getNestedWSPartitionIds(ifOp));
   elseBuilder.setInsertionPoint(newIfOp.elseYield());
   ifBuilder.setInsertionPoint(newIfOp.thenYield());
 
@@ -612,8 +612,8 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   auto loc = forOp.getLoc();
   Block *body = forOp.getBody();
 
-  OpBuilderWithAsyncTaskIds builder(forOp.getContext());
-  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(forOp));
+  OpBuilderWithPartitionIds builder(forOp.getContext());
+  builder.setPartitionIdsFromArray(getNestedWSPartitionIds(forOp));
   builder.setInsertionPoint(forOp);
 
   unsigned numAccumCnts = initialAccums.size();
@@ -642,7 +642,7 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
   }
 
   // Step 4: Create newForOp and take the region of the original forOp.
-  auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
+  auto newForOp = builder.createWithPartitionIds<scf::ForOp>(
       loc, forOp.getLowerBound(), forOp.getUpperBound(), forOp.getStep(),
       newLoopArgs);
   newForOp.getRegion().takeBody(forOp.getRegion());
@@ -836,12 +836,12 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
       startAccum =
           parentAccumBlock->getArgument(pArgSize - pCnts + accumArgId + i);
     else {
-      OpBuilderWithAsyncTaskIds builder(origForOp->getContext());
-      builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(origForOp));
+      OpBuilderWithPartitionIds builder(origForOp->getContext());
+      builder.setPartitionIdsFromArray(getNestedWSPartitionIds(origForOp));
       builder.setInsertionPoint(origForOp);
       auto loc = origForOp.getLoc();
       startAccum =
-          builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64);
+          builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 0, 64);
     }
     initialAccums.push_back(startAccum);
   }
@@ -895,10 +895,10 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
 
   // origForOp is erased in createNewLoop. Make sure taskTopOps is updated with
   // the newForOp.
-  auto asyncTaskLoopForItr =
+  auto partitionLoopForItr =
       std::find(taskTopOps.begin(), taskTopOps.end(), origForOp.getOperation());
-  if (asyncTaskLoopForItr != taskTopOps.end()) {
-    *asyncTaskLoopForItr = newForOp.getOperation();
+  if (partitionLoopForItr != taskTopOps.end()) {
+    *partitionLoopForItr = newForOp.getOperation();
   }
   auto tmpIter3 =
       std::find(regionsWithChannels.begin(), regionsWithChannels.end(),
@@ -1024,8 +1024,8 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
 static scf::WhileOp createNewWhileLoop(scf::WhileOp whileOp,
                                        SmallVector<Value> &initialAccums) {
   auto loc = whileOp.getLoc();
-  OpBuilderWithAsyncTaskIds builder(whileOp.getContext());
-  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(whileOp));
+  OpBuilderWithPartitionIds builder(whileOp.getContext());
+  builder.setPartitionIdsFromArray(getNestedWSPartitionIds(whileOp));
   unsigned numAccumCnts = initialAccums.size();
 
   Block *beforeBlk = whileOp.getBeforeBody();
@@ -1045,7 +1045,7 @@ static scf::WhileOp createNewWhileLoop(scf::WhileOp whileOp,
   unsigned beforeArgN = beforeBlk->getNumArguments();
   for (unsigned i = 0; i < numAccumCnts; ++i)
     condArgs.push_back(beforeBlk->getArgument(beforeArgN - numAccumCnts + i));
-  builder.createWithAsyncTaskIds<scf::ConditionOp>(
+  builder.createWithPartitionIds<scf::ConditionOp>(
       condOp.getLoc(), condOp.getCondition(), condArgs);
   condOp.erase();
 
@@ -1057,7 +1057,7 @@ static scf::WhileOp createNewWhileLoop(scf::WhileOp whileOp,
   unsigned afterArgN = afterBlk->getNumArguments();
   for (unsigned i = 0; i < numAccumCnts; ++i)
     yieldArgs.push_back(afterBlk->getArgument(afterArgN - numAccumCnts + i));
-  builder.createWithAsyncTaskIds<scf::YieldOp>(yieldOp.getLoc(), yieldArgs);
+  builder.createWithPartitionIds<scf::YieldOp>(yieldOp.getLoc(), yieldArgs);
   yieldOp.erase();
 
   // Step 4: build the new while op with extended init operands / result types,
@@ -1070,7 +1070,7 @@ static scf::WhileOp createNewWhileLoop(scf::WhileOp whileOp,
     newResultTypes.push_back(builder.getI64Type());
 
   builder.setInsertionPoint(whileOp);
-  auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+  auto newWhileOp = builder.createWithPartitionIds<scf::WhileOp>(
       loc, newResultTypes, newInits);
   for (auto attr : whileOp->getAttrs())
     newWhileOp->setAttr(attr.getName(), attr.getValue());
@@ -1107,8 +1107,8 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   if (tCnts == 0)
     return origWhileOp;
 
-  OpBuilderWithAsyncTaskIds builder(origWhileOp->getContext());
-  builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(origWhileOp));
+  OpBuilderWithPartitionIds builder(origWhileOp->getContext());
+  builder.setPartitionIdsFromArray(getNestedWSPartitionIds(origWhileOp));
   builder.setInsertionPoint(origWhileOp);
   auto loc = origWhileOp.getLoc();
 
@@ -1116,7 +1116,7 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   SmallVector<Value> initialAccums;
   for (unsigned i = 0; i < tCnts; ++i)
     initialAccums.push_back(
-        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64));
+        builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 0, 64));
 
   // Reuse groups (e.g. the multi-buffered epilogue TMA-store staging that the
   // subtiled epilogue creates) get their own accumCnt, appended after the
@@ -1146,10 +1146,10 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   scf::WhileOp newWhileOp = createNewWhileLoop(origWhileOp, initialAccums);
 
   // Update bookkeeping references from origWhileOp to newWhileOp.
-  auto asyncTaskItr = std::find(taskTopOps.begin(), taskTopOps.end(),
+  auto partitionItr = std::find(taskTopOps.begin(), taskTopOps.end(),
                                 origWhileOp.getOperation());
-  if (asyncTaskItr != taskTopOps.end())
-    *asyncTaskItr = newWhileOp.getOperation();
+  if (partitionItr != taskTopOps.end())
+    *partitionItr = newWhileOp.getOperation();
   if (regionsWithChannels.contains(origWhileOp.getOperation())) {
     regionsWithChannels.erase(origWhileOp.getOperation());
     regionsWithChannels.insert(newWhileOp.getOperation());
@@ -1181,12 +1181,13 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   for (auto *op : regionsWithChannels) {
     if (newWhileOp.getOperation() == op) {
       Value arg = newWhileOp.getAfterBody()->getArgument(accumArgId);
-      OpBuilderWithAsyncTaskIds yieldBuilder(newWhileOp.getContext());
-      yieldBuilder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(newWhileOp));
+      OpBuilderWithPartitionIds yieldBuilder(newWhileOp.getContext());
+      yieldBuilder.setPartitionIdsFromArray(
+          getNestedWSPartitionIds(newWhileOp));
       yieldBuilder.setInsertionPoint(yieldOp);
       Value one =
-          yieldBuilder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 64);
-      Value endAccum = yieldBuilder.createWithAsyncTaskIds<arith::AddIOp>(
+          yieldBuilder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 64);
+      Value endAccum = yieldBuilder.createWithPartitionIds<arith::AddIOp>(
           accumCntLoc(loc), arg, one);
       yieldOp->replaceUsesOfWith(arg, endAccum);
       ++accumArgId;

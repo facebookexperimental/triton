@@ -30,6 +30,11 @@ namespace mlir {
 // In Hopper, each task is a warpgroup consisting of 4 warps.
 static const int THREADS_PER_WARP = 32;
 
+static void annotateLike(Operation *newOp, Operation *srcOp) {
+  setWSPartitionIds(newOp, getWSPartitionIds(srcOp));
+  copyLoopScheduleInfo(newOp, srcOp);
+}
+
 Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
                           bool emptyBarrier) {
   auto loc = op->getLoc();
@@ -42,7 +47,9 @@ Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
   if (emptyBarrier) {
     // curPhase = curPhase xor True for emptyBarrier.
     Value _1_1b = arith::ConstantIntOp::create(builder, loc, 1, 1);
+    annotateLike(_1_1b.getDefiningOp(), op);
     curPhase = mlir::arith::XOrIOp::create(builder, loc, curPhase, _1_1b);
+    annotateLike(curPhase.getDefiningOp(), op);
   }
   LLVM_DEBUG(curPhase.dump());
   return curPhase;
@@ -54,12 +61,12 @@ void processProducerAcquireOp(OpBuilder &builder, ttnvws::ProducerAcquireOp op,
   Value phase = getMBarrierPhaseBit(builder, op, true);
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
+  annotateLike(phase.getDefiningOp(), op);
   auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferEmpty, phase,
                                             /*pred=*/Value(), /*deps=*/{},
                                             op.getConstraintsAttr());
-  assert(op.getOperation()->hasAttr("async_task_id"));
-  setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
-  copyLoopScheduleInfo(waitOp, op);
+  assert(!getWSPartitionIds(op.getOperation()).empty());
+  annotateLike(waitOp, op);
 }
 
 void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
@@ -73,8 +80,8 @@ void processProducerCommitOp(OpBuilder &builder, ttnvws::ProducerCommitOp op,
       builder, loc, bufferFull, 1, /*pred=*/Value(), /*perThread=*/false,
       op.getConstraintsAttr());
 
-  assert(op.getOperation()->hasAttr("async_task_id"));
-  setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
+  assert(!getWSPartitionIds(op.getOperation()).empty());
+  setWSPartitionIds(arriveOp, getWSPartitionIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
 }
 
@@ -84,12 +91,12 @@ void processConsumerWaitOp(OpBuilder &builder, ttnvws::ConsumerWaitOp op,
   Value phase = getMBarrierPhaseBit(builder, op, false);
   auto i32Ty = builder.getIntegerType(32);
   phase = arith::ExtUIOp::create(builder, loc, i32Ty, phase);
+  annotateLike(phase.getDefiningOp(), op);
   auto waitOp = ttng::WaitBarrierOp::create(builder, loc, bufferFull, phase,
                                             /*pred=*/Value(), /*deps=*/{},
                                             op.getConstraintsAttr());
-  assert(op.getOperation()->hasAttr("async_task_id"));
-  setAsyncTaskIds(waitOp, getAsyncTaskIds(op.getOperation()));
-  copyLoopScheduleInfo(waitOp, op);
+  assert(!getWSPartitionIds(op.getOperation()).empty());
+  annotateLike(waitOp, op);
 }
 
 void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
@@ -99,8 +106,8 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
   auto arriveOp = ttng::ArriveBarrierOp::create(
       builder, loc, bufferEmpty, 1, /*pred=*/Value(), /*perThread=*/false,
       op.getConstraintsAttr());
-  assert(op.getOperation()->hasAttr("async_task_id"));
-  setAsyncTaskIds(arriveOp, getAsyncTaskIds(op.getOperation()));
+  assert(!getWSPartitionIds(op.getOperation()).empty());
+  setWSPartitionIds(arriveOp, getWSPartitionIds(op.getOperation()));
   copyLoopScheduleInfo(arriveOp, op);
 }
 
@@ -175,7 +182,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     {
       DenseMap<int, SmallVector<Operation *>> commitsByTask, waitsByTask;
       for (Operation *user : usersForToken) {
-        auto taskIds = getAsyncTaskIds(user);
+        auto taskIds = getWSPartitionIds(user);
         if (taskIds.size() != 1)
           continue;
         int tid = taskIds[0];
@@ -256,40 +263,42 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
       // We need bufferFullArray and bufferEmptyArray.
       if (auto op = dyn_cast<ttnvws::ProducerAcquireOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
-        setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
+        assert(!getWSPartitionIds(user).empty());
+        setWSPartitionIds(bufferEmpty.getDefiningOp(), getWSPartitionIds(user));
         processProducerAcquireOp(builder, op, bufferEmpty);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ProducerCommitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
-        setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
+        assert(!getWSPartitionIds(user).empty());
+        setWSPartitionIds(bufferFull.getDefiningOp(), getWSPartitionIds(user));
         processProducerCommitOp(builder, op, bufferFull, loadType,
                                 bufferFullCount);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerWaitOp>(user)) {
         Value bufferFull = extractBufferFull(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
-        setAsyncTaskIds(bufferFull.getDefiningOp(), getAsyncTaskIds(user));
+        assert(!getWSPartitionIds(user).empty());
+        setWSPartitionIds(bufferFull.getDefiningOp(), getWSPartitionIds(user));
         processConsumerWaitOp(builder, op, bufferFull);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttnvws::ConsumerReleaseOp>(user)) {
         Value bufferEmpty = extractBufferEmpty(loc, op.getIdx());
-        assert(user->hasAttr("async_task_id"));
-        setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
+        assert(!getWSPartitionIds(user).empty());
+        setWSPartitionIds(bufferEmpty.getDefiningOp(), getWSPartitionIds(user));
         processConsumerReleaseOp(builder, op, bufferEmpty, numCTAs,
                                  bufferEmptyCount);
         deprecatedOps.push_back(user);
         return true;
       } else if (auto op = dyn_cast<ttng::TMAStoreTokenWaitOp>(user)) {
         Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
+        annotateLike(truePred.getDefiningOp(), user);
         for (auto [nvwsTok, nvwsIdx] :
              llvm::zip(op.getNvwsTokens(), op.getNvwsTokenIndices())) {
           Value bufferEmpty = extractBufferEmpty(loc, nvwsIdx);
-          setAsyncTaskIds(bufferEmpty.getDefiningOp(), getAsyncTaskIds(user));
+          setWSPartitionIds(bufferEmpty.getDefiningOp(),
+                            getWSPartitionIds(user));
           op.addBarrier(bufferEmpty, truePred);
         }
         op.getNvwsTokensMutable().clear();
@@ -376,7 +385,7 @@ void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups) {
   ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
   int numCTAs = ttg::TritonGPUDialect::getNumCTAs(mod);
 
-  // lowerGetAsyncTaskIdOp(mod, numConsumerGroups);
+  // lowerGetWSPartitionIdOp(mod, numConsumerGroups);
   lowerTokenOperations(mod, numCTAs, numConsumerGroups);
 }
 

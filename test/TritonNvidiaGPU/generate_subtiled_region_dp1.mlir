@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --triton-nvidia-gpu-test-generate-subtiled-region | FileCheck %s
 
 // Test: DP=1 epilogue subtiling with convert_layout in chain.
 // The split feeds into truncf → convert_layout → local_store for each tile.
@@ -32,18 +32,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %smem1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %off0: i32, %off1: i32, %off2: i32) {
 
-    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] {async_task_id = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
-    %reshaped = tt.reshape %loaded#0 {async_task_id = array<i32: 1>} : tensor<128x128xf32, #linear> -> tensor<128x2x64xf32, #linear1>
-    %transposed = tt.trans %reshaped {async_task_id = array<i32: 1>, order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #linear1> -> tensor<128x64x2xf32, #linear2>
-    %lhs, %rhs = tt.split %transposed {async_task_id = array<i32: 1>} : tensor<128x64x2xf32, #linear2> -> tensor<128x64xf32, #linear3>
+    %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linear>
+    %reshaped = tt.reshape %loaded#0 {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linear> -> tensor<128x2x64xf32, #linear1>
+    %transposed = tt.trans %reshaped {ttg.partition = array<i32: 1>, order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #linear1> -> tensor<128x64x2xf32, #linear2>
+    %lhs, %rhs = tt.split %transposed {ttg.partition = array<i32: 1>} : tensor<128x64x2xf32, #linear2> -> tensor<128x64xf32, #linear3>
 
-    %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 1>} : tensor<128x64xf32, #linear3> to tensor<128x64xf16, #linear3>
-    %cvt0 = ttg.convert_layout %trunc0 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #linear3> -> tensor<128x64xf16, #blocked1>
-    ttg.local_store %cvt0, %smem0 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %trunc0 = arith.truncf %lhs {ttg.partition = array<i32: 1>} : tensor<128x64xf32, #linear3> to tensor<128x64xf16, #linear3>
+    %cvt0 = ttg.convert_layout %trunc0 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #linear3> -> tensor<128x64xf16, #blocked1>
+    ttg.local_store %cvt0, %smem0 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 
-    %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 1>} : tensor<128x64xf32, #linear3> to tensor<128x64xf16, #linear3>
-    %cvt1 = ttg.convert_layout %trunc1 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #linear3> -> tensor<128x64xf16, #blocked1>
-    ttg.local_store %cvt1, %smem1 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %trunc1 = arith.truncf %rhs {ttg.partition = array<i32: 1>} : tensor<128x64xf32, #linear3> to tensor<128x64xf16, #linear3>
+    %cvt1 = ttg.convert_layout %trunc1 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #linear3> -> tensor<128x64xf16, #blocked1>
+    ttg.local_store %cvt1, %smem1 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked1> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
 
     tt.return
   }
@@ -79,18 +79,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %lb: i32, %ub: i32, %step: i32) {
 
     scf.for %iv = %lb to %ub step %step  : i32 {
-      %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] {async_task_id = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmemb, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linearb>
-      %reshaped = tt.reshape %loaded#0 {async_task_id = array<i32: 1>} : tensor<128x128xf32, #linearb> -> tensor<128x2x64xf32, #linear1b>
-      %transposed = tt.trans %reshaped {async_task_id = array<i32: 1>, order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #linear1b> -> tensor<128x64x2xf32, #linear2b>
-      %lhs, %rhs = tt.split %transposed {async_task_id = array<i32: 1>} : tensor<128x64x2xf32, #linear2b> -> tensor<128x64xf32, #linear3b>
+      %loaded:2 = ttng.tmem_load %tmem_buf[%acc_tok] {ttg.partition = array<i32: 1>} : !ttg.memdesc<128x128xf32, #tmemb, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #linearb>
+      %reshaped = tt.reshape %loaded#0 {ttg.partition = array<i32: 1>} : tensor<128x128xf32, #linearb> -> tensor<128x2x64xf32, #linear1b>
+      %transposed = tt.trans %reshaped {ttg.partition = array<i32: 1>, order = array<i32: 0, 2, 1>} : tensor<128x2x64xf32, #linear1b> -> tensor<128x64x2xf32, #linear2b>
+      %lhs, %rhs = tt.split %transposed {ttg.partition = array<i32: 1>} : tensor<128x64x2xf32, #linear2b> -> tensor<128x64xf32, #linear3b>
 
-      %trunc0 = arith.truncf %lhs {async_task_id = array<i32: 1>} : tensor<128x64xf32, #linear3b> to tensor<128x64xf16, #linear3b>
-      %cvt0 = ttg.convert_layout %trunc0 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #linear3b> -> tensor<128x64xf16, #blocked1b>
-      ttg.local_store %cvt0, %smem0 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked1b> -> !ttg.memdesc<128x64xf16, #sharedb, #smemb, mutable>
+      %trunc0 = arith.truncf %lhs {ttg.partition = array<i32: 1>} : tensor<128x64xf32, #linear3b> to tensor<128x64xf16, #linear3b>
+      %cvt0 = ttg.convert_layout %trunc0 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #linear3b> -> tensor<128x64xf16, #blocked1b>
+      ttg.local_store %cvt0, %smem0 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked1b> -> !ttg.memdesc<128x64xf16, #sharedb, #smemb, mutable>
 
-      %trunc1 = arith.truncf %rhs {async_task_id = array<i32: 1>} : tensor<128x64xf32, #linear3b> to tensor<128x64xf16, #linear3b>
-      %cvt1 = ttg.convert_layout %trunc1 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #linear3b> -> tensor<128x64xf16, #blocked1b>
-      ttg.local_store %cvt1, %smem1 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked1b> -> !ttg.memdesc<128x64xf16, #sharedb, #smemb, mutable>
+      %trunc1 = arith.truncf %rhs {ttg.partition = array<i32: 1>} : tensor<128x64xf32, #linear3b> to tensor<128x64xf16, #linear3b>
+      %cvt1 = ttg.convert_layout %trunc1 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #linear3b> -> tensor<128x64xf16, #blocked1b>
+      ttg.local_store %cvt1, %smem1 {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked1b> -> !ttg.memdesc<128x64xf16, #sharedb, #smemb, mutable>
     }
 
     tt.return

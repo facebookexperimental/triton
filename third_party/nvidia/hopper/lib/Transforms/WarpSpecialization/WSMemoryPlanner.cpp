@@ -276,7 +276,7 @@ static LogicalResult getAllAcutalUsersForChannel(Channel *TheCh,
   if (!TheCh) {
     // Allocations inside loops should have associated channels
     // For outside loop ops, channels are not created when there is
-    // no valid producer or outside loop op has no task IDs (e.g., store)
+    // no valid producer or outside loop op has no partition IDs (e.g., store)
     if (alloc && alloc->getParentOfType<scf::ForOp>()) {
       return alloc->emitError(
           "getAllAcutalUsersForChannel: expected channel for allocation "
@@ -1541,7 +1541,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
           Operation *consOp = ch->getDstOp();
           if (prodOp && consOp)
             sameTaskStaging =
-                (getAsyncTaskIds(prodOp) == getAsyncTaskIds(consOp));
+                (getWSPartitionIds(prodOp) == getWSPartitionIds(consOp));
         }
       }
 
@@ -3999,8 +3999,8 @@ public:
       auto *dstCh = allocToChannel[dst];
       if (!srcCh || !dstCh)
         return false;
-      if (getAsyncTaskIds(dstCh->getSrcOp()) ==
-          getAsyncTaskIds(srcCh->getDstOp()))
+      if (getWSPartitionIds(dstCh->getSrcOp()) ==
+          getWSPartitionIds(srcCh->getDstOp()))
         return true;
       return false;
     };
@@ -4014,13 +4014,13 @@ public:
       // For allocs not in an innermost loop
       return false;
     };
-    auto getCombinedTasks = [&](BufferT *alloc) -> SmallVector<AsyncTaskId> {
+    auto getCombinedTasks = [&](BufferT *alloc) -> SmallVector<WSPartitionId> {
       Channel *chBase = findChannelForOp(alloc->owner, *channels);
       ttng::TmemAllocChannel *TheCh = nullptr;
       if (chBase && chBase->channelKind == DataChannelKind::TMEMAlloc) {
         TheCh = static_cast<ttng::TmemAllocChannel *>(chBase);
       }
-      SmallVector<AsyncTaskId> combinedTasks;
+      SmallVector<WSPartitionId> combinedTasks;
       if (!TheCh) {
         return combinedTasks;
       }
@@ -4028,10 +4028,10 @@ public:
       if (failed(getAllTmemUsers(TheCh, users))) {
         return combinedTasks;
       }
-      DenseSet<AsyncTaskId> combinedSet;
+      DenseSet<WSPartitionId> combinedSet;
       for (auto *user : users) {
-        auto asyncTasksVec = getAsyncTaskIds(user);
-        for (auto t : asyncTasksVec) {
+        auto partitionIdsVec = getWSPartitionIds(user);
+        for (auto t : partitionIdsVec) {
           if (!combinedSet.count(t)) {
             combinedSet.insert(t);
             combinedTasks.push_back(t);
@@ -4052,8 +4052,8 @@ public:
         auto *dstCh = allocToChannel[cand->owner];
         if (!srcCh || !dstCh)
           return false;
-        auto dstChPart = getAsyncTaskIds(dstCh->getSrcOp());
-        auto srcChPart = getAsyncTaskIds(srcCh->getDstOp());
+        auto dstChPart = getWSPartitionIds(dstCh->getSrcOp());
+        auto srcChPart = getWSPartitionIds(srcCh->getDstOp());
         LLVM_DEBUG(llvm::dbgs() << "Check partitions\n");
         for (auto t : dstChPart) {
           LLVM_DEBUG(llvm::dbgs() << t << " ");
@@ -4063,8 +4063,8 @@ public:
           LLVM_DEBUG(llvm::dbgs() << t << " ");
         }
         LLVM_DEBUG(llvm::dbgs() << "\n");
-        return getAsyncTaskIds(dstCh->getSrcOp()) ==
-               getAsyncTaskIds(srcCh->getDstOp());
+        return getWSPartitionIds(dstCh->getSrcOp()) ==
+               getWSPartitionIds(srcCh->getDstOp());
       }
       auto aTasks = getCombinedTasks(alloc);
       auto bTasks = getCombinedTasks(cand);
@@ -4666,7 +4666,7 @@ static void dumpPartitionAndBufferSummary(triton::FuncOp funcOp,
       if (isa<scf::ForOp>(p))
         depth++;
     std::string tasks;
-    for (int t : getAsyncTaskIds(forOp.getOperation()))
+    for (int t : getWSPartitionIds(forOp.getOperation()))
       tasks += std::to_string(t) + ",";
     LDBG("[ws-summary] " << opRef(forOp.getOperation()) << " scf.for depth="
                          << depth << " parent=" << forRef(forOp.getOperation())
@@ -4685,7 +4685,7 @@ static void dumpPartitionAndBufferSummary(triton::FuncOp funcOp,
                n == "math.exp2" || n == "arith.truncf";
     if (!key)
       return;
-    auto ids = getAsyncTaskIds(op);
+    auto ids = getWSPartitionIds(op);
     if (ids.empty())
       return;
     std::string label = opRef(op) + " in " + forRef(op) + "  " + n.str();

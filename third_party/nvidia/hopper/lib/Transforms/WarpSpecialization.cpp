@@ -88,7 +88,7 @@ void doGenerateSubtiledRegion(triton::FuncOp funcOp) {
                  createTritonNvidiaGPUTestGenerateSubtiledRegionPass());
   // OptimizeTMemLayouts runs later via add_optimize_tmem_layouts in
   // compiler.py. This avoids transforming bare splits into tmem_subslice
-  // ops that lack async_task_id and would crash createAllocChannel.
+  // ops that lack ttg.partition and would crash createAllocChannel.
   (void)pm.run(moduleOp);
 }
 
@@ -122,16 +122,13 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     // Warp specialization is enabled for this function if any op carries WS
-    // metadata: an `async_task_id` or `ttg.partition` tag, or a loop marked
-    // with the warp-specialize attribute. A single walk with early-out
-    // suffices.
+    // metadata: a `ttg.partition` tag or the warp-specialize loop marker. A
+    // single walk with early-out suffices.
     bool enabled = false;
     funcOp->walk([&](Operation *op) {
-      if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
-          op->getAttrOfType<DenseI32ArrayAttr>(
+      if (op->getAttrOfType<DenseI32ArrayAttr>(
               triton::gpu::kPartitionAttrName) ||
-          (isa<scf::ForOp>(op) &&
-           op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
+          op->hasAttr(mlir::triton::kWarpSpecializeAttrName)) {
         enabled = true;
         return WalkResult::interrupt();
       }
@@ -182,7 +179,7 @@ public:
     // loop-carried result(s) to every partition through SMEM, or gracefully
     // bail out of warp specialization (unsupported shape). On a reject we strip
     // all WS metadata via removeWarpSpecMetadata (which also clears the
-    // `async_task_id`s that doTaskIdPropagate materialized above) so downstream
+    // partition ids that doTaskIdPropagate materialized above) so downstream
     // sees a plain, compilable non-WS kernel. The broadcast channel depth comes
     // from the `tile-prefetch-depth` pass option (a Python knob), not an env
     // var.

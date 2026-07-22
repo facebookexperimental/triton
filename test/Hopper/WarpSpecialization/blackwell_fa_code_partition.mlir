@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 smem-budget=200000" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-warp-specialization="capability=100 smem-budget=200000" | FileCheck %s
 // CHECK-LABEL: _attn_fwd_persist
 // CHECK: ttg.warp_specialize
 // default: Accumulator correction (tmem_load acc, expand_dims alpha, broadcast, mulf for acc scaling, tmem_store acc)

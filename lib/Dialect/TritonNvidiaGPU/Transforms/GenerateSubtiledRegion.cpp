@@ -16,20 +16,18 @@ namespace nvidia_gpu {
 
 namespace {
 
-/// Get the async task IDs from an operation.
-static SmallVector<int32_t> getOpAsyncTaskIds(Operation *op) {
-  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id"))
-    return SmallVector<int32_t>(attr.asArrayRef());
+/// Get the partition IDs from an operation.
+static SmallVector<int32_t> getOpWSPartitionIds(Operation *op) {
   if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(gpu::kPartitionAttrName))
     return SmallVector<int32_t>(attr.asArrayRef());
   return {};
 }
 
 /// A segment of structurally equivalent per-tile chain ops with a uniform
-/// async task set. opsPerTile[t] holds the ops for tile t.
+/// partition set. opsPerTile[t] holds the ops for tile t.
 struct ChainSegment {
   SmallVector<SmallVector<Operation *>> opsPerTile;
-  SmallVector<int32_t> taskIds;
+  SmallVector<int32_t> partitionIds;
 };
 
 /// Strip convert_layout ops wrapping a value.
@@ -76,7 +74,7 @@ struct EquivalenceResult {
   SmallVector<IdentityOp> identityOps;
 
   /// The actual operations in the template chain that are identity-inserted
-  /// (no counterpart in the other chain). Used by groupByContiguousTaskSet
+  /// (no counterpart in the other chain). Used by groupByContiguousPartitionSet
   /// to align segments when chains have different lengths.
   DenseSet<Operation *> identityOpSet;
 
@@ -494,14 +492,14 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
       // (a silent race when numTiles > buffer.copy). Pulling the copy into the
       // same chain keeps the lowered body interleaved (store_t -> copy_t ->
       // token_wait) so the TMA wait serializes slot reuse. Cross-task copies
-      // (separate_epilogue_store=True) are a different async task and are left
+      // (separate_epilogue_store=True) are a different partition and are left
       // for the concurrent separate-region path below.
       if (auto store = dyn_cast<gpu::LocalStoreOp>(user)) {
         for (Operation *bufUser : store.getDst().getUsers()) {
           if (bufUser->getBlock() != block || bufUser == store)
             continue;
           auto cp = dyn_cast<AsyncTMACopyLocalToGlobalOp>(bufUser);
-          if (!cp || getOpAsyncTaskIds(cp) != getOpAsyncTaskIds(store))
+          if (!cp || getOpWSPartitionIds(cp) != getOpWSPartitionIds(store))
             continue;
           if (cp->isBeforeInBlock(splitOp) || cp == splitOp)
             continue;
@@ -548,7 +546,7 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
   return fullChain;
 }
 
-/// Group N chains by contiguous async task set, handling identity-compatible
+/// Group N chains by contiguous partition set, handling identity-compatible
 /// ops that may make the template chain longer than the others.
 ///
 /// Walks the template chain (identified by `equiv.templateChainIdx`) and
@@ -557,8 +555,8 @@ collectPerTileChain(Value splitResult, Operation *splitOp, Block *block,
 /// opsPerTile. When chains have equal length (no identity ops), this
 /// degenerates to simple positional pairing.
 static std::optional<SmallVector<ChainSegment>>
-groupByContiguousTaskSet(ArrayRef<SmallVector<Operation *>> chains,
-                         const NWayEquivalenceResult &equiv) {
+groupByContiguousPartitionSet(ArrayRef<SmallVector<Operation *>> chains,
+                              const NWayEquivalenceResult &equiv) {
   unsigned numTiles = chains.size();
   assert(numTiles >= 2);
   unsigned tplIdx = equiv.templateChainIdx;
@@ -571,14 +569,15 @@ groupByContiguousTaskSet(ArrayRef<SmallVector<Operation *>> chains,
   SmallVector<ChainSegment> segments;
   unsigned oi = 0;
   for (size_t ti = 0; ti < tplChain.size(); ++ti) {
-    auto taskIds = getOpAsyncTaskIds(tplChain[ti]);
+    auto partitionIds = getOpWSPartitionIds(tplChain[ti]);
 
-    if (taskIds.empty() && !segments.empty()) {
-      // Ops without task IDs join the current segment.
-    } else if (segments.empty() || segments.back().taskIds != taskIds) {
+    if (partitionIds.empty() && !segments.empty()) {
+      // Ops without partition IDs join the current segment.
+    } else if (segments.empty() ||
+               segments.back().partitionIds != partitionIds) {
       ChainSegment seg;
       seg.opsPerTile.resize(numTiles);
-      seg.taskIds = taskIds;
+      seg.partitionIds = partitionIds;
       segments.push_back(std::move(seg));
     }
 
@@ -690,9 +689,10 @@ static void buildSingleSubtiledRegionN(
                                builder.getI32IntegerAttr(numTiles));
 
   for (Operation *op : tplChain) {
-    auto taskIds = getOpAsyncTaskIds(op);
-    if (!taskIds.empty()) {
-      regionOp->setAttr("async_task_id", DenseI32ArrayAttr::get(ctx, taskIds));
+    auto partitionIds = getOpWSPartitionIds(op);
+    if (!partitionIds.empty()) {
+      regionOp->setAttr(gpu::kPartitionAttrName,
+                        DenseI32ArrayAttr::get(ctx, partitionIds));
       break;
     }
   }
@@ -743,7 +743,7 @@ static gpu::MemDescType createBufferMemDescType(MLIRContext *ctx,
 }
 
 /// Build multiple SubtiledRegionOps for N-tile chains spanning multiple
-/// async task sets. Uses implicit buffering (Option 2) at segment
+/// partition sets. Uses implicit buffering (Option 2) at segment
 /// transitions — cross-segment tensor values are communicated through SMEM.
 static bool buildMultiTaskSubtiledRegionsN(
     OpBuilder &outerBuilder, Location loc, ArrayRef<Operation *> setupOps,
@@ -873,13 +873,13 @@ static bool buildMultiTaskSubtiledRegionsN(
       resolvedDiff.push_back({perTile, setupVals, needsLoad});
     }
 
-    // Check if this segment's task IDs match any setup op's task IDs.
+    // Check if this segment's partition IDs match any setup op's partition IDs.
     // If so, this segment "owns" the setup — it clones the setup ops and
     // gets the leaf values as tile args.
     bool ownsSetup = false;
     for (auto *op : setupOps) {
-      auto opTasks = getOpAsyncTaskIds(op);
-      if (!opTasks.empty() && opTasks == seg.taskIds) {
+      auto opPartitionIds = getOpWSPartitionIds(op);
+      if (!opPartitionIds.empty() && opPartitionIds == seg.partitionIds) {
         ownsSetup = true;
         break;
       }
@@ -992,18 +992,18 @@ static bool buildMultiTaskSubtiledRegionsN(
   return true;
 }
 
-/// Return true if any op across the N chains has a different async_task_id
-/// than the first task-annotated op.
-static bool isMultiTask(ArrayRef<SmallVector<Operation *>> chains) {
-  SmallVector<int32_t> firstTaskIds;
+/// Return true if any op across the N chains has a different ttg.partition
+/// than the first partition-annotated op.
+static bool isMultiPartition(ArrayRef<SmallVector<Operation *>> chains) {
+  SmallVector<int32_t> firstPartitionIds;
   for (auto &chain : chains) {
     for (auto *op : chain) {
-      auto taskIds = getOpAsyncTaskIds(op);
-      if (taskIds.empty())
+      auto partitionIds = getOpWSPartitionIds(op);
+      if (partitionIds.empty())
         continue;
-      if (firstTaskIds.empty())
-        firstTaskIds = taskIds;
-      else if (taskIds != firstTaskIds)
+      if (firstPartitionIds.empty())
+        firstPartitionIds = partitionIds;
+      else if (partitionIds != firstPartitionIds)
         return true;
     }
   }
@@ -1036,17 +1036,18 @@ findInsertionPoint(Block *block, Operation *anchor,
   return latest->getNextNode();
 }
 
-/// Return true if any task ID set appears non-contiguously in the segment
-/// list (e.g., task A → B → A).
-static bool hasNonContiguousTaskIds(ArrayRef<ChainSegment> segments) {
-  SmallVector<SmallVector<int32_t>> seenTaskSets;
+/// Return true if any partition ID set appears non-contiguously in the segment
+/// list (e.g., partition A -> B -> A).
+static bool hasNonContiguousPartitionIds(ArrayRef<ChainSegment> segments) {
+  SmallVector<SmallVector<int32_t>> seenPartitionSets;
   for (auto &seg : segments) {
-    if (seenTaskSets.empty() || seenTaskSets.back() != seg.taskIds) {
-      for (size_t i = 0; i + 1 < seenTaskSets.size(); ++i) {
-        if (seenTaskSets[i] == seg.taskIds)
+    if (seenPartitionSets.empty() ||
+        seenPartitionSets.back() != seg.partitionIds) {
+      for (size_t i = 0; i + 1 < seenPartitionSets.size(); ++i) {
+        if (seenPartitionSets[i] == seg.partitionIds)
           return true;
       }
-      seenTaskSets.push_back(seg.taskIds);
+      seenPartitionSets.push_back(seg.partitionIds);
     }
   }
   return false;
@@ -1085,10 +1086,10 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   if (!equiv)
     return;
 
-  // If collectPerTileChain pulled a same-task async TMA-store consumer into the
-  // per-tile chains, the producer store and consumer copy are emitted as ONE
-  // interleaved region; the separate consumer-region path below must then be
-  // skipped (it would otherwise double-wrap the copy).
+  // If collectPerTileChain pulled a same-partition async TMA-store consumer
+  // into the per-tile chains, the producer store and consumer copy are emitted
+  // as one interleaved region; the separate consumer-region path below must
+  // then be skipped (it would otherwise double-wrap the copy).
   bool tmaInterleaved = false;
   for (auto &chain : chains) {
     for (Operation *op : chain)
@@ -1117,14 +1118,14 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
   Location loc = splitOp.getLoc();
 
   bool built = false;
-  bool multiTask = isMultiTask(chains);
+  bool multiPartition = isMultiPartition(chains);
 
-  if (!multiTask) {
+  if (!multiPartition) {
     buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
                                *equiv);
     built = true;
   } else {
-    auto segments = groupByContiguousTaskSet(chains, *equiv);
+    auto segments = groupByContiguousPartitionSet(chains, *equiv);
     if (!segments || segments->empty())
       return;
 
@@ -1132,14 +1133,14 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
       buildSingleSubtiledRegionN(builder, loc, setupOps, leafValues, chains,
                                  *equiv);
       built = true;
-    } else if (hasNonContiguousTaskIds(*segments)) {
-      // Merge segments with the same task ID and topologically sort by
-      // data dependency to produce contiguous task groups.
+    } else if (hasNonContiguousPartitionIds(*segments)) {
+      // Merge segments with the same partition ID and topologically sort by
+      // data dependency to produce contiguous partition groups.
       SmallVector<ChainSegment> merged;
       for (auto &seg : *segments) {
         ChainSegment *target = nullptr;
         for (auto &m : merged) {
-          if (m.taskIds == seg.taskIds) {
+          if (m.partitionIds == seg.partitionIds) {
             target = &m;
             break;
           }
@@ -1274,31 +1275,32 @@ void tryGenerateForSplit(triton::SplitOp splitOp) {
 
 #ifndef NDEBUG
     // Regression guard: reaching the separate consumer-region path with a copy
-    // in the SAME async task as the producer store means the interleave above
-    // did not fire. Two separate same-task regions cannot serialize
+    // in the same partition as the producer store means the interleave above
+    // did not fire. Two separate same-partition regions cannot serialize
     // staging-slot reuse unless every subtile gets a distinct slot (buffer.copy
     // >= numTiles), so this is a silent-data-race configuration (the
     // EPILOGUE_SUBTILE > buffer.copy bug).
     if (hasTmaChains) {
-      SmallVector<int32_t> producerTaskIds;
+      SmallVector<int32_t> producerPartitionIds;
       for (Operation *op : chains[0])
         if (isa<gpu::LocalStoreOp>(op)) {
-          producerTaskIds = getOpAsyncTaskIds(op);
+          producerPartitionIds = getOpWSPartitionIds(op);
           break;
         }
       auto tmaCopy0 =
           dyn_cast<AsyncTMACopyLocalToGlobalOp>(tmaChains[0].front());
-      SmallVector<int32_t> tmaTaskIds =
-          tmaCopy0 ? getOpAsyncTaskIds(tmaCopy0) : SmallVector<int32_t>{};
+      SmallVector<int32_t> tmaPartitionIds =
+          tmaCopy0 ? getOpWSPartitionIds(tmaCopy0) : SmallVector<int32_t>{};
       int64_t copies = 0;
       if (tmaCopy0)
         if (Operation *alloc = tmaCopy0.getSrc().getDefiningOp())
           if (auto attr = alloc->getAttrOfType<IntegerAttr>("buffer.copy"))
             copies = attr.getInt();
-      assert(
-          (tmaTaskIds != producerTaskIds || copies >= (int64_t)numTiles) &&
-          "same-task subtiled TMA staging must be interleaved into one region "
-          "(buffer.copy < numTiles would race); see collectPerTileChain");
+      assert((tmaPartitionIds != producerPartitionIds ||
+              copies >= (int64_t)numTiles) &&
+             "same-partition subtiled TMA staging must be interleaved into one "
+             "region "
+             "(buffer.copy < numTiles would race); see collectPerTileChain");
     }
 #endif
 

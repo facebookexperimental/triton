@@ -2,20 +2,20 @@
 
 // Regression test for B-21-F1 / T273503312.
 // CHECK-LABEL: @matmul_ws_gather_and_descriptor_load
-// CHECK: %[[#GA:]] = tt.descriptor_gather {{.*}} {async_task_id = array<i32: 0>}
+// CHECK: %[[#GA:]] = tt.descriptor_gather {{.*}} {ttg.partition = array<i32: 0>}
 // CHECK: %[[#LA:]] = ttg.local_alloc %[[#GA]]
-// CHECK: %[[#GB:]] = tt.descriptor_load {{.*}} {async_task_id = array<i32: 0>}
+// CHECK: %[[#GB:]] = tt.descriptor_load {{.*}} {ttg.partition = array<i32: 0>}
 // CHECK: %[[#LB:]] = ttg.local_alloc %[[#GB]]
-// CHECK: %[[#C:]] = ttng.warp_group_dot %[[#LA]], %[[#LB]], {{.*}} {async_task_id = array<i32: 1, 2>
-// CHECK: tt.descriptor_store {{.*}} {async_task_id = array<i32: 1, 2>
+// CHECK: %[[#C:]] = ttng.warp_group_dot %[[#LA]], %[[#LB]], {{.*}} {inputPrecision = 0 : i32, ttg.partition = array<i32: 1, 2>
+// CHECK: tt.descriptor_store {{.*}} {ttg.partition = array<i32: 1, 2>
 
 // CHECK-LABEL: @matmul_ws_all_descriptor_gather
-// CHECK: %[[#GAA:]] = tt.descriptor_gather {{.*}} {async_task_id = array<i32: 0>}
+// CHECK: %[[#GAA:]] = tt.descriptor_gather {{.*}} {ttg.partition = array<i32: 0>}
 // CHECK: %[[#LAA:]] = ttg.local_alloc %[[#GAA]]
-// CHECK: %[[#GAB:]] = tt.descriptor_gather {{.*}} {async_task_id = array<i32: 0>}
+// CHECK: %[[#GAB:]] = tt.descriptor_gather {{.*}} {ttg.partition = array<i32: 0>}
 // CHECK: %[[#LAB:]] = ttg.local_alloc %[[#GAB]]
-// CHECK: %[[#AC:]] = ttng.warp_group_dot %[[#LAA]], %[[#LAB]], {{.*}} {async_task_id = array<i32: 1, 2>
-// CHECK: tt.descriptor_store {{.*}} {async_task_id = array<i32: 1, 2>
+// CHECK: %[[#AC:]] = ttng.warp_group_dot %[[#LAA]], %[[#LAB]], {{.*}} {inputPrecision = 0 : i32, ttg.partition = array<i32: 1, 2>
+// CHECK: tt.descriptor_store {{.*}} {ttg.partition = array<i32: 1, 2>
 
 #indices = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>

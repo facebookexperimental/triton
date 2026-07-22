@@ -269,7 +269,7 @@ static bool isAllowedUserOp(Operation *op) {
 /// Adapted from `WSDataPartition::getForwardSliceToPartition` (line 441),
 /// stripped of:
 ///   * AtomicRMWOp / DescriptorReduceOp `onlyUsedByAtomicStore` special case
-///   * AsyncTaskId tracking
+///   * WS partition tracking
 ///   * BroadcastOp / ExpandDimsOp / TransOp dim-flipping (deferred to
 ///     Phase 1c-ext if a v8/v10 user chain needs it)
 ///   * MultiResult `scf.if` follow-through (not used by v8/v10 main loop)

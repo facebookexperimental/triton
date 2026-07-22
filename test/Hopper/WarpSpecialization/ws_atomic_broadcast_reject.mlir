@@ -4,11 +4,11 @@
 // by a NON-scalar (scatter) tt.atomic_rmw replicated across partitions. AutoWS
 // cannot broadcast a data-dependent scatter, so it must bail out of warp
 // specialization and leave a plain, compilable (non-WS) kernel: no
-// ttg.warp_specialize op and no leftover partition ids / async_task_ids.
+// ttg.warp_specialize op and no leftover partition ids / ttg.partitions.
 
 // CHECK-LABEL: @reject_scatter_atomic
 // CHECK-NOT: ttg.warp_specialize
-// CHECK-NOT: async_task_id
+// CHECK-NOT: ttg.partition
 // CHECK-NOT: ttg.partition
 // The unsupported atomic itself is preserved (kernel still compiles).
 // CHECK: tt.atomic_rmw

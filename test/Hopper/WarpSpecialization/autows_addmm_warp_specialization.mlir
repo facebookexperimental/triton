@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization | FileCheck %s
 //
 // Generated from python/test/unit/language/test_autows_addmm.py with MLIR_ENABLE_DUMP=1.
 // Configuration: FLATTEN=False, EPILOGUE_SUBTILE=4, M=N=K=128, BLOCK_SIZE_M=N=128, BLOCK_SIZE_K=64.

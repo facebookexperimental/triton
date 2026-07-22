@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="capability=100" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="capability=100" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 
 // Test: Redundant TMEM zeroing removal for operand D (BWD persistent FA, BLOCK_M=64).
 //

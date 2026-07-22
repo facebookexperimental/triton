@@ -54,12 +54,12 @@ static void invalidateBarrierAlloc(OpBuilder &builder, Value barrierAlloc) {
 }
 
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
-                        OpBuilderWithAsyncTaskIds &builder,
-                        AsyncTaskId asyncTaskId);
+                        OpBuilderWithPartitionIds &builder,
+                        WSPartitionId partitionId);
 
 /// Check if `value` is transitively needed by an operation with the given
-/// asyncTaskId.
-static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
+/// partitionId.
+static bool isValueNeededByTask(Value value, WSPartitionId partitionId) {
   SmallVector<Value> worklist;
   DenseSet<Value> visited;
   worklist.push_back(value);
@@ -67,7 +67,7 @@ static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
   while (!worklist.empty()) {
     Value curr = worklist.pop_back_val();
     for (Operation *user : curr.getUsers()) {
-      if (hasAsyncTaskId(user, asyncTaskId))
+      if (hasWSPartitionId(user, partitionId))
         return true;
       for (Value result : user->getResults()) {
         if (visited.insert(result).second)
@@ -79,21 +79,21 @@ static bool isValueNeededByTask(Value value, AsyncTaskId asyncTaskId) {
 }
 
 /// Check if any result of `op` is transitively needed by an operation
-/// with the given asyncTaskId. This handles the case where an op doesn't
-/// have the target asyncTaskId but produces values consumed (directly or
+/// with the given partitionId. This handles the case where an op doesn't
+/// have the target partitionId but produces values consumed (directly or
 /// through a chain of ops) by ops that do.
-static bool isNeededByTask(Operation *op, AsyncTaskId asyncTaskId) {
+static bool isNeededByTask(Operation *op, WSPartitionId partitionId) {
   for (Value result : op->getResults()) {
-    if (isValueNeededByTask(result, asyncTaskId))
+    if (isValueNeededByTask(result, partitionId))
       return true;
   }
   return false;
 }
 
 static bool isYieldedValueAvailableForTask(Value value,
-                                           AsyncTaskId asyncTaskId) {
+                                           WSPartitionId partitionId) {
   if (Operation *def = value.getDefiningOp())
-    return hasAsyncTaskId(def, asyncTaskId);
+    return hasWSPartitionId(def, partitionId);
 
   auto blockArg = dyn_cast<BlockArgument>(value);
   if (!blockArg)
@@ -107,17 +107,17 @@ static bool isYieldedValueAvailableForTask(Value value,
     Value initArg =
         forOp.getInitArgs()[argNumber - forOp.getNumInductionVars()];
     if (Operation *def = initArg.getDefiningOp())
-      return hasAsyncTaskId(def, asyncTaskId);
+      return hasWSPartitionId(def, partitionId);
   } else if (auto whileOp = dyn_cast<scf::WhileOp>(owner)) {
     if (blockArg.getOwner() == whileOp.getBeforeBody()) {
       Value initArg = whileOp.getInits()[blockArg.getArgNumber()];
       if (Operation *def = initArg.getDefiningOp())
-        return hasAsyncTaskId(def, asyncTaskId);
+        return hasWSPartitionId(def, partitionId);
     } else if (blockArg.getOwner() == whileOp.getAfterBody()) {
       Value forwarded =
           whileOp.getConditionOp().getArgs()[blockArg.getArgNumber()];
       if (Operation *def = forwarded.getDefiningOp())
-        return hasAsyncTaskId(def, asyncTaskId);
+        return hasWSPartitionId(def, partitionId);
     }
   }
 
@@ -125,20 +125,20 @@ static bool isYieldedValueAvailableForTask(Value value,
 }
 
 static bool shouldKeepIfResultForTask(scf::IfOp ifOp, unsigned resultIdx,
-                                      Value result, AsyncTaskId asyncTaskId) {
-  if (isValueNeededByTask(result, asyncTaskId))
+                                      Value result, WSPartitionId partitionId) {
+  if (isValueNeededByTask(result, partitionId))
     return true;
   if (isYieldedValueAvailableForTask(ifOp.thenYield().getOperand(resultIdx),
-                                     asyncTaskId))
+                                     partitionId))
     return true;
   return ifOp.elseBlock() &&
          isYieldedValueAvailableForTask(ifOp.elseYield().getOperand(resultIdx),
-                                        asyncTaskId);
+                                        partitionId);
 }
 
-unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
+unsigned scanRegUsage(Block *block, WSPartitionId partitionId,
                       unsigned requestedRegisters) {
-  assert(asyncTaskId != 0 && "producer group should not request registers");
+  assert(partitionId != 0 && "producer group should not request registers");
   // TODO: scan ops to estimate register usage
   // only tma loads, or tma stores, or gen5
   return requestedRegisters == 0 ? 232 : requestedRegisters;
@@ -146,15 +146,15 @@ unsigned scanRegUsage(Block *block, AsyncTaskId asyncTaskId,
 
 // Collect argument indices that are used by the specific taskId.
 static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
-                                                     int asyncTaskId) {
+                                                     int partitionId) {
 
   // Collect argument indices that can be reached along the definition chain.
   SetVector<unsigned> argIndices;
   std::function<void(scf::ForOp, Value, unsigned)> dfs =
       [&](scf::ForOp nestedForOp, Value arg, unsigned argIdx) {
         for (auto user : arg.getUsers()) {
-          // Skip ops that are not in the same async task
-          if (!hasAsyncTaskId(user, asyncTaskId))
+          // Skip ops that are not in the same partition
+          if (!hasWSPartitionId(user, partitionId))
             continue;
 
           if (isa<scf::YieldOp>(user)) {
@@ -164,7 +164,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
                      llvm::enumerate(user->getOperands())) {
                   if (operand == arg &&
                       isValueNeededByTask(parentForOp.getResult(yieldIdx),
-                                          asyncTaskId)) {
+                                          partitionId)) {
                     argIndices.insert(argIdx);
                     return;
                   }
@@ -178,7 +178,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
                 auto initArg =
                     nestedForOp.getInitArgs()[blockArg.getArgNumber() - 1];
                 if (Operation *def = initArg.getDefiningOp()) {
-                  if (hasAsyncTaskId(def, asyncTaskId)) {
+                  if (hasWSPartitionId(def, partitionId)) {
                     argIndices.insert(argIdx);
                     return;
                   }
@@ -188,7 +188,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
               }
             }
 
-            // Skip control flow ops that are shared by all async tasks
+            // Skip control flow ops that are shared by all partitions
             continue;
           }
 
@@ -202,7 +202,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
               if (argIndices.count(argIdx))
                 return;
               if (isValueNeededByTask(userFor.getResult(initArgIdx),
-                                      asyncTaskId)) {
+                                      partitionId)) {
                 argIndices.insert(argIdx);
                 return;
               }
@@ -212,7 +212,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
               auto initArg =
                   nestedForOp.getInitArgs()[blockArg.getArgNumber() - 1];
               if (Operation *def = initArg.getDefiningOp()) {
-                if (hasAsyncTaskId(def, asyncTaskId)) {
+                if (hasWSPartitionId(def, partitionId)) {
                   argIndices.insert(argIdx);
                   return;
                 }
@@ -231,7 +231,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
                 }
               }
             }
-            // Skip control flow ops that are shared by all async tasks
+            // Skip control flow ops that are shared by all partitions
             continue;
           }
 
@@ -260,7 +260,7 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
   }
   for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
     auto result = forOp->getResult(i);
-    if (isValueNeededByTask(result, asyncTaskId))
+    if (isValueNeededByTask(result, partitionId))
       argIndices.insert(i);
     dfs(forOp, result, i);
   }
@@ -271,8 +271,8 @@ static SmallVector<unsigned> collectBlockArgsForTask(scf::ForOp forOp,
 }
 
 Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
-                          OpBuilderWithAsyncTaskIds &builder,
-                          AsyncTaskId asyncTaskId) {
+                          OpBuilderWithPartitionIds &builder,
+                          WSPartitionId partitionId) {
   LLVM_DEBUG({
     LDBG("specialize ifOp ");
     ifOp.dump();
@@ -285,7 +285,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   SmallVector<unsigned> keptResultVec;
   if (!ifOp->getResultTypes().empty()) {
     for (auto [resultIdx, result] : llvm::enumerate(ifOp->getResults())) {
-      if (shouldKeepIfResultForTask(ifOp, resultIdx, result, asyncTaskId))
+      if (shouldKeepIfResultForTask(ifOp, resultIdx, result, partitionId))
         keptResultVec.push_back(resultIdx);
     }
   }
@@ -295,25 +295,25 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
     newResultTypes.push_back(ifOp->getResultTypes()[idx]);
   }
   builder.setLoopScheduleInfoFromOp(ifOp);
-  auto newIfOp = builder.createWithAsyncTaskIds<scf::IfOp>(
+  auto newIfOp = builder.createWithPartitionIds<scf::IfOp>(
       ifOp.getLoc(), newResultTypes, mapping.lookup(ifOp.getCondition()), true,
       ifOp.elseBlock());
   builder.clearLoopScheduleInfo();
 
-  OpBuilderWithAsyncTaskIds ifBuilder(ifOp.getContext());
-  ifBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+  OpBuilderWithPartitionIds ifBuilder(ifOp.getContext());
+  ifBuilder.setPartitionIdsFromArray({partitionId});
 
   // Handle thenRegion of this IfOp.
   ifBuilder.setInsertionPointToEnd(newIfOp.thenBlock());
   for (Operation &thenOp : ifOp.thenBlock()->getOperations()) {
-    SpecializeOp(&thenOp, mapping, ifBuilder, asyncTaskId);
+    SpecializeOp(&thenOp, mapping, ifBuilder, partitionId);
   }
 
   // Update yields
   auto updateYield = [&](scf::YieldOp yield, SmallVector<Value> &operands) {
     ifBuilder.setInsertionPoint(yield);
     ifBuilder.setLoopScheduleInfoFromOp(yield);
-    ifBuilder.createWithAsyncTaskIds<scf::YieldOp>(yield.getLoc(), operands);
+    ifBuilder.createWithPartitionIds<scf::YieldOp>(yield.getLoc(), operands);
     ifBuilder.clearLoopScheduleInfo();
     yield.erase();
   };
@@ -329,7 +329,7 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
   if (ifOp.elseBlock()) {
     ifBuilder.setInsertionPointToEnd(newIfOp.elseBlock());
     for (Operation &elseOp : ifOp.elseBlock()->getOperations()) {
-      SpecializeOp(&elseOp, mapping, ifBuilder, asyncTaskId);
+      SpecializeOp(&elseOp, mapping, ifBuilder, partitionId);
     }
     if (keptResultVec.size() < ifOp->getResultTypes().size()) {
       SmallVector<Value> elseYieldOperands;
@@ -349,10 +349,10 @@ Operation *SpecializeIfOp(scf::IfOp ifOp, IRMapping &mapping,
 }
 
 Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
-                           OpBuilderWithAsyncTaskIds &builder,
-                           AsyncTaskId asyncTaskId) {
+                           OpBuilderWithPartitionIds &builder,
+                           WSPartitionId partitionId) {
   // Create newForOp for each task Id.
-  auto usedArgs = collectBlockArgsForTask(forOp, asyncTaskId);
+  auto usedArgs = collectBlockArgsForTask(forOp, partitionId);
 
   // Prepare newLoopArgs.
   SmallVector<Value> newLoopArgs;
@@ -370,15 +370,15 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 
   // Create newForOp.
   builder.setLoopScheduleInfoFromOp(forOp);
-  auto newForOp = builder.createWithAsyncTaskIds<scf::ForOp>(
+  auto newForOp = builder.createWithPartitionIds<scf::ForOp>(
       forOp.getLoc(), newLowerBound, newUpperBound, newStep, newLoopArgs);
   builder.clearLoopScheduleInfo();
   // Propagate the attributes of forOp to newForOp.
   // This is needed to preserve tt.warp_specialize,
   // and tt.loop_schedule among others.
   for (auto attr : forOp->getAttrs()) {
-    // async_task_id is set in the creation step.
-    if (attr.getName() != "async_task_id") {
+    // The partition attribute is set in the creation step.
+    if (attr.getName() != ttg::kPartitionAttrName) {
       newForOp->setAttr(attr.getName(), attr.getValue());
     }
   }
@@ -395,17 +395,17 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
   for (unsigned i = 0; i < usedArgs.size(); ++i) {
     auto oldArg = forOp.getRegionIterArgs()[usedArgs[i]];
     auto newArg = newForOp.getRegionIterArgs()[i];
-    LDBG("ForOp args mapping of task " << asyncTaskId << " argIdx "
+    LDBG("ForOp args mapping of task " << partitionId << " argIdx "
                                        << usedArgs[i]);
     mapping.map(oldArg, newArg);
   }
 
-  // Recursively clone all operations with this asyncTaskId to newForOp.
-  OpBuilderWithAsyncTaskIds forBuilder(forOp.getContext());
-  forBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+  // Recursively clone all operations with this partitionId to newForOp.
+  OpBuilderWithPartitionIds forBuilder(forOp.getContext());
+  forBuilder.setPartitionIdsFromArray({partitionId});
   forBuilder.setInsertionPointToStart(newForOp.getBody());
   for (Operation &op : forOp.getBody()->without_terminator()) {
-    SpecializeOp(&op, mapping, forBuilder, asyncTaskId);
+    SpecializeOp(&op, mapping, forBuilder, partitionId);
   }
 
   // Create YieldOp for newForOp.
@@ -419,14 +419,14 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
     auto initialYield =
         llvm::cast<scf::YieldOp>(newForOp.getBody()->getTerminator());
     if (newYieldOperands.size() == 0) {
-      setAsyncTaskIds(initialYield, {asyncTaskId});
+      setWSPartitionIds(initialYield, partitionId);
       createNewYield = false;
     }
   }
   if (createNewYield) {
     auto newYieldOp =
         scf::YieldOp::create(forBuilder, yieldOp.getLoc(), newYieldOperands);
-    setAsyncTaskIds(newYieldOp, {asyncTaskId});
+    setWSPartitionIds(newYieldOp, partitionId);
   }
 
   // Replace results of forOp with results of newForOp.
@@ -440,18 +440,18 @@ Operation *SpecializeForOp(scf::ForOp forOp, IRMapping &mapping,
 }
 
 Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
-                             OpBuilderWithAsyncTaskIds &builder,
-                             AsyncTaskId asyncTaskId) {
+                             OpBuilderWithPartitionIds &builder,
+                             WSPartitionId partitionId) {
   SmallVector<Value> newInits;
   for (Value init : whileOp.getInits())
     newInits.push_back(mapping.lookupOrDefault(init));
 
   builder.setLoopScheduleInfoFromOp(whileOp);
-  auto newWhileOp = builder.createWithAsyncTaskIds<scf::WhileOp>(
+  auto newWhileOp = builder.createWithPartitionIds<scf::WhileOp>(
       whileOp.getLoc(), whileOp->getResultTypes(), newInits);
   builder.clearLoopScheduleInfo();
   for (auto attr : whileOp->getAttrs()) {
-    if (attr.getName() != "async_task_id")
+    if (attr.getName() != ttg::kPartitionAttrName)
       newWhileOp->setAttr(attr.getName(), attr.getValue());
   }
 
@@ -476,31 +476,31 @@ Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
        llvm::zip(whileOp.getAfterArguments(), newWhileOp.getAfterArguments()))
     localMapping.map(oldArg, newArg);
 
-  OpBuilderWithAsyncTaskIds whileBuilder(whileOp.getContext());
-  whileBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+  OpBuilderWithPartitionIds whileBuilder(whileOp.getContext());
+  whileBuilder.setPartitionIdsFromArray({partitionId});
 
   whileBuilder.setInsertionPointToStart(newWhileOp.getBeforeBody());
   for (Operation &op : whileOp.getBeforeBody()->without_terminator())
-    SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
+    SpecializeOp(&op, localMapping, whileBuilder, partitionId);
   auto condOp = whileOp.getConditionOp();
   SmallVector<Value> condArgs;
   for (Value arg : condOp.getArgs())
     condArgs.push_back(localMapping.lookupOrDefault(arg));
   whileBuilder.setLoopScheduleInfoFromOp(condOp);
-  whileBuilder.createWithAsyncTaskIds<scf::ConditionOp>(
+  whileBuilder.createWithPartitionIds<scf::ConditionOp>(
       condOp.getLoc(), localMapping.lookupOrDefault(condOp.getCondition()),
       condArgs);
   whileBuilder.clearLoopScheduleInfo();
 
   whileBuilder.setInsertionPointToStart(newWhileOp.getAfterBody());
   for (Operation &op : whileOp.getAfterBody()->without_terminator())
-    SpecializeOp(&op, localMapping, whileBuilder, asyncTaskId);
+    SpecializeOp(&op, localMapping, whileBuilder, partitionId);
   auto yieldOp = whileOp.getYieldOp();
   SmallVector<Value> yieldArgs;
   for (Value arg : yieldOp.getOperands())
     yieldArgs.push_back(localMapping.lookupOrDefault(arg));
   whileBuilder.setLoopScheduleInfoFromOp(yieldOp);
-  whileBuilder.createWithAsyncTaskIds<scf::YieldOp>(yieldOp.getLoc(),
+  whileBuilder.createWithPartitionIds<scf::YieldOp>(yieldOp.getLoc(),
                                                     yieldArgs);
   whileBuilder.clearLoopScheduleInfo();
 
@@ -512,55 +512,55 @@ Operation *SpecializeWhileOp(scf::WhileOp whileOp, IRMapping &mapping,
 }
 
 Operation *SpecializeOp(Operation *op, IRMapping &mapping,
-                        OpBuilderWithAsyncTaskIds &builder,
-                        AsyncTaskId asyncTaskId) {
-  auto taskIds = getAsyncTaskIds(op);
+                        OpBuilderWithPartitionIds &builder,
+                        WSPartitionId partitionId) {
+  auto taskIds = getWSPartitionIds(op);
   // yieldOp are sometimes implict, meaning they do not necessarily have a task
-  // id, but they should be shared by all async tasks.
-  if (!hasAsyncTaskId(op, asyncTaskId) && !isa<scf::YieldOp>(op)) {
+  // id, but they should be shared by all partitions.
+  if (!hasWSPartitionId(op, partitionId) && !isa<scf::YieldOp>(op)) {
     // Before skipping, check if any result is transitively needed by an op
-    // with the target asyncTaskId. This handles ops (e.g. MemDescIndexOp)
-    // that weren't assigned the right task IDs but produce values consumed
+    // with the target partitionId. This handles ops (e.g. MemDescIndexOp)
+    // that weren't assigned the right partition IDs but produce values consumed
     // by ops in this partition.
-    if (!isNeededByTask(op, asyncTaskId))
+    if (!isNeededByTask(op, partitionId))
       return nullptr;
   }
 
   if (op->getNumRegions() == 0) {
     Operation *newOp = builder.clone(*op, mapping);
-    setAsyncTaskIds(newOp, asyncTaskId);
+    setWSPartitionIds(newOp, partitionId);
     for (unsigned i = 0; i < op->getNumResults(); ++i)
       mapping.map(op->getResult(i), newOp->getResult(i));
     return newOp;
   } else {
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-      return SpecializeIfOp(ifOp, mapping, builder, asyncTaskId);
+      return SpecializeIfOp(ifOp, mapping, builder, partitionId);
     } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      return SpecializeForOp(forOp, mapping, builder, asyncTaskId);
+      return SpecializeForOp(forOp, mapping, builder, partitionId);
     } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
-      return SpecializeWhileOp(whileOp, mapping, builder, asyncTaskId);
+      return SpecializeWhileOp(whileOp, mapping, builder, partitionId);
     } else if (auto reduceOp = dyn_cast<triton::ReduceOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
-      // recursively set async task ids for child ops
+      // recursively set partition ids for child ops
       newOp->walk(
-          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+          [&](Operation *childOp) { setWSPartitionIds(childOp, partitionId); });
       for (unsigned i = 0; i < op->getNumResults(); ++i)
         mapping.map(op->getResult(i), newOp->getResult(i));
       return newOp;
     } else if (isa<triton::MapElementwiseOp>(op)) {
       Operation *newOp = builder.clone(*op, mapping);
-      // recursively set async task ids for child ops
+      // recursively set partition ids for child ops
       newOp->walk(
-          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+          [&](Operation *childOp) { setWSPartitionIds(childOp, partitionId); });
       for (unsigned i = 0; i < op->getNumResults(); ++i)
         mapping.map(op->getResult(i), newOp->getResult(i));
       return newOp;
     } else if (isa<triton::nvidia_gpu::SubtiledRegionOp>(op)) {
-      // Single-task SubtiledRegionOp: clone wholesale and set task IDs.
+      // Single-task SubtiledRegionOp: clone wholesale and set partition IDs.
       // Multi-task ops are lowered before specializeRegion is called.
       Operation *newOp = builder.clone(*op, mapping);
       newOp->walk(
-          [&](Operation *childOp) { setAsyncTaskIds(childOp, asyncTaskId); });
+          [&](Operation *childOp) { setWSPartitionIds(childOp, partitionId); });
       for (unsigned i = 0; i < op->getNumResults(); ++i)
         mapping.map(op->getResult(i), newOp->getResult(i));
       return newOp;
@@ -579,7 +579,7 @@ static void logOpStillHasUsers(Operation *op) {
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
       llvm::errs() << " (partition: " << partitionAttr << ")";
     }
-    auto taskIds = getAsyncTaskIds(op);
+    auto taskIds = getWSPartitionIds(op);
     if (!taskIds.empty()) {
       llvm::errs() << " (taskIds: ";
       for (size_t i = 0; i < taskIds.size(); ++i) {
@@ -613,7 +613,7 @@ static void logOpStillHasUsers(Operation *op) {
                 ttg::kPartitionAttrName)) {
           llvm::errs() << " (partition: " << userPartitionAttr << ")";
         }
-        auto userTaskIds = getAsyncTaskIds(user);
+        auto userTaskIds = getWSPartitionIds(user);
         if (!userTaskIds.empty()) {
           llvm::errs() << " (taskIds: ";
           for (size_t j = 0; j < userTaskIds.size(); ++j) {
@@ -684,7 +684,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   SmallVector<Operation *> opList;
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &op : block.getOperations()) {
-      auto taskIds = getAsyncTaskIds(&op);
+      auto taskIds = getWSPartitionIds(&op);
       if (!taskIds.empty())
         opList.push_back(&op);
     }
@@ -703,17 +703,17 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     }
   });
 
-  // Create GetAsyncTaskIdOp.
+  // Create GetWSPartitionIdOp.
   Block *lastBlock = &funcOp.getBody().back();
   auto returnOp = llvm::cast<triton::ReturnOp>(lastBlock->getTerminator());
   builder.setInsertionPoint(returnOp);
 
   // Instead of a new IfOp for each task, we create one partitionRegion.
-  auto nTaskIds = getNestedAsyncTaskIds(funcOp);
+  auto nTaskIds = getNestedWSPartitionIds(funcOp);
   int defaultNumWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
   SmallVector<int32_t> partitionNumWarps;
-  for (AsyncTaskId asyncTaskId : nTaskIds) {
-    if (asyncTaskId == 0)
+  for (WSPartitionId partitionId : nTaskIds) {
+    if (partitionId == 0)
       continue;
     partitionNumWarps.push_back(defaultNumWarps);
   }
@@ -744,18 +744,18 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   // Clone all operations into the corresponding if blocks. If the operation
   // has multiple taskIds, it will be cloned for multiple if blocks.
   // If the original code has an IfOp, we should only clone its
-  // body with the right asyncTaskId, instead of cloning the IfOp.
+  // body with the right partitionId, instead of cloning the IfOp.
   // Handle producer WG.
   {
-    AsyncTaskId asyncTaskId = nTaskIds[0];
-    OpBuilderWithAsyncTaskIds taskBuilder(context);
-    taskBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+    WSPartitionId partitionId = nTaskIds[0];
+    OpBuilderWithPartitionIds taskBuilder(context);
+    taskBuilder.setPartitionIdsFromArray({partitionId});
     Block *defaultBlock = impB.createBlock(&wsOp.getDefaultRegion());
     taskBuilder.setInsertionPointToStart(defaultBlock);
     IRMapping mapping;
 
     for (Operation *op : opList) {
-      SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
+      SpecializeOp(op, mapping, taskBuilder, partitionId);
     }
     SmallVector<Value> opnds;
     ttg::WarpYieldOp::create(taskBuilder, loc, opnds);
@@ -763,9 +763,9 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
   unsigned idx = 1;
   for (Region *region : wsOp.getPartitionRegions()) {
-    AsyncTaskId asyncTaskId = nTaskIds[idx];
-    OpBuilderWithAsyncTaskIds taskBuilder(context);
-    taskBuilder.setAsynTaskIdsFromArray({asyncTaskId});
+    WSPartitionId partitionId = nTaskIds[idx];
+    OpBuilderWithPartitionIds taskBuilder(context);
+    taskBuilder.setPartitionIdsFromArray({partitionId});
     LDBG("region idx " << idx << " " << nTaskIds.size());
     ++idx;
     Block *partitionBlock = impB.createBlock(region);
@@ -784,7 +784,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
           // Check if this result is used by any operation in this partition
           bool usedInPartition = false;
           for (Operation *user : result.getUsers()) {
-            if (hasAsyncTaskId(user, asyncTaskId)) {
+            if (hasWSPartitionId(user, partitionId)) {
               usedInPartition = true;
               break;
             }
@@ -802,7 +802,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
           auto result = whileOp.getResult(resIdx);
           bool usedInPartition = false;
           for (Operation *user : result.getUsers()) {
-            if (hasAsyncTaskId(user, asyncTaskId)) {
+            if (hasWSPartitionId(user, partitionId)) {
               usedInPartition = true;
               break;
             }
@@ -817,7 +817,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
 
     // Now clone operations in order
     for (Operation *op : opList) {
-      SpecializeOp(op, mapping, taskBuilder, asyncTaskId);
+      SpecializeOp(op, mapping, taskBuilder, partitionId);
     }
     ttg::WarpReturnOp::create(taskBuilder, loc);
   }
@@ -830,9 +830,12 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
     // Rematerialize constants.
     if (capture.getDefiningOp() &&
         capture.getDefiningOp()->hasTrait<OpTrait::ConstantLike>()) {
-      for (Region *region : wsOp.getPartitionRegions()) {
+      for (auto [regionIdx, region] :
+           llvm::enumerate(wsOp.getPartitionRegions())) {
         impB.setInsertionPointToStart(&region->front());
-        Value copy = impB.clone(*capture.getDefiningOp())->getResult(0);
+        Operation *copyOp = impB.clone(*capture.getDefiningOp());
+        setWSPartitionIds(copyOp, nTaskIds[regionIdx + 1]);
+        Value copy = copyOp->getResult(0);
         replaceAllUsesInRegionWith(capture, copy, *region);
       }
       continue;
@@ -895,7 +898,7 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
   opList.clear();
   for (auto &block : funcOp.getBody().getBlocks()) {
     for (Operation &op : block.getOperations()) {
-      auto taskIds = getAsyncTaskIds(&op);
+      auto taskIds = getWSPartitionIds(&op);
       if (!taskIds.empty())
         opList.push_back(&op);
     }
@@ -924,11 +927,9 @@ void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters) {
       logOpStillHasUsers(op);
       // The op has been cloned into partition regions but still has users
       // outside the WS regions (e.g. a MemDescIndexOp at the function level
-      // that wasn't given asyncTaskIds). Keep the op alive by removing its
-      // async_task_id so it stays at the function level as a shared value.
-      op->removeAttr("async_task_id");
-      if (op->hasAttr(ttg::kPartitionAttrName))
-        op->removeAttr(ttg::kPartitionAttrName);
+      // that wasn't given a partition). Keep the op alive by removing its
+      // partition so it stays at the function level as a shared value.
+      op->removeAttr(ttg::kPartitionAttrName);
       continue;
     }
 

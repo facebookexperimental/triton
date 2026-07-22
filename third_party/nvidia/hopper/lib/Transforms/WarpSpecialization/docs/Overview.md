@@ -67,7 +67,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `SinkBroadcast.cpp` | `nvgpu-sink-broadcast` | Pre-partition peephole that sinks `tt.broadcast` producer chains to elementwise users |
 | `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes). See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) covers extending it to `scf.while` (in progress) |
 | (frontend) | `tl.range` / `tl.condition` → `tt.*` loop attrs | The user-facing AutoWS/pipelining annotations, their IR attributes and consumers, and what works on `scf.while` today: [AutoWSAnnotations.md](AutoWSAnnotations.md) |
-| `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
+| `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `ttg.partition` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
 | `WSTaskIdPropagate.cpp` | `doTaskIdPropagate` | Runs analysis and materializes task IDs |
 | `WSAtomicBroadcast.cpp` | `doDynamicTileBroadcast` | Cross-partition run-once "claim next tile" support: run a dynamic-persistent tile-id producer once and broadcast it, for both a `tt.atomic_rmw` counter and a CLC tile-scheduler fetch (`ttng.clc_read`) — or gracefully reject unsupported shapes. See [CrossPartitionAtomicSupport.md](CrossPartitionAtomicSupport.md) |
@@ -86,13 +86,13 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSTMAStoreLowering.cpp` | `doTMAStoreWaitReorder` | Reschedule TMA store waits using SWP CoarseSchedule |
 | `TMEMAlloc1D.cpp` | `TMEM1DAllocator` | 1D tensor memory allocation for cross-partition values |
 | `CodePartitionUtility.cpp` | — | Channel data structures, operand D handling, barrier fusion, buffer management |
-| `Utility.cpp` | — | `AsyncTaskId` helpers, `OpBuilderWithAsyncTaskIds` |
+| `Utility.cpp` | — | `WSPartitionId` helpers, `OpBuilderWithPartitionIds` |
 
 ### Headers
 
 | File | Description |
 |------|-------------|
-| `Utility.h` | `AsyncTaskId` typedef, `OpBuilderWithAsyncTaskIds`, `LoopScheduleInfo`, task ID helpers |
+| `Utility.h` | `WSPartitionId` typedef, `OpBuilderWithPartitionIds`, `LoopScheduleInfo`, task ID helpers |
 | `TaskIdPropagation.h` | `TaskId` lattice, `TaskIdLattice`, `TaskIdBackwardPropagation` analysis |
 | `CodePartitionUtility.h` | `Channel`, `AllocChannel`, `TmemAllocChannel`, `ReuseGroup`, `ReuseConfig`, `CommChannel` |
 | `TMEMUtils.h` | `TMEM1DAllocator`, `sliceAndReinterpretMDTMEM`, `createTMEMDesc` |
@@ -104,7 +104,7 @@ recognizes the `scf.while` outer loop (same doc).
 | Term | Definition |
 |------|-----------|
 | **Partition** | A group of operations assigned to run on the same warp group. Identified by a partition ID (integer). |
-| **Async Task** | Synonym for partition. Identified by `async_task_id` attribute on ops. |
+| **Async Task** | Synonym for partition. Identified by `ttg.partition` attribute on ops. |
 | **Channel** | A producer-consumer data dependency between partitions. Can be SMEM-backed (`AllocChannel`) or TMEM-backed (`TmemAllocChannel`). |
 | **Reuse Group** | A set of channels sharing a single physical buffer (`buffer.id`). See [ReuseGroups.md](ReuseGroups.md). |
 | **Multi-buffering** | Allocating N copies of a buffer so the producer can fill copy N+1 while the consumer reads copy N. Controlled by `buffer.copy`. |
@@ -134,7 +134,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [WS Barrier Ordered Region Tracking](WSBarrierOrderedRegionTracking.md) — V2 ordered-region metadata for overlapping channel graphs
 - [Reuse Groups](ReuseGroups.md) — buffer sharing mechanics
 - [Ping-Pong Scheduling](PingPongScheduling.md) — named barrier insertion for expensive ops
-- [Utilities](Utilities.md) — `OpBuilderWithAsyncTaskIds`, task ID helpers, location utilities
+- [Utilities](Utilities.md) — `OpBuilderWithPartitionIds`, task ID helpers, location utilities
 - [Memory Planner Visualization](MemoryPlannerVisualization.md) — debug DOT graph tools
 - [TMA Store Wait Pipeline](TMAStoreWaitPipeline.md) — annotation, reordering, and lowering of TMA store waits
 - [Debugging Accuracy / Deadlocks](DebuggingAccuracyAndDeadlocks.md) — triage process for AutoWS wrong-results / hang bugs (tools, skills, methodology)

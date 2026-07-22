@@ -9,89 +9,93 @@
 namespace tt = mlir::triton;
 namespace mlir {
 
-static void normalizeAsyncTaskIds(SmallVectorImpl<AsyncTaskId> &asyncTaskIds) {
-  llvm::sort(asyncTaskIds);
-  asyncTaskIds.erase(std::unique(asyncTaskIds.begin(), asyncTaskIds.end()),
-                     asyncTaskIds.end());
+static void
+normalizeWSPartitionIds(SmallVectorImpl<WSPartitionId> &partitionIds) {
+  llvm::sort(partitionIds);
+  partitionIds.erase(std::unique(partitionIds.begin(), partitionIds.end()),
+                     partitionIds.end());
 }
 
 //===----------------------------------------------------------------------===//
-// Helper functions for async task
+// Helper functions for partition
 //===----------------------------------------------------------------------===//
 
-SmallVector<AsyncTaskId> getAsyncTaskIds(Operation *op) {
-  SmallVector<AsyncTaskId> asyncTaskIds;
-  if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName)) {
-    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-      asyncTaskIds.push_back(asyncTaskId);
-    }
-  } else if (auto attr = op->getAttrOfType<DenseI32ArrayAttr>(
-                 tt::gpu::kPartitionAttrName)) {
-    for (AsyncTaskId asyncTaskId : attr.asArrayRef()) {
-      asyncTaskIds.push_back(asyncTaskId);
+SmallVector<WSPartitionId> getWSPartitionIds(Operation *op) {
+  SmallVector<WSPartitionId> partitionIds;
+  if (auto attr =
+          op->getAttrOfType<DenseI32ArrayAttr>(tt::gpu::kPartitionAttrName)) {
+    for (WSPartitionId partitionId : attr.asArrayRef()) {
+      partitionIds.push_back(partitionId);
     }
   }
-  normalizeAsyncTaskIds(asyncTaskIds);
-  return asyncTaskIds;
+  normalizeWSPartitionIds(partitionIds);
+  return partitionIds;
 }
 
-bool hasAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
-  return llvm::is_contained(getAsyncTaskIds(op), asyncTaskId);
+bool hasWSPartitionId(Operation *op, WSPartitionId partitionId) {
+  return llvm::is_contained(getWSPartitionIds(op), partitionId);
 }
 
-void setAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTaskIds) {
-  if (asyncTaskIds.empty())
+void setWSPartitionIds(Operation *op, ArrayRef<WSPartitionId> partitionIds) {
+  if (partitionIds.empty())
     return;
-  SmallVector<AsyncTaskId> sortedAsyncTaskIds(asyncTaskIds.begin(),
-                                              asyncTaskIds.end());
-  normalizeAsyncTaskIds(sortedAsyncTaskIds);
-  op->setAttr(kAsyncTaskIdAttrName,
-              DenseI32ArrayAttr::get(op->getContext(), sortedAsyncTaskIds));
+  SmallVector<WSPartitionId> sortedWSPartitionIds(partitionIds.begin(),
+                                                  partitionIds.end());
+  normalizeWSPartitionIds(sortedWSPartitionIds);
+  op->setAttr(tt::gpu::kPartitionAttrName,
+              DenseI32ArrayAttr::get(op->getContext(), sortedWSPartitionIds));
+}
+
+void setWSPartitionIds(Operation *op, WSPartitionId partitionId) {
+  SmallVector<WSPartitionId, 1> partitionIds{partitionId};
+  setWSPartitionIds(op, partitionIds);
 }
 
 void labelParentOps(Operation *op) {
-  auto asyncTaskIds = mlir::getAsyncTaskIds(op);
+  auto partitionIds = mlir::getWSPartitionIds(op);
   auto parent = op->getParentOp();
   while (parent && !isa<triton::FuncOp>(parent)) {
-    addAsyncTaskIds(parent, asyncTaskIds);
+    addWSPartitionIds(parent, partitionIds);
     parent = parent->getParentOp();
   }
 }
 
-SmallVector<AsyncTaskId> getNestedAsyncTaskIds(Operation *op) {
-  SetVector<AsyncTaskId> asyncTaskIds;
+SmallVector<WSPartitionId> getNestedWSPartitionIds(Operation *op) {
+  SetVector<WSPartitionId> partitionIds;
   op->walk([&](Operation *curOp) {
-    asyncTaskIds.insert_range(getAsyncTaskIds(curOp));
+    partitionIds.insert_range(getWSPartitionIds(curOp));
   });
-  SmallVector<AsyncTaskId> res = asyncTaskIds.takeVector();
+  SmallVector<WSPartitionId> res = partitionIds.takeVector();
   llvm::sort(res);
   return res;
 }
 
-void addAsyncTaskIds(Operation *op, ArrayRef<AsyncTaskId> asyncTasks) {
-  auto asyncTasksVec = getAsyncTaskIds(op);
-  DenseSet<AsyncTaskId> asyncTasksSet(asyncTasksVec.begin(),
-                                      asyncTasksVec.end());
-  for (auto a : asyncTasks) {
-    if (!asyncTasksSet.contains(a)) {
-      asyncTasksVec.push_back(a);
+void addWSPartitionIds(Operation *op, ArrayRef<WSPartitionId> partitionIds) {
+  auto partitionIdsVec = getWSPartitionIds(op);
+  DenseSet<WSPartitionId> partitionIdsSet(partitionIdsVec.begin(),
+                                          partitionIdsVec.end());
+  for (auto a : partitionIds) {
+    if (!partitionIdsSet.contains(a)) {
+      partitionIdsVec.push_back(a);
     }
   }
-  if (asyncTasksVec.size() > 0) {
-    setAsyncTaskIds(op, asyncTasksVec);
+  if (partitionIdsVec.size() > 0) {
+    setWSPartitionIds(op, partitionIdsVec);
   }
 }
 
-void removeAsyncTaskId(Operation *op, AsyncTaskId asyncTaskId) {
-  auto origAsyncTaskIds = getAsyncTaskIds(op);
-  llvm::erase(origAsyncTaskIds, asyncTaskId);
-  if (origAsyncTaskIds.empty())
-    op->removeAttr(kAsyncTaskIdAttrName);
+void removeWSPartitionId(Operation *op, WSPartitionId partitionId) {
+  auto origWSPartitionIds = getWSPartitionIds(op);
+  llvm::erase(origWSPartitionIds, partitionId);
+  if (origWSPartitionIds.empty())
+    op->removeAttr(tt::gpu::kPartitionAttrName);
   else
-    setAsyncTaskIds(op, origAsyncTaskIds);
+    setWSPartitionIds(op, origWSPartitionIds);
 }
 
-void removeAsyncTaskIds(Operation *op) { op->removeAttr(kAsyncTaskIdAttrName); }
+void removeWSPartitionIds(Operation *op) {
+  op->removeAttr(tt::gpu::kPartitionAttrName);
+}
 
 void copyLoopScheduleInfo(Operation *newOp, Operation *oldOp) {
   // This assignment is optional because we may call this code

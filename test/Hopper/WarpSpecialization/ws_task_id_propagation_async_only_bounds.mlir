@@ -3,9 +3,9 @@
 // Regression test for B-6-F2 / T273474506.
 //
 // This is the Hopper async-only variant of `nested_for_constant_bounds` from
-// `ws_task_id_propagation.mlir`: anchors already have `async_task_id`, but no
+// `ws_task_id_propagation.mlir`: anchors already have `ttg.partition`, but no
 // op has `ttg.partition`. Loop bound constants should still receive the union
-// of all task IDs.
+// of all partition IDs.
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -15,8 +15,8 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 
   // CHECK-LABEL: @nested_for_async_only_constant_bounds
-  // CHECK:       %[[C0:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 0 : i32
-  // CHECK-NEXT:  %[[C1:.*]] = arith.constant {async_task_id = array<i32: 0, 1, 2>} 1 : i32
+  // CHECK:       %[[C0:.*]] = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 0 : i32
+  // CHECK-NEXT:  %[[C1:.*]] = arith.constant {ttg.partition = array<i32: 0, 1, 2>} 1 : i32
   // CHECK:       scf.for
   // CHECK:         scf.for %{{.*}} = %[[C0]] to %{{.*}} step %[[C1]]
 
@@ -31,18 +31,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       // Inner loop: only tasks 1 (loads) and 2 (dot/alloc) are present.
       // Bounds %c0 and %c1 are constants defined at function scope.
       %inner:2 = scf.for %k = %c0 to %arg5 step %c1 iter_args(%acc = %cst, %off = %c0) -> (tensor<128x256xf32, #mma>, i32) : i32 {
-        %a = tt.descriptor_load %arg0[%tile, %off] {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
-        %a_alloc = ttg.local_alloc %a {async_task_id = array<i32: 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-        %b = tt.descriptor_load %arg1[%off, %tile] {async_task_id = array<i32: 1>} : !tt.tensordesc<64x256xf16> -> tensor<64x256xf16, #blocked1>
-        %b_alloc = ttg.local_alloc %b {async_task_id = array<i32: 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
-        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {async_task_id = array<i32: 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
-        %new_off = arith.addi %off, %c64 {async_task_id = array<i32: 1>} : i32
+        %a = tt.descriptor_load %arg0[%tile, %off] {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
+        %a_alloc = ttg.local_alloc %a {ttg.partition = array<i32: 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %b = tt.descriptor_load %arg1[%off, %tile] {ttg.partition = array<i32: 1>} : !tt.tensordesc<64x256xf16> -> tensor<64x256xf16, #blocked1>
+        %b_alloc = ttg.local_alloc %b {ttg.partition = array<i32: 2>} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {ttg.partition = array<i32: 2>, inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+        %new_off = arith.addi %off, %c64 {ttg.partition = array<i32: 1>} : i32
         scf.yield %dot, %new_off : tensor<128x256xf32, #mma>, i32
       }
       // Epilogue: only task 0 ops. This task has no ops inside the inner loop.
-      %trunc = arith.truncf %inner#0 {async_task_id = array<i32: 0>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
-      %cvt = ttg.convert_layout %trunc {async_task_id = array<i32: 0>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
-      tt.descriptor_store %arg2[%tile, %tile], %cvt {async_task_id = array<i32: 0>} : !tt.tensordesc<128x256xf16>, tensor<128x256xf16, #blocked1>
+      %trunc = arith.truncf %inner#0 {ttg.partition = array<i32: 0>} : tensor<128x256xf32, #mma> to tensor<128x256xf16, #mma>
+      %cvt = ttg.convert_layout %trunc {ttg.partition = array<i32: 0>} : tensor<128x256xf16, #mma> -> tensor<128x256xf16, #blocked1>
+      tt.descriptor_store %arg2[%tile, %tile], %cvt {ttg.partition = array<i32: 0>} : !tt.tensordesc<128x256xf16>, tensor<128x256xf16, #blocked1>
     }
     tt.return
   }

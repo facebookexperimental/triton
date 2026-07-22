@@ -504,7 +504,7 @@ needExplicitReuseWait(earlyChannel, lateChannel):
   aProducerOp = earlyChannel.srcOp
   // Resolve through memdesc_trans etc. — there may be more than one.
   for bConsumerOp in getActualConsumers(lateChannel.dstOp):
-    if getAsyncTaskIds(bConsumerOp) shares a taskId with getAsyncTaskIds(aProducerOp):
+    if getWSPartitionIds(bConsumerOp) shares a taskId with getWSPartitionIds(aProducerOp):
       // Same partition: program order already serializes the release before
       // the next acquire.
       if aProducerOp, bConsumerOp in same block and appearsBefore(aProducerOp, bConsumerOp):
@@ -719,7 +719,7 @@ distinct `buffer.offset`s (`isSpatialPacking`). Note the discriminators that do
 **not** work here: column-range overlap (`tmemReuseGroupOverlaps`) is true for
 both shapes (the owner spans the packed siblings' columns either way), and
 block-based `verifyReuseGroupCrossPartition` is unusable at this stage because
-partitions are still `async_task_id` tags within a single block.
+partitions are still `ttg.partition` tags within a single block.
 
 ## A5: Cross-Partition Reuse (N ≥ 3, realized as TMEM)
 
@@ -749,8 +749,8 @@ iff:
 
 1. **≥ 3 channels**, all **single-copy** (`getNumBuffers() == 1`).
 2. Producers span **> 1 partition** (`relation.first` — the producer
-   `async_task_id`). This is detected by task id, **not** block: at
-   `doCodePartition` the partitions are still `async_task_id` tags within one
+   `ttg.partition`). This is detected by partition id, **not** block: at
+   `doCodePartition` the partitions are still `ttg.partition` tags within one
    block, so a block-based test would always see "one block".
 3. The channels admit a **unique total dependency-chain order** —
    `orderReuseGroupChain(group)` returns a non-empty ordering (channel `i`'s

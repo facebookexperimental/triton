@@ -79,12 +79,12 @@ Key capabilities:
   `checkStructuralEquivalenceN` compares the template against the shortest
   chain first to discover all identity ops, then re-compares other chains
   with `forcedIdentityOps` for consistent identity counts.
-- **Multi-task segmentation** for chains crossing async task boundaries.
+- **Multi-task segmentation** for chains crossing partition boundaries.
   Each segment becomes a separate `SubtiledRegionOp` with SMEM transitions
   (implicit buffer via `local_store`/`local_load`). Allocs are assumed to
   be pre-hoisted by the memory planner.
-- **Multi-chain support** (addmm): when task IDs are non-contiguous
-  (e.g., task 2 → 3 → 2 → 1), segments are merged by task ID and
+- **Multi-chain support** (addmm): when partition IDs are non-contiguous
+  (e.g., task 2 → 3 → 2 → 1), segments are merged by partition ID and
   topologically sorted by data dependency, producing contiguous regions
   (e.g., task 3 → 2 → 1).
 
@@ -259,7 +259,7 @@ two consumer shapes:
   (writes, falling back to reads), not raw buffer-touching ops, so the counter
   stride stays `numTiles`.
 - **Both-endpoints-subtiled** (producer subtiled AND consumer subtiled, in
-  *different* async tasks — the `DATA_PARTITION_FACTOR=2` epilogue): the
+  *different* partitions — the `DATA_PARTITION_FACTOR=2` epilogue): the
   `numTiles` per-tile allocs of one (producer region, consumer region) pair are
   **collapsed** into a single `AllocChannel` in `collectAllocChannels`
   (`getSubtiledChannelEndpoints` resolves the two regions; the dedup key is the

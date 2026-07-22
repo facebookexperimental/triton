@@ -31,13 +31,13 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %c10 = arith.constant 10 : i32
     scf.for %iv = %c0 to %c10 step %c1 : i32 {
       // Producer task 1: TMA loads into SMEM
-      %a = tt.descriptor_load %a_desc[%c0, %c0] {async_task_id = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
-      ttg.local_store %a, %A_smem {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %b = tt.descriptor_load %b_desc[%c0, %c0] {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked>
-      ttg.local_store %b, %B_smem {async_task_id = array<i32: 1>} : tensor<64x128xf16, #blocked> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+      %a = tt.descriptor_load %a_desc[%c0, %c0] {ttg.partition = array<i32: 1>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %a, %A_smem {ttg.partition = array<i32: 1>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %b = tt.descriptor_load %b_desc[%c0, %c0] {ttg.partition = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked>
+      ttg.local_store %b, %B_smem {ttg.partition = array<i32: 1>} : tensor<64x128xf16, #blocked> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
       // Consumer task 0: reads from SMEM
-      %a_val = ttg.local_load %A_smem {async_task_id = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
-      %b_val = ttg.local_load %B_smem {async_task_id = array<i32: 0>} : !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> tensor<64x128xf16, #blocked>
+      %a_val = ttg.local_load %A_smem {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      %b_val = ttg.local_load %B_smem {ttg.partition = array<i32: 0>} : !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> tensor<64x128xf16, #blocked>
       scf.yield
     } {tt.warp_specialize}
     tt.return

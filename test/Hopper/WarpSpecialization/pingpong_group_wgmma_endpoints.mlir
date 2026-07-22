@@ -13,45 +13,45 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threa
 
 // CHECK-LABEL: @pingpong_group_wgmma_endpoints
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 1>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST:[0-9]+]] : i32
 // CHECK-SAME: pingpong_id = [[ID:[0-9]+]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 1>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 1>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 1>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 1>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 1>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 1>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 1>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 1>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 1>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 2>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 2>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 2>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 2>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 2>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 2>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 2>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 2>
 // CHECK:      ttng.warp_group_dot
-// CHECK-SAME: async_task_id = array<i32: 2>
 // CHECK-SAME: pingpong_first_partition_id = [[FIRST]] : i32
 // CHECK-SAME: pingpong_id = [[ID]] : i32
+// CHECK-SAME: ttg.partition = array<i32: 2>
 tt.func public @pingpong_group_wgmma_endpoints(
     %lhs0: !ttg.memdesc<64x64xf16, #shared, #smem>,
     %lhs1: !ttg.memdesc<64x64xf16, #shared, #smem>,
@@ -65,17 +65,17 @@ tt.func public @pingpong_group_wgmma_endpoints(
       iter_args(%acc0 = %init, %acc1 = %init)
       -> (tensor<64x128xf32, #mma>, tensor<64x128xf32, #mma>) : i32 {
     %anchor = arith.addi %iv, %c0 {loop.cluster = 0 : i32, loop.stage = 1 : i32} : i32
-    %dot0 = ttng.warp_group_dot %lhs0, %rhs, %acc0 {async_task_id = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot1 = ttng.warp_group_dot %lhs0, %rhs, %dot0 {async_task_id = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot2 = ttng.warp_group_dot %lhs0, %rhs, %dot1 {async_task_id = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot3 = ttng.warp_group_dot %lhs0, %rhs, %dot2 {async_task_id = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot4 = ttng.warp_group_dot %lhs0, %rhs, %dot3 {async_task_id = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot5 = ttng.warp_group_dot %lhs1, %rhs, %acc1 {async_task_id = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot6 = ttng.warp_group_dot %lhs1, %rhs, %dot5 {async_task_id = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot7 = ttng.warp_group_dot %lhs1, %rhs, %dot6 {async_task_id = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot8 = ttng.warp_group_dot %lhs1, %rhs, %dot7 {async_task_id = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    %dot9 = ttng.warp_group_dot %lhs1, %rhs, %dot8 {async_task_id = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
-    scf.yield {async_task_id = array<i32: 1, 2>} %dot4, %dot9 : tensor<64x128xf32, #mma>, tensor<64x128xf32, #mma>
+    %dot0 = ttng.warp_group_dot %lhs0, %rhs, %acc0 {ttg.partition = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot1 = ttng.warp_group_dot %lhs0, %rhs, %dot0 {ttg.partition = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot2 = ttng.warp_group_dot %lhs0, %rhs, %dot1 {ttg.partition = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot3 = ttng.warp_group_dot %lhs0, %rhs, %dot2 {ttg.partition = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot4 = ttng.warp_group_dot %lhs0, %rhs, %dot3 {ttg.partition = array<i32: 1>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot5 = ttng.warp_group_dot %lhs1, %rhs, %acc1 {ttg.partition = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot6 = ttng.warp_group_dot %lhs1, %rhs, %dot5 {ttg.partition = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot7 = ttng.warp_group_dot %lhs1, %rhs, %dot6 {ttg.partition = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot8 = ttng.warp_group_dot %lhs1, %rhs, %dot7 {ttg.partition = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    %dot9 = ttng.warp_group_dot %lhs1, %rhs, %dot8 {ttg.partition = array<i32: 2>, inputPrecision = 0 : i32, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<64x64xf16, #shared, #smem> * !ttg.memdesc<64x128xf16, #shared, #smem> -> tensor<64x128xf32, #mma>
+    scf.yield {ttg.partition = array<i32: 1, 2>} %dot4, %dot9 : tensor<64x128xf32, #mma>, tensor<64x128xf32, #mma>
   } {tt.scheduled_max_stage = 1 : i32}
   tt.return
 }

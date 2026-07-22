@@ -11,7 +11,7 @@
 // How the channel is (not) created between the two MMAs: handleOperandD walks
 // every op whose accumulator IS this tmem tile (each is a D-writer / chain link)
 // and calls needsChannel(producerTask, consumerTask) for consecutive writers.
-// Both dots carry the same async_task_id (gemm, task 1), so needsChannel is
+// Both dots carry the same ttg.partition (gemm, task 1), so needsChannel is
 // false for that pair -> NO MMA->MMA channel; the second dot just extends the
 // producer set (chains in place). A channel is emitted ONLY when the accumulator
 // is read from a DIFFERENT partition, i.e. a tmem_load in the computation
@@ -51,19 +51,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %d: !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>,
       %o: !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>,
       %lb: i32, %ub: i32, %step: i32) attributes {noinline = false} {
-    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
-    %false = arith.constant {async_task_id = array<i32: 0, 1>} false
-    %acc, %acc_tok = ttng.tmem_alloc {async_task_id = array<i32: 1>, buffer.copy = 1 : i32, buffer.id = 1 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %true = arith.constant {ttg.partition = array<i32: 0, 1>} true
+    %false = arith.constant {ttg.partition = array<i32: 0, 1>} false
+    %acc, %acc_tok = ttng.tmem_alloc {ttg.partition = array<i32: 1>, buffer.copy = 1 : i32, buffer.id = 1 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     scf.for %iv = %lb to %ub step %step iter_args(%tok = %acc_tok) -> (!ttg.async.token) : i32 {
       // MMA1: use_acc = false -> first producer, overwrites the accumulator.
-      %t1 = ttng.tc_gen5_mma %a, %b, %acc[%tok], %false, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %t1 = ttng.tc_gen5_mma %a, %b, %acc[%tok], %false, %true {ttg.partition = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       // MMA2: use_acc = true into the SAME acc -> chained; same task -> no channel.
-      %t2 = ttng.tc_gen5_mma %c, %d, %acc[%t1], %true, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %t2 = ttng.tc_gen5_mma %c, %d, %acc[%t1], %true, %true {ttg.partition = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       // cross-partition read of the finished accumulator (computation, task 0)
-      %val, %t3 = ttng.tmem_load %acc[%t2] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-      ttg.local_store %val, %o {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
+      %val, %t3 = ttng.tmem_load %acc[%t2] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttg.local_store %val, %o {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
       scf.yield %t3 : !ttg.async.token
-    } {async_task_id = array<i32: 0, 1>}
+    } {ttg.partition = array<i32: 0, 1>}
     tt.return
   }
 
@@ -92,23 +92,23 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %o0: !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>,
       %o1: !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>,
       %lb: i32, %ub: i32, %step: i32) attributes {noinline = false} {
-    %true = arith.constant {async_task_id = array<i32: 0, 1>} true
-    %false = arith.constant {async_task_id = array<i32: 0, 1>} false
-    %cst_half = arith.constant {async_task_id = array<i32: 0>} dense<5.000000e-01> : tensor<128x128xf32, #blocked>
-    %acc, %acc_tok = ttng.tmem_alloc {async_task_id = array<i32: 1>, buffer.copy = 1 : i32, buffer.id = 1 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+    %true = arith.constant {ttg.partition = array<i32: 0, 1>} true
+    %false = arith.constant {ttg.partition = array<i32: 0, 1>} false
+    %cst_half = arith.constant {ttg.partition = array<i32: 0>} dense<5.000000e-01> : tensor<128x128xf32, #blocked>
+    %acc, %acc_tok = ttng.tmem_alloc {ttg.partition = array<i32: 1>, buffer.copy = 1 : i32, buffer.id = 1 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     scf.for %iv = %lb to %ub step %step iter_args(%tok = %acc_tok) -> (!ttg.async.token) : i32 {
-      %t1 = ttng.tc_gen5_mma %a, %b, %acc[%tok], %false, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %t1 = ttng.tc_gen5_mma %a, %b, %acc[%tok], %false, %true {ttg.partition = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       // intermediate read of the partial accumulator (task 0), BETWEEN the dots,
       // with a compute + store on it (mirrors `output = acc / 2.0; store(output)`).
-      %mid, %t2 = ttng.tmem_load %acc[%t1] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-      %half = arith.mulf %mid, %cst_half {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked>
-      ttg.local_store %half, %o0 {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
+      %mid, %t2 = ttng.tmem_load %acc[%t1] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      %half = arith.mulf %mid, %cst_half {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked>
+      ttg.local_store %half, %o0 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
       // second dot chains into the same acc, same task -> still no MMA->MMA channel
-      %t3 = ttng.tc_gen5_mma %c, %d, %acc[%t2], %true, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-      %val, %t4 = ttng.tmem_load %acc[%t3] {async_task_id = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
-      ttg.local_store %val, %o1 {async_task_id = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
+      %t3 = ttng.tc_gen5_mma %c, %d, %acc[%t2], %true, %true {ttg.partition = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xbf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %val, %t4 = ttng.tmem_load %acc[%t3] {ttg.partition = array<i32: 0>} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked>
+      ttg.local_store %val, %o1 {ttg.partition = array<i32: 0>} : tensor<128x128xf32, #blocked> -> !ttg.memdesc<128x128xf32, #shared32, #smem, mutable>
       scf.yield %t4 : !ttg.async.token
-    } {async_task_id = array<i32: 0, 1>}
+    } {ttg.partition = array<i32: 0, 1>}
     tt.return
   }
 }

@@ -34,7 +34,7 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
-Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
+Value createBufferView(OpBuilderWithPartitionIds &builder, Value alloc,
                        Value idx) {
   assert(isa<triton::gpu::MemDescType>(alloc.getType()) &&
          "Expected MemDescType");
@@ -57,7 +57,7 @@ static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
   return loadSize * tensorTy.getElementType().getIntOrFloatBitWidth() / 8;
 }
 
-Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
+Value getBufferForPipelineStage(OpBuilderWithPartitionIds &builder,
                                 Type loadType, Value buffer, Value bufferIdx,
                                 bool mutableMem) {
   auto context = buffer.getContext();
@@ -81,12 +81,12 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                             sliceType.getEncoding(), sharedMemorySpace,
                             /*mutableMemOry=*/mutableMem);
 
-  auto desc = builder.createWithAsyncTaskIds<ttg::MemDescIndexOp>(
+  auto desc = builder.createWithPartitionIds<ttg::MemDescIndexOp>(
       buffer.getLoc(), subviewTy, buffer, bufferIdx);
   return desc;
 }
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+Operation *optimizeTMALoads(OpBuilderWithPartitionIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,
                             SmallVector<Value> &buffers, Value barrierAlloc,
                             Value bufferIdx, Value bufferIdxExtract,
@@ -109,12 +109,12 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // Create a barrier_expect with the appropriate size and insert it before the
   // first load.
   builder.setInsertionPoint(headProducer);
-  builder.setAsyncTaskIdsFromOp(headProducer);
+  builder.setPartitionIdsFromOp(headProducer);
   builder.setLoopScheduleInfoFromOp(headProducer);
   auto prodBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdx);
-  auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
-  auto expect = builder.createWithAsyncTaskIds<ttng::BarrierExpectOp>(
+  auto pred = builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 1);
+  auto expect = builder.createWithPartitionIds<ttng::BarrierExpectOp>(
       loc, prodBarrier, sizeInBytes, pred);
 
   // Convert all the producers to async_tma_copy_global_to_local
@@ -124,7 +124,7 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
     builder.setLoopScheduleInfoFromOp(tmaLoad);
     auto pipelineBuffer = getBufferForPipelineStage(builder, tmaLoad.getType(),
                                                     buffer, bufferIdx, true);
-    copy = builder.createWithAsyncTaskIds<ttng::AsyncTMACopyGlobalToLocalOp>(
+    copy = builder.createWithPartitionIds<ttng::AsyncTMACopyGlobalToLocalOp>(
         loc, tmaLoad.getDesc(), tmaLoad.getIndices(), prodBarrier,
         pipelineBuffer, pred);
   }
@@ -134,27 +134,27 @@ Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
   // need ALL consumer task IDs so they survive specializeRegion.
   builder.setInsertionPoint(headConsumerSameLevel);
   SmallVector<int> consumerTaskIds;
-  for (int id : getAsyncTaskIds(headConsumer))
+  for (int id : getWSPartitionIds(headConsumer))
     consumerTaskIds.push_back(id);
   for (int id : additionalConsumerTaskIds)
     consumerTaskIds.push_back(id);
-  builder.setAsynTaskIdsFromArray(consumerTaskIds);
+  builder.setPartitionIdsFromArray(consumerTaskIds);
   builder.setLoopScheduleInfoFromOp(headConsumerSameLevel);
   auto consBarrier =
       getBarrierForPipelineStage(builder, barrierAlloc, bufferIdxExtract);
-  phase = builder.createWithAsyncTaskIds<arith::ExtUIOp>(
+  phase = builder.createWithPartitionIds<arith::ExtUIOp>(
       loc, builder.getI32Type(), phase);
   Value waitPred =
-      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 1, 1);
+      builder.createWithPartitionIds<arith::ConstantIntOp>(loc, 1, 1);
 
   // Create one WaitBarrierOp per consumer task ID.
-  builder.setAsyncTaskIdsFromOp(headConsumer);
-  builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+  builder.setPartitionIdsFromOp(headConsumer);
+  builder.createWithPartitionIds<ttng::WaitBarrierOp>(
       loc, consBarrier, phase, waitPred, /*deps=*/ValueRange{},
       consumerWaitConstraints);
   for (int extraTaskId : additionalConsumerTaskIds) {
-    builder.setAsynTaskIdsFromArray({extraTaskId});
-    builder.createWithAsyncTaskIds<ttng::WaitBarrierOp>(
+    builder.setPartitionIdsFromArray({extraTaskId});
+    builder.createWithPartitionIds<ttng::WaitBarrierOp>(
         loc, consBarrier, phase, waitPred,
         /*deps=*/ValueRange{}, consumerWaitConstraints);
   }

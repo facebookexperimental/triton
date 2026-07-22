@@ -4219,8 +4219,11 @@ LogicalResult TritonGPUDialect::verifyOperationAttribute(Operation *op,
     for (auto &region : op->getRegions()) {
       for (auto &block : region.getBlocks()) {
         for (auto &childOp : block.getOperations()) {
-          if (isa<scf::YieldOp, ub::PoisonOp>(childOp)) {
-            // yield ops and ub.poison do not need partition ids
+          auto localAlloc = dyn_cast<LocalAllocOp>(childOp);
+          if (isa<scf::YieldOp, ub::PoisonOp>(childOp) ||
+              (localAlloc && !localAlloc.getSrc())) {
+            // Terminators, poison values, and source-free shared storage do not
+            // execute partition-specific work.
             continue;
           }
           if (!childOp.hasAttr(kPartitionAttrName))

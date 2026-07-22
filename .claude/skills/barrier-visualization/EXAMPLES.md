@@ -21,7 +21,7 @@ barriers are merged.
 | partition0 | TMA loads (A, B) | `barrier_expect`, `async_tma_copy_global_to_local` x2 | (assigned by code partition) |
 | partition1 | Epilogue store | `tmem_load`, `descriptor_store` x2              | (assigned by code partition) |
 
-**Notes:** This is pre-code-partition IR analyzed via `async_task_id` attributes:
+**Notes:** This is pre-code-partition IR analyzed via `ttg.partition` attributes:
 - Task 0 = MMA (`tc_gen5_mma`, `tmem_store`)
 - Task 1 = TMA loads (`descriptor_load`, `local_store`)
 - Task 2 = Epilogue (`tmem_load`, `descriptor_store`)
@@ -168,7 +168,7 @@ shared between two independent MMA consumers computing separate dot products.
 | partition1 | MMA consumer 2    | `warp_group_dot` (%106 * %104 -> %arg11)    | 4     |
 
 **Notes:** Three loads feed two dots. Buffer %104 (B matrix, `64x128xf16`) is
-shared between both consumers (`async_task_id = array<i32: 1, 2>`).
+shared between both consumers (`ttg.partition = array<i32: 1, 2>`).
 
 ### Section 2: Barrier Dependency Graph
 
@@ -239,7 +239,7 @@ Buffer Group: "A1 tile" (SMEM)
   Writer: default -- tt.load %arg12 (input_ptr1)
   Reader: partition0 -- warp_group_dot operand A
   Barrier: producer/consumer mbarrier (1 consumer)
-  async_task_id: {1} (consumer 1 only)
+  ttg.partition: {1} (consumer 1 only)
 
 Buffer Group: "B tile" (SMEM) -- SHARED between consumers
   Storage: !ttg.memdesc<64x128xf16, #shared, #ttg.shared_memory>
@@ -248,7 +248,7 @@ Buffer Group: "B tile" (SMEM) -- SHARED between consumers
   Reader: partition0 -- warp_group_dot operand B
           partition1 -- warp_group_dot operand B
   Barrier: producer/consumer mbarrier (2 consumers)
-  async_task_id: {1, 2} (both consumers)
+  ttg.partition: {1, 2} (both consumers)
 
 Buffer Group: "A2 tile" (SMEM)
   Storage: !ttg.memdesc<64x64xf16, #shared, #ttg.shared_memory>
@@ -256,7 +256,7 @@ Buffer Group: "A2 tile" (SMEM)
   Writer: default -- tt.load %arg14 (input_ptr3)
   Reader: partition1 -- warp_group_dot operand A
   Barrier: producer/consumer mbarrier (1 consumer)
-  async_task_id: {2} (consumer 2 only)
+  ttg.partition: {2} (consumer 2 only)
 ```
 
 ### Section 5: SSA Value to Barrier Mapping
@@ -266,24 +266,24 @@ Barrier Alias Map
 =================
 
 [Pre-code-partition IR -- barriers not yet materialized]
-[Cross-partition data flow identified by async_task_id mismatches:]
+[Cross-partition data flow identified by ttg.partition mismatches:]
 
 Data flow "A1" (task 0 -> task 1):
-  %98   = tt.load %arg12, ...  {async_task_id = array<i32: 0>}     (line 118) -- producer
-  %99   = ttg.local_alloc %98  {async_task_id = array<i32: 1>}     (line 119) -- consumer alloc
-  %107  = ttng.warp_group_dot %99, %104, ...  {async_task_id = array<i32: 1>}  (line 127) -- consumer use
+  %98   = tt.load %arg12, ...  {ttg.partition = array<i32: 0>}     (line 118) -- producer
+  %99   = ttg.local_alloc %98  {ttg.partition = array<i32: 1>}     (line 119) -- consumer alloc
+  %107  = ttng.warp_group_dot %99, %104, ...  {ttg.partition = array<i32: 1>}  (line 127) -- consumer use
   Will become: producer_acquire/copy/commit in default, consumer_wait/load in partition0
 
 Data flow "B" (task 0 -> tasks 1,2):
-  %103  = tt.load %arg13, ...  {async_task_id = array<i32: 0>}     (line 123) -- producer
-  %104  = ttg.local_alloc %103 {async_task_id = array<i32: 1, 2>}  (line 124) -- shared alloc
-  %107  = ttng.warp_group_dot %99, %104, ... {async_task_id = array<i32: 1>}  (line 127) -- consumer 1
-  %108  = ttng.warp_group_dot %106, %104, ... {async_task_id = array<i32: 2>} (line 128) -- consumer 2
+  %103  = tt.load %arg13, ...  {ttg.partition = array<i32: 0>}     (line 123) -- producer
+  %104  = ttg.local_alloc %103 {ttg.partition = array<i32: 1, 2>}  (line 124) -- shared alloc
+  %107  = ttng.warp_group_dot %99, %104, ... {ttg.partition = array<i32: 1>}  (line 127) -- consumer 1
+  %108  = ttng.warp_group_dot %106, %104, ... {ttg.partition = array<i32: 2>} (line 128) -- consumer 2
   Will become: 2 separate producer_acquire/commit groups, 2 consumer_wait/release in each partition
 
 Data flow "A2" (task 0 -> task 2):
-  %105  = tt.load %arg14, ...  {async_task_id = array<i32: 0>}     (line 125) -- producer
-  %106  = ttg.local_alloc %105 {async_task_id = array<i32: 2>}     (line 126) -- consumer alloc
-  %108  = ttng.warp_group_dot %106, %104, ... {async_task_id = array<i32: 2>} (line 128) -- consumer use
+  %105  = tt.load %arg14, ...  {ttg.partition = array<i32: 0>}     (line 125) -- producer
+  %106  = ttg.local_alloc %105 {ttg.partition = array<i32: 2>}     (line 126) -- consumer alloc
+  %108  = ttng.warp_group_dot %106, %104, ... {ttg.partition = array<i32: 2>} (line 128) -- consumer use
   Will become: producer_acquire/copy/commit in default, consumer_wait/load in partition1
 ```

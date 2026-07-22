@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
+// RUN: TRITON_USE_META_WS=1 triton-opt %s --nvgpu-warp-specialization="generate-subtiled-region=true num-stages=3 smem-budget=232448" | FileCheck %s
 
 // Test: asymmetric (inside -> outside) SMEM channels through an epilogue
 // ttng.subtiled_region. This is the EPILOGUE_SUBTILE=2, separate_epilogue_store,
@@ -24,29 +24,29 @@
 // CHECK-LABEL: @matmul_kernel_tma_persistent_ws
 // CHECK: ttg.warp_specialize
 //
-// Epilogue producer (async_task_id 0). tile 0 is outLHS at slot accumCnt+0
+// Epilogue producer (ttg.partition 0). tile 0 is outLHS at slot accumCnt+0
 // (the +0 folds in), guarded by exactly one wait/arrive on the dstTask=2 barrier.
 // CHECK:      %[[LHS:.*]], %[[RHS:.*]] = tt.split
-// CHECK:      arith.truncf %[[LHS]] {async_task_id = array<i32: 0>}
+// CHECK:      arith.truncf %[[LHS]] {ttg.partition = array<i32: 0>}
 // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
 // CHECK:      ttg.local_store
 // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
 //
 // tile 1 is outRHS at the DISTINCT slot accumCnt+1.
-// CHECK:      arith.addi %[[CNT:.*]], %c1_i64 {async_task_id = array<i32: 0>}
-// CHECK:      arith.truncf %[[RHS]] {async_task_id = array<i32: 0>}
+// CHECK:      arith.addi %[[CNT:.*]], %c1_i64 {ttg.partition = array<i32: 0>}
+// CHECK:      arith.truncf %[[RHS]] {ttg.partition = array<i32: 0>}
 // CHECK:      ttng.wait_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
 // CHECK:      ttg.local_store
 // CHECK:      ttng.arrive_barrier {{.*}}WSBarrier = {dstTask = 2 : i32}
 //
-// Epilogue-store consumer (async_task_id 2). The first column's consumer reads
+// Epilogue-store consumer (ttg.partition 2). The first column's consumer reads
 // slot accumCnt+0 (= tile 0 = outLHS); the second column's consumer reads the
 // DISTINCT slot accumCnt+1 (= tile 1 = outRHS). Same +0/+1 pairing as the
 // producer -> no swap.
 // CHECK:      ttng.wait_barrier
 // CHECK:      ttg.local_load
 // CHECK:      tt.descriptor_store
-// CHECK:      arith.addi %{{.*}}, %c1_i64{{.*}} {async_task_id = array<i32: 2>}
+// CHECK:      arith.addi %{{.*}}, %c1_i64{{.*}} {ttg.partition = array<i32: 2>}
 // CHECK:      ttng.wait_barrier
 // CHECK:      ttg.local_load
 // CHECK:      tt.descriptor_store

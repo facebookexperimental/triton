@@ -32,7 +32,7 @@ FailureOr<ttng::TMEMAllocOp> TMEM1DAllocator::alloc1DTMEMBuffer() {
 }
 
 LogicalResult TMEM1DAllocator::TMEMStore1D(OpResult producer,
-                                           AsyncTaskId producerTaskId,
+                                           WSPartitionId producerTaskId,
                                            Operation *allocOpBuffer) {
   // Expand from 1D -> 2D
   auto producerOp = producer.getDefiningOp();
@@ -41,8 +41,8 @@ LogicalResult TMEM1DAllocator::TMEMStore1D(OpResult producer,
     return failure();
   RankedTensorType oldRetType = *oldRetTypeOr;
   builder.setInsertionPointAfter(producerOp);
-  auto originTaskIds = builder.getAsyncTaskIds();
-  builder.setAsynTaskIdsFromArray(producerTaskId);
+  auto originTaskIds = builder.getWSPartitionIds();
+  builder.setPartitionIdsFromArray(producerTaskId);
   auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
   builder.setLoopScheduleInfoFromOp(producerOp);
   auto encoding = oldRetType.getEncoding();
@@ -74,10 +74,10 @@ LogicalResult TMEM1DAllocator::TMEMStore1D(OpResult producer,
     auto sliceEnc = ttg::SliceEncodingAttr::get(
         builder.getContext(), oldRetType.getRank(), blockedEnc);
     auto sliceType = oldRetType.cloneWithEncoding(sliceEnc);
-    expandDimsInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
+    expandDimsInput = builder.createWithPartitionIds<ttg::ConvertLayoutOp>(
         expandDimsInput.getLoc(), sliceType, expandDimsInput);
   }
-  auto expandDims = builder.createWithAsyncTaskIds<tt::ExpandDimsOp>(
+  auto expandDims = builder.createWithPartitionIds<tt::ExpandDimsOp>(
       producerOp->getLoc(), expandDimsInput, axis);
   setExpandedInput(expandDims);
   Operation *allocOp;
@@ -110,15 +110,15 @@ LogicalResult TMEM1DAllocator::TMEMStore1D(OpResult producer,
   if (newLayout != oldLayout) {
     auto ty = cast<RankedTensorType>(expandType);
     auto newTy = ty.cloneWithEncoding(newLayout);
-    src = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
+    src = builder.createWithPartitionIds<ttg::ConvertLayoutOp>(
         expandDims.getLoc(), newTy, expandDims);
   }
   // Generate the store
   Value trueVal =
-      builder.createWithAsyncTaskIds<arith::ConstantIntOp>(src->getLoc(), 1, 1);
-  auto storeOp = builder.createWithAsyncTaskIds<ttng::TMEMStoreOp>(
+      builder.createWithPartitionIds<arith::ConstantIntOp>(src->getLoc(), 1, 1);
+  auto storeOp = builder.createWithPartitionIds<ttng::TMEMStoreOp>(
       src->getLoc(), allocOp->getResult(0), src->getResult(0), trueVal);
-  builder.setAsynTaskIdsFromArray(originTaskIds);
+  builder.setPartitionIdsFromArray(originTaskIds);
   builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
   return success();
 }
@@ -137,28 +137,28 @@ Value TMEM1DAllocator::TMEMLoad1D(OpResult producer, Operation *consumer) {
   auto newDistributedEncoding = compatibleLayouts.front();
   auto newExpandType = oldExpandType.cloneWithEncoding(newDistributedEncoding);
   // Generate the load
-  auto originTaskIds = builder.getAsyncTaskIds();
+  auto originTaskIds = builder.getWSPartitionIds();
   auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
-  builder.setAsyncTaskIdsFromOp(consumer);
+  builder.setPartitionIdsFromOp(consumer);
   builder.setInsertionPoint(consumer);
   builder.setLoopScheduleInfoFromOp(consumer);
-  auto loadOp = builder.createWithAsyncTaskIds<ttng::TMEMLoadOp>(
+  auto loadOp = builder.createWithPartitionIds<ttng::TMEMLoadOp>(
       consumer->getLoc(), newExpandType, builder.getType<ttg::AsyncTokenType>(),
       allocOp->getResult(0), Value());
   // Generate the reshape
-  auto reshape = builder.createWithAsyncTaskIds<tt::ReshapeOp>(
+  auto reshape = builder.createWithPartitionIds<tt::ReshapeOp>(
       consumer->getLoc(), oldInputType.getShape(), loadOp);
   // Generate a convert layout.
-  auto newInput = builder.createWithAsyncTaskIds<ttg::ConvertLayoutOp>(
+  auto newInput = builder.createWithPartitionIds<ttg::ConvertLayoutOp>(
       consumer->getLoc(), oldInputType, reshape);
   // Replace the uses in the consumer
   consumer->replaceUsesOfWith(producer, newInput);
-  builder.setAsynTaskIdsFromArray(originTaskIds);
+  builder.setPartitionIdsFromArray(originTaskIds);
   builder.setLoopScheduleInfoFromInfo(originLoopScheduleInfo);
   return newInput.getResult();
 }
 
-LogicalResult generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
+LogicalResult generate1DAllocations(OpBuilderWithPartitionIds &builder,
                                     Operation *producer,
                                     llvm::SmallVector<Operation *> &allocOps) {
   assert(producer->hasAttr("tmem.start") && "Expected tmem.start");
@@ -180,9 +180,9 @@ LogicalResult generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
       allocOpBuffer = allocOp;
     }
   }
-  auto producerPartition = getAsyncTaskIds(producer);
+  auto producerPartition = getWSPartitionIds(producer);
   for (auto consumer : producer->getUsers()) {
-    auto consumerParition = getAsyncTaskIds(consumer);
+    auto consumerParition = getWSPartitionIds(consumer);
     if (producerPartition != consumerParition) {
       Value newProducer = TMEM1DAllocator(builder).replaceWith1DTMEM(
           producer->getOpResult(0), producerPartition.front(), consumer,
@@ -198,7 +198,7 @@ LogicalResult generate1DAllocations(OpBuilderWithAsyncTaskIds &builder,
 }
 
 ttg::MemDescReinterpretOp
-sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+sliceAndReinterpretMDTMEM(OpBuilderWithPartitionIds &builder,
                           Operation *allocOp, Operation *newAlloc,
                           Operation *user, int offset) {
   // This function is TMEM-specific - verify both allocations are TMEM
@@ -358,7 +358,7 @@ public:
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    OpBuilderWithAsyncTaskIds builder(moduleOp.getContext());
+    OpBuilderWithPartitionIds builder(moduleOp.getContext());
     llvm::SmallVector<Operation *> allocOps;
     moduleOp->walk([&](Operation *allocOp) {
       if (allocOp->hasAttr("tmem.start_buffer")) {

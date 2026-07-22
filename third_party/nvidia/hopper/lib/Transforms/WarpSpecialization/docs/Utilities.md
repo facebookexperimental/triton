@@ -7,43 +7,43 @@ the AutoWS pipeline.
 
 | File | Description |
 |------|-------------|
-| `Utility.h` | `AsyncTaskId` typedef, `OpBuilderWithAsyncTaskIds`, `LoopScheduleInfo`, task ID helpers, location utilities |
-| `Utility.cpp` | Implementation of task ID manipulation functions |
+| `Utility.h` | `WSPartitionId` typedef, `OpBuilderWithPartitionIds`, `LoopScheduleInfo`, partition ID helpers, location utilities |
+| `Utility.cpp` | Implementation of partition ID manipulation functions |
 
-## Async Task ID Management
+## Partition ID Management
 
 ### Type
 
 ```cpp
-typedef int AsyncTaskId;
+typedef int WSPartitionId;
 ```
 
-Task IDs are stored as `DenseI32ArrayAttr` under the `"async_task_id"` key on
-each operation. They can also be read from `ttg.partition` attributes (used by
-`PartitionSchedulingMeta` before conversion to `async_task_id`).
+Partition IDs are stored as `DenseI32ArrayAttr` under the `ttg.partition` key
+on each operation. The helper names still use `WSPartitionId` terminology, but
+they operate on `ttg.partition`.
 
 ### Functions
 
 | Function | Description |
 |----------|-------------|
-| `getAsyncTaskIds(op)` | Returns sorted task IDs from `async_task_id` or `ttg.partition` attribute |
-| `hasAsyncTaskId(op, id)` | Checks if an op has a specific task ID |
-| `setAsyncTaskIds(op, ids)` | Sets the `async_task_id` attribute (sorted) |
-| `addAsyncTaskIds(op, ids)` | Adds task IDs without duplicates |
-| `removeAsyncTaskId(op, id)` | Removes a single task ID |
-| `removeAsyncTaskIds(op)` | Removes the entire `async_task_id` attribute |
-| `getNestedAsyncTaskIds(op)` | Collects task IDs from op and all nested ops |
-| `labelParentOps(op)` | Propagates an op's task IDs upward to all parent ops |
+| `getWSPartitionIds(op)` | Returns sorted partition IDs from the `ttg.partition` attribute |
+| `hasWSPartitionId(op, id)` | Checks if an op has a specific partition ID |
+| `setWSPartitionIds(op, ids)` | Sets the `ttg.partition` attribute (sorted) |
+| `addWSPartitionIds(op, ids)` | Adds partition IDs without duplicates |
+| `removeWSPartitionId(op, id)` | Removes a single partition ID |
+| `removeWSPartitionIds(op)` | Removes the entire `ttg.partition` attribute |
+| `getNestedWSPartitionIds(op)` | Collects partition IDs from op and all nested ops |
+| `labelParentOps(op)` | Propagates an op's partition IDs upward to all parent ops |
 
 ### `labelParentOps`
 
-After task IDs are assigned to leaf ops, parent ops (loops, if-ops, while-ops)
-need the union of their children's task IDs. `labelParentOps` walks the parent
-chain up to the enclosing `FuncOp`, calling `addAsyncTaskIds` at each level.
+After partition IDs are assigned to leaf ops, parent ops (loops, if-ops, while-ops)
+need the union of their children's partition IDs. `labelParentOps` walks the parent
+chain up to the enclosing `FuncOp`, calling `addWSPartitionIds` at each level.
 
-## `OpBuilderWithAsyncTaskIds`
+## `OpBuilderWithPartitionIds`
 
-A custom `OpBuilder` subclass that **automatically sets `async_task_id` and
+A custom `OpBuilder` subclass that **automatically sets `ttg.partition` and
 loop scheduling attributes** on every operation it creates. This is the
 builder used throughout the entire WS pipeline.
 
@@ -51,21 +51,21 @@ builder used throughout the entire WS pipeline.
 
 | Method | Description |
 |--------|-------------|
-| `createWithAsyncTaskIds<OpTy>(args...)` | Creates an op with the builder's current task IDs and loop schedule info |
-| `create<OpTy>(args...)` | Alias for `createWithAsyncTaskIds` |
-| `setAsyncTaskIdsFromOp(op)` | Copy task IDs from an existing op |
-| `setAsynTaskIdsFromArray(ids)` | Set task IDs from an explicit array |
-| `setAsyncTaskIdsFromValueUsers(value)` | Set task IDs from the union of all users of a value |
+| `createWithPartitionIds<OpTy>(args...)` | Creates an op with the builder's current partition IDs and loop schedule info |
+| `create<OpTy>(args...)` | Alias for `createWithPartitionIds` |
+| `setPartitionIdsFromOp(op)` | Copy partition IDs from an existing op |
+| `setPartitionIdsFromArray(ids)` | Set partition IDs from an explicit array |
+| `setPartitionIdsFromValueUsers(value)` | Set partition IDs from the union of all users of a value |
 | `setLoopScheduleInfoFromOp(op)` | Copy `loop.stage` and `loop.cluster` from an op |
 | `clearLoopScheduleInfo()` | Stop setting loop schedule attributes |
 
 ### Usage Pattern
 
 ```cpp
-OpBuilderWithAsyncTaskIds builder(someOp);  // inherits task IDs + schedule
+OpBuilderWithPartitionIds builder(someOp);  // inherits partition IDs + schedule
 builder.setInsertionPointAfter(someOp);
-auto newOp = builder.createWithAsyncTaskIds<SomeOp>(loc, args...);
-// newOp automatically has async_task_id and loop.stage/loop.cluster set
+auto newOp = builder.createWithPartitionIds<SomeOp>(loc, args...);
+// newOp automatically has ttg.partition and loop.stage/loop.cluster set
 ```
 
 ## Loop Schedule Info
@@ -78,7 +78,7 @@ struct LoopScheduleInfo {
 ```
 
 These attributes are used by downstream loop scheduling passes to control
-software pipelining. `OpBuilderWithAsyncTaskIds` preserves these attributes
+software pipelining. `OpBuilderWithPartitionIds` preserves these attributes
 through WS transformations so that pipeline stage assignments survive code
 partitioning and specialization.
 

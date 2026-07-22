@@ -327,7 +327,7 @@ The 96870473d helpers must trigger:
      - `chB.dstOp == F.srcOp` — should be true if `chB.dstOp` (load_in)
        and `F.srcOp` (store_in) are in the same block.
      - **Wait** — the check is `withSameTask(chB.dstOp, F.srcOp)`,
-       which compares task IDs of load_in and store_in. Both T_corr —
+       which compares partition IDs of load_in and store_in. Both T_corr —
        OK.
      - Plus all in same block.
      - And `appearsBefore(chB.dstOp, F.srcOp)` — load_in before
@@ -441,7 +441,7 @@ combination requires:
 2. in-body order `tmem_load → tmem_store → tc_gen5_mma` on the same
    alloc,
 3. the init store survives the `use_acc=false` optimization, and
-4. the init store has a single task id (passes the strict
+4. the init store has a single partition id (passes the strict
    `producerTaskIds.size() != 1` check).
 
 Today's coverage:
@@ -451,7 +451,7 @@ Today's coverage:
 | `ws_code_partition_wrap_around_tmem_channel.mlir` | init + gen5 + post-loop load | No in-body channel loop (condition 2 fails) |
 | `blackwell_fa_code_partition.mlir`, `blackwell_fa_fwd_persist_code_partition.mlir`, `reuse_group_2buffer_fwd.mlir`, `ws_memory_planner_fwd.mlir` | FA fwd variants with channel-loop in body | Init store eliminated by `use_acc=false` opt (conditions 1+3 fail) |
 | `fa_code_partition.mlir`, `1D_tmem.mlir`, `blackwell_ws_data_partition.mlir` | channel-loop in body, no outside init | Condition 1 fails |
-| `ws_memory_planner.mlir` (XFAIL) | FA bwd, multi-task init | Strict task-id check fires before load handling (condition 4 fails) |
+| `ws_memory_planner.mlir` (XFAIL) | FA bwd, multi-task init | Strict partition-id check fires before load handling (condition 4 fails) |
 
 ### New lit test: `ws_code_partition_operand_d_channel_loop.mlir`
 

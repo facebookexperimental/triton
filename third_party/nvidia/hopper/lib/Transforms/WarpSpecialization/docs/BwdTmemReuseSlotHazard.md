@@ -139,7 +139,7 @@ of dk's data**, so no barrier can fix it. Program order alone cannot distinguish
 
 A reliable compile-time check must run **after `insertAsyncComm`** (barriers
 present) and **before `specializeRegion`** (still a single region with
-`async_task_id` attributes, so cross-partition program order and barrier edges
+`ttg.partition` attributes, so cross-partition program order and barrier edges
 are both visible). Sketch:
 
 1. **Group by physical slot.** Use the `ReuseConfig` groups (channels sharing
