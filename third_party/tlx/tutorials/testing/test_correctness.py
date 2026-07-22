@@ -408,6 +408,7 @@ class ScaledMM:
     # (M, N, K), N and K multiples of 128: square (small/large) plus igctr
     # production moderate / tall (large N, small K) / wide (small N, large K).
     SHAPES = [
+        (1024, 1024, 1024),  # small: exercises the occupancy-aware BLOCK_M=64 tile
         (2048, 2048, 2048),
         (8192, 8192, 8192),
         (4096, 6144, 4608),

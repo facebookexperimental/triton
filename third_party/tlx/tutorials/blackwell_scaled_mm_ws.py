@@ -198,7 +198,9 @@ def _blackwell_scaled_mm_ws_kernel(
             while tile_id != -1:
                 pid_m, pid_n = _pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_M
-                nblk = pid_n  # BLOCK_N==128 -> one N-block per tile; sb row = scale_b[nblk, :]
+                # which 128-wide scale_b N-block this tile falls in. BLOCK_N==128 -> nblk==pid_n;
+                # BLOCK_N<128 -> adjacent tiles share (re-read) the same block. (constexpr fold)
+                nblk = pid_n * BLOCK_N // 128
                 if SCALE_MODE == 0:  # BLOCKWISE: pipeline per-(row,K-group) sa + per-block sb.
                     # ROWWISE loads its tiny K-independent sa/sb directly in PROMO.
                     for g in range(0, k_groups):
@@ -387,7 +389,7 @@ def _pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     return pid_m, pid_n
 
 
-def blackwell_scaled_mm_ws(a, b, scale_a, scale_b, out_dtype=torch.bfloat16, BLOCK_M=128, BLOCK_N=128, NUM_CTAS=1,
+def blackwell_scaled_mm_ws(a, b, scale_a, scale_b, out_dtype=torch.bfloat16, BLOCK_M=None, BLOCK_N=128, NUM_CTAS=1,
                            USE_CLC=False, EPI_SUB=2, persistent=True, scale_mode="blockwise"):
     # NOTE: NUM_SMEM_BUFFERS, NUM_ACC_BUFFERS, GROUP_SIZE_M, num_warps are now
     # @triton.autotune-managed (keyed on M,N,K,SCALE_MODE) -- see _autotune_configs().
@@ -398,11 +400,15 @@ def blackwell_scaled_mm_ws(a, b, scale_a, scale_b, out_dtype=torch.bfloat16, BLO
     scale_mode="rowwise":    scale_a [M] (or [M,1]) per-row, scale_b [N] (or [1,N]) per-col; K-independent.
     scale_mode="tensorwise": scale_a, scale_b are scalars (one fp32 each); K-independent.
     NUM_CTAS=2 -> cluster of 2 SMs cooperate on the MMA (blockwise only).
+    BLOCK_M=None -> occupancy-aware M tile (64 on small shapes, 128 otherwise); pass an int to force.
     """
     SCALE_MODE = {"blockwise": 0, "rowwise": 1, "tensorwise": 2}[scale_mode]
     M, K = a.shape
     N, Kb = b.shape
     assert K == Kb and K % 128 == 0 and N % 128 == 0
+    # Blockwise uses one 128-wide scale_b block per N tile, so a tile must fit within a
+    # single block -> BLOCK_N must divide 128 (BLOCK_N<128 tiles re-read the shared block).
+    assert SCALE_MODE != 0 or 128 % BLOCK_N == 0, "blockwise requires BLOCK_N to divide 128"
     c = torch.empty((M, N), dtype=out_dtype, device=a.device)
     if SCALE_MODE == 1:
         # rowwise: kernel reads scale_a[off_m], scale_b[off_n] directly -> need contiguous 1-D.
@@ -419,6 +425,17 @@ def blackwell_scaled_mm_ws(a, b, scale_a, scale_b, out_dtype=torch.bfloat16, BLO
 
     BLOCK_K = 128
     num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+
+    # Occupancy-aware M tile. The 128x128 tile leaves most SMs idle on small problems
+    # (e.g. 1024^3 -> 64 tiles on ~148 SMs, <50% of the GPU). A 64-tall tile doubles the
+    # tile count to fill those SMs -- but only when the doubled count still fits in ONE
+    # wave, so we don't trade idle SMs for a second, poorly-occupied wave. Larger shapes
+    # keep 128, whose higher MMA efficiency wins once the GPU is already full.
+    if BLOCK_M is None:
+        num_pid_n = triton.cdiv(N, BLOCK_N)
+        tiles_128 = triton.cdiv(M, 128) * num_pid_n
+        tiles_64 = triton.cdiv(M, 64) * num_pid_n
+        BLOCK_M = 64 if (tiles_128 < num_sms and tiles_64 <= num_sms) else 128
 
     def alloc_fn(size, alignment, stream):
         return torch.empty(size, device=a.device, dtype=torch.int8)
