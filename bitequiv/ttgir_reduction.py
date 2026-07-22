@@ -58,18 +58,42 @@ def _context():
     return _ctx
 
 
-def ttgir_reduction_descriptor(ttgir):
+def _fma_eligible(ttgir):
+    """True iff the module has a float multiply that ``enable_fp_fusion`` could contract
+    into an adjacent add — a ``dot``/``warp_group_dot`` accumulation or a plain
+    ``arith.mulf``. A pure-add reduction has no such multiply, so its bits are invariant to
+    fp fusion and must NOT be split on it (that would over-split). Deliberately a broad
+    text test: a ``mulf`` that does not actually feed an add only causes an always-sound
+    over-split, never an over-merge."""
+    return "dot" in ttgir or "arith.mulf" in ttgir
+
+
+def ttgir_reduction_descriptor(ttgir, config=None):
     """Canonical, hashable reduction-order descriptor of a TTGIR module: a tuple of
     per-``tt.reduce`` signature strings built by the MLIR-native C++ analysis (one
     per reduce, plus a conservative entry for any MMA/dot accumulation). Two TTGIRs
     with equal descriptors perform identical reduction trees (sound). ``()`` when
-    the module has no reduction-like op."""
+    the module has no reduction-like op.
+
+    ``config`` (optional autotuner config): FMA contraction is decided BELOW TTGIR (ptxas
+    fuses ``mul``+``add`` into ``fma`` per ``enable_fp_fusion``), so it is invisible in the
+    IR — two configs that differ only in ``enable_fp_fusion`` compile to the SAME TTGIR yet
+    produce DIFFERENT bits. When a config is supplied and the module is fma-eligible, its
+    ``enable_fp_fusion`` value is folded into the descriptor so those configs split (the M1
+    ``dot`` reduction and the GEMM epilogue). The PTX checker reads fusion from the PTX
+    directly and is called without this arg, so it is unaffected."""
     if not ttgir:
         return ()
-    return tuple(_libtriton().bitequiv.reduction_order_signatures(ttgir, _context()))
+    sigs = tuple(_libtriton().bitequiv.reduction_order_signatures(ttgir, _context()))
+    if config is not None and sigs:
+        fp_fusion = getattr(config, "enable_fp_fusion", None)
+        if fp_fusion is not None and _fma_eligible(ttgir):
+            sigs = sigs + (f"enable_fp_fusion={fp_fusion}", )
+    return sigs
 
 
-def ttgir_reductions_equivalent(ttgir_a, ttgir_b):
+def ttgir_reductions_equivalent(ttgir_a, ttgir_b, config_a=None, config_b=None):
     """True iff the two TTGIRs reduce in the same (bitwise-equivalent) order,
-    decided statically from the parsed MLIR (no kernel launch, no inputs)."""
-    return ttgir_reduction_descriptor(ttgir_a) == ttgir_reduction_descriptor(ttgir_b)
+    decided statically from the parsed MLIR (no kernel launch, no inputs). Pass the
+    per-module configs to also decide the fp-fusion split (see ``ttgir_reduction_descriptor``)."""
+    return ttgir_reduction_descriptor(ttgir_a, config_a) == ttgir_reduction_descriptor(ttgir_b, config_b)
