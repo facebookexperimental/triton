@@ -38,6 +38,11 @@ elementwise users. This keeps broadcasts and their value materialization, such
 as a descriptor load followed by an extend, associated with their use after
 other operands, such as TMEM loads, have been prepared.
 
+The TMA store wait pipeline is enabled by default and can be disabled with the
+`nvgpu-warp-specialization` pass option `tma-store-pipelining=false`. Disabling
+it skips wait annotation, annotation validation, and wait reordering; it does
+not disable early TMA store lowering.
+
 ## Register Budgets
 
 `minRegAutoWS` and `maxRegAutoWS` control the per-thread register budgets used

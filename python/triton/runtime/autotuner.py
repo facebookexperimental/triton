@@ -1043,6 +1043,7 @@ class Config:
         reg_inc_consumer=0,
         ctas_per_cga=None,
         early_tma_store_lowering=None,
+        tma_store_pipelining=None,
         generate_subtiled_region=None,
         preferred_ctas_per_cga=None,
         multicast=False,
@@ -1062,6 +1063,7 @@ class Config:
         self.pingpongAutoWS = pingpongAutoWS
         self.ctas_per_cga = ctas_per_cga
         self.early_tma_store_lowering = early_tma_store_lowering
+        self.tma_store_pipelining = tma_store_pipelining
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
         self.multicast = multicast
@@ -1082,6 +1084,7 @@ class Config:
         self.pingpongAutoWS = state.get("pingpongAutoWS", None)
         self.ctas_per_cga = state.get("ctas_per_cga", None)
         self.early_tma_store_lowering = state.get("early_tma_store_lowering", None)
+        self.tma_store_pipelining = state.get("tma_store_pipelining", None)
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
         self.multicast = state.get("multicast", False)
@@ -1103,6 +1106,7 @@ class Config:
                     ("pingpongAutoWS", self.pingpongAutoWS),
                     ("ctas_per_cga", self.ctas_per_cga),
                     ("early_tma_store_lowering", self.early_tma_store_lowering),
+                    ("tma_store_pipelining", self.tma_store_pipelining),
                     ("generate_subtiled_region", self.generate_subtiled_region),
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                     ("multicast", self.multicast),
@@ -1124,6 +1128,7 @@ class Config:
         res.append(f"pingpongAutoWS: {self.pingpongAutoWS}")
         res.append(f"ctas_per_cga: {self.ctas_per_cga}")
         res.append(f"early_tma_store_lowering: {self.early_tma_store_lowering}")
+        res.append(f"tma_store_pipelining: {self.tma_store_pipelining}")
         res.append(f"generate_subtiled_region: {self.generate_subtiled_region}")
         res.append(f"preferred_ctas_per_cga: {self.preferred_ctas_per_cga}")
         res.append(f"multicast: {self.multicast}")
