@@ -5,6 +5,20 @@ import re
 
 STAGE = "facts"
 
+# These operations only change how integer elements are represented or laid
+# out.  They do not change the set of element values, so scalar bounds remain
+# valid across them.  Keep this separate from tensor-affine analysis: a layout
+# conversion may destroy a useful affine coordinate description while still
+# preserving the value range exactly.
+_RANGE_PRESERVING_OPS = frozenset({
+    "tt.broadcast",
+    "tt.expand_dims",
+    "tt.reshape",
+    "tt.splat",
+    "tt.trans",
+    "ttg.convert_layout",
+})
+
 
 @dataclass(frozen=True)
 class Fact:
@@ -19,6 +33,7 @@ class Fact:
     provenance: str = ""
     source_op_index: int | None = None
     mask_scope: int | None = None
+    divisor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,7 @@ def analyze_facts(source_program, type_layout_program):
     del type_layout_program
     facts = []
     _add_type_width_facts(source_program, facts)
+    _add_divisibility_facts(source_program, facts)
     _add_pointer_range_facts(source_program, facts)
     _add_assume_facts(source_program, facts)
     _add_derived_range_facts(source_program, facts)
@@ -84,6 +100,22 @@ def _add_type_width_facts(source_program, facts):
             width=width,
             signedness="signed",
             provenance=f"type:{value.type.raw}",
+            source_op_index=value.owner_op_index,
+        )
+
+
+def _add_divisibility_facts(source_program, facts):
+    for value in source_program.values.values():
+        divisor = value.type.divisibility
+        if divisor is None or int(divisor) <= 1:
+            continue
+        _append_fact(
+            facts,
+            "divisible",
+            value.value_id,
+            "mod_zero",
+            divisor=int(divisor),
+            provenance="type:tt.divisibility",
             source_op_index=value.owner_op_index,
         )
 
@@ -180,6 +212,22 @@ def _derived_ranges_for_op(source_program, facts, op):
         value = _constant_literal(op.attrs.get("value"))
         if isinstance(value, int):
             yield op.results[0], value, value, "constant"
+        return
+    if len(op.results) == 1 and op.name == "tt.make_range":
+        start = op.attrs.get("start")
+        end = op.attrs.get("end")
+        if isinstance(start, int) and isinstance(end, int) and start < end:
+            yield op.results[0], start, end - 1, "derived:tt.make_range"
+        return
+    if (len(op.operands) == 1 and len(op.results) == 1 and op.name in _RANGE_PRESERVING_OPS):
+        value_range = _combined_range(source_program, facts, op.operands[0], op.index)
+        if value_range is not None:
+            yield (
+                op.results[0],
+                value_range[0],
+                value_range[1],
+                f"derived:{op.name}",
+            )
         return
     if len(op.results) == 1 and op.name == "tt.get_program_id":
         yield op.results[0], 0, None, "tt.get_program_id"
@@ -804,6 +852,7 @@ def _append_fact(
     provenance="",
     source_op_index=None,
     mask_scope=None,
+    divisor=None,
 ):
     facts.append(
         Fact(
@@ -818,6 +867,7 @@ def _append_fact(
             provenance,
             source_op_index,
             mask_scope,
+            divisor,
         ))
 
 
