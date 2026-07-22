@@ -257,6 +257,50 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
+    SmallVector<Operation *> assertsToErase;
+    bool assertionFailed = false;
+    auto compare = [&](Operation *op, ttg::TensorOrMemDesc lhsType,
+                       ttg::TensorOrMemDesc rhsType) {
+      auto lhsEncoding = cast<ttg::LayoutEncodingTrait>(lhsType.getEncoding());
+      auto rhsEncoding = cast<ttg::LayoutEncodingTrait>(rhsType.getEncoding());
+      if (!ttg::areLayoutsEquivalent(lhsType.getShape(), lhsEncoding,
+                                     rhsEncoding)) {
+        LinearLayout lhs = ttg::toLinearLayout(lhsType);
+        LinearLayout rhs = ttg::toLinearLayout(rhsType);
+        op->emitError() << "layout assertion failed: LinearLayouts differ\n"
+                        << "lhs: " << lhs.toString() << "\n"
+                        << "rhs: " << rhs.toString();
+        assertionFailed = true;
+      }
+      assertsToErase.push_back(op);
+    };
+    m.walk([&](AssertSameLayoutOp op) {
+      compare(op, cast<ttg::TensorOrMemDesc>(op.getLhs().getType()),
+              cast<ttg::TensorOrMemDesc>(op.getRhs().getType()));
+    });
+    m.walk([&](AssertSameLayoutExpectedOp op) {
+      auto actualType = cast<ttg::TensorOrMemDesc>(op.getSrc().getType());
+      Type expectedType;
+      if (auto tensorType = dyn_cast<RankedTensorType>(actualType)) {
+        expectedType = RankedTensorType::get(tensorType.getShape(),
+                                             tensorType.getElementType(),
+                                             op.getExpected());
+      } else {
+        auto memDescType = cast<ttg::MemDescType>(actualType);
+        expectedType = ttg::MemDescType::get(
+            memDescType.getShape(), memDescType.getElementType(),
+            op.getExpected(), memDescType.getMemorySpace(),
+            memDescType.getMutableMemory(), memDescType.getAllocShape());
+      }
+      compare(op, actualType, cast<ttg::TensorOrMemDesc>(expectedType));
+    });
+    for (Operation *op : assertsToErase)
+      op->erase();
+    if (assertionFailed) {
+      signalPassFailure();
+      return;
+    }
+
     SmallVector<DumpLayoutOp> toErase;
     m.walk([&](DumpLayoutOp op) {
       Value src = op.getSrc();
