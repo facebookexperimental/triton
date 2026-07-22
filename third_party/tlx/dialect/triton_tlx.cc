@@ -119,6 +119,14 @@ void init_triton_tlx_ir(py::module &&m) {
                throw std::runtime_error("Unsupported type");
              }
            })
+      .def("create_assert_same_layout",
+           [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> void {
+             self.create<tlx::AssertSameLayoutOp>(lhs, rhs);
+           })
+      .def("create_assert_same_layout_expected",
+           [](TritonOpBuilder &self, Value &src, Attribute expected) -> void {
+             self.create<tlx::AssertSameLayoutExpectedOp>(src, expected);
+           })
       .def("create_dump_layout",
            [](TritonOpBuilder &self, Value &v) -> void {
              self.create<tlx::DumpLayoutOp>(v);
