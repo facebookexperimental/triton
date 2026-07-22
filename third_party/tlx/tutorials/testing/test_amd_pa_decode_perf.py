@@ -40,9 +40,11 @@ def _pack_aiter_kv_cache(key_cache, value_cache):
     return key_cache, value_cache
 
 
-def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen):
+def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, max_context_len):
     if provider == "tlx":
-        return lambda: _pa_decode_tlx(out, q, kc, vc, ctx, bt, sm_scale, query_length=qlen)
+        return lambda: _pa_decode_tlx(
+            out, q, kc, vc, ctx, bt, sm_scale, query_length=qlen, max_context_len=max_context_len
+        )
 
     from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
@@ -109,7 +111,7 @@ def create_benchmark(versions, qlen):
         q, kc, vc, ctx, bt = _build_inputs(BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
                                            query_length=qlen, device=DEVICE, pool_pages=pool)
         out = torch.empty_like(q)
-        fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen)
+        fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, N_CTX)
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles, warmup=100, rep=200)
 
