@@ -116,10 +116,10 @@ def _pa_decode_partition_kernel(
             safe_page = tl.minimum(logical_page, end_page - 1)
             physical = tl.load(BlockTables + seq * stride_bt_s + safe_page * stride_bt_p)
             page_row = offs_n % PAGE_SIZE
-            k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
-                      page_row[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
-            v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
-                      page_row[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
+            k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h + page_row[:, None] * stride_kc_p +
+                      offs_d[None, :] * stride_kc_d)
+            v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h + page_row[:, None] * stride_vc_p +
+                      offs_d[None, :] * stride_vc_d)
             tlx.local_store(k_view, tl.load(k_ptrs))
             tlx.local_store(v_view, tl.load(v_ptrs))
             tl.debug_barrier()
@@ -128,8 +128,7 @@ def _pa_decode_partition_kernel(
 
             qk = tl.dot(q, kt)
             kt_abs = pidx * PAGE_SIZE + offs_n
-            vis = ((kt_abs[None, :] < end_page * PAGE_SIZE) &
-                   (kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])))
+            vis = ((kt_abs[None, :] < end_page * PAGE_SIZE) & (kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])))
             qk = tl.where(vis, qk * QK_SCALE, float("-inf"))
             m_ij = tl.max(qk, 1)
             m_new = tl.maximum(m_i, m_ij)
@@ -159,10 +158,10 @@ def _pa_decode_partition_kernel(
 
             next_page = start_page + rel_page + 1
             physical_next = tl.load(BlockTables + seq * stride_bt_s + next_page * stride_bt_p)
-            k_ptrs_next = (Kc + physical_next * stride_kc_b + kv_head * stride_kc_h +
-                           offs_p[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
-            v_ptrs_next = (Vc + physical_next * stride_vc_b + kv_head * stride_vc_h +
-                           offs_p[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
+            k_ptrs_next = (Kc + physical_next * stride_kc_b + kv_head * stride_kc_h + offs_p[:, None] * stride_kc_p +
+                           offs_d[None, :] * stride_kc_d)
+            v_ptrs_next = (Vc + physical_next * stride_vc_b + kv_head * stride_vc_h + offs_p[:, None] * stride_vc_p +
+                           offs_d[None, :] * stride_vc_d)
             tok_k = tlx.async_load(k_ptrs_next, tlx.local_view(k_buf, slot_nxt))
             tok_v = tlx.async_load(v_ptrs_next, tlx.local_view(v_buf, slot_nxt))
             tlx.async_load_commit_group([tok_k, tok_v])

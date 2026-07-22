@@ -42,9 +42,8 @@ def _pack_aiter_kv_cache(key_cache, value_cache):
 
 def _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, max_context_len):
     if provider == "tlx":
-        return lambda: _pa_decode_tlx(
-            out, q, kc, vc, ctx, bt, sm_scale, query_length=qlen, max_context_len=max_context_len
-        )
+        return lambda: _pa_decode_tlx(out, q, kc, vc, ctx, bt, sm_scale, query_length=qlen, max_context_len=
+                                      max_context_len)
 
     from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 
