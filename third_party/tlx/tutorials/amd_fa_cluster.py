@@ -8,6 +8,7 @@ import triton.language.extra.tlx as tlx
 from triton.language.core import _aggregate as aggregate
 
 CLUSTER_BUF_DEPTH = 2
+CLUSTER_PIPELINE_STAGES = tl.constexpr(4)
 
 
 @triton.jit
@@ -76,6 +77,7 @@ class SoftmaxState:
         start_n,
         offs_m,
         offs_n,
+        N_CTX: tl.constexpr,
         QK_SCALE: tl.constexpr,
         DIAG_OFFSET: tl.constexpr,
         MASK_STEPS: tl.constexpr,
@@ -83,9 +85,10 @@ class SoftmaxState:
     ):
         if MASK_STEPS:
             qk_sm = qk * QK_SCALE
+            kn = start_n + offs_n
             if IS_CAUSAL:
-                kn = start_n + offs_n
                 qk_sm = tl.where(offs_m[:, None] + DIAG_OFFSET >= kn[None, :], qk_sm, float("-inf"))
+            qk_sm = tl.where(kn[None, :] < N_CTX, qk_sm, float("-inf"))
             m_ij = SoftmaxState._row_max(qk_sm)
             m_new = tl.maximum(self.m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
             p = tl.math.exp2(qk_sm - m_new[:, None])
@@ -120,6 +123,7 @@ def _attn_inner_pipelined(
     v_buf,
     stride_kn,
     stride_vn,
+    N_CTX: tl.constexpr,
     QK_SCALE: tl.constexpr,
     DIAG_OFFSET: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -129,11 +133,21 @@ def _attn_inner_pipelined(
 ):
     # Prologue: prime the pipeline for output tile block_start.
     b0 = block_start
-    tok_k0 = tlx.async_load(k_ptrs + b0 * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
-    tok_v0 = tlx.async_load(v_ptrs + b0 * BLOCK_N * stride_vn, tlx.local_view(v_buf, 0))
+    n0 = b0 * BLOCK_N
+    if MASK_STEPS:
+        mask0 = (n0 + offs_n)[:, None] < N_CTX
+        tok_k0 = tlx.async_load(k_ptrs + n0 * stride_kn, tlx.local_view(k_buf, 0), mask=mask0)
+        tok_v0 = tlx.async_load(v_ptrs + n0 * stride_vn, tlx.local_view(v_buf, 0), mask=mask0)
+    else:
+        tok_k0 = tlx.async_load(k_ptrs + n0 * stride_kn, tlx.local_view(k_buf, 0))
+        tok_v0 = tlx.async_load(v_ptrs + n0 * stride_vn, tlx.local_view(v_buf, 0))
     tlx.async_load_commit_group([tok_k0])
     tlx.async_load_commit_group([tok_v0])
-    tok_k1 = tlx.async_load(k_ptrs + (b0 + 1) * BLOCK_N * stride_kn, tlx.local_view(k_buf, 1))
+    n1 = (b0 + 1) * BLOCK_N
+    if MASK_STEPS:
+        tok_k1 = tlx.async_load(k_ptrs + n1 * stride_kn, tlx.local_view(k_buf, 1), mask=(n1 + offs_n)[:, None] < N_CTX)
+    else:
+        tok_k1 = tlx.async_load(k_ptrs + n1 * stride_kn, tlx.local_view(k_buf, 1))
     tlx.async_load_commit_group([tok_k1])
 
     wait0 = tlx.async_load_wait_group(2)
@@ -144,6 +158,7 @@ def _attn_inner_pipelined(
         b0 * BLOCK_N,
         offs_m,
         offs_n,
+        N_CTX,
         QK_SCALE,
         DIAG_OFFSET,
         MASK_STEPS,
@@ -151,11 +166,18 @@ def _attn_inner_pipelined(
     )
 
     tl.debug_barrier()
-    tok_k2 = tlx.async_load(k_ptrs + (b0 + 2) * BLOCK_N * stride_kn, tlx.local_view(k_buf, 0))
+    n2 = (b0 + 2) * BLOCK_N
+    if MASK_STEPS:
+        tok_k2 = tlx.async_load(k_ptrs + n2 * stride_kn, tlx.local_view(k_buf, 0), mask=(n2 + offs_n)[:, None] < N_CTX)
+    else:
+        tok_k2 = tlx.async_load(k_ptrs + n2 * stride_kn, tlx.local_view(k_buf, 0))
     tlx.async_load_commit_group([tok_k2])
     wait1 = tlx.async_load_wait_group(1)
     kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, 1)), token=wait1, relaxed=True)
-    tok_v1 = tlx.async_load(v_ptrs + (b0 + 1) * BLOCK_N * stride_vn, tlx.local_view(v_buf, 1))
+    if MASK_STEPS:
+        tok_v1 = tlx.async_load(v_ptrs + n1 * stride_vn, tlx.local_view(v_buf, 1), mask=(n1 + offs_n)[:, None] < N_CTX)
+    else:
+        tok_v1 = tlx.async_load(v_ptrs + n1 * stride_vn, tlx.local_view(v_buf, 1))
     tlx.async_load_commit_group([tok_v1])
 
     for block_n in tl.range(block_start, block_end - 3, num_stages=0):
@@ -173,7 +195,14 @@ def _attn_inner_pipelined(
 
         with tlx.warp_pipeline_stage("mem1", priority=1):
             v_dot = tlx.local_load(tlx.local_view(v_buf, cur_slot), relaxed=True)
-            tok_k = tlx.async_load(k_ptrs + ack_n * stride_kn, tlx.local_view(k_buf, nxt_slot))
+            if MASK_STEPS:
+                tok_k = tlx.async_load(
+                    k_ptrs + ack_n * stride_kn,
+                    tlx.local_view(k_buf, nxt_slot),
+                    mask=(ack_n + offs_n)[:, None] < N_CTX,
+                )
+            else:
+                tok_k = tlx.async_load(k_ptrs + ack_n * stride_kn, tlx.local_view(k_buf, nxt_slot))
             tlx.async_load_commit_group([tok_k])
 
         with tlx.warp_pipeline_stage("dot2", priority=0):
@@ -184,6 +213,7 @@ def _attn_inner_pipelined(
                 ahead_n,
                 offs_m,
                 offs_n,
+                N_CTX,
                 QK_SCALE,
                 DIAG_OFFSET,
                 MASK_STEPS,
@@ -194,7 +224,14 @@ def _attn_inner_pipelined(
 
         with tlx.warp_pipeline_stage("mem2", priority=1):
             kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, cur_slot)), relaxed=True)
-            tok_v = tlx.async_load(v_ptrs + acv_n * stride_vn, tlx.local_view(v_buf, cur_slot))
+            if MASK_STEPS:
+                tok_v = tlx.async_load(
+                    v_ptrs + acv_n * stride_vn,
+                    tlx.local_view(v_buf, cur_slot),
+                    mask=(acv_n + offs_n)[:, None] < N_CTX,
+                )
+            else:
+                tok_v = tlx.async_load(v_ptrs + acv_n * stride_vn, tlx.local_view(v_buf, cur_slot))
             tlx.async_load_commit_group([tok_v])
 
     # Drain the last three output tiles without out-of-bounds global prefetches.
@@ -216,13 +253,22 @@ def _attn_inner_pipelined(
         nm2 * BLOCK_N,
         offs_m,
         offs_n,
+        N_CTX,
         QK_SCALE,
         DIAG_OFFSET,
         MASK_STEPS,
         IS_CAUSAL,
     )
     tl.debug_barrier()
-    tok_vlast = tlx.async_load(v_ptrs + nm1 * BLOCK_N * stride_vn, tlx.local_view(v_buf, s_nm1))
+    nm1_n = nm1 * BLOCK_N
+    if MASK_STEPS:
+        tok_vlast = tlx.async_load(
+            v_ptrs + nm1_n * stride_vn,
+            tlx.local_view(v_buf, s_nm1),
+            mask=(nm1_n + offs_n)[:, None] < N_CTX,
+        )
+    else:
+        tok_vlast = tlx.async_load(v_ptrs + nm1_n * stride_vn, tlx.local_view(v_buf, s_nm1))
     tlx.async_load_commit_group([tok_vlast])
     tlx.async_load_wait_group(2)
     kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, s_nm1)), relaxed=True)
@@ -238,6 +284,7 @@ def _attn_inner_pipelined(
         nm1 * BLOCK_N,
         offs_m,
         offs_n,
+        N_CTX,
         QK_SCALE,
         DIAG_OFFSET,
         MASK_STEPS,
@@ -249,6 +296,70 @@ def _attn_inner_pipelined(
     state, p_dot = state.vec2(p_c, alpha_c, q.dtype)
     acc = tl.dot(p_dot, v_dot, state.acc)
     state = SoftmaxState(acc, state.l_i, state.m_i)
+
+    return state
+
+
+@triton.jit
+def _attn_inner_short(
+    state,
+    q,
+    k_ptrs,
+    v_ptrs,
+    offs_m,
+    offs_n,
+    block_start,
+    block_end,
+    k_buf,
+    v_buf,
+    stride_kn,
+    stride_vn,
+    N_CTX: tl.constexpr,
+    QK_SCALE: tl.constexpr,
+    DIAG_OFFSET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BUF_DEPTH: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    """Process ranges too short to safely fill the rotated four-stage pipeline."""
+    tlx.async_load_wait_group(0)
+
+    num_blocks = block_end - block_start
+    for chunk_start in tl.range(0, num_blocks, BUF_DEPTH, num_stages=0):
+        for slot in tl.static_range(BUF_DEPTH):
+            block_offset = chunk_start + slot
+            if block_offset < num_blocks:
+                start_n = (block_start + block_offset) * BLOCK_N
+                mask = (start_n + offs_n)[:, None] < N_CTX
+                tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, slot), mask=mask)
+                tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, slot), mask=mask)
+                tlx.async_load_commit_group([tok_k, tok_v])
+
+        wait = tlx.async_load_wait_group(0)
+
+        for slot in tl.static_range(BUF_DEPTH):
+            block_offset = chunk_start + slot
+            if block_offset < num_blocks:
+                start_n = (block_start + block_offset) * BLOCK_N
+                kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)), token=wait, relaxed=True)
+                v_dot = tlx.local_load(tlx.local_view(v_buf, slot), token=wait, relaxed=True)
+                qk = tl.dot(q, kt_dot)
+                state, p, alpha = state.vec1(
+                    qk,
+                    start_n,
+                    offs_m,
+                    offs_n,
+                    N_CTX,
+                    QK_SCALE,
+                    DIAG_OFFSET,
+                    True,
+                    IS_CAUSAL,
+                )
+                state, p_dot = state.vec2(p, alpha, q.dtype)
+                acc = tl.dot(p_dot, v_dot, state.acc)
+                state = SoftmaxState(acc, state.l_i, state.m_i)
+
+        tl.debug_barrier()
 
     return state
 
@@ -280,7 +391,7 @@ def _attn_cluster_tile(
     stride_oh,
     stride_om,
     stride_ok,
-    N_CTX,
+    N_CTX: tl.constexpr,
     QK_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -310,54 +421,24 @@ def _attn_cluster_tile(
     k_ptrs = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_ptrs = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
 
-    n_blocks = N_CTX // BLOCK_N
+    n_blocks_total: tl.constexpr = (N_CTX + BLOCK_N - 1) // BLOCK_N
+    is_modulo_mn: tl.constexpr = N_CTX % BLOCK_N == 0 and N_CTX % BLOCK_M == 0
 
     if IS_CAUSAL:
-        masked_blocks: tl.constexpr = BLOCK_M // BLOCK_N
-        causal_end = (pid_m + 1) * masked_blocks
-        n_full = causal_end - masked_blocks
-        if n_full > 0:
-            state = _attn_inner_pipelined(
-                state,
-                q,
-                k_ptrs,
-                v_ptrs,
-                offs_m,
-                offs_n,
-                0,
-                n_full,
-                k_buf,
-                v_buf,
-                stride_kn,
-                stride_vn,
-                QK_SCALE,
-                DIAG_OFFSET,
-                BLOCK_N,
-                BUF_DEPTH,
-                False,
-                True,
-            )
-        state = _attn_inner_pipelined(
-            state,
-            q,
-            k_ptrs,
-            v_ptrs,
-            offs_m,
-            offs_n,
-            n_full,
-            causal_end,
-            k_buf,
-            v_buf,
-            stride_kn,
-            stride_vn,
-            QK_SCALE,
-            DIAG_OFFSET,
-            BLOCK_N,
-            BUF_DEPTH,
-            True,
-            True,
-        )
+        causal_end = ((pid_m + 1) * BLOCK_M + BLOCK_N - 1) // BLOCK_N
+        n_blocks = min(n_blocks_total, causal_end)
+        masked_blocks: tl.constexpr = BLOCK_M // BLOCK_N + (not is_modulo_mn)
     else:
+        n_blocks = n_blocks_total
+        masked_blocks: tl.constexpr = 1 if N_CTX % BLOCK_N != 0 else 0
+
+    masked_blocks = min(masked_blocks, n_blocks)
+    n_full = n_blocks - masked_blocks
+
+    # The rotated loop needs enough blocks to fill and drain all four stages.
+    # Keep short ranges on the two-slot preload fallback, and fold tiny masked tails
+    # into a larger masked pipeline range just like the original Gluon kernel.
+    if n_blocks > CLUSTER_PIPELINE_STAGES and (n_blocks - n_full) < CLUSTER_PIPELINE_STAGES and n_full != n_blocks:
         state = _attn_inner_pipelined(
             state,
             q,
@@ -371,12 +452,103 @@ def _attn_cluster_tile(
             v_buf,
             stride_kn,
             stride_vn,
+            N_CTX,
             QK_SCALE,
             DIAG_OFFSET,
             BLOCK_N,
             BUF_DEPTH,
-            False,
-            False,
+            True,
+            IS_CAUSAL,
+        )
+    elif n_blocks > CLUSTER_PIPELINE_STAGES:
+        if n_full > CLUSTER_PIPELINE_STAGES:
+            state = _attn_inner_pipelined(
+                state,
+                q,
+                k_ptrs,
+                v_ptrs,
+                offs_m,
+                offs_n,
+                0,
+                n_full,
+                k_buf,
+                v_buf,
+                stride_kn,
+                stride_vn,
+                N_CTX,
+                QK_SCALE,
+                DIAG_OFFSET,
+                BLOCK_N,
+                BUF_DEPTH,
+                False,
+                IS_CAUSAL,
+            )
+
+        masked_start = n_full if n_full > CLUSTER_PIPELINE_STAGES else 0
+        remaining_blocks = n_blocks - masked_start
+        if remaining_blocks > CLUSTER_PIPELINE_STAGES:
+            state = _attn_inner_pipelined(
+                state,
+                q,
+                k_ptrs,
+                v_ptrs,
+                offs_m,
+                offs_n,
+                masked_start,
+                n_blocks,
+                k_buf,
+                v_buf,
+                stride_kn,
+                stride_vn,
+                N_CTX,
+                QK_SCALE,
+                DIAG_OFFSET,
+                BLOCK_N,
+                BUF_DEPTH,
+                True,
+                IS_CAUSAL,
+            )
+        elif remaining_blocks > 0:
+            state = _attn_inner_short(
+                state,
+                q,
+                k_ptrs,
+                v_ptrs,
+                offs_m,
+                offs_n,
+                masked_start,
+                n_blocks,
+                k_buf,
+                v_buf,
+                stride_kn,
+                stride_vn,
+                N_CTX,
+                QK_SCALE,
+                DIAG_OFFSET,
+                BLOCK_N,
+                BUF_DEPTH,
+                IS_CAUSAL,
+            )
+    elif n_blocks > 0:
+        state = _attn_inner_short(
+            state,
+            q,
+            k_ptrs,
+            v_ptrs,
+            offs_m,
+            offs_n,
+            0,
+            n_blocks,
+            k_buf,
+            v_buf,
+            stride_kn,
+            stride_vn,
+            N_CTX,
+            QK_SCALE,
+            DIAG_OFFSET,
+            BLOCK_N,
+            BUF_DEPTH,
+            IS_CAUSAL,
         )
 
     acc = state.acc / state.l_i[:, None]
@@ -406,7 +578,7 @@ def _attn_fwd_cluster_pipeline(
     stride_oh,
     stride_om,
     stride_ok,
-    N_CTX,
+    N_CTX: tl.constexpr,
     sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -504,7 +676,7 @@ def _attn_fwd_cluster_persistent_pipeline(
     stride_ok,
     Z,
     H,
-    N_CTX,
+    N_CTX: tl.constexpr,
     sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
