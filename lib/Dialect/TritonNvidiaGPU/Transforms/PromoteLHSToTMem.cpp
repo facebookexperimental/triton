@@ -42,11 +42,15 @@ static StringRef getOpndAMemType(Operation *op) {
     if (!str)
       continue;
     if (str->starts_with("opndA,")) {
-      // Format: "opndA,memType,numCopies,bufferId"
+      // Format: "opndA,memType[,numCopies,bufferId]". The copies/id fields are
+      // optional: a memtype-only annotation ("opndA,smem"/"opndA,tmem") marks
+      // just the memory space (the planner decides copies/id/grouping).
       auto comma = str->find(',');
       auto comma2 = str->find(',', comma + 1);
-      if (comma != StringRef::npos && comma2 != StringRef::npos)
-        return str->slice(comma + 1, comma2);
+      if (comma != StringRef::npos) {
+        size_t end = (comma2 != StringRef::npos) ? comma2 : str->size();
+        return str->slice(comma + 1, end);
+      }
     }
   }
   return "";
