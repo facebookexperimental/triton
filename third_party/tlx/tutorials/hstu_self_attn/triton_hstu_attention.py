@@ -111,11 +111,52 @@ def _sync_autows_constexprs() -> None:
     _HSTU_DQ_REUSE = tl.constexpr(_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse)
 
 
+def _reload_autotune_configs() -> None:
+    """Rebuild the fwd/bwd autotune config lists from the current _AUTOWS_CFG and
+    drop cached compilations.
+
+    The structural knobs are read inside @triton.jit as module-level tl.constexpr
+    globals (and the num_warps/block/num_stages autotune configs are derived from
+    _AUTOWS_CFG at decoration time). Neither is part of the JIT/autotune cache key,
+    so a config change would otherwise be ignored on already-compiled kernels.
+    Rebuilding .configs and clearing the caches makes configure_autows() switch the
+    config in-process (before the next launch) instead of only at import -- so a
+    single process (e.g. a tritonbench run) can benchmark multiple autoWS configs.
+    """
+    for name, gen in (
+        ("_hstu_attn_fwd", _get_fw_configs),
+        ("_hstu_attn_bwd", _get_bw_configs),
+    ):
+        kern = globals().get(name)
+        if kern is None:
+            continue  # kernels not defined yet (configure_autows() during import)
+        try:
+            kern.configs = gen()
+        except Exception:
+            pass
+        # Autotuner best-config cache + underlying JIT compile cache.
+        cache = getattr(kern, "cache", None)
+        if cache is not None:
+            cache.clear()
+        fn = getattr(kern, "fn", None)
+        device_caches = getattr(fn, "device_caches", None)
+        if device_caches is not None:
+            device_caches.clear()
+        # Reset the JIT's "used global values" guard, which otherwise raises
+        # ("Global variable ... has changed since we compiled this kernel") when a
+        # module-level tl.constexpr (_HSTU_SELF_*) flips. Cleared here so the next
+        # launch recompiles and re-captures the new values instead of erroring.
+        used_global_vals = getattr(fn, "used_global_vals", None)
+        if used_global_vals is not None:
+            used_global_vals.clear()
+
+
 def configure_autows(cfg=None, **kwargs) -> "HSTUAutoWSConfig":
     """Set the active HSTU autoWS config (replaces the HSTU_SELF_* env vars).
 
-    Accepts an HSTUAutoWSConfig, a dict of overrides, or keyword overrides. Call
-    before the first kernel launch.
+    Accepts an HSTUAutoWSConfig, a dict of overrides, or keyword overrides.
+    Switches the config in-process; call before the next kernel launch. (The prior
+    import-time-only restriction is lifted -- see _reload_autotune_configs.)
     """
     global _AUTOWS_CFG
     if cfg is not None:
@@ -126,6 +167,7 @@ def configure_autows(cfg=None, **kwargs) -> "HSTUAutoWSConfig":
     if kwargs:
         _AUTOWS_CFG = _dc_replace(_AUTOWS_CFG, **kwargs)
     _sync_autows_constexprs()
+    _reload_autotune_configs()
     return _AUTOWS_CFG
 
 
