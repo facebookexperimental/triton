@@ -394,7 +394,7 @@ def get_cuda_autotune_config():
         for num_ctas in [1, 2]
         for split_k in [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 19, 24]  # pruning selects one optimal SPLIT_K per tile group
         for interleave in [0, 1]
-        for g in [1, 8, 64]
+        for g in [1, 2, 8, 64]
         for uwb in [False, True]
     ]
 
@@ -595,8 +595,11 @@ def preprocess_configs(configs, named_args, **kwargs):
     if pruned_configs:
         IMBALANCE_THRESHOLD = 10  # ratio at which we enforce the rule
         if M > N * IMBALANCE_THRESHOLD:
-            # M >> N: keep only small GROUP_SIZE_M to sweep M
-            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] == 1]
+            # M >> N: keep the smallest GROUP_SIZE_M to sweep M. 2-CTA requires
+            # GROUP_SIZE_M to be a multiple of NUM_CTAS (see the pairing gate
+            # above), so its smallest valid value is NUM_CTAS (2), not 1 —
+            # forcing 1 here would silently prune every 2-CTA config.
+            pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] == c.kwargs["NUM_CTAS"]]
         elif N > M * IMBALANCE_THRESHOLD:
             # N >> M: keep only large GROUP_SIZE_M to sweep N
             pruned_configs = [c for c in pruned_configs if c.kwargs["GROUP_SIZE_M"] >= 32]
