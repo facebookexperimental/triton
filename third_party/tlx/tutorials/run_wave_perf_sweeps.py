@@ -4,6 +4,7 @@
 import argparse
 from dataclasses import dataclass
 from datetime import datetime
+import importlib.util
 import os
 from pathlib import Path
 import shlex
@@ -17,7 +18,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_COMPILE_WORKERS = max(1, min(8, os.cpu_count() or 1))
 ALL_SWEEPS = ("f16", "mxfp", "glu", "fa")
-F16_INPUT_MODES = ("normal", "hpl", "rand-int", "zero", "ones")
 F16_TIMING_MODES = ("triton", "batched")
 MXFP_TIMING_MODES = ("batched", "triton")
 DEFAULT_MXFP_WARMUP_LAUNCHES = 25
@@ -26,6 +26,19 @@ DEFAULT_MXFP_TIMING_REPEATS = 7
 F16_V10_BASELINE_SHAPE = "8192x8192x8192"
 F16_V11_BASELINE_SHAPE = "8192x8192x8192"
 F16_INTER_WAVE_BASELINE_SHAPE = (8192, 8192, 8192)
+
+
+def _load_f16_inputs():
+    path = SCRIPT_DIR / "gfx9_gemm" / "f16_inputs.py"
+    spec = importlib.util.spec_from_file_location("_tlx_gfx9_sweep_f16_inputs", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import f16 input helpers from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+F16_INPUT_MODES = _load_f16_inputs().INPUT_MODES
 
 
 @dataclass(frozen=True)
@@ -206,9 +219,8 @@ def build_run_specs(args, cache_root):
             command += ("--wave-split-barriers", )
         specs.append(RunSpec("f16", "f16 v9: LLVM vs Wave", "both", command, cache_dir))
 
-        # Keep the Wave-derived eight-wave kernel as a stable 8K baseline.  Its
-        # fixed input and timing methodology match the measurement used for the
-        # 1.3 PFLOP/s target while still compiling and checking both backends.
+        # Keep the Wave-derived eight-wave kernel as a stable 8K baseline while
+        # applying the same selected input distribution as the other f16 runs.
         cache_dir = cache_root / "f16-v10"
         command = (
             python,
@@ -223,9 +235,9 @@ def build_run_specs(args, cache_root):
             *timing,
             *workers,
             "--input-mode",
-            "rand-int",
+            args.f16_input_mode,
             "--seed",
-            "0",
+            str(args.f16_input_seed),
             "--timing-mode",
             "batched",
             "--warmup-launches",
@@ -250,8 +262,8 @@ def build_run_specs(args, cache_root):
         )
 
         # The four-wave variant is the specialized counterpart of the v10
-        # eight-wave baseline.  Keep the shape, inputs, timing, and provider
-        # pair identical so its result is directly comparable in every sweep.
+        # eight-wave baseline.  Keep the shape, selected inputs, timing, and
+        # provider pair identical so its result is directly comparable.
         cache_dir = cache_root / "f16-v11"
         command = (
             python,
@@ -266,9 +278,9 @@ def build_run_specs(args, cache_root):
             *timing,
             *workers,
             "--input-mode",
-            "rand-int",
+            args.f16_input_mode,
             "--seed",
-            "0",
+            str(args.f16_input_seed),
             "--timing-mode",
             "batched",
             "--warmup-launches",
@@ -301,8 +313,10 @@ def build_run_specs(args, cache_root):
                 "--shape",
                 *(str(dim) for dim in F16_INTER_WAVE_BASELINE_SHAPE),
                 *timing,
+                "--input-mode",
+                args.f16_input_mode,
                 "--seed",
-                "0",
+                str(args.f16_input_seed),
             )
             specs.append(
                 RunSpec(
