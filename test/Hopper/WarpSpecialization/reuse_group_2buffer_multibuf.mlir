@@ -1,17 +1,21 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-use-nameloc-as-prefix | FileCheck %s
 //
-// Verify that 2-buffer reuse group logic moves the late buffer's (dq)
-// producer_acquire before the early buffer's (dpT) producer.
-// Before this change, the ordering was:
-//   producer_acquire(dpT) -> dpT MMA -> ... -> producer_acquire(dq) -> dq MMA
-// After this change, the ordering is:
-//   producer_acquire(dq) -> producer_acquire(dpT) -> dpT MMA -> ... -> dq MMA
+// Multi-buffer variant of reuse_group_2buffer.mlir: the shared dsT buffer is a
+// MULTI-buffered alloc (1x128x128) accessed through memdesc_index slot views.
+// The dsT store and the dq read go through SEPARATE memdesc_index ops of the
+// same base alloc, so the dpT -> dsT -> dq data dependency is only discoverable
+// if dependsThroughMemory (CodePartitionUtility) climbs the store's subview to
+// the base buffer and fans out to the reader's subview (getRootBuffer). Without
+// that, dpT.consumer -> dq.producer has no chain, the {dpT,dq} TMEM reuse is
+// lost, and dq's producer_acquire is NOT hoisted before dpT's producer.
 //
-// dpT and dq share the same buffer.id in a reuse group with buffer.copy=1.
-// dpT's consumer feeds into dq's producer, so dpT is the early channel.
-// dq's producer_acquire must come before dpT's producer to ensure the
-// shared token prevents dq's old data from being overwritten before it
-// is consumed.
+// This is the exact multi-buffer/subview shape that occurs in FA-bwd
+// (early_tma_staging): dsT is written by the softmax partition into
+// memdesc_index(base,i) and read by the dq MMA from memdesc_index(base,j).
+//
+// dpT and dq share the same TMEM buffer.id in a reuse group with buffer.copy=1.
+// dpT's consumer (through dsT) feeds dq's producer, so dpT is the early channel;
+// dq's producer_acquire must come before dpT's producer.
 //
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 // CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
@@ -36,7 +40,7 @@
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @_attn_bwd_persist(%desc_q: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %desc_k: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %desc_v: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %sm_scale: f32, %desc_do: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %desc_dq: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %desc_dk: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %desc_dv: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %M: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %D: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %stride_z: i32 {tt.divisibility = 16 : i32}, %stride_h: i32 {tt.divisibility = 16 : i32}, %stride_tok: i32 {tt.divisibility = 16 : i32}, %BATCH: i32, %H: i32 {tt.divisibility = 16 : i32}, %N_CTX: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
     %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) loc("dq")
-    %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %dsT = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
     %dpT, %dpT_1 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32} : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token) loc("dpT")
     %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32} : () -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>
     %do = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 1 : i32} : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
@@ -145,9 +149,11 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %dsT_100 = arith.subf %dpT_98, %dsT_97 {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked1>
         %dsT_101 = arith.mulf %pT_87, %dsT_100 {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked1>
         %dsT_102 = arith.truncf %dsT_101 {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked1> to tensor<128x128xf16, #blocked1>
-        ttg.local_store %dsT_102, %dsT {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-        %dk_103 = ttng.tc_gen5_mma %dsT, %q, %dk[%dk_71], %arg20, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, tmem.end = array<i32: 9>, tmem.start = array<i32: 10>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
-        %dq_104 = ttg.memdesc_trans %dsT {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared3, #smem, mutable> loc("dq")
+        %dsT_ws = ttg.memdesc_index %dsT[%c0_i32] {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        ttg.local_store %dsT_102, %dsT_ws {async_task_id = array<i32: 3>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf16, #blocked1> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+        %dk_103 = ttng.tc_gen5_mma %dsT_ws, %q, %dk[%dk_71], %arg20, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, tmem.end = array<i32: 9>, tmem.start = array<i32: 10>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+        %dsT_rs = ttg.memdesc_index %dsT[%c0_i32] {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable> loc("dq")
+        %dq_104 = ttg.memdesc_trans %dsT_rs {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared3, #smem, mutable> loc("dq")
         %dq_105 = ttng.tc_gen5_mma %dq_104, %k, %dq[%dq_72], %false, %true {async_task_id = array<i32: 1>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf16, #shared3, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc("dq")
         %dq_106, %dq_107 = ttng.tmem_load %dq[%dq_105] {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #blocked1> loc("dq")
         %dqs = tt.reshape %dq_106 {async_task_id = array<i32: 0>, loop.cluster = 0 : i32, loop.stage = 1 : i32} : tensor<128x128xf32, #blocked1> -> tensor<128x2x64xf32, #blocked4>
