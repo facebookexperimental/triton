@@ -377,11 +377,9 @@ def _emit_binary(state, op):
         predicates = None
         if lhs_predicates is not None or rhs_predicates is not None:
             lhs_predicates = lhs_predicates or tuple(
-                _i32_payload_to_mask(state, component, lane_width) for component in lhs_components
-            )
+                _i32_payload_to_mask(state, component, lane_width) for component in lhs_components)
             rhs_predicates = rhs_predicates or tuple(
-                _i32_payload_to_mask(state, component, lane_width) for component in rhs_components
-            )
+                _i32_payload_to_mask(state, component, lane_width) for component in rhs_components)
             predicates = tuple(
                 _mask_and_predicate(
                     state,
@@ -483,14 +481,13 @@ def _emit_float_unary(state, op):
                     "ordinary SIMD float unary values must have scalar lane payloads",
                     target_op_id=op.target_op_id,
                 )
-            emitted.append(
-                _emit_wave_float_unary_component(
-                    state,
-                    operation,
-                    component,
-                    fastmath,
-                    op,
-                ))
+            emitted.append(_emit_wave_float_unary_component(
+                state,
+                operation,
+                component,
+                fastmath,
+                op,
+            ))
             continue
         if payload is None or str(payload[1]) != "f32":
             fail(
@@ -508,14 +505,13 @@ def _emit_float_unary(state, op):
                 component,
                 index,
             ).result
-            scalars.append(
-                _emit_wave_float_unary_component(
-                    state,
-                    operation,
-                    scalar,
-                    fastmath,
-                    op,
-                ))
+            scalars.append(_emit_wave_float_unary_component(
+                state,
+                operation,
+                scalar,
+                fastmath,
+                op,
+            ))
         emitted.append(state.dsl.wave.PackOp(component.type, scalars).result)
     state.values[result_id] = _pack_components(tuple(emitted))
 
@@ -554,8 +550,7 @@ def _fastmath_attr(state, flags, op):
         )
 
 
-def _emit_wave_float_binary_component(
-        state, operation, lhs_component, rhs_component, fastmath, op):
+def _emit_wave_float_binary_component(state, operation, lhs_component, rhs_component, fastmath, op):
     if operation == "divf":
         reciprocal = state.dsl.wave.FRcpOp(
             rhs_component.type,
@@ -591,8 +586,7 @@ def _emit_wave_float_binary_component(
     ).result
 
 
-def _emit_mma_packet_float_binary_component(
-        state, operation, fastmath, lhs_component, rhs_component, op):
+def _emit_mma_packet_float_binary_component(state, operation, fastmath, lhs_component, rhs_component, op):
     lhs_payload = _simd_1d_vector_payload(state, lhs_component)
     rhs_payload = _simd_1d_vector_payload(state, rhs_component)
     if lhs_payload is None or rhs_payload is None:
@@ -623,13 +617,10 @@ def _emit_mma_packet_float_binary_component(
         scalar_type,
         int(rhs_width),
     )
-    packed_splat_operand = (
-        _packed_vector_payload_is_splat(lhs_elements)
-        or _packed_vector_payload_is_splat(rhs_elements)
-    )
-    if (operation in {"addf", "mulf"} and str(lhs_element_type) == "f32"
-            and int(lhs_width) >= 2 and int(lhs_width) % 2 == 0
-            and not packed_splat_operand):
+    packed_splat_operand = (_packed_vector_payload_is_splat(lhs_elements)
+                            or _packed_vector_payload_is_splat(rhs_elements))
+    if (operation in {"addf", "mulf"} and str(lhs_element_type) == "f32" and int(lhs_width) >= 2
+            and int(lhs_width) % 2 == 0 and not packed_splat_operand):
         return _emit_wave_float_binary_component(
             state,
             operation,
@@ -640,30 +631,25 @@ def _emit_mma_packet_float_binary_component(
         )
     result_scalars = []
     for element in range(int(lhs_width)):
-        lhs_scalar = (
-            lhs_elements[element] if lhs_elements is not None
-            else state.dsl.wave.ExtractOp(
-                scalar_type,
-                lhs_component,
-                element,
-            ).result
-        )
-        rhs_scalar = (
-            rhs_elements[element] if rhs_elements is not None
-            else state.dsl.wave.ExtractOp(
-                scalar_type,
-                rhs_component,
-                element,
-            ).result
-        )
-        result_scalars.append(_emit_wave_float_binary_component(
-            state,
-            operation,
-            lhs_scalar,
-            rhs_scalar,
-            fastmath,
-            op,
-        ))
+        lhs_scalar = (lhs_elements[element] if lhs_elements is not None else state.dsl.wave.ExtractOp(
+            scalar_type,
+            lhs_component,
+            element,
+        ).result)
+        rhs_scalar = (rhs_elements[element] if rhs_elements is not None else state.dsl.wave.ExtractOp(
+            scalar_type,
+            rhs_component,
+            element,
+        ).result)
+        result_scalars.append(
+            _emit_wave_float_binary_component(
+                state,
+                operation,
+                lhs_scalar,
+                rhs_scalar,
+                fastmath,
+                op,
+            ))
     return state.dsl.wave.PackOp(
         lhs_component.type,
         result_scalars,
@@ -743,23 +729,19 @@ def _emit_cmpi_select(state, op):
     lhs, rhs, true_value, false_value = _operand_values(state, op, 4)
     result_id = _single_result(op)
     count = _component_count(state, result_id)
-    lhs_components, rhs_components, true_components, false_components = (
-        _broadcast_components(
-            state,
-            (lhs, rhs, true_value, false_value),
-            count,
-            op,
-        )
-    )
+    lhs_components, rhs_components, true_components, false_components = (_broadcast_components(
+        state,
+        (lhs, rhs, true_value, false_value),
+        count,
+        op,
+    ))
     # Keep the transient tuple of materialized scalar masks bounded without
     # forcing every compare/select pair through VCC back-to-back.  The latter
     # creates a long fixed-register hazard chain that the machine scheduler
     # fills with otherwise-late data operations, extending their VGPR live
     # ranges.  Budget in SGPR dwords so the policy is independent of wave32 vs
     # wave64 mask width.
-    lane_width = int(
-        state.target_program.values[result_id].type.lane_width or 64
-    )
+    lane_width = int(state.target_program.values[result_id].type.lane_width or 64)
     mask_dwords = max(1, lane_width // 32)
     batch_components = max(
         1,
@@ -774,9 +756,7 @@ def _emit_cmpi_select(state, op):
     components = [None] * count
     reused = []
     for batch_start in range(0, count, batch_components):
-        batch = component_operands[
-            batch_start:batch_start + batch_components
-        ]
+        batch = component_operands[batch_start:batch_start + batch_components]
         pending = []
         for component_index, operands in enumerate(batch, start=batch_start):
             existing = _find_reused_component_result(reused, operands)
@@ -784,26 +764,20 @@ def _emit_cmpi_select(state, op):
                 components[component_index] = existing
                 continue
             matching = next(
-                (
-                    indices
-                    for pending_operands, indices in pending
-                    if _same_component_operands(pending_operands, operands)
-                ),
+                (indices for pending_operands, indices in pending
+                 if _same_component_operands(pending_operands, operands)),
                 None,
             )
             if matching is not None:
                 matching.append(component_index)
                 continue
             pending.append((operands, [component_index]))
-        masks = tuple(
-            _cmpi(
-                state,
-                attrs["predicate"],
-                operands[0],
-                operands[1],
-            )
-            for operands, _ in pending
-        )
+        masks = tuple(_cmpi(
+            state,
+            attrs["predicate"],
+            operands[0],
+            operands[1],
+        ) for operands, _ in pending)
         for (operands, indices), mask in zip(pending, masks):
             selected = state.builder.select(
                 mask,
@@ -820,10 +794,7 @@ def _emit_affine_materialize(state, op):
     attrs = target_ir.attrs_dict(op)
     result_id = _single_result(op)
     result_type = state.target_program.values[result_id].type
-    if (
-        result_type.element_type not in {"i32", "index"}
-        or result_type.representation not in {"simd", "simd_tuple"}
-    ):
+    if (result_type.element_type not in {"i32", "index"} or result_type.representation not in {"simd", "simd_tuple"}):
         fail(
             "TLXW_EMIT_AFFINE_EDGE",
             STAGE,
@@ -852,37 +823,36 @@ def _emit_affine_materialize(state, op):
             state.dsl.i32(),
             lane_width,
         )
-        state.values[result_id] = _pack_components(tuple(
-            _bounded_index_edge(
-                state,
-                _packet_source_offset_index_expr(
+        state.values[result_id] = _pack_components(
+            tuple(
+                _bounded_index_edge(
                     state,
-                    component,
-                    component_count,
-                    workitem,
-                    component_thread_count,
-                    packet_elements,
-                    shape,
-                    packet_order,
-                    attrs.get("terms", ()),
-                    scalar_values,
-                    op,
+                    _packet_source_offset_index_expr(
+                        state,
+                        component,
+                        component_count,
+                        workitem,
+                        component_thread_count,
+                        packet_elements,
+                        shape,
+                        packet_order,
+                        attrs.get("terms", ()),
+                        scalar_values,
+                        op,
+                        attrs.get("value_range"),
+                        attrs.get("scalar_component_sources", ()),
+                        coordinate_mode=attrs.get(
+                            "coordinate_mode",
+                            "ordered_linear",
+                        ),
+                        linear_component_bases=attrs.get(
+                            "linear_component_bases",
+                            (),
+                        ),
+                    ),
                     attrs.get("value_range"),
-                    attrs.get("scalar_component_sources", ()),
-                    coordinate_mode=attrs.get(
-                        "coordinate_mode",
-                        "ordered_linear",
-                    ),
-                    linear_component_bases=attrs.get(
-                        "linear_component_bases",
-                        (),
-                    ),
-                ),
-                attrs.get("value_range"),
-                op,
-            )
-            for component in range(component_count)
-        ))
+                    op,
+                ) for component in range(component_count)))
         return
     if mode != "layout_coordinates":
         fail(
@@ -893,13 +863,11 @@ def _emit_affine_materialize(state, op):
         )
     shape = tuple(int(dim) for dim in attrs.get("coordinate_shape", ()))
     component_bases = tuple(
-        tuple(int(component) for component in bases)
-        for bases in attrs.get("component_coordinate_bases", ())
-    )
+        tuple(int(component) for component in bases) for bases in attrs.get("component_coordinate_bases", ()))
     workitem_coefficients = tuple(
-        tuple(int(component) for component in coefficients)
-        for coefficients in attrs.get("workitem_coordinate_coefficients", ())
-    )
+        tuple(int(component)
+              for component in coefficients)
+        for coefficients in attrs.get("workitem_coordinate_coefficients", ()))
     if len(component_bases) != component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
@@ -909,9 +877,7 @@ def _emit_affine_materialize(state, op):
             target_op_id=op.target_op_id,
         )
     if any(len(bases) != len(shape) for bases in component_bases) or any(
-        len(coefficients) != len(shape)
-        for coefficients in workitem_coefficients
-    ):
+            len(coefficients) != len(shape) for coefficients in workitem_coefficients):
         fail(
             "TLXW_EMIT_BAD_COORDINATES",
             STAGE,
@@ -922,10 +888,7 @@ def _emit_affine_materialize(state, op):
     components = []
     if result_type.element_type == "index":
         workitem_symbol = state.dsl.sym("wi")
-        scalar_symbols = tuple(
-            state.dsl.sym(f"s{index}")
-            for index in range(len(scalar_values))
-        )
+        scalar_symbols = tuple(state.dsl.sym(f"s{index}") for index in range(len(scalar_values)))
         scalar_component_sources = attrs.get("scalar_component_sources", ())
         for component, component_base in enumerate(component_bases):
             coords = tuple(
@@ -933,13 +896,8 @@ def _emit_affine_materialize(state, op):
                     state,
                     workitem_symbol,
                     int(base),
-                    tuple(
-                        coefficients[dim]
-                        for coefficients in workitem_coefficients
-                    ),
-                )
-                for dim, base in enumerate(component_base)
-            )
+                    tuple(coefficients[dim] for coefficients in workitem_coefficients),
+                ) for dim, base in enumerate(component_base))
             expr = _affine_offset_expr(
                 state,
                 attrs.get("terms", ()),
@@ -949,7 +907,8 @@ def _emit_affine_materialize(state, op):
             )
             bindings = {workitem_symbol: workitem}
             bindings.update({
-                symbol: _mapped_affine_component_binding_value(
+                symbol:
+                _mapped_affine_component_binding_value(
                     state,
                     value,
                     scalar_component_sources,
@@ -958,9 +917,7 @@ def _emit_affine_materialize(state, op):
                     component,
                     op,
                 )
-                for scalar_index, (symbol, value) in enumerate(
-                    zip(scalar_symbols, scalar_values)
-                )
+                for scalar_index, (symbol, value) in enumerate(zip(scalar_symbols, scalar_values))
             })
             index_value = state.builder.index_expr(
                 expr,
@@ -978,30 +935,35 @@ def _emit_affine_materialize(state, op):
             ))
         state.values[result_id] = _pack_components(tuple(components))
         return
-    for component_base in component_bases:
+    scalar_component_sources = attrs.get("scalar_component_sources", ())
+    for component, component_base in enumerate(component_bases):
         coords = tuple(
             _bit_linear_thread_coordinate(
                 state,
                 workitem,
                 int(base),
-                tuple(
-                    coefficients[dim]
-                    for coefficients in workitem_coefficients
-                ),
+                tuple(coefficients[dim] for coefficients in workitem_coefficients),
                 lane_width,
-            )
-            for dim, base in enumerate(component_base)
-        )
+            ) for dim, base in enumerate(component_base))
+        component_scalar_values = tuple(
+            _mapped_affine_component_binding_value(
+                state,
+                value,
+                scalar_component_sources,
+                scalar_index,
+                component_count,
+                component,
+                op,
+            ) for scalar_index, value in enumerate(scalar_values))
         components.append(
             _affine_offset_value(
                 state,
                 attrs.get("terms", ()),
                 coords,
-                scalar_values,
+                component_scalar_values,
                 op,
                 no_signed_wrap=bool(attrs.get("no_signed_wrap", False)),
-            )
-        )
+            ))
     state.values[result_id] = _pack_components(tuple(components))
 
 
@@ -1026,11 +988,8 @@ def _emit_type_convert(state, op):
                 )
             else:
                 cast_type = result_element_type
-            components.append(
-                component
-                if str(component.type) == str(cast_type)
-                else state.builder.index_cast(component, cast_type)
-            )
+            components.append(component if str(component.type) ==
+                              str(cast_type) else state.builder.index_cast(component, cast_type))
         state.values[result_id] = _pack_components(tuple(components))
         return
     if mode == "bounded_i32_to_index":
@@ -1048,35 +1007,25 @@ def _emit_type_convert(state, op):
             symbol,
             attrs.get("value_range"),
         )
-        state.values[result_id] = _pack_components(tuple(
-            _bounded_index_edge(
-                state,
-                state.builder.index_expr(
-                    symbol,
-                    bindings={symbol: component},
-                    assumptions=assumptions,
-                ),
-                attrs.get("value_range"),
-                op,
-            )
-            for component in source_components
-        ))
+        state.values[result_id] = _pack_components(
+            tuple(
+                _bounded_index_edge(
+                    state,
+                    state.builder.index_expr(
+                        symbol,
+                        bindings={symbol: component},
+                        assumptions=assumptions,
+                    ),
+                    attrs.get("value_range"),
+                    op,
+                ) for component in source_components))
         return
     if mode == "component_remap":
         mask_payload = source if isinstance(source, _I32MaskPayload) else None
-        source_components = (
-            tuple(mask_payload.components)
-            if mask_payload is not None
-            else _as_components(source)
-        )
-        component_sources = tuple(
-            int(component)
-            for component in attrs.get("component_sources", ())
-        )
-        if not component_sources or any(
-            component < 0 or component >= len(source_components)
-            for component in component_sources
-        ):
+        source_components = (tuple(mask_payload.components) if mask_payload is not None else _as_components(source))
+        component_sources = tuple(int(component) for component in attrs.get("component_sources", ()))
+        if not component_sources or any(component < 0 or component >= len(source_components)
+                                        for component in component_sources):
             fail(
                 "TLXW_EMIT_TYPE_CONVERT",
                 STAGE,
@@ -1091,19 +1040,10 @@ def _emit_type_convert(state, op):
                 "component remap does not match its result type",
                 target_op_id=op.target_op_id,
             )
-        remapped_components = tuple(
-            source_components[component]
-            for component in component_sources
-        )
+        remapped_components = tuple(source_components[component] for component in component_sources)
         if mask_payload is not None:
-            remapped_predicates = (
-                None
-                if mask_payload.predicates is None
-                else tuple(
-                    mask_payload.predicates[component]
-                    for component in component_sources
-                )
-            )
+            remapped_predicates = (None if mask_payload.predicates is None else tuple(
+                mask_payload.predicates[component] for component in component_sources))
             state.values[result_id] = _I32MaskPayload(
                 remapped_components,
                 predicates=remapped_predicates,
@@ -1154,9 +1094,7 @@ def _emit_type_convert(state, op):
                         result_type,
                         packet,
                         element,
-                    ).result
-                    for element in range(packet_width)
-                )
+                    ).result for element in range(packet_width))
             components.extend(known_elements)
         state.values[result_id] = _pack_components(tuple(components))
         return
@@ -1180,12 +1118,8 @@ def _emit_type_convert(state, op):
         packets = tuple(
             state.dsl.wave.PackOp(
                 packet_type,
-                components[
-                    packet * packet_width:(packet + 1) * packet_width
-                ],
-            ).result
-            for packet in range(packet_count)
-        )
+                components[packet * packet_width:(packet + 1) * packet_width],
+            ).result for packet in range(packet_count))
         state.values[result_id] = _pack_components(packets)
         return
     fail(
@@ -1258,6 +1192,20 @@ def _materialize_fact_ids(state, op):
                 fact_id=fact_id,
             )
         value = _require_value(state, target_value_id, op)
+        if fact.kind == "divisible":
+            if fact.divisor is None or int(fact.divisor) <= 1:
+                fail(
+                    "TLXW_EMIT_INVALID_DIVISIBILITY_FACT",
+                    STAGE,
+                    "divisibility fact requires a divisor greater than one",
+                    target_op_id=op.target_op_id,
+                    fact_id=fact_id,
+                )
+            state.values[target_value_id] = state.builder.assume_divisible(
+                value,
+                int(fact.divisor),
+            )
+            continue
         assumptions = _range_assumptions(state.dsl, fact)
         if assumptions:
             state.values[target_value_id] = state.builder.assume(
@@ -1579,9 +1527,7 @@ def _emit_splat(state, op):
         # and then be reused by another.  The durable 0/1 payload also lets all
         # memory consumers reconstruct the same explicit Wave execution mask.
         payload = _mask_to_i32_payload(state, operand, lane_width)
-        state.values[result_id] = _I32MaskPayload(
-            tuple(payload for _ in range(_component_count(state, result_id)))
-        )
+        state.values[result_id] = _I32MaskPayload(tuple(payload for _ in range(_component_count(state, result_id))))
         return
     splat = state.builder.splat(
         operand,
@@ -1624,8 +1570,8 @@ def _emit_broadcast(state, op):
                     target_op_id=op.target_op_id,
                     target_value_id=result_id,
                 )
-            predicates = (None if source_predicates is None else tuple(
-                source_predicates[source] for source in component_sources))
+            predicates = (None if source_predicates is None else tuple(source_predicates[source]
+                                                                       for source in component_sources))
             state.values[result_id] = _I32MaskPayload(
                 tuple(source_components[source] for source in component_sources),
                 predicates=predicates,
@@ -1644,8 +1590,7 @@ def _emit_broadcast(state, op):
                 target_value_id=result_id,
             )
         repeat = target_count // len(source_components)
-        predicates = (None if source_predicates is None else tuple(predicate
-                                                                   for source_predicate in source_predicates
+        predicates = (None if source_predicates is None else tuple(predicate for source_predicate in source_predicates
                                                                    for predicate in (source_predicate, ) * repeat))
         state.values[result_id] = _I32MaskPayload(
             tuple(component for source_component in source_components for component in (source_component, ) * repeat),
@@ -1742,9 +1687,7 @@ def _emit_broadcast_register_payload(state, op, source_components, attrs):
                 source_slots.append(component)
                 continue
             if int(payload[0]) == 1:
-                source_slots.append(
-                    state.dsl.wave.ExtractOp(scalar_type, component, 0).result
-                )
+                source_slots.append(state.dsl.wave.ExtractOp(scalar_type, component, 0).result)
                 continue
         elif payload is not None and int(payload[0]) == source_registers:
             source_slots.extend(
@@ -1752,9 +1695,7 @@ def _emit_broadcast_register_payload(state, op, source_components, attrs):
                     scalar_type,
                     component,
                     register,
-                ).result
-                for register in range(source_registers)
-            )
+                ).result for register in range(source_registers))
             continue
         fail(
             "TLXW_EMIT_UNSUPPORTED_BROADCAST",
@@ -1763,9 +1704,7 @@ def _emit_broadcast_register_payload(state, op, source_components, attrs):
             target_op_id=op.target_op_id,
             target_value_id=result_id,
         )
-    source_map = tuple(
-        int(source) for source in attrs["register_payload_source_slots"]
-    )
+    source_map = tuple(int(source) for source in attrs["register_payload_source_slots"])
     if any(source < 0 or source >= len(source_slots) for source in source_map):
         fail(
             "TLXW_EMIT_UNSUPPORTED_BROADCAST",
@@ -1786,10 +1725,7 @@ def _emit_broadcast_register_payload(state, op, source_components, attrs):
     components = []
     for component in range(result_component_count):
         first = component * result_registers
-        values = tuple(
-            source_slots[source]
-            for source in source_map[first:first + result_registers]
-        )
+        values = tuple(source_slots[source] for source in source_map[first:first + result_registers])
         if result_registers == 1:
             components.append(values[0])
             continue
@@ -1797,9 +1733,7 @@ def _emit_broadcast_register_payload(state, op, source_components, attrs):
             state.dsl.vector_type(result_registers, element_type),
             lane_width,
         )
-        components.append(
-            state.dsl.wave.PackOp(payload_type, values).result
-        )
+        components.append(state.dsl.wave.PackOp(payload_type, values).result)
     return _pack_components(tuple(components))
 
 
@@ -1982,12 +1916,8 @@ def _local_dma_component_issue_delay_options(state, op, component):
     group_id = int(target_ir.attrs_dict(op).get("async_group_id", -1))
     if group_id < 0:
         return {}
-    commits = tuple(
-        candidate
-        for candidate in state.target_program.ops
-        if candidate.kind == "async_commit_group"
-        and int(target_ir.attrs_dict(candidate).get("group_id", -1)) == group_id
-    )
+    commits = tuple(candidate for candidate in state.target_program.ops if candidate.kind == "async_commit_group"
+                    and int(target_ir.attrs_dict(candidate).get("group_id", -1)) == group_id)
     if not commits:
         return {}
     if len(commits) != 1:
@@ -2025,19 +1955,17 @@ def _local_dma_component_issue_delay_options(state, op, component):
 
 
 def _local_memory_access_dependency_token(
-    state,
-    target_value_id,
-    access_kind,
-    extra_tokens=(),
-    *,
-    ignore_async_writes=False,
-    ready_async_write_roots=(),
+        state,
+        target_value_id,
+        access_kind,
+        extra_tokens=(),
+        *,
+        ignore_async_writes=False,
+        ready_async_write_roots=(),
 ):
     roots = _local_memory_roots(state, target_value_id)
     dependency_roots = _local_memory_dependency_roots(state, roots)
-    ready_async_write_roots = frozenset(
-        int(root) for root in ready_async_write_roots
-    )
+    ready_async_write_roots = frozenset(int(root) for root in ready_async_write_roots)
     tokens = []
     barrier_roots = []
     token_roots = []
@@ -2046,13 +1974,8 @@ def _local_memory_access_dependency_token(
         if token is None:
             continue
         pending = state.local_memory_pending_accesses.get(root)
-        if (
-            _local_memory_access_includes(pending, "async_write")
-            and (
-                bool(ignore_async_writes)
-                or int(root) in ready_async_write_roots
-            )
-        ):
+        if (_local_memory_access_includes(pending, "async_write")
+                and (bool(ignore_async_writes) or int(root) in ready_async_write_roots)):
             continue
         if pending == "read" and access_kind == "read":
             continue
@@ -2083,9 +2006,7 @@ def _local_load_ready_async_write_roots(state, op, attrs):
     LDS hazards remain in the ordinary access state and are still honored.
     """
     readiness_count = int(attrs.get("readiness_dependency_count", 0))
-    barrier_order_count = int(
-        attrs.get("barrier_order_dependency_count", 0)
-    )
+    barrier_order_count = int(attrs.get("barrier_order_dependency_count", 0))
     dependency_ids = tuple(int(target_id) for target_id in op.operands[1:])
     if barrier_order_count:
         dependency_ids = dependency_ids[:-barrier_order_count]
@@ -2108,11 +2029,8 @@ def _local_load_ready_async_write_roots(state, op, attrs):
 def _local_memory_access_needs_barrier(pending_access, access_kind):
     if _local_memory_access_includes(pending_access, "mma_read"):
         return False
-    return (
-        _local_memory_access_includes(pending_access, "write")
-        or _local_memory_access_includes(pending_access, "async_write")
-        or access_kind in {"write", "async_write"}
-    )
+    return (_local_memory_access_includes(pending_access, "write")
+            or _local_memory_access_includes(pending_access, "async_write") or access_kind in {"write", "async_write"})
 
 
 def _local_memory_access_includes(access_kind, expected_kind):
@@ -2142,10 +2060,11 @@ def _emit_cta_barrier(state, *tokens, boundary_ids=()):
     limits reuse to barriers that dominate the later operation.
     """
     barrier_token = state.builder.barrier(*tokens)
-    materialized_boundary_ids = tuple(dict.fromkeys((
-        *(int(boundary_id) for boundary_id in boundary_ids),
-        *(int(boundary_id) for boundary_id in state.pending_mma_read_boundaries.values()),
-    )))
+    materialized_boundary_ids = tuple(
+        dict.fromkeys((
+            *(int(boundary_id) for boundary_id in boundary_ids),
+            *(int(boundary_id) for boundary_id in state.pending_mma_read_boundaries.values()),
+        )))
     for boundary_id in materialized_boundary_ids:
         state.materialized_mma_read_boundaries.setdefault(boundary_id, barrier_token)
     return barrier_token
@@ -2210,10 +2129,8 @@ def _materialize_mma_read_reuse_dependencies(state, tokens, boundary_ids):
         for boundary_id in boundary_ids
         if boundary_id in state.materialized_mma_read_boundaries
     ]
-    missing_boundary_ids = tuple(
-        boundary_id for boundary_id in boundary_ids
-        if boundary_id not in state.materialized_mma_read_boundaries
-    )
+    missing_boundary_ids = tuple(boundary_id for boundary_id in boundary_ids
+                                 if boundary_id not in state.materialized_mma_read_boundaries)
     if missing_boundary_ids or (tokens and _kernel_has_multiple_waves(state)):
         barrier_tokens.append(_emit_cta_barrier(
             state,
@@ -2233,17 +2150,12 @@ def _emit_sched_barrier(state, op):
     attrs = target_ir.attrs_dict(op)
     mask = int(attrs.get("mask", 0))
     state.builder.sched_barrier()
-    if (
-        attrs.get("border") != "mfma"
-        or mask != 0
-        or not _kernel_has_multiple_waves(state)
-    ):
+    if (attrs.get("border") != "mfma" or mask != 0 or not _kernel_has_multiple_waves(state)):
         return
     roots = tuple(
         int(root)
         for root, access_kind in sorted(state.local_memory_pending_accesses.items())
-        if _local_memory_access_includes(access_kind, "mma_read") and int(root) in state.local_memory_tokens
-    )
+        if _local_memory_access_includes(access_kind, "mma_read") and int(root) in state.local_memory_tokens)
     if not roots:
         return
     boundary_id = state.next_mma_read_boundary_id
@@ -2276,10 +2188,7 @@ def _emit_set_priority(state, op):
 
 
 def _emit_barrier(state, op):
-    tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in op.operands
-    )
+    tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands)
     barrier_token = _emit_cta_barrier(state, *tokens)
     if op.results:
         state.values[_single_result(op)] = barrier_token
@@ -2323,40 +2232,26 @@ def _sync_pending_local_memory_accesses(state, extra_tokens=(), roots=None):
         roots_to_sync = tuple(int(root) for root in sorted(state.local_memory_pending_accesses))
     else:
         roots_to_sync = tuple(int(root) for root in sorted({int(root) for root in roots}))
-    sync_roots = tuple(
-        int(root) for root in roots_to_sync
-        if root in state.local_memory_tokens)
+    sync_roots = tuple(int(root) for root in roots_to_sync if root in state.local_memory_tokens)
     read_roots = tuple(
-        int(root) for root in roots_to_sync
-        if (
-            _local_memory_access_includes(
-                state.local_memory_pending_accesses.get(int(root)),
-                "read",
-            )
-            or _local_memory_access_includes(
-                state.local_memory_pending_accesses.get(int(root)),
-                "mma_read",
-            )
-        )
-    )
+        int(root) for root in roots_to_sync if (_local_memory_access_includes(
+            state.local_memory_pending_accesses.get(int(root)),
+            "read",
+        ) or _local_memory_access_includes(
+            state.local_memory_pending_accesses.get(int(root)),
+            "mma_read",
+        )))
     read_tokens, boundary_ids = _take_local_memory_read_frontier(
         state,
         read_roots,
     )
-    state_tokens = tuple(
-        state.local_memory_tokens[root]
-        for root in sync_roots
-        if (
-            _local_memory_access_includes(
-                state.local_memory_pending_accesses.get(int(root)),
-                "write",
-            )
-            or _local_memory_access_includes(
-                state.local_memory_pending_accesses.get(int(root)),
-                "async_write",
-            )
-        )
-    )
+    state_tokens = tuple(state.local_memory_tokens[root] for root in sync_roots if (_local_memory_access_includes(
+        state.local_memory_pending_accesses.get(int(root)),
+        "write",
+    ) or _local_memory_access_includes(
+        state.local_memory_pending_accesses.get(int(root)),
+        "async_write",
+    )))
     tokens = _unique_tokens((*state_tokens, *read_tokens, *tuple(extra_tokens)))
     if not tokens and not boundary_ids:
         if roots is None:
@@ -2443,13 +2338,11 @@ def _set_local_memory_access_token(
         # Keep their completion tokens solely in local_memory_read_tokens so
         # independent reads remain siblings of the same write/wait frontier.
         # A later overwrite consumes that separate read frontier.
-        stored_token = (
-            previous_token
-            if access_kind in {"read", "mma_read"} and previous_token is not None
-            else token
-        )
+        stored_token = (previous_token if access_kind in {"read", "mma_read"} and previous_token is not None else token)
         state.local_memory_tokens[root] = stored_token
         state.local_memory_pending_accesses[root] = _merge_local_memory_pending_access(pending, access_kind)
+
+
 def _record_local_memory_access_token(state, roots, token):
     for dependency_root in _local_memory_dependency_roots(state, roots):
         dependency_root = int(dependency_root)
@@ -2462,12 +2355,13 @@ def _record_local_memory_access_token(state, roots, token):
 
 
 def _local_memory_allocation_roots(state, roots):
-    return tuple(sorted({
-        int(dependency_root)
-        for root in roots
-        for dependency_root in _local_memory_dependency_roots(state, (root, ))
-        if int(dependency_root) in state.local_memory_allocations
-    }))
+    return tuple(
+        sorted({
+            int(dependency_root)
+            for root in roots
+            for dependency_root in _local_memory_dependency_roots(state, (root, ))
+            if int(dependency_root) in state.local_memory_allocations
+        }))
 
 
 def _record_local_memory_read_token(state, roots, token):
@@ -2504,24 +2398,17 @@ def _take_local_memory_read_frontier(state, roots):
 def _local_memory_allocation_read_dependency(state, root):
     return _join_memory_tokens(
         state,
-        tuple(
-            token
-            for dependency_root in sorted(
-                _local_memory_dependency_roots(state, (int(root), )))
-            for token in state.local_memory_read_tokens.get(int(dependency_root), ())
-        ),
+        tuple(token for dependency_root in sorted(_local_memory_dependency_roots(state, (int(root), )))
+              for token in state.local_memory_read_tokens.get(int(dependency_root), ())),
     )
 
 
 def _local_memory_allocation_access_dependency(state, root):
     root = int(root)
     tokens = list(state.local_memory_access_tokens.get(root, ()))
-    tokens.extend(
-        state.local_memory_tokens[dependency_root]
-        for dependency_root in sorted(
-            _local_memory_dependency_roots(state, (root, )))
-        if dependency_root in state.local_memory_tokens
-    )
+    tokens.extend(state.local_memory_tokens[dependency_root]
+                  for dependency_root in sorted(_local_memory_dependency_roots(state, (root, )))
+                  if dependency_root in state.local_memory_tokens)
     return _join_memory_tokens(state, tokens)
 
 
@@ -2595,10 +2482,8 @@ def _local_memory_dependency_roots(state, roots):
 
 
 def _circular_local_memory_regions_disjoint(lhs, rhs):
-    return (int(lhs.base_root) == int(rhs.base_root)
-            and int(lhs.index_base_target_id) == int(rhs.index_base_target_id)
-            and int(lhs.slot_count) == int(rhs.slot_count)
-            and int(lhs.slot_stride_bytes) == int(rhs.slot_stride_bytes)
+    return (int(lhs.base_root) == int(rhs.base_root) and int(lhs.index_base_target_id) == int(rhs.index_base_target_id)
+            and int(lhs.slot_count) == int(rhs.slot_count) and int(lhs.slot_stride_bytes) == int(rhs.slot_stride_bytes)
             and int(lhs.phase) != int(rhs.phase))
 
 
@@ -2607,9 +2492,7 @@ def _is_aggregate_local_memory_root(state, root):
     if root in state.static_local_memory_root_intervals:
         return False
     return any(
-        int(base_root) == root
-        for base_root, _offset, _size in state.static_local_memory_root_intervals.values()
-    )
+        int(base_root) == root for base_root, _offset, _size in state.static_local_memory_root_intervals.values())
 
 
 def _is_static_descendant_local_memory_root(state, root, candidate):
@@ -2741,11 +2624,7 @@ def _circular_index_phase(state, target_value_id, slot_count, seen=None):
     # arithmetic no-wrap flag because remui proves that the subtrahend is 0 or
     # 1.  Recognizing the identity keeps double-buffer reads and refills in
     # distinct structural alias classes.
-    if (
-        operation == "subi"
-        and slot_count == 2
-        and _target_constant_int(state, lhs) == 1
-    ):
+    if (operation == "subi" and slot_count == 2 and _target_constant_int(state, lhs) == 1):
         nested = _circular_index_phase(state, rhs, slot_count, seen)
         if nested is None:
             return None
@@ -2781,8 +2660,7 @@ def _memdesc_index_result_roots(state, source_roots, attrs, index_target_id=None
             byte_size,
         )
     slot_count = attrs.get("slot_count")
-    if (index_target_id is None or element_byte_width is None
-            or elements_per_slot is None or slot_count is None):
+    if (index_target_id is None or element_byte_width is None or elements_per_slot is None or slot_count is None):
         return frozenset(int(root) for root in source_roots)
     slot_stride_bytes = int(element_byte_width) * int(elements_per_slot)
     circular_index = _circular_index_phase(state, index_target_id, slot_count)
@@ -2804,11 +2682,11 @@ def _record_token_local_memory_roots(state, token_target_id, memdesc_target_id):
 
 
 def _propagate_token_local_memory_roots(
-    state,
-    source_token_id,
-    result_token_id,
-    *,
-    preserved_local_memory_roots=(),
+        state,
+        source_token_id,
+        result_token_id,
+        *,
+        preserved_local_memory_roots=(),
 ):
     roots = state.token_local_memory_root_sets.get(int(source_token_id))
     if not roots:
@@ -2883,10 +2761,8 @@ def _local_memory_roots_touched_by_region(state, region_id, *, include_root_sets
                 continue
             if current_op.kind in {"local_load", "local_load_mma_payload"}:
                 current_attrs = target_ir.attrs_dict(current_op)
-                if (
-                    bool(current_attrs.get("protocol_tracked", False))
-                    and bool(current_attrs.get("synced_via_async_wait", False))
-                ):
+                if (bool(current_attrs.get("protocol_tracked", False))
+                        and bool(current_attrs.get("synced_via_async_wait", False))):
                     # Its completion is an explicit target result carried by
                     # SCF.  Do not synthesize a duplicate emitter-only read
                     # frontier for the same access.
@@ -2894,11 +2770,7 @@ def _local_memory_roots_touched_by_region(state, region_id, *, include_root_sets
                 roots = roots_for(current_op.operands[0])
                 touched_roots.update(roots)
                 read_roots.update(roots)
-                access_kind = (
-                    "mma_read"
-                    if current_op.kind == "local_load_mma_payload"
-                    else "read"
-                )
+                access_kind = ("mma_read" if current_op.kind == "local_load_mma_payload" else "read")
                 record_implicit_access(roots, access_kind)
             elif current_op.kind == "local_store":
                 roots = roots_for(current_op.operands[1])
@@ -2917,10 +2789,9 @@ def _local_memory_roots_touched_by_region(state, region_id, *, include_root_sets
                 visit_region(nested_region_id)
 
     visit_region(region_id)
-    result = (frozenset(touched_roots), {
-        int(root): access_kind
-        for root, access_kind in implicit_root_accesses.items()
-    })
+    result = (frozenset(touched_roots),
+              {int(root): access_kind
+               for root, access_kind in implicit_root_accesses.items()})
     if include_root_sets:
         return (*result, root_sets, frozenset(read_roots))
     return result
@@ -2967,9 +2838,7 @@ def _target_token_local_memory_roots(
             roots.update(operand_roots)
         return frozenset(roots)
     if op.kind == "async_wait":
-        completed_count = int(
-            target_ir.attrs_dict(op)["completed_group_dependency_count"]
-        )
+        completed_count = int(target_ir.attrs_dict(op)["completed_group_dependency_count"])
         roots = set()
         for operand in op.operands[:completed_count]:
             operand_roots = _target_token_local_memory_roots(
@@ -3026,13 +2895,8 @@ def _loop_carried_token_roots(
     # loop.  Dropping this identity made an explicit async group lose its LDS
     # destination at the block boundary and forced later loads onto a redundant
     # bridge-owned state token.
-    if (
-        init_roots == yield_roots
-        and all(
-            int(root) not in state.circular_local_memory_root_regions
-            for root in init_roots
-        )
-    ):
+    if (init_roots == yield_roots
+            and all(int(root) not in state.circular_local_memory_root_regions for root in init_roots)):
         return init_roots
     lower = _target_constant_int(state, lower_target_id)
     step = _target_constant_int(state, step_target_id)
@@ -3047,14 +2911,15 @@ def _loop_carried_token_roots(
             continue
         if int(circular.index_base_target_id) != int(induction_target_id):
             return None
-        carried_roots.extend(_circular_local_memory_roots(
-            state,
-            (int(circular.base_root), ),
-            induction_target_id,
-            (int(circular.phase) - int(step)) % int(circular.slot_count),
-            int(circular.slot_count),
-            int(circular.slot_stride_bytes),
-        ))
+        carried_roots.extend(
+            _circular_local_memory_roots(
+                state,
+                (int(circular.base_root), ),
+                induction_target_id,
+                (int(circular.phase) - int(step)) % int(circular.slot_count),
+                int(circular.slot_count),
+                int(circular.slot_stride_bytes),
+            ))
     carried_roots = frozenset(carried_roots)
     init_intervals = {
         _local_memory_root_interval_at_loop_iteration(
@@ -3104,12 +2969,13 @@ def _loop_exit_token_roots(
         if int(circular.index_base_target_id) != int(induction_target_id):
             return yield_roots
         slot = (last_induction + int(circular.phase)) % int(circular.slot_count)
-        exit_roots.extend(_static_local_memory_roots(
-            state,
-            (int(circular.base_root), ),
-            slot * int(circular.slot_stride_bytes),
-            int(circular.slot_stride_bytes),
-        ))
+        exit_roots.extend(
+            _static_local_memory_roots(
+                state,
+                (int(circular.base_root), ),
+                slot * int(circular.slot_stride_bytes),
+                int(circular.slot_stride_bytes),
+            ))
     return frozenset(exit_roots)
 
 
@@ -3118,10 +2984,10 @@ def _loop_token_root_sets(state, op, region, region_root_sets):
     result_root_sets = {}
     induction_target_id = int(region.block_arg_ids[0])
     for init_id, block_arg_id, yield_id, result_id in zip(
-        op.operands[3:],
-        region.block_arg_ids[1:],
-        region.yield_value_ids,
-        op.results,
+            op.operands[3:],
+            region.block_arg_ids[1:],
+            region.yield_value_ids,
+            op.results,
     ):
         target_type = state.target_program.values[int(init_id)].type
         if target_type.representation != "token":
@@ -3181,7 +3047,8 @@ def _loop_local_memory_state_carry_required(
     directly_synchronized_roots = set()
     token_root_sets = dict(state.token_local_memory_root_sets)
     token_root_sets.update({
-        int(target_id): frozenset(int(root) for root in roots)
+        int(target_id): frozenset(int(root)
+                                  for root in roots)
         for target_id, roots in loop_token_block_root_sets.items()
     })
 
@@ -3200,10 +3067,7 @@ def _loop_local_memory_state_carry_required(
             dependencies = _local_memory_dependency_roots(state, (int(root), ))
             if not candidate_roots.isdisjoint(dependencies):
                 return True
-            if any(
-                int(root) in _local_memory_dependency_roots(state, (candidate, ))
-                for candidate in candidate_roots
-            ):
+            if any(int(root) in _local_memory_dependency_roots(state, (candidate, )) for candidate in candidate_roots):
                 return True
         return False
 
@@ -3251,9 +3115,7 @@ def _loop_local_memory_state_carry_required(
                 waited_roots.update(int(root) for root in operand_roots)
             if complete and waited_roots:
                 directly_synchronized_roots.update(waited_roots)
-                synchronized_roots.update(
-                    _local_memory_dependency_roots(state, waited_roots)
-                )
+                synchronized_roots.update(_local_memory_dependency_roots(state, waited_roots))
             continue
         if current_op.kind == "barrier":
             directly_synchronized_roots.update(candidate_roots)
@@ -3277,10 +3139,8 @@ def _loop_local_memory_state_carry_required(
         synchronous_access = False
         if current_op.kind in {"local_load", "local_load_mma_payload"}:
             current_attrs = target_ir.attrs_dict(current_op)
-            if (
-                bool(current_attrs.get("protocol_tracked", False))
-                and bool(current_attrs.get("synced_via_async_wait", False))
-            ):
+            if (bool(current_attrs.get("protocol_tracked", False))
+                    and bool(current_attrs.get("synced_via_async_wait", False))):
                 continue
             access_roots = roots_for(current_op.operands[0])
             synchronous_access = True
@@ -3295,11 +3155,7 @@ def _loop_local_memory_state_carry_required(
                 # DMA issues never depend on earlier async DMA completion, but
                 # they still cannot bypass a synchronous writer to the same LDS.
                 synchronous_access = True
-        if (
-            synchronous_access
-            and aliases_candidates(access_roots)
-            and not is_synchronized(access_roots)
-        ):
+        if (synchronous_access and aliases_candidates(access_roots) and not is_synchronized(access_roots)):
             return True
     return False
 
@@ -3311,29 +3167,19 @@ def _loop_local_memory_history_roots(state, loop_op, allocation_roots):
         return ()
     loop_source_index = loop_op.source_op_index
     release_roots = set()
-    top_level_op_ids = frozenset(
-        int(op_id) for op_id in state.target_program.regions[0].op_ids
-    )
+    top_level_op_ids = frozenset(int(op_id) for op_id in state.target_program.regions[0].op_ids)
     for candidate in state.target_program.ops:
         if int(candidate.target_op_id) not in top_level_op_ids:
             continue
         attrs = target_ir.attrs_dict(candidate)
-        if (
-            candidate.kind != "layout_convert"
-            or attrs.get("mode") != "redistribute"
-            or not bool(attrs.get("cross_wave", False))
-        ):
+        if (candidate.kind != "layout_convert" or attrs.get("mode") != "redistribute"
+                or not bool(attrs.get("cross_wave", False))):
             continue
         candidate_source_index = candidate.source_op_index
-        is_future = (
-            loop_source_index is None
-            or candidate_source_index is None
-            or int(candidate_source_index) > int(loop_source_index)
-            or (
-                int(candidate_source_index) == int(loop_source_index)
-                and int(candidate.target_op_id) > int(loop_op.target_op_id)
-            )
-        )
+        is_future = (loop_source_index is None or candidate_source_index is None
+                     or int(candidate_source_index) > int(loop_source_index)
+                     or (int(candidate_source_index) == int(loop_source_index)
+                         and int(candidate.target_op_id) > int(loop_op.target_op_id)))
         if not is_future:
             continue
         for root in allocation_roots:
@@ -3352,11 +3198,8 @@ def _carried_local_memory_pending_access(state, root, implicit_root_accesses, ou
         # Aggregate roots represent dynamic LDS indices. Access emission already
         # expands them to the precise static aliases, so carrying descendant
         # pending state on the aggregate as well only adds redundant token deps.
-        if (
-            dep_root != root
-            and _is_aggregate_local_memory_root(state, root)
-            and _is_static_descendant_local_memory_root(state, root, dep_root)
-        ):
+        if (dep_root != root and _is_aggregate_local_memory_root(state, root)
+                and _is_static_descendant_local_memory_root(state, root, dep_root)):
             continue
         pending = _merge_local_memory_pending_access(
             pending,
@@ -3384,10 +3227,8 @@ def _region_uses_scratch_memory(state, region_id):
             current_op = state.target_program.ops[int(op_id)]
             if current_op.kind == "layout_convert":
                 attrs = target_ir.attrs_dict(current_op)
-                if (
-                    attrs.get("mode") in _SCRATCH_LAYOUT_CONVERT_MODES
-                    and int(attrs.get("scratch_allocation_bytes", 0)) > 0
-                ):
+                if (attrs.get("mode") in _SCRATCH_LAYOUT_CONVERT_MODES
+                        and int(attrs.get("scratch_allocation_bytes", 0)) > 0):
                     return True
             if any(visit(nested_region_id) for nested_region_id in current_op.region_ids):
                 return True
@@ -3487,16 +3328,10 @@ def _emit_select(state, op):
         count,
         op,
     )
-    condition_payloads = (
-        tuple(condition.components)
-        if isinstance(condition, _I32MaskPayload) and condition.predicates is None
-        else None
-    )
-    raw_cond_components = (
-        condition_payloads
-        if condition_payloads is not None
-        else _mask_predicate_components(state, condition, lane_width)
-    )
+    condition_payloads = (tuple(condition.components)
+                          if isinstance(condition, _I32MaskPayload) and condition.predicates is None else None)
+    raw_cond_components = (condition_payloads if condition_payloads is not None else _mask_predicate_components(
+        state, condition, lane_width))
     expanded = _select_vector_payload_components(
         state,
         raw_cond_components,
@@ -3510,9 +3345,7 @@ def _emit_select(state, op):
         return
     if condition_payloads is not None:
         raw_cond_components = tuple(
-            _i32_payload_to_mask(state, component, lane_width)
-            for component in condition_payloads
-        )
+            _i32_payload_to_mask(state, component, lane_width) for component in condition_payloads)
     cond_components = _broadcast_component_count(
         raw_cond_components,
         count,
@@ -3557,19 +3390,16 @@ def _select_vector_payload_components(
     conditions = tuple(conditions)
     true_components = tuple(true_components)
     false_components = tuple(false_components)
-    payloads = tuple(
-        _simd_1d_vector_payload(state, component)
-        for component in true_components
-    )
+    payloads = tuple(_simd_1d_vector_payload(state, component) for component in true_components)
     if any(payload is None for payload in payloads):
         return None
     widths = tuple(int(payload[0]) for payload in payloads)
     if len(conditions) != sum(widths) or len(conditions) == len(true_components):
         return None
     for true_component, false_component, payload in zip(
-        true_components,
-        false_components,
-        payloads,
+            true_components,
+            false_components,
+            payloads,
     ):
         if str(true_component.type) != str(false_component.type):
             return None
@@ -3580,10 +3410,10 @@ def _select_vector_payload_components(
     results = []
     cursor = 0
     for true_component, false_component, payload, width in zip(
-        true_components,
-        false_components,
-        payloads,
-        widths,
+            true_components,
+            false_components,
+            payloads,
+            widths,
     ):
         _width, element_type, lane_width = payload
         scalar_type = state.dsl.simd_type(element_type, int(lane_width))
@@ -3598,9 +3428,7 @@ def _select_vector_payload_components(
                     scalar_type,
                     true_component,
                     element,
-                ).result
-                for element in range(width)
-            )
+                ).result for element in range(width))
         false_elements = _packed_vector_payload_elements(
             false_component,
             scalar_type,
@@ -3612,14 +3440,12 @@ def _select_vector_payload_components(
                     scalar_type,
                     false_component,
                     element,
-                ).result
-                for element in range(width)
-            )
+                ).result for element in range(width))
         selected = []
         for condition, true_element, false_element in zip(
-            conditions[cursor:cursor + width],
-            true_elements,
-            false_elements,
+                conditions[cursor:cursor + width],
+                true_elements,
+                false_elements,
         ):
             if condition_payloads:
                 condition = _i32_payload_to_mask(
@@ -3627,12 +3453,8 @@ def _select_vector_payload_components(
                     condition,
                     int(lane_width),
                 )
-            selected.append(
-                state.builder.select(condition, true_element, false_element)
-            )
-        results.append(
-            state.dsl.wave.PackOp(true_component.type, selected).result
-        )
+            selected.append(state.builder.select(condition, true_element, false_element))
+        results.append(state.dsl.wave.PackOp(true_component.type, selected).result)
         cursor += width
     return tuple(results)
 
@@ -3741,15 +3563,14 @@ def _emit_reduction_tree(state, attrs, values, op):
             if operation in {"maximumf", "maxnumf"}:
                 next_values.append(state.builder.fmax(lhs, rhs))
             elif operation in {"addf", "mulf"}:
-                next_values.append(
-                    _emit_wave_float_binary_component(
-                        state,
-                        operation,
-                        lhs,
-                        rhs,
-                        fastmath,
-                        op,
-                    ))
+                next_values.append(_emit_wave_float_binary_component(
+                    state,
+                    operation,
+                    lhs,
+                    rhs,
+                    fastmath,
+                    op,
+                ))
             else:
                 fail(
                     "TLXW_EMIT_REDUCTION",
@@ -3820,12 +3641,13 @@ def _emit_if(state, op):
                 conditional_local_memory_accesses.get(int(root)),
                 access_kind,
             )
-    hidden_local_memory_roots = tuple(sorted({
-        int(dependency_root)
-        for root in conditional_local_memory_roots
-        for dependency_root in _local_memory_dependency_roots(state, (root, ))
-        if int(dependency_root) in outer_local_memory_allocation_roots
-    }))
+    hidden_local_memory_roots = tuple(
+        sorted({
+            int(dependency_root)
+            for root in conditional_local_memory_roots
+            for dependency_root in _local_memory_dependency_roots(state, (root, ))
+            if int(dependency_root) in outer_local_memory_allocation_roots
+        }))
     all_result_types = (
         *result_types,
         *([state.dsl.mem_token_type()] * (2 * len(hidden_local_memory_roots))),
@@ -3858,18 +3680,10 @@ def _emit_if(state, op):
             op,
         )
         then_local_memory_yields = tuple(
-            _local_memory_allocation_access_dependency(state, root)
-            for root in hidden_local_memory_roots
-        )
+            _local_memory_allocation_access_dependency(state, root) for root in hidden_local_memory_roots)
         then_local_memory_read_yields = tuple(
-            _local_memory_allocation_read_dependency(state, root)
-            for root in hidden_local_memory_roots
-        )
-        if (
-            then_yields
-            or then_local_memory_yields
-            or then_local_memory_read_yields
-        ):
+            _local_memory_allocation_read_dependency(state, root) for root in hidden_local_memory_roots)
+        if (then_yields or then_local_memory_yields or then_local_memory_read_yields):
             state.builder.yield_((
                 *then_yields,
                 *then_local_memory_yields,
@@ -3903,18 +3717,10 @@ def _emit_if(state, op):
                 op,
             )
             else_local_memory_yields = tuple(
-                _local_memory_allocation_access_dependency(state, root)
-                for root in hidden_local_memory_roots
-            )
+                _local_memory_allocation_access_dependency(state, root) for root in hidden_local_memory_roots)
             else_local_memory_read_yields = tuple(
-                _local_memory_allocation_read_dependency(state, root)
-                for root in hidden_local_memory_roots
-            )
-            if (
-                else_yields
-                or else_local_memory_yields
-                or else_local_memory_read_yields
-            ):
+                _local_memory_allocation_read_dependency(state, root) for root in hidden_local_memory_roots)
+            if (else_yields or else_local_memory_yields or else_local_memory_read_yields):
                 state.builder.yield_((
                     *else_yields,
                     *else_local_memory_yields,
@@ -4033,10 +3839,7 @@ def _emit_for_loop(state, op):
         )
     lower, upper, step = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands[:3])
     init_target_ids = op.operands[3:]
-    init_values = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in init_target_ids
-    )
+    init_values = tuple(_require_value(state, target_value_id, op) for target_value_id in init_target_ids)
     flat_init_values, init_shapes = _flatten_structured_values(
         state,
         init_values,
@@ -4096,10 +3899,8 @@ def _emit_for_loop(state, op):
     implicit_local_memory_roots = frozenset(implicit_local_memory_accesses)
     hidden_local_memory_seed_roots = implicit_local_memory_roots.union(
         root for root in touched_local_memory_roots
-        if root in outer_local_memory_tokens
-        or any(dep_root in outer_local_memory_tokens
-               for dep_root in _local_memory_dependency_roots(state, (root, )))
-    )
+        if root in outer_local_memory_tokens or any(dep_root in outer_local_memory_tokens
+                                                    for dep_root in _local_memory_dependency_roots(state, (root, ))))
     hidden_local_memory_candidates = set()
     for root in hidden_local_memory_seed_roots:
         for dep_root in _local_memory_dependency_roots(state, (root, )):
@@ -4110,88 +3911,66 @@ def _emit_for_loop(state, op):
     # and yield a different group's token for the same carry position, so the
     # per-root completion state still has to be carried independently.
     if not _loop_local_memory_state_carry_required(
-        state,
-        region,
-        hidden_local_memory_candidates,
-        implicit_local_memory_accesses,
-        outer_local_memory_pending_accesses,
-        region_local_memory_root_sets,
-        loop_token_block_root_sets,
+            state,
+            region,
+            hidden_local_memory_candidates,
+            implicit_local_memory_accesses,
+            outer_local_memory_pending_accesses,
+            region_local_memory_root_sets,
+            loop_token_block_root_sets,
     ):
         hidden_local_memory_candidates.clear()
     hidden_local_memory_roots = tuple(sorted(hidden_local_memory_candidates))
-    hidden_local_memory_init_tokens = (
-        _join_memory_tokens(
-            state,
-            tuple(
-                outer_local_memory_tokens[root]
-                for root in hidden_local_memory_roots
-                if root in outer_local_memory_tokens
-            ),
-        ),
-    ) if hidden_local_memory_roots else ()
+    hidden_local_memory_init_tokens = (_join_memory_tokens(
+        state,
+        tuple(outer_local_memory_tokens[root]
+              for root in hidden_local_memory_roots
+              if root in outer_local_memory_tokens),
+    ), ) if hidden_local_memory_roots else ()
     # Per-slot carries drive ordering within the loop. Keep a separate
     # allocation-wide history carry so every access token also reaches the
     # post-loop lifetime proof, even when an access uses an alias that is later
     # superseded by another physical-slot state token.
-    loop_local_memory_allocation_roots = tuple(sorted({
-        int(dependency_root)
-        for root in touched_local_memory_roots
-        for dependency_root in _local_memory_dependency_roots(state, (root, ))
-        if int(dependency_root) in state.local_memory_allocations
-    }))
+    loop_local_memory_allocation_roots = tuple(
+        sorted({
+            int(dependency_root)
+            for root in touched_local_memory_roots
+            for dependency_root in _local_memory_dependency_roots(state, (root, ))
+            if int(dependency_root) in state.local_memory_allocations
+        }))
     hidden_local_memory_access_roots = _loop_local_memory_history_roots(
         state,
         op,
         loop_local_memory_allocation_roots,
     )
-    hidden_local_memory_read_roots = tuple(
-        root
-        for root in loop_local_memory_allocation_roots
-        if any(
-            int(dependency_root) in region_local_memory_read_roots
-            for dependency_root in _local_memory_dependency_roots(state, (root, ))
-        ) or any(
+    hidden_local_memory_read_roots = tuple(root for root in loop_local_memory_allocation_roots if any(
+        int(dependency_root) in region_local_memory_read_roots
+        for dependency_root in _local_memory_dependency_roots(state, (root, ))) or any(
             int(dependency_root) in outer_local_memory_read_tokens
-            for dependency_root in _local_memory_dependency_roots(state, (root, ))
-        )
-    )
+            for dependency_root in _local_memory_dependency_roots(state, (root, ))))
     # A loop has one backedge memory frontier.  Carrying a separate cumulative
     # history for every allocation duplicates token phis and can split one
     # commit group's prior-read dependency into incomplete pieces.  Preserve
     # precise per-root slot state above, while carrying allocation lifetime
     # history as one collective token and reattaching it to every touched root
     # inside and after the loop.
-    hidden_local_memory_access_init_tokens = (
-        _join_memory_tokens(
-            state,
-            tuple(
-                token
-                for root in hidden_local_memory_access_roots
-                for token in outer_local_memory_access_tokens.get(root, ())
-            ),
-        ),
-    ) if hidden_local_memory_access_roots else ()
+    hidden_local_memory_access_init_tokens = (_join_memory_tokens(
+        state,
+        tuple(token for root in hidden_local_memory_access_roots
+              for token in outer_local_memory_access_tokens.get(root, ())),
+    ), ) if hidden_local_memory_access_roots else ()
     # Overwrite ordering needs a read-only frontier.  Carry it independently
     # from lifetime history so a refill can wait for prior LDS reads without
     # inheriting async DMA completion state from earlier accesses.
-    hidden_local_memory_read_init_tokens = (
-        _join_memory_tokens(
-            state,
-            tuple(
-                token
-                for root in hidden_local_memory_read_roots
-                for dependency_root in sorted(
-                    _local_memory_dependency_roots(state, (root, )))
-                for token in outer_local_memory_read_tokens.get(
-                    int(dependency_root), ())
-            ),
-        ),
-    ) if hidden_local_memory_read_roots else ()
+    hidden_local_memory_read_init_tokens = (_join_memory_tokens(
+        state,
+        tuple(token for root in hidden_local_memory_read_roots
+              for dependency_root in sorted(_local_memory_dependency_roots(state, (root, )))
+              for token in outer_local_memory_read_tokens.get(int(dependency_root), ())),
+    ), ) if hidden_local_memory_read_roots else ()
     carry_scratch_token = _region_uses_scratch_memory(state, region.target_region_id)
-    scratch_init_tokens = (
-        outer_scratch_token if outer_scratch_token is not None else state.builder.token(),
-    ) if carry_scratch_token else ()
+    scratch_init_tokens = (outer_scratch_token if outer_scratch_token is not None else
+                           state.builder.token(), ) if carry_scratch_token else ()
     nonzero_trip = bool(attrs.get("nonzero_trip", False))
     loop_init_values = (
         *flat_init_values,
@@ -4216,14 +3995,10 @@ def _emit_for_loop(state, op):
             hidden_local_memory_iter_tokens = loop_iter_values[hidden_start:hidden_end]
             hidden_access_start = hidden_end
             hidden_access_end = hidden_access_start + len(hidden_local_memory_access_init_tokens)
-            hidden_local_memory_access_iter_tokens = loop_iter_values[
-                hidden_access_start:hidden_access_end
-            ]
+            hidden_local_memory_access_iter_tokens = loop_iter_values[hidden_access_start:hidden_access_end]
             hidden_read_start = hidden_access_end
             hidden_read_end = hidden_read_start + len(hidden_local_memory_read_init_tokens)
-            hidden_local_memory_read_iter_tokens = loop_iter_values[
-                hidden_read_start:hidden_read_end
-            ]
+            hidden_local_memory_read_iter_tokens = loop_iter_values[hidden_read_start:hidden_read_end]
             scratch_start = hidden_read_end
             scratch_end = scratch_start + len(scratch_init_tokens)
             scratch_iter_tokens = loop_iter_values[scratch_start:scratch_end]
@@ -4318,23 +4093,17 @@ def _emit_for_loop(state, op):
             preserve_mma_packet_payloads=True,
         )
         if tuple(yield_shapes) != tuple(init_shapes):
-            shape_mismatches = tuple(
-                (
-                    index,
-                    init_target_ids[index],
-                    region.yield_value_ids[index],
-                    state.target_program.values[init_target_ids[index]].source_value_id,
-                    state.target_program.values[
-                        region.yield_value_ids[index]
-                    ].source_value_id,
-                    init_shape,
-                    yield_shape,
-                )
-                for index, (init_shape, yield_shape) in enumerate(
-                    zip(init_shapes, yield_shapes)
-                )
-                if init_shape != yield_shape
+            shape_mismatches = tuple((
+                index,
+                init_target_ids[index],
+                region.yield_value_ids[index],
+                state.target_program.values[init_target_ids[index]].source_value_id,
+                state.target_program.values[region.yield_value_ids[index]].source_value_id,
+                init_shape,
+                yield_shape,
             )
+                                     for index, (init_shape, yield_shape) in enumerate(zip(init_shapes, yield_shapes))
+                                     if init_shape != yield_shape)
             fail(
                 "TLXW_EMIT_FOR_YIELD_COMPONENTS",
                 STAGE,
@@ -4342,42 +4111,25 @@ def _emit_for_loop(state, op):
                 f"mismatches={shape_mismatches!r}",
                 target_op_id=op.target_op_id,
             )
-        hidden_local_memory_yield_tokens = (
-            _join_memory_tokens(
-                state,
-                tuple(
-                    state.local_memory_tokens.get(
-                        int(root), hidden_local_memory_iter_tokens[0])
-                    for root in hidden_local_memory_roots
-                ),
-            ),
-        ) if hidden_local_memory_iter_tokens else ()
-        hidden_local_memory_access_yield_tokens = (
-            _join_memory_tokens(
-                state,
-                tuple(
-                    token
-                    for root in hidden_local_memory_access_roots
-                    for token in state.local_memory_access_tokens.get(int(root), ())
-                ),
-            ),
-        ) if hidden_local_memory_access_iter_tokens else ()
-        hidden_local_memory_read_yield_tokens = (
-            _join_memory_tokens(
-                state,
-                tuple(
-                    token
-                    for root in hidden_local_memory_read_roots
-                    for dependency_root in sorted(
-                        _local_memory_dependency_roots(state, (root, )))
-                    for token in state.local_memory_read_tokens.get(
-                        int(dependency_root), ())
-                ),
-            ),
-        ) if hidden_local_memory_read_iter_tokens else ()
-        scratch_yield_tokens = (
-            state.scratch_token if state.scratch_token is not None else scratch_iter_tokens[0],
-        ) if scratch_iter_tokens else ()
+        hidden_local_memory_yield_tokens = (_join_memory_tokens(
+            state,
+            tuple(
+                state.local_memory_tokens.get(int(root), hidden_local_memory_iter_tokens[0])
+                for root in hidden_local_memory_roots),
+        ), ) if hidden_local_memory_iter_tokens else ()
+        hidden_local_memory_access_yield_tokens = (_join_memory_tokens(
+            state,
+            tuple(token for root in hidden_local_memory_access_roots
+                  for token in state.local_memory_access_tokens.get(int(root), ())),
+        ), ) if hidden_local_memory_access_iter_tokens else ()
+        hidden_local_memory_read_yield_tokens = (_join_memory_tokens(
+            state,
+            tuple(token for root in hidden_local_memory_read_roots
+                  for dependency_root in sorted(_local_memory_dependency_roots(state, (root, )))
+                  for token in state.local_memory_read_tokens.get(int(dependency_root), ())),
+        ), ) if hidden_local_memory_read_iter_tokens else ()
+        scratch_yield_tokens = (state.scratch_token if state.scratch_token is not None else
+                                scratch_iter_tokens[0], ) if scratch_iter_tokens else ()
         scratch_yield_needs_write_barrier = state.scratch_token_needs_write_barrier
         if loop_init_values:
             state.builder.yield_((
@@ -4425,14 +4177,10 @@ def _emit_for_loop(state, op):
     hidden_local_memory_results = flat_results[hidden_start:hidden_end]
     hidden_access_start = hidden_end
     hidden_access_end = hidden_access_start + len(hidden_local_memory_access_init_tokens)
-    hidden_local_memory_access_results = flat_results[
-        hidden_access_start:hidden_access_end
-    ]
+    hidden_local_memory_access_results = flat_results[hidden_access_start:hidden_access_end]
     hidden_read_start = hidden_access_end
     hidden_read_end = hidden_read_start + len(hidden_local_memory_read_init_tokens)
-    hidden_local_memory_read_results = flat_results[
-        hidden_read_start:hidden_read_end
-    ]
+    hidden_local_memory_read_results = flat_results[hidden_read_start:hidden_read_end]
     scratch_start = hidden_read_end
     scratch_end = scratch_start + len(scratch_init_tokens)
     scratch_results = flat_results[scratch_start:scratch_end]
@@ -4597,11 +4345,12 @@ def _structured_result_types_and_shapes(state, target_value_ids, op):
         component_count = int(target_type.component_count)
         if target_type.representation in {"mask", "mask_tuple"}:
             lane_width = int(target_type.lane_width or 64)
-            shapes.append(_LoopValueShape(
-                component_count,
-                is_mask_payload=True,
-                mask_payload_component_count=component_count,
-            ))
+            shapes.append(
+                _LoopValueShape(
+                    component_count,
+                    is_mask_payload=True,
+                    mask_payload_component_count=component_count,
+                ))
             result_types.extend([state.dsl.simd_type(state.dsl.i32(), lane_width)] * component_count)
             continue
         if target_type.representation == "token":
@@ -4624,12 +4373,13 @@ def _structured_result_types_and_shapes(state, target_value_ids, op):
                 state.dsl.vector_type(registers, element_type),
                 lane_width,
             )
-            shapes.append(_LoopValueShape(
-                component_count,
-                logical_component_count=component_count,
-                preserved_vector_payload_key=(registers, str(element_type), lane_width),
-                preserved_vector_payload_type=packet_type,
-            ))
+            shapes.append(
+                _LoopValueShape(
+                    component_count,
+                    logical_component_count=component_count,
+                    preserved_vector_payload_key=(registers, str(element_type), lane_width),
+                    preserved_vector_payload_type=packet_type,
+                ))
             result_types.extend([packet_type] * component_count)
             continue
         if target_type.representation in {
@@ -4745,12 +4495,13 @@ def _flatten_structured_values(
                     predicates = tuple(_i32_payload_to_mask(state, component, lane_width) for component in components)
                 predicate_count = len(predicates)
                 components = (*components, *predicates)
-            shapes.append(_LoopValueShape(
-                len(components),
-                is_mask_payload=True,
-                mask_payload_component_count=component_count,
-                mask_predicate_component_count=predicate_count,
-            ))
+            shapes.append(
+                _LoopValueShape(
+                    len(components),
+                    is_mask_payload=True,
+                    mask_payload_component_count=component_count,
+                    mask_predicate_component_count=predicate_count,
+                ))
         elif isinstance(value, _VectorPacketPayload):
             if int(value.logical_component_count) != component_count:
                 fail(
@@ -4762,16 +4513,16 @@ def _flatten_structured_values(
                     target_value_id=target_value_id,
                 )
             components = value.packets
-            shapes.append(_LoopValueShape(
-                len(components),
-                packet_width=int(value.packet_width),
-                logical_component_count=int(value.logical_component_count),
-            ))
+            shapes.append(
+                _LoopValueShape(
+                    len(components),
+                    packet_width=int(value.packet_width),
+                    logical_component_count=int(value.logical_component_count),
+                ))
         else:
             components = _as_components(value)
             shape = None
-            if (preserve_mma_packet_payloads
-                    and target_type.representation in _MMA_PACKET_REPRESENTATIONS):
+            if (preserve_mma_packet_payloads and target_type.representation in _MMA_PACKET_REPRESENTATIONS):
                 components, shape = _preserve_loop_vector_payload_components(
                     state,
                     components,
@@ -4821,8 +4572,7 @@ def _preserve_loop_vector_payload_components(
         if expected_payload is None:
             expected_payload = payload_key
             expected_type = component.type
-        elif (payload_key != expected_payload
-              or str(component.type) != str(expected_type)):
+        elif (payload_key != expected_payload or str(component.type) != str(expected_type)):
             fail(
                 "TLXW_EMIT_FOR_MMA_PACKET",
                 STAGE,
@@ -4887,7 +4637,7 @@ def _pack_structured_value_components(state, components, shape, context, op):
                     STAGE,
                     f"{context} mask payload predicate shape is invalid",
                     target_op_id=None if op is None else op.target_op_id,
-            )
+                )
             return _I32MaskPayload(payload_components, predicates=predicates)
         return _I32MaskPayload(payload_components)
     if shape.packet_width is not None:
@@ -4933,15 +4683,15 @@ def _pack_loop_value_components(state, components, shape, op=None):
 
 
 def _bind_loop_region_args(
-    state,
-    block_arg_ids,
-    induction_value,
-    flat_iter_values,
-    init_shapes,
-    init_target_ids,
-    *,
-    preserved_local_memory_roots=(),
-    op,
+        state,
+        block_arg_ids,
+        induction_value,
+        flat_iter_values,
+        init_shapes,
+        init_target_ids,
+        *,
+        preserved_local_memory_roots=(),
+        op,
 ):
     state.values[block_arg_ids[0]] = induction_value
     cursor = 0
@@ -5148,11 +4898,7 @@ def _local_access_result_ids(op):
     attrs = target_ir.attrs_dict(op)
     data_count = int(attrs.get("data_result_count", len(op.results)))
     completion_count = int(attrs.get("completion_result_count", 0))
-    if (
-        data_count < 0
-        or completion_count < 0
-        or data_count + completion_count != len(op.results)
-    ):
+    if (data_count < 0 or completion_count < 0 or data_count + completion_count != len(op.results)):
         fail(
             "TLXW_EMIT_LOCAL_ACCESS_RESULTS",
             STAGE,
@@ -5174,11 +4920,8 @@ def _finish_local_access(state, op, memdesc_target_id, token, access_kind):
             state,
             memdesc_target_id,
         )
-    if (
-        bool(attrs.get("protocol_tracked", False))
-        and bool(attrs.get("synced_via_async_wait", False))
-        and access_kind in {"read", "mma_read"}
-    ):
+    if (bool(attrs.get("protocol_tracked", False)) and bool(attrs.get("synced_via_async_wait", False))
+            and access_kind in {"read", "mma_read"}):
         # The target SSA completion result is the sole release frontier for a
         # wait-ready DMA consumer.  Retain only allocation-lifetime history;
         # do not rebuild a second pending/read frontier in emitter state.
@@ -5207,10 +4950,7 @@ def _emit_local_store(state, op):
         )
     values = _require_value(state, op.operands[0], op)
     base = _require_value(state, op.operands[1], op)
-    explicit_dependencies = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in op.operands[2:]
-    )
+    explicit_dependencies = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands[2:])
     memdesc_target_id = op.operands[1]
     lane_width = int(attrs["lane_width"])
     component_count = int(attrs["component_count"])
@@ -5271,11 +5011,11 @@ def _symbolic_shared_mapping(state, element_byte_width):
 
 
 def _symbolic_shared_offset_packet(state, offsets, lane_width):
-    offsets = tuple(offsets)
+    offsets = tuple(_simd_offset_value(state, offset, lane_width) for offset in offsets)
+    if not offsets:
+        raise ValueError("a symbolic-memory offset packet must not be empty")
     offset_element_type = state.dsl.SimdType(offsets[0].type).element_type
-    return _symbolic_shared_packet(
-        state, offsets, offset_element_type, lane_width
-    )
+    return _symbolic_shared_packet(state, offsets, offset_element_type, lane_width)
 
 
 def _emit_symbolic_shared_scatter(
@@ -5298,13 +5038,9 @@ def _emit_symbolic_shared_scatter(
             "symbolic local_store values and offsets must have the same positive component count",
             target_op_id=op.target_op_id,
         )
-    value_packet = _symbolic_shared_packet(
-        state, value_components, element_type, lane_width
-    )
+    value_packet = _symbolic_shared_packet(state, value_components, element_type, lane_width)
     offset_packet = _symbolic_shared_offset_packet(state, offsets, lane_width)
-    offset_symbol, bit_offset = _symbolic_shared_mapping(
-        state, element_byte_width
-    )
+    offset_symbol, bit_offset = _symbolic_shared_mapping(state, element_byte_width)
     return state.builder.scatter(
         value_packet,
         [base],
@@ -5337,9 +5073,7 @@ def _emit_symbolic_shared_gather(
         width=int(lane_width),
     )
     offset_packet = _symbolic_shared_offset_packet(state, offsets, lane_width)
-    offset_symbol, bit_offset = _symbolic_shared_mapping(
-        state, element_byte_width
-    )
+    offset_symbol, bit_offset = _symbolic_shared_mapping(state, element_byte_width)
     return state.builder.gather(
         [base],
         result_type,
@@ -5349,14 +5083,10 @@ def _emit_symbolic_shared_gather(
     )
 
 
-def _symbolic_shared_packet_components(
-    state, packet, component_count, element_type, lane_width
-):
+def _symbolic_shared_packet_components(state, packet, component_count, element_type, lane_width):
     component_type = state.dsl.simd_type(element_type, int(lane_width))
     return tuple(
-        state.dsl.wave.ExtractOp(component_type, packet, index).result
-        for index in range(int(component_count))
-    )
+        state.dsl.wave.ExtractOp(component_type, packet, index).result for index in range(int(component_count)))
 
 
 def _symbolic_contiguous_mapping(
@@ -5367,11 +5097,8 @@ def _symbolic_contiguous_mapping(
 ):
     offset = state.dsl.sym("offset")
     slot = state.dsl.sym("slot")
-    bit_offset = (
-        int(offset_element_byte_width) * 8 * offset
-        + int(packet_element_bit_width) * slot
-        + int(static_bit_offset)
-    )
+    bit_offset = (int(offset_element_byte_width) * 8 * offset + int(packet_element_bit_width) * slot +
+                  int(static_bit_offset))
     return offset, bit_offset
 
 
@@ -5397,9 +5124,7 @@ def _emit_symbolic_contiguous_scatter(
     dependency=None,
     cache=None,
 ):
-    packet = _symbolic_packet_value(
-        state, value, element_type, lane_width
-    )
+    packet = _symbolic_packet_value(state, value, element_type, lane_width)
     offset_symbol, bit_offset = _symbolic_contiguous_mapping(
         state,
         element_byte_width,
@@ -5483,6 +5208,128 @@ def _emit_symbolic_contiguous_gather(
         return packet, token
     value = state.dsl.wave.ExtractOp(result_type, packet, 0).result
     return value, token
+
+
+def _symbolic_mask_conditions(state, predicates):
+    predicates = tuple(predicates)
+    if not predicates:
+        raise ValueError("symbolic memory predicates must not be empty")
+    if all(_is_scalar_i1_value(state, predicate) for predicate in predicates):
+        if not all(predicate is predicates[0] for predicate in predicates):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_MEMORY_MASK",
+                STAGE,
+                "a scalar control predicate must be uniform across a memory packet",
+            )
+        return predicates[0]
+    return predicates
+
+
+def _symbolic_buffer_mapping(state, element_byte_width):
+    """Describe the element offset carried by an ``amdg.buffer_*`` op."""
+    offset_symbol = state.dsl.sym("offset")
+    return offset_symbol, 8 * int(element_byte_width) * offset_symbol
+
+
+def _prepare_symbolic_indexed_gather(
+    state,
+    offsets,
+    base,
+    element_type,
+    lane_width,
+    element_byte_width,
+    *,
+    dependency=None,
+    cache=None,
+):
+    """Materialize gather operands now and return the semantic access."""
+    offsets = tuple(offsets)
+    result_type = state.dsl.simd_type(
+        state.dsl.vector_type(len(offsets), element_type),
+        width=int(lane_width),
+    )
+    offset_components = tuple(_simd_offset_value(state, offset, lane_width) for offset in offsets)
+    offset_symbol, bit_offset = _symbolic_buffer_mapping(state, element_byte_width)
+
+    def emit():
+        return state.builder.gather(
+            [base],
+            result_type,
+            bit_offset=bit_offset,
+            packet_bindings={offset_symbol: offset_components},
+            after=dependency,
+            cache=cache,
+        )
+
+    return emit
+
+
+def _prepare_symbolic_indexed_scatter(
+    state,
+    values,
+    offsets,
+    base,
+    element_type,
+    lane_width,
+    element_byte_width,
+    *,
+    dependency=None,
+    cache=None,
+):
+    """Materialize scatter operands now and return the semantic access."""
+    values = tuple(values)
+    offsets = tuple(offsets)
+    if not values or len(values) != len(offsets):
+        raise ValueError("symbolic scatter values and offsets must match")
+    value_packet = _symbolic_shared_packet(
+        state,
+        values,
+        element_type,
+        lane_width,
+    )
+    offset_components = tuple(_simd_offset_value(state, offset, lane_width) for offset in offsets)
+    offset_symbol, bit_offset = _symbolic_buffer_mapping(state, element_byte_width)
+
+    def emit():
+        return state.builder.scatter(
+            value_packet,
+            [base],
+            bit_offset=bit_offset,
+            packet_bindings={offset_symbol: offset_components},
+            after=dependency,
+            cache=cache,
+        )
+
+    return emit
+
+
+def _extract_packet_components(
+    state,
+    packet,
+    element_type,
+    lane_width,
+    component_count,
+):
+    component_type = state.dsl.simd_type(element_type, int(lane_width))
+    return tuple(
+        state.dsl.wave.ExtractOp(component_type, packet, index).result for index in range(int(component_count)))
+
+
+def _buffer_inactive_element_offset(state, attrs, lane_width):
+    inactive_byte_offset = int(attrs.get("inactive_byte_offset", 1 << 31))
+    element_byte_width = int(attrs["element_byte_width"])
+    if element_byte_width <= 0 or inactive_byte_offset % element_byte_width:
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC_MASK",
+            STAGE,
+            "inactive byte offset must align to element size",
+        )
+    element_offset = inactive_byte_offset // element_byte_width
+    return state.builder.splat(
+        state.builder.constant(state.dsl.index_type(), element_offset),
+        state.dsl.index_type(),
+        lane_width,
+    )
 
 
 def _emit_local_load(state, op):
@@ -5620,9 +5467,7 @@ def _emit_local_load(state, op):
             index,
             component_count,
             op,
-        ) > 1
-        for index in range(component_count)
-    )
+        ) > 1 for index in range(component_count))
     if not uses_transpose_load:
         loaded, token = _emit_symbolic_shared_gather(
             state,
@@ -5673,7 +5518,7 @@ def _emit_local_load(state, op):
             continue
         loaded_packet, token = _emit_symbolic_shared_gather(
             state,
-            (offsets[index],),
+            (offsets[index], ),
             base,
             element_type,
             lane_width,
@@ -5716,21 +5561,11 @@ def _local_load_raw_packet_indices(attrs, component_count, op):
         return None
     packet_width = int(attrs.get("result_packet_width", 0))
     element_bit_width = int(attrs.get("result_element_bit_width", 0))
-    indices = tuple(
-        int(index) for index in attrs.get("raw_packet_component_indices", ())
-    )
+    indices = tuple(int(index) for index in attrs.get("raw_packet_component_indices", ()))
     expected = tuple(range(0, int(component_count), packet_width or 1))
     packet_bits = packet_width * element_bit_width
-    if (
-        packet_width <= 1
-        or element_bit_width <= 0
-        or int(component_count) % packet_width
-        or indices != expected
-        or packet_bits <= 0
-        or packet_bits > 128
-        or packet_bits % 32
-        or 32 % element_bit_width
-    ):
+    if (packet_width <= 1 or element_bit_width <= 0 or int(component_count) % packet_width or indices != expected
+            or packet_bits <= 0 or packet_bits > 128 or packet_bits % 32 or 32 % element_bit_width):
         fail(
             "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
@@ -5765,9 +5600,7 @@ def _emit_local_load_raw_layout_vector_packets(
         state.dsl.i32(),
         state.dsl.shared_address_space(),
     )
-    dword_base_plan = state.shared_pointer_dword_bases.get(
-        int(memdesc_target_id)
-    )
+    dword_base_plan = state.shared_pointer_dword_bases.get(int(memdesc_target_id))
     if dword_base_plan is None:
         dword_base = _ptr_cast(state, base, dword_base_type)
         dynamic_base_offset = None
@@ -5866,20 +5699,14 @@ def _emit_local_load_mma_packet_payload(
         state.dsl.vector_type(registers, element_type),
         width=int(lane_width),
     )
-    expanded_offsets = tuple(
-        offset
-        if element == 0
-        else _simd_binary_const(
-            state,
-            "addi",
-            offset,
-            element,
-            lane_width,
-            nsw=_LAYOUT_MATH_NSW,
-        )
-        for offset in offsets
-        for element in range(registers)
-    )
+    expanded_offsets = tuple(offset if element == 0 else _simd_binary_const(
+        state,
+        "addi",
+        offset,
+        element,
+        lane_width,
+        nsw=_LAYOUT_MATH_NSW,
+    ) for offset in offsets for element in range(registers))
     loaded, token = _emit_symbolic_shared_gather(
         state,
         expanded_offsets,
@@ -5901,9 +5728,7 @@ def _emit_local_load_mma_packet_payload(
         state.dsl.wave.PackOp(
             load_type,
             scalar_components[index * registers:(index + 1) * registers],
-        ).result
-        for index in range(component_count)
-    )
+        ).result for index in range(component_count))
     return _pack_components(components), token
 
 
@@ -6072,14 +5897,12 @@ def _emit_i8_transpose_gather(
     shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
     row_extent = int(shape[0])
     component_bases = tuple(
-        tuple(int(value) for value in bases)
-        for bases in attrs["destination_component_coordinate_bases"]
-    )
+        tuple(int(value) for value in bases) for bases in attrs["destination_component_coordinate_bases"])
     first_row, first_col = component_bases[int(index)]
     workitem_coefficients = tuple(
-        tuple(int(value) for value in coefficients)
-        for coefficients in attrs["destination_workitem_coordinate_coefficients"]
-    )
+        tuple(int(value)
+              for value in coefficients)
+        for coefficients in attrs["destination_workitem_coordinate_coefficients"])
     coefficients = [
         8,
         4 * row_extent,
@@ -6095,23 +5918,14 @@ def _emit_i8_transpose_gather(
     item = state.dsl.sym("item")
     slot = state.dsl.sym("slot")
     lane = state.dsl.mod(item, 64)
-    source_item = (
-        item
-        - lane
-        + 16 * state.dsl.floor(lane / 16)
-        + state.dsl.floor(state.dsl.mod(lane, 16) / 2)
-    )
+    source_item = (item - lane + 16 * state.dsl.floor(lane / 16) + state.dsl.floor(state.dsl.mod(lane, 16) / 2))
     source_offset = _bit_affine_thread_offset_expr(
         state,
         source_item,
         int(first_col) * row_extent + int(first_row),
         tuple(coefficients),
     )
-    byte_offset = (
-        source_offset
-        + 4 * state.dsl.mod(lane, 2)
-        + state.dsl.floor(slot / 2)
-    )
+    byte_offset = (source_offset + 4 * state.dsl.mod(lane, 2) + state.dsl.floor(slot / 2))
     packet_type = state.dsl.simd_type(
         state.dsl.vector_type(8, element_type),
         width=int(lane_width),
@@ -6126,13 +5940,7 @@ def _emit_i8_transpose_gather(
 
 def _b16_transpose_source_item_expr(state, item, slot):
     lane = state.dsl.mod(item, 64)
-    return (
-        item
-        - lane
-        + 16 * state.dsl.floor(lane / 16)
-        + state.dsl.floor(state.dsl.mod(lane, 16) / 4)
-        + 4 * slot
-    )
+    return (item - lane + 16 * state.dsl.floor(lane / 16) + state.dsl.floor(state.dsl.mod(lane, 16) / 4) + 4 * slot)
 
 
 def _emit_b16_transpose_gather(
@@ -6189,13 +5997,8 @@ def _local_access_offsets(
         component_indices = tuple(range(int(component_count)))
     else:
         component_indices = tuple(int(index) for index in component_indices)
-        if (
-            len(set(component_indices)) != len(component_indices)
-            or any(
-                index < 0 or index >= int(component_count)
-                for index in component_indices
-            )
-        ):
+        if (len(set(component_indices)) != len(component_indices)
+                or any(index < 0 or index >= int(component_count) for index in component_indices)):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
                 STAGE,
@@ -6249,24 +6052,16 @@ def _local_access_offset_range(attrs, shape):
 
 def _emit_buffer_load_to_local(state, op):
     attrs = target_ir.attrs_dict(op)
-    source_issue_dependency_count = int(
-        attrs.get("issue_dependency_count", 0)
-    )
-    barrier_order_dependency_count = int(
-        attrs.get("barrier_order_dependency_count", 0)
-    )
-    issue_dependency_count = (
-        source_issue_dependency_count + barrier_order_dependency_count
-    )
+    source_issue_dependency_count = int(attrs.get("issue_dependency_count", 0))
+    barrier_order_dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
+    issue_dependency_count = (source_issue_dependency_count + barrier_order_dependency_count)
     if attrs["mode"] == "dma_packet_lds":
         has_mask = bool(attrs.get("has_mask", False))
         mask_operand_count = int(has_mask)
         operands = _operand_values(
             state,
             op,
-            3
-            + mask_operand_count
-            + issue_dependency_count,
+            3 + mask_operand_count + issue_dependency_count,
         )
         dest_base, source_base, offsets = operands[:3]
         operand_index = 3
@@ -6284,17 +6079,13 @@ def _emit_buffer_load_to_local(state, op):
                 "packet DMA offset edge does not match component count",
                 target_op_id=op.target_op_id,
             )
-        mask_components = (
-            None
-            if masks is None
-            else _as_mask_predicate_components(
-                state,
-                masks,
-                component_count,
-                lane_width,
-                op,
-            )
-        )
+        mask_components = (None if masks is None else _as_mask_predicate_components(
+            state,
+            masks,
+            component_count,
+            lane_width,
+            op,
+        ))
         range_bytes = state.builder.constant(state.dsl.i32(), int(attrs["range_bytes"]))
         buffer_base = state.builder.make_buffer(
             source_base,
@@ -6321,11 +6112,7 @@ def _emit_buffer_load_to_local(state, op):
         return
     has_mask = bool(attrs.get("has_mask", False))
     mask_operand_count = int(has_mask)
-    expected_operand_count = (
-        3
-        + mask_operand_count
-        + issue_dependency_count
-    )
+    expected_operand_count = (3 + mask_operand_count + issue_dependency_count)
     if len(op.operands) != expected_operand_count:
         fail(
             "TLXW_EMIT_OPERAND_COUNT",
@@ -6337,15 +6124,9 @@ def _emit_buffer_load_to_local(state, op):
     source_base = _require_value(state, op.operands[1], op)
     offsets = _require_value(state, op.operands[2], op)
     operand_index = 3
-    masks = (
-        _require_value(state, op.operands[operand_index], op)
-        if has_mask else None
-    )
+    masks = (_require_value(state, op.operands[operand_index], op) if has_mask else None)
     operand_index += mask_operand_count
-    issue_dependencies = tuple(
-        _require_value(state, operand_id, op)
-        for operand_id in op.operands[operand_index:]
-    )
+    issue_dependencies = tuple(_require_value(state, operand_id, op) for operand_id in op.operands[operand_index:])
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     lane_width = int(attrs["lane_width"])
     expected_components = int(attrs["component_count"])
@@ -6501,16 +6282,9 @@ def _emit_buffer_load_to_local(state, op):
                 state,
                 workitem,
                 int(base),
-                tuple(
-                    coefficients[dim]
-                    for coefficients in destination_workitem_coefficients
-                ),
+                tuple(coefficients[dim] for coefficients in destination_workitem_coefficients),
                 lane_width,
-            )
-            for dim, base in enumerate(
-                destination_component_bases[component_index]
-            )
-        )
+            ) for dim, base in enumerate(destination_component_bases[component_index]))
         return _shared_destination_element_offset(
             state,
             attrs,
@@ -6546,8 +6320,7 @@ def _emit_buffer_load_to_local(state, op):
     if mask_components is None:
         component_tokens.extend(
             emit_component_load_store(index, offset_component)
-            for index, offset_component in enumerate(load_offset_components)
-        )
+            for index, offset_component in enumerate(load_offset_components))
     else:
         if mask_mode != "exec_where":
             fail(
@@ -6556,9 +6329,8 @@ def _emit_buffer_load_to_local(state, op):
                 f"unsupported buffer_load_to_local mask mode {mask_mode}",
                 target_op_id=op.target_op_id,
             )
-        for mask_component, component_indices in _group_component_indices_by_identity(
-            mask_components
-        ):
+        for mask_component, component_indices in _group_component_indices_by_identity(mask_components):
+
             def emit_masked_components(component_indices=component_indices):
                 return _join_memory_tokens(
                     state,
@@ -6566,9 +6338,7 @@ def _emit_buffer_load_to_local(state, op):
                         emit_component_load_store(
                             index,
                             load_offset_components[index],
-                        )
-                        for index in component_indices
-                    ),
+                        ) for index in component_indices),
                 )
 
             component_tokens.append(
@@ -6577,8 +6347,7 @@ def _emit_buffer_load_to_local(state, op):
                     mask_component,
                     dependency,
                     emit_masked_components,
-                )
-            )
+                ))
     token = _join_memory_tokens(state, component_tokens)
     result_id = _single_result(op)
     state.values[result_id] = token
@@ -6661,29 +6430,22 @@ def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, 
             target_op_id=op.target_op_id,
         )
     physical_shape = tuple(int(value) for value in attrs.get("destination_physical_shape", shape))
-    logical_origin = tuple(
-        int(value)
-        for value in attrs.get("destination_logical_origin", (0, ) * len(shape))
-    )
-    if (len(physical_shape) != len(shape) or len(logical_origin) != len(shape)
-            or len(coords) != len(shape)):
+    logical_origin = tuple(int(value) for value in attrs.get("destination_logical_origin", (0, ) * len(shape)))
+    if (len(physical_shape) != len(shape) or len(logical_origin) != len(shape) or len(coords) != len(shape)):
         fail(
             "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
             "shared destination view ranks do not match its logical coordinates",
             target_op_id=op.target_op_id,
         )
-    coords = tuple(
-        coord if int(origin) == 0 else _simd_binary_const(
-            state,
-            "addi",
-            coord,
-            int(origin),
-            lane_width,
-            nsw=_LAYOUT_MATH_NSW,
-        )
-        for coord, origin in zip(coords, logical_origin)
-    )
+    coords = tuple(coord if int(origin) == 0 else _simd_binary_const(
+        state,
+        "addi",
+        coord,
+        int(origin),
+        lane_width,
+        nsw=_LAYOUT_MATH_NSW,
+    ) for coord, origin in zip(coords, logical_origin))
     shape = physical_shape
     if plan == "dense_row_major":
         return _linearize_coordinates(state, coords, shape, lane_width)
@@ -6885,11 +6647,10 @@ def _emit_buffer_load_to_local_packet_dma(
             target_op_id=op.target_op_id,
         )
     for component, (source_offset, destination_offset) in enumerate(zip(
-        offset_components,
-        destination_offsets,
+            offset_components,
+            destination_offsets,
     )):
-        issue_delay_options = _local_dma_component_issue_delay_options(
-            state, op, component)
+        issue_delay_options = _local_dma_component_issue_delay_options(state, op, component)
         source_offset = _simd_offset_value(state, source_offset, lane_width)
         source_ptr = state.builder.ptr_add(
             buffer_base,
@@ -7044,10 +6805,11 @@ def _emit_buffer_load_to_local_dma(
     else:
         dest_base_i32 = _ptr_cast(state, dest_base, i32_shared)
     element_byte_width = int(attrs["element_byte_width"])
-    for component, (offset_component, destination_base_offset) in enumerate(zip(
-            offset_components,
-            destination_offsets,
-    )):
+    for component, (offset_component,
+                    destination_base_offset) in enumerate(zip(
+                        offset_components,
+                        destination_offsets,
+                    )):
         offset_component = _simd_offset_value(state, offset_component, lane_width)
         source_ptr = state.builder.ptr_add(
             buffer_base,
@@ -7075,11 +6837,7 @@ def _emit_buffer_load_to_local_dma(
                 nsw=_LAYOUT_MATH_NSW,
             )
         if dword_base is not None:
-            component_offset = (
-                None
-                if not destination_byte_offset
-                else destination_byte_offset // 4
-            )
+            component_offset = (None if not destination_byte_offset else destination_byte_offset // 4)
             component_base = _shared_pointer_with_dword_offset(
                 state,
                 dword_base.base,
@@ -7138,18 +6896,12 @@ def _emit_token(state, op):
 
 
 def _emit_token_join(state, op):
-    tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in op.operands
-    )
+    tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands)
     state.values[_single_result(op)] = _join_memory_tokens(state, tokens)
 
 
 def _emit_issue_token(state, op):
-    tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in op.operands
-    )
+    tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands)
     state.values[_single_result(op)] = state.builder.issue_token(*tokens)
 
 
@@ -7220,8 +6972,7 @@ def _scratch_write_dependency(state, extra_tokens=()):
         )
         state.scratch_token = dependency
         state.scratch_token_needs_write_barrier = False
-    elif ((dependency is not None and state.scratch_token_needs_write_barrier)
-          or extra_tokens):
+    elif ((dependency is not None and state.scratch_token_needs_write_barrier) or extra_tokens):
         dependencies = (dependency, ) if dependency is not None else ()
         dependency = _emit_cta_barrier(
             state,
@@ -7245,9 +6996,7 @@ def _local_memory_value_descendants(state, root):
             sources = set(int(operand) for operand in op.operands)
             for region_id in op.region_ids:
                 sources.update(
-                    int(value_id)
-                    for value_id in state.target_program.regions[int(region_id)].yield_value_ids
-                )
+                    int(value_id) for value_id in state.target_program.regions[int(region_id)].yield_value_ids)
             if descendants.isdisjoint(sources):
                 continue
             for result_id in op.results:
@@ -7270,13 +7019,9 @@ def _local_memory_allocation_has_future_use(state, root, current_op):
         candidate_source_index = candidate.source_op_index
         if candidate_source_index is None:
             continue
-        is_future = (
-            int(candidate_source_index) > int(current_source_index)
-            or (
-                int(candidate_source_index) == int(current_source_index)
-                and int(candidate.target_op_id) > int(current_op.target_op_id)
-            )
-        )
+        is_future = (int(candidate_source_index) > int(current_source_index)
+                     or (int(candidate_source_index) == int(current_source_index)
+                         and int(candidate.target_op_id) > int(current_op.target_op_id)))
         if is_future and not descendants.isdisjoint(int(operand) for operand in candidate.operands):
             return True
     return False
@@ -7304,9 +7049,7 @@ def _release_dead_local_memory_before_redistribute(state, op):
         # after all releases, so storage retirement and scratch publication do
         # not require separate hardware barriers.
         release_dependency = _local_memory_allocation_access_dependency(state, root)
-        released_tokens.append(
-            state.builder.release_alloc(allocation, after=release_dependency)
-        )
+        released_tokens.append(state.builder.release_alloc(allocation, after=release_dependency))
         state.released_local_memory_allocations.add(root)
     return tuple(released_tokens)
 
@@ -7338,13 +7081,8 @@ def _emit_async_wait(state, op):
     completed_count = int(attrs["completed_group_dependency_count"])
     retained_issue_count = int(attrs["retained_issue_dependency_count"])
     release_count = int(attrs["lds_release_dependency_count"])
-    if (
-        completed_count < 0
-        or retained_issue_count < 0
-        or release_count < 0
-        or completed_count + retained_issue_count + release_count
-        != len(op.operands)
-    ):
+    if (completed_count < 0 or retained_issue_count < 0 or release_count < 0
+            or completed_count + retained_issue_count + release_count != len(op.operands)):
         fail(
             "TLXW_EMIT_ASYNC_WAIT_OPERANDS",
             STAGE,
@@ -7355,18 +7093,10 @@ def _emit_async_wait(state, op):
     issue_end = completed_count + retained_issue_count
     retained_issue_target_ids = op.operands[completed_count:issue_end]
     release_target_ids = op.operands[issue_end:]
-    completed_tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in completed_target_ids
-    )
+    completed_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in completed_target_ids)
     retained_issue_tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in retained_issue_target_ids
-    )
-    release_tokens = tuple(
-        _require_value(state, target_value_id, op)
-        for target_value_id in release_target_ids
-    )
+        _require_value(state, target_value_id, op) for target_value_id in retained_issue_target_ids)
+    release_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in release_target_ids)
     dependencies = (
         *completed_tokens,
         *retained_issue_tokens,
@@ -7376,10 +7106,7 @@ def _emit_async_wait(state, op):
     if publication_mode == "workgroup":
         token = _emit_cta_barrier(state, *dependencies)
     elif publication_mode == "wave_local":
-        token = (
-            state.builder.after(*dependencies)
-            if dependencies else state.builder.token()
-        )
+        token = (state.builder.after(*dependencies) if dependencies else state.builder.token())
     else:
         fail(
             "TLXW_EMIT_ASYNC_WAIT_MODE",
@@ -7463,9 +7190,7 @@ def _emit_local_load_mma_payload(state, op):
             dependency,
         )
         state.values[data_result_id] = value
-        _finish_local_access(
-            state, op, memdesc_target_id, read_token, "mma_read"
-        )
+        _finish_local_access(state, op, memdesc_target_id, read_token, "mma_read")
         return
     if load_mode in {"swizzled_mma_payload_load", "indexed_mma_payload_load"}:
         value, read_token = _emit_swizzled_mma_payload_load(
@@ -7478,9 +7203,7 @@ def _emit_local_load_mma_payload(state, op):
             dependency,
         )
         state.values[data_result_id] = value
-        _finish_local_access(
-            state, op, memdesc_target_id, read_token, "mma_read"
-        )
+        _finish_local_access(state, op, memdesc_target_id, read_token, "mma_read")
         return
     if load_mode != "mma_payload_load":
         fail(
@@ -7640,9 +7363,7 @@ def _emit_swizzled_mma_payload_load(
     load_tokens = []
     component_physical_deltas = attrs.get("component_physical_element_deltas")
     if component_physical_deltas is not None:
-        component_physical_deltas = tuple(
-            int(value) for value in component_physical_deltas
-        )
+        component_physical_deltas = tuple(int(value) for value in component_physical_deltas)
         if len(component_physical_deltas) != len(attrs["component_tile_offsets"]):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
@@ -7652,11 +7373,8 @@ def _emit_swizzled_mma_payload_load(
             )
         physical_base_attrs = dict(attrs)
         physical_base_attrs["memdesc_logical_origin"] = tuple(
-            int(value) for value in attrs["physical_base_logical_origin"]
-        )
-        physical_base_tile_offsets = tuple(
-            int(value) for value in attrs["physical_base_tile_offsets"]
-        )
+            int(value) for value in attrs["physical_base_logical_origin"])
+        physical_base_tile_offsets = tuple(int(value) for value in attrs["physical_base_tile_offsets"])
         shared_offset = _local_fragment_element_offset(
             state,
             physical_base_attrs,
@@ -7670,31 +7388,24 @@ def _emit_swizzled_mma_payload_load(
             wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
             op=op,
         )
-        component_accesses = tuple(
-            (shared_offset, int(delta)) for delta in component_physical_deltas
-        )
+        component_accesses = tuple((shared_offset, int(delta)) for delta in component_physical_deltas)
     else:
-        component_accesses = tuple(
-            (
-                _local_fragment_element_offset(
-                    state,
-                    attrs,
-                    wi,
-                    tuple(int(value) for value in tile_offsets),
-                    0,
-                    lane_width,
-                    elements_per_lane=int(attrs["elements_per_lane"]),
-                    wave_tile_axis=attrs.get("wave_tile_axis", "none"),
-                    warps_per_cta=tuple(
-                        int(value) for value in attrs.get("warps_per_cta", (1, 1))
-                    ),
-                    wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
-                    op=op,
-                ),
+        component_accesses = tuple((
+            _local_fragment_element_offset(
+                state,
+                attrs,
+                wi,
+                tuple(int(value) for value in tile_offsets),
                 0,
-            )
-            for tile_offsets in attrs["component_tile_offsets"]
-        )
+                lane_width,
+                elements_per_lane=int(attrs["elements_per_lane"]),
+                wave_tile_axis=attrs.get("wave_tile_axis", "none"),
+                warps_per_cta=tuple(int(value) for value in attrs.get("warps_per_cta", (1, 1))),
+                wave_tile_stride=int(attrs.get("wave_tile_stride_elements", 0)),
+                op=op,
+            ),
+            0,
+        ) for tile_offsets in attrs["component_tile_offsets"])
     for offset, physical_element_delta in component_accesses:
         if physical_element_delta:
             offset = _simd_binary_const(
@@ -7813,16 +7524,9 @@ def _local_fragment_element_offset_expr(
             wave_tile_stride=wave_tile_stride,
             op=op,
         )
-    physical_shape = tuple(
-        int(dim)
-        for dim in attrs.get("memdesc_physical_shape", memdesc_shape)
-    )
-    logical_origin = tuple(
-        int(value)
-        for value in attrs.get("memdesc_logical_origin", (0, ) * len(memdesc_shape))
-    )
-    if (len(physical_shape) != len(memdesc_shape)
-            or len(logical_origin) != len(memdesc_shape)):
+    physical_shape = tuple(int(dim) for dim in attrs.get("memdesc_physical_shape", memdesc_shape))
+    logical_origin = tuple(int(value) for value in attrs.get("memdesc_logical_origin", (0, ) * len(memdesc_shape)))
+    if (len(physical_shape) != len(memdesc_shape) or len(logical_origin) != len(memdesc_shape)):
         fail(
             "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
             STAGE,
@@ -7835,10 +7539,7 @@ def _local_fragment_element_offset_expr(
             logical,
             memdesc_shape,
         )
-        physical_coords = tuple(
-            coord + int(origin)
-            for coord, origin in zip(logical_coords, logical_origin)
-        )
+        physical_coords = tuple(coord + int(origin) for coord, origin in zip(logical_coords, logical_origin))
         logical = _linearize_local_fragment_coords(
             physical_shape,
             physical_coords,
@@ -8106,12 +7807,10 @@ def _wave_tile_offset_expr(
 
 def _swizzled_element_offset_expr(state, attrs, logical, op):
     shape = tuple(
-        int(dim)
-        for dim in attrs.get(
+        int(dim) for dim in attrs.get(
             "memdesc_physical_shape",
             attrs.get("memdesc_shape", attrs["source_shape"]),
-        )
-    )
+        ))
     order = _physical_order_from_attrs(
         attrs,
         "shared_physical_order",
@@ -8150,12 +7849,10 @@ def _swizzled_element_offset_expr(state, attrs, logical, op):
 
 def _linear_shared_element_offset_expr(state, attrs, logical, op):
     shape = tuple(
-        int(dim)
-        for dim in attrs.get(
+        int(dim) for dim in attrs.get(
             "memdesc_physical_shape",
             attrs.get("memdesc_shape", attrs["source_shape"]),
-        )
-    )
+        ))
     coords = _delinearize_local_fragment_expr(state, logical, shape)
     return _linear_inverse_offset_from_expr_coords(
         state,
@@ -8169,12 +7866,10 @@ def _linear_shared_element_offset_expr(state, attrs, logical, op):
 
 def _padded_element_offset_expr(state, attrs, logical, op):
     shape = tuple(
-        int(dim)
-        for dim in attrs.get(
+        int(dim) for dim in attrs.get(
             "memdesc_physical_shape",
             attrs.get("memdesc_shape", attrs["source_shape"]),
-        )
-    )
+        ))
     coords = _delinearize_local_fragment_expr(state, logical, shape)
     physical = _linear_component_offset_from_expr_coords(
         state,
@@ -8287,9 +7982,7 @@ def _physical_linear_inverse_offset_bases(
     diagnostic,
 ):
     key = f"{prefix}_physical_linear_inverse_offset_bases"
-    bases = tuple(
-        tuple(int(value) for value in dim_bases)
-        for dim_bases in attrs.get(key, ()))
+    bases = tuple(tuple(int(value) for value in dim_bases) for dim_bases in attrs.get(key, ()))
     if len(bases) != int(rank):
         fail(
             diagnostic,
@@ -8890,8 +8583,8 @@ def _emit_mma_packet_truncf(state, op):
     packed = []
     for regs in fragments:
         payload = _simd_1d_vector_payload(state, regs)
-        if (payload is None or int(payload[0]) != registers
-                or str(payload[1]) != "f32" or int(payload[2]) != lane_width):
+        if (payload is None or int(payload[0]) != registers or str(payload[1]) != "f32"
+                or int(payload[2]) != lane_width):
             fail(
                 "TLXW_EMIT_FRAGMENT_TYPE",
                 STAGE,
@@ -8915,11 +8608,7 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
         _scratch_write_dependency(state, extra_tokens=released)
     lane_width = int(result_type.lane_width or source_type.lane_width or 64)
     mask_payload = result_type.representation in {"mask", "mask_tuple"}
-    element_type = (
-        state.dsl.i32()
-        if mask_payload
-        else _scalar_type(state.dsl, attrs["element_type"])
-    )
+    element_type = (state.dsl.i32() if mask_payload else _scalar_type(state.dsl, attrs["element_type"]))
     source_count = int(attrs["source_component_count"])
     source_registers = int(attrs["source_registers_per_component"])
     source_slots = int(attrs["source_slot_count"])
@@ -8947,14 +8636,11 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
             "redistribution source components do not match packet attrs",
             target_op_id=op.target_op_id,
         )
-    source_chunk_type = (
-        state.dsl.simd_type(element_type, lane_width)
-        if source_registers == 1
-        else state.dsl.simd_type(
-            state.dsl.vector_type(source_registers, element_type),
-            lane_width,
-        )
-    )
+    source_chunk_type = (state.dsl.simd_type(element_type, lane_width)
+                         if source_registers == 1 else state.dsl.simd_type(
+                             state.dsl.vector_type(source_registers, element_type),
+                             lane_width,
+                         ))
     chunks = tuple(
         _redistribution_component_chunk(
             state,
@@ -8962,9 +8648,7 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
             source_chunk_type,
             source_registers,
             op,
-        )
-        for component in components
-    )
+        ) for component in components)
     source_packet_type = state.dsl.simd_type(
         state.dsl.vector_type(source_slots, element_type),
         lane_width,
@@ -9006,17 +8690,13 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
         op,
     )
     out_names = {str(name) for name, _size in attrs["relation_out_dims"]}
-    source_block = (
-        _redistribution_relation_expr(
-            state,
-            attrs,
-            "block",
-            inputs,
-            op,
-        )
-        if "block" in out_names
-        else block
-    )
+    source_block = (_redistribution_relation_expr(
+        state,
+        attrs,
+        "block",
+        inputs,
+        op,
+    ) if "block" in out_names else block)
     redistributed = state.builder.redistribute(
         source_packet,
         result_packet_type,
@@ -9028,27 +8708,19 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
     )
     result_count = int(attrs["result_component_count"])
     result_registers = int(attrs["result_registers_per_component"])
-    result_chunk_type = (
-        state.dsl.simd_type(element_type, lane_width)
-        if result_registers == 1
-        else state.dsl.simd_type(
-            state.dsl.vector_type(result_registers, element_type),
-            lane_width,
-        )
-    )
+    result_chunk_type = (state.dsl.simd_type(element_type, lane_width)
+                         if result_registers == 1 else state.dsl.simd_type(
+                             state.dsl.vector_type(result_registers, element_type),
+                             lane_width,
+                         ))
     result_components = tuple(
         state.dsl.wave.ExtractOp(
             result_chunk_type,
             redistributed,
             component * result_registers,
-        ).result
-        for component in range(result_count)
-    )
-    state.values[result_id] = (
-        _I32MaskPayload(result_components)
-        if mask_payload
-        else _pack_components(result_components)
-    )
+        ).result for component in range(result_count))
+    state.values[result_id] = (_I32MaskPayload(result_components)
+                               if mask_payload else _pack_components(result_components))
 
 
 def _redistribution_component_chunk(state, component, chunk_type, width, op):
@@ -9145,15 +8817,9 @@ def _emit_layout_packet_alias(state, op, value, attrs):
     result_count = int(attrs["result_component_count"])
     result_width = int(attrs["result_packet_width"])
     result_slots = int(attrs["result_slot_count"])
-    if (
-        source_count <= 0
-        or source_width <= 0
-        or result_count <= 0
-        or result_width <= 0
-        or source_count * source_width != source_slots
-        or result_count * result_width != result_slots
-        or source_slots != result_slots
-    ):
+    if (source_count <= 0 or source_width <= 0 or result_count <= 0 or result_width <= 0
+            or source_count * source_width != source_slots or result_count * result_width != result_slots
+            or source_slots != result_slots):
         fail(
             "TLXW_EMIT_LAYOUT_ALIAS",
             STAGE,
@@ -9164,11 +8830,8 @@ def _emit_layout_packet_alias(state, op, value, attrs):
         return value
 
     if isinstance(value, _RawLayoutVectorPacketPayload):
-        if (
-            int(value.logical_component_count) != source_slots
-            or int(value.packet_width) != result_width
-            or len(value.packets) != result_count
-        ):
+        if (int(value.logical_component_count) != source_slots or int(value.packet_width) != result_width
+                or len(value.packets) != result_count):
             fail(
                 "TLXW_EMIT_LAYOUT_ALIAS",
                 STAGE,
@@ -9207,9 +8870,7 @@ def _emit_layout_packet_alias(state, op, value, attrs):
         state.dsl.wave.PackOp(
             packet_type,
             scalar_slots[index:index + result_width],
-        ).result
-        for index in range(0, result_slots, result_width)
-    )
+        ).result for index in range(0, result_slots, result_width))
     return _pack_components(packets)
 
 
@@ -9255,9 +8916,7 @@ def _layout_alias_scalar_slots(
                     target_op_id=op.target_op_id,
                 )
             scalar_type = state.dsl.simd_type(element_type, int(lane_width))
-            scalar_slots.append(
-                state.dsl.wave.ExtractOp(scalar_type, component, 0).result
-            )
+            scalar_slots.append(state.dsl.wave.ExtractOp(scalar_type, component, 0).result)
             continue
         if payload is None or int(payload[0]) != source_width:
             fail(
@@ -9273,10 +8932,9 @@ def _layout_alias_scalar_slots(
                 scalar_type,
                 component,
                 element,
-            ).result
-            for element in range(source_width)
-        )
+            ).result for element in range(source_width))
     return tuple(scalar_slots)
+
 
 def _raw_register_packet_type(state, packet_bits, lane_width, op):
     packet_bits = int(packet_bits)
@@ -9459,749 +9117,192 @@ def _direct_buffer_store_cache_attr(state, attrs, op):
     return state.dsl.store_cache(kind)
 
 
+def _symbolic_buffer_base(state, source_base, element_type, attrs, op):
+    """Preserve an amdg.buffer_* resource while Wave plans its accesses."""
+    range_bytes = int(attrs["range_bytes"])
+    if range_bytes <= 0 or range_bytes > (1 << 31) - 1:
+        fail(
+            "TLXW_EMIT_INVALID_BUFFER_RANGE",
+            STAGE,
+            "buffer memory requires a positive signed-i32 byte range",
+            target_op_id=op.target_op_id,
+        )
+    return state.builder.make_buffer(
+        source_base,
+        state.builder.constant(state.dsl.i32(), range_bytes),
+        result_type=state.dsl.buffer_ptr_type(element_type),
+    )
+
+
+def _buffer_memory_mask_predicates(
+    state,
+    masks,
+    component_count,
+    lane_width,
+    op,
+):
+    if masks is None:
+        return None
+    if isinstance(masks, _I32MaskPayload):
+        if masks.predicates is not None:
+            return _broadcast_component_count(
+                masks.predicates,
+                component_count,
+                "buffer memory mask predicate",
+                op,
+            )
+        components = _broadcast_component_count(
+            masks.components,
+            component_count,
+            "buffer memory mask payload",
+            op,
+        )
+        zero = _simd_i32_constant(state, lane_width, 0)
+        return tuple(_cmpi(state, "ne", component, zero) for component in components)
+    return _as_mask_predicate_components(
+        state,
+        masks,
+        component_count,
+        lane_width,
+        op,
+    )
+
+
+def _flatten_buffer_store_values(
+    state,
+    value,
+    component_count,
+    access_component_count,
+    element_type,
+    lane_width,
+    op,
+):
+    if isinstance(value, _RawLayoutVectorPacketPayload):
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
+            STAGE,
+            "buffer_store requires typed packet values",
+            target_op_id=op.target_op_id,
+        )
+    logical_components = _value_components(state, value, op)
+    if len(logical_components) != int(component_count):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_store value component count does not match attrs",
+            target_op_id=op.target_op_id,
+        )
+    scalar_type = state.dsl.simd_type(element_type, int(lane_width))
+    scalar_components = []
+    for component in logical_components:
+        payload = _simd_1d_vector_payload(state, component)
+        if payload is None:
+            scalar_components.append(component)
+            continue
+        width, payload_element_type, payload_lane_width = payload
+        if (str(payload_element_type) != str(element_type) or int(payload_lane_width) != int(lane_width)):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
+                STAGE,
+                "buffer_store vector payload type does not match its element type",
+                target_op_id=op.target_op_id,
+            )
+        scalar_components.extend(
+            state.dsl.wave.ExtractOp(scalar_type, component, element).result for element in range(int(width)))
+    if len(scalar_components) != int(access_component_count):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_store scalar packet does not match its access components",
+            target_op_id=op.target_op_id,
+        )
+    return tuple(scalar_components)
+
+
 def _emit_buffer_store(state, op):
     attrs = target_ir.attrs_dict(op)
     has_mask = bool(attrs["has_mask"])
-    mask_operand_count = int(has_mask)
-    expected_operand_count = 3 + mask_operand_count
-    dependency = _barrier_order_dependency(
-        state,
-        op,
-        expected_operand_count,
-    )
+    expected_operand_count = 3 + int(has_mask)
+    dependency = _barrier_order_dependency(state, op, expected_operand_count)
     _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
     capture_token = bool(issue_result_ids)
-    tokens = []
     value = _require_value(state, op.operands[0], op)
     source_base = _require_value(state, op.operands[1], op)
     offsets = _require_value(state, op.operands[2], op)
-    masks = (
-        _require_value(state, op.operands[3], op)
-        if has_mask else None
-    )
-    element_type = _scalar_type(state.dsl, attrs["element_type"])
+    masks = _require_value(state, op.operands[3], op) if has_mask else None
     lane_width = int(attrs["lane_width"])
     component_count = int(attrs["component_count"])
-    value_payload_width = int(attrs.get("value_payload_width", 1))
-    access_component_count = int(
-        attrs.get("access_component_count", component_count)
-    )
-    value_components = _value_components(state, value, op)
+    access_component_count = int(attrs.get("access_component_count", component_count))
+    element_type = _scalar_type(state.dsl, attrs["element_type"])
     offset_components = _as_components(offsets)
-    mask_payload = masks if isinstance(masks, _I32MaskPayload) else None
-    mask_components = None
-    if mask_payload is not None and mask_payload.predicates is not None:
-        mask_components = _broadcast_component_count(
-            mask_payload.predicates,
-            access_component_count,
-            "buffer_store mask predicate",
-            op,
-        )
-        mask_payload = None
-    if mask_payload is not None:
-        mask_payload = _materialize_mask_payload(
-            state,
-            mask_payload,
-            lane_width,
-        )
-    if mask_components is None and masks is not None and mask_payload is None:
-        mask_components = _as_mask_predicate_components(
-            state,
-            masks,
-            access_component_count,
-            int(attrs["lane_width"]),
-            op,
-        )
-    if (
-        len(value_components) != component_count
-        or len(offset_components) != access_component_count
-    ):
+    if len(offset_components) != access_component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
-            "buffer_store value/offset component count does not match attrs",
+            "buffer_store offset component count does not match attrs",
             target_op_id=op.target_op_id,
         )
-    if mask_components is not None and len(mask_components) != access_component_count:
-        fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
-            STAGE,
-            "buffer_store mask component count does not match attrs",
-            target_op_id=op.target_op_id,
-        )
-    if mask_payload is not None and len(mask_payload.components) != access_component_count:
-        fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
-            STAGE,
-            "buffer_store mask payload component count does not match attrs",
-            target_op_id=op.target_op_id,
-        )
-    mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
-    buffer_base = _ptr_cast(
+    value_components = _flatten_buffer_store_values(
         state,
-        source_base,
-        state.dsl.ptr_type(element_type, state.dsl.global_address_space()),
-    )
-    access_offset_components = offset_components
-    store_offset_components = tuple(
-        access_offset_components[component * value_payload_width]
-        for component in range(component_count)
-    )
-    zero_mask_payload = None
-
-    def component_mask(index):
-        nonlocal zero_mask_payload
-        if mask_payload is not None:
-            if zero_mask_payload is None:
-                zero_mask_payload = _simd_i32_constant(state, lane_width, 0)
-            return _cmpi(
-                state,
-                "ne",
-                mask_payload.components[int(index)],
-                zero_mask_payload,
-            )
-        if mask_components is not None:
-            return mask_components[int(index)]
-        return None
-
-    def packet_mask(index, packet_elements):
-        nonlocal zero_mask_payload
-        index = int(index)
-        packet_elements = int(packet_elements)
-        if mask_payload is not None:
-            payload = mask_payload.components[index]
-            if (not all(mask_payload.components[index + element] is payload for element in range(packet_elements))
-                    and not _buffer_store_packet_uses_leading_mask(attrs, index, packet_elements)):
-                return None, False
-            if zero_mask_payload is None:
-                zero_mask_payload = _simd_i32_constant(state, lane_width, 0)
-            return _cmpi(state, "ne", payload, zero_mask_payload), True
-        if mask_components is not None:
-            mask = mask_components[index]
-            if (not all(mask_components[index + element] is mask for element in range(packet_elements))
-                    and not _buffer_store_packet_uses_leading_mask(attrs, index, packet_elements)):
-                return None, False
-            return mask, True
-        return None, True
-
-    def vector_payload_packet_mask(index, packet_components):
-        nonlocal zero_mask_payload
-        access_index = int(index) * value_payload_width
-        packet_elements = int(packet_components) * value_payload_width
-        if mask_payload is not None:
-            payload = mask_payload.components[access_index]
-            if (not all(mask_payload.components[access_index + element] is payload
-                        for element in range(packet_elements))
-                    and not _buffer_store_packet_uses_leading_mask(
-                        attrs,
-                        access_index,
-                        packet_elements,
-                    )):
-                return None, False
-            if zero_mask_payload is None:
-                zero_mask_payload = _simd_i32_constant(state, lane_width, 0)
-            return _cmpi(state, "ne", payload, zero_mask_payload), True
-        if mask_components is not None:
-            mask = mask_components[access_index]
-            if (not all(mask_components[access_index + element] is mask
-                        for element in range(packet_elements))
-                    and not _buffer_store_packet_uses_leading_mask(
-                        attrs,
-                        access_index,
-                        packet_elements,
-                    )):
-                return None, False
-            return mask, True
-        return None, True
-
-    index = 0
-    while index < component_count:
-        packet_elements = 1
-        if value_payload_width == 1:
-            packet_elements = _buffer_store_packet_elements(
-                state,
-                attrs,
-                index,
-                component_count,
-                value_components,
-                store_offset_components,
-                mask_components,
-                mask_payload,
-            )
-        if packet_elements > 1:
-            mask_component, mask_supported = packet_mask(index, packet_elements)
-            if mask_supported:
-                packet_offset_component = store_offset_components[index]
-                token = _emit_buffer_store_vector_packet(
-                    state,
-                    op,
-                    attrs,
-                    index,
-                    packet_elements,
-                    buffer_base,
-                    value_components,
-                    packet_offset_component,
-                    mask_component,
-                    element_type,
-                    lane_width,
-                    mask_mode,
-                    dependency=dependency,
-                    capture_token=capture_token,
-                )
-                if token is not None:
-                    tokens.append(token)
-                index += packet_elements
-                continue
-
-        value_component = value_components[index]
-        access_index = index * value_payload_width
-        mask_payload_component = None
-        direct_mask_component = None
-        if mask_payload is not None:
-            mask_payload_component = mask_payload.components[access_index]
-        elif mask_components is not None:
-            direct_mask_component = mask_components[access_index]
-
-        value_vector = _simd_1d_vector_payload(state, value_component)
-        if value_vector is not None:
-            value_length, value_element_type, value_width = value_vector
-            if value_width != lane_width:
-                fail(
-                    "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
-                    STAGE,
-                    "buffer_store vector value payload lane width must match "
-                    "the store lane width",
-                    target_op_id=op.target_op_id,
-                )
-            mask_payload_vector = (None if mask_payload_component is None else _simd_1d_vector_payload(
-                state, mask_payload_component))
-            if mask_payload_vector is not None and (mask_payload_vector[0] != value_length
-                                                    or mask_payload_vector[2] != lane_width):
-                fail(
-                    "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
-                    STAGE,
-                    "buffer_store vector mask payload must match the value "
-                    "payload shape",
-                    target_op_id=op.target_op_id,
-                )
-            if direct_mask_component is not None:
-                direct_mask_vector = _simd_1d_vector_payload(
-                    state,
-                    direct_mask_component,
-                )
-                if direct_mask_vector is not None:
-                    fail(
-                        "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE",
-                        STAGE,
-                        "buffer_store does not support vector predicate masks; "
-                        "use an i32 mask payload remap",
-                        target_op_id=op.target_op_id,
-                    )
-            vector_packet_components = 0
-            if mask_payload_vector is None:
-                vector_packet_components = _buffer_store_vector_payload_packet_components(
-                    state,
-                    attrs,
-                    index,
-                    component_count,
-                    value_components,
-                    store_offset_components,
-                    value_length,
-                    value_element_type,
-                    lane_width,
-                    None,
-                    None,
-                )
-            if vector_packet_components > 0:
-                mask_component, mask_supported = vector_payload_packet_mask(
-                    index,
-                    vector_packet_components,
-                )
-                if mask_supported:
-                    packet_offset_component = store_offset_components[index]
-                    token = _emit_buffer_store_vector_payload_packet(
-                        state,
-                        op,
-                        attrs,
-                        index,
-                        vector_packet_components,
-                        value_length,
-                        buffer_base,
-                        value_components,
-                        packet_offset_component,
-                        mask_component,
-                        element_type,
-                        lane_width,
-                        mask_mode,
-                        dependency=dependency,
-                        capture_token=capture_token,
-                    )
-                    if token is not None:
-                        tokens.append(token)
-                    index += vector_packet_components
-                    continue
-            value_scalar_type = state.dsl.simd_type(value_element_type, lane_width)
-            for element_index in range(value_length):
-                scalar_value = state.dsl.wave.ExtractOp(
-                    value_scalar_type,
-                    value_component,
-                    int(element_index),
-                ).result
-                scalar_offset = access_offset_components[
-                    access_index + element_index
-                ]
-                scalar_mask = component_mask(access_index + element_index)
-                token = _emit_buffer_store_component(
-                    state,
-                    op,
-                    attrs,
-                    buffer_base,
-                    lane_width,
-                    scalar_value,
-                    scalar_offset,
-                    scalar_mask,
-                    mask_mode,
-                    dependency=dependency,
-                    capture_token=capture_token,
-                )
-                if token is not None:
-                    tokens.append(token)
-            index += 1
-            continue
-
-        offset_component = store_offset_components[index]
-        mask_component = component_mask(access_index)
-        token = _emit_buffer_store_component(
-            state,
-            op,
-            attrs,
-            buffer_base,
-            lane_width,
-            value_component,
-            offset_component,
-            mask_component,
-            mask_mode,
-            dependency=dependency,
-            capture_token=capture_token,
-        )
-        if token is not None:
-            tokens.append(token)
-        index += 1
-    _finish_issue_order_result(state, op, tokens)
-
-
-def _buffer_store_packet_elements(
-    state,
-    attrs,
-    index,
-    component_count,
-    value_components,
-    offset_components,
-    mask_components,
-    mask_payload,
-):
-    max_packet_elements = _buffer_max_packet_elements(attrs)
-    if max_packet_elements <= 1:
-        return 1
-    max_packet_elements = min(max_packet_elements, int(component_count) - int(index))
-    for packet_elements in range(max_packet_elements, 1, -1):
-        if not _buffer_packet_payload_is_legal(packet_elements, int(attrs["element_byte_width"])):
-            continue
-        if not _buffer_store_packet_components_are_scalar(
-                state,
-                index,
-                packet_elements,
-                value_components,
-                offset_components,
-        ):
-            continue
-        if not _buffer_store_packet_mask_is_supported(attrs, index, packet_elements, mask_components, mask_payload):
-            continue
-        if _buffer_store_access_group_allows_packet(attrs, index, packet_elements):
-            return packet_elements
-    return 1
-
-
-def _buffer_store_vector_payload_packet_components(
-    state,
-    attrs,
-    index,
-    component_count,
-    value_components,
-    offset_components,
-    vector_elements,
-    vector_element_type,
-    lane_width,
-    mask_components,
-    mask_payload,
-):
-    index = int(index)
-    component_count = int(component_count)
-    vector_elements = int(vector_elements)
-    if vector_elements <= 1:
-        return 0
-    if int(attrs.get("access_element_count", 1)) < vector_elements:
-        return 0
-    max_packet_elements = min(
-        _buffer_max_packet_elements(attrs),
-        int(attrs.get("access_element_count", 1)),
-    )
-    max_packet_components = min(
-        component_count - index,
-        max_packet_elements // vector_elements,
-    )
-    for packet_components in range(max_packet_components, 0, -1):
-        packet_elements = int(packet_components) * vector_elements
-        if not _buffer_packet_payload_is_legal(packet_elements, int(attrs["element_byte_width"])):
-            continue
-        if not _buffer_store_vector_payload_components_match(
-                state,
-                index,
-                packet_components,
-                value_components,
-                vector_elements,
-                vector_element_type,
-                lane_width,
-        ):
-            continue
-        if not _buffer_store_vector_payload_offsets_are_scalar(
-                state,
-            index,
-            packet_components,
-            offset_components,
-        ):
-            continue
-        if not _buffer_store_vector_payload_packet_mask_is_supported(
-                index,
-                packet_components,
-                mask_components,
-                mask_payload,
-        ):
-            continue
-        if packet_components == 1:
-            return 1
-        if _buffer_store_vector_payload_access_group_allows_packet(
-                attrs,
-                index,
-                packet_components,
-                vector_elements,
-        ):
-            return int(packet_components)
-    return 0
-
-
-def _buffer_store_vector_payload_components_match(
-    state,
-    index,
-    packet_components,
-    value_components,
-    vector_elements,
-    vector_element_type,
-    lane_width,
-):
-    for component in range(int(packet_components)):
-        payload = _simd_1d_vector_payload(state, value_components[int(index) + component])
-        if payload is None:
-            return False
-        payload_elements, payload_element_type, payload_lane_width = payload
-        if int(payload_elements) != int(vector_elements):
-            return False
-        if str(payload_element_type) != str(vector_element_type):
-            return False
-        if int(payload_lane_width) != int(lane_width):
-            return False
-    return True
-
-
-def _buffer_store_vector_payload_offsets_are_scalar(
-    state,
-    index,
-    packet_components,
-    offset_components,
-):
-    for component in range(int(packet_components)):
-        if _simd_1d_vector_payload(state, offset_components[int(index) + component]) is not None:
-            return False
-    return True
-
-
-def _buffer_store_vector_payload_packet_mask_is_supported(index, packet_components, mask_components, mask_payload):
-    index = int(index)
-    packet_components = int(packet_components)
-    if mask_payload is not None:
-        payload = mask_payload.components[index]
-        return all(mask_payload.components[index + component] is payload for component in range(packet_components))
-    if mask_components is not None:
-        mask = mask_components[index]
-        return all(mask_components[index + component] is mask for component in range(packet_components))
-    return True
-
-
-def _buffer_max_packet_elements(attrs):
-    element_byte_width = int(attrs["element_byte_width"])
-    if element_byte_width <= 0:
-        return 1
-    return max(1, 16 // element_byte_width)
-
-
-def _buffer_packet_payload_is_legal(packet_elements, element_byte_width):
-    packet_elements = int(packet_elements)
-    element_byte_width = int(element_byte_width)
-    if packet_elements <= 1 or element_byte_width <= 0:
-        return False
-    payload_bits = packet_elements * element_byte_width * 8
-    return payload_bits <= 128 and (payload_bits == 16 or payload_bits % 32 == 0)
-
-
-def _buffer_store_packet_components_are_scalar(
-    state,
-    index,
-    packet_elements,
-    value_components,
-    offset_components,
-):
-    for element in range(int(packet_elements)):
-        component_index = int(index) + int(element)
-        if _simd_1d_vector_payload(state, value_components[component_index]) is not None:
-            return False
-        if _simd_1d_vector_payload(state, offset_components[component_index]) is not None:
-            return False
-    return True
-
-
-def _buffer_store_packet_mask_is_supported(attrs, index, packet_elements, mask_components, mask_payload):
-    index = int(index)
-    packet_elements = int(packet_elements)
-    if mask_payload is not None:
-        payload = mask_payload.components[index]
-        return (all(mask_payload.components[index + element] is payload for element in range(packet_elements))
-                or _buffer_store_packet_uses_leading_mask(attrs, index, packet_elements))
-    if mask_components is not None:
-        mask = mask_components[index]
-        return (all(mask_components[index + element] is mask for element in range(packet_elements))
-                or _buffer_store_packet_uses_leading_mask(attrs, index, packet_elements))
-    return True
-
-
-def _buffer_store_packet_uses_leading_mask(attrs, index, packet_elements):
-    mask_alignment = int(attrs.get("mask_alignment", 1))
-    return mask_alignment >= int(packet_elements) and int(index) % int(packet_elements) == 0
-
-
-def _buffer_store_access_group_allows_packet(attrs, index, packet_elements):
-    access_elements = int(attrs.get("access_element_count", 1))
-    if access_elements <= 1:
-        return False
-    access_packet_elements = _buffer_load_packet_elements(attrs)
-    if int(packet_elements) > int(access_packet_elements):
-        return False
-    if int(index) % int(packet_elements):
-        return False
-    return int(index) % access_elements + int(packet_elements) <= access_elements
-
-
-def _buffer_store_vector_payload_access_group_allows_packet(attrs, index, packet_components, vector_elements):
-    access_elements = int(attrs.get("access_element_count", 1))
-    packet_elements = int(packet_components) * int(vector_elements)
-    logical_index = int(index) * int(vector_elements)
-    if access_elements <= 1:
-        return False
-    if packet_elements > access_elements:
-        return False
-    if logical_index % packet_elements:
-        return False
-    return logical_index % access_elements + packet_elements <= access_elements
-
-
-def _ixsimpl_proves(predicate):
-    try:
-        return int(predicate.simplify()) == 1
-    except (TypeError, ValueError):
-        return False
-
-
-def _emit_buffer_store_vector_packet(
-    state,
-    op,
-    attrs,
-    index,
-    packet_elements,
-    buffer_base,
-    value_components,
-    offset_component,
-    mask_component,
-    element_type,
-    lane_width,
-    mask_mode,
-    *,
-    dependency=None,
-    capture_token=False,
-):
-    cache = _direct_buffer_store_cache_attr(state, attrs, op)
-    packet_elements = int(packet_elements)
-    packet_type = state.dsl.simd_type(
-        state.dsl.vector_type(packet_elements, element_type),
-        width=int(lane_width),
-    )
-    packet_value = state.dsl.wave.PackOp(
-        packet_type,
-        [value_components[int(index) + element] for element in range(packet_elements)],
-    ).result
-
-    def emit_store():
-        return _emit_contiguous_store(
-            state,
-            packet_value,
-            offset_component,
-            buffer_base,
-            lane_width,
-            dependency=dependency,
-            cache=cache,
-        )
-
-    if mask_component is None:
-        return emit_store()
-    if mask_mode != "exec_where":
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
-            STAGE,
-            f"unsupported buffer_store mask mode {mask_mode}",
-            target_op_id=op.target_op_id,
-        )
-    if capture_token:
-        return _emit_masked_token_region(
-            state,
-            mask_component,
-            dependency or state.builder.token(),
-            emit_store,
-        )
-    return _emit_masked_effect_region(state, mask_component, emit_store)
-
-
-def _emit_buffer_store_vector_payload_packet(
-    state,
-    op,
-    attrs,
-    index,
-    packet_components,
-    vector_elements,
-    buffer_base,
-    value_components,
-    offset_component,
-    mask_component,
-    element_type,
-    lane_width,
-    mask_mode,
-    *,
-    dependency=None,
-    capture_token=False,
-):
-    cache = _direct_buffer_store_cache_attr(state, attrs, op)
-    packet_components = int(packet_components)
-    vector_elements = int(vector_elements)
-    packet_elements = packet_components * vector_elements
-    if packet_components == 1:
-        packet_value = value_components[int(index)]
-    else:
-        packet_type = state.dsl.simd_type(
-            state.dsl.vector_type(packet_elements, element_type),
-            width=int(lane_width),
-        )
-        packet_value = state.dsl.wave.PackOp(
-            packet_type,
-            [value_components[int(index) + component] for component in range(packet_components)],
-        ).result
-
-    def emit_store():
-        return _emit_contiguous_store(
-            state,
-            packet_value,
-            offset_component,
-            buffer_base,
-            lane_width,
-            dependency=dependency,
-            cache=cache,
-        )
-
-    if mask_component is None:
-        return emit_store()
-    if mask_mode != "exec_where":
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
-            STAGE,
-            f"unsupported buffer_store mask mode {mask_mode}",
-            target_op_id=op.target_op_id,
-        )
-    if capture_token:
-        return _emit_masked_token_region(
-            state,
-            mask_component,
-            dependency or state.builder.token(),
-            emit_store,
-        )
-    return _emit_masked_effect_region(state, mask_component, emit_store)
-
-
-def _emit_buffer_store_component(
-    state,
-    op,
-    attrs,
-    buffer_base,
-    lane_width,
-    value_component,
-    offset_component,
-    mask_component,
-    mask_mode,
-    *,
-    dependency=None,
-    capture_token=False,
-):
-    cache = _direct_buffer_store_cache_attr(state, attrs, op)
-
-    def emit_store():
-        return _emit_contiguous_store(
-            state,
-            value_component,
-            offset_component,
-            buffer_base,
-            lane_width,
-            dependency=dependency,
-            cache=cache,
-        )
-
-    if mask_component is None:
-        return emit_store()
-    if mask_mode != "exec_where":
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
-            STAGE,
-            f"unsupported buffer_store mask mode {mask_mode}",
-            target_op_id=op.target_op_id,
-        )
-    if capture_token:
-        return _emit_masked_token_region(
-            state,
-            mask_component,
-            dependency or state.builder.token(),
-            emit_store,
-        )
-    return _emit_masked_effect_region(state, mask_component, emit_store)
-
-
-def _buffer_inactive_element_offset(state, attrs, lane_width):
-    inactive_byte_offset = int(attrs.get("inactive_byte_offset", 1 << 31))
-    element_byte_width = int(attrs["element_byte_width"])
-    if element_byte_width <= 0 or inactive_byte_offset % element_byte_width:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
-            STAGE,
-            "buffer_store inactive byte offset must align to element size",
-        )
-    element_offset = inactive_byte_offset // element_byte_width
-    return state.builder.splat(
-        state.builder.constant(state.dsl.index_type(), element_offset),
-        state.dsl.index_type(),
+        value,
+        component_count,
+        access_component_count,
+        element_type,
         lane_width,
+        op,
+    )
+    mask_components = _buffer_memory_mask_predicates(
+        state,
+        masks,
+        access_component_count,
+        lane_width,
+        op,
+    )
+    if has_mask and attrs.get("mask_mode", "exec_where") != "exec_where":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
+            STAGE,
+            f"unsupported buffer_store mask mode {attrs.get('mask_mode')}",
+            target_op_id=op.target_op_id,
+        )
+    buffer_base = _symbolic_buffer_base(state, source_base, element_type, attrs, op)
+    cache = _direct_buffer_store_cache_attr(state, attrs, op)
+    emit_scatter = _prepare_symbolic_indexed_scatter(
+        state,
+        value_components,
+        offset_components,
+        buffer_base,
+        element_type,
+        lane_width,
+        int(attrs["element_byte_width"]),
+        dependency=dependency,
+        cache=cache,
+    )
+
+    if mask_components is None:
+        token = emit_scatter()
+    else:
+        predicate_conditions = _symbolic_mask_conditions(
+            state,
+            mask_components,
+        )
+        if capture_token:
+            token = _emit_masked_token_region(
+                state,
+                predicate_conditions,
+                dependency or state.builder.token(),
+                emit_scatter,
+            )
+        else:
+            token = _emit_masked_effect_region(
+                state,
+                predicate_conditions,
+                emit_scatter,
+            )
+    _finish_issue_order_result(
+        state,
+        op,
+        () if token is None else (token, ),
     )
 
 
@@ -10232,43 +9333,71 @@ def _mma_packet_payload_type(state, attrs, element_type, lane_width, op):
     )
 
 
+def _reconstruct_buffer_load_value(
+    state,
+    attrs,
+    target_type,
+    scalar_components,
+    component_count,
+    access_component_count,
+    element_type,
+    lane_width,
+    op,
+):
+    scalar_components = tuple(scalar_components)
+    if len(scalar_components) != int(access_component_count):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_load scalar packet does not match its access components",
+            target_op_id=op.target_op_id,
+        )
+    if int(access_component_count) % int(component_count):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "buffer_load access components do not evenly cover result components",
+            target_op_id=op.target_op_id,
+        )
+    payload_width = int(access_component_count) // int(component_count)
+    result_mode = attrs.get("result_value_mode")
+    if (target_type.representation in _MMA_PACKET_REPRESENTATIONS or result_mode == "register_vector_payload"):
+        packet_type = state.dsl.simd_type(
+            state.dsl.vector_type(payload_width, element_type),
+            width=int(lane_width),
+        )
+        return _pack_components(
+            tuple(
+                state.dsl.wave.PackOp(
+                    packet_type,
+                    scalar_components[index:index + payload_width],
+                ).result for index in range(0, int(access_component_count), payload_width)))
+    if payload_width != 1:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "ordinary buffer_load result components must have scalar payloads",
+            target_op_id=op.target_op_id,
+        )
+    return _pack_components(scalar_components)
+
+
 def _emit_buffer_load(state, op):
     attrs = target_ir.attrs_dict(op)
     has_mask = bool(attrs["has_mask"])
-    mask_operand_count = int(has_mask)
-    other_operand_count = int(bool(attrs["has_other"]))
-    operand_count = (
-        2
-        + mask_operand_count
-        + other_operand_count
-    )
+    operand_count = 2 + int(has_mask) + int(bool(attrs["has_other"]))
     dependency = _barrier_order_dependency(state, op, operand_count)
     source_base = _require_value(state, op.operands[0], op)
     offsets = _require_value(state, op.operands[1], op)
     operand_index = 2
-    masks = (
-        _require_value(state, op.operands[operand_index], op)
-        if has_mask else None
-    )
-    operand_index += mask_operand_count
-    other = (
-        _require_value(state, op.operands[operand_index], op)
-        if attrs["has_other"] else None
-    )
-    operand_index += other_operand_count
+    masks = _require_value(state, op.operands[operand_index], op) if has_mask else None
+    operand_index += int(has_mask)
+    other = (_require_value(state, op.operands[operand_index], op) if attrs["has_other"] else None)
     component_count = int(attrs["component_count"])
-    access_component_count = int(
-        attrs.get("access_component_count", component_count)
-    )
+    access_component_count = int(attrs.get("access_component_count", component_count))
+    lane_width = int(attrs["lane_width"])
+    element_type = _scalar_type(state.dsl, attrs["element_type"])
     offset_components = _as_components(offsets)
-    mask_components = (None if masks is None else _as_mask_predicate_components(
-        state,
-        masks,
-        access_component_count,
-        int(attrs["lane_width"]),
-        op,
-    ))
-    other_components = None if other is None else _as_components(other)
     if len(offset_components) != access_component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
@@ -10276,27 +9405,91 @@ def _emit_buffer_load(state, op):
             "buffer_load offset component count does not match attrs",
             target_op_id=op.target_op_id,
         )
-    if mask_components is not None and len(mask_components) != access_component_count:
+    mask_components = _buffer_memory_mask_predicates(
+        state,
+        masks,
+        access_component_count,
+        lane_width,
+        op,
+    )
+    if has_mask and attrs.get("mask_mode", "exec_where") != "exec_where":
         fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
+            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
             STAGE,
-            "buffer_load mask component count does not match attrs",
+            f"unsupported buffer_load mask mode {attrs.get('mask_mode')}",
             target_op_id=op.target_op_id,
         )
-    if other_components is not None and len(other_components) not in (1, component_count):
-        fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
-            STAGE,
-            "buffer_load other component count does not match attrs",
-            target_op_id=op.target_op_id,
+    fallback_components = None
+    scalar_result_type = state.dsl.simd_type(element_type, lane_width)
+    if other is not None:
+        fallback_components = _broadcast_component(
+            state,
+            other,
+            access_component_count,
+            op,
         )
-    if other_components is not None and mask_components is None:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_OTHER",
-            STAGE,
-            "buffer_load other requires a mask",
-            target_op_id=op.target_op_id,
+        splat_cache = []
+        fallback_components = tuple(
+            _memory_simd_component(
+                state,
+                component,
+                attrs["element_type"],
+                lane_width,
+                op,
+                splat_cache,
+            ) for component in fallback_components)
+    elif mask_components is not None:
+        zero = _zero_simd_value(
+            state,
+            scalar_result_type,
+            attrs["element_type"],
+            op,
         )
+        fallback_components = tuple(zero for _ in range(access_component_count))
+    buffer_base = _symbolic_buffer_base(state, source_base, element_type, attrs, op)
+    cache = _direct_buffer_load_cache_attr(state, attrs, op)
+    packet_type = state.dsl.simd_type(
+        state.dsl.vector_type(access_component_count, element_type),
+        width=lane_width,
+    )
+
+    emit_gather = _prepare_symbolic_indexed_gather(
+        state,
+        offset_components,
+        buffer_base,
+        element_type,
+        lane_width,
+        int(attrs["element_byte_width"]),
+        dependency=dependency,
+        cache=cache,
+    )
+
+    if mask_components is None:
+        packet, token = emit_gather()
+    else:
+        fallback_packet = state.dsl.wave.PackOp(
+            packet_type,
+            fallback_components,
+        ).result
+        predicate_conditions = _symbolic_mask_conditions(
+            state,
+            mask_components,
+        )
+        packet, token = _emit_masked_memory_value_region(
+            state,
+            predicate_conditions,
+            packet_type,
+            fallback_packet,
+            dependency,
+            emit_gather,
+        )
+    loaded_components = _extract_packet_components(
+        state,
+        packet,
+        element_type,
+        lane_width,
+        access_component_count,
+    )
     data_result_ids, _issue_result_ids = _issue_order_result_ids(op)
     if len(data_result_ids) != 1:
         fail(
@@ -10307,616 +9500,18 @@ def _emit_buffer_load(state, op):
         )
     result_id = data_result_ids[0]
     target_type = state.target_program.values[result_id].type
-    element_type = _scalar_type(state.dsl, attrs["element_type"])
-    lane_width = int(attrs["lane_width"])
-    mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
-    buffer_base = _ptr_cast(
+    state.values[result_id] = _reconstruct_buffer_load_value(
         state,
-        source_base,
-        state.dsl.ptr_type(element_type, state.dsl.global_address_space()),
-    )
-    load_offset_components = offset_components
-    if attrs.get("result_value_mode") in {"mma_packet_payload", "register_vector_payload"}:
-        payload, tokens = _emit_buffer_load_mma_packet_payload(
-            state,
-            op,
-            attrs,
-            buffer_base,
-            load_offset_components,
-            mask_components,
-            other_components,
-            element_type,
-            target_type,
-            lane_width,
-            access_component_count,
-            mask_mode,
-            dependency,
-        )
-        state.values[result_id] = payload
-        _finish_issue_order_result(state, op, tokens)
-        return
-    result_type = _wave_type(state.dsl, target_type)
-    packet_elements = _buffer_load_packet_elements(attrs)
-    preserve_raw_layout_packets = (
-        attrs.get("result_value_mode") == "raw_layout_vector_packets"
-    )
-    if preserve_raw_layout_packets:
-        _require_buffer_load_raw_layout_packets(
-            state,
-            op,
-            attrs,
-            packet_elements,
-            component_count,
-            mask_components,
-            other_components,
-        )
-    preserve_packets = preserve_raw_layout_packets or _buffer_load_preserves_vector_packets(
-        state,
-        op,
         attrs,
-        packet_elements,
+        target_type,
+        loaded_components,
         component_count,
-        mask_components,
-        other_components,
+        access_component_count,
+        element_type,
+        lane_width,
+        op,
     )
-    loaded_components = []
-    loaded_packets = []
-    tokens = []
-    index = 0
-    while index < component_count:
-        if _can_vectorize_buffer_load_packet(
-                attrs,
-                index,
-                packet_elements,
-                component_count,
-                mask_components,
-                other_components,
-        ):
-            loaded_packet = _emit_buffer_load_vector_packet(
-                state,
-                op,
-                attrs,
-                index,
-                packet_elements,
-                buffer_base,
-                load_offset_components,
-                mask_components,
-                element_type,
-                result_type,
-                lane_width,
-                mask_mode,
-                dependency=dependency,
-                preserve_packet=preserve_packets,
-                preserve_raw_packet=preserve_raw_layout_packets,
-            )
-            loaded_values, loaded_token = loaded_packet
-            tokens.append(loaded_token)
-            if preserve_packets:
-                loaded_packets.extend(loaded_values)
-            else:
-                loaded_components.extend(loaded_values)
-            index += packet_elements
-            continue
-        loaded, loaded_token = _emit_buffer_load_scalar_component(
-            state,
-            op,
-            attrs,
-            index,
-            buffer_base,
-            load_offset_components,
-            mask_components,
-            other_components,
-            result_type,
-            mask_mode,
-            dependency=dependency,
-        )
-        loaded_components.append(loaded)
-        tokens.append(loaded_token)
-        index += 1
-    if preserve_raw_layout_packets:
-        state.values[result_id] = _RawLayoutVectorPacketPayload(
-            tuple(loaded_packets),
-            int(packet_elements),
-            int(component_count),
-            int(attrs["result_element_bit_width"]),
-        )
-    elif preserve_packets:
-        state.values[result_id] = _VectorPacketPayload(
-            tuple(loaded_packets),
-            int(packet_elements),
-            int(component_count),
-        )
-    else:
-        state.values[result_id] = _pack_components(tuple(loaded_components))
-    _finish_issue_order_result(state, op, tokens)
-
-
-def _require_buffer_load_raw_layout_packets(
-    state,
-    op,
-    attrs,
-    packet_elements,
-    component_count,
-    mask_components,
-    other_components,
-):
-    if other_components is not None:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "raw layout-packet buffer_load does not support an other operand",
-            target_op_id=op.target_op_id,
-        )
-    requested_packet_width = int(attrs.get("result_packet_width", 0))
-    element_bit_width = int(attrs.get("result_element_bit_width", 0))
-    if (
-        requested_packet_width <= 1
-        or int(packet_elements) != requested_packet_width
-        or int(component_count) % requested_packet_width
-        or element_bit_width <= 0
-        or 32 % element_bit_width
-        or requested_packet_width * element_bit_width % 32
-    ):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "raw layout-packet buffer_load requires a uniform whole-dword packet tiling",
-            target_op_id=op.target_op_id,
-        )
-    if not all(
-        _can_vectorize_buffer_load_packet(
-            attrs,
-            index,
-            requested_packet_width,
-            component_count,
-            mask_components,
-            other_components,
-        )
-        for index in range(0, int(component_count), requested_packet_width)
-    ):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "raw layout-packet buffer_load requested non-contiguous packets",
-            target_op_id=op.target_op_id,
-        )
-
-
-def _buffer_load_preserves_vector_packets(
-    state,
-    op,
-    attrs,
-    packet_elements,
-    component_count,
-    mask_components,
-    other_components,
-):
-    if attrs.get("result_value_mode") != "vector_packets":
-        return False
-    if other_components is not None:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "vector-packet buffer_load results do not support an other operand",
-            target_op_id=op.target_op_id,
-        )
-    requested_packet_width = int(attrs.get("result_packet_width", 0))
-    if requested_packet_width <= 1:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "vector-packet buffer_load requires result_packet_width",
-            target_op_id=op.target_op_id,
-        )
-    packet_elements = int(packet_elements)
-    component_count = int(component_count)
-    if requested_packet_width != packet_elements:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "vector-packet buffer_load packet width does not match access width",
-            target_op_id=op.target_op_id,
-        )
-    if packet_elements <= 1 or component_count % packet_elements:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "vector-packet buffer_load requires a uniform packet tiling",
-            target_op_id=op.target_op_id,
-        )
-    if not all(
-            _can_vectorize_buffer_load_packet(
-                attrs,
-                index,
-                packet_elements,
-                component_count,
-                mask_components,
-                other_components,
-            ) for index in range(0, component_count, packet_elements)):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "vector-packet buffer_load requested non-contiguous packets",
-            target_op_id=op.target_op_id,
-        )
-    return True
-
-
-def _emit_buffer_load_mma_packet_payload(
-    state,
-    op,
-    attrs,
-    buffer_base,
-    offset_components,
-    mask_components,
-    other_components,
-    element_type,
-    target_type,
-    lane_width,
-    access_component_count,
-    mask_mode,
-    dependency,
-):
-    result_value_mode = attrs.get("result_value_mode")
-    if (result_value_mode == "mma_packet_payload"
-            and target_type.representation not in _MMA_PACKET_REPRESENTATIONS):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "MMA packet payload mode requires an MMA packet result type",
-            target_op_id=op.target_op_id,
-        )
-    if (result_value_mode == "register_vector_payload"
-            and target_type.representation not in {"simd", "simd_tuple"}):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "register vector payload mode requires a SIMD result type",
-            target_op_id=op.target_op_id,
-        )
-    if other_components is not None:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "MMA packet buffer_load does not support other operands",
-            target_op_id=op.target_op_id,
-        )
-    supported_mask_mode = "exec_where" if mask_components is not None else "none"
-    if mask_mode != supported_mask_mode:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
-            STAGE,
-            f"unsupported fragment buffer_load mask mode {mask_mode}",
-            target_op_id=op.target_op_id,
-        )
-    component_count = int(attrs["component_count"])
-    registers = int(attrs.get("registers", 0))
-    if registers <= 1:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "MMA packet buffer_load requires multiple registers",
-            target_op_id=op.target_op_id,
-        )
-    if int(attrs.get("access_element_count", 1)) < registers:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD",
-            STAGE,
-            "MMA packet buffer_load requires contiguous access "
-            "covering the payload registers",
-            target_op_id=op.target_op_id,
-        )
-    if int(access_component_count) != component_count * registers:
-        fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
-            STAGE,
-            "MMA packet access components must cover every register",
-            target_op_id=op.target_op_id,
-        )
-    scalar_component_type = state.dsl.simd_type(
-        _scalar_type(state.dsl, attrs["element_type"]),
-        width=int(lane_width),
-    )
-    payload_type = state.dsl.simd_type(
-        state.dsl.vector_type(registers, element_type),
-        width=int(lane_width),
-    )
-    payloads = []
-    tokens = []
-    for component in range(component_count):
-        index = component * registers
-        if _can_vectorize_buffer_load_packet(
-            attrs,
-            index,
-            registers,
-            access_component_count,
-            mask_components,
-            other_components,
-        ):
-            loaded_values, token = _emit_buffer_load_vector_packet(
-                state,
-                op,
-                attrs,
-                index,
-                registers,
-                buffer_base,
-                offset_components,
-                mask_components,
-                element_type,
-                scalar_component_type,
-                lane_width,
-                mask_mode,
-                dependency=dependency,
-                preserve_packet=True,
-            )
-            payloads.extend(loaded_values)
-            tokens.append(token)
-            continue
-        elements = []
-        for element in range(registers):
-            loaded, token = _emit_buffer_load_scalar_component(
-                state,
-                op,
-                attrs,
-                index + element,
-                buffer_base,
-                offset_components,
-                mask_components,
-                other_components,
-                scalar_component_type,
-                mask_mode,
-                dependency=dependency,
-            )
-            elements.append(loaded)
-            tokens.append(token)
-        payloads.append(state.dsl.wave.PackOp(payload_type, tuple(elements)).result)
-    return _pack_components(tuple(payloads)), tuple(tokens)
-
-
-def _buffer_load_packet_elements(attrs):
-    access_elements = int(attrs.get("access_element_count", 1))
-    element_byte_width = int(attrs["element_byte_width"])
-    if access_elements <= 1 or element_byte_width <= 0:
-        return 1
-    max_elements = max(1, 16 // element_byte_width)
-    packet_elements = min(access_elements, max_elements)
-    while packet_elements > 1:
-        payload_bits = packet_elements * element_byte_width * 8
-        if (access_elements % packet_elements == 0 and payload_bits <= 128
-                and (payload_bits == 16 or payload_bits % 32 == 0)):
-            return packet_elements
-        packet_elements -= 1
-    return 1
-
-
-def _can_vectorize_buffer_load_packet(
-    attrs,
-    index,
-    packet_elements,
-    component_count,
-    mask_components,
-    other_components,
-):
-    if packet_elements <= 1:
-        return False
-    if int(index) % int(packet_elements):
-        return False
-    if int(index) + int(packet_elements) > int(component_count):
-        return False
-    if other_components is not None:
-        return False
-    if not _buffer_load_access_group_allows_packet(attrs, index, packet_elements):
-        return False
-    if mask_components is None:
-        return True
-    packet_mask = mask_components[int(index)]
-    return (all(mask_components[int(index) + element] is packet_mask for element in range(int(packet_elements)))
-            or _buffer_load_packet_uses_leading_mask(attrs, index, packet_elements))
-
-
-def _buffer_load_access_group_allows_packet(attrs, index, packet_elements):
-    access_elements = int(attrs.get("access_element_count", 1))
-    return _buffer_access_group_allows_packet(access_elements, index, packet_elements)
-
-
-def _buffer_load_packet_uses_leading_mask(attrs, index, packet_elements):
-    mask_alignment = int(attrs.get("mask_alignment", 1))
-    return mask_alignment >= int(packet_elements) and int(index) % int(packet_elements) == 0
-
-
-def _buffer_access_group_allows_packet(access_elements, index, packet_elements):
-    access_elements = int(access_elements)
-    if access_elements <= 1:
-        return False
-    if int(packet_elements) > access_elements:
-        return False
-    if int(index) % int(packet_elements):
-        return False
-    return int(index) % access_elements + int(packet_elements) <= access_elements
-
-
-def _emit_buffer_load_scalar_component(
-    state,
-    op,
-    attrs,
-    index,
-    buffer_base,
-    offset_components,
-    mask_components,
-    other_components,
-    result_type,
-    mask_mode,
-    *,
-    dependency=None,
-):
-    cache = _direct_buffer_load_cache_attr(state, attrs, op)
-    offset_component = offset_components[int(index)]
-    result_fallback = None
-    if other_components is not None:
-        result_fallback = (other_components[0] if len(other_components) == 1 else other_components[int(index)])
-
-    def emit_active_load():
-        return _emit_symbolic_contiguous_gather(
-            state,
-            offset_component,
-            buffer_base,
-            result_type,
-            _scalar_type(state.dsl, attrs["element_type"]),
-            int(attrs["lane_width"]),
-            int(attrs["element_byte_width"]),
-            int(attrs["element_byte_width"]) * 8,
-            dependency=dependency,
-            cache=cache,
-        )
-
-    if mask_components is None:
-        return emit_active_load()
-    if mask_mode != "exec_where":
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
-            STAGE,
-            f"unsupported buffer_load mask mode {mask_mode}",
-            target_op_id=op.target_op_id,
-        )
-    if result_fallback is not None:
-        result_fallback = _memory_simd_component(
-            state,
-            result_fallback,
-            attrs["element_type"],
-            int(attrs["lane_width"]),
-            op,
-            [],
-        )
-    else:
-        result_fallback = _zero_simd_value(
-            state,
-            result_type,
-            attrs["element_type"],
-            op,
-        )
-    loaded, token = _emit_masked_memory_value_region(
-        state,
-        mask_components[int(index)],
-        result_type,
-        result_fallback,
-        dependency,
-        emit_active_load,
-    )
-    return loaded, token
-
-
-def _emit_buffer_load_vector_packet(
-    state,
-    op,
-    attrs,
-    index,
-    packet_elements,
-    buffer_base,
-    offset_components,
-    mask_components,
-    element_type,
-    component_type,
-    lane_width,
-    mask_mode,
-    *,
-    dependency=None,
-    preserve_packet=False,
-    preserve_raw_packet=False,
-):
-    cache = _direct_buffer_load_cache_attr(state, attrs, op)
-    packet_elements = int(packet_elements)
-    if preserve_raw_packet:
-        packet_bits = packet_elements * int(attrs["element_byte_width"]) * 8
-        load_type = _raw_register_packet_type(state, packet_bits, lane_width, op)
-        packet_element_type = state.dsl.i32()
-        packet_element_bit_width = 32
-        packet_component_type = state.dsl.simd_type(
-            packet_element_type,
-            width=int(lane_width),
-        )
-        packet_component_count = packet_bits // 32
-    else:
-        load_type = state.dsl.simd_type(
-            state.dsl.vector_type(packet_elements, element_type),
-            width=int(lane_width),
-        )
-        packet_element_type = element_type
-        packet_element_bit_width = int(attrs["element_byte_width"]) * 8
-        packet_component_type = component_type
-        packet_component_count = packet_elements
-
-    def emit_active_load():
-        return _emit_symbolic_contiguous_gather(
-            state,
-            offset_components[int(index)],
-            buffer_base,
-            load_type,
-            packet_element_type,
-            lane_width,
-            int(attrs["element_byte_width"]),
-            packet_element_bit_width,
-            dependency=dependency,
-            cache=cache,
-        )
-
-    if mask_components is None:
-        loaded, token = emit_active_load()
-    else:
-        if mask_mode != "exec_where":
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_BUFFER_LOAD_MASK",
-                STAGE,
-                f"unsupported buffer_load mask mode {mask_mode}",
-                target_op_id=op.target_op_id,
-            )
-        packet_mask = mask_components[int(index)]
-        if packet_component_count == 1:
-            inactive_value = _zero_simd_value(
-                state,
-                load_type,
-                "i32" if preserve_raw_packet else attrs["element_type"],
-                op,
-            )
-        else:
-            inactive_value = _zero_vector_simd_value(
-                state,
-                load_type,
-                packet_component_type,
-                "i32" if preserve_raw_packet else attrs["element_type"],
-                packet_component_count,
-                op,
-            )
-        loaded, token = _emit_masked_memory_value_region(
-            state,
-            packet_mask,
-            load_type,
-            inactive_value,
-            dependency,
-            emit_active_load,
-        )
-    if preserve_packet:
-        return (loaded, ), token
-    return tuple(
-        state.dsl.wave.ExtractOp(
-            component_type,
-            loaded,
-            element,
-        ).result for element in range(packet_elements)), token
-
-
-def _zero_vector_simd_value(
-    state,
-    result_type,
-    component_type,
-    element_type,
-    component_count,
-    op,
-):
-    zero = _zero_simd_value(state, component_type, element_type, op)
-    return state.dsl.wave.PackOp(
-        result_type,
-        [zero for _ in range(int(component_count))],
-    ).result
+    _finish_issue_order_result(state, op, (token, ))
 
 
 def _emit_store(state, op):
@@ -10980,12 +9575,13 @@ def _emit_store(state, op):
             after=dependency,
         )
         if capture_token:
-            tokens.append(_emit_masked_token_region(
-                state,
-                mask_components[index],
-                dependency or state.builder.token(),
-                emit_store,
-            ))
+            tokens.append(
+                _emit_masked_token_region(
+                    state,
+                    mask_components[index],
+                    dependency or state.builder.token(),
+                    emit_store,
+                ))
         else:
             _emit_masked_effect_region(
                 state,
@@ -11082,16 +9678,12 @@ def _emit_load(state, op):
                 )
 
             other_component = (None if other_components is None else other_components[index])
-            fallback = (
-                other_component
-                if other_component is not None
-                else _zero_simd_value(
-                    state,
-                    result_type,
-                    attrs["element_type"],
-                    op,
-                )
-            )
+            fallback = (other_component if other_component is not None else _zero_simd_value(
+                state,
+                result_type,
+                attrs["element_type"],
+                op,
+            ))
             loaded, token = _emit_masked_memory_value_region(
                 state,
                 mask_components[index],
@@ -11125,7 +9717,7 @@ def _memory_simd_component(state, value, element_type, lane_width, op, splat_cac
 
 
 def _emit_masked_effect_region(state, condition, emit_body):
-    if _is_scalar_i1_value(state, condition):
+    if not isinstance(condition, (tuple, list)) and _is_scalar_i1_value(state, condition):
         with state.builder.if_(condition):
             emit_body()
         return
@@ -11135,7 +9727,7 @@ def _emit_masked_effect_region(state, condition, emit_body):
 
 def _emit_masked_token_region(state, condition, inactive_token, emit_body):
     result_type = state.dsl.mem_token_type()
-    if _is_scalar_i1_value(state, condition):
+    if not isinstance(condition, (tuple, list)) and _is_scalar_i1_value(state, condition):
         with state.builder.if_(condition, [result_type], otherwise=True) as ifop:
             state.builder.yield_([emit_body()])
             with ifop.otherwise():
@@ -11155,7 +9747,7 @@ def _emit_masked_value_region(
     inactive_value,
     emit_body,
 ):
-    if _is_scalar_i1_value(state, condition):
+    if not isinstance(condition, (tuple, list)) and _is_scalar_i1_value(state, condition):
         with state.builder.if_(condition, [result_type], otherwise=True) as ifop:
             state.builder.yield_([emit_body()])
             with ifop.otherwise():
@@ -11179,10 +9771,8 @@ def _emit_masked_memory_value_region(
     token_type = state.dsl.mem_token_type()
     inactive_token = dependency or state.builder.token()
     result_types = [result_type, token_type]
-    if _is_scalar_i1_value(state, condition):
-        with state.builder.if_(
-            condition, result_types, otherwise=True
-        ) as ifop:
+    if not isinstance(condition, (tuple, list)) and _is_scalar_i1_value(state, condition):
+        with state.builder.if_(condition, result_types, otherwise=True) as ifop:
             value, token = emit_body()
             state.builder.yield_([value, token])
             with ifop.otherwise():
@@ -11311,10 +9901,7 @@ def _find_reused_component_result(reused, operands):
 
 
 def _same_component_operands(lhs, rhs):
-    return len(lhs) == len(rhs) and all(
-        lhs_operand is rhs_operand
-        for lhs_operand, rhs_operand in zip(lhs, rhs)
-    )
+    return len(lhs) == len(rhs) and all(lhs_operand is rhs_operand for lhs_operand, rhs_operand in zip(lhs, rhs))
 
 
 def _literal_bool(literal, op):
@@ -11385,22 +9972,22 @@ def _packet_coordinate_values(
 
 
 def _packet_source_offset_index_expr(
-    state,
-    component,
-    component_count,
-    wi,
-    component_thread_count,
-    packet_elements,
-    shape,
-    packet_order,
-    encoded_terms,
-    scalar_values,
-    op,
-    encoded_range,
-    scalar_component_sources,
-    *,
-    coordinate_mode="ordered_linear",
-    linear_component_bases=(),
+        state,
+        component,
+        component_count,
+        wi,
+        component_thread_count,
+        packet_elements,
+        shape,
+        packet_order,
+        encoded_terms,
+        scalar_values,
+        op,
+        encoded_range,
+        scalar_component_sources,
+        *,
+        coordinate_mode="ordered_linear",
+        linear_component_bases=(),
 ):
     wi_sym = state.dsl.sym("wi")
     scalar_symbols = tuple(state.dsl.sym(f"s{index}") for index, _ in enumerate(scalar_values))
@@ -11419,7 +10006,8 @@ def _packet_source_offset_index_expr(
     expr = _affine_offset_expr(state, encoded_terms, coords, scalar_symbols, op)
     bindings = {wi_sym: wi}
     bindings.update({
-        symbol: _mapped_affine_component_binding_value(
+        symbol:
+        _mapped_affine_component_binding_value(
             state,
             value,
             scalar_component_sources,
@@ -11481,17 +10069,17 @@ def _mapped_affine_component_binding_value(
 
 
 def _packet_coordinate_exprs(
-    state,
-    component,
-    wi,
-    component_thread_count,
-    packet_elements,
-    shape,
-    packet_order,
-    *,
-    coordinate_mode="ordered_linear",
-    linear_component_bases=(),
-    op=None,
+        state,
+        component,
+        wi,
+        component_thread_count,
+        packet_elements,
+        shape,
+        packet_order,
+        *,
+        coordinate_mode="ordered_linear",
+        linear_component_bases=(),
+        op=None,
 ):
     linear = wi
     if int(packet_elements) != 1:
@@ -11578,8 +10166,7 @@ def _packet_destination_offset_value(
     wi_first = state.dsl.sym("wi_first")
     wave_id = state.dsl.floor(wi_first / int(lane_width))
     expr = state.dsl.sym_ctx.int_(int(base_dwords))
-    coefficients = tuple(
-        int(value) for value in destination_wave_offset_coefficients_dwords)
+    coefficients = tuple(int(value) for value in destination_wave_offset_coefficients_dwords)
     if coefficients:
         for bit, coefficient in enumerate(coefficients):
             if not coefficient:
@@ -11674,7 +10261,7 @@ def _affine_offset_value(
     no_signed_wrap=False,
 ):
     lane_width = int(state.dsl.SimdType(coords[0].type).width) if coords else 64
-    scalar_components = tuple(_splat_i32_scalar(state, value, lane_width, op) for value in scalar_values)
+    scalar_components = tuple(_affine_i32_component(state, value, lane_width, op) for value in scalar_values)
     result = state.builder.splat(
         state.builder.constant(state.dsl.i32(), 0),
         state.dsl.i32(),
@@ -11852,12 +10439,23 @@ def _scale_simd_i32(state, value, coefficient, lane_width, *, no_signed_wrap=Fal
     )
 
 
-def _splat_i32_scalar(state, value, lane_width, op):
+def _affine_i32_component(state, value, lane_width, op):
+    if _is_simd_i32_value(state, value):
+        value_width = int(state.dsl.SimdType(value.type).width)
+        if value_width != int(lane_width):
+            fail(
+                "TLXW_EMIT_BAD_AFFINE_TERM",
+                STAGE,
+                "affine SIMD operand width does not match its result; "
+                f"expected {int(lane_width)}, got {value_width}",
+                target_op_id=op.target_op_id,
+            )
+        return value
     if str(value.type) != str(state.dsl.i32()):
         fail(
             "TLXW_EMIT_BAD_AFFINE_TERM",
             STAGE,
-            f"affine scalar operand must be i32, got {value.type}",
+            f"affine operand must be scalar or SIMD i32, got {value.type}",
             target_op_id=op.target_op_id,
         )
     return state.builder.splat(value, state.dsl.i32(), lane_width)
@@ -11923,11 +10521,7 @@ def _shared_pointer_with_dword_offset(
     if type(offset) is int and int(offset) == 0:
         state.shared_pointer_offset_cache[key] = base_i32
         return base_i32
-    offset_value = (
-        state.builder.constant(state.dsl.i32(), int(offset))
-        if type(offset) is int
-        else offset
-    )
+    offset_value = (state.builder.constant(state.dsl.i32(), int(offset)) if type(offset) is int else offset)
     result = state.builder.ptr_add(
         base_i32,
         offset_value,
@@ -12135,10 +10729,7 @@ def _as_mask_payload_components(state, value, count, lane_width, op):
 
 def _as_mask_payload_components_with_predicates(state, value, count, lane_width, op):
     if isinstance(value, _I32MaskPayload):
-        components = tuple(
-            _mask_payload_component(state, component, lane_width)
-            for component in value.components
-        )
+        components = tuple(_mask_payload_component(state, component, lane_width) for component in value.components)
         predicates = value.predicates
     else:
         payloads = []
@@ -12183,9 +10774,7 @@ def _mask_predicate_components(state, value, lane_width):
                         component,
                         lane_width,
                     ),
-                )
-                for component in value.components
-            )
+                ) for component in value.components)
     else:
         components = _as_components(value)
     return tuple(components)
@@ -12200,10 +10789,7 @@ def _group_component_indices_by_identity(components):
                 break
         else:
             groups.append((component, [index]))
-    return tuple(
-        (component, tuple(indices))
-        for component, indices in groups
-    )
+    return tuple((component, tuple(indices)) for component, indices in groups)
 
 
 def _broadcast_component_count(components, count, description, op):
@@ -12244,10 +10830,7 @@ def _simd_i32_from_lane_plan(state, plan, lane_values, lane_width):
             STAGE,
             "lane-value SIMD materialization plan must not be empty",
         )
-    if (
-        len(lane_values) != lane_width
-        or any(value < 0 or value >= lane_width for value in lane_values)
-    ):
+    if (len(lane_values) != lane_width or any(value < 0 or value >= lane_width for value in lane_values)):
         fail(
             "TLXW_EMIT_LAYOUT_REMAP",
             STAGE,
@@ -12256,11 +10839,7 @@ def _simd_i32_from_lane_plan(state, plan, lane_values, lane_width):
     kind = str(plan[0])
     if kind == "bit_affine":
         coefficient_count = max(0, lane_width.bit_length() - 1)
-        if (
-            lane_width <= 0
-            or lane_width & (lane_width - 1)
-            or len(plan) != coefficient_count + 2
-        ):
+        if (lane_width <= 0 or lane_width & (lane_width - 1) or len(plan) != coefficient_count + 2):
             fail(
                 "TLXW_EMIT_LAYOUT_REMAP",
                 STAGE,
@@ -12268,15 +10847,10 @@ def _simd_i32_from_lane_plan(state, plan, lane_values, lane_width):
             )
         base = int(plan[1])
         coefficients = tuple(int(value) for value in plan[2:])
-        planned_values = tuple(
-            base
-            + sum(
-                coefficient
-                for bit, coefficient in enumerate(coefficients)
-                if lane & (1 << bit)
-            )
-            for lane in range(lane_width)
-        )
+        planned_values = tuple(base + sum(coefficient
+                                          for bit, coefficient in enumerate(coefficients)
+                                          if lane & (1 << bit))
+                               for lane in range(lane_width))
         if planned_values != lane_values:
             fail(
                 "TLXW_EMIT_LAYOUT_REMAP",
@@ -12350,11 +10924,7 @@ def _simd_i1_mask_from_lane_plan(state, plan, lanes, lane_width):
                 STAGE,
                 "lane-bit mask plan does not match the wave width",
             )
-        planned_lanes = tuple(
-            lane
-            for lane in range(lane_width)
-            if ((lane >> bit) & 1) == value
-        )
+        planned_lanes = tuple(lane for lane in range(lane_width) if ((lane >> bit) & 1) == value)
         if planned_lanes != lanes:
             fail(
                 "TLXW_EMIT_LAYOUT_REMAP",
@@ -12448,11 +11018,9 @@ def _static_lane_membership_i32_payload(state, lane_id, lanes, lane_width):
     lane_set = frozenset(int(lane) for lane in lanes)
     words = []
     for word_index in range((lane_width + 31) // 32):
-        word = sum(
-            1 << (lane - 32 * word_index)
-            for lane in lane_set
-            if 32 * word_index <= lane < 32 * (word_index + 1)
-        )
+        word = sum(1 << (lane - 32 * word_index)
+                   for lane in lane_set
+                   if 32 * word_index <= lane < 32 * (word_index + 1))
         if word >= 1 << 31:
             word -= 1 << 32
         words.append(word)
@@ -12632,9 +11200,7 @@ def _materialize_mask_payload(state, payload, lane_width):
                 component,
                 lane_width,
             ),
-        )
-        for component in payload.components
-    )
+        ) for component in payload.components)
     return _I32MaskPayload(components)
 
 
