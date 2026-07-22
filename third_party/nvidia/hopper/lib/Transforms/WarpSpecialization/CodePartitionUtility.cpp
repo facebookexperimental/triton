@@ -119,14 +119,21 @@ Operation *skipIdxOp(Operation *op) {
 }
 
 Operation *AllocChannel::getSrcOp() {
-  // Prefer the producer cached at channel-creation time. This is the only
-  // reliable source for a producer inside a ttng.subtiled_region: once a
-  // sibling channel (sharing the same in-body template store and per-tile
-  // buffer position) is lowered, insertAsyncComm rewires that store and removes
-  // the shared per-tile position, so the alloc-walk below would no longer reach
-  // it.
-  if (cachedSrcOp)
-    return cachedSrcOp;
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
+  // Re-derive the producer from the (stable) alloc first, and use cachedSrcOp
+  // only as a fallback. The alloc is the durable anchor: buffer creation can
+  // REWRITE a channel's producer store (erase the original local_store /
+  // tma_copy that cachedSrcOp was set to at channel-creation time and emit a
+  // fresh one into the multi-buffered alloc), which leaves cachedSrcOp dangling
+  // while the alloc stays live. Returning the stale cached pointer is a
+  // use-after-free (later deref, e.g. needAccumCntForReuse -> enclosing ->
+  // getParentOp, segfaults). The alloc-walk returns the current live producer.
+  // cachedSrcOp remains the fallback for a producer inside a
+  // ttng.subtiled_region: once a sibling channel (sharing the in-body template
+  // store and per-tile buffer position) is lowered, the store is rewired and
+  // the alloc-walk no longer reaches it, so the surviving cached template op is
+  // the only source. (Both paths agree when both resolve.)
   for (auto usr : allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -145,7 +152,7 @@ Operation *AllocChannel::getSrcOp() {
       }
     }
   }
-  return nullptr;
+  return cachedSrcOp;
 }
 
 static void getAllConsumers(AllocChannel *ch,
@@ -224,6 +231,8 @@ bool appearsBefore(Operation *A, Operation *B) {
 // must be in the same region and the taskIds must be the same. We can have
 // a representative consumer in the channel.
 Operation *AllocChannel::getDstOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   SmallVector<Operation *> consumers;
   getAllConsumers(this, consumers, false);
   if (consumers.size() == 1)
@@ -284,6 +293,8 @@ static Operation *findTmemStartEnd(ttng::TmemAllocChannel *ch,
 }
 
 Operation *ttng::TmemAllocChannel::getSrcOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   if (isOperandD) { // is inout
     // Find tmem.start for this channel ID.
     return findTmemStartEnd(this, "tmem.start");
@@ -321,6 +332,8 @@ static void getAllConsumers(ttng::TmemAllocChannel *ch,
 }
 
 Operation *ttng::TmemAllocChannel::getDstOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   if (isOperandD) {
     // Find tmem.end for this channel ID.
     return findTmemStartEnd(this, "tmem.end");
@@ -387,23 +400,34 @@ static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
     return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
+  //
+  // getSrcOp()/getDstOp() may be null: a sibling channel's lowering can rewire
+  // or erase this channel's producer before we reach here (see AllocChannel's
+  // cachedSrcOp note), so the alloc-walk finds nothing. `enclosing` would then
+  // deref null in isProperAncestor. A null endpoint is not enclosed by ctrlOp,
+  // so skip it. (Which endpoints are already-rewired is iteration-order
+  // dependent, so an unguarded deref is a layout-sensitive crash.)
   for (auto *ch : group->channels) {
+    if (ch->defunct)
+      continue; // alloc folded into the representative and erased; skip.
+    Operation *src = ch->getSrcOp();
+    Operation *dst = ch->getDstOp();
     if (auto forOp = dyn_cast<scf::ForOp>(ctrlOp)) {
-      if (enclosing(forOp, ch->getSrcOp()))
+      if (src && enclosing(forOp, src))
         return true;
-      if (enclosing(forOp, ch->getDstOp()))
+      if (dst && enclosing(forOp, dst))
         return true;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(ctrlOp)) {
-      if (enclosing(ifOp, ch->getSrcOp()))
+      if (src && enclosing(ifOp, src))
         return true;
-      if (enclosing(ifOp, ch->getDstOp()))
+      if (dst && enclosing(ifOp, dst))
         return true;
     }
     if (auto whileOp = dyn_cast<scf::WhileOp>(ctrlOp)) {
-      if (enclosing(whileOp, ch->getSrcOp()))
+      if (src && enclosing(whileOp, src))
         return true;
-      if (enclosing(whileOp, ch->getDstOp()))
+      if (dst && enclosing(whileOp, dst))
         return true;
     }
   }
@@ -872,7 +896,20 @@ bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
 // Program order is NOT used across partitions: distinct async tasks run
 // concurrently, so their relative text position is not a happens-before (and
 // op-id/liveness intervals are likewise meaningless across partitions).
-static bool hasDependencyChain(Channel *A, Channel *B) {
+// `crossPartitionProgOrder` controls the program-order fallback (2):
+//   true  (default): same-block textual order is an edge even across partitions
+//                    -- what code partitioning uses to ORDER an already-decided
+//                    reuse (some real kernels, e.g. HSTU 2-KV reduce_dq, rely
+//                    on it; dropping it globally regressed FA-bwd + HSTU).
+//   false: program order is an edge only WITHIN one partition (a common
+//          async_task_id, where textual order is a genuine happens-before).
+//          This is the SOUND gate for DECIDING whether to FORM an N-way group:
+//          it refuses to order independent cross-partition siblings (FA-bwd
+//          {qkT,ppT,dsT}: ppT,dsT are cross-partition and data-independent, so
+//          no edge -> the group is correctly rejected), while a real chain
+//          ({dpT,dsT,dq}: dpT->dsT and dsT->dq are data deps) still orders.
+static bool hasDependencyChain(Channel *A, Channel *B,
+                               bool crossPartitionProgOrder = true) {
   Operation *aConsumer = A->getDstOp();
   Operation *bProducer = B->getSrcOp();
   if (!aConsumer || !bProducer)
@@ -883,14 +920,21 @@ static bool hasDependencyChain(Channel *A, Channel *B) {
   if (dependsThroughMemory(aConsumer, bProducer, /*followBufferReuse=*/true))
     return true;
 
-  // (2) program order within the same block (cross-partition included).
-  // NOTE: restricting this to the same partition is UNSOUND -- it drops
-  // legitimate cross-partition program-order reuse edges that real kernels rely
-  // on (regressed FA-bwd previously and HSTU 2-KV reduce_dq: wrong dq). The
-  // cost is that a hand-pinned unorderable group (t_bwd_badgroup) is not
-  // fast-failed here; that is the still-open N-way ordering crux (T279873316).
-  if (aConsumer->getBlock() == bProducer->getBlock())
+  // (2) program order within the same block.
+  if (aConsumer->getBlock() == bProducer->getBlock()) {
+    if (!crossPartitionProgOrder) {
+      // Sound-gate mode: only accept textual order when a single partition runs
+      // both ops (shared async_task_id) -- otherwise the ops run concurrently
+      // and their relative text position is not a happens-before.
+      auto aTasks = getAsyncTaskIds(aConsumer);
+      auto bTasks = getAsyncTaskIds(bProducer);
+      bool sharePartition = llvm::any_of(
+          aTasks, [&](int t) { return llvm::is_contained(bTasks, t); });
+      if (!sharePartition)
+        return false;
+    }
     return appearsBefore(aConsumer, bProducer);
+  }
 
   return false;
 }
@@ -1050,7 +1094,8 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group) {
       "direction (overlapping but temporally unordered reuse pair)");
 }
 
-SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group) {
+SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group,
+                                            bool crossPartitionProgOrder) {
   // Topologically order the group's channels into one dependency chain:
   // channel i's consumer reaches channel i+1's producer (via SSA use-def or
   // same-block program order — both captured by hasDependencyChain). This
@@ -1058,13 +1103,19 @@ SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group) {
   // sort, works across partitions (e.g. FA-bwd {dpT,dsT,dq}: dpT->dsT by SSA,
   // dsT->dq by gemm-partition op order). Returns the ordered channels, or an
   // empty vector when no unique total chain order exists (caller falls back).
+  //
+  // `crossPartitionProgOrder` (default true) preserves code partitioning's
+  // ordering behavior. Pass false when DECIDING whether to form a group (the
+  // planner's N-way gate) so cross-partition textual order cannot spuriously
+  // order data-independent siblings — see hasDependencyChain.
   unsigned n = group->channels.size();
   SmallVector<Channel *> chans(group->channels.begin(), group->channels.end());
   SmallVector<SmallVector<bool>> edge(n, SmallVector<bool>(n, false));
   SmallVector<unsigned> indeg(n, 0);
   for (unsigned i = 0; i < n; ++i)
     for (unsigned j = 0; j < n; ++j)
-      if (i != j && hasDependencyChain(chans[i], chans[j])) {
+      if (i != j &&
+          hasDependencyChain(chans[i], chans[j], crossPartitionProgOrder)) {
         edge[i][j] = true;
         ++indeg[j];
       }

@@ -581,6 +581,29 @@ static bool getBackwardSliceToPartition(Value v,
                                          *srcDim))
           return false;
       }
+      // Also capture stores that write this accumulator (e.g. the pre-loop
+      // zero-init store of an in-place MMA accumulator) so they get sliced
+      // per-partition. Without this, a loop-carried accumulator whose init
+      // store is not sliced keeps a single full-tile token thread: the sliced
+      // MMAs then share the original full accumulator's loop-carried token,
+      // which keeps the full pre-slice TMEM tile alive (dead data, live token)
+      // and doubles TMEM. Slicing the store gives each partition its own
+      // init/token so the full tile becomes dead and is cleaned up.
+      for (Operation *user : tmemAllocOp.getResult().getUsers()) {
+        auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
+        if (!storeOp || storeOp.getDst() != tmemAllocOp.getResult())
+          continue;
+        if (!partitionScheme.ops.insert(storeOp)) {
+          if (!isControlFlowOp(storeOp) &&
+              partitionScheme.opPartitionDims[storeOp] != currentDim)
+            return false;
+          continue;
+        }
+        partitionScheme.opPartitionDims[storeOp] = currentDim;
+        if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
+                                         currentDim))
+          return false;
+      }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
@@ -1425,21 +1448,23 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
     assert(newSrc && "TMEMStoreOp src not found in mappings; was it "
                      "backward-sliced in getSliceToPartition?");
-    // The TMEM store needs its source in a TMEM-compatible layout, but that
-    // requirement is local to this store: the source value may be shared with
-    // other consumers (e.g. an arith.constant feeding both the store and a
-    // downstream elementwise chain) that expect the original sliced encoding.
-    // Convert only for this store and restore the shared mapping afterwards, so
-    // remapping tmemStOp.getSrc() below does not force the TMEM-compatible
-    // layout onto every other user of the value.
-    Value prevSrcMapping = newSrc;
+    bool remappedSrc = false;
     if (newSrc.getType() != newSrcType) {
       auto cvtOp =
           ConvertLayoutOp::create(builder, op->getLoc(), newSrcType, newSrc);
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
+      remappedSrc = true;
     }
     newOp = cloneAndSetResultType(op);
-    mappings.map(tmemStOp.getSrc(), prevSrcMapping);
+    // The tmem-layout conversion above is private to this store. Restore the
+    // src's natural sliced mapping so other partitioned users of a shared src
+    // (e.g. a splat constant reused by the elementwise/activation chain, as in
+    // HSTU where the accumulator zero-init and the SiLU share one 0.0 constant)
+    // are not rewired to this store's converted layout.
+    if (remappedSrc) {
+      mappings.map(tmemStOp.getSrc(), newSrc);
+      reverseMappings.map(newSrc, tmemStOp.getSrc());
+    }
   } else if (auto tmemCopyOp = dyn_cast<nvidia_gpu::TMEMCopyOp>(op)) {
     sliceOp(tmemCopyOp.getDst(), offset, mappings, reverseMappings,
             partitionScheme);
@@ -2241,6 +2266,58 @@ static void reorderLoadsToFirstUse(triton::FuncOp &funcOp) {
   });
 }
 
+// The device-side TMA path (experimental_device_tensormap_create2d) bakes the tile
+// shape into a ttng::TensormapCreateOp's box_dim operands, linked to the descriptor
+// load/store only through the descriptor pointer (device memory), not through SSA.
+// The SSA-based slicer therefore never rescales it, so a data-partitioned load/store
+// keeps the full box_dim and the TMA overruns the partitioned SMEM buffer. Shrink
+// the matching box_dim operand by numPartitions here, once per create op.
+static void scaleDeviceTensormapBoxDims(DataPartitionScheme &partitionScheme) {
+  unsigned factor = partitionScheme.numPartitions;
+  if (factor <= 1)
+    return;
+  llvm::SmallPtrSet<Operation *, 8> scaled;
+  for (Operation *op : partitionScheme.ops) {
+    Value desc;
+    if (auto ld = dyn_cast<DescriptorLoadOp>(op))
+      desc = ld.getDesc();
+    else if (auto st = dyn_cast<DescriptorStoreOp>(op))
+      desc = st.getDesc();
+    else
+      continue;
+    auto dimIt = partitionScheme.opPartitionDims.find(op);
+    if (dimIt == partitionScheme.opPartitionDims.end() ||
+        dimIt->second == DataPartitionScheme::noOpPartitionDim)
+      continue;
+    unsigned dim = dimIt->second;
+    auto reinterp = desc.getDefiningOp<ttng::ReinterpretTensorDescOp>();
+    if (!reinterp)
+      continue;
+    for (Operation *user : reinterp.getRawDesc().getUsers()) {
+      auto tc = dyn_cast<ttng::TensormapCreateOp>(user);
+      if (!tc || !scaled.insert(tc).second)
+        continue;
+      auto boxDim = tc.getBoxDim();
+      unsigned rank = boxDim.size();
+      if (dim >= rank)
+        continue;
+      // box_dim is reverse(load_size): the partitioned dim maps to box_dim[rank-1-dim].
+      unsigned boxIdx = rank - 1 - dim;
+      auto cst = boxDim[boxIdx].getDefiningOp<arith::ConstantOp>();
+      if (!cst)
+        continue;
+      auto ia = dyn_cast<IntegerAttr>(cst.getValue());
+      if (!ia || ia.getInt() % factor != 0)
+        continue;
+      OpBuilder b(tc);
+      auto scaledBox = arith::ConstantOp::create(
+          b, tc.getLoc(), b.getI32IntegerAttr((int32_t)(ia.getInt() / factor)));
+      setAsyncTaskIds(scaledBox, getAsyncTaskIds(tc));
+      tc->setOperand(boxDim.getBeginOperandIndex() + boxIdx, scaledBox);
+    }
+  }
+}
+
 bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
   DataPartitionScheme partitionScheme;
   partitionScheme.numPartitions = numConsumerGroups;
@@ -2283,6 +2360,10 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     LDBG(" Final parition scheme:\n");
     partitionScheme.dump();
   });
+
+  // Shrink device-side TMA descriptor box_dims for partitioned loads/stores before
+  // slicing (the box is not on the SSA path the slicer follows).
+  scaleDeviceTensormapBoxDims(partitionScheme);
 
   // Slice the ops.
   for (int i = 0; i < partitionScheme.numPartitions; i++) {
