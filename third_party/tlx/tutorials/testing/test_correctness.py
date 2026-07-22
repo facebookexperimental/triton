@@ -1011,9 +1011,6 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8_bwd(Z, H, N_CTX, causal):
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_scaled_mm_ws(shape, scale_mode):
     M, N, K = shape
-    # Blockwise stages per-K-group scales in SMEM (~12*K bytes); it OOMs at large K.
-    if scale_mode == "blockwise" and K >= 12288:
-        pytest.skip("blockwise scale SMEM does not fit at large K")
     ScaledMM.run_test(scale_mode, shapes=[shape])
 
 

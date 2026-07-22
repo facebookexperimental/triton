@@ -1,21 +1,22 @@
-# TLX warp-specialized FP8 scaled_mm for Blackwell (SM100), mirroring the CUTLASS
-# KernelTmaWarpSpecialized structure. Computes D = (A @ B^T) * scales in bf16 from
-# A[M,K] / B[N,K] fp8 e4m3, for three scaling recipes (scale_mode=):
+# TLX warp-specialized FP8 scaled_mm for Blackwell (SM100). Computes
+# D = (A @ B^T) * scales in bf16 from A[M,K] / B[N,K] fp8 e4m3, for three scaling
+# recipes (scale_mode=):
 #   "blockwise" (DeepSeek): scale_a[M,K//128] M-major + scale_b[N//128,K//128]. The
-#       scale is K-dependent, so each 128-K group's dot is rescaled by sa[m,g]*sb[n,g]
-#       and summed in a pipelined per-group promotion.
-#   "rowwise":    scale_a[M] per-row, scale_b[N] per-col (K-independent).
-#   "tensorwise": scalar scale_a, scale_b (K-independent).
-#   K-independent modes accumulate all K in one TMEM accumulator and apply the scale
-#   once in the epilogue.
+#       scale changes along K, so each 128-wide K group's dot must be rescaled by
+#       sa[m,g]*sb[n,g] BEFORE it is summed -- a per-group rescale-then-accumulate.
+#   "rowwise":    scale_a[M] per-row, scale_b[N] per-col (constant along K).
+#   "tensorwise": scalar scale_a, scale_b (constant along K).
+#   The two K-independent recipes share one scale across the whole K reduction, so they
+#   sum all of K in a single accumulator and scale once at the end -- far cheaper than
+#   blockwise's per-group promotion.
 #
-# Warp-specialized tasks (register-donation split, CUTLASS-style):
-#   LOAD   : TMA-loads A/B per 128-K group into SMEM.
-#   SFLoad : stages blockwise scales in SMEM (no-op for rowwise/tensorwise).
-#   MMA    : producer of the NUM_ACC_BUFFERS-deep accumulator pipeline.
-#   PROMO  : consumer -- rescales / accumulates the partials and stores.
-# NUM_SMEM_BUFFERS / NUM_ACC_BUFFERS / GROUP_SIZE_M / num_warps are @triton.autotune-
-# managed (keyed on M, N, K, SCALE_MODE).
+# Work is split across specialized warps so each stays lean and the stages overlap:
+#   LOAD   : bulk-copies A/B for one K group into SMEM.
+#   SFLoad : streams the blockwise scales, one K group at a time (idle for row/tensorwise).
+#   MMA    : runs the tensor-core dots, producing accumulator partials.
+#   PROMO  : rescales / sums those partials and writes the output tile.
+# Pipeline depths and tiling (NUM_SMEM_BUFFERS / NUM_ACC_BUFFERS / GROUP_SIZE_M /
+# num_warps) are autotuned per (M, N, K, SCALE_MODE).
 
 import torch
 import triton
@@ -24,19 +25,16 @@ import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-# Register split (mirrors CUTLASS setmaxnreg): the lean load/MMA warps cap at 48
-# regs and donate the surplus to the promotion warpgroup (the "default" task),
-# which inherits it implicitly for the heavy fp32 math.
+# The load/MMA warps do almost no arithmetic, so cap them at 48 registers and give the
+# freed registers to the PROMO warpgroup, which needs them for the heavy fp32 math.
 LOAD_REGS = tl.constexpr(48)
 MMA_REGS = tl.constexpr(48)
 
 
 def _autotune_configs():
-    # Autotune the pure IN-KERNEL knobs (no effect on host-side TMA descriptors or
-    # grid, so no pre_hook needed). EPI_SUB / NUM_CTAS stay fixed at their proven
-    # optima (EPI_SUB=2, NUM_CTAS=1). NUM_PROMO_WARPS must equal the launch num_warps.
-    # Curated list centred on the square-GEMM optimum (4/4/8/8) + diversity for other
-    # shapes; keep small to bound first-call benchmarking cost.
+    # Autotune only the in-kernel knobs (no host TMA-descriptor/grid effect -> no
+    # pre_hook). EPI_SUB=2 / NUM_CTAS=1 are fixed; NUM_PROMO_WARPS must equal num_warps.
+    # Curated around the square-GEMM optimum (4/4/8/8), kept small to bound first-call cost.
     specs = [(4, 4, 8, 8),  # proven optimum for square (e.g. 4096^3)
              (4, 4, 1, 8),  # GSM=1: better L2 for tall/skinny M
              (4, 4, 16, 8),  # GSM=16: wide-N shapes
@@ -62,11 +60,10 @@ def _blackwell_scaled_mm_ws_kernel(
     BLOCK_K: tl.constexpr,  # == 128 (one DeepSeek K-group per iteration)
     GROUP_SIZE_M: tl.constexpr, NUM_SMEM_BUFFERS: tl.constexpr,  # A/B load pipeline depth
     NUM_ACC_BUFFERS: tl.constexpr,  # TMEM accumulator pipeline depth (autotuned)
-    NUM_SMS: tl.constexpr, NUM_CTAS: tl.constexpr = 1,  # 2 -> cluster of 2 SMs cooperate (CUTLASS 2-SM)
-    USE_CLC: tl.constexpr = False,  # True -> CLC dynamic-persistent scheduler (CUTLASS Sched
-    # warp); wins on ragged/grouped/variable-M. Default off (static grid-stride).
-    EPI_SUB: tl.constexpr = 2,  # N sub-tiles for the promotion/epilogue (CUTLASS epi_n loop)
-    K_GROUPS: tl.constexpr = 1,  # = K//BLOCK_K (constexpr): scales staged once per tile
+    NUM_SMS: tl.constexpr, NUM_CTAS: tl.constexpr = 1,  # 2 -> a pair of SMs cooperate on one MMA
+    USE_CLC: tl.constexpr = False,  # True -> hardware dynamic-persistent tile scheduler;
+    # wins on ragged/grouped/variable-M work. Default off (static grid-stride).
+    EPI_SUB: tl.constexpr = 2,  # split the N tile into this many epilogue sub-tiles
     NUM_PROMO_WARPS: tl.constexpr = 8,  # = num_warps; for acc_empty warp-barrier (per-thread arrive)
     SCALE_MODE: tl.constexpr = 0,  # 0=BLOCKWISE (K-dependent, per-group promotion);
     # 1=ROWWISE and 2=TENSORWISE (both K-independent: accumulate ALL K in one accumulator,
@@ -95,9 +92,8 @@ def _blackwell_scaled_mm_ws_kernel(
         pred_cta0 = False
         cta_bars = None
 
-    # TLX two_ctas is N-split ONLY (semantic.py: rhs must be [K, N/2], output N is
-    # doubled back): the 2 SMs split the output N of a shared-A tile, each holding
-    # half of B. CUTLASS's M-split (shared/multicast B) is NOT expressible here.
+    # TLX two_ctas is N-split ONLY. The 2 SMs split the output N of a shared-A tile, each holding
+    # half of B.
     BLOCK_N_CTA: tl.constexpr = BLOCK_N // NUM_CTAS  # each CTA loads/holds this N-slice of B
 
     # ---- SMEM operand buffers (A/B), multi-buffered load pipeline ----
@@ -106,58 +102,57 @@ def _blackwell_scaled_mm_ws_kernel(
 
     # ---- TMEM accumulator pipeline: NUM_ACC_BUFFERS rotating [BLOCK_M,BLOCK_N] fp32 slots ----
     acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, NUM_ACC_BUFFERS, storage=tlx.storage_kind.tmem)
-    # ---- Sub-tiled promotion: N split into EPI_SUB pieces so only a sub-tile
-    # partial is live at once (CUTLASS epilogue sub-tiling). EPI_SUB is a param. ----
+    # ---- Sub-tiled promotion: handle the N tile in EPI_SUB pieces so only one sub-tile's
+    # fp32 partials are live at a time, keeping register/SMEM pressure down. ----
     SUB_N: tl.constexpr = BLOCK_N // EPI_SUB
     # SMEM store buffers, one per sub-tile (multi-buffered TMA store)
     c_smem = tlx.local_alloc((BLOCK_M, SUB_N), tlx.dtype_of(c_desc), EPI_SUB)
 
-    # ---- Scale (SF) SMEM pipeline: the SFLoad warp stages the WHOLE tile's scales
-    # (all K_GROUPS) ONCE per tile; PROMO then reads sa[g]/sb[g] from SMEM per K-group
-    # with NO per-K-group barrier -> only a per-TILE sf handshake (cuts ~2 warpgroup
-    # BAR.SYNC per K-group in the 8-warp PROMO group). Flat buffer arrays indexed
-    # [tbuf*K_GROUPS + g]; NUM_SF_BUF tile-buffers for cross-tile overlap.
-    NUM_SF_BUF: tl.constexpr = 3
-    sa_smem = tlx.local_alloc((BLOCK_M, ), tl.float32, NUM_SF_BUF * K_GROUPS)
-    sb_smem = tlx.local_alloc((1, ), tl.float32, NUM_SF_BUF * K_GROUPS)
+    # ---- Scale (SF) SMEM pipeline: stream the blockwise scales one K group at a time,
+    # NUM_SF_BUF slots deep, so scale SMEM stays small regardless of K. Holding every K
+    # group's scales at once would grow with K and overflow SMEM on large-K problems.
+    NUM_SF_BUF: tl.constexpr = 4  # K-group pipeline depth
+    sa_smem = tlx.local_alloc((BLOCK_M, ), tl.float32, NUM_SF_BUF)
+    sb_smem = tlx.local_alloc((1, ), tl.float32, NUM_SF_BUF)
 
     # ---- Barriers ----
     # A/B load pipeline: producer(load) -> consumer(mma)
-    ab_full = tlx.alloc_barriers(NUM_SMEM_BUFFERS, arrive_count=1)  # TMA fills (expect_bytes)
+    ab_full = tlx.alloc_barriers(NUM_SMEM_BUFFERS, arrive_count=1)  # signalled when A/B are loaded
     ab_empty = tlx.alloc_barriers(NUM_SMEM_BUFFERS, arrive_count=1)  # mma releases
-    # scale (SF) pipeline: producer(sf_load) -> consumer(promo), now PER-TILE
-    sf_full = tlx.alloc_barriers(NUM_SF_BUF, arrive_count=1)  # cp.async.bulk fills (expect_bytes)
-    sf_empty = tlx.alloc_barriers(NUM_SF_BUF, arrive_count=1)  # promo releases
+    # scale (SF) pipeline: producer(sf_load) -> consumer(promo), per K-group.
+    sf_full = tlx.alloc_barriers(NUM_SF_BUF, arrive_count=1)  # signalled when the scales are loaded
+    # sf_empty: a per-thread barrier -- each PROMO thread signals only after its own scale
+    # read, so SFLoad can't overwrite a slot while a slower reader is still using it (and it
+    # avoids a full-warpgroup sync).
+    sf_empty = tlx.alloc_warp_barrier(NUM_SF_BUF, num_warps=NUM_PROMO_WARPS, num_arrivals=1)
     # accumulator pipeline: producer(mma) -> consumer(promo)
     acc_full = tlx.alloc_barriers(NUM_ACC_BUFFERS, arrive_count=1)  # mma commits a slot
-    # acc_empty: PROMO releases each slot with a PER-THREAD (warp-barrier) arrive, so no
-    # CTA BAR.SYNC. alloc_warp_barrier sets arrive_count = NUM_PROMO_WARPS*32; every thread
-    # arrives independently (safe: each warp's TMEM read is fenced by its own tcgen05.wait::ld).
+    # acc_empty: a per-thread barrier -- each PROMO thread frees the accumulator slot right
+    # after its own read, so MMA can refill it without waiting on a full-warpgroup sync.
     acc_empty = tlx.alloc_warp_barrier(NUM_ACC_BUFFERS, num_warps=NUM_PROMO_WARPS, num_arrivals=1)
 
     dsize_a: tl.constexpr = tlx.size_of(tlx.dtype_of(a_desc))
     dsize_b: tl.constexpr = tlx.size_of(tlx.dtype_of(b_desc))
 
-    # ---- CLC dynamic-persistent tile scheduler (CUTLASS Sched warp) ----
-    # A dedicated 1-warp SCHED partition (below) is the CLC pipeline producer (issues
-    # try_cancel) AND a consumer (reads its own next tile to terminate); the 4 work
-    # partitions (LOAD, SFLoad, MMA, PROMO) are the other consumers -> 5 CLC consumers.
-    # Mirrors CUTLASS's WarpCategory::Sched. Wins on ragged/grouped/variable-M.
+    # ---- Optional dynamic-persistent tile scheduler ----
+    # A dedicated scheduler warp asks the hardware for the next tile and hands it to the
+    # four work warps, so tiles are dealt out on demand instead of by a fixed stride --
+    # this keeps the SMs balanced when tiles do uneven work (ragged / grouped / variable-M).
     clc_multi_ctas: tl.constexpr = NUM_CTAS == 2
     if USE_CLC:
         clc_context = tlx.clc_create_context(num_consumers=5)
 
     with tlx.async_tasks():
-        # ============ SCHED warp (dedicated CLC producer, CUTLASS Sched) ============
+        # ============ SCHED warp (hands out the next tile to run) ============
         if USE_CLC:
             with tlx.async_task(num_warps=1, num_regs=LOAD_REGS):
                 tile_id = start_pid
                 clc_phase_producer = 1
                 clc_phase_consumer = 0
                 while tile_id != -1:
-                    # issue the try_cancel for the NEXT tile, then read it (also our
-                    # own termination signal). No GEMM work here -> the try_cancel
-                    # latency overlaps the work warps' compute for this tile.
+                    # Request the next tile, then read the answer (-1 means "no more, stop").
+                    # This warp does no math, so the request latency hides behind the other
+                    # warps' compute on the current tile.
                     tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=clc_multi_ctas)
                     clc_phase_producer ^= 1
                     tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=clc_multi_ctas)
@@ -193,34 +188,31 @@ def _blackwell_scaled_mm_ws_kernel(
                     if tile_id >= num_tiles:
                         tile_id = -1
 
-        # ============ SFLoad warp (cp.async.bulk scale_a -> SMEM) ============
-        # Dedicated scale-load partition (CUTLASS MainloopSFLoad): keeps the scale
-        # global load fully off the promotion warp's critical path.
+        # ============ SFLoad warp (loads the blockwise scales) ============
+        # A separate warp for the scale loads keeps their global-memory latency hidden and
+        # off PROMO's critical path.
         with tlx.async_task(num_warps=1, num_regs=LOAD_REGS):
-            sf_tile = 0
+            sf_cnt = 0
             tile_id = start_pid
             clc_phase = 0
             while tile_id != -1:
                 pid_m, pid_n = _pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_M
                 nblk = pid_n  # BLOCK_N==128 -> one N-block per tile; sb row = scale_b[nblk, :]
-                if SCALE_MODE == 0:  # BLOCKWISE: stage per-(row,K-group) sa + per-block sb.
+                if SCALE_MODE == 0:  # BLOCKWISE: pipeline per-(row,K-group) sa + per-block sb.
                     # ROWWISE loads its tiny K-independent sa/sb directly in PROMO.
-                    tbuf, tphase = get_bufidx_phase(sf_tile, NUM_SF_BUF)
-                    base = tbuf * K_GROUPS
-                    tlx.barrier_wait(sf_empty[tbuf], tphase ^ 1)
-                    # sb: K_GROUPS scalars via regular loads -> flat SMEM slots, fenced before
-                    # the sa bulk signals sf_full. (These loads are in the SFLoad producer,
-                    # already hidden by NUM_SF_BUF prefetch -> not on PROMO's critical path.)
                     for g in range(0, k_groups):
+                        sf_buf, sf_phase = get_bufidx_phase(sf_cnt, NUM_SF_BUF)
+                        tlx.barrier_wait(sf_empty[sf_buf], sf_phase ^ 1)  # slot drained by PROMO
+                        # sb is one scalar per group; write it to SMEM and fence before the sa
+                        # bulk load so both scales become visible to PROMO together.
                         sb_val = tl.load(scale_b_ptr + nblk * num_k_groups_scale + g + tl.arange(0, 1))
-                        tlx.local_store(sb_smem[base + g], sb_val)
-                    tlx.fence_async_shared()
-                    tlx.barrier_expect_bytes(sf_full[tbuf], 4 * BLOCK_M * K_GROUPS)
-                    for g in range(0, k_groups):
-                        tlx.async_load(scale_a_ptr + offs_am + g * M, sa_smem[base + g], bulk=True,
-                                       barrier=sf_full[tbuf])
-                sf_tile += 1
+                        tlx.local_store(sb_smem[sf_buf], sb_val)
+                        tlx.fence_async_shared()
+                        tlx.barrier_expect_bytes(sf_full[sf_buf], 4 * BLOCK_M)
+                        tlx.async_load(scale_a_ptr + offs_am + g * M, sa_smem[sf_buf], bulk=True,
+                                       barrier=sf_full[sf_buf])
+                        sf_cnt += 1
                 if USE_CLC:
                     tile_id = tlx.clc_consumer(clc_context, clc_phase, multi_ctas=clc_multi_ctas)
                     clc_phase ^= 1
@@ -237,8 +229,9 @@ def _blackwell_scaled_mm_ws_kernel(
             clc_phase = 0
             while tile_id != -1:
                 if SCALE_MODE == 0:
-                    # BLOCKWISE: FRESH MMA per K-group into a rotating acc slot -> the
-                    # producer of the NUM_ACC_BUFFERS-deep pipeline PROMO rescales+sums.
+                    # BLOCKWISE: every K group has its own scale, so its dot must be kept
+                    # separate rather than summed in the tensor core. Write each group's
+                    # product to its own accumulator slot; PROMO rescales it, then sums.
                     for g in range(0, k_groups):
                         ld_buf, ld_phase = get_bufidx_phase(ld_cnt, NUM_SMEM_BUFFERS)
                         ac_buf, ac_phase = get_bufidx_phase(acc_cnt, NUM_ACC_BUFFERS)
@@ -295,16 +288,16 @@ def _blackwell_scaled_mm_ws_kernel(
                     if tile_id >= num_tiles:
                         tile_id = -1
 
-        # ============ PROMOTION warp group (consumer: rescale + accumulate + store) ============
-        # "default" task = the launch num_warps warpgroup; it inherits the register
-        # surplus donated by the lean load/MMA warps (CUTLASS setmaxnreg 256 analog).
+        # ============ PROMOTION warpgroup (rescale + accumulate + store) ============
+        # The "default" task is the full num_warps warpgroup; it inherits the registers the
+        # lean load/MMA warps gave up and spends them on the fp32 rescale math.
         with tlx.async_task("default"):
             acc_cnt = 0
             tile_id = start_pid
             clc_phase_consumer = 0
-            sf_tile = 0
+            sf_cnt = 0
             while tile_id != -1:
-                # PROMO is a CLC consumer only; the dedicated SCHED warp produces.
+                # PROMO just reads the next tile id; the scheduler warp requests it.
                 pid_m, pid_n = _pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
                 offs_am = pid_m * BLOCK_M
                 offs_bn = pid_n * BLOCK_N
@@ -314,29 +307,29 @@ def _blackwell_scaled_mm_ws_kernel(
                     # One [BLOCK_M, SUB_N] register running-sum per N sub-tile (EPI_SUB
                     # of them), loop-carried across the K-group loop.
                     accs = [tl.zeros((BLOCK_M, SUB_N), dtype=tl.float32) for _ in range(EPI_SUB)]
-                    # Scales staged in SMEM by SFLoad; wait ONCE per tile, then read
-                    # sa[g]/sb[g] per K-group with NO barrier -> fewer warpgroup BAR.SYNC.
-                    tbuf, tphase = get_bufidx_phase(sf_tile, NUM_SF_BUF)
-                    base = tbuf * K_GROUPS
-                    tlx.barrier_wait(sf_full[tbuf], tphase)
                     for g in range(0, k_groups):
                         ac_buf, ac_phase = get_bufidx_phase(acc_cnt, NUM_ACC_BUFFERS)
-                        sa = tlx.local_load(sa_smem[base + g])  # [BLOCK_M]
-                        sb = tlx.local_load(sb_smem[base + g])  # [1]
+                        # Scales pipelined per K-group by SFLoad; slot released below once read.
+                        sf_buf, sf_phase = get_bufidx_phase(sf_cnt, NUM_SF_BUF)
+                        tlx.barrier_wait(sf_full[sf_buf], sf_phase)
+                        sa = tlx.local_load(sa_smem[sf_buf])  # [BLOCK_M]
+                        sb = tlx.local_load(sb_smem[sf_buf])  # [1]
                         sasb = sa * sb  # [BLOCK_M] (broadcast [1])
                         tlx.barrier_wait(acc_full[ac_buf], ac_phase)
-                        # Synchronous T2R load: overlapping it across K-groups (async-T2R or a
-                        # manual SW pipeline) is neutral -- the acc pipeline + warp scheduler
-                        # already hide the tcgen05.ld latency.
+                        # Read the partial straight from tensor memory; the deep accumulator
+                        # pipeline already hides this read's latency, so overlapping it by
+                        # hand would buy nothing.
                         ps = [
                             tlx.local_load(tlx.local_slice(acc_tmem[ac_buf], [0, s * SUB_N], [BLOCK_M, SUB_N]))
                             for s in range(EPI_SUB)
                         ]
                         accs = [accs[s] + ps[s] * sasb[:, None] for s in range(EPI_SUB)]
-                        tlx.barrier_arrive(acc_empty[ac_buf])  # warp barrier, no CTA BAR.SYNC
+                        tlx.barrier_arrive(acc_empty[ac_buf])  # per-thread, no warpgroup sync
+                        # free the scale slot now that sa/sb are consumed -- per-thread, so a
+                        # slower reader is never overwritten.
+                        tlx.barrier_arrive(sf_empty[sf_buf])  # per-thread, no warpgroup sync
                         acc_cnt += 1
-                    tlx.barrier_arrive(sf_empty[tbuf], 1)  # SFLoad may reload the sf buffer
-                    sf_tile += 1
+                        sf_cnt += 1
                     # sub-tiled store, deferred TMA-store wait (double-buffered c_smem):
                     # this tile's stores drain during the NEXT tile's compute.
                     for s in tl.static_range(EPI_SUB):
@@ -451,10 +444,10 @@ def blackwell_scaled_mm_ws(a, b, scale_a, scale_b, out_dtype=torch.bfloat16, BLO
         grid = (min(num_sms // NUM_CTAS * NUM_CTAS, num_tiles), )
         stride_sms = grid[0]
     else:
-        # non-persistent (vLLM/CUTLASS model): one CTA per tile (NUM_SMS==num_tiles ends
-        # each CTA's grid-stride after one tile). Slower here -- our WS prologue (register
-        # donation + deep pipeline fill) only amortizes over many tiles per CTA. Persistent
-        # is the default; kept for experimentation.
+        # non-persistent: one CTA per tile (NUM_SMS==num_tiles ends the grid-stride after one
+        # tile). Slower here -- the warp-specialized prologue (register donation + filling the
+        # deep pipeline) only pays off when amortized over many tiles per CTA. Kept for
+        # experimentation.
         grid = (num_tiles, )
         stride_sms = num_tiles
     # GROUP_SIZE_M, NUM_SMEM_BUFFERS, NUM_ACC_BUFFERS, NUM_PROMO_WARPS (+ launch
@@ -475,7 +468,6 @@ def blackwell_scaled_mm_ws(a, b, scale_a, scale_b, out_dtype=torch.bfloat16, BLO
         NUM_CTAS=NUM_CTAS,
         USE_CLC=USE_CLC,
         EPI_SUB=EPI_SUB,
-        K_GROUPS=K // BLOCK_K,  # scales staged once per tile
         SCALE_MODE=SCALE_MODE,
     )
     return c
