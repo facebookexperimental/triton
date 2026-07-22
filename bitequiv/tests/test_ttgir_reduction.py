@@ -98,3 +98,18 @@ def test_config_none_is_backward_compatible():
     # no config -> exactly the pre-2a descriptor (the PTX-checker / autotuner path).
     ir = _load("gemm_ieee")
     assert ttgir_reduction_descriptor(ir, None) == ttgir_reduction_descriptor(ir)
+
+
+# --- diff 2b: real warp_group_dot signature (tiling collapses; tf32x3 splits by dot count) ---
+def test_gemm_tiling_and_warps_collapse():
+    # M/N tiling and num_warps are FREE for a wgmma GEMM: a different tile (BM 64 vs 128) and a
+    # different num_warps, same precision, must land in ONE class -- the signature drops the
+    # operand/result shapes and encodings.
+    assert _eq("gemm_tf32_bm64", "gemm_tf32_nw8")
+
+
+def test_gemm_tf32x3_splits_by_dot_count():
+    # tf32x3 lowers to 3 chained wgmma passes (a genuinely different bit order); after that
+    # decomposition all three print inputPrecision=tf32, so the dot COUNT is the only signal
+    # that separates it from a single tf32 dot.
+    assert not _eq("gemm_tf32x3", "gemm_tf32_nw8")

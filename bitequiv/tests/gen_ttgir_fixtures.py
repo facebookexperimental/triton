@@ -87,13 +87,13 @@ def _argmin(nw):
     return argmin_kernel.warmup(src, dst, 8192, BLOCK=8192, ORD=U, num_warps=nw, grid=(1, )).asm["ttgir"]
 
 
-def _gemm(prec):
+def _gemm(prec, bm=128, bn=128, nw=4):
     M = N = K = 128
     a = torch.randn(M, K, device="cuda")
     b = torch.randn(K, N, device="cuda")
     c = torch.empty(M, N, device="cuda")
     return gemm_kernel.warmup(a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
-                              c.stride(1), PREC=prec, BM=M, BN=N, BK=K, num_warps=4, grid=(1, )).asm["ttgir"]
+                              c.stride(1), PREC=prec, BM=bm, BN=bn, BK=K, num_warps=nw, grid=(1, )).asm["ttgir"]
 
 
 def main():
@@ -112,6 +112,11 @@ def main():
         "argmin_nw4": _argmin(4),
         "gemm_ieee": _gemm("ieee"),
         "gemm_tf32": _gemm("tf32"),
+        # diff 2b: M/N tiling + num_warps are FREE (must collapse to gemm_tf32's class);
+        # tf32x3 lowers to 3 chained wgmma passes (a different bit order -> its own class).
+        "gemm_tf32_bm64": _gemm("tf32", bm=64),
+        "gemm_tf32_nw8": _gemm("tf32", nw=8),
+        "gemm_tf32x3": _gemm("tf32x3"),
     }
     for name, ttgir in fixtures.items():
         ttgir = _relativize(ttgir)
