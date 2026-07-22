@@ -664,6 +664,15 @@ bool isExpensiveLocalLoad(Operation *op) {
   auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op);
   if (!localLoad)
     return false;
+  // TLX kernels with explicit local-memory accesses use local_load as a
+  // structural read whose register layout is selected by an adjacent layout
+  // requirement.  Treating those reads as anchors prevents
+  // RemoveLayoutConversions from folding that requirement into the load and
+  // introduces a redundant shared-memory layout conversion.  Keep the
+  // upstream cost heuristic for inferred Triton local-memory traffic.
+  auto mod = op->getParentOfType<ModuleOp>();
+  if (mod->hasAttr("tlx.has_explicit_local_mem_access"))
+    return false;
   auto resultType = dyn_cast<RankedTensorType>(localLoad.getResult().getType());
   if (!resultType)
     return false;
@@ -671,7 +680,6 @@ bool isExpensiveLocalLoad(Operation *op) {
   if (resultType.getNumElements() == 1)
     return false;
   // Tensor has more threads than elements - cheap due to sharing
-  auto mod = op->getParentOfType<ModuleOp>();
   int numWarps = triton::gpu::lookupNumWarps(op);
   int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
   if (resultType.getNumElements() < numWarps * threadsPerWarp)
@@ -1181,8 +1189,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   // the swizzling
 
   auto *ctx = type.getContext();
-  auto layout = ttg::toLinearEncoding(type);
-  auto order = layout.getThreadOrder();
+  auto order = ttg::getThreadOrder(type);
   auto rank = order.size();
   if (rank < 2) {
     return {};
@@ -1195,7 +1202,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   } else {
     return {};
   }
-  auto kWidth = layout.getContigPerThread()[order[0]];
+  auto kWidth = ttg::getContigPerThread(type)[order[0]];
   SmallVector<unsigned> microtileShape(rank, 1);
   microtileShape[order[0]] = 4 * kWidth;
   microtileShape[order[1]] = 8;
@@ -1203,7 +1210,7 @@ swizzleDotOperandLike(RankedTensorType type, ttg::CGAEncodingAttr cgaLayout) {
   // 2, ...]
   auto repOrder = to_vector(llvm::seq<unsigned>(rank));
   auto tile = ttg::nvidiaMmaTile(ctx, microtileShape, kWidth, order, repOrder);
-  if (!divideLeft(layout.getLinearLayout(), tile).has_value()) {
+  if (!divideLeft(ttg::toLinearLayout(type), tile).has_value()) {
     return {};
   }
   return ttg::SwizzledSharedEncodingAttr::get(

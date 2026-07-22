@@ -66,6 +66,25 @@ public:
   }
 };
 
+// A tensor-backed local_alloc/local_load pair is only a materialization of a
+// register layout conversion.  When the source and load are in the same block,
+// the conversion is unconditionally executed after the source becomes
+// available.  Materialize it next to the source so its temporary LDS does not
+// overlap unrelated allocations introduced between the source and the load.
+// Keep conversions in nested regions at the load: moving those to an ancestor
+// could speculatively execute work on paths that do not use the value.
+static Value materializeFoldedConvertLayout(PatternRewriter &rewriter,
+                                            ttg::LocalLoadOp localLoadOp,
+                                            Value src) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  if (src.getParentBlock() == localLoadOp->getBlock())
+    rewriter.setInsertionPointAfterValue(src);
+  else
+    rewriter.setInsertionPoint(localLoadOp);
+  return ttg::ConvertLayoutOp::create(rewriter, localLoadOp.getLoc(),
+                                      localLoadOp.getType(), src);
+}
+
 // Late AMD passes can express a tensor layout conversion as a spill through
 // immutable local memory:
 //   tensor -> ttg.local_alloc -> ttg.local_load(dot)
@@ -108,8 +127,9 @@ public:
     // Replace it with a layout conversion: it lowers to register shuffles for
     // the common encoding pairs and is no worse than the spill in the few
     // cases where the conversion itself still goes through LDS.
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
-        localLoadOp, localLoadOp.getType(), allocOp.getSrc());
+    Value replacement =
+        materializeFoldedConvertLayout(rewriter, localLoadOp, allocOp.getSrc());
+    rewriter.replaceOp(localLoadOp, replacement);
     return success();
   }
 };
@@ -145,8 +165,8 @@ public:
       rewriter.setInsertionPoint(localLoadOp);
       Value replacement = src;
       if (src.getType() != localLoadOp.getType())
-        replacement = ttg::ConvertLayoutOp::create(
-            rewriter, localLoadOp.getLoc(), localLoadOp.getType(), src);
+        replacement =
+            materializeFoldedConvertLayout(rewriter, localLoadOp, src);
       rewriter.replaceOp(localLoadOp, replacement);
     }
     if (allocOp->use_empty())
@@ -166,9 +186,15 @@ static bool isRetaggableTensorProducerValue(Value value) {
     return false;
 
   Operation *definingOp = value.getDefiningOp();
+  // release_layout is a structural boundary: backward propagation must stop
+  // at its source, but its result is explicitly allowed to adopt the layout
+  // selected by downstream consumers.  This is particularly important for
+  // region-carried tensors, where the release result and block argument must
+  // be retagged together to keep RegionBranchOpInterface edges type-correct.
   // Sparse dataflow handles the RegionBranchOpInterface edge consistency; if
   // all incoming values agree, retagging the region result is safe.
-  return isa_and_nonnull<ttg::LocalLoadOp, RegionBranchOpInterface>(definingOp);
+  return isa_and_nonnull<ttg::LocalLoadOp, tlx::ReleaseLayoutOp,
+                         RegionBranchOpInterface>(definingOp);
 }
 
 static Type getTensorCandidateType(Value value, DataFlowSolver &solver,

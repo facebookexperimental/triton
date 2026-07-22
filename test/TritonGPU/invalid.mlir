@@ -1,6 +1,6 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
-// expected-error @+1 {{After removing the zero bases the CGA encoding must be a permutation matrix}}
+// expected-error @+1 {{After removing broadcast bases the CGA encoding must be a permutation matrix}}
 #blocked_bad_cga = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 1], order = [0, 1], CGALayout = [[1, 0], [1, 0]]}>
 module {
   tt.func public @invalid_cga_layout(%arg0: tensor<1x1xf32, #blocked_bad_cga>) {

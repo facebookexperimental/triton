@@ -370,9 +370,13 @@ struct CanonicalizeConvertFromConvert
       // We insert at the point of the original op as there could be ops with
       // memory side-effects between the LocalLoad op and the ConvertLayout op
       rewriter.setInsertionPoint(arg);
-      rewriter.replaceOpWithNewOp<LocalLoadOp>(op, op->getResult(0).getType(),
-                                               sharedLoad.getSrc(),
-                                               sharedLoad.getToken());
+      auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
+          op, op->getResult(0).getType(), sharedLoad.getSrc(),
+          sharedLoad.getToken());
+      // The replacement is still the same memory access.  Preserve semantic
+      // annotations carried by the source load (for example AMD async-wait
+      // readiness) when only its result layout changes.
+      replacement->setAttrs(sharedLoad->getAttrs());
 
       return success();
     }
@@ -676,10 +680,38 @@ LogicalResult MemDescReinterpretOp::verify() {
   auto oldType = getSrc().getType();
   auto newType = getType();
 
+  // Padded layouts create holes in the allocation. Both views must describe
+  // the same hole pattern unless a dialect-specific alias lowering has
+  // explicitly established that the two layouts share backing storage.
+  auto srcEnc = oldType.getEncoding();
+  auto dstEnc = newType.getEncoding();
+  if (isPaddedEncoding(srcEnc) != isPaddedEncoding(dstEnc))
+    return emitError(
+        "cannot reinterpret between padded and non-padded layouts");
+  if (isPaddedEncoding(srcEnc)) {
+    auto getPadPattern = [](MemDescType ty) {
+      auto enc = getPaddedEncoding(ty.getEncoding());
+      auto elementBytes = ty.getElementType().getIntOrFloatBitWidth() / 8;
+      llvm::MapVector<int32_t, int32_t> pattern;
+      for (auto [interval, padding] :
+           llvm::zip_equal(enc.getIntervals(), enc.getPaddings()))
+        pattern.insert({interval * elementBytes, padding * elementBytes});
+      return pattern;
+    };
+    auto srcPattern = getPadPattern(oldType);
+    auto dstPattern = getPadPattern(newType);
+    if ((srcPattern.size() != dstPattern.size() ||
+         !std::equal(srcPattern.begin(), srcPattern.end(),
+                     dstPattern.begin())) &&
+        !(*this)->hasAttr("tlx.allow_different_padding_pattern"))
+      return emitError("cannot reinterpret with different padding pattern");
+  }
+
   if (oldType.getMemorySpace() != newType.getMemorySpace())
     return emitError("source and destination memory space must match");
   if (oldType.getMutableMemory() != newType.getMutableMemory())
     return emitError("source and result must have the same mutability");
+
   auto isSubview = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
     return ty.getShape().take_back(rank) != ty.getAllocShape().take_back(rank);
@@ -688,64 +720,22 @@ LogicalResult MemDescReinterpretOp::verify() {
       (isSubview(oldType) || isSubview(newType)))
     return emitError("source and result must not be subviews; reinterpret the "
                      "parent descriptor and then take a subview");
+
   assert((isa<SharedMemorySpaceAttr, nvidia_gpu::TensorMemorySpaceAttr>(
               oldType.getMemorySpace()) &&
           "expected shared or tensor memory"));
 
-  auto newShape = newType.getShape();
-  auto newEncoding = oldType.getEncoding();
-
-  if (!oldType.getShape().equals(newShape)) {
-    if (auto mmaEncoding = dyn_cast<NVMMASharedEncodingAttr>(newEncoding)) {
-      auto contigDimSize =
-          mmaEncoding.getTransposed() ? newShape.front() : newShape.back();
-      // 8 * mmaEncoding.getSwizzlingByteWidth() is a basic unit (bits) of
-      // swizzling, the swizzling/contig dim has to be a multiple of it
-      // if swizzling mode is None, we still conservatively require at least 128
-      // bits
-      auto basicUnitBitWidth =
-          std::max(128U, 8 * mmaEncoding.getSwizzlingByteWidth());
-      if ((contigDimSize * mmaEncoding.getElementBitWidth()) %
-              basicUnitBitWidth !=
-          0) {
-        return emitError(
-            "New shape causes insufficient elements for swizzling");
-      }
-    } else if (auto swizzledEncoding =
-                   dyn_cast<SwizzledSharedEncodingAttr>(newEncoding)) {
-      auto contigDim = swizzledEncoding.getOrder()[0];
-      if (newShape.size() <= contigDim) {
-        return emitError("New shape incompatible with encoding");
-      }
-      if (swizzledEncoding.getVec() == 0) {
-        return emitError("Unexpected swizzled encoding with `vec` 0");
-      }
-      // conservatively reject cases where swizzling might be interfered
-      // new shape swizzling dim must be a multiple of getVec(), the basic
-      // swizzling unit
-      if (newShape[contigDim] % swizzledEncoding.getVec() != 0) {
-        return emitError(
-            "New shape causes insufficient elements for swizzling");
-      }
-    }
-  }
-
-  auto kBlock = StringAttr::get(getContext(), "block");
-  auto getNumBroadcastCTADims = [kBlock](MemDescType ty) {
+  auto toPhysicalLayout = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
-    auto layout =
-        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
-    auto freeVariableMask = layout.getFreeVariableMasks().lookup(kBlock);
-    return llvm::popcount<uint32_t>(freeVariableMask);
+    auto shape = ty.getAllocShape().take_back(rank);
+    auto encoding = ty.getEncoding();
+    return isPaddedEncoding(encoding) ? paddedLinearLayout(shape, encoding)
+                                      : toLinearLayout(shape, encoding);
   };
-  if (getNumBroadcastCTADims(oldType) != getNumBroadcastCTADims(newType))
-    return emitError(
-        "source and result must have the same number of broadcast CTA dims");
 
-  auto getViewNumBits = [](MemDescType ty) {
+  auto getViewNumBits = [&](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
-    auto layout =
-        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
+    auto layout = toPhysicalLayout(ty);
     int64_t numLayoutCopies = 1;
     for (int64_t dim : ty.getAllocShape().drop_back(rank))
       numLayoutCopies *= dim;
@@ -766,6 +756,13 @@ LogicalResult MemDescReinterpretOp::verify() {
              << "result logical storage size must not exceed source "
                 "logical storage size ("
              << srcNumBits << " vs " << dstNumBits << ")";
+  } else {
+    auto srcNumBits = getViewNumBits(oldType);
+    auto dstNumBits = getViewNumBits(newType);
+    if (srcNumBits != dstNumBits)
+      return emitError() << "source and result must have the same logical "
+                            "storage size ("
+                         << srcNumBits << " vs " << dstNumBits << ")";
   }
   return success();
 }

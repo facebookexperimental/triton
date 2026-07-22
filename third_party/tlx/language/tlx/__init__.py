@@ -61,14 +61,19 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
+from .mma_ops import (async_dot, async_dot_scaled, async_dot_wait, cast_preserve_layout, dot, dot_scaled,
+                      release_layout, require_amd_wmma_layout, require_layout, tcgen05_commit)
 from .types import (
     async_token,
+    amd_mfma_layout_encoding,
+    blocked_layout_encoding,
     buffered_tensor,
     buffered_tensor_type,
     clc_response,
     clc_response_type,
     CLCPipelineContext,
+    distributed_linear_layout_encoding,
+    dot_operand_layout_encoding,
     DummyRegisterLayoutEncoding,
     layout_encoding,
     mbarrier,
@@ -78,6 +83,7 @@ from .types import (
     reuse_group,
     reuse_group_ir_type,
     reuse_group_type,
+    slice_layout_encoding,
     storage_alias_spec as storage_alias_spec_type_class,
     storage_alias_spec_type,
     shared_layout_encoding,
@@ -111,6 +117,11 @@ __all__ = [
     "async_task",
     # types
     "layout_encoding",
+    "blocked_layout_encoding",
+    "slice_layout_encoding",
+    "distributed_linear_layout_encoding",
+    "amd_mfma_layout_encoding",
+    "dot_operand_layout_encoding",
     "shared_layout_encoding",
     "swizzled_layout",
     "swizzled_shared_layout_encoding",
@@ -185,6 +196,12 @@ __all__ = [
     "named_barrier_wait",
     "named_barrier_arrive",
     # mma_ops
+    "dot",
+    "dot_scaled",
+    "require_layout",
+    "release_layout",
+    "cast_preserve_layout",
+    "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",

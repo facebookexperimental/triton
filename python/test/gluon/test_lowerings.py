@@ -173,6 +173,449 @@ def test_convert_1d_to_2d_slice_cga(num_ctas, device):
 
     torch.testing.assert_close(out, torch.arange(head, device=device, dtype=torch.float32))
 
+def _swizzled_warp_layouts_1d():
+    """1D DistributedLinearLayout test layouts (non-injective, lowered as GenericLinearEncoding)."""
+
+    def ilog2(x):
+        return x.bit_length() - 1
+
+    return [
+        # Non-injective 1D: warp bases overlap with lane coverage
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1], [2]],
+            lane_bases=[[4], [8], [16], [32], [64]] + ([[0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[64], [128]],
+            block_bases=[],
+            shape=[256],
+        ),
+        # Non-injective 1D: warp bases overlap with register coverage
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1], [2], [4]],
+            lane_bases=[[8], [16], [32], [64], [128]] + ([[0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[4], [256]],
+            block_bases=[],
+            shape=[512],
+        ),
+        # Non-power-of-two basis (96 = 64 + 32) in the warp bases
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1], [2]],
+            lane_bases=[[4], [8], [16], [32], [64]] + ([[0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[96], [128]],
+            block_bases=[],
+            shape=[256],
+        ),
+    ]
+
+
+def _swizzled_warp_layouts_2d():
+    """2D DistributedLinearLayout test layouts (swizzled warp bases and/or non-injective)."""
+
+    def ilog2(x):
+        return x.bit_length() - 1
+
+    return [
+        # Mildly swizzled: one warp base touches both dims
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [0, 1]],
+            lane_bases=[[2, 0], [4, 0], [8, 0], [0, 2], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[16, 8], [0, 8]],
+            block_bases=[],
+            shape=[32, 16],
+        ),
+        # Aggressively swizzled: both warp bases touch both dims
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [0, 1]],
+            lane_bases=[[2, 0], [4, 0], [8, 0], [0, 2], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[4, 2], [8, 4]],
+            block_bases=[],
+            shape=[16, 8],
+        ),
+        # Swizzled warp + broadcasting in registers
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [0, 0], [0, 1]],
+            lane_bases=[[2, 0], [4, 0], [8, 0], [0, 2], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[16, 8], [0, 8]],
+            block_bases=[],
+            shape=[32, 16],
+        ),
+        # non-injective
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[0, 1], [0, 2], [0, 4], [0, 16], [32, 0]],
+            lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[32, 0], [16, 0]],
+            block_bases=[],
+            shape=[64, 32],
+        ),
+        # non-power-of-two basis (24 = 16 + 8) in the warp bases
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [0, 1]],
+            lane_bases=[[2, 0], [4, 0], [8, 0], [0, 2], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[24, 0], [0, 8]],
+            block_bases=[],
+            shape=[32, 16],
+        ),
+    ]
+
+
+def _swizzled_warp_layouts():
+    """All swizzled/non-injective DistributedLinearLayout test layouts (1D and 2D)."""
+    return _swizzled_warp_layouts_1d() + _swizzled_warp_layouts_2d()
+
+
+# ===--- Tests with swizzled/non-injective DistributedLinearLayout ---===
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts()))
+def test_elementwise_generic_linear(src_layout, device):
+    shape = src_layout.shape
+    num_warps = 2**len(src_layout.warp_bases)
+
+    if len(shape) == 1:
+        N, = shape
+
+        @gluon.jit
+        def kernel(x_ptr, y_ptr, N: ttgl.constexpr, layout: ttgl.constexpr):
+            offs = ttgl.arange(0, N, layout=layout)
+            x = ttgl.load(x_ptr + offs)
+            y = x * x + x
+            ttgl.store(y_ptr + offs, y)
+
+        x = torch.randn(N, dtype=torch.float32, device=device)
+        y = torch.empty_like(x)
+        kernel[(1, )](x, y, N, src_layout, num_warps=num_warps)
+    else:
+        M, N = shape
+
+        @gluon.jit
+        def kernel(x_ptr, y_ptr, M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr):
+            offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None]
+            offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))[None, :]
+            x = ttgl.load(x_ptr + offs_m * N + offs_n)
+            y = x * x + x
+            ttgl.store(y_ptr + offs_m * N + offs_n, y)
+
+        x = torch.randn((M, N), dtype=torch.float32, device=device)
+        y = torch.empty_like(x)
+        kernel[(1, )](x, y, M, N, src_layout, num_warps=num_warps)
+
+    torch.testing.assert_close(y, x * x + x)
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts_2d()))
+def test_expand_dims_generic_linear(src_layout, device):
+    M, N = src_layout.shape
+    num_warps = 2**len(src_layout.warp_bases)
+
+    @gluon.jit
+    def kernel(x_ptr, y_ptr, M: ttgl.constexpr, layout: ttgl.constexpr):
+        offs = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))
+        x = ttgl.load(x_ptr + offs)
+        x_2d = ttgl.expand_dims(x, axis=1)
+        offs_2d = ttgl.expand_dims(offs, axis=1)
+        ttgl.store(y_ptr + offs_2d, x_2d)
+
+    torch.manual_seed(17)
+    x = torch.randint(0, 4, (M, 1), dtype=torch.float32, device=device)
+    y = torch.zeros((M, 1), dtype=torch.float32, device=device)
+    kernel[(1, )](x, y, M, src_layout, num_warps=num_warps)
+    torch.testing.assert_close(y, x)
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts()))
+def test_reshape_generic_linear(src_layout, device):
+    shape = src_layout.shape
+    num_warps = 2**len(src_layout.warp_bases)
+    total = 1
+    for s in shape:
+        total *= s
+
+    if len(shape) == 1:
+        N, = shape
+
+        @gluon.jit
+        def kernel(x_ptr, y_ptr, N: ttgl.constexpr, layout: ttgl.constexpr):
+            offs = ttgl.arange(0, N, layout=layout)
+            x = ttgl.load(x_ptr + offs)
+            reshaped = x.reshape([N // 2, 2])
+            flat = reshaped.reshape([N])
+            ttgl.store(y_ptr + offs, flat)
+
+        torch.manual_seed(0)
+        x = torch.randn(N, dtype=torch.float32, device=device)
+        y = torch.zeros_like(x)
+        kernel[(1, )](x, y, N, src_layout, num_warps=num_warps)
+    else:
+        M, N = shape
+
+        @gluon.jit
+        def kernel(x_ptr, y_ptr, M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr):
+            offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None]
+            offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))[None, :]
+            x = ttgl.load(x_ptr + offs_m * N + offs_n)
+            flat = x.reshape([M * N])
+            y = flat.reshape([M, N])
+            ttgl.store(y_ptr + offs_m * N + offs_n, y)
+
+        torch.manual_seed(0)
+        x = torch.randn((M, N), dtype=torch.float32, device=device)
+        y = torch.zeros_like(x)
+        kernel[(1, )](x, y, M, N, src_layout, num_warps=num_warps)
+
+    torch.testing.assert_close(y, x)
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts_2d()))
+def test_permute_generic_linear(src_layout, device):
+    M, N = src_layout.shape
+    num_warps = 2**len(src_layout.warp_bases)
+
+    @gluon.jit
+    def kernel(x_ptr, y_ptr, M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr):
+        offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None]
+        offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))[None, :]
+        x = ttgl.load(x_ptr + offs_m * N + offs_n)
+        xt = ttgl.permute(x, [1, 0])
+        y = ttgl.permute(xt, [1, 0])
+        ttgl.store(y_ptr + offs_m * N + offs_n, y)
+
+    torch.manual_seed(0)
+    x = torch.randn((M, N), dtype=torch.float32, device=device)
+    y = torch.zeros_like(x)
+    kernel[(1, )](x, y, M, N, src_layout, num_warps=num_warps)
+    torch.testing.assert_close(y, x)
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts()))
+def test_split_join_generic_linear(src_layout, device):
+    if any(all(v == 0 for v in b) for b in src_layout.reg_bases):
+        pytest.skip(
+            "Broadcast register bases cause join/split types mismatch. This is not related to GenericLinearEncodingAttr."
+        )
+    shape = src_layout.shape
+    num_warps = 2**len(src_layout.warp_bases)
+
+    if len(shape) == 1:
+        N, = shape
+
+        @gluon.jit
+        def kernel(x_ptr, y_ptr, N: ttgl.constexpr, layout: ttgl.constexpr):
+            offs = ttgl.arange(0, N, layout=layout)
+            x = ttgl.load(x_ptr + offs)
+            joined = ttgl.join(x, x * 2)
+            a, b = ttgl.split(joined)
+            result = a + b
+            result_layout: ttgl.constexpr = result.type.layout
+            ttgl.store(y_ptr + ttgl.arange(0, N, layout=result_layout), result)
+
+        torch.manual_seed(0)
+        x = torch.randn(N, dtype=torch.float32, device=device)
+        y = torch.zeros_like(x)
+        kernel[(1, )](x, y, N, src_layout, num_warps=num_warps)
+    else:
+        M, N = shape
+
+        @gluon.jit
+        def kernel(x_ptr, y_ptr, M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr):
+            offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None]
+            offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))[None, :]
+            x = ttgl.load(x_ptr + offs_m * N + offs_n)
+            joined = ttgl.join(x, x * 2)
+            a, b = ttgl.split(joined)
+            result = a + b
+            result_layout: ttgl.constexpr = result.type.layout
+            out_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, result_layout))[:, None]
+            out_offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, result_layout))[None, :]
+            ttgl.store(y_ptr + out_offs_m * N + out_offs_n, result)
+
+        torch.manual_seed(0)
+        x = torch.randn((M, N), dtype=torch.float32, device=device)
+        y = torch.zeros_like(x)
+        kernel[(1, )](x, y, M, N, src_layout, num_warps=num_warps)
+
+    torch.testing.assert_close(y, x + x * 2)
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts_2d()))
+def test_broadcast_generic_linear(src_layout, device):
+    M, N = src_layout.shape
+    num_warps = 2**len(src_layout.warp_bases)
+
+    @gluon.jit
+    def kernel(x_ptr, y_ptr, z_ptr, M: ttgl.constexpr, N: ttgl.constexpr, layout: ttgl.constexpr):
+        offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(1, layout))[:, None]
+        offs_n = ttgl.arange(0, N, layout=ttgl.SliceLayout(0, layout))[None, :]
+        col = ttgl.load(x_ptr + offs_m)
+        row = ttgl.load(y_ptr + offs_n)
+        result = col + row
+        ttgl.store(z_ptr + offs_m * N + offs_n, result)
+
+    torch.manual_seed(0)
+    x = torch.randn(M, dtype=torch.float32, device=device)
+    y = torch.randn(N, dtype=torch.float32, device=device)
+    z = torch.zeros((M, N), dtype=torch.float32, device=device)
+    kernel[(1, )](x, y, z, M, N, src_layout, num_warps=num_warps)
+    torch.testing.assert_close(z, x[:, None] + y[None, :])
+
+
+def _shared_layout_kinds():
+    kinds = ["swizzled_trivial", "swizzled", "padded"]
+    if is_hip():
+        kinds += ["partitioned_swizzled", "partitioned_padded"]
+    return kinds
+
+
+def _make_shared_layout(kind, shape):
+    order = list(reversed(range(len(shape))))
+    if kind == "swizzled_trivial":
+        return ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=order)
+    if kind == "swizzled":
+        return ttgl.SwizzledSharedLayout(vec=4, per_phase=2, max_phase=4, order=order)
+    if kind == "padded":
+        return ttgl.PaddedSharedLayout.with_identity_for(interval_padding_pairs=[[16, 4]], shape=list(shape),
+                                                         order=order)
+    if kind == "partitioned_swizzled":
+        inner = ttgl.SwizzledSharedLayout(vec=4, per_phase=2, max_phase=4, order=order)
+        return PartitionedSharedLayout(num_partitions=2, num_groups=1, partition_dim=0, partition_layout=inner)
+    if kind == "partitioned_padded":
+        inner = ttgl.PaddedSharedLayout.with_identity_for(interval_padding_pairs=[[16, 4]], shape=list(shape),
+                                                          order=order)
+        return PartitionedSharedLayout(num_partitions=2, num_groups=1, partition_dim=0, partition_layout=inner)
+    raise ValueError(f"Unknown shared layout kind: {kind}")
+
+
+@pytest.mark.parametrize("src_layout", _filter_layouts(_swizzled_warp_layouts()))
+@pytest.mark.parametrize("shared_kind", _shared_layout_kinds())
+def test_local_load_store_generic_linear(src_layout, shared_kind, device):
+    """Round-trip through shared memory using a swizzled/non-injective DistributedLinearLayout.
+
+    Exercises local_store (smem.store) and local_load (smem.load) lowerings for
+    GenericLinearEncoding sources across various shared-memory layouts.
+    """
+    shape = tuple(src_layout.shape)
+    shared_layout = _make_shared_layout(shared_kind, shape)
+    num_warps = 2**len(src_layout.warp_bases)
+
+    @gluon.jit
+    def kernel(x_ptr, y_ptr, shape: ttgl.constexpr, layout: ttgl.constexpr, shared_layout: ttgl.constexpr):
+        if len(shape) == 1:
+            offs = ttgl.arange(0, shape[0], layout=layout)
+        else:
+            offs_m = ttgl.arange(0, shape[0], layout=ttgl.SliceLayout(1, layout))[:, None]
+            offs_n = ttgl.arange(0, shape[1], layout=ttgl.SliceLayout(0, layout))[None, :]
+            offs = offs_m * shape[1] + offs_n
+        x = ttgl.load(x_ptr + offs)
+        smem = ttgl.allocate_shared_memory(x.dtype, shape, shared_layout)
+        smem.store(x)
+        y = smem.load(layout)
+        ttgl.store(y_ptr + offs, y)
+
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.float32, device=device)
+    y = torch.empty_like(x)
+    kernel[(1, )](x, y, shape, src_layout, shared_layout, num_warps=num_warps)
+
+    torch.testing.assert_close(y, x)
+
+
+def _funky_reduce_layouts():
+
+    def ilog2(x):
+        return x.bit_length() - 1
+
+    # Broadcasting here and there and bases in a weird order
+    layouts = [
+        # Funky layout where the warp bases fit in the lane bases
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[0, 8], [1, 0], [0, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+            lane_bases=[[0, 1], [0, 0], [64, 0], [0, 2], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[32, 0], [0, 16]],
+            block_bases=[],
+            shape=[128, 32],
+        ),
+        # Another funky layout for good measure
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [2, 0]],
+            lane_bases=[[0, 1], [4, 0], [0, 2], [8, 0], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[16, 0], [32, 0]],
+            block_bases=[],
+            shape=[64, 8],
+        ),
+        # Funky layout where warp bases do *not* fit in the lane bases
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [2, 0]],
+            lane_bases=[[0, 1], [4, 0], [0, 2], [8, 0], [0, 4]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[16, 0], [32, 0], [64, 0]],
+            block_bases=[],
+            shape=[128, 8],
+        ),
+        # Basic funky layout with block bases. They fit in the lane bases
+        ttgl.DistributedLinearLayout(
+            reg_bases=[[1, 0], [2, 0]],
+            lane_bases=[[0, 1], [4, 0], [0, 2], [8, 0], [0, 0]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[16, 0], [32, 0]],
+            block_bases=[[64, 0]],
+            shape=[128, 4],
+        ),
+        # Funky layout with two convert_layouts with block_bases
+        ttgl.DistributedLinearLayout(
+            reg_bases=[],
+            lane_bases=[[0, 1], [0, 4], [0, 2], [1, 0], [0, 0]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[4, 0], [8, 0]],
+            block_bases=[[2, 0]],
+            shape=[16, 8],
+        ),
+        # Three convert_layouts
+        ttgl.DistributedLinearLayout(
+            reg_bases=[],
+            lane_bases=[[0, 1], [0, 4], [0, 2], [1, 0], [0, 0]] + ([[0, 0]] * (ilog2(THREADS_PER_WARP) - 5)),
+            warp_bases=[[4, 0], [8, 0], [16, 0], [128, 0], [512, 0]],
+            block_bases=[[2, 0], [32, 0], [64, 0], [256, 0]],
+            shape=[1024, 8],
+        ),
+    ]
+    for axis in [0, 1]:
+        for layout in layouts:
+            yield (layout, axis)
+
+
+@pytest.mark.parametrize("src_layout, axis", list(_funky_reduce_layouts()))
+def test_reduce_funky_layout(src_layout, axis, device):
+
+    shape = tuple(src_layout.shape)
+    num_warps = 2**len(src_layout.warp_bases)
+    num_ctas = 2**len(src_layout.block_bases)
+    # TODO: Remove this once AMD supports num_ctas > 1
+    if num_ctas > 1 and not is_hopper_or_newer():
+        pytest.skip("num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
+
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.float32, device=device)
+    y = torch.empty(shape[1 - axis], dtype=torch.float32, device=device)
+
+    @gluon.jit
+    def kernel(x_ptr, y_ptr, shape: ttgl.constexpr, axis: ttgl.constexpr, layout: ttgl.constexpr):
+        x_offs_m = ttgl.arange(0, shape[0], layout=ttgl.SliceLayout(1, layout))[:, None]
+        x_offs_n = ttgl.arange(0, shape[1], layout=ttgl.SliceLayout(0, layout))[None, :]
+        x = ttgl.load(x_ptr + x_offs_m * shape[1] + x_offs_n)
+        y = ttgl.sum(x, axis=axis)
+        y_offs = ttgl.arange(0, shape[1 - axis])
+        ttgl.store(y_ptr + y_offs, y)
+
+    pm = kernel[(1, )](x, y, shape, axis, src_layout, num_warps=num_warps, num_ctas=num_ctas)
+
+    torch.testing.assert_close(y, torch.sum(x, dim=axis))
+
+    def bases_along_axis(bases, axis):
+        return sum(basis[axis] != 0 for basis in bases)
+
+    axis_warps = bases_along_axis(src_layout.warp_bases, axis)
+    axis_blocks = bases_along_axis(src_layout.block_bases, axis)
+
+    # warp-sync
+    if is_cuda() and axis_warps + axis_blocks == 0:
+        assert pm.asm["ptx"].count("bar.sync") == 0
+
+
 def _reduce_linear_layouts():
     if THREADS_PER_WARP == 32:
         return [

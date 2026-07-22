@@ -42,8 +42,6 @@ struct ConvertLayoutOpConversion
     auto dstTy = op.getType();
 
     LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
-    LinearLayout srcLayout = toLinearLayout(srcTy);
-    LinearLayout dstLayout = toLinearLayout(dstTy);
 
     StringAttr kBlock = str_attr("block");
     StringAttr kWarp = str_attr("warp");
@@ -51,6 +49,13 @@ struct ConvertLayoutOpConversion
     StringAttr kRegister = str_attr("register");
 
     auto dims = conversion.getInDimNames();
+    auto srcEnc = cast<RankedTensorType>(srcTy).getEncoding();
+    auto dstEnc = cast<RankedTensorType>(dstTy).getEncoding();
+    if ((isGenericLinearEncoding(srcEnc) || isGenericLinearEncoding(dstEnc)) &&
+        llvm::range_size(dims) > 1)
+      return op.emitError("ConvertLayoutOp  supports GenericLinearEncoding "
+                          " only when the conversion is transfer between "
+                          "values in the same thread.");
     bool alwaysUseWarpShuffle = cvtAlwaysUseWarpShuffle(op);
     assert(!alwaysUseWarpShuffle || (!llvm::is_contained(dims, kBlock) &&
                                      !llvm::is_contained(dims, kWarp)));

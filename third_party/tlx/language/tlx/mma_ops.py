@@ -66,6 +66,128 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
     return _builder.create_require_layout(src.handle, layout_handle)
 
 
+@tl.builtin
+def require_layout(src, layout: tl.constexpr, _semantic=None):
+    """Require an explicit TLX/TritonGPU layout on a tensor or memdesc value."""
+    layout = tl._unwrap_if_constexpr(layout)
+    if not isinstance(layout, tlx.layout_encoding):
+        raise TypeError(f"`layout` must be a tlx.layout_encoding, got {type(layout).__name__}")
+    handle = _semantic.builder.create_exact_require_layout(src.handle, layout.to_ir(_semantic.builder))
+    if isinstance(src, tlx.buffered_tensor):
+        if not isinstance(layout, tlx.shared_layout_encoding):
+            raise TypeError("buffered tensors require a shared layout encoding")
+        return tlx.buffered_tensor(handle, src.dtype, src.shape, src.type.num, src.type.storage, layout)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def release_layout(src, _semantic=None):
+    """Return an ordinary tensor view of an explicitly laid-out tensor.
+
+    This is the structural counterpart to :func:`require_layout`: it keeps a
+    concrete layout local to an operation implementation while preventing the
+    encoded type from escaping through a function or operation boundary.
+    """
+    src = _semantic.to_tensor(src)
+    handle = _semantic.builder.create_release_layout(src.handle)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def cast_preserve_layout(src, dtype: tl.constexpr, fp_downcast_rounding: tl.constexpr = None,
+                         bitcast: tl.constexpr = False, _semantic=None):
+    """Cast a tensor while preserving its current IR layout encoding."""
+    src = _semantic.to_tensor(src)
+    dtype = tl._unwrap_if_constexpr(dtype)
+    fp_downcast_rounding = tl._unwrap_if_constexpr(fp_downcast_rounding)
+    bitcast = tl._unwrap_if_constexpr(bitcast)
+    if src.type.is_block():
+        dst_ty = src.type.with_element_ty(dtype)
+    else:
+        dst_ty = dtype
+    rounding = None if bitcast else _semantic._str_to_rounding_mode(fp_downcast_rounding)
+    handle = _semantic.builder.create_layout_preserving_cast(
+        src.handle,
+        dst_ty.to_ir(_semantic.builder),
+        rounding,
+        bitcast,
+    )
+    return tl.tensor(handle, dst_ty)
+
+
+def _set_amd_mma_tiles_per_warp(result, tiles_per_warp, semantic):
+    tiles_per_warp = tl._unwrap_if_constexpr(tiles_per_warp)
+    if tiles_per_warp is None:
+        return result
+    tiles_per_warp = [int(tile) for tile in tiles_per_warp]
+    if not tiles_per_warp or any(tile <= 0 for tile in tiles_per_warp):
+        raise ValueError("`tiles_per_warp` must contain positive integers")
+    result.handle.set_attr(
+        "amdg.mma_tiles_per_warp",
+        semantic.builder.make_i32_array_attr(tiles_per_warp),
+    )
+    return result
+
+
+@tl.builtin
+def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_imprecise_acc=None,
+        out_dtype=tl.float32,
+        tiles_per_warp: tl.constexpr = None, _semantic=None):
+    """Thin wrapper around :func:`triton.language.dot` with an optional AMD
+    per-wave tile-ownership hint.
+
+    ``tiles_per_warp`` selects how many instruction tiles each wave owns
+    contiguously in every result dimension. It is consumed by AMD's normal
+    matmul layout selection and does not expose an MFMA/WMMA fragment type at
+    the TLX operation boundary.
+    """
+    result = tl.dot(
+        input,
+        other,
+        acc=acc,
+        input_precision=input_precision,
+        allow_tf32=allow_tf32,
+        max_num_imprecise_acc=max_num_imprecise_acc,
+        out_dtype=out_dtype,
+        _semantic=_semantic,
+    )
+    return _set_amd_mma_tiles_per_warp(result, tiles_per_warp, _semantic)
+
+
+@tl.builtin
+def require_amd_wmma_layout(src, version: tl.constexpr = 3, transposed: tl.constexpr = True,
+                            warp_bases: tl.constexpr = ((0, 2), (2, 0)), reg_bases: tl.constexpr = ((0, 1), (1, 0)),
+                            instr_shape: tl.constexpr = (16, 16, 128), _semantic=None):
+    """Require an AMD WMMA register layout for a tensor value."""
+    warp_bases = [list(row) for row in tl._unwrap_if_constexpr(warp_bases)]
+    reg_bases = [list(row) for row in tl._unwrap_if_constexpr(reg_bases)]
+    instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+    rank = len(src.shape)
+    layout_handle = _semantic.builder.make_amd_wmma_encoding_attr(version, transposed, warp_bases, reg_bases,
+                                                                  instr_shape, rank)
+    handle = _semantic.builder.create_require_layout(src.handle, layout_handle)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None, fast_math=False, lhs_k_pack=True,
+               rhs_k_pack=True, out_dtype=tl.float32, tiles_per_warp: tl.constexpr = None, _semantic=None):
+    """Wrapper around tl.dot_scaled that optionally pins the AMD WMMA tiles-per-warp schedule.
+
+    `tiles_per_warp` is a per-dim sequence of ints attached to the result as
+    the `amdg.wmma_tiles_per_warp` attribute and consumed by AccelerateAMDMatmul
+    to override the default WMMA tile-per-warp count. Passing `None` or all-ones
+    is equivalent to calling `tl.dot_scaled` directly.
+    """
+    result = tl.dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc, fast_math, lhs_k_pack,
+                           rhs_k_pack, out_dtype, _semantic=_semantic)
+    tiles_per_warp = tl._unwrap_if_constexpr(tiles_per_warp)
+    if tiles_per_warp is not None and any(tile != 1 for tile in tiles_per_warp):
+        result.handle.set_attr("amdg.wmma_tiles_per_warp",
+                               _semantic.builder.make_i32_array_attr([int(tile) for tile in tiles_per_warp]))
+    return result
+
+
 def _get_use_acc_handle(use_acc: tl.constexpr | tl.tensor | None, _builder):
     if use_acc is None:
         return None

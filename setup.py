@@ -131,6 +131,21 @@ def check_env_flag(name: str, default: str = "") -> bool:
     return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
 
 
+def prepare_third_party_submodule(name: str, recursive: bool = False):
+    if not is_git_repo():
+        return
+    try:
+        cmd = ["git", "submodule", "update", "--init"]
+        if recursive:
+            cmd.append("--recursive")
+        cmd.append(name)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="third_party")
+    except subprocess.CalledProcessError:
+        pass
+    except FileNotFoundError:
+        pass
+
+
 def get_build_type():
     if check_env_flag("DEBUG"):
         return "Debug"
@@ -379,7 +394,8 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+prepare_third_party_submodule("wave", recursive=True)
+backends = [*BackendInstaller.copy(["nvidia", "amd", "tlx_wave"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():

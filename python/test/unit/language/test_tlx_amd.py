@@ -733,3 +733,51 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+
+
+@triton.jit
+def _explicit_layout_buffer_store_kernel(
+    output_ptr,
+    stride_m,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    store_layout: tl.constexpr = tlx.blocked_layout_encoding.make(
+        [1, 8],
+        [4, 16],
+        [4, 1],
+        [1, 0],
+    )
+    store_layout_m: tl.constexpr = tlx.slice_layout_encoding.make(1, store_layout)
+    store_layout_n: tl.constexpr = tlx.slice_layout_encoding.make(0, store_layout)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    row_offsets = tlx.require_layout(tl.mul(stride_m, offs_m, sanitize_overflow=False), store_layout_m)
+    col_offsets = tlx.require_layout(offs_n, store_layout_n)
+    offsets = tl.add(row_offsets[:, None], col_offsets[None, :], sanitize_overflow=False)
+    offsets = tlx.require_layout(offsets, store_layout)
+    values = tlx.require_layout(
+        tl.full((BLOCK_M, BLOCK_N), 1.0, tl.float32).to(tl.bfloat16),
+        store_layout,
+    )
+    tlx.buffer_store(values, output_ptr, offsets)
+
+
+def test_explicit_layout_buffer_store_survives_coalescing_gfx950(device):
+    """Explicit TLX buffer_store layouts should not be replaced by AMD coalescing."""
+    compiled = compile_for_gfx950(
+        _explicit_layout_buffer_store_kernel,
+        signature={"output_ptr": "*bf16", "stride_m": "i32"},
+        constexprs={"BLOCK_M": 256, "BLOCK_N": 128},
+    )
+    ttgir = compiled.asm["ttgir"]
+    store_line = next(line for line in ttgir.splitlines() if "amdg.buffer_store" in line)
+    store_encoding_match = re.search(r": tensor<256x128xbf16, (#[a-zA-Z0-9_]+)>", store_line)
+    assert store_encoding_match is not None
+    store_encoding = store_encoding_match.group(1)
+    encoding_line = next(line for line in ttgir.splitlines() if line.startswith(f"{store_encoding} = "))
+    assert "tlx.layout_is_explicit" in store_line
+    assert "sizePerThread = [1, 8]" in encoding_line
+    assert "threadsPerWarp = [4, 16]" in encoding_line
+    assert "warpsPerCTA = [4, 1]" in encoding_line

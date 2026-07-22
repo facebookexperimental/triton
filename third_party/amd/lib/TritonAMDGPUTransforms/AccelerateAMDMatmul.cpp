@@ -31,6 +31,8 @@ using triton::AMD::ISAFamily;
 
 constexpr char AttrDecomposedDotScaledSource[] =
     "amdg.decomposed_dot_scaled_source";
+constexpr char AttrAMDMmaTilesPerWarp[] = "amdg.mma_tiles_per_warp";
+constexpr char AttrAMDWmmaTilesPerWarp[] = "amdg.wmma_tiles_per_warp";
 
 int getMfmaVersion(ISAFamily isaFamily) {
   switch (isaFamily) {
@@ -93,7 +95,8 @@ FailureOr<ScaleDotElemType> mlirTypeToScaledElemType(Type type) {
 //
 SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
                                    int numWarps,
-                                   std::pair<int64_t, int64_t> instrShape) {
+                                   std::pair<int64_t, int64_t> instrShape,
+                                   bool respectChainHeuristics = true) {
   auto rank = shape.size();
   // Case 1: Early exit for batched matmul
   if (rank == 3)
@@ -108,7 +111,7 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
   // because this eliminates
   // 1) inter-warp reduction in the softmax step.
   // 2) layout conversion from #mma to #dot_op of the second dot.
-  if (isHeadDot)
+  if (respectChainHeuristics && isHeadDot)
     return {static_cast<unsigned>(numWarps), 1};
   // For the 2nd dot in chain-dot, we always distribute warp along dim0 first,
   // then dim1. Because
@@ -120,7 +123,7 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
   //    needs to hold more elements in the final output, which increases
   //    register pressure, especially for large head dim (e.g. 512) attention
   //    kernels.
-  if (isTailDot) {
+  if (respectChainHeuristics && isTailDot) {
     SmallVector<unsigned, 3> ret = {1, 1};
     ret[0] = static_cast<unsigned>(std::min(
         static_cast<int64_t>(numWarps),
@@ -152,6 +155,104 @@ SmallVector<unsigned, 3> planWarps(Operation *dotOp, ArrayRef<int64_t> shape,
   }
 
   return ret;
+}
+
+FailureOr<SmallVector<unsigned, 3>> planWarpsForAMDMmaTiles(
+    Operation *dotOp, ArrayRef<int64_t> shape, int numWarps,
+    std::pair<unsigned, unsigned> instrShape) {
+  auto attr =
+      dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDMmaTilesPerWarp);
+  if (!attr)
+    return planWarps(dotOp, shape, numWarps, instrShape);
+
+  ArrayRef<int32_t> requested = attr.asArrayRef();
+  if (requested.size() != shape.size()) {
+    dotOp->emitOpError() << AttrAMDMmaTilesPerWarp << " must have "
+                         << shape.size() << " entries";
+    return failure();
+  }
+
+  SmallVector<int64_t> planningShape(shape);
+  SmallVector<unsigned> instrPerDim(shape.size(), 1u);
+  instrPerDim[shape.size() - 2] = instrShape.first;
+  instrPerDim[shape.size() - 1] = instrShape.second;
+  for (auto [dim, tiles] : llvm::enumerate(requested)) {
+    if (tiles <= 0) {
+      dotOp->emitOpError()
+          << AttrAMDMmaTilesPerWarp << " entries must be positive";
+      return failure();
+    }
+    uint64_t tileSpan = static_cast<uint64_t>(instrPerDim[dim]) *
+                        static_cast<unsigned>(tiles);
+    if (tileSpan > static_cast<uint64_t>(shape[dim])) {
+      dotOp->emitOpError()
+          << AttrAMDMmaTilesPerWarp << " exceeds the result tile shape";
+      return failure();
+    }
+    // Plan the warp grid over groups of contiguous per-wave tiles. This makes
+    // an explicit tiles-per-warp request authoritative over the default
+    // aspect-ratio and chain-dot heuristics while retaining their normal
+    // behavior when the attribute is absent.
+    planningShape[dim] = shape[dim] / static_cast<int64_t>(tiles);
+  }
+
+  auto warpsPerTile = planWarps(dotOp, planningShape, numWarps, instrShape,
+                                /*respectChainHeuristics=*/false);
+  for (auto [dim, warps] : llvm::enumerate(warpsPerTile)) {
+    uint64_t covered = static_cast<uint64_t>(instrPerDim[dim]) * warps *
+                       static_cast<unsigned>(requested[dim]);
+    if (covered > static_cast<uint64_t>(shape[dim])) {
+      dotOp->emitOpError()
+          << AttrAMDMmaTilesPerWarp << " cannot fit the requested warp grid";
+      return failure();
+    }
+  }
+  return warpsPerTile;
+}
+
+FailureOr<SmallVector<unsigned>> getAMDMmaTilesPerWarp(
+    Operation *dotOp, ArrayRef<int64_t> shape, ArrayRef<unsigned> warpsPerTile,
+    std::pair<unsigned, unsigned> instrShape,
+    ArrayRef<unsigned> defaultTilesPerWarp) {
+  SmallVector<unsigned> tilesPerWarp(defaultTilesPerWarp);
+  auto attr =
+      dotOp->getAttrOfType<DenseI32ArrayAttr>(AttrAMDMmaTilesPerWarp);
+  if (!attr)
+    return tilesPerWarp;
+
+  ArrayRef<int32_t> requested = attr.asArrayRef();
+  if (requested.size() != shape.size()) {
+    dotOp->emitOpError() << AttrAMDMmaTilesPerWarp << " must have "
+                         << shape.size() << " entries";
+    return failure();
+  }
+  if (warpsPerTile.size() != shape.size()) {
+    dotOp->emitOpError() << "internal error: warp layout rank does not match "
+                            "the dot result rank";
+    return failure();
+  }
+
+  SmallVector<unsigned> instrPerDim(shape.size(), 1u);
+  instrPerDim[shape.size() - 2] = instrShape.first;
+  instrPerDim[shape.size() - 1] = instrShape.second;
+  tilesPerWarp.clear();
+  for (auto [dim, tiles] : llvm::enumerate(requested)) {
+    if (tiles <= 0) {
+      dotOp->emitOpError()
+          << AttrAMDMmaTilesPerWarp << " entries must be positive";
+      return failure();
+    }
+    unsigned unsignedTiles = static_cast<unsigned>(tiles);
+    uint64_t covered = static_cast<uint64_t>(instrPerDim[dim]) *
+                       warpsPerTile[dim] * unsignedTiles;
+    if (covered > static_cast<uint64_t>(shape[dim])) {
+      dotOp->emitOpError()
+          << AttrAMDMmaTilesPerWarp << " exceeds the result tile shape";
+      return failure();
+    }
+    tilesPerWarp.push_back(unsignedTiles);
+  }
+  return tilesPerWarp;
 }
 
 // Chooses a proper MFMA instruction that can used to compute the given dot op.
@@ -608,7 +709,11 @@ public:
     auto kDim = mfmaInstr->kDim;
     auto kBase = mfmaInstr->kBase;
 
-    auto warpsPerTile = planWarps(dotOp, retShape, numWarps, {mDim, nDim});
+    auto requestedWarps = planWarpsForAMDMmaTiles(
+        dotOp, retShape, numWarps, {mDim, nDim});
+    if (failed(requestedWarps))
+      return failure();
+    auto warpsPerTile = std::move(*requestedWarps);
 
     Type mfmaAccType;
     if (oldRetType.getElementType().isIntOrIndex())
@@ -673,6 +778,11 @@ public:
     if (rank == 3) {
       tilesPerWarp.insert(tilesPerWarp.begin(), 1);
     }
+    auto requestedTiles = getAMDMmaTilesPerWarp(
+        dotOp, retShape, warpsPerTile, {mDim, nDim}, tilesPerWarp);
+    if (failed(requestedTiles))
+      return failure();
+    tilesPerWarp = std::move(*requestedTiles);
 
     ttg::AMDMfmaEncodingAttr mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
         oldRetType.getContext(), mfmaVersion, warpsPerTile, {mDim, nDim, kDim},
@@ -1490,6 +1600,11 @@ public:
     // store instructions.
     bool isTransposed = true;
     SmallVector<unsigned> tilesPerWarp(retShape.size(), 1u);
+    auto requestedTiles = getAMDMmaTilesPerWarp(
+        dotOp, retShapePerCTA, warpsPerTile, {mDim, nDim}, tilesPerWarp);
+    if (failed(requestedTiles))
+      return failure();
+    tilesPerWarp = std::move(*requestedTiles);
     auto ctaLayout = ttg::chooseWmmaCTALinearLayout(ctx, retShape.size(),
                                                     warpsPerTile, tilesPerWarp);
 
