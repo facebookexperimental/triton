@@ -6,6 +6,11 @@ production tuples listed in ``SUPPORTED_SHAPES``.  Other D128/D256 shapes are
 not part of this submission's public contract yet.  Run this file with pytest
 for correctness.
 
+Each launch topology has one stable JIT entry.  Constexpr schedule kwargs pick
+the tuned split, persistent, staged, peeled, or hoisted implementation behind
+that entry; algorithms with different output ownership or launch counts remain
+separate instead of being hidden in one monolithic kernel.
+
 The validated short D128 MFMA/LDS path is opt-in for ``(16,27,200,128)`` through
 ``TLX_FA_BWD_ENABLE_EXACT_D128=1``.  With no D128 opt-in flag, the older split
 path is used.  The other fused D128 short-context kernels are narrow, opt-in
@@ -21,6 +26,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+import triton.language.core as tl_core
 import triton.language.extra.tlx as tlx
 
 # Public correctness contract for this submission.  The kernels
@@ -35,6 +41,23 @@ SUPPORTED_SHAPES = {
 # register pressure for the D-sliced kernels and prevents the accumulator from
 # using AGPRs on gfx950.
 _CDNA4_MATRIX_INSTR_NONKDIM = 16
+
+
+@tl_core.builtin
+def _require_layout_soft(x, layout, _semantic=None):
+    """Attach an explicit register layout without making it a hard anchor.
+
+    Upstream ``tlx.require_layout`` pins user-authored epilogue ownership so
+    layout optimization cannot rewrite it.  These FA kernels instead use soft
+    requirements for direct-to-LDS offsets, MFMA operands, and intermediate
+    arithmetic; those requirements must remain eligible for TLX fixup and
+    placeholder resolution.
+    """
+    x = _semantic.to_tensor(x)
+    layout = tl_core._unwrap_if_constexpr(layout)
+    encoding = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    handle = _semantic.builder.create_require_layout(x.handle, encoding, pin=False)
+    return tl_core.tensor(handle, x.type)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,7 +138,7 @@ def _run_bwd_preprocess(o, do, delta):
 
 
 @triton.jit
-def _attn_bwd_dkdv_d128_kernel(
+def _attn_bwd_dkdv_d128_single_impl(
     Q,
     K,
     V,
@@ -204,9 +227,9 @@ def _attn_bwd_dkdv_d128_kernel(
             tlx.local_store(tlx.local_view(v_buffers, 0), tl.zeros((BLOCK, D), tl.bfloat16))
             tl.debug_barrier()
         kv_offsets = row_ptrs.to(tl.int32)
-        kv_offsets = tlx.require_layout(kv_offsets, qdo_async_layout)
+        kv_offsets = _require_layout_soft(kv_offsets, qdo_async_layout)
         kv_load_mask = tl.broadcast_to(row_mask, kv_offsets.shape)
-        kv_load_mask = tlx.require_layout(kv_load_mask, qdo_async_layout)
+        kv_load_mask = _require_layout_soft(kv_load_mask, qdo_async_layout)
         k_token = tlx.buffer_load_to_local(tlx.local_view(k_buffers, 0), K, kv_offsets, mask=kv_load_mask)
         v_token = tlx.buffer_load_to_local(tlx.local_view(v_buffers, 0), V, kv_offsets, mask=kv_load_mask)
     else:
@@ -237,9 +260,9 @@ def _attn_bwd_dkdv_d128_kernel(
                 tlx.local_store(tlx.local_view(do_buffers, 0), tl.zeros((BLOCK, D), tl.bfloat16))
                 tl.debug_barrier()
             qdo_offsets = qdo_ptrs.to(tl.int32)
-            qdo_offsets = tlx.require_layout(qdo_offsets, qdo_async_layout)
+            qdo_offsets = _require_layout_soft(qdo_offsets, qdo_async_layout)
             qdo_load_mask = tl.broadcast_to(qdo_mask, qdo_offsets.shape)
-            qdo_load_mask = tlx.require_layout(qdo_load_mask, qdo_async_layout)
+            qdo_load_mask = _require_layout_soft(qdo_load_mask, qdo_async_layout)
             q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), Q, qdo_offsets, mask=qdo_load_mask)
             do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), DO, qdo_offsets, mask=qdo_load_mask)
         else:
@@ -272,7 +295,7 @@ def _attn_bwd_dkdv_d128_kernel(
 
 
 @triton.jit
-def _attn_bwd_dkdv_d128_pipe_kernel(
+def _attn_bwd_dkdv_d128_pipeline_impl(
     Q,
     K,
     V,
@@ -381,7 +404,7 @@ def _attn_bwd_dkdv_d128_pipe_kernel(
 
 
 @triton.jit
-def _attn_bwd_dkdv_d128_rect_kernel(
+def _attn_bwd_dkdv_d128_rect_impl(
     Q,
     K,
     V,
@@ -458,9 +481,9 @@ def _attn_bwd_dkdv_d128_rect_kernel(
     first_m = tl.arange(0, BLOCK_M)
     first_mask = first_m[:, None] < N
     first_offsets = (tensor_base + first_m[:, None] * D + offs_d[None, :]).to(tl.int32)
-    first_offsets = tlx.require_layout(first_offsets, qdo_async_layout)
+    first_offsets = _require_layout_soft(first_offsets, qdo_async_layout)
     first_load_mask = tl.broadcast_to(first_mask, first_offsets.shape)
-    first_load_mask = tlx.require_layout(first_load_mask, qdo_async_layout)
+    first_load_mask = _require_layout_soft(first_load_mask, qdo_async_layout)
     q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), Q, first_offsets, mask=first_load_mask)
     do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), DO, first_offsets, mask=first_load_mask)
     tlx.async_load_commit_group([q_token, do_token])
@@ -484,9 +507,9 @@ def _attn_bwd_dkdv_d128_rect_kernel(
             tlx.local_store(tlx.local_view(do_buffers, next_slot), tl.zeros((BLOCK_M, D), tl.bfloat16))
             tl.debug_barrier()
         next_offsets = (tensor_base + next_m[:, None] * D + offs_d[None, :]).to(tl.int32)
-        next_offsets = tlx.require_layout(next_offsets, qdo_async_layout)
+        next_offsets = _require_layout_soft(next_offsets, qdo_async_layout)
         next_load_mask = tl.broadcast_to(next_mask, next_offsets.shape)
-        next_load_mask = tlx.require_layout(next_load_mask, qdo_async_layout)
+        next_load_mask = _require_layout_soft(next_load_mask, qdo_async_layout)
         next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_offsets,
                                                 mask=next_load_mask)
         next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_slot), DO, next_offsets,
@@ -518,6 +541,80 @@ def _attn_bwd_dkdv_d128_rect_kernel(
     dk *= SM_SCALE
     tl.store(DK + row_ptrs, dk.to(tl.bfloat16), mask=row_mask)
     tl.store(DV + row_ptrs, dv.to(tl.bfloat16), mask=row_mask)
+
+
+@triton.jit
+def _attn_bwd_dkdv_d128_split_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PIPELINED: tl.constexpr,
+    RECTANGULAR: tl.constexpr,
+):
+    """Stable KV-owned D128 split entry configured by schedule kwargs."""
+    if PIPELINED:
+        if RECTANGULAR:
+            _attn_bwd_dkdv_d128_rect_impl(
+                Q,
+                K,
+                V,
+                DO,
+                LSE,
+                Delta,
+                DK,
+                DV,
+                SM_SCALE,
+                IS_CAUSAL,
+                N,
+                D,
+                BLOCK_M,
+                BLOCK_N,
+            )
+        else:
+            tl.static_assert(BLOCK_M == BLOCK_N)
+            _attn_bwd_dkdv_d128_pipeline_impl(
+                Q,
+                K,
+                V,
+                DO,
+                LSE,
+                Delta,
+                DK,
+                DV,
+                SM_SCALE,
+                IS_CAUSAL,
+                N,
+                D,
+                BLOCK_N,
+            )
+    else:
+        tl.static_assert(not RECTANGULAR and BLOCK_M == BLOCK_N)
+        _attn_bwd_dkdv_d128_single_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            BLOCK_N,
+        )
 
 
 @triton.jit
@@ -607,7 +704,7 @@ def _attn_bwd_dq_d128_kernel(
 # only as an opt-in correctness/performance experiment; split D128 remains the
 # default and the exact MFMA/LDS route is the measured path.
 @triton.jit
-def _attn_bwd_dkdv_dq_d128_persistent_kernel(
+def _attn_bwd_dkdv_dq_d128_persistent_impl(
     Q,
     K,
     V,
@@ -722,7 +819,7 @@ def _attn_bwd_dkdv_dq_d128_persistent_kernel(
 # competitive with the exact or split D128 route; otherwise remove the
 # experiment and its flag together with the combined persistent variant.
 @triton.jit
-def _attn_bwd_dkdv_dq_d128_persistent_pipeline_kernel(
+def _attn_bwd_dkdv_dq_d128_persistent_pipeline_impl(
     Q,
     K,
     V,
@@ -876,7 +973,7 @@ def _attn_bwd_dkdv_dq_d128_persistent_pipeline_kernel(
 
 
 @triton.jit
-def _attn_bwd_dkdv_dq_d128_exact_kernel(
+def _attn_bwd_dkdv_dq_d128_exact_impl(
     Q,
     K,
     V,
@@ -1122,10 +1219,10 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
     # the vector and leave an unresolved descriptor conversion in LLIR.
     k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
     k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
-    k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_raw_async_layout)
-    k_load_mask = tlx.require_layout(tl.broadcast_to(k_n < N, k_offsets.shape), k_raw_async_layout)
-    key_offsets = tlx.require_layout(key_ptrs.to(tl.int32), kv_async_layout)
-    key_load_mask = tlx.require_layout(tl.broadcast_to(key_mask, key_offsets.shape), kv_async_layout)
+    k_offsets = _require_layout_soft(k_offsets.to(tl.int32), k_raw_async_layout)
+    k_load_mask = _require_layout_soft(tl.broadcast_to(k_n < N, k_offsets.shape), k_raw_async_layout)
+    key_offsets = _require_layout_soft(key_ptrs.to(tl.int32), kv_async_layout)
+    key_load_mask = _require_layout_soft(tl.broadcast_to(key_mask, key_offsets.shape), kv_async_layout)
     k_token = tlx.buffer_load_to_local(
         tlx.local_view(k_raw_buffer, 0),
         K,
@@ -1151,8 +1248,8 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
     first_m = tl.arange(0, BLOCK_M)
     first_ptrs = tensor_base + first_m[:, None] * D + offs_d[None, :]
     first_mask = first_m[:, None] < N
-    first_offsets = tlx.require_layout(first_ptrs.to(tl.int32), qdo_async_layout)
-    first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout)
+    first_offsets = _require_layout_soft(first_ptrs.to(tl.int32), qdo_async_layout)
+    first_load_mask = _require_layout_soft(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout)
     first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), Q, first_offsets, mask=first_load_mask)
     first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), DO, first_offsets, mask=first_load_mask)
     if IS_CAUSAL:
@@ -1162,9 +1259,9 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
         first_q1 = first_m + BLOCK_M
         first_q1_ptrs = tensor_base + first_q1[:, None] * D + offs_d[None, :]
         first_q1_mask = first_q1[:, None] < N
-        first_q1_offsets = tlx.require_layout(first_q1_ptrs.to(tl.int32), qdo_async_layout)
-        first_q1_load_mask = tlx.require_layout(tl.broadcast_to(first_q1_mask, first_q1_offsets.shape),
-                                                qdo_async_layout)
+        first_q1_offsets = _require_layout_soft(first_q1_ptrs.to(tl.int32), qdo_async_layout)
+        first_q1_load_mask = _require_layout_soft(tl.broadcast_to(first_q1_mask, first_q1_offsets.shape),
+                                                  qdo_async_layout)
         first_q1_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 1), Q, first_q1_offsets,
                                                   mask=first_q1_load_mask)
         tlx.async_load_commit_group([first_q_token, first_do_token, first_q1_token])
@@ -1195,11 +1292,12 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
                 )
             if ((m_block + Q_LOOKAHEAD + 1) * BLOCK_M > N or (m_block + 2) * BLOCK_M > N):
                 tl.debug_barrier()
-            next_q_offsets = tlx.require_layout(next_q_ptrs.to(tl.int32), qdo_async_layout)
-            next_q_load_mask = tlx.require_layout(tl.broadcast_to(next_q_mask, next_q_offsets.shape), qdo_async_layout)
-            next_do_offsets = tlx.require_layout(next_do_ptrs.to(tl.int32), qdo_async_layout)
-            next_do_load_mask = tlx.require_layout(tl.broadcast_to(next_do_mask, next_do_offsets.shape),
-                                                   qdo_async_layout)
+            next_q_offsets = _require_layout_soft(next_q_ptrs.to(tl.int32), qdo_async_layout)
+            next_q_load_mask = _require_layout_soft(tl.broadcast_to(next_q_mask, next_q_offsets.shape),
+                                                    qdo_async_layout)
+            next_do_offsets = _require_layout_soft(next_do_ptrs.to(tl.int32), qdo_async_layout)
+            next_do_load_mask = _require_layout_soft(tl.broadcast_to(next_do_mask, next_do_offsets.shape),
+                                                     qdo_async_layout)
             next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_q_offsets,
                                                     mask=next_q_load_mask)
             next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_do_slot), DO, next_do_offsets,
@@ -1223,8 +1321,8 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
                     tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=qdo_async_layout),
                 )
                 tl.debug_barrier()
-            next_offsets = tlx.require_layout(next_ptrs.to(tl.int32), qdo_async_layout)
-            next_load_mask = tlx.require_layout(tl.broadcast_to(next_mask, next_offsets.shape), qdo_async_layout)
+            next_offsets = _require_layout_soft(next_ptrs.to(tl.int32), qdo_async_layout)
+            next_load_mask = _require_layout_soft(tl.broadcast_to(next_mask, next_offsets.shape), qdo_async_layout)
             next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_offsets,
                                                     mask=next_load_mask)
             next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_slot), DO, next_offsets,
@@ -1246,8 +1344,8 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
         score_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
         score_acc = tlx.mfma(k_nm, q_t, score_acc)
         lse_full = tl.broadcast_to(lse[None, :] * log2e, (BLOCK_N, BLOCK_M))
-        lse_full = tlx.require_layout(lse_full, mma_nm)
-        qk_scale_full = tlx.require_layout(
+        lse_full = _require_layout_soft(lse_full, mma_nm)
+        qk_scale_full = _require_layout_soft(
             tl.full((BLOCK_N, BLOCK_M), SM_SCALE * log2e, dtype=tl.float32),
             mma_nm,
         )
@@ -1255,18 +1353,18 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
         valid = key_mask & (offs_m[None, :] < N)
         if IS_CAUSAL:
             valid = valid & (offs_n[:, None] <= offs_m[None, :])
-        valid = tlx.require_layout(valid, mma_nm)
-        neg_inf = tlx.require_layout(
+        valid = _require_layout_soft(valid, mma_nm)
+        neg_inf = _require_layout_soft(
             tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
             mma_nm,
         )
         scores_t = tl.where(valid, scores_t, neg_inf)
-        p_t = tlx.require_layout(tl.math.exp2(scores_t), mma_nm)
+        p_t = _require_layout_soft(tl.math.exp2(scores_t), mma_nm)
 
         dpt_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
         dpt_acc = tlx.mfma(v_nm, do_t, dpt_acc)
         delta_full = tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M))
-        delta_full = tlx.require_layout(delta_full, mma_nm)
+        delta_full = _require_layout_soft(delta_full, mma_nm)
         ds_t = p_t * (dpt_acc - delta_full)
         # The MFMA score result has an explicit register ownership.  Release it
         # at the LDS handoff before narrowing; a direct cast would produce a
@@ -1283,7 +1381,7 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
         k_md = tlx.local_load(k_buffer, token=kv_wait, layout=k_op1_md, relaxed=True)
         dq_part = tlx.zeros((BLOCK_M, D), tl.float32, layout=mma_md)
         dq_part = tlx.mfma(ds_md, k_md, dq_part)
-        dq_scale_full = tlx.require_layout(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), mma_md)
+        dq_scale_full = _require_layout_soft(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), mma_md)
         dq_part = dq_part * dq_scale_full
         q_ptrs = tensor_base + offs_m[:, None] * D + offs_d[None, :]
         q_mask = offs_m[:, None] < N
@@ -1296,7 +1394,7 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
         # Reuse the score probabilities in the dK/dV operand ownership.  This
         # is a representation change, so release the score MFMA layout before
         # narrowing and pin the resulting BF16 tile to the dK/dV operand view.
-        pt_nd = tlx.require_layout(tlx.release_layout(p_t).to(tl.bfloat16), pt_op0_nd)
+        pt_nd = _require_layout_soft(tlx.release_layout(p_t).to(tl.bfloat16), pt_op0_nd)
         ds_nd = tlx.local_load(tlx.local_view(ds_buffer, 0), layout=dst_op0_nd, relaxed=True)
         dv = tlx.mfma(pt_nd, do_nd, dv)
         dk = tlx.mfma(ds_nd, q_nd, dk)
@@ -1305,37 +1403,101 @@ def _attn_bwd_dkdv_dq_d128_exact_kernel(
     dk = tlx.release_layout(dk)
     dv = tlx.release_layout(dv)
     dk *= SM_SCALE
-    if IS_CAUSAL:
-        # Match Gluon's MHA causal epilogue: cast in the native MFMA ownership,
-        # physically redistribute to eight contiguous BF16 values per lane, and
-        # release only at the global-store boundary. ``cast_layout`` emits a
-        # layout-preserving arith.truncf; an ordinary ``to(bfloat16)`` would
-        # drop the MFMA encoding and fail verification.
-        dk_mma = tlx.require_layout(dk, mma_nd)
-        dv_mma = tlx.require_layout(dv, mma_nd)
-        dk_bf16 = tlx.cast_layout(dk_mma, tl.bfloat16)
-        dv_bf16 = tlx.cast_layout(dv_mma, tl.bfloat16)
-        dk_vec = tlx.convert_layout(dk_bf16, kv_async_layout)
-        dv_vec = tlx.convert_layout(dv_bf16, kv_async_layout)
-        tl.store(DK + key_ptrs, tlx.release_layout(dk_vec), mask=key_mask)
-        tl.store(DV + key_ptrs, tlx.release_layout(dv_vec), mask=key_mask)
+    # Causal and non-causal modes use Gluon's whole-tile epilogue: narrow while
+    # retaining native MFMA ownership, then redistribute to eight contiguous
+    # BF16 values per lane. The current compiler canonicalizes the equivalent
+    # convert-then-cast source ordering to this same BF16 conversion, so ordering
+    # is not a separate performance claim. ``cast_layout`` is still required to
+    # preserve the MFMA encoding; an ordinary ``to(bfloat16)`` drops it and fails
+    # verification.
+    # Gluon's newer full-attention D64-half epilogue raised TLX from 496 to 503
+    # VGPR for N=200, so the lower-resource whole-tile conversion remains used.
+    dk_mma = _require_layout_soft(dk, mma_nd)
+    dv_mma = _require_layout_soft(dv, mma_nd)
+    dk_bf16 = tlx.cast_layout(dk_mma, tl.bfloat16)
+    dv_bf16 = tlx.cast_layout(dv_mma, tl.bfloat16)
+    dk_vec = tlx.convert_layout(dk_bf16, kv_async_layout)
+    dv_vec = tlx.convert_layout(dv_bf16, kv_async_layout)
+    tl.store(DK + key_ptrs, tlx.release_layout(dk_vec), mask=key_mask)
+    tl.store(DV + key_ptrs, tlx.release_layout(dv_vec), mask=key_mask)
+
+
+@triton.jit
+def _attn_bwd_dkdv_dq_d128_combined_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    DQ,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EXACT: tl.constexpr,
+    PIPELINED: tl.constexpr,
+):
+    """Stable one-CTA D128 combined entry configured by schedule kwargs."""
+    if EXACT:
+        tl.static_assert(not PIPELINED)
+        _attn_bwd_dkdv_dq_d128_exact_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            DQ,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+        )
+    elif PIPELINED:
+        _attn_bwd_dkdv_dq_d128_persistent_pipeline_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            DQ,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+        )
     else:
-        # Full attention currently uses the same whole-tile vector ownership as
-        # the causal path.  Gluon's newer D64-half epilogue was evaluated here,
-        # but it raised TLX from 496 to 503 VGPR for N=200, so the lower-resource
-        # whole-tile conversion remains selected.
-        dk_mma = tlx.require_layout(dk, mma_nd)
-        dv_mma = tlx.require_layout(dv, mma_nd)
-        dk_bf16 = tlx.cast_layout(dk_mma, tl.bfloat16)
-        dv_bf16 = tlx.cast_layout(dv_mma, tl.bfloat16)
-        dk_vec = tlx.convert_layout(dk_bf16, kv_async_layout)
-        dv_vec = tlx.convert_layout(dv_bf16, kv_async_layout)
-        tl.store(DK + key_ptrs, tlx.release_layout(dk_vec), mask=key_mask)
-        tl.store(DV + key_ptrs, tlx.release_layout(dv_vec), mask=key_mask)
-
-
-def _select_d128_dkdv_kernel(causal):
-    return _attn_bwd_dkdv_d128_kernel if causal else _attn_bwd_dkdv_d128_pipe_kernel
+        _attn_bwd_dkdv_dq_d128_persistent_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            DQ,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            BLOCK_M,
+            BLOCK_N,
+        )
 
 
 def _select_d128_dkdv_config(shape, causal):
@@ -1371,7 +1533,19 @@ def _d128_exact_layout_supported(shape, causal):
     return tuple(shape) == (16, 27, 200, 128)
 
 
-def _select_d128_kernel(shape, causal):
+@dataclasses.dataclass(frozen=True)
+class _D128Dispatch:
+    entry: object
+    block_m: int
+    block_n: int
+    num_warps: int
+    pipelined: bool = False
+    rectangular: bool = False
+    exact: bool = False
+
+
+def _select_d128_dispatch(shape, causal):
+    """Select one stable topology entry plus its constexpr schedule kwargs."""
     # The exact Gluon-derived schedule is validated only for the requested
     # square D128 target and is explicit opt-in because some gfx950 compiler
     # revisions cannot lower its SharedLinear path.  The generic persistent
@@ -1382,13 +1556,38 @@ def _select_d128_kernel(shape, causal):
     # With no opt-in branch selected, use the split fallback.
     exact_enabled = os.environ.get(_D128_EXACT_ENABLE_ENV, "") == "1"
     if _d128_exact_layout_supported(shape, causal) and exact_enabled:
-        return _attn_bwd_dkdv_dq_d128_exact_kernel
+        return _D128Dispatch(
+            _attn_bwd_dkdv_dq_d128_combined_kernel,
+            block_m=16,
+            block_n=256,
+            num_warps=4,
+            exact=True,
+        )
     if (os.environ.get(_D128_PERSISTENT_PIPE_ENABLE_ENV, "") == "1"
             and _d128_persistent_short_supported(shape, causal)):
-        return _attn_bwd_dkdv_dq_d128_persistent_pipeline_kernel
+        return _D128Dispatch(
+            _attn_bwd_dkdv_dq_d128_combined_kernel,
+            block_m=16,
+            block_n=256,
+            num_warps=4,
+            pipelined=True,
+        )
     if (os.environ.get(_D128_PERSISTENT_ENABLE_ENV, "") == "1" and _d128_persistent_short_supported(shape, causal)):
-        return _attn_bwd_dkdv_dq_d128_persistent_kernel
-    return _select_d128_dkdv_kernel(causal)
+        return _D128Dispatch(
+            _attn_bwd_dkdv_dq_d128_combined_kernel,
+            block_m=16,
+            block_n=256,
+            num_warps=8,
+        )
+    block_m, block_n, num_warps = _select_d128_dkdv_config(shape, causal)
+    return _D128Dispatch(
+        _attn_bwd_dkdv_d128_split_kernel,
+        block_m=block_m,
+        block_n=block_n,
+        num_warps=num_warps,
+        pipelined=not causal,
+        rectangular=block_m != block_n,
+    )
 
 
 def _d128_num_warps(causal=False):
@@ -1403,56 +1602,12 @@ def _matrix_instr_nonkdim():
 
 def _run_bwd_d128(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal):
     batch, heads, n_ctx, head_dim = q.shape
-    selected_kernel = _select_d128_kernel(tuple(q.shape), causal)
-    if selected_kernel is _attn_bwd_dkdv_dq_d128_exact_kernel:
-        selected_kernel[(1, batch * heads)](
-            q,
-            k,
-            v,
-            do,
-            lse,
-            delta,
-            dk,
-            dv,
-            dq,
-            SM_SCALE=sm_scale,
-            IS_CAUSAL=causal,
-            N=n_ctx,
-            D=head_dim,
-            BLOCK_M=16,
-            BLOCK_N=256,
-            num_warps=4,
-            num_stages=1,
-            matrix_instr_nonkdim=_matrix_instr_nonkdim(),
-        )
-        return
-    if selected_kernel is _attn_bwd_dkdv_dq_d128_persistent_pipeline_kernel:
-        selected_kernel[(1, batch * heads)](
-            q,
-            k,
-            v,
-            do,
-            lse,
-            delta,
-            dk,
-            dv,
-            dq,
-            SM_SCALE=sm_scale,
-            IS_CAUSAL=causal,
-            N=n_ctx,
-            D=head_dim,
-            BLOCK_M=16,
-            BLOCK_N=256,
-            num_warps=4,
-            num_stages=1,
-            matrix_instr_nonkdim=_matrix_instr_nonkdim(),
-        )
-        return
-    if selected_kernel is _attn_bwd_dkdv_dq_d128_persistent_kernel:
+    dispatch = _select_d128_dispatch(tuple(q.shape), causal)
+    if dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel:
         # A single KV-owner CTA covers the complete short key tile.  The
         # combined kernel computes dQ from the same dS tile and stores it
         # directly, so no second Q-parallel launch or reduction is needed.
-        selected_kernel[(1, batch * heads)](
+        dispatch.entry[(1, batch * heads)](
             q,
             k,
             v,
@@ -1466,58 +1621,38 @@ def _run_bwd_d128(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal):
             IS_CAUSAL=causal,
             N=n_ctx,
             D=head_dim,
-            BLOCK_M=16,
-            BLOCK_N=256,
-            num_warps=8,
+            BLOCK_M=dispatch.block_m,
+            BLOCK_N=dispatch.block_n,
+            EXACT=dispatch.exact,
+            PIPELINED=dispatch.pipelined,
+            num_warps=dispatch.num_warps,
             num_stages=1,
             matrix_instr_nonkdim=_matrix_instr_nonkdim(),
         )
         return
     batch_heads = batch * heads
-    dkdv_block_m, dkdv_block_n, dkdv_num_warps = _select_d128_dkdv_config(tuple(q.shape), causal)
-    if (selected_kernel is _attn_bwd_dkdv_d128_pipe_kernel and dkdv_block_m != dkdv_block_n):
-        dkdv_kernel = _attn_bwd_dkdv_d128_rect_kernel
-    else:
-        dkdv_kernel = selected_kernel
-    dkdv_block = dkdv_block_n
-    dkdv_grid = (triton.cdiv(n_ctx, dkdv_block), batch_heads)
-    if dkdv_kernel is _attn_bwd_dkdv_d128_rect_kernel:
-        dkdv_kernel[dkdv_grid](
-            q,
-            k,
-            v,
-            do,
-            lse,
-            delta,
-            dk,
-            dv,
-            SM_SCALE=sm_scale,
-            IS_CAUSAL=causal,
-            N=n_ctx,
-            D=head_dim,
-            BLOCK_M=dkdv_block_m,
-            BLOCK_N=dkdv_block_n,
-            num_warps=dkdv_num_warps,
-            matrix_instr_nonkdim=_matrix_instr_nonkdim(),
-        )
-    else:
-        dkdv_kernel[dkdv_grid](
-            q,
-            k,
-            v,
-            do,
-            lse,
-            delta,
-            dk,
-            dv,
-            SM_SCALE=sm_scale,
-            IS_CAUSAL=causal,
-            N=n_ctx,
-            D=head_dim,
-            BLOCK=dkdv_block,
-            num_warps=dkdv_num_warps,
-            matrix_instr_nonkdim=_matrix_instr_nonkdim(),
-        )
+    assert dispatch.entry is _attn_bwd_dkdv_d128_split_kernel
+    dkdv_grid = (triton.cdiv(n_ctx, dispatch.block_n), batch_heads)
+    dispatch.entry[dkdv_grid](
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dk,
+        dv,
+        SM_SCALE=sm_scale,
+        IS_CAUSAL=causal,
+        N=n_ctx,
+        D=head_dim,
+        BLOCK_M=dispatch.block_m,
+        BLOCK_N=dispatch.block_n,
+        PIPELINED=dispatch.pipelined,
+        RECTANGULAR=dispatch.rectangular,
+        num_warps=dispatch.num_warps,
+        matrix_instr_nonkdim=_matrix_instr_nonkdim(),
+    )
     dq_block = 64
     dq_grid = (triton.cdiv(n_ctx, dq_block), batch_heads)
     _attn_bwd_dq_d128_kernel[dq_grid](
@@ -1539,7 +1674,7 @@ def _run_bwd_d128(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal):
 
 
 @triton.jit
-def _attn_bwd_dkdv_d256_staged_kernel(
+def _attn_bwd_dkdv_d256_staged_impl(
     Q,
     K,
     V,
@@ -1679,7 +1814,7 @@ def _attn_bwd_dkdv_d256_staged_kernel(
 
 
 @triton.jit
-def _attn_bwd_dkdv_d256_peel_kernel(
+def _attn_bwd_dkdv_d256_peel_impl(
     Q,
     K,
     V,
@@ -1847,7 +1982,7 @@ def _attn_bwd_dkdv_d256_peel_kernel(
 
 
 @triton.jit
-def _attn_bwd_dkdv_d256_hoist_kernel(
+def _attn_bwd_dkdv_d256_hoist_impl(
     Q,
     K,
     V,
@@ -1974,6 +2109,88 @@ def _attn_bwd_dkdv_d256_hoist_kernel(
 
 
 @triton.jit
+def _attn_bwd_dkdv_d256_producer_kernel(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    Delta,
+    DK,
+    DV,
+    DS,
+    SM_SCALE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    N_PAD: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HALF_D: tl.constexpr,
+    STAGED: tl.constexpr,
+    PIPELINED: tl.constexpr,
+):
+    """Stable D256 dS-producing entry configured by residency/pipeline kwargs."""
+    if STAGED:
+        tl.static_assert(not PIPELINED)
+        _attn_bwd_dkdv_d256_staged_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            DS,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            N_PAD,
+            BLOCK,
+            HALF_D,
+        )
+    elif PIPELINED:
+        _attn_bwd_dkdv_d256_peel_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            DS,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            N_PAD,
+            BLOCK,
+            HALF_D,
+        )
+    else:
+        _attn_bwd_dkdv_d256_hoist_impl(
+            Q,
+            K,
+            V,
+            DO,
+            LSE,
+            Delta,
+            DK,
+            DV,
+            DS,
+            SM_SCALE,
+            IS_CAUSAL,
+            N,
+            D,
+            N_PAD,
+            BLOCK,
+            HALF_D,
+        )
+
+
+@triton.jit
 def _attn_bwd_dq_from_ds_d256_kernel(
     DS,
     K,
@@ -2077,20 +2294,25 @@ def _attn_bwd_dq_from_ds_d256_kernel(
     tl.store(DQ + out_lo_ptrs + HALF_D, dq_hi.to(tl.bfloat16), mask=out_mask)
 
 
-def _select_d256_dkdv_kernel(causal):
+@dataclasses.dataclass(frozen=True)
+class _D256Dispatch:
+    entry: object
+    num_warps: int
+    staged: bool = False
+    pipelined: bool = False
+
+
+def _select_d256_dispatch(causal):
+    """Select the stable dS producer entry plus constexpr schedule kwargs."""
     if not causal:
-        return _attn_bwd_dkdv_d256_peel_kernel
+        return _D256Dispatch(_attn_bwd_dkdv_d256_producer_kernel, num_warps=4, pipelined=True)
     # With the CDNA4 16x16x32 selection below, MFMA accumulators are assigned to
     # AGPRs on gfx950 and the Gluon-matching hoisted K/V schedule wins.  Keep a
     # staged escape hatch for compiler/resource experiments; production dispatch
     # uses the hoisted path for this gfx950-only tutorial.
     if os.environ.get("TLX_FA_BWD_FORCE_STAGED", "") == "1":
-        return _attn_bwd_dkdv_d256_staged_kernel
-    return _attn_bwd_dkdv_d256_hoist_kernel
-
-
-def _d256_dkdv_num_warps(kernel):
-    return 2 if kernel is _attn_bwd_dkdv_d256_staged_kernel else 4
+        return _D256Dispatch(_attn_bwd_dkdv_d256_producer_kernel, num_warps=2, staged=True)
+    return _D256Dispatch(_attn_bwd_dkdv_d256_producer_kernel, num_warps=4)
 
 
 def _run_bwd_d256(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, poison_scratch=False):
@@ -2102,9 +2324,8 @@ def _run_bwd_d256(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, poison_
     if poison_scratch:
         ds.fill_(float("nan"))
     grid = (triton.cdiv(n_ctx, block), batch * heads)
-    dkdv_kernel = _select_d256_dkdv_kernel(causal)
-    dkdv_num_warps = _d256_dkdv_num_warps(dkdv_kernel)
-    dkdv_kernel[grid](
+    dispatch = _select_d256_dispatch(causal)
+    dispatch.entry[grid](
         q,
         k,
         v,
@@ -2121,7 +2342,9 @@ def _run_bwd_d256(q, k, v, do, lse, delta, dq, dk, dv, sm_scale, causal, poison_
         N_PAD=n_pad,
         BLOCK=block,
         HALF_D=half_d,
-        num_warps=dkdv_num_warps,
+        STAGED=dispatch.staged,
+        PIPELINED=dispatch.pipelined,
+        num_warps=dispatch.num_warps,
         matrix_instr_nonkdim=_matrix_instr_nonkdim(),
     )
     _attn_bwd_dq_from_ds_d256_kernel[grid](
@@ -2247,9 +2470,36 @@ def _snr_db(actual, expected):
     return 20.0 * torch.log10(signal / noise).item()
 
 
-def test_d128_selects_pipelined_noncausal_dkdv():
-    assert _select_d128_dkdv_kernel(False) is _attn_bwd_dkdv_d128_pipe_kernel
-    assert _select_d128_dkdv_kernel(True) is _attn_bwd_dkdv_d128_kernel
+def test_d128_dispatch_uses_one_entry_per_launch_topology(monkeypatch):
+    """Schedule kwargs select implementations behind stable topology entries."""
+    monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
+    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
+    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
+
+    full = _select_d128_dispatch((16, 27, 200, 128), False)
+    causal = _select_d128_dispatch((16, 27, 200, 128), True)
+    assert full.entry is causal.entry is _attn_bwd_dkdv_d128_split_kernel
+    assert (full.pipelined, full.rectangular, full.block_m, full.block_n) == (True, True, 32, 64)
+    assert (causal.pipelined, causal.rectangular, causal.block_m, causal.block_n) == (False, False, 32, 32)
+
+    monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "1")
+    exact = _select_d128_dispatch((16, 27, 200, 128), False)
+    assert exact.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
+    assert exact.exact and not exact.pipelined
+
+
+def test_d256_dispatch_uses_one_configured_producer_entry(monkeypatch):
+    monkeypatch.delenv("TLX_FA_BWD_FORCE_STAGED", raising=False)
+    full = _select_d256_dispatch(False)
+    causal = _select_d256_dispatch(True)
+    assert full.entry is causal.entry is _attn_bwd_dkdv_d256_producer_kernel
+    assert (full.staged, full.pipelined, full.num_warps) == (False, True, 4)
+    assert (causal.staged, causal.pipelined, causal.num_warps) == (False, False, 4)
+
+    monkeypatch.setenv("TLX_FA_BWD_FORCE_STAGED", "1")
+    staged = _select_d256_dispatch(True)
+    assert staged.entry is _attn_bwd_dkdv_d256_producer_kernel
+    assert (staged.staged, staged.pipelined, staged.num_warps) == (True, False, 2)
 
 
 def test_d128_short_causal_uses_gluon_matching_tile_config():
@@ -2269,14 +2519,6 @@ def test_d128_persistent_short_is_exact_experiment_shape():
     assert not _d128_persistent_short_supported((1, 1, 200, 64), False)
 
 
-def test_d128_exact_dispatch_defaults_to_split(monkeypatch):
-    monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    assert _select_d128_kernel((16, 27, 200, 128), False) is _attn_bwd_dkdv_d128_pipe_kernel
-    assert _select_d128_kernel((16, 27, 200, 128), True) is _attn_bwd_dkdv_d128_kernel
-
-
 def test_d128_legacy_disable_flags_are_ignored(monkeypatch):
     """Legacy disable knobs must not override the explicit exact opt-in."""
     monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "1")
@@ -2284,7 +2526,9 @@ def test_d128_legacy_disable_flags_are_ignored(monkeypatch):
     monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
     monkeypatch.setenv("TLX_FA_BWD_DISABLE_PERSISTENT_D128", "1")
     monkeypatch.setenv("TLX_FA_BWD_DISABLE_EXACT_D128", "1")
-    assert _select_d128_kernel((16, 27, 200, 128), False) is _attn_bwd_dkdv_dq_d128_exact_kernel
+    dispatch = _select_d128_dispatch((16, 27, 200, 128), False)
+    assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
+    assert dispatch.exact
 
 
 def test_d128_exact_layout_dispatch_is_narrow_and_opt_in(monkeypatch):
@@ -2293,60 +2537,48 @@ def test_d128_exact_layout_dispatch_is_narrow_and_opt_in(monkeypatch):
     monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
     monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
     for causal in (False, True):
-        selected = _select_d128_kernel((16, 27, 200, 128), causal)
-        assert selected.__name__ == "_attn_bwd_dkdv_dq_d128_exact_kernel"
-    assert _select_d128_kernel((16, 27, 201, 128), False) is _attn_bwd_dkdv_d128_pipe_kernel
-    assert _select_d128_kernel((32, 1, 2600, 256), False).__name__ != "_attn_bwd_dkdv_dq_d128_exact_kernel"
+        dispatch = _select_d128_dispatch((16, 27, 200, 128), causal)
+        assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
+        assert dispatch.exact
+    assert _select_d128_dispatch((16, 27, 201, 128), False).entry is _attn_bwd_dkdv_d128_split_kernel
+    assert not _select_d128_dispatch((32, 1, 2600, 256), False).exact
 
     monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
-    assert _select_d128_kernel((16, 27, 200, 128), False) is _attn_bwd_dkdv_d128_pipe_kernel
+    assert _select_d128_dispatch((16, 27, 200, 128), False).entry is _attn_bwd_dkdv_d128_split_kernel
 
 
 def test_d128_persistent_short_dispatches_combined_when_opted_in(monkeypatch):
     monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
     monkeypatch.setenv(_D128_PERSISTENT_ENABLE_ENV, "1")
     monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    assert _select_d128_kernel((16, 27, 200, 128), False) is _attn_bwd_dkdv_dq_d128_persistent_kernel
+    dispatch = _select_d128_dispatch((16, 27, 200, 128), False)
+    assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
+    assert not dispatch.exact and not dispatch.pipelined
+    assert dispatch.num_warps == 8
 
 
 def test_d128_persistent_pipeline_dispatches_only_when_opted_in(monkeypatch):
     monkeypatch.setenv(_D128_EXACT_ENABLE_ENV, "0")
     monkeypatch.setenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, "1")
     monkeypatch.delenv(_D128_PERSISTENT_ENABLE_ENV, raising=False)
-    assert _select_d128_kernel((16, 27, 200, 128), False) is _attn_bwd_dkdv_dq_d128_persistent_pipeline_kernel
+    dispatch = _select_d128_dispatch((16, 27, 200, 128), False)
+    assert dispatch.entry is _attn_bwd_dkdv_dq_d128_combined_kernel
+    assert not dispatch.exact and dispatch.pipelined
+    assert dispatch.num_warps == 4
 
 
 def test_d128_persistent_short_keeps_non_target_shapes_on_split(monkeypatch):
     monkeypatch.delenv(_D128_EXACT_ENABLE_ENV, raising=False)
     monkeypatch.setenv(_D128_PERSISTENT_ENABLE_ENV, "1")
     monkeypatch.delenv(_D128_PERSISTENT_PIPE_ENABLE_ENV, raising=False)
-    assert _select_d128_kernel((1, 1, 128, 128), False) is _attn_bwd_dkdv_d128_pipe_kernel
-    assert _select_d128_kernel((1, 1, 256, 128), True) is _attn_bwd_dkdv_d128_kernel
-
-
-def test_d256_selects_peeled_noncausal_dkdv(monkeypatch):
-    monkeypatch.delenv("TLX_FA_BWD_FORCE_STAGED", raising=False)
-    assert _select_d256_dkdv_kernel(False) is _attn_bwd_dkdv_d256_peel_kernel
-    assert _select_d256_dkdv_kernel(True) is _attn_bwd_dkdv_d256_hoist_kernel
-
-
-def test_d256_selects_staged_when_forced(monkeypatch):
-    monkeypatch.setenv("TLX_FA_BWD_FORCE_STAGED", "1")
-    assert _select_d256_dkdv_kernel(True) is _attn_bwd_dkdv_d256_staged_kernel
-
-
-def test_d256_selects_hoist_by_default(monkeypatch):
-    monkeypatch.delenv("TLX_FA_BWD_FORCE_STAGED", raising=False)
-    assert _select_d256_dkdv_kernel(True) is _attn_bwd_dkdv_d256_hoist_kernel
+    assert _select_d128_dispatch((1, 1, 128, 128), False).entry is _attn_bwd_dkdv_d128_split_kernel
+    assert _select_d128_dispatch((1, 1, 256, 128), True).entry is _attn_bwd_dkdv_d128_split_kernel
 
 
 def test_shape_specific_launch_configs():
     assert _d128_num_warps(False) == 2
     assert _d128_num_warps(True) == 4
     assert _matrix_instr_nonkdim() == 16
-    assert _d256_dkdv_num_warps(_attn_bwd_dkdv_d256_staged_kernel) == 2
-    assert _d256_dkdv_num_warps(_attn_bwd_dkdv_d256_peel_kernel) == 4
-    assert _d256_dkdv_num_warps(_attn_bwd_dkdv_d256_hoist_kernel) == 4
 
 
 @pytest.mark.parametrize("causal", [False, True])
