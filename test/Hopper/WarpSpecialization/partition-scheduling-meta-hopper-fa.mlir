@@ -68,20 +68,20 @@ tt.func public @hopper_fa_forward_3_partitions(
 
   // Q descriptor and loads for two data partitions
   %desc_q_stride = arith.extsi %stride_qm : i32 to i64
-  %desc_q = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16, #shared>>
-  %desc_q_2 = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16, #shared>>
-  %q_0_data = tt.descriptor_load %desc_q[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked>
-  %q_1_data = tt.descriptor_load %desc_q_2[%c64_i32, %c0_i32] : !tt.tensordesc<tensor<64x128xf16, #shared>> -> tensor<64x128xf16, #blocked>
+  %desc_q = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16, #shared>
+  %desc_q_2 = tt.make_tensor_descriptor %Q, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16, #shared>
+  %q_0_data = tt.descriptor_load %desc_q[%c0_i32, %c0_i32] : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked>
+  %q_1_data = tt.descriptor_load %desc_q_2[%c64_i32, %c0_i32] : !tt.tensordesc<64x128xf16, #shared> -> tensor<64x128xf16, #blocked>
   %q_0 = ttg.local_alloc %q_0_data : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
   %q_1 = ttg.local_alloc %q_1_data : (tensor<64x128xf16, #blocked>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
 
   // K/V descriptors
-  %desc_k = tt.make_tensor_descriptor %K, [%KV_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>>
-  %desc_v = tt.make_tensor_descriptor %V, [%KV_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<128x128xf16, #shared>>
+  %desc_k = tt.make_tensor_descriptor %K, [%KV_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x128xf16, #shared>
+  %desc_v = tt.make_tensor_descriptor %V, [%KV_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<128x128xf16, #shared>
 
   // Output descriptor (TMA store — epilogue)
-  %desc_o = tt.make_tensor_descriptor %Out, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16, #shared>>
-  %desc_o_2 = tt.make_tensor_descriptor %Out, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<tensor<64x128xf16, #shared>>
+  %desc_o = tt.make_tensor_descriptor %Out, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16, #shared>
+  %desc_o_2 = tt.make_tensor_descriptor %Out, [%Q_LEN, %c128_i32], [%c128_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x128xf16, #shared>
 
   // Main attention loop — uses warp_group_dot (Hopper MMA, not MMAv5)
   %loop:6 = scf.for %i = %c0_i32 to %n_iters step %c1_i32
@@ -97,8 +97,8 @@ tt.func public @hopper_fa_forward_3_partitions(
 
     // Load K and V
     %kv_offset = arith.muli %i, %c128_i32 {loop.cluster = 2 : i32, loop.stage = 0 : i32} : i32
-    %k_data = tt.descriptor_load %desc_k[%kv_offset, %c0_i32] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked>
-    %v_data = tt.descriptor_load %desc_v[%kv_offset, %c0_i32] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<tensor<128x128xf16, #shared>> -> tensor<128x128xf16, #blocked>
+    %k_data = tt.descriptor_load %desc_k[%kv_offset, %c0_i32] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #blocked>
+    %v_data = tt.descriptor_load %desc_v[%kv_offset, %c0_i32] {loop.cluster = 2 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x128xf16, #shared> -> tensor<128x128xf16, #blocked>
     %k_smem = ttg.local_alloc %k_data {loop.cluster = 0 : i32, loop.stage = 1 : i32} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
     %k_trans = ttg.memdesc_trans %k_smem {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<128x128xf16, #shared, #smem> -> !ttg.memdesc<128x128xf16, #shared1, #smem>
     %v_smem = ttg.local_alloc %v_data {loop.cluster = 0 : i32, loop.stage = 1 : i32} : (tensor<128x128xf16, #blocked>) -> !ttg.memdesc<128x128xf16, #shared, #smem>
@@ -194,8 +194,8 @@ tt.func public @hopper_fa_forward_3_partitions(
   %out_f16_1 = arith.truncf %acc_norm_1 : tensor<64x128xf32, #mma> to tensor<64x128xf16, #mma>
   %out_conv_0 = ttg.convert_layout %out_f16_0 : tensor<64x128xf16, #mma> -> tensor<64x128xf16, #blocked>
   %out_conv_1 = ttg.convert_layout %out_f16_1 : tensor<64x128xf16, #mma> -> tensor<64x128xf16, #blocked>
-  tt.descriptor_store %desc_o[%c0_i32, %c0_i32], %out_conv_0 : !tt.tensordesc<tensor<64x128xf16, #shared>>, tensor<64x128xf16, #blocked>
-  tt.descriptor_store %desc_o_2[%c64_i32, %c0_i32], %out_conv_1 : !tt.tensordesc<tensor<64x128xf16, #shared>>, tensor<64x128xf16, #blocked>
+  tt.descriptor_store %desc_o[%c0_i32, %c0_i32], %out_conv_0 : !tt.tensordesc<64x128xf16, #shared>, tensor<64x128xf16, #blocked>
+  tt.descriptor_store %desc_o_2[%c64_i32, %c0_i32], %out_conv_1 : !tt.tensordesc<64x128xf16, #shared>, tensor<64x128xf16, #blocked>
 
   tt.return
 }

@@ -25,6 +25,16 @@ module {
 
 // -----
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+module {
+  // expected-error @+1 {{tensor descriptors must not wrap tensor types; use !tt.tensordesc<shape x element-type[, layout]> instead}}
+  tt.func public @nested_tensordesc(%arg0: !tt.tensordesc<tensor<8x16xf32, #shared>>) {
+    tt.return
+  }
+}
+
+// -----
+
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 1]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32} {
@@ -220,30 +230,44 @@ module attributes {"ttg.num-warps" = 1 : i32} {
 
 // -----
 
-#shared_multicast = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 0]]}>
-#shared_local = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
 #smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 2 : i32} {
-  tt.func public @memdesc_reinterpret_changed_broadcast_count(%arg0: !ttg.memdesc<128x128xf16, #shared_multicast, #smem>) {
-    // expected-error @+1 {{source and result must have the same number of broadcast CTA dims}}
-    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x128xf16, #shared_multicast, #smem> -> !ttg.memdesc<128x128xf16, #shared_local, #smem>
+tt.func public @memdesc_reinterpret_changed_storage_size(%arg0: !ttg.memdesc<8x16xf16, #shared, #smem>) {
+    // expected-error @+1 {{result logical storage size must not exceed source logical storage size}}
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<8x16xf16, #shared, #smem> -> !ttg.memdesc<8x16xf32, #shared, #smem>
     tt.return
-  }
 }
 
 // -----
 
-#shared_bc0 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1], [0, 0]]}>
-#shared_bc1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0], [0, 0]]}>
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
 #smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 4 : i32} {
-  tt.func public @memdesc_reinterpret_changed_broadcast_mask(%arg0: !ttg.memdesc<128x128xf16, #shared_bc0, #smem>) {
-    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x128xf16, #shared_bc0, #smem> -> !ttg.memdesc<128x128xf16, #shared_bc1, #smem>
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+tt.func public @memdesc_reinterpret_changed_memory_space(%arg0: !ttg.memdesc<128x128xf16, #shared, #smem>) {
+    // expected-error @+1 {{source and destination memory space must match}}
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x128xf16, #shared, #smem> -> !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory>
     tt.return
-  }
 }
 
 // -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @memdesc_reinterpret_changed_mutability(%arg0: !ttg.memdesc<8x16xf16, #shared, #smem>) {
+    // expected-error @+1 {{source and result must have the same mutability}}
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<8x16xf16, #shared, #smem> -> !ttg.memdesc<8x16xf16, #shared, #smem, mutable>
+    tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func public @memdesc_reinterpret_subview(%arg0: !ttg.memdesc<8x16xf16, #shared, #smem, 16x16>) {
+    // expected-error @+1 {{source and result must not be subviews}}
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<8x16xf16, #shared, #smem, 16x16> -> !ttg.memdesc<8x16xf16, #shared, #smem>
+    tt.return
+}
 
 #mma0 = #ttg.nvidia_mma<{versionMajor=2, warpsPerCTA=[1,1], instrShape = [16, 8]}>
 #dot_operand_a = #ttg.dot_op<{opIdx=0, parent=#mma0, kWidth=2}>

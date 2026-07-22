@@ -20,7 +20,6 @@ def main() -> int:
     BLOCK_M = 128
     BLOCK_N = 64
     HEAD_DIM = 128
-    NUM_BUFFERS_KV = 2
 
     shapes = [
         # (Z, H, N_CTX)
@@ -57,10 +56,7 @@ def main() -> int:
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             HEAD_DIM=HEAD_DIM,
-            NUM_BUFFERS_KV=NUM_BUFFERS_KV,
-            num_warps=4,
-            num_ctas=1,
-            num_stages=2,
+            # NUM_BUFFERS_KV + num_warps/num_ctas/num_stages injected by @triton.autotune.
         )
 
         ref = F.scaled_dot_product_attention(q, k, v, scale=sm_scale)

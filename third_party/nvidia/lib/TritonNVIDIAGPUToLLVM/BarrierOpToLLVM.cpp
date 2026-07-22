@@ -31,6 +31,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.h"
 
 #include "Utility.h"
 
@@ -42,6 +43,28 @@ namespace ttng = mlir::triton::nvidia_gpu;
 namespace ttg = mlir::triton::gpu;
 
 namespace {
+
+struct PhysicalClusterInfo {
+  SmallVector<int, 3> dims;
+  int size;
+  bool hasPerCTAProgramIds;
+};
+
+// num-ctas describes Triton's logical/layout cluster model. ctas_per_cga keeps
+// num-ctas == 1 and records the physical CUDA cluster in ttg.cluster-dim-*.
+// Keep those concepts separate: changing lookupNumCTAs would alter layout and
+// program-id semantics throughout the compiler.
+PhysicalClusterInfo getPhysicalClusterInfo(Operation *op) {
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  assert(mod && "expected CLC op inside a module");
+  int numCTAs = ttg::TritonGPUDialect::getNumCTAs(mod);
+  SmallVector<int, 3> dims = ttg::TritonGPUDialect::getClusterDims(mod);
+  int explicitSize = dims[0] * dims[1] * dims[2];
+  if (explicitSize > 1)
+    return {std::move(dims), explicitSize, numCTAs == 1};
+  return {{numCTAs, 1, 1}, numCTAs, false};
+}
+
 Value getElectWarp0OrThread0(const NVIDIA::TargetInfo &targetInfo,
                              TritonLLVMOpBuilder &b) {
   if (targetInfo.getComputeCapability() >= 90) {
@@ -289,6 +312,14 @@ struct WaitBarrierOpConversion
       pred = b.and_(pred, *leaderPred);
 
     bool predicated = pred && !matchPattern(pred, m_NonZero());
+    int suspendNs = 0;
+    if (targetInfo->getComputeCapability() >= 100) {
+      auto mod = op->getParentOfType<ModuleOp>();
+      if (auto attr = mod->getAttrOfType<IntegerAttr>(
+              "tlx.mbarrier_try_wait_suspend_ns"))
+        suspendNs = attr.getInt();
+    }
+    bool useSuspendHint = suspendNs > 0;
     std::string ptx;
     if (targetInfo->getComputeCapability() < 90) {
       if (!predicated) {
@@ -315,23 +346,30 @@ struct WaitBarrierOpConversion
 )";
       }
     } else {
+      // SM90+ polls with try_wait in a spin loop. Blackwell can opt into the
+      // four-operand form, whose suspend hint lowers to NANOSLEEP.SYNCS.
+      std::string tryWait = useSuspendHint
+                                ? "\tmbarrier.try_wait.parity.shared::cta.b64 "
+                                  "complete, [$0], $1, $2;\n"
+                                : "\tmbarrier.try_wait.parity.shared::cta.b64 "
+                                  "complete, [$0], $1;\n";
       if (!predicated) {
-        ptx = R"(
+        ptx = std::string(R"(
 {
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1;
-	@!complete bra.uni waitLoop;
+)") + tryWait +
+              R"(	@!complete bra.uni waitLoop;
 }
 )";
       } else {
-        ptx = R"(
-{
-	@!$2 bra.uni skipWait;
+        std::string predOperand = useSuspendHint ? "$3" : "$2";
+        ptx = std::string("\n{\n\t@!") + predOperand +
+              R"( bra.uni skipWait;
 	.reg .pred complete;
 	waitLoop:
-	mbarrier.try_wait.parity.shared::cta.b64 complete, [$0], $1;
-	@!complete bra.uni waitLoop;
+)" + tryWait +
+              R"(	@!complete bra.uni waitLoop;
 	skipWait:
 }
 )";
@@ -339,9 +377,11 @@ struct WaitBarrierOpConversion
     }
     ::mlir::triton::PTXBuilder ptxBuilder;
     auto &waitLoop = *ptxBuilder.create(ptx);
-    SmallVector<::mlir::triton::PTXBuilder::Operand *, 3> operands = {
+    SmallVector<::mlir::triton::PTXBuilder::Operand *, 4> operands = {
         ptxBuilder.newOperand(smemObj.getBase(), "r"),
         ptxBuilder.newOperand(adaptor.getPhase(), "r")};
+    if (useSuspendHint)
+      operands.push_back(ptxBuilder.newOperand(b.i32_val(suspendNs), "r"));
     if (predicated)
       operands.push_back(ptxBuilder.newOperand(pred, "b"));
 
@@ -675,16 +715,17 @@ struct CLCTryCancelOpConversion
     // Use elect predicate - only one thread should issue CLC
     Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
 
-    auto numCTAs = ttg::lookupNumCTAs(op);
-    if (numCTAs > 1) {
+    PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
+    if (cluster.size > 1) {
       TritonLLVMOpBuilder b(loc, rewriter);
-      auto clusterCtaId = targetInfo->getClusterCTAId(rewriter, loc);
+      auto clusterCtaId =
+          triton::nvgpu::ClusterCTAIdOp::create(rewriter, loc, i32_ty);
       pred = b.and_(pred, b.icmp_eq(clusterCtaId, b.i32_val(0)));
     }
 
     std::string ptxAsm = "@$2 clusterlaunchcontrol.try_cancel.async.shared::cta"
                          ".mbarrier::complete_tx::bytes";
-    if (numCTAs > 1)
+    if (cluster.size > 1)
       ptxAsm += ".multicast::cluster::all";
     ptxAsm += ".b128 [$0], [$1];";
 
@@ -808,14 +849,30 @@ struct CLCGetProgramIdOpConversion
     Value result =
         ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffects=*/false);
 
-    // Convert ctaid to clusterid, which is the real program id
-    // Note that all cluster CTAs are distributed in the X dim
-    if (op.getDim() == ProgramIDDim::X) {
-      auto numCTAs = ttg::lookupNumCTAs(op);
-      if (numCTAs > 1) {
-        TritonLLVMOpBuilder b(loc, rewriter);
-        result = b.sdiv(result, b.i32_val(numCTAs));
-      }
+    PhysicalClusterInfo cluster = getPhysicalClusterInfo(op);
+    if (cluster.hasPerCTAProgramIds) {
+      // CLC returns the first CTA coordinate of the canceled cluster. Under
+      // ctas_per_cga, every CTA is a distinct Triton program, so reconstruct
+      // this CTA's coordinate from the X-major linear cluster rank.
+      TritonLLVMOpBuilder b(loc, rewriter);
+      Value rank = triton::nvgpu::ClusterCTAIdOp::create(rewriter, loc, i32_ty);
+      int axis = static_cast<int>(op.getDim());
+      int stride = 1;
+      for (int i = 0; i < axis; ++i)
+        stride *= cluster.dims[i];
+      Value localCoord = rank;
+      if (stride > 1)
+        localCoord = b.udiv(localCoord, b.i32_val(stride));
+      if (cluster.dims[axis] > 1)
+        localCoord = b.urem(localCoord, b.i32_val(cluster.dims[axis]));
+      else
+        localCoord = b.i32_val(0);
+      result = b.add(result, localCoord);
+    } else if (op.getDim() == ProgramIDDim::X && cluster.size > 1) {
+      // Triton's num-ctas model assigns one program id to the whole 1-D
+      // cluster, so preserve the existing ctaid -> clusterid conversion.
+      TritonLLVMOpBuilder b(loc, rewriter);
+      result = b.sdiv(result, b.i32_val(cluster.size));
     }
 
     rewriter.replaceOp(op, result);

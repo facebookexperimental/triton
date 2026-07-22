@@ -1,5 +1,6 @@
 #include "ir.h"
 
+#include <algorithm>
 #include <optional>
 #include <pybind11/cast.h>
 #include <pybind11/functional.h>
@@ -213,8 +214,7 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
       continue;
 
     bool isIm2Col = isa<ttng::TensorDescIm2ColType>(arg.getType());
-    auto blockType = descTy.getBlockType();
-    auto encoding = blockType.getEncoding();
+    auto encoding = descTy.getSharedLayout();
 
     py::dict metadata;
     if (isa<ttg::NVMMASharedEncodingAttr>(encoding)) {
@@ -225,21 +225,23 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
         throw py::type_error("invalid TMA descriptor type");
       auto tmaMode = isIm2Col ? ttg::TMAMode::Im2Col : ttg::TMAMode::Tiled;
       auto blockSize =
-          ttng::getTMABlockShape(blockType, /*packedSize=*/false, tmaMode);
+          ttng::getTMABlockShape(descTy, /*packedSize=*/false, tmaMode);
       metadata["swizzle"] = *swizzle;
-      metadata["elem_size"] = blockType.getElementTypeBitWidth() / 8;
+      metadata["elem_size"] =
+          descTy.getElementType().getIntOrFloatBitWidth() / 8;
       metadata["elem_type"] = *elemType;
       metadata["block_size"] =
           std::vector<int>(blockSize.begin(), blockSize.end());
       metadata["fp4_padded"] = mmaEncoding && mmaEncoding.getFp4Padded();
       metadata["is_im2col"] = isIm2Col;
     } else {
-      auto blockShape = blockType.getShape();
+      auto blockShape = descTy.getShape();
       metadata["block_size"] =
           std::vector<int>(blockShape.begin(), blockShape.end());
-      metadata["elem_bits"] = blockType.getElementTypeBitWidth();
+      metadata["elem_bits"] = descTy.getElementType().getIntOrFloatBitWidth();
 
-      if (auto paddedEnc = dyn_cast<ttg::PaddedSharedEncodingAttr>(encoding)) {
+      if (auto paddedEnc =
+              dyn_cast_if_present<ttg::PaddedSharedEncodingAttr>(encoding)) {
         py::list intervalPaddingPairs;
         for (auto [interval, padding] : llvm::zip_equal(
                  paddedEnc.getIntervals(), paddedEnc.getPaddings())) {
@@ -249,8 +251,6 @@ py::list getTensorDescMetadata(ModuleOp &mod) {
           intervalPaddingPairs.append(pair);
         }
         metadata["interval_padding_pairs"] = intervalPaddingPairs;
-
-        auto blockShape = blockType.getShape();
       }
     }
     result.append(std::move(metadata));
@@ -267,11 +267,14 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
   auto arr = mod->getAttrOfType<ArrayAttr>("ttg.auto_tma_recipes");
   if (!arr)
     return result;
-  // Locate the kernel FuncOp so we can read each synthetic descriptor arg's
-  // shared-encoding swizzle from its final (post-pass) type. The swizzle is
-  // assigned by optimize_descriptor_encoding during TTGIR, so it is only
-  // available off the live arg type (parity with getTensorDescMetadata for user
-  // descriptors). Falls back to no swizzle if the arg/type can't be resolved.
+  // Locate the kernel FuncOp so we can read the *final* (post-pass) block shape
+  // from each synthetic descriptor arg's type. WS / 2-CTA passes
+  // (Transform2CTALoads, WSDataPartition) halve the host-side tensordesc arg
+  // type in place but do NOT update this module attr, so the attr's block_shape
+  // is stale after data partitioning. Reading the live arg type keeps the
+  // host-built CUtensorMap's box dims in sync (parity with
+  // getTensorDescMetadata for user descriptors). Falls back to the attr's
+  // block_shape if the arg/type can't be resolved.
   triton::FuncOp kernelFunc;
   mod.walk([&](triton::FuncOp func) {
     if (triton::isKernel(func)) {
@@ -307,11 +310,23 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
     r["base_ptr_arg_index"] = getReqI(d, "base_ptr_arg_index");
     r["shape_arg_indices"] = getIArr(d, "shape_arg_indices");
     r["stride_arg_indices"] = getIArr(d, "stride_arg_indices");
-    // swizzle: read from the descriptor arg's final shared encoding (assigned
-    // by optimize_descriptor_encoding) -- a GEMM dot operand's NVMMAShared
-    // swizzle differs from a box-geometry heuristic, so read it via
-    // getTMASwizzleMode (parity with getTensorDescMetadata). -1 means "derive
-    // host-side from box geometry" (non-NVMMAShared / rank<2).
+    // block_shape + swizzle: read from the FINAL descriptor arg type.
+    // block_shape reflects WS / 2-CTA halving. swizzle must match the
+    // descriptor's shared encoding (assigned by optimize_descriptor_encoding)
+    // -- a GEMM dot operand's NVMMAShared swizzle differs from a box-geometry
+    // heuristic, so read it via getTMASwizzleMode (parity with
+    // getTensorDescMetadata). -1 means "derive host-side from box geometry"
+    // (non-NVMMAShared / rank<2).
+    //
+    // block_shape is also the ENCODED box (launch.h box_dim). The full tile can
+    // exceed the 256-element cuTensorMapEncodeTiled cap (e.g. BLOCK=512), so we
+    // clamp it to the SAME box getTMABlockShape produces for the device
+    // lowering (each dim <= 256; contig dim = swizzle element width). The
+    // descriptor_load /store keeps the full-block SMEM result and the device
+    // AsyncTMACopy lowering multi-copies this clamped box to fill it -- single
+    // source of truth with the device path (both call getTMABlockShape on the
+    // same encoding). A trailing min(256) floor covers the 1D / non-NVMMAShared
+    // / no-descriptor fallbacks (idempotent for the getTMABlockShape output).
     std::vector<int> blockShape = getIArr(d, "block_shape");
     int swizzle = -1;
     if (kernelFunc && descArgIdx >= 0 &&
@@ -320,14 +335,22 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
       if (auto descTy = dyn_cast<TensorDescInterface>(descArg.getType())) {
         auto blockTy = descTy.getBlockType();
         auto shp = blockTy.getShape();
+        blockShape.assign(shp.begin(), shp.end());
         if (shp.size() >= 2 &&
             isa<ttg::NVMMASharedEncodingAttr>(blockTy.getEncoding())) {
           auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
           if (succeeded(sw))
             swizzle = *sw;
+          auto box = ttng::getTMABlockShape(descTy, /*packedSize=*/false,
+                                            ttg::TMAMode::Tiled);
+          blockShape.assign(box.begin(), box.end());
         }
       }
     }
+    // Floor every box dim at the 256-element hardware cap (idempotent after the
+    // getTMABlockShape clamp above; handles 1D / non-NVMMAShared descriptors).
+    for (auto &v : blockShape)
+      v = std::min(v, 256);
     r["block_shape"] = blockShape;
     r["swizzle"] = swizzle;
     r["elem_type"] = getReqI(d, "elem_type");
@@ -934,16 +957,16 @@ void init_triton_ir(py::module &&m) {
       ret::take_ownership);
 
   m.def("deduce_scale_factor",
-        [](Value &lhs, std::optional<Value> &lhsScale,
-           ScaleDotElemType lhsFormat, bool lhsKPack, Value &rhs,
-           std::optional<Value> &rhsScale, ScaleDotElemType rhsFormat,
-           bool rhsKPack) -> int32_t {
+        [](std::vector<int64_t> &lhs,
+           std::optional<std::vector<int64_t>> &lhsScale,
+           ScaleDotElemType lhsFormat, bool lhsKPack, std::vector<int64_t> &rhs,
+           std::optional<std::vector<int64_t>> &rhsScale,
+           ScaleDotElemType rhsFormat, bool rhsKPack) -> int32_t {
           int32_t scaleFactor = 0;
           std::string errMsg;
-          if (failed(DotScaledOp::deduceScaleFactor(
-                  lhs, lhsScale.value_or(Value()), lhsFormat, lhsKPack, rhs,
-                  rhsScale.value_or(Value()), rhsFormat, rhsKPack, scaleFactor,
-                  errMsg)))
+          if (failed(deduceScaleFactor(lhs, lhsScale, lhsFormat, lhsKPack, rhs,
+                                       rhsScale, rhsFormat, rhsKPack,
+                                       scaleFactor, errMsg)))
             throw std::runtime_error(errMsg);
           return scaleFactor;
         });
@@ -1421,6 +1444,10 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::SubFOp>(lhs, rhs);
            })
+      .def("create_fneg",
+           [](TritonOpBuilder &self, Value &input) -> Value {
+             return self.create<arith::NegFOp>(input);
+           })
       .def("create_mul",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::MulIOp>(lhs, rhs);
@@ -1682,26 +1709,30 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_tensor_descriptor_type",
            [](TritonOpBuilder &self, Type blockTy, bool isSigned) -> Type {
-             auto ctx = self.getContext();
-             return triton::TensorDescType::get(
-                 ctx, cast<RankedTensorType>(blockTy), isSigned);
+             auto rtt = cast<RankedTensorType>(blockTy);
+             return triton::TensorDescType::get(rtt.getShape(),
+                                                rtt.getElementType(), isSigned);
            })
       .def("create_reinterpret_tensor_descriptor",
            [](TritonOpBuilder &self, Value desc_ptr, Type blockTy) -> Value {
-             auto ctx = self.getContext();
+             auto rtt = cast<RankedTensorType>(blockTy);
              auto resultTy = triton::TensorDescType::get(
-                 ctx, cast<RankedTensorType>(blockTy));
+                 rtt.getShape(), rtt.getElementType(), rtt.getEncoding());
              return self.create<ttng::ReinterpretTensorDescOp>(resultTy,
                                                                desc_ptr);
            })
       .def("create_descriptor_load",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> &indices,
-              CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy) -> Value {
+              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+              std::optional<bool> multicast) -> Value {
              auto descTy = cast<triton::TensorDescType>(desc.getType());
              auto resTy = descTy.getSignlessBlockType();
-             return self.create<DescriptorLoadOp>(
+             auto op = self.create<DescriptorLoadOp>(
                  resTy, desc, indices, cacheModifier, evictionPolicy);
+             if (multicast)
+               op->setAttr("tt.multicast",
+                           self.getBuilder().getBoolAttr(*multicast));
+             return op;
            })
       .def("create_descriptor_gather",
            [](TritonOpBuilder &self, Value desc, Value x_indices, Value y_index,

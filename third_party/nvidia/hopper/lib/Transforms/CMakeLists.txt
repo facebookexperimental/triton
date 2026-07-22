@@ -35,6 +35,11 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSLowerMem.cpp
   WarpSpecialization/WSLowerToken.cpp
   WarpSpecialization/WSMemoryPlanner.cpp
+  WarpSpecialization/WSMemoryPlanOrdering.cpp
+  WarpSpecialization/WSMemoryPlanCost.cpp
+  WarpSpecialization/WSMemoryPlanCopies.cpp
+  WarpSpecialization/WSMemoryPlanSearch.cpp
+  WarpSpecialization/WSMemoryPlanPackers.cpp
   WarpSpecialization/WSSpecialize.cpp
   WarpSpecialization/SinkBroadcast.cpp
   WarpSpecialization/WSTMAStoreLowering.cpp

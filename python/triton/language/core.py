@@ -7,7 +7,7 @@ from enum import Enum
 from functools import partial, wraps, cached_property
 import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional, Tuple, TYPE_CHECKING
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import builtins
 from .. import knobs
 from ..runtime.jit import JITCallable
@@ -1538,15 +1538,22 @@ class tensor_descriptor_base(base_value):
         return str(self.type)
 
     @builtin
-    def load(self, offsets: Sequence[constexpr | tensor], latency=None, _semantic=None) -> tensor:
+    def load(self, offsets: Sequence[constexpr | tensor], latency=None, multicast=None, _semantic=None) -> tensor:
         """Load a block from the descriptor starting at the given element offsets.
 
         Values outside of the tensor bounds will be filled with zeros.
 
+        :param offsets: the offsets to load from
+        :param multicast: whether this load may use TMA multicast. ``None``
+            inherits the kernel-level setting. ``True`` grants the compiler
+            permission to use multicast when it can prove a legal recipient
+            group; it does not guarantee multicast emission. See
+            :doc:`the TMA multicast design </design/triton_tma_multicast>`.
         :note: Offset must be a multiple of 16-bytes
         """
         latency = _unwrap_if_constexpr(latency)
-        return _semantic.descriptor_load(self, offsets, "", "", latency)
+        multicast = _unwrap_if_constexpr(multicast)
+        return _semantic.descriptor_load(self, offsets, "", "", latency, multicast)
 
     @builtin
     def store(
@@ -1715,12 +1722,43 @@ else:
         return lambda obj: obj
 
 
+_AGGREGATE_MISSING = object()
+
+
+def _resolve_aggregate_fields(cls):
+    all_annotations = {}
+    all_defaults = {}
+    # Inherit from oldest first, so child overrides parent
+    for base in reversed(cls.__mro__[1:]):
+        if base is base_value or base is object:
+            continue
+        if not getattr(base, "__triton_aggregate__", False):
+            raise TypeError(f"Aggregates can only inherit from other aggregates, but got non-aggregate base: {base}")
+        all_annotations.update(getattr(base, "__annotations__", {}))
+        all_defaults.update(getattr(base, "__aggregate_defaults__", {}))
+
+    # Add cls's own fields, resolving string annotations via typing.get_type_hints.
+    own_names = cls.__dict__.get("__annotations__", {})
+    hints = typing.get_type_hints(cls)
+    for name in own_names:
+        all_annotations[name] = hints[name]
+        val = cls.__dict__.get(name, _AGGREGATE_MISSING)
+        if val is _AGGREGATE_MISSING:
+            continue
+        # Skip descriptors and methods - only plain values are defaults
+        if not callable(val) or isinstance(val, base_value):
+            all_defaults[name] = val
+    return all_annotations, all_defaults
+
+
 @dataclass_transform(eq_default=False)
 def _aggregate(cls):
-    field_annotations = typing.get_type_hints(cls)
-    field_names = builtins.tuple(field_annotations.keys())
+    all_annotations, all_defaults = _resolve_aggregate_fields(cls)
+
     init = cls.__dict__.get("__init__", None)
+
     if init is None:
+        field_names = builtins.tuple(all_annotations.keys())
 
         def init(self, *args, **kwargs):
             if len(args) > len(field_names):
@@ -1734,6 +1772,8 @@ def _aggregate(cls):
                     value = args[index]
                 elif name in kwargs:
                     value = kwargs.pop(name)
+                elif name in all_defaults:
+                    value = all_defaults[name]
                 else:
                     raise TypeError(f"{cls.__name__}.__init__() missing required argument: '{name}'")
 
@@ -1750,7 +1790,7 @@ def _aggregate(cls):
     class aggregate_value(base_value):
         __triton_builtin__ = True
         __triton_aggregate__ = True
-        __annotations__ = field_annotations
+        __annotations__ = all_annotations
 
         @classmethod
         def _get_instance(this_cls):
@@ -1759,6 +1799,9 @@ def _aggregate(cls):
         def __new__(this_cls, *args, _semantic=None, _generator=None, **kwargs):
             # Call into the user-defined constructor.
             instance = this_cls._get_instance()
+            # Track init phase so __setattr__ accepts writes during __init__
+            # but rejects post-construction mutation.
+            object.__setattr__(instance, "_aggregate_init_complete", False)
             extra_kwargs = {}
             if isinstance(init, JITCallable):
                 # raise ValueError(f"{cls.__name__}.__init__ cannot be a @triton.jit function")
@@ -1771,46 +1814,57 @@ def _aggregate(cls):
             init(instance, *args, **extra_kwargs, **kwargs)
 
             # Require that the user-defined constructor initialized all fields.
-            for name in field_names:
+            for name in all_annotations.keys():
                 if not hasattr(instance, name):
                     raise AttributeError(f"constructor for {cls.__name__} did not initialize attribute '{name}'")
 
+            # Lock further attribute assignment after __init__.
+            object.__setattr__(instance, "_aggregate_init_complete", True)
             return instance
 
-        # Only allow setting attributes defined in the class annotations.
+        # Only allow setting annotated attributes during __init__, and
+        # only for attributes defined in the class annotations.
         def __setattr__(self, name, value):
-            if name not in field_annotations:
+            if name not in all_annotations:
                 raise AttributeError(f"{cls.__name__} has no attribute '{name}'")
-            if not isinstance(value, field_annotations[name]):
-                raise TypeError(f"Expected {field_annotations[name]} for attribute '{name}', got {type(value)}")
+            if not isinstance(value, all_annotations[name]):
+                raise TypeError(f"Expected {all_annotations[name]} for attribute '{name}', got {type(value)}")
+            if getattr(self, "_aggregate_init_complete", False):
+                raise AttributeError(f"cannot assign to field '{name}' on immutable aggregate {cls.__name__}; "
+                                     f"use aggregate_replace() to construct a modified copy")
             super().__setattr__(name, value)
 
         def _set_name(self, builder: ir.builder, name: str) -> None:
-            for key_name in field_names:
+            for key_name in all_annotations.keys():
                 getattr(self, key_name)._set_name(builder, f"{name}.{key_name}")
 
         def _flatten_ir(self, handles: List[ir.value]) -> None:
-            for name in field_names:
+            for name in all_annotations.keys():
                 getattr(self, name)._flatten_ir(handles)
 
         @property
         def type(self):
-            return _aggregate_type(
-                aggregate_value,
-                [(name, getattr(self, name).type) for name in field_names],
-            )
+            return _aggregate_type(aggregate_value,
+                                   [(name, getattr(self, name).type) for name in all_annotations.keys()])
 
     hash_attrs = [init]
 
-    for name, member in inspect.getmembers(cls):
-        if (inspect.isfunction(member) or inspect.ismethod(member) or isinstance(member, JITCallable)):
-            if name != "__init__":
-                setattr(aggregate_value, name, member)
+    for (name, member) in inspect.getmembers(cls):
+        if inspect.isfunction(member) or inspect.ismethod(member) or isinstance(member, JITCallable):
+            if name == "__init__":
+                continue
+            # __annotate__ is a Python 3.14+ internal; exclude from hash and
+            # don't copy it onto the aggregate value type.
+            if name == "__annotate__":
+                continue
+            # Don't override aggregate infrastructure methods inherited from
+            # processed parent aggregates (e.g. __new__, __setattr__, _flatten_ir)
+            if name in aggregate_value.__dict__:
+                continue
+            setattr(aggregate_value, name, member)
 
-            # Exclude the members with names from hash:
-            #  * __init__ - added above.
-            #  * __annotate_func__ - isn't user facing.
-            if name not in {"__init__", "__annotate_func__"}:
+            # Exclude __annotate_func__ from hash — isn't user facing (Python 3.14+).
+            if name != "__annotate_func__":
                 hash_attrs.append(member)
 
     aggregate_value.hash_attrs = hash_attrs
@@ -1818,8 +1872,35 @@ def _aggregate(cls):
     aggregate_value.__module__ = cls.__module__
     aggregate_value.__qualname__ = cls.__qualname__
     aggregate_value.__doc__ = cls.__doc__
+    aggregate_value.__aggregate_fields__ = builtins.tuple(all_annotations.keys())
+    aggregate_value.__aggregate_defaults__ = dict(all_defaults)
 
     return aggregate_value
+
+
+def aggregate_replace(instance, **changes):
+    """Create a copy of an aggregate instance with specified fields replaced.
+
+    Similar to dataclasses.replace() — returns a new instance of the same
+    aggregate type with the given fields updated and all other fields copied
+    from the original instance.
+
+    :param instance: The aggregate instance to copy
+    :param changes: Keyword arguments for fields to replace
+    :return: A new aggregate instance with the specified changes
+    """
+    if not getattr(type(instance), "__triton_aggregate__", False):
+        raise TypeError(f"aggregate_replace() expects an aggregate instance, got {type(instance)}")
+
+    field_names = type(instance).__aggregate_fields__
+    for name in changes:
+        if name not in field_names:
+            raise TypeError(f"{type(instance).__name__} has no field '{name}'")
+
+    kwargs = {name: getattr(instance, name) for name in field_names}
+    kwargs.update(changes)
+
+    return type(instance)(**kwargs)
 
 
 def _is_block_ptr(value) -> bool:
@@ -2667,7 +2748,7 @@ def _experimental_reinterpret_tensor_descriptor(desc_ptr, block_shape, dtype, _s
 
 
 @builtin
-def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _semantic=None):
+def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, multicast=None, _semantic=None):
     """
     Experimental feature to access TMA descriptors loads. This is an escape hatch to easily exercise TTGIR operations.
     This will be removed in the future and shouldn't be used in production code.
@@ -2675,7 +2756,7 @@ def _experimental_descriptor_load(desc_pointer, offsets, shape, dtype, _semantic
     This loads a tensor of data based on the descriptor and offsets.
     """
     desc = _experimental_reinterpret_tensor_descriptor(desc_pointer, shape, dtype, _semantic=_semantic)
-    return desc.load(offsets, _semantic=_semantic)
+    return desc.load(offsets, multicast=multicast, _semantic=_semantic)
 
 
 @builtin
@@ -2692,10 +2773,10 @@ def _experimental_descriptor_store(desc_pointer, value, offsets, store_reduce=""
 
 
 @builtin
-def load_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[constexpr | tensor],
+def load_tensor_descriptor(desc: tensor_descriptor_base, offsets: Sequence[constexpr | tensor], multicast=None,
                            _semantic=None) -> tensor:
     """Load a block of data from a tensor descriptor."""
-    return desc.load(offsets, _semantic=_semantic)
+    return desc.load(offsets, multicast=multicast, _semantic=_semantic)
 
 
 @builtin
@@ -3870,7 +3951,48 @@ class static_range(base_value):
         raise RuntimeError("static_range can only be used in @triton.jit'd functions")
 
 
-class range(base_value):
+def _loop_attr(ir_name, kind):
+    """Metadata tag for an AutoWS loop option: the IR attribute name it lowers to
+    and the emission ``kind`` (see ``_apply_loop_options`` in the code generator).
+    ``kind`` is one of ``"int32"``, ``"unit"``, ``"bool"``, ``"bool_opt"``, ``"licm"``.
+    """
+    return {"loop_attr": (ir_name, kind)}
+
+
+@dataclass(eq=False, kw_only=True)
+class AutoWSLoopOptions(base_value):
+    """Compiler loop annotations shared by ``tl.range`` (``for`` loops) and
+    ``tl.condition`` (``while`` loops).
+
+    These are the single source of truth for the AutoWS / pipelining knobs: both
+    loop front-ends inherit this dataclass, so they stay in lockstep (adding an
+    option is one new field), and the code generator emits them identically onto
+    ``scf.for`` and ``scf.while``. See ``tl.range`` for the per-option docs.
+    """
+    num_stages: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.num_stages", "int32"))
+    loop_unroll_factor: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.loop_unroll_factor", "int32"))
+    disallow_acc_multi_buffer: bool = field(default=False, metadata=_loop_attr("tt.disallow_acc_multi_buffer", "unit"))
+    flatten: bool = field(default=False, metadata=_loop_attr("tt.flatten", "unit"))
+    warp_specialize: bool = field(default=False, metadata=_loop_attr("tt.warp_specialize", "unit"))
+    multi_cta: bool = field(default=False, metadata=_loop_attr("tt.multi_cta", "unit"))
+    disable_licm: bool = field(default=False, metadata=_loop_attr("llvm.loop_annotation", "licm"))
+    data_partition_factor: Optional[constexpr] = field(default=None,
+                                                       metadata=_loop_attr("tt.data_partition_factor", "int32"))
+    list_schedule_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.list_schedule_pick", "int32"))
+    mem_plan_pick: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.mem_plan_pick", "int32"))
+    merge_epilogue: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue", "bool"))
+    merge_epilogue_to_computation: bool = field(default=False, metadata=_loop_attr("tt.merge_epilogue_to_computation",
+                                                                                   "bool"))
+    merge_correction: bool = field(default=False, metadata=_loop_attr("tt.merge_correction", "bool"))
+    separate_epilogue_store: bool = field(default=False, metadata=_loop_attr("tt.separate_epilogue_store", "bool"))
+    tmem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.tmem_alloc_algo", "int32"))
+    smem_alloc_algo: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_alloc_algo", "int32"))
+    smem_budget: Optional[constexpr] = field(default=None, metadata=_loop_attr("tt.smem_budget", "int32"))
+    smem_circular_reuse: Optional[bool] = field(default=None, metadata=_loop_attr("tt.smem_circular_reuse", "bool_opt"))
+
+
+@dataclass(eq=False)
+class range(AutoWSLoopOptions):
     """
     Iterator that counts upward forever.
 
@@ -3919,65 +4041,31 @@ class range(base_value):
         (``TRITON_USE_LIST_SCHEDULE=1``), select which ranked schedule variant
         (0 = best) to apply to this loop. May be a ``tl.constexpr`` so it becomes
         part of the compilation key and can be swept by ``@triton.autotune``.
+    :param mem_plan_pick: Rank into the WS memory planner's top-K allocation
+        plans (0 = cost-best) to apply to this loop, gated by
+        ``TRITON_WS_MEM_PLAN_TOPK``. May be a ``tl.constexpr`` so it becomes part
+        of the compilation key and can be swept by ``@triton.autotune``.
 
         Note that warp specialization is only supported on Blackwell GPUs and
         only works on simple matmul loops. Support for arbitrary loops will be
         expanded over time.
     """
 
-    def __init__(
-        self,
-        arg1,
-        arg2=None,
-        step=None,
-        num_stages=None,
-        loop_unroll_factor=None,
-        disallow_acc_multi_buffer=False,
-        flatten=False,
-        warp_specialize=False,
-        multi_cta=False,
-        disable_licm=False,
-        data_partition_factor=None,
-        list_schedule_pick=None,
-        merge_epilogue=False,
-        merge_epilogue_to_computation=False,
-        merge_correction=False,
-        separate_epilogue_store=False,
-        tmem_alloc_algo=None,
-        smem_alloc_algo=None,
-        smem_budget=None,
-        smem_circular_reuse=None,
-    ):
-        if step is None:
+    # Loop bounds are the iterator's own (positional) fields; the AutoWS options
+    # are inherited (keyword-only) from AutoWSLoopOptions.
+    arg1: typing.Any
+    arg2: typing.Any = None
+    step: typing.Any = None
+
+    def __post_init__(self):
+        if self.step is None:
             self.step = constexpr(1)
-        else:
-            self.step = step
-        if arg2 is None:
+        if self.arg2 is None:
             self.start = constexpr(0)
-            self.end = arg1
+            self.end = self.arg1
         else:
-            self.start = arg1
-            self.end = arg2
-        self.num_stages = num_stages
-        self.loop_unroll_factor = loop_unroll_factor
-        self.disallow_acc_multi_buffer = disallow_acc_multi_buffer
-        self.data_partition_factor = data_partition_factor
-        # Rank of the list-schedule variant to apply to THIS loop (0 = best).
-        # May be a tl.constexpr so it participates in the compile key and can be
-        # swept by @triton.autotune. Consumed by nvgpu-list-schedule.
-        self.list_schedule_pick = list_schedule_pick
-        self.merge_epilogue = merge_epilogue
-        self.merge_epilogue_to_computation = merge_epilogue_to_computation
-        self.merge_correction = merge_correction
-        self.separate_epilogue_store = separate_epilogue_store
-        self.tmem_alloc_algo = tmem_alloc_algo
-        self.smem_alloc_algo = smem_alloc_algo
-        self.smem_budget = smem_budget
-        self.smem_circular_reuse = smem_circular_reuse
-        self.flatten = flatten
-        self.warp_specialize = warp_specialize
-        self.multi_cta = multi_cta
-        self.disable_licm = disable_licm
+            self.start = self.arg1
+            self.end = self.arg2
 
     def __iter__(self):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")
@@ -3986,27 +4074,28 @@ class range(base_value):
         raise RuntimeError("tl.range can only be used in @triton.jit'd functions")
 
 
-class condition(base_value):
+@dataclass(eq=False)
+class condition(AutoWSLoopOptions):
     """
-    While loop condition wrapper.
+    While loop condition wrapper -- the ``while``-loop analogue of ``tl.range``.
 
     .. highlight:: python
     .. code-block:: python
 
         @triton.jit
         def kernel(...):
-            while tl.condition(c, disable_licm)
+            while tl.condition(c, warp_specialize=True, num_stages=3):
                 ...
-    :note: This is a special wrapper used to annotate while loops in the context of
-        :code:`triton.jit` functions. It allows user to pass extra attributes to the compiler.
-    :param disable_licm: Tells the compiler it shouldn't hoist loop invariant
-        code outside the loop. This is often useful to avoid creating long liveranges
-        within a loop.
-    """
 
-    def __init__(self, arg1, disable_licm=False):
-        self.condition = arg1
-        self.disable_licm = disable_licm
+    :note: This is a special wrapper used to annotate while loops in the context of
+        :code:`triton.jit` functions. It accepts the same keyword-only AutoWS /
+        pipelining options as :code:`tl.range` (see there for the per-option docs);
+        they are attached to the generated :code:`scf.while` and, when the loop is
+        countable, carried onto the :code:`scf.for` it is uplifted to.
+    """
+    # The while condition value is the wrapper's own (positional) field; the
+    # AutoWS options are inherited (keyword-only) from AutoWSLoopOptions.
+    condition: typing.Any
 
 
 # -----------------------

@@ -49,7 +49,7 @@ jobs:
           GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
           REPO_NAME="${{ github.repository }}"
           # ID of integration-tests workflow
-          WORKFLOW_ID="11678186"
+          WORKFLOW_ID="160583305"
 
           # Fetch the last run time of this workflow
           LAST_RUN=$(curl -s \

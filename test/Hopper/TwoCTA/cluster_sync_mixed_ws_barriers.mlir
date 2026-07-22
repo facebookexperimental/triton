@@ -17,7 +17,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
     // CHECK: mbarrier.init.shared::cta.b64
     // CHECK: fence.mbarrier_init.release.cluster
-    // CHECK-NEXT: nvvm.cluster.arrive {aligned}
+    // CHECK-NEXT: nvvm.cluster.arrive.relaxed {aligned}
     // CHECK-NEXT: nvvm.cluster.wait {aligned}
     // CHECK: nvvm.mapa
     ttng.init_barrier %entry_barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>

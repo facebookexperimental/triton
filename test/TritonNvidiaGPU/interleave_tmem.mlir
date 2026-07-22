@@ -349,7 +349,7 @@ tt.func @no_reorder_across_arrive_like_op(
 // TMEM load sinking.
 // CHECK-LABEL: @plain_tma_store_token_wait_does_not_block_tmem_load
 tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
-    %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+    %desc: !tt.tensordesc<128x64xf16, #shared>,
     %smem_buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>) {
   %c0 = arith.constant 0 : i32
   %alloc = ttng.tmem_alloc : () -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -364,7 +364,7 @@ tt.func @plain_tma_store_token_wait_does_not_block_tmem_load(
   // CHECK-NEXT: ttg.local_store
   // CHECK-NEXT: arith.truncf
   // CHECK-NEXT: ttg.local_store
-  %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %smem_buf : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+  %tok = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %smem_buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
   ttng.async_tma_store_token_wait %tok : !ttg.async.token
   %u0 = arith.truncf %v0 : tensor<128x64xf32, #linear64> to tensor<128x64xf16, #linear64>
   ttg.local_store %u0, %smem_buf : tensor<128x64xf16, #linear64> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>

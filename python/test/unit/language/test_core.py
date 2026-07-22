@@ -1018,6 +1018,25 @@ def test_unary_op(dtype_x, expr, num_ctas, device):
     _test_unary(dtype_x, expr, device=device, num_ctas=num_ctas)
 
 
+@triton.jit
+def _neg_signed_zero_kernel(x_ptr, y_ptr):
+    offsets = tl.arange(0, 2)
+    x = tl.load(x_ptr + offsets)
+    tl.store(y_ptr + offsets, -x)
+
+
+@pytest.mark.interpreter
+def test_neg_preserves_signed_zero(device):
+    x = np.array([0.0, -0.0], dtype=np.float32)
+    y = np.empty_like(x)
+    x_tri = to_triton(x, device=device)
+    y_tri = to_triton(y, device=device)
+
+    _neg_signed_zero_kernel[(1, )](x_tri, y_tri)
+
+    np.testing.assert_array_equal(np.signbit(to_numpy(y_tri)), np.array([True, False]))
+
+
 # ----------------
 # test math ops
 # ----------------
@@ -1430,6 +1449,30 @@ def test_noinline(mode, device):
     elif mode == "shared":
         ref = torch.full((16, 16), 16, device=device, dtype=torch.float32)
         assert torch.equal(z, ref + x + y)
+
+
+@triton.jit(noinline=True)
+def noinline_load_block_fn(ptr, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    return tl.load(ptr + offsets)
+
+
+def test_noinline_returns_tensor(device):
+
+    @triton.jit
+    def kernel(X, Y, Z, BLOCK_SIZE: tl.constexpr):
+        x = noinline_load_block_fn(X, BLOCK_SIZE)
+        y = noinline_load_block_fn(Y, BLOCK_SIZE)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        tl.store(Z + offsets, x + y)
+
+    BLOCK_SIZE = 128
+    torch.manual_seed(0)
+    x = torch.randn(BLOCK_SIZE, device=device, dtype=torch.float32)
+    y = torch.randn(BLOCK_SIZE, device=device, dtype=torch.float32)
+    z = torch.empty_like(x)
+    kernel[(1, )](x, y, z, BLOCK_SIZE=BLOCK_SIZE, num_warps=1)
+    assert torch.equal(z, x + y)
 
 
 # ---------------
@@ -4013,7 +4056,8 @@ def test_dot(
             pytest.skip(f"input_precision {input_precision} is not supported in the interpreter")
     else:
         if not is_hip() and K < 16:
-            if in_dtype != 'float64':
+            tf32_n8 = (in_dtype == 'float32' and N == 8 and K == 8 and input_precision == 'tf32')
+            if in_dtype != 'float64' and not tf32_n8:
                 pytest.skip("small dots are supported only on HIP at the moment")
         if is_cuda():
             capability = torch.cuda.get_device_capability()
@@ -4262,15 +4306,16 @@ def test_dot(
                 assert "v_dot2c_f32_bf16" in amdgcn
         return
 
-    # make sure ld/st are vectorized
     ptx = pgm.asm["ptx"]
-
-    if (K > 16 or N > 16 or M > 16) and (M * N // (num_warps * 32) >= 4):
-        # XXX: skip small sizes because they are not vectorized
+    # XXX: skip small sizes because they are not vectorized; with runtime
+    # strides, v4 needs the contiguous dim >= 16 (K for loads, N for stores).
+    enough_work = (M * N // (num_warps * 32) >= 4) and (K > 16 or N > 16 or M > 16)
+    if enough_work and K >= 16:
         if "float64" in in_dtype:
             assert "ld.global.v2.b64" in ptx
         else:
             assert "ld.global.v4" in ptx
+    if enough_work and N >= 16:
         if "float8" in in_dtype:
             assert "st.global.v2" in ptx
         elif "float64" in in_dtype:
@@ -4340,6 +4385,7 @@ def test_dot(
         assert re.search(pattern, ptx, flags=re.DOTALL)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize(
     "M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, num_warps, mma, kpack",
     [(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, 4, mma, kpack)
@@ -4365,6 +4411,8 @@ def test_scaled_dot(
     kpack,
     device,
 ):
+    if is_interpreter() and normal_type != "fp16":
+        pytest.skip("bfloat16 is not supported in the interpreter")
     is_SM120 = False
     if is_cuda():
         cc = torch.cuda.get_device_capability()
@@ -4647,6 +4695,8 @@ def test_scaled_dot(
     if is_hip_rdna3() and mxfp_type == "e4m3" and normal_type == "fp16":
         large_tolerance = True
     if is_SM120:
+        large_tolerance = True
+    if mxfp_type == 'e4m3' and is_interpreter():
         large_tolerance = True
     atol = 2e-4 if large_tolerance else 1e-5
     rtol = 2e-2 if large_tolerance else 1e-2
@@ -5357,6 +5407,87 @@ def test_vectorization_hints(has_hints, device):
         assert "ld.global.v4.b32" in ptx
     else:
         assert "ld.global.v4.b32" not in ptx
+
+
+def _ptx_version(ptx):
+    match = re.search(r"^\.version\s+(\d+)\.(\d+)", ptx, re.MULTILINE)
+    assert match is not None, "PTX is missing a .version directive"
+    return int(match.group(1)), int(match.group(2))
+
+
+def _ptx_global_access_widths(ptx, op):
+    widths = []
+    for match in re.finditer(rf"\b{op}\.global(?:\.[a-zA-Z0-9_:]+)*?(?:\.v(?P<count>\d+))?\.b(?P<bits>\d+)\b", ptx):
+        widths.append(int(match.group("count") or 1) * int(match.group("bits")))
+    return widths
+
+
+@triton.jit
+def _softmax_vectorization_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n_rows, n_cols,
+                                  BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr, MAX_DIVISIBILITY: tl.constexpr):
+    row_start = tl.program_id(0)
+    row_step = tl.num_programs(0)
+    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+        input_ptrs = row_start_ptr + col_offsets
+        if MAX_DIVISIBILITY > 1:
+            n_cols = tl.multiple_of(n_cols, MAX_DIVISIBILITY)
+            input_ptrs = tl.max_contiguous(tl.multiple_of(input_ptrs, MAX_DIVISIBILITY), MAX_DIVISIBILITY)
+        mask = col_offsets < n_cols
+        row = tl.load(input_ptrs, mask=mask, other=-float("inf"))
+        row = row - tl.max(row, axis=0)
+        numerator = tl.exp(row)
+        softmax_output = numerator / tl.sum(numerator, axis=0)
+        output_ptrs = output_ptr + row_idx * output_row_stride + col_offsets
+        if MAX_DIVISIBILITY > 1:
+            output_ptrs = tl.max_contiguous(tl.multiple_of(output_ptrs, MAX_DIVISIBILITY), MAX_DIVISIBILITY)
+        tl.store(output_ptrs, softmax_output, mask=mask)
+
+
+@pytest.mark.parametrize("n_cols", [1152, 4096])
+def test_softmax_vectorization_correctness(n_cols, device):
+    if not is_cuda():
+        pytest.skip("Requires CUDA")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires Blackwell")
+
+    torch.manual_seed(0)
+    n_rows = 32
+    x = torch.randn((n_rows, n_cols), device=device, dtype=torch.float32)
+    expected = torch.softmax(x, dim=1)
+    cases = [
+        ("triton-128", 16, 1),
+        ("triton-256", 32, 1),
+        ("triton-128-pipelined", 16, 4),
+    ]
+
+    for provider, max_divisibility, num_stages in cases:
+        y = torch.empty_like(x)
+        pgm = _softmax_vectorization_kernel[(n_rows, )](
+            y,
+            x,
+            x.stride(0),
+            y.stride(0),
+            n_rows,
+            n_cols,
+            BLOCK_SIZE=triton.next_power_of_2(n_cols),
+            num_stages=num_stages,
+            MAX_DIVISIBILITY=max_divisibility,
+            num_warps=8,
+        )
+        torch.testing.assert_close(y, expected, rtol=1e-4, atol=1e-6, msg=provider)
+        ptx = pgm.asm["ptx"]
+        assert ".target sm_100" in ptx, provider
+        if num_stages == 1:
+            assert "cp.async" not in ptx, provider
+            expected_width = 256 if provider == "triton-256" and _ptx_version(ptx) >= (8, 8) else 128
+            assert expected_width in _ptx_global_access_widths(ptx, "ld"), provider
+            assert expected_width in _ptx_global_access_widths(ptx, "st"), provider
+        else:
+            assert "cp.async.cg.shared.global" in ptx, provider
+            assert "cp.async.wait_group" in ptx, provider
+            assert 128 in _ptx_global_access_widths(ptx, "st"), provider
 
 
 @pytest.mark.interpreter

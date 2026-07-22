@@ -45,6 +45,7 @@ from .core import (
     TRITON_MAX_TENSOR_NUMEL,
     _experimental_descriptor_load,
     _experimental_descriptor_store,
+    aggregate_replace,
     load_tensor_descriptor,
     store_tensor_descriptor,
     make_tensor_descriptor,

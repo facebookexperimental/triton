@@ -61,6 +61,10 @@ constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
 constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";
 constexpr static char AttrClusterDimY[] = "ttg.cluster-dim-y";
 constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
+// Set when the module contains exactly one `ttg.warp_specialize` op. Used to
+// diverge behavior in the warp specialization lowering to LLVM.
+constexpr static char AttrSingleWarpSpecializeName[] =
+    "ttg.single-warp-specialize";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
@@ -78,6 +82,12 @@ std::optional<int> maybeLookupNumWarps(Block *block);
 int lookupThreadsPerWarp(OpBuilder &rewriter);
 int lookupNumCTAs(OpBuilder &rewriter);
 int lookupNumCTAs(Operation *op);
+
+// Record/query whether the module contains exactly one `ttg.warp_specialize`
+// op via the `ttg.single-warp-specialize` module attribute. `hasSingle...`
+// returns false when the attribute is absent.
+void setHasSingleWarpSpecialize(ModuleOp module, bool value);
+bool hasSingleWarpSpecialize(ModuleOp module);
 
 template <typename Key, typename Value> class Cache {
 public:
@@ -122,6 +132,10 @@ LinearEncodingAttr toLinearEncoding(DistributedEncodingTrait layout,
 unsigned getTotalElemsPerThread(Type type);
 
 unsigned getTotalElemsPerThread(Attribute layout, ArrayRef<int64_t> shape);
+
+// Get the number of elements in each thread, ignoring register broadcasting.
+unsigned getUniqueElemsPerThread(Type type);
+unsigned getUniqueElemsPerThread(Attribute layout, ArrayRef<int64_t> shape);
 
 SmallVector<unsigned> getElemsPerThread(Type type);
 

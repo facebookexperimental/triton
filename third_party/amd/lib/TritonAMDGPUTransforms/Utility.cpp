@@ -3,6 +3,8 @@
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Tools/LayoutUtils.h"
 
 #include <limits>
@@ -418,8 +420,9 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
     // 2× ensures the stride (in dwords) is an odd multiple of the combined
     // row-access width, distributing all 16 lanes' bank accesses across
     // disjoint banks and eliminating conflicts for tile widths >= 32.
-    if (auto ldsParams = targetInfo.queryLDSTransLoadParams(typeWidthInBit)) {
-      padAmount = 2 * ldsParams->instBitWidth / typeWidthInBit;
+    auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(typeWidthInBit);
+    if (!ldsParamsVec.empty()) {
+      padAmount = 2 * ldsParamsVec[0].instBitWidth / typeWidthInBit;
     }
   } else {
     // Non-transposed path: each cycle 16 lanes at distinct nonK rows load
@@ -487,6 +490,19 @@ composePaddedLayout(const tt::AMD::TargetInfo &targetInfo, int opIdx,
   }
 
   return {};
+}
+
+ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
+                                                   RankedTensorType tensorType,
+                                                   Value desc) {
+  auto descTy = cast<tt::TensorDescType>(desc.getType());
+  auto sharedLayout = descTy.getSharedLayout();
+  if (!sharedLayout) {
+    emitError(op->getLoc()) << "Missing encoding on the tensor descriptor";
+    return {};
+  }
+  auto encoding = cast<ttg::SharedEncodingTrait>(sharedLayout);
+  return ttg::updateEncodingForShape(op, encoding, tensorType);
 }
 
 Attribute buildDefaultTDMDescriptorEncoding(MLIRContext *ctx,

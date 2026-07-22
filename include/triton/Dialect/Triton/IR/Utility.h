@@ -199,6 +199,21 @@ bool isKernel(FunctionOpInterface funcOp);
 
 unsigned getBitwidth(RankedTensorType ty);
 
+// True if `attr` is, or nests anywhere, a TLX placeholder encoding wrapper
+// (#tlx.user_layout / #tlx.no_verify_layout). These defer layout verification
+// to resolve-placeholder-layouts (make_ttgir). Detected by dialect namespace
+// (scanning the whole attribute tree) because triton core cannot depend on the
+// TLX dialect for typed isa<> checks.
+bool encodingContainsTlxPlaceholder(Attribute attr);
+
+// Peel any TLX placeholder wrapper(s) (#tlx.user_layout /
+// #tlx.no_verify_layout, which live in the "tlx" dialect and wrap a single
+// inner layout) off the top of `attr`, returning the underlying concrete
+// encoding (or `attr` unchanged if it is not tlx-wrapped). Lets a verifier
+// check the real layout under a still- unresolved placeholder instead of
+// skipping verification entirely.
+Attribute unwrapTlxWrappers(Attribute attr);
+
 // If the value "anchor" is compared against a statically-computed bound, return
 // inclusive lower and upper bounds lb <= anchor <= ub. Depending on the
 // comparison operator, one of the bounds is a computed one while the other is

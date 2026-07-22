@@ -584,6 +584,9 @@ class nvidia_knobs(base_knobs):
     enable_interleave_tmem: env_bool = env_bool("TRITON_ENABLE_INTERLEAVE_TMEM", True)
     enable_tileir: env_bool = env_bool("ENABLE_TILE")
     disable_budget_aware_layout_conversion: env_bool = env_bool("TRITON_DISABLE_BUDGET_AWARE_LAYOUT_CONVERSION")
+    # Gate opt-in perf-benchmark tests (do_bench sweeps) so unit-test runs do
+    # not pay the perf-sweep cost.
+    run_perf: env_bool = env_bool("TRITON_RUN_PERF")
 
 
 class amd_knobs(base_knobs):

@@ -35,11 +35,11 @@ def acf_args_for(ptx: str, arch: str | None, ptxas_version: str) -> list[str]:
                 "--apply-controls (set TRITON_PTXAS_BLACKWELL_PATH / COMPILE_IQ_PTXAS_MIN_VERSION)")
             return []
         sha = store.ptx_sha256(ptx)
-        p = store.acf_path(sha, arch)
+        p = store.acf_path(sha, arch, ptxas_version)  # version-tagged: match the ptxas that minted the ACF
         if not os.path.exists(p):
-            store.dlog("consume", f"MISS {sha[:16]} {arch}")
+            store.dlog("consume", f"MISS {sha[:16]} {arch} ptxas={ptxas_version}")
             return []
-        store.dlog("consume", f"HIT {sha[:16]} {arch}")
+        store.dlog("consume", f"HIT {sha[:16]} {arch} ptxas={ptxas_version}")
         return [f"--apply-controls={p}"]
     except Exception as e:  # never break compilation
         store.dlog("consume", f"error (fail-open): {type(e).__name__}: {e}")

@@ -82,7 +82,7 @@ _DTYPE_ALT = (
     r"|f8e4m3|f8e5m2|f16|f32|f64|i1|i8|i16|i32|i64)"
 )
 _TENSOR_TYPE_RE = re.compile(rf"tensor<([0-9x]+)x({_DTYPE_ALT})\b")
-_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<tensor<([0-9x]+)x({_DTYPE_ALT})\b")
+_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<(?:tensor<)?([0-9x]+)x({_DTYPE_ALT})\b")
 # `!ttg.memdesc<128x128xbf16, ...>` — used for hoisted SMEM/TMEM allocs.
 _MEMDESC_TYPE_RE = re.compile(rf"!ttg\.memdesc<([0-9x]+)x({_DTYPE_ALT})\b")
 
@@ -101,7 +101,7 @@ def _parse_tensor_shape(type_str: str) -> tuple[list[int], str] | None:
 
 
 def _parse_desc_block_shape(type_str: str) -> tuple[list[int], str] | None:
-    """Extract block shape from `!tt.tensordesc<tensor<128x64xf16,...>>`."""
+    """Extract block shape from `!tt.tensordesc<128x64xf16,...>`."""
     m = _DESC_TYPE_RE.search(type_str)
     if not m:
         return None
@@ -471,6 +471,24 @@ def _render_memdesc_trans(op: Op, rctx: RenderCtx) -> str:
     return f"tlx.local_trans({inner})"
 
 
+def _subtiled_store_n_size_for_desc(op: Op, rctx: RenderCtx) -> int:
+    """Pass A.7: if `op` (a make_tensor_descriptor) feeds a subtiled
+    descriptor_store, return that store's sub-tile N width (n_size); else 0.
+    TMA requires the descriptor block element count to equal the SMEM staging
+    tensor, so a subtiled (BM, BN/S) store needs a (BM, BN/S) descriptor."""
+    for lp in rctx.graph.loops:
+        for nd in lp.schedule.nodes:
+            if nd.op_kind != "tt.descriptor_store" or nd.subtile_count <= 1:
+                continue
+            store_op = rctx.graph.ops.get(nd.op_ref) if nd.op_ref else None
+            if not store_op or not store_op.operands:
+                continue
+            desc = store_op.operands[0]
+            if isinstance(desc, OpRef) and desc.op_id == op.op_id:
+                return nd.n_size
+    return 0
+
+
 def _render_make_tensor_descriptor(op: Op, rctx: RenderCtx) -> str:
     # operandSegmentSizes: [ptr_count, shape_count, stride_count, padding_count]
     seg = op.attributes.get("operandSegmentSizes", [1, 2, 2, 0])
@@ -491,6 +509,11 @@ def _render_make_tensor_descriptor(op: Op, rctx: RenderCtx) -> str:
     if block_info is None:
         return f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], [{', '.join(strides)}], [...])"
     block_dims, _ = block_info
+    # Pass A.7: a descriptor feeding a subtiled store must use the (BM, BN/S)
+    # block so the TMA copy matches the shrunk SMEM staging tensor.
+    sub_n = _subtiled_store_n_size_for_desc(op, rctx)
+    if sub_n and len(block_dims) >= 2:
+        block_dims = list(block_dims[:-1]) + [sub_n]
     block_str = ", ".join(str(d) for d in block_dims)
     return (
         f"tl.make_tensor_descriptor({ptr}, [{', '.join(shape)}], "
@@ -2131,38 +2154,38 @@ def _result_feeds_descriptor_store(
 
 
 def _epilogue_colocation_wg(g: ScheduleGraph) -> int | None:
-    """The single inner warp group that produces the outer-loop epilogue's
-    register input — the WG the epilogue can be CO-LOCATED into (promotion +
-    store in one task, like the hand-written kernel), dropping the cross-WG SMEM
-    staging entirely. Returns None when there are zero or multiple such producers
-    (multi-producer, e.g. FA-bwd dK/dV, keeps the SMEM fallback) or the kernel is
-    non-persistent (no separate outer-epilogue task to merge)."""
-    outer_scopes = {f"loop:{L.loop_id}" for L in g.loops if L.is_outer}
-    if not outer_scopes:
-        return None
-    producers: set[int] = set()
-    for loop in g.loops:
-        if loop.is_outer:
-            continue
-        for_op = _find_loop_for(g, loop)
-        if for_op is None:
-            continue
-        wg_of_op = {n.op_ref: n.warp_group for n in loop.schedule.nodes if n.op_ref}
-        for idx, init, yld in _loop_iter_args(g, loop):
-            if not isinstance(yld, OpRef):
-                continue
-            pw = wg_of_op.get(yld.op_id)
-            if pw is None:
-                continue
-            if not (
-                isinstance(init, ConstRef)
-                and init.type
-                and _TENSOR_TYPE_RE.search(init.type)
-            ):
-                continue
-            if _result_feeds_descriptor_store(g, for_op.op_id, idx, outer_scopes):
-                producers.add(pw)
-    return next(iter(producers)) if len(producers) == 1 else None
+    """The inner warp group the outer-loop epilogue is CO-LOCATED into
+    (promotion + store in one task, like the hand-written kernel), dropping the
+    cross-WG SMEM staging entirely.
+
+    This is a FAITHFUL LOWERING of the compiler's decision: the modulo
+    scheduler's cost model (`unifyNestEpilogueWarpGroup`) prices the register
+    hand-off by storage class and, when co-location wins, RENUMBERS the
+    epilogue-owning outer warp group to SHARE the inner producer's id; separate
+    epilogues get a fresh id that aliases no inner group. So co-location is
+    signalled purely by the epilogue's warp-group id landing inside the inner
+    warp-group set — no dedicated field. The emitter only reads the ids; it does
+    NOT decide co-location. Returns None when the epilogue's id is fresh
+    (separate), e.g. a GEMM whose TMEM accumulator is cheap to hand off cross-WG."""
+    inner_wgs = {
+        n.warp_group
+        for loop in g.loops
+        if not loop.is_outer
+        for n in loop.schedule.nodes
+        if n.warp_group >= 0
+    }
+    epi_wgs = {
+        n.warp_group
+        for loop in g.loops
+        if loop.is_outer
+        for n in loop.schedule.nodes
+        if n.op_kind in ("tt.descriptor_store", "ttng.tmem_load")
+        and n.warp_group >= 0
+    }
+    colo = {w for w in epi_wgs if w in inner_wgs}
+    if len(colo) != 1:
+        return None  # separate (fresh id), or (defensively) ambiguous.
+    return next(iter(colo))
 
 
 def _derive_crossloop_result_channels(
@@ -2235,10 +2258,10 @@ def _derive_crossloop_result_channels(
             outer_ref = _result_feeds_descriptor_store(
                 g, for_op.op_id, idx, outer_scopes
             )
-            # Lever #2: if this producer WG will own the epilogue itself
-            # (co-location), the register value never crosses a WG boundary — no
-            # SMEM staging channel is needed. Only the SMEM fallback path (no
-            # co-location, or a function-scope consumer) still stages.
+            # If the compiler co-located the epilogue into this producer WG
+            # (co_locate_wg), the register value never crosses a WG boundary — no
+            # SMEM staging channel is needed. Only the separate-partition path
+            # (compiler left it uncolocated, or a function-scope consumer) stages.
             if outer_ref and prod_wg == _epilogue_colocation_wg(g):
                 outer_ref = False
             if not (func_ref or outer_ref):
@@ -5777,9 +5800,15 @@ def _emit_outer_epilogue_partitioned(
             tlx.async_descriptor_store_wait(0)
         tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
 
-    c_desc stays (BM, BN) so the launcher's `c_desc.block_shape = (BM, BN)`
-    contract is unchanged; c_smem is shrunk to (m_size, BN) at its alloc
-    site since only one group's tile is staged at a time.
+    The partition CHANGES the launcher's C descriptor contract: each
+    async_descriptor_store copies a (m_size, BN) c_smem box, and TMA
+    requires the descriptor block to equal the copied box, so the host
+    must build `c_desc.block_shape = (m_size, BN)` — NOT the ttgir's
+    (BM, BN). A/B load descriptors keep their ttgir blocks (loads are
+    not split; the MMA slices the full A tile per group). c_smem is
+    shrunk to (m_size, BN) at its alloc site since only one group's
+    tile is staged at a time. See case2's run_generated.py/bench_spec.py
+    for the contract in fixture form.
     """
     lines += (
         f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size}, per-group c_smem)"
@@ -5930,6 +5959,49 @@ def _emit_outer_epilogue_subtiled(
                 if is_last_sub:
                     lines += "tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)"
                 continue
+            if op.kind == "ttg.local_load":
+                # External SMEM input to the chain (e.g. case5's bias staging):
+                # keep the buffer full-size and sub-slice it along N per sub-tile,
+                # exactly like the TMEM accumulator above. This (plus the generic
+                # fallback below) lifts the old truncf/convert-only allowlist for
+                # any load-sourced chain input.
+                src = _render_operand(op.operands[0], rctx)
+                _sd = _parse_tensor_shape(op.result_types[0]) if op.result_types else None
+                _bm = _sd[0][0] if _sd else sub_size
+                name = f"ld_{sub_n}_{rctx.fresh_idx()}"
+                # SMEM memdesc: tlx.subslice is TMEM-only, so use the 2-D
+                # tlx.local_slice([0, n_off], [BM, sub_size]) along the N dim.
+                lines += (
+                    f"{name}_sub = tlx.local_slice({src}, [0, {n_off}], "
+                    f"[{_bm}, {sub_size}])"
+                )
+                lines += f"{name} = tlx.local_load({name}_sub)"
+                rctx.op_var[op.op_id] = name
+                continue
+            if op.kind == "tt.descriptor_load":
+                # External TMA input (e.g. case5 bias): the FULL [BM,BN] staging
+                # load is emitted once per tile in the outer body via
+                # outer_load_bindings (option B, load-once). Here we only sub-slice
+                # that staging per sub-tile — no re-load.
+                binding = rctx.outer_load_bindings.get(n.id)
+                if binding is not None:
+                    buf = binding["bufname"]
+                    _sd = (
+                        _parse_tensor_shape(op.result_types[0])
+                        if op.result_types
+                        else None
+                    )
+                    _bm = _sd[0][0] if _sd else sub_size
+                    name = f"ld_{sub_n}_{rctx.fresh_idx()}"
+                    # SMEM staging: tlx.subslice is TMEM-only, so slice the N dim
+                    # with the 2-D tlx.local_slice([0, n_off], [BM, sub_size]).
+                    lines += (
+                        f"{name}_sub = tlx.local_slice({buf}[0], [0, {n_off}], "
+                        f"[{_bm}, {sub_size}])"
+                    )
+                    lines += f"{name} = tlx.local_load({name}_sub)"
+                    rctx.op_var[op.op_id] = name
+                    continue
             if op.kind == "arith.truncf":
                 inner = _render_operand(op.operands[0], rctx)
                 rt = op.result_types[0] if op.result_types else ""
@@ -5965,6 +6037,14 @@ def _emit_outer_epilogue_subtiled(
                     f'[{offs_str}], eviction_policy="evict_first")'
                 )
                 continue
+            # Any remaining chain op is elementwise-along-N (guaranteed by the
+            # subtile gate): render it generically on the already-sub-sliced
+            # operands. This is what generalizes the epilogue subtiler beyond the
+            # truncf/convert_layout allowlist — bias addf, scale mulf, math.exp,
+            # arith.extf, etc. all lower with no per-op special case.
+            gname = f"{_OP_KIND_NAME_PREFIX.get(op.kind, 'sub')}_{sub_n}_{rctx.fresh_idx()}"
+            rctx.op_var[op.op_id] = gname
+            lines += f"{gname} = {_render_op_expr(op, rctx)}"
     # NOTE: no per-tile wait(0). The caller emits a single wait(0) AFTER
     # the persistent for-loop to drain remaining in-flight stores.
 

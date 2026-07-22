@@ -41,6 +41,12 @@ static LogicalResult verifySameEncoding(Type typeA, Type typeB) {
     if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
       ret = tensorType.getEncoding();
     }
+    // Peel any TLX placeholder wrapper(s) (#tlx.user_layout / no_verify) and
+    // verify the underlying concrete layout, rather than skipping verification.
+    // The wrapper itself is retired later by resolve-placeholder-layouts; a
+    // still-null inner (unresolved) is accepted by the null short-circuit
+    // below.
+    ret = triton::unwrapTlxWrappers(ret);
     return ret;
   };
   auto encodingA = getEncoding(typeA);

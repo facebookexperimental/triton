@@ -170,6 +170,98 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_addmm_warppipe_split_k(self, dtype: torch.dtype):
+        """Split-K path of the TLX warp-pipe addmm (AMD MI350X / gfx950), col-major B.
+
+        An undersaturated grid (few MN tiles) + large K makes the heuristic offer
+        SPLIT_K > 1 candidates (registry gate: `tiles < NUM_SMS`). On a 2-tile shape
+        the split-K configs win autotune, so the addmm lowers to the split-K path: a
+        partial-GEMM kernel that writes an fp32 workspace + a separate
+        `_reduce_k_kernel` that sums the partials, re-adds bias, and casts. Verifies
+        the 2-kernel split-K reduce is (a) actually taken and (b) numerically correct.
+        """
+        # 256x4096x256: 2 MN tiles (128x256) on 256 CUs -> deeply undersaturated, so
+        # split-K (up to SK=8 -> 16 workgroups) is far faster than SK=1 (2 workgroups)
+        # and wins the autotune. K=4096 keeps each split > NUM_BUFFERS K-iters.
+        M, K, N = 256, 4096, 256
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        # w.t() => B is [K, N] col-major (stride_bk == 1) -- the nn.Linear weight layout.
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        # fp32 reference; the split-K fp32 workspace reduction is order-different from a
+        # single-pass accumulation, so allow a modest tolerance (benign reduction noise).
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
+
+        code_str = "\n".join(code)
+        # force mode keeps only the TLX template (never extern/aten)...
+        self.assertIn("triton_tem", code_str)
+        # ...and the undersaturated grid takes the split-K path -> separate reduce kernel.
+        self.assertIn("_reduce_k_kernel", code_str)
+
+
+class TestWarpPipeSplitKCodegen(TestCase):
+    """Deterministic codegen check for the AMD warp-pipe split-K template.
+
+    The e2e test above relies on autotune *selecting* a SPLIT_K > 1 config (highly
+    reliable on a 2-tile shape, but a timing decision). This test renders the
+    `amd_addmm_warppipe` jinja template directly with SPLIT_K=2 vs SPLIT_K=1 -- no
+    GPU, no autotune -- so the split-K branches are *guaranteed* covered even if
+    autotune ever stops picking split-K, and it runs on any host (not gfx950-gated).
+    """
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_warppipe_split_k_template_render(self):
+        import jinja2
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        source = load_tlx_template("amd_addmm_warppipe")
+
+        # Stub the Inductor render hooks; the split-K branches are pure jinja that
+        # only depends on SPLIT_K, so the stubs just need to be present + callable.
+        hooks = {
+            "def_kernel": lambda *a, **k: "def _kernel(A, B, out_ptr0):",
+            "size": lambda *a, **k: "0",
+            "stride": lambda *a, **k: "1",
+            "output_ptr": lambda *a, **k: "out_ptr0",
+            "store_output": lambda *a, **k: "# store_output(...)",
+        }
+        tmpl = jinja2.Environment().from_string(source)
+        split = tmpl.render(SPLIT_K=2, **hooks)
+        nosplit = tmpl.render(SPLIT_K=1, **hooks)
+
+        # SPLIT_K > 1 must emit: split-id decode, balanced K-partition, fp32 workspace store.
+        self.assertIn("split_id = (pid % SPLIT_K)", split)
+        self.assertIn("base = K_ITERS // SPLIT_K", split)
+        self.assertIn("k_lo = split_id * base", split)
+        self.assertIn("tl.store(split_k_ws + ws_off, acc", split)
+
+        # SPLIT_K == 1 must take the plain data-parallel path: no split-id, no workspace,
+        # full-K loop, and store via store_output (not the reduce workspace).
+        self.assertNotIn("split_id = (pid % SPLIT_K)", nosplit)
+        self.assertNotIn("split_k_ws", nosplit)
+        self.assertIn("k_lo = 0", nosplit)
+        self.assertIn("store_output", nosplit)
+
 
 class TestInterleaveEpilogue(TestCase):
     """Test that INTERLEAVE_EPILOGUE produces correct results and interleaved stores."""
@@ -351,6 +443,7 @@ class TestReduceKKernel(TestCase):
         _reduce_k_kernel[grid](
             workspace,
             output,
+            output,  # bias_ptr (unused when HAS_BIAS=False, passed as dummy)
             M,
             N,
             SPLIT_K=SPLIT_K,

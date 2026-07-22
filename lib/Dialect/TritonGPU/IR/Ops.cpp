@@ -488,7 +488,6 @@ LogicalResult Fp4ToFpOp::verifyFp4ToFp(mlir::Operation *op,
   auto srcLl = toLinearLayout(srcTy);
   auto resLl = toLinearLayout(resTy);
   auto *ctx = srcTy.getContext();
-  auto regDim = StringAttr::get(ctx, "register");
   auto outDims = standardOutDimNames(ctx, rank);
 
   // We use backward inference here as it is striclty more general
@@ -679,6 +678,19 @@ LogicalResult MemDescReinterpretOp::verify() {
 
   if (oldType.getMemorySpace() != newType.getMemorySpace())
     return emitError("source and destination memory space must match");
+  if (oldType.getMutableMemory() != newType.getMutableMemory())
+    return emitError("source and result must have the same mutability");
+  auto isSubview = [](MemDescType ty) {
+    auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
+    return ty.getShape().take_back(rank) != ty.getAllocShape().take_back(rank);
+  };
+  if (isa<SharedMemorySpaceAttr>(oldType.getMemorySpace()) &&
+      (isSubview(oldType) || isSubview(newType)))
+    return emitError("source and result must not be subviews; reinterpret the "
+                     "parent descriptor and then take a subview");
+  assert((isa<SharedMemorySpaceAttr, nvidia_gpu::TensorMemorySpaceAttr>(
+              oldType.getMemorySpace()) &&
+          "expected shared or tensor memory"));
 
   auto newShape = newType.getShape();
   auto newEncoding = oldType.getEncoding();
@@ -730,6 +742,31 @@ LogicalResult MemDescReinterpretOp::verify() {
     return emitError(
         "source and result must have the same number of broadcast CTA dims");
 
+  auto getViewNumBits = [](MemDescType ty) {
+    auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
+    auto layout =
+        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
+    int64_t numLayoutCopies = 1;
+    for (int64_t dim : ty.getAllocShape().drop_back(rank))
+      numLayoutCopies *= dim;
+    // Shared memory is allocated by offset and TMEM is allocated by column;
+    // prefix dimensions outside the layout-ranked suffix represent separate
+    // copies of that logical allocation.
+    auto *ctx = ty.getContext();
+    bool isSharedMemory = isa<SharedMemorySpaceAttr>(ty.getMemorySpace());
+    auto dim = StringAttr::get(ctx, isSharedMemory ? "offset" : "col");
+    return numLayoutCopies * layout.getInDimSize(dim) *
+           ty.getElementTypeBitWidth();
+  };
+  if (isa<SharedMemorySpaceAttr>(oldType.getMemorySpace())) {
+    auto srcNumBits = getViewNumBits(oldType);
+    auto dstNumBits = getViewNumBits(newType);
+    if (dstNumBits > srcNumBits)
+      return emitError()
+             << "result logical storage size must not exceed source "
+                "logical storage size ("
+             << srcNumBits << " vs " << dstNumBits << ")";
+  }
   return success();
 }
 
@@ -1367,7 +1404,7 @@ void WarpSpecializeOp::build(OpBuilder &builder, OperationState &state,
                              unsigned partitionNumRegions) {
   build(builder, state, resultTypes, partitionNumWarps, {}, {}, {});
   OpBuilder::InsertionGuard guard(builder);
-  Block *container = builder.createBlock(state.regions.back().get());
+  builder.createBlock(state.regions.back().get());
   WarpSpecializePartitionsOp::create(builder, state.location,
                                      /*explicitCaptures=*/ValueRange(),
                                      partitionNumRegions);
@@ -1396,7 +1433,6 @@ ParseResult WarpSpecializeOp::parse(OpAsmParser &p, OperationState &result) {
   while (succeeded(p.parseOptionalKeyword(
       ("partition" + Twine(partitionNumWarps.size()).str())))) {
     partitionArgs.clear();
-    SMLoc regionLoc = p.getCurrentLocation();
     if (p.parseArgumentList(partitionArgs, AsmParser::Delimiter::Paren,
                             /*allowType=*/true) ||
         p.parseKeyword("num_warps") || p.parseLParen() ||

@@ -13,6 +13,23 @@ from triton import CompilationError
 
 
 @pytest.mark.interpreter
+@pytest.mark.parametrize("multicast", [None, False, True])
+def test_tensor_descriptor_load_multicast_policy(multicast, device):
+
+    @triton.jit
+    def kernel(out, inp, MULTICAST: tl.constexpr):
+        desc = tl.make_tensor_descriptor(inp, shape=[8, 16], strides=[16, 1], block_shape=[8, 16])
+        block = desc.load([0, 0], multicast=MULTICAST)
+        offsets = tl.arange(0, 8)[:, None] * 16 + tl.arange(0, 16)[None, :]
+        tl.store(out + offsets, block)
+
+    inp = torch.arange(128, dtype=torch.float16, device=device).reshape(8, 16)
+    out = torch.empty_like(inp)
+    kernel[(1, )](out, inp, MULTICAST=multicast)
+    torch.testing.assert_close(out, inp)
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", tma_dtypes)
 @pytest.mark.parametrize("num_ctas", [1, 2])
 @pytest.mark.parametrize("M_BLOCK,N_BLOCK", [(2, 16), (8, 16), (8, 32), (8, 128), (512, 32), (1, 1024)])
@@ -1309,6 +1326,7 @@ def mxfp8_mxfp4_matmul_tma(  #
     tl.store(output_ptrs, accumulator, mask=c_mask)
 
 
+@pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (8192, 8192, 8192)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (128, 128, 256), (128, 256, 128),
                                                        (128, 256, 256)])

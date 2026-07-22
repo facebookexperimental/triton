@@ -95,6 +95,21 @@ def TritonNvidiaGPUFuseTMEMLoadReducePass : Pass<"triton-nvidia-tmem-load-reduce
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonNvidiaGPUTMemBarrierInsertionPass : Pass<"triton-nvidia-gpu-tmem-barrier-insertion", "mlir::ModuleOp"> {
+  let summary = "Insert barriers to order tensor-memory reuse";
+
+  let description = [{
+    This pass inserts CTA barriers between tensor-memory accesses that reuse
+    aliasing physical tensor-memory storage and require ordering across logical
+    allocation lifetimes.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::ModuleOp"> {
   let summary = "lower to TMA load/store operations";
 
@@ -284,20 +299,24 @@ def TritonNvidiaGPUCLCHoistPass : Pass<"triton-nvidia-gpu-clc-hoist", "mlir::Mod
 }
 
 def TritonNvidiaGPUCLCMaterializePass : Pass<"triton-nvidia-gpu-clc-materialize", "mlir::ModuleOp"> {
-  let summary = "Materialize the CLC token form into mbarrier ops (single-CTA only)";
+  let summary = "Materialize the CLC token form into response and reuse barriers";
 
   let description = [{
     Stage 4 of the CLC tile-scheduler lowering. Materializes each
     `clc_try_cancel_async` / `clc_read` pair into a response buffer + completion
-    mbarrier: the issue becomes `barrier_expect` + `clc_try_cancel`, the read
+    mbarrier. Explicit clusters also get an empty-barrier rendezvous that
+    prevents reuse until every CTA consumes the multicast. The issue becomes
+    `barrier_expect` + `clc_try_cancel`, and the read
     becomes `wait_barrier` + `clc_load_result` + `clc_is_canceled` /
     `clc_get_program_id`, with a loop-carried, per-iteration-toggled phase.
-    Supports a single CTA only; multi-cluster / multi-CTA is rejected.
+    Supports single-CTA and explicit ctas_per_cga program-id semantics;
+    Triton's num-ctas > 1 program-id model is rejected.
   }];
 
   let dependentDialects = [
     "mlir::triton::gpu::TritonGPUDialect",
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::triton::nvgpu::NVGPUDialect",
     "mlir::arith::ArithDialect",
     "mlir::scf::SCFDialect"
   ];

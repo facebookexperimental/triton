@@ -15,12 +15,31 @@ into the alternate SMEM buffer (producer/consumer mbarriers).
 
 from __future__ import annotations
 
+import os
+
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from torch._inductor.runtime.triton_compat import libdevice
 
 
+# To keep the comparison against the generated kernel apples-to-apples, we
+# autotune ONLY the SMEM ring depth (the
+# same degree of freedom the modulo scheduler chooses); LayerNorm is SMEM-only
+# (no TMEM), and BLOCK_M/N, num_warps, and everything else stay fixed.
+def _autotune_configs():
+    # Measured best (do_bench on B200, square/representative shape). TLX_HW_BEST_CONFIG=1
+    # uses it directly (fast path, no autotune search); otherwise the full depth grid
+    # is swept. Mirrors the tutorial WS GEMM TLX_GEMM_USE_HEURISTIC pattern.
+    if os.environ.get("TLX_HW_BEST_CONFIG") == "1":
+        return [triton.Config({"NUM_BUFFERS": 2}, num_warps=4)]
+    return [
+        triton.Config({"NUM_BUFFERS": s}, num_warps=4)
+        for s in (2, 3, 4, 5, 6)
+    ]
+
+
+@triton.autotune(configs=_autotune_configs(), key=["M", "N"])
 @triton.jit
 def layernorm_fwd_tma(
     X,  # [M, N]
@@ -34,9 +53,9 @@ def layernorm_fwd_tma(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,  # next_pow2(N), TMA tile width (OOB zero-padded)
     NUM_PERSIST: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
 ):
     COMPUTE_DTYPE = tl.float32
-    NUM_BUFFERS: tl.constexpr = 2
 
     # Double-buffered SMEM staging for X tiles + producer/consumer barriers.
     x_buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(X), NUM_BUFFERS)
