@@ -260,6 +260,44 @@ def test_warp_pipe_bmm_partial_k_gfx950(device):
 
 
 # ---------------------------------------------------------------------------
+# Test: unmasked full-tile async_load with a non-16-aligned global row stride.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _row_stride_async_load_kernel(a_ptr, out_ptr, stride_am, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs = offs_m[:, None] * stride_am + offs_k[None, :]
+    smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
+    tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))  # unmasked -- full tile
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    t = tlx.local_load(tlx.local_view(smem, 0))
+    tl.store(out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], t)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("K", [2320, 2309, 2312, 1956])
+def test_async_load_row_stride_gfx950(device, K):
+    """Unmasked full-tile async_load with a non-16-aligned global row stride (T280910119).
+
+    A row stride not a multiple of 16 elements collapses the direct-to-LDS vector width
+    below a supported bitwidth (fp16 -> 16-bit) on CDNA4, so the copy cannot be lowered as
+    a direct-to-LDS load (its swizzled dst hits loadContig == 0). CoalesceAsyncCopy now
+    falls back to a synchronous tt.load + ttg.local_store for both swizzled and padded
+    dsts, so it compiles and runs correctly. Previously K % 16 != 0 aborted make_llir with
+    an unrealized_conversion_cast. K=2320 (% 16 == 0) is the positive control and keeps the
+    fast direct-to-LDS path.
+    """
+    BLOCK_M, BLOCK_K = 128, 64
+    a = torch.randn((BLOCK_M, K), device=device, dtype=torch.float16)
+    out = torch.empty((BLOCK_M, BLOCK_K), device=device, dtype=torch.float16)
+    _row_stride_async_load_kernel[(1, )](a, out, a.stride(0), BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K)
+    torch.testing.assert_close(out, a[:, :BLOCK_K])
+
+
+# ---------------------------------------------------------------------------
 # Test: local_load after async_wait compiles and runs correctly.
 # ---------------------------------------------------------------------------
 

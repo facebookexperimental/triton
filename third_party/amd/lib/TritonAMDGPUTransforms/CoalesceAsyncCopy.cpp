@@ -24,16 +24,20 @@ namespace mlir {
 
 namespace {
 
-// Fallback for a direct-to-LDS async copy that cannot be lowered on this target
-// (e.g. a masked partial-K fp16 load whose per-thread vector width collapses to
-// a bitwidth CDNA does not support for direct-to-LDS: 16-bit). Rather than
-// leave an op that later fails to legalize in ConvertTritonAMDGPUToLLVM
-// (`unrealized_conversion_cast` / "failed to legalize
-// async_copy_global_to_local"), rewrite it into a synchronous
-// tt.load + ttg.local_store. This mirrors the non-async load->local_store
-// pipeline; the Membar pass inserts the LDS barrier before the consuming
-// local_load, so it is correct (it only loses the async prefetch overlap for
-// this copy).
+// Fallback for a direct-to-LDS async copy that cannot be lowered on this
+// target. On CDNA the per-thread vector width can collapse below a bitwidth
+// supported for direct-to-LDS (only 32- or 128-bit are legal), e.g. a masked
+// partial-K fp16 load (vec=1 -> 16-bit) or a non-16-element-aligned global row
+// stride (vec collapses toward 1-2). `canLoadDirectToLDS` then returns false
+// and the op has no legal lowering: it later fails to legalize in
+// ConvertTritonAMDGPUToLLVM (`unrealized_conversion_cast` / "failed to legalize
+// async_copy_global_to_local"). Rather than leave such an op, rewrite it into a
+// synchronous tt.load + ttg.local_store. This mirrors the non-async
+// load->local_store pipeline; the Membar pass inserts the LDS barrier before
+// the consuming local_load, so it is correct. It only loses the direct
+// GMEM->LDS overlap for this copy -- the tt.load is still turned into a
+// vectorized (alignment-tolerant) buffer_load/global_load into registers by the
+// later convert-to-buffer-ops pass.
 static LogicalResult
 decomposeAsyncCopyToSync(ttg::AsyncCopyGlobalToLocalOp copyOp,
                          PatternRewriter &rewriter) {
@@ -156,16 +160,17 @@ struct CoalesceAsyncCopyWrites
         fitToValidDirectToLdsVecSize(loadContig, elemBitWidth, targetInfo);
 
     if (loadContig == 0) {
-      // A padded dst whose per-thread width collapses below a supported
-      // direct-to-LDS bitwidth (e.g. 16-bit partial-K masked load on CDNA4)
-      // cannot be lowered as a direct-to-LDS copy and would crash later in
-      // ConvertTritonAMDGPUToLLVM. Fall back to a synchronous load +
-      // local_store. Swizzled dsts are left unchanged (the lowering applies
-      // swizzling to the src pointers and can still handle them).
-      if (paddedEnc)
-        return decomposeAsyncCopyToSync(copyOp, rewriter);
-      return rewriter.notifyMatchFailure(
-          copyOp, "could not find layout config to create coalesced writes");
+      // No supported direct-to-LDS vector width for this copy. On CDNA the
+      // per-thread width can collapse below a legal direct-to-LDS bitwidth
+      // (only 32- or 128-bit are supported), e.g. an fp16 load whose width
+      // becomes 16-bit: a masked partial-K load, or a non-16-element-aligned
+      // global row stride. This holds for both swizzled and padded dsts --
+      // `canLoadDirectToLDS` (and thus the LLVM lowering) rejects the
+      // sub-32-bit width regardless -- so the op would fail to legalize later
+      // in ConvertTritonAMDGPUToLLVM (`unrealized_conversion_cast`). Fall back
+      // to a synchronous tt.load + ttg.local_store instead of leaving an
+      // un-lowerable op.
+      return decomposeAsyncCopyToSync(copyOp, rewriter);
     }
 
     // Do not rewrite if we already use the correct contiguity (could be from a
