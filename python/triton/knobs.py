@@ -566,6 +566,15 @@ class nvidia_knobs(base_knobs):
     # Number of buffers for the dynamic-persistent tile-id broadcast channel
     # (cross-partition run-once atomic support). 1 = single-stage.
     ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
+    # TMEM memory-planner top-K packing search. topk>1 enumerates the top-K
+    # column packings; pick selects which rank to apply (0 = cost/occupancy-best,
+    # == the default first-fit result); topk_dump writes the ranked packings as
+    # JSON for a harness. Prefer these knobs over the TRITON_WS_MEM_PLAN_* env
+    # vars so tests can scope them (knobs.nvidia.scope()) without leaking global
+    # env state across a batch run.
+    ws_mem_plan_topk: env_int = env_int("TRITON_WS_MEM_PLAN_TOPK", 1)
+    ws_mem_plan_pick: env_int = env_int("TRITON_WS_MEM_PLAN_PICK", 0)
+    ws_mem_plan_topk_dump: env_opt_str = env_opt_str("TRITON_WS_MEM_PLAN_TOPK_DUMP")
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     use_list_schedule: env_bool = env_bool("TRITON_USE_LIST_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
