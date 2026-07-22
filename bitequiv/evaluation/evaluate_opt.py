@@ -230,18 +230,25 @@ def optimization(resolved):
 
 
 def _clear_jit_caches():
-    """Drop the eval kernels' in-memory compile caches so the next warmup recompiles."""
+    """Drop the eval kernels' in-memory compile caches so the next warmup recompiles.
+
+    A stale in-memory hit would silently reuse the baseline compile and mask the pass
+    under test (the make_ttgir patch/env is not part of the compile-cache key). Every
+    kernel evaluate_opt evaluates lives in ``eval_kernels`` (its REGISTRY /
+    resolve_kernels), so clearing that one module is sufficient; if a module of eval
+    @triton.jit kernels is ever added to the REGISTRY, add it to the tuple below."""
     from triton.runtime.jit import JITFunction
 
-    for obj in vars(eval_kernels).values():
-        if isinstance(obj, JITFunction):
-            for attr in ("device_caches", "cache"):
-                cache = getattr(obj, attr, None)
-                if hasattr(cache, "clear"):
-                    try:
-                        cache.clear()
-                    except Exception:  # noqa: BLE001
-                        pass
+    for mod in (eval_kernels, ):
+        for obj in vars(mod).values():
+            if isinstance(obj, JITFunction):
+                for attr in ("device_caches", "cache"):
+                    cache = getattr(obj, attr, None)
+                    if hasattr(cache, "clear"):
+                        try:
+                            cache.clear()
+                        except Exception:  # noqa: BLE001
+                            pass
 
 
 @contextlib.contextmanager
@@ -353,8 +360,15 @@ def correctness(spec, base_variant, opt_variant, config_effort, fuzzer_effort, o
 # --------------------------------------------------------------------------- #
 # Stage 3 — performance (opt-in)
 # --------------------------------------------------------------------------- #
-def performance(spec, base_variant, opt_variant, config_effort, ordering):
-    """Benchmark baseline vs optimized per in-scope config; report speedups."""
+def performance(spec, base_variant, opt_variant, config_effort, ordering, ceiling=False):
+    """Benchmark baseline vs optimized per in-scope config; report speedups.
+
+    With ``ceiling`` the 3-way comparison also times the per-config UNORDERED
+    "ceiling" (the same kernel/config compiled ``reduction_ordering=unordered`` =
+    what the compiler picks when free of the ordering constraint) and reports how
+    much of the ordered-vs-unordered gap the optimization closed:
+    ``gap_closed = (base_ms - opt_ms) / (base_ms - ceil_ms)`` (1.0 = fully closed).
+    """
     if not spec.supports_perf:
         return dict(name=spec.name, no_perf=True)
     size = spec.perf_size
@@ -370,10 +384,21 @@ def performance(spec, base_variant, opt_variant, config_effort, ordering):
             _clear_jit_caches()
             with opt_variant():
                 opt_ms, opt_bytes, _ = spec.benchmark(config, size)
+            ceil_ms = None
+            if ceiling and config.reduction_ordering is not None:
+                # The ceiling is measured on the STANDARD pipeline (base_variant),
+                # only the ordering constraint is dropped.
+                ceil_cfg = config._replace(reduction_ordering="unordered")
+                _clear_jit_caches()
+                with base_variant():
+                    ceil_ms, _, _ = spec.benchmark(ceil_cfg, size)
         except Exception:  # noqa: BLE001
             fails += 1
             continue
-        rows.append(dict(config=config, base_ms=base_ms, opt_ms=opt_ms, bit_identical=base_bytes == opt_bytes))
+        row = dict(config=config, base_ms=base_ms, opt_ms=opt_ms, bit_identical=base_bytes == opt_bytes)
+        if ceil_ms is not None:
+            row["ceil_ms"] = ceil_ms
+        rows.append(row)
     return dict(name=spec.name, size=size, rows=rows, fails=fails)
 
 
@@ -437,7 +462,7 @@ def render_performance(results):
             continue
         rows, cols = r["size"]
         lines.append(f"{r['name']}  (size {rows}x{cols}, do_bench min-of-medians)")
-        speedups = []
+        speedups, gaps = [], []
         for row in r["rows"]:
             valid = math.isfinite(row["opt_ms"]) and row["opt_ms"] > 0
             if valid:
@@ -446,11 +471,24 @@ def render_performance(results):
                 tail = f"= {speedup:.2f}x  bit_identical={row['bit_identical']}"
             else:
                 tail = "opt timing invalid (excluded from summary)"
+            # 3-way ceiling: how much of the ordered-vs-unordered gap did we close?
+            ceil_str = ""
+            if "ceil_ms" in row:
+                denom = row["base_ms"] - row["ceil_ms"]
+                if abs(denom) > 1e-9 and valid:
+                    gap = (row["base_ms"] - row["opt_ms"]) / denom
+                    gaps.append(gap)
+                    ceil_str = f"  ceil {row['ceil_ms']:.3f} ms  gap_closed={gap:.2f}"
+                else:
+                    ceil_str = f"  ceil {row['ceil_ms']:.3f} ms  (no gap)"
             lines.append(f"  {config_label(row['config'])}: base {row['base_ms']:.3f} ms -> opt "
-                         f"{row['opt_ms']:.3f} ms  {tail}")
+                         f"{row['opt_ms']:.3f} ms  {tail}{ceil_str}")
         if speedups:
-            lines.append(f"  -> speedup min {min(speedups):.2f}x | median "
-                         f"{statistics.median(speedups):.2f}x | max {max(speedups):.2f}x")
+            summary = (f"  -> speedup min {min(speedups):.2f}x | median "
+                       f"{statistics.median(speedups):.2f}x | max {max(speedups):.2f}x")
+            if gaps:
+                summary += f" | median gap_closed {statistics.median(gaps):.2f}"
+            lines.append(summary)
         else:
             lines.append("  -> no valid timings")
         lines.append("")
@@ -489,6 +527,10 @@ def parse_args(argv):
     p.add_argument("--fuzzer-effort", default="fast", choices=("fast", "convincing"))
     p.add_argument("--ordering", default="inner_tree", choices=("inner_tree", "unordered", "all"),
                    help="which reduction ordering to evaluate (default inner_tree = M2's target)")
+    p.add_argument("--ceiling", action="store_true",
+                   help="Stage 3 only: also time the per-config UNORDERED ceiling (the layout the "
+                   "compiler picks free of the ordering constraint) and report gap_closed = "
+                   "(base-opt)/(base-ceil). This is M2's goal metric: drive gap_closed -> 1.")
     p.add_argument("--out", default=_DEFAULT_OUT, help="result table path")
     return p.parse_args(argv)
 
@@ -635,7 +677,8 @@ def main(argv=None):
         print("== Stage 3: performance ==", flush=True)
         results = []
         for spec in specs:
-            results.append(performance(spec, base_variant, opt_variant, args.config_effort, args.ordering))
+            results.append(
+                performance(spec, base_variant, opt_variant, args.config_effort, args.ordering, args.ceiling))
         sections.append(render_performance(results))
 
     write_report(args.out, header, sections)
