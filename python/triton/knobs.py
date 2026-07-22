@@ -573,9 +573,13 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
-    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER")
+    # Default ON; opt out with TRITON_USE_C_DISPATCHER=0.
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)
     auto_tma: env_bool = env_bool("TRITON_AUTO_TMA")
-    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
+    # Default ON; opt out with TRITON_AUTOTUNE_USE_C_CACHE=0.
+    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE", True)
+    # Default ON; opt out with TRITON_ENABLE_C_CACHE=0.
+    enable_c_cache: env_bool = env_bool("TRITON_ENABLE_C_CACHE", True)
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
     # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
