@@ -170,6 +170,23 @@ class Gemm:
             "EPILOGUE_SUBTILE": False,
             "NUM_CTAS": 1,
         },
+        "blackwell_gemm_ws_2cta_2group": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 2,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": 2,
+            "NUM_CTAS": 2,
+            "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 1,
+            "USE_WARP_BARRIER": False,
+            "num_warps": 4,
+            "num_stages": 1,
+            "ctas_per_cga": (2, 1, 1),
+        },
         "blackwell_gemm_ws_warp_barrier": {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 256,
@@ -457,6 +474,16 @@ class ScaledMM:
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws(dtype):
     Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_2cta_2group():
+    Gemm.run_test(
+        _blackwell_gemm_ws,
+        Gemm.CONFIGS["blackwell_gemm_ws_2cta_2group"],
+        shapes=[(1024, 12800, 1152)],
+        dtype=torch.float16,
+    )
 
 
 @pytest.mark.parametrize(
