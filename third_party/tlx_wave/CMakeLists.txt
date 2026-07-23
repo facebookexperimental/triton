@@ -41,6 +41,34 @@ if(NOT "${TLX_WAVE_BUILD_JOBS}" STREQUAL "")
   list(APPEND _tlx_wave_build_parallel_args "--parallel" "${TLX_WAVE_BUILD_JOBS}")
 endif()
 
+if("${CMAKE_BUILD_TYPE}" STREQUAL "")
+  message(FATAL_ERROR
+    "tlx_wave requires a non-empty CMAKE_BUILD_TYPE for its standalone Wave build")
+endif()
+
+# The Wave runtime is built as a separate CMake project, so explicitly mirror
+# the parent build configuration. Config-specific flags must be forwarded too:
+# Triton defines custom configurations such as TritonRelBuildWithAsserts that a
+# standalone project would not otherwise know how to compile.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _tlx_wave_build_type_upper)
+set(_tlx_wave_configure_args
+  "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+  "-DLLVM_INSTALL_DIR=${TLX_WAVE_LLVM_INSTALL_DIR}"
+  "-DWAVE_ENABLE_PYTHON_BINDINGS=ON")
+foreach(_flag_kind
+    C_FLAGS
+    CXX_FLAGS
+    EXE_LINKER_FLAGS
+    MODULE_LINKER_FLAGS
+    SHARED_LINKER_FLAGS
+    STATIC_LINKER_FLAGS)
+  set(_flag_var "CMAKE_${_flag_kind}_${_tlx_wave_build_type_upper}")
+  if(DEFINED ${_flag_var})
+    list(APPEND _tlx_wave_configure_args
+      "-D${_flag_var}=${${_flag_var}}")
+  endif()
+endforeach()
+
 tlx_wave_mlir_has_python_bindings("${TLX_WAVE_LLVM_INSTALL_DIR}" _tlx_wave_local_has_mlir_python)
 if(_tlx_wave_local_has_mlir_python)
   add_custom_target(TLXWavePinnedLLVM)
@@ -96,8 +124,7 @@ add_custom_target(TLXWaveStandaloneConfigure
     -U MLIR_DIR
     -U Clang_DIR
     -U LLD_DIR
-    "-DLLVM_INSTALL_DIR=${TLX_WAVE_LLVM_INSTALL_DIR}"
-    "-DWAVE_ENABLE_PYTHON_BINDINGS=ON"
+    ${_tlx_wave_configure_args}
   DEPENDS TLXWavePinnedLLVM
   VERBATIM
   USES_TERMINAL)
