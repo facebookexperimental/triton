@@ -2,7 +2,6 @@
 
 # pyre-unsafe
 
-
 import os
 
 from typing import List, Optional, Tuple
@@ -105,15 +104,8 @@ def get_fwd_persistent_configs() -> List[triton.Config]:
 
 def prune_configs_by_hdim(configs, named_args, **kwargs):
     DimQ = kwargs["DimQ"]
-    STAGE = kwargs["STAGE"]
     target_kv_buffers = 6 if DimQ == 64 else 3
-    target_group_size_n = 4 if STAGE == 3 else 1
-    return [
-        conf
-        for conf in configs
-        if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers
-        # and conf.kwargs.get("GROUP_SIZE_N", 0) == target_group_size_n
-    ]
+    return [conf for conf in configs if conf.kwargs.get("NUM_BUFFERS_KV", 0) == target_kv_buffers]
 
 
 @triton.jit
@@ -173,9 +165,7 @@ def _fma_f32x2(a, b, c):
 
 
 @triton.jit
-def _get_unfused_loop_bounds(
-    fused_lo, fused_hi, start_m, max_seq_len, BLOCK_N, STAGE: tl.constexpr
-):
+def _get_unfused_loop_bounds(fused_lo, fused_hi, start_m, max_seq_len, BLOCK_N, STAGE: tl.constexpr):
     if STAGE == 1:
         # First part of STAGE == 3 in _get_fused_loop_bounds
         lo = fused_lo
@@ -293,7 +283,7 @@ def _compute_offsets(
 @triton.jit
 def _split_n(x, SPLIT_FACTOR: tl.constexpr):
     if SPLIT_FACTOR == 1:
-        return (x,)
+        return (x, )
     else:
         x0, x1 = x.reshape([x.shape[0], 2, x.shape[1] // 2]).permute(0, 2, 1).split()
         return _split_n(x0, SPLIT_FACTOR // 2) + _split_n(x1, SPLIT_FACTOR // 2)
@@ -304,8 +294,8 @@ def _join_n(xs):
     if len(xs) == 1:
         return xs[0]
     else:
-        x0 = _join_n(xs[: len(xs) // 2])
-        x1 = _join_n(xs[len(xs) // 2 :])
+        x0 = _join_n(xs[:len(xs) // 2])
+        x1 = _join_n(xs[len(xs) // 2:])
         x = tl.join(x0, x1).permute(0, 2, 1).reshape([x0.shape[0], x0.shape[1] * 2])
         return x
 
@@ -361,9 +351,7 @@ def _softmax_inner_loop(
     NUM_MMA_GROUPS: tl.constexpr,
     STAGE: tl.constexpr,
 ):
-    lo, hi = _get_unfused_loop_bounds(
-        fused_lo, fused_hi, start_m, max_seq_len, BLOCK_N, STAGE
-    )
+    lo, hi = _get_unfused_loop_bounds(fused_lo, fused_hi, start_m, max_seq_len, BLOCK_N, STAGE)
 
     for start_n in tl.range(lo, hi, BLOCK_N):
         _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
@@ -402,7 +390,7 @@ def _softmax_inner_loop(
             tlx.local_store(tlx.local_view(p_tiles, p_bufIdx), p_i.to(out_dtype))
             # pyrefly: ignore [missing-attribute]
             tlx.barrier_arrive(tlx.local_view(p_fulls, slice_id + cid * NUM_MMA_SLICES))
-            ps = ps + (p_i,)
+            ps = ps + (p_i, )
 
         p = _join_n(ps)
         l_ij = tl.sum(p, 1)
@@ -884,26 +872,24 @@ def _attn_fwd_ws(
             tile_cnt = 0
             for _ in range(0, tiles_per_sm):
                 # initialize offsets
-                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (
-                    _compute_offsets(
-                        tile_idx,
-                        H,
-                        num_pid_n,
-                        num_pid_in_group,
-                        seq_offsets,
-                        num_targets,
-                        max_attn_len,
-                        full_attn_size,
-                        contextual_seq_len,
-                        BLOCK_M,
-                        BLOCK_N,
-                        GROUP_SIZE_N,
-                        HAS_NUM_TARGETS,
-                        HAS_MAX_ATTN_LEN,
-                        HAS_FULL_ATTN_SIZE,
-                        HAS_CONTEXTUAL_SEQ_LEN,
-                    )
-                )
+                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (_compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    seq_offsets,
+                    num_targets,
+                    max_attn_len,
+                    full_attn_size,
+                    contextual_seq_len,
+                    BLOCK_M,
+                    BLOCK_N,
+                    GROUP_SIZE_N,
+                    HAS_NUM_TARGETS,
+                    HAS_MAX_ATTN_LEN,
+                    HAS_FULL_ATTN_SIZE,
+                    HAS_CONTEXTUAL_SEQ_LEN,
+                ))
                 if start_m < seq_len:
                     if SOFTMAX:
                         accum_cnt = _softmax_correction_inner_loop(
@@ -981,32 +967,28 @@ def _attn_fwd_ws(
 
         # softmax/silu groups
         # pyrefly: ignore [missing-attribute]
-        with tlx.async_task(
-            num_warps=4, registers=NUM_REGS_ACT, replicate=NUM_MMA_GROUPS
-        ):
+        with tlx.async_task(num_warps=4, registers=NUM_REGS_ACT, replicate=NUM_MMA_GROUPS):
             accum_cnt_qk = 0
             for _ in range(0, tiles_per_sm):
                 # initialize offsets
-                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (
-                    _compute_offsets(
-                        tile_idx,
-                        H,
-                        num_pid_n,
-                        num_pid_in_group,
-                        seq_offsets,
-                        num_targets,
-                        max_attn_len,
-                        full_attn_size,
-                        contextual_seq_len,
-                        BLOCK_M,
-                        BLOCK_N,
-                        GROUP_SIZE_N,
-                        HAS_NUM_TARGETS,
-                        HAS_MAX_ATTN_LEN,
-                        HAS_FULL_ATTN_SIZE,
-                        HAS_CONTEXTUAL_SEQ_LEN,
-                    )
-                )
+                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (_compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    seq_offsets,
+                    num_targets,
+                    max_attn_len,
+                    full_attn_size,
+                    contextual_seq_len,
+                    BLOCK_M,
+                    BLOCK_N,
+                    GROUP_SIZE_N,
+                    HAS_NUM_TARGETS,
+                    HAS_MAX_ATTN_LEN,
+                    HAS_FULL_ATTN_SIZE,
+                    HAS_CONTEXTUAL_SEQ_LEN,
+                ))
                 if start_m < seq_len:
                     if SOFTMAX:
                         # initialize pointer to m and l
@@ -1020,9 +1002,7 @@ def _attn_fwd_ws(
 
                         # pyrefly: ignore [missing-attribute]
                         cid = tlx.async_task_replica_id()
-                        offs_m = start_m + (
-                            (cid * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT)
-                        )
+                        offs_m = start_m + ((cid * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
                         if STAGE & 1:
                             m_i, l_i, accum_cnt_qk = _softmax_inner_loop(
                                 qk_fulls,
@@ -1094,9 +1074,7 @@ def _attn_fwd_ws(
                         out_dtype = tlx.dtype_of(desc_v)
                         # pyrefly: ignore [missing-attribute]
                         cid = tlx.async_task_replica_id()
-                        offs_m = start_m + (
-                            (cid * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT)
-                        )
+                        offs_m = start_m + ((cid * BLOCK_M_SPLIT) + tl.arange(0, BLOCK_M_SPLIT))
                         accum_cnt_qk = _silu_inner_loop(
                             qk_fulls,
                             qk_tiles,
@@ -1137,32 +1115,28 @@ def _attn_fwd_ws(
             tile_cnt = 0
             for _ in range(0, tiles_per_sm):
                 # initialize offsets
-                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (
-                    _compute_offsets(
-                        tile_idx,
-                        H,
-                        num_pid_n,
-                        num_pid_in_group,
-                        seq_offsets,
-                        num_targets,
-                        max_attn_len,
-                        full_attn_size,
-                        contextual_seq_len,
-                        BLOCK_M,
-                        BLOCK_N,
-                        GROUP_SIZE_N,
-                        HAS_NUM_TARGETS,
-                        HAS_MAX_ATTN_LEN,
-                        HAS_FULL_ATTN_SIZE,
-                        HAS_CONTEXTUAL_SEQ_LEN,
-                    )
-                )
+                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (_compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    seq_offsets,
+                    num_targets,
+                    max_attn_len,
+                    full_attn_size,
+                    contextual_seq_len,
+                    BLOCK_M,
+                    BLOCK_N,
+                    GROUP_SIZE_N,
+                    HAS_NUM_TARGETS,
+                    HAS_MAX_ATTN_LEN,
+                    HAS_FULL_ATTN_SIZE,
+                    HAS_CONTEXTUAL_SEQ_LEN,
+                ))
                 if start_m < seq_len:
                     q_bufIdx, q_phase = _get_bufidx_phase(tile_cnt, NUM_BUFFERS_Q)
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
-                    v_bufIdx, v_phase = _get_bufidx_phase(
-                        accum_cnt_kv + 1, NUM_BUFFERS_KV
-                    )
+                    v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
                     # wait for the K buffer to be populated by the producer
                     # pyrefly: ignore [missing-attribute]
@@ -1213,9 +1187,7 @@ def _attn_fwd_ws(
                     # p[NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id] for cid=1
                     for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                         # pyrefly: ignore [missing-attribute]
-                        tlx.barrier_wait(
-                            p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase
-                        )
+                        tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
                         # pyrefly: ignore [missing-attribute]
                         kv_slice = tlx.local_slice(
                             kv_tiles[v_bufIdx],
@@ -1239,12 +1211,8 @@ def _attn_fwd_ws(
 
                         accum_cnt_qk += 1
                         accum_cnt_kv += 2
-                        k_bufIdx, k_phase = _get_bufidx_phase(
-                            accum_cnt_kv, NUM_BUFFERS_KV
-                        )
-                        v_bufIdx, v_phase = _get_bufidx_phase(
-                            accum_cnt_kv + 1, NUM_BUFFERS_KV
-                        )
+                        k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
+                        v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
 
                         # -- compute q0 @ k ----
                         # wait for the K buffer to be populated by the producer
@@ -1269,26 +1237,16 @@ def _attn_fwd_ws(
                             tlx.barrier_wait(acc_fulls[1], qk_phase_prev)
                         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                             # pyrefly: ignore [missing-attribute]
-                            tlx.barrier_wait(
-                                p_fulls[slice_id + 1 * NUM_MMA_SLICES], qk_phase_prev
-                            )
+                            tlx.barrier_wait(p_fulls[slice_id + 1 * NUM_MMA_SLICES], qk_phase_prev)
                             # pyrefly: ignore [missing-attribute]
                             kv_slice = tlx.local_slice(
                                 kv_tiles[v_bufIdx_prev],
                                 [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                                 [BLOCK_N // NUM_MMA_SLICES, DimQ],
                             )
-                            p_bufIdx = (
-                                1 * NUM_MMA_GROUPS * NUM_MMA_SLICES
-                                + NUM_MMA_SLICES
-                                + slice_id
-                            )
+                            p_bufIdx = (1 * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id)
                             use_acc = acc1_init if slice_id == 0 else True
-                            mBarriers = (
-                                [kv_empties[v_bufIdx_prev]]
-                                if slice_id == NUM_MMA_SLICES - 1
-                                else []
-                            )
+                            mBarriers = ([kv_empties[v_bufIdx_prev]] if slice_id == NUM_MMA_SLICES - 1 else [])
                             # pyrefly: ignore [missing-attribute]
                             tlx.async_dot(
                                 p_tiles[p_bufIdx],
@@ -1320,9 +1278,7 @@ def _attn_fwd_ws(
                             tlx.barrier_wait(acc_fulls[0], qk_phase)
                         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
                             # pyrefly: ignore [missing-attribute]
-                            tlx.barrier_wait(
-                                p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase
-                            )
+                            tlx.barrier_wait(p_fulls[slice_id + 0 * NUM_MMA_SLICES], qk_phase)
                             # Use p[1] for cid=0, and p[3] for cid=1
                             # pyrefly: ignore [missing-attribute]
                             kv_slice = tlx.local_slice(
@@ -1360,17 +1316,9 @@ def _attn_fwd_ws(
                             [BLOCK_N * slice_id // NUM_MMA_SLICES, 0],
                             [BLOCK_N // NUM_MMA_SLICES, DimQ],
                         )
-                        p_bufIdx = (
-                            1 * NUM_MMA_GROUPS * NUM_MMA_SLICES
-                            + NUM_MMA_SLICES
-                            + slice_id
-                        )
+                        p_bufIdx = (1 * NUM_MMA_GROUPS * NUM_MMA_SLICES + NUM_MMA_SLICES + slice_id)
                         use_acc = acc1_init if slice_id == 0 else True
-                        mBarriers = (
-                            [acc_empties[1], kv_empties[v_bufIdx]]
-                            if slice_id == NUM_MMA_SLICES - 1
-                            else []
-                        )
+                        mBarriers = ([acc_empties[1], kv_empties[v_bufIdx]] if slice_id == NUM_MMA_SLICES - 1 else [])
                         # pyrefly: ignore [missing-attribute]
                         tlx.async_dot(
                             p_tiles[p_bufIdx],
@@ -1392,26 +1340,24 @@ def _attn_fwd_ws(
             tile_cnt = 0
             for _ in range(0, tiles_per_sm):
                 # initialize offsets
-                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (
-                    _compute_offsets(
-                        tile_idx,
-                        H,
-                        num_pid_n,
-                        num_pid_in_group,
-                        seq_offsets,
-                        num_targets,
-                        max_attn_len,
-                        full_attn_size,
-                        contextual_seq_len,
-                        BLOCK_M,
-                        BLOCK_N,
-                        GROUP_SIZE_N,
-                        HAS_NUM_TARGETS,
-                        HAS_MAX_ATTN_LEN,
-                        HAS_FULL_ATTN_SIZE,
-                        HAS_CONTEXTUAL_SEQ_LEN,
-                    )
-                )
+                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (_compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    seq_offsets,
+                    num_targets,
+                    max_attn_len,
+                    full_attn_size,
+                    contextual_seq_len,
+                    BLOCK_M,
+                    BLOCK_N,
+                    GROUP_SIZE_N,
+                    HAS_NUM_TARGETS,
+                    HAS_MAX_ATTN_LEN,
+                    HAS_FULL_ATTN_SIZE,
+                    HAS_CONTEXTUAL_SEQ_LEN,
+                ))
 
                 if start_m < seq_len:
                     # load q0
@@ -1419,9 +1365,7 @@ def _attn_fwd_ws(
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                     # pyrefly: ignore [missing-attribute]
-                    tlx.barrier_expect_bytes(
-                        q_fulls[q_bufIdx], 2 * BLOCK_M_SPLIT * DimQ
-                    )  # float16
+                    tlx.barrier_expect_bytes(q_fulls[q_bufIdx], 2 * BLOCK_M_SPLIT * DimQ)  # float16
                     qo_offset_y_split = seq_start + start_m
 
                     # pyrefly: ignore [missing-attribute]
@@ -1461,9 +1405,7 @@ def _attn_fwd_ws(
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(q_empties[q_bufIdx], q_phase ^ 1)
                     # pyrefly: ignore [missing-attribute]
-                    tlx.barrier_expect_bytes(
-                        q_fulls[q_bufIdx], 2 * BLOCK_M_SPLIT * DimQ
-                    )  # float16
+                    tlx.barrier_expect_bytes(q_fulls[q_bufIdx], 2 * BLOCK_M_SPLIT * DimQ)  # float16
                     qo_offset_y_split += BLOCK_M_SPLIT
                     # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
@@ -1473,9 +1415,7 @@ def _attn_fwd_ws(
                         q_fulls[q_bufIdx],
                     )
 
-                    v_bufIdx, v_phase = _get_bufidx_phase(
-                        accum_cnt_kv + 1, NUM_BUFFERS_KV
-                    )
+                    v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     # wait for the V buffer to be released by the consumer
                     # pyrefly: ignore [missing-attribute]
                     v_empty = tlx.local_view(kv_empties, v_bufIdx)
@@ -1500,9 +1440,7 @@ def _attn_fwd_ws(
                     accum_cnt_kv += 2
 
                     for _ in tl.range(lo + BLOCK_N, hi, BLOCK_N):
-                        k_bufIdx, k_phase = _get_bufidx_phase(
-                            accum_cnt_kv, NUM_BUFFERS_KV
-                        )
+                        k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                         # wait for the K buffer to be released by the consumer
                         # pyrefly: ignore [missing-attribute]
                         k_empty = tlx.local_view(kv_empties, k_bufIdx)
@@ -1523,9 +1461,7 @@ def _attn_fwd_ws(
                             k_full,
                         )
 
-                        v_bufIdx, v_phase = _get_bufidx_phase(
-                            accum_cnt_kv + 1, NUM_BUFFERS_KV
-                        )
+                        v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                         # wait for the V buffer to be released by the consumer
                         # pyrefly: ignore [missing-attribute]
                         v_empty = tlx.local_view(kv_empties, v_bufIdx)
@@ -1559,26 +1495,24 @@ def _attn_fwd_ws(
             tile_cnt = 0
             for _ in range(0, tiles_per_sm):
                 # initialize offsets
-                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (
-                    _compute_offsets(
-                        tile_idx,
-                        H,
-                        num_pid_n,
-                        num_pid_in_group,
-                        seq_offsets,
-                        num_targets,
-                        max_attn_len,
-                        full_attn_size,
-                        contextual_seq_len,
-                        BLOCK_M,
-                        BLOCK_N,
-                        GROUP_SIZE_N,
-                        HAS_NUM_TARGETS,
-                        HAS_MAX_ATTN_LEN,
-                        HAS_FULL_ATTN_SIZE,
-                        HAS_CONTEXTUAL_SEQ_LEN,
-                    )
-                )
+                start_m, off_z, off_h, lo, hi, seq_start, seq_len, n_targets = (_compute_offsets(
+                    tile_idx,
+                    H,
+                    num_pid_n,
+                    num_pid_in_group,
+                    seq_offsets,
+                    num_targets,
+                    max_attn_len,
+                    full_attn_size,
+                    contextual_seq_len,
+                    BLOCK_M,
+                    BLOCK_N,
+                    GROUP_SIZE_N,
+                    HAS_NUM_TARGETS,
+                    HAS_MAX_ATTN_LEN,
+                    HAS_FULL_ATTN_SIZE,
+                    HAS_CONTEXTUAL_SEQ_LEN,
+                ))
                 if start_m < seq_len:
                     _, phase = _get_bufidx_phase(tile_cnt, 1)
                     qo_offset_y = seq_start + start_m
@@ -1619,42 +1553,28 @@ def _attn_fwd_ws(
 
 
 @triton.jit
-def _attn_bwd_preprocess(
-    O,
-    DO,  #
-    Delta,  #
-    N_CTX,  #
-    BLOCK_M: tl.constexpr,
-    HEAD_DIM: tl.constexpr,  #
-):
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         N_CTX,  #
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                         ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_hz = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
     # load
-    o = tl.load(
-        O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]
-    )
-    do = tl.load(
-        DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]
-    ).to(tl.float32)
+    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_hz * N_CTX + off_m, delta)
 
 
 @triton.jit
-def _hstu_attn_bwd_preprocess(
-    O,
-    DO,  #
-    Delta,  #
-    seq_offsets,
-    stride_oh,
-    stride_doh,
-    stride_deltah,
-    H,
-    BLOCK_M: tl.constexpr,
-    HEAD_DIM: tl.constexpr,  #
-):
+def _hstu_attn_bwd_preprocess(O, DO,  #
+                              Delta,  #
+                              seq_offsets, stride_oh, stride_doh, stride_deltah, H, BLOCK_M: tl.constexpr,
+                              HEAD_DIM: tl.constexpr,  #
+                              ):
     off_z = tl.program_id(1) // H
     off_h = tl.program_id(1) % H
 
@@ -1666,14 +1586,8 @@ def _hstu_attn_bwd_preprocess(
     off_d = tl.arange(0, HEAD_DIM)
     mask_m = off_m < seq_len
 
-    o_offset = (
-        (seq_start + off_m[:, None]) * H * HEAD_DIM + off_h * stride_oh + off_d[None, :]
-    )
-    do_offset = (
-        (seq_start + off_m[:, None]) * H * HEAD_DIM
-        + off_h * stride_doh
-        + off_d[None, :]
-    )
+    o_offset = ((seq_start + off_m[:, None]) * H * HEAD_DIM + off_h * stride_oh + off_d[None, :])
+    do_offset = ((seq_start + off_m[:, None]) * H * HEAD_DIM + off_h * stride_doh + off_d[None, :])
 
     # load
     o = tl.load(O + o_offset, mask=mask_m[:, None], other=0.0)
@@ -2190,9 +2104,7 @@ def _hstu_bwd_compute_inner_loop_silu(
         else:
             # Unmasked region: only need boundary mask for last Q/dO and K/V blocks
             # Interior tiles (all elements in bounds): skip masking entirely
-            is_interior = (
-                curr_m + BLOCK_M1 <= seq_len and start_block_n + BLOCK_N1 <= seq_len
-            )
+            is_interior = (curr_m + BLOCK_M1 <= seq_len and start_block_n + BLOCK_N1 <= seq_len)
             mask_m = offs_m < seq_len
             qkT_scaled = qkT * alpha
             if ALPHA_BWD_PRESCALE:
@@ -2244,11 +2156,9 @@ def _hstu_bwd_compute_inner_loop_silu(
             dsT = (
                 dpT
                 # pyre-fixme[61]: `one_plus_tanh` is undefined, or not always defined.
-                * one_plus_tanh
-                * _fma_f32x2(qkT_scaled, one_minus_tanh, 1.0)
+                * one_plus_tanh * _fma_f32x2(qkT_scaled, one_minus_tanh, 1.0)
                 # pyre-fixme[61]: `half_scale` is undefined, or not always defined.
-                * half_scale
-            )
+                * half_scale)
         else:
             # Old path: dsT = dpT * sig * (1 + x*(1-sig)) * scale
             # pyre-fixme[61]: `sig_trans` is undefined, or not always defined.
@@ -2349,9 +2259,7 @@ def bwd_calculate_offsets(
     pid = tile_idx % n_tile_num
     pid, bhid = tl.swizzle2d(pid, bhid, n_tile_num, num_pid_m, GROUP_SIZE_M)
     off_chz = (bhid * N_CTX).to(tl.int64)
-    off_bh = (
-        (stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)
-    ) // stride_tok
+    off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
     start_n = pid
     start_m = _get_start_m_bwd(start_n, BLOCK_N1, STAGE)
     num_steps = (N_CTX - start_m) // BLOCK_M1
@@ -2539,9 +2447,7 @@ def get_hstu_bwd_configs() -> List[triton.Config]:
     ]
 
 
-@triton.autotune(
-    configs=get_hstu_bwd_configs(), key=["AUTOTUNE_MAX_SEQ_LEN", "HEAD_DIM"]
-)
+@triton.autotune(configs=get_hstu_bwd_configs(), key=["AUTOTUNE_MAX_SEQ_LEN", "HEAD_DIM"])
 @triton.jit
 def _hstu_attn_bwd_ws(
     DQ,
@@ -2818,7 +2724,6 @@ def _hstu_attn_bwd_ws(
         # reduction group: accumulate dq
         # pyrefly: ignore [missing-attribute]
         with tlx.async_task("default"):
-            LN2 = 0.6931471824645996  # = ln(2)
             blk_idx = 0
             clc_phase_producer = 1
             clc_phase_consumer = 0
@@ -2903,14 +2808,10 @@ def _hstu_attn_bwd_ws(
                     # release TMEM early, then process from registers.
                     # PART 1: Masked region [low1, high1)
                     for curr_m in tl.range(low1, high1, BLOCK_M1):
-                        tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                            blk_idx, NUM_BUFFERS_TMEM
-                        )
+                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                        for slice_id in tl.static_range(
-                            DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES
-                        ):
+                        for slice_id in tl.static_range(DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES):
                             dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                             # pyrefly: ignore [missing-attribute]
                             dq_slice = tlx.local_slice(
@@ -2937,9 +2838,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[dq_smem_idx],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -2952,8 +2851,7 @@ def _hstu_attn_bwd_ws(
                                     dq_tiles[tmem_buf_id],
                                     [0, er0 * DQ_REDUCE_NCOL],
                                     [BLOCK_M1, DQ_REDUCE_NCOL],
-                                )
-                            )
+                                ))
                             # pyrefly: ignore [missing-attribute]
                             tlx.barrier_arrive(dq_empties[tmem_buf_id])
                             dq_er0 = dq_er0 * sm_scale
@@ -2973,9 +2871,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[er0 % DQ_REDUCE_STAGES],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -2989,8 +2885,7 @@ def _hstu_attn_bwd_ws(
                                     dq_tiles[tmem_buf_id],
                                     [0, er0 * DQ_REDUCE_NCOL],
                                     [BLOCK_M1, DQ_REDUCE_NCOL],
-                                )
-                            )
+                                ))
                             # pyrefly: ignore [missing-attribute]
                             dq_er1 = tlx.local_load(
                                 # pyrefly: ignore [missing-attribute]
@@ -2998,8 +2893,7 @@ def _hstu_attn_bwd_ws(
                                     dq_tiles[tmem_buf_id],
                                     [0, er1 * DQ_REDUCE_NCOL],
                                     [BLOCK_M1, DQ_REDUCE_NCOL],
-                                )
-                            )
+                                ))
                             # pyrefly: ignore [missing-attribute]
                             tlx.barrier_arrive(dq_empties[tmem_buf_id])
                             dq_er0 = dq_er0 * sm_scale
@@ -3019,9 +2913,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[er0 % DQ_REDUCE_STAGES],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -3042,9 +2934,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[er1 % DQ_REDUCE_STAGES],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -3052,14 +2942,10 @@ def _hstu_attn_bwd_ws(
 
                     # PART 2: Unmasked region [low2, high2)
                     for curr_m in tl.range(low2, high2, BLOCK_M1):
-                        tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                            blk_idx, NUM_BUFFERS_TMEM
-                        )
+                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                        for slice_id in tl.static_range(
-                            DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES
-                        ):
+                        for slice_id in tl.static_range(DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES):
                             dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                             # pyrefly: ignore [missing-attribute]
                             dq_slice = tlx.local_slice(
@@ -3086,9 +2972,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[dq_smem_idx],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -3101,8 +2985,7 @@ def _hstu_attn_bwd_ws(
                                     dq_tiles[tmem_buf_id],
                                     [0, er0 * DQ_REDUCE_NCOL],
                                     [BLOCK_M1, DQ_REDUCE_NCOL],
-                                )
-                            )
+                                ))
                             # pyrefly: ignore [missing-attribute]
                             tlx.barrier_arrive(dq_empties[tmem_buf_id])
                             dq_er0 = dq_er0 * sm_scale
@@ -3122,9 +3005,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[er0 % DQ_REDUCE_STAGES],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -3138,8 +3019,7 @@ def _hstu_attn_bwd_ws(
                                     dq_tiles[tmem_buf_id],
                                     [0, er0 * DQ_REDUCE_NCOL],
                                     [BLOCK_M1, DQ_REDUCE_NCOL],
-                                )
-                            )
+                                ))
                             # pyrefly: ignore [missing-attribute]
                             dq_er1 = tlx.local_load(
                                 # pyrefly: ignore [missing-attribute]
@@ -3147,8 +3027,7 @@ def _hstu_attn_bwd_ws(
                                     dq_tiles[tmem_buf_id],
                                     [0, er1 * DQ_REDUCE_NCOL],
                                     [BLOCK_M1, DQ_REDUCE_NCOL],
-                                )
-                            )
+                                ))
                             # pyrefly: ignore [missing-attribute]
                             tlx.barrier_arrive(dq_empties[tmem_buf_id])
                             dq_er0 = dq_er0 * sm_scale
@@ -3168,9 +3047,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[er0 % DQ_REDUCE_STAGES],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -3191,9 +3068,7 @@ def _hstu_attn_bwd_ws(
                                 dq_store_buf[er1 % DQ_REDUCE_STAGES],
                                 [
                                     (seq_start + curr_m).to(tl.int32),
-                                    (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                        tl.int32
-                                    ),
+                                    (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                                 ],
                                 store_reduce="add",
                             )
@@ -3374,9 +3249,7 @@ def _hstu_attn_bwd_ws(
                             sdv_store_buf[kv_buf_id],
                             [
                                 (seq_start + start_block_n).to(tl.int32),
-                                (off_h * stride_dvh + slice_id * DKV_STORE_NCOL).to(
-                                    tl.int32
-                                ),
+                                (off_h * stride_dvh + slice_id * DKV_STORE_NCOL).to(tl.int32),
                             ],
                         )
                     # pyrefly: ignore [missing-attribute]
@@ -3413,9 +3286,7 @@ def _hstu_attn_bwd_ws(
                             sdk_store_buf[kv_buf_id],
                             [
                                 (seq_start + start_block_n).to(tl.int32),
-                                (off_h * stride_dkh + slice_id * DKV_STORE_NCOL).to(
-                                    tl.int32
-                                ),
+                                (off_h * stride_dkh + slice_id * DKV_STORE_NCOL).to(tl.int32),
                             ],
                         )
                     # pyrefly: ignore [missing-attribute]
@@ -3484,9 +3355,7 @@ def _hstu_attn_bwd_ws(
                     # Prolog
                     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
                     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-                    tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                        blk_idx, NUM_BUFFERS_TMEM
-                    )
+                    tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
                     # Compute qkT = tl.dot(k, qT)
                     # pyrefly: ignore [missing-attribute]
@@ -3540,9 +3409,7 @@ def _hstu_attn_bwd_ws(
                     tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
                     for j in range(1, num_steps):
                         q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                        tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                            blk_idx, NUM_BUFFERS_TMEM
-                        )
+                        tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                         # Compute qkT = tl.dot(k, qT)
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
@@ -3560,23 +3427,15 @@ def _hstu_attn_bwd_ws(
                         )
 
                         prev_blk_idx = blk_idx - 1
-                        q_buf_id_prev, _ = _get_bufidx_phase(
-                            prev_blk_idx, NUM_BUFFERS_Q
-                        )
-                        tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(
-                            prev_blk_idx, NUM_BUFFERS_TMEM
-                        )
-                        ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(
-                            prev_blk_idx, NUM_BUFFERS_DS
-                        )
+                        q_buf_id_prev, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
+                        tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+                        ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
                         # Compute dq = tl.dot(tl.trans(dsT), k)
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
                         # pyrefly: ignore [missing-attribute]
-                        tlx.barrier_wait(
-                            dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1
-                        )
+                        tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
                         # pyrefly: ignore [missing-attribute]
                         dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
                         # pyrefly: ignore [missing-attribute]
@@ -3638,12 +3497,8 @@ def _hstu_attn_bwd_ws(
                     # Epilog
                     prev_blk_idx = blk_idx - 1
                     q_buf_id, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-                    tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                        prev_blk_idx, NUM_BUFFERS_TMEM
-                    )
-                    ds_buf_id, ds_phase = _get_bufidx_phase(
-                        prev_blk_idx, NUM_BUFFERS_DS
-                    )
+                    tmem_buf_id, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+                    ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
                     # Compute dk += tl.dot(dsT, tl.trans(qT))
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
@@ -3722,9 +3577,7 @@ def _hstu_attn_bwd_ws(
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                     # pyrefly: ignore [missing-attribute]
-                    tlx.barrier_expect_bytes(
-                        k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM
-                    )  # float16
+                    tlx.barrier_expect_bytes(k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
                     # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
                         desc_k,
@@ -3738,9 +3591,7 @@ def _hstu_attn_bwd_ws(
 
                     # Load V
                     # pyrefly: ignore [missing-attribute]
-                    tlx.barrier_expect_bytes(
-                        v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM
-                    )  # float16
+                    tlx.barrier_expect_bytes(v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
                     # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
                         desc_v,
@@ -3760,9 +3611,7 @@ def _hstu_attn_bwd_ws(
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                         # pyrefly: ignore [missing-attribute]
-                        tlx.barrier_expect_bytes(
-                            q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM
-                        )
+                        tlx.barrier_expect_bytes(q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                         # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_load(
                             desc_q,
@@ -3777,9 +3626,7 @@ def _hstu_attn_bwd_ws(
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                         # pyrefly: ignore [missing-attribute]
-                        tlx.barrier_expect_bytes(
-                            do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM
-                        )
+                        tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                         # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_load(
                             desc_do,
@@ -3800,9 +3647,7 @@ def _hstu_attn_bwd_ws(
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(q_empties[q_buf_id], q_phase ^ 1)
                         # pyrefly: ignore [missing-attribute]
-                        tlx.barrier_expect_bytes(
-                            q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM
-                        )
+                        tlx.barrier_expect_bytes(q_fulls[q_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                         # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_load(
                             desc_q,
@@ -3817,9 +3662,7 @@ def _hstu_attn_bwd_ws(
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                         # pyrefly: ignore [missing-attribute]
-                        tlx.barrier_expect_bytes(
-                            do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM
-                        )
+                        tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                         # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_load(
                             desc_do,
@@ -3836,9 +3679,7 @@ def _hstu_attn_bwd_ws(
                 clc_phase_consumer ^= 1
 
 
-@triton.autotune(
-    configs=get_hstu_bwd_configs(), key=["AUTOTUNE_MAX_SEQ_LEN", "HEAD_DIM"]
-)
+@triton.autotune(configs=get_hstu_bwd_configs(), key=["AUTOTUNE_MAX_SEQ_LEN", "HEAD_DIM"])
 @triton.jit
 def _hstu_attn_bwd_ws_non_persistent(
     DQ,
@@ -4093,7 +3934,6 @@ def _hstu_attn_bwd_ws_non_persistent(
         # reduction group: accumulate dq
         # pyrefly: ignore [missing-attribute]
         with tlx.async_task("default"):
-            LN2 = 0.6931471824645996  # = ln(2)
             blk_idx = 0
             (
                 off_z,
@@ -4170,14 +4010,10 @@ def _hstu_attn_bwd_ws_non_persistent(
                 # dQ early TMEM release optimization (from D98825322)
                 # PART 1: Masked region [low1, high1)
                 for curr_m in tl.range(low1, high1, BLOCK_M1):
-                    tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                        blk_idx, NUM_BUFFERS_TMEM
-                    )
+                    tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                    for slice_id in tl.static_range(
-                        DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES
-                    ):
+                    for slice_id in tl.static_range(DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES):
                         dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                         # pyrefly: ignore [missing-attribute]
                         dq_slice = tlx.local_slice(
@@ -4204,9 +4040,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[dq_smem_idx],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4219,8 +4053,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                                 dq_tiles[tmem_buf_id],
                                 [0, er0 * DQ_REDUCE_NCOL],
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
-                            )
-                        )
+                            ))
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(dq_empties[tmem_buf_id])
                         dq_er0 = dq_er0 * sm_scale
@@ -4240,9 +4073,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[er0 % DQ_REDUCE_STAGES],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4256,8 +4087,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                                 dq_tiles[tmem_buf_id],
                                 [0, er0 * DQ_REDUCE_NCOL],
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
-                            )
-                        )
+                            ))
                         # pyrefly: ignore [missing-attribute]
                         dq_er1 = tlx.local_load(
                             # pyrefly: ignore [missing-attribute]
@@ -4265,8 +4095,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                                 dq_tiles[tmem_buf_id],
                                 [0, er1 * DQ_REDUCE_NCOL],
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
-                            )
-                        )
+                            ))
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(dq_empties[tmem_buf_id])
                         dq_er0 = dq_er0 * sm_scale
@@ -4286,9 +4115,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[er0 % DQ_REDUCE_STAGES],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4309,9 +4136,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[er1 % DQ_REDUCE_STAGES],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4319,14 +4144,10 @@ def _hstu_attn_bwd_ws_non_persistent(
 
                 # PART 2: Unmasked region [low2, high2)
                 for curr_m in tl.range(low2, high2, BLOCK_M1):
-                    tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                        blk_idx, NUM_BUFFERS_TMEM
-                    )
+                    tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                    for slice_id in tl.static_range(
-                        DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES
-                    ):
+                    for slice_id in tl.static_range(DQ_REDUCE_ITERS - EARLY_RELEASE_SUBTILES):
                         dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                         # pyrefly: ignore [missing-attribute]
                         dq_slice = tlx.local_slice(
@@ -4353,9 +4174,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[dq_smem_idx],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (slice_id * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4368,8 +4187,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                                 dq_tiles[tmem_buf_id],
                                 [0, er0 * DQ_REDUCE_NCOL],
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
-                            )
-                        )
+                            ))
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(dq_empties[tmem_buf_id])
                         dq_er0 = dq_er0 * sm_scale
@@ -4389,9 +4207,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[er0 % DQ_REDUCE_STAGES],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4405,8 +4221,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                                 dq_tiles[tmem_buf_id],
                                 [0, er0 * DQ_REDUCE_NCOL],
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
-                            )
-                        )
+                            ))
                         # pyrefly: ignore [missing-attribute]
                         dq_er1 = tlx.local_load(
                             # pyrefly: ignore [missing-attribute]
@@ -4414,8 +4229,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                                 dq_tiles[tmem_buf_id],
                                 [0, er1 * DQ_REDUCE_NCOL],
                                 [BLOCK_M1, DQ_REDUCE_NCOL],
-                            )
-                        )
+                            ))
                         # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(dq_empties[tmem_buf_id])
                         dq_er0 = dq_er0 * sm_scale
@@ -4435,9 +4249,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[er0 % DQ_REDUCE_STAGES],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (er0 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4458,9 +4270,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                             dq_store_buf[er1 % DQ_REDUCE_STAGES],
                             [
                                 (seq_start + curr_m).to(tl.int32),
-                                (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(
-                                    tl.int32
-                                ),
+                                (er1 * DQ_REDUCE_NCOL + off_h * stride_dqh).to(tl.int32),
                             ],
                             store_reduce="add",
                         )
@@ -4765,9 +4575,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                 tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
                 for j in range(1, num_steps):
                     q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
-                    tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                        blk_idx, NUM_BUFFERS_TMEM
-                    )
+                    tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
                     # Compute qkT = tl.dot(k, qT)
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(q_fulls[q_buf_id], q_phase)
@@ -4786,12 +4594,8 @@ def _hstu_attn_bwd_ws_non_persistent(
 
                     prev_blk_idx = blk_idx - 1
                     q_buf_id_prev, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-                    tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(
-                        prev_blk_idx, NUM_BUFFERS_TMEM
-                    )
-                    ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(
-                        prev_blk_idx, NUM_BUFFERS_DS
-                    )
+                    tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
+                    ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
                     # Compute dq = tl.dot(tl.trans(dsT), k)
                     # pyrefly: ignore [missing-attribute]
@@ -4859,9 +4663,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                 # Epilog
                 prev_blk_idx = blk_idx - 1
                 q_buf_id, _ = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_Q)
-                tmem_buf_id, tmem_phase = _get_bufidx_phase(
-                    prev_blk_idx, NUM_BUFFERS_TMEM
-                )
+                tmem_buf_id, tmem_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
                 ds_buf_id, ds_phase = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
                 # Compute dk += tl.dot(dsT, tl.trans(qT))
                 # pyrefly: ignore [missing-attribute]
@@ -4936,9 +4738,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                 # pyrefly: ignore [missing-attribute]
                 tlx.barrier_wait(k_empties[kv_buf_id], kv_phase ^ 1)
                 # pyrefly: ignore [missing-attribute]
-                tlx.barrier_expect_bytes(
-                    k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM
-                )  # float16
+                tlx.barrier_expect_bytes(k_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
                 # pyrefly: ignore [missing-attribute]
                 tlx.async_descriptor_load(
                     desc_k,
@@ -4952,9 +4752,7 @@ def _hstu_attn_bwd_ws_non_persistent(
 
                 # Load V
                 # pyrefly: ignore [missing-attribute]
-                tlx.barrier_expect_bytes(
-                    v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM
-                )  # float16
+                tlx.barrier_expect_bytes(v_fulls[kv_buf_id], 2 * BLOCK_N1 * HEAD_DIM)  # float16
                 # pyrefly: ignore [missing-attribute]
                 tlx.async_descriptor_load(
                     desc_v,
@@ -4989,9 +4787,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                     # pyrefly: ignore [missing-attribute]
-                    tlx.barrier_expect_bytes(
-                        do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM
-                    )
+                    tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                     # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
                         desc_do,
@@ -5027,9 +4823,7 @@ def _hstu_attn_bwd_ws_non_persistent(
                     # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                     # pyrefly: ignore [missing-attribute]
-                    tlx.barrier_expect_bytes(
-                        do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM
-                    )
+                    tlx.barrier_expect_bytes(do_fulls[do_buf_id], 2 * BLOCK_M1 * HEAD_DIM)
                     # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
                         desc_do,
@@ -5055,10 +4849,6 @@ def backward_custom_vars(
     out = saved_tensors[idx]
 
     # Compute Delta = sum(out * dout, dim=-1)
-    Delta = torch.empty_like(M)
-    total_seq_len, H, HEAD_DIM = out.shape
-    BLOCK_M = 128
-    grid = (triton.cdiv(total_seq_len, BLOCK_M), H)
     # For jagged, we compute delta per head
     Delta = (out * dout).sum(dim=-1).to(torch.float32)
 
@@ -5184,23 +4974,16 @@ def tlx_hstu_attention_bwd(
             block_shape=dummy_block,
         )
 
-    BLOCK_M1 = 128
     stage = 3 if causal else 1
-
-    num_sms = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
 
     use_persistent = True
     if use_persistent:
         grid = lambda meta: (  # noqa E731
-            H * Z * triton.cdiv(max_seq_len, meta["BLOCK_N1"]),
-        )
+            H * Z * triton.cdiv(max_seq_len, meta["BLOCK_N1"]), )
         bwd_kernel = _hstu_attn_bwd_ws
     else:
         grid = lambda meta: (  # noqa E731
-            H * Z * triton.cdiv(max_seq_len, meta["BLOCK_N1"]),
-        )
+            H * Z * triton.cdiv(max_seq_len, meta["BLOCK_N1"]), )
         bwd_kernel = _hstu_attn_bwd_ws_non_persistent
 
     bwd_kernel[grid](
@@ -5252,13 +5035,10 @@ def tlx_hstu_attention_bwd(
     return dq, dk, dv
 
 
-def forward_custom_vars(
-    q: torch.Tensor, num_softmax_heads: int, saved_tensors: List[torch.Tensor]
-) -> Tuple[torch.Tensor, int]:
+def forward_custom_vars(q: torch.Tensor, num_softmax_heads: int,
+                        saved_tensors: List[torch.Tensor]) -> Tuple[torch.Tensor, int]:
     assert num_softmax_heads <= q.shape[1]
-    M = torch.empty(
-        (q.shape[0], num_softmax_heads), device=q.device, dtype=torch.float32
-    )
+    M = torch.empty((q.shape[0], num_softmax_heads), device=q.device, dtype=torch.float32)
     saved_tensors.append(M)
     stride_mm = M.stride(0)
     return M, stride_mm
@@ -5286,10 +5066,6 @@ def tlx_hstu_attention_fwd(
     k = switch_to_contiguous_if_needed(k)
     v = switch_to_contiguous_if_needed(v)
     Z = seq_offsets.numel() - 1
-    # Previously this is AUTOTUNE_Z=prev_power_of_2(Z)
-    # We rollback to Z to avoid the .item() call in prev_power_of_2
-    # TODO: remove this once we have a better way to handle the .item() call
-    AUTOTUNE_Z = Z
     total_seq_len_q, H, DimQ = q.shape
     _, _, DimV = v.shape
     out = torch.empty(total_seq_len_q, H, DimV, device=q.device, dtype=q.dtype)
@@ -5300,8 +5076,7 @@ def tlx_hstu_attention_fwd(
     else:
         attn_scale_type = "dynamic"
     assert num_softmax_heads == 0 or num_softmax_heads == H, (
-        "num_softmax_heads must be 0 or H in tlx version due to a compilation issue"
-    )
+        "num_softmax_heads must be 0 or H in tlx version due to a compilation issue")
     HAS_NUM_TARGETS = num_targets is not None
     if not HAS_NUM_TARGETS:
         num_targets = torch.empty(0)
@@ -5347,12 +5122,9 @@ def tlx_hstu_attention_fwd(
     # pyrefly: ignore [bad-argument-type]
     triton.set_allocator(alloc_fn)
 
-    num_sms = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     grid = lambda meta: (  # noqa E731
-        min(num_sms, H * Z * triton.cdiv(max_seq_len, meta["BLOCK_M"])),
-    )
+        min(num_sms, H * Z * triton.cdiv(max_seq_len, meta["BLOCK_M"])), )
     _attn_fwd_ws[grid](
         Out=out,
         sm_scale=alpha,
@@ -5391,6 +5163,7 @@ def tlx_hstu_attention_fwd(
 
 
 class _AttentionFunction(torch.autograd.Function):
+
     @staticmethod
     # pyre-ignore[14]
     def forward(
@@ -5413,9 +5186,7 @@ class _AttentionFunction(torch.autograd.Function):
         sort_by_length_indices = None
         if sort_by_length:
             seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
-            _, sort_by_length_indices = torch.sort(
-                seq_lengths, descending=True, stable=False
-            )
+            _, sort_by_length_indices = torch.sort(seq_lengths, descending=True, stable=False)
         saved_tensors = [q, k, v, seq_offsets, attn_scale]
         if sort_by_length_indices is not None:
             saved_tensors.append(sort_by_length_indices)
@@ -5458,29 +5229,26 @@ class _AttentionFunction(torch.autograd.Function):
     def backward(
         ctx, dout: torch.Tensor
     ) -> Tuple[
-        None,
-        None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+            None,
+            None,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
     ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale = saved_tensors[:5]
         idx = 5
         if ctx.sort_by_length:
-            sort_by_length_indices = saved_tensors[idx]
             idx += 1
-        else:
-            sort_by_length_indices = None
         num_softmax_heads = ctx.num_softmax_heads
         if ctx.has_num_targets:
             num_targets = ctx.saved_tensors[idx]
@@ -5492,9 +5260,7 @@ class _AttentionFunction(torch.autograd.Function):
         _, _, DimV = v.shape
         d_qkv = torch.zeros((Z, H, DimQ * 2 + DimV), device=q.device, dtype=q.dtype)
         dq, dk, dv = d_qkv.split([DimQ, DimQ, DimV], dim=-1)
-        M, Delta, stride_mm = backward_custom_vars(
-            dout, num_softmax_heads, idx, saved_tensors
-        )
+        M, Delta, stride_mm = backward_custom_vars(dout, num_softmax_heads, idx, saved_tensors)
         dq, dk, dv = tlx_hstu_attention_bwd(
             dout=dout,
             q=q,

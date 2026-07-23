@@ -45,12 +45,7 @@ _HSTU_SELF_AUTOWS = tl.constexpr(os.environ.get("HSTU_SELF_AUTOWS") == "1")
 # autoWS analog of TLX's replicate=NUM_MMA_GROUPS). Default 2 when autoWS is on
 # (matches TLX's 2 MMA groups), 1 otherwise; override with HSTU_SELF_DP.
 _HSTU_SELF_DP = tl.constexpr(
-    int(
-        os.environ.get(
-            "HSTU_SELF_DP", "2" if os.environ.get("HSTU_SELF_AUTOWS") == "1" else "1"
-        )
-    )
-)
+    int(os.environ.get("HSTU_SELF_DP", "2" if os.environ.get("HSTU_SELF_AUTOWS") == "1" else "1")))
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -72,8 +67,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                                     },
                                     num_stages=num_stages,
                                     num_warps=num_warps,
-                                )
-                            )
+                                ))
     else:
         configs = [
             triton.Config(
@@ -235,19 +229,13 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
             # BLOCK_M = 128 * _dp (doubling the split dim) -> each partition tile
             # is 128 rows, matching TLX (BLOCK_M=256, 2 groups of 128).
             _bn = int(os.environ.get("HSTU_SELF_AUTOWS_BN", "128"))
-            return [
-                triton.Config(
-                    {"BLOCK_M": 128 * _dp, "BLOCK_N": _bn},
-                    num_stages=1,
-                    num_warps=_w,
-                )
-            ]
+            return [triton.Config(
+                {"BLOCK_M": 128 * _dp, "BLOCK_N": _bn},
+                num_stages=1,
+                num_warps=_w,
+            )]
         # DP off: pick the largest existing tile / most warps.
-        cand = [
-            c
-            for c in configs
-            if c.num_stages >= 1 and c.kwargs.get("BLOCK_M", 0) >= 64
-        ]
+        cand = [c for c in configs if c.num_stages >= 1 and c.kwargs.get("BLOCK_M", 0) >= 64]
         cand.sort(
             key=lambda c: (
                 c.kwargs.get("BLOCK_M", 0) + c.kwargs.get("BLOCK_N", 0),
@@ -295,8 +283,7 @@ def _get_bw_configs() -> List[triton.Config]:
                                             num_stages=num_stages,
                                             num_warps=num_warps,
                                             pre_hook=_bwd_pre_hook,
-                                        )
-                                    )
+                                        ))
         return configs
 
     configs = [
@@ -569,9 +556,7 @@ def backward_valid_mask(
     if HAS_MAX_ATTN_LEN:
         valid_mask_trans = valid_mask_trans & (pos_offs_m_minus_n <= max_attn_len)
     if HAS_CONTEXTUAL_SEQ_LEN:
-        valid_mask_trans = valid_mask_trans | (
-            (offs_m[None, :] == 0) & (pos_offs_n[:, None] < max_ids)
-        )
+        valid_mask_trans = valid_mask_trans | ((offs_m[None, :] == 0) & (pos_offs_n[:, None] < max_ids))
     return valid_mask_trans
 
 
@@ -700,7 +685,7 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
         # tma can only be loaded in one order, use trans afterwards
         qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32)
     else:
-        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+        k = tl.load(K_block_ptr, boundary_check=(1, ), padding_option="zero")
         qk = tl.dot(q, k, allow_tf32=ALLOW_TF32)
     valid_mask = forward_valid_mask(
         offs_m,
@@ -723,7 +708,7 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
             V.dtype.element_ty,
         )
     else:
-        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+        v = tl.load(V_block_ptr, boundary_check=(0, ), padding_option="zero")
     act_qk = act_qk.to(v.dtype)
     acc += tl.dot(act_qk, v, allow_tf32=ALLOW_TF32)
     return acc
@@ -806,9 +791,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         HAS_NUM_TARGETS,
         HAS_MAX_ATTN_LEN,
     )
-    qk_trans, sig_trans, act_qk_trans = backward_activation(
-        qk_trans, alpha, scale, valid_mask_trans, k
-    )
+    qk_trans, sig_trans, act_qk_trans = backward_activation(qk_trans, alpha, scale, valid_mask_trans, k)
     # compute dv
     if ENABLE_TMA:
         do = tl._experimental_descriptor_load(
@@ -827,9 +810,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
 
     # compute dk and dq
     dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
-    dqk_trans = backward_d_activation(
-        dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans
-    )
+    dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
     dqk_trans = dqk_trans.to(k.dtype)
 
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
@@ -905,9 +886,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
     device_desc_v = None
     device_desc_o = None
     if ENABLE_TMA:
-        workspace_base = workspace_ptr + TMA_DESC_SIZE * 4 * (
-            tl.program_id(1) + tl.program_id(0) * tl.num_programs(1)
-        )
+        workspace_base = workspace_ptr + TMA_DESC_SIZE * 4 * (tl.program_id(1) + tl.program_id(0) * tl.num_programs(1))
         device_desc_q = workspace_base
         device_desc_k = workspace_base + 1 * TMA_DESC_SIZE
         device_desc_v = workspace_base + 2 * TMA_DESC_SIZE
@@ -950,9 +929,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
             scale = tl.load(attn_scale).to(tl.float32)
         else:
             tl.static_assert(ATTN_SCALE_TYPE == "dynamic")
-            scale = tl.load(
-                attn_scale + seq_start_q + offs_m, mask=offs_m < seq_len_q
-            ).to(tl.float32)
+            scale = tl.load(attn_scale + seq_start_q + offs_m, mask=offs_m < seq_len_q).to(tl.float32)
 
         Q_block_ptr = None
         K_block_ptr = None
@@ -966,7 +943,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 block_shape=(BLOCK_M, BLOCK_D_Q),
                 order=(1, 0),
             )
-            q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+            q = tl.load(Q_block_ptr, boundary_check=(0, ), padding_option="zero")
 
             K_block_ptr = tl.make_block_ptr(
                 base=K + off_h * stride_kh + seq_start_kv * stride_kn,
@@ -1043,11 +1020,11 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
         end_n = low
         for start_n in tl.range(
-            low,
-            high,
-            BLOCK_N,
-            warp_specialize=_HSTU_SELF_AUTOWS,
-            data_partition_factor=_HSTU_SELF_DP,
+                low,
+                high,
+                BLOCK_N,
+                warp_specialize=_HSTU_SELF_AUTOWS,
+                data_partition_factor=_HSTU_SELF_DP,
         ):
             acc = _hstu_attn_fwd_one_block_0(
                 start_n=start_n,
@@ -1588,9 +1565,8 @@ def _hstu_attn_bwd(  # noqa C901
     device_desc_dk = None
     device_desc_dv = None
     if ENABLE_TMA:
-        workspace_base = tma_workspace_ptr + TMA_DESC_SIZE * 6 * (
-            tl.program_id(1) + tl.program_id(0) * tl.num_programs(1)
-        )
+        workspace_base = tma_workspace_ptr + TMA_DESC_SIZE * 6 * (tl.program_id(1) +
+                                                                  tl.program_id(0) * tl.num_programs(1))
         device_desc_q = workspace_base
         device_desc_k = workspace_base + 1 * TMA_DESC_SIZE
         device_desc_v = workspace_base + 2 * TMA_DESC_SIZE
@@ -2006,6 +1982,7 @@ def triton_hstu_attention_bwd(
 
 
 class _AttentionFunction(torch.autograd.Function):
+
     @staticmethod
     # pyre-ignore[14]
     def forward(
@@ -2028,9 +2005,7 @@ class _AttentionFunction(torch.autograd.Function):
         sort_by_length_indices = None
         if sort_by_length:
             seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
-            _, sort_by_length_indices = torch.sort(
-                seq_lengths, descending=True, stable=False
-            )
+            _, sort_by_length_indices = torch.sort(seq_lengths, descending=True, stable=False)
         saved_tensors = [q, k, v, seq_offsets, attn_scale]
         if sort_by_length_indices is not None:
             saved_tensors.append(sort_by_length_indices)
@@ -2072,20 +2047,20 @@ class _AttentionFunction(torch.autograd.Function):
     def backward(
         ctx, dout: torch.Tensor
     ) -> Tuple[
-        None,
-        None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+            None,
+            None,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
     ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale = saved_tensors[:5]

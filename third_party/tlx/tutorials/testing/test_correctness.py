@@ -1177,6 +1177,34 @@ def test_amd_fa_cluster(causal, dtype, HEAD_DIM):
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("persistent", [False, True], ids=["direct", "persistent"])
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("use_direct_load", [None, False, True], ids=["autotune", "lds", "direct-load"])
+@pytest.mark.parametrize(
+    "N_CTX,BLOCK_M",
+    [(128, 128), (129, 128), (257, 256)],
+    ids=["short", "short-unaligned", "pipeline-unaligned"],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_block_n_boundaries(persistent, causal, use_direct_load, N_CTX, BLOCK_M):
+    torch.manual_seed(42)
+    B, H, D = 1, 4, 64
+    dtype = torch.bfloat16
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
+    kernel = _amd_fa_cluster_persistent if persistent else _amd_fa_cluster
+    config = {"BLOCK_M": BLOCK_M, "BLOCK_N": 64}
+    if use_direct_load is not None:
+        config["USE_DIRECT_LOAD"] = use_direct_load
+    if persistent:
+        config.update({"NUM_SMS": 16, "NUM_XCDS": 4})
+    out = kernel(q, k, v, sm, causal, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")

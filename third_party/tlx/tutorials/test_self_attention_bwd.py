@@ -41,8 +41,12 @@ def test_self_attention_bwd_triton_vs_tlx(L, Z):
 
     # Each kernel's grads must match the torch-float reference (bf16 precision).
     for name, got in (
-        ("triton dq", dq_t), ("triton dk", dk_t), ("triton dv", dv_t),
-        ("tlx dq", dq_x), ("tlx dk", dk_x), ("tlx dv", dv_x),
+        ("triton dq", dq_t),
+        ("triton dk", dk_t),
+        ("triton dv", dv_t),
+        ("tlx dq", dq_x),
+        ("tlx dk", dk_x),
+        ("tlx dv", dv_x),
     ):
         want = {"dq": rq, "dk": rk, "dv": rv}[name.split()[1]]
         rl2 = bs.rel_l2(got, want)

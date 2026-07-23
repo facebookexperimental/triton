@@ -67,17 +67,34 @@ def rel_l2(a, b):
 
 def run_triton(q, k, v, so, L, asc):
     return A.triton_hstu_mha(
-        max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, num_targets=None, max_attn_len=0, contextual_seq_len=0,
+        max_seq_len=L,
+        alpha=1.0 / D,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=so,
+        attn_scale=asc,
+        num_targets=None,
+        max_attn_len=0,
+        contextual_seq_len=0,
         enable_tma=True,
     )
 
 
 def run_tlx(q, k, v, so, L, asc, causal=True):
     return T.tlx_bw_hstu_mha(
-        max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, num_softmax_heads=0, num_targets=None,
-        max_attn_len=0, contextual_seq_len=0, causal=causal,
+        max_seq_len=L,
+        alpha=1.0 / D,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=so,
+        attn_scale=asc,
+        num_softmax_heads=0,
+        num_targets=None,
+        max_attn_len=0,
+        contextual_seq_len=0,
+        causal=causal,
     )
 
 

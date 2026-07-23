@@ -20,18 +20,15 @@ except ImportError:
     HAS_TLX = False
 
 from triton.language.extra.libdevice import (  # @manual=//triton:triton
-    fast_dividef,
-    fast_expf,
+    fast_dividef, fast_expf,
 )
 
 HAS_FAST_TANH_INSTRUCTION = (
-    torch.version.cuda is not None
-    and torch.cuda.is_available()
+    torch.version.cuda is not None and torch.cuda.is_available()
     and torch.cuda.get_device_capability()[0] >= 9  # >= H100
 )
 HAS_F32X2_INSTRUCTION = (
-    torch.version.cuda is not None
-    and torch.cuda.is_available()
+    torch.version.cuda is not None and torch.cuda.is_available()
     and torch.cuda.get_device_capability()[0] >= 10  # >= B200
 )
 
@@ -168,14 +165,8 @@ def backward_d_silu_activation(
 
 
 @triton.jit
-def backward_d_softmax_activation(
-    dact_qk_trans,
-    Delta_off,
-    offs_m,
-    stride_mm,
-    mask_m,
-    pT,  # pT represents sig_trans
-):
+def backward_d_softmax_activation(dact_qk_trans, Delta_off, offs_m, stride_mm, mask_m, pT,  # pT represents sig_trans
+                                  ):
     Di = tl.load(Delta_off + offs_m * stride_mm, mask=mask_m)
     dqk_trans = pT * (dact_qk_trans - Di[None, :])
     return dqk_trans
@@ -192,9 +183,7 @@ def backward_silu_activation(qk_trans, alpha, valid_mask_trans, dtype_k, scale):
 
 
 @triton.jit
-def backward_softmax_activation(
-    qk_trans, alpha, valid_mask_trans, M_off, offs_m, stride_mm, mask_m, k
-):
+def backward_softmax_activation(qk_trans, alpha, valid_mask_trans, M_off, offs_m, stride_mm, mask_m, k):
     qk_trans = qk_trans * alpha * 1.44269504
     m = tl.load(M_off + offs_m * stride_mm, mask=mask_m)
     pT = tl.math.exp2(qk_trans - m[None, :])
@@ -204,9 +193,7 @@ def backward_softmax_activation(
 
 
 @triton.jit
-def forward_softmax_activation_scaled_alpha(
-    qk, scaled_alpha, valid_mask, m_i, acc, l_i
-):
+def forward_softmax_activation_scaled_alpha(qk, scaled_alpha, valid_mask, m_i, acc, l_i):
     qk = qk * scaled_alpha
     qk = tl.where(valid_mask, qk, -float("inf"))
     m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -221,9 +208,7 @@ def forward_softmax_activation_scaled_alpha(
 
 
 @triton.jit
-def forward_softmax_activation_trans_scaled_alpha(
-    qk_trans, scaled_alpha, valid_mask_trans, m_i, acc, l_i
-):
+def forward_softmax_activation_trans_scaled_alpha(qk_trans, scaled_alpha, valid_mask_trans, m_i, acc, l_i):
     qk_trans = qk_trans * scaled_alpha
     qk_trans = tl.where(valid_mask_trans, qk_trans, -float("inf"))
     m_ij = tl.maximum(m_i, tl.max(qk_trans, 0))
@@ -238,9 +223,8 @@ def forward_softmax_activation_trans_scaled_alpha(
 
 
 @triton.jit
-def backward_softmax_activation_scaled_alpha(
-    qk_trans, scaled_alpha, valid_mask_trans, M_off, offs_m, stride_mm, mask_m, k
-):
+def backward_softmax_activation_scaled_alpha(qk_trans, scaled_alpha, valid_mask_trans, M_off, offs_m, stride_mm, mask_m,
+                                             k):
     qk_trans = qk_trans * scaled_alpha
     m = tl.load(M_off + offs_m * stride_mm, mask=mask_m)
     pT = tl.math.exp2(qk_trans - m[None, :])

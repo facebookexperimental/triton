@@ -58,10 +58,11 @@ std::string axisLayoutKey(triton::ReduceOp op) {
 // (tf32 / ieee / tf32x3) and the fp8 partial-accumulator flush period
 // (maxNumImpreciseAcc) -- plus the op name (a tt.dot ieee-FMA path vs an
 // ttng.warp_group_dot wgmma path is itself a numeric change). It deliberately
-// DROPS the operand/result types: their shapes are the free M/N/K tiling and their
-// encodings are the free warpsPerCTA, while the element dtype is fixed per kernel,
-// so keeping them would only over-split. A genuine K-decomposition (tf32x3 = 3
-// passes) is recovered from the dot COUNT by the caller, not from the types.
+// DROPS the operand/result types: their shapes are the free M/N/K tiling and
+// their encodings are the free warpsPerCTA, while the element dtype is fixed
+// per kernel, so keeping them would only over-split. A genuine K-decomposition
+// (tf32x3 = 3 passes) is recovered from the dot COUNT by the caller, not from
+// the types.
 std::string dotAccumKey(Operation *o) {
   std::string s;
   llvm::raw_string_ostream os(s);
@@ -77,18 +78,19 @@ std::string dotAccumKey(Operation *o) {
 }
 
 bool isMmaLikeName(StringRef n) {
-  // Match the accumulation ops (tt.dot, ttng.warp_group_dot, tcgen05_mma, ...) but NOT
-  // their async completion barriers (ttng.warp_group_dot_wait / *_mma_wait): a wait is
-  // pure synchronization with no numeric effect, and it only appears once the loop is
-  // pipelined (num_stages > 1), so counting it would spuriously split num_stages (free).
+  // Match the accumulation ops (tt.dot, ttng.warp_group_dot, tcgen05_mma, ...)
+  // but NOT their async completion barriers (ttng.warp_group_dot_wait /
+  // *_mma_wait): a wait is pure synchronization with no numeric effect, and it
+  // only appears once the loop is pipelined (num_stages > 1), so counting it
+  // would spuriously split num_stages (free).
   return (n.contains("dot") || n.contains("mma")) && !n.contains("wait");
 }
 
-// True if `o` is nested inside an `scf.for` (the K-loop). A dot in the loop body is
-// the steady-state accumulation; the pipeliner peels copies OUT of the loop as
-// prologue/epilogue (pure scheduling driven by num_stages, same bits), so counting
-// only loop-body dots keeps num_stages free while still seeing an in-loop
-// K-decomposition like tf32x3.
+// True if `o` is nested inside an `scf.for` (the K-loop). A dot in the loop
+// body is the steady-state accumulation; the pipeliner peels copies OUT of the
+// loop as prologue/epilogue (pure scheduling driven by num_stages, same bits),
+// so counting only loop-body dots keeps num_stages free while still seeing an
+// in-loop K-decomposition like tf32x3.
 bool inForLoop(Operation *o) {
   for (Operation *p = o->getParentOp(); p; p = p->getParentOp())
     if (p->getName().getStringRef() == "scf.for")
@@ -136,12 +138,12 @@ llvm::SmallVector<std::string> getReductionOrderSignatures(ModuleOp module) {
 
   // A dot / wgmma accumulation sums over K in a structured `scf.for` with the
   // accumulator as an iter_arg -- the order is sequential and fixed by
-  // construction, so (unlike PTX) no back-edge / reassociation modelling is needed.
-  // Emit one bit-deciding key per accumulation and let the COUNT carry the
-  // K-decomposition multiplicity (tf32x3 = 3 in-loop dots vs tf32 = 1). Count only
-  // loop-body dots -- peeled pipeline copies live outside the loop -- so num_stages
-  // stays free; if a GEMM has no K-loop at all, fall back to every dot so none is
-  // dropped (soundness over tightness).
+  // construction, so (unlike PTX) no back-edge / reassociation modelling is
+  // needed. Emit one bit-deciding key per accumulation and let the COUNT carry
+  // the K-decomposition multiplicity (tf32x3 = 3 in-loop dots vs tf32 = 1).
+  // Count only loop-body dots -- peeled pipeline copies live outside the loop
+  // -- so num_stages stays free; if a GEMM has no K-loop at all, fall back to
+  // every dot so none is dropped (soundness over tightness).
   std::vector<Operation *> loopDots, allDots;
   module.walk([&](Operation *o) {
     if (!isMmaLikeName(o->getName().getStringRef()))
@@ -150,12 +152,14 @@ llvm::SmallVector<std::string> getReductionOrderSignatures(ModuleOp module) {
     if (inForLoop(o))
       loopDots.push_back(o);
   });
-  const std::vector<Operation *> &dotOps = loopDots.empty() ? allDots : loopDots;
+  const std::vector<Operation *> &dotOps =
+      loopDots.empty() ? allDots : loopDots;
   if (!dotOps.empty()) {
     std::vector<std::string> keys;
     for (Operation *o : dotOps)
       keys.push_back(dotAccumKey(o));
-    std::sort(keys.begin(), keys.end()); // order-independent multiset; count matters
+    std::sort(keys.begin(),
+              keys.end()); // order-independent multiset; count matters
     std::string s;
     llvm::raw_string_ostream os(s);
     os << "dot";

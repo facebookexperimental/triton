@@ -1,5 +1,7 @@
 # Standalone OSS stubs for the fbcode leaf deps used by the HSTU cross-attention
 # triton kernels. Lets the kernels run under OSS triton (MetaMain2) without buck.
+import functools
+
 import triton
 import triton.language as tl
 
@@ -41,9 +43,6 @@ def is_sm90_plus(*a, **k):
     return False
 
 
-import functools
-
-
 class _CustomOpStub:
     """Mimics a torch custom op enough for import: callable + register_fake/register_kernel."""
 
@@ -80,6 +79,7 @@ class NamedSpecType:  # noqa
 
 
 class VersionedSpec:  # noqa
+
     def __init__(self, *a, **k):
         pass
 
@@ -88,6 +88,7 @@ def tritoncc_specs(*a, **k):
     # used as a decorator: @tritoncc_specs(...) -> identity decorator
     def deco(fn):
         return fn
+
     return deco
 
 
