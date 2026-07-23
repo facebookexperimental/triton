@@ -61,7 +61,7 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, cast_preserve_layout, require_layout, tcgen05_commit
+from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, release_layout, require_layout, tcgen05_commit
 from .types import (
     async_token,
     buffered_tensor,
@@ -188,7 +188,7 @@ __all__ = [
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",
-    "cast_preserve_layout",
+    "release_layout",
     "require_layout",
     "tcgen05_commit",
     # utility
