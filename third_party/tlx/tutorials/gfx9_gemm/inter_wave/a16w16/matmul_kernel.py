@@ -405,8 +405,8 @@ def a16w16_8wave(
             # remove-layout-conversions / AMD optimize-epilogue so the store stays
             # a wide dwordx4. Fails compilation if a future change drops the pin.
             tlx.assert_same_layout(c_tl, L)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
-                     c_tl, mask=m_top & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], c_tl,
+                     mask=m_top & n_left)
             tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
                      tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
             tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
@@ -414,14 +414,14 @@ def a16w16_8wave(
             tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
                      tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
         else:
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
-                     acc_tl.to(et), mask=m_top & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
-                     acc_bl.to(et), mask=m_bot & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
-                     acc_tr.to(et), mask=m_top & n_right)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
-                     acc_br.to(et), mask=m_bot & n_right)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], acc_tl.to(et),
+                     mask=m_top & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :], acc_bl.to(et),
+                     mask=m_bot & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :], acc_tr.to(et),
+                     mask=m_top & n_right)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :], acc_br.to(et),
+                     mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
@@ -460,9 +460,14 @@ def _reduce_k_kernel(workspace_ptr, c_ptr, M, N, SPLIT_K: tl.constexpr, BLOCK_SI
 
 
 NUM_CU = 256  # gfx950 (CDNA4) compute units
-# Below this many K-tiles per split, the per-split prologue/epilogue overhead
-# starts to dominate (measured: Router SPLIT_K=16 (8 tiles/split) beats 32 (4)).
-MIN_KTILES_PER_SPLIT = 8
+# Minimum K-tiles per split. Two forces set this floor: (1) below it the per-split
+# prologue/epilogue overhead dominates the shrinking K work; (2) more splits means
+# a proportionally larger fp32 workspace for the reduce to stream back (reduce cost
+# ~ SPLIT_K*M*N), so an over-split that only marginally improves the GEMM loses the
+# gain to the reduce. Every measured production optimum uses >= 16 tiles/split
+# (e.g. K=12288 wants SPLIT_K=12 (16 tiles) not 16 (12 tiles); the latter fills the
+# CUs but its extra reduce traffic makes it net slower).
+MIN_KTILES_PER_SPLIT = 16
 
 # Tile candidates, largest first. The big tile is the tuned default; the smaller
 # one is used only when the big tile can't fill the CUs (see choose_tile).
@@ -472,35 +477,38 @@ TILE_CANDIDATES = ((256, 256), (128, 128))
 
 
 def _split_k_for(grid_mn, K):
-    """Largest power-of-two SPLIT_K keeping grid_mn*SK within one CU wave and each
-    split a whole, BLOCK_K-aligned chunk of >= MIN_KTILES_PER_SPLIT tiles."""
+    """Largest SPLIT_K keeping grid_mn*SK within one CU wave and each split a whole,
+    BLOCK_K-aligned chunk of >= MIN_KTILES_PER_SPLIT tiles.
+
+    All divisors of K are considered, not just powers of two: for K with odd factors
+    (e.g. 22272 = 64*348) a non-pow2 SPLIT_K divides K and fills the CUs far more
+    precisely than the nearest pow2 (SPLIT_K=12 -> 192 CUs vs SPLIT_K=4 -> 64 CUs).
+    The scan is <= NUM_CU/grid_mn (~20) iterations, negligible at compile time."""
     min_ks = MIN_KTILES_PER_SPLIT * BLOCK_K
-    # TODO: only powers of two are considered. Optimal for pure-pow2 K (8192, 4096
-    # -- every divisor is pow2); for K with odd factors a non-pow2 SPLIT_K could
-    # divide K and fill more precisely. Generalize to enumerate divisors of K.
-    sk = 1
-    while True:
-        nxt = sk * 2
-        ks = K // nxt
-        if grid_mn * nxt > NUM_CU or K % nxt != 0 or ks < min_ks or ks % BLOCK_K != 0:
-            break
-        sk = nxt
-    return sk
+    best = 1
+    for sk in range(2, NUM_CU // grid_mn + 1):  # grid_mn*sk <= NUM_CU
+        ks = K // sk
+        if K % sk == 0 and ks >= min_ks and ks % BLOCK_K == 0:
+            best = sk  # fill = grid_mn*sk grows with sk, so the last valid sk wins
+    return best
 
 
 def choose_tile(M, N, K):
     """Pick (BLOCK_M, BLOCK_N, SPLIT_K) by CU fill -- no shape hardcoding.
 
-    Prefer the tuned 256x256 tile. Fall back to the smaller 128x128 tile only when
-    the 256 grid cannot fill the CUs even after split-K (thin-N / small-tile-count
-    shapes, e.g. N=256): the 4x-denser MN grid then reaches full occupancy with a
-    smaller SPLIT_K (and a cheaper reduce). For shapes the big tile already fills,
-    the smaller tile only adds overhead, so it is never chosen there."""
+    Prefer the tuned 256x256 tile; it is more MFMA-efficient per work-group than the
+    128x128 tile. Fall back to the smaller tile only when the 256 grid leaves most of
+    the machine idle even after split-K (fill < NUM_CU/2) -- the genuinely thin-N /
+    small-tile-count shapes (e.g. N=256, gmn=8): the 4x-denser MN grid then reaches
+    occupancy the big tile can't. When the big tile fills at least half the CUs, its
+    efficiency beats a full grid of small tiles, so it is kept (comparing raw
+    work-group counts across tile sizes is apples-to-oranges -- a 128 tile does 1/4
+    the work -- so a bigger small-tile count does not mean it is faster)."""
     bm, bn = TILE_CANDIDATES[0]
     gmn = triton.cdiv(M, bm) * triton.cdiv(N, bn)
     sk = _split_k_for(gmn, K)
     best_fill = gmn * sk
-    if best_fill < NUM_CU:  # big tile under-fills even with split-K
+    if best_fill < NUM_CU // 2:  # big tile leaves most CUs idle even with split-K
         for cbm, cbn in TILE_CANDIDATES[1:]:
             g = triton.cdiv(M, cbm) * triton.cdiv(N, cbn)
             s = _split_k_for(g, K)
