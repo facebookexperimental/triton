@@ -1,6 +1,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-taskid-propagate=num-warp-groups=2 | FileCheck %s --check-prefix=TASKID
 // RUN: triton-opt %s -split-input-file --nvgpu-ws-data-partition=num-warp-groups=3 | FileCheck %s --check-prefix=DATAPART
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-code-partition="num-buffers=1" | FileCheck %s --check-prefix=CODEPART
+// RUN: triton-opt %s -split-input-file --nvgpu-ws-data-partition=num-warp-groups=3 --triton-simplify-single-trip-while --nvgpu-partition-scheduling-meta | FileCheck %s --check-prefix=DEFERRED
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
@@ -28,6 +29,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       %use = arith.addi %new_off, %arg0 {async_task_id = array<i32: 1>} : i32
       scf.yield %use, %false : i32, i1
     }
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [2, 2], order = [1, 0]}>
+#blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 256, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // Data partitioning must see the outer while's factor before simplification.
+  // Partition scheduling must then see warp_specialize on the forwarded loop.
+  // DEFERRED-LABEL: @deferred_single_trip_while
+  // DEFERRED-NOT: scf.while
+  // DEFERRED: scf.for
+  // DEFERRED: ttng.warp_group_dot
+  // DEFERRED-SAME: ttg.partition
+  // DEFERRED: ttng.warp_group_dot
+  // DEFERRED-SAME: ttg.partition
+  // DEFERRED: } {tt.data_partition_factor = 2 : i32
+  // DEFERRED-SAME: tt.warp_specialize
+  tt.func public @deferred_single_trip_while(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %out: !tt.ptr<f32>, %k_tiles: index) {
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : i32
+    %c0_idx = arith.constant 0 : index
+    %c1_idx = arith.constant 1 : index
+    scf.while (%valid = %true) : (i1) -> () {
+      scf.condition(%valid)
+    } do {
+      %acc_init = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #mma>
+      %inner = scf.for %ki = %c0_idx to %k_tiles step %c1_idx iter_args(%iter_acc = %acc_init) -> (tensor<128x256xf32, #mma>) {
+        %a_ptrs = tt.splat %arg0 : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+        %a = tt.load %a_ptrs : tensor<128x64x!tt.ptr<f16>, #blocked>
+        %a_alloc = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %b_ptrs = tt.splat %arg1 : !tt.ptr<f16> -> tensor<64x256x!tt.ptr<f16>, #blocked1>
+        %b = tt.load %b_ptrs : tensor<64x256x!tt.ptr<f16>, #blocked1>
+        %b_alloc = ttg.local_alloc %b : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %iter_acc {inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+        scf.yield %dot : tensor<128x256xf32, #mma>
+      }
+      %ptrs = tt.splat %out : !tt.ptr<f32> -> tensor<128x256x!tt.ptr<f32>, #blocked1>
+      %cvt = ttg.convert_layout %inner : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked1>
+      tt.store %ptrs, %cvt : tensor<128x256x!tt.ptr<f32>, #blocked1>
+      scf.yield %false : i1
+    } attributes {tt.warp_specialize, tt.data_partition_factor = 2 : i32}
     tt.return
   }
 }

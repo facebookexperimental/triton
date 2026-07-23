@@ -27,8 +27,10 @@ Two of the four schedules are already covered without touching AutoWS:
 - **Static persistent** — the while is *countable*, so `triton-uplift-while-to-for`
   rewrites it to an `scf.for` (carrying the annotations) before AutoWS runs. It is
   then warp-specialized by the existing `scf.for` path.
-- **Non-persistent** — the while is single-trip and eliminated by
-  `triton-simplify-single-trip-while`; there is no persistent loop to specialize.
+- **Non-persistent** — the while is kept through data partitioning and initial
+  loop scheduling, then `triton-simplify-single-trip-while` forwards AutoWS to
+  the scheduled inner loop and eliminates the single-trip outer loop before
+  partition scheduling.
 
 That leaves the **genuinely non-countable** schedules — **dynamic** (atomic
 work-stealing) and **CLC** (hardware `_valid`) — whose outer loop stays an
