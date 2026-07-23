@@ -12,11 +12,12 @@ import pytest
 from skc_cute import binder_cute, fa4_pin
 
 PKG = Path(__file__).resolve().parent.parent
-FA4_CUTE = Path(os.environ.get("FA4_CUTE", ""))  # flash_attn/cute dir of the pinned FA4 clone
+_FA4_ENV = os.environ.get("FA4_CUTE", "")  # flash_attn/cute dir of the pinned FA4 clone
+FA4_CUTE = Path(_FA4_ENV) if _FA4_ENV else None
 
 
 def _need_fa4():
-    if not str(FA4_CUTE) or not FA4_CUTE.exists():
+    if FA4_CUTE is None or not FA4_CUTE.exists():
         pytest.skip("set FA4_CUTE to the FA4 clone flash_attn/cute dir")
 
 

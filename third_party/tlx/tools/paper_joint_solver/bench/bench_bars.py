@@ -44,7 +44,8 @@ TOOLS_DIR = PKG_DIR.parent  # third_party/tlx/tools/
 REPO_ROOT = TOOLS_DIR.parents[2]
 EXAMPLES = TOOLS_DIR / "sched2tlx" / "examples"
 TUTORIAL_FA = REPO_ROOT / "python" / "tutorials" / "06-fused-attention.py"
-FA4_PYTHON = Path(os.environ.get("FA4_PYTHON", ""))  # FA4 venv python
+_FA4_PY_ENV = os.environ.get("FA4_PYTHON", "")  # FA4 venv python
+FA4_PYTHON = Path(_FA4_PY_ENV) if _FA4_PY_ENV else None
 
 BATCH = 4
 NUM_HEADS = 32
@@ -459,7 +460,7 @@ def make_registry(args):
 
 
 def run_fa4(cfg, mode, args):
-    if not str(FA4_PYTHON) or not FA4_PYTHON.exists():
+    if FA4_PYTHON is None or not FA4_PYTHON.exists():
         return {"ok": False,
                 "reason": "set FA4_PYTHON to the FA4 venv python binary"}
     cmd = [
