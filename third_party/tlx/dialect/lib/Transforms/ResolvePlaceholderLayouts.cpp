@@ -374,6 +374,29 @@ static bool containsUserLayout(Type type) {
   return found;
 }
 
+/// Peel every consecutive register-layout marker at this attribute boundary.
+///
+/// AttrTypeReplacer does not recursively revisit the attribute returned by a
+/// replacement callback.  Returning `wrapper.getLayout()` directly therefore
+/// leaves one marker behind for alternating nests such as
+/// `user_layout<no_verify_layout<L>>`.  This matters for region edges: a loop
+/// init and its block argument can temporarily carry opposite wrapper orders,
+/// and partially unwrapping either side makes the edge ill-typed.
+static Attribute unwrapRegisterLayoutMarkers(Attribute attr) {
+  while (attr) {
+    if (auto user = dyn_cast<UserLayoutAttr>(attr)) {
+      attr = user.getLayout();
+      continue;
+    }
+    if (auto noVerify = dyn_cast<NoVerifyLayoutAttr>(attr)) {
+      attr = noVerify.getLayout();
+      continue;
+    }
+    break;
+  }
+  return attr;
+}
+
 /// Unwrap user-pinned register layouts (#tlx.user_layout on a RankedTensorType)
 /// back to the concrete wrapped layout, and verify none remain. These are kept
 /// wrapped through the layout-optimization passes (they anchor via
@@ -386,12 +409,13 @@ static bool containsUserLayout(Type type) {
 /// leave nested wrappers behind and produce inconsistent op types.
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   mlir::AttrTypeReplacer replacer;
-  replacer.addReplacement(
-      [](UserLayoutAttr wrapper) -> Attribute { return wrapper.getLayout(); });
+  replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
+    return unwrapRegisterLayoutMarkers(wrapper);
+  });
   // Defensively also strip any no-verify wrapper that reached this point (e.g.
   // nested under a user-layout that resolve-placeholder-layouts left in place).
   replacer.addReplacement([](NoVerifyLayoutAttr wrapper) -> Attribute {
-    return wrapper.getLayout();
+    return unwrapRegisterLayoutMarkers(wrapper);
   });
 
   moduleOp->walk([&](Operation *op) {

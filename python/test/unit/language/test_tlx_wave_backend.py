@@ -796,7 +796,7 @@ def test_tlx_perf_sweep_forwards_mxfp_batched_timing_options(tmp_path):
             assert spec.command[spec.command.index(option) + 1] == expected
 
 
-def test_tlx_wave_gfx9_a4w4_scale_loads_keep_gluon_packet_layouts(tmp_path, monkeypatch):
+def test_tlx_wave_gfx9_a4w4_scale_loads_keep_requested_packet_layouts(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     bench = _load_tlx_gfx9_a4w4_bench_module("_tlx_wave_test_gfx9_a4w4_bench_scale_loads")
     cache_dir = tmp_path / "a4w4-scale-load-cache"
@@ -825,8 +825,16 @@ def test_tlx_wave_gfx9_a4w4_scale_loads_keep_gluon_packet_layouts(tmp_path, monk
     )
     assert a_load is not None
     assert b_load is not None
-    assert f"{a_load.group(1)} = #ttg.blocked<{{sizePerThread = [8, 1]" in ttgir
-    assert f"{b_load.group(1)} = #ttg.blocked<{{sizePerThread = [4, 1]" in ttgir
+    assert re.search(
+        rf"{re.escape(a_load.group(1))} = #ttg\.linear<\{{register = "
+        r"\[\[1, 0\], \[2, 0\], \[4, 0\]\],",
+        ttgir,
+    )
+    assert re.search(
+        rf"{re.escape(b_load.group(1))} = #ttg\.linear<\{{register = "
+        r"\[\[1, 0\], \[2, 0\]\],",
+        ttgir,
+    )
 
     global_i8_scalar_load = (r"wave\.gather .* : \(!wave\.ptr<#waveamd\.buffer, i8>.*-> "
                              r"\(!wave\.simd<vector<1xi8>, 64>")
@@ -1082,6 +1090,37 @@ def test_tlx_wave_converter_type_layout_stage_converts_source_snapshot(tmp_path)
     addptr_op = next(op for op in source.ops if op.name == "tt.addptr")
     assert converted.values[addptr_op.results[0]].type.representation == "pointer_tuple"
     assert not hasattr(converted, "target_ops")
+    del ctx
+
+
+def test_tlx_wave_converter_type_layout_unwraps_tlx_layout_markers(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [[1]], lane = [[2], [4], [8], [16], [32], [64]], warp = [], block = []}>
+#user_no_verify = #tlx.user_layout<#tlx.no_verify_layout<#linear>>
+#no_verify_user = #tlx.no_verify_layout<#tlx.user_layout<#linear>>
+"""
+    local_func = """
+  tt.func public @converter_wrapped_layouts() attributes {noinline = false} {
+    %a = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #user_no_verify>
+    %b = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #no_verify_user>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+    source = converter_source_import.import_source_program(mod)
+
+    converted = converter_types.convert_source_program(source)
+
+    ranges = [op for op in source.ops if op.name == "tt.make_range"]
+    assert len(ranges) == 2
+    for range_op in ranges:
+        value = converted.values[range_op.results[0]]
+        layout = converted.layouts[value.layout_map_id]
+        assert layout.kind == "linear"
+        assert layout.properties["register_bases"] == ((1,), )
+        assert layout.properties["lane_bases"] == ((2,), (4,), (8,), (16,), (32,), (64,))
+        assert value.type.representation == "simd_tuple"
+        assert value.type.component_count == 2
     del ctx
 
 

@@ -46,33 +46,23 @@ def _a4w4_kernel(
     BLOCK_K_SCALE: tl.constexpr = BLOCK_K // SCALE_GROUP_SIZE
     HALF_N: tl.constexpr = BLOCK_N // 2
 
-    g_load_layout_a: tl.constexpr = tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0], [128, 0]],
-        lane_bases=[[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]],
-        warp_bases=[[1, 0], [2, 0]],
-        block_bases=[],
-        shape=[BLOCK_M, BLOCK_K_PACKED],
+    g_load_layout_a: tl.constexpr = tlx.layout(
+        shape=((8, 8, 4), (16, 4, 2)),
+        stride=((16, 2048, 128), (1, 512, 16384)),
     )
-    g_load_layout_b: tl.constexpr = tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]],
-        lane_bases=[[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]],
-        warp_bases=[[1, 0], [2, 0]],
-        block_bases=[],
-        shape=[HALF_N, BLOCK_K_PACKED],
+    g_load_layout_b: tl.constexpr = tlx.layout(
+        shape=((8, 8, 4), (16, 4)),
+        stride=((16, 2048, 128), (1, 512)),
     )
-    blocked_scales_a: tl.constexpr = tlx.blocked_layout_encoding.make(
-        [8, 1],
-        [32, 2],
-        [1, 4],
-        [0, 1],
+    scale_load_layout_a: tl.constexpr = tlx.layout(
+        shape=((32, 2, 4), (8,)),
+        stride=((64, 1, 2), (8,)),
     )
-    blocked_scales_b: tl.constexpr = tlx.blocked_layout_encoding.make(
-        [4, 1],
-        [32, 2],
-        [1, 4],
-        [0, 1],
+    scale_load_layout_b: tl.constexpr = tlx.layout(
+        shape=((32, 2, 4), (4,)),
+        stride=((32, 1, 2), (8,)),
     )
-    shared_layout_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_offsets(
+    shared_layout_a: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
             [0, 1],
@@ -91,10 +81,9 @@ def _a4w4_kernel(
             [8, 0],
             [128, 0],
         ],
-        [],
         [BLOCK_M, BLOCK_K_PACKED],
     )
-    shared_layout_b: tl.constexpr = tlx.padded_shared_layout_encoding.with_offsets(
+    shared_layout_b: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
         [[1024, 32]],
         [
             [0, 1],
@@ -112,44 +101,21 @@ def _a4w4_kernel(
             [4, 0],
             [8, 0],
         ],
-        [],
         [HALF_N, BLOCK_K_PACKED],
     )
-    shared_scales: tl.constexpr = tlx.swizzled_shared_layout_encoding.with_order([0, 1])
-    mfma_layout: tl.constexpr = tlx.amd_mfma_layout_encoding.make(
-        version=4,
-        instr_shape=[16, 16, 128],
-        transposed=True,
-        warps_per_cta=[2, 2],
+    shared_scales: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
+    scale_a_layout: tl.constexpr = tlx.layout(
+        shape=((16, 4, 2, 2), (2, 8)),
+        stride=((8, 1, 0, 128), (4, 256)),
     )
-    dot_a_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(0, mfma_layout, 16)
-    dot_b_layout: tl.constexpr = tlx.dot_operand_layout_encoding.make(1, mfma_layout, 16)
-    scale_a_layout: tl.constexpr = tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[[0, 4], [32, 0], [64, 0], [128, 0]],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]],
-        warp_bases=[[0, 0], [16, 0]],
-        block_bases=[],
-        shape=[BLOCK_M, BLOCK_K_SCALE],
+    scale_b_layout: tl.constexpr = tlx.layout(
+        shape=((16, 4, 2, 2), (2, 4)),
+        stride=((8, 1, 128, 0), (4, 256)),
     )
-    scale_b_layout: tl.constexpr = tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[[0, 4], [32, 0], [64, 0]],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]],
-        warp_bases=[[16, 0], [0, 0]],
-        block_bases=[],
-        shape=[HALF_N, BLOCK_K_SCALE],
+    store_layout_c: tl.constexpr = tlx.layout(
+        shape=((64, 4), (8, 16)),
+        stride=((8, 512), (1, 2048)),
     )
-    store_layout_c: tl.constexpr = tlx.blocked_layout_encoding.make(
-        [1, 8],
-        [4, 16],
-        [4, 1],
-        [1, 0],
-    )
-    store_layout_c_m: tl.constexpr = tlx.slice_layout_encoding.make(1, store_layout_c)
-    store_layout_c_n: tl.constexpr = tlx.slice_layout_encoding.make(0, store_layout_c)
-    scale_a_layout_k: tl.constexpr = tlx.slice_layout_encoding.make(0, blocked_scales_a)
-    scale_a_layout_m: tl.constexpr = tlx.slice_layout_encoding.make(1, blocked_scales_a)
-    scale_b_layout_k: tl.constexpr = tlx.slice_layout_encoding.make(0, blocked_scales_b)
-    scale_b_layout_n: tl.constexpr = tlx.slice_layout_encoding.make(1, blocked_scales_b)
 
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -204,68 +170,52 @@ def _a4w4_kernel(
     b_left_offsets_next = tlx.require_layout(b_left_offsets_next, g_load_layout_b)
     b_right_offsets_next = tlx.require_layout(b_right_offsets_next, g_load_layout_b)
 
-    offs_sk_a = tlx.require_layout(tl.arange(0, BLOCK_K_SCALE), scale_a_layout_k)
-    offs_asm = tlx.require_layout(tl.arange(0, BLOCK_M), scale_a_layout_m)
-    offs_asm_base = tlx.require_layout(tl.full((BLOCK_M, ), pid_m * BLOCK_M, tl.int32), scale_a_layout_m)
-    offs_asm = tl.add(offs_asm_base, offs_asm, sanitize_overflow=False)
-    a_scale_m_stride = tlx.require_layout(tl.full((BLOCK_M, 1), stride_asm, tl.int32), blocked_scales_a)
-    a_scale_m_offsets = tl.mul(offs_asm[:, None], a_scale_m_stride, sanitize_overflow=False)
-    a_scale_k_stride = tlx.require_layout(tl.full((1, BLOCK_K_SCALE), stride_ask, tl.int32), blocked_scales_a)
-    a_scale_k_offsets = tl.mul(offs_sk_a[None, :], a_scale_k_stride, sanitize_overflow=False)
+    offs_sk_a = tl.arange(0, BLOCK_K_SCALE)
+    offs_asm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    a_scale_m_offsets = tl.mul(offs_asm[:, None], stride_asm, sanitize_overflow=False)
+    a_scale_k_offsets = tl.mul(offs_sk_a[None, :], stride_ask, sanitize_overflow=False)
     a_scale_offsets = tl.add(a_scale_m_offsets, a_scale_k_offsets, sanitize_overflow=False)
-    a_scale_next_delta = tlx.require_layout(
-        tl.full((BLOCK_M, BLOCK_K_SCALE), BLOCK_K_SCALE * stride_ask, tl.int32),
-        blocked_scales_a,
-    )
-    a_scale_offsets_next = tl.add(a_scale_offsets, a_scale_next_delta, sanitize_overflow=False)
-    offs_sk_b = tlx.require_layout(tl.arange(0, BLOCK_K_SCALE), scale_b_layout_k)
-    offs_bsn = tlx.require_layout(tl.arange(0, HALF_N), scale_b_layout_n)
-    offs_bsn_base = tlx.require_layout(tl.full((HALF_N, ), pid_n * BLOCK_N, tl.int32), scale_b_layout_n)
-    offs_bsn = tl.add(offs_bsn_base, offs_bsn, sanitize_overflow=False)
-    b_scale_n_stride = tlx.require_layout(tl.full((HALF_N, 1), stride_bsn, tl.int32), blocked_scales_b)
-    b_scale_n_offsets = tl.mul(offs_bsn[:, None], b_scale_n_stride, sanitize_overflow=False)
-    b_scale_k_stride = tlx.require_layout(tl.full((1, BLOCK_K_SCALE), stride_bsk, tl.int32), blocked_scales_b)
-    b_scale_k_offsets = tl.mul(offs_sk_b[None, :], b_scale_k_stride, sanitize_overflow=False)
+    a_scale_offsets = tlx.require_layout(a_scale_offsets, scale_load_layout_a)
+    a_scale_offsets_next = tl.add(a_scale_offsets, BLOCK_K_SCALE * stride_ask, sanitize_overflow=False)
+    offs_sk_b = tl.arange(0, BLOCK_K_SCALE)
+    offs_bsn = pid_n * BLOCK_N + tl.arange(0, HALF_N)
+    b_scale_n_offsets = tl.mul(offs_bsn[:, None], stride_bsn, sanitize_overflow=False)
+    b_scale_k_offsets = tl.mul(offs_sk_b[None, :], stride_bsk, sanitize_overflow=False)
     b_scale_left_offsets = tl.add(b_scale_n_offsets, b_scale_k_offsets, sanitize_overflow=False)
+    b_scale_left_offsets = tlx.require_layout(b_scale_left_offsets, scale_load_layout_b)
     b_scale_right_step = tl.mul(stride_bsn, HALF_N, sanitize_overflow=False)
-    b_scale_right_delta = tlx.require_layout(
-        tl.full((HALF_N, BLOCK_K_SCALE), b_scale_right_step, tl.int32),
-        blocked_scales_b,
-    )
-    b_scale_right_offsets = tl.add(b_scale_left_offsets, b_scale_right_delta, sanitize_overflow=False)
-    b_scale_next_delta = tlx.require_layout(
-        tl.full((HALF_N, BLOCK_K_SCALE), BLOCK_K_SCALE * stride_bsk, tl.int32),
-        blocked_scales_b,
-    )
+    b_scale_right_offsets = tl.add(b_scale_left_offsets, b_scale_right_step, sanitize_overflow=False)
+    b_scale_next_delta = BLOCK_K_SCALE * stride_bsk
     b_scale_left_offsets_next = tl.add(b_scale_left_offsets, b_scale_next_delta, sanitize_overflow=False)
     b_scale_right_offsets_next = tl.add(b_scale_right_offsets, b_scale_next_delta, sanitize_overflow=False)
     a_scales_base = a_scales_ptr
     b_scales_base = b_scales_ptr
 
-    acc_left = tlx.require_layout(tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32), mfma_layout)
-    acc_right = tlx.require_layout(tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32), mfma_layout)
+    acc_left = tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32)
+    acc_right = tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32)
 
     iter_max: tl.constexpr = K // BLOCK_K
     tl.assume(iter_max > 3)
 
     tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-    a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), blocked_scales_a)
-    b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets), blocked_scales_b)
+    a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), scale_load_layout_a)
+    b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets), scale_load_layout_b)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
-    b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets), blocked_scales_b)
+    b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets), scale_load_layout_b)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
     tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-    a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), blocked_scales_a)
-    b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next), blocked_scales_b)
+    a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), scale_load_layout_a)
+    b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next), scale_load_layout_b)
     tlx.async_load_commit_group()
 
     tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
-    b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next), blocked_scales_b)
+    b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
+                                         scale_load_layout_b)
     tlx.async_load_commit_group()
 
     a_base += BLOCK_K_PACKED * stride_ak * 2
@@ -274,71 +224,71 @@ def _a4w4_kernel(
     b_scales_base += BLOCK_K_SCALE * stride_bsk * 2
 
     tlx.async_load_wait_group(3)
-    a = tlx.require_layout(tlx.local_load(smem_a[0], relaxed=True), dot_a_layout)
-    b_left = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True), dot_b_layout)
+    a = tlx.local_load(smem_a[0], relaxed=True)
+    b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
     tlx.local_store(smem_as[0], a_sc_buf1)
     tlx.local_store(smem_bs[0], b_sc_left_buf1)
-    a_sc_reg_buf0 = tlx.require_layout(tlx.local_load(smem_as[0]), scale_a_layout)
-    b_sc_left_reg_buf0 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+    a_sc_reg_buf0 = tlx.local_load(smem_as[0], layout=scale_a_layout)
+    b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
 
     for _ in tl.range(0, iter_max - 2, 2, num_stages=1):
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_left = tlx.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
         with tlx.warp_pipeline_stage("mem", priority=1):
             tlx.async_load_wait_group(2)
-            b_right = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True), dot_b_layout)
+            b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
             tlx.local_store(smem_bs[0], b_sc_right_buf1)
-            b_sc_right_reg_buf0 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+            b_sc_right_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
             tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
             tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-            a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), blocked_scales_a)
+            a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), scale_load_layout_a)
             b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets),
-                                                blocked_scales_b)
+                                                scale_load_layout_b)
             tlx.async_load_commit_group()
 
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_right = tlx.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
         with tlx.warp_pipeline_stage("mem", priority=1):
             tlx.async_load_wait_group(2)
-            a_next = tlx.require_layout(tlx.local_load(smem_a[1], relaxed=True), dot_a_layout)
-            b_left = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True), dot_b_layout)
+            a_next = tlx.local_load(smem_a[1], relaxed=True)
+            b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
             tlx.local_store(smem_as[0], a_sc_buf3)
             tlx.local_store(smem_bs[0], b_sc_left_buf3)
-            a_sc_reg_buf2 = tlx.require_layout(tlx.local_load(smem_as[0]), scale_a_layout)
-            b_sc_left_reg_buf2 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+            a_sc_reg_buf2 = tlx.local_load(smem_as[0], layout=scale_a_layout)
+            b_sc_left_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
             tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
             b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets),
-                                                 blocked_scales_b)
+                                                 scale_load_layout_b)
             tlx.async_load_commit_group()
 
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_left = tlx.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
         with tlx.warp_pipeline_stage("mem", priority=1):
             tlx.async_load_wait_group(2)
-            b_right = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True), dot_b_layout)
+            b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
             tlx.local_store(smem_bs[0], b_sc_right_buf3)
-            b_sc_right_reg_buf2 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+            b_sc_right_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
             tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
             tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
             a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next),
-                                           blocked_scales_a)
+                                           scale_load_layout_a)
             b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
-                                                blocked_scales_b)
+                                                scale_load_layout_b)
             tlx.async_load_commit_group()
 
         with tlx.warp_pipeline_stage("mfma", priority=0):
             acc_right = tlx.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
         with tlx.warp_pipeline_stage("mem", priority=1):
             tlx.async_load_wait_group(2)
-            a = tlx.require_layout(tlx.local_load(smem_a[0], relaxed=True), dot_a_layout)
-            b_left = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True), dot_b_layout)
+            a = tlx.local_load(smem_a[0], relaxed=True)
+            b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
             tlx.local_store(smem_as[0], a_sc_buf1)
             tlx.local_store(smem_bs[0], b_sc_left_buf1)
-            a_sc_reg_buf0 = tlx.require_layout(tlx.local_load(smem_as[0]), scale_a_layout)
-            b_sc_left_reg_buf0 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+            a_sc_reg_buf0 = tlx.local_load(smem_as[0], layout=scale_a_layout)
+            b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
             tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
             b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
-                                                 blocked_scales_b)
+                                                 scale_load_layout_b)
             tlx.async_load_commit_group()
 
         a_base += BLOCK_K_PACKED * stride_ak * 2
@@ -348,37 +298,34 @@ def _a4w4_kernel(
 
     acc_left = tlx.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
     tlx.async_load_wait_group(2)
-    b_right = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True), dot_b_layout)
+    b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
     tlx.local_store(smem_bs[0], b_sc_right_buf1)
-    b_sc_right_reg_buf0 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+    b_sc_right_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
 
     acc_right = tlx.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
     tlx.async_load_wait_group(1)
-    a_next = tlx.require_layout(tlx.local_load(smem_a[1], relaxed=True), dot_a_layout)
-    b_left = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True), dot_b_layout)
+    a_next = tlx.local_load(smem_a[1], relaxed=True)
+    b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
     tlx.local_store(smem_as[0], a_sc_buf3)
     tlx.local_store(smem_bs[0], b_sc_left_buf3)
-    a_sc_reg_buf2 = tlx.require_layout(tlx.local_load(smem_as[0]), scale_a_layout)
-    b_sc_left_reg_buf2 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+    a_sc_reg_buf2 = tlx.local_load(smem_as[0], layout=scale_a_layout)
+    b_sc_left_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
 
     acc_left = tlx.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
     tlx.async_load_wait_group(0)
-    b_right = tlx.require_layout(tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True), dot_b_layout)
+    b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
     tlx.local_store(smem_bs[0], b_sc_right_buf3)
-    b_sc_right_reg_buf2 = tlx.require_layout(tlx.local_load(smem_bs[0]), scale_b_layout)
+    b_sc_right_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
 
     offs_cm = tl.arange(0, BLOCK_M)
     offs_cn_left = pid_n * BLOCK_N + tl.arange(0, HALF_N)
-    c_row_offsets = tlx.require_layout(tl.mul(stride_cm, offs_cm, sanitize_overflow=False), store_layout_c_m)
-    c_col_offsets = tlx.require_layout(tl.mul(stride_cn, offs_cn_left, sanitize_overflow=False), store_layout_c_n)
+    c_row_offsets = tl.mul(stride_cm, offs_cm, sanitize_overflow=False)
+    c_col_offsets = tl.mul(stride_cn, offs_cn_left, sanitize_overflow=False)
     c_left_offsets = tl.add(c_row_offsets[:, None], c_col_offsets[None, :], sanitize_overflow=False)
-    c_right_delta = tlx.require_layout(
-        tl.mul(tl.full((BLOCK_M, HALF_N), HALF_N, tl.int32), stride_cn, sanitize_overflow=False),
-        store_layout_c,
-    )
+    c_left_offsets = tlx.require_layout(c_left_offsets, store_layout_c)
+    c_right_delta = tl.mul(HALF_N, stride_cn, sanitize_overflow=False)
     c_right_offsets = tl.add(c_left_offsets, c_right_delta, sanitize_overflow=False)
     c_tile_base = c_ptr + pid_m * BLOCK_M * stride_cm
-    c_left_offsets = tlx.require_layout(c_left_offsets, store_layout_c)
     c_left = tlx.require_layout(tlx.cast_preserve_layout(acc_left, c_ptr.dtype.element_ty), store_layout_c)
     tlx.buffer_store(c_left, c_tile_base, c_left_offsets)
 

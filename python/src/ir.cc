@@ -848,6 +848,28 @@ void init_triton_ir(py::module &&m) {
       .def("id", [](Block &self) { return (uint64_t)&self; });
 
   py::class_<Attribute>(m, "attribute", py::module_local())
+      .def("is_tlx_no_verify_layout",
+           [](Attribute &self) {
+             return isa<::mlir::triton::tlx::NoVerifyLayoutAttr>(self);
+           })
+      .def("get_tlx_no_verify_layout",
+           [](Attribute &self) -> py::object {
+             if (auto wrapper =
+                     dyn_cast<::mlir::triton::tlx::NoVerifyLayoutAttr>(self))
+               return py::cast(wrapper.getLayout());
+             return py::none();
+           })
+      .def("is_tlx_user_layout",
+           [](Attribute &self) {
+             return isa<::mlir::triton::tlx::UserLayoutAttr>(self);
+           })
+      .def("get_tlx_user_layout",
+           [](Attribute &self) -> py::object {
+             if (auto wrapper =
+                     dyn_cast<::mlir::triton::tlx::UserLayoutAttr>(self))
+               return py::cast(wrapper.getLayout());
+             return py::none();
+           })
       .def("is_dot_operand_encoding",
            [](Attribute &self) {
              return isa<ttg::DotOperandEncodingAttr>(self);

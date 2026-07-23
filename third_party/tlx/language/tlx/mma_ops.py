@@ -68,15 +68,27 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
 
 @tl.builtin
 def require_layout(src, layout: tl.constexpr, _semantic=None):
-    """Require an explicit TLX/TritonGPU layout on a tensor or memdesc value."""
+    """Require an explicit TLX/TritonGPU layout on a tensor or memdesc value.
+
+    Shape/stride ``tlx.layout`` values are materialized against the source
+    tensor shape.  The explicit require operation is the conversion boundary;
+    load-time user-layout pinning remains the responsibility of
+    ``tlx.local_load(..., layout=...)``.
+    """
     layout = tl._unwrap_if_constexpr(layout)
     if not isinstance(layout, tlx.layout_encoding):
         raise TypeError(f"`layout` must be a tlx.layout_encoding, got {type(layout).__name__}")
-    handle = _semantic.builder.create_exact_require_layout(src.handle, layout.to_ir(_semantic.builder))
     if isinstance(src, tlx.buffered_tensor):
         if not isinstance(layout, tlx.shared_layout_encoding):
             raise TypeError("buffered tensors require a shared layout encoding")
+        layout_handle = layout.to_ir(_semantic.builder)
+        handle = _semantic.builder.create_exact_require_layout(src.handle, layout_handle)
         return tlx.buffered_tensor(handle, src.dtype, src.shape, src.type.num, src.type.storage, layout)
+    if isinstance(layout, tlx.layout):
+        layout_handle = layout.to_ir(_semantic.builder, src.type.shape, src.type.element_ty)
+    else:
+        layout_handle = layout.to_ir(_semantic.builder)
+    handle = _semantic.builder.create_exact_require_layout(src.handle, layout_handle)
     return tl.tensor(handle, src.type)
 
 

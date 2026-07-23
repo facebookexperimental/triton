@@ -592,6 +592,30 @@ def test_user_register_layout_anchored_on_smem():
     _assert_no_layout_residue(ttgir)
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_user_register_layout_smem_loop_carried_amd():
+    """Alternating user/no-verify wrapper order must fully disappear on both
+    sides of an AMD scf.for edge."""
+
+    @triton.jit
+    def kernel(REG: tl.constexpr, n):
+        initial = tl.zeros((256, 8), tl.int8)
+        buf = tlx.local_alloc((256, 8), tl.int8, tl.constexpr(1))
+        view = tlx.local_view(buf, 0)
+        tlx.local_store(view, initial)
+        value = tlx.local_load(view, layout=REG)
+        for _ in tl.range(0, n, num_stages=1):
+            value += 1
+        tlx.local_store(view, value)
+
+    reg = tlx.layout(
+        shape=((32, 2, 4), (8, )),
+        stride=((64, 1, 2), (8, )),
+    )
+    compiled = kernel.warmup(reg, 4, grid=(1, ), num_warps=4)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+
+
 @pytest.mark.skipif(not is_cuda(), reason="Need CUDA")
 def test_user_padded_shared_layout_survives():
     """The wrapper is general across the shared family, not just swizzled: a
