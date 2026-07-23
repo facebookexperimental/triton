@@ -137,6 +137,9 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+               // Do not require an encoding at builder time: TLX fixup
+               // propagates a preceding require_layout placeholder through
+               // same-shape casts before layout lowering.
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);
