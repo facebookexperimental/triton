@@ -7411,6 +7411,67 @@ def test_tlx_wave_converter_pipeline_carries_async_token_across_dynamic_for(tmp_
     del ctx
 
 
+def test_tlx_wave_converter_loop_dma_group_is_not_an_implicit_ds_dependency(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_loop_dma_group_not_ds_dependency(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: i32) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %warmup0 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %group0 = ttg.async_commit_group tokens %warmup0
+    %warmup1 = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+    %group1 = ttg.async_commit_group tokens %warmup1
+    %ready = ttg.async_wait {num = 1 : i32}
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0_i32 to %arg1 step %c1_i32 iter_args(%acc = %c0_i32) -> (i32)  : i32 {
+      %loaded = ttg.local_load %alloc {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<512xf16, #shared, #smem, mutable> -> tensor<512xf16, #blocked>
+      %body = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %body_group = ttg.async_commit_group tokens %body
+      %next_ready = ttg.async_wait {num = 1 : i32}
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }
+    %final_wait = ttg.async_wait {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (for_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    region = output.target_program.regions[for_op.region_ids[0]]
+    block_arg_domains = [
+        output.target_program.values[target_id].event_domain
+        for target_id in region.block_arg_ids[1:]
+    ]
+    queue_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_DMA_GROUP)
+    ready_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY)
+
+    wave = output.emitted_module.text
+    (loop_match, ) = _scf_for_matches(wave)
+    iter_args = _loop_iter_arg_names(loop_match.group(0))
+    queue_arg = iter_args[queue_index]
+    ready_arg = iter_args[ready_index]
+    loop_body = wave[loop_match.end():]
+    load_line = next(line for line in loop_body.splitlines()
+                     if "wave.gather" in line or "wave.load" in line)
+    load_dependency = re.search(r"after (?P<token>%[\w#]+)", load_line)
+    assert load_dependency is not None
+    load_dependency = load_dependency.group("token")
+    assert _wave_token_depends_on(wave, load_dependency, ready_arg)
+    assert not _wave_token_depends_on(wave, load_dependency, queue_arg)
+    _run_wave_verify(wave)
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_carries_loop_issued_async_token_to_final_wait(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -8080,6 +8141,42 @@ def test_tlx_wave_converter_lowers_memdesc_subslice_as_physical_parent_view(
     del ctx
 
 
+def test_tlx_wave_converter_carries_shared_memdescs_as_structural_offsets(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_loop_carried_memdesc() attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x64xf32, #shared, #smem, mutable>
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c2 = arith.constant 2 : i32
+    %slot0 = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x64xf32, #shared, #smem, mutable> -> !ttg.memdesc<64xf32, #shared, #smem, mutable>
+    %slot1 = ttg.memdesc_index %alloc[%c1] : !ttg.memdesc<2x64xf32, #shared, #smem, mutable> -> !ttg.memdesc<64xf32, #shared, #smem, mutable>
+    %loop:2 = scf.for %i = %c0 to %c2 step %c1 iter_args(%current = %slot0, %next = %slot1) -> (!ttg.memdesc<64xf32, #shared, #smem, mutable>, !ttg.memdesc<64xf32, #shared, #smem, mutable>) : i32 {
+      %loaded = ttg.local_load %current : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> tensor<64xf32, #blocked>
+      scf.yield %next, %current : !ttg.memdesc<64xf32, #shared, #smem, mutable>, !ttg.memdesc<64xf32, #shared, #smem, mutable>
+    }
+    %final = ttg.local_load %loop#0 : !ttg.memdesc<64xf32, #shared, #smem, mutable> -> tensor<64xf32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    (loop_match, ) = _scf_for_matches(wave)
+    loop_header = loop_match.group(0)
+    assert "!wave.ptr<#wave.shared" not in loop_header
+    assert loop_header.count("i32") >= 5
+    assert "wave.gather" in wave or "wave.load" in wave
+    _run_wave_verify(wave)
+    del ctx
+
+
 def test_tlx_wave_converter_applies_memdesc_subslice_to_local_load_store(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -8299,7 +8396,9 @@ def test_tlx_wave_converter_pipeline_lowers_padded_memdesc_index_stride(tmp_path
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     local_alloc_attrs = converter_target_ir.attrs_dict(output.target_program.ops[0])
-    assert local_alloc_attrs["allocation_bytes"] == 67552
+    # Preserve the full physical stride for both indexed slots, including
+    # the otherwise-unused terminal padding of the final slot.
+    assert local_alloc_attrs["allocation_bytes"] == 67584
     assert output.emitted_module.lds_size == 0
     assert "wave.lds_size" not in output.emitted_module.text
     assert "wave.alloc" in output.emitted_module.text
@@ -8343,7 +8442,7 @@ def test_tlx_wave_converter_pipeline_sizes_three_slot_padded_dot_buffers(tmp_pat
     local_alloc_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_alloc"
     ]
-    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [25312, 25312]
+    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [25344, 25344]
     memdesc_index_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
@@ -8380,7 +8479,7 @@ def test_tlx_wave_converter_pipeline_sizes_non_glu_padded_memdesc_slots(tmp_path
     local_alloc_attrs = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_alloc"
     ]
-    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [42208]
+    assert [attrs["allocation_bytes"] for attrs in local_alloc_attrs] == [42240]
     (memdesc_index_attrs, ) = [
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "memdesc_index"
     ]
@@ -8472,6 +8571,79 @@ def test_tlx_wave_converter_pipeline_preserves_pointer_range_through_addptr_dma(
     assert attrs["mode"] == "dma_packet_lds"
     assert attrs["range_bytes"] == 2147483647
     assert "waveamd.make_buffer" in output.emitted_module.text
+    del ctx
+
+
+def test_tlx_wave_converter_carries_packet_dma_pointers_through_loop(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_loop_carried_dma_pointer(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c64_i32 = arith.constant 64 : i32
+    %loop = scf.for %i = %c0_i32 to %c2_i32 step %c1_i32 iter_args(%base_offset = %c64_i32) -> (i32)  : i32 {
+      %next_offset = arith.addi %base_offset, %c64_i32 : i32
+      %base = tt.addptr %arg0, %next_offset : !tt.ptr<f16>, i32
+      %token = amdg.buffer_load_to_local %base[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
+      %group = ttg.async_commit_group tokens %token
+      %wait = ttg.async_wait %group {num = 0 : i32}
+      scf.yield %next_offset : i32
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (dma_op,) = [
+        op for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local"
+    ]
+    dma_attrs = converter_target_ir.attrs_dict(dma_op)
+    assert dma_attrs["mode"] == "dma_packet_lds"
+    assert dma_attrs["source_pointer_mode"] == "direct"
+    pointer_type = output.target_program.values[dma_op.operands[1]].type
+    assert pointer_type.representation == "buffer_pointer"
+    assert pointer_type.component_count == 1
+    assert len([
+        op for op in output.target_program.ops if op.kind == "make_buffer"
+    ]) == 1
+
+    (for_op,) = [
+        op for op in output.target_program.ops if op.kind == "for_loop"
+    ]
+    region = output.target_program.regions[for_op.region_ids[0]]
+    assert any(
+        output.target_program.values[value_id].type.representation
+        == "buffer_pointer"
+        for value_id in for_op.operands[3:]
+    )
+    assert any(
+        output.target_program.values[value_id].type.representation
+        == "buffer_pointer"
+        for value_id in region.block_arg_ids[1:]
+    )
+
+    wave = output.emitted_module.text
+    assert "!wave.simd<!wave.ptr<#waveamd.buffer, f16>, 64>" in wave
+    assert "waveamd.dma_load_lds" in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.reg_after" not in machine
+    _run_wave_compile_kernels(wave)
     del ctx
 
 
@@ -8623,7 +8795,9 @@ def test_tlx_wave_converter_lowers_dynamic_padded_memdesc_index_packet_dma_desti
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (local_alloc_op, ) = [op for op in output.target_program.ops if op.kind == "local_alloc"]
-    assert converter_target_ir.attrs_dict(local_alloc_op)["allocation_bytes"] == 16864
+    # Four indexed slots retain the full 4224-byte physical stride, including
+    # the final slot's terminal padding.
+    assert converter_target_ir.attrs_dict(local_alloc_op)["allocation_bytes"] == 16896
     (memdesc_index_op, ) = [op for op in output.target_program.ops if op.kind == "memdesc_index"]
     memdesc_attrs = converter_target_ir.attrs_dict(memdesc_index_op)
     assert memdesc_attrs["elements_per_slot"] == 2112
@@ -8705,7 +8879,7 @@ def test_tlx_wave_converter_lowers_bit_affine_padded_dot_dma_packet(tmp_path, ):
     assert attrs["destination_component_offsets"] == (0, 1056)
     assert attrs["destination_wave_offset_coefficients_dwords"] == (64, 128, 264)
     local_alloc = next(op for op in output.target_program.ops if op.kind == "local_alloc")
-    assert converter_target_ir.attrs_dict(local_alloc)["allocation_bytes"] == 16864
+    assert converter_target_ir.attrs_dict(local_alloc)["allocation_bytes"] == 16896
     memdesc_index_ops = [op for op in output.target_program.ops if op.kind == "memdesc_index"]
     assert [converter_target_ir.attrs_dict(op)["elements_per_slot"] for op in memdesc_index_ops] == [2112, 2112]
     assert "wave.where" not in output.emitted_module.text

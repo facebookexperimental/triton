@@ -150,6 +150,7 @@ class ConversionInput:
     async_protocol_dependency_value_ids_by_op: dict[int, tuple[int, ...]]
     wait_publication_barrier_by_op: dict[int, int]
     async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
+    direct_dma_pointer_target_ids_by_op: dict[int, int]
     static_memdesc_byte_offsets: dict[int, int]
     layout_address_value_ids: frozenset[int]
 
@@ -188,6 +189,7 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         source_program.ops,
         source_program.kernel.arg_ids,
         memdescs,
+        source_program.regions,
     )
     constant_ints = _constant_ints(source_program)
     memdesc_physical_allocation_bytes = _compute_memdesc_physical_allocation_bytes(
@@ -259,6 +261,7 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         token_program.if_token_carries_by_op,
         async_protocol_dependencies,
         wait_publication_barriers,
+        {},
         {},
         static_memdesc_byte_offsets,
         _layout_address_value_ids(source_program),
@@ -606,6 +609,12 @@ def _convert_source_op(
         return
     if op.name == "tt.broadcast":
         _convert_broadcast(builder, type_layout_program, op)
+        return
+    if op.name == "tt.join":
+        _convert_join(builder, type_layout_program, op)
+        return
+    if op.name == "tt.split":
+        _convert_split(builder, type_layout_program, op)
         return
     if op.name == "arith.cmpi":
         _convert_cmpi(
@@ -1656,6 +1665,92 @@ def _convert_broadcast(builder, type_layout_program, op):
     )
 
 
+def _convert_join(builder, type_layout_program, op):
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_STRUCTURAL_JOIN",
+            STAGE,
+            "tt.join requires two operands and one result",
+            source_op_index=op.index,
+        )
+    operands = tuple(
+        type_layout_program.values[value_id] for value_id in op.operands
+    )
+    result = type_layout_program.values[op.results[0]]
+    operand_layouts = tuple(
+        _require_layout(type_layout_program, operand.layout_map_id, op)
+        for operand in operands
+    )
+    result_layout = _require_layout(
+        type_layout_program,
+        result.layout_map_id,
+        op,
+    )
+    attrs = layout_remap.structural_join_plan(
+        operands,
+        result,
+        operand_layouts,
+        result_layout,
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "component_join",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs=attrs,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_split(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 2:
+        fail(
+            "TLXW_OP_STRUCTURAL_SPLIT",
+            STAGE,
+            "tt.split requires one operand and two results",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    results = tuple(
+        type_layout_program.values[value_id] for value_id in op.results
+    )
+    operand_layout = _require_layout(
+        type_layout_program,
+        operand.layout_map_id,
+        op,
+    )
+    result_layouts = tuple(
+        _require_layout(type_layout_program, result.layout_map_id, op)
+        for result in results
+    )
+    attrs = layout_remap.structural_split_plan(
+        operand,
+        results,
+        operand_layout,
+        result_layouts,
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "component_split",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs=attrs,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
 def _broadcast_register_payload_remap(type_layout_program, op):
     operand = type_layout_program.values[op.operands[0]]
     result = type_layout_program.values[op.results[0]]
@@ -2304,6 +2399,344 @@ def _if_token_carry_type_source_value_id(carry):
     raise AssertionError("if token carry requires a token from at least one branch")
 
 
+@dataclass(frozen=True)
+class _LoopDMAPointerRecurrenceSpec:
+    dma_op_index: int
+    base_source_value_id: int
+    init_offset_source_value_id: int
+    stride_source_value_id: int
+
+
+@dataclass(frozen=True)
+class _LoopDMAPointerCarry:
+    dma_op_index: int
+    init_target_id: int
+    block_arg_target_id: int
+    result_target_id: int
+    current_target_id: int
+    stride_target_id: int
+
+
+def _loop_dma_pointer_recurrence_specs(
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    """Find uniform pointer recurrences feeding loop-local async DMAs.
+
+    Triton canonicalizes a carried scalar pointer into an invariant pointer
+    plus a carried integer offset.  Retain that structural relation here so
+    the target program can carry the final buffer pointers instead of asking
+    Wave to rediscover them after DMA lowering.
+    """
+    source_region = conversion_input.regions[int(op.region_ids[0])]
+    yielded_source_values = _region_yield_value_ids(
+        conversion_input,
+        source_region.region_id,
+    )
+    if len(yielded_source_values) != len(op.results):
+        return ()
+
+    producer_by_result = _producer_by_result(conversion_input)
+    region_op_indices = tuple(int(index) for index in source_region.op_indices)
+    region_ops = tuple(conversion_input.ops[index] for index in region_op_indices)
+    block_arg_ids = frozenset(int(value_id) for value_id in source_region.block_arg_ids)
+
+    def is_loop_invariant(source_value_id):
+        source_value_id = int(source_value_id)
+        if source_value_id in block_arg_ids:
+            return False
+        producer = producer_by_result.get(source_value_id)
+        if producer is None:
+            return True
+        return _op_anchor_in_region(
+            conversion_input,
+            producer.index,
+            source_region.region_id,
+        ) is None
+
+    specs = []
+    seen_dma_ops = set()
+    for carry_index, (init_source_value_id, block_arg_source_value_id,
+                      yield_source_value_id) in enumerate(zip(
+                          op.operands[3:],
+                          source_region.block_arg_ids[1:],
+                          yielded_source_values,
+                      )):
+        block_arg_type = type_layout_program.values[
+            int(block_arg_source_value_id)
+        ].type
+        if (
+            block_arg_type.representation != "scalar"
+            or block_arg_type.element_type not in {"i32", "index"}
+        ):
+            continue
+        recurrence = producer_by_result.get(int(yield_source_value_id))
+        if (
+            recurrence is None
+            or recurrence.name != "arith.addi"
+            or recurrence.parent_region_id != source_region.region_id
+            or len(recurrence.operands) != 2
+        ):
+            continue
+        if int(recurrence.operands[0]) == int(block_arg_source_value_id):
+            stride_source_value_id = int(recurrence.operands[1])
+        elif int(recurrence.operands[1]) == int(block_arg_source_value_id):
+            stride_source_value_id = int(recurrence.operands[0])
+        else:
+            continue
+        if not is_loop_invariant(stride_source_value_id):
+            continue
+
+        for addptr in region_ops:
+            if (
+                addptr.name != "tt.addptr"
+                or len(addptr.operands) != 2
+                or len(addptr.results) != 1
+                or int(addptr.operands[1]) != int(yield_source_value_id)
+                or not is_loop_invariant(addptr.operands[0])
+            ):
+                continue
+            base_type = type_layout_program.values[int(addptr.operands[0])].type
+            if base_type.representation != "uniform_pointer":
+                continue
+            pointer_source_value_id = int(addptr.results[0])
+            for dma_op in region_ops:
+                if (
+                    dma_op.name != "amdg.buffer_load_to_local"
+                    or dma_op.index in seen_dma_ops
+                ):
+                    continue
+                fields = _buffer_load_to_local_fields(dma_op)
+                if (
+                    int(fields["base_value_id"]) != pointer_source_value_id
+                    or fields["mask_value_id"] is not None
+                    or fields["other_value_id"] is not None
+                    or fields["stride_value_id"] is not None
+                    or not is_loop_invariant(fields["offset_value_id"])
+                ):
+                    continue
+                specs.append(_LoopDMAPointerRecurrenceSpec(
+                    int(dma_op.index),
+                    int(addptr.operands[0]),
+                    int(init_source_value_id),
+                    int(stride_source_value_id),
+                ))
+                seen_dma_ops.add(int(dma_op.index))
+    return tuple(specs)
+
+
+def _declare_loop_dma_pointer_carries(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    loop_op,
+    specs,
+):
+    """Materialize packet DMA pointer state outside a loop.
+
+    Each logical target value may contain several SIMD pointer components;
+    structured loop emission flattens those components into ordinary Wave
+    iter_args.  Buffer resources and scalar recurrence bases are shared when
+    several DMA requests use the same source pointer.
+    """
+    buffer_targets = {}
+    scalar_base_targets = {}
+    carries = []
+    for spec in specs:
+        dma_op = conversion_input.ops[int(spec.dma_op_index)]
+        fields = _buffer_load_to_local_fields(dma_op)
+        memdesc = _memdesc_info(
+            conversion_input,
+            fields["memdesc_value_id"],
+            dma_op,
+        )
+        if memdesc.element_byte_width is None:
+            continue
+        offset_type = type_layout_program.values[
+            int(fields["offset_value_id"])
+        ].type
+        if offset_type.representation not in {"simd", "simd_tuple"}:
+            continue
+        lane_width = int(
+            offset_type.lane_width or conversion_input.threads_per_warp
+        )
+        packet_plan = _buffer_load_to_local_packet_plan(
+            conversion_input,
+            type_layout_program,
+            fact_program,
+            fields["memdesc_value_id"],
+            fields["offset_value_id"],
+            memdesc,
+            lane_width,
+            dma_op,
+        )
+        if packet_plan is None:
+            continue
+        scalar_component_sources = (
+            _buffer_load_to_local_packet_scalar_component_sources(
+                conversion_input,
+                type_layout_program,
+                packet_plan,
+                packet_plan["scalar_value_ids"],
+                tuple(int(dim) for dim in memdesc.shape),
+                lane_width,
+                dma_op,
+            )
+        )
+        if scalar_component_sources is None:
+            continue
+
+        range_fact = _pointer_byte_range_fact(
+            fact_program,
+            fields["base_value_id"],
+            dma_op,
+        )
+        source_offset_upper = _buffer_source_offset_upper(
+            range_fact.upper,
+            packet_plan["packet_bytes"],
+            memdesc.element_byte_width,
+            dma_op,
+        )
+        source_offset_no_signed_wrap = (
+            _affine_source_offset_no_signed_wrap(
+                conversion_input,
+                fact_program,
+                packet_plan["source_affine"],
+                dma_op,
+                source_offset_upper,
+            )
+        )
+        runtime_offset_target_id = _materialize_packet_affine_edge(
+            builder,
+            type_layout_program,
+            int(fields["offset_value_id"]),
+            packet_plan,
+            scalar_component_sources,
+            dma_op,
+            no_signed_wrap=bool(source_offset_no_signed_wrap),
+            offset_range=(0, int(source_offset_upper)),
+        )
+
+        base_target_id = _single_source_target(
+            builder,
+            spec.base_source_value_id,
+            dma_op,
+        )
+        init_offset_target_id = _single_source_target(
+            builder,
+            spec.init_offset_source_value_id,
+            loop_op,
+        )
+        stride_target_id = _single_source_target(
+            builder,
+            spec.stride_source_value_id,
+            loop_op,
+        )
+        buffer_key = (
+            int(base_target_id),
+            int(range_fact.upper),
+            str(memdesc.element_type),
+        )
+        buffer_target_id = buffer_targets.get(buffer_key)
+        if buffer_target_id is None:
+            buffer_target_id = builder.add_value(
+                target_ir.TargetType(
+                    "pointer",
+                    "uniform_buffer_pointer",
+                    memdesc.element_type,
+                    lane_width,
+                ),
+                debug_name=(
+                    f"loop_dma_buffer_{loop_op.index}_{len(buffer_targets)}"
+                ),
+            )
+            builder.add_op(
+                "make_buffer",
+                operands=(base_target_id,),
+                results=(buffer_target_id,),
+                attrs={
+                    "element_type": str(memdesc.element_type),
+                    "range_bytes": int(range_fact.upper),
+                },
+                source_op_index=dma_op.index,
+            )
+            buffer_targets[buffer_key] = int(buffer_target_id)
+
+        scalar_base_key = (
+            int(buffer_target_id),
+            int(init_offset_target_id),
+        )
+        scalar_base_target_id = scalar_base_targets.get(scalar_base_key)
+        if scalar_base_target_id is None:
+            scalar_base_target_id = builder.add_value(
+                target_ir.TargetType(
+                    "pointer",
+                    "uniform_buffer_pointer",
+                    memdesc.element_type,
+                    lane_width,
+                ),
+                debug_name=(
+                    f"loop_dma_scalar_base_{loop_op.index}_"
+                    f"{len(scalar_base_targets)}"
+                ),
+            )
+            builder.add_op(
+                "addptr",
+                operands=(buffer_target_id, init_offset_target_id),
+                results=(scalar_base_target_id,),
+                source_op_index=dma_op.index,
+            )
+            scalar_base_targets[scalar_base_key] = int(
+                scalar_base_target_id
+            )
+
+        component_count = int(packet_plan["component_count"])
+        pointer_type = target_ir.TargetType(
+            "tensor",
+            (
+                "buffer_pointer"
+                if component_count == 1
+                else "buffer_pointer_tuple"
+            ),
+            memdesc.element_type,
+            lane_width,
+            component_count,
+        )
+        init_target_id = builder.add_value(
+            pointer_type,
+            debug_name=f"loop_dma_pointer_init_{dma_op.index}",
+        )
+        builder.add_op(
+            "addptr",
+            operands=(scalar_base_target_id, runtime_offset_target_id),
+            results=(init_target_id,),
+            source_op_index=dma_op.index,
+        )
+        block_arg_target_id = builder.add_value(
+            pointer_type,
+            debug_name=f"loop_dma_pointer_arg_{dma_op.index}",
+        )
+        result_target_id = builder.add_value(
+            pointer_type,
+            debug_name=f"loop_dma_pointer_result_{dma_op.index}",
+        )
+        current_target_id = builder.add_value(
+            pointer_type,
+            debug_name=f"loop_dma_pointer_current_{dma_op.index}",
+        )
+        carries.append(_LoopDMAPointerCarry(
+            int(dma_op.index),
+            int(init_target_id),
+            int(block_arg_target_id),
+            int(result_target_id),
+            int(current_target_id),
+            int(stride_target_id),
+        ))
+    return tuple(carries)
+
+
 def _convert_for(
     builder,
     conversion_input,
@@ -2345,6 +2778,11 @@ def _convert_for(
                                        for op_index in source_region.op_indices)
     explicit_warp_pipeline_protocol = ("rocdl.sched.barrier" in source_region_op_names
                                        and "rocdl.s.setprio" in source_region_op_names)
+    dma_pointer_recurrence_specs = _loop_dma_pointer_recurrence_specs(
+        conversion_input,
+        type_layout_program,
+        op,
+    )
 
     token_carries = conversion_input.loop_token_carries_by_op.get(op.index, ())
     outer_protocol_state = builder.snapshot_protocol_state()
@@ -2374,10 +2812,19 @@ def _convert_for(
             _yield_key,
             init_target_ids,
         ) in enumerate(protocol_carry_specs))
+    dma_pointer_carries = _declare_loop_dma_pointer_carries(
+        builder,
+        conversion_input,
+        type_layout_program,
+        fact_program,
+        op,
+        dma_pointer_recurrence_specs,
+    )
     loop_operands = (
         *source_loop_operands,
         *token_init_target_ids,
         *protocol_init_target_ids,
+        *(carry.init_target_id for carry in dma_pointer_carries),
     )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -2406,6 +2853,7 @@ def _convert_for(
         *result_target_ids,
         *token_result_target_ids,
         *protocol_result_target_ids,
+        *(carry.result_target_id for carry in dma_pointer_carries),
     )
     block_arg_target_ids = tuple(
         builder.add_value(
@@ -2435,6 +2883,7 @@ def _convert_for(
         *block_arg_target_ids,
         *token_block_arg_target_ids,
         *protocol_block_arg_target_ids,
+        *(carry.block_arg_target_id for carry in dma_pointer_carries),
     )
     target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
     token_issue_dependency_pairs = _loop_token_carry_issue_dependencies(
@@ -2450,6 +2899,13 @@ def _convert_for(
         async_issue_dependency_target_ids_by_op={
             **conversion_input.async_issue_dependency_target_ids_by_op,
             **issue_dependencies,
+        },
+        direct_dma_pointer_target_ids_by_op={
+            **conversion_input.direct_dma_pointer_target_ids_by_op,
+            **{
+                carry.dma_op_index: carry.current_target_id
+                for carry in dma_pointer_carries
+            },
         },
     )
     saved_token_targets = _replace_source_targets(
@@ -2483,6 +2939,16 @@ def _convert_for(
                 builder.protocol_frontiers.pop(int(key), None)
     with builder.insertion_region(target_region_id):
         try:
+            for carry in dma_pointer_carries:
+                builder.add_op(
+                    "addptr",
+                    operands=(
+                        carry.block_arg_target_id,
+                        carry.stride_target_id,
+                    ),
+                    results=(carry.current_target_id,),
+                    source_op_index=carry.dma_op_index,
+                )
             yielded_source_values = _convert_region(
                 builder,
                 body_conversion_input,
@@ -2536,6 +3002,7 @@ def _convert_for(
             *yielded_target_ids,
             *yielded_token_target_ids,
             *yielded_protocol_target_ids,
+            *(carry.current_target_id for carry in dma_pointer_carries),
         ),
     )
     builder.add_op(
@@ -2543,7 +3010,8 @@ def _convert_for(
         operands=loop_operands,
         results=result_target_ids,
         attrs={
-            "init_arg_count": (data_init_arg_count + len(token_carries) + len(protocol_carry_specs)),
+            "init_arg_count": (data_init_arg_count + len(token_carries) + len(protocol_carry_specs)
+                               + len(dma_pointer_carries)),
             "protocol_frontier_init_arg_indices":
             tuple(data_init_arg_count + len(token_carries) + index for index in range(len(protocol_carry_specs))),
             "protocol_frontier_key_mappings":
@@ -3172,16 +3640,40 @@ def _convert_buffer_load_to_local(
             op,
             source_offset_upper,
         )
-        runtime_offset_target_id = _materialize_packet_affine_edge(
-            builder,
-            type_layout_program,
-            int(fields["offset_value_id"]),
-            packet_plan,
-            scalar_component_sources,
-            op,
-            no_signed_wrap=bool(source_offset_no_signed_wrap),
-            offset_range=(0, int(source_offset_upper)),
+        direct_pointer_target_id = (
+            conversion_input.direct_dma_pointer_target_ids_by_op.get(
+                int(op.index)
+            )
         )
+        if direct_pointer_target_id is None:
+            runtime_offset_target_id = _materialize_packet_affine_edge(
+                builder,
+                type_layout_program,
+                int(fields["offset_value_id"]),
+                packet_plan,
+                scalar_component_sources,
+                op,
+                no_signed_wrap=bool(source_offset_no_signed_wrap),
+                offset_range=(0, int(source_offset_upper)),
+            )
+        else:
+            direct_pointer_type = builder.values[
+                int(direct_pointer_target_id)
+            ].type
+            if (
+                direct_pointer_type.representation
+                not in {"buffer_pointer", "buffer_pointer_tuple"}
+                or direct_pointer_type.element_type != memdesc.element_type
+                or int(direct_pointer_type.component_count)
+                != int(packet_plan["component_count"])
+            ):
+                fail(
+                    "TLXW_OP_DMA_POINTER_RECURRENCE",
+                    STAGE,
+                    "loop DMA pointer carry does not match the packet plan",
+                    source_op_index=op.index,
+                    target_value_id=int(direct_pointer_target_id),
+                )
         runtime_mask_target_id = None
         if has_mask:
             runtime_mask_target_id = _component_remap_edge(
@@ -3194,11 +3686,11 @@ def _convert_buffer_load_to_local(
                 mask_source_indices,
                 op,
             )
-        packet_operands = [
-            destination_target_id,
-            base_target_id,
-            runtime_offset_target_id,
-        ]
+        packet_operands = [destination_target_id]
+        if direct_pointer_target_id is None:
+            packet_operands.extend((base_target_id, runtime_offset_target_id))
+        else:
+            packet_operands.append(int(direct_pointer_target_id))
         if runtime_mask_target_id is not None:
             packet_operands.append(runtime_mask_target_id)
         packet_operands.extend(issue_dependency_target_ids)
@@ -3250,6 +3742,15 @@ def _convert_buffer_load_to_local(
                 len(issue_dependency_target_ids),
                 "source_issue_dependency_count":
                 len(source_issue_dependency_target_ids),
+                "source_pointer_mode": (
+                    "base_offset"
+                    if direct_pointer_target_id is None
+                    else "direct"
+                ),
+                **({
+                    target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR:
+                    (int(base_target_id), ),
+                } if direct_pointer_target_id is not None else {}),
             },
             fact_ids=(range_fact.fact_id, ),
             fact_target_ids=(base_target_id, ),
@@ -6124,6 +6625,8 @@ _SPECIALIZED_SOURCE_OPS = frozenset({
     "scf.if",
     "tt.broadcast",
     "tt.expand_dims",
+    "tt.join",
+    "tt.split",
     "tt.reshape",
     "tt.trans",
     "tt.make_range",
@@ -6492,8 +6995,15 @@ def _memdesc_infos(source_program):
     return result
 
 
-def _compute_memdesc_view_infos(source_values, ops, kernel_arg_ids, memdescs):
+def _compute_memdesc_view_infos(
+    source_values,
+    ops,
+    kernel_arg_ids,
+    memdescs,
+    regions=(),
+):
     result = {}
+    for_yield_edges = {}
 
     def base_view(value_id):
         memdesc = _memdesc_info_from_table(memdescs, value_id, None)
@@ -6504,13 +7014,159 @@ def _compute_memdesc_view_infos(source_values, ops, kernel_arg_ids, memdescs):
             physical_shape,
         )
 
+    def copy_view(value_id, view):
+        if view is None:
+            return None
+        return MemdescViewInfo(
+            int(value_id),
+            tuple(int(origin) for origin in view.logical_origin),
+            tuple(int(dim) for dim in view.physical_shape),
+        )
+
+    def same_view_geometry(lhs, rhs):
+        return (lhs is not None and rhs is not None
+                and lhs.logical_origin == rhs.logical_origin
+                and lhs.physical_shape == rhs.physical_shape)
+
+    def require_same_memdesc_type(lhs_id, rhs_id, op, description):
+        lhs = source_values[int(lhs_id)].type
+        rhs = source_values[int(rhs_id)].type
+        fields = (
+            "element_type",
+            "element_byte_width",
+            "shape",
+            "alloc_shape",
+            "encoding",
+            "memory_space",
+            "mutable",
+        )
+        mismatches = tuple(
+            field for field in fields
+            if getattr(lhs, field) != getattr(rhs, field)
+        )
+        if mismatches:
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                f"{description} must preserve the memdesc type; "
+                f"mismatched_fields={mismatches!r}",
+                source_op_index=op.index,
+                source_value_id=rhs_id,
+            )
+
+    def for_region_and_yield(op):
+        if len(op.region_ids) != 1 or not regions:
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                "memdesc scf.for carry requires one structurally available body region",
+                source_op_index=op.index,
+            )
+        region = regions[int(op.region_ids[0])]
+        if (len(op.operands) < 3
+                or len(op.results) != len(op.operands) - 3
+                or len(region.block_arg_ids) != 1 + len(op.results)):
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                "memdesc scf.for carry has inconsistent iter-arg structure",
+                source_op_index=op.index,
+            )
+        yield_op = None
+        for op_index in reversed(region.op_indices):
+            candidate = ops[int(op_index)]
+            if candidate.name == "scf.yield":
+                yield_op = candidate
+                break
+        if yield_op is None or len(yield_op.operands) != len(op.results):
+            fail(
+                "TLXW_OP_MEMDESC_FOR_CARRY",
+                STAGE,
+                "memdesc scf.for carry requires a matching structural yield",
+                source_op_index=op.index,
+            )
+        return region, yield_op
+
     for value_id in kernel_arg_ids:
         if value_id in memdescs:
             result[int(value_id)] = base_view(value_id)
 
     for op in ops:
+        # Validate a loop's provisional result geometry at its backedge before
+        # any operation following the loop consumes that result.  The parent
+        # scf.for precedes its body in source order, so its block arguments can
+        # be seeded from the initial iter-args while body view operations are
+        # analyzed normally.
+        for edge in for_yield_edges.get(int(op.index), ()):
+            init_id, block_arg_id, yielded_id, result_id, for_op = edge
+            init_view = result.get(int(init_id))
+            yielded_view = result.get(int(yielded_id))
+            if init_view is None or yielded_view is None:
+                result[int(result_id)] = None
+                continue
+            if not same_view_geometry(init_view, yielded_view):
+                fail(
+                    "TLXW_OP_MEMDESC_FOR_CARRY",
+                    STAGE,
+                    "scf.for memdesc iter-arg view geometry must be loop invariant",
+                    source_op_index=for_op.index,
+                    source_value_id=yielded_id,
+                )
+            result[int(block_arg_id)] = copy_view(block_arg_id, init_view)
+            result[int(result_id)] = copy_view(result_id, init_view)
+
         memdesc_results = tuple(result_id for result_id in op.results if result_id in memdescs)
         if not memdesc_results:
+            continue
+        if op.name == "scf.for":
+            region, yield_op = for_region_and_yield(op)
+            edges = []
+            for index, result_id in enumerate(op.results):
+                if result_id not in memdescs:
+                    continue
+                init_id = int(op.operands[3 + index])
+                block_arg_id = int(region.block_arg_ids[1 + index])
+                yielded_id = int(yield_op.operands[index])
+                if (init_id not in memdescs
+                        or block_arg_id not in memdescs
+                        or yielded_id not in memdescs):
+                    fail(
+                        "TLXW_OP_MEMDESC_FOR_CARRY",
+                        STAGE,
+                        "scf.for memdesc result must have memdesc init, block, and yield values",
+                        source_op_index=op.index,
+                        source_value_id=result_id,
+                    )
+                require_same_memdesc_type(
+                    init_id,
+                    block_arg_id,
+                    op,
+                    "scf.for memdesc init and block argument",
+                )
+                require_same_memdesc_type(
+                    init_id,
+                    yielded_id,
+                    op,
+                    "scf.for memdesc init and yielded value",
+                )
+                require_same_memdesc_type(
+                    init_id,
+                    result_id,
+                    op,
+                    "scf.for memdesc init and result",
+                )
+                init_view = result.get(init_id)
+                result[block_arg_id] = copy_view(block_arg_id, init_view)
+                result[int(result_id)] = copy_view(result_id, init_view)
+                edges.append((
+                    init_id,
+                    block_arg_id,
+                    yielded_id,
+                    int(result_id),
+                    op,
+                ))
+            if edges:
+                for_yield_edges.setdefault(int(yield_op.index), []).extend(edges)
             continue
         if op.name in {"ttg.local_alloc", "ttg.memdesc_index"}:
             for result_id in memdesc_results:
@@ -7024,7 +7680,25 @@ def _indexed_memdesc_parent_allocation_bytes(
         child_op, child_memdesc = first_child
         slot_offsets = _memdesc_index_parent_slot_offsets(parent_memdesc, child_memdesc, parent_layout, child_op)
         if slot_offsets is not None and len(slot_offsets) == int(slot_count):
-            return _align_to(max(int(offset) + int(child_slot_bytes) for offset in slot_offsets), 16)
+            # An indexed parent is an array of equally strided physical
+            # slots.  Preserve that extent for the final slot as well.  A
+            # padded child may not need its trailing padding in isolation,
+            # but dropping it from the parent makes the last slot shorter
+            # than every preceding slot and hides the actual allocation
+            # extent from downstream pointer-range analysis.
+            terminal_slot_bytes = int(child_slot_bytes)
+            if child_slot_stride_bytes is not None:
+                terminal_slot_bytes = max(
+                    terminal_slot_bytes,
+                    int(child_slot_stride_bytes),
+                )
+            return _align_to(
+                max(
+                    int(offset) + terminal_slot_bytes
+                    for offset in slot_offsets
+                ),
+                16,
+            )
     if child_slot_stride_bytes is not None:
         return _align_to((max(1, int(slot_count)) - 1) * int(child_slot_stride_bytes) + int(child_slot_bytes), 16)
     return _align_to(slot_count * int(child_slot_bytes), 16)
