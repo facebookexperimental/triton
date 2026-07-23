@@ -81,8 +81,7 @@ def generate_mxfp4_inputs(M, N, K, seed=42):
 
     k_scales = K // SCALE_GROUP_SIZE
     m_pad = triton.cdiv(M, BLOCK_M) * BLOCK_M
-    a_scales = torch.randint(124, 128, (k_scales, m_pad), dtype=torch.uint8, device=device,
-                             generator=generator).T[:M]
+    a_scales = torch.randint(124, 128, (k_scales, m_pad), dtype=torch.uint8, device=device, generator=generator).T[:M]
     b_scales = torch.randint(124, 128, (k_scales, N), dtype=torch.uint8, device=device, generator=generator).T
     return a, b, a_scales, b_scales
 

@@ -140,8 +140,7 @@ class swizzled_layout:
         self.base = int(tl._unwrap_if_constexpr(base))  # M
         self.shift = int(tl._unwrap_if_constexpr(shift))  # S
         order = tl._unwrap_if_constexpr(order)
-        self.order = ([int(tl._unwrap_if_constexpr(dim)) for dim in order]
-                      if order is not None else None)
+        self.order = ([int(tl._unwrap_if_constexpr(dim)) for dim in order] if order is not None else None)
 
     @classmethod
     def make_default(cls, rank):
