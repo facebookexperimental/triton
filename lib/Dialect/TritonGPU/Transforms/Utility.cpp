@@ -944,13 +944,10 @@ getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value) {
   while (auto arg = dyn_cast<BlockArgument>(value)) {
     if (arg.getOwner() != body || arg == inductionVar)
       return {nullptr, 0};
-    unsigned slot = arg.getArgNumber();
-    if (isa<scf::ForOp>(loop.getOperation())) {
-      assert(slot > 0 && "expected a carried argument, not the induction var");
-      --slot;
-    }
     ++distance;
-    value = getLoopYieldedValues(loop)[slot];
+    value = getLoopCarriedYieldedValue(loop, arg);
+    if (!value)
+      return {nullptr, 0};
     if (!seen.insert(value).second)
       return {nullptr, 0};
   }
@@ -960,15 +957,34 @@ getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value) {
 BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k) {
   if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
     return forOp.getRegionIterArg(k);
-  if (isa<scf::WhileOp>(loop.getOperation())) {
-    BlockArgument afterArg = getLoopCarriedSlot(loop, k).afterArg;
-    assert(afterArg && "scf.while must identity-forward every carried value");
-    return afterArg;
-  }
+  if (isa<scf::WhileOp>(loop.getOperation()))
+    return getLoopCarriedSlot(loop, k).afterArg;
   llvm_unreachable("unsupported loop type");
 }
 
-bool hasIdentityLoopCarry(LoopLikeOpInterface loop) {
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop,
+                                 BlockArgument bodyArg) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation())) {
+    if (bodyArg.getOwner() != forOp.getBody() ||
+        bodyArg == forOp.getInductionVar())
+      return {};
+    return getLoopYieldedValues(loop)[bodyArg.getArgNumber() - 1];
+  }
+
+  auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation());
+  if (!whileOp || bodyArg.getOwner() != whileOp.getAfterBody())
+    return {};
+  unsigned forwardedIdx = bodyArg.getArgNumber();
+  auto forwarded = whileOp.getConditionOp().getArgs();
+  if (forwardedIdx >= forwarded.size())
+    return {};
+  auto beforeArg = dyn_cast<BlockArgument>(forwarded[forwardedIdx]);
+  if (!beforeArg || beforeArg.getOwner() != whileOp.getBeforeBody())
+    return {};
+  return getLoopYieldedValues(loop)[beforeArg.getArgNumber()];
+}
+
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop) {
   if (isa<scf::ForOp>(loop.getOperation()))
     return true;
   auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation());
@@ -977,13 +993,23 @@ bool hasIdentityLoopCarry(LoopLikeOpInterface loop) {
 
   auto beforeArgs = loop.getRegionIterArgs();
   auto forwarded = whileOp.getConditionOp().getArgs();
-  if (forwarded.size() != beforeArgs.size() ||
-      whileOp.getAfterArguments().size() != beforeArgs.size() ||
+  if (forwarded.empty() ||
+      whileOp.getAfterArguments().size() != forwarded.size() ||
+      whileOp.getNumResults() != forwarded.size() ||
       getLoopYieldedValues(loop).size() != beforeArgs.size())
     return false;
-  return llvm::all_of(llvm::enumerate(forwarded), [&](auto indexedValue) {
-    return indexedValue.value() == beforeArgs[indexedValue.index()];
-  });
+
+  std::optional<unsigned> previousIdx;
+  for (Value value : forwarded) {
+    auto arg = dyn_cast<BlockArgument>(value);
+    if (!arg || arg.getOwner() != whileOp.getBeforeBody())
+      return false;
+    unsigned idx = arg.getArgNumber();
+    if (idx >= beforeArgs.size() || (previousIdx && idx <= *previousIdx))
+      return false;
+    previousIdx = idx;
+  }
+  return true;
 }
 
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,

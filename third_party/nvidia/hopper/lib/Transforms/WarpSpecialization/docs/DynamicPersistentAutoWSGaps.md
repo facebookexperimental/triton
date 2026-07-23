@@ -66,8 +66,8 @@ Existing coverage includes:
 
 ## Partition Assignment Foundation
 
-`PartitionSchedulingMeta` now discovers annotated `scf::ForOp` and
-identity-carry `scf::WhileOp` loops. Its categorization, cross-iteration
+`PartitionSchedulingMeta` now discovers annotated `scf::ForOp` and supported
+ordered-subset-carry `scf::WhileOp` loops. Its categorization, cross-iteration
 tracing, partition propagation, schedule optimization, and serialization APIs
 use `LoopLikeOpInterface`, while nested software-pipelined K-loops remain
 `scf::ForOp`.
@@ -83,10 +83,11 @@ The pass and its helpers need a loop-body abstraction over
 | condition forwarding | implicit | before-region `scf.condition` args |
 | induction variable | explicit body arg 0 | none |
 
-The partition scheduler may only use the simple identity-carry while shape:
-every before-region argument must be forwarded by `scf.condition` in the same
-order. Other shapes must retain a documented, safe no-op behavior rather than
-risk incorrect cross-iteration dependency tracing.
+The partition scheduler accepts direct, unique, non-empty, order-preserving subsets of
+before-region arguments. It maps after-region arguments back through
+`scf.condition` to the matching yield slots and stops scheduled-body traversal
+for condition-only slots. Empty, reordered, duplicate, and computed forwarding retain
+a documented safe no-op behavior.
 
 ### Implemented PSM changes
 
@@ -103,8 +104,9 @@ risk incorrect cross-iteration dependency tracing.
 - Keep the existing `scf.for` behavior unchanged.
 
 Focused lit coverage validates direct outer-while scheduling, schedule
-round-tripping, condition/task replication, warp-budget cleanup, and graceful
-rejection of reordered or subset condition forwarding.
+round-tripping, CLC-shaped ordered-subset carry, condition/task replication,
+warp-budget cleanup, and graceful rejection of reordered or computed
+condition forwarding.
 
 The atomic-broadcast half of the outer-while path is now also validated in
 isolation (`ws_atomic_broadcast_from_psm.mlir`): starting from an
@@ -220,37 +222,38 @@ frontend diagnostic; stages belong on the nested K loop.
 
 ## Test Gaps
 
-The unified `DynamicPersistent1DScheduler` now validates an annotated outer
-while with an unannotated K loop on Blackwell, including numerical correctness
-and the absence of incomplete pipeline-stage diagnostics. Cross-architecture
-and feature-combination coverage remains open.
+The unified `DynamicPersistent1DScheduler` and `ClcTileScheduler` now validate
+an annotated outer while with an unannotated K loop on Blackwell, including
+numerical correctness and the absence of incomplete pipeline-stage diagnostics.
+Cross-architecture and feature-combination coverage remains open.
 
 Required coverage:
 
-1. **PSM lit** [done]: an annotated identity-carry `scf.while` with a nested MMA
-   loop; check partitions on condition, tile mapping, loads, MMA, epilogue,
-   atomic, and while terminators. (`ws_while_loop_autows.mlir`.)
-2. **Negative PSM lit** [done]: reordered/subset condition forwarding is skipped
+1. **PSM lit** [done]: annotated full-carry and CLC-shaped ordered-subset
+   `scf.while` loops with a nested MMA or serialized partition schedule;
+   check partitions on condition, tile mapping, loads, MMA, epilogue, atomic,
+   and while terminators. (`ws_while_loop_autows.mlir`.)
+2. **Negative PSM lit** [done]: reordered/computed condition forwarding is skipped
    without partial metadata. (`ws_while_loop_autows.mlir`.)
 3. **Atomic integration lit** [done]: PSM + task propagation + atomic broadcast
    from an initially unpartitioned outer while, extended through code
    partitioning, physical specialization, depth-2 slot/phase rotation, and
    nested K-loop rescheduling. (`ws_atomic_broadcast_from_psm.mlir`.)
-4. **Unified E2E** [Blackwell done]: `DynamicPersistent1DScheduler` with outer
-   `tl.condition(..., warp_specialize=True)` and an unannotated K loop. Hopper
-   remains pending.
+4. **Unified E2E** [Blackwell done]: `DynamicPersistent1DScheduler` and
+   `ClcTileScheduler` with outer `tl.condition(..., warp_specialize=True)` and
+   an unannotated K loop. The dynamic scheduler remains pending on Hopper.
 5. **Feature E2E**: epilogue subtiles, DP=2, separate epilogue store, generated
    subtiled regions, and broadcast depths greater than one.
 6. **Bailout E2E/lit**: scatter, strict-subset, non-carried, and unrelated
    replicated atomics leave a compilable non-WS kernel.
-7. **Hopper and Blackwell**: correctness on both architectures; CLC remains a
-   Blackwell-only sibling path.
+7. **Hopper and Blackwell**: CLC sibling correctness is covered on Blackwell;
+   unified dynamic atomic correctness remains to be run on Hopper.
 8. **Performance**: compare static persistent, dynamic inner-loop AutoWS,
    dynamic outer-loop AutoWS at depth 1, and tuned broadcast depth.
 
 ## Recommended Implementation Order
 
-1. Complete unified dynamic E2E coverage on Hopper and add the CLC sibling.
+1. Complete unified dynamic E2E coverage on Hopper.
 2. Add feature combinations.
 3. Address dynamic 2-CTA as a separate cluster-level design.
 

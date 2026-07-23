@@ -1254,17 +1254,19 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             # `_x += num_programs`); triton-uplift-while-to-for (after LICM hoists
             # num_tiles out of the before-region) rewrites it into an `scf.for`.
             assert "scf.while" not in ttgir, "Expected countable static-persistent while to uplift to scf.for"
-        else:
-            assert "scf.while" in ttgir, "Expected dynamic and CLC schedules to retain their outer while"
-            if SCHEDULE is tl.DynamicPersistent1DScheduler:
-                assert "tt.scheduled_max_stage" in ttgir, "Expected the nested K loop to retain its stage count"
-                assert "loop.stage" in ttgir, "Expected the nested K loop operations to retain their stage assignments"
+        elif SCHEDULE is tl.DynamicPersistent1DScheduler:
+            assert "scf.while" in ttgir, "Expected dynamic persistent outer loop to remain an scf.while"
+        elif SCHEDULE is tl.ClcTileScheduler:
+            assert "scf.while" in ttgir, "Expected CLC outer loop to remain an scf.while"
+            assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
+            assert "tt.atomic_rmw" not in ttgir, "CLC must not use the atomic tile counter"
+        if SCHEDULE in (tl.DynamicPersistent1DScheduler, tl.ClcTileScheduler):
+            assert "tt.scheduled_max_stage" in ttgir, "Expected the nested K loop to retain its stage count"
+            assert "loop.stage" in ttgir, "Expected the nested K loop operations to retain their stage assignments"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
-        if SCHEDULE is tl.ClcTileScheduler:
-            assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
-        else:
+        if SCHEDULE is not tl.ClcTileScheduler:
             assert "ttng.clc_" not in ttgir, "Expected non-CLC scheduling"
         if SCHEDULE is tl.DynamicPersistent1DScheduler:
             assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"

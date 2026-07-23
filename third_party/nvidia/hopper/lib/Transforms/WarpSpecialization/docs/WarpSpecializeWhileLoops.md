@@ -59,7 +59,7 @@ the single-region for-loop shape:
   `loop.getYieldedValues()`, `loop.getOps<scf::ForOp>()`.
 
 The partition and PSM APIs now use `LoopLikeOpInterface` for the supported
-`scf.for` and identity-carry `scf.while` forms. Everything downstream of the
+`scf.for` and ordered-subset-carry `scf.while` forms. Everything downstream of the
 partition schedule already handles `scf.while`:
 task-id propagation, data partition, and code partition each have `scf.while`
 lit tests (`ws_while_loop_autows.mlir`). So the change is concentrated in this
@@ -80,14 +80,13 @@ one pass.
 
 **Caveat — condition forwarding.** In an `scf.while`, loop-carried values flow
 `inits → before-args → scf.condition (forwards a subset, possibly reordered) →
-after-args → body → scf.yield → before-args`. The scheduler's cross-iteration
-tracing assumes yield-operand `i` ↔ body-arg `i` ↔ result `i`. That identity
-holds only when the `scf.condition` forwards **all** before-args in order — which
-is exactly what the tile-scheduler frontend emits (`scf.condition(%cond) %args…`
-in order). We therefore **guard**: a `while` is only scheduled when its
-`scf.condition` forwards every before-arg in index order. Any other shape falls
-back to "not warp-specialized" (the annotation becomes a documented no-op),
-rather than risking a mis-scheduled loop.
+after-args → body → scf.yield → before-args`. The CLC scheduler carries
+`(valid, x)` but forwards only `x`, so after-argument index 0 maps back to yield
+slot 1. The scheduler resolves both directions through the condition operands
+rather than assuming matching indices. It accepts a direct, unique, non-empty,
+order-preserving subset of before arguments; condition-only slots simply have
+no scheduled-body argument. Reordered, duplicate, or computed forwarding still
+falls back to an unspecialized loop.
 
 ## Design: a loop-body abstraction
 
@@ -103,18 +102,21 @@ Operation *getLoopBodyTerminator(LoopLikeOpInterface loop);
 ValueRange getLoopYieldedValues(LoopLikeOpInterface loop);
 Value    getLoopInductionVar(LoopLikeOpInterface loop); // for: iv; while: {} (null)
 // Maps a body-terminator operand index to the body block arg that carries it
-// into the next iteration.
+// into the next iteration, or null when the slot is condition-only.
 BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned yieldOperandIdx);
-// True when the while's scf.condition forwards all before-args in order
+// Maps a scheduled-body argument back to its corresponding yielded value.
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop, BlockArgument bodyArg);
+// True when the while's scf.condition forwards a supported ordered subset
 // (always true for scf.for). Loops failing this are skipped.
-bool hasIdentityLoopCarry(LoopLikeOpInterface loop);
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop);
 ```
 
 The one index subtlety, already present in the code: `findDefOpInLoop`
 (`~L940`) does `getYieldedValues()[arg.getArgNumber() - 1]` — the `-1` is the
-for-loop induction-var offset. `getLoopCarriedBodyArg` / the corresponding
-inverse hide this: for `scf.for`, body-arg `i+1` ↔ yield operand `i`; for
-`scf.while`, body-arg `i` ↔ yield operand `i`.
+for-loop induction-var offset. The paired carry helpers hide this: for
+`scf.for`, body-arg `i+1` maps to yield operand `i`; for `scf.while`, an after
+argument maps through its `scf.condition` operand to the corresponding before
+argument and yield slot.
 
 Nested-loop collection `mainLoop.getOps<scf::ForOp>()` (`~L334`, `~L1282`)
 becomes "collect `scf::ForOp` in the body block" via
@@ -131,7 +133,7 @@ the body block and iter-arg mapping are abstracted.
 ```cpp
 getOperation().walk([&](LoopLikeOpInterface loop) {
   if (!loop->hasAttr(kWarpSpecializeAttrName)) return;
-  if (isa<scf::WhileOp>(loop) && !hasIdentityLoopCarry(loop)) return; // safe skip
+  if (!hasSupportedLoopCarry(loop)) return; // safe skip
   loops.push_back(loop);
 });
 ```
@@ -204,7 +206,8 @@ while continuing to pipeline only the nested K `scf.for`.
 - **For-loop path must be byte-for-byte unchanged.** The helpers return exactly
   the current values for `scf::ForOp`; the for-loop regression suite
   (autows-testing) is the guard.
-- **Condition-forwarding guard** prevents mis-scheduling non-identity `while`s.
+- **Condition-forwarding guard** accepts only direct ordered subsets and
+  prevents mis-scheduling empty, reordered, duplicate, or computed forwarding.
 - Downstream buffer sizing uses `ttg.partition.stages`; the persistent `while`
   is depth-1 at the outer level (no outer pipelining), with the inner K-loop
   providing the producer/consumer overlap — same as the for-loop persistent
@@ -233,4 +236,6 @@ while continuing to pipeline only the nested K `scf.for`.
 - [x] Code partition, physical specialization, accumulation-counter rotation,
   and nested K-loop rescheduling validated from a PSM-assigned outer while.
 - [x] Unified dynamic atomic scheduler correctness validated on Blackwell.
-- [ ] Hopper runtime validation and unified CLC coverage.
+- [x] Unified CLC scheduler correctness validated on Blackwell with an
+  unannotated inner K loop.
+- [ ] Hopper runtime validation of the unified dynamic atomic scheduler.
