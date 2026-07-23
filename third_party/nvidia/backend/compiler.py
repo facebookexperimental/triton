@@ -1010,6 +1010,19 @@ class CUDABackend(BaseBackend):
         # it here keeps the pin an anchor through the whole pipeline.
         tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
 
+        # M2 (bitequiv): reduction-layout optimization for inner_tree reduces. Placed
+        # after remove-layout-conversions so its layout choice is not reverted by a later
+        # conversion pass. Gated off by default (TRITON_SET_RED_ORDERING_LAYOUTS=1 to turn
+        # on in-pipeline); the bitequiv eval hook injects it via --opt-passes for a clean
+        # baseline-vs-optimized A/B. Tunables are pass Options driven by knobs.nvidia.*.
+        if knobs.nvidia.set_red_ordering_layouts:
+            passes.ttgpuir.add_optimize_reduction_layout(
+                pm,
+                knobs.nvidia.red_ordering_strategy,
+                knobs.nvidia.red_ordering_min_underparallel,
+                knobs.nvidia.red_ordering_max_elems_per_thread,
+            )
+
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
         tlx.tlx_passes.add_tlx_dump_layout(pm)
