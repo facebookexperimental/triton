@@ -1456,6 +1456,136 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
 
 
 # ============================================================================
+# Test 2f: Hopper dynamic outer-while AutoWS. The unified matrix above marks its
+# dynamic feature configs blackwell_only, so the dynamic outer-`scf.while` path
+# has no explicit Hopper (SM90) coverage. These configs exercise the
+# Hopper-capable feature set on the SAME kernel
+# (matmul_kernel_tma_unified_persistent_ws_while): the dynamic atomic scheduler,
+# epilogue subtiling, separate epilogue store, broadcast depth > 1, and data
+# partitioning. Hopper-only differences vs the Blackwell matrix:
+#   - NUM_CTAS is always 1 (2-CTA MMA is a tcgen5 cta_group feature);
+#   - generate_subtiled_region stays False (subtiled regions are a TMEM opt);
+#   - DATA_PARTITION_FACTOR=2 uses BLOCK_M=128 (wgmma min-M=64), not 256;
+#   - the MMA lowers to wgmma (ttng.warp_group_dot), not ttng.tc_gen5_mma.
+# ClcTileScheduler is Blackwell-only and is intentionally excluded.
+_HOPPER_DYNAMIC_OUTER_AUTOWS_CONFIGS = [
+    # SCHEDULE, BLOCK_M, BLOCK_N, EPILOGUE_SUBTILE, DATA_PARTITION_FACTOR,
+    # generate_subtiled_region, separate_epilogue_store, tile_prefetch_depth
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, False, False, 1, id="hopper-dynamic-baseline"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, False, False, 1,
+                 id="hopper-dynamic-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, False, True, 1,
+                 id="hopper-dynamic-separate-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, False, False, 2,
+                 id="hopper-dynamic-broadcast-depth-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 2, False, True, 1,
+                 id="hopper-dynamic-dp2-separate-subtile-2"),
+]
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
+@pytest.mark.parametrize(
+    "SCHEDULE,BLOCK_SIZE_M,BLOCK_SIZE_N,EPILOGUE_SUBTILE,DATA_PARTITION_FACTOR,"
+    "generate_subtiled_region,separate_epilogue_store,tile_prefetch_depth",
+    _HOPPER_DYNAMIC_OUTER_AUTOWS_CONFIGS,
+)
+def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize_hopper(
+    SCHEDULE,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    EPILOGUE_SUBTILE,
+    DATA_PARTITION_FACTOR,
+    generate_subtiled_region,
+    separate_epilogue_store,
+    tile_prefetch_depth,
+    capfd,
+):
+    """Exercise the dynamic outer-while AutoWS feature set on Hopper (wgmma).
+
+    Local note: this is skipped on Blackwell (B200); it runs on SM90 hardware/CI.
+    """
+    M, N, K = 2048, 2048, 256
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+    NUM_CTAS = 1
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.ws_tile_prefetch_depth = tile_prefetch_depth
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
+        num_clusters = min(max(NUM_SMS, 1), num_tiles)
+        grid_size = num_clusters
+        tile_counter = torch.full((1, ), grid_size, dtype=torch.int32, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        kernel = matmul_kernel_tma_unified_persistent_ws_while[(grid_size, )](
+            a_desc,
+            b_desc,
+            c_desc,
+            tile_counter,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            SCHEDULE=SCHEDULE,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            NUM_CTAS=NUM_CTAS,
+            TWO_CTAS=False,
+            SMEM_ALLOC_ALGO=None,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            generate_subtiled_region=generate_subtiled_region,
+        )
+        compiler_output = capfd.readouterr()
+
+        ttgir = kernel.asm["ttgir"]
+        assert "scf.while" in ttgir, "Expected dynamic persistent outer loop to remain an scf.while"
+        assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
+        assert "not assigned a pipeline stage" not in compiler_output.err
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        # Hopper lowers the MMA to wgmma; the Blackwell tcgen5 path must be absent.
+        assert "ttng.warp_group_dot" in ttgir, "Expected a Hopper wgmma instruction"
+        assert "ttng.tc_gen5_mma" not in ttgir, "Did not expect a Blackwell tcgen5 MMA on Hopper"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        assert "ttng.clc_" not in ttgir, "Expected dynamic atomic scheduling, not CLC"
+
+        assert ttgir.count("ttng.warp_group_dot") >= DATA_PARTITION_FACTOR, "Expected one MMA per data partition"
+        expected_stores = EPILOGUE_SUBTILE * DATA_PARTITION_FACTOR
+        assert ttgir.count("ttng.async_tma_copy_local_to_global") >= expected_stores, (
+            "Expected every epilogue subtile and data partition to emit a TMA store")
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
 # Test 3: matmul_kernel_descriptor_persistent warp specialization (device-side TMA)
 # Tests both Flatten=True and Flatten=False
 # ============================================================================
