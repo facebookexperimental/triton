@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test a locally-built meta-triton wheel (produced by .backports/build-wheel.sh).
+# Test a locally-built meta-triton wheel (produced by .claude/skills/fbtriton-backport/build-wheel.sh).
 #
 # Installs the wheel (arg > $WHEEL > newest in dist/) into a throwaway uv venv
 # alongside the torch build matching the GPU on this box (auto-detected: CUDA
@@ -15,13 +15,13 @@
 # libs depend on at runtime — the same toolchain the build used.
 #
 # Usage:
-#   ./.backports/test-wheel.sh [path/to/wheel.whl]
+#   ./.claude/skills/fbtriton-backport/test-wheel.sh [path/to/wheel.whl]
 # Env overrides: WHEEL, TEST_VENV, GCC_TOOLSET, CUDA_VISIBLE_DEVICES, TLX_TIMEOUT,
 #                GPU_VENDOR (nvidia|amd, else auto-detected),
 #                TORCH_INDEX_URL (torch wheel index; else picked from the GPU).
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 GCC_TOOLSET="${GCC_TOOLSET:-/opt/rh/gcc-toolset-14}"
 TLX_TIMEOUT="${TLX_TIMEOUT:-1800}"
 
@@ -69,7 +69,7 @@ if [[ -z "$WHEEL" ]]; then
   WHEEL="$(ls -t "$REPO_ROOT"/dist/*.whl 2>/dev/null | head -1 || true)"
 fi
 if [[ -z "$WHEEL" || ! -f "$WHEEL" ]]; then
-  echo "ERROR: no wheel found. Build one first (.backports/build-wheel.sh) or pass a path." >&2
+  echo "ERROR: no wheel found. Build one first (.claude/skills/fbtriton-backport/build-wheel.sh) or pass a path." >&2
   exit 1
 fi
 

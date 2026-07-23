@@ -21,7 +21,7 @@
 # env vars to skip prompts: GOOGLETEST_DIR, TRITON_CACHE, GCC_TOOLSET, CLEAN.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 mkdir -p "$REPO_ROOT/dist"
 LOG_FILE="$REPO_ROOT/dist/build-$(date +%Y%m%d-%H%M%S).log"
 
@@ -203,4 +203,4 @@ echo ">>> Done:"
 ls -lh "$REPO_ROOT/dist/"*.whl
 echo
 echo "Build log saved to: $LOG_FILE"
-echo "To test the wheel:  $REPO_ROOT/.backports/test-wheel.sh"
+echo "To test the wheel:  $REPO_ROOT/.claude/skills/fbtriton-backport/test-wheel.sh"
