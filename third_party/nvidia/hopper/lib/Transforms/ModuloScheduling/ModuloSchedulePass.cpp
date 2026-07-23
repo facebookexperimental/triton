@@ -555,6 +555,23 @@ static int smemBudget() {
 // macro that would bypass scoping and break constexpr contexts.
 static inline int kSmemBudgetBytes() { return smemBudget(); }
 
+// Emitter-overhead reserve subtracted from the budget the depth reducers
+// enforce. The pass accounts rings + its own barriers, but the emitted
+// kernel additionally allocates SMEM the schedule never sees:
+//   * epilogue TMA-store staging (`c_smem`, up to a full output tile —
+//     32 KB for a (128,128) f16 store),
+//   * the warp-specialize scratch region (~272 B),
+//   * mbarrier slots for the emitter's legacy carve-outs (8 B per slot:
+//     per-accumulator handoffs, cross-loop channels, phase joins),
+//   * cvt/allocation alignment padding.
+// Measured on case8 dual-GEMM: a schedule the pass sized to 229432 B
+// ("fits" vs 232448) compiled to 238044 B (no staging sidestep) and
+// 262860 B (with c_smem) → OutOfResources at launch. 10 KB is an interim
+// flat reserve — it does NOT cover a full 32 KB staging tile; kernels whose
+// pass-side footprint lands within staging-size of the budget still need
+// a staging-aware term (follow-up).
+constexpr int64_t kEmitterSmemReserveBytes = 10 * 1024;
+
 // Fallback trip count when the loop bounds aren't constant-foldable.
 // Used so kernel_time_cost can give a finite (rather than div-by-zero)
 // answer for cost-based depth reduction.
@@ -1445,7 +1462,8 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
 
   int originalII = loop.II;
 
-  int64_t effectiveSmemBudget = kSmemBudgetBytes() - smemReserved;
+  int64_t effectiveSmemBudget =
+      kSmemBudgetBytes() - smemReserved - kEmitterSmemReserveBytes;
   if (smemReserved > 0) {
     LLVM_DEBUG(llvm::dbgs()
                << "[Step4.6] SMEM reserved by other regions: " << smemReserved
@@ -1495,6 +1513,12 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
       LLVM_DEBUG(llvm::dbgs() << "[Step4.6] Reduced SMEM buf" << bestIdx
                               << " to count=" << newDepth << "\n");
     }
+    // computeTotalSmem charges merged buffers through the PhysicalBuffer
+    // cache (count = max over members), so the reduction is invisible to
+    // the loop condition until the cache is rebuilt — without this refresh
+    // the greedy loop over-reduces every candidate to count=1 and then
+    // reports a phantom EXCEEDED.
+    buildPhysicalBuffers(loop);
   }
 
   // TMEM reduction
@@ -1520,6 +1544,8 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     LLVM_DEBUG(llvm::dbgs()
                << "[Step4.6] Reduced TMEM buf" << bestIdx
                << " to count=" << loop.buffers[bestIdx].count << "\n");
+    // Same PhysicalBuffer-cache refresh as the SMEM loop above.
+    buildPhysicalBuffers(loop);
   }
 
   // Recompute II from reduced buffer depths.
@@ -1616,7 +1642,7 @@ static void reduceBuffersForGlobalBudget(ttg::ScheduleGraph &graph) {
       }
     }
   });
-  if (initialTotal <= kSmemBudgetBytes()) {
+  if (initialTotal <= kSmemBudgetBytes() - kEmitterSmemReserveBytes) {
     LLVM_DEBUG(llvm::dbgs() << "[Step4.6-Global] Already fits, skipping\n");
     return;
   }
@@ -1626,7 +1652,7 @@ static void reduceBuffersForGlobalBudget(ttg::ScheduleGraph &graph) {
   // Greedy: at each step, pick the cheapest reducible SMEM buffer in any
   // loop and decrement its count. Stop when fits, or when no buffer can
   // be reduced further.
-  while (totalSmem() > kSmemBudgetBytes()) {
+  while (totalSmem() > kSmemBudgetBytes() - kEmitterSmemReserveBytes) {
     int bestLoopIdx = -1;
     int bestBufIdx = -1;
     double bestCost = std::numeric_limits<double>::infinity();
@@ -1964,9 +1990,12 @@ static void mergeNonOverlappingBuffers(ttg::ScheduleLoop &loop) {
     if (buf.kind == ttg::MemoryKind::BARRIER ||
         buf.kind == ttg::MemoryKind::Register)
       continue;
-    // Skip buffers with zero-length lifetime — they have no producer/
-    // consumer pattern we can reason about and shouldn't be merged blindly.
-    if (buf.liveEnd == buf.liveStart)
+    // Skip buffers with empty or degenerate lifetimes — they have no
+    // producer/consumer pattern we can reason about and shouldn't be merged
+    // blindly. `<=` (not `==`): a negative-length interval reads as
+    // "overlaps nothing" to the modular test and would become a universal
+    // merge donor.
+    if (buf.liveEnd <= buf.liveStart)
       continue;
 
     bool merged = false;
@@ -4243,8 +4272,19 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
       chan.id = loop.buffers.size();
       chan.kind = ttg::MemoryKind::SMEM;
       chan.count = spec.depth;
+      // Synthesized after the budget reducers ran — never trimmed, so the
+      // requested depth is the emitted depth.
+      chan.requestedCount = spec.depth;
       chan.liveStart = src.cycle;
-      chan.liveEnd = dst.cycle + std::max(dst.latency, 0);
+      // Loop-carried channels (edge.distance > 0) hand the value to a LATER
+      // iteration: the consumer's cycle is in the next iteration's frame, so
+      // the flat-schedule end is dst.cycle + distance * II — the same
+      // convention walkLastConsumerEnd applies to data buffers. Without the
+      // distance term a backward channel gets a negative-length interval,
+      // which the modular-overlap test treats as "overlaps nothing" and any
+      // interval-based sharing decision would alias it into live storage.
+      chan.liveEnd = dst.cycle + static_cast<int>(edge.distance) * loop.II +
+                     std::max(dst.latency, 0);
       chan.shape.assign(spec.shape.begin(), spec.shape.end());
       chan.elementBitWidth = spec.elementBitWidth;
       loop.buffers.push_back(chan);
@@ -4749,6 +4789,13 @@ struct ScheduledLoop {
   bool isOuter{false};
   std::optional<ttg::ModuloScheduleResult> outerSched;
 
+  // Step 4.6 (cross-nest): SMEM phase group this loop's nest belongs to.
+  // Loops in DIFFERENT groups never run concurrently (sequential top-level
+  // phases of the kernel), so their SMEM pools are candidates for
+  // time-multiplexed sharing (footprint = max over groups, not sum).
+  // -1 = ungrouped (single-nest kernel, or pooling disabled).
+  int smemPhaseGroup{-1};
+
   // Pre-partition snapshot of `graph`, taken right before the Phase-4
   // warp-group partition commits the winner. Only populated when
   // TRITON_MODULO_DUMP_TOPN > 1. The top-N autotuning dump re-finalizes each
@@ -4810,6 +4857,198 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
       outerLoop->setAttr(tt::kScheduledMaxStageAttrName,
                          IntegerAttr::get(IntegerType::get(ctx, 32), 1));
   }
+}
+
+// ============================================================================
+// Step 4.6 (cross-nest): Phase-pooled joint SMEM budget across sibling nests
+// ============================================================================
+
+/// The per-nest budget reducers (reduceBuffersForBudget /
+/// reduceBuffersForGlobalBudget) each operate on ONE ScheduleGraph — one loop
+/// nest. A kernel with two SIBLING top-level nests (e.g. two back-to-back
+/// GEMM K-loops) has each nest reduced independently, so their SUM can exceed
+/// the CTA budget and the kernel fails to launch — the cross-nest analogue of
+/// issue 001_annotation_smem_overflow.
+///
+/// This step runs once after all loops are scheduled. Two accounting modes
+/// via TRITON_MODULO_PHASE_POOL:
+///   "sum"          — joint footprint = Σ over top-level nests. The naive
+///                    fix: correct, but trims depths that phase-disjoint
+///                    nests could have kept.
+///   "pool" (dflt)  — top-level sibling nests execute SEQUENTIALLY per CTA
+///                    (two adjacent scf.for in the function body; neither
+///                    encloses the other, no enclosing scheduled loop), so
+///                    their live ranges are time-disjoint and their pools
+///                    can share bytes: footprint = MAX over nests. Each nest
+///                    is assigned an smemPhaseGroup id (block program order)
+///                    which the dump exposes; the emitter realizes the
+///                    sharing with a tlx.storage_alias_spec over the groups'
+///                    allocations.
+///   "off"          — skip (legacy behavior: siblings unchecked).
+///
+/// Pooling is intentionally conservative: it only engages when EVERY
+/// top-level nest is a single-loop graph (pure sibling compute loops). A
+/// multi-loop nest (persistent outer + inner) among siblings falls back to
+/// "sum" — the outer loop is software-pipelined, so phase disjointness
+/// against its neighbors cannot be assumed. Single-nest kernels (the whole
+/// existing corpus) return immediately: all modes are identical there.
+///
+/// CAVEAT (emitter contract): max-pooling is only physically real once the
+/// emitter aliases the groups' allocations AND joins the phases (TMA-store
+/// drain before the next nest's first producer touches the pool). The dump's
+/// smem_phase_group field is that contract's carrier.
+static void
+reduceBuffersAcrossNests(MutableArrayRef<ScheduledLoop> scheduledLoops) {
+  auto mode = triton::tools::getStrEnv("TRITON_MODULO_PHASE_POOL");
+  if (mode == "off")
+    return;
+  bool pool = mode.empty() || mode == "pool";
+
+  // Nest roots: scheduled loops whose forOp has no enclosing scheduled loop.
+  llvm::SmallVector<ScheduledLoop *, 4> roots;
+  for (auto &sl : scheduledLoops) {
+    bool hasScheduledAncestor = false;
+    for (Operation *p = sl.loop->getParentOp(); p && !hasScheduledAncestor;
+         p = p->getParentOp())
+      for (auto &other : scheduledLoops)
+        if (other.loop.getOperation() == p) {
+          hasScheduledAncestor = true;
+          break;
+        }
+    if (!hasScheduledAncestor)
+      roots.push_back(&sl);
+  }
+  if (roots.size() < 2)
+    return; // single nest — per-nest reducers already enforced the budget.
+
+  // Deterministic phase order: block program order of the root forOps.
+  llvm::sort(roots, [](ScheduledLoop *a, ScheduledLoop *b) {
+    return a->loop->isBeforeInBlock(b->loop.getOperation());
+  });
+
+  // Pool only across pure sibling compute loops (single-loop graphs). A
+  // persistent nest among them pipelines across its own iterations, so it is
+  // never phase-disjoint from its neighbors — degrade to sum.
+  if (pool)
+    for (auto *r : roots)
+      if (r->graph.loops.size() != 1 || r->isOuter) {
+        LDBG("[Step4.6-Nest] multi-loop nest among siblings — pooling "
+             "degraded to sum");
+        pool = false;
+        break;
+      }
+
+  if (pool)
+    for (size_t i = 0; i < roots.size(); ++i)
+      roots[i]->smemPhaseGroup = static_cast<int>(i);
+
+  auto rootSmem = [](ScheduledLoop *r) {
+    int64_t t = 0;
+    for (const auto &loop : r->graph.loops)
+      t += computeTotalSmem(loop);
+    return t;
+  };
+  auto footprint = [&]() {
+    int64_t f = 0;
+    for (auto *r : roots)
+      f = pool ? std::max(f, rootSmem(r)) : f + rootSmem(r);
+    return f;
+  };
+
+  int64_t initial = footprint();
+  LDBG("[Step4.6-Nest] " << roots.size() << " top-level nests, "
+                         << (pool ? "pooled" : "summed") << " footprint "
+                         << initial << " / " << kSmemBudgetBytes());
+  if (initial <= kSmemBudgetBytes() - kEmitterSmemReserveBytes)
+    return;
+
+  // Greedy: reduce the cheapest reducible SMEM buffer in a nest whose
+  // reduction actually lowers the footprint — every nest under "sum", only
+  // the current argmax nest under "pool".
+  llvm::DenseSet<ScheduledLoop *> touched;
+  while (footprint() > kSmemBudgetBytes() - kEmitterSmemReserveBytes) {
+    llvm::SmallVector<ScheduledLoop *, 4> searchSet;
+    if (pool) {
+      auto *maxRoot = *std::max_element(
+          roots.begin(), roots.end(), [&](ScheduledLoop *a, ScheduledLoop *b) {
+            return rootSmem(a) < rootSmem(b);
+          });
+      searchSet.push_back(maxRoot);
+    } else {
+      searchSet.append(roots.begin(), roots.end());
+    }
+
+    ScheduledLoop *bestSl = nullptr;
+    ttg::ScheduleLoop *bestLoop = nullptr;
+    int bestBuf = -1;
+    double bestCost = std::numeric_limits<double>::infinity();
+    for (auto *r : searchSet) {
+      for (auto &loop : r->graph.loops) {
+        for (unsigned bi = 0; bi < loop.buffers.size(); ++bi) {
+          const auto &buf = loop.buffers[bi];
+          if (buf.kind != ttg::MemoryKind::SMEM || buf.count <= 1)
+            continue;
+          double cost = kernelTimeCost(loop, buf);
+          if (cost < bestCost) {
+            bestCost = cost;
+            bestSl = r;
+            bestLoop = &loop;
+            bestBuf = static_cast<int>(bi);
+          }
+        }
+      }
+    }
+    if (!bestLoop)
+      break; // nothing reducible left — report and bail below.
+
+    auto &buf = bestLoop->buffers[bestBuf];
+    unsigned newDepth = buf.count - 1;
+    buf.count = newDepth;
+    if (buf.pairedBufferId != UINT_MAX)
+      bestLoop->buffers[buf.pairedBufferId].count = newDepth;
+    buildPhysicalBuffers(*bestLoop);
+    touched.insert(bestSl);
+    LDBG("[Step4.6-Nest] Reduced nest buf"
+         << bestBuf << " to count=" << newDepth << " (cost=" << bestCost
+         << ", footprint=" << footprint() << ")");
+  }
+
+  // Recompute II per touched loop from the reduced depths — same rule as the
+  // per-nest reducers: new_II = max over buffers of ceil(lifetime / depth).
+  for (auto *r : touched) {
+    for (auto &loop : r->graph.loops) {
+      int originalII = loop.II;
+      int newII = originalII;
+      for (auto &buf : loop.buffers) {
+        if (buf.kind == ttg::MemoryKind::BARRIER ||
+            buf.kind == ttg::MemoryKind::Register || buf.count == 0)
+          continue;
+        for (const auto &node : loop.nodes) {
+          if (node.producesBuffer != buf.id)
+            continue;
+          int lifetime = computeBufferLifetime(loop, node.id);
+          newII = std::max(newII, (lifetime + static_cast<int>(buf.count) - 1) /
+                                      static_cast<int>(buf.count));
+          break;
+        }
+      }
+      if (newII != originalII) {
+        LDBG("[Step4.6-Nest] Loop " << loop.id << ": raising II from "
+                                    << originalII << " to " << newII);
+        loop.II = newII;
+        loop.maxStage = 0;
+        for (auto &node : loop.nodes) {
+          node.stage = node.cycle / newII;
+          loop.maxStage = std::max(loop.maxStage, node.stage);
+        }
+      }
+    }
+  }
+
+  int64_t final = footprint();
+  LDBG("[Step4.6-Nest] Final footprint "
+       << final << "/" << kSmemBudgetBytes()
+       << (final <= kSmemBudgetBytes() ? " OK" : " STILL EXCEEDED"));
 }
 
 /// Whole-nest epilogue warp-group unification (cost-model, storage-class-priced).
@@ -5209,7 +5448,8 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
   // that factor even before the search (the user asked for it); every other MMA
   // is N=1. Variants (computeDataPartitionPlanForN) layer the searched N onto
   // only the un-pinned MMAs, so a pinned MMA never re-enters the search.
-  DataPartitionPlan baseline = computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
+  DataPartitionPlan baseline =
+      computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
   std::set<unsigned> factors;
   // Per-MMA per-CTA accumulator height, off the candidate surface (every
   // candidate has mSize = bm / n, so bm = n * mSize). This is the basis of
@@ -5658,7 +5898,9 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
        << ", \"shape\": ";
     jsonDumpShape(os, b.shape);
     os << ", \"element_bits\": " << b.elementBitWidth
-       << ", \"count\": " << b.count << ", \"size_bytes\": " << b.sizeBytes()
+       << ", \"count\": " << b.count
+       << ", \"requested_count\": " << b.requestedCount
+       << ", \"size_bytes\": " << b.sizeBytes()
        << ", \"total_bytes\": " << b.totalBytes() << ", \"merge_group_id\": "
        << (b.mergeGroupId == UINT_MAX ? std::string("null")
                                       : std::to_string(b.mergeGroupId))
@@ -5942,6 +6184,101 @@ void jsonDumpDataPartitionCandidates(llvm::raw_ostream &os,
   os << (first ? "" : "\n  ") << "],\n";
 }
 
+// Launch hints for memory-bound warp-specialized kernels (occupancy).
+//
+// Without a maxnreg cap, AllocateWarpGroups auto-fills the full 64K register
+// file (regs/thread = 64K / total_warps / 32), which pins co-residency at
+// 1 CTA/SM. That is right for TC-bound kernels (one CTA should own the SM)
+// but exactly wrong for memory-bound ones, which need several co-resident
+// CTAs interleaving their TMA waits to cover HBM latency. Measured on B200
+// (case6 LayerNorm, M=262144): the committed 3-WG kernel runs 3161 GB/s at
+// the default launch and 6185 GB/s at maxnreg=48-56 with a 4x-SMS persistent
+// grid — parity with the hand-written reference (6151 GB/s), with no change
+// to the kernel body at all.
+//
+// Emitted only when the kernel is memory-bound AND warp-specialized:
+//   memory_bound     — the module contains no MMA op and at least one loop
+//                      schedules a TMA node; >= 2 modulo warp groups exist.
+//   total_warps      — mirrors AllocateWarpGroups' CTA warp layout: the
+//                      default warp group (module ttg.num-warps) plus every
+//                      other modulo WG padded to a whole 4-warp group.
+//   maxnreg          — regs/thread fitting kTargetCoResidentCTAs CTAs:
+//                      floor(64K / (target * total_warps * 32) / 8) * 8,
+//                      floored at the hardware minimum 24.
+//   grid_multiplier  — persistent-grid scale (empirical B200 sweep: 4x SMS
+//                      beats 2x and 8x across M=16K..256K).
+// The sched2tlx emitter forwards these as RECOMMENDED_* module constants in
+// the generated kernel; launchers pass maxnreg= and scale the grid.
+void jsonDumpLaunchHints(llvm::raw_ostream &os, ModuleOp moduleOp,
+                         ArrayRef<ScheduledLoop> scheduledLoops) {
+  bool anyMMA = false;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp, ttng::WarpGroupDotOp,
+            tt::DotOp>(op))
+      anyMMA = true;
+  });
+  if (anyMMA)
+    return;
+
+  bool anyTMA = false;
+  std::map<int, int> wgMaxMinWarps;
+  for (const auto &sl : scheduledLoops) {
+    for (const auto &loop : sl.graph.loops) {
+      for (const auto &n : loop.nodes) {
+        if (n.pipeline == ttg::HWPipeline::TMA)
+          anyTMA = true;
+        if (n.warpGroup >= 0) {
+          int &mw = wgMaxMinWarps[n.warpGroup];
+          mw = std::max(mw, std::max(n.minWarps, 1));
+        }
+      }
+    }
+  }
+  if (!anyTMA || wgMaxMinWarps.size() < 2)
+    return;
+
+  auto snapWarps = [](int m) {
+    if (m <= 1)
+      return 1;
+    if (m <= 2)
+      return 2;
+    if (m <= 4)
+      return 4;
+    return 8;
+  };
+  int baseWarps = 4;
+  if (auto attr = moduleOp->getAttrOfType<IntegerAttr>("ttg.num-warps"))
+    baseWarps = attr.getInt();
+  // The emitter maps the first >= 4-warp WG onto the default async_task; all
+  // other WGs become explicit tasks, each padded to whole 4-warp groups by
+  // AllocateWarpGroups.
+  int defaultWg = -1;
+  for (const auto &[wg, mw] : wgMaxMinWarps) {
+    if (snapWarps(mw) >= 4) {
+      defaultWg = wg;
+      break;
+    }
+  }
+  int totalWarps = baseWarps;
+  for (const auto &[wg, mw] : wgMaxMinWarps) {
+    if (wg == defaultWg)
+      continue;
+    totalWarps += (snapWarps(mw) + 3) / 4 * 4;
+  }
+
+  constexpr int kSMRegisterFile = 64 * 1024;
+  constexpr int kTargetCoResidentCTAs = 3;
+  constexpr int kGridMultiplier = 4;
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
+  int maxnreg =
+      kSMRegisterFile / (kTargetCoResidentCTAs * totalWarps * threadsPerWarp);
+  maxnreg = std::max(24, maxnreg / 8 * 8);
+
+  os << "  \"launch_hints\": {\"memory_bound\": true, \"total_warps\": "
+     << totalWarps << ", \"maxnreg\": " << maxnreg
+     << ", \"grid_multiplier\": " << kGridMultiplier << "},\n";
+}
+
 // Write ONE schedule-graph JSON document (kernel + ops + loops) to `os`.
 // Factored out so both the single-graph dumper and the multi-variant dumper
 // (top-N autotuning) can reuse it — each variant is a self-contained doc.
@@ -5961,6 +6298,7 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
   jsonDumpKernelSection(os, kernelFn, dc);
   jsonDumpOpsTable(os, kernelFn, dc);
   jsonDumpDataPartitionCandidates(os, scheduledLoops);
+  jsonDumpLaunchHints(os, moduleOp, scheduledLoops);
 
   // loops section — drive off scheduledLoops, each contains a ScheduleGraph
   // (which itself may contain nested loops, but in fbsource beta each
@@ -5978,6 +6316,11 @@ void writeScheduleGraphDoc(llvm::raw_ostream &os, ModuleOp moduleOp,
     os << "    {\n";
     os << "      \"loop_id\": " << loopId << ",\n";
     os << "      \"is_outer\": " << (sl.isOuter ? "true" : "false") << ",\n";
+    // Step 4.6 (cross-nest): loops in different phase groups never run
+    // concurrently — their SMEM pools may be aliased by the emitter.
+    // Omitted (parses to "ungrouped") for single-nest kernels.
+    if (sl.smemPhaseGroup >= 0)
+      os << "      \"smem_phase_group\": " << sl.smemPhaseGroup << ",\n";
     jsonDumpWarpGroups(os, schedLoop);
     // Inline the schedule loop body inside this entry for ergonomics —
     // jsonDumpScheduleLoop emits its own "{ ... }" so we inline its inner
@@ -6368,6 +6711,12 @@ struct ModuloSchedulePass
       }
       LDBG("Scheduled " << numInner << " inner loop(s), " << numOuter
                         << " outer loop(s)");
+
+      // Step 4.6 (cross-nest): sibling top-level nests share one CTA SMEM
+      // budget — enforce it jointly (and, for phase-disjoint siblings,
+      // pooled). Runs before partitioning so the capacity gates see the
+      // final depths.
+      reduceBuffersAcrossNests(scheduledLoops);
 
       // ================================================================
       // Pass B: Global warp-group partition + cross-group barriers across

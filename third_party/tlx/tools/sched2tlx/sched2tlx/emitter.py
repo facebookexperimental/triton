@@ -241,6 +241,15 @@ class RenderCtx:
     # with no MMA there is no `tcgen05_commit` to arrive it, so the wait would
     # deadlock. Set in `emit()`.
     has_acc_tmem_handoff: bool = True
+    # Multi-phase (sibling-loop) emission mode. When True: the canonical
+    # `acc_tmem` name is never minted (per-var handoffs only), epilogue
+    # staging is per-store via `store_staging`, and the multi-phase driver
+    # owns task formation. Single-phase emission is byte-identical with the
+    # default False.
+    multiphase: bool = False
+    # tt.descriptor_store op_id → staging SMEM var. Empty in single-phase
+    # mode (the renderer falls back to the legacy `c_smem` name).
+    store_staging: dict[str, str] = field(default_factory=dict)
     # Mirror of partition_buffer_names keyed by def_op id (the SSA alloc).
     # Used when an emitter resolves a buffer via alloc_op_var instead of
     # (loop_id, buf_id).
@@ -1509,6 +1518,24 @@ def _signal_only_buffer_ids(loop: Loop) -> set[int]:
 
 
 def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) -> None:
+    """Loop-owned buffer allocs + kernel-global function-scope allocs.
+
+    Split into `_emit_loop_buffers` (per-loop, callable once per phase in the
+    multi-phase driver) and `_emit_function_scope_allocs` (kernel-global:
+    fn-scope SMEM/TMEM allocs, c_smem staging, dq_smem). This composition is
+    the legacy single-nest behavior, byte-for-byte."""
+    _emit_loop_buffers(loop, g, rctx, lines)
+    _emit_function_scope_allocs(g, rctx, lines)
+
+
+def _emit_loop_buffers(
+    loop: Loop,
+    g: ScheduleGraph,
+    rctx: RenderCtx,
+    lines: _Lines,
+    pool_spec: str | None = None,
+    pool_member_out: list[str] | None = None,
+) -> None:
     lines += "# ── Multi-buffered allocations (from modulo's lifetime analysis) ──"
     loop_tag = "inner" if not loop.is_outer else "outer"
     signal_only = _signal_only_buffer_ids(loop)
@@ -1575,6 +1602,15 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             if mgid is not None and mgid in merge_group_owner:
                 reuse = f", reuse={merge_group_owner[mgid]}"
                 origin += f"; reuses {merge_group_owner[mgid]} (group {mgid})"
+            elif pool_spec is not None and b.def_op:
+                # Phase pooling (smem_phase_group): data rings opt into the
+                # shared storage_alias_spec. Merge-group followers keep their
+                # owner reuse (the owner carries the spec); synthesized
+                # channels (no def_op) stay out of the pool.
+                reuse = f", reuse={pool_spec}"
+                origin += f"; phase pool member ({pool_spec})"
+                if pool_member_out is not None:
+                    pool_member_out.append(var)
             lines += f"# {loop_tag}-loop buf {b.id}: SMEM count={b.count} ({origin})"
             if b.partition_count > 1:
                 # Pass A.5: emit N SMEM allocs, each (mSize, *trailing).
@@ -1648,6 +1684,11 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
         elif b.kind == "barrier":
             # Barriers are emitted later (paired with their data buffer).
             continue
+
+
+def _emit_function_scope_allocs(
+    g: ScheduleGraph, rctx: RenderCtx, lines: _Lines
+) -> None:
     # Function-scope allocs (e.g., the accumulator TMEM for case1, or the
     # per-tile-resident Q SMEM for non-persistent FA) live in the preamble.
     # Hoist them up here so MMAs can reference them by name. Pre-sort the
@@ -1730,6 +1771,13 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
             # name collision.
             existing_acc = any(v == "acc_tmem" for v in rctx.alloc_op_var.values())
             name = f"acc_tmem_{len(rctx.alloc_op_var)}" if existing_acc else "acc_tmem"
+            if rctx.multiphase:
+                # Multi-phase: NEVER mint the canonical `acc_tmem` name. Every
+                # phase accumulator goes through the per-var full/empty
+                # handoff (_epilogue_acc_wg) — the canonical one-shot carve-out
+                # (single acc_tmem_full/empty, kernel-global has_mma checks)
+                # cannot express two phases' accumulators.
+                name = f"acc_tmem_{len(rctx.alloc_op_var)}"
             # Bind via alloc_op_var only — `_render_operand` walks alloc_op_var
             # and appends `[0]` to make it a slot reference. If we ALSO bind
             # via op_var, the bare name without `[0]` wins and we get
@@ -1766,6 +1814,49 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 )
     # Epilogue staging SMEM (for the descriptor_store) — derived from the
     # store op's source tensor shape.
+    #
+    # Multi-phase: every function-scope descriptor_store gets a staging
+    # buffer; stores of the same (shape, dtype) share one (the default task
+    # serializes them with async_descriptor_store_wait(0) between uses,
+    # same as the legacy multi-store single-c_smem behavior). The first
+    # keeps the legacy `c_smem` name. rctx.store_staging records the
+    # store-op → staging-var binding the default-task renderer consumes.
+    if rctx.multiphase:
+        staging_by_sig: dict[tuple[str, str], str] = {}
+        n_staging = 0
+        for op in g.ops.values():
+            if op.scope != "function" or op.kind != "tt.descriptor_store":
+                continue
+            if len(op.operands) < 2:
+                continue
+            shape, dtype = [128, 128], "tl.float16"
+            op0 = op.operands[0]
+            if isinstance(op0, OpRef):
+                desc_op = g.ops.get(op0.op_id)
+                if desc_op:
+                    bs = _parse_desc_block_shape(
+                        desc_op.result_types[0] if desc_op.result_types else ""
+                    )
+                    if bs:
+                        shape, dtype = bs[0], _dtype_str_to_tl(bs[1])
+            elif isinstance(op0, ArgRef):
+                arg = next(
+                    (a for a in g.kernel.args if a.name == op0.name), None
+                )
+                if arg:
+                    bs = _parse_desc_block_shape(arg.type)
+                    if bs:
+                        shape, dtype = bs[0], _dtype_str_to_tl(bs[1])
+            sig = (", ".join(str(d) for d in shape), dtype)
+            var = staging_by_sig.get(sig)
+            if var is None:
+                var = "c_smem" if n_staging == 0 else f"c_smem_{n_staging}"
+                n_staging += 1
+                staging_by_sig[sig] = var
+                lines += f"{var} = tlx.local_alloc(({sig[0]}), {dtype}, 1)"
+            rctx.store_staging[op.op_id] = var
+        lines += ""
+        return
     epi_store = next(
         (
             op
@@ -2506,7 +2597,7 @@ def _reassign_orphan_nodes(graph: ScheduleGraph, loop: Loop) -> None:
                     break
 
 
-def _epilogue_acc_wg(g: ScheduleGraph, rctx: RenderCtx) -> dict[str, int]:
+def _epilogue_acc_wg(g: ScheduleGraph, rctx: RenderCtx) -> dict[str, tuple[int, int]]:
     """Map each non-canonical epilogue-output TMEM accumulator (var name) to the
     warp group whose in-loop MMA produces it.
 
@@ -2537,7 +2628,9 @@ def _epilogue_acc_wg(g: ScheduleGraph, rctx: RenderCtx) -> dict[str, int]:
                 continue
             v = rctx.alloc_op_var.get(op.operands[2].op_id)
             if v in epi_vars and n.warp_group != -1:
-                out[v] = n.warp_group
+                # Loop-qualified: two sibling loops may reuse the same local
+                # wg id — the commit site must match on (loop, wg), not wg.
+                out[v] = (L.loop_id, n.warp_group)
     rctx._epilogue_acc_wg_cache = out
     return out
 
@@ -2781,6 +2874,23 @@ def _emit_default_partition(
             lines += f"{ch['var_name']} = tlx.local_load({ch['bufname']}[0])"
         # Find the tmem_load → arith.truncf → ttg.convert_layout → tt.descriptor_store chain.
         # Render each non-skipped epilogue op.
+        _emit_default_epilogue_ops(g, epi_ops, rctx, lines)
+        if len(lines.buf) == _n0:
+            # No work landed in the default task (e.g. case6 with no acc_tmem
+            # hand-off and the store living in a compute WG). Keep the
+            # `with tlx.async_task("default"):` block valid Python.
+            lines += "pass"
+
+
+def _emit_default_epilogue_ops(
+    g: ScheduleGraph, epi_ops: list[Op], rctx: RenderCtx, lines: _Lines
+) -> None:
+    """Render a list of function-scope epilogue ops (default-task body).
+
+    Factored from `_emit_default_partition` so the multi-phase driver can
+    render each phase's epilogue segment separately. Behavior for the
+    single-phase caller is unchanged."""
+    if True:
         for op in epi_ops:
             if op.kind in _SKIP_FUNCTION_SCOPE:
                 continue
@@ -2825,20 +2935,16 @@ def _emit_default_partition(
                 value_expr = _render_operand(op.operands[1], rctx)
                 offsets = [_render_operand(o, rctx) for o in op.operands[2:]]
                 offs_str = ", ".join(offsets)
-                lines += f"tlx.local_store(c_smem[0], {value_expr})"
+                stage = rctx.store_staging.get(op.op_id, "c_smem")
+                lines += f"tlx.local_store({stage}[0], {value_expr})"
                 lines += "tlx.fence_async_shared()"
-                lines += f"tlx.async_descriptor_store({desc}, c_smem[0], [{offs_str}])"
+                lines += f"tlx.async_descriptor_store({desc}, {stage}[0], [{offs_str}])"
                 lines += "tlx.async_descriptor_store_wait(0)"
                 continue
             if op.kind in _NAMED_FUNCTION_OPS:
                 name = _auto_name(op, rctx.fresh_idx())
                 rctx.op_var[op.op_id] = name
                 lines += f"{name} = {_render_op_expr(op, rctx)}"
-        if len(lines.buf) == _n0:
-            # No work landed in the default task (e.g. case6 with no acc_tmem
-            # hand-off and the store living in a compute WG). Keep the
-            # `with tlx.async_task("default"):` block valid Python.
-            lines += "pass"
 
 
 def _op_depends_on_iv(op_id: str, g: ScheduleGraph, lid: int, cache: dict) -> bool:
@@ -3650,7 +3756,7 @@ def _emit_warp_group(
         # only flags the canonical acc_tmem producer) — commit so the default
         # partition's post-loop tmem_load sees the completed accumulator.
         for var, pwg in _epilogue_acc_wg(g, rctx).items():
-            if pwg == wg.id:
+            if pwg == (loop.loop_id, wg.id):
                 lines += f"tlx.tcgen05_commit({var}_full[0])"
 
     # Restore global (preamble) names shadowed by the per-WG localization above.
@@ -6217,6 +6323,558 @@ def _emit_uwg_body_impl(
 # ===========================================================================
 
 
+# ===========================================================================
+# Multi-phase (sibling-loop) emission driver
+# ===========================================================================
+#
+# A kernel with N top-level sibling loops (N sequential compute PHASES, e.g.
+# two back-to-back GEMM K-loops) is emitted as ONE tlx.async_tasks() region
+# whose tasks each run their per-phase bodies in order, separated by a
+# full-task-set join barrier per phase boundary. The per-phase bodies reuse
+# the single-phase machinery unchanged (_emit_loop_buffers, _emit_warp_group,
+# _emit_default_epilogue_ops, SemIR). When the modulo pass assigned
+# smem_phase_group ids (TRITON_MODULO_PHASE_POOL=pool), the phases' SMEM data
+# rings share backing bytes through one tlx.storage_alias_spec — footprint =
+# max over phases instead of the sum.
+#
+# Deliberate v1 restrictions (validated, hard error — never mis-emit):
+# non-persistent single-level phases only, no descriptor_reduce, no
+# function-scope resident loads (Q-tile style), loop bodies may only capture
+# segment-0 (preamble) values, SemIR required.
+
+
+def _segment_function_ops(g: ScheduleGraph, n_phases: int) -> list[list[Op]]:
+    """Slice function-scope ops into N+1 positional segments at the scf.for
+    entries (ops-table insertion order is source order): segment 0 = preamble,
+    segment i>=1 = ops between phase i-1's loop and the next loop (its
+    epilogue), segment N = post-last-loop ops."""
+    segs: list[list[Op]] = [[] for _ in range(n_phases + 1)]
+    seg = 0
+    for op in g.ops.values():
+        if op.scope != "function":
+            continue
+        if op.kind == "scf.for":
+            seg += 1
+            if seg > n_phases:
+                raise NotImplementedError(
+                    "multi-phase: more function-scope scf.for ops than "
+                    "scheduled loops (unscheduled control loop?)"
+                )
+            continue
+        segs[seg].append(op)
+    if seg != n_phases:
+        raise NotImplementedError(
+            f"multi-phase: found {seg} function-scope scf.for ops, expected "
+            f"{n_phases} (one per phase)"
+        )
+    return segs
+
+
+def _validate_multiphase(
+    g: ScheduleGraph, phases: list[Loop], segments: list[list[Op]]
+) -> None:
+    for L in phases:
+        if L.is_outer or any(
+            n.child_pipeline_id is not None for n in L.schedule.nodes
+        ):
+            raise NotImplementedError(
+                "multi-phase: persistent/nested phases are unsupported "
+                f"(loop {L.loop_id})"
+            )
+    if any(op.kind == "tt.descriptor_reduce" for op in g.ops.values()):
+        raise NotImplementedError("multi-phase: tt.descriptor_reduce unsupported")
+    if not _use_semaphore_ir():
+        raise NotImplementedError("multi-phase: requires SemIR emission")
+    # In-loop operands referencing function-scope ops must live in segment 0:
+    # later segments render inside the default task and other tasks cannot
+    # capture their values. Hoisted allocs and inlined constants are exempt —
+    # they are emitted at kernel scope regardless of their source segment.
+    _capturable_anywhere = {"ttg.local_alloc", "ttng.tmem_alloc", "arith.constant"}
+    seg_of: dict[str, int] = {}
+    for si, ops in enumerate(segments):
+        for op in ops:
+            if op.kind in _capturable_anywhere:
+                continue
+            seg_of[op.op_id] = si
+    for L in phases:
+        for op in g.ops.values():
+            if op.scope != f"loop:{L.loop_id}":
+                continue
+            for o in op.operands:
+                if isinstance(o, OpRef) and seg_of.get(o.op_id, 0) != 0:
+                    raise NotImplementedError(
+                        f"multi-phase: loop {L.loop_id} consumes function-scope "
+                        f"op {o.op_id} from segment {seg_of[o.op_id]} — only "
+                        "preamble (segment 0) values are capturable"
+                    )
+    # A segment op must not consume a later phase's loop results (E <= seg).
+    for_phase: dict[str, int] = {}
+    fi = 0
+    for op in g.ops.values():
+        if op.scope == "function" and op.kind == "scf.for":
+            for_phase[op.op_id] = fi
+            fi += 1
+
+    def _earliest(op: Op, seen: set[str]) -> int:
+        e = 0
+        for o in op.operands:
+            if not isinstance(o, OpRef) or o.op_id in seen:
+                continue
+            seen.add(o.op_id)
+            if o.op_id in for_phase:
+                e = max(e, for_phase[o.op_id] + 1)
+                continue
+            sub = g.ops.get(o.op_id)
+            if sub is not None:
+                e = max(e, _earliest(sub, seen))
+        return e
+
+    for si, ops in enumerate(segments):
+        for op in ops:
+            e = _earliest(op, set())
+            if e > si:
+                raise NotImplementedError(
+                    f"multi-phase: segment-{si} op {op.op_id} ({op.kind}) "
+                    f"consumes phase-{e - 1} results — dump op order violates "
+                    "E <= segment"
+                )
+
+
+def _multiphase_tasks(phases: list[Loop]) -> list[dict]:
+    """Union the phases' warp groups into physical tasks by role class.
+
+    Role class: TC > TMA > joined pipeline names. Within a class each phase's
+    wgs are sorted (num_warps desc, id) and zipped index-wise across phases;
+    an index one phase doesn't fill leaves that task idle for that phase.
+    num_warps of a physical task = max over its phases."""
+
+    def role_of(wg: WarpGroup) -> str:
+        if "TC" in wg.pipelines:
+            return "TC"
+        if "TMA" in wg.pipelines:
+            return "TMA"
+        return "+".join(wg.pipelines)
+
+    classes: dict[str, list[dict]] = {}
+    for pi, L in enumerate(phases):
+        by_class: dict[str, list[WarpGroup]] = {}
+        for wg in L.warp_groups:
+            by_class.setdefault(role_of(wg), []).append(wg)
+        for cls, wgs in by_class.items():
+            wgs.sort(key=lambda w: (-w.num_warps, w.id))
+            slots = classes.setdefault(cls, [])
+            for idx, wg in enumerate(wgs):
+                while len(slots) <= idx:
+                    slots.append({"num_warps": 1, "wg_of_phase": {}})
+                slots[idx]["wg_of_phase"][pi] = wg.id
+                slots[idx]["num_warps"] = max(slots[idx]["num_warps"], wg.num_warps)
+    tasks: list[dict] = []
+    for cls in sorted(classes):
+        for k, slot in enumerate(classes[cls]):
+            nw = slot["num_warps"]
+            tasks.append(
+                {
+                    "name": f"mp_{cls.lower()}{k}",
+                    "role": cls,
+                    "num_warps": nw,
+                    "num_regs": 152 if nw >= 4 else 24,
+                    "wg_of_phase": slot["wg_of_phase"],
+                }
+            )
+    return tasks
+
+
+def _emit_multiphase(graph: ScheduleGraph) -> str:
+    lines = _Lines()
+    lines += "# @" + "generated by sched2tlx (multi-phase) — do not edit by hand."
+    lines += f"# Source: schedule_graph for kernel `{graph.kernel.name}`"
+    phases = list(graph.loops)
+    n = len(phases)
+    for i, L in enumerate(phases):
+        wgs = ", ".join(
+            f"wg{w.id}=[{'+'.join(w.pipelines)}]" for w in L.warp_groups
+        )
+        pg = getattr(L, "smem_phase_group", None)
+        lines += (
+            f"# Phase {i} (loop {L.loop_id}, II={L.schedule.II}, "
+            f"smem_phase_group={pg}): {wgs}"
+        )
+    lines += "import torch"
+    lines += "import triton"
+    lines += "import triton.language as tl"
+    lines += "import triton.language.extra.tlx as tlx"
+    lines += ""
+    _kernel_sig_lines(graph, lines)
+
+    segments = _segment_function_ops(graph, n)
+    _validate_multiphase(graph, phases, segments)
+
+    for L in phases:
+        _reassign_orphan_nodes(graph, L)
+
+    iv_names: dict[int, str] = {}
+    for i, L in enumerate(phases):
+        base = L.schedule.induction_var_name
+        iv_names[L.loop_id] = f"k{i}" if base == "iv" else base
+    for L in phases:
+        L.schedule.induction_var_name = iv_names[L.loop_id]
+
+    rctx = RenderCtx(
+        graph=graph,
+        op_var={},
+        buffer_var={},
+        alloc_op_var={},
+        loop_iv=iv_names,
+    )
+    rctx.multiphase = True
+    rctx._buf_consumer_count = _buf_mma_consumer_counts(graph)
+    # Canonical acc_tmem carve-out retired on this path: every phase
+    # accumulator uses the per-var full/empty handoff (_epilogue_acc_wg).
+    rctx.has_acc_tmem_handoff = False
+
+    lines.indent = 1
+
+    # ── Preamble: segment 0 at kernel scope (captured by every task) ──
+    lines += "# ── Preamble (function-scope ops before phase 0) ──"
+    reduce_descs = _descriptor_reduce_desc_ops(graph)
+    for op in segments[0]:
+        if op.kind in _SKIP_FUNCTION_SCOPE:
+            continue
+        if op.kind not in _NAMED_FUNCTION_OPS:
+            continue
+        if op.op_id in reduce_descs:
+            continue
+        name = _auto_name(op, rctx.fresh_idx())
+        rctx.op_var[op.op_id] = name
+        lines += f"{name} = {_render_op_expr(op, rctx)}"
+    lines += ""
+
+    # ── Buffers: per-phase rings (pooled when phase groups say so) ──
+    groups = [getattr(L, "smem_phase_group", None) for L in phases]
+    pooled = len({x for x in groups if x is not None}) >= 2
+    pool_members: list[list[str]] = [[] for _ in phases]
+    pool_spec: str | None = None
+    if pooled:
+        pool_spec = "smem_pool"
+        lines += "# ── Phase pool: sibling phases' SMEM rings share bytes ──"
+        lines += (
+            f"{pool_spec} = tlx.storage_alias_spec("
+            f"storage=tlx.storage_kind.smem)"
+        )
+    for i, L in enumerate(phases):
+        _emit_loop_buffers(
+            L, graph, rctx, lines,
+            pool_spec=pool_spec, pool_member_out=pool_members[i],
+        )
+    if pooled:
+        nonempty = [m for m in pool_members if m]
+        if len(nonempty) >= 2:
+            inner_groups = ", ".join(
+                f"tlx.reuse_group({', '.join(m)}, "
+                f"group_type=tlx.reuse_group_type.distinct)"
+                for m in nonempty
+            )
+            lines += (
+                f"{pool_spec}.set_buffer_overlap(tlx.reuse_group("
+                f"{inner_groups}, group_type=tlx.reuse_group_type.shared))"
+            )
+    _emit_function_scope_allocs(graph, rctx, lines)
+    if rctx.fn_scope_loads:
+        raise NotImplementedError(
+            "multi-phase: function-scope resident TMA loads (Q-tile style) "
+            "are unsupported"
+        )
+
+    # ── Channels (union over phases) + SemIR ──
+    channels: list[Channel] = []
+    for L in phases:
+        channels.extend(_derive_channels(L, rctx))
+    sched_channels: list[Channel] = []
+    for L in graph.loops:
+        for cb in L.schedule.cross_wg_barriers:
+            if cb.paired_buffer_id is None:
+                sync_name = f"sync_L{L.loop_id}_n{cb.producer_node}_to_n{cb.consumer_node}"
+                sched_channels.append(
+                    Channel(
+                        name=sync_name,
+                        depth=cb.depth,
+                        producer_wg=cb.producer_wg,
+                        consumer_wg=cb.consumer_wg,
+                        kind="named",
+                        producer_node=cb.producer_node,
+                        consumer_node=cb.consumer_node,
+                        buffer_id=None,
+                        loop_id=L.loop_id,
+                    )
+                )
+                continue
+            buf_var = rctx.buffer_var.get((L.loop_id, cb.paired_buffer_id))
+            if buf_var is None:
+                continue
+            sched_channels.append(
+                Channel(
+                    name=buf_var,
+                    depth=cb.depth,
+                    producer_wg=cb.producer_wg,
+                    consumer_wg=cb.consumer_wg,
+                    kind="smem",
+                    producer_node=cb.producer_node,
+                    consumer_node=cb.consumer_node,
+                    buffer_id=cb.paired_buffer_id,
+                    loop_id=L.loop_id,
+                )
+            )
+    by_name = {c.name: c for c in channels}
+    for L in phases:
+        for tc in _derive_tmem_channels(graph, L):
+            if tc.alloc_op_id and tc.alloc_op_id in rctx.alloc_op_var:
+                tc.name = rctx.alloc_op_var[tc.alloc_op_id]
+            if tc.name in by_name:
+                ex = by_name[tc.name]
+                ex.kind = "tmem"
+                ex.alloc_op_id = ex.alloc_op_id or tc.alloc_op_id
+                ex.bridge_op_id = ex.bridge_op_id or tc.bridge_op_id
+            else:
+                channels.append(tc)
+                by_name[tc.name] = tc
+        for sb in _derive_smem_bridge_channels(graph, L):
+            sb.name = rctx.buffer_var.get((sb.loop_id, sb.buffer_id), sb.name)
+            if sb.name in by_name:
+                continue
+            channels.append(sb)
+            by_name[sb.name] = sb
+    bridge_op_ids = {
+        c.bridge_op_id for c in channels if c.kind == "tmem" and c.bridge_op_id
+    }
+    node_op_ref: dict[tuple[int, int], str] = {}
+    for L in graph.loops:
+        for nn in L.schedule.nodes:
+            if nn.op_ref:
+                node_op_ref[(L.loop_id, nn.id)] = nn.op_ref
+    for sc in sched_channels:
+        if sc.kind == "smem" and sc.consumer_node is not None:
+            cons_op = node_op_ref.get((sc.loop_id, sc.consumer_node))
+            if cons_op and cons_op in bridge_op_ids:
+                continue
+        if sc.name in by_name:
+            ex = by_name[sc.name]
+            ex.producer_node = ex.producer_node or sc.producer_node
+            ex.consumer_node = ex.consumer_node or sc.consumer_node
+            ex.buffer_id = ex.buffer_id or sc.buffer_id
+            ex.loop_id = ex.loop_id if ex.loop_id is not None else sc.loop_id
+        else:
+            channels.append(sc)
+            by_name[sc.name] = sc
+    chan_names = {c.name for c in channels}
+    extra: list[tuple[str, int]] = []
+    for L in graph.loops:
+        for b in L.schedule.buffers:
+            if b.kind not in ("smem", "tmem") or not b.def_op:
+                continue
+            name = rctx.buffer_var.get((L.loop_id, b.id))
+            if name is None or name in chan_names:
+                continue
+            has_load = any(
+                op.kind in ("ttg.local_alloc",)
+                and op.operands
+                and (
+                    isinstance(op.operands[0], OpRef)
+                    and (
+                        (g_op := graph.ops.get(op.operands[0].op_id))
+                        and g_op.kind == "tt.descriptor_load"
+                    )
+                )
+                for oid, op in graph.ops.items()
+                if oid == b.def_op
+            )
+            if has_load:
+                extra.append((name, b.count))
+    rctx.crossloop_channels = _derive_crossloop_result_channels(graph, rctx)
+    for ch in rctx.crossloop_channels:
+        extra.append((ch["bufname"], 1))
+        shape = ", ".join(str(d) for d in ch["shape"]) + (
+            "," if len(ch["shape"]) == 1 else ""
+        )
+        lines += (
+            f"# {ch['bufname']}: cross-loop iter_arg result channel "
+            f"(loop {ch['loop_id']} iter_arg {ch['idx']} → epilogue)"
+        )
+        lines += f"{ch['bufname']} = tlx.local_alloc(({shape}), {ch['dtype']}, 1)"
+
+    wg_of_node: dict[tuple[int, int], int] = {}
+    for L in graph.loops:
+        for nn in L.schedule.nodes:
+            wg_of_node[(L.loop_id, nn.id)] = nn.warp_group
+    rctx.sem_set = build_sem_set_for_graph(
+        graph, wg_of_node=wg_of_node, intra_wg_skip_pairs=set()
+    )
+
+    # ── Mbarriers (SemIR pairs; no canonical acc_tmem carve-out here) ──
+    lines += "# ── Mbarriers (SemIR: full+empty pair per semaphore) ──"
+    empty_total: dict[str, int] = {}
+    for ls in rctx.sem_set.lowered:
+        if ls.alloc_empty_stmt is not None:
+            m = re.search(r"arrive_count=(\d+)", ls.alloc_empty_stmt)
+            empty_total[ls.empty_name] = empty_total.get(ls.empty_name, 0) + (
+                int(m.group(1)) if m else 1
+            )
+    bcc = getattr(rctx, "_buf_consumer_count", {}) or {}
+    for ls in rctx.sem_set.lowered:
+        if ls.alloc_empty_stmt is None or ls.sem.buffer is None:
+            continue
+        cnt = bcc.get(ls.sem.buffer.buffer_id, 0)
+        if cnt > empty_total.get(ls.empty_name, 1):
+            empty_total[ls.empty_name] = cnt
+    seen_alloc: set[str] = set()
+    for ls in rctx.sem_set.lowered:
+        sem = ls.sem
+        if ls.full_name in seen_alloc:
+            continue
+        seen_alloc.add(ls.full_name)
+        lines += f"# {ls.name}: {sem.note or ''}"
+        lines += ls.alloc_full_stmt
+        if ls.alloc_empty_stmt is not None:
+            lines += re.sub(
+                r"arrive_count=\d+",
+                f"arrive_count={empty_total[ls.empty_name]}",
+                ls.alloc_empty_stmt,
+            )
+    for c in channels:
+        if c.kind != "tmem" or not c.bridge_op_id:
+            continue
+        lines += (
+            f"# {c.name}: TMEM bridge channel "
+            f"(SW producer → MMA consumer via TMEM, depth={c.depth})"
+        )
+        lines += (
+            f"{_bar_full(c.name)} = tlx.alloc_barriers"
+            f"(num_barriers={c.depth}, arrive_count=1)"
+        )
+        lines += (
+            f"{_bar_empty(c.name)} = tlx.alloc_barriers"
+            f"(num_barriers={c.depth}, arrive_count={c.num_consumers})"
+        )
+    for var in _epilogue_acc_wg(graph, rctx):
+        lines += f"# {var}_full: epilogue accumulator handoff (TC → default)"
+        lines += f"{var}_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)"
+        lines += f"{var}_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)"
+    for name, depth in extra or []:
+        lines += (
+            f"# {name}: legacy carve-out (cross-loop iter_arg or "
+            f"intra-WG async load)"
+        )
+        eac = bcc.get(name, 1)
+        lines += (
+            f"{_bar_full(name)} = tlx.alloc_barriers"
+            f"(num_barriers={depth}, arrive_count=1)"
+        )
+        lines += (
+            f"{_bar_empty(name)} = tlx.alloc_barriers"
+            f"(num_barriers={depth}, arrive_count={eac})"
+        )
+    rctx.channels = channels
+
+    # ── Physical task set (role-class union across phases) ──
+    tasks = _multiphase_tasks(phases)
+    for i, L in enumerate(phases):
+        covered = {t["wg_of_phase"].get(i) for t in tasks} - {None}
+        for nn in L.schedule.nodes:
+            if nn.child_pipeline_id is not None:
+                continue
+            if nn.warp_group is None or nn.warp_group < 0:
+                continue
+            if nn.op_kind in _COVERAGE_EXEMPT_KINDS:
+                continue
+            if nn.warp_group not in covered:
+                raise RuntimeError(
+                    f"multi-phase task-coverage error: phase {i} wg "
+                    f"{nn.warp_group} N{nn.id} {nn.op_kind} has no owning task"
+                )
+
+    # ── Inter-phase joins: full task-set rendezvous per boundary ──
+    n_participants = 1 + len(tasks)  # default + every physical task
+    for i in range(n - 1):
+        lines += (
+            f"# mp_join_{i}: phase {i}→{i + 1} rendezvous — every task arrives "
+            f"(TC tasks via tcgen05_commit, witnessing async operand reads) "
+            f"then waits; phase {i + 1} touches no (pooled) ring bytes before "
+            f"every phase-{i} read completed."
+        )
+        lines += (
+            f"mp_join_{i} = tlx.alloc_barriers(num_barriers=1, "
+            f"arrive_count={n_participants})"
+        )
+
+    def _phase_has_tc(L: Loop, wg_id: int | None) -> bool:
+        if wg_id is None:
+            return False
+        return any(
+            nn.warp_group == wg_id and "mma" in nn.op_kind.lower()
+            for nn in L.schedule.nodes
+        )
+
+    # ── Tasks ──
+    with lines.block("with tlx.async_tasks():"):
+        # Default task: per-phase epilogue segments + join relays.
+        lines += "# Async task: default — per-phase epilogues + phase joins"
+        with lines.block('with tlx.async_task("default"):'):
+            snapshot = dict(rctx.op_var)
+            _n0 = len(lines.buf)
+            for i, L in enumerate(phases):
+                lines += f"# ── phase {i} epilogue ──"
+                for ch in rctx.crossloop_channels:
+                    if ch["loop_id"] != L.loop_id:
+                        continue
+                    lines += f"tlx.barrier_wait({_bar_full(ch['bufname'])}[0], 0)"
+                    lines += (
+                        f"{ch['var_name']} = tlx.local_load({ch['bufname']}[0])"
+                    )
+                _emit_default_epilogue_ops(graph, segments[i + 1], rctx, lines)
+                if i < n - 1:
+                    lines += f"tlx.barrier_arrive(mp_join_{i}[0], 1)"
+                    lines += f"tlx.barrier_wait(mp_join_{i}[0], 0)"
+            if len(lines.buf) == _n0:
+                lines += "pass"
+            rctx.op_var = snapshot
+        # Physical tasks: per-phase WG bodies + joins.
+        for t in tasks:
+            lines += (
+                f"# Async task: {t['name']} role={t['role']} ← phases "
+                f"{{{', '.join(f'{pi}: wg{w}' for pi, w in sorted(t['wg_of_phase'].items()))}}}"
+            )
+            hdr = (
+                f"with tlx.async_task(num_warps={t['num_warps']}, "
+                f"num_regs={t['num_regs']}):"
+            )
+            with lines.block(hdr):
+                _t0 = len(lines.buf)
+                for i, L in enumerate(phases):
+                    wg_id = t["wg_of_phase"].get(i)
+                    if wg_id is not None:
+                        wg_obj = next(
+                            (w for w in L.warp_groups if w.id == wg_id), None
+                        )
+                        if wg_obj is not None:
+                            lines += f"# ── phase {i} body (loop {L.loop_id} wg{wg_id}) ──"
+                            snap = dict(rctx.op_var)
+                            _emit_warp_group(
+                                graph, L, wg_obj, channels, rctx, lines
+                            )
+                            rctx.op_var = snap
+                    if i < n - 1:
+                        if _phase_has_tc(L, wg_id):
+                            # The TC engine arrives once all prior async
+                            # tcgen5 ops (= every ring read) completed.
+                            lines += f"tlx.tcgen05_commit(mp_join_{i}[0])"
+                        else:
+                            lines += f"tlx.barrier_arrive(mp_join_{i}[0], 1)"
+                        lines += f"tlx.barrier_wait(mp_join_{i}[0], 0)"
+                if len(lines.buf) == _t0:
+                    lines += "pass"
+
+    return lines.render()
+
+
 def emit(graph: ScheduleGraph) -> str:
     lines = _Lines()
     # Emit a generated-code marker so linters/formatters (arc f, black) skip the
@@ -6232,11 +6890,35 @@ def emit(graph: ScheduleGraph) -> str:
     lines += "import triton"
     lines += "import triton.language as tl"
     lines += "import triton.language.extra.tlx as tlx"
+    if graph.launch_hints:
+        # Memory-bound WS kernel: without a maxnreg cap the WS lowering
+        # requests the full register file and pins residency at 1 CTA/SM.
+        # Launchers should pass maxnreg=RECOMMENDED_MAXNREG and scale the
+        # persistent grid by RECOMMENDED_GRID_MULTIPLIER x NUM_SMS so
+        # multiple CTAs co-reside and hide HBM latency.
+        lines += ""
+        lines += "# Launch hints from the modulo pass (memory-bound kernel)."
+        lines += f"RECOMMENDED_MAXNREG = {graph.launch_hints['maxnreg']}"
+        lines += (f"RECOMMENDED_GRID_MULTIPLIER = "
+                  f"{graph.launch_hints['grid_multiplier']}")
     lines += ""
     _kernel_sig_lines(graph, lines)
 
     outer_loop = _find_outer_loop(graph)
     inner_loop = _find_inner_loop(graph, outer_loop) if outer_loop else None
+
+    # A schedule graph with SIBLING loops (two+ back-to-back compute phases,
+    # smem_phase_group set by the pass) routes to the multi-phase driver —
+    # historically these loops were SILENTLY DROPPED from the emitted kernel.
+    # Shapes the driver can't lower still hard-error inside
+    # `_validate_multiphase`, never mis-emit.
+    unclaimed = [
+        L.loop_id
+        for L in graph.loops
+        if L is not outer_loop and L is not inner_loop
+    ]
+    if unclaimed:
+        return _emit_multiphase(graph)
 
     # Fold pipeline=NONE sink ops (warp_group=-1) into their producer's group.
     for L in graph.loops:

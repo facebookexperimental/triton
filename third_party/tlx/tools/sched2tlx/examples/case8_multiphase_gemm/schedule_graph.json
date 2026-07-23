@@ -1,4 +1,5 @@
 {
+  "@generated": "by triton — do not edit by hand.",
   "schema_version": "0.1",
   "kernel": {
     "name": "triple_gemm_nows",

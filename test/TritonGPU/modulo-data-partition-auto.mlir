@@ -1,28 +1,39 @@
-// REQUIRES: asserts
-// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+// RUN: env TRITON_MODULO_DUMP_SCHEDULE=%t.json triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -o /dev/null && FileCheck %s --check-prefix=SURFACE < %t.json
+// RUN: env TRITON_DATA_PARTITION_N=auto TRITON_MODULO_DUMP_SCHEDULE=%t2.json triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -o /dev/null && FileCheck %s --check-prefix=AUTO < %t2.json
 
 //===----------------------------------------------------------------------===//
-// Test: Step 4 (budget check) + Step 4.5 (buffer merging)
-//   Verify budget passes for a standard GEMM and that buffers with
-//   overlapping lifetimes are NOT merged (separate physical groups).
+// Test: A.5 auto factor search — the tie-keeps-baseline path.
+//
+// The accumulator is 128 rows with blockM = 64, so BOTH configurations are
+// TMEM-legal: baseline (128 rows <= 128 lanes) and the N=2 split
+// (m_size = 64 >= minM = blockM = 64). The M-split conserves MAC area
+// (occupancy = max(occ_full, N x issue floor) stays occ_full), the loop
+// schedules either way, and no SMEM ring is budget-reduced — so all four
+// score terms tie and the search must keep the incumbent baseline (N=1).
+// This is the ONLY corpus input that exercises the tie chain: the example
+// cases are either candidate-free (BM=128, blockM=128) or decided at the
+// legality term (case2's BM=256).
 //===----------------------------------------------------------------------===//
+
+// --- Candidate surface: the N=2 split is legal and reported, not applied ---
+// SURFACE: "op_kind": "ttng.tc_gen5_mma", "dim": 0, "applied_n": 1, "factors": [{"n": 2, "m_size": 64}]
+
+// --- Under auto: same dump — the search ran and kept N=1. Non-vacuous by
+// --- construction: the SURFACE check proves the factor set is non-empty,
+// --- and with env=auto and no explicit attr the search's only
+// --- exit-before-evaluate is an empty factor set — so N=2 was evaluated
+// --- and lost the tie. ---
+// AUTO: "op_kind": "ttng.tc_gen5_mma", "dim": 0, "applied_n": 1, "factors": [{"n": 2, "m_size": 64}]
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
-#acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#acc_layout = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]], warp = [[16, 0], [32, 0]], block = []}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
-#acc_tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+#acc_tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 128, colStride = 1>
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Step 4.5: Merge first (before budget check — reduces memory footprint)
-// Step 4.6: Budget check passes (SMEM ~65KB << 232KB, TMEM ~196KB << 256KB)
-//
-// A/B operand SMEM (overlapping lifetimes) stay in separate groups; the TMEM
-// accumulator gets its own; the mbarrier record is excluded from merging.
-// CHECK: [Step4.5] 4 buffers -> 3 physical groups
-// CHECK: [Step4.6] Budget: SMEM {{[0-9]+}}/{{[0-9]+}} OK, TMEM {{[0-9]+}}/{{[0-9]+}} OK
-tt.func @test_budget_and_merge(
+tt.func @test_dp_auto_tie(
   %a_desc: !tt.tensordesc<128x64xf16>,
   %b_desc: !tt.tensordesc<64x128xf16>
 ) {

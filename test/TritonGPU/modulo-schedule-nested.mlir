@@ -17,14 +17,18 @@
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
+// The graph dumps are now labeled Inner/Outer (was: two generic "Loop
+// ScheduleGraph" headers). Same intent: both loops must be scheduled.
+// CHECK: [PASS-A] === Inner ScheduleGraph ===
 // CHECK: modulo.schedule @loop0 {
 //
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
+// CHECK: [PASS-A] === Outer ScheduleGraph ===
 // CHECK: modulo.schedule @loop0 {
 //
-// Inner loop gets tt.num_stages (no loop.stage — uses emitMMAAnnotations).
-// Outer loop gets loop.stage attrs via emitScheduleAttributes.
+// Both loops now get full schedule attrs (loop.stage/loop.cluster on ops,
+// tt.modulo_ii + tt.num_stages on the scf.for). The first tt.num_stages
+// after the label is the inner K-loop's attr dict; the following
+// tt.modulo_ii match is the outer loop's.
 // CHECK-LABEL: @persistent_gemm_nested
 // Inner loop has tt.num_stages:
 // CHECK: scf.for

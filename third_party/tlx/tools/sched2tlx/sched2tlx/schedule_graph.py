@@ -115,6 +115,10 @@ class Buffer:
     partition_count: int = 1
     partition_dim: int = 0
     m_size: int = 0
+    # Depth the schedule's lifetime analysis asked for, before the SMEM/TMEM
+    # budget reducers trimmed `count`. requested_count > count means this
+    # ring runs shallower than the schedule wants (budget-trim shortfall).
+    requested_count: int = 0
 
 
 @dataclass
@@ -218,6 +222,10 @@ class Loop:
     is_outer: bool
     warp_groups: list[WarpGroup]
     schedule: ScheduleLoop
+    # Step 4.6 (cross-nest): loops in different phase groups never run
+    # concurrently — their SMEM pools may be aliased. None = ungrouped
+    # (single-nest kernel or pooling disabled).
+    smem_phase_group: int | None = None
 
 
 @dataclass
@@ -232,6 +240,10 @@ class ScheduleGraph:
     kernel: Kernel
     ops: dict[str, Op]
     loops: list[Loop]
+    # Optional launch hints from the modulo pass (present only for
+    # memory-bound WS kernels): {"memory_bound": true, "maxnreg": N,
+    # "grid_multiplier": M, "total_warps": W}. See SCHEMA.md.
+    launch_hints: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +286,7 @@ def _to_buffer(d: dict[str, Any]) -> Buffer:
         live_start=d["live_start"],
         live_end=d["live_end"],
         def_op=d.get("def_op"),
+        requested_count=d.get("requested_count", d["count"]),
     )
 
 
@@ -364,6 +377,8 @@ def load_graph(path: str | Path) -> ScheduleGraph:
                 is_outer=L.get("is_outer", False),
                 warp_groups=[WarpGroup(**w) for w in L.get("warp_groups", [])],
                 schedule=_to_schedule_loop(L["schedule_loop"]),
+                smem_phase_group=L.get("smem_phase_group"),
             ) for L in data.get("loops", [])
         ],
+        launch_hints=data.get("launch_hints"),
     )

@@ -92,6 +92,9 @@ def fa_bwd_dkdv_5mma(
     q_smem_9_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     # q_smem_10_full: per-tile resident load barrier
     q_smem_10_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    # acc_tmem_5_full: epilogue accumulator handoff (TC → default)
+    acc_tmem_5_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    acc_tmem_5_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     # acc_tmem_7_full: epilogue accumulator handoff (TC → default)
     acc_tmem_7_full = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     acc_tmem_7_empty = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
@@ -99,22 +102,23 @@ def fa_bwd_dkdv_5mma(
         # Async task: role=default ← (none) (Phase 4 plan)
         with tlx.async_task("default"):
             tlx.barrier_wait(acc_tmem_full[0], 0)
+            tlx.barrier_wait(acc_tmem_5_full[0], 0)
+            acc_13 = tlx.local_load(acc_tmem_5[0])
+            tlx.barrier_arrive(acc_tmem_5_empty[0], 1)
             tlx.barrier_wait(acc_tmem_7_full[0], 0)
-            acc_13 = tlx.local_load(acc_tmem_7[0])
+            acc_14 = tlx.local_load(acc_tmem_7[0])
             tlx.barrier_arrive(acc_tmem_7_empty[0], 1)
-            acc = tlx.local_load(acc_tmem[0])
-            tlx.barrier_arrive(acc_tmem_empty[0], 1)
-            desc_14 = tl.make_tensor_descriptor((dK + mul_4), [N_CTX, 64], [ext_6, 1], [128, 64])
-            desc_15 = tl.make_tensor_descriptor((dV + mul_4), [N_CTX, 64], [ext_6, 1], [128, 64])
-            trunc_16 = acc.to(tl.float16)
-            tlx.local_store(c_smem[0], trunc_16)
-            tlx.fence_async_shared()
-            tlx.async_descriptor_store(desc_14, c_smem[0], [mul_5, 0])
-            tlx.async_descriptor_store_wait(0)
-            trunc_17 = acc_13.to(tl.float16)
+            desc_15 = tl.make_tensor_descriptor((dK + mul_4), [N_CTX, 64], [ext_6, 1], [128, 64])
+            desc_16 = tl.make_tensor_descriptor((dV + mul_4), [N_CTX, 64], [ext_6, 1], [128, 64])
+            trunc_17 = acc_14.to(tl.float16)
             tlx.local_store(c_smem[0], trunc_17)
             tlx.fence_async_shared()
             tlx.async_descriptor_store(desc_15, c_smem[0], [mul_5, 0])
+            tlx.async_descriptor_store_wait(0)
+            trunc_18 = acc_13.to(tl.float16)
+            tlx.local_store(c_smem[0], trunc_18)
+            tlx.fence_async_shared()
+            tlx.async_descriptor_store(desc_16, c_smem[0], [mul_5, 0])
             tlx.async_descriptor_store_wait(0)
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -151,34 +155,34 @@ def fa_bwd_dkdv_5mma(
                 _it = (tile_id - 0) // 64
                 buf = _it % 1
                 phase = (_it // 1) & 1
-                splat_18 = tile_id
-                add_19 = (splat_18 + _wgloc600)
-                addptr_20 = ((M + mul_3) + add_19)
-                addptr_21 = ((D + mul_3) + add_19)
-                v_22 = tl.load(addptr_20)
+                splat_19 = tile_id
+                add_20 = (splat_19 + _wgloc600)
+                addptr_21 = ((M + mul_3) + add_20)
+                addptr_22 = ((D + mul_3) + add_20)
                 v_23 = tl.load(addptr_21)
-                expand_24 = v_22[None, :]
-                bcast_25 = expand_24
-                expand_26 = v_23[None, :]
-                bcast_27 = expand_26
+                v_24 = tl.load(addptr_22)
+                expand_25 = v_23[None, :]
+                bcast_26 = expand_25
+                expand_27 = v_24[None, :]
+                bcast_28 = expand_27
                 tlx.barrier_wait(sem1_full[0], (_it & 1))  # N11→N12  ttng.tc_gen5_mma→ttng.tmem_load  cyc508→cyc1067  forward  buf=None  kind=named
-                tmload_28 = tlx.local_load(acc_tmem_6[0])
+                tmload_29 = tlx.local_load(acc_tmem[0])
                 tlx.barrier_arrive(sem6_full[0], 1)
                 tlx.barrier_wait(sem3_full[0], (_it & 1))  # N21→N25  ttng.tc_gen5_mma→ttng.tmem_load  cyc538→cyc1195  forward  buf=None  kind=named
-                tmload_29 = tlx.local_load(acc_tmem_5[0])
+                tmload_30 = tlx.local_load(acc_tmem_6[0])
                 tlx.barrier_arrive(sem7_full[0], 1)
-                mulf_30 = (tmload_28 * tl.full((128, 64), 1.4427, tl.float32))
-                subf_31 = (mulf_30 - bcast_25)
-                subf_32 = (tmload_29 - bcast_27)
-                exp2_33 = tl.math.exp2(subf_31)
-                trunc_34 = exp2_33.to(tl.float16)
-                mulf_35 = (exp2_33 * subf_32)
-                trunc_36 = mulf_35.to(tl.float16)
+                mulf_31 = (tmload_29 * tl.full((128, 64), 1.4427, tl.float32))
+                subf_32 = (mulf_31 - bcast_26)
+                subf_33 = (tmload_30 - bcast_28)
+                exp2_34 = tl.math.exp2(subf_32)
+                trunc_35 = exp2_34.to(tl.float16)
+                mulf_36 = (exp2_34 * subf_33)
+                trunc_37 = mulf_36.to(tl.float16)
                 tlx.barrier_wait(L0_acc_tmem_2_empty[0], (_it & 1) ^ 1)  # TMEM bridge
-                tlx.local_store(L0_acc_tmem_2[0], trunc_34)
+                tlx.local_store(L0_acc_tmem_2[0], trunc_35)
                 tlx.barrier_arrive(L0_acc_tmem_2_full[0], 1)
                 tlx.barrier_wait(sem4_b3_empty[(_it % 3)], (((_it // 3) & 1) ^ 1))
-                tlx.local_store(L0_smem_3[(_it % 3)], trunc_36)
+                tlx.local_store(L0_smem_3[(_it % 3)], trunc_37)
                 tlx.barrier_arrive(sem4_b3_full[(_it % 3)], 1)
         # Async task: role=TC ← inner wg3 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -191,13 +195,13 @@ def fa_bwd_dkdv_5mma(
                 _it = (tile_id - 0) // 64
                 buf = _it % 3
                 phase = (_it // 3) & 1
-                mdt_37 = tlx.local_trans(L0_smem_0[0])
+                mdt_38 = tlx.local_trans(L0_smem_0[0])
                 # MMA
                 tlx.barrier_wait(L0_smem_0_full[(_it % 3)], ((_it // 3) & 1))
                 tlx.barrier_wait(sem6_full[0], (_it & 1))
                 use_acc = False
-                tlx.async_dot(q_smem_9[0], tlx.local_trans(L0_smem_0[buf]), acc_tmem_6[0], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 3)], sem1_full[0]])
-                mdt_38 = tlx.local_trans(L0_smem_3[0])
+                tlx.async_dot(q_smem_9[0], tlx.local_trans(L0_smem_0[buf]), acc_tmem[0], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 3)], sem1_full[0]])
+                mdt_39 = tlx.local_trans(L0_smem_3[0])
                 # MMA
                 tlx.barrier_wait(sem4_b3_full[(_it % 3)], ((_it // 3) & 1))
                 tlx.barrier_wait(sem8_full[0], (_it & 1))
@@ -205,9 +209,10 @@ def fa_bwd_dkdv_5mma(
                 tlx.async_dot(tlx.local_trans(L0_smem_3[buf]), q_smem_9[0], acc_tmem_8[0], use_acc=use_acc, mBarriers=[sem4_b3_empty[(_it % 3)], sem5_full[0]])
                 # MMA
                 use_acc = (tile_id > 0)
-                tlx.async_dot(L0_smem_3[buf], L0_smem_0[buf], acc_tmem[0], use_acc=use_acc, mBarriers=[sem4_b3_empty[(_it % 3)], L0_smem_0_empty[(_it % 3)]])
+                tlx.async_dot(L0_smem_3[buf], L0_smem_0[buf], acc_tmem_7[0], use_acc=use_acc, mBarriers=[sem4_b3_empty[(_it % 3)], L0_smem_0_empty[(_it % 3)]])
                 i0_0 = True
             tlx.tcgen05_commit(acc_tmem_full[0])
+            tlx.tcgen05_commit(acc_tmem_7_full[0])
         # Async task: role=TC ← inner wg4 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             tlx.barrier_wait(q_smem_10_full[0], 0)  # wait Q tile loaded
@@ -217,18 +222,18 @@ def fa_bwd_dkdv_5mma(
                 _it = (tile_id - 0) // 64
                 buf = _it % 3
                 phase = (_it // 3) & 1
-                mdt_39 = tlx.local_trans(L0_smem_1[0])
+                mdt_40 = tlx.local_trans(L0_smem_1[0])
                 # MMA
                 tlx.barrier_wait(L0_smem_1_full[(_it % 3)], ((_it // 3) & 1))
                 tlx.barrier_wait(sem7_full[0], (_it & 1))
                 use_acc = False
-                tlx.async_dot(q_smem_10[0], tlx.local_trans(L0_smem_1[buf]), acc_tmem_5[0], use_acc=use_acc, mBarriers=[L0_smem_1_empty[(_it % 3)], sem3_full[0]])
+                tlx.async_dot(q_smem_10[0], tlx.local_trans(L0_smem_1[buf]), acc_tmem_6[0], use_acc=use_acc, mBarriers=[L0_smem_1_empty[(_it % 3)], sem3_full[0]])
                 # MMA
                 tlx.barrier_wait(L0_acc_tmem_2_full[0], _it & 1)  # TMEM bridge operand
                 use_acc = (tile_id > 0)
-                tlx.async_dot(L0_acc_tmem_2[0], L0_smem_1[buf], acc_tmem_7[0], use_acc=use_acc, mBarriers=[L0_acc_tmem_2_empty[0], L0_smem_1_empty[(_it % 3)]])
+                tlx.async_dot(L0_acc_tmem_2[0], L0_smem_1[buf], acc_tmem_5[0], use_acc=use_acc, mBarriers=[L0_acc_tmem_2_empty[0], L0_smem_1_empty[(_it % 3)]])
                 i0_0 = True
-            tlx.tcgen05_commit(acc_tmem_7_full[0])
+            tlx.tcgen05_commit(acc_tmem_5_full[0])
         # Async task: role=CUDA ← inner wg5 (Phase 4 plan)
         with tlx.async_task(num_warps=4, num_regs=152):
             for tile_id in range(0, N_CTX, 64):
@@ -236,12 +241,12 @@ def fa_bwd_dkdv_5mma(
                 buf = _it % 1
                 phase = (_it // 1) & 1
                 tlx.barrier_wait(sem5_full[0], (_it & 1))  # N31→N32  ttng.tc_gen5_mma→ttng.tmem_load  cyc2684→cyc3697  forward  buf=None  kind=named
-                tmload_40 = tlx.local_load(acc_tmem_8[0])
+                tmload_41 = tlx.local_load(acc_tmem_8[0])
                 tlx.barrier_arrive(sem8_full[0], 1)
-                trunc_41 = tmload_40.to(tl.float16)
-                cvt_42 = trunc_41
-                desc_43 = tl.make_tensor_descriptor((dQ + mul_4), [N_CTX, 64], [ext_9, 1], [64, 64])
-                tlx.local_store(dq_smem[0], cvt_42)
+                trunc_42 = tmload_41.to(tl.float16)
+                cvt_43 = trunc_42
+                desc_44 = tl.make_tensor_descriptor((dQ + mul_4), [N_CTX, 64], [ext_9, 1], [64, 64])
+                tlx.local_store(dq_smem[0], cvt_43)
                 tlx.fence_async_shared()
-                tlx.async_descriptor_store(desc_43, dq_smem[0], [tile_id, 0], store_reduce="add")
+                tlx.async_descriptor_store(desc_44, dq_smem[0], [tile_id, 0], store_reduce="add")
                 tlx.async_descriptor_store_wait(0)

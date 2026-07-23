@@ -12,6 +12,8 @@ not need the original IR or any out-of-band context.
   "kernel": { ... },
   "ops": { "<id>": { ... }, ... },
   "data_partition_candidates": [ { ... }, ... ],
+  "launch_hints": { "memory_bound": true, "total_warps": 12,
+                    "maxnreg": 56, "grid_multiplier": 4 },
   "loops": [ { ... }, ... ]
 }
 ```
@@ -33,6 +35,17 @@ not need the original IR or any out-of-band context.
   external tooling can re-run the modulo pass with
   `TRITON_DATA_PARTITION_N=<n>` per candidate and compare the resulting
   schedules.
+- `launch_hints` — OPTIONAL; present only for memory-bound warp-specialized
+  kernels (no MMA in the module, ≥1 TMA node, ≥2 warp groups). Without a
+  maxnreg cap the WS lowering auto-fills the full register file, pinning
+  residency at 1 CTA/SM — right for TC-bound kernels, wrong for memory-bound
+  ones. `maxnreg` = regs/thread sized for 3 co-resident CTAs given
+  `total_warps` (default WG + non-default WGs padded to 4-warp groups);
+  `grid_multiplier` = persistent-grid scale (× NUM_SMS). The emitter forwards
+  these as `RECOMMENDED_MAXNREG` / `RECOMMENDED_GRID_MULTIPLIER` module
+  constants in the generated kernel; launchers pass `maxnreg=` and scale the
+  grid. Measured on B200 case6 LayerNorm: 3161 → 6185 GB/s (parity with the
+  hand-written reference) with no kernel-body change.
 - `loops` — each scheduled loop's schedule graph (nodes + edges) plus its
   bounds and induction variable.
 
