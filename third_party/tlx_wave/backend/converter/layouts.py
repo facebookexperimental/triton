@@ -358,6 +358,15 @@ def distributed_linear_layout_from_parts(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
+    if kind == "dot_operand":
+        return _mfma_dot_operand_linear_layout(
+            shape,
+            properties,
+            lane_width,
+            stage=stage,
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
     _layout_fail(
         "TLXW_TYPE_UNSUPPORTED_LAYOUT",
         stage,
@@ -499,6 +508,11 @@ def _layout_parts_are_mfma(kind, properties):
 def layout_warp_count(layout):
     if layout.kind in {"linear", "generic_linear"}:
         return 1 << len(tuple(layout.properties.get("warp_bases", ())))
+    if layout.kind == "dot_operand":
+        return _layout_warp_count_from_parts(
+            layout.properties.get("parent_kind"),
+            layout.properties.get("parent_properties", {}),
+        )
     if layout.kind == "slice":
         return _layout_warp_count_from_parts(
             layout.properties.get("parent_kind"),
@@ -2029,6 +2043,147 @@ def _mfma_linear_layout(
     )
 
 
+def _mfma_dot_operand_linear_layout(
+    shape,
+    properties,
+    lane_width,
+    *,
+    stage,
+    source_op_index,
+    source_value_id,
+):
+    """Build Triton's canonical kWidth-aware MFMA operand layout."""
+    shape = tuple(int(value) for value in shape)
+    if len(shape) != 2:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            "MFMA dot-operand layout currently requires rank-2 tensors",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    if properties.get("parent_kind") != "amd_mfma":
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            stage,
+            "dot-operand layout requires an AMD MFMA parent",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    parent = properties.get("parent_properties", {})
+    instr_shape = tuple(int(value) for value in parent.get("instr_shape", ()))
+    if len(instr_shape) != 3:
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "MFMA dot-operand layout requires a rank-3 instrShape",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    op_idx = int(properties.get("op_idx", -1))
+    if op_idx not in {0, 1}:
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            f"unsupported dot operand index {op_idx}",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    k_width = int(properties.get("k_width", 0) or 0)
+    non_k_extent = int(instr_shape[op_idx])
+    lane_width = int(lane_width)
+    if (
+        not _is_power_of_two(k_width)
+        or not _is_power_of_two(non_k_extent)
+        or not _is_power_of_two(lane_width)
+        or lane_width % non_k_extent
+    ):
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "MFMA dot-operand layout requires power-of-two kWidth, lane width, "
+            "and instruction non-K extent with an integral lane partition",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+
+    k_dim_index = 1 if op_idx == 0 else 0
+    non_k_dim_index = 0 if op_idx == 0 else 1
+    dim_k = f"dim{k_dim_index}"
+    dim_non_k = f"dim{non_k_dim_index}"
+    k_size = int(shape[k_dim_index])
+
+    registers = LinearLayout.identity_1d(k_width, "register", dim_k)
+    lanes = (
+        LinearLayout.identity_1d(non_k_extent, "lane", dim_non_k)
+        * LinearLayout.identity_1d(
+            lane_width // non_k_extent,
+            "lane",
+            dim_k,
+        )
+    )
+    tile = registers * lanes
+    k_tile_size = (lane_width // non_k_extent) * k_width
+
+    # Keep Triton's special 64x4 operand rule even though the current WaveAMD
+    # MMA emitter supports only the symmetric MFMA families.  The layout model
+    # itself should stay faithful as support expands.
+    m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
+    if ((m_dim, n_dim, op_idx) == (64, 4, 0) or
+            (m_dim, n_dim, op_idx) == (4, 64, 1)):
+        tile *= LinearLayout.identity_1d(16, "register", dim_k)
+        k_tile_size *= 16
+
+    if k_size > k_tile_size:
+        if k_size % k_tile_size:
+            _layout_fail(
+                "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+                stage,
+                "MFMA dot-operand K extent is not an integral number of tiles",
+                source_op_index=source_op_index,
+                source_value_id=source_value_id,
+            )
+        tile *= LinearLayout.identity_1d(
+            k_size // k_tile_size,
+            "register",
+            dim_k,
+        )
+
+    tiles_per_warp = tuple(
+        int(value) for value in parent.get("tiles_per_warp", (1, 1))
+    )
+    if len(tiles_per_warp) < 2:
+        tiles_per_warp = (1, 1)
+    tile *= LinearLayout.identity_1d(
+        max(1, int(tiles_per_warp[non_k_dim_index])),
+        "register",
+        dim_non_k,
+    )
+    tile = _linear_layout_transpose_outs(tile, (dim_k, dim_non_k))
+
+    warps_per_cta = tuple(
+        int(value) for value in parent.get("warps_per_cta", ())
+    )
+    if len(warps_per_cta) != 2:
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "MFMA dot-operand layout requires rank-2 warpsPerCTA metadata",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    warp = _identity_standard_nd("warp", warps_per_cta, (1, 0))
+    linear = tile * warp
+    return _ensure_layout_matches_shape(
+        linear,
+        shape,
+        extension_order=(k_dim_index, non_k_dim_index),
+        stage=stage,
+        source_op_index=source_op_index,
+        source_value_id=source_value_id,
+    )
+
+
 def _linear_layout_transpose_outs(linear, out_dim_names):
     out_dim_names = tuple(str(name) for name in out_dim_names)
     old_out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
@@ -2059,11 +2214,25 @@ def _ensure_layout_matches_shape(
     linear,
     shape,
     *,
+    extension_order=None,
     stage,
     source_op_index,
     source_value_id,
 ):
-    shape_by_dim = {f"dim{dim}": int(size) for dim, size in enumerate(shape)}
+    if extension_order is None:
+        extension_order = tuple(range(len(shape)))
+    extension_order = tuple(int(dim) for dim in extension_order)
+    if sorted(extension_order) != list(range(len(shape))):
+        _layout_fail(
+            "TLXW_TYPE_MALFORMED_LAYOUT",
+            stage,
+            "layout shape extension order is not a complete permutation",
+            source_op_index=source_op_index,
+            source_value_id=source_value_id,
+        )
+    shape_by_dim = {
+        f"dim{dim}": int(shape[dim]) for dim in extension_order
+    }
     linear = _ensure_layout_not_smaller_than(
         linear,
         shape_by_dim,
