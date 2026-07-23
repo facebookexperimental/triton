@@ -85,6 +85,8 @@ def test_remote_shmem_store(device):
         offset = tl.arange(0, 1) + cluster_cta_rank
         value = tl.load(x + offset) + (cluster_cta_rank + 1) * 100
 
+        # Ensure every CTA has entered before accessing its distributed SMEM.
+        tlx.cluster_barrier()
         tlx.remote_shmem_store(
             dst=remote_store_view,
             src=value,
