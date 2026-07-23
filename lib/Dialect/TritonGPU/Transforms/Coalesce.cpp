@@ -154,7 +154,8 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         // Respect a user-pinned result layout: don't coalesce it to a "full
         // contiguity" blocked layout -- the user chose this register layout on
         // purpose. The pin (PinnedEncodingTrait) may sit under a
-        // #tlx.no_verify_layout wrapper here (peeled later by resolve-placeholder).
+        // #tlx.no_verify_layout wrapper here (peeled later by
+        // resolve-placeholder).
         if (hasRecursivePin(resultType.getEncoding()))
           return;
       } else {
@@ -188,14 +189,16 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
       } else {
         // Respect a user-pinned store value layout. A tt.store has no result to
         // carry a PinnedEncodingTrait, so the pin rides on the value operand,
-        // wrapped as #tlx.no_verify_layout(#tlx.user_layout): the outer no-verify
-        // defers store operand-layout verification until resolve-placeholder-layouts
-        // peels it, and it is still present here because coalesce runs before that
-        // pass. Find the pin (hasRecursivePin), then store in the peeled concrete
-        // layout instead of a freshly-coalesced one: convertDistributedOpEncoding
-        // then converts ptr/mask to match, the value's bridging convert folds away,
+        // wrapped as #tlx.no_verify_layout(#tlx.user_layout): the outer
+        // no-verify defers store operand-layout verification until
+        // resolve-placeholder-layouts peels it, and it is still present here
+        // because coalesce runs before that pass. Find the pin
+        // (hasRecursivePin), then store in the peeled concrete layout instead
+        // of a freshly-coalesced one: convertDistributedOpEncoding then
+        // converts ptr/mask to match, the value's bridging convert folds away,
         // and the user's chosen store layout survives to codegen (AMD
-        // OptimizeEpilogue leaves it alone since it is no longer a #blocked store).
+        // OptimizeEpilogue leaves it alone since it is no longer a #blocked
+        // store).
         Attribute pinned;
         if (auto store = dyn_cast<triton::StoreOp>(curr)) {
           if (auto vt =

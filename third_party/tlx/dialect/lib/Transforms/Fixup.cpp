@@ -204,10 +204,10 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
       // tt.store: value / ptr / mask must share one encoding
       // (SameLoadStoreOperandsEncoding). If the value carries a user pin,
       // propagate it to ptr/mask so make_ttir's verifier accepts the store
-      // without a per-op tolerance; concrete layouts resolve later in make_ttgir.
-      // Bridge (require_layout convert) the ptr/mask for this use only, leaving
-      // their producers (addptr / mask cmp, with their own same-encoding
-      // verifiers) untouched.
+      // without a per-op tolerance; concrete layouts resolve later in
+      // make_ttgir. Bridge (require_layout convert) the ptr/mask for this use
+      // only, leaving their producers (addptr / mask cmp, with their own
+      // same-encoding verifiers) untouched.
       if (auto store = dyn_cast<::mlir::triton::StoreOp>(op)) {
         SmallVector<Value> linked{store.getValue(), store.getPtr()};
         if (store.getMask())
