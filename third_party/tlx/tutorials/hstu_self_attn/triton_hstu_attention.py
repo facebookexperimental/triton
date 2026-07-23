@@ -35,22 +35,146 @@ from stubs import (
 )
 from stubs import acc_dq
 from triton.language.extra.libdevice import fast_dividef  # @manual=//triton:triton
+from triton.language.extra.subtile_ops import _split_n_2D  # @manual=//triton:triton
+
+from dataclasses import dataclass, replace as _dc_replace
+
+
+@dataclass
+class HSTUAutoWSConfig:
+    """AutoWS configuration for the HSTU self-attn kernels.
+
+    Replaces the former scattered HSTU_SELF_* environment variables with a single
+    config object, settable via configure_autows() or the `autows_cfg` argument on
+    the public entrypoints (triton_hstu_mha / triton_hstu_attention_fwd|bwd). The
+    env vars are still read once by from_env() as import-time defaults for
+    back-compat. Structural fields are tl.constexpr (read inside @triton.jit) and
+    the tile fields feed the autotune config list (built at import per Triton), so
+    configure_autows() must run before the first kernel launch.
+    """
+
+    autows: bool = False  # enable meta-WS on the KV loop
+    dp: int = 1  # data-partition factor (MMA groups)
+    dq_reduce: bool = False  # bwd dq via TMA reduce-add (vs in-loop RMW)
+    dq_reuse: bool = False  # FA-style TMEM reuse for the dq-reduce bwd
+    dq_iters: int = 1  # dq TMA-reduce column subtiles
+    warps: int = 8  # num_warps for the autoWS config
+    bn: int = 128  # fwd DP BLOCK_N
+    bwd_bm: int = 64  # bwd autoWS BLOCK_M
+    bwd_bn: int = 64  # bwd autoWS BLOCK_N
+    bwd_stages: int = 1  # bwd autoWS num_stages
+    sp: bool = False  # bwd SEQUENCE_PARALLEL
+    pin: bool = False  # pin autotune to one config (fast compile)
+
+    @classmethod
+    def from_env(cls) -> "HSTUAutoWSConfig":
+        g = os.environ.get
+        autows = g("HSTU_SELF_AUTOWS") == "1"
+        return cls(
+            autows=autows,
+            dp=int(g("HSTU_SELF_DP", "2" if autows else "1")),
+            dq_reduce=g("HSTU_SELF_DQ_REDUCE") == "1",
+            dq_reuse=g("HSTU_SELF_DQ_REUSE", "0") == "1",
+            dq_iters=int(g("HSTU_SELF_DQ_ITERS", "1")),
+            warps=int(g("HSTU_SELF_AUTOWS_WARPS", "8")),
+            bn=int(g("HSTU_SELF_AUTOWS_BN", "128")),
+            bwd_bm=int(g("HSTU_SELF_AUTOWS_BWD_BM", "64")),
+            bwd_bn=int(g("HSTU_SELF_AUTOWS_BWD_BN", "64")),
+            bwd_stages=int(g("HSTU_SELF_AUTOWS_BWD_STAGES", "1")),
+            sp=g("HSTU_SELF_AUTOWS_SP") == "1",
+            pin=bool(g("HSTU_SELF_PIN")),
+        )
+
+
+_AUTOWS_CFG = HSTUAutoWSConfig.from_env()
+# Merge any pre-import overrides set via hstu_autows_config.set_config(...) so
+# callers/tests can pass the config as a dict instead of HSTU_SELF_* env vars.
+try:
+    import hstu_autows_config as _hstu_autows_config_hook
+
+    _AUTOWS_CFG = _dc_replace(_AUTOWS_CFG, **_hstu_autows_config_hook.pop_overrides())
+except Exception:  # noqa: BLE001 -- hook is optional
+    pass
+
+
+def _sync_autows_constexprs() -> None:
+    # Re-derive the tl.constexpr views (read inside @triton.jit) from _AUTOWS_CFG.
+    global _HSTU_SELF_AUTOWS, _HSTU_SELF_DP, _HSTU_SELF_DQ_REDUCE
+    global _HSTU_SELF_DQ_ITERS, _HSTU_DQ_REUSE
+    _HSTU_SELF_AUTOWS = tl.constexpr(_AUTOWS_CFG.autows)
+    _HSTU_SELF_DP = tl.constexpr(_AUTOWS_CFG.dp)
+    _HSTU_SELF_DQ_REDUCE = tl.constexpr(_AUTOWS_CFG.dq_reduce)
+    _HSTU_SELF_DQ_ITERS = tl.constexpr(_AUTOWS_CFG.dq_iters)
+    _HSTU_DQ_REUSE = tl.constexpr(_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse)
+
+
+def configure_autows(cfg=None, **kwargs) -> "HSTUAutoWSConfig":
+    """Set the active HSTU autoWS config (replaces the HSTU_SELF_* env vars).
+
+    Accepts an HSTUAutoWSConfig, a dict of overrides, or keyword overrides. Call
+    before the first kernel launch.
+    """
+    global _AUTOWS_CFG
+    if cfg is not None:
+        if isinstance(cfg, HSTUAutoWSConfig):
+            _AUTOWS_CFG = cfg
+        else:
+            _AUTOWS_CFG = _dc_replace(_AUTOWS_CFG, **cfg)
+    if kwargs:
+        _AUTOWS_CFG = _dc_replace(_AUTOWS_CFG, **kwargs)
+    _sync_autows_constexprs()
+    return _AUTOWS_CFG
+
 
 # HSTU_SELF_AUTOWS=1 turns on Meta-Triton autoWS on the main KV loop (needs
 # TRITON_USE_META_WS=1 + TRITON_DISABLE_WSBARRIER_REORDER=1 at runtime, and a
 # num_stages>=1 config -- pair with HSTU_SELF_PIN=1). Default off -> identical to
 # the plain-Triton kernel. Must be a tl.constexpr to be read inside @triton.jit.
-_HSTU_SELF_AUTOWS = tl.constexpr(os.environ.get("HSTU_SELF_AUTOWS") == "1")
+_HSTU_SELF_AUTOWS = tl.constexpr(_AUTOWS_CFG.autows)
 # Data-partition factor for autoWS: splits the loop's MMAs into N groups (the
 # autoWS analog of TLX's replicate=NUM_MMA_GROUPS). Default 2 when autoWS is on
 # (matches TLX's 2 MMA groups), 1 otherwise; override with HSTU_SELF_DP.
-_HSTU_SELF_DP = tl.constexpr(
-    int(
-        os.environ.get(
-            "HSTU_SELF_DP", "2" if os.environ.get("HSTU_SELF_AUTOWS") == "1" else "1"
-        )
-    )
-)
+_HSTU_SELF_DP = tl.constexpr(_AUTOWS_CFG.dp)
+# EXPERIMENTAL, opt-in via HSTU_SELF_DQ_REDUCE=1 (OFF by default): dq via TMA
+# reduce-add instead of the in-loop global RMW, mirroring the cross-attn autoWS
+# bwd (triton_bw_cross_attention.py: natural dq_trans = trans(k)@dqk MMA, then
+# tl.trans of the *result*, then store_reduce="add" -- transpose the result, not
+# the dqk register operand, or meta-WS declines to partition). DQ is pre-zeroed.
+# NOTE: the reduce adds a reduction partition, so PSM's warp-budget check
+# (kMaxWarps=16) needs the default partition small -- pair with
+# HSTU_SELF_AUTOWS_WARPS=4 (num_warps=8 overflows the budget -> WS silently
+# falls back to SIMT). Still needs a TMEM-fitting config (TLX-style dq subtiling)
+# to compile at 64x64; left off by default so the shipped autoWS path keeps the
+# faster RMW dq (which warp-specializes at num_warps=8).
+_HSTU_SELF_DQ_REDUCE = tl.constexpr(_AUTOWS_CFG.dq_reduce)
+# Subtile count for the dq TMA reduce, matching FA bwd's DQ_SUBTILE. The store is
+# split into _HSTU_SELF_DQ_ITERS contiguous column-subtiles via _split_n_2D (the
+# same helper FA bwd uses; register-tensor slicing `dq[:, a:b]` is unsupported).
+# Each subtile is an independent store_reduce the compiler can stage. Must be a
+# power of 2 dividing HEAD_DIM. Default 1 (whole tile); override HSTU_SELF_DQ_ITERS.
+_HSTU_SELF_DQ_ITERS = tl.constexpr(_AUTOWS_CFG.dq_iters)
+# EXPERIMENTAL, opt-in via HSTU_SELF_DQ_REUSE=1 (default OFF): when set (and
+# dq-reduce is on), annotate the bwd MMAs' opndD with FA-bwd-style tt.autows
+# channel attrs (see WarpSpecialization/docs/AnnotationBasedBufferPreAssignment.md)
+# forming a TMEM reuse scheme that mirrors _BWD_DOT_ATTRS in
+# fused_attention_ws_device_tma.py + TLX REUSE_DP_FOR_DQ / NUM_BUFFERS_TMEM=1. At
+# BM=BN=HEAD_DIM=128 every opndD accumulator is [128,128] f32 = 128 cols; four
+# reuse groups pack to exactly 512 cols:
+#   id2 : qk_trans (f32) -> reused by act_qk_trans (bf16, dv's opndA)
+#   id5 : dp (dact_qk_trans) -> reused by dq_trans          [REUSE_DP_FOR_DQ]
+#   id7 : dv  (persistent accumulator, live across the inner loop)
+#   id10: dk  (persistent accumulator, live across the inner loop)
+# Sharing id5 also gives the otherwise-standalone single-buffered dq accumulator
+# dp's cross-iteration WAR barrier (the fix for the gemm->reduction ping-pong
+# deadlock). dp/dq have disjoint liveness (dp is consumed into dqk_trans before dq
+# is produced) and dk is emitted before dq, so nothing reads id5 after dq
+# overwrites it (BwdTmemReuseSlotHazard.md). Reuse validity needs dp and dq
+# shape-compatible, which holds only at BLOCK_N==HEAD_DIM==128 (dp=[BLOCK_N,BLOCK_M],
+# dq=[HEAD_DIM,BLOCK_M]); at BLOCK_N=64 the shapes differ and the reuse falls back.
+# The attrs are inline dict literals gated by a constexpr bool -- tl.dot's attrs=
+# is a trace-time literal, so this avoids referencing a (dict) JIT global, which
+# is unsupported. None (reuse off) leaves the dots unannotated (heuristic alloc).
+_HSTU_DQ_REUSE = tl.constexpr(_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse)
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -226,15 +350,15 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     # split into producer/consumer partitions (the tiny default config with
     # num_warps=2/BLOCK_M=16 does NOT warp-specialize). Pin to a num_warps>=4,
     # BLOCK_M>=64 config.
-    if os.environ.get("HSTU_SELF_AUTOWS") == "1":
-        _w = int(os.environ.get("HSTU_SELF_AUTOWS_WARPS", "8"))
-        _dp = int(os.environ.get("HSTU_SELF_DP", "2"))
+    if _AUTOWS_CFG.autows:
+        _w = _AUTOWS_CFG.warps
+        _dp = _AUTOWS_CFG.dp
         if _dp >= 2:
             # DP splits BLOCK_M by _dp; each slice must be >= the TMEM blockM
             # (128) or WSDataPartition skips (WSDataPartition.cpp). So set
             # BLOCK_M = 128 * _dp (doubling the split dim) -> each partition tile
             # is 128 rows, matching TLX (BLOCK_M=256, 2 groups of 128).
-            _bn = int(os.environ.get("HSTU_SELF_AUTOWS_BN", "128"))
+            _bn = _AUTOWS_CFG.bn
             return [
                 triton.Config(
                     {"BLOCK_M": 128 * _dp, "BLOCK_N": _bn},
@@ -261,7 +385,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
         return configs[:1]
     # HSTU_SELF_PIN=1 shrinks the fwd autotune to one config (fast compile for
     # tritonbench --mode bwd, which recompiles fwd+bwd).
-    if os.environ.get("HSTU_SELF_PIN"):
+    if _AUTOWS_CFG.pin:
         return configs[:1]
     return configs
 
@@ -479,9 +603,39 @@ def _get_bw_configs() -> List[triton.Config]:
         ]
     else:
         print("WARNING: temporarily disabled some autotune configs for CUDA 12.8+")
+    # HSTU_SELF_AUTOWS needs a big-enough tile + enough warps or meta-WS silently
+    # does NOT partition the bwd M-loop (the tiny default BLOCK_M=16/num_warps=2
+    # config stays SIMT). Pin one num_warps>=8, BLOCK_M>=64, num_stages>=1 config.
+    # DP is left at 1 for bwd (TLX bwd uses replicate=1), so no split-dim doubling.
+    # Use the non-SEQUENCE_PARALLEL path (single program per (z,h); dq is a direct
+    # global RMW, ATOMIC_ADD=False) and UNROLL=1 (no unroll under WS).
+    if _AUTOWS_CFG.autows:
+        _w = _AUTOWS_CFG.warps
+        _bm = _AUTOWS_CFG.bwd_bm
+        _bn = _AUTOWS_CFG.bwd_bn
+        _ns = _AUTOWS_CFG.bwd_stages
+        # SEQUENCE_PARALLEL=True -> one KV block per program => a single M loop
+        # (no outer start_n loop), matching FA bwd's flat reduction loop; the
+        # nested (SP=False) path is where the dq-reduce reduction partition's
+        # phase lockstep breaks. Default False (RMW path); set HSTU_SELF_AUTOWS_SP=1
+        # for the FA-like single-loop structure (pair with HSTU_SELF_DQ_REDUCE=1).
+        _sp = _AUTOWS_CFG.sp
+        return [
+            triton.Config(
+                {
+                    "BLOCK_M": _bm,
+                    "BLOCK_N": _bn,
+                    "SEQUENCE_PARALLEL": _sp,
+                    "UNROLL": 1,
+                },
+                num_stages=_ns,
+                num_warps=_w,
+                pre_hook=_bwd_pre_hook,
+            )
+        ]
     # HSTU_SELF_PIN=1 shrinks the bwd autotune to one config so tritonbench
     # --mode bwd compiles fast instead of building all ~29 configs.
-    if os.environ.get("HSTU_SELF_PIN"):
+    if _AUTOWS_CFG.pin:
         return configs[:1]
     return configs
 
@@ -739,6 +893,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     do_ptrs,
     device_desc_q,
     device_desc_do,
+    device_desc_dq,
     dk,
     dv,
     k,
@@ -752,6 +907,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     stride_qm,
     stride_dom,
     stride_dqm,
+    stride_dqh,
     alpha,
     attn_scale,
     max_q_len,
@@ -794,7 +950,9 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             mask=mask_m[None, :],
             other=0.0,
         )
-    qk_trans = tl.dot(k, q_trans, allow_tf32=ALLOW_TF32)
+    qk_trans = tl.dot(
+        k, q_trans, allow_tf32=ALLOW_TF32, attrs=({"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]} if _HSTU_DQ_REUSE else None)
+    )
     valid_mask_trans = backward_valid_mask(
         offs_m,
         pos_offs_n,
@@ -823,31 +981,82 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
             mask=mask_m[:, None],
             other=0.0,
         )
-    dv += tl.dot(act_qk_trans, do, allow_tf32=ALLOW_TF32)
+    # dp (dact_qk_trans) is emitted BEFORE dv: dp and dv are both stage 0 with the
+    # SAME `order`, so the `order` annotation does NOT reorder them -- same-stage
+    # dots keep PROGRAM order. Emitting dp first makes the final-ttgir schedule match
+    # TLX's dp-before-dv body order (dv/dp were the only swapped pair vs TLX).
+    dact_qk_trans = tl.dot(
+        v, tl.trans(do), allow_tf32=ALLOW_TF32, attrs=({"stage": "0", "order": "2", "channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None)
+    )
+    dv += tl.dot(
+        act_qk_trans, do, allow_tf32=ALLOW_TF32, attrs=(
+            {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]}
+            if _HSTU_DQ_REUSE
+            else None
+        )
+    )
 
     # compute dk and dq
-    dact_qk_trans = tl.dot(v, tl.trans(do), allow_tf32=ALLOW_TF32)
     dqk_trans = backward_d_activation(
         dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans
     )
     dqk_trans = dqk_trans.to(k.dtype)
 
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
-    dk += tl.dot(dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32)
-    acc_dq(
-        dq_ptrs_trans=dq_ptrs_trans,
-        start_m=start_m,
-        stride_dqm=stride_dqm,
-        k=k,
-        dqk_trans=dqk_trans,
-        alpha=alpha,
-        mask_m=mask_m,
-        MAX_SEQ_LEN=max_q_len,
-        LOCK=LOCK,
-        BLOCK_M=BLOCK_M,
-        ATOMIC_ADD=ATOMIC_ADD,
-        ALLOW_TF32=ALLOW_TF32,
+    dk += tl.dot(
+        dqk_trans, tl.trans(q_trans), allow_tf32=ALLOW_TF32,
+        # dsT (opndA) MUST live in SMEM, not TMEM. Left unannotated it defaults to
+        # TMEM and the planner column-packs it into id2 (the qk_trans buffer), where
+        # the qk MMA's useAcc=false full-overwrite races this cross-stage (stage-1)
+        # read -> corrupt grads. TLX keeps dsT in a dedicated SMEM buffer (ds_tiles);
+        # opndA,smem,1,8 mirrors that (and FA bwd's dsT-in-smem convention).
+        attrs=({"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,10"]} if _HSTU_DQ_REUSE else None),
     )
+    if _HSTU_SELF_DQ_REDUCE and ENABLE_TMA:
+        # dq via TMA reduce-add. Compute dq TRANSPOSED with the SAME dot as acc_dq
+        # (tl.trans(k) is a cheap memdesc_trans on the SMEM k tile), then transpose
+        # the small [BLOCK_D_Q, BLOCK_M] result to [BLOCK_M, BLOCK_D_Q] and atomic-add
+        # into global dq. Transposing the *result* (not the dqk register operand)
+        # keeps the MMA structure meta-WS can partition. DQ is pre-zeroed; the head
+        # slice is selected by the store column offset (device_desc_dq base has only
+        # the seq offset). Mirrors triton_bw_cross_attention.py's autoWS dq reduce.
+        dq_trans = (
+            tl.dot(
+                tl.trans(k), dqk_trans, allow_tf32=ALLOW_TF32,
+                attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,5"]} if _HSTU_DQ_REUSE else None),
+            )
+            * alpha
+        )
+        dq = tl.trans(dq_trans).to(k.dtype)
+        # Subtile the dq reduce into _HSTU_SELF_DQ_ITERS contiguous column-subtiles
+        # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
+        # compiler stages separately (the source-level analog of TLX's subtiled +
+        # depth-2 dq_store_buf staging). _split_n_2D does the register split that
+        # `dq[:, a:b]` cannot.
+        dq_slice_size: tl.constexpr = BLOCK_D_Q // _HSTU_SELF_DQ_ITERS
+        dqs = _split_n_2D(dq, _HSTU_SELF_DQ_ITERS)
+        for _s in tl.static_range(_HSTU_SELF_DQ_ITERS):
+            tl._experimental_descriptor_store(
+                device_desc_dq,
+                dqs[_s],
+                [start_m, (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
+                store_reduce="add",
+            )
+    else:
+        acc_dq(
+            dq_ptrs_trans=dq_ptrs_trans,
+            start_m=start_m,
+            stride_dqm=stride_dqm,
+            k=k,
+            dqk_trans=dqk_trans,
+            alpha=alpha,
+            mask_m=mask_m,
+            MAX_SEQ_LEN=max_q_len,
+            LOCK=LOCK,
+            BLOCK_M=BLOCK_M,
+            ATOMIC_ADD=ATOMIC_ADD,
+            ALLOW_TF32=ALLOW_TF32,
+        )
     return dk, dv
 
 
@@ -1291,6 +1500,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     device_desc_do,
     device_desc_dk,
     device_desc_dv,
+    device_desc_dq,
     LOCK,
     off_h,
     off_z,
@@ -1305,6 +1515,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     stride_vn,
     stride_dom,
     stride_dqm,
+    stride_dqh,
     stride_dkn,
     stride_dvn,
     alpha,
@@ -1381,6 +1592,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 do_ptrs=do_ptrs,
                 device_desc_q=device_desc_q,
                 device_desc_do=device_desc_do,
+                device_desc_dq=device_desc_dq,
                 dk=dk,
                 dv=dv,
                 k=k,
@@ -1394,6 +1606,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 stride_qm=stride_qm,
                 stride_dom=stride_dom,
                 stride_dqm=stride_dqm,
+                stride_dqh=stride_dqh,
                 alpha=alpha,
                 attn_scale=attn_scale,
                 max_q_len=max_q_len,
@@ -1432,7 +1645,21 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         contextual_block_end = tl.cdiv(contextual_seq_len, BLOCK_M) * BLOCK_M
         if low < contextual_block_end:
             low = contextual_block_end
-    for start_m in tl.range(low, high, BLOCK_M, loop_unroll_factor=UNROLL):
+    for start_m in tl.range(
+        low,
+        high,
+        BLOCK_M,
+        loop_unroll_factor=UNROLL,
+        # autoWS on the bwd compute loop (dk/dv/dq MMAs). DP=1 (bwd uses TLX
+        # replicate=1); pair with a num_warps>=8, BLOCK_M>=64, num_stages>=1
+        # config from _get_bw_configs() (HSTU_SELF_AUTOWS branch).
+        warp_specialize=_HSTU_SELF_AUTOWS,
+        # For the dq TMA-reduce path (which adds a reduction partition), fold the
+        # dk/dv epilogue into the computation partition (as TLX does) so the total
+        # warp count stays <= 16 (reduction4+gemm1+load1+compute8=14 vs the
+        # 5-partition 18 that overflows PSM's warp budget). No-op for the RMW path.
+        merge_epilogue_to_computation=_HSTU_SELF_DQ_REDUCE,
+    ):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         dk, dv = _hstu_attn_bwd_one_block_0(
             start_m=start_m,
@@ -1443,6 +1670,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             do_ptrs=do_ptrs,
             device_desc_q=device_desc_q,
             device_desc_do=device_desc_do,
+            device_desc_dq=device_desc_dq,
             dk=dk,
             dv=dv,
             k=k,
@@ -1456,6 +1684,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             stride_qm=stride_qm,
             stride_dom=stride_dom,
             stride_dqm=stride_dqm,
+            stride_dqh=stride_dqh,
             alpha=alpha,
             attn_scale=attn_scale,
             max_q_len=max_q_len,
@@ -1578,7 +1807,12 @@ def _hstu_attn_bwd(  # noqa C901
     K = K + seq_start_kv * stride_kn
     V = V + seq_start_kv * stride_vn
     DOut = DOut + seq_start_q * stride_dom
-    DQ = DQ + seq_start_q * stride_dqm + off_h * stride_dqh
+    if _HSTU_SELF_DQ_REDUCE and ENABLE_TMA:
+        # TMA-reduce dq: the descriptor base carries only the seq offset; the head
+        # slice is selected by the store column offset (off_h*stride_dqh).
+        DQ = DQ + seq_start_q * stride_dqm
+    else:
+        DQ = DQ + seq_start_q * stride_dqm + off_h * stride_dqh
     DK = DK + seq_start_kv * stride_dkn
     DV = DV + seq_start_kv * stride_dvn
     device_desc_q = None
@@ -1587,8 +1821,11 @@ def _hstu_attn_bwd(  # noqa C901
     device_desc_do = None
     device_desc_dk = None
     device_desc_dv = None
+    device_desc_dq = None
     if ENABLE_TMA:
-        workspace_base = tma_workspace_ptr + TMA_DESC_SIZE * 6 * (
+        # 7 descriptor slots per program (q,k,v,do,dk,dv,dq); dq only used by the
+        # autoWS TMA-reduce path (gated below).
+        workspace_base = tma_workspace_ptr + TMA_DESC_SIZE * 7 * (
             tl.program_id(1) + tl.program_id(0) * tl.num_programs(1)
         )
         device_desc_q = workspace_base
@@ -1597,6 +1834,7 @@ def _hstu_attn_bwd(  # noqa C901
         device_desc_do = workspace_base + 3 * TMA_DESC_SIZE
         device_desc_dk = workspace_base + 4 * TMA_DESC_SIZE
         device_desc_dv = workspace_base + 5 * TMA_DESC_SIZE
+        device_desc_dq = workspace_base + 6 * TMA_DESC_SIZE
 
         # pyre-ignore [20]
         tl.extra.cuda.experimental_device_tensormap_create2d(
@@ -1676,6 +1914,22 @@ def _hstu_attn_bwd(  # noqa C901
         )
         # pyre-ignore [20]
         tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_dv)
+        if _HSTU_SELF_DQ_REDUCE:
+            # dq TMA reduce-add target: non-transposed [seq_len_q, H*DimQ]; base
+            # (DQ) carries only the seq offset, head via the store column.
+            # pyre-ignore [20]
+            tl.extra.cuda.experimental_device_tensormap_create2d(
+                desc_ptr=device_desc_dq,
+                global_address=DQ,
+                load_size=[
+                    BLOCK_M,
+                    BLOCK_D_Q // _HSTU_SELF_DQ_ITERS,
+                ],
+                global_size=[seq_len_q, H * DimQ],
+                element_ty=DQ.dtype.element_ty,
+            )
+            # pyre-ignore [20]
+            tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_dq)
     else:
         Q += off_h * stride_qh
         K += off_h * stride_kh
@@ -1704,6 +1958,7 @@ def _hstu_attn_bwd(  # noqa C901
             device_desc_do=device_desc_do,
             device_desc_dk=device_desc_dk,
             device_desc_dv=device_desc_dv,
+            device_desc_dq=device_desc_dq,
             LOCK=LOCK,
             off_h=off_h,
             off_z=off_z,
@@ -1718,6 +1973,7 @@ def _hstu_attn_bwd(  # noqa C901
             stride_vn=stride_vn,
             stride_dom=stride_dom,
             stride_dqm=stride_dqm,
+            stride_dqh=stride_dqh,
             stride_dkn=stride_dkn,
             stride_dvn=stride_dvn,
             alpha=alpha,
@@ -1759,6 +2015,7 @@ def _hstu_attn_bwd(  # noqa C901
                 device_desc_do=device_desc_do,
                 device_desc_dk=device_desc_dk,
                 device_desc_dv=device_desc_dv,
+                device_desc_dq=device_desc_dq,
                 LOCK=LOCK,
                 off_h=off_h,
                 off_z=off_z,
@@ -1773,6 +2030,7 @@ def _hstu_attn_bwd(  # noqa C901
                 stride_vn=stride_vn,
                 stride_dom=stride_dom,
                 stride_dqm=stride_dqm,
+                stride_dqh=stride_dqh,
                 stride_dkn=stride_dkn,
                 stride_dvn=stride_dvn,
                 alpha=alpha,
@@ -1943,8 +2201,10 @@ def triton_hstu_attention_bwd(
     tma_workspace = None
     if enable_tma:
         MIN_BLOCK_N = 16
+        # 7 TMA descriptor slots (q,k,v,do,dk,dv,dq); the 7th (dq) is used by the
+        # autoWS TMA-reduce dq path. Allocating it unconditionally is cheap.
         tma_workspace = torch.empty(
-            6 * TMA_DESC_SIZE * (triton.cdiv(max_seq_len, MIN_BLOCK_N) * Z * H),
+            7 * TMA_DESC_SIZE * (triton.cdiv(max_seq_len, MIN_BLOCK_N) * Z * H),
             dtype=torch.uint8,
             device="cuda",
         )
@@ -2165,7 +2425,13 @@ def triton_hstu_mha(
     num_targets: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
+    autows_cfg=None,
 ) -> torch.Tensor:
+    # AutoWS knobs: pass an HSTUAutoWSConfig/dict here (or via configure_autows())
+    # instead of the HSTU_SELF_* env vars. Applies the structural flags before the
+    # kernel launch; call before the first launch so it also affects tracing.
+    if autows_cfg is not None:
+        configure_autows(autows_cfg)
     return _AttentionFunction.apply(
         max_seq_len,
         alpha,

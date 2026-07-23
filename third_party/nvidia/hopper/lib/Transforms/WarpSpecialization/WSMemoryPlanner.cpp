@@ -895,13 +895,19 @@ getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
 }
 
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
-/// Format: "opndA,smem,2,0" → operand=opndA, memType=smem, numCopies=2,
-/// bufferId=0.
+/// Two forms:
+///   "opndA,smem,2,0"  → full pin: memType=smem, numCopies=2, bufferId=0.
+///   "opndA,smem"      → memtype-only: mark the operand's memory space
+///   (consumed
+///                       by PromoteLHSToTMem for opndA promotion) and let the
+///                       memory planner decide copies/id/grouping. hasBufferPin
+///                       is false and numCopies/bufferId are unset.
 struct ChannelAnnotation {
-  std::string operand; // "opndA", "opndB", "opndD", or scaled-MMA scales
-  std::string memType; // "smem", "tmem"
-  unsigned numCopies;
-  unsigned bufferId;
+  std::string operand;      // "opndA", "opndB", "opndD", or scaled-MMA scales
+  std::string memType;      // "smem", "tmem"
+  unsigned numCopies = 0;   // valid only if hasBufferPin
+  unsigned bufferId = 0;    // valid only if hasBufferPin
+  bool hasBufferPin = true; // false for memtype-only ("opndA,smem") annotations
 };
 
 static std::optional<unsigned> parseUnsignedAnnotationField(StringRef field) {
@@ -961,21 +967,27 @@ parseChannelAnnotations(Operation *parentOp) {
         continue;
       SmallVector<StringRef, 4> parts;
       StringRef(*str).split(parts, ',');
-      if (parts.size() != 4)
+      // Two accepted forms: full pin "opnd,mem,copies,id" (4 fields) or
+      // memtype-only "opnd,mem" (2 fields — planner decides copies/id).
+      if (parts.size() != 4 && parts.size() != 2)
         continue;
       ChannelAnnotation ann;
       ann.operand = parts[0].str();
       ann.memType = parts[1].str();
-      std::optional<unsigned> numCopies =
-          parseUnsignedAnnotationField(parts[2]);
-      std::optional<unsigned> bufferId = parseUnsignedAnnotationField(parts[3]);
-      if (!numCopies || !bufferId) {
-        LDBG("WARNING: invalid numeric field in channel annotation '" << *str
-                                                                      << "'");
-        continue;
+      ann.hasBufferPin = (parts.size() == 4);
+      if (ann.hasBufferPin) {
+        std::optional<unsigned> numCopies =
+            parseUnsignedAnnotationField(parts[2]);
+        std::optional<unsigned> bufferId =
+            parseUnsignedAnnotationField(parts[3]);
+        if (!numCopies || !bufferId) {
+          LDBG("WARNING: invalid numeric field in channel annotation '" << *str
+                                                                        << "'");
+          continue;
+        }
+        ann.numCopies = *numCopies;
+        ann.bufferId = *bufferId;
       }
-      ann.numCopies = *numCopies;
-      ann.bufferId = *bufferId;
 
       // Validate operand name.
       auto opIdx = getChannelAnnotationOperandIdx(ann.operand);
@@ -1002,21 +1014,24 @@ parseChannelAnnotations(Operation *parentOp) {
              << ann.memType << "," << ann.numCopies << "," << ann.bufferId);
       }
 
-      // Check for same bufferId with conflicting numCopies across all MMA ops.
-      auto bufIt = bufferIdToInfo.find(ann.bufferId);
-      if (bufIt != bufferIdToInfo.end()) {
-        if (bufIt->second.first != ann.numCopies) {
-          LDBG("WARNING: bufferId="
-               << ann.bufferId
-               << " has conflicting numCopies: " << bufIt->second.first
-               << " vs " << ann.numCopies << " — using max("
-               << bufIt->second.first << ", " << ann.numCopies << ")");
-          unsigned maxCopies = std::max(bufIt->second.first, ann.numCopies);
-          ann.numCopies = maxCopies;
-          bufIt->second.first = maxCopies;
+      // Check for same bufferId with conflicting numCopies across all MMA ops
+      // (only for pinned annotations — memtype-only ones carry no bufferId).
+      if (ann.hasBufferPin) {
+        auto bufIt = bufferIdToInfo.find(ann.bufferId);
+        if (bufIt != bufferIdToInfo.end()) {
+          if (bufIt->second.first != ann.numCopies) {
+            LDBG("WARNING: bufferId="
+                 << ann.bufferId
+                 << " has conflicting numCopies: " << bufIt->second.first
+                 << " vs " << ann.numCopies << " — using max("
+                 << bufIt->second.first << ", " << ann.numCopies << ")");
+            unsigned maxCopies = std::max(bufIt->second.first, ann.numCopies);
+            ann.numCopies = maxCopies;
+            bufIt->second.first = maxCopies;
+          }
+        } else {
+          bufferIdToInfo[ann.bufferId] = {ann.numCopies, op};
         }
-      } else {
-        bufferIdToInfo[ann.bufferId] = {ann.numCopies, op};
       }
 
       // Check for operand D annotated as SMEM (always TMEM).
@@ -1078,6 +1093,11 @@ static DenseMap<Operation *, ChannelAnnotation> buildAllocToAnnotationMap(
     return result;
 
   for (auto &[key, ann] : annotations) {
+    // Memtype-only annotations ("opndA,smem") carry no buffer.id/copies to pin;
+    // they only steer promotion (PromoteLHSToTMem). Leave the buffer to the
+    // planner.
+    if (!ann.hasBufferPin)
+      continue;
     auto [mmaOp, opIdx] = key;
     auto mma = dyn_cast<ttng::MMAv5OpInterface>(mmaOp);
     if (!mma)
@@ -3350,6 +3370,67 @@ public:
            << ctrlInt.end());
       for (auto t : allocsForThisLoop)
         LLVM_DEBUG(t.getOperation()->dump());
+
+      // ---- Test-only: run the unified group-level reuse predicate
+      // (orderReuseGroupChain) over EVERY candidate pair/triple of this loop's
+      // TMEM allocs and emit one CHECK-able verdict line each. This changes NO
+      // planning decision (observation only) — it is the fast-iteration harness
+      // for wiring the shared predicate into the planner (step 1 of the N-way
+      // reuse-grouping plan). Gated by TRITON_WS_MEM_PLAN_VERIFY_GROUPS so the
+      // default path is byte-identical (no regression by construction).
+      if (::getenv("TRITON_WS_MEM_PLAN_VERIFY_GROUPS")) {
+        // This loop's allocs that carry a TMEM channel, in a stable (index)
+        // order, each with a readable name for the verdict line. Scan by
+        // liveness interval rather than `allocsForThisLoop` so PRE-ASSIGNED
+        // (annotation-pinned) allocs — which are already in `handledAllocs` and
+        // thus dropped from `allocsForThisLoop` — are still observed. The
+        // hand-pinned {dpT,dsT,dq} fixtures pin every alloc, so without this
+        // the harness would see nothing there.
+        SmallVector<std::pair<Channel *, std::string>> members;
+        unsigned vIdx = 0;
+        for (auto alloc : allocs) {
+          auto allocInt = bufferRange.lookup(buffers[vIdx]);
+          ++vIdx;
+          bool inLoop = ctrlInt.intersects(allocInt) ||
+                        ctrlIdx == innermostLoops.size() - 1;
+          if (!inLoop)
+            continue;
+          auto it = allocToChannel.find(alloc.getOperation());
+          if (it == allocToChannel.end() || !it->second)
+            continue;
+          members.push_back({it->second, getLocName(alloc.getOperation())});
+        }
+        auto emit = [&](ArrayRef<unsigned> idxs) {
+          ReuseGroup g;
+          std::string names;
+          for (unsigned k : idxs) {
+            g.channels.push_back(members[k].first);
+            names += (names.empty() ? "" : ",") + members[k].second;
+          }
+          // Sound group-FORMATION gate: drop cross-partition program order so
+          // data-independent cross-partition siblings are not spuriously
+          // ordered (see hasDependencyChain / orderReuseGroupChain).
+          auto order =
+              orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false);
+          llvm::errs() << "[ws-mem-plan-verify] group {" << names << "} => ";
+          if (order.empty()) {
+            llvm::errs() << "REJECT (no unique dependency-chain order)\n";
+          } else {
+            std::string ord;
+            for (auto *ch : order)
+              ord += (ord.empty() ? "" : "->") + getLocName(ch->getAllocOp());
+            llvm::errs() << "ACCEPT order=" << ord << "\n";
+          }
+        };
+        unsigned m = members.size();
+        for (unsigned i = 0; i < m; ++i)
+          for (unsigned j = i + 1; j < m; ++j) {
+            emit(SmallVector<unsigned, 3>{i, j});
+            for (unsigned k = j + 1; k < m; ++k)
+              emit(SmallVector<unsigned, 3>{i, j, k});
+          }
+      }
+
       // Check for per-loop tt.tmem_alloc_algo attribute on the forOp
       // or its parent ForOps (e.g., the WS loop wrapping the innermost
       // scheduled loop in persistent kernels).
@@ -3694,6 +3775,125 @@ public:
     return maxColOffset;
   }
 
+  /// N-way group formation: can `candidate` join `owner`'s reuse group as a
+  /// time-multiplexed (offset 0) member even without a pairwise data dependency
+  /// to any current member? This is the case for common-ancestor siblings like
+  /// FA-bwd {dpT,dsT,dq} (dq reads dsT from SMEM, dk from TMEM, so dq<->dsT
+  /// have no direct producer->consumer edge), which hasPotentialReuse cannot
+  /// form.
+  ///
+  /// Accept only when the WHOLE prospective group admits a unique dependency-
+  /// chain order under BOTH edge policies. Chain order is a happens-before, so
+  /// the members are not co-live and time-multiplexing the shared slot is safe.
+  /// Requires >=3 members (pairwise is handled by hasPotentialReuse) and that
+  /// candidate fits the owner's columns.
+  ///
+  /// Two gates, both required:
+  ///   (1) crossPartitionProgOrder=false (SOUND formation gate): refuses to
+  ///       order data-independent cross-partition siblings, so we never form a
+  ///       spurious group.
+  ///   (2) crossPartitionProgOrder=true (code partitioning's edge policy): the
+  ///       loose gate has MORE edges than the strict one, so a strict-orderable
+  ///       group is NOT guaranteed loose-orderable -- an added cross-partition
+  ///       program-order edge can create a cycle. If it does, insertAsyncComm
+  ///       (WSCodePartition) would later hit its report_fatal_error on this
+  ///       very group. Requiring loose-orderability here refuses such a group
+  ///       up front so a repair can never manufacture a group code partitioning
+  ///       then rejects.
+  ///
+  /// Called only by repairUnsafeReuseGroups, which runs on the default path but
+  /// is INERT unless first-fit produced an unorderable (>=3) group, so packings
+  /// first-fit already gets right never reach here (default compiles
+  /// unchanged).
+  bool canJoinReuseGroupChain(BufferT *owner, BufferT *candidate,
+                              const AllocationState &state) {
+    if (candidate->colSize > owner->colSize)
+      return false;
+    if (bufferRange[owner].intersects(bufferRange[candidate]))
+      return false;
+    ReuseGroup g;
+    SmallVector<BufferT *, 4> members{owner};
+    for (auto &[reuser, asg] : state.assignment)
+      if (asg.first == owner)
+        members.push_back(reuser);
+    members.push_back(candidate);
+    if (members.size() < 3)
+      return false;
+    for (auto *m : members) {
+      auto *ch = allocToChannel.lookup(m->owner);
+      if (!ch)
+        return false;
+      g.channels.push_back(ch);
+    }
+    return !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false)
+                .empty() &&
+           !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/true).empty();
+  }
+
+  /// Post-pass repair: first-fit builds reuse groups incrementally in buffer
+  /// order, which cannot assemble a common-ancestor sibling group whose bridge
+  /// member sorts last -- FA-bwd BM128 lands dsT in {qkT,ppT,dsT} (ppT<->dsT
+  /// make it unorderable) instead of {dpT,dsT,dq}. This order-independent pass
+  /// repairs it: for each unorderable group, relocate a reuser to another group
+  /// where it forms a chain-orderable slot, provided the source group is left
+  /// orderable too. One relocation per call; the caller loops to a fixpoint
+  /// (each move takes a member from an unsafe group to a safe one, so it
+  /// terminates).
+  ///
+  /// INERT unless first-fit produced an unorderable (>=3, single-copy) group,
+  /// so packings first-fit already gets right are byte-identical (no
+  /// regression).
+  bool repairUnsafeReuseGroups(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
+                               AllocationState &state) {
+    auto membersOf = [&](BufferT *owner) {
+      SmallVector<BufferT *, 4> m{owner};
+      for (auto &[r, a] : state.assignment)
+        if (a.first == owner)
+          m.push_back(r);
+      return m;
+    };
+    auto orderable = [&](ArrayRef<BufferT *> mem) -> bool {
+      if (mem.size() < 3)
+        return true; // 2-way is covered by pairwise legality at formation
+      ReuseGroup g;
+      for (auto *b : mem) {
+        auto *c = allocToChannel.lookup(b->owner);
+        if (!c)
+          return false;
+        g.channels.push_back(c);
+      }
+      return !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false)
+                  .empty();
+    };
+    for (auto &[owner, pl] : state.owners) {
+      SmallVector<BufferT *, 4> mem = membersOf(owner);
+      if (orderable(mem))
+        continue; // group is safe
+      // Relocate a reuser member (never the owner -- it holds the slot).
+      for (BufferT *m : mem) {
+        if (m == owner)
+          continue;
+        SmallVector<BufferT *, 4> rest;
+        for (auto *b : mem)
+          if (b != m)
+            rest.push_back(b);
+        if (!orderable(rest))
+          continue; // removing m alone doesn't make the source orderable
+        for (auto &[dOwner, dpl] : state.owners) {
+          if (dOwner == owner)
+            continue;
+          if (canJoinReuseGroupChain(dOwner, m, state)) {
+            LDBG("repairUnsafeReuseGroups: relocating a reuser from an "
+                 "unorderable group into a chain-orderable group");
+            state.assignment[m] = {dOwner, 0};
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   /// Recursive backtracking search for buffer allocation.
   bool tryAllocate(SmallVectorImpl<ttng::TMEMAllocOp> &allocs, size_t idx,
                    AllocationState &state, size_t maxCols, Operation *ctrlOp) {
@@ -3855,6 +4055,160 @@ public:
     }
   }
 
+  // ---- Top-K TMEM packing enumeration (prototype: mem_plan_pick over TMEM)
+  // ----
+  //
+  // tryAllocate returns the first feasible packing. TMEM packing is genuinely
+  // multi-solution (which liveness-disjoint buffers share a block + 2D
+  // placement), so to expose alternatives as a sweep axis we enumerate the
+  // distinct feasible packings, rank them, and let mem_plan_pick choose. This
+  // reuses tryAllocate's exact legality (hasPotentialReuse / computeColOffset /
+  // findPlacements), so every enumerated packing is as legal as the first-fit.
+
+  struct ScoredTMemState {
+    AllocationState state;
+    size_t peak;  // peak column extent (ranking key; lower = tighter)
+    uint64_t sig; // canonical placement signature (dedup + stable tiebreak)
+  };
+
+  // Peak column extent across both row groups.
+  size_t tmemStatePeakCols(const AllocationState &state) const {
+    size_t peak = 0;
+    for (int rg = 0; rg < kNumRowGroups; ++rg)
+      for (auto &iv : state.rowGroupCols[rg])
+        peak = std::max(peak, iv.second);
+    return peak;
+  }
+
+  // Canonical signature: each alloc's absolute physical column in a fixed alloc
+  // order. This is canonical w.r.t. the emitted allocation (buffer.id partition
+  // + buffer.offset): two states that apply to the same IR hash equally.
+  // rowGroup is intentionally excluded — it is not emitted as an IR attribute
+  // and does not change codegen, so branching on it (e.g. a 64-row owner that
+  // fits in either row group) would otherwise over-count physically-equivalent
+  // packings. Owner-vs-reuser labeling collapses too, since both members share
+  // one column.
+  uint64_t tmemStateSignature(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
+                              const AllocationState &state) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t x) {
+      h ^= x;
+      h *= 1099511628211ull;
+    };
+    for (auto alloc : allocs) {
+      BufferT *b = getBuffer(alloc.getOperation());
+      size_t col = std::numeric_limits<size_t>::max();
+      auto oit = state.owners.find(b);
+      if (oit != state.owners.end()) {
+        col = oit->second.colStart;
+      } else if (auto ait = state.assignment.find(b);
+                 ait != state.assignment.end()) {
+        auto pit = state.owners.find(ait->second.first);
+        if (pit != state.owners.end())
+          col = pit->second.colStart + ait->second.second;
+      }
+      mix(col);
+    }
+    return h;
+  }
+
+  // Enumerate distinct feasible packings into `sols` (deduped by signature).
+  // `budget` bounds total recursive calls as a backstop against combinatorial
+  // blowup; `sols` is capped so memory stays bounded. Mirrors tryAllocate's
+  // candidate logic but never early-returns at the first solution.
+  void enumerateTMemAllocations(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
+                                size_t idx, AllocationState &state,
+                                size_t maxCols, Operation *ctrlOp,
+                                SmallVectorImpl<ScoredTMemState> &sols,
+                                DenseSet<uint64_t> &seen, unsigned &budget) {
+    if (budget == 0)
+      return;
+    --budget;
+    if (idx == allocs.size()) {
+      uint64_t sig = tmemStateSignature(allocs, state);
+      if (seen.insert(sig).second) {
+        sols.push_back({state, tmemStatePeakCols(state), sig});
+        if (sols.size() >= 512)
+          budget = 0; // enough distinct packings; stop
+      }
+      return;
+    }
+    BufferT *buf = getBuffer(allocs[idx].getOperation());
+
+    // Reuse candidates, in the same deterministic order as tryAllocate.
+    struct ReuseCand {
+      BufferT *owner;
+      int priority;
+      size_t colOffset;
+    };
+    SmallVector<ReuseCand> candidates;
+    for (auto &[owner, placement] : state.owners) {
+      int priority = hasPotentialReuse(owner, buf, ctrlOp);
+      if (priority <= 0)
+        continue;
+      size_t colOffset = computeColOffset(buf, owner, state, ctrlOp);
+      if (colOffset == std::numeric_limits<size_t>::max())
+        continue;
+      candidates.push_back({owner, priority, colOffset});
+    }
+    llvm::sort(candidates, [&](const ReuseCand &a, const ReuseCand &b) {
+      if (a.priority != b.priority)
+        return a.priority > b.priority;
+      if (a.colOffset != b.colOffset)
+        return a.colOffset < b.colOffset;
+      return bufferRange[a.owner].start() < bufferRange[b.owner].start();
+    });
+    for (auto &c : candidates) {
+      AllocationState newState = state;
+      newState.assignment[buf] = {c.owner, c.colOffset};
+      enumerateTMemAllocations(allocs, idx + 1, newState, maxCols, ctrlOp, sols,
+                               seen, budget);
+      if (budget == 0)
+        return;
+    }
+    // New-space placements.
+    for (auto &placement : findPlacements(buf, state, maxCols)) {
+      AllocationState newState = state;
+      addOwnerToState(newState, buf, placement);
+      enumerateTMemAllocations(allocs, idx + 1, newState, maxCols, ctrlOp, sols,
+                               seen, budget);
+      if (budget == 0)
+        return;
+    }
+  }
+
+  // Append the ranked TMEM packings to TRITON_WS_MEM_PLAN_TOPK_DUMP (one JSON
+  // per rank, pool "tmem") so an external harness can see what each pick does.
+  void dumpTMemEnumPlans(SmallVectorImpl<ttng::TMEMAllocOp> &allocs,
+                         ArrayRef<ScoredTMemState> sols) {
+    auto path = triton::tools::getStrEnv("TRITON_WS_MEM_PLAN_TOPK_DUMP");
+    if (path.empty() || sols.empty())
+      return;
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_Append);
+    if (ec)
+      return;
+    for (unsigned r = 0; r < sols.size(); ++r) {
+      const AllocationState &s = sols[r].state;
+      // Count members per physical owner (owner = self if not a reuser).
+      std::map<size_t, unsigned> groupMembers; // key: owner's liveness start
+      for (auto alloc : allocs) {
+        BufferT *b = getBuffer(alloc.getOperation());
+        BufferT *owner = b;
+        if (auto ait = s.assignment.find(b); ait != s.assignment.end())
+          owner = ait->second.first;
+        groupMembers[bufferRange[owner].start()]++;
+      }
+      os << "{\"pool\": \"tmem\", \"rank\": " << r
+         << ", \"peak_cols\": " << sols[r].peak
+         << ", \"blocks\": " << groupMembers.size() << ", \"members\": [";
+      unsigned bi = 0;
+      for (auto &[k, cnt] : groupMembers)
+        os << (bi++ ? ", " : "") << cnt;
+      os << "]}\n";
+    }
+  }
+
   FailureOr<unsigned> allocateTMemAllocs2(
       SmallVector<ttng::TMEMAllocOp> &allocs, SmallVector<BufferT *> &buffers,
       DenseMap<Operation *, ttng::TmemAllocChannel *> &allocToChannel,
@@ -3918,9 +4272,76 @@ public:
     // Start from the seeded state (includes pre-assigned owners)
     AllocationState state = initialState;
 
-    if (!tryAllocate(allocs, 0, state, kMaxTMemCols, ctrlOp)) {
+    // Top-K packing search (opt-in): when TRITON_WS_MEM_PLAN_TOPK>1 or a
+    // mem_plan_pick is set, enumerate distinct feasible packings and apply the
+    // picked rank. Default (topK=1, pick=0) keeps the exact first-fit path so
+    // non-search compiles are byte-identical.
+    unsigned topK = getMemPlanTopK();
+    triton::FuncOp funcOp = ctrlOp->getParentOfType<triton::FuncOp>();
+    unsigned pick = funcOp ? getMemPlanPick(funcOp) : 0;
+    bool enumerated = false;
+    if (topK > 1 || pick > 0) {
+      // Rank 0 is ALWAYS the deterministic first-fit (the validated-safe
+      // default), so pick 0 == the default topK=1 result even under search.
+      // Alternatives follow, ordered by occupancy then signature. This matters
+      // because equal-occupancy packings are common (peak columns tie), and a
+      // raw signature tiebreak could otherwise float a runtime-unsafe packing
+      // to rank 0.
+      AllocationState firstFit = initialState;
+      bool haveFirstFit =
+          tryAllocate(allocs, 0, firstFit, kMaxTMemCols, ctrlOp);
+      SmallVector<ScoredTMemState, 0> sols;
+      DenseSet<uint64_t> seen;
+      unsigned budget = 100000;
+      AllocationState enumStart = initialState;
+      enumerateTMemAllocations(allocs, 0, enumStart, kMaxTMemCols, ctrlOp, sols,
+                               seen, budget);
+      if (budget == 0)
+        LDBG("TMEM top-K enumeration hit call/solution budget; truncated");
+      if (haveFirstFit && !sols.empty()) {
+        llvm::stable_sort(
+            sols, [](const ScoredTMemState &a, const ScoredTMemState &b) {
+              if (a.peak != b.peak)
+                return a.peak < b.peak;
+              return a.sig < b.sig;
+            });
+        // Pin the true first-fit STATE (not merely a column-signature match) to
+        // rank 0, so pick 0 is byte-identical to the default topK=1 result --
+        // including the physical rowOffset. tmemStateSignature deliberately
+        // excludes rowGroup, so an enumerated solution sharing firstFit's column
+        // signature may live in a different row group (a 64-row owner fits either
+        // group); rotating that solution to rank 0 would apply its rowGroup, not
+        // firstFit's. Instead drop the signature-equivalent enumerated solution
+        // (deduped to one by the column-only signature) and insert firstFit
+        // itself at rank 0, so sols[0].state == firstFit exactly.
+        uint64_t ffSig = tmemStateSignature(allocs, firstFit);
+        for (unsigned i = 0; i < sols.size(); ++i) {
+          if (sols[i].sig == ffSig) {
+            sols.erase(sols.begin() + i);
+            break;
+          }
+        }
+        sols.insert(sols.begin(),
+                    {firstFit, tmemStatePeakCols(firstFit), ffSig});
+        dumpTMemEnumPlans(allocs, sols);
+        unsigned r = std::min<unsigned>(pick, sols.size() - 1);
+        LDBG("TMEM top-K: "
+             << sols.size() << " distinct packings; applying rank " << r
+             << " of " << sols.size() << " (peak_cols " << sols[r].peak << ")");
+        state = sols[r].state;
+        enumerated = true;
+      } else {
+        LDBG("TMEM top-K: no packing enumerated; falling back to tryAllocate");
+      }
+    }
+
+    if (!enumerated && !tryAllocate(allocs, 0, state, kMaxTMemCols, ctrlOp)) {
       return allocs[0].emitError(
           "allocateTMemAllocs2: failed to allocate TMEM buffers");
+    }
+
+    // Repair any unorderable reuse group first-fit produced (inert otherwise).
+    while (repairUnsafeReuseGroups(allocs, state)) {
     }
 
     // Apply the final allocation state (skip pre-assigned buffers)
@@ -4894,7 +5315,8 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
       smemAllocAnnotations =
           buildAllocToAnnotationMap(channels, mmaAnnotations);
       for (auto &[key, ann] : mmaAnnotations)
-        annotationMaxId = std::max(annotationMaxId, ann.bufferId + 1);
+        if (ann.hasBufferPin)
+          annotationMaxId = std::max(annotationMaxId, ann.bufferId + 1);
     }
 
     bufferId = smemPlanSearch

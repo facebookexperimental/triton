@@ -16,9 +16,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ.pop("TRITON_USE_META_WS", None)  # TLX is hand-WS, not compiler-WS
 
 import torch  # noqa: E402
+import triton  # noqa: E402
 
 import triton_hstu_attention as A  # noqa: E402
 import tlx_bw_hstu_attention as T  # noqa: E402
@@ -84,8 +84,14 @@ def run_tlx(q, k, v, so, L, asc, causal=True):
 def grads(run, q, k, v, so, L, asc, do, **kw):
     for t in (q, k, v):
         t.grad = None
-    out = run(q, k, v, so, L, asc, **kw)
-    out.backward(do)
+    # TLX and plain Triton are not compiler-warp-specialized: force meta-WS off
+    # (and the WS-barrier reorder off, which TLX lowering needs) through a knobs
+    # scope so the override is auto-isolated instead of leaking into os.environ.
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = False
+        triton.knobs.nvidia.disable_wsbarrier_reorder = True
+        out = run(q, k, v, so, L, asc, **kw)
+        out.backward(do)
     return out.detach(), q.grad.clone(), k.grad.clone(), v.grad.clone()
 
 

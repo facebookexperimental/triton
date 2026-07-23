@@ -396,7 +396,12 @@ std::pair<Channel *, Channel *> orderReuseGroup2(ReuseGroup *group);
 // (channel i's consumer reaches channel i+1's producer). Generalizes
 // orderReuseGroup2 to N channels and across partitions. Returns the ordered
 // channels, or an empty vector if no unique total chain order exists.
-SmallVector<Channel *> orderReuseGroupChain(ReuseGroup *group);
+//
+// `crossPartitionProgOrder` (default true) matches code partitioning's edge
+// policy. Pass false for the planner's group-FORMATION gate so cross-partition
+// textual order cannot spuriously order data-independent siblings.
+SmallVector<Channel *>
+orderReuseGroupChain(ReuseGroup *group, bool crossPartitionProgOrder = true);
 
 // Verify that a reuse group with N channels (N >= 2) is well-formed:
 // - At least 2 channels, each with a single copy (getNumBuffers() == 1).
