@@ -1052,8 +1052,8 @@ LinearLayout SliceEncodingAttr::toLinearLayout(ArrayRef<int64_t> shape) const {
   }
   bases[S("register")] = newRegBases;
 
-  return LinearLayout(std::move(bases),
-                      llvm::to_vector(sliceLL.getOutDimNames()));
+  return LinearLayout(std::move(bases), sliceLL.getOutDims(),
+                      /*requireSurjective=*/true);
 }
 
 LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,

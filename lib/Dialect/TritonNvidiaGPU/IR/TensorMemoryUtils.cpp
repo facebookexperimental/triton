@@ -277,6 +277,13 @@ computeTMemLdStEncodingInfo(RankedTensorType regTy, MemDescType memTy,
                             std::function<InFlightDiagnostic()> emitError) {
   auto memLayout = toLinearLayout(memTy);
   auto regLayout = toLinearLayout(regTy);
+  if (regLayout.isModular()) {
+    SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+    for (auto dim : regLayout.getOutDimNames())
+      paddedOutDims.push_back({dim, memLayout.getOutDimSize(dim)});
+    regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
+                             /*requireSurjective=*/false);
+  }
   auto *ctx = regTy.getContext();
   auto S = [ctx](StringRef str) { return StringAttr::get(ctx, str); };
   auto kBlock = S("block");

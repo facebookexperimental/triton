@@ -7,6 +7,7 @@
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <numeric>
 
@@ -51,6 +52,45 @@ unsigned
 getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                         triton::ModuleAxisInfoAnalysis &axisInfoAnalysis,
                         ArrayRef<int64_t> shape, unsigned maxVecBits = 128);
+
+inline bool hasNpotShape(RankedTensorType ty) {
+  return llvm::any_of(ty.getShape(), [](int64_t d) {
+    return d > 0 && !llvm::isPowerOf2_64(d);
+  });
+}
+
+// Whether this encoding supports modular LinearLayouts.
+inline bool npotSafeForLinearLayout(Attribute encoding) {
+  if (!encoding) {
+    return false;
+  }
+  if (isa<triton::gpu::BlockedEncodingAttr, triton::gpu::LinearEncodingAttr>(
+          encoding)) {
+    return true;
+  }
+  if (auto mma = dyn_cast<triton::gpu::NvidiaMmaEncodingAttr>(encoding)) {
+    return mma.getVersionMajor() >= 2;
+  }
+  if (auto dotOp = dyn_cast<triton::gpu::DotOperandEncodingAttr>(encoding)) {
+    return npotSafeForLinearLayout(dotOp.getParent());
+  }
+  if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(encoding)) {
+    return npotSafeForLinearLayout(slice.getParent());
+  }
+  if (isa<triton::gpu::SharedEncodingTrait>(encoding)) {
+    return true;
+  }
+  return false;
+}
+
+// Whether both layouts support modular conversion.
+inline bool npotCvtSafe(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
+    return true;
+  }
+  return npotSafeForLinearLayout(srcTy.getEncoding()) &&
+         npotSafeForLinearLayout(dstTy.getEncoding());
+}
 
 // Returns whether the op is a "view op", i.e. doesn't move any data
 bool isView(Operation *op);

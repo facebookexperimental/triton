@@ -14,6 +14,22 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+static std::pair<LinearLayout, LinearLayout>
+getPhysicalLayouts(LinearLayout regLayout, MemDescType memDescTy) {
+  auto sharedLayout = toLinearLayout(memDescTy);
+  if (!regLayout.isModular())
+    return {std::move(regLayout), std::move(sharedLayout)};
+
+  auto allocShape = getAllocationShapePerCTA(memDescTy);
+  sharedLayout = toLinearLayout(allocShape, memDescTy.getEncoding());
+  SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+  for (auto dim : regLayout.getOutDimNames())
+    paddedOutDims.push_back({dim, sharedLayout.getOutDimSize(dim)});
+  regLayout = LinearLayout(regLayout.getBases(), paddedOutDims,
+                           /*requireSurjective=*/false);
+  return {std::move(regLayout), std::move(sharedLayout)};
+}
+
 // Helper for LocalGather/ScatterOpConversion.
 // For gather: storeVals is empty, returns loaded values.
 // For scatter: storeVals contains values to store, returns empty.
@@ -64,7 +80,9 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   if (isPaddedEncoding(memDescTy.getEncoding())) {
     cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
   } else {
-    auto sharedLayout = toLinearLayout(memDescTy);
+    auto [physicalRegLayout, sharedLayout] =
+        getPhysicalLayouts(regLayout, memDescTy);
+    regLayout = std::move(physicalRegLayout);
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
   auto kBlock = str_attr("block");
@@ -210,7 +228,9 @@ public:
     if (isPaddedEncoding(memDescTy.getEncoding())) {
       cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
     } else {
-      auto sharedLayout = toLinearLayout(memDescTy);
+      auto [physicalRegLayout, sharedLayout] =
+          getPhysicalLayouts(regLayout, memDescTy);
+      regLayout = std::move(physicalRegLayout);
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");

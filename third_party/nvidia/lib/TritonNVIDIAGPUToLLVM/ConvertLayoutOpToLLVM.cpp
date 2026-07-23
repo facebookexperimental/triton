@@ -37,6 +37,10 @@ struct ConvertLayoutOpSwizzlingConversion
     auto srcTy = op.getSrc().getType();
     auto dstTy = op.getType();
 
+    // Modular layouts use the generic conversion path.
+    if (hasNpotShape(srcTy) || hasNpotShape(dstTy))
+      return failure();
+
     LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
     LinearLayout srcLayout = toLinearLayout(srcTy);
     LinearLayout dstLayout = toLinearLayout(dstTy);

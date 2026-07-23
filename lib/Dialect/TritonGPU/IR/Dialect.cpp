@@ -426,10 +426,18 @@ SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape) {
 SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
                                               ArrayRef<int64_t> shapeLogical) {
   SmallVector<int64_t> shape(shapeLogical);
-  if (auto sharedMMALayout = dyn_cast<NVMMASharedEncodingAttr>(layout)) {
-    if (sharedMMALayout.getFp4Padded()) {
+  auto sharedMMALayout = dyn_cast<NVMMASharedEncodingAttr>(layout);
+  if (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout)) {
+    if (sharedMMALayout && sharedMMALayout.getFp4Padded()) {
       auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
       shape[packedAxis] *= 2;
+    }
+    // Pad only the trailing dimensions covered by the swizzle.
+    unsigned tileRank = getCGALayout(layout).getRank();
+    size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;
+    for (size_t i = firstTileDim; i < shape.size(); ++i) {
+      if (!llvm::isPowerOf2_64(shape[i]))
+        shape[i] = llvm::NextPowerOf2(shape[i]);
     }
   }
   return getShapePerCTA(layout, shape);
@@ -3930,7 +3938,7 @@ std::string mlir::triton::gpu::getDistributedLayoutStr(LinearLayout &ll,
   StringAttr kWarp = StringAttr::get(ctx, "warp");
   StringAttr kBlock = StringAttr::get(ctx, "block");
 
-  int64_t tensorSize = ll.getTotalOutDimSize();
+  int64_t tensorSize = ll.getTotalOutDimSizeProduct();
   std::vector<std::string> elementMapping(tensorSize);
   std::vector<std::string> threadMapping;
   auto shape = convertType<int64_t>(llvm::to_vector(ll.getOutDimSizes()));
