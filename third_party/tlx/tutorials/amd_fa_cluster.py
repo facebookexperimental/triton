@@ -9,6 +9,67 @@ from triton.language.core import _aggregate as aggregate
 
 CLUSTER_BUF_DEPTH = 2
 CLUSTER_PIPELINE_STAGES = tl.constexpr(4)
+_CLUSTER_PIPELINE_STAGE_COUNT = 4
+_CLUSTER_AUTOTUNE_NUM_WARPS = tuple(range(1, 9))
+
+
+def _cluster_short_load_configs():
+    return [
+        triton.Config({"USE_DIRECT_LOAD": use_direct_load}, num_warps=num_warps, num_stages=3)
+        for num_warps in _CLUSTER_AUTOTUNE_NUM_WARPS
+        for use_direct_load in (False, True)
+    ]
+
+
+def _cluster_meta_arg(name, named_args, kwargs):
+    return kwargs[name] if name in kwargs else named_args[name]
+
+
+def _cluster_has_short_range(n_ctx, block_m, block_n, is_causal):
+    num_blocks_total = (n_ctx + block_n - 1) // block_n
+    is_modulo_mn = n_ctx % block_n == 0 and n_ctx % block_m == 0
+    num_m_blocks = (n_ctx + block_m - 1) // block_m if is_causal else 1
+
+    for pid_m in range(num_m_blocks):
+        if is_causal:
+            causal_end = ((pid_m + 1) * block_m + block_n - 1) // block_n
+            num_blocks = min(num_blocks_total, causal_end)
+            masked_blocks = block_m // block_n + (not is_modulo_mn)
+        else:
+            num_blocks = num_blocks_total
+            masked_blocks = 1 if n_ctx % block_n != 0 else 0
+
+        masked_blocks = min(masked_blocks, num_blocks)
+        num_full = num_blocks - masked_blocks
+        if 0 < num_blocks <= _CLUSTER_PIPELINE_STAGE_COUNT:
+            return True
+        if (num_blocks > _CLUSTER_PIPELINE_STAGE_COUNT and (num_blocks - num_full) < _CLUSTER_PIPELINE_STAGE_COUNT
+                and num_full != num_blocks):
+            continue
+
+        masked_start = num_full if num_full > _CLUSTER_PIPELINE_STAGE_COUNT else 0
+        remaining_blocks = num_blocks - masked_start
+        if 0 < remaining_blocks <= _CLUSTER_PIPELINE_STAGE_COUNT:
+            return True
+    return False
+
+
+def _prune_cluster_short_load_configs(configs, named_args, **kwargs):
+    """Tune LDS versus direct loads only when a short range is reachable."""
+    block_m = _cluster_meta_arg("BLOCK_M", named_args, kwargs)
+    block_n = _cluster_meta_arg("BLOCK_N", named_args, kwargs)
+    n_ctx = _cluster_meta_arg("N_CTX", named_args, kwargs)
+    is_causal = _cluster_meta_arg("IS_CAUSAL", named_args, kwargs)
+    num_warps = min(8, max(1, block_m // 32))
+
+    candidates = [config for config in configs if config.num_warps == num_warps]
+    if not _cluster_has_short_range(n_ctx, block_m, block_n, is_causal):
+        candidates = [config for config in candidates if not config.kwargs["USE_DIRECT_LOAD"]]
+    return candidates
+
+
+_CLUSTER_AUTOTUNE_KEY = ["Z", "H", "N_CTX", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "IS_CAUSAL"]
+_CLUSTER_PERSISTENT_AUTOTUNE_KEY = [*_CLUSTER_AUTOTUNE_KEY, "NUM_SMS", "NUM_XCDS"]
 
 
 @triton.jit
@@ -319,47 +380,70 @@ def _attn_inner_short(
     DIAG_OFFSET: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BUF_DEPTH: tl.constexpr,
+    USE_DIRECT_LOAD: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
     """Process ranges too short to safely fill the rotated four-stage pipeline."""
     tlx.async_load_wait_group(0)
 
     num_blocks = block_end - block_start
-    for chunk_start in tl.range(0, num_blocks, BUF_DEPTH, num_stages=0):
-        for slot in tl.static_range(BUF_DEPTH):
-            block_offset = chunk_start + slot
-            if block_offset < num_blocks:
-                start_n = (block_start + block_offset) * BLOCK_N
-                mask = (start_n + offs_n)[:, None] < N_CTX
-                tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, slot), mask=mask)
-                tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, slot), mask=mask)
-                tlx.async_load_commit_group([tok_k, tok_v])
+    if USE_DIRECT_LOAD:
+        for block_offset in tl.range(0, num_blocks, num_stages=0):
+            start_n = (block_start + block_offset) * BLOCK_N
+            mask = (start_n + offs_n)[:, None] < N_CTX
+            k = tl.load(k_ptrs + start_n * stride_kn, mask=mask, other=0.0)
+            qk = tl.dot(q, tl.trans(k))
+            state, p, alpha = state.vec1(
+                qk,
+                start_n,
+                offs_m,
+                offs_n,
+                N_CTX,
+                QK_SCALE,
+                DIAG_OFFSET,
+                True,
+                IS_CAUSAL,
+            )
+            state, p_dot = state.vec2(p, alpha, q.dtype)
+            v = tl.load(v_ptrs + start_n * stride_vn, mask=mask, other=0.0)
+            acc = tl.dot(p_dot, v, state.acc)
+            state = SoftmaxState(acc, state.l_i, state.m_i)
+    else:
+        for chunk_start in tl.range(0, num_blocks, BUF_DEPTH, num_stages=0):
+            for slot in tl.static_range(BUF_DEPTH):
+                block_offset = chunk_start + slot
+                if block_offset < num_blocks:
+                    start_n = (block_start + block_offset) * BLOCK_N
+                    mask = (start_n + offs_n)[:, None] < N_CTX
+                    tok_k = tlx.async_load(k_ptrs + start_n * stride_kn, tlx.local_view(k_buf, slot), mask=mask)
+                    tok_v = tlx.async_load(v_ptrs + start_n * stride_vn, tlx.local_view(v_buf, slot), mask=mask)
+                    tlx.async_load_commit_group([tok_k, tok_v])
 
-        wait = tlx.async_load_wait_group(0)
+            wait = tlx.async_load_wait_group(0)
 
-        for slot in tl.static_range(BUF_DEPTH):
-            block_offset = chunk_start + slot
-            if block_offset < num_blocks:
-                start_n = (block_start + block_offset) * BLOCK_N
-                kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)), token=wait, relaxed=True)
-                v_dot = tlx.local_load(tlx.local_view(v_buf, slot), token=wait, relaxed=True)
-                qk = tl.dot(q, kt_dot)
-                state, p, alpha = state.vec1(
-                    qk,
-                    start_n,
-                    offs_m,
-                    offs_n,
-                    N_CTX,
-                    QK_SCALE,
-                    DIAG_OFFSET,
-                    True,
-                    IS_CAUSAL,
-                )
-                state, p_dot = state.vec2(p, alpha, q.dtype)
-                acc = tl.dot(p_dot, v_dot, state.acc)
-                state = SoftmaxState(acc, state.l_i, state.m_i)
+            for slot in tl.static_range(BUF_DEPTH):
+                block_offset = chunk_start + slot
+                if block_offset < num_blocks:
+                    start_n = (block_start + block_offset) * BLOCK_N
+                    kt_dot = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, slot)), token=wait, relaxed=True)
+                    v_dot = tlx.local_load(tlx.local_view(v_buf, slot), token=wait, relaxed=True)
+                    qk = tl.dot(q, kt_dot)
+                    state, p, alpha = state.vec1(
+                        qk,
+                        start_n,
+                        offs_m,
+                        offs_n,
+                        N_CTX,
+                        QK_SCALE,
+                        DIAG_OFFSET,
+                        True,
+                        IS_CAUSAL,
+                    )
+                    state, p_dot = state.vec2(p, alpha, q.dtype)
+                    acc = tl.dot(p_dot, v_dot, state.acc)
+                    state = SoftmaxState(acc, state.l_i, state.m_i)
 
-        tl.debug_barrier()
+            tl.debug_barrier()
 
     return state
 
@@ -397,6 +481,7 @@ def _attn_cluster_tile(
     BLOCK_N: tl.constexpr,
     BUF_DEPTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_DIRECT_LOAD: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
     q_off = off_z * stride_qz + off_h * stride_qh
@@ -527,6 +612,7 @@ def _attn_cluster_tile(
                 DIAG_OFFSET,
                 BLOCK_N,
                 BUF_DEPTH,
+                USE_DIRECT_LOAD,
                 IS_CAUSAL,
             )
     elif n_blocks > 0:
@@ -548,6 +634,7 @@ def _attn_cluster_tile(
             DIAG_OFFSET,
             BLOCK_N,
             BUF_DEPTH,
+            USE_DIRECT_LOAD,
             IS_CAUSAL,
         )
 
@@ -578,12 +665,15 @@ def _attn_fwd_cluster_pipeline(
     stride_oh,
     stride_om,
     stride_ok,
+    Z,
+    H,
     N_CTX: tl.constexpr,
     sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BUF_DEPTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_DIRECT_LOAD: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
     _assume_strides(
@@ -648,6 +738,7 @@ def _attn_fwd_cluster_pipeline(
         BLOCK_N,
         BUF_DEPTH,
         HEAD_DIM,
+        USE_DIRECT_LOAD,
         IS_CAUSAL,
     )
 
@@ -682,6 +773,7 @@ def _attn_fwd_cluster_persistent_pipeline(
     BLOCK_N: tl.constexpr,
     BUF_DEPTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    USE_DIRECT_LOAD: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     NUM_M_BLOCKS: tl.constexpr,
     NUM_SMS: tl.constexpr,
@@ -773,8 +865,26 @@ def _attn_fwd_cluster_persistent_pipeline(
                         BLOCK_N,
                         BUF_DEPTH,
                         HEAD_DIM,
+                        USE_DIRECT_LOAD,
                         IS_CAUSAL,
                     )
+
+
+# Short cluster kernels can exhaust ROCm event resources in the entropy
+# benchmarker. Use the standard benchmarker for this small two-config sweep.
+_attn_fwd_cluster_pipeline_autotuned = triton.autotune(
+    configs=_cluster_short_load_configs(),
+    key=_CLUSTER_AUTOTUNE_KEY,
+    prune_configs_by={"early_config_prune": _prune_cluster_short_load_configs},
+    do_bench=triton.testing.do_bench,
+)(_attn_fwd_cluster_pipeline)
+
+_attn_fwd_cluster_persistent_pipeline_autotuned = triton.autotune(
+    configs=_cluster_short_load_configs(),
+    key=_CLUSTER_PERSISTENT_AUTOTUNE_KEY,
+    prune_configs_by={"early_config_prune": _prune_cluster_short_load_configs},
+    do_bench=triton.testing.do_bench,
+)(_attn_fwd_cluster_persistent_pipeline)
 
 
 def _cluster_default_block_n(causal):
@@ -785,67 +895,33 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, **kw):
     mfma_m = 32
     block_m = kw.pop("BLOCK_M", 256)
     block_n = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
+    has_explicit_num_warps = "num_warps" in kw
+    has_explicit_waves_per_eu = "waves_per_eu" in kw
     num_warps = kw.pop("num_warps", min(8, max(1, block_m // mfma_m)))
     waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
+    use_direct_load = kw.pop("USE_DIRECT_LOAD", None)
     B, H, N_CTX, D = q.shape
 
     o = torch.empty_like(q)
     m_blocks = triton.cdiv(N_CTX, block_m)
     grid = (H, m_blocks, B) if causal else (m_blocks, H, B)
-    _attn_fwd_cluster_pipeline[grid](
-        q,
-        k,
-        v,
-        o,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
-        N_CTX,
-        sm_scale,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BUF_DEPTH=CLUSTER_BUF_DEPTH,
-        HEAD_DIM=D,
-        IS_CAUSAL=causal,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+    use_autotune = (use_direct_load is None and not has_explicit_num_warps and not has_explicit_waves_per_eu and not kw)
+    kernel = _attn_fwd_cluster_pipeline_autotuned if use_autotune else _attn_fwd_cluster_pipeline
+    launch_meta = {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BUF_DEPTH": CLUSTER_BUF_DEPTH,
+        "HEAD_DIM": D,
+        "IS_CAUSAL": causal,
+        "waves_per_eu": waves_per_eu,
         **kw,
-    )
-    return o
-
-
-def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw):
-    mfma_m = 32
-    block_m = kw.pop("BLOCK_M", 256)
-    block_n = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
-    num_warps = kw.pop("num_warps", min(8, max(1, block_m // mfma_m)))
-    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
-    B, H, N_CTX, D = q.shape
-    num_xcds = kw.pop("NUM_XCDS", 8)
-    assert num_xcds > 0, f"cluster attention: NUM_XCDS must be positive, got {num_xcds}"
-    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
-    assert num_sms >= num_xcds, f"cluster attention: NUM_SMS ({num_sms}) must be >= NUM_XCDS ({num_xcds})"
-    assert num_sms % num_xcds == 0, (
-        f"cluster attention: NUM_SMS ({num_sms}) must be divisible by NUM_XCDS ({num_xcds})")
-
-    o = torch.empty_like(q)
-    m_blocks = triton.cdiv(N_CTX, block_m)
-    grid = (num_sms, )
-    _attn_fwd_cluster_persistent_pipeline[grid](
+    }
+    if not use_autotune:
+        launch_meta.update({
+            "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,
+            "num_warps": num_warps,
+        })
+    kernel[grid](
         q,
         k,
         v,
@@ -870,17 +946,78 @@ def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw
         H,
         N_CTX,
         sm_scale,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BUF_DEPTH=CLUSTER_BUF_DEPTH,
-        HEAD_DIM=D,
-        IS_CAUSAL=causal,
-        NUM_M_BLOCKS=m_blocks,
-        NUM_SMS=num_sms,
-        NUM_XCDS=num_xcds,
-        num_warps=num_warps,
-        waves_per_eu=waves_per_eu,
+        **launch_meta,
+    )
+    return o
+
+
+def flash_attn_cluster_persistent_pipeline(q, k, v, sm_scale, causal=False, **kw):
+    mfma_m = 32
+    block_m = kw.pop("BLOCK_M", 256)
+    block_n = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
+    has_explicit_num_warps = "num_warps" in kw
+    has_explicit_waves_per_eu = "waves_per_eu" in kw
+    num_warps = kw.pop("num_warps", min(8, max(1, block_m // mfma_m)))
+    waves_per_eu = kw.pop("waves_per_eu", 0 if causal else 2)
+    use_direct_load = kw.pop("USE_DIRECT_LOAD", None)
+    B, H, N_CTX, D = q.shape
+    num_xcds = kw.pop("NUM_XCDS", 8)
+    assert num_xcds > 0, f"cluster attention: NUM_XCDS must be positive, got {num_xcds}"
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = kw.pop("NUM_SMS", (cu_count // num_xcds) * num_xcds)
+    assert num_sms >= num_xcds, f"cluster attention: NUM_SMS ({num_sms}) must be >= NUM_XCDS ({num_xcds})"
+    assert num_sms % num_xcds == 0, (
+        f"cluster attention: NUM_SMS ({num_sms}) must be divisible by NUM_XCDS ({num_xcds})")
+
+    o = torch.empty_like(q)
+    m_blocks = triton.cdiv(N_CTX, block_m)
+    grid = (num_sms, )
+    use_autotune = (use_direct_load is None and not has_explicit_num_warps and not has_explicit_waves_per_eu and not kw)
+    kernel = (_attn_fwd_cluster_persistent_pipeline_autotuned
+              if use_autotune else _attn_fwd_cluster_persistent_pipeline)
+    launch_meta = {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BUF_DEPTH": CLUSTER_BUF_DEPTH,
+        "HEAD_DIM": D,
+        "IS_CAUSAL": causal,
+        "NUM_M_BLOCKS": m_blocks,
+        "NUM_SMS": num_sms,
+        "NUM_XCDS": num_xcds,
+        "waves_per_eu": waves_per_eu,
         **kw,
+    }
+    if not use_autotune:
+        launch_meta.update({
+            "USE_DIRECT_LOAD": False if use_direct_load is None else use_direct_load,
+            "num_warps": num_warps,
+        })
+    kernel[grid](
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        B,
+        H,
+        N_CTX,
+        sm_scale,
+        **launch_meta,
     )
     return o
 
