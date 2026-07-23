@@ -25,7 +25,7 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 
 def is_in_thread_transpose_enabled(arch):
-    return (arch == "gfx942" or "gfx120" in arch) \
+    return (arch == "gfx942" or "gfx110" in arch or "gfx115" in arch or "gfx120" in arch) \
         if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
@@ -440,6 +440,10 @@ class HIPBackend(BaseBackend):
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
+        if knobs.amd.use_buffer_ops:
+            # CSE matching assume and loop-bound expressions before range analysis.
+            passes.common.add_cse(pm)
+            amd.passes.ttgpuir.add_annotate_buffer_op_split_safety(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
         ##    of the value of kernel arg `allow_flush_denorm`.
@@ -564,7 +568,7 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion, True)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during

@@ -67,11 +67,6 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
     auto sharedLayout = toLinearLayout(memDescTy);
     cvt = regLayout.invertAndCompose(sharedLayout);
   }
-  auto kBlock = str_attr("block");
-  // NYI. We would need to emit a map.shared::cluster instruction.
-  if (!cvt.isTrivialOver({kBlock})) {
-    return failure();
-  }
   // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
   // can select the per-partition base pointer; lowerLdSt strips it afterwards.
   SmallVector<StringAttr> ldStOutDims = {kOffset};

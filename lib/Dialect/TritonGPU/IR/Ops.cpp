@@ -680,6 +680,35 @@ LogicalResult MemDescReinterpretOp::verify() {
     return emitError("source and destination memory space must match");
   if (oldType.getMutableMemory() != newType.getMutableMemory())
     return emitError("source and result must have the same mutability");
+
+  // Padded layout creates some "holes". The hole patterns of the source and
+  // the destination layouts must be equal.
+  auto srcEnc = oldType.getEncoding();
+  auto dstEnc = newType.getEncoding();
+  if (isPaddedEncoding(srcEnc) != isPaddedEncoding(dstEnc))
+    return emitError(
+        "cannot reinterpret between padded and non-padded layouts");
+
+  if (isPaddedEncoding(srcEnc)) {
+    auto getPadPattern = [](MemDescType ty) {
+      auto enc = getPaddedEncoding(ty.getEncoding());
+      auto elmtSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
+      llvm::MapVector<int32_t, int32_t> pattern;
+
+      for (auto [interval, padding] :
+           llvm::zip_equal(enc.getIntervals(), enc.getPaddings())) {
+        pattern.insert({interval * elmtSize, padding * elmtSize});
+      }
+      return pattern;
+    };
+
+    auto srcPat = getPadPattern(oldType);
+    auto dstPat = getPadPattern(newType);
+    if (srcPat.size() != dstPat.size() ||
+        !std::equal(srcPat.begin(), srcPat.end(), dstPat.begin())) {
+      return emitError("cannot reinterpret with different padding pattern");
+    }
+  }
   auto isSubview = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
     return ty.getShape().take_back(rank) != ty.getAllocShape().take_back(rank);
@@ -733,8 +762,13 @@ LogicalResult MemDescReinterpretOp::verify() {
   auto kBlock = StringAttr::get(getContext(), "block");
   auto getNumBroadcastCTADims = [kBlock](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
-    auto layout =
-        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
+    auto shape = ty.getAllocShape().take_back(rank);
+    auto encoding = ty.getEncoding();
+    // Padded layouts are not representable via toLinearLayout; use the
+    // padded-aware conversion so the verifier does not assert on them.
+    LinearLayout layout = isPaddedEncoding(encoding)
+                              ? paddedLinearLayout(shape, encoding)
+                              : toLinearLayout(shape, encoding);
     auto freeVariableMask = layout.getFreeVariableMasks().lookup(kBlock);
     return llvm::popcount<uint32_t>(freeVariableMask);
   };
@@ -744,8 +778,11 @@ LogicalResult MemDescReinterpretOp::verify() {
 
   auto getViewNumBits = [](MemDescType ty) {
     auto rank = cast<LayoutEncodingTrait>(ty.getEncoding()).getRank();
-    auto layout =
-        toLinearLayout(ty.getAllocShape().take_back(rank), ty.getEncoding());
+    auto shape = ty.getAllocShape().take_back(rank);
+    auto encoding = ty.getEncoding();
+    LinearLayout layout = isPaddedEncoding(encoding)
+                              ? paddedLinearLayout(shape, encoding)
+                              : toLinearLayout(shape, encoding);
     int64_t numLayoutCopies = 1;
     for (int64_t dim : ty.getAllocShape().drop_back(rank))
       numLayoutCopies *= dim;
@@ -869,6 +906,8 @@ static LogicalResult verifySharedMemoryRank(Operation *op,
 LogicalResult LocalAllocOp::verify() {
   if (!isa<SharedMemorySpaceAttr>(getType().getMemorySpace()))
     return emitOpError("should create a buffer of shared memory");
+  if (getIntOrFloatOrPtrBitWidth(getType().getElementType()) % 8 != 0)
+    return emitOpError("element type bit width must be a multiple of 8");
   if (getSrc() && failed(verifySharedMemoryRank(*this, getSrc().getType(),
                                                 getType(), "source")))
     return failure();
@@ -1228,14 +1267,7 @@ LogicalResult MemDescSubsliceOp::verify() {
     ll = triton::gpu::toLinearLayout(srcTy);
   }
 
-  // If any block basis is fully broadcasted, multiple CTAs can alias the same
-  // output tile region. Subslice on such layouts is unsupported.
-  auto kBlock = mlir::StringAttr::get(ctx, "block");
-  if (ll.getFreeVariableMasks()[kBlock] != 0) {
-    return emitError("We don't support splitting with broadcasted CTA outputs");
-  }
-
-  auto llInv = ll.invert();
+  auto llInv = ll.pseudoinvert();
   for (auto dim : splitDims) {
     auto kDim = mlir::StringAttr::get(ctx, "dim" + llvm::Twine(dim));
     llvm::SmallVector<std::pair<mlir::StringAttr, int32_t>> namedOffsets;

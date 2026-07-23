@@ -618,6 +618,12 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   if (failed(verifyResult))
     return verifyResult;
 
+  // NOTE: no strict `descriptor sharedLayout == smem encoding` check here.
+  // beta derives the destination encoding from the descriptor via
+  // updateEncodingForShape (order/shape/CGA are rebuilt for the result tensor),
+  // so the two are compatible-by-construction but not attribute-equal. Upstream
+  // reconciles them with alignTDMDescriptorEncodings, which is not yet ported;
+  // the interval/padding check below is the guard until it is.
   auto swizzledEnc =
       llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
   if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
@@ -694,6 +700,9 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   if (failed(verifyResult))
     return verifyResult;
 
+  // NOTE: no strict `descriptor sharedLayout == smem encoding` check here — see
+  // AsyncTDMCopyGlobalToLocalOp::verify (alignTDMDescriptorEncodings not
+  // ported).
   auto swizzledEnc =
       llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
   if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)

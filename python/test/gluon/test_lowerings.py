@@ -163,6 +163,7 @@ def test_scan_blocked_broadcast_layout_multiblock(device):
 
     torch.testing.assert_close(y, torch.cumsum(x, dim=0))
 
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
 @pytest.mark.parametrize("num_ctas", [2, 4, 8])
 def test_convert_1d_to_2d_slice_cga(num_ctas, device):
@@ -172,6 +173,7 @@ def test_convert_1d_to_2d_slice_cga(num_ctas, device):
     convert_1d_to_2d_slice_cga_kernel[(1, )](out, head, num_ctas, num_warps=2, num_ctas=num_ctas)
 
     torch.testing.assert_close(out, torch.arange(head, device=device, dtype=torch.float32))
+
 
 def _reduce_linear_layouts():
     if THREADS_PER_WARP == 32:
@@ -344,6 +346,60 @@ def test_store_layouts(M, src_layout, device):
     y = torch.zeros((M, 1), dtype=torch.float32, device=device)
     kernel[(1, )](x, y, M, src_layout, num_warps=4)
     torch.testing.assert_close(y, x)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="Requires Hopper or newer")
+def test_local_store_tmem_32x32b_2cta_splitm_to_splitk(device):
+    shape = (256, 128)
+    src_layout = ttgl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [128, 0]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]],
+        warp_bases=[[32, 0], [64, 0]],
+        block_bases=[[0, 64]],
+        shape=list(shape),
+    )
+    dst_layout = ttgl.BlockedLayout(
+        size_per_thread=[1, shape[1]],
+        threads_per_warp=[THREADS_PER_WARP, 1],
+        warps_per_cta=[4, 1],
+        order=[0, 1],
+        cga_layout=[[1, 0]],
+    )
+    shared_layout = ttgl.NVMMASharedLayout(
+        swizzle_byte_width=128,
+        transposed=False,
+        element_bitwidth=16,
+        rank=2,
+        cga_layout=[[1, 0]],
+    )
+
+    @gluon.jit
+    def kernel(x_ptr, y_ptr, shape: ttgl.constexpr, src_layout: ttgl.constexpr, dst_layout: ttgl.constexpr,
+               shared_layout: ttgl.constexpr):
+        K: ttgl.constexpr = shape[0]
+        M: ttgl.constexpr = shape[1]
+        src_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(1, src_layout))[:, None]
+        src_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(0, src_layout))[None, :]
+        src_offs = src_offs_k * M + src_offs_m
+
+        x = ttgl.load(x_ptr + src_offs)
+        smem = ttgl.allocate_shared_memory(x.dtype, shape, shared_layout)
+        smem.store(x)
+        ttgl.barrier(cluster=True)
+        y = smem.load(dst_layout)
+
+        dst_offs_k = ttgl.arange(0, K, layout=ttgl.SliceLayout(1, dst_layout))[:, None]
+        dst_offs_m = ttgl.arange(0, M, layout=ttgl.SliceLayout(0, dst_layout))[None, :]
+        dst_offs = dst_offs_k * M + dst_offs_m
+        ttgl.store(y_ptr + dst_offs, y)
+
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.float16, device=device)
+    y = torch.empty_like(x)
+
+    kernel[(1, )](x, y, shape, src_layout, dst_layout, shared_layout, num_warps=4, num_ctas=2)
+
+    torch.testing.assert_close(y, x, rtol=0, atol=0)
 
 
 _1d_layouts = _filter_layouts([
@@ -1533,6 +1589,55 @@ def test_memdesc_subslice(M, N, M_tile_size, N_tile_size, shared_layout_cfg, dev
     kernel[(1, )](out, M, N, M_tile_size, N_tile_size, blocked_layout, shared_layout)
 
     out_ref = torch.arange(0, M * N, device=device).reshape((M, N)).to(torch.float16)
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_hopper_or_newer(), reason="num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
+def test_memdesc_subslice_two_cta_broadcasted_cga(device):
+    ALLOC = 512
+    SLICE = 256
+    NUM_CTAS = 2
+    alloc_layout = ttgl.BlockedLayout([4], [THREADS_PER_WARP], [4], [0], cga_layout=[[0]])
+    load_layout = ttgl.BlockedLayout([2], [THREADS_PER_WARP], [4], [0], cga_layout=[[0]])
+    store_layout = ttgl.BlockedLayout([1], [THREADS_PER_WARP], [4], [0], cga_layout=[[1]])
+    shared_layout = ttgl.SwizzledSharedLayout(
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[0],
+        cga_layout=[[0]],
+    )
+
+    @gluon.jit
+    def kernel(
+        in_ptr,
+        out_ptr,
+        ALLOC: ttgl.constexpr,
+        SLICE: ttgl.constexpr,
+        alloc_layout: ttgl.constexpr,
+        load_layout: ttgl.constexpr,
+        store_layout: ttgl.constexpr,
+        shared_layout: ttgl.constexpr,
+    ):
+        alloc_offs = ttgl.arange(0, ALLOC, layout=alloc_layout)
+        vals = ttgl.load(in_ptr + alloc_offs)
+
+        smem = ttgl.allocate_shared_memory(vals.dtype, (ALLOC, ), shared_layout, value=vals)
+        ttgl.barrier(cluster=True)
+
+        tile = smem.slice(0, SLICE)
+        tile_vals = tile.load(load_layout)
+
+        store_offs = ttgl.arange(0, SLICE, layout=store_layout)
+        store_vals = ttgl.convert_layout(tile_vals, store_layout)
+        ttgl.store(out_ptr + store_offs, store_vals + store_offs + 1)
+
+    inp = torch.arange(0, ALLOC, device=device, dtype=torch.int32)
+    out = torch.zeros((SLICE, ), device=device, dtype=torch.int32)
+    kernel[(1, )](inp, out, ALLOC, SLICE, alloc_layout, load_layout, store_layout, shared_layout, num_warps=4,
+                  num_ctas=NUM_CTAS)
+
+    out_ref = inp[:SLICE] + torch.arange(1, SLICE + 1, device=device, dtype=torch.int32)
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
 
 
