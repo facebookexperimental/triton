@@ -134,3 +134,61 @@ def loop_carried_accumulators(insts, loop, loops):
             if acc is not None:
                 out.append((acc, inst))
     return out
+
+
+def outer_reduction_loops(insts, loops):
+    """Loops whose range contains BOTH a matmul AND a self-accumulating fp combine (``acc = acc + x``)
+    — an OUTER reduction that COMBINES matmul partials. Split-K is the canonical case: the split loop's
+    ``acc += partial`` wraps the inner K-loop's MMA. A plain tiled GEMM's single K-loop contains the
+    MMA but NO in-loop self-accumulate (the MMA itself IS the accumulation into a TMEM/register acc),
+    so it is not flagged and keeps its tiling-invariant fence.
+
+    The outer loop's TRIP COUNT (= number of partials combined = num_splits) is bit-relevant: it
+    regroups the K sum (``((s0)+(s1))+...`` vs one in-order fold), so different trips are NOT
+    bitwise-equivalent even though the static MMA/op structure is identical across trips. This is the
+    reusable structural hook for any nested-reduction GEMM (split-K, tree-combine, GEMM+reduction).
+
+    Detection = a loop whose range contains a self-accumulating fp combine ``acc = acc + x`` (dst ==
+    src0) — a running fp total folded across iterations. Split-K's split loop (``acc += partial``) is
+    exactly that; a plain tiled GEMM accumulates via the MMA/TMEM accumulator itself (no fp add) and
+    has none, so it keeps its tiling-invariant fence.
+
+    Keying on the self-accumulate combine (not nested matmul loops) is what survives the compiler
+    restructuring at some tilings: at BLOCK_N=256 the split loop and the MMA K-loop are emitted as
+    SEPARATE / overlapping loops (the split loop's range holds NO matmul), so a nested-matmul-loop test
+    misses the split structure and over-merges the split counts. The split loop still carries the
+    ``acc += partial`` combine, so a range scan for it fires in both the nested and the flattened form."""
+    out = []
+    for lp in loops:
+        h, latch = lp
+        if any(_self_accumulate(insts[k]) is not None for k in range(h, latch + 1)):
+            out.append(lp)
+    return out
+
+
+def reduction_trip_signature(func):
+    """Hashable fingerprint that distinguishes the outer reduction loops' TRIP COUNTS (the split-K
+    regrouping), or ``None`` when the entry has no nested-reduction structure (a plain GEMM, whose K
+    sum is a single in-order fold that tiling never regroups).
+
+    A split-K GEMM's static instruction structure is IDENTICAL across split counts — only the outer
+    loop's runtime TRIP differs — so the checker must key on the loop-control constants. We return the
+    sorted set of ``setp`` immediate compare-constants in the entry: the outer split loop's bound
+    (= num_splits) and the inner K-loop's bound both appear here as literals and both change with the
+    split count, so different split counts get different signatures (SOUND, never over-merged). This is
+    a FAIL-CLOSED fingerprint of the trip structure — the checker cannot yet model the split regrouping
+    precisely; exact per-split recovery (nested ``LoopReduce``) is a follow-up. Returns ``None`` unless
+    an outer reduction loop exists, so a plain tiled GEMM keeps its tiling-invariant fence."""
+    insts, loops = find_loops(func)
+    if not outer_reduction_loops(insts, loops):
+        return None
+    consts = set()
+    for inst in insts:
+        if inst.opcode == "setp" and len(inst.operands) >= 3:
+            for o in inst.operands[1:]:
+                if isinstance(o, ImmediateOperand):
+                    try:
+                        consts.add(int(o.text, 0))
+                    except (ValueError, TypeError):
+                        continue
+    return tuple(sorted(consts))
