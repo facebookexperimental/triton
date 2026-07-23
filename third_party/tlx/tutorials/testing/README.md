@@ -66,14 +66,14 @@ Running paged-decode benchmarks for: ['tlx', 'aiter'], qlens=[1]
 === query_length = 1 ===
 paged-decode-performance-bf16-qlen1:
    BATCH     N_CTX  tlx (TB/s (effective HBM read))  aiter (TB/s (effective HBM read))  aiter/tlx speedup
-0    1.0    8192.0                         0.998644                           0.642793           0.643666
-1    8.0    8192.0                         2.067028                           2.077185           1.004914
-2   32.0    8192.0                         0.889442                           1.342993           1.509928
-3  128.0    8192.0                         0.216355                           0.205458           0.949631
-4    1.0   32768.0                         2.222148                           1.465259           0.659389
-5    8.0   32768.0                         2.451306                           2.350204           0.958756
-6   32.0   32768.0                         0.821394                           1.284909           1.564303
-7    8.0  131072.0                         3.117773                           2.593580           0.831869
+0    1.0    8192.0                         1.018035                           0.738434           0.725352
+1    8.0    8192.0                         2.500307                           2.383085           0.953117
+2   32.0    8192.0                         3.929076                           4.129776           1.051081
+3  128.0    8192.0                         5.200688                           5.161203           0.992408
+4    1.0   32768.0                         2.424453                           1.425422           0.587935
+5    8.0   32768.0                         3.919882                           3.666124           0.935264
+6   32.0   32768.0                         5.192640                           4.783209           0.921152
+7    8.0  131072.0                         5.207757                           4.215191           0.809406
 ```
 Peak MI350 HBM bandwidth is ~8 TB/s. Numbers are well below that, indicating the
 kernel is not yet fully utilizing memory bandwidth. TLX leads aiter for 1-seq and
@@ -86,14 +86,14 @@ and pipeline speedup (Jul 23 pipelined vs Jul 22 baseline), all in TB/s (effecti
 
 | BATCH | N_CTX  | tlx (no pipeline) | tlx (2-stage pipeline) | aiter   | tlx/aiter speedup | pipeline speedup |
 |------:|-------:|------------------:|-----------------------:|--------:|------------------:|-----------------:|
-|     1 |   8192 |             0.898 |                  1.065 |   0.756 |             1.41x |            1.19x |
-|     8 |   8192 |             1.851 |                  2.591 |   2.387 |             1.09x |            1.40x |
-|    32 |   8192 |             2.325 |                  4.222 |   4.130 |             1.02x |            1.82x |
-|   128 |   8192 |             2.438 |                  5.756 |   5.156 |             1.12x |            2.36x |
-|     1 |  32768 |             1.613 |                  2.414 |   1.434 |             1.68x |            1.50x |
-|     8 |  32768 |             2.321 |                  4.330 |   3.668 |             1.18x |            1.87x |
-|    32 |  32768 |             2.473 |                  5.724 |   4.775 |             1.20x |            2.31x |
-|     8 | 131072 |             2.456 |                  5.745 |   4.216 |             1.36x |            2.34x |
+|     1 |   8192 |             1.018 |                  1.065 |   0.756 |             1.41x |            1.05x |
+|     8 |   8192 |             2.500 |                  2.591 |   2.387 |             1.09x |            1.04x |
+|    32 |   8192 |             3.929 |                  4.222 |   4.130 |             1.02x |            1.07x |
+|   128 |   8192 |             5.201 |                  5.756 |   5.156 |             1.12x |            1.11x |
+|     1 |  32768 |             2.424 |                  2.414 |   1.434 |             1.68x |            1.00x |
+|     8 |  32768 |             3.920 |                  4.330 |   3.668 |             1.18x |            1.10x |
+|    32 |  32768 |             5.193 |                  5.724 |   4.775 |             1.20x |            1.10x |
+|     8 | 131072 |             5.208 |                  5.745 |   4.216 |             1.36x |            1.10x |
 
-The 2-stage pipeline delivers 1.2–2.4x gains across all configurations. TLX outperforms aiter
+The 2-stage pipeline delivers 1.0–1.1x gains across all configurations. TLX outperforms aiter
 across all configurations after pipelining.
