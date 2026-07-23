@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>fbtriton v3.7.3 — AMD perf backport: stacked pick DAG</title>
+<style>
+  body { margin:0; padding:20px; background:#f3f4f6;
+         font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .wrap { max-width:1320px; margin:0 auto; }
+  h1 { font-size:18px; font-weight:700; letter-spacing:-0.3px; color:#111827; margin:0 0 2px; }
+  .sub { font-size:12px; color:#6b7280; margin:0 0 12px; }
+  a.pr { cursor:pointer; }
+  a.pr:hover rect { stroke-width:2.5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>fbtriton v3.7.3 — AMD perf backport · stacked pick DAG</h1>
+  <p class="sub">Four chains stacked into one series off <code>release/3.7.x</code>: <b>L → B → A → M</b> (land bottom-up). Edges point downstream (A → B = B needs A). Boxes link to their GitHub PR. <b style="color:#15803d">green</b> = candidate pick (on the review list) · <b style="color:#6b7280">grey</b> = extra dependency pulled in, not a candidate · grey <b>dashed</b> = 🔧 shim/partial (<code>[partial]</code>=subset of 1 PR · <code>[shim]</code>=bridge from &gt;1 source) · <b style="color:#92400e">amber</b> ⏳ = not on <code>main</code> yet.</p>
+
+<!-- ── Comment bar ── -->
+<div id="comment-bar" style="margin-bottom:10px;display:flex;gap:10px;align-items:center;">
+  <button id="btn-point" onclick="setMode(mode==='point'?'none':'point')"
+    style="padding:6px 14px;border:1.5px solid #d0d7de;border-radius:6px;background:#fff;font-size:12px;cursor:pointer;font-family:inherit;font-weight:600;color:#1f2328;">✏️ Comment <span style="font-size:10px;font-weight:400;color:#656d76">(or Shift · click=pin · drag=area)</span></button>
+  <button onclick="exportComments()" style="padding:6px 14px;border:1.5px solid #d0d7de;border-radius:6px;background:#fff;font-size:12px;cursor:pointer;font-family:inherit;color:#1f2328;">📋 Export</button>
+  <button onclick="clearComments()" style="padding:6px 14px;border:1.5px solid #d0d7de;border-radius:6px;background:#fff;font-size:12px;cursor:pointer;font-family:inherit;color:#6e7681;">Clear</button>
+  <span id="comment-status" style="font-size:12px;color:#656d76;"></span>
+</div>
+<div id="export-box" style="display:none;margin-bottom:10px;">
+  <textarea id="export-text-top" readonly style="width:100%;height:120px;font-family:monospace;font-size:12px;padding:10px;border:1.5px solid #d0d7de;border-radius:6px;background:#f6f8fa;resize:vertical;"></textarea>
+  <p style="font-size:11px;color:#656d76;margin-top:4px;">Copy and paste back to Claude.</p>
+</div>
+
+<svg width="1280" height="888" viewBox="0 0 1280 888" style="display:block" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<defs>
+  <marker id="a" markerWidth="9" markerHeight="7" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#94a3b8"/></marker>
+  <marker id="ag" markerWidth="9" markerHeight="7" refX="8" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#22c55e"/></marker>
+  <filter id="sh"><feDropShadow dx="0" dy="1" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.08"/></filter>
+</defs>
+<rect x="0" y="0" width="1280" height="888" fill="#f3f4f6"/>
+
+<!-- ============ STACK BANNER ============ -->
+<g filter="url(#sh)"><rect x="16" y="12" width="1248" height="54" rx="10" fill="#eff6ff" stroke="#3b82f6"/></g>
+<text x="34" y="34" font-size="10" font-weight="700" letter-spacing="0.5" fill="#1e40af">STACK · LAND BOTTOM-UP</text>
+<text x="34" y="49" font-size="8" fill="#3b82f6">off release/3.7.x</text>
+<!-- chevron chain: release → L → B → A → M -->
+<rect x="150" y="24" width="112" height="30" rx="6" fill="#ffffff" stroke="#93c5fd"/>
+<text x="206" y="43" text-anchor="middle" font-size="9" font-weight="600" fill="#1e40af">release/3.7.x</text>
+<line x1="262" y1="39" x2="286" y2="39" stroke="#22c55e" stroke-width="1.6" marker-end="url(#ag)"/>
+<rect x="290" y="24" width="70" height="30" rx="6" fill="#f0fdf4" stroke="#22c55e"/>
+<text x="325" y="43" text-anchor="middle" font-size="10" font-weight="700" fill="#15803d">L · 8</text>
+<line x1="360" y1="39" x2="384" y2="39" stroke="#22c55e" stroke-width="1.6" marker-end="url(#ag)"/>
+<rect x="388" y="24" width="70" height="30" rx="6" fill="#f0fdf4" stroke="#22c55e"/>
+<text x="423" y="43" text-anchor="middle" font-size="10" font-weight="700" fill="#15803d">B · 18</text>
+<line x1="458" y1="39" x2="482" y2="39" stroke="#22c55e" stroke-width="1.6" marker-end="url(#ag)"/>
+<rect x="486" y="24" width="70" height="30" rx="6" fill="#f0fdf4" stroke="#22c55e"/>
+<text x="521" y="43" text-anchor="middle" font-size="10" font-weight="700" fill="#15803d">A · 23</text>
+<line x1="556" y1="39" x2="580" y2="39" stroke="#22c55e" stroke-width="1.6" marker-end="url(#ag)"/>
+<rect x="584" y="24" width="70" height="30" rx="6" fill="#f0fdf4" stroke="#22c55e"/>
+<text x="619" y="43" text-anchor="middle" font-size="10" font-weight="700" fill="#15803d">M · 24</text>
+<!-- build status -->
+<rect x="700" y="20" width="550" height="38" rx="6" fill="#f0fdf4" stroke="#86efac"/>
+<text x="712" y="36" font-size="9.5" font-weight="700" fill="#15803d">WHEEL BUILT ✅  triton-3.7.2+git3368ad9b  (441M · stack tip 3368ad9b)</text>
+<text x="712" y="50" font-size="8.5" fill="#4b5563">smoke ✓ · launch.h ✓ · TLX 69 passed / 4 skip ✓ (gfx950, 21-pick tip) · re-build+test after D113115691 fold</text>
+
+<!-- ============ ① CHAIN L · LAYOUT ============ -->
+<rect x="16" y="74" width="1248" height="150" rx="12" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="34" y="98" font-size="10" font-weight="700" letter-spacing="0.5" fill="#6b7280">① CHAIN L · TLX LAYOUT / LOAD INFRA  —  foundational (B depends on it)</text>
+
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/1955" target="_blank"><title>PR #1955</title>
+  <g filter="url(#sh)"><rect x="150" y="112" width="118" height="46" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="209" y="132" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #1955</text>
+  <text x="209" y="147" text-anchor="middle" font-size="8" fill="#4b5563">dump_layout</text></a>
+<line x1="268" y1="135" x2="284" y2="135" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/1994" target="_blank"><title>PR #1994</title>
+  <g filter="url(#sh)"><rect x="288" y="112" width="118" height="46" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="347" y="132" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #1994</text>
+  <text x="347" y="147" text-anchor="middle" font-size="8" fill="#4b5563">swizzled_layout</text></a>
+<line x1="406" y1="135" x2="422" y2="135" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2017" target="_blank"><title>PR #2017</title>
+  <g filter="url(#sh)"><rect x="426" y="112" width="118" height="46" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="485" y="132" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2017</text>
+  <text x="485" y="147" text-anchor="middle" font-size="8" fill="#4b5563">user-pinned layouts</text></a>
+<line x1="544" y1="135" x2="560" y2="135" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#a)"/>
+<!-- Fixup.cpp machinery, now pulled in -->
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2054" target="_blank"><title>#2054 · #2146 · #2151 (Fixup.cpp machinery)</title>
+  <g filter="url(#sh)"><rect x="564" y="110" width="196" height="50" rx="8" fill="#f3f4f6" stroke="#9ca3af"/></g>
+  <text x="662" y="128" text-anchor="middle" font-size="10.5" font-weight="700" fill="#374151">✅ #2054 · #2146 · #2151</text>
+  <text x="662" y="141" text-anchor="middle" font-size="7.5" fill="#4b5563">Fixup.cpp machinery (pulled in</text>
+  <text x="662" y="152" text-anchor="middle" font-size="7.5" fill="#4b5563">to unblock #2158)</text></a>
+<line x1="760" y1="135" x2="776" y2="135" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2158" target="_blank"><title>PR #2158</title>
+  <g filter="url(#sh)"><rect x="780" y="112" width="128" height="46" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="844" y="132" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2158</text>
+  <text x="844" y="147" text-anchor="middle" font-size="8" fill="#4b5563">auto-release pinned</text></a>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2286" target="_blank"><title>PR #2286</title>
+  <g filter="url(#sh)"><rect x="928" y="112" width="118" height="46" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="987" y="132" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2286</text>
+  <text x="987" y="147" text-anchor="middle" font-size="8" fill="#4b5563">layout asserts</text></a>
+<text x="150" y="184" font-size="8" fill="#15803d">Pulling #2054/#2146/#2151 (Fixup.cpp) makes #2158 a clean pick → the whole layout chain applies clean. #2017 also unblocks Chain B's #2156.</text>
+<text x="150" y="200" font-size="8" fill="#6b7280">Base of the stack (8 commits off release/3.7.x).</text>
+
+<!-- ============ ② CHAIN B · GEMM (on L) ============ -->
+<rect x="16" y="232" width="1248" height="272" rx="12" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="34" y="256" font-size="10" font-weight="700" letter-spacing="0.5" fill="#6b7280">② CHAIN B · a16w16 GEMM  —  stacked on L (needs #2017)  ·  + D113115691 clean chain</text>
+
+<!-- prereqs -->
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2152" target="_blank"><title>PR #2152</title>
+  <g filter="url(#sh)"><rect x="150" y="270" width="120" height="40" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="210" y="286" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">✅ #2152</text>
+  <text x="210" y="300" text-anchor="middle" font-size="8" fill="#4b5563">AGPR prereq</text></a>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2156" target="_blank"><title>PR #2156</title>
+  <g filter="url(#sh)"><rect x="150" y="316" width="120" height="40" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="210" y="332" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">✅ #2156</text>
+  <text x="210" y="346" text-anchor="middle" font-size="8" fill="#4b5563">layouts (needs L #2017)</text></a>
+<!-- shim path -->
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2153" target="_blank"><title>[shim] #10081 → enables #2153</title>
+  <g filter="url(#sh)"><rect x="150" y="366" width="184" height="52" rx="8" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.8" stroke-dasharray="5,2"/></g>
+  <text x="242" y="384" text-anchor="middle" font-size="11" font-weight="700" fill="#374151">🔧 [shim] #10081</text>
+  <text x="242" y="397" text-anchor="middle" font-size="7.5" fill="#4b5563">Pipeline.cpp CDNA4 SWP perf fix</text>
+  <text x="242" y="408" text-anchor="middle" font-size="7.5" fill="#4b5563">+ asyncmark test (== main)</text></a>
+<line x1="334" y1="392" x2="352" y2="392" stroke="#22c55e" stroke-width="1.5" marker-end="url(#ag)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2153" target="_blank"><title>PR #2153</title>
+  <g filter="url(#sh)"><rect x="356" y="368" width="128" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="420" y="388" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">✅ #2153</text>
+  <text x="420" y="403" text-anchor="middle" font-size="8" fill="#4b5563">tokenless async_wait</text></a>
+<!-- base + follow-ups -->
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2157" target="_blank"><title>PR #2157</title>
+  <g filter="url(#sh)"><rect x="540" y="316" width="128" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="604" y="336" text-anchor="middle" font-size="13" font-weight="600" fill="#15803d">✅ #2157</text>
+  <text x="604" y="352" text-anchor="middle" font-size="8.5" fill="#4b5563">base GEMM</text></a>
+<line x1="668" y1="340" x2="704" y2="340" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2269" target="_blank"><title>PR #2269</title>
+  <g filter="url(#sh)"><rect x="708" y="316" width="128" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="772" y="336" text-anchor="middle" font-size="13" font-weight="600" fill="#15803d">✅ #2269</text>
+  <text x="772" y="352" text-anchor="middle" font-size="8.5" fill="#4b5563">auto split-K</text></a>
+<line x1="836" y1="340" x2="872" y2="340" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2289" target="_blank"><title>PR #2289 · D113111412</title>
+  <g filter="url(#sh)"><rect x="876" y="316" width="140" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="946" y="336" text-anchor="middle" font-size="13" font-weight="600" fill="#15803d">✅ #2289</text>
+  <text x="946" y="352" text-anchor="middle" font-size="8" fill="#4b5563">thin-N 128×128 (landed 07-22)</text></a>
+<!-- arrows into #2157 -->
+<line x1="270" y1="290" x2="536" y2="330" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+<line x1="270" y1="336" x2="536" y2="340" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+<line x1="484" y1="388" x2="536" y2="352" stroke="#94a3b8" stroke-width="1.4" marker-end="url(#a)"/>
+<text x="150" y="230" font-size="8" fill="#6b7280"></text>
+<g filter="url(#sh)"><rect x="1030" y="312" width="222" height="60" rx="8" fill="#f9fafb" stroke="#d1d5db" stroke-dasharray="4,3"/></g>
+<text x="1141" y="329" text-anchor="middle" font-size="8" font-weight="700" fill="#374151">[shim] #10081 (bridge from &gt;1 source)</text>
+<text x="1141" y="342" text-anchor="middle" font-size="7.2" fill="#4b5563">test file absent on release (only in #10081/</text>
+<text x="1141" y="353" text-anchor="middle" font-size="7.2" fill="#4b5563">bundle #2031, dropped fixes-only). Bring</text>
+<text x="1141" y="364" text-anchor="middle" font-size="7.2" fill="#4b5563">Pipeline.cpp+test; omit block-pingpong (#1847).</text>
+
+<!-- D113115691 clean chain (extends B): #10059 -> #2150 -> #2290 -->
+<text x="150" y="446" font-size="8.5" font-weight="700" fill="#15803d">D113115691 · a16w16 FP16 epilogue dwordx4 — clean chain, all == main:</text>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/10059" target="_blank"><title>upstream #10059 (real commit ca6bd0c30, from bundle #1981)</title>
+  <g filter="url(#sh)"><rect x="150" y="452" width="128" height="44" rx="8" fill="#f3f4f6" stroke="#9ca3af"/></g>
+  <text x="214" y="471" text-anchor="middle" font-size="11" font-weight="600" fill="#374151">✅ #10059</text>
+  <text x="214" y="485" text-anchor="middle" font-size="7.5" fill="#4b5563">coalesce int atomics (enabler)</text></a>
+<line x1="278" y1="474" x2="296" y2="474" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2150" target="_blank"><title>PR #2150</title>
+  <g filter="url(#sh)"><rect x="300" y="452" width="120" height="44" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="360" y="471" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">✅ #2150</text>
+  <text x="360" y="485" text-anchor="middle" font-size="7.5" fill="#4b5563">256-bit loads</text></a>
+<line x1="420" y1="474" x2="580" y2="474" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2290" target="_blank"><title>PR #2290 · D113115691</title>
+  <g filter="url(#sh)"><rect x="584" y="452" width="164" height="44" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="666" y="471" text-anchor="middle" font-size="11" font-weight="600" fill="#15803d">✅ #2290</text>
+  <text x="666" y="485" text-anchor="middle" font-size="7.5" fill="#4b5563">dwordx4 epilogue = D113115691</text></a>
+<text x="770" y="470" font-size="7.5" fill="#6b7280">#10059 = the upstream original (bundle #1981), not the 12-PR bundle.</text>
+<text x="770" y="481" font-size="7.5" fill="#6b7280">Folded 07-23, clean. Coalesce.cpp == main modulo #2320 (NPOT, out of scope).</text>
+
+<!-- ============ ③ CHAIN A · DECODE ============ -->
+<rect x="16" y="512" width="1248" height="146" rx="12" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="34" y="536" font-size="10" font-weight="700" letter-spacing="0.5" fill="#6b7280">③ CHAIN A · PAGED DECODE</text>
+
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2040" target="_blank"><title>PR #2040</title>
+  <g filter="url(#sh)"><rect x="150" y="552" width="128" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="214" y="572" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2040</text>
+  <text x="214" y="588" text-anchor="middle" font-size="8" fill="#4b5563">base kernel</text></a>
+<line x1="278" y1="576" x2="296" y2="576" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2149" target="_blank"><title>[partial] #2149 decode slice</title>
+  <g filter="url(#sh)"><rect x="300" y="550" width="184" height="52" rx="8" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.8" stroke-dasharray="5,2"/></g>
+  <text x="392" y="568" text-anchor="middle" font-size="11" font-weight="700" fill="#374151">🔧 [partial] #2149</text>
+  <text x="392" y="581" text-anchor="middle" font-size="7.5" fill="#4b5563">decode files only</text>
+  <text x="392" y="592" text-anchor="middle" font-size="7.5" fill="#4b5563">CI/lint/modulo dropped</text></a>
+<line x1="484" y1="576" x2="502" y2="576" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2281" target="_blank"><title>PR #2281</title>
+  <g filter="url(#sh)"><rect x="506" y="552" width="120" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="566" y="572" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2281</text>
+  <text x="566" y="588" text-anchor="middle" font-size="8" fill="#4b5563">page-16 aggregation</text></a>
+<line x1="626" y1="576" x2="644" y2="576" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2288" target="_blank"><title>PR #2288</title>
+  <g filter="url(#sh)"><rect x="648" y="552" width="120" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="708" y="572" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2288</text>
+  <text x="708" y="588" text-anchor="middle" font-size="8" fill="#4b5563">page-64 pipeline</text></a>
+<line x1="768" y1="576" x2="786" y2="576" stroke="#94a3b8" stroke-width="1.6" marker-end="url(#a)"/>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2306" target="_blank"><title>PR #2306</title>
+  <g filter="url(#sh)"><rect x="790" y="552" width="130" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="855" y="572" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #2306</text>
+  <text x="855" y="588" text-anchor="middle" font-size="8" fill="#4b5563">decode opt (landed 07-22)</text></a>
+<text x="150" y="624" font-size="8" fill="#15803d">[partial] #2149 = amd_pa_decode.py + decode tests only (CI/lint/ModuloSchedule omitted) → #2281/#2288/#2306 pick clean; decode files verify == main.</text>
+<text x="150" y="640" font-size="8" fill="#6b7280">Independent of L — stacked after B only for a linear series.</text>
+
+<!-- ============ ④ CHAIN M + PENDING ============ -->
+<rect x="16" y="666" width="1248" height="124" rx="12" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="34" y="690" font-size="10" font-weight="700" letter-spacing="0.5" fill="#6b7280">④ CHAIN M · addmm (standalone) ✅  ·  NOT ON main YET ⏳ (cannot pick)</text>
+
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/1963" target="_blank"><title>PR #1963</title>
+  <g filter="url(#sh)"><rect x="150" y="708" width="160" height="48" rx="8" fill="#f0fdf4" stroke="#22c55e"/></g>
+  <text x="230" y="728" text-anchor="middle" font-size="12" font-weight="600" fill="#15803d">✅ #1963</text>
+  <text x="230" y="744" text-anchor="middle" font-size="8" fill="#4b5563">addmm+GLU (standalone) · stack tip</text></a>
+
+<text x="470" y="700" font-size="8.5" fill="#92400e">can't cherry-pick until landed on main →</text>
+<a class="pr" xlink:href="https://github.com/facebookexperimental/triton/pull/2336" target="_blank"><title>PR #2336 (supersedes closed #1919)</title>
+  <g filter="url(#sh)"><rect x="660" y="708" width="160" height="48" rx="8" fill="#fffbeb" stroke="#fbbf24"/></g>
+  <text x="740" y="728" text-anchor="middle" font-size="11" font-weight="600" fill="#92400e">⏳ #2336</text>
+  <text x="740" y="744" text-anchor="middle" font-size="8" fill="#92400e">MXFP4 / w4a4 MoE (was #1919)</text></a>
+
+<!-- ============ SUMMARY BAR ============ -->
+<rect x="16" y="798" width="1248" height="74" rx="10" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="34" y="818" font-size="11" font-weight="700" fill="#15803d">BANKED (24 commits · 2 shims):</text>
+<text x="240" y="818" font-size="10.5" fill="#374151">L: #1955 #1994 #2017 #2054 #2146 #2151 #2158 #2286 · B: #2152 #2156 🔧#10081 #2153 #2157 #2269 #2289 #10059 #2150 #2290 · A: #2040 🔧#2149 #2281 #2288 #2306 · M: #1963</text>
+<text x="34" y="838" font-size="11" font-weight="700" fill="#92400e">PENDING ⏳:</text>
+<text x="240" y="838" font-size="10.5" fill="#374151">#2336 (MXFP4/w4a4 MoE; supersedes closed #1919) — not on main yet.  (D113115691 landed 07-23 → folded as the #10059→#2150→#2290 clean chain.)</text>
+<text x="34" y="860" font-size="11" font-weight="700" fill="#1e40af">BUILD ✅:</text>
+<text x="240" y="860" font-size="10.5" fill="#374151">wheel triton-3.7.2+gitb8e35f17 (post-fold, 07-23) · smoke ✓ · launch.h ✓ · TLX 69 passed / 4 skip ✓ · folded-chain LIT tests ✓ (gfx950). Land order L→B→A→M.</text>
+</svg>
+
+<script>
+const svg = document.querySelector('svg');
+const VB_W = 1280, VB_H = 888;
+let mode='none', comments=[], nextId=1, dragStart=null, dragRect=null, dragMoved=false;
+const ZONES = [
+  ['Stack banner', 16, 12, 1264, 66],
+  ['Chain L · layout', 16, 74, 1264, 224],
+  ['Chain B · GEMM', 16, 232, 1264, 504],
+  ['Chain A · decode', 16, 512, 1264, 658],
+  ['Chain M + pending', 16, 666, 1264, 790],
+  ['Summary', 16, 798, 1264, 872],
+];
+function hitZone(x,y){let b=null,ba=Infinity;for(const[l,x1,y1,x2,y2]of ZONES){if(x>=x1&&x<=x2&&y>=y1&&y<=y2){const a=(x2-x1)*(y2-y1);if(a<ba){ba=a;b=l;}}}return b;}
+function svgCoords(e){const r=svg.getBoundingClientRect();return{x:Math.round((e.clientX-r.left)*VB_W/r.width),y:Math.round((e.clientY-r.top)*VB_H/r.height)};}
+function setMode(m){mode=m;const btn=document.getElementById('btn-point'),s=document.getElementById('comment-status'),a=m!=='none';btn.style.background=a?'#dbeafe':'#fff';btn.style.borderColor=a?'#2563eb':'#d0d7de';btn.style.color=a?'#1d4ed8':'#1f2328';svg.style.cursor=a?'crosshair':'';s.textContent=a?'Click to pin · drag to highlight. (PR links disabled while commenting)':'';}
+svg.addEventListener('click',e=>{if(mode==='none'||dragMoved)return;e.preventDefault();const{x,y}=svgCoords(e),zone=hitZone(x,y),text=prompt('Comment:');if(!text?.trim())return;const id=nextId++;comments.push({id,x,y,zone,text:text.trim(),type:'point'});renderPin(id,x,y);updateStatus();});
+svg.addEventListener('mousedown',e=>{if(mode==='none')return;dragStart=svgCoords(e);dragMoved=false;});
+svg.addEventListener('mousemove',e=>{if(mode==='none'||!dragStart)return;dragMoved=true;e.preventDefault();const cur=svgCoords(e),ns='http://www.w3.org/2000/svg';if(!dragRect){dragRect=document.createElementNS(ns,'rect');dragRect.setAttribute('fill','rgba(34,197,94,0.1)');dragRect.setAttribute('stroke','#16a34a');dragRect.setAttribute('stroke-width','2');dragRect.setAttribute('stroke-dasharray','6,3');dragRect.style.pointerEvents='none';svg.appendChild(dragRect);}const rx=Math.min(dragStart.x,cur.x),ry=Math.min(dragStart.y,cur.y);dragRect.setAttribute('x',rx);dragRect.setAttribute('y',ry);dragRect.setAttribute('width',Math.abs(cur.x-dragStart.x));dragRect.setAttribute('height',Math.abs(cur.y-dragStart.y));});
+svg.addEventListener('mouseup',e=>{if(mode==='none'||!dragStart||!dragMoved){dragStart=null;return;}const end=svgCoords(e);if(dragRect){dragRect.remove();dragRect=null;}const rx=Math.min(dragStart.x,end.x),ry=Math.min(dragStart.y,end.y),rw=Math.abs(end.x-dragStart.x),rh=Math.abs(end.y-dragStart.y);dragStart=null;if(rw<10||rh<10)return;const cx=Math.round(rx+rw/2),cy=Math.round(ry+rh/2),zone=hitZone(cx,cy),text=prompt('Comment on this area:');if(!text?.trim())return;const id=nextId++;comments.push({id,x:rx,y:ry,w:rw,h:rh,zone,text:text.trim(),type:'area'});renderArea(id,rx,ry,rw,rh);updateStatus();});
+document.addEventListener('keydown',e=>{if(e.key==='Shift'&&mode==='none')setMode('point');});
+document.addEventListener('keyup',e=>{if(e.key==='Shift'&&!dragStart)setMode('none');});
+function renderPin(id,x,y){const ns='http://www.w3.org/2000/svg',g=document.createElementNS(ns,'g');g.id='ann-'+id;const c=document.createElementNS(ns,'circle');c.setAttribute('cx',x);c.setAttribute('cy',y);c.setAttribute('r',13);c.setAttribute('fill','#ef4444');c.setAttribute('stroke','#fff');c.setAttribute('stroke-width','2');c.style.cursor='pointer';c.addEventListener('click',ev=>{ev.stopPropagation();showComment(id);});const t=document.createElementNS(ns,'text');t.setAttribute('x',x);t.setAttribute('y',y+5);t.setAttribute('text-anchor','middle');t.setAttribute('font-size','11');t.setAttribute('font-weight','700');t.setAttribute('fill','#fff');t.style.pointerEvents='none';t.textContent=id;g.appendChild(c);g.appendChild(t);svg.appendChild(g);}
+function renderArea(id,x,y,w,h){const ns='http://www.w3.org/2000/svg',g=document.createElementNS(ns,'g');g.id='ann-'+id;const r=document.createElementNS(ns,'rect');r.setAttribute('x',x);r.setAttribute('y',y);r.setAttribute('width',w);r.setAttribute('height',h);r.setAttribute('fill','rgba(239,68,68,0.08)');r.setAttribute('stroke','#ef4444');r.setAttribute('stroke-width','2');r.style.cursor='pointer';r.addEventListener('click',ev=>{ev.stopPropagation();showComment(id);});const t=document.createElementNS(ns,'text');t.setAttribute('x',x+4);t.setAttribute('y',y+14);t.setAttribute('font-size','11');t.setAttribute('font-weight','700');t.setAttribute('fill','#ef4444');t.style.pointerEvents='none';t.textContent='['+id+']';g.appendChild(r);g.appendChild(t);svg.appendChild(g);}
+function showComment(id){const c=comments.find(c=>c.id===id);if(c)alert(`[${id}]${c.zone?' '+c.zone:''}\n\n${c.text}`);}
+function updateStatus(){document.getElementById('comment-status').textContent=`${comments.length} comment${comments.length!==1?'s':''} added.`;}
+function exportComments(){const box=document.getElementById('export-box'),area=document.getElementById('export-text-top');if(!comments.length){alert('No comments yet.');return;}const lines=comments.map(c=>{const loc=c.type==='area'?`area (${c.x},${c.y})→(${c.x+c.w},${c.y+c.h})`:`point (${c.x},${c.y})`;return `[${c.id}]${c.zone?' ['+c.zone+']':''} ${loc} — ${c.text}`;});const txt='--- Diagram Comments ---\n'+lines.join('\n')+'\n--- End ---';area.value=txt;box.style.display='block';if(navigator.clipboard)navigator.clipboard.writeText(txt).then(()=>{document.getElementById('comment-status').textContent=`${comments.length} copied to clipboard.`;}).catch(()=>{area.select();});}
+function clearComments(){comments.forEach(c=>{const el=document.getElementById('ann-'+c.id);if(el)el.remove();});comments=[];nextId=1;document.getElementById('comment-status').textContent='';document.getElementById('export-box').style.display='none';setMode('none');}
+</script>
+</div>
+</body>
+</html>
