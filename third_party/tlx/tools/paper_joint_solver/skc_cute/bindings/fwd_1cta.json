@@ -1,0 +1,91 @@
+{
+ "kind": "fwd",
+ "solution": "/projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/paper_joint_solver/subtiled_fa4exact_solution.json",
+ "solver_point": {
+  "ii": 66,
+  "length": 148,
+  "num_warps": 5
+ },
+ "verifies": {
+  "kv_stage": {
+   "expect": 3,
+   "solver_source": "K liveness 2 copies + V 1 (Phase A audit)"
+  },
+  "s_stage": {
+   "expect": 2,
+   "solver_source": "QK span 66 > II=66 -> depth 2"
+  },
+  "q_stage": {
+   "expect": 2,
+   "solver_source": "two softmax chains (W=5 partition)"
+  },
+  "m_block_size": {
+   "expect": 128,
+   "solver_source": "SUB_M=64 realized at 128 (Phase A TMEM-tile clamp)"
+  },
+  "n_block_size": {
+   "expect": 128,
+   "solver_source": "BN=64 solved; FA4 tile fixed \u2014 VERIFY records the geometry delta, not an equality claim"
+  },
+  "dedicated_mma_issuer": {
+   "expect": true,
+   "solver_source": "FA4-exact colocate probe SAT"
+  }
+ },
+ "overrides": {
+  "reg_candidates": {
+   "solver_liveness": {
+    "num_regs_softmax": 200,
+    "num_regs_correction": 88,
+    "_derivation": {
+     "sm_peak_units": 6336,
+     "corr_peak_units": 16384,
+     "geom_scale": 4,
+     "corr_stream_div": 8,
+     "addr_floor": 24
+    }
+   },
+   "transfer_2cta_tuned": {
+    "num_regs_softmax": 176,
+    "num_regs_correction": 88
+   },
+   "upstream_default": {
+    "num_regs_softmax": 192,
+    "num_regs_correction": 80
+   }
+  },
+  "split_P_arrive": {
+   "default": 96,
+   "sweep": [
+    96,
+    64,
+    32,
+    0
+   ],
+   "solver_source": "MMA_PV_SKEW=1 (iteration-level) ~ sub-iteration partial-P overlap; semantic approximation, audited"
+  },
+  "kv_stage_sweep": [
+   3,
+   2,
+   1
+  ]
+ },
+ "dropped": [
+  "exact normalized cycles (II=66, L=148 offsets) \u2014 same handoff information loss Phase A audited",
+  "solver geometry BN=64 (FA4 tile is protocol; delta recorded in verifies.n_block_size)"
+ ],
+ "frozen": [
+  {
+   "param": "warp role tuples",
+   "reason": "named-barrier index arithmetic hardcodes 4-warp groups (flash_fwd_sm100.py:1015-1017, named_barrier.py:15-25)"
+  },
+  {
+   "param": "MMA issue order",
+   "reason": "fused tri-role mbarrier ring + deliberately elided O-full commits are justified by the static order (flash_fwd_sm100.py:966-977, 1760-1764)"
+  },
+  {
+   "param": "producer_tail workarounds",
+   "reason": "upstream comments 'commented out because it hangs' (flash_bwd_sm100.py:2758-2762) \u2014 inherit verbatim, never fix"
+  }
+ ]
+}
