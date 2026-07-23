@@ -1,4 +1,4 @@
-# 复现报告：《Optimal Software Pipelining and Warp Specialization for Tensor Core GPUs》(arXiv:2512.18134)
+# 复现报告：联合 SWP+WS 求解器论文（下称 JOS）
 ## B200 单平台 · TLX (sched2tlx emitter) 落地 · 2026-07-21/22
 
 > 论文系统代号 **JOS**（Joint Optimal Scheduler）。范围与落地方式为用户指定的两项偏差
