@@ -80,3 +80,20 @@ kernel is not yet fully utilizing memory bandwidth. TLX leads aiter for 1-seq an
 large-context cases; aiter leads for mid-range batch (32 seqs). Performance
 optimization is ongoing.
 
+# Jul 23 2026
+Implemented the 2-stage pipeline for PAGES_PER_TILE=4. Combined results showing perf vs aiter
+and pipeline speedup (Jul 23 pipelined vs Jul 22 baseline), all in TB/s (effective HBM read):
+
+| BATCH | N_CTX  | tlx (no pipeline) | tlx (2-stage pipeline) | aiter   | tlx/aiter speedup | pipeline speedup |
+|------:|-------:|------------------:|-----------------------:|--------:|------------------:|-----------------:|
+|     1 |   8192 |             0.898 |                  1.065 |   0.756 |             1.41x |            1.19x |
+|     8 |   8192 |             1.851 |                  2.591 |   2.387 |             1.09x |            1.40x |
+|    32 |   8192 |             2.325 |                  4.222 |   4.130 |             1.02x |            1.82x |
+|   128 |   8192 |             2.438 |                  5.756 |   5.156 |             1.12x |            2.36x |
+|     1 |  32768 |             1.613 |                  2.414 |   1.434 |             1.68x |            1.50x |
+|     8 |  32768 |             2.321 |                  4.330 |   3.668 |             1.18x |            1.87x |
+|    32 |  32768 |             2.473 |                  5.724 |   4.775 |             1.20x |            2.31x |
+|     8 | 131072 |             2.456 |                  5.745 |   4.216 |             1.36x |            2.34x |
+
+The 2-stage pipeline delivers 1.2–2.4x gains across all configurations. TLX outperforms aiter
+across all configurations after pipelining.
