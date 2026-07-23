@@ -23,6 +23,13 @@ def _eq(a, b):
     return ttgir_reductions_equivalent(_load(a), _load(b))
 
 
+class _Cfg:
+    """Minimal stand-in for an autotuner config exposing just ``enable_fp_fusion``."""
+
+    def __init__(self, enable_fp_fusion):
+        self.enable_fp_fusion = enable_fp_fusion
+
+
 # --- single-operand reductions (the in-scope core) ---
 def test_unordered_different_warps_not_equivalent():
     assert not _eq("sum_uno_nw2", "sum_uno_nw4")
@@ -68,3 +75,26 @@ def test_gemm_mma_sound():
     assert ttgir_reduction_descriptor(_load("gemm_ieee")) != ()
     assert not _eq("gemm_ieee", "gemm_tf32")  # precision differs -> not merged
     assert _eq("gemm_ieee", "gemm_ieee")  # reflexive
+
+
+# --- enable_fp_fusion (invisible in TTGIR) folded in from the config (diff 2a) ---
+def test_fp_fusion_splits_fma_eligible():
+    # GEMM (warp_group_dot) is fma-eligible: fma contraction is decided below TTGIR, so
+    # fp_fusion on vs off compile to the SAME IR but different bits. With the config
+    # supplied they must NOT merge; with the same config they must.
+    ir = _load("gemm_ieee")
+    assert ttgir_reduction_descriptor(ir, _Cfg(True)) != ttgir_reduction_descriptor(ir, _Cfg(False))
+    assert ttgir_reduction_descriptor(ir, _Cfg(True)) == ttgir_reduction_descriptor(ir, _Cfg(True))
+
+
+def test_fp_fusion_not_split_for_pure_add():
+    # a pure-add reduction has no multiply to contract, so fp_fusion cannot change its
+    # bits -- on and off must stay equal (no over-split).
+    ir = _load("sum_uno_nw4")
+    assert ttgir_reduction_descriptor(ir, _Cfg(True)) == ttgir_reduction_descriptor(ir, _Cfg(False))
+
+
+def test_config_none_is_backward_compatible():
+    # no config -> exactly the pre-2a descriptor (the PTX-checker / autotuner path).
+    ir = _load("gemm_ieee")
+    assert ttgir_reduction_descriptor(ir, None) == ttgir_reduction_descriptor(ir)
