@@ -7,7 +7,11 @@ an explicit GPUTarget and verify the generated TTGIR/AMDGCN. No AMD hardware is
 required for the compilation checks. Correctness checks (actual execution) run
 only when the corresponding hardware is available.
 """
+import importlib.util
 import re
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,6 +39,36 @@ def compile_for_gfx950(fn, signature, constexprs):
     """Compile a TLX kernel for gfx950 and return the compiled object."""
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
     return triton_compile(src, target=GFX950)
+
+
+def _load_tlx_gfx9_gemm_bench_module(module_name="_tlx_amd_test_gfx9_bench"):
+    repo_root = Path(__file__).resolve().parents[4]
+    bench_path = (repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "a16w16" / "bench.py")
+    spec = importlib.util.spec_from_file_location(module_name, bench_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_tlx_gfx9_inter_wave_bench_module(module_name="_tlx_amd_test_gfx9_inter_wave_bench"):
+    repo_root = Path(__file__).resolve().parents[4]
+    bench_path = (repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "inter_wave" / "a16w16" / "bench.py")
+    previous_kernel_module = sys.modules.get("matmul_kernel")
+    try:
+        sys.modules["matmul_kernel"] = SimpleNamespace(
+            matmul=lambda _a, _b: None,
+            MIN_K=128,
+            KERNEL_NAME="a16w16_8wave",
+        )
+        spec = importlib.util.spec_from_file_location(module_name, bench_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if previous_kernel_module is None:
+            sys.modules.pop("matmul_kernel", None)
+        else:
+            sys.modules["matmul_kernel"] = previous_kernel_module
 
 
 # ---------------------------------------------------------------------------
@@ -931,3 +965,211 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+
+
+def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
+    bench = _load_tlx_gfx9_gemm_bench_module()
+
+    assert not hasattr(bench, "DEVICE")
+    assert set(bench.VERSION_MAP) == set(range(10))
+    assert set(bench.PROVIDER_LABELS) == {"rocblas", "tlx"}
+    assert bench.provider_defaults(9) == ["rocblas", "tlx"]
+    assert bench.provider_defaults(0) == ["rocblas", "tlx"]
+    assert bench.parse_shape("128x256x64") == (128, 256, 64)
+    assert bench.parse_shape("128,256,64") == (128, 256, 64)
+    with pytest.raises(Exception, match="shape dimensions must be positive"):
+        bench.parse_shape("128x0x64")
+    with pytest.raises(Exception, match="shape must be MxNxK"):
+        bench.parse_shape("128x256")
+    bench.validate_shape_for_providers((256, 256, 64), 0, ["tlx"])
+    bench.validate_shape_for_providers((128, 128, 64), 9, ["rocblas"])
+    with pytest.raises(Exception, match="M to be a multiple of 256"):
+        bench.validate_shape_for_providers((128, 256, 64), 9, ["tlx"])
+    with pytest.raises(Exception, match="N to be a multiple of 256"):
+        bench.validate_shape_for_providers((256, 128, 64), 9, ["tlx"])
+    with pytest.raises(Exception, match="K to be a multiple of 64"):
+        bench.validate_shape_for_providers((256, 256, 96), 2, ["tlx"])
+    with pytest.raises(Exception, match="prefetch two 64-wide K tiles"):
+        bench.validate_shape_for_providers((256, 256, 64), 9, ["tlx"])
+    bench.validate_shape_for_providers((256, 256, 128), 9, ["tlx"])
+
+
+def test_tlx_gfx9_gemm_bench_input_modes_are_deterministic():
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_inputs")
+    inter_wave = _load_tlx_gfx9_inter_wave_bench_module("_tlx_amd_test_gfx9_inter_wave_bench_inputs")
+    assert inter_wave.INPUT_MODES == bench.INPUT_MODES
+    normal_seed_zero = None
+
+    for input_mode in bench.INPUT_MODES:
+        a, b = bench.make_inputs(
+            2,
+            4,
+            8,
+            torch.device("cpu"),
+            "transposed",
+            input_mode=input_mode,
+            seed=0,
+        )
+        repeat_a, repeat_b = bench.make_inputs(
+            2,
+            4,
+            8,
+            torch.device("cpu"),
+            "transposed",
+            input_mode=input_mode,
+            seed=0,
+        )
+        torch.testing.assert_close(a, repeat_a)
+        torch.testing.assert_close(b, repeat_b)
+        inter_wave_a, inter_wave_b = inter_wave.make_inputs(
+            2,
+            4,
+            8,
+            torch.device("cpu"),
+            "transposed",
+            input_mode=input_mode,
+            seed=0,
+        )
+        torch.testing.assert_close(inter_wave_a, a)
+        torch.testing.assert_close(inter_wave_b, b)
+        assert b.shape == (8, 4)
+        assert b.stride() == (1, 8)
+        if input_mode == "normal":
+            normal_seed_zero = a
+
+    normal_a, _ = bench.make_inputs(2, 4, 8, "cpu", "transposed", input_mode="normal", seed=1)
+    assert not torch.equal(normal_seed_zero, normal_a)
+
+
+def test_tlx_gfx9_gemm_bench_reproduces_hipblaslt_rand_int_inputs():
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_rand_int")
+
+    a, b = bench.make_inputs(
+        2,
+        4,
+        8,
+        torch.device("cpu"),
+        "transposed",
+        input_mode="rand-int",
+        seed=0,
+    )
+
+    expected_a = torch.tensor(
+        [
+            [-2, -2, 0, 0, 1, 0, 1, 2],
+            [-1, -2, 0, -1, -2, -2, 0, -1],
+        ],
+        dtype=torch.float16,
+    )
+    expected_b_storage = torch.tensor(
+        [
+            [2, -2, 0, 0, -1, 0, -1, 2],
+            [-1, 2, 0, 1, -2, 2, 0, 1],
+            [2, 0, -2, -1, 1, 2, 0, 2],
+            [2, -1, -1, 1, 2, 2, 1, 2],
+        ],
+        dtype=torch.float16,
+    )
+    torch.testing.assert_close(a, expected_a)
+    torch.testing.assert_close(b.T, expected_b_storage)
+
+
+def test_tlx_gfx9_gemm_bench_launch_reuses_output():
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_output")
+    call = {}
+
+    class FakeKernel:
+
+        def __getitem__(self, grid):
+            call["grid"] = grid
+
+            def launch(*args, **kwargs):
+                call["args"] = args
+                call["kwargs"] = kwargs
+
+            return launch
+
+    module = SimpleNamespace(v9_beyond_hotloop=FakeKernel())
+    a = torch.empty((256, 128), dtype=torch.float16)
+    b = torch.empty((128, 256), dtype=torch.float16)
+    out = torch.empty((256, 256), dtype=torch.float16)
+
+    result = bench.launch_tutorial_matmul(module, "v9_beyond_hotloop", a, b, out=out)
+
+    assert result is out
+    assert call["args"][2] is out
+    assert call["grid"] == (1, )
+
+
+def test_tlx_gfx9_gemm_bench_batched_timing_uses_one_event_span_per_repeat():
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_timing")
+    state = {"launches": 0, "synchronizes": 0, "events": 0}
+
+    class FakeEvent:
+
+        def __init__(self):
+            self.launch = None
+
+        def record(self):
+            self.launch = state["launches"]
+
+        def elapsed_time(self, other):
+            return (other.launch - self.launch) * 0.25
+
+    class FakeDeviceInterface:
+
+        def Event(self, *, enable_timing):
+            assert enable_timing
+            state["events"] += 1
+            return FakeEvent()
+
+        def synchronize(self):
+            state["synchronizes"] += 1
+
+    def launch():
+        state["launches"] += 1
+
+    ms = bench.do_bench_batched(
+        launch,
+        warmup_launches=2,
+        timed_launches=4,
+        repeats=3,
+        device_interface=FakeDeviceInterface(),
+    )
+
+    assert ms == 0.25
+    assert state == {"launches": 18, "synchronizes": 6, "events": 6}
+
+
+def test_tlx_gfx9_gemm_bench_triton_timing_reports_median(monkeypatch):
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_median")
+    call = {}
+
+    def do_bench(fn, **kwargs):
+        call["fn"] = fn
+        call["kwargs"] = kwargs
+        return 0.75
+
+    monkeypatch.setattr(bench.triton.testing, "do_bench", do_bench)
+    fn = lambda: None
+    ms = bench.measure_provider(
+        SimpleNamespace(timing_mode="triton", warmup=13, rep=29),
+        fn,
+    )
+
+    assert ms == 0.75
+    assert call == {
+        "fn": fn,
+        "kwargs": {"warmup": 13, "rep": 29, "return_mode": "median"},
+    }
+
+
+def test_tlx_gfx9_gemm_bench_loads_modules_without_import_leaks():
+    bench = _load_tlx_gfx9_gemm_bench_module("_tlx_amd_test_gfx9_bench_imports")
+    before_path = list(sys.path)
+
+    module = bench.load_matmul_module("v0_naive", "test")
+
+    assert hasattr(module, "matmul")
+    assert list(sys.path) == before_path
+    assert module.__name__ not in sys.modules
