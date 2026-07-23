@@ -119,6 +119,8 @@ Operation *skipIdxOp(Operation *op) {
 }
 
 Operation *AllocChannel::getSrcOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   // Prefer the producer cached at channel-creation time. This is the only
   // reliable source for a producer inside a ttng.subtiled_region: once a
   // sibling channel (sharing the same in-body template store and per-tile
@@ -224,6 +226,8 @@ bool appearsBefore(Operation *A, Operation *B) {
 // must be in the same region and the taskIds must be the same. We can have
 // a representative consumer in the channel.
 Operation *AllocChannel::getDstOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   SmallVector<Operation *> consumers;
   getAllConsumers(this, consumers, false);
   if (consumers.size() == 1)
@@ -284,6 +288,8 @@ static Operation *findTmemStartEnd(ttng::TmemAllocChannel *ch,
 }
 
 Operation *ttng::TmemAllocChannel::getSrcOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   if (isOperandD) { // is inout
     // Find tmem.start for this channel ID.
     return findTmemStartEnd(this, "tmem.start");
@@ -321,6 +327,8 @@ static void getAllConsumers(ttng::TmemAllocChannel *ch,
 }
 
 Operation *ttng::TmemAllocChannel::getDstOp() {
+  if (defunct)
+    return nullptr; // alloc erased by reuse folding; endpoints are dangling.
   if (isOperandD) {
     // Find tmem.end for this channel ID.
     return findTmemStartEnd(this, "tmem.end");
@@ -387,23 +395,34 @@ static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
     return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
+  //
+  // getSrcOp()/getDstOp() may be null: a sibling channel's lowering can rewire
+  // or erase this channel's producer before we reach here (see AllocChannel's
+  // cachedSrcOp note), so the alloc-walk finds nothing. `enclosing` would then
+  // deref null in isProperAncestor. A null endpoint is not enclosed by ctrlOp,
+  // so skip it. (Which endpoints are already-rewired is iteration-order
+  // dependent, so an unguarded deref is a layout-sensitive crash.)
   for (auto *ch : group->channels) {
+    if (ch->defunct)
+      continue; // alloc folded into the representative and erased; skip.
+    Operation *src = ch->getSrcOp();
+    Operation *dst = ch->getDstOp();
     if (auto forOp = dyn_cast<scf::ForOp>(ctrlOp)) {
-      if (enclosing(forOp, ch->getSrcOp()))
+      if (src && enclosing(forOp, src))
         return true;
-      if (enclosing(forOp, ch->getDstOp()))
+      if (dst && enclosing(forOp, dst))
         return true;
     }
     if (auto ifOp = dyn_cast<scf::IfOp>(ctrlOp)) {
-      if (enclosing(ifOp, ch->getSrcOp()))
+      if (src && enclosing(ifOp, src))
         return true;
-      if (enclosing(ifOp, ch->getDstOp()))
+      if (dst && enclosing(ifOp, dst))
         return true;
     }
     if (auto whileOp = dyn_cast<scf::WhileOp>(ctrlOp)) {
-      if (enclosing(whileOp, ch->getSrcOp()))
+      if (src && enclosing(whileOp, src))
         return true;
-      if (enclosing(whileOp, ch->getDstOp()))
+      if (dst && enclosing(whileOp, dst))
         return true;
     }
   }
