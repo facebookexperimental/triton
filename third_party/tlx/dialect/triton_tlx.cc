@@ -98,7 +98,8 @@ void init_triton_tlx_ir(py::module &&m) {
                                                         offsets);
            })
       .def("create_require_layout",
-           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
+           [](TritonOpBuilder &self, Value &v, Attribute &encoding,
+              bool pin) -> Value {
              Type newType;
              if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
                // consider allocation type for subslice
@@ -111,14 +112,25 @@ void init_triton_tlx_ir(py::module &&m) {
                    type.getMemorySpace(), type.getMutableMemory(), allocShape);
                return self.create<tlx::RequireLayoutOp>(newType, v);
              } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               Attribute tensorEncoding = tlx::wrapNoVerifyLayout(encoding);
+               // `pin`: wrap in #tlx.no_verify_layout(#tlx.user_layout) -- the
+               // #tlx.user_layout carries PinnedEncodingTrait so the requirement is
+               // honored as a hard anchor by Coalesce / RemoveLayoutConversions /
+               // OptimizeEpilogue (e.g. to pin an epilogue store's register layout),
+               // and the outer #tlx.no_verify_layout defers operand-layout
+               // verification until ResolvePlaceholderLayouts peels it (so a pinned
+               // store whose ptr/mask layouts don't yet match verifies fine). Non-pin
+               // is a soft requirement (#tlx.no_verify_layout only, e.g. dot operands).
+               Attribute tensorEncoding =
+                   pin ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(encoding))
+                       : tlx::wrapNoVerifyLayout(encoding);
                newType = RankedTensorType::get(
                    type.getShape(), type.getElementType(), tensorEncoding);
                return self.create<tlx::RequireLayoutOp>(newType, v);
              } else {
                throw std::runtime_error("Unsupported type");
              }
-           })
+           },
+           py::arg("v"), py::arg("encoding"), py::arg("pin") = false)
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {

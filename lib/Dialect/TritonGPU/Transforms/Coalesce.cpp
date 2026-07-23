@@ -69,6 +69,29 @@ static void pickDescriptorLoadStoreLayout(
   });
 }
 
+// A value pinned via tlx.require_layout(pin=True) carries a PinnedEncodingTrait
+// (#tlx.user_layout), possibly under a #tlx.no_verify_layout wrapper that
+// resolve-placeholder-layouts peels only after coalesce runs. Walk the TLX
+// wrapper chain to detect the pin (used for both a pinned load result and a
+// pinned store value operand).
+static bool hasRecursivePin(Attribute enc) {
+  for (Attribute e = enc; e && e.getDialect().getNamespace() == "tlx";) {
+    if (isa<PinnedEncodingTrait>(e))
+      return true;
+    Attribute inner;
+    e.walkImmediateSubElements(
+        [&](Attribute sub) {
+          if (!inner)
+            inner = sub;
+        },
+        [](Type) {});
+    if (!inner || inner == e)
+      break;
+    e = inner;
+  }
+  return false;
+}
+
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
   using impl::TritonGPUCoalesceBase<CoalescePass>::TritonGPUCoalesceBase;
 
@@ -128,10 +151,11 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
             dyn_cast<RankedTensorType>(localLoad.getResult().getType());
         if (!resultType)
           return;
-        // Respect a user-pinned result layout (PinnedEncodingTrait, e.g. TLX's
-        // #tlx.user_layout): don't coalesce it to a "full contiguity" blocked
-        // layout -- the user chose this register layout on purpose.
-        if (isa_and_nonnull<PinnedEncodingTrait>(resultType.getEncoding()))
+        // Respect a user-pinned result layout: don't coalesce it to a "full
+        // contiguity" blocked layout -- the user chose this register layout on
+        // purpose. The pin (PinnedEncodingTrait) may sit under a
+        // #tlx.no_verify_layout wrapper here (peeled later by resolve-placeholder).
+        if (hasRecursivePin(resultType.getEncoding()))
           return;
       } else {
         // Not a memory operation we handle
@@ -162,13 +186,38 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
             &getContext(), resultType.getShape(), sizePerThread, order,
             numWarps, threadsPerWarp, CGALayout);
       } else {
-        auto tensorType = cast<RankedTensorType>(ptr.getType());
-        CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
-        SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
-        auto layout = buildCoalescedEncoding(axisInfoAnalysis, curr, numWarps,
-                                             threadsPerWarp, cgaLayout,
-                                             shapePerCTA, maxVecBits);
-        layoutMap[curr] = layout;
+        // Respect a user-pinned store value layout. A tt.store has no result to
+        // carry a PinnedEncodingTrait, so the pin rides on the value operand,
+        // wrapped as #tlx.no_verify_layout(#tlx.user_layout): the outer no-verify
+        // defers store operand-layout verification until resolve-placeholder-layouts
+        // peels it, and it is still present here because coalesce runs before that
+        // pass. Find the pin (hasRecursivePin), then store in the peeled concrete
+        // layout instead of a freshly-coalesced one: convertDistributedOpEncoding
+        // then converts ptr/mask to match, the value's bridging convert folds away,
+        // and the user's chosen store layout survives to codegen (AMD
+        // OptimizeEpilogue leaves it alone since it is no longer a #blocked store).
+        Attribute pinned;
+        if (auto store = dyn_cast<triton::StoreOp>(curr)) {
+          if (auto vt =
+                  dyn_cast<RankedTensorType>(store.getValue().getType())) {
+            if (hasRecursivePin(vt.getEncoding())) {
+              Attribute concrete = triton::unwrapTlxWrappers(vt.getEncoding());
+              if (isa_and_nonnull<DistributedEncodingTrait>(concrete))
+                pinned = concrete;
+            }
+          }
+        }
+        if (pinned) {
+          layoutMap[curr] = pinned;
+        } else {
+          auto tensorType = cast<RankedTensorType>(ptr.getType());
+          CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
+          SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
+          auto layout = buildCoalescedEncoding(axisInfoAnalysis, curr, numWarps,
+                                               threadsPerWarp, cgaLayout,
+                                               shapePerCTA, maxVecBits);
+          layoutMap[curr] = layout;
+        }
       }
     });
 
