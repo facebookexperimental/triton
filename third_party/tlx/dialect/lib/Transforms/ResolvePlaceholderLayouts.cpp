@@ -384,14 +384,32 @@ static bool containsUserLayout(Type type) {
 /// `slice<parent = #tlx.user_layout<...>>`) and inside a constant's `value`
 /// DenseElementsAttr type. Stripping only top-level result encodings would
 /// leave nested wrappers behind and produce inconsistent op types.
+// Recursively strip a chain of TLX wrapper attrs (user_layout / no_verify) down
+// to the concrete layout. AttrTypeReplacer applies each replacement only once
+// per matched attr, so a *nested* wrapper -- e.g.
+// no_verify<user_layout<no_verify<L>>>, produced when a require_layout store pin
+// also carries a tlx.assert_same_layout -- would keep an inner user_layout after
+// a single getLayout(), which the residual check below then flags as
+// "unresolved TLX user layout". Unwrapping the whole chain here resolves it
+// (wrappers nested inside ttg encodings are still reached by the replacer's own
+// sub-element recursion, which re-invokes this on the inner wrapper).
+static Attribute deepUnwrapTlxWrappers(Attribute attr) {
+  if (auto u = dyn_cast<UserLayoutAttr>(attr))
+    return deepUnwrapTlxWrappers(u.getLayout());
+  if (auto n = dyn_cast<NoVerifyLayoutAttr>(attr))
+    return deepUnwrapTlxWrappers(n.getLayout());
+  return attr;
+}
+
 static LogicalResult finalizeUserLayouts(ModuleOp moduleOp) {
   mlir::AttrTypeReplacer replacer;
-  replacer.addReplacement(
-      [](UserLayoutAttr wrapper) -> Attribute { return wrapper.getLayout(); });
+  replacer.addReplacement([](UserLayoutAttr wrapper) -> Attribute {
+    return deepUnwrapTlxWrappers(wrapper);
+  });
   // Defensively also strip any no-verify wrapper that reached this point (e.g.
   // nested under a user-layout that resolve-placeholder-layouts left in place).
   replacer.addReplacement([](NoVerifyLayoutAttr wrapper) -> Attribute {
-    return wrapper.getLayout();
+    return deepUnwrapTlxWrappers(wrapper);
   });
 
   moduleOp->walk([&](Operation *op) {

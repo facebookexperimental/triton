@@ -4,6 +4,24 @@ from . import types as tlx
 from .utility import cuda_parse_arch
 
 
+@tl.builtin
+def require_layout(x, layout, _semantic=None):
+    """Pin a register tensor's layout as a hard user anchor.
+
+    ``layout`` is a ``tlx.layout(...)`` (Shape:Stride) mapped to a ``#linear``
+    encoding and wrapped as ``#tlx.user_layout`` (PinnedEncodingTrait), so the
+    downstream layout passes (tritongpu-coalesce, remove-layout-conversions, AMD
+    optimize-epilogue) treat it as fixed and never rewrite it. Unlike a plain
+    (no_verify) require_layout, this survives to Coalesce and lets you pin an
+    epilogue ``tl.store`` to a coalesced register layout *without* staging the
+    value through LDS.
+    """
+    layout = tl._unwrap_if_constexpr(layout)
+    enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
+    handle = _semantic.builder.create_require_layout(x.handle, enc, pin=True)
+    return tl.tensor(handle, x.type)
+
+
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     rank = len(x.shape)
