@@ -268,6 +268,378 @@ def structural_view_alias_plan(
     }
 
 
+def structural_join_plan(
+    operands,
+    result,
+    operand_layouts,
+    result_layout,
+    op,
+):
+    """Describe a same-workitem ``tt.join`` as scalar register selection.
+
+    Triton's join appends a two-element minor dimension.  It is structural
+    when every result register slot is supplied by a register slot owned by
+    the same block, warp, and lane in one input.  The plan is expressed over
+    scalar register slots and separately records bridge packet grouping, so
+    vector-valued MFMA payloads can be unpacked and regrouped without turning
+    an in-thread representation change into a semantic redistribution.
+    """
+    if len(operands) != 2 or len(operand_layouts) != 2:
+        _structural_join_fail(op, result.value_id, "tt.join requires two operands")
+    if result_layout is None or any(layout is None for layout in operand_layouts):
+        _structural_join_fail(
+            op,
+            result.value_id,
+            "tt.join requires distributed operand and result layouts",
+        )
+    first, second = operands
+    source_shape = tuple(int(dim) for dim in operand_layouts[0].shape)
+    if tuple(int(dim) for dim in operand_layouts[1].shape) != source_shape:
+        _structural_join_fail(op, result.value_id, "tt.join operand shapes must match")
+    result_shape = tuple(int(dim) for dim in result_layout.shape)
+    if result_shape != source_shape + (2,):
+        _structural_join_fail(
+            op,
+            result.value_id,
+            "tt.join result shape must append a two-element minor dimension",
+        )
+    if (
+        first.type.kind != "tensor"
+        or second.type.kind != "tensor"
+        or result.type.kind != "tensor"
+        or first.type.element_type != second.type.element_type
+        or first.type.element_type != result.type.element_type
+    ):
+        _structural_join_fail(
+            op,
+            result.value_id,
+            "tt.join requires matching tensor element types",
+        )
+
+    lane_width = int(result.type.lane_width or 64)
+    if any(int(value.type.lane_width or 64) != lane_width for value in operands):
+        _structural_join_fail(op, result.value_id, "tt.join changed its wave width")
+    source_linears = tuple(
+        _redistribution_linear_layout(layout, op) for layout in operand_layouts
+    )
+    result_linear = _redistribution_linear_layout(result_layout, op)
+    source_slots = tuple(
+        layouts.linear_layout_in_dim_size(linear, "register")
+        for linear in source_linears
+    )
+    result_slots = layouts.linear_layout_in_dim_size(result_linear, "register")
+    source_components = tuple(int(value.type.component_count) for value in operands)
+    result_components = int(result.type.component_count)
+    if any(slots % components for slots, components in zip(source_slots, source_components)):
+        _structural_join_fail(
+            op,
+            result.value_id,
+            "tt.join source packets do not evenly cover register slots",
+        )
+    if result_slots % result_components:
+        _structural_join_fail(
+            op,
+            result.value_id,
+            "tt.join result packets do not evenly cover register slots",
+        )
+
+    source_warps = tuple(_redistribution_warp_count(layout) for layout in operand_layouts)
+    result_warps = _redistribution_warp_count(result_layout)
+    source_blocks = tuple(
+        layouts.linear_layout_in_dim_size(linear, "block")
+        for linear in source_linears
+    )
+    result_blocks = layouts.linear_layout_in_dim_size(result_linear, "block")
+    if any(count != result_warps for count in source_warps):
+        _structural_join_fail(op, result.value_id, "tt.join changed its workgroup size")
+    if any(count != result_blocks for count in source_blocks):
+        _structural_join_fail(op, result.value_id, "tt.join changed its cluster size")
+
+    source_by_item_and_coordinate = []
+    for linear, slot_count, operand in zip(source_linears, source_slots, operands):
+        source_map = {}
+        for block in range(int(result_blocks)):
+            for warp in range(int(result_warps)):
+                for lane in range(lane_width):
+                    for slot in range(int(slot_count)):
+                        coordinate = _redistribution_coords(
+                            linear,
+                            slot,
+                            lane,
+                            warp,
+                            block,
+                            len(source_shape),
+                            op,
+                            operand.value_id,
+                            "tt.join structural component mapping",
+                        )
+                        source_map.setdefault(
+                            (block, warp, lane, coordinate),
+                            [],
+                        ).append(slot)
+        source_by_item_and_coordinate.append(source_map)
+
+    scalar_sources = []
+    for result_slot in range(int(result_slots)):
+        sources = set()
+        for block in range(int(result_blocks)):
+            for warp in range(int(result_warps)):
+                for lane in range(lane_width):
+                    coordinate = _redistribution_coords(
+                        result_linear,
+                        result_slot,
+                        lane,
+                        warp,
+                        block,
+                        len(result_shape),
+                        op,
+                        result.value_id,
+                        "tt.join structural component mapping",
+                    )
+                    operand_index = int(coordinate[-1])
+                    if operand_index not in (0, 1):
+                        _structural_join_fail(
+                            op,
+                            result.value_id,
+                            "tt.join result selector is outside the appended dimension",
+                        )
+                    candidates = source_by_item_and_coordinate[operand_index].get(
+                        (block, warp, lane, tuple(coordinate[:-1])),
+                        (),
+                    )
+                    if not candidates:
+                        _structural_join_fail(
+                            op,
+                            result.value_id,
+                            "tt.join result coordinate is not owned by the selected operand workitem",
+                        )
+                    sources.add((operand_index, min(int(candidate) for candidate in candidates)))
+        if len(sources) != 1:
+            _structural_join_fail(
+                op,
+                result.value_id,
+                "tt.join scalar source varies across workitems",
+            )
+        scalar_sources.append(sources.pop())
+
+    return {
+        "scalar_sources": tuple(scalar_sources),
+        "source_component_counts": source_components,
+        "source_packet_widths": tuple(
+            slots // components
+            for slots, components in zip(source_slots, source_components)
+        ),
+        "source_slot_counts": source_slots,
+        "result_component_count": result_components,
+        "result_packet_width": result_slots // result_components,
+        "result_slot_count": result_slots,
+    }
+
+
+def _structural_join_fail(op, value_id, message):
+    fail(
+        "TLXW_OP_STRUCTURAL_JOIN",
+        STAGE,
+        message,
+        source_op_index=op.index,
+        source_value_id=value_id,
+    )
+
+
+def structural_split_plan(
+    operand,
+    results,
+    operand_layout,
+    result_layouts,
+    op,
+):
+    """Describe a same-workitem ``tt.split`` as scalar register selection.
+
+    Triton's split removes a trailing two-element dimension and returns one
+    tensor for each selector value.  The lowering is structural exactly when
+    every output register slot is already owned by the same block, warp, and
+    lane in the input.  Packet grouping is recorded separately so this also
+    handles vector-valued register payloads without exposing their physical
+    representation through source operation boundaries.
+    """
+    if len(results) != 2 or len(result_layouts) != 2:
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split requires two results",
+        )
+    if operand_layout is None or any(layout is None for layout in result_layouts):
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split requires distributed operand and result layouts",
+        )
+    source_shape = tuple(int(dim) for dim in operand_layout.shape)
+    if not source_shape or source_shape[-1] != 2:
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split operand shape must end in a two-element dimension",
+        )
+    result_shape = source_shape[:-1]
+    if any(
+        tuple(int(dim) for dim in layout.shape) != result_shape
+        for layout in result_layouts
+    ):
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split result shapes must remove the trailing selector dimension",
+        )
+    if (
+        operand.type.kind != "tensor"
+        or any(result.type.kind != "tensor" for result in results)
+        or any(
+            result.type.element_type != operand.type.element_type
+            for result in results
+        )
+    ):
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split requires matching tensor element types",
+        )
+
+    lane_width = int(operand.type.lane_width or 64)
+    if any(int(result.type.lane_width or 64) != lane_width for result in results):
+        _structural_split_fail(op, operand.value_id, "tt.split changed its wave width")
+    source_linear = _redistribution_linear_layout(operand_layout, op)
+    result_linears = tuple(
+        _redistribution_linear_layout(layout, op) for layout in result_layouts
+    )
+    source_slots = layouts.linear_layout_in_dim_size(source_linear, "register")
+    result_slots = tuple(
+        layouts.linear_layout_in_dim_size(linear, "register")
+        for linear in result_linears
+    )
+    source_components = int(operand.type.component_count)
+    result_components = tuple(int(result.type.component_count) for result in results)
+    if source_slots % source_components:
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split source packets do not evenly cover register slots",
+        )
+    if any(slots % components for slots, components in zip(result_slots, result_components)):
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split result packets do not evenly cover register slots",
+        )
+
+    source_warps = _redistribution_warp_count(operand_layout)
+    result_warps = tuple(
+        _redistribution_warp_count(layout) for layout in result_layouts
+    )
+    source_blocks = layouts.linear_layout_in_dim_size(source_linear, "block")
+    result_blocks = tuple(
+        layouts.linear_layout_in_dim_size(linear, "block")
+        for linear in result_linears
+    )
+    if any(count != source_warps for count in result_warps):
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split changed its workgroup size",
+        )
+    if any(count != source_blocks for count in result_blocks):
+        _structural_split_fail(
+            op,
+            operand.value_id,
+            "tt.split changed its cluster size",
+        )
+
+    source_by_item_and_coordinate = {}
+    for block in range(int(source_blocks)):
+        for warp in range(int(source_warps)):
+            for lane in range(lane_width):
+                for slot in range(int(source_slots)):
+                    coordinate = _redistribution_coords(
+                        source_linear,
+                        slot,
+                        lane,
+                        warp,
+                        block,
+                        len(source_shape),
+                        op,
+                        operand.value_id,
+                        "tt.split structural component mapping",
+                    )
+                    source_by_item_and_coordinate.setdefault(
+                        (block, warp, lane, coordinate),
+                        [],
+                    ).append(slot)
+
+    scalar_source_slots = []
+    for selector, (result, result_linear, slot_count) in enumerate(
+        zip(results, result_linears, result_slots)
+    ):
+        result_sources = []
+        for result_slot in range(int(slot_count)):
+            sources = set()
+            for block in range(int(source_blocks)):
+                for warp in range(int(source_warps)):
+                    for lane in range(lane_width):
+                        coordinate = _redistribution_coords(
+                            result_linear,
+                            result_slot,
+                            lane,
+                            warp,
+                            block,
+                            len(result_shape),
+                            op,
+                            result.value_id,
+                            "tt.split structural component mapping",
+                        )
+                        candidates = source_by_item_and_coordinate.get(
+                            (block, warp, lane, tuple(coordinate) + (selector,)),
+                            (),
+                        )
+                        if not candidates:
+                            _structural_split_fail(
+                                op,
+                                result.value_id,
+                                "tt.split result coordinate is not owned by the same input workitem",
+                            )
+                        sources.add(min(int(candidate) for candidate in candidates))
+            if len(sources) != 1:
+                _structural_split_fail(
+                    op,
+                    result.value_id,
+                    "tt.split scalar source varies across workitems",
+                )
+            result_sources.append(sources.pop())
+        scalar_source_slots.append(tuple(result_sources))
+
+    return {
+        "source_component_count": source_components,
+        "source_packet_width": source_slots // source_components,
+        "source_slot_count": source_slots,
+        "scalar_source_slots": tuple(scalar_source_slots),
+        "result_component_counts": result_components,
+        "result_packet_widths": tuple(
+            slots // components
+            for slots, components in zip(result_slots, result_components)
+        ),
+        "result_slot_counts": result_slots,
+    }
+
+
+def _structural_split_fail(op, value_id, message):
+    fail(
+        "TLXW_OP_STRUCTURAL_SPLIT",
+        STAGE,
+        message,
+        source_op_index=op.index,
+        source_value_id=value_id,
+    )
+
+
 def _identity_packet_grouping_plan(
     operand,
     result,

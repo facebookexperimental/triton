@@ -193,7 +193,10 @@ def _is_dead_eliminable(op, provenance_slice_ops):
     return (
         op.kind in {
             "affine_materialize",
+            "component_join",
+            "component_split",
             "layout_convert",
+            "make_buffer",
             "type_convert",
         }
         or op.target_op_id in provenance_slice_ops
@@ -206,10 +209,13 @@ _PROVENANCE_SLICE_PURE_OPS = frozenset({
     "broadcast",
     "cmpi",
     "cmpi_select",
+    "component_join",
+    "component_split",
     "constant",
     "expand_dims",
     "layout_convert",
     "make_range",
+    "make_buffer",
     "maxsi",
     "minsi",
     "program_id",
@@ -270,6 +276,7 @@ _ASYNC_WAIT_HOIST_PURE_OPS = frozenset({
     "float_cast",
     "mma_packet_truncf",
     "make_range",
+    "make_buffer",
     "memdesc_index",
     "memdesc_view",
     "maxsi",
