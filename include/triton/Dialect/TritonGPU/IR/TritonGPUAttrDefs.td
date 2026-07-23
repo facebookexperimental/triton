@@ -816,15 +816,27 @@ for
       unsigned prevLanes = 1;
       unsigned prevWarps = 1;
 
+      // A non-power-of-2 dim (e.g. shapePerCTA[i]/sizePerThread[i] == 6) yields a
+      // non-pow2 lane/warp factor, so threadsPerWarp/warpsPerCTA no longer tile
+      // to the warp/CTA. Under TRITON_ALLOW_NPOT, floor each factor to a pow2 so
+      // the tile stays pow2 and the NPOT remainder is carried by the tensor shape
+      // (the modular LinearLayout). Flooring a pow2 is a no-op, so pow2 shapes
+      // are byte-identical.
+      static const bool allowNpot =
+          mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+      auto pow2Floor = [&](unsigned x) -> unsigned {
+        return allowNpot ? (1u << llvm::Log2_32(std::max<unsigned>(x, 1))) : x;
+      };
+
       // starting from the contiguous dimension
       for (unsigned d = 0; d < rank - 1; ++d) {
         unsigned i = order[d];
         unsigned threadsPerCTA = std::clamp<unsigned>(remainingThreads, 1, std::max<unsigned>(1, shapePerCTA[i] / sizePerThread[i]));
-        threadsPerWarp[i] = std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes);
-        warpsPerCTA[i] = std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps);
+        threadsPerWarp[i] = pow2Floor(std::clamp<unsigned>(threadsPerCTA, 1, remainingLanes));
+        warpsPerCTA[i] = pow2Floor(std::clamp<unsigned>(threadsPerCTA / threadsPerWarp[i], 1, remainingWarps));
         remainingWarps /= warpsPerCTA[i];
         remainingLanes /= threadsPerWarp[i];
-        remainingThreads /= threadsPerCTA;
+        remainingThreads /= threadsPerWarp[i] * warpsPerCTA[i];
         prevLanes *= threadsPerWarp[i];
         prevWarps *= warpsPerCTA[i];
       }
