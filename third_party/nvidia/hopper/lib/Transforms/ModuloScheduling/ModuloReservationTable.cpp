@@ -3,12 +3,14 @@
 #include "ModuloReservationTable.h"
 
 #include "ExhaustiveScheduler.h"
+#include "JointSolverScheduler.h"
 #include "SwingScheduler.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>
 #include <numeric>
+#include <optional>
 
 #define DEBUG_TYPE "modulo-scheduling-rau"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -257,6 +259,31 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
+// Storage for ScopedScheduleAlgoOverride. Process-global on purpose: it
+// shadows a process-global env var, and the only writer is a module pass
+// (which MLIR runs single-threaded per module).
+static std::optional<std::string> &scheduleAlgoOverrideSlot() {
+  static std::optional<std::string> slot;
+  return slot;
+}
+
+ScopedScheduleAlgoOverride::ScopedScheduleAlgoOverride(std::string algo) {
+  assert(!scheduleAlgoOverrideSlot() &&
+         "nested schedule-algo overrides are not supported");
+  scheduleAlgoOverrideSlot() = std::move(algo);
+}
+
+ScopedScheduleAlgoOverride::~ScopedScheduleAlgoOverride() {
+  scheduleAlgoOverrideSlot().reset();
+}
+
+std::string getActiveScheduleAlgo() {
+  if (auto &override = scheduleAlgoOverrideSlot())
+    return *override;
+  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+  return algo.empty() ? "rau" : algo;
+}
+
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
                     int maxBacktracks) {
@@ -266,13 +293,50 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   if (maxII <= 0)
     maxII = 2 * minII;
 
+  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
+  //   "joint_solver" → complete solver (OR-Tools CP-SAT subprocess), joint
+  //                  schedule + buffer depths; falls back to Rau on failure
+  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
+  //   "exhaustive" → Exhaustive search with joint memory feasibility
+  //   "random"     → Random sampling with greedy placement
+  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+  // A live ScopedScheduleAlgoOverride (the joint-solver pass) wins over the
+  // env var — getActiveScheduleAlgo folds both into one answer.
+  auto algo = getActiveScheduleAlgo();
+
+  if (algo == "joint_solver") {
+    // Complete search: sweeps II from minII to a true feasibility bound
+    // (critical path + serial work) with NO slack window — the window below
+    // (guard 2) exists only to absorb the incomplete heuristics'
+    // reservation-table fragmentation, a failure mode a complete solver
+    // does not have. See docs/SolverMigrationNotes.md (guard 2).
+    //
+    // Rau runs first (with its window) as the warm-start incumbent: among
+    // model-equivalent optima the solver then keeps the heuristic's
+    // placement discipline (criticality-ordered issue within a pipeline
+    // row) and departs only for a strictly better objective. Rau failing
+    // (e.g. layernorm's fragmented CUDA row) just means no hint.
+    LLVM_DEBUG(DBGS() << "Using joint solver (OR-Tools CP-SAT)\n");
+    int rauMaxII = std::min(maxII, minII + std::max(10, minII / 8));
+    auto incumbent = runRauIMS(ddg, minII, rauMaxII, maxBacktracks);
+    auto res = runJointSolverSchedule(
+        ddg, minII, succeeded(incumbent) ? &*incumbent : nullptr);
+    if (succeeded(res))
+      return res;
+    if (succeeded(incumbent)) {
+      LLVM_DEBUG(DBGS() << "Joint solver failed — returning Rau incumbent\n");
+      return incumbent;
+    }
+    LLVM_DEBUG(DBGS() << "Joint solver failed/unavailable — falling back\n");
+  }
+
   // Cap maxII to avoid spending too long on large DDGs. The slack window
   // scales with minII: GPU inner-loop IIs are hundreds of cycles with
   // multi-hundred-cycle op durations, so a fixed +10 window (classic CPU
   // modulo-scheduling folklore) is too narrow to absorb reservation-table
   // fragmentation when one pipeline is saturated (ResMII-bound with zero
-  // slack, e.g. layernorm's CUDA pipe). A complete (ILP-style) search has
-  // no such fragmentation failure mode and needs no window at all.
+  // slack, e.g. layernorm's CUDA pipe). Applies to the heuristic paths
+  // below only — the joint_solver path above needs no window (guard 2).
   maxII = std::min(maxII, minII + std::max(10, minII / 8));
 
   LLVM_DEBUG({
@@ -281,13 +345,6 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
     DBGS() << "ResMII=" << ddg.computeResMII()
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
-
-  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
-  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
-  //   "exhaustive" → Exhaustive search with joint memory feasibility
-  //   "random"     → Random sampling with greedy placement
-  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
-  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
 
   if (algo == "exhaustive") {
     LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");
