@@ -368,6 +368,7 @@ def matmul_kernel_tma_unified_persistent_ws_while(
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     SCHEDULE: tl.constexpr,
+    OUTER_WARP_SPECIALIZE: tl.constexpr,
 ):
     dtype = tl.float16
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -377,13 +378,13 @@ def matmul_kernel_tma_unified_persistent_ws_while(
 
     lowering_args = _MatmulTileArgs(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
     sched = SCHEDULE.initialize(lowering_args, _unified_num_tiles, tile_counter)
-    while sched.is_valid():
+    while tl.condition(sched.is_valid(), warp_specialize=OUTER_WARP_SPECIALIZE):
         pid_m, pid_n = _compute_pid(sched.tile_id[0], num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in tl.range(k_tiles, warp_specialize=True):
+        for ki in tl.range(k_tiles, warp_specialize=not OUTER_WARP_SPECIALIZE):
             offs_k = ki * BLOCK_SIZE_K
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
@@ -1143,6 +1144,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             SCHEDULE=SCHEDULE,
+            OUTER_WARP_SPECIALIZE=SCHEDULE is tl.NonPersistentScheduler,
             num_stages=num_stages,
             num_warps=num_warps,
         )
@@ -1151,7 +1153,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
         if SCHEDULE is tl.NonPersistentScheduler:
             # The non-persistent schedule's outer loop provably runs exactly once
             # (`_valid` flips True->False), so triton-simplify-single-trip-while
-            # optimizes the `scf.while` away at the TTIR stage.
+            # optimizes the `scf.while` away after TTGIR loop scheduling.
             assert "scf.while" not in ttgir, "Expected single-trip outer while to be optimized away"
         elif SCHEDULE is tl.StaticPersistent1DScheduler:
             # The static-persistent schedule is a countable loop (`_x < num_tiles`,
