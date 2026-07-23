@@ -2146,10 +2146,8 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
     // Buffer ops already use scalar ptr + i32 offsets (BufferOpInterface), but
     // their scalar base can still be derived from a function pointer argument
     // that was rewritten to a fat-pointer unrealized cast above. In that case
-    // the op is in opsToRewrite and must materialize the scalar base pointer.
-    if (llvm::isa<triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
-                  triton::amdgpu::BufferLoadToLocalOp>(op))
-      return !opsToRewrite.contains(op);
+    // the op is in opsToRewrite and must materialize the scalar base pointer,
+    // so buffer ops intentionally use the same legality check as other ops.
     return !opsToRewrite.contains(op);
   };
 
