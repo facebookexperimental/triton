@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deterministic discovery for the release backport sync.
-# Judgment prompt supplied to Claude: .backports/backport-prompt.md
+# Judgment prompt supplied to Claude: .claude/skills/fbtriton-backport/SKILL.md
 #
 # Runs in YOUR shell (real network) — not Claude's sandbox — so the fetch +
 # enumerate git ops are reliable and reproducible. It:
@@ -19,20 +19,20 @@
 #     commits to OpenAI's release by inline hash / PR# / title) -> fork-point fallback
 #   Meta-main:      --meta-frontier   -> env file -> bootstrap (release fork-point on main)
 # Candidates = frontier..head for each. After a sync LANDS, advance BOTH:
-#   .backports/backport-sync.sh --advance-head    (OpenAI->openai head, Meta->main head)
+#   .claude/skills/fbtriton-backport/backport-sync.sh --advance-head    (OpenAI->openai head, Meta->main head)
 #
 # The script does NO cherry-pick/build — those are Claude's job, or a later step.
 #
 # Usage:
-#   .backports/backport-sync.sh                        # auto (env file / bootstrap)
-#   .backports/backport-sync.sh --openai-frontier <sha|tag> --meta-frontier <sha>
-#   .backports/backport-sync.sh --advance-head         # after a sync: frontiers := heads
+#   .claude/skills/fbtriton-backport/backport-sync.sh                        # auto (env file / bootstrap)
+#   .claude/skills/fbtriton-backport/backport-sync.sh --openai-frontier <sha|tag> --meta-frontier <sha>
+#   .claude/skills/fbtriton-backport/backport-sync.sh --advance-head         # after a sync: frontiers := heads
 # Artifacts: .backports/<version>/{candidates.tsv,report.md,.backport-sync.env}
 # Env/flags: RELEASE, VERSION, OUTDIR, OPENAI_FRONTIER, META_FRONTIER, OPENAI_URL,
 #            OPENAI_REPO, MAIN_REF, OUT, ENV_FILE, PROMPT_FILE, HEADLESS=1, NO_CLAUDE=1
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 RELEASE="${RELEASE:-release/3.7.x}"
 OPENAI_URL="${OPENAI_URL:-https://github.com/triton-lang/triton.git}"
 OPENAI_REPO="${OPENAI_REPO:-$HOME/github/triton}"   # local OpenAI clone (for fork-point merge-base)
@@ -43,7 +43,7 @@ VERSION="${VERSION:-}"          # defaults to the release version (release/3.7.x
 OUTDIR="${OUTDIR:-}"            # defaults to .backports/<version>
 OUT="${OUT:-}"                  # defaults to <outdir>/candidates.tsv
 ENV_FILE="${ENV_FILE:-}"        # defaults to <outdir>/.backport-sync.env
-PROMPT_FILE="${PROMPT_FILE:-$REPO_ROOT/.backports/backport-prompt.md}"
+PROMPT_FILE="${PROMPT_FILE:-$REPO_ROOT/.claude/skills/fbtriton-backport/SKILL.md}"
 ADVANCE_HEAD=""
 
 while [[ $# -gt 0 ]]; do case "$1" in
