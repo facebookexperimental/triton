@@ -46,6 +46,14 @@ struct DDGNode {
   // fewer warps, effective selfLat scales up by minWarps/actualWarps. See
   // `notes/latency_vs_selflatency.md` and `LatencyModel::getMinWarps`.
   int minWarps{1};
+  // True hardware floor on WG width (TMEM = 4) — see
+  // OpLatencyInfo::hardMinWarps. minWarps above is only the calibration
+  // anchor; the width search may narrow below it, never below this.
+  int hardMinWarps{1};
+  // Cross-warp reduce facts for the width search (0 = not a reduce). See
+  // OpLatencyInfo::reduceAxisWarps / reduceSyncSelfLat1w.
+  int reduceAxisWarps{0};
+  int reduceSyncSelfLat1w{0};
   bool isSuperNode{false}; // True if this node represents an inner loop
   int innerII{0};          // If super-node, the inner loop's II
   int prologueLatency{0};  // If super-node, cycles before TC starts (MEM busy)

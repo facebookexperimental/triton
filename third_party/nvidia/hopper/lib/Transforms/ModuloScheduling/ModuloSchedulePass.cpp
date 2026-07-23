@@ -56,6 +56,16 @@ namespace ttng = triton::nvidia_gpu;
 
 namespace {
 
+/// Width search over per-WG warp counts (see chooseWgWidthRegs). ON by
+/// default — WG width is a priced decision, not a derived constant.
+/// TRITON_MODULO_WIDTH_SEARCH=0|off|false is the kill-switch back to the
+/// pure anchor-width derivation (note: that also gives up the 1-warp
+/// reduce-sink narrowing, e.g. case7's dbias reducer runs 4-warp again).
+static bool widthSearchEnabled() {
+  std::string v = triton::tools::getStrEnv("TRITON_MODULO_WIDTH_SEARCH");
+  return !(v == "0" || v == "off" || v == "false");
+}
+
 // ============================================================================
 // Emit all schedule annotations from the ScheduleGraph
 // ============================================================================
@@ -276,9 +286,18 @@ static void emitScheduleFromGraph(scf::ForOp loop,
       SmallVector<int32_t> numWarps(numParts, 1);
       if (!(regDefault && defaultWg >= 0))
         numWarps[0] = 4; // reserved empty default warp group (legacy)
-      for (int wg = 0; wg <= maxWg; ++wg)
-        numWarps[partOf(wg)] =
-            snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+      for (int wg = 0; wg <= maxWg; ++wg) {
+        int32_t w = snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+        // Width search on: consume the committed chooser value so this path
+        // and jsonDumpWarpGroups can never disagree on a WG's width (the
+        // legacy reduce-sink override only fired on the JSON path).
+        if (widthSearchEnabled()) {
+          auto cIt = schedLoop.committedWgWidthRegs.find(wg);
+          if (cIt != schedLoop.committedWgWidthRegs.end())
+            w = cIt->second.warps;
+        }
+        numWarps[partOf(wg)] = w;
+      }
       numWarps[0] = std::max<int32_t>(numWarps[0], 4); // default is a full WG
       loop->setAttr("ttg.partition_num_warps",
                     DenseI32ArrayAttr::get(ctx, numWarps));
@@ -578,6 +597,9 @@ convertDDGNode(const ttg::DDGNode &ddgNode, unsigned nodeId,
   sn.selfLatency = ddgNode.selfLatency;
   sn.occupancy = ddgNode.occupancy;
   sn.minWarps = ddgNode.minWarps;
+  sn.hardMinWarps = ddgNode.hardMinWarps;
+  sn.reduceAxisWarps = ddgNode.reduceAxisWarps;
+  sn.reduceSyncSelfLat1w = ddgNode.reduceSyncSelfLat1w;
 
   // Pass A.5: carry the partition-bundle tag from the DDG node.
   sn.partitionCount = ddgNode.partitionCount;
@@ -2091,14 +2113,13 @@ static int computeWGBarrierCost(
   // stream, so they belong in the barrier cost on whichever WG owns the op.
   for (unsigned nid : nodeIds) {
     const auto &n = loop.nodes[nid];
-    int freq = std::max(n.frequencyMultiplier, 1);
     if (n.pipeline == ttg::HWPipeline::TMA) {
-      mbarrierInsts += 2 * freq; // wait_empty + expect_bytes
+      mbarrierInsts += 2; // wait_empty + expect_bytes
     } else if (n.pipeline == ttg::HWPipeline::TC) {
-      mbarrierInsts += 2 * freq; // operand wait_full × ~2
+      mbarrierInsts += 2; // operand wait_full × ~2
     } else if (n.op && llvm::StringRef(n.op->getName().getStringRef())
                            .contains("tmem_store")) {
-      mbarrierInsts += 1 * freq; // tcgen05_commit
+      mbarrierInsts += 1; // tcgen05_commit
     }
   }
   // Cross-WG edge: one wait/arrive on each side. Already counted above some
@@ -2111,14 +2132,12 @@ static int computeWGBarrierCost(
       continue;
     if (srcIt->second == dstIt->second)
       continue;
-    int freq = std::max(loop.nodes[edge.srcId].frequencyMultiplier,
-                        loop.nodes[edge.dstId].frequencyMultiplier);
     if (srcIt->second == thisWg || dstIt->second == thisWg) {
       // Same kind selection as insertCrossGroupBarriers: TC → named.
       if (loop.nodes[edge.srcId].pipeline == ttg::HWPipeline::TC)
-        namedInsts += freq;
+        namedInsts += 1;
       else
-        mbarrierInsts += freq;
+        mbarrierInsts += 1;
     }
   }
   return mbarrierInsts * kMBarrierIssueCost +
@@ -2164,6 +2183,73 @@ static int effectiveSelfLat(const ttg::ScheduleNode &n, int wgWarps) {
   int minW = std::max(n.minWarps, 1);
   int actW = std::max(std::min(wgWarps, minW), 1);
   return base * minW / actW;
+}
+
+/// warpsPerCTA[reduce axis] of node `n`'s reduce when its WG runs at
+/// `wgWarps`. The encoding is only known for the anchor width (the captured
+/// IR); other widths use a CONSERVATIVE model: assume layout inference keeps
+/// the reduced axis warp-distributed as long as it can (min(axisWarps, w)),
+/// so only w == 1 is guaranteed warp-synchronous. An optimistic proportional
+/// model here narrowed case6 layernorm's compute WG to 2 warps on the guess
+/// that its [2,2] layout would re-infer as axis-undistributed — a guess the
+/// real inference need not honor. Returns 0 for non-reduce nodes.
+static int reduceAxisWarpsAt(const ttg::ScheduleNode &n, int wgWarps) {
+  if (n.reduceAxisWarps <= 0)
+    return 0;
+  int anchorW = std::max(n.minWarps, 1);
+  int w = std::max(std::min(wgWarps, anchorW), 1);
+  return std::max(1, std::min(n.reduceAxisWarps, w));
+}
+
+/// Per-op warp-issue cost at width `wgWarps` — effectiveSelfLat plus the ONE
+/// discontinuity the linear law cannot see: a reduce that is cross-warp at
+/// the anchor encoding (reduceAxisWarps > 1) becomes WARP-SYNCHRONOUS once
+/// the width drops enough that its axis lands in one warp
+/// (ReduceOpToLLVM.cpp early-exits before the SMEM staging). In that regime
+/// the calibrated anchor selfLat (measured on the cross-warp form) scaled by
+/// minWarps/actual mis-prices the op; use the modeled warp-synchronous cost
+/// instead: each lane serially combines its inputElems/(32·w) strip.
+/// At wgWarps >= minWarps this is exactly effectiveSelfLat == selfLatency.
+static int effectiveIssueCost(const ttg::ScheduleNode &n, int wgWarps) {
+  if (n.reduceAxisWarps > 1 && n.reduceSyncSelfLat1w > 0 &&
+      reduceAxisWarpsAt(n, wgWarps) == 1)
+    return std::max(n.reduceSyncSelfLat1w / std::max(wgWarps, 1), 1);
+  return effectiveSelfLat(n, wgWarps);
+}
+
+/// Latency-scale serialization a WG pays PER ITERATION for each contained
+/// reduce whose axis spans >1 warp at width `wgWarps`: the lowering stages
+/// partials through SMEM between TWO warp-group-wide bar.syncs
+/// (ReduceOpToLLVM.cpp), and the rendezvous blocks every warp — the region
+/// does not pipeline across iterations. Bootstrap magnitude = the calibrated
+/// RAW-latency-over-occupancy gap of the reduce (its non-pipelinable tail,
+/// which the anchor microbench measured WITH the SMEM round-trip included)
+/// plus the two barrier waits. Refine via the width-scaling microbench
+/// (study #71).
+///
+/// Priced ONLY as a delta between candidate widths (crossWarpSerialDelta):
+/// at the anchor width the term cancels, so every committed score stays
+/// byte-identical to the pre-width-search model — the shared bias lives in
+/// the calibration, exactly as it did before this term existed.
+static int crossWarpReduceSerial(const ttg::ScheduleNode &n, int wgWarps) {
+  if (reduceAxisWarpsAt(n, wgWarps) <= 1)
+    return 0;
+  return std::max(n.latency - n.selfLatency, 0) + 2 * kBarrierOverhead;
+}
+
+/// Σ over the WG's reduces of crossWarpReduceSerial(w) − (same at anchorW).
+/// Negative when narrowing to `wgWarps` turns cross-warp reduces
+/// warp-synchronous — the credit that lets a 1-warp reduce sink win.
+static int crossWarpSerialDelta(const SmallVector<unsigned> &nodeIds,
+                                const ttg::ScheduleLoop &loop, int wgWarps,
+                                int anchorWarps) {
+  int d = 0;
+  for (unsigned nid : nodeIds) {
+    const auto &n = loop.nodes[nid];
+    d += crossWarpReduceSerial(n, wgWarps) -
+         crossWarpReduceSerial(n, anchorWarps);
+  }
+  return d;
 }
 
 /// Required WG warp count = max minWarps over the WG's ops. An async-only
@@ -2225,7 +2311,7 @@ static int computeMultiPipelineMakespan(const SmallVector<unsigned> &nodeIds,
     int pipeReady = pipeAvail.lookup(node.pipeline);
     int start = std::max({dataReady, pipeReady, warpAvail});
     opStart[nid] = start;
-    int dur = effectiveSelfLat(node, wgWarps) * node.frequencyMultiplier;
+    int dur = effectiveIssueCost(node, wgWarps);
     pipeAvail[node.pipeline] = start + dur;
     warpAvail = start + dur;
   }
@@ -2234,11 +2320,25 @@ static int computeMultiPipelineMakespan(const SmallVector<unsigned> &nodeIds,
   for (unsigned nid : sorted) {
     const auto &node = loop.nodes[nid];
     makespan =
-        std::max(makespan, opStart[nid] + effectiveSelfLat(node, wgWarps) *
-                                              node.frequencyMultiplier);
+        std::max(makespan, opStart[nid] + effectiveIssueCost(node, wgWarps));
   }
   return makespan;
 }
+
+/// Per-WG (warp count, regs/thread) chosen by chooseWgWidthRegs — the
+/// single source of truth for WG width across every ranking path and (via
+/// ScheduleLoop::committedWgWidthRegs) both emission paths. Defined here,
+/// implemented after the register-tier helpers it needs.
+struct WGWidthChoice {
+  int warps{4};
+  int regs{0};
+};
+static WGWidthChoice chooseWgWidthRegs(const SmallVector<unsigned> &nodeIds,
+                                       const ttg::ScheduleLoop &loop,
+                                       int minWarpFloor);
+static int wgMakespanAtChoice(const SmallVector<unsigned> &nodeIds,
+                              const ttg::ScheduleLoop &loop,
+                              const WGWidthChoice &choice, int anchorW);
 
 /// Candidate warp group for agglomerative clustering.
 struct WarpGroupCandidate {
@@ -2316,13 +2416,15 @@ static void partitionIntoWarpGroups(ttg::ScheduleLoop &loop) {
           continue;
 
         // Precise check: multi-pipeline makespan at the merged WG's
-        // required warp count.
+        // chosen warp count (the same chooser every ranking path uses).
         SmallVector<unsigned> mergedNodes;
         mergedNodes.append(groups[i].nodeIds);
         mergedNodes.append(groups[j].nodeIds);
-        int mergedWarps = wgRequiredWarps(mergedNodes, loop);
+        int mergedAnchor = wgRequiredWarps(mergedNodes, loop);
+        WGWidthChoice mergedChoice =
+            chooseWgWidthRegs(mergedNodes, loop, /*minWarpFloor=*/1);
         int makespan =
-            computeMultiPipelineMakespan(mergedNodes, loop, mergedWarps);
+            wgMakespanAtChoice(mergedNodes, loop, mergedChoice, mergedAnchor);
         if (makespan > loop.II)
           continue;
 
@@ -2517,6 +2619,176 @@ static int regsForWarpCount(int numWarps) {
 }
 static int wgFootprint(int numWarps) {
   return numWarps * 32 * regsForWarpCount(numWarps);
+}
+
+/// Reduce-sink structural bound for the width search's bring-up
+/// eligibility gate below.
+constexpr int64_t kReduceSinkMaxElems = 1024;
+/// Per-thread setmaxnreg for a WG the width search NARROWED below its
+/// anchor. Deliberately a flat generous ceiling, not a live-byte estimate:
+/// 232 is ILP headroom for the per-lane accumulation strips that motivated
+/// narrowing (matches the handwritten case7 reducer), and 1×32×232 = 7,424
+/// regs is trivially co-resident. The emitter's _rescale_task_regs still
+/// guards the SM budget downstream.
+constexpr int kReduceSinkRegs = 232;
+
+/// BRING-UP SCAFFOLD for the width search — remove once the width-scaling
+/// and cross-warp-serialization constants are microbenched (study #71) and
+/// the priced argmin is validated beyond this corpus. Gates which WGs may
+/// even offer a narrowed candidate: only those whose big-tensor dataflow
+/// terminates in small in-WG reductions (nothing big escapes to another WG,
+/// a store, or the loop boundary). WGs that normalize/store full tiles
+/// after a reduction (layernorm compute, FA softmax) fail the escape test
+/// and keep their tile-parallel width without relying on the numeric argmin
+/// being calibrated for them.
+static bool reduceSinkEligibleNodes(const SmallVector<unsigned> &nodeIds,
+                                    const ttg::ScheduleLoop &loop) {
+  llvm::SmallDenseSet<unsigned, 16> inSet(nodeIds.begin(), nodeIds.end());
+  bool hasReduce = false;
+  for (unsigned nid : nodeIds) {
+    const auto &n = loop.nodes[nid];
+    if (n.isSuperNode())
+      return false;
+    if (!n.op)
+      continue;
+    if (n.pipeline != ttg::HWPipeline::CUDA &&
+        n.pipeline != ttg::HWPipeline::SFU &&
+        n.pipeline != ttg::HWPipeline::NONE)
+      return false;
+    if (isa<tt::ReduceOp>(n.op)) {
+      hasReduce = true;
+      for (Value r : n.op->getResults()) {
+        auto rt = dyn_cast<RankedTensorType>(r.getType());
+        if (rt && rt.getNumElements() > kReduceSinkMaxElems)
+          return false;
+      }
+      continue;
+    }
+    for (Value r : n.op->getResults()) {
+      auto rt = dyn_cast<RankedTensorType>(r.getType());
+      if (!rt || rt.getNumElements() <= kReduceSinkMaxElems)
+        continue; // scalars and small accumulators are free
+      for (Operation *user : r.getUsers()) {
+        auto it = loop.opToNodeId.find(user);
+        if (it == loop.opToNodeId.end())
+          return false; // escapes the loop body
+        if (!inSet.contains(it->second))
+          return false; // crosses to another WG
+        bool userShrinks = isa<tt::ReduceOp>(user) ||
+                           llvm::any_of(user->getResults(), [](Value ur) {
+                             return isa<RankedTensorType>(ur.getType());
+                           });
+        if (!userShrinks)
+          return false; // e.g. a big-tile store
+      }
+    }
+  }
+  return hasReduce;
+}
+
+/// Snap to the TLX-allowed warp counts {1,2,4,8}.
+static int snapWarpCount(int m) {
+  if (m <= 1)
+    return 1;
+  if (m <= 2)
+    return 2;
+  if (m <= 4)
+    return 4;
+  return 8;
+}
+
+/// Choose the WG's width by pricing, not deriving. Default (flag off, or no
+/// cross-warp reduce present): today's anchor law — max(minWarps) over the
+/// WG snapped to {1,2,4,8}, floored by `minWarpFloor` — byte-identical to
+/// the pre-width-search model. With TRITON_MODULO_WIDTH_SEARCH=1, a WG that
+/// contains a reduce whose axis spans warps at the anchor also prices the
+/// narrower widths:
+///
+///   cost(w) = makespan(w) + Σ_reduces [crossWarpSerial(w) − (at anchor)]
+///
+/// The makespan already carries the issue-cost scaling of narrowing (the
+/// price); the delta term carries the vanished SMEM+bar.sync serialization
+/// (the credit — see crossWarpReduceSerial). Strict `<` keeps ties at the
+/// anchor, so any WG the physics doesn't favor narrowing keeps today's
+/// width AND today's score. Narrowing is bounded below by the TMEM hard
+/// floor (hardMinWarps) — never by the anchor-semantics minWarps, whose
+/// under-width penalty is priced instead of enforced.
+static WGWidthChoice chooseWgWidthRegs(const SmallVector<unsigned> &nodeIds,
+                                       const ttg::ScheduleLoop &loop,
+                                       int minWarpFloor) {
+  int anchorW =
+      std::max(wgRequiredWarps(nodeIds, loop), std::max(minWarpFloor, 1));
+  WGWidthChoice choice{anchorW, regsForWarpCount(anchorW)};
+  if (!widthSearchEnabled())
+    return choice;
+
+  bool crossReduce = false;
+  int hardW = 1;
+  for (unsigned nid : nodeIds) {
+    const auto &n = loop.nodes[nid];
+    hardW = std::max(hardW, n.hardMinWarps);
+    if (reduceAxisWarpsAt(n, anchorW) > 1)
+      crossReduce = true;
+  }
+  if (!crossReduce)
+    return choice; // nothing to gain from narrowing; skip the search
+  // Bring-up scaffold: only structurally-eligible reduce sinks may narrow
+  // (see reduceSinkEligibleNodes — remove once calibration matures).
+  if (!reduceSinkEligibleNodes(nodeIds, loop))
+    return choice;
+  hardW = snapWarpCount(hardW);
+
+  int bestCost = computeMultiPipelineMakespan(nodeIds, loop, anchorW);
+  for (int w : {1, 2, 4}) {
+    if (w < hardW || w >= anchorW)
+      continue;
+    int cost = computeMultiPipelineMakespan(nodeIds, loop, w) +
+               crossWarpSerialDelta(nodeIds, loop, w, anchorW);
+    if (cost < bestCost) {
+      bestCost = cost;
+      choice.warps = w;
+      choice.regs = kReduceSinkRegs;
+    }
+  }
+  LLVM_DEBUG({
+    if (choice.warps < anchorW)
+      llvm::dbgs() << "[WidthSearch] narrowed WG (anchor=" << anchorW << ") to "
+                   << choice.warps << " warps / " << choice.regs
+                   << " regs, cost " << bestCost << "\n";
+  });
+  return choice;
+}
+
+/// The WG's per-iteration cost contribution at its chosen width — the same
+/// quantity chooseWgWidthRegs minimized. The cross-warp serialization enters
+/// only as a delta vs the anchor (0 when the WG keeps its anchor width), so
+/// committed scores are byte-identical whenever nothing narrows.
+static int wgMakespanAtChoice(const SmallVector<unsigned> &nodeIds,
+                              const ttg::ScheduleLoop &loop,
+                              const WGWidthChoice &choice, int anchorW) {
+  int ms = computeMultiPipelineMakespan(nodeIds, loop, choice.warps);
+  if (choice.warps < anchorW)
+    ms = std::max(
+        ms + crossWarpSerialDelta(nodeIds, loop, choice.warps, anchorW), 0);
+  return ms;
+}
+
+/// Recompute each committed WG's (width, regs) on FINAL post-propagation
+/// membership and store it on the loop. Scoring ran the same chooser on the
+/// clustered-node preview; this commit-time run is the authoritative value
+/// both emission paths (jsonDumpWarpGroups, ttg.partition_num_warps)
+/// consume — neither re-derives width from node minWarps, so
+/// scoring-law == emission-law by construction.
+static void commitWgWidthRegs(ttg::ScheduleLoop &schedLoop) {
+  schedLoop.committedWgWidthRegs.clear();
+  llvm::DenseMap<int, SmallVector<unsigned>> wgToNodes;
+  for (const auto &node : schedLoop.nodes)
+    if (node.warpGroup >= 0)
+      wgToNodes[node.warpGroup].push_back(node.id);
+  for (auto &[wg, nodes] : wgToNodes) {
+    WGWidthChoice wc = chooseWgWidthRegs(nodes, schedLoop, /*minWarpFloor=*/1);
+    schedLoop.committedWgWidthRegs[wg] = {wc.warps, wc.regs};
+  }
 }
 
 /// A "tight unit" of ops on the same hardware pipeline that should travel
@@ -2919,10 +3191,8 @@ accumulateCrossWGRoundTrip(const ttg::ScheduleLoop &loop,
     int64_t bytes = registerTensorBytes(sN.op);
     if (bytes <= 0)
       continue;
-    int freq = std::max(sN.frequencyMultiplier, 1);
     // Consumer eats the full handshake latency + SMEM move cost, per iter.
-    int rt = kCrossWGRoundTripLatency + smemMoveCost(bytes);
-    rtPerWg[dIt->second] += rt * freq;
+    rtPerWg[dIt->second] += kCrossWGRoundTripLatency + smemMoveCost(bytes);
   }
 }
 
@@ -3219,7 +3489,9 @@ accumulatePropagatedMinWarps(const ttg::ScheduleLoop &loop,
 /// assignment, and the globally calibrated hand-off constants above.
 static int
 computePartitionRecMII(const ttg::ScheduleLoop &loop,
-                       const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
+                       const llvm::SmallDenseMap<unsigned, int> &nodeToWg,
+                       const llvm::SmallDenseMap<int, int> &wgWidth =
+                           llvm::SmallDenseMap<int, int>()) {
   const size_t n = loop.nodes.size();
   if (n == 0)
     return 0;
@@ -3337,9 +3609,18 @@ computePartitionRecMII(const ttg::ScheduleLoop &loop,
         return std::make_pair(loop.nodes[a].cycle, a) <
                std::make_pair(loop.nodes[b].cycle, b);
       });
+      // Issue-order chain weight = the node's issue cost AT THE WG'S CHOSEN
+      // WIDTH (effectiveIssueCost == raw selfLatency at the anchor width, so
+      // this is byte-identical whenever no WG was narrowed — and when one
+      // was, its serial stream is priced at the width it will actually run).
+      int chosenW = wgWidth.lookup(wgId);
       for (size_t i = 0; i + 1 < members.size(); ++i) {
         unsigned u = members[i], v = members[i + 1];
-        succ[u].push_back({v, std::max(loop.nodes[u].selfLatency, 0)});
+        const auto &uN = loop.nodes[u];
+        int weight = (uN.selfLatency <= 0 || chosenW <= 0)
+                         ? std::max(uN.selfLatency, 0)
+                         : effectiveIssueCost(uN, chosenW);
+        succ[u].push_back({v, weight});
         ++indeg[v];
       }
       unsigned firstWaiter = UINT_MAX, lastWaiter = UINT_MAX;
@@ -3433,6 +3714,38 @@ computePartitionRecMII(const ttg::ScheduleLoop &loop,
   return recMII;
 }
 
+/// Shared-engine floor: max over per-SM singleton engines of the total
+/// occupancy scheduled on that engine, across ALL warp groups.
+///
+/// `computeMultiPipelineMakespan`'s pipeAvail cursors are per-WG, so a
+/// candidate that splits same-engine work across warp groups models the
+/// halves as running in parallel — but the SM has ONE TMA engine and ONE
+/// tensor core shared by every WG in the CTA. Whatever the partition, the
+/// steady state cannot beat Σ occupancy on the busiest shared engine, so
+/// this floors the bottleneck the same way the RecMII' term does. Without
+/// it, every "split same-engine work into more WGs" candidate gets a
+/// systematically underestimated bottleneck (case7's second TMA producer
+/// WG, case6's load/store separation).
+///
+/// Occupancy fallback mirrors pipelineOccupancy() in DataDependenceGraph.h.
+/// Only TMA and TC are floored: CUDA/SFU work genuinely parallelizes across
+/// warp groups (different warps issue on different SM sub-partitions).
+/// Super-nodes are skipped — an inner loop's engine work is priced by its
+/// own per-loop partition run, not the outer body's.
+static int computeSharedEngineBound(const ttg::ScheduleLoop &loop) {
+  int tmaWork = 0, tcWork = 0;
+  for (const auto &node : loop.nodes) {
+    if (node.isSuperNode())
+      continue;
+    if (node.pipeline != ttg::HWPipeline::TMA &&
+        node.pipeline != ttg::HWPipeline::TC)
+      continue;
+    int occ = node.occupancy > 0 ? node.occupancy : std::max(node.latency, 1);
+    (node.pipeline == ttg::HWPipeline::TMA ? tmaWork : tcWork) += occ;
+  }
+  return std::max(tmaWork, tcWork);
+}
+
 /// TRITON_MODULO_DEBUG_RECMII=1: print the committed partition's RecMII'
 /// against the schedule II — the probe that diagnoses recurrence-bound
 /// partitions without a debug build.
@@ -3481,14 +3794,18 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   int bottleneck = 0;
   int totalRegs = kDefaultWGFootprint; // include implicit "default" WG
   int explicitWarps = 0;
+  llvm::SmallDenseMap<int, int> wgWidth; // chosen width per WG (for RecMII)
   for (auto &[wgId, nodes] : wgToNodes) {
-    int wgWarps = std::max(wgRequiredWarps(nodes, loop), mwPerWg.lookup(wgId));
+    int anchorW = std::max(wgRequiredWarps(nodes, loop), mwPerWg.lookup(wgId));
+    WGWidthChoice wc = chooseWgWidthRegs(nodes, loop, mwPerWg.lookup(wgId));
+    int wgWarps = wc.warps;
+    wgWidth[wgId] = wgWarps;
     explicitWarps += wgWarps;
-    int ms = computeMultiPipelineMakespan(nodes, loop, wgWarps);
+    int ms = wgMakespanAtChoice(nodes, loop, wc, anchorW);
     int barCost = computeWGBarrierCost(nodes, loop, nodeToWg, wgId);
     int rtCost = rtPerWg.lookup(wgId);
     int wgCost = ms + barCost + rtCost;
-    int fp = wgFootprint(wgWarps);
+    int fp = wgWarps * 32 * wc.regs;
     totalRegs += fp;
     if (verbose) {
       LLVM_DEBUG({
@@ -3509,7 +3826,7 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   // Recurrence floor: the steady state can't beat the partition-aware
   // cycle bound, whatever the per-WG makespans say. See
   // computePartitionRecMII.
-  int recMII = computePartitionRecMII(loop, nodeToWg);
+  int recMII = computePartitionRecMII(loop, nodeToWg, wgWidth);
   if (verbose && recMII > bottleneck) {
     LLVM_DEBUG(llvm::dbgs()
                << "[Score-VERBOSE]   recurrence floor: RecMII'=" << recMII
@@ -3517,21 +3834,27 @@ static ScoredCandidate scoreCandidate(const ClusterAssignment &assn,
   }
   bottleneck = std::max(bottleneck, recMII);
 
+  // Shared-engine floor: the busiest per-SM singleton engine (TMA/TC) caps
+  // the steady state no matter how the work is split across WGs. See
+  // computeSharedEngineBound.
+  int engineBound = computeSharedEngineBound(loop);
+  if (verbose && engineBound > bottleneck) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[Score-VERBOSE]   engine floor: engineBound=" << engineBound
+               << " > bottleneck=" << bottleneck << " — cost floored\n");
+  }
+  bottleneck = std::max(bottleneck, engineBound);
+
   // Cross-wg edges (cost of barriers). Only count edges where both endpoints
-  // are non-NONE (NONE ops aren't in any cluster). A cross-wg dep inside the
-  // K-loop fires K times per outer iter, so weight by max of the endpoints'
-  // frequency multipliers.
+  // are non-NONE (NONE ops aren't in any cluster).
   int crossEdges = 0;
   for (const auto &edge : loop.edges) {
     auto srcIt = nodeToWg.find(edge.srcId);
     auto dstIt = nodeToWg.find(edge.dstId);
     if (srcIt == nodeToWg.end() || dstIt == nodeToWg.end())
       continue;
-    if (srcIt->second != dstIt->second) {
-      int freq = std::max(loop.nodes[edge.srcId].frequencyMultiplier,
-                          loop.nodes[edge.dstId].frequencyMultiplier);
-      crossEdges += std::max(freq, 1);
-    }
+    if (srcIt->second != dstIt->second)
+      ++crossEdges;
   }
 
   // Pipeline-via-WG-separation workaround for missing software pipeline
@@ -3670,16 +3993,20 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
   accumulatePropagatedMinWarps(loop, nodeToWg, mwPerWg);
   int bottleneck = 0;
   int explicitWarps = 0;
+  llvm::SmallDenseMap<int, int> wgWidth; // chosen width per WG (for RecMII)
   for (unsigned wgi = 0; wgi < wgs.size(); ++wgi) {
-    int wgWarps = std::max(wgRequiredWarps(wgs[wgi].nodeIds, loop),
-                           mwPerWg.lookup(static_cast<int>(wgi)));
+    int floor = mwPerWg.lookup(static_cast<int>(wgi));
+    int anchorW = std::max(wgRequiredWarps(wgs[wgi].nodeIds, loop), floor);
+    WGWidthChoice wc = chooseWgWidthRegs(wgs[wgi].nodeIds, loop, floor);
+    int wgWarps = wc.warps;
+    wgWidth[static_cast<int>(wgi)] = wgWarps;
     explicitWarps += wgWarps;
-    int ms = computeMultiPipelineMakespan(wgs[wgi].nodeIds, loop, wgWarps);
+    int ms = wgMakespanAtChoice(wgs[wgi].nodeIds, loop, wc, anchorW);
     int barCost = computeWGBarrierCost(wgs[wgi].nodeIds, loop, nodeToWg,
                                        static_cast<int>(wgi));
     bottleneck = std::max(bottleneck,
                           ms + barCost + rtPerWg.lookup(static_cast<int>(wgi)));
-    totalRegs += wgFootprint(wgWarps);
+    totalRegs += wgWarps * 32 * wc.regs;
   }
   int deficit = std::max(0, totalRegs - kBlackwellSMRegs);
   int residual = std::max(0, deficit - kDefaultSlack);
@@ -3688,7 +4015,11 @@ static double evalGreedyCost(const SmallVector<GreedyWG> &wgs,
                                     committedSmemBytes);
   // Recurrence floor — identical term to scoreCandidate so the two
   // partitioner paths stay directly comparable.
-  bottleneck = std::max(bottleneck, computePartitionRecMII(loop, nodeToWg));
+  bottleneck =
+      std::max(bottleneck, computePartitionRecMII(loop, nodeToWg, wgWidth));
+  // Shared-engine floor — identical term to scoreCandidate (see
+  // computeSharedEngineBound).
+  bottleneck = std::max(bottleneck, computeSharedEngineBound(loop));
   // Cross-WG barrier-issue cost is folded into per-WG bottleneck via
   // `computeWGBarrierCost`; the legacy global `crossEdges * kBarrierOverhead`
   // term has been dropped to avoid double-charging.
@@ -4997,6 +5328,7 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);
       coLocateOperandAllocsWithLoads(schedLoop);
+      commitWgWidthRegs(schedLoop);
     }
   }
 
@@ -5056,6 +5388,7 @@ static void finalizeLoopPartitionForDump(ttg::ScheduleLoop &schedLoop,
   demoteScalarArithToInfra(schedLoop);
   propagateWarpGroupToInfraOps(schedLoop);
   coLocateOperandAllocsWithLoads(schedLoop);
+  commitWgWidthRegs(schedLoop);
   insertCrossGroupBarriers(schedLoop);
   for (auto &buf : schedLoop.buffers)
     buf.mergeGroupId = UINT_MAX;
@@ -5696,7 +6029,6 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
        << ", \"warp_group\": " << n.warpGroup << ", \"latency\": " << n.latency
        << ", \"self_latency\": " << n.selfLatency
        << ", \"min_warps\": " << n.minWarps
-       << ", \"frequency_multiplier\": " << n.frequencyMultiplier
        << ", \"schedule\": {\"cycle\": " << n.cycle
        << ", \"stage\": " << n.stage << ", \"cluster\": " << n.cluster << "}"
        << ", \"produces_buffer\": "
@@ -5765,10 +6097,12 @@ void jsonDumpScheduleLoop(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl,
 
 // Aggregate Phase 4 / WS plan from per-node warp groups: build a stable list
 // of unique warp_group ids in ascending order. Each loop reports the distinct
-// pipelines present in each group plus the WG's chosen `num_warps` (= max
-// minWarps over its ops, snapped to {1,2,4,8}). The emitter consumes
-// num_warps directly instead of inferring it from a binary tmem-presence
-// rule.
+// pipelines present in each group plus the WG's committed `num_warps` (from
+// chooseWgWidthRegs via ScheduleLoop::committedWgWidthRegs — the same priced
+// choice scoring used); narrowed WGs carry an explicit `num_regs`. The
+// emitter consumes num_warps directly instead of inferring it from a binary
+// tmem-presence rule, and prefers the dumped `num_regs` over its warp-count
+// heuristic.
 void jsonDumpWarpGroups(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl) {
   // Collect (warpGroup -> {pipelines, max minWarps}) deterministically.
   std::map<int, std::set<std::string>> pipes;
@@ -5799,9 +6133,22 @@ void jsonDumpWarpGroups(llvm::raw_ostream &os, const ttg::ScheduleLoop &sl) {
   for (const auto &[wg, pipeSet] : pipes) {
     if (!first)
       os << ", ";
+    // Width: consume the committed chooser value (single source of truth
+    // with scoring and the ttg.partition_num_warps attr); fall back to the
+    // legacy max-minWarps snap if the commit didn't run (identical value —
+    // the chooser's default path IS that law).
     int numWarps = snapWarps(wgMaxMinWarps[wg]);
-    os << "{\"id\": " << wg << ", \"num_warps\": " << numWarps
-       << ", \"pipelines\": [";
+    int numRegs = 0; // 0 = emitter default for this width
+    auto cIt = sl.committedWgWidthRegs.find(wg);
+    if (cIt != sl.committedWgWidthRegs.end()) {
+      numWarps = cIt->second.warps;
+      if (cIt->second.regs != regsForWarpCount(numWarps))
+        numRegs = cIt->second.regs;
+    }
+    os << "{\"id\": " << wg << ", \"num_warps\": " << numWarps;
+    if (numRegs > 0)
+      os << ", \"num_regs\": " << numRegs;
+    os << ", \"pipelines\": [";
     bool fp = true;
     for (const auto &p : pipeSet) {
       if (!fp)
@@ -7006,6 +7353,9 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
     sn.selfLatency = ddgNode.selfLatency;
     sn.occupancy = ddgNode.occupancy;
     sn.minWarps = ddgNode.minWarps;
+    sn.hardMinWarps = ddgNode.hardMinWarps;
+    sn.reduceAxisWarps = ddgNode.reduceAxisWarps;
+    sn.reduceSyncSelfLat1w = ddgNode.reduceSyncSelfLat1w;
     sn.stage = 0;
 
     auto cycleIt = result.nodeToCycle.find(ddgNode.idx);

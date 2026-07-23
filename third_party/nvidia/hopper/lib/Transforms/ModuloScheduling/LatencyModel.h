@@ -72,6 +72,24 @@ struct OpLatencyInfo {
   // TMA stores are bandwidth-bound (occupancy ≈ latency); TC = latency;
   // CUDA/SFU = selfLatency. 0 means "unset" (fall back to the old rule).
   int occupancy{0};
+  // True HARDWARE floor on the containing WG's warp count (TLX/Blackwell
+  // TMEM load/store requires 4). Distinct from `minWarps`, which is only the
+  // throughput anchor the calibration assumed — a WG may be narrowed below
+  // `minWarps` (paying the modeled issue-cost scaling) but never below
+  // `hardMinWarps`.
+  int hardMinWarps{1};
+  // Cross-warp reduce facts (tt.reduce only; 0 otherwise). `reduceAxisWarps`
+  // = warpsPerCTA[reduce axis] at the op's actual encoding: > 1 means the
+  // lowering (ReduceOpToLLVM) stages partials through SMEM between two
+  // WG-wide bar.syncs EVERY iteration; == 1 means the reduce is
+  // warp-synchronous (shuffles only, no SMEM, no bar.sync).
+  int reduceAxisWarps{0};
+  // Modeled warp-issue cost of the WARP-SYNCHRONOUS form of this reduce at
+  // 1 warp (~ inputElems / 32 lanes × 1 cyc/elem combine). Used when a
+  // width search narrows the WG enough that the reduce goes warp-synchronous
+  // — the anchor-width `selfLatency` (measured on the cross-warp form)
+  // scaled by minWarps/actual would mis-price that regime. 0 = not a reduce.
+  int reduceSyncSelfLat1w{0};
 };
 
 /// Abstract latency-model interface consumed by the (hardware-agnostic)
