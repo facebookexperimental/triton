@@ -8,9 +8,10 @@ pipeline — it determines which warp group each operation will execute on.
 
 ## Overview
 
-The pass walks all `scf.for` loops with the `tt.warp_specialize` attribute and
-assigns each operation inside the loop (and post-loop consumers) to a
-**partition**. Each partition maps to a warp group at runtime.
+The pass walks supported loop-like operations with the `tt.warp_specialize`
+attribute and assigns each operation inside the scheduled body (and post-loop
+consumers) to a **partition**. Each partition maps to a warp group at runtime.
+The supported forms are `scf.for` and identity-carry `scf.while`.
 
 ```
 Phase 1: Categorize operations         (OpCategorizer + collectMMABackwardSlices)
@@ -22,6 +23,24 @@ Phase 6: Schedule post-loop ops        (schedulePostLoopOps — epilogue routing
   ─── end of getInitialSchedule ───
 Post:    propagatePartitions + optimizeSchedule + splitDataPartitionedIfOps
 ```
+
+## Supported Loop Forms
+
+Partition scheduling uses `LoopLikeOpInterface` at its API boundary, but does
+not accept arbitrary loop-like operations. `scf.for` uses its body region and
+retains the existing induction-variable offset. `scf.while` uses its after
+region as the scheduled body and has no induction variable.
+
+An `scf.while` is schedulable only when `scf.condition` forwards every
+before-region argument once, in the same order. This makes yield slot `k`,
+before argument `k`, after argument `k`, and the next-iteration carried value
+unambiguous. Reordered or subset forwarding is rejected by stripping the
+loop-local warp-specialization metadata and leaving a plain while loop.
+
+The before region remains loop control rather than a PSM partition. Task-ID
+propagation marks the while, its condition computation, `scf.condition`, and
+`scf.yield` with the union of tasks after the single-partition PSM anchors have
+been converted to task IDs.
 
 ## Tuning Knobs
 

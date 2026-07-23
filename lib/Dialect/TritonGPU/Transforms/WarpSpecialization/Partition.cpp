@@ -24,8 +24,9 @@ bool Partition::hasOp(Operation *op) const {
   return partitionIds.contains(getIndex());
 }
 
-void Partition::iterateInputs(scf::ForOp loop,
+void Partition::iterateInputs(LoopLikeOpInterface loop,
                               function_ref<void(OpOperand &)> callback) const {
+  Block *body = getLoopBodyBlock(loop);
   for (Operation *op : getOps()) {
     visitNestedOperands(op, [&](OpOperand &operand) {
       // Ignore implicit captures.
@@ -33,21 +34,20 @@ void Partition::iterateInputs(scf::ForOp loop,
       std::optional<SetVector<int>> partitionIds;
       if (hasPartition(value.getDefiningOp()))
         partitionIds = getPartitionIds(value.getDefiningOp());
-      if (value.getParentBlock() != loop.getBody())
+      if (value.getParentBlock() != body)
         return;
       if (auto arg = dyn_cast<BlockArgument>(value)) {
-        assert(arg.getOwner() == loop.getBody());
+        assert(arg.getOwner() == body);
         // Ignore the induction variable.
-        if (arg == loop.getInductionVar())
+        if (arg == getLoopInductionVar(loop))
           return;
         // This value originates from a previous iteration.
-        assert(llvm::is_contained(loop.getRegionIterArgs(), arg));
         callback(operand);
       } else {
         if (!partitionIds || !partitionIds->contains(getIndex())) {
           // This value originates from a different partition in the same
           // iteration.
-          assert(value.getDefiningOp()->getParentOp() == loop);
+          assert(value.getDefiningOp()->getParentOp() == loop.getOperation());
           callback(operand);
         }
       }
@@ -56,11 +56,13 @@ void Partition::iterateInputs(scf::ForOp loop,
 }
 
 void Partition::iterateOutputs(
-    scf::ForOp loop,
+    LoopLikeOpInterface loop,
     function_ref<void(Operation *, OpOperand &)> callback) const {
+  Block *body = getLoopBodyBlock(loop);
+  Operation *terminator = getLoopBodyTerminator(loop);
   for (Operation *op : getOps()) {
     for (OpOperand &use : op->getUses()) {
-      Operation *owner = loop.getBody()->findAncestorOpInBlock(*use.getOwner());
+      Operation *owner = body->findAncestorOpInBlock(*use.getOwner());
 
       // Handle post-loop operations.
       if (!owner) {
@@ -76,7 +78,7 @@ void Partition::iterateOutputs(
       std::optional<SetVector<int>> partitionIds;
       if (hasPartition(owner))
         partitionIds = getPartitionIds(owner);
-      if (isa<scf::YieldOp>(owner)) {
+      if (owner == terminator) {
         // This value is used in a subsequent iteration.
         callback(owner, use);
       } else {
@@ -90,16 +92,17 @@ void Partition::iterateOutputs(
 }
 
 void Partition::iterateDefs(
-    scf::ForOp loop, function_ref<void(OpResult, unsigned)> callback) const {
+    LoopLikeOpInterface loop,
+    function_ref<void(OpResult, unsigned)> callback) const {
   iterateInputs(loop, [&](OpOperand &input) {
-    auto [def, distance] = getDefinitionAndDistance(loop, input.get());
-    if (def && def.getParentBlock() == loop.getBody())
+    auto [def, distance] = getLoopDefinitionAndDistance(loop, input.get());
+    if (def && def.getParentBlock() == getLoopBodyBlock(loop))
       callback(def, distance);
   });
 }
 
 void Partition::iterateUses(
-    scf::ForOp loop,
+    LoopLikeOpInterface loop,
     function_ref<void(OpResult, OpOperand &, unsigned)> callback) const {
   SmallVector<std::tuple<OpResult, OpOperand *, unsigned>> uses;
   iterateOutputs(loop, [&](Operation *owner, OpOperand &use) {
@@ -107,7 +110,8 @@ void Partition::iterateUses(
   });
   while (!uses.empty()) {
     auto [output, use, distance] = uses.pop_back_val();
-    Operation *owner = loop.getBody()->findAncestorOpInBlock(*use->getOwner());
+    Operation *owner =
+        getLoopBodyBlock(loop)->findAncestorOpInBlock(*use->getOwner());
 
     // Handle post-loop operations.
     if (!owner) {
@@ -116,11 +120,11 @@ void Partition::iterateUses(
       continue;
     }
 
-    if (!isa<scf::YieldOp>(owner)) {
+    if (owner != getLoopBodyTerminator(loop)) {
       callback(output, *use, distance);
       continue;
     }
-    BlockArgument arg = loop.getRegionIterArg(use->getOperandNumber());
+    BlockArgument arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
     for (OpOperand &use : arg.getUses())
       uses.emplace_back(output, &use, distance + 1);
   }
@@ -150,7 +154,7 @@ Partition *PartitionSet::getPartition(Operation *op) {
 }
 
 void PartitionSet::swapPartitions(unsigned idxA, unsigned idxB,
-                                  scf::ForOp loop) {
+                                  LoopLikeOpInterface loop) {
   if (idxA == idxB)
     return;
 
@@ -183,7 +187,11 @@ void PartitionSet::swapPartitions(unsigned idxA, unsigned idxB,
   });
 }
 
-FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
+FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
+  // Validate at this API boundary even when the caller already gated the loop.
+  if (!isa<scf::ForOp, scf::WhileOp>(loop.getOperation()) ||
+      !hasIdentityLoopCarry(loop))
+    return failure();
   auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
   if (!stages)
     return failure();
@@ -191,6 +199,11 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
   auto tag = loop->getAttrOfType<IntegerAttr>(kWarpSpecializeTagAttrName);
   if (!tag)
     return failure();
+
+  auto types = loop->getAttrOfType<ArrayAttr>(kPartitionTypesAttrName);
+  if (types && types.size() != stages.size())
+    return mlir::emitError(loop.getLoc(), "partition types attribute '")
+           << kPartitionTypesAttrName << "' must match partition stages size";
 
   PartitionSet result;
   result.tag = tag.getInt();
@@ -201,12 +214,20 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
              << kPartitionStagesAttrName << "' has invalid element " << attr;
     }
 
-    result.partitions.push_back(
-        std::make_unique<Partition>(idx, stage.getInt()));
+    auto partition = std::make_unique<Partition>(idx, stage.getInt());
+    if (types) {
+      auto type = dyn_cast<StringAttr>(types[idx]);
+      if (!type)
+        return mlir::emitError(loop.getLoc(), "partition types attribute '")
+               << kPartitionTypesAttrName << "' has invalid element "
+               << types[idx];
+      partition->setType(type.getValue());
+    }
+    result.partitions.push_back(std::move(partition));
   }
 
   SmallVector<Operation *> annotatedOps;
-  loop->walk([&](Operation *op) {
+  getLoopBodyRegion(loop).walk([&](Operation *op) {
     if (hasPartition(op)) {
       annotatedOps.push_back(op);
     }
@@ -224,12 +245,12 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(scf::ForOp loop) {
   return result;
 }
 
-void PartitionSet::serialize(scf::ForOp loop) const {
+void PartitionSet::serialize(LoopLikeOpInterface loop) const {
   // In the new PartitionSet system, per-op partition attributes are already set
   // by setPartition(). We only need to serialize the partition stages array.
   SmallVector<Attribute> stages;
   SmallVector<Attribute> types;
-  Builder b(loop.getContext());
+  Builder b(loop->getContext());
   for (const Partition &partition : getPartitions()) {
     stages.push_back(b.getI32IntegerAttr(partition.getStage()));
     types.push_back(b.getStringAttr(partition.getType()));

@@ -90,20 +90,15 @@ later consumers such as the memory planner and multi-CTA reduction still
 receive `tt.mem_plan_pick` and `tt.multi_cta`, respectively. Existing
 attributes on the selected inner loop take precedence over outer defaults.
 
-### `warp_specialize` on a non-countable `while`: **no-op today**
+### `warp_specialize` on a non-countable `while`
 
 `ttg.warp_specialize` is emitted by the pipeline `ScheduleLoops` →
-`PartitionSchedulingMeta` → `hopper_warpspec`. `ScheduleLoops` and
-`PartitionSchedulingMeta` walk **`scf::ForOp` only**, so a `tt.warp_specialize`
-on a raw `scf.while` (dynamic/CLC) is never consumed — no partitions are
-assigned and no `ttg.warp_specialize` is produced. Only the *static* schedule,
-which is uplifted to an `scf.for` before these passes run, is warp-specialized.
-
-This is a code-scope limitation, not a fundamental one, and **not** a software-
-pipelining requirement (the partition scheduler derives partitions structurally
-and ignores the SWP `distance`). Closing it means generalizing
-`PartitionSchedulingMeta` (and `ScheduleLoops`) to `scf.while`. The full plan is
-in **[WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md)**.
+`PartitionSchedulingMeta` → `hopper_warpspec`. `PartitionSchedulingMeta` accepts
+identity-carry `scf.while` and derives its partitions structurally from the
+after region. `ScheduleLoops` remains `scf.for`-only: the non-countable outer
+while is not software-pipelined, while its nested K-loop retains the existing
+for-loop software pipeline. Downstream dynamic/CLC validation is tracked in
+**[WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md)**.
 
 ### `num_stages` / pipelining on a `while`: not applicable
 
