@@ -388,6 +388,25 @@ def test_dump_layout_cute(capfd, monkeypatch):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_assert_same_layout(monkeypatch):
+    """`tlx.assert_same_layout` compares final layouts for both value/layout
+    and value/value forms, then is erased after successful assertions."""
+    monkeypatch.setattr(triton.knobs.compilation, "always_compile", True)
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        buf = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        value = tlx.local_load(tlx.local_view(buf, 0), layout=LAYOUT)
+        other = tlx.local_load(tlx.local_view(buf, 0), layout=LAYOUT)
+        tlx.assert_same_layout(value, LAYOUT)
+        tlx.assert_same_layout(value, other)
+        tlx.local_store(tlx.local_view(buf, 0), value)
+
+    compiled = kernel.warmup(_separable_qk_layout(), grid=(1, ), num_warps=8)
+    assert "tlx.assert_same_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_dump_layout_round_trips_shape_stride(capfd, monkeypatch):
     """Dumping a tensor that carries the separable `tlx.layout` reproduces the
     same CuTe (thread, value) shape/stride it was built from."""

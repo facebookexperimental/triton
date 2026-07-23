@@ -671,6 +671,7 @@
       "attributes": {}
     }
   },
+  "data_partition_candidates": [],
   "loops": [
     {
       "loop_id": 0,

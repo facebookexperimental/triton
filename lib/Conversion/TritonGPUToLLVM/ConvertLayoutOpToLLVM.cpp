@@ -12,6 +12,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/Sys/GetEnv.h"
 
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 
@@ -82,6 +83,26 @@ struct ConvertLayoutOpConversion
     } else {
       // Cast 5. The two layouts are equivalent. We should probably remove
       // these in RemoveLayoutConversion.
+      //
+      // NPOT: minimalCvtLayout's quotient uses squareSublayoutIsIdentity (pure
+      // GF(2), basis == 1<<b), which false-positives on modular register dims
+      // and collapses two different ADD-mod-N maps to a no-op -> scramble. If
+      // either side is modular and they are not truly equal, route the real
+      // remap through transferWithinThread. pow2 unaffected (isModular() is
+      // false).
+      if (srcLayout.isModular() || dstLayout.isModular()) {
+        static const bool allowNpot =
+            ::mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+        if (allowNpot && srcLayout != dstLayout) {
+          // Rebuild the register remap without the quotient; lane/warp/block
+          // are identity at Case 5, so the register sublayout is the full
+          // conversion.
+          LinearLayout fullConversion = dstLayout.invertAndCompose(srcLayout);
+          LinearLayout regConversion =
+              fullConversion.sublayout({kRegister}, {kRegister});
+          return transferWithinThread(op, regConversion, adaptor, rewriter);
+        }
+      }
       rewriter.replaceOp(op, adaptor.getSrc());
       return success();
     }
@@ -169,7 +190,12 @@ struct ConvertLayoutOpConversion
     // At this point we have a type that's at least 8-bit
     // and we don't have broadcasting in the registers
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
-    auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
+    int numBanks = targetInfo.getSharedMemoryBanks();
+    int32_t vecBitwidth =
+        triton::gpu::getVecBitwidthLdSt(srcLayout, dstLayout, bitwidth);
+    auto [dstTile, srcTile] = targetInfo.getSharedLdStTiles(vecBitwidth);
+    auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth, numBanks,
+                                     srcTile, dstTile);
 
     // Extract reps from smem
     auto kReg = str_attr("register");

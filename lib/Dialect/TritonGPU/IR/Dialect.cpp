@@ -78,6 +78,13 @@ unsigned getTotalElemsPerThread(Attribute layout, ArrayRef<int64_t> shape) {
       .getTotalElemsPerThread(shape);
 }
 
+unsigned getUniqueElemsPerThread(Attribute layout, ArrayRef<int64_t> shape) {
+  auto kReg = StringAttr::get(layout.getContext(), "register");
+  auto strippedLayout =
+      toLinearLayout(shape, layout).removeZeroBasesAlongDim(kReg);
+  return strippedLayout.getInDimSize(kReg);
+}
+
 SmallVector<unsigned> getElemsPerThread(Attribute layout,
                                         ArrayRef<int64_t> shape) {
   return toLinearEncoding(cast<DistributedEncodingTrait>(layout), shape)
@@ -97,6 +104,14 @@ unsigned getTotalElemsPerThread(Type type) {
   auto tensorType = cast<RankedTensorType>(type);
   return getTotalElemsPerThread(tensorType.getEncoding(),
                                 tensorType.getShape());
+}
+
+unsigned getUniqueElemsPerThread(Type type) {
+  if (type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type))
+    return 1;
+  auto tensorType = cast<RankedTensorType>(type);
+  return getUniqueElemsPerThread(tensorType.getEncoding(),
+                                 tensorType.getShape());
 }
 
 FailureOr<RankedTensorType>
@@ -142,6 +157,22 @@ bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
                      ArrayRef<int64_t> dstShape, Attribute dstEncoding) {
   auto llSrc = toLinearLayout(srcShape, srcEncoding);
   auto llDst = toLinearLayout(dstShape, dstEncoding);
+  // NPOT: getFreeVariableMasks() cannot distinguish two different ADD-mod-N
+  // maps, so distinct modular layouts compare "cheap" and callers skip the
+  // relayout -> scramble. A shape-changing modular view can never be proven a
+  // true no-op (the `llSrc != llDst` LinearLayout compare has holes for
+  // modular maps: some genuine reshapes still compare equal/"cheap" and fall
+  // through to a silent no-op repack in ViewOpToLLVM). Conservatively treat any
+  // modular view whose src and dst shapes differ as expensive so it is
+  // loud-rejected / routed through the real remap rather than silently
+  // scrambled. Same-shape modular views (identity) stay cheap. pow2 unaffected
+  // (isModular() is false).
+  if (llSrc.isModular() || llDst.isModular()) {
+    static const bool allowNpot =
+        mlir::triton::tools::getBoolEnv("TRITON_ALLOW_NPOT");
+    if (allowNpot && srcShape != dstShape)
+      return true;
+  }
   // In case there are replicated value we need to make sure the new and old
   // layout have matching masks.
   for (auto [srcMask, dstMask] :
@@ -443,26 +474,13 @@ SmallVector<unsigned> orderPerDimImpl(const LinearLayout &ll,
   return order.takeVector();
 }
 
-static int64_t getNumNonBroadcastRegisters(ArrayRef<int64_t> shape,
-                                           Attribute encoding) {
-  auto kReg = StringAttr::get(encoding.getContext(), "register");
-  auto strippedLayout =
-      toLinearLayout(shape, encoding).removeZeroBasesAlongDim(kReg);
-  return strippedLayout.getInDimSize(kReg);
-}
-
-static int64_t getNumNonBroadcastRegisters(RankedTensorType tensorType) {
-  return getNumNonBroadcastRegisters(tensorType.getShape(),
-                                     tensorType.getEncoding());
-}
-
 bool isLegalCatEncoding(CatOp cat, Attribute targetEncoding) {
   // Cat lowering concatenates the operands' unique register values. So the
   // number of unique register values in the result must be equal to those in
   // the operands.
-  int64_t operandRegs = getNumNonBroadcastRegisters(cat.getLhs().getType()) * 2;
+  int64_t operandRegs = getUniqueElemsPerThread(cat.getLhs().getType()) * 2;
   int64_t resultRegs =
-      getNumNonBroadcastRegisters(cat.getType().getShape(), targetEncoding);
+      getUniqueElemsPerThread(targetEncoding, cat.getType().getShape());
   return resultRegs == operandRegs;
 }
 
@@ -3109,9 +3127,8 @@ struct TritonGPUInferLayoutInterface
 
   LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
     auto cat = cast<CatOp>(op);
-    int64_t operandRegs =
-        getNumNonBroadcastRegisters(cat.getLhs().getType()) * 2;
-    int64_t resultRegs = getNumNonBroadcastRegisters(cat.getType());
+    int64_t operandRegs = getUniqueElemsPerThread(cat.getLhs().getType()) * 2;
+    int64_t resultRegs = getUniqueElemsPerThread(cat.getType());
     if (resultRegs != operandRegs) {
       return op->emitError("tt.cat result encoding requires ")
              << resultRegs
@@ -3402,7 +3419,17 @@ struct TritonGPUInferLayoutInterface
     auto result =
         inferReshapeOpLegacyEncoding(srcShape, srcEnc, dstShape, dstEnc);
     if (succeeded(result)) {
-      return result;
+      // A modular (NPOT) reshape can get a legacy default->default encoding
+      // that looks like a cheap register no-op but is NOT order-preserving
+      // (getFreeVariableMasks cannot tell two ADD-mod-N maps apart). Lowering
+      // that as a no-op repack (ReshapeOpConversion) silently scrambles data in
+      // opt builds (the assert(!isExpensiveView) there is compiled out). If the
+      // inferred view is expensive, fall through to the LinearLayout-based
+      // inference (real remap / loud-fail) instead of returning the scrambling
+      // no-op. pow2 is unaffected: isExpensiveView's modular branch never
+      // fires, so pow2 default->default stays cheap -> byte-identical.
+      if (!isExpensiveView(srcShape, srcEnc, dstShape, dstEnc))
+        return result;
     }
     if (!isa<DistributedEncodingTrait>(srcEnc)) {
       return emitOptionalError(loc,
@@ -3683,10 +3710,13 @@ struct TritonGPUVerifyTensorLayoutInterface
                          << " which is not a power of two.";
       }
       // Layouts whose modular (non-power-of-2) lowering is implemented.
-      bool npotLoweringImplemented =
-          isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr>(
-              layout);
-      if (!npotLoweringImplemented) {
+      // Dot-operand and MMA encodings (Nvidia WGMMA/MMAv5, AMD MFMA/WMMA) are
+      // admitted so an NPOT tl.dot's operand/result tensors pass verification
+      // under the flag; the modular LinearLayout they resolve to is lowered by
+      // the encoding-agnostic ADD+UREM path in applyLinearLayout.
+      if (!isa<BlockedEncodingAttr, SliceEncodingAttr, LinearEncodingAttr,
+               DotOperandEncodingAttr, NvidiaMmaEncodingAttr,
+               AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(layout)) {
         return makeErr()
                << "NPOT layout not yet supported: tensor shape "
                << rankedTy.getShape()

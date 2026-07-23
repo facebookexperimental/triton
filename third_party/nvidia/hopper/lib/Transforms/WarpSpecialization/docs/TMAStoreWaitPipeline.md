@@ -173,6 +173,13 @@ doMemoryPlanner
   → doTMAStoreWaitReorder         ← move waits using the SWP schedule
 ```
 
+This sequence is controlled by the `nvgpu-warp-specialization` pass option
+`tma-store-pipelining`, which defaults to `true`. When set to `false`, AutoWS
+skips all three steps: annotation, validation, and post-schedule reordering.
+This option is independent of `early_tma_store_lowering`, which controls
+whether descriptor stores are lowered into async TMA store operations before
+warp specialization.
+
 Each function is also available as a standalone MLIR pass for use outside
 the monolithic pipeline.
 

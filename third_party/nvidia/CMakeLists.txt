@@ -59,6 +59,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
               -fno-exceptions
               -fcuda-flush-denormals-to-zero
               --cuda-gpu-arch=sm_80
+              --cuda-feature=+ptx70
               -Wno-unknown-cuda-version
               ${GSAN_RUNTIME_TOOLCHAIN_FLAGS}
               ${GSAN_RUNTIME_PLATFORM_FLAGS}

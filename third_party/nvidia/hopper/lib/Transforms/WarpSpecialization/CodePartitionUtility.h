@@ -89,6 +89,14 @@ public:
   DataChannelKind channelKind = DataChannelKind::SMEM;
   unsigned uniqID;
   std::string srcName; // Producer name captured at channel creation
+
+  // Set once this channel's allocOp has been folded into a reuse-group
+  // representative and erased (replaceBufferReuse). The channel's alloc — and
+  // any producer/consumer op reached through it — is then dangling, so
+  // getSrcOp()/getDstOp() must not walk it. Any pass step that iterates reuse
+  // groups after folding (e.g. needAccumCntForReuse) should skip defunct
+  // channels; the representative covers their space.
+  bool defunct = false;
 };
 
 // A few assumptions, a channel can have multiple consumers, but the consumers
@@ -352,6 +360,18 @@ int channelInReuseGroup(Channel *channel, ReuseConfig *config,
 void fuseTcgen05CommitBarriers(triton::FuncOp &funcOp);
 void doTMAStoreLowering(triton::FuncOp &funcOp);
 bool appearsBefore(Operation *A, Operation *B);
+
+// Shared reuse-legality primitive: is `dstOp` in the forward slice of `srcOp`,
+// following SSA results AND memory (store -> buffer -> load)?  Single source of
+// truth for "one op's value flows into another"; used by both the memory
+// planner (hasPotentialReuse) and code partitioning (hasDependencyChain).
+//
+// `followBufferReuse` widens the memory hop from the store's own slot to any
+// view/slot of the root buffer (see the .cpp). Use it only to ORDER an
+// already-decided reuse (code partitioning), never to gate the planner's
+// packing decision -- the wider walk over-forms reuse groups.
+bool dependsThroughMemory(Operation *srcOp, Operation *dstOp,
+                          bool followBufferReuse = false);
 
 // Verify that an A1 (SMEM circular reuse) group is well-formed:
 // - Multi-buffered (channels[0]->getNumBuffers() > 1).

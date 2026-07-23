@@ -37,6 +37,8 @@ def min_dot_size(target: GPUTarget):
             return (1, 1, 32)
         elif lhs_bitwidth == 64:
             return (1, 1, 4)
+        elif lhs_bitwidth == 32:
+            return (1, 1, 8)
         else:
             return (1, 1, 16)
 
@@ -198,7 +200,9 @@ class CUDAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     early_tma_store_lowering: Optional[None] = None
+    tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
+    multicast: bool = False
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
     # TRITON_AUTO_TMA knob when left at the default in make_ttir.
     auto_tma: bool = False
@@ -853,6 +857,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+            tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
             nvidia.passes.hopper.add_hopper_warpspec(
                 pm,
                 opt.num_stages,
@@ -862,6 +867,7 @@ class CUDABackend(BaseBackend):
                 smem_budget,
                 generate_subtiled,
                 knobs.nvidia.ws_tile_prefetch_depth,
+                tma_store_pipelining,
             )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
@@ -878,7 +884,7 @@ class CUDABackend(BaseBackend):
             # CLC tile scheduler (Stages 1 & 2): split ttng.clc_advance into the
             # async-token form and hoist the issue for compute/CLC overlap. This
             # runs before warp specialization; the token is materialized into the
-            # completion mbarrier after WS (add_clc_materialize below).
+            # completion/reuse mbarriers after WS (add_clc_materialize below).
             nvidia.passes.ttnvgpuir.add_clc_split(pm)
             nvidia.passes.ttnvgpuir.add_clc_hoist(pm)
             if knobs.nvidia.use_llm_schedule:
@@ -927,6 +933,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+                tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
                 nvidia.passes.hopper.add_hopper_warpspec(
                     pm,
                     opt.num_stages,
@@ -936,6 +943,7 @@ class CUDABackend(BaseBackend):
                     smem_budget,
                     generate_subtiled,
                     knobs.nvidia.ws_tile_prefetch_depth,
+                    tma_store_pipelining,
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
@@ -943,8 +951,8 @@ class CUDABackend(BaseBackend):
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             # CLC tile scheduler (Stage 4): materialize the async-token form into
-            # the response buffer + completion mbarrier (single-CTA only). Runs
-            # after warp specialization.
+            # the response buffer + completion mbarrier. Explicit clusters also
+            # get a reuse rendezvous. Runs after warp specialization.
             nvidia.passes.ttnvgpuir.add_clc_materialize(pm)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
@@ -1001,6 +1009,19 @@ class CUDABackend(BaseBackend):
         # would otherwise be free to rewrite the unwrapped pinned layout). Placing
         # it here keeps the pin an anchor through the whole pipeline.
         tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
+
+        # M2 (bitequiv): reduction-layout optimization for inner_tree reduces. Placed
+        # after remove-layout-conversions so its layout choice is not reverted by a later
+        # conversion pass. Gated off by default (TRITON_SET_RED_ORDERING_LAYOUTS=1 to turn
+        # on in-pipeline); the bitequiv eval hook injects it via --opt-passes for a clean
+        # baseline-vs-optimized A/B. Tunables are pass Options driven by knobs.nvidia.*.
+        if knobs.nvidia.set_red_ordering_layouts:
+            passes.ttgpuir.add_optimize_reduction_layout(
+                pm,
+                knobs.nvidia.red_ordering_strategy,
+                knobs.nvidia.red_ordering_min_underparallel,
+                knobs.nvidia.red_ordering_max_elems_per_thread,
+            )
 
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
@@ -1090,6 +1111,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
+        nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)

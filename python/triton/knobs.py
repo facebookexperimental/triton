@@ -586,6 +586,13 @@ class nvidia_knobs(base_knobs):
     # Gate opt-in perf-benchmark tests (do_bench sweeps) so unit-test runs do
     # not pay the perf-sweep cost.
     run_perf: env_bool = env_bool("TRITON_RUN_PERF")
+    # M2 (bitequiv): tritongpu-optimize-reduction-layout gate + tunables. The gate
+    # adds the pass at end of make_ttgir; the tunables are forwarded as pass Options.
+    # Off by default; the eval hook can also inject the pass via --opt-passes.
+    set_red_ordering_layouts: env_bool = env_bool("TRITON_SET_RED_ORDERING_LAYOUTS")
+    red_ordering_strategy: env_str = env_str("TRITON_RED_ORDERING_STRATEGY", "ideal")
+    red_ordering_min_underparallel: env_int = env_int("TRITON_RED_ORDERING_MIN_UNDERPARALLEL", 8)
+    red_ordering_max_elems_per_thread: env_int = env_int("TRITON_RED_ORDERING_MAX_ELEMS_PER_THREAD", 256)
 
 
 class amd_knobs(base_knobs):
