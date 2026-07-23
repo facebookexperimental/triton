@@ -94,8 +94,9 @@ attributes on the selected inner loop take precedence over outer defaults.
 
 `ttg.warp_specialize` is emitted by the pipeline `ScheduleLoops` →
 `PartitionSchedulingMeta` → `hopper_warpspec`. `PartitionSchedulingMeta` accepts
-identity-carry `scf.while` and derives its partitions structurally from the
-after region. `ScheduleLoops` remains `scf.for`-only: the non-countable outer
+`scf.while` loops whose condition forwards a direct non-empty ordered subset of carried
+values, and derives their partitions structurally from the after region.
+`ScheduleLoops` remains `scf.for`-only: the non-countable outer
 while is not software-pipelined, while its nested K-loop retains the existing
 for-loop software pipeline. Downstream dynamic/CLC validation is tracked in
 **[WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md)**.

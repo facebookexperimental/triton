@@ -11,7 +11,7 @@ pipeline — it determines which warp group each operation will execute on.
 The pass walks supported loop-like operations with the `tt.warp_specialize`
 attribute and assigns each operation inside the scheduled body (and post-loop
 consumers) to a **partition**. Each partition maps to a warp group at runtime.
-The supported forms are `scf.for` and identity-carry `scf.while`.
+The supported forms are `scf.for` and ordered-subset-carry `scf.while`.
 
 ```
 Phase 1: Categorize operations         (OpCategorizer + collectMMABackwardSlices)
@@ -31,11 +31,13 @@ not accept arbitrary loop-like operations. `scf.for` uses its body region and
 retains the existing induction-variable offset. `scf.while` uses its after
 region as the scheduled body and has no induction variable.
 
-An `scf.while` is schedulable only when `scf.condition` forwards every
-before-region argument once, in the same order. This makes yield slot `k`,
-before argument `k`, after argument `k`, and the next-iteration carried value
-unambiguous. Reordered or subset forwarding is rejected by stripping the
-loop-local warp-specialization metadata and leaving a plain while loop.
+An `scf.while` is schedulable when `scf.condition` forwards a direct, unique,
+non-empty, order-preserving subset of its before-region arguments. Forwarded values map
+from after-region arguments through the condition operands to their actual
+yield slots; non-forwarded values are condition-only state and do not re-enter
+the scheduled body. This supports CLC's `(valid, x)` carry, where only `x` is
+forwarded. Empty, reordered, duplicate, or computed forwarding is rejected by
+stripping loop-local warp-specialization metadata and leaving a plain while.
 
 The before region remains loop control rather than a PSM partition. Task-ID
 propagation marks the while, its condition computation, `scf.condition`, and
