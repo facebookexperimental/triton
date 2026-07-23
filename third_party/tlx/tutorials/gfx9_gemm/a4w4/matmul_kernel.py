@@ -23,7 +23,7 @@ def _a4w4_kernel(
     b_scales_ptr,
     M,
     N,
-    K: tl.constexpr,
+    K,
     stride_am,
     stride_ak,
     stride_bn,
@@ -200,7 +200,8 @@ def _a4w4_kernel(
     acc_left = tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32)
     acc_right = tl.zeros((BLOCK_M, HALF_N), dtype=tl.float32)
 
-    iter_max: tl.constexpr = K // BLOCK_K
+    # Keep the trip count runtime so all supported K sizes share one compiled kernel.
+    iter_max = K // BLOCK_K
     tl.assume(iter_max > 3)
 
     tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)

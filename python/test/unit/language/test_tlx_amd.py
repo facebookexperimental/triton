@@ -1186,9 +1186,14 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     with knobs.runtime.scope():
         knobs.runtime.override_arch = "gfx950"
         _compile_a4w4_shape((256, 256, 1024), tmp_path)
+        _compile_a4w4_shape((256, 256, 1536), tmp_path)
 
-    ttgir = next(tmp_path.rglob("_a4w4_kernel.ttgir")).read_text()
-    amdgcn = next(tmp_path.rglob("_a4w4_kernel.amdgcn")).read_text()
+    ttgir_files = list(tmp_path.rglob("_a4w4_kernel.ttgir"))
+    amdgcn_files = list(tmp_path.rglob("_a4w4_kernel.amdgcn"))
+    assert len(ttgir_files) == 1
+    assert len(amdgcn_files) == 1
+    ttgir = ttgir_files[0].read_text()
+    amdgcn = amdgcn_files[0].read_text()
     assert ttgir.count("tt.dot_scaled") == 8
     assert "#tlx.user_layout" not in ttgir
     assert "#tlx.no_verify_layout" not in ttgir
@@ -1203,8 +1208,8 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
     m = n = 256
-    k = 1024
-    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
-    actual = _launch_a4w4(a, b, a_scales, b_scales)
-    expected = _a4w4_reference(a, b, a_scales, b_scales)
-    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+    for k in (1024, 1536):
+        a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+        actual = _launch_a4w4(a, b, a_scales, b_scales)
+        expected = _a4w4_reference(a, b, a_scales, b_scales)
+        torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
