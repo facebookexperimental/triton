@@ -226,14 +226,24 @@ Value getLoopInductionVar(LoopLikeOpInterface loop);
 std::pair<OpResult, int64_t>
 getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value);
 
-// Map carried-value slot `k` to its argument in the scheduled body.
+// Callers must verify hasSupportedLoopCarry(loop) before using either mapping
+// helper below.
+// Map carried-value slot `k` to its argument in the scheduled body. Returns a
+// null BlockArgument for an scf.while slot that is not forwarded by
+// scf.condition.
 BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k);
 
-// Partition scheduling supports scf.while only when scf.condition forwards
-// every before-region argument exactly once and in the same order. scf.for is
-// identity-carry by construction; other LoopLikeOpInterface implementations
-// are unsupported.
-bool hasIdentityLoopCarry(LoopLikeOpInterface loop);
+// Map a scheduled-body argument to the value yielded into its corresponding
+// carried slot on the next iteration.
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop,
+                                 BlockArgument bodyArg);
+
+// Partition scheduling supports scf.while when scf.condition forwards a
+// direct, unique, non-empty, order-preserving subset of the before-region
+// arguments.
+// scf.for is supported by construction; other LoopLikeOpInterface
+// implementations are unsupported.
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);

@@ -118,6 +118,12 @@
 - **Fix**: Recognize annotated outer `scf.while` operations during post-WS preprocessing and apply `tt.warp_specialize` to their already-staged innermost `scf.for` loops. The outer while remains physically warp-specialized but is not software-pipelined.
 - **Tests**: `ws_atomic_broadcast_from_psm.mlir` covers the production PSM-to-code-partition path and nested-loop rescheduling; the unified `DynamicPersistent1DScheduler` tutorial09 case checks Blackwell correctness and rejects the missing-stage diagnostic.
 
+### 15. Unified CLC outer while silently drops AutoWS (2026-07-20, fixed)
+- **Symptom**: `ClcTileScheduler` with `warp_specialize=True` on the outer condition compiles correctly but emits no `ttg.warp_specialize`; the same unified kernel specializes with the dynamic atomic scheduler.
+- **Root cause**: CLC lowers to an `scf.while` carry `(valid, x)` whose condition forwards only `x`. PSM required full identity forwarding and stripped the WS marker. Its dependency traversal also assumed after-argument index 0 mapped to yield slot 0, but CLC's forwarded `x` maps to yield slot 1.
+- **Fix**: Accept direct, unique, non-empty, order-preserving condition subsets. Map scheduled-body arguments back through `scf.condition` to their true yield slots, and stop forward traversal for condition-only slots that have no after-region argument. Empty, reordered, duplicate, and computed forwarding still reject safely.
+- **Tests**: `ws_while_loop_autows.mlir` covers the shifted CLC-shaped carry plus reordered/computed rejection. The unified tutorial09 `ClcTileScheduler` case keeps the K loop unannotated and checks physical WS, CLC lowering, clean pipeline diagnostics, and numerical correctness on Blackwell.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)
