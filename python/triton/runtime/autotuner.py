@@ -241,6 +241,26 @@ def _timed_measurement(kernel_call, clear_cache, n_repeat, torch):
     return torch.tensor([s.elapsed_time(e) for s, e in zip(start_ev, end_ev)], dtype=torch.float)
 
 
+class _AutotuneCache(dict):
+    """dict that invalidates C autotune proxy when cleared."""
+
+    def __init__(self, autotuner):
+        super().__init__()
+        self._autotuner = autotuner
+
+    def __reduce__(self):
+        return (dict, ())
+
+    def clear(self):
+        super().clear()
+        if hasattr(self._autotuner, '_autotune_proxy'):
+            del self._autotuner._autotune_proxy
+        if hasattr(self._autotuner, '_at_proxy_seeded'):
+            self._autotuner._at_proxy_seeded = set()
+        if hasattr(self._autotuner, '_fc_seeded'):
+            self._autotuner._fc_seeded = set()
+
+
 class Autotuner(KernelInterface):
 
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
@@ -280,7 +300,7 @@ class Autotuner(KernelInterface):
             self.configs = configs
         self.keys = key
         self.include_npot = include_npot
-        self.cache: Dict[Tuple, Config] = {}
+        self.cache: Dict[Tuple, Config] = _AutotuneCache(self)
         self.arg_names = arg_names
         self.cache_results = (cache_results or knobs.autotuning.cache) and not knobs.runtime.interpret
 
@@ -563,7 +583,8 @@ class Autotuner(KernelInterface):
         """Return C-level AutotuneCacheProxy for fast dispatch if available."""
         # Check if we can use the C-level autotune proxy
         if (native_create_autotune_proxy is not None and getattr(self.fn, 'c_cache', False)
-                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1):
+                and knobs.nvidia.use_autotune_c_cache and knobs.nvidia.use_triton_dispatcher and len(self.configs) > 1
+                and knobs.autotuning.listener is None):
             proxy = getattr(self, '_autotune_proxy', None)
             if proxy is None:
                 # Compute key_indices: positions in arg_names for autotuner key fields

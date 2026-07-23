@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <pybind11/pybind11.h>
 #include <string>
 #include <string_view>
@@ -38,6 +39,64 @@ specialize_arg(PyObject *backend, PyObject *arg, bool is_const,
                bool specialize_value, bool align);
 
 static bool init_called = false;
+
+// --- dispatch/cache stats (opt-in via TRITON_CACHE_STATS=1) ------------------
+// Counts hit vs fallback per dispatch path, per kernel, so owners can find
+// kernels that silently miss the C fast path once the flags are on by default.
+// When off (the default) every record site is guarded by a single
+// `if (g_cache_stats)` branch, so no map/mutex/name work happens on the hot
+// path.
+static const bool g_cache_stats = [] {
+  const char *v = std::getenv("TRITON_CACHE_STATS");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}();
+static std::mutex g_cache_stats_mu;
+// kernel name -> (event -> count), e.g. event "jit_proxy_hit" /
+// "jit_proxy_fallback"
+static std::unordered_map<std::string,
+                          std::unordered_map<std::string, uint64_t>>
+    g_cache_stats_map;
+
+static void cache_stats_record(PyObject *name_obj, const char *event) {
+  // Caller must guard with `if (g_cache_stats)`.
+  const char *name = (name_obj && PyUnicode_Check(name_obj))
+                         ? PyUnicode_AsUTF8(name_obj)
+                         : nullptr;
+  std::lock_guard<std::mutex> lk(g_cache_stats_mu);
+  g_cache_stats_map[name ? name : "<unknown>"][event]++;
+}
+
+// native_dump_cache_stats() -> {kernel: {event: count}}
+static PyObject *native_dump_cache_stats(PyObject *, PyObject *) {
+  PyObject *outer = PyDict_New();
+  if (!outer)
+    return nullptr;
+  std::lock_guard<std::mutex> lk(g_cache_stats_mu);
+  for (const auto &kv : g_cache_stats_map) {
+    PyObject *inner = PyDict_New();
+    if (!inner) {
+      Py_DECREF(outer);
+      return nullptr;
+    }
+    for (const auto &ev : kv.second) {
+      PyObject *cnt = PyLong_FromUnsignedLongLong(ev.second);
+      if (cnt) {
+        PyDict_SetItemString(inner, ev.first.c_str(), cnt);
+        Py_DECREF(cnt);
+      }
+    }
+    PyDict_SetItemString(outer, kv.first.c_str(), inner);
+    Py_DECREF(inner);
+  }
+  return outer;
+}
+
+// native_reset_cache_stats() -> None
+static PyObject *native_reset_cache_stats(PyObject *, PyObject *) {
+  std::lock_guard<std::mutex> lk(g_cache_stats_mu);
+  g_cache_stats_map.clear();
+  Py_RETURN_NONE;
+}
 
 static PyObject *constexpr_cls = nullptr;
 static PyObject *jit_callable_cls = nullptr;
@@ -1518,6 +1577,7 @@ typedef struct {
   PyObject *stream_getter;     // driver.active.get_current_stream
   PyObject *device_getter;     // driver.active.get_current_device
   PyObject *param_name_to_idx; // dict: param_name → positional index
+  PyObject *kernel_name;       // interned _fn_name for stats (may be NULL)
   uint64_t options_hash;
   int n_params;
 } JITCacheProxy;
@@ -1661,12 +1721,16 @@ static PyObject *JITCacheProxy_vectorcall(PyObject *callable,
     }
     Py_DECREF(result);
     Py_INCREF(kernel);
+    if (g_cache_stats)
+      cache_stats_record(self->kernel_name, "jit_proxy_hit");
     return kernel;
   }
 
 fallback:
   // Fall through to Python: self.run(*args, grid=grid, warmup=False, **kwargs)
   // Use Vectorcall to preserve any keyword arguments from kwnames.
+  if (g_cache_stats)
+    cache_stats_record(self->kernel_name, "jit_proxy_fallback");
   return PyObject_Vectorcall(self->run_partial, args, nargsf, kwnames);
 }
 
@@ -1682,6 +1746,7 @@ static void JITCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->stream_getter);
   Py_XDECREF(self->device_getter);
   Py_XDECREF(self->param_name_to_idx);
+  Py_XDECREF(self->kernel_name);
   Py_TYPE(o)->tp_free(o);
 }
 
@@ -1696,6 +1761,7 @@ static int JITCacheProxy_traverse(PyObject *o, visitproc visit, void *arg) {
   Py_VISIT(self->stream_getter);
   Py_VISIT(self->device_getter);
   Py_VISIT(self->param_name_to_idx);
+  Py_VISIT(self->kernel_name);
   return 0;
 }
 
@@ -1705,6 +1771,7 @@ static int JITCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->params_list);
   Py_CLEAR(self->run_partial);
   Py_CLEAR(self->param_name_to_idx);
+  Py_CLEAR(self->kernel_name);
   Py_CLEAR(self->grid_py[0]);
   Py_CLEAR(self->grid_py[1]);
   Py_CLEAR(self->grid_py[2]);
@@ -1845,6 +1912,12 @@ PyObject *native_create_jit_proxy(PyObject *self_unused, PyObject *const *args,
   PyObject *pnti = PyObject_GetAttr(jit_fn, pnti_str);
   proxy->param_name_to_idx = pnti; // may be NULL if attr missing
   if (!pnti)
+    PyErr_Clear();
+  static PyObject *fn_name_str = nullptr;
+  if (!fn_name_str)
+    fn_name_str = PyUnicode_InternFromString("_fn_name");
+  proxy->kernel_name = PyObject_GetAttr(jit_fn, fn_name_str);
+  if (!proxy->kernel_name)
     PyErr_Clear();
   proxy->options_hash = opts_hash;
   proxy->n_params = n_params;
@@ -2017,6 +2090,7 @@ typedef struct {
   int *dtype_indices; // positions of tensor args (for dtype in key)
   int n_dtype_indices;
   int n_params;                  // total params of inner JITFunction
+  PyObject *kernel_name;         // interned _fn_name for stats (may be NULL)
   std::vector<ATEntry> at_table; // autotune dispatch table
   size_t at_count;               // number of occupied entries
   // Old table buffers retained (never freed) across resizes so that a
@@ -2340,6 +2414,8 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
       Py_DECREF(result);
       Py_XDECREF(e_pre_hook);
       Py_INCREF(fc_entry->kernel);
+      if (g_cache_stats)
+        cache_stats_record(self->kernel_name, "autotune_proxy_hit");
       return fc_entry->kernel;
     }
 
@@ -2350,6 +2426,8 @@ static PyObject *AutotuneCacheProxy_vectorcall(PyObject *callable,
 
 fallback:
   Py_XDECREF(e_pre_hook);
+  if (g_cache_stats)
+    cache_stats_record(self->kernel_name, "autotune_proxy_fallback");
   return PyObject_Vectorcall(self->fallback_run, args, nargsf, kwnames);
 }
 
@@ -2364,6 +2442,7 @@ static void AutotuneCacheProxy_dealloc(PyObject *o) {
   Py_XDECREF(self->grid_fn);
   Py_XDECREF(self->grid_static);
   Py_XDECREF(self->param_name_to_idx);
+  Py_XDECREF(self->kernel_name);
   free(self->key_indices);
   free(self->dtype_indices);
   for (size_t i = 0; i < self->at_table.size(); i++) {
@@ -2388,6 +2467,7 @@ static int AutotuneCacheProxy_traverse(PyObject *o, visitproc visit,
   Py_VISIT(self->grid_fn);
   Py_VISIT(self->grid_static);
   Py_VISIT(self->param_name_to_idx);
+  Py_VISIT(self->kernel_name);
   for (size_t i = 0; i < self->at_table.size(); i++) {
     if (self->at_table[i].occupied) {
       ATEntry *entry = &self->at_table[i];
@@ -2411,6 +2491,7 @@ static int AutotuneCacheProxy_clear(PyObject *o) {
   Py_CLEAR(self->grid_fn);
   Py_CLEAR(self->grid_static);
   Py_CLEAR(self->param_name_to_idx);
+  Py_CLEAR(self->kernel_name);
   for (size_t i = 0; i < self->at_table.size(); i++) {
     if (self->at_table[i].occupied) {
       ATEntry *entry = &self->at_table[i];
@@ -2519,6 +2600,12 @@ PyObject *native_create_autotune_proxy(PyObject *self_unused,
   PyObject *pnti = PyObject_GetAttr(jit_fn, pnti_str);
   proxy->param_name_to_idx = pnti; // may be NULL if attr missing
   if (!pnti)
+    PyErr_Clear();
+  static PyObject *at_fn_name_str = nullptr;
+  if (!at_fn_name_str)
+    at_fn_name_str = PyUnicode_InternFromString("_fn_name");
+  proxy->kernel_name = PyObject_GetAttr(jit_fn, at_fn_name_str);
+  if (!proxy->kernel_name)
     PyErr_Clear();
   proxy->key_indices = key_indices;
   proxy->n_key_indices = (int)n_keys;
@@ -2804,6 +2891,12 @@ static PyMethodDef module_methods[] = {
      METH_FASTCALL, nullptr},
     {"native_autotune_proxy_set_grid",
      (PyCFunction)native_autotune_proxy_set_grid, METH_FASTCALL, nullptr},
+    {"native_dump_cache_stats", (PyCFunction)native_dump_cache_stats,
+     METH_NOARGS,
+     "Return {kernel: {event: count}} of C dispatch hit/fallback stats "
+     "(TRITON_CACHE_STATS=1)"},
+    {"native_reset_cache_stats", (PyCFunction)native_reset_cache_stats,
+     METH_NOARGS, "Clear the C dispatch stats counters"},
     {"register_tensor_access_api",
      (PyCFunction) + [](PyObject *self, PyObject *arg) -> PyObject * {
        (void)self;

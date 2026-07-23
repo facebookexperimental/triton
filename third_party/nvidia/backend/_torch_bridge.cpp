@@ -28,6 +28,11 @@ struct TritonTensorAccessAPI {
   int (*extract_tensordesc)(PyObject *td_obj, uint64_t *out_data_ptr,
                             int64_t *out_shape, int64_t *out_strides,
                             int max_ndim);
+  // Cheap device check (no CUDA driver call — reads the tensor's device off
+  // the c10::TensorImpl struct). Returns 1 if obj is a torch tensor on a CUDA
+  // device, 0 if it is a torch tensor NOT on CUDA (e.g. a cpu tensor), and -1
+  // if obj is not a torch tensor at all (device unknown — caller decides).
+  int8_t (*is_cuda_tensor)(PyObject *obj);
 };
 
 // ============================================================================
@@ -49,6 +54,15 @@ static uint64_t fast_get_data_ptr(PyObject *obj) {
     return 0;
   const auto &tensor = THPVariable_Unpack(obj);
   return reinterpret_cast<uint64_t>(tensor.data_ptr());
+}
+
+static int8_t fast_is_cuda_tensor(PyObject *obj) {
+  // Use Check (not CheckExact) so tensor subclasses (nn.Parameter, DTensor,
+  // ...) are validated too — they share the at::Tensor memory layout.
+  if (!THPVariable_Check(obj))
+    return -1; // not a torch tensor — device unknown to the bridge
+  const auto &tensor = THPVariable_Unpack(obj);
+  return tensor.is_cuda() ? 1 : 0;
 }
 
 // Interned attribute name strings for fast dict lookup
@@ -115,6 +129,7 @@ static TritonTensorAccessAPI g_api = {
     fast_get_scalar_type,
     fast_get_data_ptr,
     fast_extract_tensordesc,
+    fast_is_cuda_tensor,
 };
 
 // ============================================================================
