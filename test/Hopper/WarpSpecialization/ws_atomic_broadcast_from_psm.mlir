@@ -1,5 +1,7 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta --nvgpu-test-taskid-propagate=num-warp-groups=2 --nvgpu-test-ws-atomic-broadcast | FileCheck %s --check-prefix=BCAST
 // RUN: triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta --nvgpu-test-taskid-propagate=num-warp-groups=2 --nvgpu-test-ws-atomic-broadcast=tile-prefetch-depth=2 | FileCheck %s --check-prefix=DEPTH2
+// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000 tile-prefetch-depth=2' | FileCheck %s --check-prefix=FULL
+// RUN: TRITON_USE_META_WS=1 triton-opt %s -split-input-file --nvgpu-partition-scheduling-meta '--nvgpu-warp-specialization=capability=90 num-stages=3 smem-budget=200000 tile-prefetch-depth=2' '--tritongpu-pipeline=num-stages=3' 2>&1 | FileCheck %s --check-prefix=PIPELINE
 
 // Dynamic-persistent GEMM: an outer scf.while claims each tile with a scalar
 // atomic, starting UNPARTITIONED. This exercises the full front half of the
@@ -45,6 +47,45 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // DEPTH2: tt.atomic_rmw
   // DEPTH2-NOT: tt.atomic_rmw
   // DEPTH2: tt.unsplat
+
+  // FULL-LABEL: @while_atomic_broadcast
+  // The production pipeline materializes a two-slot broadcast channel and
+  // physically specializes the outer while.
+  // FULL: %[[ATOMIC_SLOT:[0-9]+]] = ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32} : () -> !ttg.memdesc<2x1xi32
+  // FULL: ttg.warp_specialize
+  // FULL: default {
+  // FULL: scf.while {{.*}} : (i32, i64, i64) -> (i32, i64, i64)
+  // Post-WS preprocessing must mark the staged inner K loop so scheduleLoops
+  // completes the partial schedule before software pipelining.
+  // FULL: scf.for
+  // FULL: } {async_task_id
+  // FULL-SAME: tt.scheduled_max_stage = {{[0-9]+}} : i32
+  // FULL-SAME: tt.warp_specialize
+  // The default partition rotates the slot and full-barrier phase from the
+  // direct while accumulation counter before loading the broadcast value.
+  // FULL: arith.andi
+  // FULL: ttg.memdesc_index %[[ATOMIC_SLOT]]
+  // FULL: ttng.wait_barrier
+  // FULL: ttg.local_load
+  // FULL: ttng.arrive_barrier
+  // FULL: partition0
+  // FULL: scf.while {{.*}} : (i32, i64, i64) -> (i32, i64, i64)
+  // FULL: scf.for
+  // FULL: } {async_task_id
+  // FULL-SAME: tt.scheduled_max_stage = {{[0-9]+}} : i32
+  // FULL-SAME: tt.warp_specialize
+  // The owner partition uses the same rotating counter for the empty wait,
+  // store, and full arrive.
+  // FULL: tt.atomic_rmw
+  // FULL: arith.andi
+  // FULL: ttng.wait_barrier
+  // FULL: ttg.local_store
+  // FULL: ttng.arrive_barrier
+
+  // PIPELINE-NOT: not assigned a pipeline stage
+  // PIPELINE-LABEL: @while_atomic_broadcast
+  // PIPELINE: ttg.warp_specialize
+  // PIPELINE-NOT: not assigned a pipeline stage
   tt.func public @while_atomic_broadcast(
       %a_desc: !tt.tensordesc<128x64xf16, #shared>,
       %b_desc: !tt.tensordesc<64x256xf16, #shared>,
@@ -60,13 +101,13 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     } do {
     ^bb0(%tile: i32):
       %inner = scf.for %ki = %c0 to %k_tiles step %c1 iter_args(%acc = %acc_init) -> (tensor<128x256xf32, #mma>) : i32 {
-        %a = tt.descriptor_load %a_desc[%tile, %ki] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
-        %a_alloc = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-        %b = tt.descriptor_load %b_desc[%ki, %tile] : !tt.tensordesc<64x256xf16, #shared> -> tensor<64x256xf16, #blocked1>
-        %b_alloc = ttg.local_alloc %b : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
-        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {inputPrecision = 0 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
+        %a = tt.descriptor_load %a_desc[%tile, %ki] {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+        %a_alloc = ttg.local_alloc %a {loop.cluster = 0 : i32, loop.stage = 0 : i32} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
+        %b = tt.descriptor_load %b_desc[%ki, %tile] {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !tt.tensordesc<64x256xf16, #shared> -> tensor<64x256xf16, #blocked1>
+        %b_alloc = ttg.local_alloc %b {loop.cluster = 0 : i32, loop.stage = 0 : i32} : (tensor<64x256xf16, #blocked1>) -> !ttg.memdesc<64x256xf16, #shared, #smem>
+        %dot = ttng.warp_group_dot %a_alloc, %b_alloc, %acc {inputPrecision = 0 : i32, loop.cluster = 1 : i32, loop.stage = 2 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x256xf16, #shared, #smem> -> tensor<128x256xf32, #mma>
         scf.yield %dot : tensor<128x256xf32, #mma>
-      }
+      } {tt.scheduled_max_stage = 2 : i32}
       %ptrs = tt.splat %out : !tt.ptr<f32> -> tensor<128x256x!tt.ptr<f32>, #blocked1>
       %cvt = ttg.convert_layout %inner : tensor<128x256xf32, #mma> -> tensor<128x256xf32, #blocked1>
       tt.store %ptrs, %cvt : tensor<128x256x!tt.ptr<f32>, #blocked1>
