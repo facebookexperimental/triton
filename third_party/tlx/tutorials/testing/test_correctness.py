@@ -1100,15 +1100,14 @@ def test_amd_pa_decode(num_splits, query_length):
     sm_scale = 1.0 / math.sqrt(head_dim)
 
     query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
-        num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size,
-        query_length=query_length, device=DEVICE)
+        num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, query_length=query_length, device=DEVICE)
 
     out = torch.empty_like(query)
-    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
-                   query_length=query_length, num_splits=num_splits)
+    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, query_length=query_length,
+                   num_splits=num_splits)
 
-    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale,
-                             num_q_heads, num_kv_heads, query_length)
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, query_length)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 

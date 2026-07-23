@@ -22,8 +22,7 @@ HEAD_DIM = 128
 PAGE_SIZE = 64
 
 DECODE_METHODS = {
-    "tlx":
-    lambda out, q, kc, vc, ctx, bt, sm, qlen: _pa_decode_tlx(out, q, kc, vc, ctx, bt, sm, query_length=qlen),
+    "tlx": lambda out, q, kc, vc, ctx, bt, sm, qlen: _pa_decode_tlx(out, q, kc, vc, ctx, bt, sm, query_length=qlen),
 }
 DEFAULT_DECODE_VERSIONS = ["tlx"]
 
@@ -55,18 +54,16 @@ def create_benchmark(versions, qlen):
             args={},
         ))
     def benchmark(BATCH, N_CTX, provider):
-        sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+        sm_scale = 1.0 / (HEAD_DIM**0.5)
         # Bound physical KV memory for large sweeps via a shared page pool.
         pool = 4 * ((N_CTX + PAGE_SIZE - 1) // PAGE_SIZE) + 16
-        q, kc, vc, ctx, bt = _build_inputs(
-            BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
-            query_length=qlen, device=DEVICE, pool_pages=pool)
+        q, kc, vc, ctx, bt = _build_inputs(BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
+                                           query_length=qlen, device=DEVICE, pool_pages=pool)
         out = torch.empty_like(q)
         fn = DECODE_METHODS[provider]
         quantiles = [0.5, 0.2, 0.8]
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: fn(out, q, kc, vc, ctx, bt, sm_scale, qlen),
-            quantiles=quantiles, warmup=100, rep=200)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: fn(out, q, kc, vc, ctx, bt, sm_scale, qlen),
+                                                     quantiles=quantiles, warmup=100, rep=200)
 
         # Decode reads the whole KV cache once (K + V, bf16): report effective
         # HBM read bandwidth, the meaningful metric for this memory-bound op.
