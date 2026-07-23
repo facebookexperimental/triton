@@ -27,15 +27,17 @@ Two of the four schedules are already covered without touching AutoWS:
 - **Static persistent** — the while is *countable*, so `triton-uplift-while-to-for`
   rewrites it to an `scf.for` (carrying the annotations) before AutoWS runs. It is
   then warp-specialized by the existing `scf.for` path.
-- **Non-persistent** — the while is single-trip and eliminated by
-  `triton-simplify-single-trip-while`; there is no persistent loop to specialize.
+- **Non-persistent** — the while is kept through data partitioning and initial
+  loop scheduling, then `triton-simplify-single-trip-while` forwards AutoWS to
+  the scheduled inner loop and eliminates the single-trip outer loop before
+  partition scheduling.
 
 That leaves the **genuinely non-countable** schedules — **dynamic** (atomic
 work-stealing) and **CLC** (hardware `_valid`) — whose outer loop stays an
 `scf.while`. Today they are *not* warp-specialized. This doc describes making
 `PartitionSchedulingMeta` (the first AutoWS pass) schedule an `scf.while`.
 
-## Why it doesn't work today (and why SWP is *not* the blocker)
+## Implemented boundary (and why SWP is *not* the blocker)
 
 `PartitionSchedulingMeta` derives the partition schedule **structurally**
 (op categorization + MMA backward slices — see `PartitionSchedulingMeta.md`); it
@@ -45,7 +47,7 @@ only reads a pre-serialized schedule (`ttg.partition.stages` /
 its own. So warp-specializing the `while` does **not** require software
 pipelining it.
 
-The actual blocker is purely that the pass is typed on `scf::ForOp` and assumes
+The original blocker was that the pass was typed on `scf::ForOp` and assumed
 the single-region for-loop shape:
 
 - Entry walk: `getOperation().walk([&](scf::ForOp loop){ if hasAttr(tt.warp_specialize) })`
@@ -56,7 +58,9 @@ the single-region for-loop shape:
   body via `loop.getBody()`, `loop.getRegionIterArg(n)`, `loop.getInductionVar()`,
   `loop.getYieldedValues()`, `loop.getOps<scf::ForOp>()`.
 
-Everything downstream of the partition schedule already handles `scf.while`:
+The partition and PSM APIs now use `LoopLikeOpInterface` for the supported
+`scf.for` and ordered-subset-carry `scf.while` forms. Everything downstream of the
+partition schedule already handles `scf.while`:
 task-id propagation, data partition, and code partition each have `scf.while`
 lit tests (`ws_while_loop_autows.mlir`). So the change is concentrated in this
 one pass.
@@ -76,14 +80,13 @@ one pass.
 
 **Caveat — condition forwarding.** In an `scf.while`, loop-carried values flow
 `inits → before-args → scf.condition (forwards a subset, possibly reordered) →
-after-args → body → scf.yield → before-args`. The scheduler's cross-iteration
-tracing assumes yield-operand `i` ↔ body-arg `i` ↔ result `i`. That identity
-holds only when the `scf.condition` forwards **all** before-args in order — which
-is exactly what the tile-scheduler frontend emits (`scf.condition(%cond) %args…`
-in order). We therefore **guard**: a `while` is only scheduled when its
-`scf.condition` forwards every before-arg in index order. Any other shape falls
-back to "not warp-specialized" (the annotation becomes a documented no-op),
-rather than risking a mis-scheduled loop.
+after-args → body → scf.yield → before-args`. The CLC scheduler carries
+`(valid, x)` but forwards only `x`, so after-argument index 0 maps back to yield
+slot 1. The scheduler resolves both directions through the condition operands
+rather than assuming matching indices. It accepts a direct, unique, non-empty,
+order-preserving subset of before arguments; condition-only slots simply have
+no scheduled-body argument. Reordered, duplicate, or computed forwarding still
+falls back to an unspecialized loop.
 
 ## Design: a loop-body abstraction
 
@@ -99,18 +102,21 @@ Operation *getLoopBodyTerminator(LoopLikeOpInterface loop);
 ValueRange getLoopYieldedValues(LoopLikeOpInterface loop);
 Value    getLoopInductionVar(LoopLikeOpInterface loop); // for: iv; while: {} (null)
 // Maps a body-terminator operand index to the body block arg that carries it
-// into the next iteration.
+// into the next iteration, or null when the slot is condition-only.
 BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned yieldOperandIdx);
-// True when the while's scf.condition forwards all before-args in order
+// Maps a scheduled-body argument back to its corresponding yielded value.
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop, BlockArgument bodyArg);
+// True when the while's scf.condition forwards a supported ordered subset
 // (always true for scf.for). Loops failing this are skipped.
-bool hasIdentityLoopCarry(LoopLikeOpInterface loop);
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop);
 ```
 
 The one index subtlety, already present in the code: `findDefOpInLoop`
 (`~L940`) does `getYieldedValues()[arg.getArgNumber() - 1]` — the `-1` is the
-for-loop induction-var offset. `getLoopCarriedBodyArg` / the corresponding
-inverse hide this: for `scf.for`, body-arg `i+1` ↔ yield operand `i`; for
-`scf.while`, body-arg `i` ↔ yield operand `i`.
+for-loop induction-var offset. The paired carry helpers hide this: for
+`scf.for`, body-arg `i+1` maps to yield operand `i`; for `scf.while`, an after
+argument maps through its `scf.condition` operand to the corresponding before
+argument and yield slot.
 
 Nested-loop collection `mainLoop.getOps<scf::ForOp>()` (`~L334`, `~L1282`)
 becomes "collect `scf::ForOp` in the body block" via
@@ -127,7 +133,7 @@ the body block and iter-arg mapping are abstracted.
 ```cpp
 getOperation().walk([&](LoopLikeOpInterface loop) {
   if (!loop->hasAttr(kWarpSpecializeAttrName)) return;
-  if (isa<scf::WhileOp>(loop) && !hasIdentityLoopCarry(loop)) return; // safe skip
+  if (!hasSupportedLoopCarry(loop)) return; // safe skip
   loops.push_back(loop);
 });
 ```
@@ -186,16 +192,22 @@ then exercises `hopper_warpspec` (region split), task-id propagation,
 `WSDataPartition`, `WSCodePartition` (channels/barriers), and `WSMemoryPlanner`.
 None of these use `PartitionSet::iterate*`; they have their own loop handling
 with `scf.while` lit coverage for *simple* bodies (`ws_while_loop_autows.mlir`).
-A full GEMM tile body (TMA loads + MMA + epilogue store) in a `while` is not yet
-validated end-to-end, so any `scf::ForOp` assumption that surfaces there is
-empirical follow-on work — not a known blocker.
+A full GEMM tile body (TMA loads + MMA + epilogue store) is now validated
+through code partitioning and physical specialization in
+`ws_atomic_broadcast_from_psm.mlir`, and through the unified dynamic scheduler
+on Blackwell. That validation exposed one downstream `scf::ForOp` assumption:
+post-WS loop-schedule preprocessing only recognized an outer `scf.for`, so the
+nested K loop inside a specialized `scf.while` kept a partial schedule and the
+software pipeliner bailed. Preprocessing now recognizes both outer loop forms
+while continuing to pipeline only the nested K `scf.for`.
 
 ## Risks / invariants
 
 - **For-loop path must be byte-for-byte unchanged.** The helpers return exactly
   the current values for `scf::ForOp`; the for-loop regression suite
   (autows-testing) is the guard.
-- **Condition-forwarding guard** prevents mis-scheduling non-identity `while`s.
+- **Condition-forwarding guard** accepts only direct ordered subsets and
+  prevents mis-scheduling empty, reordered, duplicate, or computed forwarding.
 - Downstream buffer sizing uses `ttg.partition.stages`; the persistent `while`
   is depth-1 at the outer level (no outer pipelining), with the inner K-loop
   providing the producer/consumer overlap — same as the for-loop persistent
@@ -215,5 +227,15 @@ empirical follow-on work — not a known blocker.
 
 - [x] Frontend annotation on `while` (`AutoWSLoopOptions` + `tl.condition`) — done.
 - [x] `uplift-while-to-for` attribute transfer (static path) — done.
-- [ ] Loop-body abstraction + `PartitionSchedulingMeta` generalization — this doc.
-- [ ] Downstream end-to-end validation for dynamic/CLC.
+- [x] Loop-body abstraction + `PartitionSchedulingMeta` generalization — done.
+- [x] Atomic broadcast validated in isolation from a PSM-assigned outer while
+  (`ws_atomic_broadcast_from_psm.mlir`, via the new `nvgpu-test-ws-atomic-broadcast`
+  test pass). Task-id propagation already supplies the full-union `async_task_id`
+  the broadcast needs — no PSM change was required. See
+  `docs/DynamicPersistentAutoWSGaps.md`.
+- [x] Code partition, physical specialization, accumulation-counter rotation,
+  and nested K-loop rescheduling validated from a PSM-assigned outer while.
+- [x] Unified dynamic atomic scheduler correctness validated on Blackwell.
+- [x] Unified CLC scheduler correctness validated on Blackwell with an
+  unannotated inner K loop.
+- [ ] Hopper runtime validation of the unified dynamic atomic scheduler.

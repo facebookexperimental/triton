@@ -271,6 +271,11 @@ bool channelIsSubtiled(Channel *ch);
 // buffer.copy == 1 without misfiring on consumer-only-subtiled channels.
 bool channelIsCollapsedBothSubtiled(Channel *ch);
 
+// True when a reuse group needs a loop-carried accumulation counter. Keep this
+// predicate shared by counter counting, channel discovery, and loop rewriting
+// so collapsed subtiled groups cannot make their argument counts disagree.
+bool reuseGroupNeedsAccumCnt(ReuseGroup *group);
+
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,
