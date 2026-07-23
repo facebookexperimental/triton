@@ -52,6 +52,7 @@ def _sizevar_hint(sizevars, expr, fallback):
 from . import tlx_config
 from .mm_templates import (
     amd_addmm_warppipe_template,
+    amd_bmm_warppipe_persistent_template,
     amd_bmm_warppipe_template,
     blackwell_gemm_ws_template,
 )
@@ -1390,6 +1391,24 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             yield self._convert_config_to_template_kwargs(
                 triton_config, m, n, k, out_dtype
             )
+
+
+@register_template_heuristic(
+    amd_bmm_warppipe_persistent_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
+)
+class ROCmBMMWarpPipePersistentTemplateConfigHeuristic(
+    ROCmBMMWarpPipeTemplateConfigHeuristic
+):
+    """Persistent variant of the warp-pipe bmm heuristic. Same configs + gates as the non-
+    persistent one; just injects NUM_SMS (the persistent grid launches NUM_SMS programs that
+    stride over tiles). Both variants compete in the aten.bmm autotune -- persistent wins on
+    large-K (amortizes launch/setup), non-persistent on thin-M/small-tile shapes."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        num_sms = get_num_sms()
+        for kwargs in super()._get_template_configs_impl(kernel_inputs, op_name):
+            kwargs["NUM_SMS"] = num_sms
+            yield kwargs
 
 
 @register_template_heuristic(

@@ -345,6 +345,27 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
 
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_persistent_registered(self):
+        """The persistent bmm variant is registered and has the persistent while-loop structure.
+
+        It competes with the non-persistent variant in the aten.bmm autotune (autotune picks
+        persistent on large-K, non-persistent on thin-M/small-tile). No GPU needed -- source +
+        registration check.
+        """
+        from triton.language.extra.tlx.inductor.mm_templates import (
+            amd_bmm_warppipe_persistent_template,
+            load_tlx_template,
+        )
+
+        self.assertEqual(
+            amd_bmm_warppipe_persistent_template.name, "tlx_amd_bmm_warppipe_persistent"
+        )
+        src = load_tlx_template("amd_bmm_warppipe_persistent")
+        self.assertIn("while tile_id < num_tiles", src)  # persistent stride loop
+        self.assertIn("tile_id += NUM_SMS", src)
+        self.assertIn("tl.debug_barrier", src)  # inter-tile LDS-reuse barrier
+
 
 class TestWarpPipeSplitKCodegen(TestCase):
     """Deterministic codegen check for the AMD warp-pipe split-K template.

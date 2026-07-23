@@ -55,6 +55,14 @@ def _bmm_grid_warppipe(b, m, n, meta, *, cdiv):
     return (b * cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
 
 
+@SymbolicGridFn
+def _bmm_persistent_grid(b, m, n, meta, *, cdiv, min):
+    """Persistent grid for the warp-pipe bmm: min(NUM_SMS, BATCH * grid_m * grid_n) programs, each
+    striding over the (batch, tile) space in a while-loop. NUM_SMS is injected by the heuristic."""
+    num_tiles = b * cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"])
+    return (min(meta["NUM_SMS"], num_tiles), 1, 1)
+
+
 blackwell_gemm_ws_template = TritonTemplate(
     name="tlx_blackwell_gemm_ws",
     grid=_persistent_mm_grid_split_k,
@@ -82,6 +90,15 @@ amd_bmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("amd_bmm_warppipe"),
 )
 
+# Persistent variant of the warp-pipe bmm (NUM_SMS programs, 1 per CU, striding over tiles). Wins
+# on large-K bmm (amortizes launch/setup); competes with the non-persistent variant in the same
+# aten.bmm autotune, which picks per shape.
+amd_bmm_warppipe_persistent_template = TritonTemplate(
+    name="tlx_amd_bmm_warppipe_persistent",
+    grid=_bmm_persistent_grid,
+    source=load_tlx_template("amd_bmm_warppipe_persistent"),
+)
+
 
 def append_tlx(templates, op_name="mm"):
     # Import registry to trigger heuristic registration via decorators
@@ -105,6 +122,7 @@ def append_tlx(templates, op_name="mm"):
         uids = {getattr(t, "uid", None) for t in templates}
         if bmm_template.uid in uids and amd_bmm_warppipe_template.uid not in uids:
             templates.append(amd_bmm_warppipe_template)
+            templates.append(amd_bmm_warppipe_persistent_template)
     else:
         templates.append(blackwell_gemm_ws_template)
     return templates
