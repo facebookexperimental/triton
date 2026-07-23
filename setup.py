@@ -266,6 +266,34 @@ class CMakeBuild(build_ext):
         cmake_args += ["-DROCTRACER_INCLUDE_DIR=" + roctracer_include_dir]
         return cmake_args
 
+    def get_llvm_syspath(self):
+        # When LLVM_SYSPATH is set, the build uses that prebuilt LLVM directly.
+        # Otherwise build_helpers downloads the default prebuilt LLVM into the
+        # triton cache during the cmake configure step; resolve that path the
+        # same way build_helpers does so callers see the identical directory.
+        llvm_syspath = os.getenv("LLVM_SYSPATH")
+        if llvm_syspath:
+            return llvm_syspath
+        from python.build_helpers import BuildHelperArgs, get_llvm_package_info
+        helper_args = BuildHelperArgs(
+            cache_path=get_triton_cache_path(),
+            offline_build=check_env_flag("TRITON_OFFLINE_BUILD"),
+            llvm_system_suffix=os.getenv("TRITON_LLVM_SYSTEM_SUFFIX"),
+            llvm_syspath=None,
+            json_syspath=None,
+            ptxas_path=None,
+            ptxas_blackwell_path=None,
+            cuobjdump_path=None,
+            nvdisasm_path=None,
+            cudacrt_path=None,
+            cudart_path=None,
+            cupti_include_path=None,
+            cupti_lib_path=None,
+            cupti_lib_blackwell_path=None,
+        )
+        package = get_llvm_package_info(helper_args)
+        return os.path.join(get_triton_cache_path(), "llvm", package.name)
+
     def build_extension(self, ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
@@ -319,20 +347,6 @@ class CMakeBuild(build_ext):
                 "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
                 "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",
             ]
-
-        # Build against the default prebuilt LLVM (compiled on a newer distro) on
-        # a host with an older libstdc++: the prebuilt LLVM build tools
-        # (mlir-tblgen, clang++, opt, ...) that run during the build dynamically
-        # need GLIBCXX_3.4.30 (GCC 12) symbols absent from the host libstdc++.
-        # Build a drop-in libstdc++.so.6 and install it into the LLVM lib dir; the
-        # tools have RUNPATH "$ORIGIN/../lib" so they pick it up with no env, for
-        # any build invocation. See scripts/build-glibcxx-compat.sh.
-        if check_env_flag("TRITON_LIBSTDCXX_COMPAT"):
-            compat_dir = os.path.join(self.build_temp, "glibcxx-compat")
-            # LLVM_SYSPATH is required by the build (CMake fatal-errors without it).
-            llvm_lib = os.path.join(os.environ["LLVM_SYSPATH"], "lib")
-            subprocess.check_call(
-                [os.path.join(self.base_dir, "scripts", "build-glibcxx-compat.sh"), compat_dir, llvm_lib])
 
         if check_env_flag("TRITON_EXT_ENABLED"):
             cmake_args += ["-DTRITON_EXT_ENABLED=1"]
@@ -389,6 +403,22 @@ class CMakeBuild(build_ext):
         cmake_dir = get_cmake_dir()
         subprocess.check_call(["cmake", self.base_dir] + cmake_args, cwd=cmake_dir, env=env)
         update_symlink(Path(self.base_dir) / "compile_commands.json", cmake_dir / "compile_commands.json")
+
+        # Build against the default prebuilt LLVM (compiled on a newer distro) on
+        # a host with an older libstdc++: the prebuilt LLVM build tools
+        # (mlir-tblgen, clang++, opt, ...) that run during the build dynamically
+        # need GLIBCXX_3.4.30 (GCC 12) symbols absent from the host libstdc++.
+        # Build a drop-in libstdc++.so.6 and install it into the LLVM lib dir; the
+        # tools have RUNPATH "$ORIGIN/../lib" so they pick it up with no env, for
+        # any build invocation. See scripts/build-glibcxx-compat.sh. This runs
+        # after the cmake configure above, which is what downloads/extracts the
+        # default prebuilt LLVM, so the lib dir is guaranteed to exist here.
+        if check_env_flag("TRITON_LIBSTDCXX_COMPAT"):
+            compat_dir = os.path.join(self.build_temp, "glibcxx-compat")
+            llvm_lib = os.path.join(self.get_llvm_syspath(), "lib")
+            subprocess.check_call(
+                [os.path.join(self.base_dir, "scripts", "build-glibcxx-compat.sh"), compat_dir, llvm_lib])
+
         subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=cmake_dir)
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
 
