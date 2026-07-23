@@ -308,6 +308,43 @@ class TestTLXTemplates(TestCase):
             with self.assertRaises(Exception):
                 run_and_get_code(torch.compile(addmm), bias, a, w)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_bmm_warppipe(self, dtype: torch.dtype):
+        """TLX warp-pipelined bmm template (AMD MI350X / gfx950).
+
+        Batched C[b] = A[b] @ B[b], standard torch.bmm layout (B [batch,K,N] row-major, no
+        transpose). Same warp-pipe core as the addmm + a batch axis + per-batch int64 base
+        advance. K=272 is a multiple of 16 (the heuristic's alignment gate) but of no BLOCK_K in
+        the config set, so every config exercises the sync-tail. Verifies the TLX bmm lowers to a
+        Triton template (never extern/aten in force mode) and is numerically correct.
+        """
+        batch, M, K, N = 8, 256, 272, 256  # K=272 = 16*17: passes the ÷16 gate, exercises the tail
+        a = torch.randn(batch, M, K, device=GPU_TYPE, dtype=dtype)
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=dtype)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(bmm), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem", code_str)
+
 
 class TestWarpPipeSplitKCodegen(TestCase):
     """Deterministic codegen check for the AMD warp-pipe split-K template.
