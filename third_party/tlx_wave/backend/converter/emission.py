@@ -7085,7 +7085,12 @@ def _emit_local_load_mma_payload(state, op):
     wave_tile_axis = attrs.get("wave_tile_axis", "none")
     wave_tile_stride_dwords = int(attrs.get("wave_tile_stride_dwords", 0))
     load_mode = attrs.get("load_mode", "mma_payload_load")
-    offset_attr = ("component_dword_offsets" if load_mode == "mma_payload_load" else "component_tile_offsets")
+    if load_mode == "mma_payload_load":
+        offset_attr = "component_dword_offsets"
+    elif load_mode == "symbolic_mma_payload_load":
+        offset_attr = "component_coordinate_bases"
+    else:
+        offset_attr = "component_tile_offsets"
     if len(attrs[offset_attr]) != expected_components:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
@@ -7111,6 +7116,18 @@ def _emit_local_load_mma_payload(state, op):
     # MMA payload values carry the data dependency into MFMA.  The read token is
     # kept only as a lightweight anti-dependency for later writes that reuse the
     # same LDS slot; async_wait does not collect it into an unrelated barrier.
+    if load_mode == "symbolic_mma_payload_load":
+        value, read_token = _emit_symbolic_mma_payload_load(
+            state,
+            op,
+            attrs,
+            base,
+            element_type,
+            dependency,
+        )
+        state.values[data_result_id] = value
+        _finish_local_access(state, op, memdesc_target_id, read_token, "mma_read")
+        return
     if load_mode == "transpose_mma_payload_load":
         value, read_token = _emit_transpose_mma_payload_load(
             state,
@@ -7193,6 +7210,166 @@ def _emit_local_load_mma_payload(state, op):
         memdesc_target_id,
         _join_memory_tokens(state, load_tokens),
         "mma_read",
+    )
+
+
+def _emit_symbolic_mma_payload_load(
+    state,
+    op,
+    attrs,
+    base,
+    element_type,
+    dependency,
+):
+    lane_width = int(attrs["lane_width"])
+    packet_width = int(attrs["elements_per_lane"])
+    base_type = state.dsl.ptr_type(
+        element_type,
+        state.dsl.shared_address_space(),
+    )
+    base = _ptr_cast(state, base, base_type)
+    load_type = state.dsl.simd_type(
+        state.dsl.vector_type(packet_width, element_type),
+        width=lane_width,
+    )
+    item = state.dsl.sym("item")
+    slot = state.dsl.sym("slot")
+    payloads = []
+    load_tokens = []
+    for component, component_base in enumerate(
+        attrs["component_coordinate_bases"]
+    ):
+        logical_coords = _bit_linear_packet_coordinate_exprs(
+            state,
+            attrs,
+            tuple(int(value) for value in component_base),
+            item,
+            slot,
+            op,
+        )
+        element_offset = _local_physical_element_offset_from_coords_expr(
+            state,
+            attrs,
+            logical_coords,
+            op,
+        )
+        bit_offset = (
+            _element_byte_width(attrs["element_type"], op)
+            * 8
+            * element_offset
+        ).simplify()
+        payload, token = state.builder.gather(
+            [base],
+            load_type,
+            bit_offset=bit_offset,
+            after=dependency,
+        )
+        payloads.append(payload)
+        load_tokens.append(token)
+    return _pack_components(tuple(payloads)), _join_memory_tokens(
+        state,
+        load_tokens,
+    )
+
+
+def _bit_linear_packet_coordinate_exprs(
+    state,
+    attrs,
+    component_base,
+    item,
+    slot,
+    op,
+):
+    shape = tuple(int(dim) for dim in attrs["coordinate_shape"])
+    slot_coefficients = tuple(
+        tuple(int(value) for value in basis)
+        for basis in attrs["slot_coordinate_coefficients"]
+    )
+    item_coefficients = tuple(
+        tuple(int(value) for value in basis)
+        for basis in attrs["workitem_coordinate_coefficients"]
+    )
+    if (
+        len(component_base) != len(shape)
+        or any(len(basis) != len(shape) for basis in slot_coefficients)
+        or any(len(basis) != len(shape) for basis in item_coefficients)
+    ):
+        fail(
+            "TLXW_EMIT_BAD_COORDINATES",
+            STAGE,
+            "symbolic MMA payload coordinate bases do not match the tensor rank",
+            target_op_id=op.target_op_id,
+        )
+    coords = []
+    for dim, base in enumerate(component_base):
+        coord = state.dsl.sym_ctx.int_(int(base))
+        for bit, basis in enumerate(slot_coefficients):
+            coefficient = int(basis[dim])
+            if not coefficient:
+                continue
+            value = state.dsl.mod(state.dsl.floor(slot / (1 << bit)), 2)
+            if coefficient != 1:
+                value *= coefficient
+            coord = state.dsl.xor(coord, value)
+        for bit, basis in enumerate(item_coefficients):
+            coefficient = int(basis[dim])
+            if not coefficient:
+                continue
+            value = state.dsl.mod(state.dsl.floor(item / (1 << bit)), 2)
+            if coefficient != 1:
+                value *= coefficient
+            coord = state.dsl.xor(coord, value)
+        coords.append(coord)
+    return tuple(coords)
+
+
+def _local_physical_element_offset_from_coords_expr(
+    state,
+    attrs,
+    logical_coords,
+    op,
+):
+    shape = tuple(int(dim) for dim in attrs["coordinate_shape"])
+    physical_shape = tuple(
+        int(dim) for dim in attrs["memdesc_physical_shape"]
+    )
+    logical_origin = tuple(
+        int(value) for value in attrs["memdesc_logical_origin"]
+    )
+    if not (
+        len(logical_coords)
+        == len(shape)
+        == len(physical_shape)
+        == len(logical_origin)
+    ):
+        fail(
+            "TLXW_EMIT_BAD_COORDINATES",
+            STAGE,
+            "symbolic MMA payload view ranks do not match",
+            target_op_id=op.target_op_id,
+        )
+    physical_coords = tuple(
+        coord + int(origin)
+        for coord, origin in zip(logical_coords, logical_origin)
+    )
+    logical = _linearize_local_fragment_coords(
+        physical_shape,
+        physical_coords,
+    )
+    plan = attrs.get("shared_physical_offset_plan")
+    if plan == "dense_row_major":
+        return logical
+    if plan == "swizzled_xor":
+        return _swizzled_element_offset_expr(state, attrs, logical, op)
+    if plan == "linear_shared":
+        return _linear_shared_element_offset_expr(state, attrs, logical, op)
+    if plan == "padded_linear":
+        return _padded_element_offset_expr(state, attrs, logical, op)
+    fail(
+        "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"unsupported symbolic MMA payload physical offset plan {plan}",
+        target_op_id=op.target_op_id,
     )
 
 
