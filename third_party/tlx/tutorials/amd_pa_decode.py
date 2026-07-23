@@ -109,24 +109,23 @@ def _pa_decode_partition_kernel(
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), Vc.dtype.element_ty, BUFFER_DEPTH)
 
     if PAGES_PER_TILE == 4:
-        g_idx = 0
-        pidx = start_page
-        logical_page = pidx + offs_n // PAGE_SIZE
+        preload_slot = (start_page // PAGES_PER_TILE) % 2
+        logical_page = start_page + offs_n // PAGE_SIZE
         safe_page = tl.minimum(logical_page, end_page - 1)
         physical = tl.load(BlockTables + seq * stride_bt_s + safe_page * stride_bt_p)
         page_row = offs_n % PAGE_SIZE
         k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
-                    page_row[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
+                  page_row[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
         v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
-                    page_row[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
-        tlx.local_store(tlx.local_view(k_buf, g_idx), tl.load(k_ptrs))
-        tlx.local_store(tlx.local_view(v_buf, g_idx), tl.load(v_ptrs))        
-        start_page += PAGES_PER_TILE
-        g_idx += 1
+                  page_row[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
+        tlx.local_store(tlx.local_view(k_buf, preload_slot), tl.load(k_ptrs))
+        tlx.local_store(tlx.local_view(v_buf, preload_slot), tl.load(v_ptrs))
+        tl.debug_barrier()
         
-        for pidx in tl.range(start_page, end_page, PAGES_PER_TILE):
-            l_idx = 1 - (g_idx % 2)
-            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, l_idx)))
+        for pidx in tl.range(start_page + PAGES_PER_TILE, end_page, PAGES_PER_TILE):
+            r_idx = 1 - ((pidx // PAGES_PER_TILE) % 2)
+            w_idx = (pidx // PAGES_PER_TILE) % 2
+            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, r_idx)))
 
             logical_page = pidx + offs_n // PAGE_SIZE
             safe_page = tl.minimum(logical_page, end_page - 1)
@@ -139,10 +138,10 @@ def _pa_decode_partition_kernel(
             k_next = tl.load(k_ptrs)
             v_next = tl.load(v_ptrs)
             # tl.debug_barrier()
-            v = tlx.local_load(tlx.local_view(v_buf, l_idx))
+            v = tlx.local_load(tlx.local_view(v_buf, r_idx))
 
             qk = tl.dot(q, kt)
-            kt_abs = pidx * PAGE_SIZE + offs_n
+            kt_abs = (pidx - PAGES_PER_TILE) * PAGE_SIZE + offs_n
             vis = ((kt_abs[None, :] < end_page * PAGE_SIZE) &
                    (kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])))
             qk = tl.where(vis, qk * QK_SCALE, float("-inf"))
@@ -153,18 +152,18 @@ def _pa_decode_partition_kernel(
             l_i = l_i * alpha + tl.sum(p, 1)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             m_i = m_new
-            k_view = tlx.local_view(k_buf, (g_idx % 2))
-            v_view = tlx.local_view(v_buf, (g_idx % 2))
+            k_view = tlx.local_view(k_buf, (w_idx % 2))
+            v_view = tlx.local_view(v_buf, (w_idx % 2))
             tlx.local_store(k_view, k_next)
             tlx.local_store(v_view, v_next)
-            g_idx += 1
             tl.debug_barrier()
         # last tile in lds to be processed
-        l_idx = 1 - (g_idx % 2)
-        kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, l_idx)))
+        last_page = end_page - PAGES_PER_TILE
+        last_r_idx = (last_page // PAGES_PER_TILE) % 2
+        kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, last_r_idx)))
         qk = tl.dot(q, kt)
-        v = tlx.local_load(tlx.local_view(v_buf, l_idx))
-        kt_abs = pidx * PAGE_SIZE + offs_n
+        v = tlx.local_load(tlx.local_view(v_buf, last_r_idx))
+        kt_abs = last_page * PAGE_SIZE + offs_n
         vis = ((kt_abs[None, :] < end_page * PAGE_SIZE) &
                 (kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])))
         qk = tl.where(vis, qk * QK_SCALE, float("-inf"))
