@@ -108,6 +108,20 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
 def _layout_kind_and_properties(attr, value_id, *, encoding=None):
     if attr is None:
         return "none", {}
+    if _attr_bool(attr, "is_tlx_no_verify_layout"):
+        inner = _attr_value(attr, "get_tlx_no_verify_layout")
+        return _layout_kind_and_properties(
+            inner,
+            value_id,
+            encoding=str(inner),
+        )
+    if _attr_bool(attr, "is_tlx_user_layout"):
+        inner = _attr_value(attr, "get_tlx_user_layout")
+        return _layout_kind_and_properties(
+            inner,
+            value_id,
+            encoding=str(inner),
+        )
     if _attr_bool(attr, "is_blocked_encoding"):
         return "blocked", {
             "size_per_thread": _int_tuple(_attr_value(attr, "get_blocked_size_per_thread")),

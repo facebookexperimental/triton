@@ -23,6 +23,29 @@ def _assert_no_layout_residue(ttgir):
     assert "ttg.require_layout" not in ttgir, "require_layout boundary leaked into final IR"
 
 
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_user_register_layout_smem_loop_carried_amd():
+    """Alternating user/no-verify wrapper order must disappear across an AMD loop edge."""
+
+    @triton.jit
+    def kernel(REG: tl.constexpr, n):
+        initial = tl.zeros((256, 8), tl.int8)
+        buf = tlx.local_alloc((256, 8), tl.int8, tl.constexpr(1))
+        view = tlx.local_view(buf, 0)
+        tlx.local_store(view, initial)
+        value = tlx.local_load(view, layout=REG)
+        for _ in tl.range(0, n, num_stages=1):
+            value += 1
+        tlx.local_store(view, value)
+
+    reg = tlx.layout(
+        shape=((32, 2, 4), (8, )),
+        stride=((64, 1, 2), (8, )),
+    )
+    compiled = kernel.warmup(reg, 4, grid=(1, ), num_warps=4)
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+
+
 _A16W16_SHARED_INTERVALS = [(512, 16)]
 
 _A16W16_SHARED_OFFSET_BASES = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0],
