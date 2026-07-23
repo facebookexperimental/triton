@@ -1,6 +1,10 @@
-"""SKC Phase B CPU tests (main venv; no flash_attn import)."""
+"""SKC Phase B CPU tests (main venv; no flash_attn import).
+
+Tests touching the FA4 clone need env FA4_CUTE=<clone>/flash_attn/cute.
+"""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -8,16 +12,23 @@ import pytest
 from skc_cute import binder_cute, fa4_pin
 
 PKG = Path(__file__).resolve().parent.parent
-FA4_CUTE = Path("/projects/kzhou6/hwu27/baselines/flash-attention/flash_attn/cute")
+FA4_CUTE = Path(os.environ.get("FA4_CUTE", ""))  # flash_attn/cute dir of the pinned FA4 clone
+
+
+def _need_fa4():
+    if not str(FA4_CUTE) or not FA4_CUTE.exists():
+        pytest.skip("set FA4_CUTE to the FA4 clone flash_attn/cute dir")
 
 
 def test_pin_matches_clone():
+    _need_fa4()
     if not fa4_pin.PIN_FILE.exists():
         pytest.skip("pin not yet written")
     fa4_pin.verify_pin(FA4_CUTE)
 
 
 def test_pin_detects_drift(tmp_path):
+    _need_fa4()
     if not fa4_pin.PIN_FILE.exists():
         pytest.skip("pin not yet written")
     import shutil
@@ -64,6 +75,7 @@ def test_bind_bwd_invariants(tmp_path):
 
 def test_fa4_source_facts_still_hold():
     """The binder's E1 expectations are keyed to source facts — re-grep them."""
+    _need_fa4()
     src = (FA4_CUTE / "flash_fwd_sm100.py").read_text()
     # the untuned 1-CTA nc key must still be absent from _TUNING_CONFIG
     assert "(False, False, 128, False)" not in src.split("_FP8_TUNING_CONFIG")[0]

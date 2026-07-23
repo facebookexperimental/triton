@@ -13,7 +13,7 @@ LD_LIBRARY_PATH unset:
         --bars triton_ws_on,tlx_default,jos --mode fwd --out bench/results_fwd.json
 
 The `fa4` / `fa4_bwd` bars shell out to bench/fa4_worker.py under the separate
-FA4 venv (/projects/kzhou6/hwu27/baselines/.venv-fa4).
+FA4 venv (set env FA4_PYTHON to its python binary).
 
 GPU clocks cannot be locked (non-root); instead
 `nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu` is recorded
@@ -44,7 +44,7 @@ TOOLS_DIR = PKG_DIR.parent  # third_party/tlx/tools/
 REPO_ROOT = TOOLS_DIR.parents[2]
 EXAMPLES = TOOLS_DIR / "sched2tlx" / "examples"
 TUTORIAL_FA = REPO_ROOT / "python" / "tutorials" / "06-fused-attention.py"
-FA4_PYTHON = Path("/projects/kzhou6/hwu27/baselines/.venv-fa4/bin/python")
+FA4_PYTHON = Path(os.environ.get("FA4_PYTHON", ""))  # FA4 venv python
 
 BATCH = 4
 NUM_HEADS = 32
@@ -459,8 +459,9 @@ def make_registry(args):
 
 
 def run_fa4(cfg, mode, args):
-    if not FA4_PYTHON.exists():
-        return {"ok": False, "reason": f"fa4 venv python missing: {FA4_PYTHON}"}
+    if not str(FA4_PYTHON) or not FA4_PYTHON.exists():
+        return {"ok": False,
+                "reason": "set FA4_PYTHON to the FA4 venv python binary"}
     cmd = [
         str(FA4_PYTHON), str(BENCH_DIR / "fa4_worker.py"), "--mode", mode,
         "--b", str(cfg.batch), "--h", str(cfg.heads), "--s", str(cfg.seqlen),

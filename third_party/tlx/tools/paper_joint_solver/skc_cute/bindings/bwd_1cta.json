@@ -1,6 +1,6 @@
 {
  "kind": "bwd",
- "solution": "/projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/paper_joint_solver/bwd_skc_solution.json",
+ "solution": "bwd_skc_solution.json",
  "solver_point": {
   "ii": 95,
   "length": 273

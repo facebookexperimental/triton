@@ -49,7 +49,7 @@ Forward (`--mode fwd`):
 | `tlx_default` | emitted baseline-schedule kernel `case3_FA_fp16/generated.py::fa_fwd_kernel_nows`, tensor prep per that dir's `fa_fwd_nows_fp16.py run()` (flattened [Z·H·N, D] tensors, grid (cdiv(N,128), Z·H)) |
 | `jos` | solver-schedule kernel, default `case3_FA_fp16_subtiled/generated.py::fa_fwd_kernel_nows_subtiled`, same launch shape, grid cdiv(N,128).  Point `--jos-file` at a regenerated file (kernel name must stay `fa_fwd_kernel_nows_subtiled`) |
 | `cudnn` | torch SDPA forced to `SDPBackend.CUDNN_ATTENTION`, inputs (B,H,S,D) fp16 |
-| `fa4` | `flash_attn.cute.interface.flash_attn_func` via `bench/fa4_worker.py` under the separate venv `/projects/kzhou6/hwu27/baselines/.venv-fa4` (layout B,S,H,D) |
+| `fa4` | `flash_attn.cute.interface.flash_attn_func` via `bench/fa4_worker.py` under the separate FA4 venv (env `FA4_PYTHON`) (layout B,S,H,D) |
 
 Backward (`--mode bwd`):
 

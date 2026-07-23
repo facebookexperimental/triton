@@ -4,7 +4,7 @@
 # Usage: run_phase_b.sh {m4|e3|bwd} [out.jsonl]
 set -u
 PKG="$(cd "$(dirname "$0")/.." && pwd)"
-PY=/projects/kzhou6/hwu27/baselines/.venv-fa4/bin/python
+PY="${FA4_PYTHON:?set FA4_PYTHON to the FA4 venv python binary}"
 OUT="${2:-$PKG/skc_cute/results_$1.jsonl}"
 run() { # name dis2cta worker extra...
   local name=$1 dis=$2 worker=$3; shift 3

@@ -3,7 +3,7 @@
 
 > 论文系统代号 **JOS**（Joint Optimal Scheduler）。范围与落地方式为用户指定的两项偏差
 > （仅 Blackwell/B200；codegen 用 emitter→TLX 而非论文的手工 CUDA C++），其余按论文 1:1。
-> 全部审计与过程记录见 `/projects/kzhou6/hwu27/repro-plan-b200-tlx.md` §14–§20。
+> 全部审计与过程记录见复现工作区的 plan 文档（仓库外维护）§14–§20。
 
 ---
 

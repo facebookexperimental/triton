@@ -2,7 +2,7 @@
 
 Solution : None
 DDG      : None
-Skeleton : skc.skeleton_fwd (verified blackwell_fa_ws protocol)
+Skeleton : skc.skeleton_fwd (verified handwritten-kernel protocol)
 
 Binding audit:
   {
@@ -14,9 +14,10 @@ Binding audit:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, '/projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/paper_joint_solver')
+# instances live in the paper_joint_solver dir, next to the skc package
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from skc.skeleton_fwd import attention as _skeleton_attention  # noqa: E402
+from skc.skeleton_fwd import attention as _skeleton_entry  # noqa: E402
 
 PARAMS = {
     "BLOCK_M": 256,
@@ -36,5 +37,5 @@ AUDIT = {
 }
 
 
-def attention(q, k, v, sm_scale):
-    return _skeleton_attention(q, k, v, sm_scale, PARAMS)
+def attention(*args, **kwargs):
+    return _skeleton_entry(*args, params=PARAMS, **kwargs)

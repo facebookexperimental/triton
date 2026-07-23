@@ -1,6 +1,6 @@
 """Self-contained FA4 timing worker for bench_bars — run under the FA4 venv:
 
-    env -u LD_LIBRARY_PATH /projects/kzhou6/hwu27/baselines/.venv-fa4/bin/python \
+    env -u LD_LIBRARY_PATH "$FA4_PYTHON" \
         bench/fa4_worker.py --mode fwd --b 4 --h 32 --s 4096 --d 128
 
 Uses flash_attn.cute.interface.flash_attn_func; layout is (B, S, H, D).

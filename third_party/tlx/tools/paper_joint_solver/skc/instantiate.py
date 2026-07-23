@@ -22,7 +22,8 @@ Binding audit:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, {pkg_dir!r})
+# instances live in the paper_joint_solver dir, next to the skc package
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from skc.{skeleton_mod} import {entry} as _skeleton_entry  # noqa: E402
 
@@ -41,18 +42,27 @@ _SKELETONS = {
 }
 
 
+def _relativize(path):
+    """Record provenance paths relative to the package dir, not the machine."""
+    if path is None:
+        return None
+    pkg = Path(__file__).resolve().parent.parent
+    try:
+        return Path(path).resolve().relative_to(pkg.parent).as_posix()
+    except ValueError:
+        return Path(path).name
+
+
 def render(params: dict, audit: dict, *, solution_path, ddg_path, out_path,
            skeleton="fwd"):
     skeleton_mod, entry = _SKELETONS[skeleton]
-    pkg_dir = str(Path(__file__).resolve().parent.parent)
     audit_json = json.dumps(audit, indent=2, default=str)
     text = _TEMPLATE.format(
-        solution=solution_path,
-        ddg=ddg_path,
+        solution=_relativize(solution_path),
+        ddg=_relativize(ddg_path),
         skeleton_mod=skeleton_mod,
         entry=entry,
         audit_block="\n".join("  " + ln for ln in audit_json.splitlines()),
-        pkg_dir=pkg_dir,
         params=json.dumps(params, indent=4),
         audit=audit_json,
     )

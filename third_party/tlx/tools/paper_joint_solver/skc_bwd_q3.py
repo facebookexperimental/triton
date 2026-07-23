@@ -17,7 +17,8 @@ Binding audit:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, '/projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/paper_joint_solver')
+# instances live in the paper_joint_solver dir, next to the skc package
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from skc.skeleton_bwd import bwd_attention as _skeleton_entry  # noqa: E402
 

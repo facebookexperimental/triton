@@ -1,6 +1,6 @@
 {
  "kind": "fwd",
- "solution": "/projects/kzhou6/hwu27/triton-beta-3-paper-solver-wt/third_party/tlx/tools/paper_joint_solver/subtiled_fa4exact_solution.json",
+ "solution": "subtiled_fa4exact_solution.json",
  "solver_point": {
   "ii": 66,
   "length": 148,

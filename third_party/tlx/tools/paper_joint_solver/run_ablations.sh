@@ -8,7 +8,8 @@
 # the ablation's UNSAT result.
 set -u
 VENV=../../../../.venv/bin/python
-export LD_LIBRARY_PATH=/projects/kzhou6/hwu27/tools/yices-2.7.0/lib:/projects/kzhou6/hwu27/tools/cudd/lib
+# SOLVER_LIB_PATH: colon-separated lib dirs holding yices/cudd shared objects
+export LD_LIBRARY_PATH="${SOLVER_LIB_PATH:?set SOLVER_LIB_PATH to <yices>/lib:<cudd>/lib}"
 SUB=../sched2tlx/examples/case3_FA_fp16_subtiled/ddg.json
 FWD=../sched2tlx/examples/case3_FA_fp16/ddg.json
 OUT=ablations

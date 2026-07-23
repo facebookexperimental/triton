@@ -161,7 +161,7 @@ def bind_fwd(solution_path=None, out_path=None):
             FA4_1CTA_EXPECT["kv_stage"], FA4_1CTA_EXPECT["split_P_arrive"])
 
     binding = {
-        "kind": "fwd", "solution": str(solution_path),
+        "kind": "fwd", "solution": Path(solution_path).name,
         "solver_point": {"ii": sol["ii"], "length": sol["length"],
                          "num_warps": sol["stats"].get("num_warps")},
         "verifies": {
@@ -223,7 +223,7 @@ def bind_bwd(solution_path=None, out_path=None):
             raise ValueError(f"bwd quota candidate {name} not multiples of 8")
 
     binding = {
-        "kind": "bwd", "solution": str(solution_path),
+        "kind": "bwd", "solution": Path(solution_path).name,
         "solver_point": {"ii": sol["ii"], "length": sol["length"]},
         "verifies": {
             "Q_stage": {"expect": 2, "solver_source":
