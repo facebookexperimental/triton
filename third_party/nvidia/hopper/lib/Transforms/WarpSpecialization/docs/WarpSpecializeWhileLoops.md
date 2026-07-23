@@ -37,7 +37,7 @@ work-stealing) and **CLC** (hardware `_valid`) — whose outer loop stays an
 `scf.while`. Today they are *not* warp-specialized. This doc describes making
 `PartitionSchedulingMeta` (the first AutoWS pass) schedule an `scf.while`.
 
-## Why it doesn't work today (and why SWP is *not* the blocker)
+## Implemented boundary (and why SWP is *not* the blocker)
 
 `PartitionSchedulingMeta` derives the partition schedule **structurally**
 (op categorization + MMA backward slices — see `PartitionSchedulingMeta.md`); it
@@ -47,7 +47,7 @@ only reads a pre-serialized schedule (`ttg.partition.stages` /
 its own. So warp-specializing the `while` does **not** require software
 pipelining it.
 
-The actual blocker is purely that the pass is typed on `scf::ForOp` and assumes
+The original blocker was that the pass was typed on `scf::ForOp` and assumed
 the single-region for-loop shape:
 
 - Entry walk: `getOperation().walk([&](scf::ForOp loop){ if hasAttr(tt.warp_specialize) })`
@@ -58,7 +58,9 @@ the single-region for-loop shape:
   body via `loop.getBody()`, `loop.getRegionIterArg(n)`, `loop.getInductionVar()`,
   `loop.getYieldedValues()`, `loop.getOps<scf::ForOp>()`.
 
-Everything downstream of the partition schedule already handles `scf.while`:
+The partition and PSM APIs now use `LoopLikeOpInterface` for the supported
+`scf.for` and identity-carry `scf.while` forms. Everything downstream of the
+partition schedule already handles `scf.while`:
 task-id propagation, data partition, and code partition each have `scf.while`
 lit tests (`ws_while_loop_autows.mlir`). So the change is concentrated in this
 one pass.
@@ -217,5 +219,5 @@ empirical follow-on work — not a known blocker.
 
 - [x] Frontend annotation on `while` (`AutoWSLoopOptions` + `tl.condition`) — done.
 - [x] `uplift-while-to-for` attribute transfer (static path) — done.
-- [ ] Loop-body abstraction + `PartitionSchedulingMeta` generalization — this doc.
+- [x] Loop-body abstraction + `PartitionSchedulingMeta` generalization — done.
 - [ ] Downstream end-to-end validation for dynamic/CLC.

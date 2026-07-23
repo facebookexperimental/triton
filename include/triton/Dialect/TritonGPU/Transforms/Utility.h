@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <algorithm>
 #include <numeric>
+#include <utility>
 
 namespace mlir {
 class DominanceInfo;
@@ -208,6 +209,31 @@ struct LoopCarriedSlot {
 // Build the slot descriptor for iter-arg index `k`
 // (k < loop.getRegionIterArgs().size()).
 LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k);
+
+// Return the single block/region that partition scheduling treats as the loop
+// body. For scf.while this is the "after" region; the "before" region is loop
+// control and is replicated later by task-id propagation.
+Block *getLoopBodyBlock(LoopLikeOpInterface loop);
+Region &getLoopBodyRegion(LoopLikeOpInterface loop);
+Operation *getLoopBodyTerminator(LoopLikeOpInterface loop);
+ValueRange getLoopYieldedValues(LoopLikeOpInterface loop);
+
+// Return the induction variable for scf.for, or a null Value for scf.while.
+Value getLoopInductionVar(LoopLikeOpInterface loop);
+
+// Trace a loop-carried value to its defining result and iteration distance.
+// Returns a null result and zero distance for non-carried values and cycles.
+std::pair<OpResult, int64_t>
+getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value);
+
+// Map carried-value slot `k` to its argument in the scheduled body.
+BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k);
+
+// Partition scheduling supports scf.while only when scf.condition forwards
+// every before-region argument exactly once and in the same order. scf.for is
+// identity-carry by construction; other LoopLikeOpInterface implementations
+// are unsupported.
+bool hasIdentityLoopCarry(LoopLikeOpInterface loop);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);
