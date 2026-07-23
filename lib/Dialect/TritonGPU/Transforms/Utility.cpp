@@ -903,6 +903,115 @@ LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
   return slot;
 }
 
+Block *getLoopBodyBlock(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getBody();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation()))
+    return whileOp.getAfterBody();
+  llvm_unreachable("unsupported loop type");
+}
+
+Region &getLoopBodyRegion(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getBodyRegion();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation()))
+    return whileOp.getAfter();
+  llvm_unreachable("unsupported loop type");
+}
+
+Operation *getLoopBodyTerminator(LoopLikeOpInterface loop) {
+  return getLoopBodyBlock(loop)->getTerminator();
+}
+
+ValueRange getLoopYieldedValues(LoopLikeOpInterface loop) {
+  return getLoopBodyTerminator(loop)->getOperands();
+}
+
+Value getLoopInductionVar(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getInductionVar();
+  if (isa<scf::WhileOp>(loop.getOperation()))
+    return {};
+  llvm_unreachable("unsupported loop type");
+}
+
+std::pair<OpResult, int64_t>
+getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value) {
+  int64_t distance = 0;
+  DenseSet<Value> seen;
+  Block *body = getLoopBodyBlock(loop);
+  Value inductionVar = getLoopInductionVar(loop);
+  while (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (arg.getOwner() != body || arg == inductionVar)
+      return {nullptr, 0};
+    ++distance;
+    value = getLoopCarriedYieldedValue(loop, arg);
+    if (!value)
+      return {nullptr, 0};
+    if (!seen.insert(value).second)
+      return {nullptr, 0};
+  }
+  return {dyn_cast<OpResult>(value), distance};
+}
+
+BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getRegionIterArg(k);
+  if (isa<scf::WhileOp>(loop.getOperation()))
+    return getLoopCarriedSlot(loop, k).afterArg;
+  llvm_unreachable("unsupported loop type");
+}
+
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop,
+                                 BlockArgument bodyArg) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation())) {
+    if (bodyArg.getOwner() != forOp.getBody() ||
+        bodyArg == forOp.getInductionVar())
+      return {};
+    return getLoopYieldedValues(loop)[bodyArg.getArgNumber() - 1];
+  }
+
+  auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation());
+  if (!whileOp || bodyArg.getOwner() != whileOp.getAfterBody())
+    return {};
+  unsigned forwardedIdx = bodyArg.getArgNumber();
+  auto forwarded = whileOp.getConditionOp().getArgs();
+  if (forwardedIdx >= forwarded.size())
+    return {};
+  auto beforeArg = dyn_cast<BlockArgument>(forwarded[forwardedIdx]);
+  if (!beforeArg || beforeArg.getOwner() != whileOp.getBeforeBody())
+    return {};
+  return getLoopYieldedValues(loop)[beforeArg.getArgNumber()];
+}
+
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop) {
+  if (isa<scf::ForOp>(loop.getOperation()))
+    return true;
+  auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation());
+  if (!whileOp)
+    return false;
+
+  auto beforeArgs = loop.getRegionIterArgs();
+  auto forwarded = whileOp.getConditionOp().getArgs();
+  if (forwarded.empty() ||
+      whileOp.getAfterArguments().size() != forwarded.size() ||
+      whileOp.getNumResults() != forwarded.size() ||
+      getLoopYieldedValues(loop).size() != beforeArgs.size())
+    return false;
+
+  std::optional<unsigned> previousIdx;
+  for (Value value : forwarded) {
+    auto arg = dyn_cast<BlockArgument>(value);
+    if (!arg || arg.getOwner() != whileOp.getBeforeBody())
+      return false;
+    unsigned idx = arg.getArgNumber();
+    if (idx >= beforeArgs.size() || (previousIdx && idx <= *previousIdx))
+      return false;
+    previousIdx = idx;
+  }
+  return true;
+}
+
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
                                       TypeRange newResultTypes) {
   SmallVector<std::tuple<Value, Value>> replacements;

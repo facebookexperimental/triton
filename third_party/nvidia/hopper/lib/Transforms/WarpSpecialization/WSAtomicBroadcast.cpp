@@ -36,6 +36,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Pass/Pass.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
@@ -443,5 +445,29 @@ LogicalResult doDynamicTileBroadcast(triton::FuncOp funcOp,
   }
   return success();
 }
+
+#define GEN_PASS_DEF_NVGPUTESTWSATOMICBROADCAST
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+// Test-only wrapper that runs `doDynamicTileBroadcast` in isolation so the
+// outer-`scf.while` broadcast path can be validated with lit, chained after
+// `nvgpu-partition-scheduling-meta` + `nvgpu-test-taskid-propagate`. Mirrors
+// `nvgpu-test-taskid-propagate`: a reject (unsupported atomic/CLC shape)
+// surfaces as a pass failure rather than performing the orchestrator's
+// WS-metadata teardown, which the full `nvgpu-warp-specialization` pass owns.
+class NVGPUTestWSAtomicBroadcastPass
+    : public impl::NVGPUTestWSAtomicBroadcastBase<
+          NVGPUTestWSAtomicBroadcastPass> {
+public:
+  using impl::NVGPUTestWSAtomicBroadcastBase<
+      NVGPUTestWSAtomicBroadcastPass>::NVGPUTestWSAtomicBroadcastBase;
+
+  void runOnOperation() override {
+    getOperation()->walk([&](triton::FuncOp funcOp) {
+      if (failed(doDynamicTileBroadcast(funcOp, tilePrefetchDepth)))
+        signalPassFailure();
+    });
+  }
+};
 
 } // namespace mlir

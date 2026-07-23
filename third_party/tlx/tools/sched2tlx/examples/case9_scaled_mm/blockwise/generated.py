@@ -121,7 +121,7 @@ def _scaled_mm_blockwise(
         # Async task: role=TMA ← inner wg3 (Phase 4 plan)
         with tlx.async_task(num_warps=4, num_regs=152):
             smem_accum = 0
-            # Re-materialize function-scope register tensors locally (a 
+            # Re-materialize function-scope register tensors locally (a
             # non-default warp group cannot capture RankedTensorType).
             _wgloc600 = tl.arange(0, 128)
             # Outer persistent loop (loop 1, II=45824). Each task replays it; body trimmed to this WG's ops.
@@ -143,7 +143,7 @@ def _scaled_mm_blockwise(
         with tlx.async_task("default"):
             smem_accum = 0
             tmem_accum_cnt = 0
-            # Re-materialize function-scope register tensors locally (a 
+            # Re-materialize function-scope register tensors locally (a
             # non-default warp group cannot capture RankedTensorType).
             _wgloc600 = tl.arange(0, 128)
             # Outer persistent loop (loop 1, II=45824). Each task replays it; body trimmed to this WG's ops.
