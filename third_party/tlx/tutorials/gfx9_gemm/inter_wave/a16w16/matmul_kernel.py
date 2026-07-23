@@ -44,6 +44,14 @@ NUM_XCDS = 8
 MIN_K = 2 * BLOCK_K  # pipeline prefetches 2 whole K-tiles; the rest goes to the masked tail
 KERNEL_NAME = "a16w16_8wave"
 
+# Coalesced SIMD register layout for the [HALF_M, HALF_N] = [128, 128] fp16 quadrant
+# store (num_warps=8, warp_size=64): each thread holds 8 contiguous N elements ->
+# 128-bit buffer_store_dwordx4. Applied to the epilogue store via tlx.require_layout
+# so tritongpu-coalesce sets the store to this #linear layout and AMD
+# OptimizeEpilogue leaves it alone (it only rewrites #blocked stores) -- keeping the
+# wide coalesced store instead of the narrow MMA-accumulator (dwordx2) fallback.
+_C_STORE_SIMD_LAYOUT = tlx.layout(shape=((16, 4, 8), (8, 4)), stride=((8, 128, 512), (1, 4096)))
+
 
 def _swz_offset_bases(shape, contig_dim):
     """Padded-shared swizzle offset bases for a 2D fp16 half-tile, derived from the
@@ -385,14 +393,35 @@ def a16w16_8wave(
     if SPLIT_K == 1:
         # Direct store to C -- exact no-op vs the champion kernel.
         et = c_ptr.dtype.element_ty
-        tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], acc_tl.to(et),
-                 mask=m_top & n_left)
-        tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :], acc_bl.to(et),
-                 mask=m_bot & n_left)
-        tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :], acc_tr.to(et),
-                 mask=m_top & n_right)
-        tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :], acc_br.to(et),
-                 mask=m_bot & n_right)
+        if HALF_M == 128 and HALF_N == 128:
+            # Pin each 128x128 quadrant to the coalesced SIMD #linear layout (no LDS
+            # staging) so OptimizeEpilogue keeps the wide dwordx4 store.
+            # _C_STORE_SIMD_LAYOUT is derived for the 128x128 quadrant, so it only
+            # applies to the 256x256 tile; a smaller tile (64x64 quadrant) uses a
+            # plain store.
+            L: tl.constexpr = _C_STORE_SIMD_LAYOUT
+            c_tl = tlx.require_layout(acc_tl.to(et), L)
+            # Static guard (no device code): the pin must survive coalesce /
+            # remove-layout-conversions / AMD optimize-epilogue so the store stays
+            # a wide dwordx4. Fails compilation if a future change drops the pin.
+            tlx.assert_same_layout(c_tl, L)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
+                     c_tl, mask=m_top & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
+                     tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
+                     tlx.require_layout(acc_tr.to(et), L), mask=m_top & n_right)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
+                     tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
+        else:
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
+                     acc_tl.to(et), mask=m_top & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
+                     acc_bl.to(et), mask=m_bot & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
+                     acc_tr.to(et), mask=m_top & n_right)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
+                     acc_br.to(et), mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
