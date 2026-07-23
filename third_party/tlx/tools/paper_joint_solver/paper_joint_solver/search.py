@@ -31,7 +31,13 @@ def run_search(prob: Problem, num_warps: int | None = None,
                allow_cross_warp: bool = True, max_ii_span: int = 8,
                ilp_seconds: float = 300.0, smt_seconds: float | None = None,
                max_wall_s: float = 3600.0, minimize_warps: bool = True,
-               max_probes_per_ii: int = 6) -> SearchResult:
+               max_probes_per_ii: int | None = None) -> SearchResult:
+    """Per Algorithm 1 the inner loop probes the FULL L window while
+    ceil(L/I) is unchanged (it is finite: the window closes when the ceiling
+    grows).  max_probes_per_ii=None is the paper-faithful default; an integer
+    is an explicit resource cap, like max_ii_span / max_wall_s (plan doc
+    sec 12 resource-limit class).
+    """
     t0 = time.time()
     attempts: list[dict] = []
     start_ii = prob.min_ii()
@@ -45,7 +51,8 @@ def run_search(prob: Problem, num_warps: int | None = None,
         length = m.length
         copies = -(-length // ii)
         probes = 0
-        while -(-length // ii) == copies and probes < max_probes_per_ii:
+        while (-(-length // ii) == copies
+               and (max_probes_per_ii is None or probes < max_probes_per_ii)):
             if time.time() - t0 > max_wall_s:
                 break
             t1 = time.time()

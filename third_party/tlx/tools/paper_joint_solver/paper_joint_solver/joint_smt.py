@@ -285,10 +285,11 @@ def solve_joint(prob: Problem, ii: int, length: int,
             # The wait excludes other ops from the warp's ISSUE slots.  An
             # asynchronous op (TC/TMA) holds its warp only for the issue
             # cycle — its execution runs on the fixed-function unit (paper
-            # Fig 2); synchronous CUDA/SFU/TMEM work occupies the warp for
-            # its full duration.
+            # Fig 2); a synchronous op occupies the warp for its full
+            # duration cycles(o) — the paper's window bound, the same
+            # quantity COMPLETION uses, i.e. normalized lat.
             async_issue = prob.nodes[o].pipeline in ("TC", "TMA")
-            win = 1 if async_issue else max(1, prob.occ[o])
+            win = 1 if async_issue else max(1, prob.lat[o])
             for i in range(copies):
                 for ip in range(copies):
                     lo_gap = Terms.arith_leq_atom(
