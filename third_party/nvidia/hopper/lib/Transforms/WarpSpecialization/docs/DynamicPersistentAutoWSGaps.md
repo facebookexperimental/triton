@@ -249,8 +249,19 @@ Required coverage:
    `dynamic-generated-separate-subtile-4`,
    `dynamic-dp2-generated-separate-subtile-2`, and `dynamic-broadcast-depth-2`,
    all passing on Blackwell. Hopper feature-combination runtime remains pending.
-6. **Bailout E2E/lit**: scatter, strict-subset, non-carried, and unrelated
-   replicated atomics leave a compilable non-WS kernel.
+6. **Bailout E2E/lit** [done]: unsupported replicated atomics/CLC fetches leave a
+   compilable non-WS kernel. Coverage: (a) **E2E** — a scatter-atomic
+   dynamic-persistent outer-while GEMM
+   (`test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize_bailout`)
+   asserts `ttg.warp_specialize`/`async_task_id` absent **and** numerical
+   correctness on Blackwell; (b) **classify-branch lit** —
+   `ws_atomic_broadcast_reject_classify.mlir` pins strict-subset, non-carried,
+   and CLC (not-in-while, subset) rejects via `not triton-opt
+   --nvgpu-test-ws-atomic-broadcast` (the test pass `signalPassFailure`s on
+   reject); (c) **full-pass teardown** — the scatter case in
+   `ws_atomic_broadcast_reject.mlir` proves the shared, category-independent
+   `bailOut`/`removeWarpSpecMetadata` teardown. ("non-carried" and
+   "unrelated-replicated" are the same `getLoopCarryingWhile==null` check.)
 7. **Hopper and Blackwell**: CLC sibling correctness is covered on Blackwell;
    unified dynamic atomic correctness remains to be run on Hopper.
 8. **Performance**: compare static persistent, dynamic inner-loop AutoWS,
