@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
+from triton import knobs
 from triton._internal_testing import is_hip, is_hip_cdna4, is_hip_gfx1250
 from triton.compiler.compiler import ASTSource, compile as triton_compile
 from triton.compiler.errors import CompilationError
@@ -27,6 +28,12 @@ from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.a4w4.bench import (
+    compile_shape as _compile_a4w4_shape,
+    generate_mxfp4_inputs as _generate_a4w4_inputs,
+    launch_matmul as _launch_a4w4,
+    torch_reference as _a4w4_reference,
+)
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -1173,3 +1180,27 @@ def test_tlx_gfx9_gemm_bench_loads_modules_without_import_leaks():
     assert hasattr(module, "matmul")
     assert list(sys.path) == before_path
     assert module.__name__ not in sys.modules
+
+
+def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
+    with knobs.runtime.scope():
+        knobs.runtime.override_arch = "gfx950"
+        _compile_a4w4_shape((256, 256, 1024), tmp_path)
+
+    ttgir = next(tmp_path.rglob("_a4w4_kernel.ttgir")).read_text()
+    amdgcn = next(tmp_path.rglob("_a4w4_kernel.amdgcn")).read_text()
+    assert ttgir.count("tt.dot_scaled") == 8
+    assert "#tlx.user_layout" not in ttgir
+    assert "#tlx.no_verify_layout" not in ttgir
+    assert amdgcn.count("v_mfma_scale_f32_16x16x128_f8f6f4") == 512
+    assert "buffer_store_dwordx4" in amdgcn
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
+    m = n = 256
+    k = 1024
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _launch_a4w4(a, b, a_scales, b_scales)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
