@@ -1404,21 +1404,24 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     dv = tlx.release_layout(dv)
     dk *= SM_SCALE
     # Causal and non-causal modes use Gluon's whole-tile epilogue: narrow while
-    # retaining native MFMA ownership, then redistribute to eight contiguous
-    # BF16 values per lane. The current compiler canonicalizes the equivalent
-    # convert-then-cast source ordering to this same BF16 conversion, so ordering
-    # is not a separate performance claim. ``cast_layout`` is still required to
-    # preserve the MFMA encoding; an ordinary ``to(bfloat16)`` drops it and fails
-    # verification.
+    # retaining native MFMA ownership, then anchor the final store to eight
+    # contiguous BF16 values per lane. ``cast_layout`` is required to preserve
+    # the MFMA encoding; an ordinary ``to(bfloat16)`` drops it and fails
+    # verification. The hard ``require_layout`` store anchor is provided by
+    # #2290, so Coalesce and AMD OptimizeEpilogue retain the coalesced store
+    # ownership without pinning the intermediate MFMA arithmetic.
     # Gluon's newer full-attention D64-half epilogue raised TLX from 496 to 503
-    # VGPR for N=200, so the lower-resource whole-tile conversion remains used.
+    # VGPR for N=200, so the lower-resource whole-tile epilogue remains used.
     dk_mma = _require_layout_soft(dk, mma_nd)
-    dv_mma = _require_layout_soft(dv, mma_nd)
     dk_bf16 = tlx.cast_layout(dk_mma, tl.bfloat16)
+    dk_vec = tlx.require_layout(dk_bf16, kv_async_layout)
+    tl.store(DK + key_ptrs, dk_vec, mask=key_mask)
+    # Keep dV's physical conversion explicit. Pinning both output stores makes
+    # the causal N=200 build cross the gfx950 register-spill threshold; the
+    # dK-only anchor preserves the coalesced dwordx4 stores without that spill.
+    dv_mma = _require_layout_soft(dv, mma_nd)
     dv_bf16 = tlx.cast_layout(dv_mma, tl.bfloat16)
-    dk_vec = tlx.convert_layout(dk_bf16, kv_async_layout)
     dv_vec = tlx.convert_layout(dv_bf16, kv_async_layout)
-    tl.store(DK + key_ptrs, tlx.release_layout(dk_vec), mask=key_mask)
     tl.store(DV + key_ptrs, tlx.release_layout(dv_vec), mask=key_mask)
 
 
