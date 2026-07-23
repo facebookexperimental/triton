@@ -120,9 +120,11 @@ and classifies it `Transform`. The owner resolves to the TMA-load partition via
 new thin test pass wrapping `doDynamicTileBroadcast`, mirroring
 `nvgpu-test-taskid-propagate`; the step has no standalone pass otherwise.)
 
-The remaining gap is end-to-end validation through **code partitioning**
-(channel/barrier synthesis, while accumulation counters) and physical
-specialization for a full GEMM while body.
+The same fixture now continues through the production warp-specialization path,
+validating channel/barrier synthesis, while accumulation counters, physical
+specialization, and depth-2 broadcast slot/phase rotation for a full GEMM while
+body. The unified `DynamicPersistent1DScheduler` outer-while path is also
+correct on Blackwell. Hopper runtime and the CLC sibling remain to be validated.
 
 ## Cleanup and Bailout Foundation
 
@@ -155,8 +157,9 @@ narrower:
 
 - preserve the inner K-loop schedule while the outer while is partitioned and
   cloned;
-- make post-WS loop-schedule preprocessing recognize that the specialized
-  outer control flow can be an `scf.while`;
+- post-WS loop-schedule preprocessing recognizes an annotated outer
+  `scf.while` and marks its already-staged innermost `scf.for` loops for
+  schedule completion;
 - do not interpret `tt.num_stages` on the outer dynamic while as a request to
   software-pipeline that while.
 
@@ -217,10 +220,10 @@ frontend diagnostic; stages belong on the nested K loop.
 
 ## Test Gaps
 
-The current E2E dynamic GEMM test validates the manual atomic scheduler shape
-with inner-loop AutoWS. It does not prove that an annotated outer while is the
-selected AutoWS loop. The unified `DynamicPersistent1DScheduler` currently has
-frontend IR-shape coverage, but no outer-while AutoWS E2E coverage.
+The unified `DynamicPersistent1DScheduler` now validates an annotated outer
+while with an unannotated K loop on Blackwell, including numerical correctness
+and the absence of incomplete pipeline-stage diagnostics. Cross-architecture
+and feature-combination coverage remains open.
 
 Required coverage:
 
@@ -229,12 +232,13 @@ Required coverage:
    atomic, and while terminators. (`ws_while_loop_autows.mlir`.)
 2. **Negative PSM lit** [done]: reordered/subset condition forwarding is skipped
    without partial metadata. (`ws_while_loop_autows.mlir`.)
-3. **Atomic integration lit** [partial]: PSM + task propagation + atomic
-   broadcast from an initially unpartitioned outer while is done
-   (`ws_atomic_broadcast_from_psm.mlir`, accept + depth-2). Extending the same
-   chain through **code partitioning** is still pending.
-4. **Unified E2E**: `DynamicPersistent1DScheduler` with outer
-   `tl.condition(..., warp_specialize=True)` and an unannotated K loop.
+3. **Atomic integration lit** [done]: PSM + task propagation + atomic broadcast
+   from an initially unpartitioned outer while, extended through code
+   partitioning, physical specialization, depth-2 slot/phase rotation, and
+   nested K-loop rescheduling. (`ws_atomic_broadcast_from_psm.mlir`.)
+4. **Unified E2E** [Blackwell done]: `DynamicPersistent1DScheduler` with outer
+   `tl.condition(..., warp_specialize=True)` and an unannotated K loop. Hopper
+   remains pending.
 5. **Feature E2E**: epilogue subtiles, DP=2, separate epilogue store, generated
    subtiled regions, and broadcast depths greater than one.
 6. **Bailout E2E/lit**: scatter, strict-subset, non-carried, and unrelated
@@ -246,11 +250,8 @@ Required coverage:
 
 ## Recommended Implementation Order
 
-1. Validate the existing atomic broadcast and while accumulation-counter paths
-   against the newly assigned outer schedule. **Atomic broadcast is validated in
-   isolation** (`ws_atomic_broadcast_from_psm.mlir`); the accumulation-counter /
-   code-partition half of this step is still open.
-2. Add unified dynamic E2E and feature combinations.
+1. Complete unified dynamic E2E coverage on Hopper and add the CLC sibling.
+2. Add feature combinations.
 3. Address dynamic 2-CTA as a separate cluster-level design.
 
 ## Definition of Done

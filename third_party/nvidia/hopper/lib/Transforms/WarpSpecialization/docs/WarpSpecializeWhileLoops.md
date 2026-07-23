@@ -190,9 +190,14 @@ then exercises `hopper_warpspec` (region split), task-id propagation,
 `WSDataPartition`, `WSCodePartition` (channels/barriers), and `WSMemoryPlanner`.
 None of these use `PartitionSet::iterate*`; they have their own loop handling
 with `scf.while` lit coverage for *simple* bodies (`ws_while_loop_autows.mlir`).
-A full GEMM tile body (TMA loads + MMA + epilogue store) in a `while` is not yet
-validated end-to-end, so any `scf::ForOp` assumption that surfaces there is
-empirical follow-on work — not a known blocker.
+A full GEMM tile body (TMA loads + MMA + epilogue store) is now validated
+through code partitioning and physical specialization in
+`ws_atomic_broadcast_from_psm.mlir`, and through the unified dynamic scheduler
+on Blackwell. That validation exposed one downstream `scf::ForOp` assumption:
+post-WS loop-schedule preprocessing only recognized an outer `scf.for`, so the
+nested K loop inside a specialized `scf.while` kept a partial schedule and the
+software pipeliner bailed. Preprocessing now recognizes both outer loop forms
+while continuing to pipeline only the nested K `scf.for`.
 
 ## Risks / invariants
 
@@ -225,5 +230,7 @@ empirical follow-on work — not a known blocker.
   test pass). Task-id propagation already supplies the full-union `async_task_id`
   the broadcast needs — no PSM change was required. See
   `docs/DynamicPersistentAutoWSGaps.md`.
-- [ ] Downstream end-to-end validation for dynamic/CLC (code partition + physical
-  specialization for a full GEMM while body).
+- [x] Code partition, physical specialization, accumulation-counter rotation,
+  and nested K-loop rescheduling validated from a PSM-assigned outer while.
+- [x] Unified dynamic atomic scheduler correctness validated on Blackwell.
+- [ ] Hopper runtime validation and unified CLC coverage.
