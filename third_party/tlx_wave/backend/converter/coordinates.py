@@ -15,6 +15,14 @@ class CoordinatePlan:
     workitem_coefficients: tuple[tuple[int, ...], ...]
 
 
+@dataclass(frozen=True)
+class PacketCoordinatePlan:
+    shape: tuple[int, ...]
+    component_bases: tuple[tuple[int, ...], ...]
+    slot_coefficients: tuple[tuple[int, ...], ...]
+    workitem_coefficients: tuple[tuple[int, ...], ...]
+
+
 def layout_coordinate_plan(
     layout,
     component_count,
@@ -91,6 +99,144 @@ def layout_coordinate_plan(
         workitem_coefficients=tuple(
             tuple(int(value) for value in coefficients) for coefficients in workitem_coefficients),
     )
+
+
+def packet_layout_coordinate_plan(
+    layout,
+    component_count,
+    packet_width,
+    lane_width,
+    warp_count,
+    op,
+    source_value_id,
+):
+    """Split a distributed register basis into component, slot, and item."""
+    if layout.kind not in {
+        "blocked",
+        "linear",
+        "generic_linear",
+        "slice",
+        "amd_mfma",
+        "dot_operand",
+    }:
+        return None
+    shape = tuple(int(dim) for dim in layout.shape)
+    component_count = int(component_count)
+    packet_width = int(packet_width)
+    lane_width = int(lane_width)
+    warp_count = int(warp_count)
+    if (
+        component_count <= 0
+        or not _is_power_of_two(packet_width)
+        or not _is_power_of_two(lane_width)
+        or not _is_power_of_two(warp_count)
+    ):
+        _packet_fail(
+            "packet coordinate materialization requires positive components "
+            "and power-of-two packet, lane, and warp extents",
+            layout,
+            op,
+            source_value_id,
+        )
+    linear = layouts.distributed_linear_layout(
+        layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    register_count = layouts.linear_layout_in_dim_size(linear, "register")
+    if register_count != component_count * packet_width:
+        _packet_fail(
+            "packet component grouping does not cover the layout register dimension",
+            layout,
+            op,
+            source_value_id,
+        )
+    block_bases = layouts.linear_layout_bases(linear, "block")
+    if any(any(int(value) for value in basis) for basis in block_bases):
+        _packet_fail(
+            "packet coordinate materialization does not support nontrivial block bases",
+            layout,
+            op,
+            source_value_id,
+        )
+
+    register_bases = _logical_dim_bases(linear, "register")
+    slot_bits = packet_width.bit_length() - 1
+    if len(register_bases) < slot_bits:
+        _packet_fail(
+            "packet width exceeds the layout register basis",
+            layout,
+            op,
+            source_value_id,
+        )
+    slot_coefficients = tuple(register_bases[:slot_bits])
+    workitem_coefficients = _workitem_coefficients(
+        linear,
+        lane_width.bit_length() - 1,
+        warp_count.bit_length() - 1,
+    )
+    component_bases = tuple(
+        layouts.linear_layout_coords(
+            linear,
+            component * packet_width,
+            0,
+            warp=0,
+        )
+        for component in range(component_count)
+    )
+
+    for component, component_base in enumerate(component_bases):
+        for slot in range(packet_width):
+            register = component * packet_width + slot
+            for warp in range(warp_count):
+                for lane in range(lane_width):
+                    workitem = warp * lane_width + lane
+                    planned = _coords_from_packet_plan(
+                        component_base,
+                        slot_coefficients,
+                        workitem_coefficients,
+                        slot,
+                        workitem,
+                    )
+                    actual = layouts.linear_layout_coords(
+                        linear,
+                        register,
+                        lane,
+                        warp=warp,
+                    )
+                    if planned != actual:
+                        _packet_fail(
+                            "packet coordinate plan does not match linear layout bases",
+                            layout,
+                            op,
+                            source_value_id,
+                        )
+    return PacketCoordinatePlan(
+        shape=shape,
+        component_bases=tuple(
+            tuple(int(value) for value in base) for base in component_bases
+        ),
+        slot_coefficients=tuple(
+            tuple(int(value) for value in basis)
+            for basis in slot_coefficients
+        ),
+        workitem_coefficients=tuple(
+            tuple(int(value) for value in basis)
+            for basis in workitem_coefficients
+        ),
+    )
+
+
+def packet_slots_are_contiguous_along_dimension(plan, dimension):
+    dimension = int(dimension)
+    if dimension < 0 or dimension >= len(plan.shape):
+        return False
+    expected = []
+    for bit in range(len(plan.slot_coefficients)):
+        basis = [0] * len(plan.shape)
+        basis[dimension] = 1 << bit
+        expected.append(tuple(basis))
+    return tuple(plan.slot_coefficients) == tuple(expected)
 
 
 def is_default_flat_make_range(plan, lane_width):
@@ -275,6 +421,24 @@ def _coords_from_plan(component_base, workitem_coefficients, workitem):
     return tuple(coords)
 
 
+def _coords_from_packet_plan(
+    component_base,
+    slot_coefficients,
+    workitem_coefficients,
+    slot,
+    workitem,
+):
+    coords = list(
+        _coords_from_plan(component_base, workitem_coefficients, workitem)
+    )
+    for bit, coefficients in enumerate(slot_coefficients):
+        if not (int(slot) & (1 << bit)):
+            continue
+        for dim, coefficient in enumerate(coefficients):
+            coords[dim] ^= int(coefficient)
+    return tuple(coords)
+
+
 def _xor_masks_are_additive(bases, coefficients):
     occupied = 0
     for coefficient in coefficients:
@@ -322,6 +486,17 @@ def _fail(message, layout, op, source_value_id):
         "TLXW_OP_MAKE_RANGE_LAYOUT",
         STAGE,
         f"tt.make_range {message}; layout={layout.kind} "
+        f"shape={tuple(layout.shape)} bases={_basis_pattern(layout)}",
+        source_op_index=op.index,
+        source_value_id=source_value_id,
+    )
+
+
+def _packet_fail(message, layout, op, source_value_id):
+    fail(
+        "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+        STAGE,
+        f"local_load {message}; layout={layout.kind} "
         f"shape={tuple(layout.shape)} bases={_basis_pattern(layout)}",
         source_op_index=op.index,
         source_value_id=source_value_id,

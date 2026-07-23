@@ -10429,6 +10429,17 @@ def _fragment_local_load_plan(
     view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
     layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
     layout = (None if layout_id is None else type_layout_program.layouts[int(layout_id)])
+    symbolic_plan = _noncontiguous_mma_payload_gather_plan(
+        memdesc,
+        view,
+        layout,
+        result_layout,
+        component_count,
+        registers,
+        op,
+    )
+    if symbolic_plan is not None:
+        return symbolic_plan
     transpose_plan = _transpose_mma_payload_load_plan(
         memdesc,
         view,
@@ -10466,6 +10477,85 @@ def _fragment_local_load_plan(
         "warps_per_cta": tuple(offset_plan["warps_per_cta"]),
         "wave_tile_axis": offset_plan["wave_tile_axis"],
         "wave_tile_stride_dwords": int(offset_plan["wave_tile_stride_dwords"]),
+    }
+
+
+def _noncontiguous_mma_payload_gather_plan(
+    memdesc,
+    view,
+    layout,
+    result_layout,
+    component_count,
+    registers,
+    op,
+):
+    """Represent non-contiguous register packets as symbolic gathers."""
+    element_byte_width = int(memdesc.element_byte_width or 0)
+    if element_byte_width <= 0 or 4 % element_byte_width:
+        return None
+    packet_width = int(registers) * (4 // element_byte_width)
+    lane_width = int(result_layout.lane_width or 64)
+    warp_count = layouts.layout_warp_count(result_layout)
+    plan = coordinates.packet_layout_coordinate_plan(
+        result_layout,
+        int(component_count),
+        int(packet_width),
+        lane_width,
+        int(warp_count),
+        op,
+        result_layout.value_id,
+    )
+    op_idx = int(result_layout.properties.get("op_idx", -1))
+    k_dim = 1 if op_idx == 0 else 0 if op_idx == 1 else -1
+    if coordinates.packet_slots_are_contiguous_along_dimension(plan, k_dim):
+        return None
+    if memdesc.element_type != result_layout.element_type:
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "symbolic MMA payload gather requires matching memdesc and result element types",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    if tuple(int(dim) for dim in memdesc.shape) != tuple(plan.shape):
+        fail(
+            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
+            STAGE,
+            "symbolic MMA payload gather requires the local view and dot operand shapes to match",
+            source_op_index=op.index,
+            source_value_id=result_layout.value_id,
+        )
+    attrs = _encoded_shared_layout_attrs(
+        layout,
+        view.physical_shape,
+        element_byte_width,
+        op,
+    )
+    return {
+        **attrs,
+        "component_coordinate_bases": tuple(
+            tuple(int(value) for value in base)
+            for base in plan.component_bases
+        ),
+        "coordinate_shape": tuple(int(dim) for dim in plan.shape),
+        "elements_per_lane": int(packet_width),
+        "load_mode": "symbolic_mma_payload_load",
+        "memdesc_shape": tuple(int(dim) for dim in memdesc.shape),
+        "memdesc_logical_origin": tuple(
+            int(value) for value in view.logical_origin
+        ),
+        "memdesc_physical_shape": tuple(
+            int(dim) for dim in view.physical_shape
+        ),
+        "slot_coordinate_coefficients": tuple(
+            tuple(int(value) for value in basis)
+            for basis in plan.slot_coefficients
+        ),
+        "source_shape": tuple(int(dim) for dim in plan.shape),
+        "workitem_coordinate_coefficients": tuple(
+            tuple(int(value) for value in basis)
+            for basis in plan.workitem_coefficients
+        ),
     }
 
 

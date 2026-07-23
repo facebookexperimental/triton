@@ -15061,10 +15061,10 @@ def test_tlx_wave_converter_lowers_chunked_blocked_dot_operand_pack(tmp_path):
 
 @pytest.mark.parametrize(
     "instr_shape,k_width,tensor_shape,source_components,source_registers,"
-    "result_components,result_scalars",
+    "result_components,result_scalars,expected_mode",
     [
-        ((32, 32, 16), 4, (256, 64), 4, 16, 8, 64),
-        ((16, 16, 32), 8, (128, 64), 8, 4, 4, 32),
+        ((32, 32, 16), 4, (256, 64), 4, 16, 8, 64, "alias"),
+        ((16, 16, 32), 8, (128, 64), 8, 4, 4, 32, "redistribute"),
     ],
     ids=["mfma32", "mfma16"],
 )
@@ -15077,6 +15077,7 @@ def test_tlx_wave_converter_lowers_mfma_fragment_to_dot_operand(
     source_registers,
     result_components,
     result_scalars,
+    expected_mode,
 ):
     preamble = f"""
 #mma = #ttg.amd_mfma<{{version = 4, warpsPerCTA = [4, 1], instrShape = [{instr_shape[0]}, {instr_shape[1]}, {instr_shape[2]}], isTransposed = true}}>
@@ -15096,25 +15097,30 @@ def test_tlx_wave_converter_lowers_mfma_fragment_to_dot_operand(
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
+    assert attrs["mode"] == expected_mode
     assert attrs["result_component_count"] == result_components
-    assert attrs["result_registers_per_component"] == 8
     assert attrs["result_slot_count"] == result_scalars
     assert attrs["source_component_count"] == source_components
-    assert attrs["source_registers_per_component"] == source_registers
     assert attrs["source_slot_count"] == source_components * source_registers
-    assert attrs["cross_wave"] is False
     assert "scratch_allocation_bytes" not in attrs
     wave = output.emitted_module.text
     assert f"vector<{source_registers}xbf16>" in wave
     assert "vector<8xbf16>" in wave
-    assert wave.count("wave.redistribute") == 1
+    assert wave.count("wave.redistribute") == (expected_mode == "redistribute")
     assert "wave.alloc" not in wave
     assert "wave.barrier" not in wave
     assert "wave.store" not in wave
     assert "wave.load" not in wave
     machine = _run_waveamd_to_machine(wave)
-    assert "waveamdmachine.ds_bpermute_b32" in machine
+    if expected_mode == "alias":
+        assert attrs["source_packet_width"] == source_registers
+        assert attrs["result_packet_width"] == 8
+        assert "waveamdmachine.ds_bpermute_b32" not in machine
+    else:
+        assert attrs["result_registers_per_component"] == 8
+        assert attrs["source_registers_per_component"] == source_registers
+        assert attrs["cross_wave"] is False
+        assert "waveamdmachine.ds_bpermute_b32" in machine
     assert "waveamdmachine.ds_store" not in machine
     assert "waveamdmachine.ds_load" not in machine
     assert "waveamdmachine.s_barrier" not in machine
@@ -15147,16 +15153,27 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
         converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
     ]
     assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "swizzled_mma_payload_load",
-        "transpose_mma_payload_load",
+        "symbolic_mma_payload_load",
+        "symbolic_mma_payload_load",
     ]
     assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
         "swizzled_xor",
         "swizzled_xor",
     ]
     assert all(attrs["shared_physical_swizzled_vec"] == 8 for attrs in local_load_attrs)
+    assert [attrs["slot_coordinate_coefficients"] for attrs in local_load_attrs] == [
+        ((0, 1), (0, 2), (0, 8)),
+        ((1, 0), (2, 0), (8, 0)),
+    ]
     assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
     assert [op.kind for op in output.target_program.ops].count("layout_convert") == 0
+    wave = output.emitted_module.text
+    assert wave.count("wave.gather") == 4
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 4
+    assert machine.count("waveamdmachine.ds_read_tr_b64_b16") == 4
+    assert "waveamdmachine.ds_bpermute_b32" not in machine
+    assert "waveamdmachine.v_permlane32_b32" not in machine
     del ctx
 
 
@@ -15222,7 +15239,7 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     ]
 
     assert len(local_load_attrs) == 1
-    assert local_load_attrs[0]["load_mode"] == "transpose_mma_payload_load"
+    assert local_load_attrs[0]["load_mode"] == "symbolic_mma_payload_load"
     assert local_load_attrs[0]["shared_physical_offset_plan"] == "padded_linear"
     assert local_load_attrs[0]["shared_physical_intervals"] == (4, )
     assert local_load_attrs[0]["shared_physical_paddings"] == (16, )
@@ -15242,12 +15259,18 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
         (32, 0),
     )
     assert "shared_layout_kind" not in local_load_attrs[0]
-    assert local_load_attrs[0]["chunk_element_deltas"] == ((0, 2560), ) * 8
+    assert local_load_attrs[0]["slot_coordinate_coefficients"] == (
+        (1, 0),
+        (2, 0),
+        (8, 0),
+    )
     wave = output.emitted_module.text
-    assert "wave.gather" in wave
+    assert wave.count("wave.gather") == 8
     assert "waveamd.transpose_load" not in wave
     machine = _run_waveamd_to_machine(wave)
-    assert "waveamdmachine.ds_read_tr_b64_b16" in machine
+    assert machine.count("waveamdmachine.ds_read_tr_b64_b16") == 16
+    assert "waveamdmachine.ds_load" not in machine
+    assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
 
 
