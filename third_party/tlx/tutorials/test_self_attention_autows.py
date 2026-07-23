@@ -17,7 +17,6 @@ Notes:
 
 Run: pytest third_party/tlx/tutorials/test_self_attention_autows.py
 """
-import math
 import os
 import sys
 
@@ -83,8 +82,14 @@ def test_self_attention_fwd_autows(L, Z):
     for tsr in (q, k, v):
         tsr.grad = None
     o = A.triton_hstu_mha(
-        max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, enable_tma=True,
+        max_seq_len=L,
+        alpha=1.0 / D,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=so,
+        attn_scale=asc,
+        enable_tma=True,
     )
     o.backward(do)
     dq, dk, dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
