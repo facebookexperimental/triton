@@ -1073,7 +1073,8 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
 
 
 # ============================================================================
-# Test 2e: Outer-loop AutoWS through a unified scheduler while.
+# Test 2e: Outer-loop AutoWS through a unified scheduler while;
+# dynamic persistent keeps the outer while and pipelines its nested K loop.
 # ============================================================================
 _UNIFIED_OUTER_AUTOWS_CONFIGS = [
     pytest.param(tl.NonPersistentScheduler, 128, 128, 1, 1, 1, False, False, id="nonpersistent-baseline"),
@@ -1255,6 +1256,9 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             assert "scf.while" not in ttgir, "Expected countable static-persistent while to uplift to scf.for"
         else:
             assert "scf.while" in ttgir, "Expected dynamic and CLC schedules to retain their outer while"
+            if SCHEDULE is tl.DynamicPersistent1DScheduler:
+                assert "tt.scheduled_max_stage" in ttgir, "Expected the nested K loop to retain its stage count"
+                assert "loop.stage" in ttgir, "Expected the nested K loop operations to retain their stage assignments"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
