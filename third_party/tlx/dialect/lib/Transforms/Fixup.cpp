@@ -201,6 +201,27 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
         }
         return;
       }
+      // tt.store: value / ptr / mask must share one encoding
+      // (SameLoadStoreOperandsEncoding). If the value carries a user pin,
+      // propagate it to ptr/mask so make_ttir's verifier accepts the store
+      // without a per-op tolerance; concrete layouts resolve later in make_ttgir.
+      // Bridge (require_layout convert) the ptr/mask for this use only, leaving
+      // their producers (addptr / mask cmp, with their own same-encoding
+      // verifiers) untouched.
+      if (auto store = dyn_cast<::mlir::triton::StoreOp>(op)) {
+        SmallVector<Value> linked{store.getValue(), store.getPtr()};
+        if (store.getMask())
+          linked.push_back(store.getMask());
+        Attribute enc = findPlaceholder(linked, op);
+        if (enc) {
+          bridgeOrRetype(store.getPtr(), enc, op, /*operandIdx=*/0,
+                         /*forceBridge=*/true);
+          if (store.getMask())
+            bridgeOrRetype(store.getMask(), enc, op, /*operandIdx=*/2,
+                           /*forceBridge=*/true);
+        }
+        return;
+      }
       // scf.for: init / region iter-arg / yield operand / result of each
       // loop-carried value must share the encoding.
       if (auto forOp = dyn_cast<scf::ForOp>(op)) {

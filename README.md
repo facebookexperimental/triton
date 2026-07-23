@@ -1031,6 +1031,23 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     tlx.dump_layout(v)                  # -> // cute: _64:_1
     ```
 
+- `x = tlx.require_layout(x, layout)` **[Hopper+, MI300+]**
+
+    Pin a register tensor `x`'s layout as a hard user anchor. `layout` is a
+    `tlx.layout(...)` (Shape:Stride) mapped to a `#linear` encoding and wrapped as
+    `#tlx.no_verify_layout(#tlx.user_layout(...))`. The inner `#tlx.user_layout`
+    carries `PinnedEncodingTrait`, so the downstream layout passes
+    (`tritongpu-coalesce`, `remove-layout-conversions`, AMD `optimize-epilogue`)
+    treat it as fixed and never rewrite it; the outer `#tlx.no_verify_layout` defers
+    operand-layout verification until the pin is peeled by
+    `TLXResolvePlaceholderLayouts` in `make_ttgir`. Example: pin an FP16 epilogue
+    `tl.store` to a coalesced layout so `OptimizeEpilogue` keeps the wide
+    `buffer_store_dwordx4` instead of narrowing it to the MMA-accumulator store,
+    without staging the value through LDS.
+
+    Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
+    pin survived to the final TTGIR.
+
 - `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
 
     Compile-time assertion that two layouts are equivalent after layout
