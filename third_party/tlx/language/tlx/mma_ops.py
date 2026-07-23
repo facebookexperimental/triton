@@ -84,6 +84,28 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
     return _builder.create_require_layout(src.handle, layout_handle)
 
 
+@tl.builtin
+def cast_preserve_layout(src, dtype: tl.constexpr, fp_downcast_rounding: tl.constexpr = None,
+                         bitcast: tl.constexpr = False, _semantic=None):
+    """Cast a tensor while preserving its current IR layout encoding."""
+    src = _semantic.to_tensor(src)
+    dtype = tl._unwrap_if_constexpr(dtype)
+    fp_downcast_rounding = tl._unwrap_if_constexpr(fp_downcast_rounding)
+    bitcast = tl._unwrap_if_constexpr(bitcast)
+    if src.type.is_block():
+        dst_ty = src.type.with_element_ty(dtype)
+    else:
+        dst_ty = dtype
+    rounding = None if bitcast else _semantic._str_to_rounding_mode(fp_downcast_rounding)
+    handle = _semantic.builder.create_layout_preserving_cast(
+        src.handle,
+        dst_ty.to_ir(_semantic.builder),
+        rounding,
+        bitcast,
+    )
+    return tl.tensor(handle, dst_ty)
+
+
 def _get_use_acc_handle(use_acc: tl.constexpr | tl.tensor | None, _builder):
     if use_acc is None:
         return None
