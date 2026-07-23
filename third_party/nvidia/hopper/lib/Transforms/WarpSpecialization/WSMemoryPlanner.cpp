@@ -4957,6 +4957,9 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
     }
   }
 
+  // Emit the text summary after planning so buffer.id is populated.
+  LLVM_DEBUG(dumpPartitionAndBufferSummary(funcOp, channels));
+
   // allocateTMem(funcOp, channels, bufferId);
   return success();
 }
