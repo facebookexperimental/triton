@@ -53,31 +53,47 @@ std::string axisLayoutKey(triton::ReduceOp op) {
   return axisLL.toString();
 }
 
-// A conservative, structural string for a tensor-core/MMA accumulation op:
-// op name + sorted attributes + operand/result types (no SSA value names). It
-// differs whenever the numerics could differ (precision attribute, operand
-// layouts) yet is identical for identical IR.
-std::string mmaOpKey(Operation *o) {
+// Bit-deciding key for a dot / wgmma accumulation. It splits on exactly the
+// numeric-mode attributes that change the result bits -- the input precision
+// (tf32 / ieee / tf32x3) and the fp8 partial-accumulator flush period
+// (maxNumImpreciseAcc) -- plus the op name (a tt.dot ieee-FMA path vs an
+// ttng.warp_group_dot wgmma path is itself a numeric change). It deliberately
+// DROPS the operand/result types: their shapes are the free M/N/K tiling and their
+// encodings are the free warpsPerCTA, while the element dtype is fixed per kernel,
+// so keeping them would only over-split. A genuine K-decomposition (tf32x3 = 3
+// passes) is recovered from the dot COUNT by the caller, not from the types.
+std::string dotAccumKey(Operation *o) {
   std::string s;
   llvm::raw_string_ostream os(s);
   os << o->getName().getStringRef();
   for (NamedAttribute a : o->getAttrs()) {
-    os << "|" << a.getName().str() << "=";
-    a.getValue().print(os);
-  }
-  for (Type t : o->getOperandTypes()) {
-    os << "|in:";
-    t.print(os);
-  }
-  for (Type t : o->getResultTypes()) {
-    os << "|out:";
-    t.print(os);
+    StringRef n = a.getName().getValue();
+    if (n == "inputPrecision" || n == "maxNumImpreciseAcc") {
+      os << "|" << n.str() << "=";
+      a.getValue().print(os);
+    }
   }
   return os.str();
 }
 
 bool isMmaLikeName(StringRef n) {
-  return n.contains("dot") || n.contains("mma");
+  // Match the accumulation ops (tt.dot, ttng.warp_group_dot, tcgen05_mma, ...) but NOT
+  // their async completion barriers (ttng.warp_group_dot_wait / *_mma_wait): a wait is
+  // pure synchronization with no numeric effect, and it only appears once the loop is
+  // pipelined (num_stages > 1), so counting it would spuriously split num_stages (free).
+  return (n.contains("dot") || n.contains("mma")) && !n.contains("wait");
+}
+
+// True if `o` is nested inside an `scf.for` (the K-loop). A dot in the loop body is
+// the steady-state accumulation; the pipeliner peels copies OUT of the loop as
+// prologue/epilogue (pure scheduling driven by num_stages, same bits), so counting
+// only loop-body dots keeps num_stages free while still seeing an in-loop
+// K-decomposition like tf32x3.
+bool inForLoop(Operation *o) {
+  for (Operation *p = o->getParentOp(); p; p = p->getParentOp())
+    if (p->getName().getStringRef() == "scf.for")
+      return true;
+  return false;
 }
 
 } // namespace
@@ -118,21 +134,32 @@ llvm::SmallVector<std::string> getReductionOrderSignatures(ModuleOp module) {
     sigs.push_back(getReductionOrderSignature(op));
   });
 
-  // Soundness guard: an MMA/dot accumulation is reduction-like but not modeled
-  // here. Append a conservative entry so two modules that contain such ops are
-  // never declared equivalent on an empty signature (they only match when the
-  // dot ops' structure/types/attrs are identical).
-  std::vector<std::string> mma;
+  // A dot / wgmma accumulation sums over K in a structured `scf.for` with the
+  // accumulator as an iter_arg -- the order is sequential and fixed by
+  // construction, so (unlike PTX) no back-edge / reassociation modelling is needed.
+  // Emit one bit-deciding key per accumulation and let the COUNT carry the
+  // K-decomposition multiplicity (tf32x3 = 3 in-loop dots vs tf32 = 1). Count only
+  // loop-body dots -- peeled pipeline copies live outside the loop -- so num_stages
+  // stays free; if a GEMM has no K-loop at all, fall back to every dot so none is
+  // dropped (soundness over tightness).
+  std::vector<Operation *> loopDots, allDots;
   module.walk([&](Operation *o) {
-    if (isMmaLikeName(o->getName().getStringRef()))
-      mma.push_back(mmaOpKey(o));
+    if (!isMmaLikeName(o->getName().getStringRef()))
+      return;
+    allDots.push_back(o);
+    if (inForLoop(o))
+      loopDots.push_back(o);
   });
-  if (!mma.empty()) {
-    std::sort(mma.begin(), mma.end());
+  const std::vector<Operation *> &dotOps = loopDots.empty() ? allDots : loopDots;
+  if (!dotOps.empty()) {
+    std::vector<std::string> keys;
+    for (Operation *o : dotOps)
+      keys.push_back(dotAccumKey(o));
+    std::sort(keys.begin(), keys.end()); // order-independent multiset; count matters
     std::string s;
     llvm::raw_string_ostream os(s);
-    os << "unanalyzed-mma";
-    for (const auto &e : mma)
+    os << "dot";
+    for (const auto &e : keys)
       os << "||" << e;
     sigs.push_back(os.str());
   }
