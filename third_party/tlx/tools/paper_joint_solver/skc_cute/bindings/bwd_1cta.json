@@ -1,0 +1,67 @@
+{
+ "kind": "bwd",
+ "solution": "bwd_skc_solution.json",
+ "solver_point": {
+  "ii": 95,
+  "length": 273
+ },
+ "verifies": {
+  "Q_stage": {
+   "expect": 2,
+   "solver_source": "Q liveness 3 clamped to 2 by SMEM accounting (M4 audit); FA4 1-CTA sets Q_stage=2 (flash_bwd_sm100.py:238)"
+  },
+  "tile_m": {
+   "expect": 128
+  },
+  "tile_n": {
+   "expect": 128
+  },
+  "dedicated_mma_issuer": {
+   "expect": true,
+   "solver_source": "R1 pin SAT at free optimum (II=95,L=273)"
+  },
+  "compute_split_2wg": {
+   "expect": true,
+   "solver_source": "monolithic compute colocate genuinely UNSAT"
+  }
+ },
+ "overrides": {
+  "reg_candidates": {
+   "transfer_2cta_tuned": {
+    "num_regs_reduce": 136,
+    "num_regs_compute": 136,
+    "num_regs_load": 104,
+    "num_regs_mma": 104
+   },
+   "upstream_default_1cta": {
+    "num_regs_reduce": 152,
+    "num_regs_compute": 136,
+    "num_regs_load": 88,
+    "num_regs_mma": 88
+   }
+  },
+  "Q_stage_sweep": [
+   2,
+   1
+  ]
+ },
+ "dropped": [
+  "exact cycles",
+  "5-dot issue order (FROZEN protocol)"
+ ],
+ "frozen": [
+  {
+   "param": "warp role tuples",
+   "reason": "named-barrier index arithmetic hardcodes 4-warp groups (flash_fwd_sm100.py:1015-1017, named_barrier.py:15-25)"
+  },
+  {
+   "param": "MMA issue order",
+   "reason": "fused tri-role mbarrier ring + deliberately elided O-full commits are justified by the static order (flash_fwd_sm100.py:966-977, 1760-1764)"
+  },
+  {
+   "param": "producer_tail workarounds",
+   "reason": "upstream comments 'commented out because it hangs' (flash_bwd_sm100.py:2758-2762) \u2014 inherit verbatim, never fix"
+  }
+ ],
+ "risk_R1": "bwd 1-CTA path is never exercised upstream (no CUDA-12 fallback for bwd) \u2014 M3 correctness gate is load-bearing"
+}
