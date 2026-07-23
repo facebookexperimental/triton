@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <optional>
 #include <utility>
@@ -13,13 +14,8 @@ class DominanceInfo;
 class ImplicitLocOpBuilder;
 namespace triton {
 
-static const char *kNumStagesAttrName = "tt.num_stages";
-static const char *kDisallowAccMultiBufferAttrName =
-    "tt.disallow_acc_multi_buffer";
-static const char *kWarpSpecializeAttrName = "tt.warp_specialize";
 static const char *kLoopStageAttrName = "loop.stage";
 static const char *kLoopClusterAttrName = "loop.cluster";
-static const char *kScheduledMaxStageAttrName = "tt.scheduled_max_stage";
 class CoarseSchedule;
 class ModuleAxisInfoAnalysis;
 //===----------------------------------------------------------------------===//

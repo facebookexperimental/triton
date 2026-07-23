@@ -160,5 +160,3 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 #loc83 = loc(callsite(#loc9 at #loc55))
 #loc84 = loc(callsite(#loc7 at #loc57))
 #loc85 = loc(callsite(#loc9 at #loc57))
-
-

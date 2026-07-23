@@ -2,9 +2,11 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 
@@ -65,6 +67,34 @@ static bool isSingleTripConstantFlip(scf::WhileOp whileOp) {
     return false;
   return isConstantBool(whileOp.getInits()[c], /*expected=*/true) &&
          isConstantBool(yieldOp.getResults()[c], /*expected=*/false);
+}
+
+// Forward AutoWS to for loops exactly one loop-nesting level inside the
+// scheduler while. Intervening non-loop control flow, such as scf.if, does not
+// add a nesting level. Existing inner-loop settings take precedence.
+static bool forwardAutoWSToInnerLoops(scf::WhileOp whileOp) {
+  if (!whileOp->hasAttr(kWarpSpecializeAttrName))
+    return true;
+
+  SmallVector<scf::ForOp> innerLoops;
+  whileOp.getAfter().walk([&](scf::ForOp forOp) {
+    LoopLikeOpInterface parentLoop =
+        forOp->getParentOfType<LoopLikeOpInterface>();
+    if (parentLoop && parentLoop.getOperation() == whileOp.getOperation())
+      innerLoops.push_back(forOp);
+  });
+  if (innerLoops.empty())
+    return false;
+
+  SmallVector<NamedAttribute> attrs = filterAutoWSLoopAttrs(
+      whileOp, AutoWSLoopAttrPropagation::ForwardToInnerLoop);
+  for (scf::ForOp forOp : innerLoops) {
+    for (NamedAttribute attr : attrs) {
+      if (!forOp->hasAttr(attr.getName()))
+        forOp->setAttr(attr.getName(), attr.getValue());
+    }
+  }
+  return true;
 }
 
 // Clone the (pure) before-region ops under `argMap` (before-arg -> concrete
@@ -129,12 +159,18 @@ class SimplifySingleTripWhilePass
 public:
   void runOnOperation() override {
     SmallVector<scf::WhileOp> loops;
-    getOperation()->walk([&](scf::WhileOp whileOp) {
+    getOperation()->walk<WalkOrder::PostOrder>([&](scf::WhileOp whileOp) {
       if (isSingleTripConstantFlip(whileOp))
         loops.push_back(whileOp);
     });
 
     for (scf::WhileOp whileOp : loops) {
+      if (!forwardAutoWSToInnerLoops(whileOp)) {
+        LDBG("Keeping annotated single-trip while without a first-level inner "
+             "loop: "
+             << whileOp);
+        continue;
+      }
       LDBG("Simplifying single-trip while: " << whileOp);
       rewriteSingleTripWhile(whileOp);
     }
