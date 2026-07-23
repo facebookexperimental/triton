@@ -8,6 +8,9 @@ STAGE = "verification"
 
 _PROOF_DEPENDENT_OPS = frozenset({"assume", "buffer_load_to_local", "buffer_load", "buffer_store"})
 _TARGET_REPRESENTATIONS = frozenset({
+    "buffer_pointer",
+    "buffer_pointer_tuple",
+    "uniform_buffer_pointer",
     "mask",
     "mask_tuple",
     "memdesc",
@@ -146,6 +149,12 @@ def _verify_ops(target_program, fact_program, source_program):
             _verify_affine_materialize(op, target_program)
         if op.kind == "type_convert":
             _verify_type_convert(op, target_program)
+        if op.kind == "make_buffer":
+            _verify_make_buffer(op, target_program)
+        if op.kind == "component_join":
+            _verify_component_join(op, target_program)
+        if op.kind == "component_split":
+            _verify_component_split(op, target_program)
         if op.kind == "cmpi_select":
             _verify_cmpi_select(op, target_program)
         if len(op.fact_target_ids) != len(op.fact_ids):
@@ -1084,32 +1093,67 @@ def _verify_memory_edges(op, target_program):
             f"edge attrs are forbidden: {leaked_attrs}",
             target_op_id=op.target_op_id,
         )
-    offset_operand = {
-        "buffer_load": 1,
-        "buffer_load_to_local": 2,
-        "buffer_store": 2,
-    }[op.kind]
-    if len(op.operands) <= offset_operand:
+    source_pointer_mode = attrs.get("source_pointer_mode", "base_offset")
+    if source_pointer_mode not in {"base_offset", "direct"}:
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
-            "memory operation is missing its typed offset operand",
+            f"unsupported memory source pointer mode {source_pointer_mode!r}",
             target_op_id=op.target_op_id,
         )
-    offset_type = target_program.values[
-        int(op.operands[offset_operand])
-    ].type
-    if (
-        offset_type.element_type != "index"
-        or offset_type.representation not in {"simd", "simd_tuple"}
-    ):
-        fail(
-            "TLXW_VERIFY_MEMORY_EDGE",
-            STAGE,
-            "memory offset operands must use the SIMD index representation",
-            target_op_id=op.target_op_id,
-            target_value_id=int(op.operands[offset_operand]),
-        )
+    if source_pointer_mode == "direct":
+        if (
+            op.kind != "buffer_load_to_local"
+            or attrs.get("mode") != "dma_packet_lds"
+            or len(op.operands) < 2
+        ):
+            fail(
+                "TLXW_VERIFY_MEMORY_EDGE",
+                STAGE,
+                "only packet direct-to-LDS DMA may consume a direct buffer pointer",
+                target_op_id=op.target_op_id,
+            )
+        pointer_type = target_program.values[int(op.operands[1])].type
+        if (
+            pointer_type.representation
+            not in {"buffer_pointer", "buffer_pointer_tuple"}
+            or int(pointer_type.component_count)
+            != int(attrs.get("component_count", 0))
+        ):
+            fail(
+                "TLXW_VERIFY_MEMORY_EDGE",
+                STAGE,
+                "direct DMA pointer components must match the memory op",
+                target_op_id=op.target_op_id,
+                target_value_id=int(op.operands[1]),
+            )
+    else:
+        offset_operand = {
+            "buffer_load": 1,
+            "buffer_load_to_local": 2,
+            "buffer_store": 2,
+        }[op.kind]
+        if len(op.operands) <= offset_operand:
+            fail(
+                "TLXW_VERIFY_MEMORY_EDGE",
+                STAGE,
+                "memory operation is missing its typed offset operand",
+                target_op_id=op.target_op_id,
+            )
+        offset_type = target_program.values[
+            int(op.operands[offset_operand])
+        ].type
+        if (
+            offset_type.element_type != "index"
+            or offset_type.representation not in {"simd", "simd_tuple"}
+        ):
+            fail(
+                "TLXW_VERIFY_MEMORY_EDGE",
+                STAGE,
+                "memory offset operands must use the SIMD index representation",
+                target_op_id=op.target_op_id,
+                target_value_id=int(op.operands[offset_operand]),
+            )
     has_mask = bool(attrs.get("has_mask", False))
     mode = attrs.get(
         "mask_operand_mode",
@@ -1129,6 +1173,13 @@ def _verify_memory_edges(op, target_program):
             "memory mask operand mode does not match has_mask",
             target_op_id=op.target_op_id,
         )
+    if source_pointer_mode == "direct" and has_mask:
+        fail(
+            "TLXW_VERIFY_MASK_EDGE",
+            STAGE,
+            "direct loop-carried DMA pointers currently require an unmasked access",
+            target_op_id=op.target_op_id,
+        )
     forbidden = tuple(
         name for name in attrs
         if name.startswith("mask_predicate_") or name == "mask_scalar_count"
@@ -1139,6 +1190,36 @@ def _verify_memory_edges(op, target_program):
             STAGE,
             "memory operations must consume a typed mask operand; semantic "
             f"predicate attrs are forbidden: {forbidden}",
+            target_op_id=op.target_op_id,
+        )
+
+
+def _verify_make_buffer(op, target_program):
+    attrs = _attrs_dict(op)
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_VERIFY_MAKE_BUFFER",
+            STAGE,
+            "make_buffer requires one base pointer and one result",
+            target_op_id=op.target_op_id,
+        )
+    base_type = target_program.values[int(op.operands[0])].type
+    result_type = target_program.values[int(op.results[0])].type
+    range_bytes = attrs.get("range_bytes")
+    if (
+        base_type.representation != "uniform_pointer"
+        or result_type.representation != "uniform_buffer_pointer"
+        or int(result_type.component_count) != 1
+        or base_type.element_type != result_type.element_type
+        or attrs.get("element_type") != result_type.element_type
+        or not isinstance(range_bytes, int)
+        or range_bytes <= 0
+        or range_bytes > (1 << 31) - 1
+    ):
+        fail(
+            "TLXW_VERIFY_MAKE_BUFFER",
+            STAGE,
+            "make_buffer base, result, element type, or byte range is invalid",
             target_op_id=op.target_op_id,
         )
 
@@ -1494,6 +1575,182 @@ def _verify_type_convert(op, target_program):
             "TLXW_VERIFY_TYPE_CONVERT",
             STAGE,
             "packet structural conversion types do not match its dimensions",
+            target_op_id=op.target_op_id,
+        )
+
+
+def _verify_component_join(op, target_program):
+    attrs = _attrs_dict(op)
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_VERIFY_COMPONENT_JOIN",
+            STAGE,
+            "component_join requires two operands and one result",
+            target_op_id=op.target_op_id,
+        )
+    operand_types = tuple(
+        target_program.values[int(value_id)].type for value_id in op.operands
+    )
+    result_type = target_program.values[int(op.results[0])].type
+    source_counts = attrs.get("source_component_counts")
+    source_widths = attrs.get("source_packet_widths")
+    source_slots = attrs.get("source_slot_counts")
+    scalar_sources = attrs.get("scalar_sources")
+    result_count = attrs.get("result_component_count")
+    result_width = attrs.get("result_packet_width")
+    result_slots = attrs.get("result_slot_count")
+    valid_source_metadata = (
+        isinstance(source_counts, tuple)
+        and isinstance(source_widths, tuple)
+        and isinstance(source_slots, tuple)
+        and len(source_counts) == len(source_widths) == len(source_slots) == 2
+        and all(isinstance(value, int) and value > 0 for value in source_counts)
+        and all(isinstance(value, int) and value > 0 for value in source_widths)
+        and all(isinstance(value, int) and value > 0 for value in source_slots)
+        and all(
+            count == int(operand_type.component_count)
+            and count * width == slots
+            for count, width, slots, operand_type in zip(
+                source_counts,
+                source_widths,
+                source_slots,
+                operand_types,
+            )
+        )
+    )
+    valid_result_metadata = (
+        isinstance(result_count, int)
+        and isinstance(result_width, int)
+        and isinstance(result_slots, int)
+        and result_count == int(result_type.component_count)
+        and result_count > 0
+        and result_width > 0
+        and result_count * result_width == result_slots
+    )
+    valid_sources = (
+        isinstance(scalar_sources, tuple)
+        and isinstance(result_slots, int)
+        and len(scalar_sources) == result_slots
+        and all(
+            isinstance(source, tuple)
+            and len(source) == 2
+            and all(isinstance(index, int) for index in source)
+            and 0 <= source[0] < len(operand_types)
+            and isinstance(source_slots, tuple)
+            and 0 <= source[1] < source_slots[source[0]]
+            for source in scalar_sources
+        )
+    )
+    valid_types = (
+        all(operand_type.kind == result_type.kind for operand_type in operand_types)
+        and all(
+            operand_type.element_type == result_type.element_type
+            for operand_type in operand_types
+        )
+        and all(
+            operand_type.lane_width == result_type.lane_width
+            for operand_type in operand_types
+        )
+    )
+    if not (
+        valid_source_metadata
+        and valid_result_metadata
+        and valid_sources
+        and valid_types
+    ):
+        fail(
+            "TLXW_VERIFY_COMPONENT_JOIN",
+            STAGE,
+            "component_join packet metadata or types are inconsistent",
+            target_op_id=op.target_op_id,
+        )
+
+
+def _verify_component_split(op, target_program):
+    attrs = _attrs_dict(op)
+    if len(op.operands) != 1 or len(op.results) != 2:
+        fail(
+            "TLXW_VERIFY_COMPONENT_SPLIT",
+            STAGE,
+            "component_split requires one operand and two results",
+            target_op_id=op.target_op_id,
+        )
+    operand_type = target_program.values[int(op.operands[0])].type
+    result_types = tuple(
+        target_program.values[int(value_id)].type for value_id in op.results
+    )
+    source_count = attrs.get("source_component_count")
+    source_width = attrs.get("source_packet_width")
+    source_slots = attrs.get("source_slot_count")
+    result_counts = attrs.get("result_component_counts")
+    result_widths = attrs.get("result_packet_widths")
+    result_slots = attrs.get("result_slot_counts")
+    scalar_sources = attrs.get("scalar_source_slots")
+    valid_source_metadata = (
+        isinstance(source_count, int)
+        and isinstance(source_width, int)
+        and isinstance(source_slots, int)
+        and source_count == int(operand_type.component_count)
+        and source_count > 0
+        and source_width > 0
+        and source_count * source_width == source_slots
+    )
+    valid_result_metadata = (
+        isinstance(result_counts, tuple)
+        and isinstance(result_widths, tuple)
+        and isinstance(result_slots, tuple)
+        and len(result_counts) == len(result_widths) == len(result_slots) == 2
+        and all(isinstance(value, int) and value > 0 for value in result_counts)
+        and all(isinstance(value, int) and value > 0 for value in result_widths)
+        and all(isinstance(value, int) and value > 0 for value in result_slots)
+        and all(
+            count == int(result_type.component_count)
+            and count * width == slots
+            for count, width, slots, result_type in zip(
+                result_counts,
+                result_widths,
+                result_slots,
+                result_types,
+            )
+        )
+    )
+    valid_sources = (
+        isinstance(scalar_sources, tuple)
+        and isinstance(result_slots, tuple)
+        and len(scalar_sources) == len(result_slots) == 2
+        and all(
+            isinstance(sources, tuple)
+            and len(sources) == slots
+            and all(
+                isinstance(source, int)
+                and isinstance(source_slots, int)
+                and 0 <= source < source_slots
+                for source in sources
+            )
+            for sources, slots in zip(scalar_sources, result_slots)
+        )
+    )
+    valid_types = (
+        all(result_type.kind == operand_type.kind for result_type in result_types)
+        and all(
+            result_type.element_type == operand_type.element_type
+            for result_type in result_types
+        )
+        and all(
+            result_type.lane_width == operand_type.lane_width
+            for result_type in result_types
+        )
+    )
+    if not (
+        valid_source_metadata
+        and valid_result_metadata
+        and valid_sources
+        and valid_types
+    ):
+        fail(
+            "TLXW_VERIFY_COMPONENT_SPLIT",
+            STAGE,
+            "component_split packet metadata or types are inconsistent",
             target_op_id=op.target_op_id,
         )
 
