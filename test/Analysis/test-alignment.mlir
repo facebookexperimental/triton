@@ -1095,6 +1095,17 @@ tt.func @unrealized_conversion_cast(%arg0: tensor<128x128xi32> {tt.contiguity = 
 
 // -----
 
+// An unrealized conversion cast can materialize a value without an input.
+// AxisInfo must return a pessimistic state with the result rank instead of
+// indexing an empty operand lattice.
+tt.func @empty_unrealized_conversion_cast() {
+  // expected-remark @below {{contiguity = [1, 1], divisibility = [1, 1], constancy = [1, 1], constant_value = <none>}}
+  %0 = "builtin.unrealized_conversion_cast"() : () -> tensor<4x8xi32>
+  tt.return
+}
+
+// -----
+
 // Axis analysis does not support multi-dimensional function arguments. Make
 // sure that we don't crash.
 tt.func @callee(%arg0: tensor<128x1xi32>) {
