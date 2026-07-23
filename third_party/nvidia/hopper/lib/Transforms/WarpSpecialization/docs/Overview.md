@@ -77,7 +77,7 @@ recognizes the `scf.while` outer loop (same doc).
 |------|----------------|-------------|
 | `WarpSpecialization.cpp` | `NVGPUWarpSpecialization` | Top-level pipeline orchestration |
 | `SinkBroadcast.cpp` | `nvgpu-sink-broadcast` | Pre-partition peephole that sinks `tt.broadcast` producer chains to elementwise users |
-| `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes). See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) covers extending it to `scf.while` (in progress) |
+| `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes), including identity-carry `scf.while`. See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); downstream dynamic/CLC validation is tracked in [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) |
 | (frontend) | `tl.range` / `tl.condition` → `tt.*` loop attrs | The user-facing AutoWS/pipelining annotations, their IR attributes and consumers, and what works on `scf.while` today: [AutoWSAnnotations.md](AutoWSAnnotations.md) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
@@ -130,6 +130,7 @@ recognizes the `scf.while` outer loop (same doc).
 
 - [Task Partitioning & ID Propagation](TaskPartitionAndPropagation.md) — how ops are assigned to partitions
 - [Cross-Partition Run-Once Atomic Support](CrossPartitionAtomicSupport.md) — dynamic-persistent tile-id `atomic_add` broadcast
+- [Dynamic Persistent AutoWS Gaps](DynamicPersistentAutoWSGaps.md) — current inner-loop support, outer-while blockers, and completion criteria
 - [Data Partitioning](DataPartition.md) — splitting tensor dimensions across consumer warp groups
 - [Code Partitioning](CodePartition.md) — channel discovery, buffer creation, sync insertion
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
