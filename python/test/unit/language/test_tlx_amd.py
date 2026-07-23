@@ -753,6 +753,10 @@ def test_a4w4_shape_stride_layouts_compile_gfx950(device, tmp_path):
     assert "#tlx.user_layout" not in ttgir
     assert "#tlx.no_verify_layout" not in ttgir
     assert amdgcn.count("v_mfma_scale_f32_16x16x128_f8f6f4") == 512
+    # Narrow in the accumulator layout before redistributing for the store.
+    # A wide f32 epilogue redistribution adds 32 writes and 32 reads here.
+    assert amdgcn.count("ds_write") == 44
+    assert amdgcn.count("ds_read") == 176
     assert "buffer_store_dwordx4" in amdgcn
 
 

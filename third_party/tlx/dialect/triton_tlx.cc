@@ -53,22 +53,6 @@ static ttg::CGAEncodingAttr makeCGALayout(mlir::MLIRContext *ctx,
                                                CTAOrder);
 }
 
-static Type getElementType(Type type) {
-  if (auto rankedType = dyn_cast<RankedTensorType>(type))
-    return rankedType.getElementType();
-  return type;
-}
-
-static Type getLayoutPreservingType(Value src, Type dstType) {
-  auto srcType = src.getType();
-  auto dstElementType = getElementType(dstType);
-  if (auto srcTensorType = dyn_cast<RankedTensorType>(srcType)) {
-    return RankedTensorType::get(srcTensorType.getShape(), dstElementType,
-                                 srcTensorType.getEncoding());
-  }
-  return dstElementType;
-}
-
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -113,74 +97,46 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttg::MemDescSubsliceOp>(memDescType, localAlloc,
                                                         offsets);
            })
-      .def("create_require_layout",
-           [](TritonOpBuilder &self, Value &v, Attribute &encoding,
-              bool pin) -> Value {
-             Type newType;
-             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
-               // consider allocation type for subslice
-               SmallVector<int64_t> allocShape(type.getAllocShape());
-               if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
-                 allocShape.assign(type.getShape().begin(),
-                                   type.getShape().end());
-               newType = ttg::MemDescType::get(
-                   type.getShape(), type.getElementType(), encoding,
-                   type.getMemorySpace(), type.getMutableMemory(), allocShape);
-               return self.create<tlx::RequireLayoutOp>(newType, v);
-             } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               // `pin`: wrap in #tlx.no_verify_layout(#tlx.user_layout) -- the
-               // #tlx.user_layout carries PinnedEncodingTrait so the requirement is
-               // honored as a hard anchor by Coalesce / RemoveLayoutConversions /
-               // OptimizeEpilogue (e.g. to pin an epilogue store's register layout),
-               // and the outer #tlx.no_verify_layout defers operand-layout
-               // verification until ResolvePlaceholderLayouts peels it (so a pinned
-               // store whose ptr/mask layouts don't yet match verifies fine). Non-pin
-               // is a soft requirement (#tlx.no_verify_layout only, e.g. dot operands).
-               Attribute tensorEncoding =
-                   pin ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(encoding))
-                       : tlx::wrapNoVerifyLayout(encoding);
-               newType = RankedTensorType::get(
-                   type.getShape(), type.getElementType(), tensorEncoding);
-               return self.create<tlx::RequireLayoutOp>(newType, v);
-             } else {
-               throw std::runtime_error("Unsupported type");
-             }
-           },
-           py::arg("v"), py::arg("encoding"), py::arg("pin") = false)
-      .def("create_layout_preserving_cast",
-           [](TritonOpBuilder &self, Value &src, Type &dstType,
-              std::optional<tt::RoundingMode> roundingMode,
-              bool bitcast) -> Value {
-             auto resultType = getLayoutPreservingType(src, dstType);
-             auto srcElementType = getElementType(src.getType());
-             auto dstElementType = getElementType(resultType);
-             if (srcElementType == dstElementType)
-               return src;
-             if (bitcast)
-               return self.create<tt::BitcastOp>(resultType, src);
-             if (isa<FloatType>(srcElementType) &&
-                 isa<FloatType>(dstElementType)) {
-               if (roundingMode.has_value()) {
-                 auto roundingAttr = tt::RoundingModeAttr::get(
-                     self.getContext(), roundingMode.value());
-                 return self.create<tt::FpToFpOp>(resultType, src,
-                                                  roundingAttr);
-               }
-               unsigned srcWidth = srcElementType.getIntOrFloatBitWidth();
-               unsigned dstWidth = dstElementType.getIntOrFloatBitWidth();
-               if (srcWidth > dstWidth)
-                 return self.create<arith::TruncFOp>(resultType, src);
-               if (srcWidth < dstWidth)
-                 return self.create<arith::ExtFOp>(resultType, src);
-               return self.create<tt::BitcastOp>(resultType, src);
-             }
-             throw std::runtime_error(
-                 "Unsupported layout-preserving cast element types");
-           })
+      .def(
+          "create_require_layout",
+          [](TritonOpBuilder &self, Value &v, Attribute &encoding,
+             bool pin) -> Value {
+            Type newType;
+            if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
+              // consider allocation type for subslice
+              SmallVector<int64_t> allocShape(type.getAllocShape());
+              if (isa<ttng::TensorMemoryScalesEncodingAttr>(encoding))
+                allocShape.assign(type.getShape().begin(),
+                                  type.getShape().end());
+              newType = ttg::MemDescType::get(
+                  type.getShape(), type.getElementType(), encoding,
+                  type.getMemorySpace(), type.getMutableMemory(), allocShape);
+              return self.create<tlx::RequireLayoutOp>(newType, v);
+            } else if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
+              // `pin`: wrap in #tlx.no_verify_layout(#tlx.user_layout) -- the
+              // #tlx.user_layout carries PinnedEncodingTrait so the requirement
+              // is honored as a hard anchor by Coalesce /
+              // RemoveLayoutConversions / OptimizeEpilogue (e.g. to pin an
+              // epilogue store's register layout), and the outer
+              // #tlx.no_verify_layout defers operand-layout verification until
+              // ResolvePlaceholderLayouts peels it (so a pinned store whose
+              // ptr/mask layouts don't yet match verifies fine). Non-pin is a
+              // soft requirement (#tlx.no_verify_layout only, e.g. dot
+              // operands).
+              Attribute tensorEncoding =
+                  pin ? tlx::wrapNoVerifyLayout(tlx::wrapUserLayout(encoding))
+                      : tlx::wrapNoVerifyLayout(encoding);
+              newType = RankedTensorType::get(
+                  type.getShape(), type.getElementType(), tensorEncoding);
+              return self.create<tlx::RequireLayoutOp>(newType, v);
+            } else {
+              throw std::runtime_error("Unsupported type");
+            }
+          },
+          py::arg("v"), py::arg("encoding"), py::arg("pin") = false)
       .def("create_release_layout",
            [](TritonOpBuilder &self, Value &v) -> Value {
              if (auto type = dyn_cast<RankedTensorType>(v.getType())) {
-               assert(type.getEncoding() && "Expect layout encoding");
                auto newType = RankedTensorType::get(type.getShape(),
                                                     type.getElementType());
                return self.create<tlx::ReleaseLayoutOp>(newType, v);

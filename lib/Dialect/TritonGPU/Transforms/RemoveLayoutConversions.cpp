@@ -908,64 +908,6 @@ bool canBeRemat(Operation *op) {
   return true;
 }
 
-// Sink a cross-thread layout conversion below a unary narrowing operation:
-//
-//   convert<A -> B>(wide) -> narrow<B>
-//     =>
-//   narrow<A> -> convert<A -> B>(narrow)
-//
-// Layout conversion only redistributes elements, so it commutes with a pure
-// elementwise narrowing operation. Doing the redistribution after narrowing
-// avoids communicating the wider representation. Require the conversion to
-// have one use so the rewrite cannot duplicate communication for other users.
-// A following convert is folded by ConvertLayoutOp's canonicalizer, which also
-// removes unnecessary intermediate layouts introduced around MMA results.
-static bool sinkConvertBelowNarrowingOps(ModuleOp module) {
-  SmallVector<ConvertLayoutOp> convertOps;
-  module.walk(
-      [&](ConvertLayoutOp convertOp) { convertOps.push_back(convertOp); });
-
-  bool changed = false;
-  for (ConvertLayoutOp convertOp : convertOps) {
-    Value converted = convertOp.getResult();
-    if (!converted.hasOneUse())
-      continue;
-
-    Operation *narrowOp = *converted.getUsers().begin();
-    if (!narrowOp->hasTrait<OpTrait::Elementwise>() ||
-        !isMemoryEffectFree(narrowOp) || narrowOp->getNumOperands() != 1 ||
-        narrowOp->getNumResults() != 1)
-      continue;
-
-    auto wideType =
-        dyn_cast<RankedTensorType>(narrowOp->getOperand(0).getType());
-    auto narrowType =
-        dyn_cast<RankedTensorType>(narrowOp->getResult(0).getType());
-    if (!wideType || !narrowType || wideType.getShape() != narrowType.getShape())
-      continue;
-    if (getElementBitWidth(wideType) <= getElementBitWidth(narrowType))
-      continue;
-
-    auto srcType = cast<RankedTensorType>(convertOp.getSrc().getType());
-    if (cvtReordersRegisters(srcType, wideType))
-      continue;
-
-    OpBuilder builder(narrowOp);
-    IRMapping mapping;
-    mapping.map(converted, convertOp.getSrc());
-    Operation *movedNarrow = builder.clone(*narrowOp, mapping);
-    movedNarrow->getResult(0).setType(
-        narrowType.cloneWithEncoding(srcType.getEncoding()));
-    auto movedConvert = ConvertLayoutOp::create(
-        builder, convertOp.getLoc(), narrowType, movedNarrow->getResult(0));
-    narrowOp->getResult(0).replaceAllUsesWith(movedConvert);
-    narrowOp->erase();
-    convertOp->erase();
-    changed = true;
-  }
-  return changed;
-}
-
 void LayoutRematerialization::updateRematMapping(
     SmallVector<std::tuple<Value, Value>> &values) {
   for (auto [old, newV] : values) {
@@ -2008,14 +1950,6 @@ public:
     });
 
     cleanupConvertOps();
-
-    // Layout propagation around a fixed-layout producer (for example an MMA)
-    // may leave a conversion on the wide side of a narrowing operation. Move
-    // such cross-thread conversions to the narrow side before backward
-    // rematerialization considers pulling later conversions in the opposite
-    // direction.
-    while (sinkConvertBelowNarrowingOps(m))
-      cleanupConvertOps();
 
     bool changed = false;
     do {
