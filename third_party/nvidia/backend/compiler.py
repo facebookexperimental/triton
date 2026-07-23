@@ -752,7 +752,6 @@ class CUDABackend(BaseBackend):
         if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
             nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
         passes.common.add_canonicalizer(pm)
-        passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
@@ -849,6 +848,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            # Support simplify trip while after data partitioning to
+            # enable using this loop to data partition.
+            passes.ttir.add_simplify_single_trip_while(pm)
+            if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
@@ -904,6 +907,7 @@ class CUDABackend(BaseBackend):
                 # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
                 nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            passes.ttir.add_simplify_single_trip_while(pm)
             # The modulo / LLM / list scheduler above already produced the full
             # loop schedule (loop.stage / loop.cluster). Re-running
             # assign_latencies + schedule_loops here would recompute and OVERRIDE

@@ -32,6 +32,13 @@ Data partitioning is not Hopper-only; it can run as the separate
 `nvgpu-ws-data-partition` pass when an explicit data partition factor or warp
 group configuration requires per-consumer slices.
 
+For a non-persistent unified scheduler, the single-trip `scf.while` is kept
+through data partitioning and the initial loop schedule. The
+`triton-simplify-single-trip-while` pass then forwards the outer AutoWS
+attributes to the scheduled inner `scf.for` loop and inlines the while before
+`PartitionSchedulingMeta` assigns partitions. Physical `ttg.warp_specialize`
+regions are created later by `specializeRegion` during `doCodePartitionPost`.
+
 Before `PartitionSchedulingMeta`, the Meta WS backend runs
 `nvgpu-sink-broadcast` to move `tt.broadcast` producer chains next to their
 elementwise users. This keeps broadcasts and their value materialization, such
