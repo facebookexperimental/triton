@@ -100,6 +100,204 @@ def test_async_load_correctness(device):
 
 
 # ---------------------------------------------------------------------------
+# Test: warp-pipelined batched matmul (bmm) with a partial-K tail on gfx950.
+#
+# Models the production "compression bmm" (batch, M, prime K=2309, N).
+# The kernel mirrors the AMD warp-pipe addmm template (async_load prefetch
+# into multi-buffered LDS, tlx.warp_pipeline_stage mfma/mem stages, B fed [N, K]
+# K-contiguous + local_trans) plus a batch dimension addressed with a genuine
+# 64-bit base (bid.to(tl.int64) * stride), as the real bmm requires (A can exceed
+# 2**31 elements).
+#
+# Partial-K (K not a multiple of BLOCK_K) makes the async_load masked, which forces
+# the async src blocked layout to sizePerThread=[1,1] (vec=1). fp16 x vec1 = 16-bit
+# direct-to-LDS, which CDNA4 supports only at {32, 128} bits, so canLoadDirectToLDS()
+# (third_party/amd/lib/TritonAMDGPUToLLVM/Utility.cpp) returns false and both
+# async-copy conversion patterns bail. With no async_copy -> load+local_store
+# fallback, ttg.async_copy_global_to_local is left unlowered and make_llir aborts:
+#   error: LLVM Translation failed for operation: builtin.unrealized_conversion_cast
+#   RuntimeError: failed to translate module to LLVM IR
+# Aligned K (K % BLOCK_K == 0) coalesces to 128-bit and compiles + runs fine.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _warp_pipe_bmm_kernel(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    sab,
+    sam,
+    sak,
+    sbb,
+    sbn,
+    sbk,
+    scb,
+    scm,
+    scn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+):
+    """C[b] = A[b] @ B[b]; B fed [b, N, K] (K-contiguous) + local_trans; 64-bit batch base."""
+    bid = tl.program_id(1)
+    pid = tl.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    offs_k = tl.arange(0, BLOCK_K)
+    # 64-bit base: batch offset can exceed 2**31 for the production shape.
+    a_base = bid.to(tl.int64) * sab + offs_m[:, None].to(tl.int64) * sam
+    b_base = bid.to(tl.int64) * sbb + offs_n[:, None].to(tl.int64) * sbn
+    K_ITERS = tl.cdiv(K, BLOCK_K)
+
+    smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_N, BLOCK_K), tlx.dtype_of(B), NUM_BUFFERS)
+
+    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
+        ks = i * BLOCK_K
+        m = offs_k[None, :] < K - ks  # partial-K mask (folds away when K % BLOCK_K == 0)
+        ta = tlx.async_load(A + a_base + (ks + offs_k[None, :]) * sak, tlx.local_view(smemA, i), mask=m, other=0.0)
+        tb = tlx.async_load(B + b_base + (ks + offs_k[None, :]) * sbk, tlx.local_view(smemB, i), mask=m, other=0.0)
+        tlx.async_load_commit_group([ta, tb])
+
+    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, 0)))
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+        pf = (tile_id % NUM_BUFFERS).to(tl.int32)
+        nb = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
+        kpf = (tile_id + NUM_BUFFERS) * BLOCK_K
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            m = offs_k[None, :] < K - kpf
+            ta = tlx.async_load(A + a_base + (kpf + offs_k[None, :]) * sak, tlx.local_view(smemA, pf), mask=m,
+                                other=0.0)
+            tb = tlx.async_load(B + b_base + (kpf + offs_k[None, :]) * sbk, tlx.local_view(smemB, pf), mask=m,
+                                other=0.0)
+            tlx.async_load_commit_group([ta, tb])
+            a_tile = tlx.local_load(tlx.local_view(smemA, nb))
+            b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, nb)))
+        tlx.async_load_wait_group(NUM_BUFFERS - 2)
+
+    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+    tlx.async_load_wait_group(0)
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        buf = ((K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+
+    ocm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    ocn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    c_ptr = C + bid.to(tl.int64) * scb + scm * ocm[:, None].to(tl.int64) + scn * ocn[None, :]
+    tl.store(c_ptr, acc.to(tlx.dtype_of(C)), mask=(ocm[:, None] < M) & (ocn[None, :] < N))
+
+
+def _run_warp_pipe_bmm(device, bt, M, N, K):
+    """Build fp16 operands and launch the warp-pipe bmm (B fed [bt, N, K] for local_trans)."""
+    BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS = 128, 64, 64, 2
+    a = torch.randn((bt, M, K), device=device, dtype=torch.float16) * 0.1
+    b = torch.randn((bt, K, N), device=device, dtype=torch.float16) * 0.1
+    bT = b.transpose(1, 2).contiguous()  # [bt, N, K], K-contiguous
+    c = torch.empty((bt, M, N), device=device, dtype=torch.float16)
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), bt)
+    _warp_pipe_bmm_kernel[grid](
+        a,
+        bT,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        a.stride(2),
+        bT.stride(0),
+        bT.stride(1),
+        bT.stride(2),
+        c.stride(0),
+        c.stride(1),
+        c.stride(2),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        NUM_BUFFERS=NUM_BUFFERS,
+        num_warps=8,
+        num_stages=1,
+        matrix_instr_nonkdim=16,
+    )
+    return a, b, c
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_warp_pipe_bmm_aligned_k_gfx950(device):
+    """Warp-pipe bmm with K a multiple of BLOCK_K compiles + runs correctly (positive control)."""
+    a, b, c = _run_warp_pipe_bmm(device, bt=8, M=256, N=256, K=2560)  # 2560 % 64 == 0
+    torch.testing.assert_close(c.float(), torch.bmm(a.float(), b.float()), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_warp_pipe_bmm_partial_k_gfx950(device):
+    """Warp-pipe bmm with a partial-K tail (K not a multiple of BLOCK_K).
+
+    Same kernel and config as the aligned-K positive control; only K differs (prime 2309, the
+    production compression-bmm K). The partial-K mask makes the async_load un-lowerable as a
+    direct-to-LDS copy on CDNA4 (vec=1 -> 16-bit); CoalesceAsyncCopy now falls back to a
+    synchronous tt.load + ttg.local_store so it compiles and runs correctly.
+    Previously this aborted make_llir with an unrealized_conversion_cast.
+    """
+    a, b, c = _run_warp_pipe_bmm(device, bt=8, M=256, N=256, K=2309)  # 2309 % 64 == 5
+    torch.testing.assert_close(c.float(), torch.bmm(a.float(), b.float()), atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# Test: unmasked full-tile async_load with a non-16-aligned global row stride.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _row_stride_async_load_kernel(a_ptr, out_ptr, stride_am, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs = offs_m[:, None] * stride_am + offs_k[None, :]
+    smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
+    tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))  # unmasked -- full tile
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    t = tlx.local_load(tlx.local_view(smem, 0))
+    tl.store(out_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :], t)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+@pytest.mark.parametrize("K", [2320, 2309, 2312, 1956])
+def test_async_load_row_stride_gfx950(device, K):
+    """Unmasked full-tile async_load with a non-16-aligned global row stride (T280910119).
+
+    A row stride not a multiple of 16 elements collapses the direct-to-LDS vector width
+    below a supported bitwidth (fp16 -> 16-bit) on CDNA4, so the copy cannot be lowered as
+    a direct-to-LDS load (its swizzled dst hits loadContig == 0). CoalesceAsyncCopy now
+    falls back to a synchronous tt.load + ttg.local_store for both swizzled and padded
+    dsts, so it compiles and runs correctly. Previously K % 16 != 0 aborted make_llir with
+    an unrealized_conversion_cast. K=2320 (% 16 == 0) is the positive control and keeps the
+    fast direct-to-LDS path.
+    """
+    BLOCK_M, BLOCK_K = 128, 64
+    a = torch.randn((BLOCK_M, K), device=device, dtype=torch.float16)
+    out = torch.empty((BLOCK_M, BLOCK_K), device=device, dtype=torch.float16)
+    _row_stride_async_load_kernel[(1, )](a, out, a.stride(0), BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K)
+    torch.testing.assert_close(out, a[:, :BLOCK_K])
+
+
+# ---------------------------------------------------------------------------
 # Test: local_load after async_wait compiles and runs correctly.
 # ---------------------------------------------------------------------------
 
