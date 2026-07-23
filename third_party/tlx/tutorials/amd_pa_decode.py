@@ -109,9 +109,25 @@ def _pa_decode_partition_kernel(
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), Vc.dtype.element_ty, BUFFER_DEPTH)
 
     if PAGES_PER_TILE == 4:
+        g_idx = 0
+        pidx = start_page
+        logical_page = pidx + offs_n // PAGE_SIZE
+        safe_page = tl.minimum(logical_page, end_page - 1)
+        physical = tl.load(BlockTables + seq * stride_bt_s + safe_page * stride_bt_p)
+        page_row = offs_n % PAGE_SIZE
+        k_ptrs = (Kc + physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
+                    page_row[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
+        v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
+                    page_row[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
+        tlx.local_store(tlx.local_view(k_buf, g_idx), tl.load(k_ptrs))
+        tlx.local_store(tlx.local_view(v_buf, g_idx), tl.load(v_ptrs))        
+        start_page += PAGES_PER_TILE
+        g_idx += 1
+        
         for pidx in tl.range(start_page, end_page, PAGES_PER_TILE):
-            k_view = tlx.local_view(k_buf, 0)
-            v_view = tlx.local_view(v_buf, 0)
+            l_idx = 1 - (g_idx % 2)
+            kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, l_idx)))
+
             logical_page = pidx + offs_n // PAGE_SIZE
             safe_page = tl.minimum(logical_page, end_page - 1)
             physical = tl.load(BlockTables + seq * stride_bt_s + safe_page * stride_bt_p)
@@ -120,11 +136,10 @@ def _pa_decode_partition_kernel(
                       page_row[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d)
             v_ptrs = (Vc + physical[:, None] * stride_vc_b + kv_head * stride_vc_h +
                       page_row[:, None] * stride_vc_p + offs_d[None, :] * stride_vc_d)
-            tlx.local_store(k_view, tl.load(k_ptrs))
-            tlx.local_store(v_view, tl.load(v_ptrs))
-            tl.debug_barrier()
-            kt = tlx.local_load(tlx.local_trans(k_view))
-            v = tlx.local_load(v_view)
+            k_next = tl.load(k_ptrs)
+            v_next = tl.load(v_ptrs)
+            # tl.debug_barrier()
+            v = tlx.local_load(tlx.local_view(v_buf, l_idx))
 
             qk = tl.dot(q, kt)
             kt_abs = pidx * PAGE_SIZE + offs_n
@@ -138,7 +153,29 @@ def _pa_decode_partition_kernel(
             l_i = l_i * alpha + tl.sum(p, 1)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
             m_i = m_new
+            k_view = tlx.local_view(k_buf, (g_idx % 2))
+            v_view = tlx.local_view(v_buf, (g_idx % 2))
+            tlx.local_store(k_view, k_next)
+            tlx.local_store(v_view, v_next)
+            g_idx += 1
             tl.debug_barrier()
+        # last tile in lds to be processed
+        l_idx = 1 - (g_idx % 2)
+        kt = tlx.local_load(tlx.local_trans(tlx.local_view(k_buf, l_idx)))
+        qk = tl.dot(q, kt)
+        v = tlx.local_load(tlx.local_view(v_buf, l_idx))
+        kt_abs = pidx * PAGE_SIZE + offs_n
+        vis = ((kt_abs[None, :] < end_page * PAGE_SIZE) &
+                (kt_abs[None, :] <= (ctx_len - QLEN + m_qpos[:, None])))
+        qk = tl.where(vis, qk * QK_SCALE, float("-inf"))
+        m_ij = tl.max(qk, 1)
+        m_new = tl.maximum(m_i, m_ij)
+        p = tl.math.exp2(qk - m_new[:, None])
+        alpha = tl.math.exp2(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+            
     elif start_page < end_page:
         physical = tl.load(BlockTables + seq * stride_bt_s + start_page * stride_bt_p)
         k_ptrs = (Kc + physical * stride_kc_b + kv_head * stride_kc_h + offs_p[:, None] * stride_kc_p +
@@ -361,7 +398,7 @@ def pa_decode_tlx(
         PAGE_SIZE=page_size,
         BLOCK_N=64 if page_size == 16 else page_size,
         PAGES_PER_TILE=4 if page_size == 16 else 1,
-        BUFFER_DEPTH=1 if page_size == 16 else BUF_DEPTH,
+        BUFFER_DEPTH=2 if page_size == 16 else BUF_DEPTH,
         QUERY_GROUP_SIZE=query_group_size,
         GROUP_POW2=group_pow2,
         QLEN=query_length,
@@ -415,6 +452,7 @@ def build_inputs(num_seqs, ctx_lens, num_q_heads, num_kv_heads, head_dim, page_s
 
     max_pages = (max(ctx_lens) + page_size - 1) // page_size
     distinct = num_seqs * max_pages
+    # print(f"max_pages = {max_pages}, distinct = {distinct}, pool_pages = {pool_pages}")
     total_pages = distinct if pool_pages is None else min(distinct, pool_pages)
     key_cache = torch.randn(total_pages, num_kv_heads, page_size, head_dim, dtype=dtype, device=device) * 0.2
     value_cache = torch.randn(total_pages, num_kv_heads, page_size, head_dim, dtype=dtype, device=device) * 0.2
