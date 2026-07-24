@@ -339,6 +339,12 @@ def TritonNvidiaGPUPromoteLoadToTMAPass : Pass<"triton-nvidia-promote-load-to-tm
     "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
     "mlir::arith::ArithDialect"
   ];
+
+  let options = [
+    Option<"deviceMode", "device-mode", "bool", /*default=*/"false",
+           "Emit device-side tt.make_tensor_descriptor + descriptor_load/store "
+           "instead of host-side TMA recipes.">
+  ];
 }
 
 #endif
