@@ -157,6 +157,13 @@ createTritonGPUProxyFenceInsertionWrapper(int32_t capability) {
   return ttng::createTritonGPUProxyFenceInsertion(options);
 }
 
+static std::unique_ptr<mlir::Pass>
+createPromoteLoadToTMAWrapper(bool deviceMode) {
+  ttng::TritonNvidiaGPUPromoteLoadToTMAPassOptions options;
+  options.deviceMode = deviceMode;
+  return ttng::createTritonNvidiaGPUPromoteLoadToTMAPass(options);
+}
+
 void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_plan_cta", ttng::createTritonNvidiaGPUPlanCTAPass);
   ADD_PASS_WRAPPER_1("add_fence_insertion",
@@ -169,8 +176,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUTMemBarrierInsertionPass);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
                      ttng::createTritonNvidiaGPUTMALoweringPass);
-  ADD_PASS_WRAPPER_0("add_promote_load_to_tma",
-                     ttng::createTritonNvidiaGPUPromoteLoadToTMAPass);
+  ADD_PASS_WRAPPER_1("add_promote_load_to_tma", createPromoteLoadToTMAWrapper,
+                     bool);
   ADD_PASS_WRAPPER_0("add_tma_store_buffer_reuse",
                      ttng::createTritonNvidiaGPUTMAStoreBufferReusePass);
   ADD_PASS_WRAPPER_0("add_promote_lhs_to_tmem",
