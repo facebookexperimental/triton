@@ -1,15 +1,22 @@
-// RUN: TRITON_AMD_EARLY_LOWER=1 triton-opt %s -split-input-file \
-// RUN:   -tritonamdgpu-dot-decompose-and-schedule 2>/dev/null \
+// RUN: triton-opt %s -split-input-file \
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=early-lower 2>/dev/null \
+// RUN:   | TRITON_USE_MODULO_SCHEDULE=1 triton-opt -split-input-file \
+// RUN:       -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=SCHEDULE
+// RUN: triton-opt %s -split-input-file \
+// RUN:   -tritonamdgpu-dot-decompose-and-schedule=mode=early-lower 2>/dev/null \
+// RUN:   | TRITON_USE_MODULO_SCHEDULE=1 triton-opt -split-input-file \
+// RUN:       -tritonamdgpu-dot-decompose-and-schedule=mode=modulo 2>/dev/null \
 // RUN:   | triton-opt -split-input-file \
 // RUN:       -tritonamdgpu-dot-decompose-and-schedule=mode=expand 2>&1 \
 // RUN:   | FileCheck %s
 //
-// Change #4 (ModuloDotSchedule expander): mode=expand takes the early-lowered
-// loop (single-buffer async_copy + local_load) and produces a real software
-// pipeline — re-buffer single->double (memdesc<2x...>) + ring extractIdx, then the
-// general expander peels a prologue async_copy and an epilogue dot. The two RUNs
-// chain change #1 (early-lower) into change #4 (expand).
+// The primary modulo path lowers eligible loads and attempts to serialize the
+// raw DDG/MRT schedule. The current cost model produces no cross-iteration
+// stage for this loop, so expansion deliberately uses the double-buffer fallback.
 
+// SCHEDULE: remark: amd-modulo:{{.*}}maxStage=0{{.*}}serialize=rejected(no-overlap)
+// SCHEDULE-NOT: triton.warp_pipeline.border
 // CHECK-LABEL: tt.func @early_lower
 // double-buffered alloc:
 // CHECK:       ttg.local_alloc {{.*}}memdesc<2x256x64xf16
