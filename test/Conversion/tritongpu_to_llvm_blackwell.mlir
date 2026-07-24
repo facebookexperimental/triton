@@ -1372,3 +1372,52 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     tt.return
   }
 }
+
+// -----
+
+// Regression test for "Shorten live range of SMEM operand of MMA".
+//
+// The MMA SMEM operand base address is computed with a *side-effecting* inline
+// PTX `add.s32` instead of a plain `llvm.add`. The side effect is what stops
+// LLVM from CSE-ing the address across MMAs: two MMAs reading the same SMEM
+// operand would otherwise share one address computation, giving that value a
+// very long live range and spilling registers in MMA-heavy kernels.
+//
+// The two tc_gen5_mma ops below share the same A and B SMEM operands at the same
+// offsets, so their per-operand address computations are structurally identical
+// -- exactly what CSE folds (this file's RUN line runs -cse). Each MMA still
+// emits its own side-effecting add.s32 for A and B, so all FOUR survive: a plain
+// (non-side-effecting) add would let CSE collapse them to 2.
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: @two_mma_shared_smem_operand_no_cse
+  // Two MMAs, one side-effecting add.s32 per SMEM operand each -> 4 total, none
+  // folded by CSE despite the shared operands.
+  // CHECK-COUNT-4: llvm.inline_asm has_side_effects {{.*}}"add.s32 $0, $1, $2;", "=r,r,r"
+  // CHECK-NOT: "add.s32 $0, $1, $2;"
+  tt.func @two_mma_shared_smem_operand_no_cse(%a: !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    // Both MMAs read the same %a and %b, so the operand-descriptor addresses are
+    // identical CSE candidates; the side effect keeps them separate.
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+    tt.return
+  }
+}
