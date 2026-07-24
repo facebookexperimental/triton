@@ -34,6 +34,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <climits>
 #include <cstdlib>
 #include <functional>
 #include <string>
@@ -111,6 +112,10 @@ struct DimInfo {
   bool loopAdvanced = false;
   Value loopIV;             // scf.for induction variable
   int64_t perIterElems = 0; // per-iteration advance along this (contiguous) dim
+  // Compile-time constant tile offset (from a dense splat constant in a
+  // subtiled epilogue). Materialized as an i32 arith.constant at rewrite time
+  // rather than inside the matcher to avoid orphan IR when the op is rejected.
+  std::optional<int32_t> deferredConstOffset;
 };
 
 struct DecomposedLoad {
@@ -193,6 +198,7 @@ static bool isRawIndexOffset(Value v) {
 
 // Match (make_range(0,BLOCK) + splat(tile_off)) * splat(stride), or the
 // contiguous form make_range(0,BLOCK) + splat(tile_off).
+static bool matchUniformIntConst(Value v, int64_t &out);
 static bool match1DOffset(Value offsetVal, DimInfo &info) {
   // Peel the no-mask OOB idiom `offs = (pid*BLOCK + arange) % M`: the modulus
   // is this dim's global extent. Record the modulus kernel arg as the shape
@@ -265,13 +271,30 @@ static bool match1DOffset(Value offsetVal, DimInfo &info) {
     Value addRhs = addOp.getRhs();
     for (int swap = 0; swap < 2; swap++) {
       int64_t blockSize;
-      Value tileOff = matchSplat(addRhs);
-      if (matchMakeRange(addLhs, blockSize) && tileOff) {
-        info.blockSize = blockSize;
-        info.stride = {};
-        info.offset = tileOff;
-        info.strideArgIdx = -1;
-        return true;
+      if (matchMakeRange(addLhs, blockSize)) {
+        // make_range + splat(tile_off): runtime/device tile offset.
+        if (Value tileOff = matchSplat(addRhs)) {
+          info.blockSize = blockSize;
+          info.stride = {};
+          info.offset = tileOff;
+          info.strideArgIdx = -1;
+          return true;
+        }
+        // make_range + compile-time-constant offset (a dense splat constant,
+        // e.g. a subtiled epilogue's column slice offset slice*size).
+        // matchSplat misses dense constants, so match here and record the
+        // value for deferred materialization at rewrite time.
+        int64_t cst;
+        if (matchUniformIntConst(addRhs, cst)) {
+          if (cst < INT32_MIN || cst > INT32_MAX)
+            return false;
+          info.blockSize = blockSize;
+          info.stride = {};
+          info.offset = {};
+          info.deferredConstOffset = (int32_t)cst;
+          info.strideArgIdx = -1;
+          return true;
+        }
       }
       std::swap(addLhs, addRhs);
     }
@@ -540,6 +563,27 @@ static DecomposedLoad decomposePointer(Value ptr) {
         result.dims[d].loopIV = loop.iv;
         result.dims[d].perIterElems = loop.stepElems;
       }
+  // For a contiguous row-major tensor the innermost extent equals the
+  // next-outer dim's stride (e.g. HEAD_DIM == stride_tok). Set it for the
+  // contiguous dim so that ALL subtiled slices — including slice 0 (offset
+  // folds to a bare arange, so it would otherwise take the blockSize=-2 path
+  // and get a *different* extent) — build the SAME descriptor
+  // (base+extent+block; only the store index differs). One shared descriptor
+  // lets the WS memory planner group every slice's staging into a single
+  // physical buffer. Correct for a full-dim tile too (block == extent == outer
+  // stride), so it also covers plain loads/stores.
+  //
+  // SAFETY: this inference is only valid when the tensor is contiguous in
+  // row-major order (inner extent == outer stride).  The pass cannot verify
+  // contiguity from IR alone — callers (e.g. backward()) must assert
+  // is_contiguous() before launching the kernel.
+  if (rank >= 2) {
+    DimInfo &inner = result.dims[rank - 1];
+    const DimInfo &outer = result.dims[rank - 2];
+    if (inner.strideArgIdx < 0 && inner.shapeArgIdx < 0 &&
+        outer.strideArgIdx >= 0)
+      inner.shapeArgIdx = outer.strideArgIdx;
+  }
   result.valid = true;
   return result;
 }
@@ -999,9 +1043,9 @@ static bool dimStrideIs16BAligned(tt::FuncOp func, const DimInfo &dim,
 // TMA-eligibility for a store's value tensor — mirrors isTMAEligible minus the
 // load-only `other`/OOB-fill check (TMA store bounds via the descriptor's
 // globalDim, so a masked store maps to a bounded TMA copy).
-static bool isTMAEligibleStore(tt::StoreOp storeOp,
+static bool isTMAEligibleStore(Value valueTensor,
                                const DecomposedLoad &decomp) {
-  auto valTy = dyn_cast<RankedTensorType>(storeOp.getValue().getType());
+  auto valTy = dyn_cast<RankedTensorType>(valueTensor.getType());
   if (!valTy)
     return false;
   // Shared eligibility core (dtype, rank, single contiguous dim, inner box a
@@ -1050,7 +1094,10 @@ struct Promotion {
 };
 
 struct StorePromotion {
-  tt::StoreOp storeOp;
+  Operation *op; // tt::StoreOp or tt::AtomicRMWOp(add/fadd)
+  Value value;   // stored / accumulated value tensor
+  bool isAtomicAdd =
+      false; // emit tt.descriptor_reduce(add), not descriptor_store
   DecomposedLoad decomp;
   SmallVector<int> shapeArgIndices;
   bool useDeviceMode = false;
@@ -1139,7 +1186,7 @@ public:
         // unmasked (no mask bound unattributable to a tiled dim): a
         // partially-masked untiled dim could have a true extent > blockSize, so
         // fabricating blockSize would under-size the descriptor.
-        if (s < 0 && !dim.offset &&
+        if (s < 0 && !dim.offset && !dim.deferredConstOffset &&
             !maskHasUnattributedBound(loadOp.getMask(), decomp)) {
           s = -2;
           needsDevice = true;
@@ -1197,7 +1244,7 @@ public:
     if (kernelIsWarpSpecialized(kernelFunc)) {
       kernelFunc.walk([&](tt::StoreOp storeOp) {
         DecomposedLoad decomp = decomposePointer(storeOp.getPtr());
-        if (!decomp.valid || !isTMAEligibleStore(storeOp, decomp))
+        if (!decomp.valid || !isTMAEligibleStore(storeOp.getValue(), decomp))
           return;
         // Per-store host-vs-device decision (same logic as loads).
         bool needsDevice = useDevice;
@@ -1233,7 +1280,7 @@ public:
             s = findShapeArgForDim(kernelFunc, storeOp.getMask(), dim);
           if (s < 0)
             s = findShapeArgFromTileBound(kernelFunc, dim);
-          if (s < 0 && !dim.offset &&
+          if (s < 0 && !dim.offset && !dim.deferredConstOffset &&
               !maskHasUnattributedBound(storeOp.getMask(), decomp)) {
             s = -2;
             needsDevice = true;
@@ -1242,7 +1289,7 @@ public:
         }
         bool ok = true;
         for (int d = 0; d < rank; d++)
-          if (shapeArgs[d] == -1) // -2 = constant extent (device mode)
+          if (shapeArgs[d] == -1)
             ok = false;
         if (!ok)
           return;
@@ -1264,7 +1311,80 @@ public:
         if (!storeMaskIsRectangular(storeOp.getMask(), decomp))
           return;
         StorePromotion p;
-        p.storeOp = storeOp;
+        p.op = storeOp;
+        p.value = storeOp.getValue();
+        p.decomp = decomp;
+        p.shapeArgIndices = shapeArgs;
+        p.useDeviceMode = needsDevice;
+        storePromotions.push_back(std::move(p));
+      });
+      // Phase 1c: eligible tt.atomic_rmw(add/fadd) whose result is unused -> a
+      // TMA reducing store (tt.descriptor_reduce). Same eligibility/geometry as
+      // a store; the only extra requirement is the unused result
+      // (descriptor_reduce returns nothing). Reuses the StorePromotion path
+      // (isAtomicAdd=true).
+      kernelFunc.walk([&](tt::AtomicRMWOp atomicOp) {
+        tt::RMWOp rmw = atomicOp.getAtomicRmwOp();
+        if (rmw != tt::RMWOp::ADD && rmw != tt::RMWOp::FADD)
+          return;
+        if (!atomicOp.getResult().use_empty())
+          return;
+        DecomposedLoad decomp = decomposePointer(atomicOp.getPtr());
+        if (!decomp.valid || !isTMAEligibleStore(atomicOp.getVal(), decomp))
+          return;
+        // Per-atomic host-vs-device decision (same logic as loads/stores).
+        bool needsDevice = useDevice;
+        if (!decomp.scalarBaseOffsets.empty())
+          needsDevice = true;
+        if (needsDevice && !scalarBaseOffsetsHoistable(atomicOp, decomp))
+          return;
+        int rank = decomp.dims.size();
+        if (decomp.dims[rank - 1].strideArgIdx >= 0)
+          return;
+        bool loopAdvanced = false;
+        for (int d = 0; d < rank; d++)
+          if (decomp.dims[d].loopAdvanced)
+            loopAdvanced = true;
+        if (loopAdvanced)
+          return;
+        // static_cast<unsigned>: dodge GCC 13 -Wstringop-overflow false
+        // positive.
+        SmallVector<int> shapeArgs(static_cast<unsigned>(rank), -1);
+        for (int d = 0; d < rank; d++) {
+          const DimInfo &dim = decomp.dims[d];
+          int s = dim.shapeArgIdx;
+          if (s < 0)
+            s = findShapeArgForDim(kernelFunc, atomicOp.getMask(), dim);
+          if (s < 0)
+            s = findShapeArgFromTileBound(kernelFunc, dim);
+          if (s < 0 && !dim.offset && !dim.deferredConstOffset &&
+              !maskHasUnattributedBound(atomicOp.getMask(), decomp)) {
+            s = -2;
+            needsDevice = true;
+          }
+          shapeArgs[d] = s;
+        }
+        bool ok = true;
+        for (int d = 0; d < rank; d++)
+          if (shapeArgs[d] == -1)
+            ok = false;
+        if (!ok)
+          return;
+        int elemBytes = cast<RankedTensorType>(atomicOp.getVal().getType())
+                            .getElementType()
+                            .getIntOrFloatBitWidth() /
+                        8;
+        for (int d = 0; d < rank; d++)
+          if (!dimStrideIs16BAligned(kernelFunc, decomp.dims[d], elemBytes))
+            return;
+        if (!argIs16BAligned(kernelFunc, decomp.basePtrArgIndex, elemBytes))
+          return;
+        if (!storeMaskIsRectangular(atomicOp.getMask(), decomp))
+          return;
+        StorePromotion p;
+        p.op = atomicOp;
+        p.value = atomicOp.getVal();
+        p.isAtomicAdd = true;
         p.decomp = decomp;
         p.shapeArgIndices = shapeArgs;
         p.useDeviceMode = needsDevice;
@@ -1472,12 +1592,17 @@ public:
           Value prod = arith::MulIOp::create(builder, loc, iv, step);
           indices.push_back(arith::TruncIOp::create(builder, loc, i32, prod));
         } else if (!dim.offset) {
-          // Whole-dim (untiled, e.g. FA HEAD_DIM): index is 0. Use the hoisted
-          // zero (deviceMode) so it isn't a constant inside the WS loop.
-          indices.push_back(
-              deviceZeroIdx ? deviceZeroIdx
-                            : arith::ConstantOp::create(
-                                  builder, loc, builder.getI32IntegerAttr(0)));
+          if (dim.deferredConstOffset) {
+            indices.push_back(arith::ConstantOp::create(
+                builder, loc,
+                builder.getI32IntegerAttr(*dim.deferredConstOffset)));
+          } else {
+            indices.push_back(
+                deviceZeroIdx
+                    ? deviceZeroIdx
+                    : arith::ConstantOp::create(builder, loc,
+                                                builder.getI32IntegerAttr(0)));
+          }
         } else {
           indices.push_back(toI32(dim.offset));
         }
@@ -1535,15 +1660,27 @@ public:
     // synthesized host-side descriptor (symmetric to loads; the
     // descriptor_store TTGIR lowering creates the reg->smem staging +
     // async_tma_copy_local_to_global).
+    struct DescCacheEntry {
+      Value basePtr;
+      SmallVector<Value> baseOffsets;
+      SmallVector<int> shapeArgs;
+      SmallVector<int> strideArgs;
+      SmallVector<int64_t> block;
+      Type elemTy;
+      Operation *hoistPt;
+      Value descVal;
+      Value zeroIdx;
+    };
+    SmallVector<DescCacheEntry, 0> descCache;
     for (auto &promo : storePromotions) {
-      tt::StoreOp storeOp = promo.storeOp;
+      Operation *op = promo.op;
       int rank = promo.decomp.dims.size();
-      Value value = storeOp.getValue();
+      Value value = promo.value;
       auto valTy = cast<RankedTensorType>(value.getType());
       Type elemTy = valTy.getElementType();
-      Location loc = storeOp.getLoc();
+      Location loc = op->getLoc();
 
-      builder.setInsertionPoint(storeOp);
+      builder.setInsertionPoint(op);
       Type i32 = builder.getI32Type();
 
       // Descriptor for the store: device-built (deviceMode) or host recipe arg.
@@ -1551,12 +1688,58 @@ public:
       unsigned descArgIdx = 0;
       Value deviceZeroIdx;
       if (promo.useDeviceMode) {
-        SmallVector<int> identity;
-        for (int d = 0; d < rank; d++)
-          identity.push_back(d);
-        descVal =
-            buildDeviceDescriptor(storeOp, promo.decomp, promo.shapeArgIndices,
-                                  identity, loc, deviceZeroIdx);
+        // Dedup descriptors: subtiled slices build an identical descriptor
+        // (same base/shape/stride/block; only the store INDEX differs). Reuse
+        // one shared descriptor SSA so the WS memory planner groups all slices'
+        // staging into a single physical buffer (it keys staging groups by
+        // descriptor value).
+        // LICM hoist point for cache key (must match buildDeviceDescriptor).
+        Operation *hoistPt = op;
+        for (auto forOp = op->getParentOfType<scf::ForOp>(); forOp;
+             forOp = forOp->getParentOfType<scf::ForOp>()) {
+          Region &loopBody = forOp.getRegion();
+          bool allInvariant = true;
+          for (Value off : promo.decomp.scalarBaseOffsets) {
+            if (loopBody.isAncestor(off.getParentRegion())) {
+              allInvariant = false;
+              break;
+            }
+          }
+          if (!allInvariant)
+            break;
+          hoistPt = forOp;
+        }
+        SmallVector<int> shapeArgsK, strideArgsK;
+        SmallVector<int64_t> blockK;
+        for (int d = 0; d < rank; d++) {
+          shapeArgsK.push_back(promo.shapeArgIndices[d]);
+          strideArgsK.push_back(promo.decomp.dims[d].strideArgIdx);
+          blockK.push_back(promo.decomp.dims[d].blockSize);
+        }
+        DescCacheEntry *hit = nullptr;
+        for (auto &e : descCache)
+          if (e.hoistPt == hoistPt && e.basePtr == promo.decomp.basePtr &&
+              e.elemTy == elemTy &&
+              e.baseOffsets == promo.decomp.scalarBaseOffsets &&
+              e.shapeArgs == shapeArgsK && e.strideArgs == strideArgsK &&
+              e.block == blockK) {
+            hit = &e;
+            break;
+          }
+        if (hit) {
+          descVal = hit->descVal;
+          deviceZeroIdx = hit->zeroIdx;
+        } else {
+          SmallVector<int> identity;
+          for (int d = 0; d < rank; d++)
+            identity.push_back(d);
+          descVal =
+              buildDeviceDescriptor(op, promo.decomp, promo.shapeArgIndices,
+                                    identity, loc, deviceZeroIdx);
+          descCache.push_back(
+              {promo.decomp.basePtr, promo.decomp.scalarBaseOffsets, shapeArgsK,
+               strideArgsK, blockK, elemTy, hoistPt, descVal, deviceZeroIdx});
+        }
       } else {
         auto descTy = tt::TensorDescType::get(
             valTy.getShape(), valTy.getElementType(), valTy.getEncoding());
@@ -1590,17 +1773,31 @@ public:
       SmallVector<Value> indices;
       for (int d = 0; d < rank; d++) {
         Value off = promo.decomp.dims[d].offset;
-        if (!off)
-          indices.push_back(
-              deviceZeroIdx ? deviceZeroIdx
-                            : arith::ConstantOp::create(
-                                  builder, loc, builder.getI32IntegerAttr(0)));
-        else
+        if (!off) {
+          if (promo.decomp.dims[d].deferredConstOffset) {
+            indices.push_back(arith::ConstantOp::create(
+                builder, loc,
+                builder.getI32IntegerAttr(
+                    *promo.decomp.dims[d].deferredConstOffset)));
+          } else {
+            indices.push_back(
+                deviceZeroIdx
+                    ? deviceZeroIdx
+                    : arith::ConstantOp::create(builder, loc,
+                                                builder.getI32IntegerAttr(0)));
+          }
+        } else {
           indices.push_back(toI32(off));
+        }
       }
 
-      tt::DescriptorStoreOp::create(builder, loc, descVal, value, indices);
-      storeOp.erase();
+      if (promo.isAtomicAdd)
+        tt::DescriptorReduceOp::create(builder, loc,
+                                       tt::DescriptorReduceKind::ADD, descVal,
+                                       value, indices);
+      else
+        tt::DescriptorStoreOp::create(builder, loc, descVal, value, indices);
+      op->erase();
 
       // Device stores need no launcher recipe.
       if (promo.useDeviceMode)

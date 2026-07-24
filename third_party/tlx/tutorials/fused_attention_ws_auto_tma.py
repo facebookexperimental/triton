@@ -627,13 +627,15 @@ _BWD_DOT_ATTRS_SCHED = FrozenDotAttrs({
 def _attn_bwd_dkdv_inner(
     dk,
     dv,
-    desc_q,
+    Q,
     k,
     v,
-    desc_do,
-    desc_dq,
-    desc_m,
-    desc_delta,
+    DO,
+    DQ,
+    M_ptr,
+    Delta_ptr,
+    y_dim,
+    stride_tok,
     off_bh,
     off_chz,
     curr_m,
@@ -649,10 +651,14 @@ def _attn_bwd_dkdv_inner(
     RESCHED: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
 ):
-    q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
+    offs_qm = off_bh + curr_m + tl.arange(0, BLOCK_M1)
+    offs_hd = tl.arange(0, HEAD_DIM)[None, :]
+    bwd_row_mask = offs_qm[:, None] < y_dim
+    q = tl.load(Q + offs_qm[:, None] * stride_tok + offs_hd, mask=bwd_row_mask, other=0.0)
     qT = tl.trans(q)
     offs_m_start = off_chz + curr_m
-    m = desc_m.load([offs_m_start.to(tl.int32)])
+    offs_m1 = offs_m_start + tl.arange(0, BLOCK_M1)
+    m = tl.load(M_ptr + offs_m1, mask=offs_m1 < y_dim, other=0.0)
     if RESCHED:
         qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"))
     else:
@@ -662,16 +668,16 @@ def _attn_bwd_dkdv_inner(
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         mask = offs_m[None, :] >= offs_n[:, None]
         pT = tl.where(mask, pT, 0.0)
-    do = desc_do.load([(off_bh + curr_m).to(tl.int32), 0])
+    do = tl.load(DO + offs_qm[:, None] * stride_tok + offs_hd, mask=bwd_row_mask, other=0.0)
     ppT = pT
     ppT = ppT.to(dtype)
     if RESCHED:
         dpT = tl.dot(v, tl.trans(do), attrs=BWD_DOT_ATTRS.get("dpT")).to(tl.float32)
-        Di = desc_delta.load([offs_m_start.to(tl.int32)])
+        Di = tl.load(Delta_ptr + offs_m1, mask=offs_m1 < y_dim, other=0.0)
         dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"))
     else:
         dv += tl.dot(ppT, do)
-        Di = desc_delta.load([offs_m_start.to(tl.int32)])
+        Di = tl.load(Delta_ptr + offs_m1, mask=offs_m1 < y_dim, other=0.0)
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
     dsT = pT * (dpT - Di[None, :])
     dsT = dsT.to(dtype)
@@ -689,7 +695,8 @@ def _attn_bwd_dkdv_inner(
     slice_size: tl.constexpr = HEAD_DIM // DQ_SUBTILE
     for slice_id in tl.static_range(0, DQ_SUBTILE):
         dqN = dqs[slice_id] * LN2
-        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dqN)
+        offs_dqd = slice_id * slice_size + tl.arange(0, slice_size)
+        tl.atomic_add(DQ + offs_qm[:, None] * stride_tok + offs_dqd[None, :], dqN, mask=bwd_row_mask)
     curr_m += step_m
     return dk, dv, curr_m
 
@@ -698,14 +705,15 @@ def _attn_bwd_dkdv_inner(
 def _attn_bwd_dkdv(
     dk,
     dv,  #
-    desc_q,
+    Q,
     k,
     v,
     sm_scale,  #
-    desc_do,  #
-    desc_dq,
-    desc_m,
-    desc_delta,  #
+    DO,  #
+    DQ,
+    M_ptr,
+    Delta_ptr,  #
+    y_dim,
     # shared by Q/K/V/DO.
     stride_tok,
     stride_d,  #
@@ -749,13 +757,15 @@ def _attn_bwd_dkdv(
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
-                desc_q,
+                Q,
                 k,
                 v,
-                desc_do,
-                desc_dq,
-                desc_m,
-                desc_delta,
+                DO,
+                DQ,
+                M_ptr,
+                Delta_ptr,
+                y_dim,
+                stride_tok,
                 off_bh,
                 off_chz,
                 curr_m,
@@ -776,13 +786,15 @@ def _attn_bwd_dkdv(
             dk, dv, curr_m = _attn_bwd_dkdv_inner(
                 dk,
                 dv,
-                desc_q,
+                Q,
                 k,
                 v,
-                desc_do,
-                desc_dq,
-                desc_m,
-                desc_delta,
+                DO,
+                DQ,
+                M_ptr,
+                Delta_ptr,
+                y_dim,
+                stride_tok,
                 off_bh,
                 off_chz,
                 curr_m,
@@ -803,30 +815,11 @@ def _attn_bwd_dkdv(
 
 
 def _bwd_host_descriptor_pre_hook(nargs):
-    BLOCK_M1 = nargs["BLOCK_M1"]
-    BLOCK_N1 = nargs["BLOCK_N1"]
-    HEAD_DIM = nargs["HEAD_DIM"]
-    EPILOGUE_SUBTILE = nargs["EPILOGUE_SUBTILE"]
-    # DQ_SUBTILE controls dq atomic_add staging only; defaults to
-    # EPILOGUE_SUBTILE so existing configs continue to behave the same.
-    DQ_SUBTILE = nargs.get("DQ_SUBTILE", EPILOGUE_SUBTILE)
-    if not isinstance(nargs["desc_q"], TensorDescriptor):
-        return
-
     # Reset dq accumulator to zeros before each autotuner warmup run.
     # Without this, dq accumulates across autotuner benchmark runs when
     # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
-    nargs["desc_dq"].base.zero_()
-
-    nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // DQ_SUBTILE]
-    nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
-    nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
-    nargs["desc_m"].block_shape = [BLOCK_M1]
-    nargs["desc_delta"].block_shape = [BLOCK_M1]
+    if "DQ" in nargs:
+        nargs["DQ"].zero_()
 
 
 configs_bwd = [
@@ -875,7 +868,7 @@ configs_bwd_persist = [
             "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
         },
         num_warps=4,
-        num_stages=2,
+        num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook,
     ),
     triton.Config(
@@ -939,16 +932,17 @@ configs_bwd_persist = [
 
 @triton.jit
 def _attn_bwd_core(
-    desc_q,
-    desc_k,
-    desc_v,
+    Q,
+    K,
+    V,
     sm_scale,  #
-    desc_do,  #
-    desc_dq,
-    desc_dk,
-    desc_dv,  #
-    desc_m,
-    desc_delta,  #
+    DO,  #
+    DQ,
+    DK,
+    DV,  #
+    M_ptr,
+    Delta_ptr,  #
+    y_dim,
     stride_tok,
     stride_d,  #
     stride_z,
@@ -969,7 +963,13 @@ def _attn_bwd_core(
     SMEM_BUDGET: tl.constexpr = 200000,
 ):
     off_chz = (bhid * N_CTX).to(tl.int64)
-    off_bh = ((stride_h * (bhid % H) + stride_z * (bhid // H)).to(tl.int64)) // stride_tok
+    # auto-TMA: plain int32 row index (descriptor tile offsets are i32; an i64
+    # offset blocks the pass's affine decomposition). off_bh = bhid*N_CTX assumes a
+    # CONTIGUOUS [Z, N_HEAD, N_CTX, HEAD_DIM] layout (each (batch,head) packed as
+    # exactly N_CTX rows, row stride == HEAD_DIM). NOT valid for padded-seq /
+    # varlen / strided / transposed batch-head layouts -- backward() asserts
+    # contiguity so those fail loudly instead of reading wrong addresses.
+    off_bh = bhid * N_CTX
 
     dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
@@ -977,20 +977,24 @@ def _attn_bwd_core(
     start_n = pid * BLOCK_N1
     start_m = 0
 
-    k = desc_k.load([(off_bh + start_n).to(tl.int32), 0])
-    v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
+    offs_kvn = off_bh + start_n + tl.arange(0, BLOCK_N1)
+    offs_hdc = tl.arange(0, HEAD_DIM)[None, :]
+    kv_mask = offs_kvn[:, None] < y_dim
+    k = tl.load(K + offs_kvn[:, None] * stride_tok + offs_hdc, mask=kv_mask, other=0.0)
+    v = tl.load(V + offs_kvn[:, None] * stride_tok + offs_hdc, mask=kv_mask, other=0.0)
     num_steps = (N_CTX - start_m) // BLOCK_M1
     dk, dv = _attn_bwd_dkdv(  #
         dk,
         dv,  #
-        desc_q,
+        Q,
         k,
         v,
         sm_scale,  #
-        desc_do,  #
-        desc_dq,
-        desc_m,
-        desc_delta,  #
+        DO,  #
+        DQ,
+        M_ptr,
+        Delta_ptr,  #
+        y_dim,
         stride_tok,
         stride_d,  #
         off_bh,
@@ -1016,33 +1020,30 @@ def _attn_bwd_core(
     slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dvN = dvs[slice_id]
-        desc_dv.store(
-            [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
-            dvN.to(dtype),
-        )
+        offs_ev = slice_id * slice_size + tl.arange(0, slice_size)
+        tl.store(DV + offs_kvn[:, None] * stride_tok + offs_ev[None, :], dvN.to(dtype), mask=kv_mask)
 
     dks = _split_n_2D(dk, EPILOGUE_SUBTILE)
     for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
         dkN = dks[slice_id] * sm_scale
-        desc_dk.store(
-            [(off_bh + start_n).to(tl.int32), slice_id * slice_size],
-            dkN.to(dtype),
-        )
+        offs_ek = slice_id * slice_size + tl.arange(0, slice_size)
+        tl.store(DK + offs_kvn[:, None] * stride_tok + offs_ek[None, :], dkN.to(dtype), mask=kv_mask)
 
 
 @triton.autotune(configs=configs_bwd, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd(
-    desc_q,
-    desc_k,
-    desc_v,
+    Q,
+    K,
+    V,
     sm_scale,  #
-    desc_do,  #
-    desc_dq,
-    desc_dk,
-    desc_dv,  #
-    desc_m,
-    desc_delta,
+    DO,  #
+    DQ,
+    DK,
+    DV,  #
+    M_ptr,
+    Delta_ptr,
+    y_dim,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -1068,16 +1069,17 @@ def _attn_bwd(
     pid = tl.program_id(0)
 
     _attn_bwd_core(
-        desc_q,
-        desc_k,
-        desc_v,
+        Q,
+        K,
+        V,
         sm_scale,
-        desc_do,
-        desc_dq,
-        desc_dk,
-        desc_dv,
-        desc_m,
-        desc_delta,
+        DO,
+        DQ,
+        DK,
+        DV,
+        M_ptr,
+        Delta_ptr,
+        y_dim,
         stride_tok,
         stride_d,
         stride_z,
@@ -1102,16 +1104,17 @@ def _attn_bwd(
 @triton.autotune(configs=configs_bwd_persist, key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def _attn_bwd_persist(
-    desc_q,
-    desc_k,
-    desc_v,
+    Q,
+    K,
+    V,
     sm_scale,  #
-    desc_do,  #
-    desc_dq,
-    desc_dk,
-    desc_dv,  #
-    desc_m,
-    desc_delta,
+    DO,  #
+    DQ,
+    DK,
+    DV,  #
+    M_ptr,
+    Delta_ptr,
+    y_dim,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -1144,62 +1147,6 @@ def _attn_bwd_persist(
 
     tile_idx = prog_id
 
-    y_dim = BATCH * H * N_CTX
-    desc_q = _maybe_make_tensor_desc(
-        desc_q,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM],
-    )
-    desc_do = _maybe_make_tensor_desc(
-        desc_do,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM],
-    )
-    desc_dq = _maybe_make_tensor_desc(
-        desc_dq,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M1, HEAD_DIM // DQ_SUBTILE],
-    )
-    desc_v = _maybe_make_tensor_desc(
-        desc_v,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM],
-    )
-    desc_k = _maybe_make_tensor_desc(
-        desc_k,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM],
-    )
-    desc_dv = _maybe_make_tensor_desc(
-        desc_dv,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
-    )
-    desc_dk = _maybe_make_tensor_desc(
-        desc_dk,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE],
-    )
-    desc_m = _maybe_make_tensor_desc(
-        desc_m,
-        shape=[y_dim],
-        strides=[1],
-        block_shape=[BLOCK_M1],
-    )
-    desc_delta = _maybe_make_tensor_desc(
-        desc_delta,
-        shape=[y_dim],
-        strides=[1],
-        block_shape=[BLOCK_M1],
-    )
-
     for _ in tl.range(
             0,
             tiles_per_sm,
@@ -1212,16 +1159,17 @@ def _attn_bwd_persist(
         pid = tile_idx % n_tile_num
         bhid = tile_idx // n_tile_num
         _attn_bwd_core(
-            desc_q,
-            desc_k,
-            desc_v,
+            Q,
+            K,
+            V,
             sm_scale,
-            desc_do,
-            desc_dq,
-            desc_dk,
-            desc_dv,
-            desc_m,
-            desc_delta,
+            DO,
+            DQ,
+            DK,
+            DV,
+            M_ptr,
+            Delta_ptr,
+            y_dim,
             stride_tok,
             stride_d,
             stride_z,
@@ -1359,12 +1307,20 @@ class _attention_opt(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, M = ctx.saved_tensors
+        # auto-TMA backward addresses rows as off_bh = bhid * N_CTX (see the
+        # _attn_bwd_* kernels), which is only correct for a contiguous
+        # [Z, N_HEAD, N_CTX, HEAD_DIM] layout with each (batch,head) packed as
+        # exactly N_CTX rows. Enforce contiguity so a strided / padded / varlen
+        # input fails loudly here instead of silently reading wrong addresses.
         assert do.is_contiguous()
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and o.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
         dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
+        assert BATCH * N_HEAD * N_CTX <= 2**31 - 1, (f"off_bh = bhid * N_CTX is computed as i32; "
+                                                     f"BATCH*N_HEAD*N_CTX={BATCH * N_HEAD * N_CTX} overflows int32")
         PRE_BLOCK = 128
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
@@ -1381,9 +1337,6 @@ class _attention_opt(torch.autograd.Function):
         )
         warp_specialize = True
 
-        dummy_block = [1, 1]
-        HEAD_DIM = ctx.HEAD_DIM
-
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
@@ -1397,61 +1350,15 @@ class _attention_opt(torch.autograd.Function):
         # the dv/dk TMA-staging buffers (aliasing the v/do operand SMEM) race
         # the next tile's operand load. See test_bwd_tmem_dsT_reuse_3group and
         # test_bwd_tmem_dsT_reuse_3group_persistent.
-        desc_k = TensorDescriptor(
-            arg_k,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        desc_v = TensorDescriptor(
-            v,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        desc_q = TensorDescriptor(
-            q,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        desc_do = TensorDescriptor(
-            do,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        desc_dq = TensorDescriptor(
-            dq,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        desc_dk = TensorDescriptor(
-            dk,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        desc_dv = TensorDescriptor(
-            dv,
-            shape=[BATCH * N_HEAD * N_CTX, HEAD_DIM],
-            strides=[HEAD_DIM, 1],
-            block_shape=dummy_block,
-        )
-        dummy_block_1d = [1]
-        desc_m = TensorDescriptor(
-            M,
-            shape=[BATCH * N_HEAD * N_CTX],
-            strides=[1],
-            block_shape=dummy_block_1d,
-        )
-        desc_delta = TensorDescriptor(
-            delta,
-            shape=[BATCH * N_HEAD * N_CTX],
-            strides=[1],
-            block_shape=dummy_block_1d,
-        )
+        desc_k = arg_k
+        desc_v = v
+        desc_q = q
+        desc_do = do
+        desc_dq = dq
+        desc_dk = dk
+        desc_dv = dv
+        desc_m = M
+        desc_delta = delta
 
         def grid(meta):
             return (
@@ -1477,6 +1384,8 @@ class _attention_opt(torch.autograd.Function):
             triton.knobs.nvidia.use_meta_ws = True
             triton.knobs.nvidia.use_meta_partition = True
             triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.auto_tma = True
+            triton.knobs.nvidia.auto_tma_device = True
             if ctx.persistent:
                 _attn_bwd_persist[grid_persist_bwd](
                     desc_q,
@@ -1489,6 +1398,7 @@ class _attention_opt(torch.autograd.Function):
                     desc_dv,  #
                     desc_m,
                     desc_delta,  #
+                    BATCH * N_HEAD * N_CTX,
                     q.stride(0),
                     q.stride(1),
                     q.stride(2),
@@ -1514,6 +1424,7 @@ class _attention_opt(torch.autograd.Function):
                     desc_dv,  #
                     desc_m,
                     desc_delta,  #
+                    BATCH * N_HEAD * N_CTX,
                     q.stride(0),
                     q.stride(1),
                     q.stride(2),
