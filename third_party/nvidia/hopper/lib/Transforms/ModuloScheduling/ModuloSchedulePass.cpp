@@ -847,27 +847,57 @@ static int walkLastConsumerEnd(const ttg::ScheduleLoop &loop, unsigned startId,
   return lastEnd;
 }
 
+/// The cycle at which a buffer's storage first becomes occupied.
+///
+/// For a TMA-loaded SMEM ring this is the load's ISSUE cycle, NOT the
+/// local_alloc's data-ready cycle. The TMA engine is multi-outstanding: it
+/// commits the ring slot for the whole transfer, and independent loads to
+/// different slots run concurrently, so the in-flight transfer window is part
+/// of the buffer's occupancy. The producer node (local_alloc) is a
+/// zero-latency rename scheduled AFTER the load completes, so its cycle already
+/// folds in the TMA latency — starting the lifetime there omits the transfer
+/// and under-provisions the prefetch ring (e.g. GEMM depth 3 vs the 5-6
+/// throughput optimum). Walk back through the producer's incoming data edges to
+/// any feeding TMA load and take the earliest issue cycle. (Scaling the modeled
+/// TMA latency does NOT help: it shifts both the load and the alloc by the same
+/// amount, leaving this span fixed.)
+static int bufferOccupancyStart(const ttg::ScheduleLoop &loop,
+                                unsigned producerNodeId) {
+  int start = loop.getNode(producerNodeId).cycle;
+  for (const auto &edge : loop.edges) {
+    if (edge.dstId != producerNodeId)
+      continue;
+    const auto &pred = loop.getNode(edge.srcId);
+    if (pred.pipeline == ttg::HWPipeline::TMA)
+      start = std::min(start, pred.cycle);
+  }
+  return start;
+}
+
 /// Step 3: Compute buffer count from cycle-level lifetime.
 ///
 /// Design doc formula:
 ///   lifetime(R) = lastConsumerEnd - producerStart
 ///   num_buffers(R) = floor(lifetime(R) / II) + 1
 ///
+/// producerStart is the buffer's occupancy start (bufferOccupancyStart), which
+/// for a TMA-loaded ring is the load issue cycle, not data-ready.
+///
 /// For loop-carried edges (distance > 0), the consumer in iteration i+d
 /// effectively ends at: consumerEnd + d * II (in absolute time).
 /// This is equivalent to adding d * II to the lifetime.
 static unsigned computeBufferCount(const ttg::ScheduleLoop &loop,
                                    unsigned producerNodeId) {
-  const auto &producer = loop.getNode(producerNodeId);
-  int prodCycle = producer.cycle;
   int II = loop.II;
   if (II <= 0)
     return 1;
 
+  int prodCycle = bufferOccupancyStart(loop, producerNodeId);
+
   llvm::DenseSet<unsigned> seen;
   seen.insert(producerNodeId);
-  int lastConsumerEnd =
-      walkLastConsumerEnd(loop, producerNodeId, prodCycle, II, 0, seen);
+  int lastConsumerEnd = walkLastConsumerEnd(
+      loop, producerNodeId, loop.getNode(producerNodeId).cycle, II, 0, seen);
 
   int lifetime = lastConsumerEnd - prodCycle;
   int numBuffers = lifetime / II + 1;
@@ -1286,11 +1316,14 @@ static int64_t computeTotalTmem(const ttg::ScheduleLoop &loop) {
 /// computed by computeBufferCount.
 static int computeBufferLifetime(const ttg::ScheduleLoop &loop,
                                  unsigned producerNodeId) {
-  const auto &producer = loop.getNode(producerNodeId);
-  int prodCycle = producer.cycle;
+  // Occupancy starts at the TMA load issue for a TMA-loaded ring (matches
+  // computeBufferCount / bufferOccupancyStart), so the post-reduction II
+  // recompute sees the same resident span the depth was derived from.
+  int prodCycle = bufferOccupancyStart(loop, producerNodeId);
   llvm::DenseSet<unsigned> seen;
-  int lastConsumerEnd =
-      walkLastConsumerEnd(loop, producerNodeId, prodCycle, loop.II, 0, seen);
+  int lastConsumerEnd = walkLastConsumerEnd(
+      loop, producerNodeId, loop.getNode(producerNodeId).cycle, loop.II, 0,
+      seen);
   return lastConsumerEnd - prodCycle;
 }
 
@@ -1398,14 +1431,43 @@ buildCoConsumedGroups(const ttg::ScheduleLoop &loop) {
   return groups;
 }
 
-/// Reduce all buffers in a co-consumed group to the given depth.
-static void reduceGroupToDepth(ttg::ScheduleLoop &loop,
-                               const llvm::SmallVector<unsigned> &group,
-                               unsigned newDepth) {
-  for (unsigned bufId : group) {
-    if (loop.buffers[bufId].count > newDepth) {
-      loop.buffers[bufId].count = newDepth;
-      unsigned barId = loop.buffers[bufId].pairedBufferId;
+/// Reduce `bestIdx` together with every buffer it must stay equal-depth with,
+/// to `newDepth`. That set is the transitive closure over two relations:
+///   - co-consumed group: buffers feeding the same pipeline op share a ring
+///     depth;
+///   - merge group: buffers sharing one physical allocation, whose footprint is
+///     max(member.count) and whose members must stay equal for the emitter's
+///     reuse= aliasing (mergeNonOverlappingBuffers only groups equal counts).
+/// Reducing a single member would leave the physical footprint unchanged (so
+/// the budget loop would keep hammering that one member down to 1) and break
+/// the equal-count invariant. Paired barriers follow their data buffer.
+static void reduceBufferGroup(
+    ttg::ScheduleLoop &loop, unsigned bestIdx,
+    const llvm::SmallVector<llvm::SmallVector<unsigned>> &coGroups,
+    const llvm::DenseMap<unsigned, unsigned> &bufToGroupIdx, unsigned newDepth) {
+  llvm::DenseSet<unsigned> toReduce;
+  llvm::SmallVector<unsigned> work;
+  work.push_back(bestIdx);
+  while (!work.empty()) {
+    unsigned b = work.pop_back_val();
+    if (b >= loop.buffers.size() || !toReduce.insert(b).second)
+      continue;
+    // Co-consumed peers (same ring depth).
+    auto git = bufToGroupIdx.find(b);
+    if (git != bufToGroupIdx.end())
+      for (unsigned m : coGroups[git->second])
+        work.push_back(m);
+    // Merge-group peers (same physical allocation).
+    unsigned mg = loop.buffers[b].mergeGroupId;
+    if (mg != UINT_MAX)
+      for (unsigned j = 0; j < loop.buffers.size(); ++j)
+        if (loop.buffers[j].mergeGroupId == mg)
+          work.push_back(j);
+  }
+  for (unsigned b : toReduce) {
+    if (loop.buffers[b].count > newDepth) {
+      loop.buffers[b].count = newDepth;
+      unsigned barId = loop.buffers[b].pairedBufferId;
       if (barId != UINT_MAX)
         loop.buffers[barId].count = newDepth;
     }
@@ -1420,21 +1482,6 @@ static void reduceGroupToDepth(ttg::ScheduleLoop &loop,
 /// The schedule (op placement) stays fixed — only II and buffer depths change.
 static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
                                    int64_t smemReserved = 0) {
-  // Precompute buffer lifetimes (from the original schedule, before reduction).
-  llvm::DenseMap<unsigned, int> bufLifetimes;
-  for (unsigned i = 0; i < loop.buffers.size(); ++i) {
-    auto &buf = loop.buffers[i];
-    if (buf.kind == ttg::MemoryKind::BARRIER ||
-        buf.kind == ttg::MemoryKind::Register)
-      continue;
-    for (const auto &node : loop.nodes) {
-      if (node.producesBuffer == buf.id) {
-        bufLifetimes[i] = computeBufferLifetime(loop, node.id);
-        break;
-      }
-    }
-  }
-
   // Build co-consumed groups so we reduce them together.
   auto coGroups = buildCoConsumedGroups(loop);
   // Map bufId → group index for quick lookup.
@@ -1480,21 +1527,18 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     if (bestIdx < 0)
       break;
     unsigned newDepth = loop.buffers[bestIdx].count - 1;
-    // If this buffer is in a co-consumed group, reduce the whole group.
-    auto groupIt = bufToGroupIdx.find(bestIdx);
-    if (groupIt != bufToGroupIdx.end()) {
-      reduceGroupToDepth(loop, coGroups[groupIt->second], newDepth);
-      LLVM_DEBUG(llvm::dbgs()
-                 << "[Step4.6] Reduced co-consumed group (buf" << bestIdx
-                 << " + partners) to count=" << newDepth << "\n");
-    } else {
-      loop.buffers[bestIdx].count = newDepth;
-      unsigned barId = loop.buffers[bestIdx].pairedBufferId;
-      if (barId != UINT_MAX)
-        loop.buffers[barId].count = newDepth;
-      LLVM_DEBUG(llvm::dbgs() << "[Step4.6] Reduced SMEM buf" << bestIdx
-                              << " to count=" << newDepth << "\n");
-    }
+    // Reduce bestIdx together with its co-consumed AND merge-group peers, so the
+    // physical footprint actually drops and the equal-count invariants hold.
+    reduceBufferGroup(loop, bestIdx, coGroups, bufToGroupIdx, newDepth);
+    LLVM_DEBUG(llvm::dbgs()
+               << "[Step4.6] Reduced SMEM buf" << bestIdx
+               << " (+ co-consumed/merge peers) to count=" << newDepth << "\n");
+    // Refresh physical buffers so the next computeTotalSmem() reflects the
+    // reduced logical count. Without this the merge-group footprint stays
+    // frozen at the pre-reduction depth, the total never drops below budget,
+    // and the loop over-reduces every ring to count=1 — collapsing the pipeline
+    // to a serial (non-buffered) schedule.
+    buildPhysicalBuffers(loop);
   }
 
   // TMEM reduction
@@ -1513,33 +1557,49 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     }
     if (bestIdx < 0)
       break;
-    loop.buffers[bestIdx].count--;
-    unsigned barId = loop.buffers[bestIdx].pairedBufferId;
-    if (barId != UINT_MAX)
-      loop.buffers[barId].count = loop.buffers[bestIdx].count;
+    unsigned newDepth = loop.buffers[bestIdx].count - 1;
+    reduceBufferGroup(loop, bestIdx, coGroups, bufToGroupIdx, newDepth);
     LLVM_DEBUG(llvm::dbgs()
                << "[Step4.6] Reduced TMEM buf" << bestIdx
-               << " to count=" << loop.buffers[bestIdx].count << "\n");
+               << " (+ co-consumed/merge peers) to count=" << newDepth << "\n");
+    // Refresh physical buffers so the next computeTotalTmem() reflects the
+    // reduced logical count (see the SMEM loop above).
+    buildPhysicalBuffers(loop);
   }
 
-  // Recompute II from reduced buffer depths.
-  // new_II = max over all buffers of ceil(lifetime / depth).
+  // Recompute II from the reduced buffer depths:
+  //   new_II = max over buffers of ceil(lifetime / depth).
+  // For a loop-carried buffer (consumer distance d > 0) the lifetime itself
+  // grows with II -- lastConsumerEnd includes d*II -- so a single pass using
+  // lifetimes measured at the old II under-estimates II and can let the loader
+  // reclaim a slot before its loop-carried consumer finishes. Iterate to a
+  // fixed point: set the trial II, recompute lifetimes AT that II, take the
+  // tightest ceil(lifetime/depth), repeat. II only increases, so this
+  // converges; the iteration cap guards the depth <= d case (no feasible II --
+  // the budget check below then reports the residual overflow).
   int newII = originalII;
-  for (unsigned i = 0; i < loop.buffers.size(); ++i) {
-    auto &buf = loop.buffers[i];
-    if (buf.kind == ttg::MemoryKind::BARRIER ||
-        buf.kind == ttg::MemoryKind::Register)
-      continue;
-    auto it = bufLifetimes.find(i);
-    if (it == bufLifetimes.end() || buf.count <= 0)
-      continue;
-    int requiredII = (it->second + buf.count - 1) / buf.count;
-    if (requiredII > newII) {
-      LLVM_DEBUG(llvm::dbgs() << "[Step4.6] buf" << i << " lifetime="
-                              << it->second << " depth=" << buf.count
-                              << " → requires II=" << requiredII << "\n");
-      newII = requiredII;
+  for (int iter = 0; iter < 64; ++iter) {
+    loop.II = newII;
+    int trialII = originalII;
+    for (unsigned i = 0; i < loop.buffers.size(); ++i) {
+      auto &buf = loop.buffers[i];
+      if (buf.kind == ttg::MemoryKind::BARRIER ||
+          buf.kind == ttg::MemoryKind::Register || buf.count <= 0)
+        continue;
+      int lifetime = -1;
+      for (const auto &node : loop.nodes)
+        if (node.producesBuffer == buf.id) {
+          lifetime = computeBufferLifetime(loop, node.id);
+          break;
+        }
+      if (lifetime < 0)
+        continue;
+      trialII = std::max(trialII,
+                         static_cast<int>((lifetime + buf.count - 1) / buf.count));
     }
+    if (trialII == newII)
+      break;
+    newII = trialII;
   }
 
   if (newII != originalII) {
@@ -1792,7 +1852,10 @@ static void computeBufferLifetimes(ttg::ScheduleLoop &loop) {
     for (const auto &node : loop.nodes) {
       if (node.producesBuffer != buf.id)
         continue;
-      buf.liveStart = node.cycle;
+      // Occupancy starts at the TMA load issue for a TMA-loaded ring (see
+      // bufferOccupancyStart), not the local_alloc's data-ready cycle. Keeps the
+      // merge-analysis live interval consistent with the buffer count.
+      buf.liveStart = bufferOccupancyStart(loop, node.id);
       // Walk transitively through transparent view ops (memdesc_trans /
       // memdesc_subview) so the buffer's live range reaches the actual
       // MMA / load / store that holds the SMEM, not just the metadata
