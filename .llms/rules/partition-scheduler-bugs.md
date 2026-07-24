@@ -112,6 +112,12 @@
 - **Lit test**: covered by `ws_buffer_allocation_inloop_store_terminator.mlir` (added with the fix in D111818256): `reorderEpilogOps` must not move a block terminator, else the loop body is left without a valid terminator (invalid IR that later crashes `hasLoopCarriedAccToken`).
 - **Regression**: `test_self_attention_autows.py` 2/2 (fwd+bwd autoWS grads vs torch); WarpSpecialization lit suite 111 pass / 11 xfail / 0 unexpected.
 
+### 14. Inner K loop not rescheduled under a warp-specialized outer scf.while (2026-07-20, fixed)
+- **Symptom**: Unified dynamic outer-while AutoWS emits `'arith.divui' op not assigned a pipeline stage` twice on Blackwell. Compilation continues and numerical correctness passes, but the inner K-loop software pipeliner bails instead of completing the partial post-WS schedule.
+- **Root cause** (`ScheduleLoops.cpp`): `doLoopSchedulePreprocessing` only recognized an outer `scf.for`. After code partition physically specializes a dynamic outer `scf.while`, its nested K loops retain `tt.scheduled_max_stage` and partial `loop.stage` assignments but never regain the `tt.warp_specialize` marker required by `getInitialSchedule` to deserialize and complete that schedule.
+- **Fix**: Recognize annotated outer `scf.while` operations during post-WS preprocessing and apply `tt.warp_specialize` to their already-staged innermost `scf.for` loops. The outer while remains physically warp-specialized but is not software-pipelined.
+- **Tests**: `ws_atomic_broadcast_from_psm.mlir` covers the production PSM-to-code-partition path and nested-loop rescheduling; the unified `DynamicPersistent1DScheduler` tutorial09 case checks Blackwell correctness and rejects the missing-stage diagnostic.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

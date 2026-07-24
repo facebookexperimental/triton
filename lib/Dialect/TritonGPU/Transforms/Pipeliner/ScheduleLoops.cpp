@@ -81,6 +81,18 @@ void preprocesssWarpSpecializedOuterLoop(scf::ForOp &forOp, Builder &builder) {
   }
 }
 
+// A dynamic-persistent warp-specialized loop remains an scf.while after code
+// partitioning. Its nested scf.for loops still need to be rescheduled before
+// software pipelining, just like the nested loops of an outer scf.for.
+void preprocesssWarpSpecializedOuterLoop(scf::WhileOp whileOp,
+                                         Builder &builder) {
+  if (!whileOp->hasAttr(kWarpSpecializeAttrName))
+    return;
+  whileOp.walk([&](scf::ForOp innerLoop) {
+    preprocesssWarpSpecializedInnerLoop(innerLoop, builder);
+  });
+}
+
 void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder) {
   // Process the given function to propagate the warp-specialize attribute
   // from the outer loop to the inner loops. This is done to enable the loop
@@ -91,6 +103,9 @@ void doLoopSchedulePreprocessing(ModuleOp moduleOp, Builder &builder) {
   // attribute when the inner loop already has the max stage count.
   moduleOp.walk([&](scf::ForOp forOp) {
     preprocesssWarpSpecializedOuterLoop(forOp, builder);
+  });
+  moduleOp.walk([&](scf::WhileOp whileOp) {
+    preprocesssWarpSpecializedOuterLoop(whileOp, builder);
   });
 }
 
