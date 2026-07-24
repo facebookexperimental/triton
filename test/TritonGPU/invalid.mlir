@@ -231,7 +231,7 @@ module attributes {"ttg.num-warps" = 1 : i32} {
 #shared = #ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 4, order = [0, 1]}>
 #smem = #ttg.shared_memory
 tt.func public @memdesc_reinterpret_changed_storage_size(%arg0: !ttg.memdesc<8x16xf16, #shared, #smem>) {
-    // expected-error @+1 {{result storage size}}
+    // expected-error @+1 {{result logical storage size must not exceed source logical storage size}}
     %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<8x16xf16, #shared, #smem> -> !ttg.memdesc<8x16xf32, #shared, #smem>
     tt.return
 }
@@ -273,7 +273,7 @@ tt.func public @memdesc_reinterpret_subview(%arg0: !ttg.memdesc<8x16xf16, #share
 #shared_linear_dst = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0]]}, alignment = 16>
 #smem = #ttg.shared_memory
 tt.func public @memdesc_reinterpret_oversized_shared_linear(%arg0: !ttg.memdesc<16x16xf16, #shared_linear_src, #smem>) {
-    // expected-error @+1 {{result storage size}}
+    // expected-error @+1 {{result logical storage size must not exceed source logical storage size}}
     %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<16x16xf16, #shared_linear_src, #smem> -> !ttg.memdesc<32x16xf16, #shared_linear_dst, #smem>
     tt.return
 }

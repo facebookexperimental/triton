@@ -228,9 +228,11 @@ Operation *sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto newShape = newType.getShape();
   auto blockN = newShape[shape.size() - 1];
 
-  // The source allocation is measured in its physical TMEM columns.  A
-  // narrower destination element type consumes fewer source columns, matching
-  // the subslice width below.
+  // `oldBlockN` and `offset` are measured in the source allocation's physical
+  // TMEM columns, while `blockN` is the destination tile width.  A 16-bit
+  // destination packed into a 32-bit source occupies blockN / 2 source
+  // columns (the f32 -> f16/bf16 reuse case), so validate the effective width
+  // before constructing the parent view and converted subslice below.
   auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
   auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
   int64_t sliceCols = blockN;

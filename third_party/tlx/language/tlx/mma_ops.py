@@ -24,22 +24,18 @@ def require_layout(x, layout, _semantic=None):
 
 @tl.builtin
 def mfma(a, b, acc, _semantic=None):
-    """Compute an AMD MFMA while preserving the accumulator layout.
+    """Compute an AMD MFMA using the accumulator's explicit layout.
 
-    Gluon's ``gl.amd.mfma`` uses the regular Triton dot builder for the
-    operation, but wraps the resulting handle in ``acc.type``.  That small
-    type contract is important for explicit CDNA MFMA layouts: standard
-    ``tl.dot`` returns a null-layout block tensor, which leaves an unresolved
-    blocked-to-MFMA materialization when the accumulator is pinned.  TLX
-    callers use this primitive only with matching AMD dot-operand layouts and
-    an explicitly laid-out accumulator.
+    The shared semantic dot builder now returns the accumulator type whenever
+    an accumulator is supplied.  That keeps Gluon distributed/MFMA layouts
+    attached to the Python value while remaining a no-op for regular Triton
+    block tensors.
     """
     assert acc is not None, "acc is required"
     acc = tl._unwrap_if_constexpr(acc)
     a = tl._unwrap_if_constexpr(a)
     b = tl._unwrap_if_constexpr(b)
-    result = _semantic.dot(a, b, acc, input_precision=None, max_num_imprecise_acc=None, out_dtype=acc.dtype)
-    return tl.tensor(result.handle, acc.type)
+    return _semantic.dot(a, b, acc, input_precision=None, max_num_imprecise_acc=None, out_dtype=acc.dtype)
 
 
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):

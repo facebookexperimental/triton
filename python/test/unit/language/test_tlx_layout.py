@@ -1001,10 +1001,9 @@ def test_amd_mfma_layout_anchors_and_releases_on_cdna4():
 def test_tlx_mfma_preserves_explicit_accumulator_layout_on_cdna4():
     """The TLX MFMA wrapper must keep the concrete accumulator layout live.
 
-    Standard ``tl.dot`` returns an unresolved block tensor even when its
-    accumulator is explicitly pinned.  The AMD MFMA builtin instead mirrors
-    Gluon's ``gl.amd.mfma`` contract and returns the accumulator's layout, so
-    the score dot can feed elementwise operations without an unresolved
+    The shared semantic ``tl.dot`` path now propagates an explicitly laid-out
+    accumulator type.  The AMD MFMA builtin delegates to that path, so the
+    score dot can feed elementwise operations without an unresolved
     blocked-to-MFMA materialization.
     """
     mma = tlx.amd_mfma_layout(4, [16, 16, 32], True, [4, 1])
