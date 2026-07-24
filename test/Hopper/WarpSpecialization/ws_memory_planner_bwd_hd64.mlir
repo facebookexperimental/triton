@@ -1,4 +1,10 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// Top-K TMEM packing enumeration (mem_plan_pick over TMEM): with TOPK>1 the
+// planner enumerates distinct feasible packings, ranked by occupancy. Rank 0 is
+// the occupancy-best packing and matches the default first-fit; rank 1 is the
+// alternative (looser) packing. mem_plan_pick selects the rank.
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=8 TRITON_WS_MEM_PLAN_PICK=0 triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: env TRITON_WS_MEM_PLAN_TOPK=8 TRITON_WS_MEM_PLAN_PICK=1 triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=PICK1
 
 // Test case: FA BWD with HEAD_DIM=64 — dq reuses a larger tmem buffer at a col offset.
 //
@@ -19,6 +25,15 @@
 // CHECK-LABEL: tt.func public @_attn_bwd
 // CHECK: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 8 : i32, buffer.offset = 0 : i32}
 // CHECK: %dpT, %dpT_1 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 8 : i32}
+//
+// Enumeration rank 1 selects the *other* legal packing: dq reuses qkT's block
+// (buffer.id 7) at column offset 64 instead of dpT's block at offset 0. This
+// pins that mem_plan_pick surfaces distinct TMEM packings. Note this is exactly
+// the offset-64 packing described above as runtime-unsafe (it aliases a co-live
+// region) — so non-default picks are model-legal but NOT correctness-guaranteed;
+// a harness sweeping mem_plan_pick must validate each pick at runtime.
+// PICK1-LABEL: tt.func public @_attn_bwd
+// PICK1: %dq, %dq_0 = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 64 : i32}
 // CHECK: %dv = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 7 : i32, buffer.offset = 0 : i32}
 // CHECK: %qkT, %qkT_2 = ttng.tmem_alloc {{{.*}}buffer.copy = 1 : i32, buffer.id = 7 : i32}
 // CHECK: %dv_3, %dv_4 = ttng.tmem_alloc {{{.*}}buffer.copy = 2 : i32, buffer.id = 6 : i32}
