@@ -193,6 +193,13 @@ standardOutDimPairs(MLIRContext *ctx, ArrayRef<int64_t> dstShape) {
 // Returns a 1D -> ND layout into [dim0, dim1, ...] that's equivalent to
 // creating a 1D -> 1D mapping of size product(shape) and then reshaping to
 // permute(shape, order).
+LinearLayout identity1DForShape(int32_t size, StringAttr inDim,
+                                StringAttr outDim) {
+  if (size == 0 || llvm::isPowerOf2_32(size))
+    return LinearLayout::identity1D(size, inDim, outDim);
+  return LinearLayout::modularIdentity1D(size, inDim, outDim);
+}
+
 LinearLayout identityStandardND(StringAttr inDimName, ArrayRef<unsigned> shape,
                                 ArrayRef<unsigned> order) {
   assert(shape.size() == order.size());
@@ -206,7 +213,7 @@ LinearLayout identityStandardND(StringAttr inDimName, ArrayRef<unsigned> shape,
   for (int i = 0; i < shape.size(); i++) {
     // Start with the most-minor dimension, which is order[0].
     int dim = order[i];
-    ret *= LinearLayout::identity1D(shape[dim], inDimName, outDimNames[dim]);
+    ret *= identity1DForShape(shape[dim], inDimName, outDimNames[dim]);
   }
   return ret;
 }
