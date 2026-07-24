@@ -903,6 +903,89 @@ LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k) {
   return slot;
 }
 
+Block *getLoopBodyBlock(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getBody();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation()))
+    return whileOp.getAfterBody();
+  llvm_unreachable("unsupported loop type");
+}
+
+Region &getLoopBodyRegion(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getBodyRegion();
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation()))
+    return whileOp.getAfter();
+  llvm_unreachable("unsupported loop type");
+}
+
+Operation *getLoopBodyTerminator(LoopLikeOpInterface loop) {
+  return getLoopBodyBlock(loop)->getTerminator();
+}
+
+ValueRange getLoopYieldedValues(LoopLikeOpInterface loop) {
+  return getLoopBodyTerminator(loop)->getOperands();
+}
+
+Value getLoopInductionVar(LoopLikeOpInterface loop) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getInductionVar();
+  if (isa<scf::WhileOp>(loop.getOperation()))
+    return {};
+  llvm_unreachable("unsupported loop type");
+}
+
+std::pair<OpResult, int64_t>
+getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value) {
+  int64_t distance = 0;
+  DenseSet<Value> seen;
+  Block *body = getLoopBodyBlock(loop);
+  Value inductionVar = getLoopInductionVar(loop);
+  while (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (arg.getOwner() != body || arg == inductionVar)
+      return {nullptr, 0};
+    unsigned slot = arg.getArgNumber();
+    if (isa<scf::ForOp>(loop.getOperation())) {
+      assert(slot > 0 && "expected a carried argument, not the induction var");
+      --slot;
+    }
+    ++distance;
+    value = getLoopYieldedValues(loop)[slot];
+    if (!seen.insert(value).second)
+      return {nullptr, 0};
+  }
+  return {dyn_cast<OpResult>(value), distance};
+}
+
+BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation()))
+    return forOp.getRegionIterArg(k);
+  if (isa<scf::WhileOp>(loop.getOperation())) {
+    BlockArgument afterArg = getLoopCarriedSlot(loop, k).afterArg;
+    assert(afterArg && "scf.while must identity-forward every carried value");
+    return afterArg;
+  }
+  llvm_unreachable("unsupported loop type");
+}
+
+bool hasIdentityLoopCarry(LoopLikeOpInterface loop) {
+  if (isa<scf::ForOp>(loop.getOperation()))
+    return true;
+  auto whileOp = dyn_cast<scf::WhileOp>(loop.getOperation());
+  if (!whileOp)
+    return false;
+
+  auto beforeArgs = loop.getRegionIterArgs();
+  auto forwarded = whileOp.getConditionOp().getArgs();
+  if (forwarded.size() != beforeArgs.size() ||
+      whileOp.getAfterArguments().size() != beforeArgs.size() ||
+      getLoopYieldedValues(loop).size() != beforeArgs.size())
+    return false;
+  return llvm::all_of(llvm::enumerate(forwarded), [&](auto indexedValue) {
+    return indexedValue.value() == beforeArgs[indexedValue.index()];
+  });
+}
+
 scf::IfOp replaceIfOpWithNewSignature(OpBuilder &rewriter, scf::IfOp ifOp,
                                       TypeRange newResultTypes) {
   SmallVector<std::tuple<Value, Value>> replacements;

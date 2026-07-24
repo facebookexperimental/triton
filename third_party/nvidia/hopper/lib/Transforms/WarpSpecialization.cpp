@@ -130,7 +130,7 @@ public:
       if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
           op->getAttrOfType<DenseI32ArrayAttr>(
               triton::gpu::kPartitionAttrName) ||
-          (isa<scf::ForOp>(op) &&
+          (isa<scf::ForOp, scf::WhileOp>(op) &&
            op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
         enabled = true;
         return WalkResult::interrupt();
