@@ -239,63 +239,53 @@ def _a4w4_kernel(
     b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
 
     for _ in tl.range(0, iter_max - 2, 2, num_stages=1):
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
-            b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
-            tlx.local_store(smem_bs[0], b_sc_right_buf1)
-            b_sc_right_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
-            tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
-            tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-            a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), scale_load_layout_a)
-            b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets),
-                                                scale_load_layout_b)
-            tlx.async_load_commit_group()
+        acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
+        tlx.async_load_wait_group(2)
+        b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
+        tlx.local_store(smem_bs[0], b_sc_right_buf1)
+        b_sc_right_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
+        tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
+        a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets), scale_load_layout_a)
+        b_sc_left_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets), scale_load_layout_b)
+        tlx.async_load_commit_group()
 
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_right = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
-            a_next = tlx.local_load(smem_a[1], relaxed=True)
-            b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
-            tlx.local_store(smem_as[0], a_sc_buf3)
-            tlx.local_store(smem_bs[0], b_sc_left_buf3)
-            a_sc_reg_buf2 = tlx.local_load(smem_as[0], layout=scale_a_layout)
-            b_sc_left_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
-            tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
-            b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets),
-                                                 scale_load_layout_b)
-            tlx.async_load_commit_group()
+        acc_right = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
+        tlx.async_load_wait_group(2)
+        a_next = tlx.local_load(smem_a[1], relaxed=True)
+        b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
+        tlx.local_store(smem_as[0], a_sc_buf3)
+        tlx.local_store(smem_bs[0], b_sc_left_buf3)
+        a_sc_reg_buf2 = tlx.local_load(smem_as[0], layout=scale_a_layout)
+        b_sc_left_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
+        b_sc_right_buf1 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets), scale_load_layout_b)
+        tlx.async_load_commit_group()
 
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_left = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
-            b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
-            tlx.local_store(smem_bs[0], b_sc_right_buf3)
-            b_sc_right_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
-            tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
-            tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-            a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), scale_load_layout_a)
-            b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
-                                                scale_load_layout_b)
-            tlx.async_load_commit_group()
+        acc_left = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
+        tlx.async_load_wait_group(2)
+        b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
+        tlx.local_store(smem_bs[0], b_sc_right_buf3)
+        b_sc_right_reg_buf2 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
+        tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
+        a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next), scale_load_layout_a)
+        b_sc_left_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_left_offsets_next),
+                                            scale_load_layout_b)
+        tlx.async_load_commit_group()
 
-        with tlx.warp_pipeline_stage("mfma", priority=0):
-            acc_right = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
-        with tlx.warp_pipeline_stage("mem", priority=1):
-            tlx.async_load_wait_group(2)
-            a = tlx.local_load(smem_a[0], relaxed=True)
-            b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
-            tlx.local_store(smem_as[0], a_sc_buf1)
-            tlx.local_store(smem_bs[0], b_sc_left_buf1)
-            a_sc_reg_buf0 = tlx.local_load(smem_as[0], layout=scale_a_layout)
-            b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
-            tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
-            b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
-                                                 scale_load_layout_b)
-            tlx.async_load_commit_group()
+        acc_right = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
+        tlx.async_load_wait_group(2)
+        a = tlx.local_load(smem_a[0], relaxed=True)
+        b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+        tlx.local_store(smem_as[0], a_sc_buf1)
+        tlx.local_store(smem_bs[0], b_sc_left_buf1)
+        a_sc_reg_buf0 = tlx.local_load(smem_as[0], layout=scale_a_layout)
+        b_sc_left_reg_buf0 = tlx.local_load(smem_bs[0], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
+        b_sc_right_buf3 = tlx.require_layout(tlx.buffer_load(b_scales_base, b_scale_right_offsets_next),
+                                             scale_load_layout_b)
+        tlx.async_load_commit_group()
 
         a_base += BLOCK_K_PACKED * stride_ak * 2
         b_base += BLOCK_K_PACKED * stride_bk * 2
