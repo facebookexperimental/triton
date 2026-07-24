@@ -63,9 +63,9 @@ _DQREDUCE_CFG = dict(
     autows=True, dq_reduce=True, dq_reuse=True, dp=1,
     bwd_bm=128, bwd_bn=128, bwd_stages=2, warps=4, dq_iters=4, pin=True,
 )
-# FA-style manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
+# Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
-_FADP_CFG = dict(autows=True, fa_dp=True, dp=2, warps=4, pin=True)
+_MANUAL_DP_CFG = dict(autows=True, manual_dp=True, dp=2, warps=4, pin=True)
 # Compiler data_partition_factor=2 fwd (no FA_DP): the compiler splits the 256 tile
 # (fixed via the WSDataPartition box_dim scaling).
 _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
@@ -76,7 +76,7 @@ if "--run-dqreduce" in sys.argv:
     _C.set_config(**_DQREDUCE_CFG)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
 elif "--run-fadp" in sys.argv:
-    _C.set_config(**_FADP_CFG)
+    _C.set_config(**_MANUAL_DP_CFG)
 elif "--run-fwd" in sys.argv:
     _C.set_config(**_COMPILER_DP2_CFG)
 else:
@@ -177,7 +177,7 @@ def test_self_attention_fwd_autows(L, Z):
     """DEFAULT autoWS config (in-process): fwd + grads vs torch reference."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    assert bool(A._HSTU_SELF_AUTOWS), "autoWS flag not baked on"
+    assert bool(A._AUTOWS_CFG.autows), "autoWS flag not baked on"
 
     (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(L, Z)
 
@@ -226,7 +226,7 @@ def test_self_attention_fwd_autows_fadp(L, Z):
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    # The subprocess selects _FADP_CFG via set_config() (argv --run-fadp) before
+    # The subprocess selects _MANUAL_DP_CFG via set_config() (argv --run-fadp) before
     # importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fadp", str(L), str(Z)],
@@ -272,7 +272,7 @@ if __name__ == "__main__":
     # kernel import, so the dq-reduce constexprs / autotune config are baked on.
     if len(sys.argv) >= 4 and sys.argv[1] == "--run-dqreduce":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
-        assert bool(A._HSTU_DQ_REUSE), "dq-reduce reuse flag not baked on"
+        assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z)
         rls = {n: _rel_l2(g_, w) for n, g_, w in
                (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
@@ -286,11 +286,11 @@ if __name__ == "__main__":
             sys.exit(1)
         print("OK")
         sys.exit(0)
-    # Subprocess entry point for the FA-style manual-DP fwd config (_FADP_CFG
+    # Subprocess entry point for the FA-style manual-DP fwd config (_MANUAL_DP_CFG
     # applied via set_config() at import). Forward-only check vs the torch ref.
     if len(sys.argv) >= 4 and sys.argv[1] == "--run-fadp":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
-        assert bool(A._HSTU_SELF_FA_DP), "FA-DP flag not baked on"
+        assert bool(A._AUTOWS_CFG.manual_dp), "manual-DP flag not baked on"
         o, ref = _run_autows_fwd(_L, _Z)
         rl2 = _rel_l2(o, ref)
         print(f"REL_L2 fwd = {rl2:.2e} (L={_L} Z={_Z})")
