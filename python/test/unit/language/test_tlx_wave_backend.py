@@ -1454,6 +1454,38 @@ def test_tlx_wave_converter_lowers_nonnegative_for_iv_rem_as_unsigned(tmp_path):
     del ctx
 
 
+@pytest.mark.parametrize(("lower", "step", "divisor"), ((0, 16, 16), (8, 4, 4), (6, 4, 2)))
+def test_tlx_wave_converter_passes_loop_induction_facts_to_wave(tmp_path, lower, step, divisor):
+    local_func = f"""
+  tt.func public @converter_for_iv_facts(%upper: i32) attributes {{noinline = false}} {{
+    %lower = arith.constant {lower} : i32
+    %step = arith.constant {step} : i32
+    %sum = scf.for %i = %lower to %upper step %step iter_args(%acc = %lower) -> (i32)  : i32 {{
+      %next = arith.addi %acc, %i : i32
+      scf.yield %next : i32
+    }}
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    fact_program = converter_facts.analyze_facts(source, converted)
+
+    for_op = next(op for op in source.ops if op.name == "scf.for")
+    induction_arg = source.regions[for_op.region_ids[0]].block_arg_ids[0]
+    induction_facts = converter_facts.facts_for_value(fact_program, induction_arg)
+    assert any(fact.kind == "divisible" and fact.divisor == divisor and fact.provenance == "derived:scf.for.step"
+               for fact in induction_facts)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    loop_body = output.emitted_module.text.split("scf.for", maxsplit=1)[1]
+    assert f'#wave.pred<"Mod(x, {divisor}) == 0">' in loop_body
+    assert loop_body.index("wave.assume") < loop_body.index("wave.binary addi")
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
 def test_tlx_wave_converter_keeps_unproven_signed_div_signed(tmp_path):
     local_func = """
   tt.func public @converter_unproven_signed_div(%arg0: i32) attributes {noinline = false} {
