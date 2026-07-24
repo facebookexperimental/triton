@@ -50,7 +50,11 @@ def _sizevar_hint(sizevars, expr, fallback):
 
 
 from . import tlx_config
-from .mm_templates import amd_addmm_warppipe_template, blackwell_gemm_ws_template
+from .mm_templates import (
+    amd_addmm_warppipe_template,
+    amd_bmm_warppipe_template,
+    blackwell_gemm_ws_template,
+)
 
 
 @dataclasses.dataclass
@@ -1292,6 +1296,100 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
                 yield self._convert_config_to_template_kwargs(
                     triton_config, m, n, k, out_dtype
                 )
+
+
+@register_template_heuristic(
+    amd_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
+)
+class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
+
+    Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
+    tlx.warp_pipeline_stage), plus a batch axis and a per-batch int64 base advance. No bias, no
+    col-major transpose (bmm B is [BATCH,K,N] row-major), no split-K -- a plain data-parallel
+    baseline for Inductor autotune iteration. Gates (fp16/bf16 only): per-batch M*K and N*K fit
+    int32 (async_load's flat offset); (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16) so the direct-to-LDS async_copy vectorizes
+    legally on CDNA4 (an unaligned K makes the vectorizer pick an illegal 16-bit layout, so decline
+    and fall back to stock bmm/aten rather than miscompile); and K_ITERS = K // BLOCK_K >=
+    NUM_BUFFERS so the prologue prefetch is well-formed (the K % BLOCK_K remainder is a sync-tail).
+    """
+
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
+    WARPPIPE_CONFIGS = [
+        (256, 256, 64, 16, 8, 2),
+        (256, 128, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 2),
+        (128, 128, 64, 8, 8, 3),
+        (128, 128, 128, 8, 8, 2),
+        (128, 64, 128, 8, 8, 3),
+        (64, 128, 64, 8, 8, 3),
+        (64, 64, 128, 8, 4, 3),
+        (64, 64, 64, 8, 4, 3),
+        (32, 128, 128, 4, 4, 3),
+        (32, 256, 128, 4, 4, 2),
+        (16, 256, 128, 4, 4, 3),
+    ]
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        import sympy
+        from torch._inductor.virtualized import V
+
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            raise AssertionError(f"{self.__class__.__name__} requires MMKernelInputs")
+        if kernel_inputs.dtype(kernel_inputs._mat1_idx) not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return
+        m, n, k = kernel_inputs.mnk_symbolic()
+        out_dtype = kernel_inputs.out_dtype()
+        sizevars = V.graph.sizevars
+        int32_max = 2**31 - 1
+        # per-batch offsets must fit int32 (the batch offset is applied separately in int64).
+        if not (
+            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
+            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
+        ):
+            return
+        # 16-byte (128-bit transaction) alignment: the row stride K*itemsize bytes must be a
+        # multiple of 16 (K % 8 == 0 for fp16/bf16) for a legal direct-to-LDS async_copy on CDNA4.
+        # Also declines dynamic/unknown K.
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        if not sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0)):
+            return
+        num_xcds = _amd_num_xcds()
+        for (
+            block_m,
+            block_n,
+            block_k,
+            group_m,
+            num_warps,
+            num_buffers,
+        ) in self.WARPPIPE_CONFIGS:
+            # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
+            if block_m % 16 != 0 or block_n % 16 != 0:
+                continue
+            # prologue prefetches NUM_BUFFERS full K-tiles: require K_ITERS = K // BLOCK_K >= NB.
+            if not sizevars.statically_known_true(
+                sympy.Ge(k, num_buffers * block_k)
+            ):
+                continue
+            triton_config = self.triton_config(
+                1,  # num_stages=1: TLX is hand-pipelined; auto software-pipelining must be off
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=group_m,
+                NUM_BUFFERS=num_buffers,
+                NUM_XCDS=num_xcds,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=0,
+                kpack=get_default_kpack(block_k),
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config, m, n, k, out_dtype
+            )
 
 
 @register_template_heuristic(
