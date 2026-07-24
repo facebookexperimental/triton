@@ -1213,6 +1213,14 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
             and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
         ):
             return
+        # 16-byte (128-bit transaction) alignment: the fp16/bf16 padded direct-to-LDS async_copy
+        # lowers to 128-bit loads, so each row start must be 16-byte aligned -- i.e. the row stride
+        # K*itemsize bytes must be a multiple of 16 (K % 8 == 0 for fp16/bf16). Without this guard
+        # an unaligned K reaches the template and fails at async_copy legalization (T280910119);
+        # decline up front so it falls back to aten cleanly. Also declines dynamic/unknown K.
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        if not sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0)):
+            return
         num_xcds = _amd_num_xcds()
         # split-K only helps grids that leave CUs idle. NUM_SMS is the device CU count
         # (get_num_sms() maps to multi_processor_count = CUs on ROCm; 256 on gfx950/MI350X);
