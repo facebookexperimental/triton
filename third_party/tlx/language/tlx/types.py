@@ -312,6 +312,89 @@ class padded_shared_layout_encoding(shared_layout_encoding):
         )
 
 
+class shared_linear_layout_encoding(shared_layout_encoding):
+    """Explicit linear shared-memory mapping used by Gluon K-tile paths.
+
+    Unlike :class:`padded_shared_layout_encoding`, this encoding has no
+    implicit interval padding.  Each offset basis maps one shared-memory bit
+    to a tensor dimension, which lets CDNA4 transpose reads consume a physical
+    row-major 16x16 tile image without an intermediate register permutation.
+    """
+
+    def __init__(self, offset_bases, block_bases=None, alignment=16):
+        super().__init__()
+        self.offset_bases = [list(map(int, basis)) for basis in offset_bases]
+        self.block_bases = [list(map(int, basis)) for basis in (block_bases or [])]
+        self.alignment = int(alignment)
+        assert self.offset_bases and len(self.offset_bases[0]) > 0
+        rank = len(self.offset_bases[0])
+        assert all(len(basis) == rank for basis in self.offset_bases)
+        assert all(len(basis) == rank for basis in self.block_bases)
+        assert self.alignment > 0 and (self.alignment & (self.alignment - 1)) == 0
+
+    def make_permute(self, dims):
+        # SharedLinear is used as a physical image; preserve the bit bases and
+        # let the consumer's memdesc_trans describe the logical permutation.
+        del dims
+        return self
+
+    def to_ir(self, builder: ir.builder) -> None:
+        return builder.make_shared_linear_encoding_attr(self.offset_bases, self.block_bases, self.alignment)
+
+
+class amd_mfma_layout(layout_encoding):
+    """gfx950 MFMA distributed layout for explicit shared-load consumers."""
+
+    def __init__(self, version, instr_shape, transposed, warps_per_cta, element_bitwidth=32, tiles_per_warp=None,
+                 cga_layout=None):
+        super().__init__()
+        self.version = int(version)
+        self.instr_shape = list(map(int, instr_shape))
+        self.transposed = bool(transposed)
+        self.warps_per_cta = list(map(int, warps_per_cta))
+        self.element_bitwidth = int(element_bitwidth)
+        # Gluon's AMDMFMALayout uses one tile factor for each warp-layout axis
+        # (M, N).  The instruction shape also has a K dimension, but that
+        # dimension is not a tiles-per-warp axis and must not be synthesized in
+        # the default or validation length.
+        warp_rank = len(self.warps_per_cta)
+        self.tiles_per_warp = list(map(int, tiles_per_warp or [1] * warp_rank))
+        self.cga_layout = [list(map(int, basis)) for basis in (cga_layout or [])]
+        assert 1 <= self.version <= 4
+        assert len(self.instr_shape) == 3
+        assert self.instr_shape[:2] in ([32, 32], [16, 16], [64, 4], [4, 64])
+        assert self.element_bitwidth in (32, 64)
+        assert len(self.tiles_per_warp) == warp_rank
+        assert all(len(basis) == len(self.warps_per_cta) for basis in self.cga_layout)
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape, element_type
+        return builder.make_amd_mfma_encoding_attr(self.version, self.warps_per_cta, self.instr_shape, self.transposed,
+                                                   self.cga_layout, self.tiles_per_warp, self.element_bitwidth)
+
+
+class dot_operand_layout(layout_encoding):
+    """Explicit MFMA dot-operand view for a shared-memory local load."""
+
+    def __init__(self, operand_index, parent, k_width=8):
+        super().__init__()
+        self.operand_index = int(operand_index)
+        # Layout constructors are commonly nested inside a Triton JIT body,
+        # where an annotated ``tl.constexpr`` argument is wrapped once more by
+        # the frontend. Unwrap it here so ``to_ir`` sees the actual MFMA
+        # encoding rather than a constexpr shell.
+        self.parent = tl._unwrap_if_constexpr(parent)
+        self.k_width = int(k_width)
+        assert self.operand_index in (0, 1)
+        assert self.k_width > 0
+
+    def to_ir(self, builder: ir.builder, shape=None, element_type=None) -> None:
+        del shape
+        parent = self.parent.to_ir(builder)
+        del element_type
+        return builder.make_dot_operand_encoding_attr_with_type(self.operand_index, parent, self.k_width)
+
+
 class TMemCTAMode:
     # The order of fields here must be in sync with TTNG_TensorMemoryCTAMode enum
     DEFAULT = 0

@@ -22,6 +22,22 @@ def require_layout(x, layout, _semantic=None):
     return tl.tensor(handle, x.type)
 
 
+@tl.builtin
+def mfma(a, b, acc, _semantic=None):
+    """Compute an AMD MFMA using the accumulator's explicit layout.
+
+    The shared semantic dot builder now returns the accumulator type whenever
+    an accumulator is supplied.  That keeps Gluon distributed/MFMA layouts
+    attached to the Python value while remaining a no-op for regular Triton
+    block tensors.
+    """
+    assert acc is not None, "acc is required"
+    acc = tl._unwrap_if_constexpr(acc)
+    a = tl._unwrap_if_constexpr(a)
+    b = tl._unwrap_if_constexpr(b)
+    return _semantic.dot(a, b, acc, input_precision=None, max_num_imprecise_acc=None, out_dtype=acc.dtype)
+
+
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     rank = len(x.shape)

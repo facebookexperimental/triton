@@ -16,14 +16,11 @@ namespace tt = mlir::triton;
 namespace mlir {
 // Generate code to reintepret a TMEM buffer operation by converting
 // the N dimension to the given value that must be less the current size.
-ttg::MemDescReinterpretOp
-sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
-                          Operation *allocOp, Operation *newAlloc,
-                          Operation *user, int offset);
-ttg::MemDescReinterpretOp sliceAndReinterpretTMEMBuffer(OpBuilder &builder,
-                                                        Operation *allocOp,
-                                                        int offset,
-                                                        size_t blockN);
+Operation *sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
+                                     Operation *allocOp, Operation *newAlloc,
+                                     Operation *user, int offset);
+Operation *sliceAndReinterpretTMEMBuffer(OpBuilder &builder, Operation *allocOp,
+                                         int offset, size_t blockN);
 // Create a TMEM descriptor that is sufficient for the given
 // TMEM Allocation Operator.
 ttg::MemDescType createTMEMDesc(OpBuilder &builder, Type inputType,

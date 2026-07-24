@@ -5,6 +5,7 @@ import re
 from triton.backends.compiler import GPUTarget
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
+from triton.experimental.gluon.language._core import builtin as gluon_builtin
 from triton.experimental.gluon.language.nvidia import blackwell
 from triton.experimental.gluon.language.nvidia import hopper
 from triton.experimental.gluon.language.nvidia.hopper import cluster
@@ -42,6 +43,19 @@ HIP_TARGET_RDNA4 = GPUTarget("hip", "gfx1200", 32)
 HIP_TARGET_CDNA3 = GPUTarget("hip", "gfx942", 64)
 HIP_TARGET_CDNA4 = GPUTarget("hip", "gfx950", 64)
 HIP_TARGET_GFX1250 = GPUTarget("hip", "gfx1250", 32)
+
+
+@gluon_builtin
+def _semantic_dot_with_acc_layout(a, b, acc, _semantic=None):
+    """Expose the shared semantic dot wrapper for its layout-preservation test."""
+    return _semantic.dot(
+        a,
+        b,
+        acc,
+        input_precision=None,
+        max_num_imprecise_acc=None,
+        out_dtype=acc.dtype,
+    )
 
 ALL_TARGETS = [AMPERE_TARGET, HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_RDNA4]
 ALL_MULTICTA_TARGETS = [HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_GFX1250]
@@ -3129,6 +3143,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 """,
     )
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
+def test_dot_propagates_accumulator_layout(target):
+    """A semantic dot with an explicit accumulator keeps its distributed type."""
+
+    @gluon.jit
+    def kernel():
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+            version=4, warps_per_cta=[4, 1], instr_shape=[16, 16, 32], transposed=True
+        )
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(0, mfma_layout, 8)
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, mfma_layout, 8)
+        a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, layout=a_layout)
+        b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, layout=b_layout)
+        acc = ttgl.full([16, 16], 0.0, ttgl.float32, layout=mfma_layout)
+        result = _semantic_dot_with_acc_layout(a, b, acc)
+        ttgl.static_assert(result.type.layout == mfma_layout)
+
+    module = run_parser(kernel, target=target)
+    assert "#ttg.amd_mfma" in module.str_nodebug()
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
