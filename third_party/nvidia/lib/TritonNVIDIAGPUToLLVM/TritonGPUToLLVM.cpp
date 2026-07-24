@@ -481,7 +481,7 @@ private:
     // CTA_Y's bar before CTA_Y inits it, as shown in ptx doc examples:
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-test-wait-try-wait
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
-                                  /*relaxed*/ false);
+                                  /*relaxed*/ true);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
     // mark mod attr so that WS lowering is aware of this cluster sync point
     tlx::setClusterSyncKernelInitOnMod(mod, true);

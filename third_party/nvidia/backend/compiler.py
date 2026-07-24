@@ -684,7 +684,9 @@ class CUDABackend(BaseBackend):
                 and opt.ctas_per_cga is not None):
             nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
         # optimize TTGIR
-        passes.ttgpuir.add_coalesce(pm)
+        ptx_version = get_ptx_version_from_options(opt, capability)
+        max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
+        passes.ttgpuir.add_coalesce(pm, max_vec_bits)
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         # Storage alias lowering runs after layout propagation so the backing
         # TMEM allocation is materialized with the resolved 2-CTA storage format.
@@ -835,6 +837,16 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # Retire user-pinned register layout markers (#tlx.user_layout) only after
+        # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
+        # marker; every remove_layout_conversions / reduce_data_duplication above
+        # would otherwise be free to rewrite the unwrapped pinned layout). Placing
+        # it here keeps the pin an anchor through the whole pipeline.
+        tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
+
+        # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
+        # the ops. Runs last so the reported layouts reflect all optimizations.
+        tlx.tlx_passes.add_tlx_dump_layout(pm)
 
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()

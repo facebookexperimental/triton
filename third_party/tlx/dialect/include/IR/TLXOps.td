@@ -295,6 +295,59 @@ def TLX_ReleaseLayoutOp : TLX_Op<"release_layout",
   let hasFolder = 1;
 }
 
+def TLX_AssertSameLayoutOp : TLX_Op<"assert_same_layout", []> {
+  let summary = "compile-time assertion that two values have the same layout";
+
+  let description = [{
+    Compares the final resolved layouts of two register tensors or buffers at
+    the end of the TTGIR pipeline. Both layouts are converted to LinearLayout.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$lhs, TTG_TensorOrMemDesc:$rhs);
+
+  let results = (outs);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs)";
+}
+
+def TLX_AssertSameLayoutExpectedOp : TLX_Op<"assert_same_layout_expected", []> {
+  let summary = "compile-time assertion against a constant layout";
+
+  let description = [{
+    Compares a value's final resolved layout against a constant layout encoding
+    at the end of the TTGIR pipeline using LinearLayout equivalence.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$src, AnyAttr:$expected);
+
+  let results = (outs);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
+def TLX_DumpLayoutOp : TLX_Op<"dump_layout", []> {
+  let summary = "compile-time diagnostic that prints the layout of a value";
+
+  let description = [{
+    `tlx.dump_layout` prints the resolved layout/encoding of a register tensor
+    or a shared/tensor-memory buffer (memdesc) to the compiler log at compile
+    time. It emits no device code and produces no result.
+
+    The op is consumed by the `tlx-dump-layout` pass, which runs at the end of
+    the TTGIR pipeline so that the reported layout is final. The pass prints the
+    value type and its layout in CuTe Shape:Stride notation, then erases the op.
+
+    This is a static, host-side diagnostic and is distinct from the runtime,
+    device-side `tt.print` / `tl.device_print` family.
+  }];
+
+  let arguments = (ins TTG_TensorOrMemDesc:$src);
+
+  let results = (outs);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
 def TLX_LocalAliasOp : TLX_Op<"local_alias",
                               [SameOperandAndResultMemorySpace,
                                Pure]> {

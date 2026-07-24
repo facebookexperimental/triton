@@ -160,6 +160,20 @@ def _validate_warp_group_start_ids(
 @tlx_enter_sub_region()
 def visit_withAsyncTasks(self, node):
     from triton.compiler.code_generator import enter_sub_region, _is_list_like, _is_constexpr
+    from triton.language.core import _unwrap_if_constexpr
+
+    # `tlx.async_tasks(exclusive=..., no_ending_cluster_sync=...)`: mark the
+    # warp_specialize op so the Fixup pass can propagate these to module
+    # attributes (`exclusive` -> single-warp-specialize lowering;
+    # `no_ending_cluster_sync` -> user provides the post-WS sync).
+    ws_context = node.items[0].context_expr
+    exclusive = False
+    no_ending_cluster_sync = False
+    for kw in getattr(ws_context, "keywords", []):
+        if kw.arg == "exclusive":
+            exclusive = bool(_unwrap_if_constexpr(self.visit(kw.value)))
+        elif kw.arg == "no_ending_cluster_sync":
+            no_ending_cluster_sync = bool(_unwrap_if_constexpr(self.visit(kw.value)))
 
     with enter_sub_region(self) as sr:
         liveins, _ = sr
@@ -271,6 +285,10 @@ def visit_withAsyncTasks(self, node):
             sum(task_replicas),
             task_warp_group_start_ids if task_warp_group_start_ids else None,
         )
+        if exclusive:
+            ws_op.set_attr("tlx.exclusive", self.builder.get_unit_attr())
+        if no_ending_cluster_sync:
+            ws_op.set_attr("tlx.no_ending_cluster_sync", self.builder.get_unit_attr())
 
         # dry visit async task body to calculate captures
         index = 0

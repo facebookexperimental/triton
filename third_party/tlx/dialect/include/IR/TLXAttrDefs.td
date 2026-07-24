@@ -24,6 +24,29 @@ def TLX_LayoutEncodingTrait : AttrInterface<"LayoutEncodingTrait"> {
 def TLX_DeclareLayoutEncodingMethods : DeclareAttrInterfaceMethods<
   TLX_LayoutEncodingTrait, ["getCGALayout"]>;
 
+// Mirror of ttg::SharedEncodingTrait so TLX-owned attributes can advertise
+// themselves as shared-memory encodings (accepted by the MemDescType verifier).
+def TLX_SharedEncodingTrait : AttrInterface<"SharedEncodingTrait"> {
+  let cppNamespace = "::mlir::triton::gpu";
+  let methods = [
+    InterfaceMethod<"Return the default alignment for the layout.",
+                    "int32_t", "getAlignment", (ins), [{}], [{ return 16; }]>,
+  ];
+}
+
+def TLX_DeclareSharedEncodingMethods : DeclareAttrInterfaceMethods<
+  TLX_SharedEncodingTrait, ["getAlignment"]>;
+
+// Mirror of ttg::PinnedEncodingTrait so a TLX attribute can
+// advertise itself as user-pinned to core TritonGPU passes.
+def TLX_PinnedEncodingTrait : AttrInterface<"PinnedEncodingTrait"> {
+  let cppNamespace = "::mlir::triton::gpu";
+  let methods = [
+    InterfaceMethod<"Return the concrete layout this wrapper pins.",
+                    "::mlir::Attribute", "getPinnedLayout">,
+  ];
+}
+
 def TLX_DistributedEncodingTrait : AttrInterface<"DistributedEncodingTrait"> {
   let cppNamespace = "::mlir::triton::gpu";
   let methods = [
@@ -129,6 +152,48 @@ def TLX_NoVerifyLayoutAttr
   let extraClassDeclaration = [{
     SmallVector<unsigned> getRepOrder() const;
     ::mlir::triton::LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+  }];
+
+  let genVerifyDecl = 1;
+  let assemblyFormat = "`<` $layout `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// User Layout Attribute
+//===----------------------------------------------------------------------===//
+
+def TLX_UserLayoutAttr
+    : TLX_Attr<"UserLayout",
+               [TLX_DistributedEncodingTrait, TLX_SharedEncodingTrait,
+                TLX_PinnedEncodingTrait, TLX_LayoutEncodingTrait,
+                TLX_DeclareLayoutEncodingMethods,
+                TLX_DeclareSharedEncodingMethods]> {
+  let mnemonic = "user_layout";
+  let summary = "TLX wrapper marking a user-specified layout (register or shared)";
+
+  let description = [{
+    A general wrapper for a concrete layout that the user pinned explicitly --
+    either a distributed/register layout (e.g. #ttg.linear, on a value fed to
+    `tlx.local_load`) or a shared-memory layout (e.g. #ttg.swizzled_shared /
+    #ttg.padded_shared / #ttg.nvmma_shared, on a `tlx.local_alloc`).
+
+    The wrapper advertises both the distributed and shared layout interfaces and
+    delegates every query to the wrapped layout (dispatching on the concrete
+    inner), so it is a valid encoding on both RankedTensorType and MemDescType
+    and is transparent to trait-based code.
+
+    Its presence is a hard "do not retag this value" signal: `tlx-propagate-layout`
+    treats a value whose encoding is this wrapper as a fixed source and never
+    rewrites it to satisfy a consumer, then unwraps it back to the concrete
+    wrapped layout once the constraint has been honored.
+  }];
+
+  let parameters = (ins "Attribute":$layout);
+
+  let extraClassDeclaration = [{
+    SmallVector<unsigned> getRepOrder() const;
+    ::mlir::triton::LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+    ::mlir::Attribute getPinnedLayout() const { return getLayout(); }
   }];
 
   let genVerifyDecl = 1;

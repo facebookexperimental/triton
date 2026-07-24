@@ -733,7 +733,7 @@ Examples: how mbarriers are communicated in warp specialization
 - `tlx.async_tasks` and `tlx.async_task` **[Hopper+]**
 
 ```
-    with tlx.async_tasks
+    with tlx.async_tasks()
         with tlx.async_task("default")
             ...
         with tlx.async_task(num_warps=4)
@@ -744,6 +744,13 @@ Examples: how mbarriers are communicated in warp specialization
 `tlx.async_task("default")` defines the default task, also known as the trunk. It uses the available warps not explicitly reserved by other tasks.
 
 `tlx.async_task(num_warps=4)` defines a warp-specialized asynchronous task that explicitly reserves 4 warps in addition to those used by the trunk task.
+
+#### async_tasks Parameters
+
+| Parameter                | Description                                                                                                                                                                                      |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `exclusive`              | Assert this is the only one `tlx.async_tasks` in the kernel for more efficient PTX. Default to False.                                                                                            |
+| `no_ending_cluster_sync` | This suppresses compiler generated cluster sync at end of Warp Spec. Should only be used if user guarantees all cross CTA SMEM/TMEM access are done by end of WS default task. Default to False. |
 
 #### async_task Parameters
 
@@ -943,6 +950,99 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
         )
   tlx.prefetch(desc_in, tensormap=True)
   ```
+
+- `tlx.dump_layout(x)` **[Hopper+, MI300+]**
+
+    Compile-time diagnostic that prints the resolved layout of a value to the
+    compiler log. `x` may be a register tensor or a shared/tensor-memory buffer
+    (memdesc). It emits **no** device code and returns nothing — this is a
+    static, host-side diagnostic, distinct from the runtime `tl.device_print` /
+    `tl.print`. The op is rendered at the end of the TTGIR pipeline, so the
+    printed layout reflects all compiler optimizations, then it is erased.
+
+    The layout is printed in CuTe (CUTLASS) `Shape:Stride` notation (`_N` marks
+    a static integer):
+    - Register tensors → a thread-value (TV) layout
+      `((thread...),(value...)):((thread...),(value...))`, where the thread
+      group comes from the hardware lane/warp/block dims and the value group
+      from the per-thread registers (stride `_0` denotes a broadcast).
+    - Shared/tensor-memory buffers → a single strided layout, e.g. `_64:_1`.
+    - Swizzled shared buffers → `Swizzle<B,M,S> o (base):(stride)`.
+
+    In all cases the layout maps a coordinate to the **logical tensor's
+    row-major element index** (its codomain): for a register tensor a
+    `(thread, value)` coordinate → the logical element index it holds, and for
+    a buffer an offset → the buffer element index. The strides are offsets in
+    that logical index space, not physical byte/bank addresses.
+
+    Layouts that are not representable as a CuTe layout fall back to the raw
+    linear-layout string.
+
+    Example:
+    ```python
+    x = tl.load(x_ptr + offs)          # register tensor
+    tlx.dump_layout(x)                  # -> // cute: ((_32,_2,_2),_1):((_1,_32,_0),_0)
+
+    buf = tlx.local_alloc((BLOCK,), tl.float32, 1)
+    v = tlx.local_view(buf, 0)
+    tlx.dump_layout(v)                  # -> // cute: _64:_1
+    ```
+
+- `x = tlx.require_layout(x, layout)` **[Hopper+, MI300+]**
+
+    Pin a register tensor `x`'s layout as a hard user anchor. `layout` is a
+    `tlx.layout(...)` (Shape:Stride) mapped to a `#linear` encoding and wrapped as
+    `#tlx.no_verify_layout(#tlx.user_layout(...))`. The inner `#tlx.user_layout`
+    carries `PinnedEncodingTrait`, so the downstream layout passes
+    (`tritongpu-coalesce`, `remove-layout-conversions`, AMD `optimize-epilogue`)
+    treat it as fixed and never rewrite it; the outer `#tlx.no_verify_layout` defers
+    operand-layout verification until the pin is peeled by
+    `TLXResolvePlaceholderLayouts` in `make_ttgir`. Example: pin an FP16 epilogue
+    `tl.store` to a coalesced layout so `OptimizeEpilogue` keeps the wide
+    `buffer_store_dwordx4` instead of narrowing it to the MMA-accumulator store,
+    without staging the value through LDS.
+
+    Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
+    pin survived to the final TTGIR.
+
+- `tlx.assert_same_layout(lhs, rhs)` **[Hopper+, MI300+]**
+
+    Compile-time assertion that two layouts are equivalent after layout
+    propagation and all other TTGIR layout optimizations have completed. Like
+    `tlx.dump_layout`, it emits no device code and is consumed at the end of the
+    TTGIR pipeline.
+
+    `rhs` supports two forms:
+
+    - **Value/value:** `rhs` is another register tensor or shared/tensor-memory
+      buffer. The frontend emits `tlx.assert_same_layout`, whose two operands
+      retain their independently resolved final types.
+    - **Value/layout:** `rhs` is a constant `tlx.layout_encoding`. The frontend
+      lowers the constant to an encoding attribute and emits
+      `tlx.assert_same_layout_expected`. At assertion time, the pass combines
+      that encoding with `lhs`'s shape, element type, and (for buffers) memory
+      properties to construct an expected tensor or memdesc type.
+
+    These are separate internal operations only because an SSA value is an MLIR
+    operand while a constant layout is an MLIR attribute. They share the same
+    comparison path and the same public Python API.
+
+    Before comparison, both final types are converted with
+    `ttg::toLinearLayout`. The assertion compares the resulting
+    `LinearLayout`s, not the original encoding attributes. Consequently,
+    structurally different encodings pass if they describe the same logical
+    mapping. A mismatch reports both normalized LinearLayouts and fails
+    compilation.
+
+    Example:
+
+    ```python
+    x = tlx.local_load(x_buf, layout=REGISTER_LAYOUT)
+    y = tlx.local_load(y_buf, layout=REGISTER_LAYOUT)
+
+    tlx.assert_same_layout(x, y)                # value/value
+    tlx.assert_same_layout(x, REGISTER_LAYOUT)  # value/layout
+    ```
 
 
 ## Buffer Operations (AMD)

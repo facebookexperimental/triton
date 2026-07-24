@@ -238,8 +238,9 @@ def tlx_addmm_glu_kernel_optimized(
     a_tile = tlx.local_load(tlx.local_view(smemA, 0))
     b_tile = tlx.local_load(tlx.local_view(smemB, 0))
 
-    # Create accumulator array
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Create accumulator array (bias folded in so the K-loop yields X = bias + A@B)
+    bias = tl.load(bias_ptr + offs_n).to(tl.float32)
+    acc = bias[None, :] + tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Hot loop: warp-pipelined MFMA / async-prefetch
     for i in tl.range(0, k_iters - NUM_BUFFERS, loop_unroll_factor=0):
@@ -275,7 +276,11 @@ def tlx_addmm_glu_kernel_optimized(
         # Most recently committed buffers (GR i + NUM_BUFFERS) can be in flight
         tlx.async_load_wait_group(1)
 
-    # Can potentially async load the y and bias here
+    # Prefetch Y from GMEM into registers. Issues the streaming Y load into VGPRs
+    # here so its 44MB HBM read overlaps the drain MFMAs below and is only
+    # consumed at the fma
+    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+    y_regs = tl.load(y_ptrs, cache_modifier=".cs")
 
     # Epilogue: drain the remaining in-flight tiles
     acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
@@ -292,20 +297,12 @@ def tlx_addmm_glu_kernel_optimized(
 
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-    # Fused epilogue: addmm + GLU
-    # Add bias (broadcast over M), then GLU: X = X + X*Y
+    # Fused epilogue: addmm + GLU. Bias was folded into acc and Y was prefetched
+    # above. Collapse to one packed fma: X + X*Y = fma(X, Y, X).
     # Streaming cache hints (.cs) on Y and C: both are touched once and never
     # reused, so we avoid polluting L2 with this 44MB+44MB epilogue traffic
 
-    bias = tl.load(bias_ptr + offs_n).to(tl.float32)
-
-    y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
-
-    y = tl.load(y_ptrs, cache_modifier=".cs").to(tl.float32)
-
-    x = acc + bias[None, :]
-
-    out = x + x * y
+    out = tl.fma(acc, y_regs.to(tl.float32), acc)
 
     c_ptrs = c_ptr + offs_m[:, None] * sc0 + offs_n[None, :] * sc1
 
@@ -760,7 +757,9 @@ def tlx_addmm_glu_kernel_persistent(
         a_tile = tlx.local_load(tlx.local_view(smemA, 0), token=wait_tok)
         b_tile = tlx.local_load(tlx.local_view(smemB, 0), token=wait_tok)
 
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        # bias folded into the accumulator init so the K-loop yields X = bias + A@B
+        bias = tl.load(bias_ptr + offs_n).to(tl.float32)
+        acc = bias[None, :] + tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         # Hot loop: warp-pipelined MFMA / async-prefetch
         for i in tl.range(0, k_iters - NUM_BUFFERS, loop_unroll_factor=0):
@@ -787,6 +786,10 @@ def tlx_addmm_glu_kernel_persistent(
 
             wait_tok = tlx.async_load_wait_group(1)
 
+        # Register-resident Y prefetch before the drain dots (overlaps its HBM latency)
+        y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
+        y_regs = tl.load(y_ptrs, cache_modifier=".cs")
+
         # Epilogue: drain remaining in-flight tiles
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
@@ -798,12 +801,9 @@ def tlx_addmm_glu_kernel_persistent(
             b_tile = tlx.local_load(tlx.local_view(smemB, buf), token=wait_tok)
             acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
 
-        # Fused addmm + GLU epilogue
-        bias = tl.load(bias_ptr + offs_n).to(tl.float32)
-        y_ptrs = y_ptr + offs_m[:, None] * sy0 + offs_n[None, :] * sy1
-        y = tl.load(y_ptrs, cache_modifier=".cs").to(tl.float32)
-        x = acc + bias[None, :]
-        out = x + x * y
+        # Fused addmm + GLU epilogue: bias folded into acc, Y prefetched above.
+        # Collapse to one packed fma: X + X*Y = fma(X, Y, X)
+        out = tl.fma(acc, y_regs.to(tl.float32), acc)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -956,7 +956,8 @@ def tlx_addmm_glu_kernel_baseline(
         a_ptrs += BLOCK_SIZE_K * sa1
         b_ptrs += BLOCK_SIZE_K * sb0
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    bias = tl.load(bias_ptr + offs_n).to(tl.float32)
+    acc = bias[None, :] + tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in tl.range(NUM_STAGES - 1, k_iters, num_stages=0):
         a_smem = tlx.local_view(buffers_a, k % (NUM_STAGES - 1))
         b_smem = tlx.local_view(buffers_b, k % (NUM_STAGES - 1))
@@ -973,23 +974,20 @@ def tlx_addmm_glu_kernel_baseline(
         a_ptrs += BLOCK_SIZE_K * sa1
         b_ptrs += BLOCK_SIZE_K * sb0
 
+    # Register-resident Y prefetch before the drain dots (overlaps latency)
+    ocm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    ocn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    cmask = (ocm[:, None] < M) & (ocn[None, :] < N)
+    y_ptrs = y_ptr + ocm[:, None] * sy0 + ocn[None, :] * sy1
+    y = tl.load(y_ptrs, mask=cmask, other=0.0).to(tl.float32)
     for k in tl.range(k_iters - (NUM_STAGES - 1), k_iters, loop_unroll_factor=NUM_STAGES - 1):
         buf = k % (NUM_STAGES - 1)
         a_prev = tlx.local_load(tlx.local_view(buffers_a, buf))
         b_prev = tlx.local_load(tlx.local_view(buffers_b, buf))
         acc = tl.dot(a_prev, b_prev, acc)
 
-    # === Fused epilogue: addmm + GLU ===
-    ocm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    ocn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    cmask = (ocm[:, None] < M) & (ocn[None, :] < N)
-
-    bias = tl.load(bias_ptr + ocn, mask=ocn < N, other=0.0).to(tl.float32)
-    x = acc + bias[None, :]
-
-    y_ptrs = y_ptr + ocm[:, None] * sy0 + ocn[None, :] * sy1
-    y = tl.load(y_ptrs, mask=cmask, other=0.0).to(tl.float32)
-    out = x + x * y
+    # Fused epilogue with bias folded into acc, Y prefetched into registers, and a single fma
+    out = tl.fma(acc, y, acc)
 
     c_ptrs = c_ptr + ocm[:, None] * sc0 + ocn[None, :] * sc1
     tl.store(c_ptrs, out.to(c_ptr.dtype.element_ty), mask=cmask)

@@ -195,3 +195,22 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
     tt.return
   }
 }
+
+// -----
+
+// A `tlx.no_ending_cluster_sync` marker on the warp_specialize op is propagated
+// to the `tlx.user_post_ws_sync` module attribute (NVIDIA target).
+// CHECK: module attributes {
+// CHECK-SAME: tlx.user_post_ws_sync = true
+module {
+  tt.func @kernel_no_ending_cluster_sync() {
+    ttg.warp_specialize() attributes {tlx.no_ending_cluster_sync}
+    default {
+      ttg.warp_yield
+    }
+    partition0() num_warps(1) {
+      ttg.warp_return
+    } : () -> ()
+    tt.return
+  }
+}

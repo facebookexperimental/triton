@@ -33,6 +33,8 @@ def get_x_vals():
 def main():
     parser = argparse.ArgumentParser(description="TLX GEMM benchmark")
     parser.add_argument("--K", type=int, default=None)
+    parser.add_argument("--shape", type=int, nargs=3, action="append", metavar=("M", "N", "K"),
+                        help="Custom M N K shape (repeatable). Overrides default sizes.")
     parser.add_argument("--version", type=int, default=0, choices=range(0, 10))
     args = parser.parse_args()
 
@@ -40,7 +42,7 @@ def main():
     module = importlib.import_module(f"{version_dir}.matmul_kernel")
     matmul = module.matmul
 
-    sizes = get_x_vals()
+    sizes = [tuple(s) for s in args.shape] if args.shape else get_x_vals()
     if args.K:
         sizes = [(m, n, k) for m, n, k in sizes if k == args.K]
 

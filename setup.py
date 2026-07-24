@@ -563,7 +563,7 @@ def get_triton_version_suffix():
 
 
 # keep it separate for easy substitution
-TRITON_VERSION = "3.7.2" + get_triton_version_suffix()
+TRITON_VERSION = "3.7.3" + get_triton_version_suffix()
 
 # Dynamically define supported Python versions and classifiers
 MIN_PYTHON = (3, 10)
@@ -583,7 +583,7 @@ setup(
     version=TRITON_VERSION,
     author="Philippe Tillet",
     author_email="phil@openai.com",
-    description="A language and compiler for custom Deep Learning operations",
+    description="A language and compiler for custom Deep Learning operations (Meta fbtriton fork, with TLX + AMD gfx950/MI350 perf kernels)",
     long_description="",
     license="MIT",
     install_requires=[
@@ -613,7 +613,12 @@ setup(
     zip_safe=False,
     # for PyPI
     keywords=["Compiler", "Deep Learning"],
-    url="https://github.com/triton-lang/triton/",
+    url="https://github.com/facebookexperimental/triton/",
+    project_urls={
+        "Source": "https://github.com/facebookexperimental/triton",
+        "Changelog": "https://github.com/facebookexperimental/triton/releases",
+        "Upstream": "https://github.com/triton-lang/triton",
+    },
     python_requires=PYTHON_REQUIRES,
     classifiers=CLASSIFIERS,
 )
