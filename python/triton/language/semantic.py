@@ -1695,11 +1695,17 @@ class TritonSemantic(Generic[TensorTy]):
         # Transform2CTALoads pass will handle B splitting at the IR level.
         # tlx_paired_ctas=True assumes B is already half-width (TLX approach),
         # but pure Triton passes full-width B.
+        acc = tl._unwrap_if_constexpr(acc)
         (lhs, rhs, acc_handle, input_precision, max_num_imprecise_acc,
          ret_ty) = self.dot_precheck(lhs, rhs, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype,
                                      tlx_paired_ctas=False)
 
-        result = tl.tensor(
+        # DotOp's IR result is defined by the accumulator type.  Preserve the
+        # same type at the frontend boundary when an explicit accumulator is
+        # supplied; this is a no-op for regular Triton block tensors, while
+        # Gluon uses it to retain the accumulator's distributed/MFMA layout.
+        result_type = acc.type if acc is not None else ret_ty
+        result = self.tensor(
             self.builder.create_dot(
                 lhs.handle,
                 rhs.handle,
@@ -1708,7 +1714,7 @@ class TritonSemantic(Generic[TensorTy]):
                 max_num_imprecise_acc,
                 two_ctas,
             ),
-            ret_ty,
+            result_type,
         )
         if attrs is not None:
             if not isinstance(attrs, dict):

@@ -45,13 +45,17 @@ _CDNA4_MATRIX_INSTR_NONKDIM = 16
 
 @tl_core.builtin
 def _require_layout_soft(x, layout, _semantic=None):
-    """Attach an explicit register layout without making it a hard anchor.
+    """Attach a temporary register-layout hint without making it a hard anchor.
 
     Upstream ``tlx.require_layout`` pins user-authored epilogue ownership so
-    layout optimization cannot rewrite it.  These FA kernels instead use soft
-    requirements for direct-to-LDS offsets, MFMA operands, and intermediate
-    arithmetic; those requirements must remain eligible for TLX fixup and
-    placeholder resolution.
+    layout optimization cannot rewrite it.  These FA kernels instead use a
+    non-pinned requirement for direct-to-LDS offsets, MFMA operands, and
+    intermediate arithmetic.  TLX is therefore allowed to replace this hint
+    with a conversion or propagate another compatible layout; it is not a
+    correctness guarantee.  A hard pin is reserved for the final dK store,
+    while ``tlx.release_layout`` is the explicit operation for dropping a hard
+    pin.  Requiring a second layout would add another constraint rather than
+    cancel the first one.
     """
     x = _semantic.to_tensor(x)
     layout = tl_core._unwrap_if_constexpr(layout)
@@ -1393,7 +1397,9 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
 
         # Reuse the score probabilities in the dK/dV operand ownership.  This
         # is a representation change, so release the score MFMA layout before
-        # narrowing and pin the resulting BF16 tile to the dK/dV operand view.
+        # narrowing and provide a temporary BF16 layout hint for the dK/dV
+        # operand view.  This hint may be rewritten by TLX; it is not a store
+        # anchor.
         pt_nd = _require_layout_soft(tlx.release_layout(p_t).to(tl.bfloat16), pt_op0_nd)
         ds_nd = tlx.local_load(tlx.local_view(ds_buffer, 0), layout=dst_op0_nd, relaxed=True)
         dv = tlx.mfma(pt_nd, do_nd, dv)

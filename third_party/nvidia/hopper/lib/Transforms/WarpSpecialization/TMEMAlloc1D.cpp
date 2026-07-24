@@ -228,10 +228,11 @@ Operation *sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   auto newShape = newType.getShape();
   auto blockN = newShape[shape.size() - 1];
 
-  // The source allocation is measured in its physical TMEM columns.  A
-  // narrower destination element type consumes fewer source columns, matching
-  // the subslice width below.  Wider destinations and non-integral element
-  // width ratios cannot share the representative allocation.
+  // `oldBlockN` and `offset` are measured in the source allocation's physical
+  // TMEM columns, while `blockN` is the destination tile width.  A narrower
+  // destination occupies blockN / colRatio source columns, so validate that
+  // the element-width ratio is integral before constructing the parent view
+  // and converted subslice below.
   auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
   auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
   if (oldElemTyWidth < elemTyWidth ||
