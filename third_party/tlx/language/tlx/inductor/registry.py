@@ -1307,11 +1307,16 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
     Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
     tlx.warp_pipeline_stage), plus a batch axis and a per-batch int64 base advance. No bias, no
     col-major transpose (bmm B is [BATCH,K,N] row-major), no split-K -- a plain data-parallel
-    baseline for Inductor autotune iteration. Gates (fp16/bf16 only): per-batch M*K and N*K fit
-    int32 (async_load's flat offset); (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16) so the direct-to-LDS async_copy vectorizes
-    legally on CDNA4 (an unaligned K makes the vectorizer pick an illegal 16-bit layout, so decline
-    and fall back to stock bmm/aten rather than miscompile); and K_ITERS = K // BLOCK_K >=
-    NUM_BUFFERS so the prologue prefetch is well-formed (the K % BLOCK_K remainder is a sync-tail).
+    baseline for Inductor autotune iteration.
+
+    Dual path selected by K's 16-byte alignment (the template's USE_ASYNC constexpr):
+      * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16): USE_ASYNC=1, the direct-to-LDS async_load
+        warp-pipe (needs K_ITERS = K // BLOCK_K >= NUM_BUFFERS for a well-formed prologue; the
+        K % BLOCK_K remainder is a sync-tail).
+      * otherwise (unaligned K -- the direct-to-LDS async_copy cannot legalize on CDNA4 -- or
+        dynamic K): USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined),
+        correct for ANY K (T280910119). Common gate (fp16/bf16 only): per-batch M*K and N*K fit
+        int32 (the within-batch offset is int32 on both paths).
     """
 
     # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
@@ -1351,12 +1356,17 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
         ):
             return
-        # 16-byte (128-bit transaction) alignment: the row stride K*itemsize bytes must be a
-        # multiple of 16 (K % 8 == 0 for fp16/bf16) for a legal direct-to-LDS async_copy on CDNA4.
-        # Also declines dynamic/unknown K.
+        # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch):
+        #  * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16, 16-byte-aligned rows) -> USE_ASYNC=1, the
+        #    fast direct-to-LDS async_load warp-pipe.
+        #  * otherwise (e.g. odd K -- which the direct-to-LDS async_copy cannot legalize on CDNA4 --
+        #    or dynamic/unknown K, treated as unaligned) -> USE_ASYNC=0, the register-path fallback
+        #    (tl.load->registers->tl.dot, auto-pipelined; ~0.76x rocBLAS, T280910119). This is
+        #    correct for ANY K, so unaligned-K bmm still gets a Triton candidate rather than only aten.
         itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
-        if not sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0)):
-            return
+        use_async = sizevars.statically_known_true(
+            sympy.Eq(sympy.Mod(k * itemsize, 16), 0)
+        )
         num_xcds = _amd_num_xcds()
         for (
             block_m,
@@ -1369,13 +1379,16 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
             if block_m % 16 != 0 or block_n % 16 != 0:
                 continue
-            # prologue prefetches NUM_BUFFERS full K-tiles: require K_ITERS = K // BLOCK_K >= NB.
-            if not sizevars.statically_known_true(
+            # async path only: its prologue prefetches NUM_BUFFERS full K-tiles, so require
+            # K_ITERS = K // BLOCK_K >= NB. The register path has no prologue -> it takes any K.
+            if use_async and not sizevars.statically_known_true(
                 sympy.Ge(k, num_buffers * block_k)
             ):
                 continue
             triton_config = self.triton_config(
-                1,  # num_stages=1: TLX is hand-pipelined; auto software-pipelining must be off
+                # async is hand-pipelined (num_stages=1, auto software-pipelining off); the register
+                # path relies on the auto-pipeliner (num_stages=3) to overlap its tl.loads.
+                1 if use_async else 3,
                 num_warps,
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
@@ -1383,6 +1396,7 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
                 GROUP_M=group_m,
                 NUM_BUFFERS=num_buffers,
                 NUM_XCDS=num_xcds,
+                USE_ASYNC=use_async,
                 matrix_instr_nonkdim=16,
                 waves_per_eu=0,
                 kpack=get_default_kpack(block_k),
