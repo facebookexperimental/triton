@@ -1,6 +1,7 @@
 """Fact analysis for the TLX Wave converter."""
 
 from dataclasses import dataclass, field
+import math
 import re
 
 STAGE = "facts"
@@ -117,6 +118,29 @@ def _add_divisibility_facts(source_program, facts):
             divisor=int(divisor),
             provenance="type:tt.divisibility",
             source_op_index=value.owner_op_index,
+        )
+    op_by_result = {result_id: op for op in source_program.ops for result_id in op.results}
+    for op in source_program.ops:
+        if op.name != "scf.for" or len(op.operands) < 3 or len(op.region_ids) != 1:
+            continue
+        region = source_program.regions[op.region_ids[0]]
+        if not region.block_arg_ids:
+            continue
+        lower = _constant_int(source_program, op_by_result, op.operands[0])
+        step = _constant_int(source_program, op_by_result, op.operands[2])
+        if lower is None or step is None or step <= 0:
+            continue
+        divisor = math.gcd(lower, step)
+        if divisor <= 1:
+            continue
+        _append_fact(
+            facts,
+            "divisible",
+            region.block_arg_ids[0],
+            "mod_zero",
+            divisor=divisor,
+            provenance="derived:scf.for.step",
+            source_op_index=op.index,
         )
 
 
