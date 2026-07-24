@@ -8,6 +8,7 @@ import pathlib
 import uuid
 from triton._internal_testing import is_cuda, is_hip_cdna2
 from triton.runtime import autotuner as _autotuner
+from triton.runtime import _wave_quant
 
 
 def do_bench(kernel_call, quantiles, use_cuda_graph=False):
@@ -594,32 +595,32 @@ def test_dump_best_config_ir(device, tmp_path):
         knobs.cache.dump_dir = original_dump_dir
 
 
-# --- NPOT autotuner: wave-quant candidate generation + bench-path prune gating ---
+# --- NPOT autotuner: resource-aware wave frontier + bench-path prune gating ---
 
 
 def test_wave_efficiency_and_pre_check():
     # Full waves -> 1.0; just over a boundary -> a near-empty trailing wave.
-    assert _autotuner._wave_efficiency(64, 64) == 1.0
-    assert _autotuner._wave_efficiency(65, 64) < 0.55
+    assert _wave_quant.wave_efficiency(64, 64) == 1.0
+    assert _wave_quant.wave_efficiency(65, 64) < 0.55
     # A cleanly-tiling pow2 shape yields no NPOT candidates (no autotune tax on POT shapes).
-    assert _autotuner._wave_quant_npot_candidates(128, 128, 1024, 1024, 64) == []
+    assert _wave_quant.wave_quant_npot_candidates(128, 128, 1024, 1024, 64) == []
     # A single-wave shape cannot be improved by re-tiling -> none, even when it underfills the wave.
-    assert _autotuner._wave_quant_npot_candidates(128, 128, 100, 100, 64) == []
+    assert _wave_quant.wave_quant_npot_candidates(128, 128, 100, 100, 64) == []
 
 
 def test_wave_quant_candidates_target_bad_tail():
     # 9x8 = 72 tiles over 64 units -> 2 waves, ~0.56 efficiency: a real wave-quant tail.
     M, N, U = 1152, 1024, 64
-    cands = _autotuner._wave_quant_npot_candidates(128, 128, M, N, U)
+    cands = _wave_quant.wave_quant_npot_candidates(128, 128, M, N, U)
     assert cands, "expected NPOT candidates for a bad wave tail"
-    pow2_tiles = _autotuner._cdiv(M, 128) * _autotuner._cdiv(N, 128)
-    pow2_waves = _autotuner._cdiv(pow2_tiles, U)
-    pow2_eff = _autotuner._wave_efficiency(pow2_tiles, U)
+    pow2_tiles = _wave_quant.cdiv(M, 128) * _wave_quant.cdiv(N, 128)
+    pow2_waves = _wave_quant.cdiv(pow2_tiles, U)
+    pow2_eff = _wave_quant.wave_efficiency(pow2_tiles, U)
     for bm, bn in cands:
         assert bm % 16 == 0 and bn % 16 == 0  # legal-snapped
-        tiles = _autotuner._cdiv(M, bm) * _autotuner._cdiv(N, bn)
-        waves = _autotuner._cdiv(tiles, U)
-        eff = _autotuner._wave_efficiency(tiles, U)
+        tiles = _wave_quant.cdiv(M, bm) * _wave_quant.cdiv(N, bn)
+        waves = _wave_quant.cdiv(tiles, U)
+        eff = _wave_quant.wave_efficiency(tiles, U)
         # every candidate strictly improves on (fewer waves, then higher efficiency)
         assert waves < pow2_waves or (waves == pow2_waves and eff > pow2_eff)
 
@@ -630,32 +631,231 @@ def test_generate_wave_quant_candidates_appends_npot_and_noop():
     try:
         triton.knobs.language.allow_npot = True
         # Clean shape -> unchanged (no tax). Unknown shape / no SMs -> no-op.
-        assert _autotuner._generate_wave_quant_candidates([base], {'M': 1024, 'N': 1024}, 64) == [base]
-        assert _autotuner._generate_wave_quant_candidates([base], {}, 64) == [base]
-        assert _autotuner._generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 0) == [base]
+        assert _wave_quant.generate_wave_quant_candidates([base], {'M': 1024, 'N': 1024}, 64) == [base]
+        assert _wave_quant.generate_wave_quant_candidates([base], {}, 64) == [base]
+        assert _wave_quant.generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 0) == [base]
         # Bad tail -> NPOT candidates appended; original preserved (and stays pow2).
-        out = _autotuner._generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 64)
+        out = _wave_quant.generate_wave_quant_candidates([base], {'M': 1152, 'N': 1024}, 64)
     finally:
         triton.knobs.language.allow_npot = prev
     assert base in out
-    assert not _autotuner._config_has_npot_block(base)
-    npot = [c for c in out if c is not base and _autotuner._config_has_npot_block(c)]
+    assert not _wave_quant.config_has_npot_block(base)
+    npot = [c for c in out if c is not base and _wave_quant.config_has_npot_block(c)]
     assert npot, "expected wave-quant NPOT candidates for a bad tail"
+
+
+def test_wave_frontier_resource_model_changes_occupancy_and_rejects_over_budget():
+    limits = _wave_quant.WaveDeviceLimits(
+        num_sms=64,
+        max_shared_mem=232448,
+        max_num_regs=65536,
+        warp_size=32,
+        max_threads_per_sm=2048,
+    )
+    dims = {'M': 4096, 'N': 4096, 'K': 1024}
+    shallow = triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=2)
+    deep = _wave_quant.clone_config(shallow)
+    deep.num_stages = 4
+    shallow_point = _wave_quant.estimate_wave_frontier_point(shallow, dims, limits)
+    deep_point = _wave_quant.estimate_wave_frontier_point(deep, dims, limits)
+    assert shallow_point is not None and deep_point is not None
+    assert shallow_point.shared_mem < deep_point.shared_mem
+    assert shallow_point.ctas_per_sm > deep_point.ctas_per_sm
+
+    oversized = triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 128}, num_warps=4, num_stages=3)
+    assert _wave_quant.estimate_wave_frontier_point(oversized, dims, limits) is None
+
+    block_limited = _wave_quant.WaveDeviceLimits(
+        num_sms=64,
+        max_shared_mem=232448,
+        max_num_regs=65536,
+        warp_size=32,
+        max_threads_per_sm=2048,
+        max_shared_mem_per_block=65536,
+        max_num_regs_per_block=65536,
+        max_ctas_per_sm=16,
+    )
+    # The shallow config fits the whole-SM budget but exceeds this per-block launch limit.
+    assert shallow_point.shared_mem < block_limited.max_shared_mem
+    assert _wave_quant.estimate_wave_frontier_point(shallow, dims, block_limited) is None
+
+
+def test_device_wave_limits_use_explicit_per_sm_properties(monkeypatch):
+    props = {
+        "multiprocessor_count": 120,
+        "max_shared_mem": 99000,
+        "max_shared_mem_per_sm": 228000,
+        "max_num_regs": 65536,
+        "max_num_regs_per_sm": 131072,
+        "warpSize": 32,
+        "max_threads_per_sm": 2048,
+        "max_blocks_per_sm": 24,
+    }
+
+    class Utils:
+        @staticmethod
+        def get_device_properties(device):
+            return props
+
+    class Active:
+        utils = Utils()
+
+        @staticmethod
+        def get_current_device():
+            return 0
+
+        @staticmethod
+        def get_current_target():
+            return type("Target", (), {"warp_size": 32})()
+
+    monkeypatch.setattr(_wave_quant, "driver", type("Driver", (), {"active": Active()})())
+    limits = _wave_quant.device_wave_limits()
+    assert limits is not None
+    assert limits.max_shared_mem == 228000
+    assert limits.max_shared_mem_per_block == 99000
+    assert limits.max_num_regs == 131072
+    assert limits.max_num_regs_per_block == 65536
+    del props["max_num_regs_per_sm"]
+    assert _wave_quant.device_wave_limits() is None
+
+
+def test_coupled_wave_frontier_includes_pot_npot_and_stage_choices():
+    limits = _wave_quant.WaveDeviceLimits(
+        num_sms=64,
+        max_shared_mem=232448,
+        max_num_regs=65536,
+        warp_size=32,
+        max_threads_per_sm=2048,
+    )
+    dims = {'M': 1152, 'N': 1024, 'K': 1024}
+    base = triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=3)
+    base_point = _wave_quant.estimate_wave_frontier_point(base, dims, limits)
+    frontier = _wave_quant.coupled_wave_frontier(base, dims, limits, allow_npot=True)
+
+    assert base_point is not None and frontier
+    assert len(frontier) <= _wave_quant.MAX_NPOT_CANDIDATES
+    assert any(not _wave_quant.config_has_npot_block(config) and
+               (config.kwargs['BLOCK_M'], config.kwargs['BLOCK_N']) != (128, 128) for config in frontier)
+    assert any(_wave_quant.config_has_npot_block(config) for config in frontier)
+    assert any(config.num_stages > base.num_stages for config in frontier)
+    assert len({tuple(config.kwargs[name] for name in ('BLOCK_M', 'BLOCK_N', 'BLOCK_K'))
+                for config in frontier}) == len(frontier)
+    for config in frontier:
+        assert all(config.kwargs[name] % 16 == 0 for name in ('BLOCK_M', 'BLOCK_N', 'BLOCK_K'))
+        point = _wave_quant.estimate_wave_frontier_point(config, dims, limits)
+        assert point is not None
+        assert point.shared_mem <= limits.max_shared_mem
+        assert point.registers <= limits.max_num_regs
+        assert point.estimated_cost < base_point.estimated_cost
+
+
+def test_generate_coupled_frontier_gates_only_npot_blocks_and_skips_clean_wave():
+    limits = _wave_quant.WaveDeviceLimits(
+        num_sms=64,
+        max_shared_mem=232448,
+        max_num_regs=65536,
+        warp_size=32,
+        max_threads_per_sm=2048,
+    )
+    base = triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=3)
+    prev = triton.knobs.language.allow_npot
+    try:
+        triton.knobs.language.allow_npot = False
+        pot_only = _wave_quant.generate_wave_quant_candidates(
+            [base], {'M': 1152, 'N': 1024, 'K': 1024}, limits
+        )
+        assert len(pot_only) > 1
+        assert all(not _wave_quant.config_has_npot_block(config) for config in pot_only)
+        # 64 tiles at modeled occupancy one is a full wave.
+        assert _wave_quant.generate_wave_quant_candidates(
+            [base], {'M': 1024, 'N': 1024, 'K': 1024}, limits
+        ) == [base]
+        triton.knobs.language.allow_npot = True
+        expanded = _wave_quant.generate_wave_quant_candidates(
+            [base], {'M': 1152, 'N': 1024, 'K': 1024}, limits
+        )
+        seeds = [
+            base,
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=2),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
+        ]
+        multi_seed = _wave_quant.generate_wave_quant_candidates(
+            seeds, {'M': 1152, 'N': 1024, 'K': 1024}, limits
+        )
+    finally:
+        triton.knobs.language.allow_npot = prev
+    assert len(expanded) > 1
+    assert len(expanded) <= 1 + _wave_quant.MAX_NPOT_CANDIDATES
+    assert any(_wave_quant.config_has_npot_block(config) for config in expanded)
+    assert sum(_wave_quant.config_has_npot_block(config) for config in expanded) == 1
+    assert len(multi_seed) <= len(seeds) + _wave_quant.MAX_NPOT_CANDIDATES
+    assert any(_wave_quant.config_has_npot_block(config) for config in multi_seed)
+
+
+def test_single_seed_include_npot_benchmarks_generated_frontier(device, monkeypatch):
+    base = triton.Config({'BLOCK_SIZE': 16})
+    alternative = triton.Config({'BLOCK_SIZE': 32})
+
+    @triton.autotune(configs=[base], key=['N'], include_npot=True)
+    @triton.jit
+    def kernel(out, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        tl.store(out + offsets, offsets, mask=offsets < N)
+
+    monkeypatch.setattr(kernel, '_add_wave_quant_npot_configs',
+                        lambda configs, named_args: [base, alternative])
+    benchmarked = []
+
+    def fake_bench(*args, config, **kwargs):
+        benchmarked.append(config)
+        value = 1.0 if config is alternative else 2.0
+        return [value, value, value]
+
+    monkeypatch.setattr(kernel, '_bench', fake_bench)
+    out = torch.empty(16, device=device, dtype=torch.int32)
+    previous = triton.knobs.language.allow_npot
+    try:
+        triton.knobs.language.allow_npot = True
+        kernel[(1, )](out, 16)
+    finally:
+        triton.knobs.language.allow_npot = previous
+
+    assert benchmarked == [base, alternative]
+    assert kernel.best_config is alternative
 
 
 def test_npot_runtime_error_prunable_gating():
     pow2_cfg = triton.Config(kwargs={'BLOCK_M': 128})
-    npot_cfg = _autotuner._clone_config(pow2_cfg, BLOCK_M=96)
+    npot_cfg = _wave_quant.clone_config(pow2_cfg, BLOCK_M=96)
     # A pow2 config must re-raise even a device error (never be masked).
-    assert _autotuner._npot_runtime_error_prunable(pow2_cfg, RuntimeError("Triton Error [CUDA]: out of memory"),
+    assert _wave_quant.npot_runtime_error_prunable(pow2_cfg, RuntimeError("Triton Error [CUDA]: out of memory"),
                                                    allow_npot=True) is False
     # An NPOT config under the flag is prunable on a device failure -- case-insensitively and across
     # both backends (CUDA and HIP).
     for msg in ("Triton Error [CUDA]: misaligned address", "Triton Error [HIP]: out of memory range.", "Out Of Memory",
                 "an illegal memory access was encountered"):
-        assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError(msg), allow_npot=True) is True
+        assert _wave_quant.npot_runtime_error_prunable(npot_cfg, RuntimeError(msg), allow_npot=True) is True
+    # AMD currently surfaces an unsupported NPOT tile as a bare MLIR verifier RuntimeError. The
+    # exact structural reject is prunable; arbitrary compiler failures are not.
+    assert _wave_quant.npot_runtime_error_prunable(
+        npot_cfg,
+        RuntimeError("Number of elements must be power-of-two, but tt.make_range has 112 elements"),
+        allow_npot=True,
+    ) is True
+    assert _wave_quant.npot_runtime_error_prunable(
+        npot_cfg,
+        RuntimeError("NPOT layout not yet supported: tensor shape 112, 48"),
+        allow_npot=True,
+    ) is True
+    assert _wave_quant.npot_runtime_error_prunable(
+        npot_cfg,
+        RuntimeError("Layout has 128 threads per warp, but the module specifies 64 threads per warp"),
+        allow_npot=True,
+    ) is True
+    # Some AMD layout lookups surface the unsupported NPOT config as std::map::at.
+    assert _wave_quant.npot_runtime_error_prunable(npot_cfg, IndexError("map::at"), allow_npot=True) is True
     # Flag off, or a non-device RuntimeError -> re-raise.
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("Triton Error [CUDA]: x"),
+    assert _wave_quant.npot_runtime_error_prunable(npot_cfg, RuntimeError("Triton Error [CUDA]: x"),
                                                    allow_npot=False) is False
-    assert _autotuner._npot_runtime_error_prunable(npot_cfg, RuntimeError("invalid config value"),
+    assert _wave_quant.npot_runtime_error_prunable(npot_cfg, RuntimeError("invalid config value"),
                                                    allow_npot=True) is False

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import builtins
-import copy
 import math
 import time
 import inspect
@@ -17,6 +16,7 @@ from .jit import KernelInterface, JITFunction, _compile_iq_suppress_competition
 from .errors import OutOfResources, PTXASError, AutotunerError
 from .driver import driver
 from .cache import get_cache_manager, triton_key
+from . import _wave_quant
 
 try:
     from triton._C.libtriton import native_create_autotune_proxy, native_autotune_proxy_insert, native_autotune_proxy_set_grid
@@ -526,10 +526,10 @@ class Autotuner(KernelInterface):
             if verbose:
                 print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
-        except RuntimeError as e:
+        except (RuntimeError, IndexError) as e:
             # Prune an NPOT candidate to inf if it hit a device compile/launch failure so the sweep
             # continues; pow2 configs (and non-device errors) re-raise.
-            if _npot_runtime_error_prunable(config, e, knobs.language.allow_npot):
+            if _wave_quant.npot_runtime_error_prunable(config, e, knobs.language.allow_npot):
                 if verbose:
                     print(f"Autotuning pruned NPOT config after runtime error: {e}")
                 return [float("inf"), float("inf"), float("inf")]
@@ -767,7 +767,11 @@ class Autotuner(KernelInterface):
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
-        if len(self.configs) > 1:
+        allow_npot = knobs.language.allow_npot
+        wave_quant = allow_npot and getattr(self, "include_npot", False)
+        # An opted-in single seed can expand into a bounded wave frontier, so it must take the
+        # tuning path rather than the legacy one-config fast path.
+        if len(self.configs) > 1 or wave_quant:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
             # Keep self.nargs as positional-only named args (the contract
@@ -783,8 +787,8 @@ class Autotuner(KernelInterface):
             key = tuple(key)
             if key not in self.cache:
                 used_cached_result = False
-                if getattr(self, "include_npot", False) and knobs.language.allow_npot:
-                    # Prune the NPOT-augmented list via the helper (keeps prune_configs 1-arg).
+                if wave_quant:
+                    # Prune the wave-frontier-augmented list via the helper (keeps prune_configs 1-arg).
                     configs = self._add_wave_quant_npot_configs(self.configs, _args)
                     pruned_configs = self._prune_configs(kwargs, configs)
                 else:
@@ -907,15 +911,17 @@ class Autotuner(KernelInterface):
         return ret
 
     def _add_wave_quant_npot_configs(self, configs, named_args):
-        """Append wave-quant NPOT BLOCK_M/N candidates at tune time. No-op on missing shape/SMs or exception."""
+        """Append a resource-constrained POT/NPOT GEMM wave frontier at tune time."""
         try:
-            # Spatial grid dims are M and N; the reduction dim K is a loop, not a grid dim.
-            problem_dims = {d: named_args.get(d) for d in ("M", "N") if isinstance(named_args.get(d), int)}
-            if len(problem_dims) < 2:
+            problem_dims = {d: named_args.get(d) for d in ("M", "N", "K") if isinstance(named_args.get(d), int)}
+            if not all(d in problem_dims for d in ("M", "N")):
                 return configs
-            # SM count on NVIDIA / CU count on AMD; None on backends that don't report it, which
-            # makes _generate_wave_quant_candidates a no-op. ctas_per_sm is estimated as 1.
-            return _generate_wave_quant_candidates(configs, problem_dims, _device_num_sms())
+            limits = _wave_quant.device_wave_limits()
+            if limits is None:
+                return configs
+            return _wave_quant.generate_wave_quant_candidates(
+                configs, problem_dims, limits, _wave_quant.problem_element_bytes(named_args)
+            )
         except Exception:
             return configs
 
@@ -1171,144 +1177,6 @@ class Config:
         return self_tuple == other_tuple
 
 
-def _is_pow2(x):
-    return x > 0 and (x & (x - 1)) == 0
-
-
-def _cdiv(a, b):
-    return -(-a // b)
-
-
-def _clone_config(config, **kwargs_override):
-    """Clone a Config with kwargs overrides; copy.copy carries future Config fields, replace kwargs to avoid alias."""
-    new_config = copy.copy(config)
-    new_config.kwargs = {**config.kwargs, **kwargs_override}
-    return new_config
-
-
-def _config_has_npot_block(config):
-    """True if any of the config's BLOCK_* tile sizes is non-power-of-2."""
-    return any(isinstance(v, int) and not _is_pow2(v) for k, v in config.kwargs.items() if 'BLOCK' in k.upper())
-
-
-# Markers of a device compile/launch failure (vs a logic bug), matched case-insensitively. The
-# NVIDIA and AMD drivers tag every device RuntimeError with "Triton Error [CUDA]"/"[HIP]"; the rest
-# cover common HW failure signatures (including torch-surfaced wordings).
-_DEVICE_ERROR_MARKERS = (
-    "triton error [cuda]",
-    "triton error [hip]",
-    "out of memory",
-    "misaligned",
-    "illegal memory access",
-    "illegal instruction",
-    "device-side assert",
-)
-
-
-def _npot_runtime_error_prunable(config, err, allow_npot):
-    """Prune only an NPOT config, under the flag, on a device error; else re-raise."""
-    if not (allow_npot and _config_has_npot_block(config)):
-        return False
-    text = str(err).lower()
-    return any(marker in text for marker in _DEVICE_ERROR_MARKERS)
-
-
-def _wave_efficiency(num_tiles, num_units):
-    """Useful work fraction = tiles / (waves * units). 1.0 = full waves."""
-    if num_tiles <= 0 or num_units <= 0:
-        return 1.0
-    waves = _cdiv(num_tiles, num_units)
-    return num_tiles / (waves * num_units)
-
-
-def _legal_npot_blocks(base, legal_multiple):
-    """Legal NPOT multiples of ``legal_multiple`` in [base/2, base*2], excluding base and pow2."""
-    lo = max(legal_multiple, base // 2)
-    hi = base * 2
-    v = lo + ((legal_multiple - lo % legal_multiple) % legal_multiple)  # first legal multiple >= lo
-    out = []
-    while v <= hi:
-        if v != base and not _is_pow2(v):
-            out.append(v)
-        v += legal_multiple
-    return out
-
-
-# Only intervene when the pow2 tiling spans more than one wave and wastes more than (1 - threshold)
-# of capacity; a single wave cannot be improved by re-tiling.
-_WAVE_EFFICIENCY_THRESHOLD = 0.9
-
-# Per-config cap on proposed NPOT tiles (the top-ranked few). This bounds candidate GENERATION; the
-# overall sweep size is then governed by the autotuner's normal pruning (early_config_prune/top_k).
-_MAX_NPOT_CANDIDATES = 4
-
-
-def _wave_quant_npot_candidates(base_m, base_n, problem_m, problem_n, num_units, legal_m=16, legal_n=16):
-    """Up to _MAX_NPOT_CANDIDATES legal NPOT (BLOCK_M, BLOCK_N) improving wave count then efficiency
-    over the pow2 base; [] if pow2 is already efficient (>1 wave and >= threshold)."""
-    if not (base_m and base_n and problem_m and problem_n and num_units):
-        return []
-    pow2_tiles = _cdiv(problem_m, base_m) * _cdiv(problem_n, base_n)
-    pow2_waves = _cdiv(pow2_tiles, num_units)
-    pow2_eff = pow2_tiles / (pow2_waves * num_units)
-    if pow2_waves <= 1 or pow2_eff >= _WAVE_EFFICIENCY_THRESHOLD:
-        return []
-    scored = []
-    for bm in [base_m] + _legal_npot_blocks(base_m, legal_m):
-        for bn in [base_n] + _legal_npot_blocks(base_n, legal_n):
-            if bm == base_m and bn == base_n:
-                continue
-            tiles = _cdiv(problem_m, bm) * _cdiv(problem_n, bn)
-            waves = _cdiv(tiles, num_units)
-            eff = tiles / (waves * num_units)
-            if waves < pow2_waves or (waves == pow2_waves and eff > pow2_eff):
-                scored.append(((waves, -eff), (bm, bn)))
-    scored.sort(key=lambda x: x[0])
-    out, seen = [], set()
-    for _, pair in scored:
-        if pair in seen:
-            continue
-        seen.add(pair)
-        out.append(pair)
-        if len(out) >= _MAX_NPOT_CANDIDATES:
-            break
-    return out
-
-
-def _generate_wave_quant_candidates(configs, problem_dims, num_units):
-    """Append wave-quant NPOT BLOCK_M/N candidates for each pow2 config; no-op if flag off or M/N shape/units unknown.
-
-    ``problem_dims`` = {'M': int, 'N': int} (spatial grid dims; K is a reduction loop)."""
-    if not knobs.language.allow_npot or not num_units:
-        return configs
-    pm = problem_dims.get('M')
-    pn = problem_dims.get('N')
-    if not (isinstance(pm, int) and isinstance(pn, int)):
-        return configs
-    expanded = list(configs)
-    for config in configs:
-        bm = config.kwargs.get('BLOCK_M')
-        bn = config.kwargs.get('BLOCK_N')
-        if not (isinstance(bm, int) and isinstance(bn, int)):
-            continue
-        for (nbm, nbn) in _wave_quant_npot_candidates(bm, bn, pm, pn, num_units):
-            new_config = _clone_config(config, BLOCK_M=nbm, BLOCK_N=nbn)
-            if new_config not in expanded:
-                expanded.append(new_config)
-    return expanded
-
-
-def _device_num_sms():
-    """Best-effort device SM count (from the Triton driver) for the wave-quant model; None ->
-    wave-quant is skipped."""
-    try:
-        dev = driver.active.get_current_device()
-        n = driver.active.utils.get_device_properties(dev).get("multiprocessor_count")
-        return int(n) if n else None
-    except Exception:
-        return None
-
-
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
              warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, include_npot=False):
     """
@@ -1368,9 +1236,10 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :type do_bench: lambda fn, quantiles
     :param cache_results: whether to cache autotune timings to disk.  Defaults to False.
     "type cache_results: bool
-    :param include_npot: when True and TRITON_ALLOW_NPOT=1, the autotuner adds wave-quant-targeted
-        NPOT BLOCK_M/BLOCK_N candidates at tune time, but ONLY when the pow2 tiling has a real
-        wave-quantization tail. No-op otherwise, so pow2 autotuning is unchanged. Defaults to False.
+    :param include_npot: when True and TRITON_ALLOW_NPOT is on, add a globally capped wave-quant
+        Pareto frontier over BLOCK_M/BLOCK_N/BLOCK_K and num_stages, including NPOT block
+        alternatives. Occupancy is constrained by modeled register/SMEM use and live device limits.
+        No-op when the base tiling has no useful wave tail. Defaults to False.
     :type include_npot: bool
     """
 
