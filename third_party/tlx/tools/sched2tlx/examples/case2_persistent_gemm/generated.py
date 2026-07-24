@@ -35,10 +35,10 @@ def _gemm_persistent(
     div_14 = (add_13 // 64)
 
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
-    # inner-loop buf 0: SMEM count=3 (modulo lifetime [557..1146], II=256)
-    L0_smem_0 = tlx.local_alloc((128, 64), tl.float16, 3)
-    # inner-loop buf 1: SMEM count=3 (modulo lifetime [587..1146], II=256)
-    L0_smem_1 = tlx.local_alloc((64, 128), tl.float16, 3)
+    # inner-loop buf 0: SMEM count=5 (modulo lifetime [1..1146], II=256)
+    L0_smem_0 = tlx.local_alloc((128, 64), tl.float16, 5)
+    # inner-loop buf 1: SMEM count=5 (modulo lifetime [31..1146], II=256)
+    L0_smem_1 = tlx.local_alloc((64, 128), tl.float16, 5)
 
     # acc_tmem: outer-loop buf 0, count=2 (TC writes / default reads across 2 tiles)
     acc_tmem = tlx.local_alloc((128, 128), tl.float32, 2, tlx.storage_kind.tmem)
@@ -46,11 +46,11 @@ def _gemm_persistent(
 
     # ── Mbarriers (SemIR: full+empty pair per semaphore) ──
     # L0_smem_0: N2→N5  ttg.local_alloc→ttng.tc_gen5_mma  cyc557→cyc587  forward  buf=0  kind=mbarrier
-    L0_smem_0_full = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
-    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    L0_smem_0_full = tlx.alloc_barriers(num_barriers=5, arrive_count=1)
+    L0_smem_0_empty = tlx.alloc_barriers(num_barriers=5, arrive_count=1)
     # L0_smem_1: N4→N5  ttg.local_alloc→ttng.tc_gen5_mma  cyc587→cyc587  forward  buf=1  kind=mbarrier
-    L0_smem_1_full = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
-    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=3, arrive_count=1)
+    L0_smem_1_full = tlx.alloc_barriers(num_barriers=5, arrive_count=1)
+    L0_smem_1_empty = tlx.alloc_barriers(num_barriers=5, arrive_count=1)
     # acc_tmem: cross-region TC-loop → default-epilogue hand-off, depth=2 (legacy carve-out)
     acc_tmem_full = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
     acc_tmem_empty = tlx.alloc_barriers(num_barriers=2, arrive_count=1)
@@ -80,11 +80,11 @@ def _gemm_persistent(
             smem_accum = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_12, 148):
-                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=5; smem_accum persists across outer tiles.
                 for k in range(0, div_14, 1):
                     _it = smem_accum
-                    buf = smem_accum % 3
-                    phase = (smem_accum // 3) & 1
+                    buf = smem_accum % 5
+                    phase = (smem_accum // 5) & 1
                     # load → L0_smem_0
                     tlx.barrier_wait(L0_smem_0_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_0_full[buf], 16384)
@@ -95,11 +95,11 @@ def _gemm_persistent(
             smem_accum = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_12, 148):
-                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=5; smem_accum persists across outer tiles.
                 for k in range(0, div_14, 1):
                     _it = smem_accum
-                    buf = smem_accum % 3
-                    phase = (smem_accum // 3) & 1
+                    buf = smem_accum % 5
+                    phase = (smem_accum // 5) & 1
                     # load → L0_smem_1
                     tlx.barrier_wait(L0_smem_1_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_1_full[buf], 16384)
@@ -115,16 +115,16 @@ def _gemm_persistent(
                 tmem_phase = (tmem_accum_cnt // 2) & 1
                 tlx.barrier_wait(acc_tmem_empty[tmem_buf], tmem_phase ^ 1)
                 i0_0 = False
-                # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
+                # Inner K-loop (loop 0, II=256). SMEM ring depth=5; smem_accum persists across outer tiles.
                 for k in range(0, div_14, 1):
                     _it = smem_accum
-                    buf = smem_accum % 3
-                    phase = (smem_accum // 3) & 1
+                    buf = smem_accum % 5
+                    phase = (smem_accum // 5) & 1
                     # MMA
-                    tlx.barrier_wait(L0_smem_0_full[(_it % 3)], ((_it // 3) & 1))
-                    tlx.barrier_wait(L0_smem_1_full[(_it % 3)], ((_it // 3) & 1))
+                    tlx.barrier_wait(L0_smem_0_full[(_it % 5)], ((_it // 5) & 1))
+                    tlx.barrier_wait(L0_smem_1_full[(_it % 5)], ((_it // 5) & 1))
                     use_acc = (k > 0)
-                    tlx.async_dot(L0_smem_0[buf], L0_smem_1[buf], acc_tmem[tmem_buf], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 3)], L0_smem_1_empty[(_it % 3)]])
+                    tlx.async_dot(L0_smem_0[buf], L0_smem_1[buf], acc_tmem[tmem_buf], use_acc=use_acc, mBarriers=[L0_smem_0_empty[(_it % 5)], L0_smem_1_empty[(_it % 5)]])
                     smem_accum += 1
                     i0_0 = True
                 tlx.tcgen05_commit(acc_tmem_full[tmem_buf])

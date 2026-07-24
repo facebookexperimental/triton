@@ -13,37 +13,37 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- Graph structure: II=1005, max_stage=1, trip_count=32 ---
-// With selfLatency=1, loads issue every cycle (not every 518 cycles),
+// --- Graph structure: II=1091, max_stage=1, trip_count=32 ---
+// With load selfLatency=30, loads issue every 30 cycles (not every 556 cycles),
 // so II is driven by RecMII (loop-carried dep: MMA→tmem_load→tmem_alloc→MMA).
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
+// CHECK: [PASS-A] === Inner ScheduleGraph ===
 // CHECK-NEXT: modulo.schedule @loop0 {
-// CHECK-NEXT:   ii = 1005, max_stage = 1, prologue_latency = 703, trip_count = 32
+// CHECK-NEXT:   ii = 1091, max_stage = 1, prologue_latency = 587, trip_count = 32
 //
 // --- Nodes: loads+allocs+MMA@s0, tmem_load@s1 ---
 // CHECK: modulo.stage @s0 {
-// CHECK:   tt.descriptor_load  {pipe: TMA, cycle: 0, cluster: 0, latency: 1218, selfLatency: 1}
-// CHECK:   tt.descriptor_load  {pipe: TMA, cycle: 1, cluster: 1, latency: 1218, selfLatency: 1}
-// CHECK:   ttg.local_alloc  {pipe: TMA, cycle: 2, cluster: 2, latency: 700
-// CHECK:   ttg.local_alloc  {pipe: TMA, cycle: 3, cluster: 3, latency: 700
-// CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 703, cluster: 4, latency: 900, selfLatency: 1
+// CHECK:   %N1 = tt.descriptor_load  {pipe: TMA, cycle: 1, cluster: 1, latency: 556, selfLatency: 30}
+// CHECK:   %N2 = tt.descriptor_load  {pipe: TMA, cycle: 31, cluster: 2, latency: 556, selfLatency: 30}
+// CHECK:   %N3 = ttg.local_alloc  {pipe: NONE, cycle: 557, cluster: 3, ->buf0}
+// CHECK:   %N4 = ttg.local_alloc  {pipe: NONE, cycle: 587, cluster: 4, ->buf1}
+// CHECK:   %N6 = ttng.tc_gen5_mma  {pipe: TC, cycle: 587, cluster: 4, latency: 559, selfLatency: 30, <-buf0, <-buf1, <-buf2}
 // CHECK: }
 // CHECK: modulo.stage @s1 {
-// CHECK:   ttng.tmem_load  {pipe: CUDA, cycle: 1603, cluster: 0, latency: 105, selfLatency: 1
+// CHECK:   %N7 = ttng.tmem_load  {pipe: CUDA, cycle: 1146, cluster: 0, latency: 532, selfLatency: 256, <-buf2}
 // CHECK: }
 //
 // --- Edges: SSA + loop-carried ---
 // CHECK: edges {
-// CHECK-DAG: N0 -> N1  lat=0  dist=0
-// CHECK-DAG: N0 -> N2  lat=0  dist=0
-// CHECK-DAG: N1 -> N3  lat=1  dist=0
-// CHECK-DAG: N2 -> N4  lat=1  dist=0
-// CHECK-DAG: N3 -> N6  lat=700  dist=0
-// CHECK-DAG: N4 -> N6  lat=700  dist=0
+// CHECK-DAG: N0 -> N1  lat=1  dist=0
+// CHECK-DAG: N0 -> N2  lat=1  dist=0
+// CHECK-DAG: N1 -> N3  lat=556  dist=0
+// CHECK-DAG: N2 -> N4  lat=556  dist=0
+// CHECK-DAG: N3 -> N6  lat=0  dist=0
+// CHECK-DAG: N4 -> N6  lat=0  dist=0
 // CHECK-DAG: N5 -> N6  lat=0  dist=0
 // CHECK-DAG: N5 -> N7  lat=0  dist=0
-// CHECK-DAG: N6 -> N7  lat=900  dist=0
-// CHECK-DAG: N7 -> N5  lat=105  dist=1
+// CHECK-DAG: N6 -> N7  lat=559  dist=0
+// CHECK-DAG: N7 -> N5  lat=532  dist=1
 // CHECK: }
 // CHECK: }
 tt.func @test_basic_graph(

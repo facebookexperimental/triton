@@ -16,31 +16,25 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- Graph: makespan=2767, all stage 0 ---
-// CHECK: [A.6] === List ScheduleGraph ===
-// CHECK-NEXT: modulo.schedule @loop0 {
-// CHECK-NEXT:   ii = 2767, max_stage = 0
+// --- Schedule: makespan=1402, all ops stage 0 ---
+// --- List-schedule debug summary: makespan only (no II), single default heuristic ---
+// CHECK: [nvgpu-list-schedule]: List scheduling loop with 8 nodes (genK=1, pick=0, ranked=0)
+// CHECK: [nvgpu-list-schedule]: List schedule: makespan=1402 nodes=8
+// CHECK: [nvgpu-list-schedule]: List schedule: applying rank 0 of 1 (makespan=1402)
+// CHECK: [nvgpu-list-schedule]: reorderByCluster: permuted 8 body ops into schedule order
 //
-// --- All ops in single stage, cluster IDs 0-5 by cycle ---
-// CHECK: modulo.stage @s0 {
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 0, cluster: 0, latency: 1218, selfLatency: 518}
-// CHECK:   tt.descriptor_load  {pipe: MEM, cycle: 518, cluster: 1, latency: 1218, selfLatency: 518}
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1036, cluster: 2, latency: 700}
-// CHECK:   ttg.local_alloc  {pipe: MEM, cycle: 1037, cluster: 3, latency: 700}
-// CHECK:   ttng.tc_gen5_mma  {pipe: TC, cycle: 1737, cluster: 4, latency: 900, selfLatency: 900}
-// CHECK:   ttng.tmem_load  {pipe: CUDA, cycle: 2637, cluster: 5, latency: 130, selfLatency: 130}
-// CHECK: }
-//
-// --- Edges ---
-// CHECK: edges {
-// CHECK-DAG: N0 -> N1  lat=0  dist=0
-// CHECK-DAG: N1 -> N3  lat=518  dist=0
-// CHECK-DAG: N2 -> N4  lat=518  dist=0
-// CHECK-DAG: N3 -> N6  lat=700  dist=0
-// CHECK-DAG: N4 -> N6  lat=700  dist=0
-// CHECK-DAG: N6 -> N7  lat=900  dist=0
-// CHECK: }
-// CHECK: }
+// --- Transformed IR: all ops at stage 0, cluster IDs as dense rank of cycle ---
+// --- MEM (loads) get earliest clusters, TC (MMA) later, CUDA (tmem_load) last ---
+// CHECK-LABEL: @gemm_list_schedule_graph
+// CHECK:      ttng.tmem_alloc {{.*}} {loop.cluster = 0 : i32, loop.stage = 0 : i32}
+// CHECK:      tt.descriptor_load {{.*}} {loop.cluster = 1 : i32, loop.stage = 0 : i32}
+// CHECK:      tt.descriptor_load {{.*}} {loop.cluster = 2 : i32, loop.stage = 0 : i32}
+// CHECK:      ttg.local_alloc {{.*}} {loop.cluster = 3 : i32, loop.stage = 0 : i32}
+// CHECK:      ttg.local_alloc {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
+// CHECK:      ttng.tc_gen5_mma {{.*}} {loop.cluster = 4 : i32, loop.stage = 0 : i32}
+// CHECK:      ttng.tmem_load {{.*}} {loop.cluster = 5 : i32, loop.stage = 0 : i32}
+// CHECK:      tt.list_schedule_makespan = 1402 : i32
+// CHECK-SAME: tt.modulo_ii = 1402 : i32
 tt.func @gemm_list_schedule_graph(
   %a_desc: !tt.tensordesc<128x64xf16>,
   %b_desc: !tt.tensordesc<64x128xf16>
