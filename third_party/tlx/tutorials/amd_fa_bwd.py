@@ -1346,7 +1346,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         lse = tl.load(LSE + batch_head * N + offs_m, mask=offs_m < N, other=0.0)
         delta = tl.load(Delta + batch_head * N + offs_m, mask=offs_m < N, other=0.0)
         score_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
-        score_acc = tlx.mfma(k_nm, q_t, score_acc)
+        score_acc = tl.dot(k_nm, q_t, acc=score_acc, out_dtype=score_acc.dtype)
         lse_full = tl.broadcast_to(lse[None, :] * log2e, (BLOCK_N, BLOCK_M))
         lse_full = _require_layout_soft(lse_full, mma_nm)
         qk_scale_full = _require_layout_soft(
@@ -1366,7 +1366,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         p_t = _require_layout_soft(tl.math.exp2(scores_t), mma_nm)
 
         dpt_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
-        dpt_acc = tlx.mfma(v_nm, do_t, dpt_acc)
+        dpt_acc = tl.dot(v_nm, do_t, acc=dpt_acc, out_dtype=dpt_acc.dtype)
         delta_full = tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M))
         delta_full = _require_layout_soft(delta_full, mma_nm)
         ds_t = p_t * (dpt_acc - delta_full)
@@ -1384,7 +1384,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         ds_md = tlx.local_load(tlx.local_trans(tlx.local_view(ds_buffer, 0)), layout=ds_op0_md, relaxed=True)
         k_md = tlx.local_load(k_buffer, token=kv_wait, layout=k_op1_md, relaxed=True)
         dq_part = tlx.zeros((BLOCK_M, D), tl.float32, layout=mma_md)
-        dq_part = tlx.mfma(ds_md, k_md, dq_part)
+        dq_part = tl.dot(ds_md, k_md, acc=dq_part, out_dtype=dq_part.dtype)
         dq_scale_full = _require_layout_soft(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), mma_md)
         dq_part = dq_part * dq_scale_full
         q_ptrs = tensor_base + offs_m[:, None] * D + offs_d[None, :]
@@ -1402,8 +1402,8 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         # anchor.
         pt_nd = _require_layout_soft(tlx.release_layout(p_t).to(tl.bfloat16), pt_op0_nd)
         ds_nd = tlx.local_load(tlx.local_view(ds_buffer, 0), layout=dst_op0_nd, relaxed=True)
-        dv = tlx.mfma(pt_nd, do_nd, dv)
-        dk = tlx.mfma(ds_nd, q_nd, dk)
+        dv = tl.dot(pt_nd, do_nd, acc=dv, out_dtype=dv.dtype)
+        dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=dk.dtype)
 
     tlx.async_load_wait_group(0)
     dk = tlx.release_layout(dk)
@@ -1418,17 +1418,25 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     # ownership without pinning the intermediate MFMA arithmetic.
     # Gluon's newer full-attention D64-half epilogue raised TLX from 496 to 503
     # VGPR for N=200, so the lower-resource whole-tile epilogue remains used.
+    # ``release_layout`` above intentionally leaves the scaled accumulator
+    # layout-flexible. Reattach the MFMA ownership before the layout-preserving
+    # cast: ``cast_layout`` does not infer its source layout backwards from the
+    # later hard kv_async_layout store anchor. Without this hint, the compiler
+    # selects a generic linear layout for the scale/cast sequence instead of
+    # preserving the intended MFMA -> BF16 -> vector handoff.
     dk_mma = _require_layout_soft(dk, mma_nd)
     dk_bf16 = tlx.cast_layout(dk_mma, tl.bfloat16)
     dk_vec = tlx.require_layout(dk_bf16, kv_async_layout)
     tl.store(DK + key_ptrs, dk_vec, mask=key_mask)
-    # Keep dV's physical conversion explicit. Pinning both output stores makes
-    # the causal N=200 build cross the gfx950 register-spill threshold; the
-    # dK-only anchor preserves the coalesced dwordx4 stores without that spill.
+    # Keep dV's physical conversion explicit without adding a hard store anchor.
+    # ``convert_layout`` already materializes kv_async_layout for the store;
+    # releasing it here would discard the requested store ownership and let the
+    # epilogue remap the value. Unlike dK's hard anchor, this conversion remains
+    # optimizer-flexible and avoids the causal N=200 register-spill threshold.
     dv_mma = _require_layout_soft(dv, mma_nd)
     dv_bf16 = tlx.cast_layout(dv_mma, tl.bfloat16)
     dv_vec = tlx.convert_layout(dv_bf16, kv_async_layout)
-    tl.store(DV + key_ptrs, tlx.release_layout(dv_vec), mask=key_mask)
+    tl.store(DV + key_ptrs, dv_vec, mask=key_mask)
 
 
 @triton.jit

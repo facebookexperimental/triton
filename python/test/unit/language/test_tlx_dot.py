@@ -3,7 +3,12 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton.backends.compiler import GPUTarget
 from triton._internal_testing import is_blackwell, is_hopper
+from triton._filecheck import run_parser
+from triton.experimental import gluon
+from triton.experimental.gluon import language as ttgl
+from triton.experimental.gluon.language._core import builtin as gluon_builtin
 import triton.language.extra.tlx as tlx
 from typing import Optional
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -14,6 +19,41 @@ if is_fbcode_dependant():
     from python.test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
 else:
     from conftest import _generate_test_params, _swizzle_scale_to_5d
+
+HIP_TARGET_CDNA4 = GPUTarget("hip", "gfx950", 64)
+
+
+@gluon_builtin
+def _semantic_dot_with_acc_layout(a, b, acc, _semantic=None):
+    """Expose semantic dot for the accumulator-layout propagation test."""
+    return _semantic.dot(
+        a,
+        b,
+        acc,
+        input_precision=None,
+        max_num_imprecise_acc=None,
+        out_dtype=acc.dtype,
+    )
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
+def test_dot_propagates_accumulator_layout(target):
+    """A semantic dot with an explicit accumulator keeps its distributed type."""
+
+    @gluon.jit
+    def kernel():
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(version=4, warps_per_cta=[4, 1], instr_shape=[16, 16, 32],
+                                                             transposed=True)
+        a_layout: ttgl.constexpr = ttgl.DotOperandLayout(0, mfma_layout, 8)
+        b_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, mfma_layout, 8)
+        a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, layout=a_layout)
+        b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, layout=b_layout)
+        acc = ttgl.full([16, 16], 0.0, ttgl.float32, layout=mfma_layout)
+        result = _semantic_dot_with_acc_layout(a, b, acc)
+        ttgl.static_assert(result.type.layout == mfma_layout)
+
+    module = run_parser(kernel, target=target)
+    assert "#ttg.amd_mfma" in module.str_nodebug()
 
 
 # Test tl.dot wit tlx smem ops

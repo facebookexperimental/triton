@@ -998,12 +998,11 @@ def test_amd_mfma_layout_anchors_and_releases_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
-def test_tlx_mfma_preserves_explicit_accumulator_layout_on_cdna4():
-    """The TLX MFMA wrapper must keep the concrete accumulator layout live.
+def test_tlx_dot_preserves_explicit_accumulator_layout_on_cdna4():
+    """A standard ``tl.dot`` keeps an explicit AMD accumulator layout live.
 
-    The shared semantic ``tl.dot`` path now propagates an explicitly laid-out
-    accumulator type.  The AMD MFMA builtin delegates to that path, so the
-    score dot can feed elementwise operations without an unresolved
+    The semantic ``tl.dot`` path propagates an explicitly laid-out accumulator
+    type, so the score dot can feed elementwise operations without an unresolved
     blocked-to-MFMA materialization.
     """
     mma = tlx.amd_mfma_layout(4, [16, 16, 32], True, [4, 1])
@@ -1020,7 +1019,7 @@ def test_tlx_mfma_preserves_explicit_accumulator_layout_on_cdna4():
         a = tlx.local_load(tlx.local_view(a_buf, 0), layout=DOT0)
         b = tlx.local_load(tlx.local_view(b_buf, 0), layout=DOT1)
         acc = tlx.zeros((256, 16), tl.float32, layout=MMA)
-        out = tlx.mfma(a, b, acc)
+        out = tl.dot(a, b, acc=acc, out_dtype=acc.dtype)
         out = tlx.release_layout(out)
         rows = tl.arange(0, 256)
         cols = tl.arange(0, 16)
