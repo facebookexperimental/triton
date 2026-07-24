@@ -427,6 +427,10 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     Type valueElemTy =
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
 
+    auto ptrTensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    bool hasModularLayout =
+        ptrTensorTy && triton::gpu::toLinearLayout(ptrTensorTy).isModular();
+
     unsigned vec = getVectorSize(ptr);
     unsigned elemsPerThread = getTotalElemsPerThread(ptr.getType());
 
@@ -444,6 +448,12 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
 
       unsigned maskAlign = getMaskAlignment(mask);
       vec = std::min(vec, maskAlign);
+    }
+
+    if (hasModularLayout) {
+      // Ownership can flip at an NPOT boundary inside an otherwise
+      // vectorizable group, so predicate modular stores element by element.
+      vec = 1;
     }
 
     if (vec == 1 && elemsPerThread > 1) {
@@ -464,6 +474,22 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
+
+    // For a modular (NPOT) layout, phantom column/row registers get raw
+    // out-of-range pointer offsets that the free-variable mask does not catch.
+    // Predicate every register to a single canonical owner so a maskless store
+    // cannot overflow into a neighbouring logical element. Empty (and therefore
+    // a no-op) for non-modular layouts, so power-of-two stores are byte
+    // identical.
+    SmallVector<Value> canonicalPredicates;
+    if (ptrTensorTy) {
+      auto predicates = ttg::emitCanonicalIndexPredicates(
+          loc, rewriter, targetInfo, ptrTensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no canonical store owner prefix");
+      canonicalPredicates = std::move(*predicates);
+    }
 
     const int numVecs = elemsPerThread / vec;
     for (size_t vecStart = 0; vecStart < elemsPerThread; vecStart += vec) {
@@ -512,7 +538,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
       PTXBuilder ptxBuilder;
       auto *asmArgList = ptxBuilder.newListOperand(asmArgs);
 
-      Value pred = threadPred;
+      Value pred = !canonicalPredicates.empty() ? canonicalPredicates[vecStart]
+                                                : threadPred;
       if (llMask) {
         auto mask = maskElems[vecStart];
         pred = ttg::maybeAnd(rewriter, loc, pred, mask);
@@ -612,6 +639,19 @@ struct AtomicCASOpConversion
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
+    SmallVector<Value> canonicalPredicates;
+    if (tensorTy) {
+      auto predicates = ttg::emitCanonicalIndexPredicates(
+          loc, rewriter, targetInfo,
+          cast<RankedTensorType>(op.getPtr().getType()), threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
 
     SmallVector<Value> resultVals(elemsPerThread);
 
@@ -626,9 +666,11 @@ struct AtomicCASOpConversion
       Value casVal = valElements[i];
       Value casCmp = cmpElements[i];
       Value casPtr = ptrElements[i];
-      Value old = NVIDIA::emitPtxAtomicCAS(rewriter, loc, valueElemTy, casPtr,
-                                           casCmp, casVal, op.getSem(),
-                                           op.getScope(), threadPred);
+      Value pred =
+          !canonicalPredicates.empty() ? canonicalPredicates[i] : threadPred;
+      Value old =
+          NVIDIA::emitPtxAtomicCAS(rewriter, loc, valueElemTy, casPtr, casCmp,
+                                   casVal, op.getSem(), op.getScope(), pred);
 
       if (tensorTy) {
         resultVals[i] = old;
@@ -755,6 +797,9 @@ public:
 
     auto valueTy = op.getType();
     auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
+    auto ptrTensorTy = dyn_cast<RankedTensorType>(ptr.getType());
+    bool hasModularLayout =
+        ptrTensorTy && triton::gpu::toLinearLayout(ptrTensorTy).isModular();
     Type valueElemTy =
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
                  : valueTy;
@@ -785,6 +830,12 @@ public:
       numElems = 1;
       packed = 1;
     }
+    if (hasModularLayout) {
+      // Ownership can change at an NPOT boundary inside an otherwise
+      // vectorizable group, so predicate modular atomics element by element.
+      vec = 1;
+      packed = 1;
+    }
     assert((packed == 1 || vec == 1) && "packed or vec must be 1");
 
     if (vec * packed == 1 && numElems > 1)
@@ -796,6 +847,18 @@ public:
     Value threadPred = emitRedundantThreadPredicate(freeVarMasks, rewriter, loc,
                                                     targetInfo, op);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
+    SmallVector<Value> canonicalPredicates;
+    if (ptrTensorTy) {
+      auto predicates = ttg::emitCanonicalIndexPredicates(
+          loc, rewriter, targetInfo, ptrTensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
 
     auto packedTy = vec_ty(valueElemTy, packed);
     SmallVector<Value> resultVals(elemsPerThread);
@@ -822,8 +885,9 @@ public:
 
       Value rmwPtr = ptrElements[i];
       Value pred =
-          llMask ? ttg::maybeAnd(rewriter, loc, threadPred, maskElements[i])
-                 : threadPred;
+          !canonicalPredicates.empty() ? canonicalPredicates[i] : threadPred;
+      if (llMask)
+        pred = ttg::maybeAnd(rewriter, loc, pred, maskElements[i]);
 
       if (doPTXLDPromotion) {
         Type convertedValueTy =

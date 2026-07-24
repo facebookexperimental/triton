@@ -105,9 +105,10 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
     ModuleOp moduleOp = getOperation();
 
     // Modular layouts can have multiple physical slots for one logical tensor
-    // element. Loads and stores tolerate equivalent duplicate values, but an
-    // atomic would apply the update more than once. Reject until lowering can
-    // predicate a canonical representative for every modular alias class.
+    // element. Result-unused atomics select one canonical representative in
+    // lowering. Consumed results still require redistributing the owner's old
+    // value to its aliases. Multi-CTA ownership remains gated until validated
+    // on cluster-capable hardware.
     if (triton::tools::getBoolEnv("TRITON_ALLOW_NPOT")) {
       bool hasUnsupportedAtomic = false;
       moduleOp.walk([&](Operation *op) {
@@ -119,9 +120,24 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
               return llvm::isPowerOf2_64(dim);
             }))
           return;
-        op->emitError("NPOT atomic operations are not yet supported with "
-                      "modular tensor layouts");
-        hasUnsupportedAtomic = true;
+        Value atomicValue = isa<triton::AtomicRMWOp>(op)
+                                ? cast<triton::AtomicRMWOp>(op).getVal()
+                                : cast<triton::AtomicCASOp>(op).getVal();
+        Type elementType =
+            cast<RankedTensorType>(atomicValue.getType()).getElementType();
+        if (elementType.getIntOrFloatBitWidth() < 32) {
+          op->emitError("NPOT atomic operations do not yet support element "
+                        "types narrower than 32 bits");
+          hasUnsupportedAtomic = true;
+        } else if (!op->getResult(0).use_empty()) {
+          op->emitError("NPOT atomic results are not yet supported with "
+                        "modular tensor layouts");
+          hasUnsupportedAtomic = true;
+        } else if (triton::gpu::TritonGPUDialect::getNumCTAs(moduleOp) != 1) {
+          op->emitError("NPOT atomic operations do not yet support multiple "
+                        "CTAs per cluster");
+          hasUnsupportedAtomic = true;
+        }
       });
       if (hasUnsupportedAtomic) {
         signalPassFailure();
