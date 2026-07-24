@@ -1,0 +1,1752 @@
+import copy
+import json
+import pytest
+import torch
+
+import triton
+import triton.language as tl
+from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
+from triton.language.extra.subtile_ops import _split_n_2D
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+def is_cuda():
+    target = triton.runtime.driver.active.get_current_target()
+    return getattr(target, "is_cuda_backend", lambda: target.backend == "cuda")()
+
+
+def supports_host_descriptor():
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+
+
+def is_blackwell():
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+
+
+def is_hopper():
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 9
+
+
+@triton.jit
+def _mask_scalar(qk, col_limit_right, s, i):
+    col_lim_right_s = col_limit_right - s
+    col_lim_right_cur = max(col_lim_right_s, 0)
+    mask = -1 << col_lim_right_cur
+    mask_i_bit = (mask & (1 << i)) == 0
+    return tl.where(mask_i_bit, qk, -float("inf"))
+
+
+@triton.jit
+def _apply_causal_mask(qk, col_limit_right, BLOCK_N: tl.constexpr):
+    # Apply causal mask via a bitmask calculated for each block of 16 elements.
+    # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
+    # Credit to Tri Dao,
+    # https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
+    #
+    # NOTE: We use map_elementwise here in order to generate an interleaved sequence of instructions
+    # that processes one element of qk at a time. This improves ptxas's resulting SASS.
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
+    s = offs_n & ~0xF
+    i = offs_n & 0xF
+    return tl.map_elementwise(_mask_scalar, qk, col_limit_right, s, i)
+
+
+@triton.jit
+def _attn_fwd_subtile(
+    q,
+    k,
+    offs_m,
+    start_n,
+    start_m,
+    BLOCK_N,
+    BLOCK_M,
+    offs_n,
+    qk_scale,
+    l_i0,
+    l_i1,  # used when FADD2_REDUCE is true
+    m_i,
+    acc,
+    v,
+    dtype: tl.constexpr,
+    STAGE: tl.constexpr,
+    SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
+    FADD2_REDUCE: tl.constexpr,
+):
+    qk = tl.dot(q, k)
+
+    if STAGE == 3 and start_n >= start_m * BLOCK_M:
+        col_limit_right = (offs_m - start_n + 1)[:, None]
+        qk = _apply_causal_mask(qk, col_limit_right, BLOCK_N)
+
+    m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+
+    if VECT_MUL == 2 or VECT_MUL == 3:
+        qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
+    else:
+        qk = qk * qk_scale - m_ij[:, None]
+
+    p = tl.math.exp2(qk)
+    # -- compute correction factor
+    alpha = tl.math.exp2(m_i - m_ij)
+    if not FADD2_REDUCE:
+        l_ij = tl.sum(p, 1)
+
+    # -- update output accumulator --
+    BM: tl.constexpr = acc.shape[0]
+    BN: tl.constexpr = acc.shape[1]
+
+    if SUBTILING:
+        acc0, acc1 = acc.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
+        if VECT_MUL == 1 or VECT_MUL == 3:
+            acc0 = _mul_f32x2(acc0, alpha[:, None])
+            acc1 = _mul_f32x2(acc1, alpha[:, None])
+        else:
+            acc0 = acc0 * alpha[:, None]
+            acc1 = acc1 * alpha[:, None]
+        acc = tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
+    else:
+        acc = acc * alpha[:, None]
+
+    PM: tl.constexpr = p.shape[0]
+    PN: tl.constexpr = p.shape[1]
+    if FADD2_REDUCE:
+        p0, p1 = p.reshape([PM, 2, PN // 2]).permute(0, 2, 1).split()
+        l_ij0, l_ij1 = tl.reduce((p0, p1), axis=1, combine_fn=_reduce_fadd2)
+        l_i0 = l_i0 * alpha + l_ij0
+        l_i1 = l_i1 * alpha + l_ij1
+
+    # prepare p and v for the dot
+    p = p.to(dtype)
+    # note that this non transposed v for FP8 is only supported on Blackwell
+    acc = tl.dot(p, v, acc)
+    # update m_i and l_i
+    # place this at the end of the loop to reduce register pressure
+    if not FADD2_REDUCE:
+        l_i0 = l_i0 * alpha + l_ij
+    m_i = m_ij
+
+    return l_i0, l_i1, m_i, acc
+
+
+@triton.jit
+def _attn_fwd_inner_oss_dp(
+    acc0,
+    l_i0,
+    l_i0_1,
+    m_i0,
+    q0,
+    K,
+    V,  #
+    y_dim,
+    stride_m,
+    offset_y,
+    dtype: tl.constexpr,
+    start_m,
+    qk_scale,  #
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,  #
+    STAGE: tl.constexpr,
+    offs_m0: tl.constexpr,
+    offs_n: tl.constexpr,  #
+    N_CTX: tl.constexpr,
+    warp_specialize: tl.constexpr,
+    SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
+    FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
+):
+    # range of values handled by this stage
+    if STAGE == 1:  # causal = False
+        lo, hi = 0, N_CTX
+    else:  # causal = True
+        lo, hi = 0, (start_m + 1) * BLOCK_M
+    offsetkv_y = offset_y + lo
+
+    # loop over k, v and update accumulator
+    for start_n in tl.range(
+            lo,
+            hi,
+            BLOCK_N,
+            warp_specialize=warp_specialize,
+            merge_epilogue=True,
+            separate_epilogue_store=True,
+            # disallow_acc_multi_buffer=True,
+            data_partition_factor=DP_FACTOR,
+    ):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+
+        # auto-TMA: plain masked loads (mask recovers the global row extent y_dim;
+        # the contiguous HEAD_DIM dim has no mask -> whole-dim constant extent).
+        offs_kv = offsetkv_y + tl.arange(0, BLOCK_N)
+        offs_d = tl.arange(0, HEAD_DIM)[None, :]
+        kv_mask = offs_kv[:, None] < y_dim
+        k = tl.load(K + offs_kv[:, None] * stride_m + offs_d, mask=kv_mask, other=0.0).T
+        v = tl.load(V + offs_kv[:, None] * stride_m + offs_d, mask=kv_mask, other=0.0)
+
+        l_i0, l_i0_1, m_i0, acc0 = _attn_fwd_subtile(
+            q0,
+            k,
+            offs_m0,
+            start_n,
+            start_m,
+            BLOCK_N,
+            BLOCK_M,
+            offs_n,
+            qk_scale,
+            l_i0,
+            l_i0_1,
+            m_i0,
+            acc0,
+            v,
+            dtype,
+            STAGE,
+            SUBTILING,
+            VECT_MUL,
+            FADD2_REDUCE,
+        )
+
+        offsetkv_y += BLOCK_N
+
+    return acc0, l_i0, l_i0_1, m_i0
+
+
+def _host_descriptor_pre_hook(nargs):
+    BLOCK_M = nargs["BLOCK_M"]
+    BLOCK_N = nargs["BLOCK_N"]
+    HEAD_DIM = nargs["HEAD_DIM"]
+    # auto-TMA path passes raw tensors (Q/K/V/O) instead of host descriptors, so
+    # there is nothing to pre-shape here.
+    if "desc_q" not in nargs or not isinstance(nargs["desc_q"], TensorDescriptor):
+        return
+    nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]  # due to data partitioning
+    if nargs["FP8_OUTPUT"]:
+        nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
+    else:
+        nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
+    nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
+    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
+
+
+if is_hip():
+    NUM_STAGES_OPTIONS = [1]
+elif supports_host_descriptor():
+    NUM_STAGES_OPTIONS = [3]
+else:
+    NUM_STAGES_OPTIONS = [3]
+
+configs = [
+    triton.Config(
+        {
+            "BLOCK_M": BM,
+            "BLOCK_N": BN,
+            "DP_FACTOR": 2,
+        },
+        num_stages=s,
+        num_warps=w,
+        pre_hook=_host_descriptor_pre_hook,
+    ) for BM in [256] for BN in [128] for s in NUM_STAGES_OPTIONS for w in [4]
+]
+
+
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    return not (is_cuda() and torch.cuda.get_device_capability()[0] == 9 and BLOCK_M * BLOCK_N < 128 * 128
+                and conf.num_warps == 8)
+
+
+def prune_invalid_configs(configs, named_args, **kwargs):
+    N_CTX = kwargs["N_CTX"]
+
+    # Filter out configs where BLOCK_M > N_CTX
+    return [conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX]
+
+
+@triton.jit
+def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
+    if isinstance(desc_or_ptr, tl.tensor_descriptor):
+        return desc_or_ptr
+    else:
+        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+
+
+@triton.jit
+def _attn_fwd_tma_dp(
+    sm_scale,
+    M,  #
+    Z,
+    H,
+    Q,
+    K,
+    V,
+    O,
+    y_dim,
+    stride_m,
+    pid,
+    off_hz,
+    N_CTX: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    FP8_OUTPUT: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    warp_specialize: tl.constexpr,  #
+    dtype: tl.constexpr,
+    SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
+    FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
+):
+    start_m = pid  # tl.program_id(0)
+    # off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
+    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
+    qo_offset_y = offset_y + start_m * BLOCK_M
+    # initialize offsets
+    offs_m0 = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    m_i0 = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i0_0 = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc0 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    qk_scale = sm_scale
+    qk_scale *= 1.44269504  # 1/log(2)
+
+    offs_q = qo_offset_y + tl.arange(0, BLOCK_M)
+    offs_dq = tl.arange(0, HEAD_DIM)[None, :]
+    q_mask = offs_q[:, None] < y_dim
+    q0 = tl.load(Q + offs_q[:, None] * stride_m + offs_dq, mask=q_mask, other=0.0)
+
+    if FADD2_REDUCE:
+        l_i0_1 = tl.zeros([BLOCK_M // 2], dtype=tl.float32)
+    else:
+        l_i0_1 = 0
+
+    acc0, l_i0_0, l_i0_1, m_i0 = _attn_fwd_inner_oss_dp(
+        acc0,
+        l_i0_0,
+        l_i0_1,
+        m_i0,
+        q0,
+        K,
+        V,
+        y_dim,
+        stride_m,
+        offset_y,
+        dtype,
+        start_m,
+        qk_scale,
+        BLOCK_M,
+        HEAD_DIM,
+        BLOCK_N,
+        STAGE,
+        offs_m0,
+        offs_n,
+        N_CTX,
+        warp_specialize,
+        SUBTILING,
+        VECT_MUL,
+        FADD2_REDUCE,
+        DP_FACTOR,
+    )
+
+    if FADD2_REDUCE:
+        l_i0 = l_i0_0 + l_i0_1
+    else:
+        l_i0 = l_i0_0
+
+    m_i0 += tl.math.log2(l_i0)
+    acc0 = acc0 / l_i0[:, None]
+    m_ptrs0 = M + off_hz * N_CTX + offs_m0
+    tl.store(m_ptrs0, m_i0)
+    tl.store(O + offs_q[:, None] * stride_m + offs_dq, acc0.to(dtype), mask=q_mask)
+
+
+@triton.autotune(
+    configs=list(filter(keep, configs)),
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+    prune_configs_by={"early_config_prune": prune_invalid_configs},
+)
+@triton.jit
+def _attn_fwd(
+    sm_scale,
+    M,  #
+    Z,
+    H,
+    Q,
+    K,
+    V,
+    O,
+    y_dim,
+    stride_m,
+    N_CTX: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    FP8_OUTPUT: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    warp_specialize: tl.constexpr,  #
+    dtype: tl.constexpr,
+    SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
+    FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    _attn_fwd_tma_dp(
+        sm_scale,
+        M,
+        Z,
+        H,
+        Q,
+        K,
+        V,
+        O,
+        y_dim,
+        stride_m,
+        pid,
+        off_hz,
+        N_CTX,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
+        FP8_OUTPUT,
+        STAGE,
+        warp_specialize,
+        dtype,
+        SUBTILING,
+        VECT_MUL,
+        FADD2_REDUCE,
+        DP_FACTOR,
+    )
+
+
+@triton.autotune(
+    configs=list(filter(keep, configs)),
+    key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+    prune_configs_by={"early_config_prune": prune_invalid_configs},
+)
+@triton.jit
+def _attn_fwd_persist(
+    sm_scale,
+    M,  #
+    Z,
+    H,
+    Q,
+    K,
+    V,
+    O,
+    y_dim,
+    stride_m,
+    N_CTX: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    FP8_OUTPUT: tl.constexpr,  #
+    STAGE: tl.constexpr,  #
+    warp_specialize: tl.constexpr,  #
+    OUTER_LOOP: tl.constexpr,
+    dtype: tl.constexpr,
+    SUBTILING: tl.constexpr,
+    VECT_MUL: tl.constexpr,
+    FADD2_REDUCE: tl.constexpr,
+    DP_FACTOR: tl.constexpr,
+):
+    n_tile_num = tl.cdiv(N_CTX, BLOCK_M)
+    prog_id = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    total_tiles = n_tile_num * Z * H
+
+    tiles_per_sm = total_tiles // num_progs
+    if prog_id < total_tiles % num_progs:
+        tiles_per_sm += 1
+
+    tile_idx = prog_id
+
+    # inner loop warpspec vs. outer loop warpspec
+    for _ in tl.range(
+            0,
+            tiles_per_sm,
+            warp_specialize=warp_specialize and OUTER_LOOP,
+            merge_epilogue=True,
+            separate_epilogue_store=True,
+            data_partition_factor=DP_FACTOR,
+    ):
+        pid = tile_idx % n_tile_num
+        off_hz = tile_idx // n_tile_num
+        _attn_fwd_tma_dp(
+            sm_scale,
+            M,
+            Z,
+            H,
+            Q,
+            K,
+            V,
+            O,
+            y_dim,
+            stride_m,
+            pid,
+            off_hz,
+            N_CTX,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
+            FP8_OUTPUT,
+            STAGE,
+            warp_specialize and not OUTER_LOOP,
+            dtype,
+            SUBTILING,
+            VECT_MUL,
+            FADD2_REDUCE,
+            DP_FACTOR,
+        )
+        tile_idx += num_progs
+
+
+def torch_dtype_to_triton(dtype):
+    if dtype == torch.float8_e5m2:
+        return tl.float8e5
+    return getattr(tl, str(dtype).split(".")[1])
+
+
+@triton.jit
+def _attn_bwd_preprocess(O, DO,  #
+                         Delta,  #
+                         Z, H, N_CTX,  #
+                         BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr,  #
+                         ):
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_hz = tl.program_id(1)
+    off_n = tl.arange(0, HEAD_DIM)
+    # load
+    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
+    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
+    delta = tl.sum(o * do, axis=1)
+    # write-back
+    tl.store(Delta + off_hz * N_CTX + off_m, delta)
+
+
+# Frozen (hashable) wrapper for dot attrs configuration, usable in triton.Config.
+# Supports .get(key) like a dict but is hashable for Triton's JIT cache key.
+class FrozenDotAttrs:
+
+    def __init__(self, d):
+        self._data = d
+        self._hash = hash(json.dumps(d, sort_keys=True)) if d else hash(None)
+
+    def get(self, key, default=None):
+        return self._data.get(key, default) if self._data else default
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if isinstance(other, FrozenDotAttrs):
+            return self._data == other._data
+        return NotImplemented
+
+    def __repr__(self):
+        return f"FrozenDotAttrs({self._data})"
+
+    def __bool__(self):
+        return bool(self._data)
+
+
+# Default dot attrs configuration for the BWD kernel.
+# Each key corresponds to a dot operation in _attn_bwd_dkdv_inner.
+# Set to None to disable attrs for a given dot (heuristic allocation).
+# Format: {"stage": str, "order": str, "channels": [str, ...]}
+_DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
+})
+
+# For BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT.
+_BWD_DOT_ATTRS_TMEM = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
+    "dpT": {"stage": "0", "order": "2", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,5"]},
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem,1,5", "opndD,tmem,1,10"]},
+})
+
+_BWD_DOT_ATTRS_BM64_TMEM = FrozenDotAttrs({
+    # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
+    # no need to reuse between dq and dpT
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},  # k, q
+    "dpT": {
+        "stage": "0",
+        "order": "2",
+        "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"],
+    },  # v, do
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},  # ppT
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]},  # dsT
+    "dk": {"stage": "1", "order": "1", "channels": ["opndA,tmem,1,5", "opndD,tmem,1,10"]},  # dsT in tmem
+})
+
+_BWD_DOT_ATTRS_BM64 = FrozenDotAttrs({
+    # qkT inputs: k, q; dpT inputs: v, do; dv inputs: ppT, do; dq inputs: dsT, k; dk inputs: dsT, q
+    # no need to reuse between dq and dpT
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},  # k, q
+    "dpT": {
+        "stage": "0",
+        "order": "2",
+        "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"],
+    },  # v, do
+    "dv": {"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]},  # ppT
+    "dq": {"stage": "1", "order": "1", "channels": ["opndA,smem,1,8", "opndD,tmem,1,11"]},  # dsT
+    "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
+})
+
+_BWD_DOT_ATTRS_SCHED = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0"},
+    "dpT": {"stage": "0", "order": "2"},
+    "dv": {"stage": "0", "order": "2"},
+    "dq": {"stage": "1", "order": "1"},
+    "dk": {"stage": "1", "order": "1"},
+})
+
+
+@triton.jit
+def _attn_bwd_dkdv_inner(
+    dk,
+    dv,
+    Q,
+    k,
+    v,
+    DO,
+    DQ,
+    M_ptr,
+    Delta_ptr,
+    y_dim,
+    stride_tok,
+    off_bh,
+    off_chz,
+    curr_m,
+    step_m,
+    start_n,
+    offs_n,
+    BLOCK_M1: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MASK: tl.constexpr,
+    dtype: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
+    LN2: tl.constexpr,
+    RESCHED: tl.constexpr,
+    BWD_DOT_ATTRS: tl.constexpr = None,
+):
+    offs_qm = off_bh + curr_m + tl.arange(0, BLOCK_M1)
+    offs_hd = tl.arange(0, HEAD_DIM)[None, :]
+    bwd_row_mask = offs_qm[:, None] < y_dim
+    q = tl.load(Q + offs_qm[:, None] * stride_tok + offs_hd, mask=bwd_row_mask, other=0.0)
+    qT = tl.trans(q)
+    offs_m_start = off_chz + curr_m
+    offs_m1 = offs_m_start + tl.arange(0, BLOCK_M1)
+    m = tl.load(M_ptr + offs_m1, mask=offs_m1 < y_dim, other=0.0)
+    if RESCHED:
+        qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"))
+    else:
+        qkT = tl.dot(k, qT)
+    pT = tl.math.exp2(qkT - m[None, :])
+    if MASK:
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+        mask = offs_m[None, :] >= offs_n[:, None]
+        pT = tl.where(mask, pT, 0.0)
+    do = tl.load(DO + offs_qm[:, None] * stride_tok + offs_hd, mask=bwd_row_mask, other=0.0)
+    ppT = pT
+    ppT = ppT.to(dtype)
+    if RESCHED:
+        dpT = tl.dot(v, tl.trans(do), attrs=BWD_DOT_ATTRS.get("dpT")).to(tl.float32)
+        Di = tl.load(Delta_ptr + offs_m1, mask=offs_m1 < y_dim, other=0.0)
+        dv += tl.dot(ppT, do, attrs=BWD_DOT_ATTRS.get("dv"))
+    else:
+        dv += tl.dot(ppT, do)
+        Di = tl.load(Delta_ptr + offs_m1, mask=offs_m1 < y_dim, other=0.0)
+        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+    dsT = pT * (dpT - Di[None, :])
+    dsT = dsT.to(dtype)
+    if RESCHED:
+        # dk reads dsT from the reused TMEM buffer-5; dq writes the same buffer.
+        # dk must read before dq overwrites (cf. TLX
+        # blackwell_fa_ws_pipelined_persistent: "dk must read dsT_tmem BEFORE
+        # dq writes ... same TMEM slot"). Emit dk first.
+        dk += tl.dot(dsT, tl.trans(qT), attrs=BWD_DOT_ATTRS.get("dk"))
+        dq = tl.dot(tl.trans(dsT), k, attrs=BWD_DOT_ATTRS.get("dq"))
+    else:
+        dk += tl.dot(dsT, tl.trans(qT))
+        dq = tl.dot(tl.trans(dsT), k)
+    dqs = _split_n_2D(dq, DQ_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // DQ_SUBTILE
+    for slice_id in tl.static_range(0, DQ_SUBTILE):
+        dqN = dqs[slice_id] * LN2
+        offs_dqd = slice_id * slice_size + tl.arange(0, slice_size)
+        tl.atomic_add(DQ + offs_qm[:, None] * stride_tok + offs_dqd[None, :], dqN, mask=bwd_row_mask)
+    curr_m += step_m
+    return dk, dv, curr_m
+
+
+@triton.jit
+def _attn_bwd_dkdv(
+    dk,
+    dv,  #
+    Q,
+    k,
+    v,
+    sm_scale,  #
+    DO,  #
+    DQ,
+    M_ptr,
+    Delta_ptr,  #
+    y_dim,
+    # shared by Q/K/V/DO.
+    stride_tok,
+    stride_d,  #
+    off_bh,
+    off_chz,
+    H,
+    N_CTX,
+    BLOCK_M1: tl.constexpr,  #
+    BLOCK_N1: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,  #
+    # Filled in by the wrapper.
+    start_n,
+    start_m,
+    num_steps,  #
+    MASK: tl.constexpr,
+    dtype: tl.constexpr,
+    warp_specialize: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
+    BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
+):
+    offs_n = start_n + tl.arange(0, BLOCK_N1)
+
+    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
+
+    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
+    tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
+    curr_m = start_m
+    step_m = BLOCK_M1
+    if warp_specialize:
+        for blk_idx in tl.range(
+                0,
+                num_steps,
+                warp_specialize=True,
+                merge_epilogue_to_computation=True,
+                tmem_alloc_algo=2,
+                smem_alloc_algo=1,
+                smem_budget=SMEM_BUDGET,
+        ):
+            dk, dv, curr_m = _attn_bwd_dkdv_inner(
+                dk,
+                dv,
+                Q,
+                k,
+                v,
+                DO,
+                DQ,
+                M_ptr,
+                Delta_ptr,
+                y_dim,
+                stride_tok,
+                off_bh,
+                off_chz,
+                curr_m,
+                step_m,
+                start_n,
+                offs_n,
+                BLOCK_M1,
+                HEAD_DIM,
+                MASK,
+                dtype,
+                DQ_SUBTILE,
+                LN2,
+                True,
+                BWD_DOT_ATTRS,
+            )
+    else:
+        for blk_idx in tl.range(0, num_steps):
+            dk, dv, curr_m = _attn_bwd_dkdv_inner(
+                dk,
+                dv,
+                Q,
+                k,
+                v,
+                DO,
+                DQ,
+                M_ptr,
+                Delta_ptr,
+                y_dim,
+                stride_tok,
+                off_bh,
+                off_chz,
+                curr_m,
+                step_m,
+                start_n,
+                offs_n,
+                BLOCK_M1,
+                HEAD_DIM,
+                MASK,
+                dtype,
+                DQ_SUBTILE,
+                LN2,
+                True,
+                BWD_DOT_ATTRS,
+            )
+
+    return dk, dv
+
+
+def _bwd_host_descriptor_pre_hook(nargs):
+    # Reset dq accumulator to zeros before each autotuner warmup run.
+    # Without this, dq accumulates across autotuner benchmark runs when
+    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
+    if "DQ" in nargs:
+        nargs["DQ"].zero_()
+
+
+configs_bwd = [
+    triton.Config(
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 4,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": FrozenDotAttrs(None),
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    )
+]
+
+configs_bwd_subtile_opt = [
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 4,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+]
+
+configs_bwd_persist = [
+    triton.Config(
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 4,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _DEFAULT_BWD_DOT_ATTRS,
+        },
+        num_warps=4,
+        num_stages=1,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 128, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 128, "EPILOGUE_SUBTILE": 4, "DQ_SUBTILE": 4, "BWD_DOT_ATTRS":
+            _BWD_DOT_ATTRS_SCHED,  # use memory planner heuristics
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config( # test dk/dv staging buffer reuse
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            # The 3-group TMEM reuse benefits from extra SMEM headroom so Phase 4
+            # can pipeline (double-buffer) its staging; the other configs keep the
+            # default 200000 (a larger budget double-buffers their early-TMA store
+            # staging, which the store lowering mishandles -> wrong dv/dk/dq).
+            "SMEM_BUDGET": 220000,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_TMEM,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64_TMEM,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M1": 64,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 2,
+            "DQ_SUBTILE": 4,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM64,
+        },
+        num_warps=4,
+        num_stages=2,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+    ),
+]
+
+
+@triton.jit
+def _attn_bwd_core(
+    Q,
+    K,
+    V,
+    sm_scale,  #
+    DO,  #
+    DQ,
+    DK,
+    DV,  #
+    M_ptr,
+    Delta_ptr,  #
+    y_dim,
+    stride_tok,
+    stride_d,  #
+    stride_z,
+    stride_h,  #
+    pid,
+    bhid,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N_CTX: tl.constexpr,  #
+    BLOCK_M1: tl.constexpr,  #
+    BLOCK_N1: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,
+    dtype: tl.constexpr,
+    warp_specialize: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
+    BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
+):
+    off_chz = (bhid * N_CTX).to(tl.int64)
+    # auto-TMA: plain int32 row index (descriptor tile offsets are i32; an i64
+    # offset blocks the pass's affine decomposition). off_bh = bhid*N_CTX assumes a
+    # CONTIGUOUS [Z, N_HEAD, N_CTX, HEAD_DIM] layout (each (batch,head) packed as
+    # exactly N_CTX rows, row stride == HEAD_DIM). NOT valid for padded-seq /
+    # varlen / strided / transposed batch-head layouts -- backward() asserts
+    # contiguity so those fail loudly instead of reading wrong addresses.
+    off_bh = bhid * N_CTX
+
+    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+    start_n = pid * BLOCK_N1
+    start_m = 0
+
+    offs_kvn = off_bh + start_n + tl.arange(0, BLOCK_N1)
+    offs_hdc = tl.arange(0, HEAD_DIM)[None, :]
+    kv_mask = offs_kvn[:, None] < y_dim
+    k = tl.load(K + offs_kvn[:, None] * stride_tok + offs_hdc, mask=kv_mask, other=0.0)
+    v = tl.load(V + offs_kvn[:, None] * stride_tok + offs_hdc, mask=kv_mask, other=0.0)
+    num_steps = (N_CTX - start_m) // BLOCK_M1
+    dk, dv = _attn_bwd_dkdv(  #
+        dk,
+        dv,  #
+        Q,
+        k,
+        v,
+        sm_scale,  #
+        DO,  #
+        DQ,
+        M_ptr,
+        Delta_ptr,  #
+        y_dim,
+        stride_tok,
+        stride_d,  #
+        off_bh,
+        off_chz,
+        H,
+        N_CTX,  #
+        BLOCK_M1,
+        BLOCK_N1,
+        HEAD_DIM,  #
+        start_n,
+        start_m,
+        num_steps,  #
+        MASK=False,  #
+        dtype=dtype,
+        warp_specialize=warp_specialize,
+        EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+        DQ_SUBTILE=DQ_SUBTILE,
+        BWD_DOT_ATTRS=BWD_DOT_ATTRS,
+        SMEM_BUDGET=SMEM_BUDGET,
+    )
+
+    dvs = _split_n_2D(dv, EPILOGUE_SUBTILE)
+    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
+    for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+        dvN = dvs[slice_id]
+        offs_ev = slice_id * slice_size + tl.arange(0, slice_size)
+        tl.store(DV + offs_kvn[:, None] * stride_tok + offs_ev[None, :], dvN.to(dtype), mask=kv_mask)
+
+    dks = _split_n_2D(dk, EPILOGUE_SUBTILE)
+    for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+        dkN = dks[slice_id] * sm_scale
+        offs_ek = slice_id * slice_size + tl.arange(0, slice_size)
+        tl.store(DK + offs_kvn[:, None] * stride_tok + offs_ek[None, :], dkN.to(dtype), mask=kv_mask)
+
+
+@triton.autotune(configs=configs_bwd, key=["N_CTX", "HEAD_DIM"])
+@triton.jit
+def _attn_bwd(
+    Q,
+    K,
+    V,
+    sm_scale,  #
+    DO,  #
+    DQ,
+    DK,
+    DV,  #
+    M_ptr,
+    Delta_ptr,
+    y_dim,
+    # shared by Q/K/V/DO.
+    stride_z,
+    stride_h,
+    stride_tok,
+    stride_d,  #
+    BATCH,
+    H,
+    N_CTX,  #
+    BLOCK_M1: tl.constexpr,  #
+    BLOCK_N1: tl.constexpr,  #
+    BLOCK_M2: tl.constexpr,  #
+    BLOCK_N2: tl.constexpr,  #
+    BLK_SLICE_FACTOR: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,
+    dtype: tl.constexpr,
+    warp_specialize: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
+    BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
+):
+    bhid = tl.program_id(2)
+    pid = tl.program_id(0)
+
+    _attn_bwd_core(
+        Q,
+        K,
+        V,
+        sm_scale,
+        DO,
+        DQ,
+        DK,
+        DV,
+        M_ptr,
+        Delta_ptr,
+        y_dim,
+        stride_tok,
+        stride_d,
+        stride_z,
+        stride_h,
+        pid,
+        bhid,
+        BATCH,
+        H,
+        N_CTX,
+        BLOCK_M1,
+        BLOCK_N1,
+        HEAD_DIM,
+        dtype,
+        warp_specialize,
+        EPILOGUE_SUBTILE,
+        DQ_SUBTILE,
+        BWD_DOT_ATTRS,
+        SMEM_BUDGET,
+    )
+
+
+@triton.autotune(configs=configs_bwd_persist, key=["N_CTX", "HEAD_DIM"])
+@triton.jit
+def _attn_bwd_persist(
+    Q,
+    K,
+    V,
+    sm_scale,  #
+    DO,  #
+    DQ,
+    DK,
+    DV,  #
+    M_ptr,
+    Delta_ptr,
+    y_dim,
+    # shared by Q/K/V/DO.
+    stride_z,
+    stride_h,
+    stride_tok,
+    stride_d,  #
+    BATCH,
+    H,
+    N_CTX,  #
+    BLOCK_M1: tl.constexpr,  #
+    BLOCK_N1: tl.constexpr,  #
+    BLOCK_M2: tl.constexpr,  #
+    BLOCK_N2: tl.constexpr,  #
+    BLK_SLICE_FACTOR: tl.constexpr,  #
+    HEAD_DIM: tl.constexpr,
+    dtype: tl.constexpr,
+    warp_specialize: tl.constexpr,  #
+    EPILOGUE_SUBTILE: tl.constexpr,
+    DQ_SUBTILE: tl.constexpr,
+    BWD_DOT_ATTRS: tl.constexpr = None,
+    SMEM_BUDGET: tl.constexpr = 200000,
+):
+    n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
+    prog_id = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    total_tiles = n_tile_num * BATCH * H
+
+    tiles_per_sm = total_tiles // num_progs
+    if prog_id < total_tiles % num_progs:
+        tiles_per_sm += 1
+
+    tile_idx = prog_id
+
+    for _ in tl.range(
+            0,
+            tiles_per_sm,
+            warp_specialize=True,
+            merge_epilogue_to_computation=True,
+            tmem_alloc_algo=2,
+            smem_alloc_algo=1,
+            smem_budget=SMEM_BUDGET,
+    ):
+        pid = tile_idx % n_tile_num
+        bhid = tile_idx // n_tile_num
+        _attn_bwd_core(
+            Q,
+            K,
+            V,
+            sm_scale,
+            DO,
+            DQ,
+            DK,
+            DV,
+            M_ptr,
+            Delta_ptr,
+            y_dim,
+            stride_tok,
+            stride_d,
+            stride_z,
+            stride_h,
+            pid,
+            bhid,
+            BATCH,
+            H,
+            N_CTX,
+            BLOCK_M1,
+            BLOCK_N1,
+            HEAD_DIM,
+            dtype,
+            False,
+            EPILOGUE_SUBTILE,
+            DQ_SUBTILE,
+            BWD_DOT_ATTRS,
+            SMEM_BUDGET,
+        )
+        tile_idx += num_progs
+
+
+class _attention_opt(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE):
+        # shape constraints
+        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        # when v is in float8_e5m2 it is transposed.
+        HEAD_DIM_V = v.shape[-1]
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        o = torch.empty_like(q)
+        stage = 3 if causal else 1
+        extra_kern_args = {}
+
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        warp_specialize = True
+        desc_q = q
+        desc_v = v
+        desc_k = k
+        desc_o = o
+        y_dim = q.shape[0] * q.shape[1] * q.shape[2]
+        stride_m = q.stride(2)  # row stride (= HEAD_DIM) as a runtime arg for auto-TMA
+
+        def alloc_fn(size: int, align: int, _):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+        def grid(META):
+            return (
+                triton.cdiv(q.shape[2], META["BLOCK_M"]),
+                q.shape[0] * q.shape[1],
+                1,
+            )
+
+        def grid_persist(META):
+            return (
+                min(
+                    NUM_SMS,
+                    triton.cdiv(q.shape[2], META["BLOCK_M"]) * q.shape[0] * q.shape[1],
+                ),
+                1,
+                1,
+            )
+
+        ctx.grid = grid
+        persistent = baseVariant == "persistent" or baseVariant == "ws_persistent"
+        if is_blackwell() and warp_specialize:
+            extra_kern_args["maxnreg"] = 128
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = True
+            triton.knobs.nvidia.use_meta_partition = True
+            triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.auto_tma = True
+            triton.knobs.nvidia.auto_tma_device = True
+            if persistent:
+                _attn_fwd_persist[grid_persist](
+                    sm_scale,
+                    M,  #
+                    q.shape[0],
+                    q.shape[1],  #
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    desc_o,
+                    y_dim,
+                    stride_m,  #
+                    N_CTX=q.shape[2],  #
+                    HEAD_DIM=HEAD_DIM_K,  #
+                    FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                    STAGE=stage,  #
+                    warp_specialize=warp_specialize,
+                    OUTER_LOOP=True,
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    SUBTILING=SUBTILING,
+                    VECT_MUL=VECT_MUL,
+                    FADD2_REDUCE=FADD2_REDUCE,
+                    **extra_kern_args,
+                )
+            else:
+                _attn_fwd[grid](
+                    sm_scale,
+                    M,  #
+                    q.shape[0],
+                    q.shape[1],  #
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    desc_o,
+                    y_dim,
+                    stride_m,  #
+                    N_CTX=q.shape[2],  #
+                    HEAD_DIM=HEAD_DIM_K,  #
+                    FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                    STAGE=stage,  #
+                    warp_specialize=warp_specialize,
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    SUBTILING=SUBTILING,
+                    VECT_MUL=VECT_MUL,
+                    FADD2_REDUCE=FADD2_REDUCE,
+                    **extra_kern_args,
+                )
+
+        ctx.save_for_backward(q, k, v, o, M)
+
+        ctx.sm_scale = sm_scale
+        ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
+        ctx.persistent = persistent
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, M = ctx.saved_tensors
+        # auto-TMA backward addresses rows as off_bh = bhid * N_CTX (see the
+        # _attn_bwd_* kernels), which is only correct for a contiguous
+        # [Z, N_HEAD, N_CTX, HEAD_DIM] layout with each (batch,head) packed as
+        # exactly N_CTX rows. Enforce contiguity so a strided / padded / varlen
+        # input fails loudly here instead of silently reading wrong addresses.
+        assert do.is_contiguous()
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and o.is_contiguous()
+        assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+        dq = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        BATCH, N_HEAD, N_CTX = q.shape[:3]
+        assert BATCH * N_HEAD * N_CTX <= 2**31 - 1, (f"off_bh = bhid * N_CTX is computed as i32; "
+                                                     f"BATCH*N_HEAD*N_CTX={BATCH * N_HEAD * N_CTX} overflows int32")
+        PRE_BLOCK = 128
+        BLK_SLICE_FACTOR = 2
+        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
+        arg_k = k
+        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
+        assert N_CTX % PRE_BLOCK == 0
+        pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+        delta = torch.empty_like(M)
+        _attn_bwd_preprocess[pre_grid](
+            o, do,  #
+            delta,  #
+            BATCH, N_HEAD, N_CTX,  #
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM,  #
+        )
+        warp_specialize = True
+
+        def alloc_fn(size: int, align: int, _):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        # NOTE: the persistent backward (_attn_bwd_persist) is functional for
+        # the tested configs (bwd_config_idx 0-4). bwd_config_idx 2
+        # (_BWD_DOT_ATTRS_TMEM, the 3-group dpT/dq/dsT TMEM reuse) relies on the
+        # early-TMA store staging (always on since #1709) and the cross-tile
+        # staging-reuse WAR barrier (WSCodePartition.cpp Step 7.5) — without it
+        # the dv/dk TMA-staging buffers (aliasing the v/do operand SMEM) race
+        # the next tile's operand load. See test_bwd_tmem_dsT_reuse_3group and
+        # test_bwd_tmem_dsT_reuse_3group_persistent.
+        desc_k = arg_k
+        desc_v = v
+        desc_q = q
+        desc_do = do
+        desc_dq = dq
+        desc_dk = dk
+        desc_dv = dv
+        desc_m = M
+        desc_delta = delta
+
+        def grid(meta):
+            return (
+                triton.cdiv(N_CTX, meta["BLOCK_N1"]),  # tiles along N (K/V)
+                1,  # (or cdiv over M if you need)
+                BATCH * N_HEAD,
+            )  # batch*heads
+
+        if ctx.persistent:
+            NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+            def grid_persist_bwd(meta):
+                return (
+                    min(
+                        NUM_SMS,
+                        triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD,
+                    ),
+                    1,
+                    1,
+                )
+
+        with triton.knobs.nvidia.scope():
+            triton.knobs.nvidia.use_meta_ws = True
+            triton.knobs.nvidia.use_meta_partition = True
+            triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.auto_tma = True
+            triton.knobs.nvidia.auto_tma_device = True
+            if ctx.persistent:
+                _attn_bwd_persist[grid_persist_bwd](
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    ctx.sm_scale,
+                    desc_do,
+                    desc_dq,
+                    desc_dk,
+                    desc_dv,  #
+                    desc_m,
+                    desc_delta,  #
+                    BATCH * N_HEAD * N_CTX,
+                    q.stride(0),
+                    q.stride(1),
+                    q.stride(2),
+                    q.stride(3),  #
+                    BATCH,
+                    N_HEAD,
+                    N_CTX,  #
+                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                    HEAD_DIM=ctx.HEAD_DIM,  #
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    warp_specialize=warp_specialize,
+                    maxRegAutoWS=192,
+                )
+            else:
+                _attn_bwd[grid](
+                    desc_q,
+                    desc_k,
+                    desc_v,
+                    ctx.sm_scale,
+                    desc_do,
+                    desc_dq,
+                    desc_dk,
+                    desc_dv,  #
+                    desc_m,
+                    desc_delta,  #
+                    BATCH * N_HEAD * N_CTX,
+                    q.stride(0),
+                    q.stride(1),
+                    q.stride(2),
+                    q.stride(3),  #
+                    BATCH,
+                    N_HEAD,
+                    N_CTX,  #
+                    BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+                    HEAD_DIM=ctx.HEAD_DIM,  #
+                    dtype=torch_dtype_to_triton(q.dtype),
+                    warp_specialize=warp_specialize,
+                    maxRegAutoWS=192,
+                )
+
+        return dq, dk, dv, None, None, None, None, None, None, None
+
+
+attention = _attention_opt.apply
+
+
+@pytest.mark.skipif(
+    not is_blackwell(),
+    reason="Requires Blackwell GPU",
+)
+@pytest.mark.parametrize("Z", [8])
+@pytest.mark.parametrize("H", [16])
+@pytest.mark.parametrize("N_CTX", [1024])  # , 2048])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("mode", ["fwd", "bwd"])
+@pytest.mark.parametrize("baseVariant", ["ws_persistent", "ws"])
+@pytest.mark.parametrize("provider", ["triton-fp16"])
+@pytest.mark.parametrize("SUBTILING", [False, True])
+@pytest.mark.parametrize("VECT_MUL", [0])  # , 1, 2, 3])
+@pytest.mark.parametrize("FADD2_REDUCE", [False])
+@pytest.mark.parametrize("bwd_config_idx", range(len(configs_bwd_persist)))
+def test_op(
+    Z,
+    H,
+    N_CTX,
+    HEAD_DIM,
+    causal,
+    mode,
+    baseVariant,
+    provider,
+    SUBTILING,
+    VECT_MUL,
+    FADD2_REDUCE,
+    bwd_config_idx,
+    dtype=torch.float16,
+    smem_budget=None,
+):
+    # For fwd mode, only run once (bwd_config_idx=0) to avoid redundant tests
+    if mode == "fwd" and bwd_config_idx > 0:
+        pytest.skip("bwd_config_idx only applies to bwd mode")
+    if mode == "bwd" and "fp8" in provider:
+        pytest.skip("Backward pass with FP8 is not supported.")
+    if mode == "bwd" and HEAD_DIM == 64 and bwd_config_idx == 1:
+        pytest.skip("bwd_config_idx of 1 does not work with hDim 64")
+    # SUBTILING / VECT_MUL / FADD2_REDUCE only affect the forward kernels; the
+    # backward kernels ignore them. Running bwd across both SUBTILING values
+    # would re-run identical backward tests, so keep a single representative.
+    if mode == "bwd" and SUBTILING:
+        pytest.skip("SUBTILING is forward-only; redundant for bwd")
+    # bwd_config_idx 2 is the _BWD_DOT_ATTRS_TMEM 3-group TMEM-reuse config
+    # (BLOCK_M1=128, EPILOGUE_SUBTILE=2). The reuse packs dpT/dq/dsT into one
+    # TMEM allocation, which only fits via the early-TMA store staging (now
+    # always on; #1709 removed the early_tma_store_lowering knob). It runs on
+    # both the non-persistent (ws) and persistent (ws_persistent) backends
+    # (dedicated coverage: test_bwd_tmem_dsT_reuse_3group / _persistent).
+    if mode == "bwd":
+        chosen_cfg = configs_bwd_persist[bwd_config_idx]
+        # Optional per-test SMEM budget override (e.g. force depth-2 early-TMA
+        # store staging for the T277224987 regression). Copy so we never mutate
+        # the shared global config.
+        if smem_budget is not None:
+            chosen_cfg = copy.copy(chosen_cfg)
+            chosen_cfg.kwargs = dict(chosen_cfg.kwargs)
+            chosen_cfg.kwargs["SMEM_BUDGET"] = smem_budget
+        if baseVariant == "ws_persistent":
+            _attn_bwd_persist.configs = [chosen_cfg]
+            _attn_bwd_persist.cache = {}
+        elif baseVariant == "ws":
+            _attn_bwd.configs = [chosen_cfg]
+            _attn_bwd.cache = {}
+    torch.manual_seed(20)
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    sm_scale = 0.5
+    # reference implementation
+    ref_dtype = dtype
+    if mode == "fwd" and "fp8" in provider:
+        ref_dtype = torch.float32
+    q = q.to(ref_dtype)
+    k = k.to(ref_dtype)
+    v = v.to(ref_dtype)
+    M = torch.tril(torch.ones((N_CTX, N_CTX), device=DEVICE))
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    if causal:
+        p[:, :, M == 0] = float("-inf")
+    p = torch.softmax(p.float(), dim=-1)
+    p = p.to(ref_dtype)
+    # p = torch.exp(p)
+    ref_out = torch.matmul(p, v).half()
+    if mode == "bwd":
+        dout = torch.randn_like(q)
+        ref_out.backward(dout)
+        ref_dv, v.grad = v.grad.clone(), None
+        ref_dk, k.grad = k.grad.clone(), None
+        ref_dq, q.grad = q.grad.clone(), None
+    # triton implementation
+    if mode == "fwd" and "fp8" in provider:
+        q = q.to(torch.float8_e5m2)
+        k = k.to(torch.float8_e5m2)
+        v = v.permute(0, 1, 3, 2).contiguous()
+        v = v.permute(0, 1, 3, 2)
+        v = v.to(torch.float8_e5m2)
+    tri_out = attention(q, k, v, causal, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE).half()
+    if mode == "fwd":
+        atol = 3 if "fp8" in provider else 1e-2
+        torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0)
+        return
+    tri_out.backward(dout)
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q.grad = q.grad.clone(), None
+    # compare
+    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+    rtol = 0.0
+    # Relative tolerance workaround for known hardware limitation of CDNA2 GPU.
+    # For details see https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
+    if torch.version.hip is not None and triton.runtime.driver.active.get_current_target().arch == "gfx90a":
+        rtol = 1e-2
+    torch.testing.assert_close(tri_dv, ref_dv, atol=1e-2, rtol=rtol)
+    torch.testing.assert_close(tri_dk, ref_dk, atol=1e-2, rtol=rtol)
+    torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_tmem_dsT_reuse_3group():
+    # Regression for the 3-group TMEM-reuse accuracy bug.
+    #
+    # configs_bwd_persist[2] == _BWD_DOT_ATTRS_TMEM routes dsT through a TMEM
+    # buffer shared by {dpT, dq, dsT} (buffer.id=5) so dk reads dsT from TMEM
+    # instead of SMEM. The kernel computes dq and dk both from dsT and they
+    # alias the same TMEM slot: dk MUST read dsT before dq overwrites the slot
+    # (cf. TLX blackwell_fa_ws_pipelined_persistent: "dk must read dsT_tmem
+    # BEFORE dq writes ... same TMEM slot"). Before the fix the kernel emitted
+    # dq before dk, so dq clobbered dsT and the backward produced NaN. This test
+    # fails (NaN in dv/dk/dq) without the dk-before-dq ordering and passes with
+    # it.
+    #
+    # Runs on the non-persistent ("ws") backward.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws",
+        provider="triton-fp16",
+        SUBTILING=False,  # forward-only knob; inert for the bwd kernel
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=2,
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_tmem_dsT_reuse_3group_persistent():
+    # Regression for the PERSISTENT 3-group TMEM-reuse SMEM race.
+    #
+    # Same config as test_bwd_tmem_dsT_reuse_3group but on the persistent
+    # backward (_attn_bwd_persist). The dv/dk TMA-staging buffers alias the v/do
+    # operand SMEM (allocation.reuseTarget); across the persistent outer tile
+    # loop the next tile's operand load raced the previous tile's staging TMA
+    # store (Step-7.5 cross-tile WAR barrier in WSCodePartition.cpp). Before the
+    # fix this produced non-deterministic wrong gradients (max-abs error ~3-4);
+    # with the dedicated cross-tile reuse token it is correct and deterministic.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws_persistent",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=2,
+    )
+
+
+# T277224987: idx0 (EPILOGUE_SUBTILE=4) is shipped at SMEM_BUDGET=200000, which
+# keeps the early-TMA dk/dv/dq store-staging single-buffered. These regressions
+# force SMEM_BUDGET=220000 so Phase 4 double-buffers that staging (buffer.copy=2)
+# — the exact config that used to (1) corrupt dv/dk/dq (staging slot staggered by
+# the outer accumCnt instead of the subtile index) and then (2) OOR (Phase 3.6
+# marking an unrealizable swizzle-mismatched staging->operand reuse, undercounting
+# SMEM). The shipped configs pin 200000 so the autotuned matrix never exercises
+# this; these tests guard the underlying compiler fix directly.
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_early_tma_staging_depth2():
+    # Non-persistent ("ws"): correctness + fits SMEM at the depth-2 budget.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=0,
+        smem_budget=220000,
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_early_tma_staging_depth2_persistent():
+    # Persistent ("ws_persistent") variant of the T277224987 regression.
+    test_op(
+        Z=8,
+        H=16,
+        N_CTX=1024,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws_persistent",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=0,
+        smem_budget=220000,
+    )
+
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func as flash_attn_func
+
+    HAS_FLASH = True
+except BaseException:
+    HAS_FLASH = False
+
+TORCH_HAS_FP8 = False
+BATCH, N_HEADS = 4, 48
+# vary seq length for fixed head and batch=4
+configs = []
+for HEAD_DIM in [128]:  # 64, 128]:
+    for baseVariant in ["ws_persistent"]:
+        for mode in ["bwd"]:
+            configs.append(
+                triton.testing.Benchmark(
+                    x_names=["N_CTX"],
+                    x_vals=[2**i for i in range(12, 13)],  # 0, 15)],
+                    line_arg="provider",
+                    line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
+                    line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
+                    styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+                    ylabel="TFLOPS",
+                    plot_name=f"fused-attention-{baseVariant}-{mode}-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}",
+                    args={
+                        "H": N_HEADS,
+                        "BATCH": BATCH,
+                        "HEAD_DIM": HEAD_DIM,
+                        "mode": mode,
+                        "baseVariant": baseVariant,
+                    },
+                ))
+
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, mode, baseVariant, provider, device=DEVICE):
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+    if "triton" in provider:
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        if mode == "fwd" and "fp8" in provider:
+            q = q.to(torch.float8_e5m2)
+            k = k.to(torch.float8_e5m2)
+            v = v.permute(0, 1, 3, 2).contiguous()
+            v = v.permute(0, 1, 3, 2)
+            v = v.to(torch.float8_e5m2)
+        sm_scale = 1.3
+        SUBTILING = True
+        VECT_MUL = 1
+        FADD2_REDUCE = False
+        fn = lambda: attention(q, k, v, False, sm_scale, baseVariant, SUBTILING, VECT_MUL, FADD2_REDUCE)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn)
+
+    if provider == "flash":
+        qkv = torch.randn((BATCH, N_CTX, 3, H, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        fn = lambda: flash_attn_func(qkv)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn)
+    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+    total_flops = 2 * flops_per_matmul
+    if mode == "bwd":
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops * 1e-12 / (ms * 1e-3)
+
+
+if __name__ == "__main__":
+    if is_blackwell():
+        print("Running benchmarks...")
+        bench_flash_attention.run(print_data=True)
+    else:
+        print("Skipping benchmarks, no Blackwell GPU found.")
