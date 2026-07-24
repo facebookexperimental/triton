@@ -117,6 +117,11 @@ struct DecomposedLoad {
   Value basePtr;
   int basePtrArgIndex;
   SmallVector<DimInfo> dims;
+  // Uniform (per-program) scalar offset terms with no arange/expand_dims, e.g.
+  // `off_z * stride_z` in a batched/FA kernel. These shift the whole tile, so
+  // for a device descriptor they fold into the descriptor base pointer
+  // (make_tensor_descriptor(addptr(base, Σ scalarBaseOffsets), ...)).
+  SmallVector<Value> scalarBaseOffsets;
   bool valid;
 };
 
@@ -395,6 +400,14 @@ static DecomposedLoad decomposePointer(Value ptr) {
   Value base = matchSplat(cur);
   if (!base)
     return result;
+  // Peel scalar per-program addptr(s) folded into the base pointer before the
+  // tile splat, e.g. `addptr(Qptr, off_z*stride_z)`. Collect their offsets as
+  // per-program base shifts (folded into the descriptor base) and continue to
+  // the underlying kernel-arg pointer.
+  while (auto ap = base.getDefiningOp<tt::AddPtrOp>()) {
+    result.scalarBaseOffsets.push_back(ap.getOffset());
+    base = ap.getPtr();
+  }
   result.basePtr = base;
   result.basePtrArgIndex = getFuncArgIndex(base);
   if (result.basePtrArgIndex < 0)
@@ -450,6 +463,16 @@ static DecomposedLoad decomposePointer(Value ptr) {
     Value inner = term;
     if (auto broadcastOp = inner.getDefiningOp<tt::BroadcastOp>())
       inner = broadcastOp.getSrc();
+    // Uniform scalar offset (splat of a scalar, no arange/expand_dims): this is
+    // a per-program base shift (e.g. `off_z * stride_z` in a batched/FA
+    // kernel). Fold it into the descriptor base later instead of a per-dim
+    // index.
+    if (Value s = matchSplat(inner)) {
+      if (s.getType().isIntOrIndex()) {
+        result.scalarBaseOffsets.push_back(s);
+        continue;
+      }
+    }
     // The canonical Triton idiom `offs[:, None] * stride` lowers to
     // muli(expand_dims(offs), splat(stride)) -- the multiply is applied AFTER
     // expand_dims, and no canonicalization hoists it through expand_dims. Peel
@@ -751,6 +774,68 @@ static int findShapeArgForDim(tt::FuncOp func, Value ownMask,
   return found;
 }
 
+// Device mode hoists the make_tensor_descriptor above the load/store's
+// enclosing scf.for so the lowered tensormap_create can be predicated. Any
+// per-program scalar base offset folded into the descriptor base
+// (scalarBaseOffsets) is an operand of that hoisted op, so it must be defined
+// ABOVE the loop or the hoist would violate SSA dominance. Return false if any
+// offset is defined inside the enclosing loop (then the caller skips
+// promotion). No enclosing loop -> nothing to hoist past -> hoistable.
+static bool scalarBaseOffsetsHoistable(Operation *op,
+                                       const DecomposedLoad &decomp) {
+  if (decomp.scalarBaseOffsets.empty())
+    return true;
+  auto forOp = op->getParentOfType<scf::ForOp>();
+  if (!forOp)
+    return true;
+  Region &loopRegion = forOp.getRegion();
+  for (Value off : decomp.scalarBaseOffsets)
+    if (loopRegion.isAncestor(off.getParentRegion()))
+      return false;
+  return true;
+}
+
+// Whether `mask` carries an upper-bound comparison that is NOT attributable to
+// any *tiled* dim (a dim with a tile offset). Such an "unattributed" bound may
+// constrain an untiled/whole dim, whose true global extent could then exceed
+// blockSize -- in which case the -2 constant-extent sentinel would encode too
+// small an extent. Used to gate the whole-dim sentinel to genuinely unmasked
+// dims. Conservative: an unrecognized comparison counts as unattributed, so the
+// guard only ever declines to fabricate an extent (never emits a wrong one).
+static bool maskHasUnattributedBound(Value mask, const DecomposedLoad &decomp) {
+  if (!mask)
+    return false;
+  SmallVector<Value> cmpTerms;
+  std::function<void(Value)> collectCmps = [&](Value v) {
+    if (auto andOp = v.getDefiningOp<arith::AndIOp>()) {
+      collectCmps(andOp.getLhs());
+      collectCmps(andOp.getRhs());
+    } else {
+      cmpTerms.push_back(v);
+    }
+  };
+  collectCmps(mask);
+  for (Value cmpVal : cmpTerms) {
+    Value c = cmpVal;
+    if (auto bcast = c.getDefiningOp<tt::BroadcastOp>())
+      c = bcast.getSrc();
+    auto cmpOp = c.getDefiningOp<arith::CmpIOp>();
+    if (!cmpOp)
+      continue; // not a comparison we treat as a bound
+    bool attributed = false;
+    for (const DimInfo &dim : decomp.dims) {
+      int argIdx = -1;
+      if (dim.offset && cmpBoundsDim(cmpOp, dim, argIdx)) {
+        attributed = true;
+        break;
+      }
+    }
+    if (!attributed)
+      return true;
+  }
+  return false;
+}
+
 // Structural equality of scalar index expressions. The promote pass runs before
 // CSE, so the tile offset used in a pointer (`muli(ki, BLOCK)`) and the same
 // quantity recomputed in a mask bound (`K - muli(ki, BLOCK)`) are equal in
@@ -959,12 +1044,16 @@ struct Promotion {
   // Logical-tile -> descriptor-memory dim order (the single contiguous dim is
   // moved last). Identity when the contiguous dim is already innermost.
   SmallVector<int> perm;
+  // True when this load requires a device-built descriptor (in-kernel
+  // tt.make_tensor_descriptor) rather than the host recipe path.
+  bool useDeviceMode = false;
 };
 
 struct StorePromotion {
   tt::StoreOp storeOp;
   DecomposedLoad decomp;
   SmallVector<int> shapeArgIndices;
+  bool useDeviceMode = false;
 };
 
 class TritonNvidiaGPUPromoteLoadToTMAPass
@@ -1003,11 +1092,30 @@ public:
       return signalPassFailure();
     }
 
+    // Device-descriptor mode: build tt.make_tensor_descriptor in-kernel instead
+    // of a host recipe (handles per-program base + constant/whole-dim extents).
+    // Controlled by the `device-mode` pass option
+    // (knobs.nvidia.auto_tma_device); TRITON_AUTO_TMA_DEVICE stays as an env
+    // fallback for ad-hoc runs.
+    const char *devEnv = std::getenv("TRITON_AUTO_TMA_DEVICE");
+    bool useDevice = deviceMode || (devEnv && std::string(devEnv) == "1");
+
     // Phase 1: collect eligible loads.
-    SmallVector<Promotion> promotions;
+    SmallVector<Promotion, 0> promotions;
     kernelFunc.walk([&](tt::LoadOp loadOp) {
       DecomposedLoad decomp = decomposePointer(loadOp.getPtr());
       if (!decomp.valid || !isTMAEligible(loadOp, decomp))
+        return;
+      // Per-load host-vs-device decision: start with the global override, then
+      // auto-escalate to device mode for loads that host recipe can't handle.
+      bool needsDevice = useDevice;
+      // scalarBaseOffsets (per-program base shifts like off_z*stride_z) require
+      // device mode — the host recipe can only record base_ptr_arg_index.
+      if (!decomp.scalarBaseOffsets.empty())
+        needsDevice = true;
+      // Device mode hoists the descriptor above enclosing loops; skip if a
+      // scalar base offset is loop-defined (SSA dominance).
+      if (needsDevice && !scalarBaseOffsetsHoistable(loadOp, decomp))
         return;
       int rank = decomp.dims.size();
       SmallVector<int> shapeArgs(rank, -1);
@@ -1023,11 +1131,24 @@ public:
           s = findShapeArgFromTileBound(kernelFunc, dim);
         if (s < 0 && dim.loopAdvanced)
           s = findShapeArgForLoopDim(kernelFunc, dim);
+        // A dim loaded WHOLE (no tile offset -> not tiled, e.g. the FA head dim
+        // `offs_d = arange(0, HEAD_DIM)`) has global extent == blockSize, a
+        // compile-time constant. Use the -2 sentinel so Phase 2 emits an
+        // arith.constant extent. Host recipe can't encode a constant extent, so
+        // this auto-escalates to device mode. Require the dim be genuinely
+        // unmasked (no mask bound unattributable to a tiled dim): a
+        // partially-masked untiled dim could have a true extent > blockSize, so
+        // fabricating blockSize would under-size the descriptor.
+        if (s < 0 && !dim.offset &&
+            !maskHasUnattributedBound(loadOp.getMask(), decomp)) {
+          s = -2;
+          needsDevice = true;
+        }
         shapeArgs[d] = s;
       }
       bool ok = true;
       for (int d = 0; d < rank; d++)
-        if (shapeArgs[d] < 0)
+        if (shapeArgs[d] == -1) // -2 = constant extent (device mode), allowed
           ok = false;
       if (!ok)
         return;
@@ -1053,6 +1174,7 @@ public:
       p.loadOp = loadOp;
       p.decomp = decomp;
       p.shapeArgIndices = shapeArgs;
+      p.useDeviceMode = needsDevice;
       // Descriptor memory order: keep dims in order but move the single
       // contiguous dim last (TMA descriptor innermost must be contiguous).
       int contigDim = -1;
@@ -1071,11 +1193,17 @@ public:
     // already innermost (the standard row-major C[M,N] output); a transposed
     // store would need the value transposed before descriptor_store -- skipped
     // for now.
-    SmallVector<StorePromotion> storePromotions;
+    SmallVector<StorePromotion, 0> storePromotions;
     if (kernelIsWarpSpecialized(kernelFunc)) {
       kernelFunc.walk([&](tt::StoreOp storeOp) {
         DecomposedLoad decomp = decomposePointer(storeOp.getPtr());
         if (!decomp.valid || !isTMAEligibleStore(storeOp, decomp))
+          return;
+        // Per-store host-vs-device decision (same logic as loads).
+        bool needsDevice = useDevice;
+        if (!decomp.scalarBaseOffsets.empty())
+          needsDevice = true;
+        if (needsDevice && !scalarBaseOffsetsHoistable(storeOp, decomp))
           return;
         int rank = decomp.dims.size();
         // contiguous dim must already be innermost (identity perm).
@@ -1105,11 +1233,16 @@ public:
             s = findShapeArgForDim(kernelFunc, storeOp.getMask(), dim);
           if (s < 0)
             s = findShapeArgFromTileBound(kernelFunc, dim);
+          if (s < 0 && !dim.offset &&
+              !maskHasUnattributedBound(storeOp.getMask(), decomp)) {
+            s = -2;
+            needsDevice = true;
+          }
           shapeArgs[d] = s;
         }
         bool ok = true;
         for (int d = 0; d < rank; d++)
-          if (shapeArgs[d] < 0)
+          if (shapeArgs[d] == -1) // -2 = constant extent (device mode)
             ok = false;
         if (!ok)
           return;
@@ -1134,6 +1267,7 @@ public:
         p.storeOp = storeOp;
         p.decomp = decomp;
         p.shapeArgIndices = shapeArgs;
+        p.useDeviceMode = needsDevice;
         storePromotions.push_back(std::move(p));
       });
     }
@@ -1153,6 +1287,87 @@ public:
     OpBuilder builder(mod.getContext());
     MLIRContext *ctx = mod.getContext();
     Builder b(ctx);
+
+    // Shared builder for the device (in-kernel) TMA descriptor, used by both
+    // the load and store rewrites in device mode. Emits make_tensor_descriptor
+    // in the given dim order (`perm`; identity for stores), hoisted via LICM
+    // to the outermost scf.for where all descriptor operands are still
+    // loop-invariant, so the lowered tensormap_create is rebuilt only when its
+    // inputs actually change. Base ptr, shape, and stride args are kernel
+    // function arguments (always invariant); only scalarBaseOffsets can be
+    // loop-defined and thus limit the hoist distance. Phase 1
+    // (scalarBaseOffsetsHoistable) has already ensured at least one level of
+    // hoist is legal when an enclosing loop exists.
+    auto buildDeviceDescriptor =
+        [&](Operation *anchorOp, const DecomposedLoad &decomp,
+            ArrayRef<int> shapeArgIndices, ArrayRef<int> perm, Location loc,
+            Value &deviceZeroIdxOut) -> Value {
+      OpBuilder::InsertionGuard guard(builder);
+      // LICM: walk up nested scf::ForOps while all scalar base offsets are
+      // defined outside the loop (base ptr and shape/stride args are kernel
+      // function arguments, so they are invariant w.r.t. every loop).
+      Operation *hoistPt = anchorOp;
+      for (auto forOp = anchorOp->getParentOfType<scf::ForOp>(); forOp;
+           forOp = forOp->getParentOfType<scf::ForOp>()) {
+        Region &loopBody = forOp.getRegion();
+        bool allInvariant = true;
+        for (Value off : decomp.scalarBaseOffsets) {
+          if (loopBody.isAncestor(off.getParentRegion())) {
+            allInvariant = false;
+            break;
+          }
+        }
+        if (!allInvariant)
+          break;
+        hoistPt = forOp;
+      }
+      builder.setInsertionPoint(hoistPt);
+      Type i32 = builder.getI32Type();
+      deviceZeroIdxOut =
+          arith::ConstantOp::create(builder, loc, builder.getI32IntegerAttr(0));
+      SmallVector<Value> descShape, descStrides;
+      SmallVector<int32_t> descBlock;
+      for (int i = 0; i < (int)perm.size(); i++) {
+        int d = perm[i];
+        // Shape extent: kernel arg, or a compile-time constant (blockSize) for
+        // a whole-dim (untiled) dim recovered as the -2 sentinel.
+        Value shapeArg;
+        if (shapeArgIndices[d] == -2) {
+          shapeArg = arith::ConstantOp::create(
+              builder, loc,
+              builder.getI32IntegerAttr((int)decomp.dims[d].blockSize));
+        } else {
+          shapeArg = kernelFunc.getArgument(shapeArgIndices[d]);
+          if (shapeArg.getType().isInteger(64))
+            shapeArg = arith::TruncIOp::create(builder, loc, i32, shapeArg);
+        }
+        descShape.push_back(shapeArg);
+        // Contiguous dim (strideArgIdx < 0) has unit stride;
+        // make_tensor_descriptor needs an i64 stride operand per dim.
+        int strideIdx = decomp.dims[d].strideArgIdx;
+        Value strideV;
+        if (strideIdx < 0) {
+          strideV = arith::ConstantOp::create(builder, loc,
+                                              builder.getI64IntegerAttr(1));
+        } else {
+          strideV = kernelFunc.getArgument(strideIdx);
+          if (strideV.getType().isInteger(32))
+            strideV = arith::ExtSIOp::create(builder, loc, builder.getI64Type(),
+                                             strideV);
+        }
+        descStrides.push_back(strideV);
+        descBlock.push_back((int32_t)decomp.dims[d].blockSize);
+      }
+      // Fold uniform per-program scalar offsets (off_z*stride_z, ...) into the
+      // descriptor base -> a per-program (e.g. per-(batch,head)) view.
+      Value descBase = decomp.basePtr;
+      for (Value off : decomp.scalarBaseOffsets)
+        descBase = tt::AddPtrOp::create(builder, loc, descBase.getType(),
+                                        descBase, off);
+      return tt::MakeTensorDescOp::create(
+          builder, loc, descBase, descShape, descStrides, descBlock,
+          /*isSignedInteger=*/false, tt::PaddingOption::PAD_ZERO);
+    };
     auto i32Attr = [&](int v) { return b.getI32IntegerAttr(v); };
     SmallVector<Attribute> recipeAttrs;
 
@@ -1190,23 +1405,36 @@ public:
           isIdentity ? resultTy.getEncoding() : Attribute();
       auto descTileTy = RankedTensorType::get(permShape, elemTy, descEncoding);
 
-      // Synthesized host-side descriptor; its block type is the memory-order
-      // tile.
-      auto descTy = tt::TensorDescType::get(descTileTy.getShape(),
-                                            descTileTy.getElementType(),
-                                            descTileTy.getEncoding());
-      unsigned descArgIdx = kernelFunc.getNumArguments();
-      auto argAttrs =
-          b.getDictionaryAttr({b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});
-      LogicalResult inserted =
-          kernelFunc.insertArgument(descArgIdx, descTy, argAttrs, loc);
-      assert(succeeded(inserted) &&
-             "failed to insert TMA descriptor kernel argument");
-      (void)inserted;
-      Value descArg = kernelFunc.getArgument(descArgIdx);
-
       builder.setInsertionPoint(loadOp);
       Type i32 = builder.getI32Type();
+
+      // The descriptor fed to descriptor_load: device-built (deviceMode) or a
+      // host-built descriptor passed as a synthesized kernel arg (recipe path).
+      Value descVal;
+      unsigned descArgIdx = 0;
+      // Loop-invariant zero index for whole-dim (untiled) dims, created OUTSIDE
+      // any loop so it needs no ttg.partition attr under warp specialization.
+      Value deviceZeroIdx;
+      if (promo.useDeviceMode) {
+        descVal =
+            buildDeviceDescriptor(loadOp, promo.decomp, promo.shapeArgIndices,
+                                  promo.perm, loc, deviceZeroIdx);
+      } else {
+        // Synthesized host-side descriptor; block type is the memory-order
+        // tile.
+        auto descTy = tt::TensorDescType::get(descTileTy.getShape(),
+                                              descTileTy.getElementType(),
+                                              descTileTy.getEncoding());
+        descArgIdx = kernelFunc.getNumArguments();
+        auto argAttrs = b.getDictionaryAttr(
+            {b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});
+        LogicalResult inserted =
+            kernelFunc.insertArgument(descArgIdx, descTy, argAttrs, loc);
+        assert(succeeded(inserted) &&
+               "failed to insert TMA descriptor kernel argument");
+        (void)inserted;
+        descVal = kernelFunc.getArgument(descArgIdx);
+      }
       Type i64 = builder.getI64Type();
       // Convert an integer/index value to a target integer width,
       // sign-extending or truncating as needed. descriptor_load indices must be
@@ -1244,17 +1472,19 @@ public:
           Value prod = arith::MulIOp::create(builder, loc, iv, step);
           indices.push_back(arith::TruncIOp::create(builder, loc, i32, prod));
         } else if (!dim.offset) {
-          // Bare make_range with no tile offset (e.g. `arange % M` or a
-          // select-clamp, which peel to a bare range): the tile starts at 0.
-          indices.push_back(arith::ConstantOp::create(
-              builder, loc, builder.getI32IntegerAttr(0)));
+          // Whole-dim (untiled, e.g. FA HEAD_DIM): index is 0. Use the hoisted
+          // zero (deviceMode) so it isn't a constant inside the WS loop.
+          indices.push_back(
+              deviceZeroIdx ? deviceZeroIdx
+                            : arith::ConstantOp::create(
+                                  builder, loc, builder.getI32IntegerAttr(0)));
         } else {
           indices.push_back(toI32(dim.offset));
         }
       }
 
       auto newLoad = tt::DescriptorLoadOp::create(
-          builder, loc, descTileTy, descArg, indices, tt::CacheModifier::NONE,
+          builder, loc, descTileTy, descVal, indices, tt::CacheModifier::NONE,
           tt::EvictionPolicy::NORMAL);
 
       Value loaded = newLoad.getResult();
@@ -1269,6 +1499,10 @@ public:
 
       loadOp.getResult().replaceAllUsesWith(loaded);
       loadOp.erase();
+
+      // Device descriptors need no launcher recipe.
+      if (promo.useDeviceMode)
+        continue;
 
       // Record the recipe: how the launcher builds this CUtensorMap from the
       // existing scalar kernel args (base ptr / shape / stride) at launch time.
@@ -1309,20 +1543,33 @@ public:
       Type elemTy = valTy.getElementType();
       Location loc = storeOp.getLoc();
 
-      auto descTy = tt::TensorDescType::get(
-          valTy.getShape(), valTy.getElementType(), valTy.getEncoding());
-      unsigned descArgIdx = kernelFunc.getNumArguments();
-      auto argAttrs =
-          b.getDictionaryAttr({b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});
-      LogicalResult inserted =
-          kernelFunc.insertArgument(descArgIdx, descTy, argAttrs, loc);
-      assert(succeeded(inserted) &&
-             "failed to insert TMA descriptor kernel argument");
-      (void)inserted;
-      Value descArg = kernelFunc.getArgument(descArgIdx);
-
       builder.setInsertionPoint(storeOp);
       Type i32 = builder.getI32Type();
+
+      // Descriptor for the store: device-built (deviceMode) or host recipe arg.
+      Value descVal;
+      unsigned descArgIdx = 0;
+      Value deviceZeroIdx;
+      if (promo.useDeviceMode) {
+        SmallVector<int> identity;
+        for (int d = 0; d < rank; d++)
+          identity.push_back(d);
+        descVal =
+            buildDeviceDescriptor(storeOp, promo.decomp, promo.shapeArgIndices,
+                                  identity, loc, deviceZeroIdx);
+      } else {
+        auto descTy = tt::TensorDescType::get(
+            valTy.getShape(), valTy.getElementType(), valTy.getEncoding());
+        descArgIdx = kernelFunc.getNumArguments();
+        auto argAttrs = b.getDictionaryAttr(
+            {b.getNamedAttr("tt.auto_tma", b.getUnitAttr())});
+        LogicalResult inserted =
+            kernelFunc.insertArgument(descArgIdx, descTy, argAttrs, loc);
+        assert(succeeded(inserted) &&
+               "failed to insert TMA descriptor kernel argument");
+        (void)inserted;
+        descVal = kernelFunc.getArgument(descArgIdx);
+      }
       // Same width handling as the load path's toIntWidth: descriptor_store
       // indices must be i32, but a tile offset may be index / i16 / i64 / etc.
       // depending on how the kernel computed it. Sign-extend or truncate as
@@ -1342,21 +1589,22 @@ public:
       };
       SmallVector<Value> indices;
       for (int d = 0; d < rank; d++) {
-        const DimInfo &dim = promo.decomp.dims[d];
-        if (!dim.offset) {
-          // Bare make_range with no tile offset (e.g. `arange % M` or a
-          // select-clamp that peels to a bare range): the tile starts at 0.
-          // Phase 1b can accept such a dim via shapeArgIdx alone, so mirror the
-          // load path (Phase 2) here instead of calling toI32 on a null offset.
-          indices.push_back(arith::ConstantOp::create(
-              builder, loc, builder.getI32IntegerAttr(0)));
-        } else {
-          indices.push_back(toI32(dim.offset));
-        }
+        Value off = promo.decomp.dims[d].offset;
+        if (!off)
+          indices.push_back(
+              deviceZeroIdx ? deviceZeroIdx
+                            : arith::ConstantOp::create(
+                                  builder, loc, builder.getI32IntegerAttr(0)));
+        else
+          indices.push_back(toI32(off));
       }
 
-      tt::DescriptorStoreOp::create(builder, loc, descArg, value, indices);
+      tt::DescriptorStoreOp::create(builder, loc, descVal, value, indices);
       storeOp.erase();
+
+      // Device stores need no launcher recipe.
+      if (promo.useDeviceMode)
+        continue;
 
       SmallVector<Attribute> shapeIdx, strideIdx, blk;
       for (int d = 0; d < rank; d++) {

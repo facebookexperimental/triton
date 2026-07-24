@@ -407,3 +407,23 @@ def test_auto_tma_metaws_store_over_256():
         "meta-WS BLOCK_N=512 load must be auto-TMA promoted (clamped box + multi-copy)")
     assert "tt.descriptor_store" in k.asm["ttir"], (
         "meta-WS BLOCK_N=512 store must be auto-TMA store-promoted (clamped box + multi-copy)")
+
+
+@pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
+def test_auto_tma_device_block_over_256(monkeypatch):
+    # DEVICE-descriptor mode (TRITON_AUTO_TMA_DEVICE=1, added in this diff): the load
+    # is promoted to an in-kernel tt.make_tensor_descriptor. Contiguous BLOCK_N=512 >
+    # 256. Unlike the host recipe, the device path clamps the box via getTMABlockShape
+    # at descriptor-build time (TMAUtilities::createTMADesc) and the device lowering
+    # multi-copies to fill the tile, so box>256 promotes and computes correctly. Non-WS,
+    # so it does not touch the AutoWS partition bug that blocks the host store path.
+    monkeypatch.setenv("TRITON_AUTO_TMA_DEVICE", "1")
+    M, N = 128, 512
+    BLOCK_M, BLOCK_N = 64, 512  # contiguous 512 > 256 -> device box clamp + multi-copy
+    x = torch.randn((M, N), device="cuda", dtype=torch.float16)
+    out = torch.empty((M, N), device="cuda", dtype=torch.float16)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    k = _scale_2d_kernel[grid](x, out, M, N, x.stride(0), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N)
+    torch.testing.assert_close(out, x * 2.0, atol=1e-2, rtol=1e-2)
+    assert "tt.make_tensor_descriptor" in k.asm["ttir"], "expected a device descriptor"
+    assert "tt.descriptor_load" in k.asm["ttir"], ("device-descriptor BLOCK_N=512 load must be auto-TMA promoted")
