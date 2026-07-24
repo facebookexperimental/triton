@@ -15,11 +15,14 @@ import sys
 _HSTU_DIR = os.path.join(os.path.dirname(__file__), "hstu_self_attn")
 sys.path.insert(0, _HSTU_DIR)
 
-# plain Triton + TLX (no autoWS, no meta-WS); TLX needs the wsbarrier-reorder off.
-os.environ.pop("HSTU_SELF_AUTOWS", None)
-os.environ.pop("TRITON_USE_META_WS", None)
-os.environ["HSTU_SELF_PIN"] = "1"
-os.environ["TRITON_DISABLE_WSBARRIER_REORDER"] = "1"
+# HSTU autoWS config as a dict (replaces HSTU_SELF_* env vars), applied via
+# hstu_autows_config.set_config() before importing the kernel (config is read at
+# import). This is the non-autoWS path (plain-Triton vs TLX): autoWS off, pinned
+# for fast compile. The Triton compiler knobs (use_meta_ws off, wsbarrier-reorder
+# off for TLX) are applied per-run via a knobs scope in bench_self.grads().
+import hstu_autows_config as _C  # noqa: E402
+
+_C.set_config(autows=False, pin=True)
 
 import pytest  # noqa: E402
 import torch  # noqa: E402

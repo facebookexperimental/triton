@@ -4877,6 +4877,7 @@ def tlx_hstu_attention_bwd(
     max_attn_len: int = 0,
     full_attn_size: int = 0,
     contextual_seq_len: int = 0,
+    use_persistent: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass for HSTU attention with jagged sequences."""
     q = switch_to_contiguous_if_needed(q)
@@ -4976,7 +4977,6 @@ def tlx_hstu_attention_bwd(
 
     stage = 3 if causal else 1
 
-    use_persistent = True
     if use_persistent:
         grid = lambda meta: (  # noqa E731
             H * Z * triton.cdiv(max_seq_len, meta["BLOCK_N1"]), )
