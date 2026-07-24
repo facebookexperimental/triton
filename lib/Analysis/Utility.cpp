@@ -13,6 +13,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.h"
@@ -928,6 +929,33 @@ unsigned getNumScratchElements(ArrayRef<unsigned> shape) {
   return product<unsigned>(shape);
 }
 
+// NPOT K must align to the 32-byte MMA K granule.
+static bool isNpotMmaKAligned(int64_t k, Type elementType) {
+  if (llvm::isPowerOf2_64(k))
+    return true;
+  int64_t bitwidth = elementType.getIntOrFloatBitWidth();
+  return (k * bitwidth) % 256 == 0;
+}
+
+static bool isMmaOutputShapeSupported(ArrayRef<int64_t> shape, int version) {
+  assert(shape.size() >= 2 && "MMA output must have M and N dimensions");
+  int64_t m = shape[shape.size() - 2];
+  int64_t n = shape[shape.size() - 1];
+
+  if (version == 2) {
+    return llvm::none_of(shape, [](int64_t dim) {
+      return dim > 0 && !llvm::isPowerOf2_64(dim);
+    });
+  }
+  if (version == 3) {
+    int64_t mAlignment = llvm::isPowerOf2_64(m) ? 64 : 16;
+    return m % mAlignment == 0 && n % 8 == 0;
+  }
+  assert(version == 5 && "unexpected MMA version with output constraints");
+  bool mOk = llvm::isPowerOf2_64(m) ? m % 64 == 0 : m <= 128 && m % 16 == 0;
+  return mOk && llvm::isPowerOf2_64(n) && n % 8 == 0;
+}
+
 bool supportMMA(triton::DotOp op, int version) {
   // Refer to mma section for the data type supported by Volta and Hopper
   // Tensor Core in
@@ -944,7 +972,6 @@ bool supportMMA(triton::DotOp op, int version) {
     int k = typeA.getShape().back();
     auto retType = op.getType();
     auto retShapePerCTA = getShapePerCTA(retType);
-    auto rank = retShapePerCTA.size();
     int numWarps = lookupNumWarps(op);
     // Allow int8 * int8 -> int32 for MMAv5, reject other integer combinations
     if (aElemTy.isInteger() || bElemTy.isInteger() ||
@@ -962,8 +989,7 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
-    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % 8 == 0))
+    if (!isMmaOutputShapeSupported(retShapePerCTA, version))
       return false;
     if (aElemTy.isF64() || bElemTy.isF64() ||
         retType.getElementType().isF64()) {
@@ -981,14 +1007,16 @@ bool supportMMA(triton::DotOp op, int version) {
     // If k size is smaller than the native mma size, we cannot use MMA.
     if (k < 256 / aElemTy.getIntOrFloatBitWidth())
       return false;
+    if (!isNpotMmaKAligned(k, aElemTy))
+      return false;
     auto retShapePerCTA = getShapePerCTA(retType);
     auto rank = retShapePerCTA.size();
     int numWarps = lookupNumWarps(op);
     // TODO(Keren): for now, fallback to MMAv2 if handling batch matmul.
     if (rank == 3)
       return false;
-    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
-          retShapePerCTA[rank - 1] % 8 == 0 &&
+    if (!(numWarps % 4 == 0 &&
+          isMmaOutputShapeSupported(retShapePerCTA, version) &&
           (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy) ||
            aElemTy.isInteger(8) || aElemTy.isF16() || aElemTy.isBF16() ||
            aElemTy.isF32()))) {
@@ -1000,6 +1028,12 @@ bool supportMMA(triton::DotOp op, int version) {
         cast<RankedTensorType>(op.getType()).getElementType().isF32()) {
       return false;
     }
+  }
+  if (version == 2) {
+    int64_t k = op.getA().getType().getShape().back();
+    if (!isNpotMmaKAligned(k, aElemTy) ||
+        !isMmaOutputShapeSupported(getShapePerCTA(op.getType()), version))
+      return false;
   }
   if (aElemTy.isF32() && bElemTy.isF32()) {
     assert(op.getInputPrecision() == InputPrecision::TF32);
@@ -1060,7 +1094,27 @@ LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
   return comp;
 }
 
+static bool npotMmaConversion(RankedTensorType srcTy, RankedTensorType dstTy) {
+  if (!hasNpotShape(srcTy) && !hasNpotShape(dstTy)) {
+    return false;
+  }
+  auto hasMmaFamily = [](Attribute enc) {
+    if (isa<triton::gpu::NvidiaMmaEncodingAttr>(enc)) {
+      return true;
+    }
+    if (auto dot = dyn_cast<triton::gpu::DotOperandEncodingAttr>(enc)) {
+      return isa<triton::gpu::NvidiaMmaEncodingAttr>(dot.getParent());
+    }
+    return false;
+  };
+  return hasMmaFamily(srcTy.getEncoding()) || hasMmaFamily(dstTy.getEncoding());
+}
+
 bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // Modular MMA conversions can alias bases; use shared memory.
+  if (npotMmaConversion(srcTy, dstTy)) {
+    return false;
+  }
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1069,6 +1123,10 @@ bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // Warp decomposition assumes pow2 GF(2) layouts.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    return false;
+  }
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
@@ -1082,6 +1140,14 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
+  // Keep modular-unsafe encodings out of layout algebra.
+  if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+    bool srcSafe = npotSafeForLinearLayout(srcTy.getEncoding());
+    bool dstSafe = npotSafeForLinearLayout(dstTy.getEncoding());
+    if (!srcSafe || !dstSafe) {
+      return true;
+    }
+  }
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }

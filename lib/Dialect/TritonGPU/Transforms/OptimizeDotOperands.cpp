@@ -58,11 +58,30 @@ public:
     auto newLl =
         transposeLinearLayout(oldCGALayout.getLinearLayout(), trans.getOrder());
     auto newCGALayout = CGAEncodingAttr::get(ctx, std::move(newLl));
-    auto newInnerCvtEnc =
-        SwizzledSharedEncodingAttr::get(ctx, cvtEncoding, srcTy.getShape(),
-                                        /*order=*/getOrderForMemory(srcTy),
-                                        newCGALayout, srcTy.getElementType(),
-                                        /*needTrans=*/true);
+    Attribute newInnerCvtEnc;
+    bool isNpot = hasNpotShape(srcTy);
+    if (isNpot && !npotSafeForLinearLayout(cvtEncoding.getParent())) {
+      return failure();
+    }
+    // Modular SM90+ layouts require NVMMAShared.
+    ModuleOp mod;
+    if (isNpot) {
+      mod = cvtOp->getParentOfType<ModuleOp>();
+      assert(mod && "convert op must be nested in a ModuleOp");
+    }
+    // NPOT FP4 is intentionally unsupported here.
+    if (isNpot && srcTy.getElementType().getIntOrFloatBitWidth() < 8) {
+      return failure();
+    }
+    if (isNpot && getNVIDIAComputeCapability(mod) >= 90) {
+      newInnerCvtEnc = NVMMASharedEncodingAttr::get(
+          ctx, srcTy.getShape(), getOrderForMemory(srcTy), newCGALayout,
+          srcTy.getElementType(), /*fp4Padded=*/false);
+    } else {
+      newInnerCvtEnc = SwizzledSharedEncodingAttr::get(
+          ctx, cvtEncoding, srcTy.getShape(), getOrderForMemory(srcTy),
+          newCGALayout, srcTy.getElementType(), /*needTrans=*/true);
+    }
     if (newInnerCvtEnc == cvtEncoding)
       return failure();
     rewriter.setInsertionPoint(trans);

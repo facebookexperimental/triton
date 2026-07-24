@@ -1192,6 +1192,15 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
+    if (srcLayout.isModular()) {
+      auto allocShape = ttg::getAllocationShapePerCTA(dstTy);
+      smemLayout = ttg::toLinearLayout(allocShape, dstTy.getEncoding());
+      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+      for (auto dim : srcLayout.getOutDimNames())
+        paddedOutDims.push_back({dim, smemLayout.getOutDimSize(dim)});
+      srcLayout = LinearLayout(srcLayout.getBases(), paddedOutDims,
+                               /*requireSurjective=*/false);
+    }
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,

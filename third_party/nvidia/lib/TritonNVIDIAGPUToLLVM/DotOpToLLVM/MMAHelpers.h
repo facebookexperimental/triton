@@ -69,7 +69,12 @@ public:
     // we would need to handle the getReps part more carefuly
     // This way we could support more subviews that we don't
     // We can implement this generalisation in the future if needed
-    auto llInv = toLinearLayout(memTy).pseudoinvert();
+    auto memLayout = toLinearLayout(memTy);
+    if (memLayout.isModular()) {
+      auto allocShape = gpu::getAllocationShapePerCTA(memTy);
+      memLayout = gpu::toLinearLayout(allocShape, memTy.getEncoding());
+    }
+    auto llInv = memLayout.pseudoinvert();
     auto bitwidth = memTy.getElementType().getIntOrFloatBitWidth();
     if (isFp4) {
       // hacky but well

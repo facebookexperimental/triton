@@ -257,7 +257,7 @@ std::pair<int, int> bankConflicts(ArrayRef<int32_t> tileSrc,
   auto segment = StringAttr::get(ctx, "segment");
   auto segmentBases = flatten(smemFlat, segment);
 
-  int32_t rank = smem.getTotalOutDimSizeLog2();
+  int32_t rank = smem.getTotalOutDimSizeBits();
   // compute conflicts
   int write = 1 << intersectionBasis(segmentBases, tileSrc, rank).size();
   int read = 1 << intersectionBasis(segmentBases, tileDst, rank).size();
@@ -357,7 +357,7 @@ std::optional<SmallVector<int32_t>> optimalSwizzlingTile(
   auto *ctx = a.getInDimNames().begin()->getContext();
   auto kReg = StringAttr::get(ctx, "register");
   auto kLane = StringAttr::get(ctx, "lane");
-  auto dim = a.getTotalOutDimSizeLog2();
+  auto dim = a.getTotalOutDimSizeBits();
   // map from b to a
   LinearLayout cvt = b.invertAndCompose(a);
 
@@ -431,7 +431,7 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   assert(src.getNumOutDims() == 1 && dst.getNumOutDims() == 1 &&
          "src and dst must have a single output dimension");
 
-  const int32_t dim = src.getTotalOutDimSizeLog2();
+  const int32_t dim = src.getTotalOutDimSizeBits();
   auto *ctx = src.getInDimNames().begin()->getContext();
   auto kReg = StringAttr::get(ctx, "register");
 
@@ -496,6 +496,52 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   return basis1D.reshapeOuts(outDims);
 }
 
+// Swizzle pow2 dimensions and map NPOT dimensions to segment.
+static LinearLayout
+optimalSwizzlingLdStMixed(const LinearLayout &src, const LinearLayout &dst,
+                          int32_t bitwidth, int32_t numBanks,
+                          LocalMemOpTile srcTile, LocalMemOpTile dstTile) {
+  auto *ctx = src.getInDimNames().begin()->getContext();
+  auto S = [ctx](StringRef str) { return StringAttr::get(ctx, str); };
+  auto kSeg = S("segment");
+
+  SmallVector<StringAttr> pow2Dims, npotDims;
+  for (auto outDim : src.getOutDimNames()) {
+    if (src.isOutDimModular(outDim))
+      npotDims.push_back(outDim);
+    else
+      pow2Dims.push_back(outDim);
+  }
+
+  // NPOT inputs are pow2-padded; outputs remain modular.
+  LinearLayout npotPart = LinearLayout::empty();
+  for (auto npotDim : npotDims) {
+    int32_t N = src.getOutDimSize(npotDim);
+    npotPart *= LinearLayout::modularIdentity1D(N, kSeg, npotDim);
+  }
+
+  if (pow2Dims.empty()) {
+    auto kVec = S("vector"), kBank = S("bank"), kReps = S("reps");
+    auto segBases = npotPart.getBases().lookup(kSeg);
+    return LinearLayout(
+        {{kVec, {}}, {kBank, {}}, {kSeg, segBases}, {kReps, {}}},
+        npotPart.getOutDims(), /*requireSurjective=*/true);
+  }
+
+  auto inDims = llvm::to_vector(src.getInDimNames());
+  auto srcPow2 = src.sublayout(inDims, pow2Dims);
+  auto dstPow2 = dst.sublayout(inDims, pow2Dims);
+  srcPow2 = actionRemoveBroadcastedRegs(srcPow2).apply(srcPow2);
+  dstPow2 = actionRemoveBroadcastedRegs(dstPow2).apply(dstPow2);
+
+  auto smemPow2 = optimalSwizzlingLdSt(srcPow2, dstPow2, bitwidth, numBanks,
+                                       srcTile, dstTile);
+
+  // NPOT segment bases are disjoint from pow2 vector/bank bases. Output
+  // projection preserves the lane-basis indices used by srcTile/dstTile.
+  return smemPow2 * npotPart;
+}
+
 std::pair<SmallVector<int32_t>, std::optional<bool>>
 getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
                 int32_t bitwidth) {
@@ -506,7 +552,7 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
   auto regDst = flatten(dstFlat, kReg);
   auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
                                                       : SmallVector<int32_t>{};
-  auto dim = srcFlat.getTotalOutDimSizeLog2();
+  auto dim = srcFlat.getTotalOutDimSizeBits();
   SmallVector<int32_t> vbasis = intersectionBasis(regSrc, regDst, dim);
   // Restrict the vectorisation to the maximum we can use
   auto maxVecBases = llvm::Log2_32(128 / bitwidth);
@@ -600,6 +646,10 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
                                   const LinearLayout &dst, int32_t bitwidth,
                                   int32_t numBanks, LocalMemOpTile srcTile,
                                   LocalMemOpTile dstTile) {
+  if (src.isModular())
+    return optimalSwizzlingLdStMixed(src, dst, bitwidth, numBanks, srcTile,
+                                     dstTile);
+
   auto *ctx = src.getInDimNames().begin()->getContext();
   auto kReg = StringAttr::get(ctx, "register");
   auto kLane = StringAttr::get(ctx, "lane");

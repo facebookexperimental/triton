@@ -131,6 +131,108 @@ struct ConvertLayoutOpConversion
     return success();
   }
 
+  SmallVector<Value> transferWithinBlockModular(
+      Location loc, ConversionPatternRewriter &rewriter,
+      const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase) const {
+    auto *ctx = rewriter.getContext();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto kReg = str_attr("register");
+    auto kLane = str_attr("lane");
+    auto kWarp = str_attr("warp");
+
+    auto hasSupportedInputs = [&](const LinearLayout &layout) {
+      return llvm::all_of(layout.getInDimNames(), [&](StringAttr dim) {
+        return dim == kReg || dim == kLane || dim == kWarp;
+      });
+    };
+    // The caller removes block before entering this helper.
+    assert(hasSupportedInputs(srcLayout) && hasSupportedInputs(dstLayout) &&
+           "modular shared transfer expects register/lane/warp inputs");
+    assert(srcLayout.isSurjective() && dstLayout.isSurjective() &&
+           "modular shared transfer requires complete logical covers");
+    assert(to_vector(srcLayout.getOutDimNames()) ==
+               to_vector(dstLayout.getOutDimNames()) &&
+           "source and destination must cover the same logical dimensions");
+    for (auto dim : srcLayout.getOutDimNames())
+      assert(srcLayout.getOutDimSize(dim) == dstLayout.getOutDimSize(dim) &&
+             "source and destination logical dimensions must have equal size");
+
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+    auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
+    smemBase = b.bitcast(smemBase, elemPtrTy);
+
+    auto getIndices = [&](const LinearLayout &layout, int32_t reg) {
+      SmallVector<std::pair<StringAttr, Value>> indices;
+      for (auto dim : layout.getInDimNames()) {
+        if (dim == kReg)
+          indices.push_back({dim, b.i32_val(reg)});
+        else if (dim == kLane)
+          indices.push_back({dim, laneId});
+        else if (dim == kWarp)
+          indices.push_back({dim, warpId});
+        else
+          llvm_unreachable("unsupported modular conversion input dimension");
+      }
+      return indices;
+    };
+
+    auto getOffset = [&](const LinearLayout &layout,
+                         ArrayRef<std::pair<StringAttr, Value>> indices) {
+      auto logical = applyLinearLayout(loc, rewriter, layout, indices);
+      SmallVector<Value> coords;
+      SmallVector<unsigned> shape;
+      for (auto &[dim, value] : logical) {
+        coords.push_back(value);
+        shape.push_back(layout.getOutDimSize(dim));
+      }
+      return LLVM::linearize(rewriter, loc, coords, shape);
+    };
+
+    // Select one pre-modulo representative per logical coordinate.
+    auto isCanonical = [&](const LinearLayout &layout,
+                           ArrayRef<std::pair<StringAttr, Value>> indices) {
+      Value canonical = b.true_val();
+      for (auto dim : layout.getOutDimNames()) {
+        if (!layout.isOutDimModular(dim))
+          continue;
+        Value raw = b.i32_val(0);
+        for (auto [inDim, index] : indices) {
+          for (int32_t bit = 0; bit < layout.getInDimSizeLog2(inDim); ++bit) {
+            int32_t basis = layout.getBasis(inDim, bit, dim);
+            if (basis == 0)
+              continue;
+            Value set =
+                b.icmp_ne(b.and_(index, b.i32_val(1u << bit)), b.i32_val(0));
+            raw = b.add(raw, b.select(set, b.i32_val(basis), b.i32_val(0)));
+          }
+        }
+        canonical = b.and_(
+            canonical, b.icmp_ult(raw, b.i32_val(layout.getOutDimSize(dim))));
+      }
+      return canonical;
+    };
+
+    for (auto [reg, value] : llvm::enumerate(inVals)) {
+      auto indices = getIndices(srcLayout, reg);
+      Value offset = getOffset(srcLayout, indices);
+      Value canonical = isCanonical(srcLayout, indices);
+      Value ptr = b.gep(elemPtrTy, llvmElemTy, smemBase, offset);
+      targetInfo.storeShared(rewriter, loc, ptr, value, canonical);
+    }
+    targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
+
+    // Every destination offset has a canonical source store.
+    SmallVector<Value> outVals;
+    outVals.reserve(dstLayout.getInDimSize(kReg));
+    for (int32_t reg = 0; reg < dstLayout.getInDimSize(kReg); ++reg) {
+      Value offset = getOffset(dstLayout, getIndices(dstLayout, reg));
+      Value ptr = b.gep(elemPtrTy, llvmElemTy, smemBase, offset);
+      outVals.push_back(b.load(llvmElemTy, ptr));
+    }
+    return outVals;
+  }
+
   SmallVector<Value> transferWithinBlockSwizzlingImpl(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
@@ -189,6 +291,10 @@ struct ConvertLayoutOpConversion
 
     // At this point we have a type that's at least 8-bit
     // and we don't have broadcasting in the registers
+    if (srcLayout.isModular() || dstLayout.isModular())
+      return transferWithinBlockModular(loc, rewriter, srcLayout, dstLayout,
+                                        inVals, llvmElemTy, smemBase);
+
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
     int numBanks = targetInfo.getSharedMemoryBanks();
     int32_t vecBitwidth =

@@ -7,6 +7,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -59,7 +60,7 @@ static unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto [smem, _] = triton::gpu::optimalSwizzling(srcLayout, dstLayout, srcTiles,
                                                  dstTiles, bitwidth);
   auto reps = smem.getInDimSize(StringAttr::get(ctx, "reps"));
-  return smem.getTotalOutDimSize() / reps;
+  return smem.getTotalOutDimSizeProduct() / reps;
 }
 
 std::function<unsigned(Operation *)>
@@ -68,6 +69,15 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     if (auto cvtOp = dyn_cast<triton::gpu::ConvertLayoutOp>(op)) {
       auto srcTy = cvtOp.getSrc().getType();
       auto dstTy = cvtOp.getType();
+      if (hasNpotShape(srcTy) || hasNpotShape(dstTy)) {
+        // Use modular physical-cover sizing.
+        if (!cvtNeedsSharedMemory(srcTy, dstTy)) {
+          return 0;
+        }
+        auto elems = mlir::triton::getNumScratchElemsSwizzledCvt(srcTy, dstTy);
+        // Modular sub-byte values occupy one byte in shared memory.
+        return elems * std::max<unsigned>(getBitwidth(srcTy), 8) / 8;
+      }
       if (!cvtNeedsSharedMemory(srcTy, dstTy))
         return 0;
       // In cuda we always swizzle

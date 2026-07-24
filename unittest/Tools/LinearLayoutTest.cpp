@@ -1484,6 +1484,15 @@ TEST_F(LinearLayoutTest, SurjectivityTruncationRegression) {
 // Verifies that per-layout isModular is correct for mixed shapes.
 //===----------------------------------------------------------------------===//
 
+TEST_F(LinearLayoutTest, MixedShapeSurjectivityUsesPerDimAlgebra) {
+  LinearLayout layout({{S("in"), {{1, 0}, {3, 0}, {0, 1}, {0, 2}, {0, 4}}}},
+                      {{S("pow2"), 4}, {S("npot"), 6}},
+                      /*requireSurjective=*/false);
+
+  EXPECT_TRUE(layout.isModular());
+  EXPECT_TRUE(layout.isModularSurjective());
+}
+
 TEST_F(LinearLayoutTest, MixedShape_OperatorStar_SharedDim) {
   // When inner and outer share an output dim, sizes multiply (not shift).
   // inner: 4 -> dim0=4; outer: 6 -> dim0=6. Product should be 24, not 64.

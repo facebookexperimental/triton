@@ -2793,6 +2793,19 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                          {S("dim0")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
+  auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto layout = toLinearLayout({48}, slice(parent, 0));
+
+  EXPECT_EQ(layout,
+            LinearLayout({{S("register"), {{1}, {2}, {32}}},
+                          {S("lane"), {{4}, {8}, {16}, {0}, {0}}},
+                          {S("warp"), {{0}, {0}}},
+                          {S("block"), {}}},
+                         {{S("dim0"), 48}}, /*requireSurjective=*/true));
+  EXPECT_TRUE(layout.isModular());
+}
+
 TEST_F(LinearLayoutConversionsTest, SliceWithShape1) {
   auto parent = blocked({1, 4}, {8, 4}, {2, 2}, {1, 1}, {1, 1}, {0, 1}, {1, 0});
   EXPECT_EQ(toLinearLayout({1}, slice(parent, 0)),

@@ -20,6 +20,7 @@ namespace mlir::triton::gpu {
 // ldmatrix.v4 / stmatrix.v4
 // ldmatrix.trans.v4 / stmatrix.trans.v4
 struct LocalMemOpTile {
+  // Input-lane basis indices; output projection preserves their positions.
   // If laneContig.size() < log2(128/bitwidth), we assume that
   // the first log2(128/bitwidth) - laneContig.size() bases are registers
   llvm::SmallVector<int32_t> laneContig;

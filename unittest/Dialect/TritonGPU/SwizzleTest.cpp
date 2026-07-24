@@ -426,6 +426,55 @@ TEST_F(SwizzleTest, Test64x128F16BlockedLinear32Bank) {
   EXPECT_EQ(w, 0);
 }
 
+TEST_F(SwizzleTest, MixedLayoutPreservesPow2TileSwizzle) {
+  auto kReg = S("register");
+  auto kLane = S("lane");
+  auto kWarp = S("warp");
+  auto kBlock = S("block");
+  auto dim0 = S("dim0");
+  auto dim1 = S("dim1");
+  LinearLayout src(
+      {{kReg, {{0, 1}, {0, 2}, {0, 4}, {16, 0}, {32, 0}}},
+       {kLane, {{0, 8}, {0, 16}, {0, 32}, {0, 64}, {1, 0}, {2, 0}}},
+       {kWarp, {{4, 0}, {8, 0}}},
+       {kBlock, {}}},
+      {{dim0, 64}, {dim1, 96}}, /*requireSurjective=*/true);
+  LinearLayout dst(
+      {{kReg, {{0, 1}, {0, 2}, {0, 8}, {0, 16}, {0, 32}, {0, 64}, {32, 0}}},
+       {kLane, {{1, 0}, {2, 0}, {4, 0}, {8, 0}, {16, 0}, {0, 4}}},
+       {kWarp, {{0, 0}, {0, 0}}},
+       {kBlock, {}}},
+      {{dim0, 64}, {dim1, 96}}, /*requireSurjective=*/true);
+
+  constexpr int32_t numBanks = 32;
+  LocalMemOpTile srcTile;
+  LocalMemOpTile dstTile{{}, {0, 1, 4}};
+  auto mixed = optimalSwizzlingLdSt(src, dst, /*bitwidth=*/16, numBanks,
+                                    srcTile, dstTile);
+
+  auto inDims = llvm::to_vector(src.getInDimNames());
+  auto srcPow2 = src.sublayout(inDims, {dim0});
+  auto dstPow2 = dst.sublayout(inDims, {dim0});
+  srcPow2 = actionRemoveBroadcastedRegs(srcPow2).apply(srcPow2);
+  dstPow2 = actionRemoveBroadcastedRegs(dstPow2).apply(dstPow2);
+  auto pow2 = optimalSwizzlingLdSt(srcPow2, dstPow2, /*bitwidth=*/16, numBanks,
+                                   srcTile, dstTile);
+
+  for (auto inDim : {S("vector"), S("bank")}) {
+    EXPECT_EQ(mixed.getInDimSize(inDim), pow2.getInDimSize(inDim));
+    for (int bit = 0; bit < pow2.getInDimSizeLog2(inDim); ++bit) {
+      EXPECT_EQ(mixed.getBasis(inDim, bit, dim0),
+                pow2.getBasis(inDim, bit, dim0));
+      EXPECT_EQ(mixed.getBasis(inDim, bit, dim1), 0);
+    }
+  }
+
+  auto kSegment = S("segment");
+  int pow2SegmentBits = pow2.getInDimSizeLog2(kSegment);
+  for (int bit = pow2SegmentBits; bit < mixed.getInDimSizeLog2(kSegment); ++bit)
+    EXPECT_EQ(mixed.getBasis(kSegment, bit, dim0), 0);
+}
+
 TEST_F(SwizzleTest, Test64x128F16BlockedMfma64Bank) {
   LinearLayout src(
       {{S("register"), {{0, 1}, {0, 2}, {0, 4}, {16, 0}, {32, 0}}},
