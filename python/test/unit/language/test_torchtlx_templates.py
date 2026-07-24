@@ -218,6 +218,133 @@ class TestTLXTemplates(TestCase):
         # ...and the undersaturated grid takes the split-K path -> separate reduce kernel.
         self.assertIn("_reduce_k_kernel", code_str)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_addmm_warppipe_unaligned_k(self, dtype: torch.dtype):
+        """Unaligned K (K % BLOCK_K != 0) on the TLX warp-pipe addmm (gfx950).
+
+        A masked (partial-K) tlx.async_load fails to lower on gfx950, so the template
+        walks only the FULL K-tiles with unmasked async_load and folds the leftover K
+        columns in via a synchronous masked tl.load ("sync-load the tail"). K=2312 is a
+        multiple of 8 but of no BLOCK_K in the config set (32/64/128), so every config
+        has a partial last K-tile and exercises the tail. Before the fix this raised
+        "failed to legalize operation 'ttg.async_copy_global_to_local'".
+
+        NOTE: K must be a multiple of 8 (16-byte row alignment: stride = K elems * 2 B).
+        An odd K (e.g. the production compression bmm's K=2309) additionally hits a
+        SEPARATE, deeper limit -- the col-major B's async_copy into the swizzled
+        padded_shared LDS layout cannot legalize with a non-16-byte-aligned row stride
+        (builtin.unrealized_conversion_cast on arg_B) -- which the sync-tail does NOT
+        address (it needs an AMD-backend async_copy alignment fix).
+        """
+        M, K, N = 4096, 2312, 192  # K=2312: multiple of 8, but not of 32/64/128 -> partial tail
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        # w.t() => B is [K, N] col-major (stride_bk == 1) -- the nn.Linear weight layout.
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+
+        # force mode keeps only the TLX template, so an unaligned-K addmm must still
+        # lower through the warp-pipe Triton template (never falling back to extern/aten).
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem", code_str)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_odd_k_async_copy_alignment_repro(self):
+        """REPRO of the residual odd-K async_copy 16-byte-alignment failure (gfx950).
+
+        The sync-load-the-tail fix handles K % BLOCK_K != 0, but ONLY when the row stride is
+        16-byte aligned (K a multiple of 8). K=2309 (odd; the production compression bmm's K) is
+        NOT: A [M,K] and col-major B [K,N] both have row stride K, so a row spans 2309*2 = 4618 B,
+        not a multiple of 16. The col-major B's async_copy into the swizzled #ttg.padded_shared
+        LDS layout then cannot legalize -> builtin.unrealized_conversion_cast on arg_B -> "failed
+        to translate module to LLVM IR". In tlx_mode=force (TRITON-only) every config fails to
+        compile, so select_algorithm raises NoValidChoicesError.
+
+        This documents a KNOWN residual -- an AMD-backend async_copy alignment fix, out of scope
+        for the sync-tail kernel change. When that fix lands this test will start passing
+        (NoValidChoicesError no longer raised); convert it to a correctness check then.
+        compile_threads=1 keeps the compile in-process so the real MLIR error is visible in the
+        test log (subprocess autotune otherwise swallows it behind NoValidChoicesError).
+        """
+        M, K, N = 4096, 2309, 192  # odd K -> 2309*2 = 4618 B row stride, NOT 16-byte aligned
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=torch.float16)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=torch.float16)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=torch.float16)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "compile_threads": 1,
+        }):
+            with self.assertRaises(Exception):
+                run_and_get_code(torch.compile(addmm), bias, a, w)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_bmm_warppipe(self, dtype: torch.dtype):
+        """TLX warp-pipelined bmm template (AMD MI350X / gfx950).
+
+        Batched C[b] = A[b] @ B[b], standard torch.bmm layout (B [batch,K,N] row-major, no
+        transpose). Same warp-pipe core as the addmm + a batch axis + per-batch int64 base
+        advance. K=272 is a multiple of 16 (the heuristic's alignment gate) but of no BLOCK_K in
+        the config set, so every config exercises the sync-tail. Verifies the TLX bmm lowers to a
+        Triton template (never extern/aten in force mode) and is numerically correct.
+        """
+        batch, M, K, N = 8, 256, 272, 256  # K=272 = 16*17: passes the ÷16 gate, exercises the tail
+        a = torch.randn(batch, M, K, device=GPU_TYPE, dtype=dtype)
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=dtype)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(bmm), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem", code_str)
+
 
 class TestWarpPipeSplitKCodegen(TestCase):
     """Deterministic codegen check for the AMD warp-pipe split-K template.
