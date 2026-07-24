@@ -63,42 +63,31 @@ elif [[ "$GPU_VENDOR" == "amd" ]]; then
     export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:=4}"
 
     GPU_INFO=$(rocm-smi -d "$HIP_VISIBLE_DEVICES" --showproductname 2>/dev/null)
-    GPU_MODEL=$(printf '%s\n' "$GPU_INFO" | awk -F: '/Card Series/ {print $NF; exit}' | xargs)
-    if [[ -z "$GPU_MODEL" || "$GPU_MODEL" == "N/A" ]]; then
-        GPU_MODEL=$(printf '%s\n' "$GPU_INFO" | awk -F: '/Card Model/ {print $NF; exit}' | xargs)
-    fi
-    if [[ -z "$GPU_MODEL" || "$GPU_MODEL" == "N/A" ]]; then
-        GPU_MODEL=$(amd-smi static --asic -g "$HIP_VISIBLE_DEVICES" 2>/dev/null \
-            | grep -i "market_name\|model" | head -1 | awk -F: '{print $NF}' | xargs)
-    fi
+    # "Card Series" is often just "AMD Radeon Graphics" on CDNA data-center parts (e.g. MI350),
+    # so identify by the PCI device id ("Card Model") and GFX version, which are reliable; keep
+    # Series only for display. (MI350/MI355 both report gfx950, so match device id before gfx.)
+    DEVICE_ID=$(printf  '%s\n' "$GPU_INFO" | awk -F: '/Card Model/  {print $NF; exit}' | xargs)
+    GFX_VER=$(printf    '%s\n' "$GPU_INFO" | awk -F: '/GFX Version/ {print $NF; exit}' | xargs)
+    GPU_SERIES=$(printf '%s\n' "$GPU_INFO" | awk -F: '/Card Series/ {print $NF; exit}' | xargs)
 
-    # Map model to GPU name and default power
-    case "$GPU_MODEL" in
-        *MI300*|0x74a0|0x74a1)
-            GPU_NAME="MI300X"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=750
-            ;;
-        *MI350*|0x75a0)
-            GPU_NAME="MI350X"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=1000
-            ;;
-        *MI355*|0x75a1|0x75a3)
-            GPU_NAME="MI355X"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=1400
-            ;;
-        *)
-            GPU_NAME="AMD GPU ($GPU_MODEL)"
-            [[ -z "${DESIRED_POWER:-}" ]] && DESIRED_POWER=500
-            ;;
+    case "$DEVICE_ID:$GFX_VER:$GPU_SERIES" in
+        *0x74a0*|*0x74a1*|*MI300*|*gfx942*) GPU_NAME="MI300X"; : "${DESIRED_POWER:=750}"  ;;
+        *0x75a1*|*0x75a3*|*MI355*)          GPU_NAME="MI355X"; : "${DESIRED_POWER:=1400}" ;;
+        *0x75a0*|*MI350*|*gfx950*)          GPU_NAME="MI350X"; : "${DESIRED_POWER:=1000}" ;;
+        *) GPU_NAME="AMD GPU (${GPU_SERIES:-$DEVICE_ID $GFX_VER})"; : "${DESIRED_POWER:=500}" ;;
     esac
 
-    echo "Detected $GPU_NAME"
-    echo "Locking GPU $HIP_VISIBLE_DEVICES power cap to ${DESIRED_POWER} W"
-    echo "Setting GPU $HIP_VISIBLE_DEVICES to high performance mode"
+    # sclk to pin via perf-determinism (overridable). CDNA4/MI350 does NOT support
+    # `--setperflevel high` (rocm-smi returns "Not supported on the given system"),
+    # so that silently did nothing — use --setperfdeterminism, which pins the GFX clock.
+    DETERMINISM_CLK="${DETERMINISM_CLK:=2100}"
 
-    # Lock GPU clocks by setting performance level to high and applying power overdrive
+    echo "Detected $GPU_NAME"
+    echo "Locking GPU $HIP_VISIBLE_DEVICES sclk to ${DETERMINISM_CLK} MHz (perf-determinism) + power cap ${DESIRED_POWER} W"
+
+    # Lock GPU clocks via perf-determinism and apply power overdrive (both best-effort under sudo)
     (
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setperflevel high
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setperfdeterminism "$DETERMINISM_CLK"
         sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --setpoweroverdrive "$DESIRED_POWER"
     ) >/dev/null
 fi
@@ -133,7 +122,7 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
     ) >/dev/null
 elif [[ "$GPU_VENDOR" == "amd" ]]; then
     (
-        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetclocks
+        sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetperfdeterminism
         sudo rocm-smi -d "$HIP_VISIBLE_DEVICES" --resetpoweroverdrive
     ) >/dev/null
 fi
