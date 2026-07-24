@@ -107,6 +107,28 @@ def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::Modu
   ];
 }
 
+def NVGPUTestWSAtomicBroadcast : Pass<"nvgpu-test-ws-atomic-broadcast", "mlir::ModuleOp"> {
+  let summary = "test warp specialization dynamic-tile atomic/CLC broadcast";
+
+  let description = [{
+    Runs the cross-partition run-once broadcast transform
+    (`doDynamicTileBroadcast`) in isolation for testing. It rewrites a
+    loop-carried scalar `tt.atomic_rmw` tile counter (or CLC fetch) so the claim
+    runs once in the owner/producer partition and the result is broadcast to
+    every partition through a shared-memory slot. Intended to be run after
+    `nvgpu-partition-scheduling-meta` and `nvgpu-test-taskid-propagate`, which
+    supply the op-level `async_task_id` metadata this transform consumes.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"tilePrefetchDepth", "tile-prefetch-depth",
+           "int32_t", /*default*/"1",
+           "broadcast channel depth (SMEM slot multi-buffering)">
+  ];
+}
+
 def NVGPUWSDataPartition : Pass<"nvgpu-ws-data-partition", "mlir::ModuleOp"> {
   let summary = "warp specialization data partition";
 

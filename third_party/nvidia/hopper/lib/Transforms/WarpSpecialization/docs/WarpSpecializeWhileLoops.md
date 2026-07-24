@@ -220,4 +220,10 @@ empirical follow-on work — not a known blocker.
 - [x] Frontend annotation on `while` (`AutoWSLoopOptions` + `tl.condition`) — done.
 - [x] `uplift-while-to-for` attribute transfer (static path) — done.
 - [x] Loop-body abstraction + `PartitionSchedulingMeta` generalization — done.
-- [ ] Downstream end-to-end validation for dynamic/CLC.
+- [x] Atomic broadcast validated in isolation from a PSM-assigned outer while
+  (`ws_atomic_broadcast_from_psm.mlir`, via the new `nvgpu-test-ws-atomic-broadcast`
+  test pass). Task-id propagation already supplies the full-union `async_task_id`
+  the broadcast needs — no PSM change was required. See
+  `docs/DynamicPersistentAutoWSGaps.md`.
+- [ ] Downstream end-to-end validation for dynamic/CLC (code partition + physical
+  specialization for a full GEMM while body).
