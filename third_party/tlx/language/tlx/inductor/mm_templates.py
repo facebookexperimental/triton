@@ -45,6 +45,16 @@ def _mm_grid_split_k(m, n, meta, *, cdiv):
     )
 
 
+@SymbolicGridFn
+def _bmm_grid_warppipe(b, m, n, meta, *, cdiv):
+    """1-D grid for the warp-pipe bmm: BATCH * grid_m * grid_n programs, one per (batch, tile).
+
+    The batch index is recovered in-kernel as pid // grid_mn (grid dim 0 is not 65535-limited,
+    and BATCH*grid_mn stays well under 2**31), so no grid_y/grid_z batch split is needed.
+    """
+    return (b * cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
+
+
 blackwell_gemm_ws_template = TritonTemplate(
     name="tlx_blackwell_gemm_ws",
     grid=_persistent_mm_grid_split_k,
@@ -62,6 +72,16 @@ amd_addmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("amd_addmm_warppipe"),
 )
 
+# TLX warp-pipelined bmm template (AMD / MI350X gfx950). Same warp-pipe core as the addmm, plus a
+# batch axis on the grid + a per-batch int64 base advance. B is the standard torch.bmm [BATCH,K,N]
+# row-major layout (loaded as (BLOCK_K, BLOCK_N) tiles, no transpose). Selection via TLX_MODE; the
+# heuristic (registry.py) gates on K % 16 == 0 + int32-representable per-batch offsets.
+amd_bmm_warppipe_template = TritonTemplate(
+    name="tlx_amd_bmm_warppipe",
+    grid=_bmm_grid_warppipe,
+    source=load_tlx_template("amd_bmm_warppipe"),
+)
+
 
 def append_tlx(templates, op_name="mm"):
     # Import registry to trigger heuristic registration via decorators
@@ -77,6 +97,14 @@ def append_tlx(templates, op_name="mm"):
         uids = {getattr(t, "uid", None) for t in templates}
         if mm_template.uid in uids and amd_addmm_warppipe_template.uid not in uids:
             templates.append(amd_addmm_warppipe_template)
+    elif op_name == "bmm":
+        # Compete as an additional candidate alongside the stock bmm_template + aten. Inject once,
+        # gated on bmm_template already being present (the unified choice call).
+        from torch._inductor.kernel.bmm import bmm_template
+
+        uids = {getattr(t, "uid", None) for t in templates}
+        if bmm_template.uid in uids and amd_bmm_warppipe_template.uid not in uids:
+            templates.append(amd_bmm_warppipe_template)
     else:
         templates.append(blackwell_gemm_ws_template)
     return templates
