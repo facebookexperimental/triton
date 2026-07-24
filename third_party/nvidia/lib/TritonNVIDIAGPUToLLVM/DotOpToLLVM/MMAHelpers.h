@@ -175,10 +175,25 @@ public:
     currDesc.matrixBaseOffset = (smemByteOffsetb8 / 128) & mask;
     currDesc.baseAddress = 0;
     int32_t smemByteOffsetb128 = smemByteOffsetb8 >> 4;
+
     // Compute the base address at runtime to prevent LLVM from folding the
     // per-tile offset into a unique 64-bit constant. This produces a short
     // dependency chain (add→and→zext→add) that helps hide WGMMA latency.
-    Value fullAddrb128 = tb.add(baseSrcb128, tb.i32_val(smemByteOffsetb128));
+
+    // NOTE: intentionally use inline PTX with *side-effecting* here to
+    // compute an address. This hack is to prevent LLVM CSE which could
+    // cause two distant MMA sharing the same SMEM operand which would have
+    // a very long live range and cause register spill when there're many mma
+    // instructions. This way each MMA computes its own operand.
+    // TODO: do it for TMEM operand too?
+    PTXBuilder ptxBuilder;
+    auto &addInstr = *ptxBuilder.create("add.s32");
+    auto *addOut = ptxBuilder.newOperand("=r");
+    auto *addLhs = ptxBuilder.newOperand(baseSrcb128, "r");
+    auto *addRhs = ptxBuilder.newOperand(tb.i32_val(smemByteOffsetb128), "r");
+    addInstr(addOut, addLhs, addRhs);
+    Value fullAddrb128 =
+        ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffect=*/true);
     Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x3FFF));
     Value addr64 = tb.zext(i64_ty, addrMasked);
     Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
