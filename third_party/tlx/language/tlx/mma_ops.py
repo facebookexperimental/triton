@@ -136,12 +136,25 @@ def async_dot(
     (A, B, acc_handle, input_precision, max_num_imprecise_acc,
      ret_ty) = _semantic.dot_precheck(A, B, acc, input_precision, None, None, out_dtype, two_ctas)
 
-    assert A.shape[0] >= 64, "M must be at least 64"
-    assert A.shape[1] >= 16, "K must be at least 16"
-    assert B.shape[1] >= 32, "N must be at least 32"
-
     cuda_compute_capability = int(cuda_parse_arch(_semantic.builder.options.arch))
     version = 5 if cuda_compute_capability >= 100 else 3
+
+    M, K, N = A.shape[0], A.shape[1], B.shape[1]
+    # K is only lower-bounded: the lowering splits the K blocks across instructions,
+    # so there is no maximum to enforce here.
+    assert K >= 16, "K must be at least 16"
+    if version == 5:
+        # Blackwell tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA instruction shape
+        # is M x N with M in {64, 128} and N a multiple of 8 in [8, 256]. With CTA
+        # group 2 the logical M/N double across the two CTAs, but the per-CTA operand
+        # tiles passed here still follow this rule.
+        assert M in (64, 128), f"M must be 64 or 128 on Blackwell, but got {M}"
+        assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
+    else:
+        # Hopper wgmma.mma_async (PTX ISA 9.3): M is a multiple of 64 and N a multiple
+        # of 8 in [8, 256].
+        assert M % 64 == 0, f"M must be a multiple of 64 on Hopper, but got {M}"
+        assert 8 <= N <= 256 and N % 8 == 0, f"N must be a multiple of 8 in [8, 256], but got {N}"
 
     # TODO. batched dot is not supported yet
     a_is_tmem = isinstance(A, tlx.buffered_tensor) and A.type.storage == tlx.storage_kind.tmem
@@ -266,13 +279,19 @@ def async_dot_scaled(
         A TMEM tensor representing the updated accumulator tile D.
     """
 
-    assert A.shape[0] >= 64, "M must be at least 64"
-    assert A.shape[1] >= 16, "K must be at least 16"
-    assert B.shape[1] >= 32, "N must be at least 32"
-
     cuda_compute_capability = int(cuda_parse_arch(_semantic.builder.options.arch))
     version = 5 if cuda_compute_capability >= 100 else 3
     assert version == 5, "async_dot_scaled is only available on Blackwell"
+
+    M, K, N = A.shape[0], A.shape[1], B.shape[1]
+    # Blackwell block-scaled tcgen05.mma (PTX ISA 9.3, Table 42): the per-CTA
+    # instruction shape is fixed to M=128 with N a multiple of 8 in [8, 256]. K is
+    # only lower-bounded because the lowering splits the K blocks across instructions.
+    # Gap: the ISA allows N up to 256, but the current lowering rejects blockN==256 for
+    # the scaled op (see InsertTmemAref.cpp), so we cap N at 128 until that is fixed.
+    assert M == 128, f"M must be 128 for the scaled MMA, but got {M}"
+    assert K >= 16, "K must be at least 16"
+    assert 8 <= N <= 128 and N % 8 == 0, f"N must be a multiple of 8 in [8, 128], but got {N}"
 
     assert isinstance(A, tlx.buffered_tensor), "input must be a buffered tensor"
     assert isinstance(B, tlx.buffered_tensor), "input must be a buffered tensor"
