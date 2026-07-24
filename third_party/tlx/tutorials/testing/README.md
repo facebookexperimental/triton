@@ -97,3 +97,17 @@ and pipeline speedup (Jul 23 pipelined vs Jul 22 baseline), all in TB/s (effecti
 
 The 2-stage pipeline delivers 1.0–1.1x gains across all configurations. TLX outperforms aiter
 across all configurations after pipelining.
+
+The main branch just landed a new version with some optimization here are the perf numbers of the main branch:
+```
+   BATCH     N_CTX  tlx (TB/s (effective HBM read))  aiter (TB/s (effective HBM read))  aiter/tlx speedup
+0    1.0    8192.0                         0.842230                           0.573776           0.681259
+1    8.0    8192.0                         2.571221                           2.371338           0.922261
+2   32.0    8192.0                         4.314261                           4.123401           0.955761
+3  128.0    8192.0                         5.830760                           5.148329           0.882960
+4    1.0   32768.0                         2.605158                           1.425422           0.547154
+5    8.0   32768.0                         4.387634                           3.653152           0.832602
+6   32.0   32768.0                         5.678139                           4.770882           0.840219
+7    8.0  131072.0                         5.421255                           4.208248           0.776250
+```
+The two implementation has comparable perf numbers. Next step is for a three stage
