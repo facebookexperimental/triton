@@ -386,12 +386,7 @@ bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
-  // A collapsed both-endpoints-subtiled channel is the sole member of its group
-  // and still needs a shared accumCnt (the numTiles counter stride feeds the
-  // in-body per-tile slot/phase rotation) even at buffer.copy == 1. Only plain
-  // single-buffered groups carry no accumCnt.
-  if (group->channels[0]->getNumBuffers() <= 1 &&
-      !channelIsCollapsedBothSubtiled(group->channels[0]))
+  if (!reuseGroupNeedsAccumCnt(group))
     return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
@@ -547,21 +542,26 @@ bool channelIsCollapsedBothSubtiled(Channel *ch) {
   return static_cast<AllocChannel *>(ch)->isCollapsedBothSubtiled;
 }
 
+bool reuseGroupNeedsAccumCnt(ReuseGroup *group) {
+  if (!group || group->channels.empty())
+    return false;
+  Channel *representative = group->channels.front();
+  // A collapsed both-endpoints-subtiled channel still needs its numTiles
+  // counter stride when it is the sole group member and buffer.copy == 1.
+  if (representative->getNumBuffers() <= 1 &&
+      !channelIsCollapsedBothSubtiled(representative))
+    return false;
+  if (group->channels.size() <= 1 && !channelIsSubtiled(representative))
+    return false;
+  return true;
+}
+
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
   if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp) &&
       !isa<scf::WhileOp>(regionOp))
     return;
-  // A collapsed subtiled channel needs its dst region threaded into chList for
-  // the numTiles counter stride even at buffer.copy == 1 (single physical slot,
-  // alternating barrier phase); only plain single-buffered groups bail here.
-  if (group->channels[0]->getNumBuffers() <= 1 &&
-      !channelIsCollapsedBothSubtiled(group->channels[0]))
-    return;
-  // Size-1 reuse groups normally carry no shared circular buffer, but a
-  // collapsed subtiled channel is intentionally alone in its group and still
-  // needs its dst region threaded into chList for the numTiles counter stride.
-  if (group->channels.size() <= 1 && !channelIsSubtiled(group->channels[0]))
+  if (!reuseGroupNeedsAccumCnt(group))
     return;
   // Goes through body of regionOp, if the body op is a regionOp, check
   // to see if it contains a channel in the reuse group.
@@ -735,6 +735,17 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
 //     ThenYield ForC.arg[accumIfB] + 1
 //     ElseYield ForC.arg[accumIfB]
 //   Channel D --> uses ForA.arg[accumForA]
+static Operation *
+getAccumCntRegion(Operation *op, Operation *parentLoop,
+                  const DenseSet<Operation *> &regionsWithChannels) {
+  Operation *region = op->getParentOp();
+  while (region && region != parentLoop &&
+         !regionsWithChannels.contains(region))
+    region = region->getParentOp();
+  assert(region && "operation must be nested under its accumulation loop");
+  return region;
+}
+
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
@@ -746,7 +757,8 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     // carried across persistent iterations.
     if (auto parentWhileOp = op->getParentOfType<scf::WhileOp>()) {
       Block *afterBlk = parentWhileOp.getAfterBody();
-      auto *pOp = op->getParentOp();
+      Operation *pOp = getAccumCntRegion(op, parentWhileOp.getOperation(),
+                                         regionsWithChannels);
       unsigned tSize = afterBlk->getNumArguments();
       unsigned parentTCnts =
           getAccumCnts(parentWhileOp, regionsWithChannels, config);
@@ -763,7 +775,8 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
   }
 
-  auto *pOp = op->getParentOp();
+  Operation *pOp =
+      getAccumCntRegion(op, parentForOp.getOperation(), regionsWithChannels);
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);

@@ -1077,7 +1077,7 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
 # dynamic persistent keeps the outer while and pipelines its nested K loop.
 # ============================================================================
 _UNIFIED_OUTER_AUTOWS_CONFIGS = [
-    pytest.param(tl.NonPersistentScheduler, 128, 128, 1, 1, 1, False, False, id="nonpersistent-baseline"),
+    pytest.param(tl.NonPersistentScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="nonpersistent-baseline"),
     pytest.param(
         tl.NonPersistentScheduler,
         128,
@@ -1086,6 +1086,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         1,
         1,
         False,
+        False,
+        1,
         True,
         id="nonpersistent-epilogue-subtile-4",
     ),
@@ -1097,6 +1099,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         2,
         1,
         False,
+        False,
+        1,
         True,
         id="nonpersistent-data-partition-2-subtile-2",
     ),
@@ -1108,10 +1112,12 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         2,
         2,
         False,
+        False,
+        1,
         True,
         id="nonpersistent-2cta-data-partition-2",
     ),
-    pytest.param(tl.StaticPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, id="static-baseline"),
+    pytest.param(tl.StaticPersistent1DScheduler, 128, 128, 1, 1, 1, False, True, 1, False, id="static-baseline"),
     pytest.param(
         tl.StaticPersistent1DScheduler,
         128,
@@ -1120,6 +1126,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         1,
         1,
         True,
+        True,
+        1,
         True,
         id="static-epilogue-subtile-4",
     ),
@@ -1132,6 +1140,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         1,
         True,
         True,
+        1,
+        True,
         id="static-data-partition-2-subtile-2",
     ),
     pytest.param(
@@ -1143,21 +1153,35 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         2,
         False,
         True,
+        1,
+        True,
         id="static-2cta-data-partition-2",
     ),
-    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, id="dynamic-subtile-1"),
-    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, id="dynamic-subtile-2"),
-    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, id="dynamic-subtile-4"),
-    pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, True, id="clc-subtile-1"),
-    pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, True, id="clc-subtile-2"),
-    pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, True, id="clc-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="dynamic-subtile-1"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, 1, False, id="dynamic-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, False, id="dynamic-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, False,
+                 id="dynamic-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, True, 1, False,
+                 id="dynamic-separate-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, True, False, 1, True,
+                 id="dynamic-generated-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, True, True, 1, True,
+                 id="dynamic-generated-separate-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 256, 128, 2, 2, 1, True, True, 1, True,
+                 id="dynamic-dp2-generated-separate-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 2, False,
+                 id="dynamic-broadcast-depth-2"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, False, 1, True, id="clc-subtile-1"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="clc-subtile-2"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="clc-subtile-4"),
 ]
 
 
 @pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 @pytest.mark.parametrize(
     "SCHEDULE,BLOCK_SIZE_M,BLOCK_SIZE_N,EPILOGUE_SUBTILE,DATA_PARTITION_FACTOR,NUM_CTAS,"
-    "generate_subtiled_region,blackwell_only",
+    "generate_subtiled_region,separate_epilogue_store,tile_prefetch_depth,blackwell_only",
     _UNIFIED_OUTER_AUTOWS_CONFIGS,
 )
 def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
@@ -1168,6 +1192,8 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
     DATA_PARTITION_FACTOR,
     NUM_CTAS,
     generate_subtiled_region,
+    separate_epilogue_store,
+    tile_prefetch_depth,
     blackwell_only,
 ):
     """Exercise outer-loop AutoWS with each unified scheduler."""
@@ -1185,6 +1211,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.ws_tile_prefetch_depth = tile_prefetch_depth
 
         dtype = torch.float16
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1239,7 +1266,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             NUM_CTAS=NUM_CTAS,
             TWO_CTAS=NUM_CTAS == 2,
             SMEM_ALLOC_ALGO=1 if NUM_CTAS == 2 else None,
-            SEPARATE_EPILOGUE_STORE=SCHEDULE is tl.StaticPersistent1DScheduler,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             **launch_options,
         )
 
