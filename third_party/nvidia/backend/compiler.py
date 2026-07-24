@@ -206,6 +206,9 @@ class CUDAOptions:
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
     # TRITON_AUTO_TMA knob when left at the default in make_ttir.
     auto_tma: bool = False
+    # Emit device-side descriptors (make_tensor_descriptor + descriptor_load/store)
+    # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
+    auto_tma_device: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -743,14 +746,15 @@ class CUDABackend(BaseBackend):
         # so the backing TMEM allocation is materialized with the resolved
         # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
-        if capability // 10 < 9:
-            passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         # Auto-TMA: rewrite eligible masked block loads into descriptor_load so
         # the standard sm_90+ TMA lowering turns them into real TMA copies. The
-        # per-config option (autotunable) takes precedence; otherwise fall back
-        # to the global TRITON_AUTO_TMA knob.
+        # per-config option (autotunable) takes precedence; otherwise the global
+        # TRITON_AUTO_TMA knob. (Block pointers are already tensor descriptors in
+        # this dialect, so there is no separate rewrite_tensor_pointer pass.)
         if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
-            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
+            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm, opt.auto_tma_device or knobs.nvidia.auto_tma_device)
+        if capability // 10 < 9:
+            passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
