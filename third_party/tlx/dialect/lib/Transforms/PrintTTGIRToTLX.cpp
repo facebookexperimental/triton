@@ -1738,27 +1738,37 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       os << "\n";
       os << "@triton.jit\n";
       os << "def " << funcOp.getName() << "(";
-      // Print function arguments, collapsing expanded TensorDescriptor args
-      // Pattern: desc_q, desc_q_0, desc_q_1, ... -> just desc_q
+      // Print function arguments, collapsing expanded TensorDescriptor args.
+      // A host-side TensorDescriptor lowers to a !tt.tensordesc value followed
+      // by expanded shape/stride scalars that share the descriptor's name, in
+      // one of two conventions:
+      //   - underscore-numbered: a_desc, a_desc_0, a_desc_1, ...
+      //   - dot-qualified:       desc_q, desc_q.shape.0, desc_q.stride.1, ...
+      // Detection is type-driven (the leading arg is !tt.tensordesc), so we
+      // support both; keep the descriptor value and drop the expansion args.
       SmallVector<std::string> argNames;
       for (unsigned i = 0; i < funcOp.getNumArguments(); ++i)
         argNames.push_back(
             getValueName(funcOp.getArgument(i), argSubstitutionMap));
       std::set<std::string> skipArgs;
-      for (unsigned i = 0; i < argNames.size(); ++i) {
+      for (unsigned i = 0; i < funcOp.getNumArguments(); ++i) {
+        if (!isa<tt::TensorDescType>(funcOp.getArgument(i).getType()))
+          continue;
         StringRef name(argNames[i]);
-        if (name.starts_with("desc_") &&
-            name.substr(5).find('_') == StringRef::npos) {
-          for (unsigned j = i + 1; j < argNames.size(); ++j) {
-            StringRef next(argNames[j]);
-            if (next.starts_with(name) && next.size() > name.size() &&
-                next[name.size()] == '_' &&
-                std::all_of(next.begin() + name.size() + 1, next.end(),
-                            [](char c) { return std::isdigit(c); }))
-              skipArgs.insert(argNames[j]);
-            else
-              break;
-          }
+        for (unsigned j = i + 1; j < argNames.size(); ++j) {
+          StringRef next(argNames[j]);
+          bool underscoreExpansion =
+              next.starts_with(name) && next.size() > name.size() &&
+              next[name.size()] == '_' &&
+              std::all_of(next.begin() + name.size() + 1, next.end(),
+                          [](char c) { return std::isdigit(c); });
+          bool dotExpansion = next.starts_with(name) &&
+                              next.size() > name.size() &&
+                              next[name.size()] == '.';
+          if (underscoreExpansion || dotExpansion)
+            skipArgs.insert(argNames[j]);
+          else
+            break;
         }
       }
       bool first = true;
