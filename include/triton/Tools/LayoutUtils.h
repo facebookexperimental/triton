@@ -95,6 +95,10 @@ SmallVector<StringAttr> standardOutDimNames(MLIRContext *ctx, int rank);
 SmallVector<std::pair<StringAttr, int32_t>>
 standardOutDimPairs(MLIRContext *ctx, ArrayRef<int64_t> dstShape);
 
+// Use modular identity semantics for NPOT shapes.
+LinearLayout identity1DForShape(int32_t size, StringAttr inDim,
+                                StringAttr outDim);
+
 // Return an identity mapping from `inDimName` to the standard out dimensions,
 // with the dimensions sized according to the shape. The bases are sorted
 // according to `order`, with the most minor dimension first.
