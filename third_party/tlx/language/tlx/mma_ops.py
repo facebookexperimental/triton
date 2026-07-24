@@ -22,6 +22,19 @@ def require_layout(x, layout, _semantic=None):
     return tl.tensor(handle, x.type)
 
 
+@tl.builtin
+def release_layout(src, _semantic=None):
+    """End an explicit register-layout region.
+
+    The source may acquire its concrete encoding from a preceding
+    ``require_layout`` during TLX fixup; the result deliberately remains an
+    ordinary tensor so later layout requirements do not propagate across this
+    boundary.
+    """
+    src = _semantic.to_tensor(src)
+    return tl.tensor(_semantic.builder.create_release_layout(src.handle), src.type)
+
+
 def require_nv_mma_shared_layout(x: tlx.buffered_tensor, swizzled: bool, _builder=None, fp4Padded: bool = False):
     assert isinstance(x.type.layout, tlx.shared_layout_encoding), "input must be a shared tensor"
     rank = len(x.shape)
