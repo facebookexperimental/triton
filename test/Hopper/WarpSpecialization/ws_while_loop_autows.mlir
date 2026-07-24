@@ -166,20 +166,58 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
-  // PSM-LABEL: @while_partition_subset_rejected
+  // A condition-only slot may precede a forwarded slot, as it does for the
+  // CLC scheduler's (valid, x) carry. The after-region argument must map back
+  // to yield slot 1 rather than assuming after-argument index 0.
+  // PSM-LABEL: @while_partition_ordered_subset
+  // PSM: %[[RESULT:.*]] = scf.while
+  // PSM: scf.condition
+  // PSM: ^bb0(%[[J:.*]]: i32):
+  // PSM: arith.addi %[[J]], {{.*}} {ttg.partition = array<i32: 0>}
+  // PSM: scf.yield
+  // PSM: attributes {
+  // PSM-SAME: tt.warp_specialize
+  // PSM-SAME: ttg.partition.stages = [0 : i32]
+  // PSM-SAME: ttg.partition.types = ["computation"]
+  // PSM-ROUNDTRIP-LABEL: @while_partition_ordered_subset
+  // PSM-ROUNDTRIP: arith.addi {{.*}} {ttg.partition = array<i32: 0>}
+  // PSM-ROUNDTRIP: attributes {
+  // PSM-ROUNDTRIP-SAME: tt.warp_specialize
+  // PSM: tt.return
+  tt.func public @while_partition_ordered_subset() {
+    %true = arith.constant true
+    %false = arith.constant false
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %result = scf.while (%valid = %true, %j = %c0) : (i1, i32) -> i32 {
+      scf.condition(%valid) %j : i32
+    } do {
+    ^bb0(%j: i32):
+      %next = arith.addi %j, %c1 {ttg.partition = array<i32: 0>} : i32
+      scf.yield %false, %next : i1, i32
+    } attributes {tt.warp_specialize, ttg.partition.stages = [0 : i32], ttg.partition.types = ["computation"], ttg.warp_specialize.tag = 0 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // PSM-LABEL: @while_partition_computed_forward_rejected
   // PSM-NOT: tt.warp_specialize
   // PSM-NOT: ttg.partition
   // PSM: tt.return
-  tt.func public @while_partition_subset_rejected() {
+  tt.func public @while_partition_computed_forward_rejected() {
     %true = arith.constant true
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %result = scf.while (%i = %c0, %j = %c1) : (i32, i32) -> i32 {
-      scf.condition(%true) %i : i32
+      %sum = arith.addi %i, %j : i32
+      scf.condition(%true) %sum : i32
     } do {
-    ^bb0(%i: i32):
-      %next = arith.addi %i, %c1 {ttg.partition = array<i32: 0>} : i32
-      scf.yield %next, %i : i32, i32
+    ^bb0(%sum: i32):
+      %next = arith.addi %sum, %c1 {ttg.partition = array<i32: 0>} : i32
+      scf.yield %next, %sum : i32, i32
     } attributes {tt.warp_specialize, ttg.partition.stages = [0 : i32], ttg.partition.types = ["computation"], ttg.warp_specialize.tag = 0 : i32}
     tt.return
   }

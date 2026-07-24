@@ -559,8 +559,9 @@ private:
       // Also follow cross-iteration paths: MMA result → yield → iter arg
       for (OpOperand &use : mmaOp->getUses()) {
         if (use.getOwner() == getLoopBodyTerminator(innermostLoop)) {
-          worklist.push_back(
-              getLoopCarriedBodyArg(innermostLoop, use.getOperandNumber()));
+          if (BlockArgument arg =
+                  getLoopCarriedBodyArg(innermostLoop, use.getOperandNumber()))
+            worklist.push_back(arg);
         }
       }
 
@@ -906,8 +907,10 @@ private:
         if (use.getOwner() != getLoopBodyTerminator(loop))
           continue;
         // MMA result is yielded - find users in next iteration
-        for (OpOperand &iterUse :
-             getLoopCarriedBodyArg(loop, use.getOperandNumber()).getUses()) {
+        BlockArgument arg = getLoopCarriedBodyArg(loop, use.getOperandNumber());
+        if (!arg)
+          continue;
+        for (OpOperand &iterUse : arg.getUses()) {
           Operation *user = iterUse.getOwner();
           if (!opCategories.contains(user)) {
             addCategorizedOp(user, OpCategory::Correction, dpId, mmaOp);
@@ -1062,11 +1065,10 @@ static Operation *findDefOpInLoop(LoopLikeOpInterface loop, Value value,
     // Don't look back more than distance 1.
     if (distance == 1)
       return {};
-    unsigned slot = arg.getArgNumber();
-    if (isa<scf::ForOp>(loop.getOperation()))
-      --slot;
-    return findDefOpInLoop(loop, getLoopYieldedValues(loop)[slot],
-                           distance + 1);
+    Value yielded = getLoopCarriedYieldedValue(loop, arg);
+    if (!yielded)
+      return {};
+    return findDefOpInLoop(loop, yielded, distance + 1);
   }
   Operation *defOp = value.getDefiningOp();
   if (!defOp || !getLoopBodyRegion(loop).isAncestor(defOp->getParentRegion()))
@@ -1134,6 +1136,8 @@ static void iterateUsers(LoopLikeOpInterface loop, Operation *op,
       continue;
     }
     BlockArgument arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
+    if (!arg)
+      continue;
     for (OpOperand &use : arg.getUses())
       uses.emplace_back(&use);
   }
@@ -1188,8 +1192,10 @@ static Partition *scheduleUsers(LoopLikeOpInterface loop,
         getLoopBodyBlock(loop)->findAncestorOpInBlock(*use->getOwner());
 
     if (user == getLoopBodyTerminator(loop)) {
-      for (OpOperand &use :
-           getLoopCarriedBodyArg(loop, use->getOperandNumber()).getUses())
+      BlockArgument arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
+      if (!arg)
+        continue;
+      for (OpOperand &use : arg.getUses())
         uses.push_back(&use);
       continue;
     }
@@ -1830,8 +1836,10 @@ getInitialSchedule(LoopLikeOpInterface mainLoop,
         auto loop = getEnclosingSupportedLoop(mmaOp);
         if (use.getOwner() != getLoopBodyTerminator(loop))
           continue;
-        for (OpOperand &use :
-             getLoopCarriedBodyArg(loop, use.getOperandNumber()).getUses()) {
+        BlockArgument arg = getLoopCarriedBodyArg(loop, use.getOperandNumber());
+        if (!arg)
+          continue;
+        for (OpOperand &use : arg.getUses()) {
           tryScheduleOp(corrDest, use.getOwner());
           scheduleUsers(loop, schedule, corrDest, use.getOwner());
         }
@@ -2796,9 +2804,8 @@ void PartitionSchedulingMeta::runOnOperation() {
     if (!isa<scf::ForOp, scf::WhileOp>(loop.getOperation()) ||
         !loop->hasAttr(kWarpSpecializeAttrName))
       return;
-    if (!hasIdentityLoopCarry(loop)) {
-      LDBG("Skipping non-identity scf.while warp-specialize loop at "
-           << loop.getLoc());
+    if (!hasSupportedLoopCarry(loop)) {
+      LDBG("Skipping unsupported scf.while carry mapping at " << loop.getLoc());
       dropWarpSpec(loop);
       return;
     }

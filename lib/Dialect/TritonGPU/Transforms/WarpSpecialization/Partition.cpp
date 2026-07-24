@@ -125,6 +125,8 @@ void Partition::iterateUses(
       continue;
     }
     BlockArgument arg = getLoopCarriedBodyArg(loop, use->getOperandNumber());
+    if (!arg)
+      continue;
     for (OpOperand &use : arg.getUses())
       uses.emplace_back(output, &use, distance + 1);
   }
@@ -190,7 +192,7 @@ void PartitionSet::swapPartitions(unsigned idxA, unsigned idxB,
 FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   // Validate at this API boundary even when the caller already gated the loop.
   if (!isa<scf::ForOp, scf::WhileOp>(loop.getOperation()) ||
-      !hasIdentityLoopCarry(loop))
+      !hasSupportedLoopCarry(loop))
     return failure();
   auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
   if (!stages)
