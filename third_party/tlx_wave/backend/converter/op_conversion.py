@@ -2886,6 +2886,9 @@ def _convert_for(
         *(carry.block_arg_target_id for carry in dma_pointer_carries),
     )
     target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
+    induction_fact_ids = tuple(fact_id for fact_id in fact_program.by_value.get(source_region.block_arg_ids[0], ())
+                               if fact_program.facts[fact_id].source_op_index == op.index
+                               and fact_program.facts[fact_id].kind in {"range", "divisible"})
     token_issue_dependency_pairs = _loop_token_carry_issue_dependencies(
         token_carries,
         token_block_arg_target_ids,
@@ -2939,6 +2942,14 @@ def _convert_for(
                 builder.protocol_frontiers.pop(int(key), None)
     with builder.insertion_region(target_region_id):
         try:
+            if induction_fact_ids:
+                builder.add_op(
+                    "assume",
+                    operands=(block_arg_target_ids[0], ),
+                    fact_ids=induction_fact_ids,
+                    fact_target_ids=(block_arg_target_ids[0], ) * len(induction_fact_ids),
+                    source_op_index=op.index,
+                )
             for carry in dma_pointer_carries:
                 builder.add_op(
                     "addptr",
