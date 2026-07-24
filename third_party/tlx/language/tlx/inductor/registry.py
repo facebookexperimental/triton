@@ -50,7 +50,12 @@ def _sizevar_hint(sizevars, expr, fallback):
 
 
 from . import tlx_config
-from .mm_templates import amd_addmm_warppipe_template, blackwell_gemm_ws_template
+from .mm_templates import (
+    amd_addmm_warppipe_template,
+    amd_bmm_warppipe_persistent_template,
+    amd_bmm_warppipe_template,
+    blackwell_gemm_ws_template,
+)
 
 
 @dataclasses.dataclass
@@ -1213,6 +1218,14 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
             and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
         ):
             return
+        # 16-byte (128-bit transaction) alignment: the fp16/bf16 padded direct-to-LDS async_copy
+        # lowers to 128-bit loads, so each row start must be 16-byte aligned -- i.e. the row stride
+        # K*itemsize bytes must be a multiple of 16 (K % 8 == 0 for fp16/bf16). Without this guard
+        # an unaligned K reaches the template and fails at async_copy legalization (T280910119);
+        # decline up front so it falls back to aten cleanly. Also declines dynamic/unknown K.
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        if not sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0)):
+            return
         num_xcds = _amd_num_xcds()
         # split-K only helps grids that leave CUs idle. NUM_SMS is the device CU count
         # (get_num_sms() maps to multi_processor_count = CUs on ROCm; 256 on gfx950/MI350X);
@@ -1284,6 +1297,138 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
                 yield self._convert_config_to_template_kwargs(
                     triton_config, m, n, k, out_dtype
                 )
+
+
+@register_template_heuristic(
+    amd_bmm_warppipe_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
+)
+class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
+    """TLX warp-pipelined bmm heuristic for ROCm (MI350X/gfx950).
+
+    Same warp-pipe core as the addmm (async_load prefetch into multi-buffered LDS + MFMA via
+    tlx.warp_pipeline_stage), plus a batch axis and a per-batch int64 base advance. No bias, no
+    col-major transpose (bmm B is [BATCH,K,N] row-major), no split-K -- a plain data-parallel
+    baseline for Inductor autotune iteration.
+
+    Dual path selected by K's 16-byte alignment (the template's USE_ASYNC constexpr):
+      * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16): USE_ASYNC=1, the direct-to-LDS async_load
+        warp-pipe (needs K_ITERS = K // BLOCK_K >= NUM_BUFFERS for a well-formed prologue; the
+        K % BLOCK_K remainder is a sync-tail).
+      * otherwise (unaligned K -- the direct-to-LDS async_copy cannot legalize on CDNA4 -- or
+        dynamic K): USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined),
+        correct for ANY K (T280910119). Common gate (fp16/bf16 only): per-batch M*K and N*K fit
+        int32 (the within-batch offset is int32 on both paths).
+    """
+
+    # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
+    WARPPIPE_CONFIGS = [
+        (256, 256, 64, 16, 8, 2),
+        (256, 128, 64, 8, 8, 2),
+        (128, 256, 64, 8, 8, 2),
+        (128, 128, 64, 8, 8, 3),
+        (128, 128, 128, 8, 8, 2),
+        (128, 64, 128, 8, 8, 3),
+        (64, 128, 64, 8, 8, 3),
+        (64, 64, 128, 8, 4, 3),
+        (64, 64, 64, 8, 4, 3),
+        (32, 128, 128, 4, 4, 3),
+        (32, 256, 128, 4, 4, 2),
+        (16, 256, 128, 4, 4, 3),
+    ]
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        import sympy
+        from torch._inductor.virtualized import V
+
+        if not isinstance(kernel_inputs, MMKernelInputs):
+            raise AssertionError(f"{self.__class__.__name__} requires MMKernelInputs")
+        if kernel_inputs.dtype(kernel_inputs._mat1_idx) not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return
+        m, n, k = kernel_inputs.mnk_symbolic()
+        out_dtype = kernel_inputs.out_dtype()
+        sizevars = V.graph.sizevars
+        int32_max = 2**31 - 1
+        # per-batch offsets must fit int32 (the batch offset is applied separately in int64).
+        if not (
+            _sizevar_hint(sizevars, m * k, int32_max) < int32_max
+            and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
+        ):
+            return
+        # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch):
+        #  * (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16, 16-byte-aligned rows) -> USE_ASYNC=1, the
+        #    fast direct-to-LDS async_load warp-pipe.
+        #  * otherwise (e.g. odd K -- which the direct-to-LDS async_copy cannot legalize on CDNA4 --
+        #    or dynamic/unknown K, treated as unaligned) -> USE_ASYNC=0, the register-path fallback
+        #    (tl.load->registers->tl.dot, auto-pipelined; ~0.76x rocBLAS, T280910119). This is
+        #    correct for ANY K, so unaligned-K bmm still gets a Triton candidate rather than only aten.
+        itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
+        use_async = sizevars.statically_known_true(
+            sympy.Eq(sympy.Mod(k * itemsize, 16), 0)
+        )
+        num_xcds = _amd_num_xcds()
+        for (
+            block_m,
+            block_n,
+            block_k,
+            group_m,
+            num_warps,
+            num_buffers,
+        ) in self.WARPPIPE_CONFIGS:
+            # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
+            if block_m % 16 != 0 or block_n % 16 != 0:
+                continue
+            # async path only: its prologue prefetches NUM_BUFFERS full K-tiles, so require
+            # K_ITERS = K // BLOCK_K >= NB. The register path has no prologue -> it takes any K.
+            if use_async and not sizevars.statically_known_true(
+                sympy.Ge(k, num_buffers * block_k)
+            ):
+                continue
+            triton_config = self.triton_config(
+                # async is hand-pipelined (num_stages=1, auto software-pipelining off); the register
+                # path relies on the auto-pipeliner (num_stages=3) to overlap its tl.loads.
+                1 if use_async else 3,
+                num_warps,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                GROUP_M=group_m,
+                NUM_BUFFERS=num_buffers,
+                NUM_XCDS=num_xcds,
+                USE_ASYNC=use_async,
+                matrix_instr_nonkdim=16,
+                waves_per_eu=0,
+                kpack=get_default_kpack(block_k),
+            )
+            yield self._convert_config_to_template_kwargs(
+                triton_config, m, n, k, out_dtype
+            )
+
+
+@register_template_heuristic(
+    amd_bmm_warppipe_persistent_template.uid, "cuda", register=IS_ROCM, op_name="bmm"
+)
+class ROCmBMMWarpPipePersistentTemplateConfigHeuristic(
+    ROCmBMMWarpPipeTemplateConfigHeuristic
+):
+    """Persistent variant of the warp-pipe bmm heuristic. Injects NUM_SMS (the persistent grid
+    launches NUM_SMS programs that stride over tiles) and, because the persistent template has only
+    the async path, skips the non-persistent parent's USE_ASYNC=0 register configs (unaligned K).
+    Both async variants compete in the aten.bmm autotune -- persistent wins on large-K (amortizes
+    launch/setup), non-persistent on thin-M/small-tile shapes."""
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        num_sms = get_num_sms()
+        for kwargs in super()._get_template_configs_impl(kernel_inputs, op_name):
+            # The persistent template is async-only (no register-path branch), so skip the parent's
+            # USE_ASYNC=0 register configs (emitted for unaligned K); the non-persistent template
+            # covers those. Only aligned-K (USE_ASYNC=1) configs get a persistent variant.
+            if not kwargs.get("USE_ASYNC", True):
+                continue
+            kwargs["NUM_SMS"] = num_sms
+            yield kwargs
 
 
 @register_template_heuristic(

@@ -5,10 +5,25 @@
     # transposed via tlx.local_trans for the MFMA. Bias is applied by store_output via the
     # epilogue_fn / prefix_args supplied by the heuristic (not referenced here). num_stages=1.
     #
-    # NOTE: tlx.async_load lowers to a 32-bit block pointer (flat-offset pattern, like the AMD
-    # warp-pipeline tutorials). It cannot represent 64-bit offsets, and a pre-advanced base pointer
-    # is miscompiled, so this template is restricted (by the heuristic) to shapes Inductor indexes
-    # with int32 (M*K and N*K statically < 2**31, i.e. static/bounded shapes).
+    # NOTE: tlx.async_load's flat offset is int32 here, so this template is restricted (by the
+    # heuristic) to shapes Inductor indexes with int32 (M*K and N*K statically < 2**31). An int32
+    # offset that overflows faults at runtime (GPU memory access fault), which is why the bound is
+    # enforced. (A 64-bit *base* advance -- e.g. `a_ptr + batch*stride` cast to int64 -- DOES lower
+    # and read correctly on gfx950, verified separately, so a future batched bmm can address
+    # per-batch bases that way; only the 32-bit within-tile offset is the hard limit.)
+    #
+    # UNALIGNED K: a MASKED (partial-K) async_load fails to lower on gfx950 (the partial
+    # ttg.async_copy_global_to_local into a padded_shared LDS layout is marked illegal). So the
+    # warp-pipe walks only FULL K-tiles (K_ITERS = K // BLOCK_K, UNMASKED async_load) and the
+    # leftover K columns (K % BLOCK_K) are handled once, after the pipeline, by a synchronous
+    # masked tl.load + one extra dot ("sync-load the tail"). For K that IS a multiple of BLOCK_K
+    # the tail is a no-op (all-false mask), so aligned-K codegen is unchanged.
+    #
+    # CAVEAT: this needs K to be a multiple of 8 (16-byte row alignment; A [M,K] and col-major
+    # B [K,N] both have row stride K, so K*2 bytes must be 16-aligned). An odd/non-8 K hits a
+    # SEPARATE limit -- B's async_copy into the swizzled padded_shared layout cannot legalize a
+    # non-16-byte-aligned row (builtin.unrealized_conversion_cast on arg_B) -- which the sync
+    # tail does NOT fix (it is an AMD-backend async_copy alignment issue).
     M = {{size("A", 0)}}
     N = {{size("B", 1)}}
     K = {{size("A", 1)}}
@@ -68,7 +83,7 @@
     a_base = offs_m[:, None] * stride_am
     b_base = offs_n[:, None] * stride_bn          # B as (BLOCK_N, BLOCK_K): n is the row of the [N,K] view
 
-    K_ITERS = tl.cdiv(K, BLOCK_K)
+    K_ITERS = K // BLOCK_K   # FULL K-tiles only; the partial-K tail is handled after the pipeline
 {% if SPLIT_K > 1 %}
     # this split's contiguous K-iteration range [k_lo, k_lo + n_iters). BALANCED
     # partition: the first `rem` splits get (base + 1) iters, the rest get `base`.
@@ -96,9 +111,10 @@
         k_start = (k_lo + i) * BLOCK_K
         a_offs = a_base + (k_start + offs_k[None, :]) * stride_ak
         b_offs = b_base + (k_start + offs_k[None, :]) * stride_bk
-        # int32 cast is lossless: the heuristic only emits this template when offsets fit int32.
-        tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, i), mask=offs_k[None, :] < K - k_start)
-        tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, i), mask=offs_k[None, :] < K - k_start)
+        # Full tiles only (k_start + BLOCK_K <= K_ITERS*BLOCK_K <= K) -> UNMASKED: a masked
+        # (partial-K) async_load fails to lower on gfx950. int32 cast is lossless (heuristic bound).
+        tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, i))
+        tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, i))
         tlx.async_load_commit_group([tok_a, tok_b])
 
     tlx.async_load_wait_group(NUM_BUFFERS - 2)
@@ -120,10 +136,9 @@
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_offs = a_base + (k_prefetch + offs_k[None, :]) * stride_ak
             b_offs = b_base + (k_prefetch + offs_k[None, :]) * stride_bk
-            tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, prefetch_buf),
-                                   mask=offs_k[None, :] < K - k_prefetch)
-            tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, prefetch_buf),
-                                   mask=offs_k[None, :] < K - k_prefetch)
+            # full tile (see prologue) -> UNMASKED async_load.
+            tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, prefetch_buf))
+            tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, prefetch_buf))
             tlx.async_load_commit_group([tok_a, tok_b])
             a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
             b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, next_buf)))
@@ -143,6 +158,27 @@
         a_tile = tlx.local_load(tlx.local_view(smemA, buf))
         b_tile = tlx.local_load(tlx.local_trans(tlx.local_view(smemB, buf)))
         acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+    # --- partial-K tail ("sync-load the tail") ---
+    # The warp-pipe above covered [0, K_ITERS*BLOCK_K); the leftover K columns (K % BLOCK_K, if
+    # any) are loaded here with a SYNCHRONOUS masked tl.load (async_load cannot lower a partial-K
+    # tile) and folded into acc with one extra dot. tail_width == 0 when K is a multiple of BLOCK_K,
+    # giving an all-false mask (a no-op), so aligned-K shapes are unaffected. Under split-K only the
+    # last split owns the tail -- every other split zeroes tail_width so it is not double-counted.
+    k_tail = K_ITERS * BLOCK_K
+{% if SPLIT_K > 1 %}
+    tail_width = (K - k_tail) * (split_id == SPLIT_K - 1).to(INDEX_DTYPE)
+{% else %}
+    tail_width = K - k_tail
+{% endif %}
+    a_offs = a_base + (k_tail + offs_k[None, :]) * stride_ak          # (BLOCK_M, BLOCK_K)
+    a_tail = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < tail_width, other=0.0)
+    # Load B's tail directly as (BLOCK_K, BLOCK_N) (K along rows) so it feeds tl.dot without a
+    # transpose -- the warp-pipe uses tlx.local_trans, but that is LDS-only; here a plain tl.load
+    # with a transposed index is simplest for the one-off tail.
+    b_offs = (k_tail + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+    b_tail = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < tail_width, other=0.0)
+    acc = tl.dot(a_tail, b_tail, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
 
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
