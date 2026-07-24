@@ -4,7 +4,7 @@
 //===----------------------------------------------------------------------===//
 // Test: Buffer allocations and barrier pairing
 //   SMEM buffers for A (128x64xf16) and B (64x128xf16) tiles,
-//   TMEM buffer for accumulator (128x128xf32), each with paired barriers.
+//   TMEM buffer for accumulator (128x128xf32) with a paired barrier.
 //===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -15,8 +15,9 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// --- SMEM buffers: count=2, shapes match tiles, live=[start, end) per
-//     design doc §215 worked example. ---
+// --- SMEM buffers: count=2 (the operand rings are double-buffered — SMEM
+//     ring depth = ceil(full-load-to-consume lifetime / II)), shapes match
+//     tiles, live=[start, end) per design doc §215 worked example. ---
 // CHECK: %buf0 = modulo.alloc SMEM [2 x 128x64 x f16]
 // CHECK-SAME: live=[
 // CHECK-SAME: bytes total
@@ -24,22 +25,23 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-SAME: live=[
 // CHECK-SAME: bytes total
 //
-// --- TMEM buffer: count=3 for accumulator ---
-// CHECK: %buf2 = modulo.alloc TMEM [3 x 128x128 x f32]
+// --- TMEM buffer: count=2 for accumulator ---
+// CHECK: %buf2 = modulo.alloc TMEM [2 x 128x128 x f32]
 // CHECK-SAME: live=[
-// CHECK-SAME: 196608 bytes total
+// CHECK-SAME: 131072 bytes total
 //
-// --- Paired barriers carry the same live interval as their data buffer ---
+// --- Each count>1 data buffer gets a paired barrier carrying the same live
+//     interval; the accumulator's barrier is now bar5. ---
 // CHECK: %bar3 = modulo.alloc BARRIER [2] for buf0
 // CHECK-SAME: live=[
 // CHECK: %bar4 = modulo.alloc BARRIER [2] for buf1
 // CHECK-SAME: live=[
-// CHECK: %bar5 = modulo.alloc BARRIER [3] for buf2
+// CHECK: %bar5 = modulo.alloc BARRIER [2] for buf2
 // CHECK-SAME: live=[
 //
 // --- Producers: local_alloc → ->buf ---
-// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf0}
-// CHECK: ttg.local_alloc  {pipe: TMA, {{.*}}->buf1}
+// CHECK: ttg.local_alloc  {pipe: NONE, {{.*}}->buf0}
+// CHECK: ttg.local_alloc  {pipe: NONE, {{.*}}->buf1}
 //
 // --- Consumer: MMA consumes all three buffers ---
 // CHECK: ttng.tc_gen5_mma  {pipe: TC, {{.*}}<-buf0, <-buf1, <-buf2}

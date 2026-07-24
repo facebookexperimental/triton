@@ -17,10 +17,10 @@
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
+// CHECK: [PASS-A] === Inner ScheduleGraph ===
 // CHECK: modulo.schedule @loop0 {
 //
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
+// CHECK: [PASS-A] === Outer ScheduleGraph ===
 // CHECK: modulo.schedule @loop0 {
 //
 // Inner loop gets tt.num_stages (no loop.stage — uses emitMMAAnnotations).
