@@ -78,6 +78,14 @@ def TritonSimplifySingleTripWhile : Pass</*cli-arg*/"triton-simplify-single-trip
     again on the yielded values to produce them. Broader conditions (computed
     condition expressions) are not handled and could be added later via constant
     folding of the condition.
+
+    When the while carries `tt.warp_specialize`, the pass forwards the AutoWS
+    attributes that still have downstream consumers to `scf.for` loops exactly
+    one loop-nesting level inside it. Intervening non-loop control flow such as
+    `scf.if` does not add a nesting level. The shared AutoWS loop attribute
+    registry defines the complete attribute inventory and whether each
+    attribute needs forwarding. If no such loop exists, the annotated while is
+    preserved rather than silently dropping warp specialization.
   }];
 
   let dependentDialects = [

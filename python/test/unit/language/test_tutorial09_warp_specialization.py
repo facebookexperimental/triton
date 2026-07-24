@@ -194,13 +194,13 @@ def matmul_kernel_tma_static_persistent_ws_while(
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     tile_id = start_pid
 
-    while tile_id < num_tiles:
+    while tl.condition(tile_id < num_tiles, warp_specialize=True):
         pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in tl.range(k_tiles, warp_specialize=True):
+        for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
@@ -329,13 +329,7 @@ def matmul_kernel_tma_clc_persistent_ws_while(
 
 # ============================================================================
 # Kernel 2e: matmul_kernel_tma_unified_persistent_ws_while
-# A SINGLE warp-specialized persistent matmul kernel that works with ANY of the
-# unified tile schedules (non-persistent, static/dynamic persistent, CLC): the
-# schedule class is passed as the `SCHEDULE` constexpr and the loop body is
-# identical regardless of which schedule is selected. This is the whole point of
-# the unified tile-scheduler stdlib (triton.language.schedule) -- one kernel,
-# swap the schedule to autotune. `tile_counter` is only used by the dynamic
-# schedule; the others ignore it.
+# A single outer-loop AutoWS kernel for the unified schedules.
 # ============================================================================
 class _MatmulTileArgs(NamedTuple):
     """Named ``lowering_args`` for the schedule -- the fields ``_unified_num_tiles``
@@ -345,11 +339,14 @@ class _MatmulTileArgs(NamedTuple):
     N: tl.tensor
     BLOCK_SIZE_M: tl.constexpr
     BLOCK_SIZE_N: tl.constexpr
+    NUM_CTAS: tl.constexpr
 
 
 @triton.jit
 def _unified_num_tiles(lowering_args):
-    return tl.cdiv(lowering_args.M, lowering_args.BLOCK_SIZE_M) * tl.cdiv(lowering_args.N, lowering_args.BLOCK_SIZE_N)
+    num_tiles = tl.cdiv(lowering_args.M, lowering_args.BLOCK_SIZE_M) * tl.cdiv(lowering_args.N,
+                                                                               lowering_args.BLOCK_SIZE_N)
+    return tl.cdiv(num_tiles, lowering_args.NUM_CTAS) * lowering_args.NUM_CTAS
 
 
 @triton.jit
@@ -368,6 +365,11 @@ def matmul_kernel_tma_unified_persistent_ws_while(
     EPILOGUE_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     SCHEDULE: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
+    SMEM_ALLOC_ALGO: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     dtype = tl.float16
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -375,19 +377,25 @@ def matmul_kernel_tma_unified_persistent_ws_while(
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    lowering_args = _MatmulTileArgs(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    lowering_args = _MatmulTileArgs(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_CTAS)
     sched = SCHEDULE.initialize(lowering_args, _unified_num_tiles, tile_counter)
-    while sched.is_valid():
+    while tl.condition(
+            sched.is_valid(),
+            warp_specialize=True,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
+            smem_alloc_algo=SMEM_ALLOC_ALGO,
+    ):
         pid_m, pid_n = _compute_pid(sched.tile_id[0], num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
         offs_am = pid_m * BLOCK_SIZE_M
         offs_bn = pid_n * BLOCK_SIZE_N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for ki in tl.range(k_tiles, warp_specialize=True):
+        for ki in range(k_tiles):
             offs_k = ki * BLOCK_SIZE_K
             a = a_desc.load([offs_am, offs_k])
             b = b_desc.load([offs_bn, offs_k])
-            accumulator = tl.dot(a, b.T, accumulator)
+            accumulator = tl.dot(a, b.T, accumulator, two_ctas=TWO_CTAS)
 
         acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
         slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
@@ -1065,30 +1073,136 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
 
 
 # ============================================================================
-# Test 2e: One kernel, any schedule -- pass the unified tile-scheduler class as a
-# constexpr argument. Parametrized over BOTH EPILOGUE_SUBTILE and the schedule
-# type to show the same kernel is reused across all four schedules.
+# Test 2e: Outer-loop AutoWS through a unified scheduler while;
+# dynamic persistent keeps the outer while and pipelines its nested K loop.
 # ============================================================================
-_UNIFIED_SCHEDULES = [
-    tl.NonPersistentScheduler,
-    tl.StaticPersistent1DScheduler,
-    tl.DynamicPersistent1DScheduler,
-    tl.ClcTileScheduler,
+_UNIFIED_OUTER_AUTOWS_CONFIGS = [
+    pytest.param(tl.NonPersistentScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="nonpersistent-baseline"),
+    pytest.param(
+        tl.NonPersistentScheduler,
+        128,
+        128,
+        4,
+        1,
+        1,
+        False,
+        False,
+        1,
+        True,
+        id="nonpersistent-epilogue-subtile-4",
+    ),
+    pytest.param(
+        tl.NonPersistentScheduler,
+        256,
+        128,
+        2,
+        2,
+        1,
+        False,
+        False,
+        1,
+        True,
+        id="nonpersistent-data-partition-2-subtile-2",
+    ),
+    pytest.param(
+        tl.NonPersistentScheduler,
+        256,
+        256,
+        1,
+        2,
+        2,
+        False,
+        False,
+        1,
+        True,
+        id="nonpersistent-2cta-data-partition-2",
+    ),
+    pytest.param(tl.StaticPersistent1DScheduler, 128, 128, 1, 1, 1, False, True, 1, False, id="static-baseline"),
+    pytest.param(
+        tl.StaticPersistent1DScheduler,
+        128,
+        128,
+        4,
+        1,
+        1,
+        True,
+        True,
+        1,
+        True,
+        id="static-epilogue-subtile-4",
+    ),
+    pytest.param(
+        tl.StaticPersistent1DScheduler,
+        256,
+        128,
+        2,
+        2,
+        1,
+        True,
+        True,
+        1,
+        True,
+        id="static-data-partition-2-subtile-2",
+    ),
+    pytest.param(
+        tl.StaticPersistent1DScheduler,
+        256,
+        256,
+        1,
+        2,
+        2,
+        False,
+        True,
+        1,
+        True,
+        id="static-2cta-data-partition-2",
+    ),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="dynamic-subtile-1"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, 1, False, id="dynamic-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, False, id="dynamic-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, False,
+                 id="dynamic-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, True, 1, False,
+                 id="dynamic-separate-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, True, False, 1, True,
+                 id="dynamic-generated-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, True, True, 1, True,
+                 id="dynamic-generated-separate-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 256, 128, 2, 2, 1, True, True, 1, True,
+                 id="dynamic-dp2-generated-separate-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 2, False,
+                 id="dynamic-broadcast-depth-2"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, False, 1, True, id="clc-subtile-1"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="clc-subtile-2"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="clc-subtile-4"),
 ]
 
 
 @pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
-@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2, 4])
-@pytest.mark.parametrize("SCHEDULE", _UNIFIED_SCHEDULES, ids=lambda s: s.__name__)
-def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPILOGUE_SUBTILE, SCHEDULE):
-    """One warp-specialized persistent matmul kernel reused across all four unified
-    tile schedules by passing the schedule class as a constexpr argument."""
-    if SCHEDULE is tl.ClcTileScheduler and is_hopper():
-        pytest.skip("CLC requires Blackwell (SM100+); not supported on Hopper")
+@pytest.mark.parametrize(
+    "SCHEDULE,BLOCK_SIZE_M,BLOCK_SIZE_N,EPILOGUE_SUBTILE,DATA_PARTITION_FACTOR,NUM_CTAS,"
+    "generate_subtiled_region,separate_epilogue_store,tile_prefetch_depth,blackwell_only",
+    _UNIFIED_OUTER_AUTOWS_CONFIGS,
+)
+def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
+    SCHEDULE,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    EPILOGUE_SUBTILE,
+    DATA_PARTITION_FACTOR,
+    NUM_CTAS,
+    generate_subtiled_region,
+    separate_epilogue_store,
+    tile_prefetch_depth,
+    blackwell_only,
+):
+    """Exercise outer-loop AutoWS with each unified scheduler."""
+    if blackwell_only and not is_blackwell():
+        pytest.skip("Subtiled regions, BLOCK_M=256 data partitioning, and 2-CTA require Blackwell")
+    if NUM_CTAS == 2 and SCHEDULE in (tl.DynamicPersistent1DScheduler, tl.ClcTileScheduler):
+        pytest.skip("2-CTA is not supported for dynamic or CLC scheduling")
 
     M, N, K = 2048, 2048, 256
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 64
     GROUP_SIZE_M = 8
     num_stages = 3
@@ -1096,6 +1210,8 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
 
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.ws_tile_prefetch_depth = tile_prefetch_depth
 
         dtype = torch.float16
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1106,13 +1222,8 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
         B = torch.randn((N, K), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
-        # Grid + workspace are the caller's responsibility and depend on the
-        # schedule: non-persistent / CLC launch one program per tile (CLC
-        # over-subscribes so pending clusters can be stolen); the static / dynamic
-        # persistent schedules launch min(NUM_SMS, num_tiles). The dynamic schedule
-        # additionally needs a shared atomic counter seeded past the statically
-        # launched tiles (== the number of launched programs).
-        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
+        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N // NUM_CTAS)
+        num_tiles = triton.cdiv(num_tiles, NUM_CTAS) * NUM_CTAS
         if SCHEDULE in (tl.NonPersistentScheduler, tl.ClcTileScheduler):
             grid_size = num_tiles
         else:
@@ -1127,6 +1238,14 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
         a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
         b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
         c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        launch_options = {
+            "num_stages": num_stages,
+            "num_warps": num_warps,
+            "generate_subtiled_region": generate_subtiled_region,
+        }
+        if NUM_CTAS == 2:
+            launch_options["ctas_per_cga"] = (2, 1, 1)
 
         kernel = matmul_kernel_tma_unified_persistent_ws_while[(grid_size, )](
             a_desc,
@@ -1143,35 +1262,49 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(EPI
             EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
             NUM_SMS=NUM_SMS,
             SCHEDULE=SCHEDULE,
-            num_stages=num_stages,
-            num_warps=num_warps,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            NUM_CTAS=NUM_CTAS,
+            TWO_CTAS=NUM_CTAS == 2,
+            SMEM_ALLOC_ALGO=1 if NUM_CTAS == 2 else None,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
+            **launch_options,
         )
 
         ttgir = kernel.asm["ttgir"]
         if SCHEDULE is tl.NonPersistentScheduler:
             # The non-persistent schedule's outer loop provably runs exactly once
             # (`_valid` flips True->False), so triton-simplify-single-trip-while
-            # optimizes the `scf.while` away at the TTIR stage.
+            # optimizes the `scf.while` away after TTGIR loop scheduling.
             assert "scf.while" not in ttgir, "Expected single-trip outer while to be optimized away"
         elif SCHEDULE is tl.StaticPersistent1DScheduler:
             # The static-persistent schedule is a countable loop (`_x < num_tiles`,
             # `_x += num_programs`); triton-uplift-while-to-for (after LICM hoists
             # num_tiles out of the before-region) rewrites it into an `scf.for`.
             assert "scf.while" not in ttgir, "Expected countable static-persistent while to uplift to scf.for"
-        else:
-            # Dynamic (atomic advance) and CLC (hardware valid) are not countable
-            # and stay as `scf.while`.
-            assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        elif SCHEDULE is tl.DynamicPersistent1DScheduler:
+            assert "scf.while" in ttgir, "Expected dynamic persistent outer loop to remain an scf.while"
+        elif SCHEDULE is tl.ClcTileScheduler:
+            assert "scf.while" in ttgir, "Expected CLC outer loop to remain an scf.while"
+            assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
+            assert "tt.atomic_rmw" not in ttgir, "CLC must not use the atomic tile counter"
+        if SCHEDULE in (tl.DynamicPersistent1DScheduler, tl.ClcTileScheduler):
+            assert "tt.scheduled_max_stage" in ttgir, "Expected the nested K loop to retain its stage count"
+            assert "loop.stage" in ttgir, "Expected the nested K loop operations to retain their stage assignments"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
-        # Schedule-specific IR markers confirm the chosen schedule was actually used.
-        if SCHEDULE is tl.ClcTileScheduler:
-            assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
-        else:
+        if SCHEDULE is not tl.ClcTileScheduler:
             assert "ttng.clc_" not in ttgir, "Expected non-CLC scheduling"
         if SCHEDULE is tl.DynamicPersistent1DScheduler:
             assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
+
+        mma_op = "ttng.tc_gen5_mma" if is_blackwell() else "ttng.warp_group_dot"
+        assert ttgir.count(mma_op) >= DATA_PARTITION_FACTOR, "Expected one MMA per data partition"
+        expected_stores = EPILOGUE_SUBTILE * DATA_PARTITION_FACTOR
+        assert ttgir.count("ttng.async_tma_copy_local_to_global") >= expected_stores, (
+            "Expected every epilogue subtile and data partition to emit a TMA store")
+        if NUM_CTAS == 2:
+            assert ttgir.count("two_ctas") >= DATA_PARTITION_FACTOR, "Expected 2-CTA MMA per data partition"
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

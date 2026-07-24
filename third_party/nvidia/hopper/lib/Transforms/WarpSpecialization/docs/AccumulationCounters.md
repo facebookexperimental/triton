@@ -149,6 +149,12 @@ reuse handling end-to-end:
 - `createNewWhileWrapper` appends a reuse-group counter to `initialAccums`
   (seeded via `getAccumForReuseGroup`, which is a constant 0 for the outermost
   while) and wires its yield with the staggered next value.
+- The while reuse counter advances by `getReuseGroupStride` per persistent
+  iteration, exactly like the `scf.for` path. `getAccumForReuseGroup` multiplies
+  the per-op offset by that stride (`(before ? opIdx : opIdx + 1) * stride`) so a
+  subtiled group with `numTiles` tiles steps by `numTiles`, not by 1. Without the
+  stride factor the while counter would advance by one while the `scf.for` path
+  advanced by `numTiles`, so the slot/phase rotation diverged from the barrier.
 - `getReuseChannels`, `needAccumCntForReuse`, and `getAccumForReuseGroup` accept
   `scf::WhileOp` (iterating / indexing the after region).
 - `getStaggeredAccumCnt` finds the enclosing loop as `scf::ForOp` **or**
@@ -159,6 +165,40 @@ Missing any of these makes the per-channel accumCnt index run past the counters
 actually threaded into the while (an out-of-bounds after-region argument /
 non-integer accumCnt), the same failure class the `getAccumCount` `isIntOrIndex`
 assertion guards against.
+
+#### Reuse-only counter case
+
+A generated same-task subtiled region can need **only** a reuse-group counter,
+with no ordinary channel-bearing region contributing to the while. In that case
+`getAccumCntsPreOrder` returns `tCnts == 0`, but the reuse group still needs its
+counter threaded. `createNewWhileWrapper` therefore defers its empty-return
+decision: instead of bailing out early on `tCnts == 0`, it first builds
+`initialAccums` (per-region counters **plus** reuse-group counters) and only
+returns the original while unchanged when `initialAccums` is empty. Bailing on
+`tCnts == 0` alone would drop the reuse counter for a while whose only
+multibuffered channel is the subtiled epilogue.
+
+### Shared reuse-group eligibility predicate
+
+Whether a reuse group carries a loop-carried accumulation counter is decided by
+one shared predicate, `reuseGroupNeedsAccumCnt(group)` (`CodePartitionUtility`),
+used by **counter counting** (`needAccumCntForReuse`), **channel discovery**
+(`getReuseChannels`), and **both loop wrappers** (`createNewLoopWrapper`,
+`createNewWhileWrapper`). It returns true unless:
+
+- the representative channel is plain single-buffered (`getNumBuffers() <= 1`)
+  and is *not* a collapsed both-endpoints-subtiled channel — a collapsed subtiled
+  channel still needs its `numTiles` counter stride even at `buffer.copy == 1`
+  (single physical slot, alternating barrier phase); or
+- the group has a single member that is not subtiled — a size-1 group normally
+  carries no shared circular buffer, but a collapsed subtiled channel is
+  intentionally alone in its group and still needs its counter.
+
+Keeping this in one predicate is a correctness requirement, not just cleanup: the
+three call sites must agree on the counter count exactly, or the loop argument
+count and the per-channel accumCnt indices disagree (out-of-bounds after-region
+argument / non-integer accumCnt). Previously each site inlined the same two
+special cases; drift between them was the failure mode this predicate removes.
 
 ### Redundant accumulator zero-store removal
 
@@ -173,6 +213,26 @@ in the while's after region, so its enclosing loop is found via
 token (`getDep()`) to its result token (`getToken()`) so the accumulator
 dependency chain skips the removed store; forwarding the wrong operand leaves the
 store un-erased and reintroduces the cross-tile race.
+
+## Resolving the counter-bearing region
+
+`getAccumCount` indexes an op's accumCnt from the arguments of the control-flow
+region that actually *carries* counters (the enclosing `scf.for` body or
+`scf.while` after region). To find that region it does **not** simply take
+`op->getParentOp()`: an op can be nested inside a *structural* region that carries
+no counters — most importantly `ttng.subtiled_region`, which a generated subtiled
+epilogue wraps around its per-tile stores. Indexing the subtiled region as if it
+were a counter-bearing region would compute the wrong argument (or index a region
+with no accumCnt arguments at all).
+
+`getAccumCntRegion(op, parentLoop, regionsWithChannels)` walks outward from
+`op->getParentOp()` until it reaches either the enclosing accumulation loop
+(`parentLoop`) or a region recorded in `regionsWithChannels`, skipping any
+non-counter structural region such as `ttng.subtiled_region` on the way. Both the
+`scf.while` and `scf.for` branches of `getAccumCount` use it, so an op nested in a
+subtiled region resolves its counter to the nearest real counter-bearing region
+(e.g. the persistent while's after region) rather than to the subtiled region
+itself.
 
 ## Interaction with Reuse Groups
 
@@ -227,6 +287,8 @@ mbarrier rotation tolerates any K.
 | `updateAccumLoopCount` | Recursively threads counters through nested control flow |
 | `generateYieldCntsForForOp` | Generates loop yield values for counters |
 | `generateYieldCntsForIfOp` | Generates if-op yield values for counters |
+| `reuseGroupNeedsAccumCnt` | Shared predicate: does a reuse group carry a loop-carried accumCnt? Used by counter counting, channel discovery, and both loop wrappers |
+| `getAccumCntRegion` | Walks outward from an op to the nearest counter-bearing region, skipping non-counter structural regions like `ttng.subtiled_region` |
 | `getAccumCount` | Retrieves the accumCnt value for an op from its enclosing loop |
 | `getAccumCnts` | Returns the number of accumCnt arguments for a control flow op |
 | `getAccumArgIdx` | Returns the starting index of accumCnt arguments in a block argument list |

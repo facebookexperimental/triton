@@ -315,7 +315,9 @@ public:
 
   void runOnFuncOp(triton::FuncOp funcOp) {
     llvm::DenseSet<Operation *> anchorOps;
+    bool hasPartitionAnchors = false;
     funcOp.walk([&](mlir::Operation *op) {
+      hasPartitionAnchors |= op->hasAttr(ttg::kPartitionAttrName);
       auto asyncTasks = getAsyncTaskIds(op);
       if (!asyncTasks.empty()) {
         std::sort(asyncTasks.begin(), asyncTasks.end());
@@ -326,7 +328,7 @@ public:
           op->removeAttr("async_task_id");
       }
     });
-    if (numWarpGroups == 0 || anchorOps.empty())
+    if (numWarpGroups == 0 || (anchorOps.empty() && !hasPartitionAnchors))
       return;
     if (failed(doTaskIdPropagate(funcOp)))
       signalPassFailure();

@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <algorithm>
 #include <numeric>
+#include <utility>
 
 namespace mlir {
 class DominanceInfo;
@@ -208,6 +209,41 @@ struct LoopCarriedSlot {
 // Build the slot descriptor for iter-arg index `k`
 // (k < loop.getRegionIterArgs().size()).
 LoopCarriedSlot getLoopCarriedSlot(LoopLikeOpInterface loop, unsigned k);
+
+// Return the single block/region that partition scheduling treats as the loop
+// body. For scf.while this is the "after" region; the "before" region is loop
+// control and is replicated later by task-id propagation.
+Block *getLoopBodyBlock(LoopLikeOpInterface loop);
+Region &getLoopBodyRegion(LoopLikeOpInterface loop);
+Operation *getLoopBodyTerminator(LoopLikeOpInterface loop);
+ValueRange getLoopYieldedValues(LoopLikeOpInterface loop);
+
+// Return the induction variable for scf.for, or a null Value for scf.while.
+Value getLoopInductionVar(LoopLikeOpInterface loop);
+
+// Trace a loop-carried value to its defining result and iteration distance.
+// Returns a null result and zero distance for non-carried values and cycles.
+std::pair<OpResult, int64_t>
+getLoopDefinitionAndDistance(LoopLikeOpInterface loop, Value value);
+
+// Callers must verify hasSupportedLoopCarry(loop) before using either mapping
+// helper below.
+// Map carried-value slot `k` to its argument in the scheduled body. Returns a
+// null BlockArgument for an scf.while slot that is not forwarded by
+// scf.condition.
+BlockArgument getLoopCarriedBodyArg(LoopLikeOpInterface loop, unsigned k);
+
+// Map a scheduled-body argument to the value yielded into its corresponding
+// carried slot on the next iteration.
+Value getLoopCarriedYieldedValue(LoopLikeOpInterface loop,
+                                 BlockArgument bodyArg);
+
+// Partition scheduling supports scf.while when scf.condition forwards a
+// direct, unique, non-empty, order-preserving subset of the before-region
+// arguments.
+// scf.for is supported by construction; other LoopLikeOpInterface
+// implementations are unsupported.
+bool hasSupportedLoopCarry(LoopLikeOpInterface loop);
 
 Operation *cloneWithInferType(mlir::OpBuilder &rewriter, Operation *op,
                               IRMapping &mapping);
