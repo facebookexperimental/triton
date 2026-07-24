@@ -345,6 +345,56 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("triton_tem", code_str)
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe bmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_bmm_warppipe_regpath_odd_k(self, dtype: torch.dtype):
+        """Odd K on the TLX bmm template -> register-path branch (USE_ASYNC=0), T280910119.
+
+        K=2309 (odd; the production compression bmm's K) has a 2309*2 = 4618 B row stride that is
+        never 16-byte aligned, so the direct-to-LDS async_load path cannot legalize on CDNA4. The
+        heuristic sets USE_ASYNC=0 and the template takes the register-path fallback (tl.load ->
+        registers -> tl.dot, auto-pipelined), which lowers for ANY alignment. In tlx_mode=force
+        (TRITON-only) this must still lower to the Triton template (never extern/aten) and be
+        numerically correct -- exactly the shape the aligned-K async path could not compile.
+        """
+        batch, M, K, N = 8, 256, 2309, 256  # odd K -> register-path branch (USE_ASYNC=0)
+        a = torch.randn(batch, M, K, device=GPU_TYPE, dtype=dtype)
+        b = torch.randn(batch, K, N, device=GPU_TYPE, dtype=dtype)
+
+        def bmm(a, b):
+            return torch.bmm(a, b)
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(bmm), a, b)
+
+        c_expected = torch.bmm(a.float(), b.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem", code_str)
+
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_bmm_warppipe_dual_path_source(self):
+        """The non-persistent bmm template carries BOTH branches: the async_load direct-to-LDS path
+        (aligned K) and the register-path fallback (unaligned/odd K, T280910119). Source check --
+        no GPU needed."""
+        from triton.language.extra.tlx.inductor.mm_templates import load_tlx_template
+
+        src = load_tlx_template("amd_bmm_warppipe")
+        self.assertIn("USE_ASYNC", src)  # dual-path selector constexpr
+        self.assertIn("tlx.async_load", src)  # aligned-K async path
+        self.assertIn("a_reg = tl.load", src)  # register-path fallback load
+
     @unittest.skipIf(not has_tlx(), "TLX not available")
     def test_tlx_bmm_warppipe_persistent_registered(self):
         """The persistent bmm variant is registered and has the persistent while-loop structure.

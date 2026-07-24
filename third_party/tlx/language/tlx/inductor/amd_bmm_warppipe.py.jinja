@@ -8,8 +8,14 @@
     #
     # NOTE: tlx.async_load's flat offset is int32, so the heuristic restricts this template to
     # per-batch M*K and N*K < 2**31. The per-batch base advance is done in int64 (batch*M*K can
-    # exceed 2**31). The heuristic also requires (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16, i.e. 16-byte-aligned rows) so the direct-to-LDS
-    # async_copy vectorizes legally on CDNA4; the K % BLOCK_K remainder is a synchronous sync-tail.
+    # exceed 2**31).
+    #
+    # DUAL PATH (selected by the USE_ASYNC constexpr the heuristic sets from K's alignment):
+    #  * USE_ASYNC=1  (K % 8 == 0, i.e. (K*itemsize) % 16 == 0, 16-byte-aligned rows): the fast
+    #    async_load direct-to-LDS warp-pipe below; the K % BLOCK_K remainder is a synchronous sync-tail.
+    #  * USE_ASYNC=0  (unaligned K, e.g. odd K): a register-path fallback (tl.load -> registers ->
+    #    tl.dot, auto-pipelined) that lowers for ANY alignment where the async_copy path cannot
+    #    (T280910119). Same register-staged data path rocBLAS uses; ~0.76x rocBLAS on odd K.
     M = {{size("A", -2)}}
     N = {{size("B", -1)}}
     K = {{size("A", -1)}}
@@ -64,6 +70,8 @@
     a_base = offs_m[:, None] * stride_am
     b_base = offs_n[None, :] * stride_bn          # B as (BLOCK_K, BLOCK_N): n is the col of [K,N]
 
+{% if USE_ASYNC %}
+    # --- async_load direct-to-LDS warp-pipe path (USE_ASYNC=1: K % 8 == 0, 16-byte-aligned rows) ---
     K_ITERS = K // BLOCK_K   # FULL K-tiles (unmasked); the K % BLOCK_K remainder -> sync-tail below
 
     smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
@@ -122,6 +130,22 @@
         b_offs = (k_tail + offs_k[:, None]) * stride_bk + b_base
         b_tail = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < tail_width, other=0.0)
         acc = tl.dot(a_tail, b_tail, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% else %}
+    # --- register-path fallback (USE_ASYNC=0: K % 8 != 0, e.g. odd K) ---
+    # buffer_load (tl.load) is element-granular, so it lowers for ANY row-stride alignment -- no
+    # direct-to-LDS 16-byte constraint -- and the masked tail handles K % BLOCK_K in the same loop.
+    # num_stages>1 (set by the heuristic) lets Triton's auto-pipeliner overlap the loads across
+    # K-iters; this is the register-staged path rocBLAS itself uses (buffer_load->registers->MFMA).
+    # ~0.76x rocBLAS on the odd-K compression bmm (T280910119) vs the async path's near-parity -- a
+    # working Triton candidate for shapes the async_copy path cannot legalize.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for k in range(0, K, BLOCK_K):
+        a_offs = a_base + (k + offs_k[None, :]) * stride_ak
+        b_offs = (k + offs_k[:, None]) * stride_bk + b_base
+        a_reg = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < K - k, other=0.0)
+        b_reg = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < K - k, other=0.0)
+        acc = tl.dot(a_reg, b_reg, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% endif %}
 
     # rematerialize rm/rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)

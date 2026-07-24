@@ -82,8 +82,11 @@ amd_addmm_warppipe_template = TritonTemplate(
 
 # TLX warp-pipelined bmm template (AMD / MI350X gfx950). Same warp-pipe core as the addmm, plus a
 # batch axis on the grid + a per-batch int64 base advance. B is the standard torch.bmm [BATCH,K,N]
-# row-major layout (loaded as (BLOCK_K, BLOCK_N) tiles, no transpose). Selection via TLX_MODE; the
-# heuristic (registry.py) gates on K % 16 == 0 + int32-representable per-batch offsets.
+# row-major layout (loaded as (BLOCK_K, BLOCK_N) tiles, no transpose). Selection via TLX_MODE.
+# Dual path (USE_ASYNC constexpr from the heuristic): aligned K (K % 8 for fp16/bf16) uses the fast
+# async_load direct-to-LDS warp-pipe; unaligned/odd K -- which async_copy can't legalize on CDNA4 --
+# uses a register-path fallback (tl.load->tl.dot, T280910119). Gate: int32-representable per-batch
+# offsets.
 amd_bmm_warppipe_template = TritonTemplate(
     name="tlx_amd_bmm_warppipe",
     grid=_bmm_grid_warppipe,
