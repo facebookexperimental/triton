@@ -709,7 +709,7 @@ SmallVector<Value> computeLocalPtrs(Location loc,
   auto sharedLayout = triton::gpu::isPaddedEncoding(memDescTy.getEncoding())
                           ? paddedLinearLayout(memDescTy)
                           : toLinearLayout(memDescTy);
-  LinearLayout invSharedLayout = sharedLayout.invert();
+  LinearLayout invSharedLayout = sharedLayout.pseudoinvert();
 
   // Get layout dimension names for all dims
   SmallVector<StringAttr> allDims;
@@ -1429,11 +1429,8 @@ SharedMemoryObject::getMaskSpanOffsets(triton::gpu::MemDescType srcTy) {
   }
   auto totalLl = triton::gpu::toLinearLayout(allocShape, srcTy.getEncoding());
   auto dimNames = standardOutDimNames(ctx, shape.size());
-  // Remove the kBlock dimension
-  auto kOffset = StringAttr::get(ctx, "offset");
-  totalLl = totalLl.sublayout({kOffset}, dimNames);
-  // Map from dimNames to offset
-  auto invLl = totalLl.invert();
+  // Map from dimNames to offset, block
+  auto invLl = totalLl.pseudoinvert();
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
   for (auto dim : standardOutDimNames(srcTy.getContext(), shape.size())) {
     logicalOffsets.push_back({dim, 0});
@@ -1478,9 +1475,12 @@ Value SharedMemoryObject::getShmemOffset(Location loc, RewriterBase &rewriter,
     logicalOffsets.push_back({dim, offset});
   }
 
-  ll = ll.sublayout({str_attr("offset")}, dimNames);
+  // We don't allow for non-trivial block dimensions in the shared memory
+  // layout. We have in practice that offsetAndBlock[1].second is zero, but we
+  // cannot assert that without constant propagation so we just discard it.
   auto offset =
-      applyLinearLayout(loc, rewriter, ll.invert(), logicalOffsets)[0].second;
+      applyLinearLayout(loc, rewriter, ll.pseudoinvert(), logicalOffsets)[0]
+          .second;
   return offset;
 }
 

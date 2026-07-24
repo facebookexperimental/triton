@@ -46,6 +46,13 @@ Attribute buildDefaultTDMDescriptorEncoding(
     MLIRContext *ctx, ArrayRef<int64_t> shape, ArrayRef<unsigned> order,
     triton::gpu::CGAEncodingAttr cgaLayout, Type elementType);
 
+// Returns null when useAsyncCopy is false or when the operand's MFMA shape,
+// kWidth, or element bitwidth fall outside the supported set.
+triton::gpu::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
+    triton::gpu::DotOperandEncodingAttr dotOpEnc,
+    triton::gpu::TensorOrMemDesc srcTy, ArrayRef<unsigned> sharedOrder,
+    bool useAsyncCopy, unsigned warpSize);
+
 triton::gpu::SharedEncodingTrait
 getEncodingFromDescriptor(Operation *op, RankedTensorType tensorType,
                           Value desc);

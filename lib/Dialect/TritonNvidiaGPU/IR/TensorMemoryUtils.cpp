@@ -237,14 +237,12 @@ lowerTMemLdSt(const LinearLayout &cvt, int maxnreg, int bitwidth, bool isScales,
       auto col = reps.getBasis(kLane, 4, kCol);
       secondHalfOffset = (row << 16) | col;
       if (*secondHalfOffset == 0) {
-        // Workaround for ptxas bug, we cannot use secondHalfOffset = 0 to write
-        // only 16 elements. We use secondHalfOffset = 1 instead and we pad the
-        // allocation.
+        // The Buck toolchain still needs a nonzero second-half offset when
+        // writing only 16 scale elements; the allocation is padded for this.
         if (!isScales) {
-          if (emitError) {
+          if (emitError)
             emitError()
                 << "Only supported for scales as we pad the allocation.";
-          }
           return failure();
         }
         secondHalfOffset = 1;
