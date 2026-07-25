@@ -52,10 +52,10 @@ def _require_layout_soft(x, layout, _semantic=None):
     non-pinned requirement for direct-to-LDS offsets, MFMA operands, and
     intermediate arithmetic.  TLX is therefore allowed to replace this hint
     with a conversion or propagate another compatible layout; it is not a
-    correctness guarantee.  A hard pin is reserved for the final dK store,
-    while ``tlx.release_layout`` is the explicit operation for dropping a hard
-    pin.  Requiring a second layout would add another constraint rather than
-    cancel the first one.
+    correctness guarantee.  Hard pins are reserved for explicit output-store
+    ownership, while ``tlx.release_layout`` is the operation for dropping one.
+    Requiring a second layout would add another constraint rather than cancel
+    the first one.
     """
     x = _semantic.to_tensor(x)
     layout = tl_core._unwrap_if_constexpr(layout)
@@ -1409,33 +1409,25 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     dk = tlx.release_layout(dk)
     dv = tlx.release_layout(dv)
     dk *= SM_SCALE
-    # Causal and non-causal modes use Gluon's whole-tile epilogue: narrow while
-    # retaining native MFMA ownership, then anchor the final store to eight
-    # contiguous BF16 values per lane. ``cast_layout`` is required to preserve
-    # the MFMA encoding; an ordinary ``to(bfloat16)`` drops it and fails
-    # verification. The hard ``require_layout`` store anchor is provided by
-    # #2290, so Coalesce and AMD OptimizeEpilogue retain the coalesced store
-    # ownership without pinning the intermediate MFMA arithmetic.
+    # Causal and non-causal modes use Gluon's whole-tile epilogue: pin each
+    # completed accumulator in native MFMA ownership before narrowing, then
+    # pin each final store to eight contiguous BF16 values per lane.  The hard
+    # ``require_layout`` anchors make each conversion boundary explicit;
+    # Coalesce and AMD OptimizeEpilogue lower the ordinary cast to the same
+    # MFMA -> BF16 -> vector handoff as a layout-preserving cast.
     # Gluon's newer full-attention D64-half epilogue raised TLX from 496 to 503
     # VGPR for N=200, so the lower-resource whole-tile epilogue remains used.
-    # ``release_layout`` above intentionally leaves the scaled accumulator
-    # layout-flexible. Reattach the MFMA ownership before the layout-preserving
-    # cast: ``cast_layout`` does not infer its source layout backwards from the
-    # later hard kv_async_layout store anchor. Without this hint, the compiler
-    # selects a generic linear layout for the scale/cast sequence instead of
-    # preserving the intended MFMA -> BF16 -> vector handoff.
-    dk_mma = _require_layout_soft(dk, mma_nd)
-    dk_bf16 = tlx.cast_layout(dk_mma, tl.bfloat16)
+    # ``release_layout`` above intentionally leaves the accumulators
+    # layout-flexible until this epilogue, so the MFMA anchors do not constrain
+    # the loop-carried arithmetic.  Pinning dV's final store ownership as well
+    # removes the non-causal spills without adding causal spills on gfx950.
+    dk_mma = tlx.require_layout(dk, mma_nd)
+    dk_bf16 = dk_mma.to(tl.bfloat16)
     dk_vec = tlx.require_layout(dk_bf16, kv_async_layout)
     tl.store(DK + key_ptrs, dk_vec, mask=key_mask)
-    # Keep dV's physical conversion explicit without adding a hard store anchor.
-    # ``convert_layout`` already materializes kv_async_layout for the store;
-    # releasing it here would discard the requested store ownership and let the
-    # epilogue remap the value. Unlike dK's hard anchor, this conversion remains
-    # optimizer-flexible and avoids the causal N=200 register-spill threshold.
-    dv_mma = _require_layout_soft(dv, mma_nd)
-    dv_bf16 = tlx.cast_layout(dv_mma, tl.bfloat16)
-    dv_vec = tlx.convert_layout(dv_bf16, kv_async_layout)
+    dv_mma = tlx.require_layout(dv, mma_nd)
+    dv_bf16 = dv_mma.to(tl.bfloat16)
+    dv_vec = tlx.require_layout(dv_bf16, kv_async_layout)
     tl.store(DV + key_ptrs, dv_vec, mask=key_mask)
 
 

@@ -235,8 +235,7 @@ Operation *sliceAndReinterpretMDTMEM(OpBuilderWithAsyncTaskIds &builder,
   // and converted subslice below.
   auto elemTyWidth = newType.getElementType().getIntOrFloatBitWidth();
   auto oldElemTyWidth = allocType.getElementType().getIntOrFloatBitWidth();
-  if (oldElemTyWidth < elemTyWidth ||
-      oldElemTyWidth % elemTyWidth != 0)
+  if (oldElemTyWidth < elemTyWidth || oldElemTyWidth % elemTyWidth != 0)
     return nullptr;
 
   int64_t colRatio = oldElemTyWidth / elemTyWidth;
