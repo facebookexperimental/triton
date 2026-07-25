@@ -281,7 +281,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     def hash(self):
-        return (f"{self.target}:stage13-amd-membar-wave-scheduler-options:"
+        return (f"{self.target}:stage14-amd-membar-issue-order:"
                 f"wave-opt-sha256={_wave_opt_sha256()}:"
                 f"wave-pipelines-sha256={_wave_pipelines_sha256()}")
 

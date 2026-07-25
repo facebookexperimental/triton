@@ -192,6 +192,7 @@ def _collect_region(
             attrs = _source_attrs(op)
             if op in compiler_membar_barriers:
                 attrs["tlx.compiler_membar_barrier"] = True
+                attrs["tlx.orders_memory_issue"] = True
             source_op = SourceOp(
                 op_index,
                 op.get_name(),
