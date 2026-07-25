@@ -1238,7 +1238,17 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
         # returns a plain False, so this stays safe for symbolic scalars.
         scalars = getattr(kernel_inputs, "_scalars", None) or {}
-        allow_split_k = scalars.get("alpha", 1) == 1 and scalars.get("beta", 1) == 1
+        # split-K needs the JIT Python wrapper: its _reduce_k_kernel is emitted via a Python
+        # `import` (emit_reduce_k_call / _tlx_emit_post_kernel_code), which is ILLEGAL in the
+        # AOTInductor C++ wrapper -- emitting `from ...reduce_k import _reduce_k_kernel` there yields
+        # "unknown type name 'from'" + dropped split_k_ws buffer decls, breaking the C++ compile
+        # (T280910119, seen in the merge-net E2E). So only offer split-K under the Python wrapper;
+        # cpp_wrapper (AOTI, the production path) uses SPLIT_K=1. Proper AOTI-C++ reduce-k is a follow-up.
+        allow_split_k = (
+            scalars.get("alpha", 1) == 1
+            and scalars.get("beta", 1) == 1
+            and not config.cpp_wrapper
+        )
         m_hint = sizevars.optimization_hint(m, fallback=NUM_SMS)
         n_hint = sizevars.optimization_hint(n, fallback=NUM_SMS)
         for (
