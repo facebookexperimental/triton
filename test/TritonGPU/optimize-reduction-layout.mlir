@@ -7,7 +7,7 @@
 // (threadsPerWarp = [32, 1], warpsPerCTA = [1, 4]) via a convert_layout. Bit-identical
 // because inner_tree is layout-invariant.
 
-// CHECK-DAG: #[[MOVED:blocked[0-9]*]] = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
+// CHECK-DAG: #[[$MOVED:blocked[0-9]*]] = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
@@ -28,9 +28,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %x_9 = tt.addptr %x_7, %x_8 : tensor<128x32x!tt.ptr<f32>, #blocked>, tensor<128x32xi32, #blocked>
     %x_10 = tt.load %x_9 : tensor<128x32x!tt.ptr<f32>, #blocked>
     // The pass converts the operand to the moved layout and keeps axis + ordering.
-    // CHECK: ttg.convert_layout %{{[0-9]+}} : {{.*}} -> tensor<128x32xf32, #[[MOVED]]>
+    // CHECK: ttg.convert_layout %{{[0-9]+}} : {{.*}} -> tensor<128x32xf32, #[[$MOVED]]>
     // CHECK: "tt.reduce"({{.*}}) <{axis = 0 : i32, reduction_ordering = "inner_tree"}>
-    // CHECK: (tensor<128x32xf32, #[[MOVED]]>)
+    // CHECK: (tensor<128x32xf32, #[[$MOVED]]>)
     %s = "tt.reduce"(%x_10) <{axis = 0 : i32, reduction_ordering = "inner_tree"}> ({
     ^bb0(%s_11: f32, %s_12: f32):
       %s_13 = arith.addf %s_11, %s_12 : f32
