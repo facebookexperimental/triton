@@ -6711,6 +6711,10 @@ def _convert_barrier(builder, conversion_input, op):
     attrs = {
         "address_space": int(op.attrs.get("addrSpace", 0)),
         "dependency_count": len(dependency_target_ids),
+        "orders_memory_issue": bool(
+            int(op.attrs.get("addrSpace", 0)) == 31
+            or op.attrs.get("tlx.orders_memory_issue", False)
+        ),
     }
     if bool(op.attrs.get("tlx.compiler_membar_barrier", False)):
         attrs["compiler_membar_barrier"] = True

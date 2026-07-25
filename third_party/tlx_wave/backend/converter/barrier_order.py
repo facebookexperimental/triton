@@ -1,4 +1,4 @@
-"""Completion-free memory issue ordering around full-memory barriers."""
+"""Completion-free memory issue ordering around ordering barriers."""
 
 from dataclasses import replace
 
@@ -7,20 +7,17 @@ from .diagnostics import fail
 
 STAGE = "barrier_order"
 
-FULL_MEMORY_ADDRESS_SPACE = 31
-
-_PRE_BARRIER_PROVENANCE = "full_barrier_predecessors"
-_POST_BARRIER_PROVENANCE = "full_barrier_successors"
+_PRE_BARRIER_PROVENANCE = "memory_barrier_predecessors"
+_POST_BARRIER_PROVENANCE = "memory_barrier_successors"
 
 
-def thread_full_barrier_issue_order(target_program):
+def thread_barrier_issue_order(target_program):
     """Thread sparse issue-only frontiers through each target region.
 
-    A full-memory source barrier orders real memory issue on either side, but
-    it must not turn an async DMA completion into an implicit wait.  Raw memory
-    tokens are therefore projected through ``issue_token`` before the barrier.
-    The barrier result is projected a second time before being shared by every
-    following memory issuer.  Pure operations receive no dependency.
+    An ordering barrier orders real memory issue on either side, but it must
+    not turn an async DMA completion into an implicit wait. Raw memory tokens
+    are projected through ``issue_token`` before the barrier. The barrier
+    result is projected again before reaching following memory issuers.
 
     Structured operations already delimit WaveAMDMachine scheduling regions,
     so the frontier is intentionally region-local and does not become an
@@ -70,17 +67,17 @@ def thread_full_barrier_issue_order(target_program):
 
     for region in target_program.regions:
         original_op_ids = tuple(int(op_id) for op_id in region.op_ids)
-        has_later_full_barrier = _suffix_matches(
+        has_later_ordering_barrier = _suffix_matches(
             original_op_ids,
             ops,
-            _is_full_memory_barrier,
+            _orders_memory_issue,
         )
         has_later_ordered_op = _suffix_matches(
             original_op_ids,
             ops,
             lambda op: (
                 op.kind in target_ir.MEMORY_ISSUER_OP_KINDS
-                or _is_full_memory_barrier(op)
+                or _orders_memory_issue(op)
             ),
         )
         ordered_op_ids = []
@@ -93,7 +90,7 @@ def thread_full_barrier_issue_order(target_program):
                 if barrier_epoch is not None:
                     op = _append_barrier_dependency(op, barrier_epoch)
                     ops[op_id] = op
-                if has_later_full_barrier[position]:
+                if has_later_ordering_barrier[position]:
                     op, completion_id = _ensure_memory_completion_result(
                         op,
                         values,
@@ -103,7 +100,7 @@ def thread_full_barrier_issue_order(target_program):
                 ordered_op_ids.append(op_id)
                 continue
 
-            if not _is_full_memory_barrier(op):
+            if not _orders_memory_issue(op):
                 ordered_op_ids.append(op_id)
                 continue
 
@@ -117,7 +114,7 @@ def thread_full_barrier_issue_order(target_program):
                 )
                 ordered_op_ids.append(issue_op_id)
             elif barrier_epoch is not None:
-                # Consecutive full barriers need no extra projection: the
+                # Consecutive ordering barriers need no extra projection: the
                 # previous epoch is already completion-free.
                 issue_dependency = barrier_epoch
 
@@ -131,7 +128,7 @@ def thread_full_barrier_issue_order(target_program):
             if not has_later_ordered_op[position]:
                 continue
 
-            op, barrier_result_id = _ensure_full_barrier_result(op, values)
+            op, barrier_result_id = _ensure_ordering_barrier_result(op, values)
             ops[op_id] = op
             epoch_op_id, barrier_epoch = add_issue_token(
                 (barrier_result_id, ),
@@ -168,11 +165,10 @@ def _suffix_matches(op_ids, ops, predicate):
     return tuple(result)
 
 
-def _is_full_memory_barrier(op):
+def _orders_memory_issue(op):
     return (
         op.kind == "barrier"
-        and int(target_ir.attrs_dict(op).get("address_space", 0))
-        == FULL_MEMORY_ADDRESS_SPACE
+        and bool(target_ir.attrs_dict(op).get("orders_memory_issue", False))
     )
 
 
@@ -183,7 +179,7 @@ def _append_barrier_dependency(op, target_value_id):
         fail(
             "TLXW_BARRIER_ORDER_DUPLICATE_DEPENDENCY",
             STAGE,
-            f"target {op.kind} already has a full-barrier order dependency",
+            f"target {op.kind} already has a barrier-order dependency",
             target_op_id=op.target_op_id,
         )
     attrs["barrier_order_dependency_count"] = 1
@@ -272,12 +268,12 @@ def _existing_memory_completion_result(op, values):
     return result_id
 
 
-def _ensure_full_barrier_result(op, values):
+def _ensure_ordering_barrier_result(op, values):
     if len(op.results) > 1:
         fail(
             "TLXW_BARRIER_ORDER_BARRIER_RESULT",
             STAGE,
-            "full-memory barrier may expose at most one token result",
+            "issue-ordering barrier may expose at most one token result",
             target_op_id=op.target_op_id,
         )
     if op.results:
@@ -285,7 +281,7 @@ def _ensure_full_barrier_result(op, values):
         value = values[result_id]
         values[result_id] = replace(
             value,
-            event_domain=target_ir.EVENT_DOMAIN_FULL_BARRIER,
+            event_domain=target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
         )
         return op, result_id
 
@@ -293,7 +289,7 @@ def _ensure_full_barrier_result(op, values):
     values.append(target_ir.TargetValue(
         result_id,
         target_ir.TargetType("token", "token"),
-        debug_name=f"full_barrier_{op.target_op_id}",
-        event_domain=target_ir.EVENT_DOMAIN_FULL_BARRIER,
+        debug_name=f"memory_barrier_{op.target_op_id}",
+        event_domain=target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
     ))
     return replace(op, results=(result_id, )), result_id

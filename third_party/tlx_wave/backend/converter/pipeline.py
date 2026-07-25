@@ -49,7 +49,7 @@ def convert_ttgir_to_wave(
     target_program = canonicalize.eliminate_redundant_compiler_membar_barriers(
         target_program
     )
-    target_program = barrier_order.thread_full_barrier_issue_order(
+    target_program = barrier_order.thread_barrier_issue_order(
         target_program
     )
     if verify:

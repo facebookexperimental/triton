@@ -231,7 +231,7 @@ def _verify_memory_issue_order(op, target_program):
                 "TLXW_VERIFY_BARRIER_ORDER_DOMAIN",
                 STAGE,
                 "memory barrier-order dependency must be a completion-free "
-                "full-barrier issue token",
+                "barrier-issue token",
                 target_op_id=op.target_op_id,
                 target_value_id=operand,
             )
@@ -252,7 +252,7 @@ def _verify_memory_issue_order(op, target_program):
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_SEGMENT",
             STAGE,
-            "full-barrier issue tokens must use the dedicated final operand segment",
+            "barrier-issue tokens must use the dedicated final operand segment",
             target_op_id=op.target_op_id,
             target_value_id=hidden_barrier_operands[0],
         )
@@ -319,20 +319,20 @@ def _verify_issue_projection_structure(op, target_program, projection_domain):
             fail(
                 "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
                 STAGE,
-                "post-barrier issue projection requires one full-barrier result",
+                "post-barrier issue projection requires one ordering-barrier result",
                 target_op_id=op.target_op_id,
             )
         producer = _target_value_producer(target_program, op.operands[0])
         attrs = _attrs_dict(producer)
         if (
             producer.kind != "barrier"
-            or int(attrs.get("address_space", 0)) != 31
+            or not bool(attrs.get("orders_memory_issue", False))
         ):
             fail(
                 "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
                 STAGE,
                 "post-barrier issue projection must come from an explicit "
-                "full-memory barrier",
+                "memory-issue-ordering barrier",
                 target_op_id=op.target_op_id,
                 target_value_id=int(op.operands[0]),
             )
@@ -455,9 +455,9 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 target_ir.EVENT_DOMAIN_DMA_ISSUE:
                 "partial_wait_retained_group",
                 target_ir.EVENT_DOMAIN_MEMORY_ISSUE:
-                "full_barrier_predecessors",
+                "memory_barrier_predecessors",
                 target_ir.EVENT_DOMAIN_BARRIER_ISSUE:
-                "full_barrier_successors",
+                "memory_barrier_successors",
             }.get(projection_domain)
             if expected_provenance is None:
                 fail(
@@ -488,7 +488,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                 },
                 target_ir.EVENT_DOMAIN_BARRIER_ISSUE: {
-                    target_ir.EVENT_DOMAIN_FULL_BARRIER,
+                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
                 },
             }[projection_domain]
             for operand in op.operands:
@@ -519,7 +519,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                         target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                         target_ir.EVENT_DOMAIN_LDS_FRONTIER,
                         target_ir.EVENT_DOMAIN_LDS_RELEASED,
-                        target_ir.EVENT_DOMAIN_FULL_BARRIER,
+                        target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
                         target_ir.EVENT_DOMAIN_EMPTY,
                     },
                 )
@@ -544,7 +544,18 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             )
         completion_operands = op.operands[:dependency_count]
         issue_operands = op.operands[dependency_count:]
-        is_full_memory = int(attrs.get("address_space", 0)) == 31
+        orders_memory_issue = bool(attrs.get("orders_memory_issue", False))
+        requires_issue_order = (
+            int(attrs.get("address_space", 0)) == 31
+            or bool(attrs.get("compiler_membar_barrier", False))
+        )
+        if requires_issue_order and not orders_memory_issue:
+            fail(
+                "TLXW_VERIFY_BARRIER_ORDER_ASSUMPTION",
+                STAGE,
+                "full-memory and compiler membar barriers must order memory issue",
+                target_op_id=op.target_op_id,
+            )
         if len(op.results) > 1:
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
@@ -553,7 +564,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 target_op_id=op.target_op_id,
             )
         if not completion_operands:
-            if op.results and not is_full_memory:
+            if op.results and not orders_memory_issue:
                 fail(
                     "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
                     STAGE,
@@ -575,7 +586,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                     target_ir.EVENT_DOMAIN_LDS_FRONTIER,
                     target_ir.EVENT_DOMAIN_LDS_RELEASED,
-                    target_ir.EVENT_DOMAIN_FULL_BARRIER,
+                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
                     target_ir.EVENT_DOMAIN_EMPTY,
                 },
             )
@@ -592,9 +603,9 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             _require_precedes_in_same_region(target_program, producer, op)
         if op.results:
             allowed_result_domains = {target_ir.EVENT_DOMAIN_LDS_RELEASED}
-            if is_full_memory:
+            if orders_memory_issue:
                 allowed_result_domains.add(
-                    target_ir.EVENT_DOMAIN_FULL_BARRIER
+                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER
                 )
             require_token(
                 op.results[0],
@@ -726,7 +737,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     target_ir.EVENT_DOMAIN_LDS_COMPLETION,
                     target_ir.EVENT_DOMAIN_LDS_FRONTIER,
                     target_ir.EVENT_DOMAIN_LDS_RELEASED,
-                    target_ir.EVENT_DOMAIN_FULL_BARRIER,
+                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
                     target_ir.EVENT_DOMAIN_EMPTY,
                 },
             )
