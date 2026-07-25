@@ -1018,6 +1018,12 @@ def _launch_kernel(kernel, grid, args, compile_kwargs, *, warmup=False):
     return kernel[grid](*args, **compile_kwargs)
 
 
+def _async_simple_default_waves_per_eu(head_dim, causal):
+    # D64 causal needs two resident waves to avoid the register-allocation
+    # occupancy cliff. D128 cannot meet that target without spilling.
+    return 2 if causal and head_dim <= 64 else 0
+
+
 def flash_attn_async_simple(q, k, v, sm_scale, causal=False, *, out=None, warmup=False, **kw):
     """Launch with K in original BHND layout — stride_kk=1 avoids alignment issues."""
     B, H, N_CTX, D = q.shape
@@ -1026,6 +1032,7 @@ def flash_attn_async_simple(q, k, v, sm_scale, causal=False, *, out=None, warmup
     BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", 64)
     num_warps = kw.pop("num_warps", 4)
+    waves_per_eu = kw.pop("waves_per_eu", _async_simple_default_waves_per_eu(D, causal))
 
     grid = (triton.cdiv(N_CTX, BLOCK_M), B * H)
     compile_kwargs = {
@@ -1034,6 +1041,7 @@ def flash_attn_async_simple(q, k, v, sm_scale, causal=False, *, out=None, warmup
         "HEAD_DIM": D,
         "IS_CAUSAL": causal,
         "num_warps": num_warps,
+        "waves_per_eu": waves_per_eu,
         **kw,
     }
     _launch_kernel(
@@ -1475,21 +1483,17 @@ PERF_BASELINE_TFLOPS = {
 def compilation_jobs(args):
     """Return every launch configuration that the selected run will measure."""
     if args.mode == "perf_test":
-        jobs = [
-            (kernel_name, B, 64, N, D, causal, "bf16")
-            for kernel_name, B, D, N, causal in sorted(PERF_BASELINE_TFLOPS)
-        ]
+        jobs = [(kernel_name, B, 64, N, D, causal, "bf16")
+                for kernel_name, B, D, N, causal in sorted(PERF_BASELINE_TFLOPS)]
     else:
         causal_modes = [value.lower() in ("true", "1", "yes") for value in args.causal]
-        jobs = [
-            (kernel_name, B, H, N, D, causal, args.dtype)
-            for kernel_name in args.kernel
-            for B in args.b
-            for H in args.hq
-            for D in args.d
-            for N in args.sq
-            for causal in causal_modes
-        ]
+        jobs = [(kernel_name, B, H, N, D, causal, args.dtype)
+                for kernel_name in args.kernel
+                for B in args.b
+                for H in args.hq
+                for D in args.d
+                for N in args.sq
+                for causal in causal_modes]
     return list(dict.fromkeys(jobs))
 
 
