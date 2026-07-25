@@ -36,6 +36,24 @@ BufferEmitter::BufferEmitter(RewriterBase &rw, Location loc, TargetInfo ti)
 Value BufferEmitter::createResourceDescriptor(Value basePtr,
                                               Value blockStride) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+  // Buffer ops require a *uniform* (scalar / SGPR) base pointer -- see the
+  // BufferEmitter class comment, requirement 1. When the backend cannot PROVE
+  // the base uniform (e.g. a pointer loaded from a pointer array in a grouped
+  // GEMM: `a_ptr = tl.load(group_a_ptrs + g)`), it defensively scalarizes every
+  // buffer access into a per-lane "waterfall" (v_readfirstlane / v_cmp_eq_u64 /
+  // s_and_saveexec / s_cbranch_execnz) around the load -- catastrophic in a hot
+  // loop. Such a base is uniform *in value* across the wave, so make that
+  // explicit with a readfirstlane. If the base is already uniform (e.g. a
+  // kernel-argument pointer), LLVM's InstCombine folds the readfirstlane (and
+  // the ptrtoint/inttoptr roundtrip) away, so this is a no-op in that case.
+  {
+    Value baseAsI64 = b.ptrtoint(i64_ty, basePtr);
+    Value uniformI64 =
+        ROCDL::ReadfirstlaneOp::create(rewriter, loc, i64_ty, baseAsI64);
+    basePtr = b.inttoptr(basePtr.getType(), uniformI64);
+  }
+
   // 1. Create the resource descriptor
   // bits 0-11: dst sel, ignored by these intrinsics
   // bits 12-14: data format (ignored, must be nonzero, 7=float)
