@@ -6,17 +6,16 @@ Storage (both operands row-major with K, the contraction dim, innermost):
         (logically column-major [K, N]), the natural weight layout.
 
 With K contiguous for both A and B, the A and B tiles can load identically
-as [outer, K] tiles via plain coalesced `async_load`. The transpose to the
-[K, N] B operand MFMA wants is folded into the LDS read
-(`tlx.local_load(tlx.local_trans(smemB))`), so the dot stays `tl.dot(a, b)`.
+as [outer, K] tiles via plain coalesced `async_load`. B is loaded directly into a [BLOCK_K, BLOCK_N] LDS tile (K on dim0, which is
+contiguous for the column-major B), so the dot is `tl.dot(a, b)`.
 
 The hot loop is mask-free. M is the outer axis of A and N is the outer axis
 of B, so both dimensions are wrapped with a modulo to prevent out of bounds
 reads. Garbage rows and columns are discarded at the final store to C. The
 hot loop runs full K-tiles that it can load with wide `async_load` instructions.
 The partial last K-tile (if it exists) is a cold masked `tl.load`. The only
-constraint is that gn >= 8. The `tl.multiple_of(gn, 8) enables wide C stores.
-Only gn < 8 is affected. Unaligned gn >= 8 (e.g. 300, 1000) is still correct.
+constraint is that gn % 8 = 0 and stride_bn % 16 = 0 (for wide vector loads
+and no masking).
 """
 import os
 
@@ -67,7 +66,8 @@ def _grouped_gemm_tile(
     stride_cm,
     # LDS ring buffers, allocated once by the scheduler and reused per tile
     smemA,
-    smemB,
+    smemB_left,
+    smemB_right,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -76,126 +76,199 @@ def _grouped_gemm_tile(
     """
     Compute one [BLOCK_SIZE_M, BLOCK_SIZE_N] output tile of ``A @ B`` for a
     single GEMM and store it to C.
+
+    N-split pipeline (ported from v9_beyond_hotloop): B is split into left/right
+    [BLOCK_K, HALF_N] halves fed to two independent accumulators. Each K tile is
+    two async groups (A + B_left, then B_right) so the left/right MFMAs alternate
+    with the local/global memory ops (four regions per two-K-tile body).
     """
+    tl.static_assert(NUM_BUFFERS == 2, "the four-region N-split pipeline requires two LDS buffers")
+
     # How many K-tile iterations we have where each tile is full BLOCK_SIZE_K size
     k_full_chunk_iters = gk // BLOCK_SIZE_K
+
+    HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
 
     # A rows and B columns are wrapped to keep all reads in bound and maintain
     # vectorized loads along the K dimension. The garbage from wrapped lanes
     # is dropped by the masked C store
     offs_am = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
-    offs_bn = tl.multiple_of((pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn, BLOCK_SIZE_N)
+    offs_bn_left = tl.multiple_of((pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)) % gn, HALF_N)
+    offs_bn_right = tl.multiple_of((pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)) % gn, HALF_N)
 
     # K is the contiguous/innermost axis of both A and B tiles
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
 
-    # Compute base offsets for A and B without K indexing
-    a_base_off = offs_am[:, None] * stride_am  # [BLOCK_M, 1]
-    b_base_off = offs_bn[:, None] * stride_bn  # [BLOCK_N, 1]
+    # Full tile offsets computed once. The running K position is advanced with the
+    # scalars a_k / b_k (K stride is 1 for both A and col-major B). B halves are
+    # loaded directly as [BLOCK_K, HALF_N] (K on dim0, contiguous for col-major B):
+    # feeds tl.dot as [K, N] with NO local_trans.
+    a_off = offs_am[:, None] * stride_am + offs_k[None, :]
+    bl_off = offs_k[:, None] + offs_bn_left[None, :] * stride_bn
+    br_off = offs_k[:, None] + offs_bn_right[None, :] * stride_bn
 
-    # Create accumulator register array
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    a_k = tl.zeros([], dtype=tl.int32)
+    b_k = tl.zeros([], dtype=tl.int32)
 
-    # If we have enough K-iterations for a prologue, hot loop, and epilogue
-    # pipeline, we run it. Otherwise we run a simpler small-K pipeline
+    # Two independent accumulators, one per N half
+    acc_left = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+    acc_right = tl.zeros((BLOCK_SIZE_M, HALF_N), dtype=tl.float32)
+
     if k_full_chunk_iters >= NUM_BUFFERS:
-        # Prologue: async-copy the first NUM_BUFFERS K-tiles
+        # ── Prologue: fill both buffers (four async groups) ──
         for pi in tl.static_range(0, NUM_BUFFERS):
-            k_start = pi * BLOCK_SIZE_K
-            a_offs = a_base_off + (k_start + offs_k[None, :])
-            b_offs = b_base_off + (k_start + offs_k[None, :])
+            tlx.buffer_load_to_local(smemA[pi], a_ptr, a_off + a_k)
+            tlx.buffer_load_to_local(smemB_left[pi], b_ptr, bl_off + b_k)
+            tlx.async_load_commit_group()
 
-            # GR i
-            tok_a = tlx.async_load(a_ptr + a_offs, smemA[pi], cache_modifier=".ca", eviction_policy="evict_first")
-            tok_b = tlx.async_load(b_ptr + b_offs, smemB[pi], cache_modifier=".ca", eviction_policy="evict_last")
+            tlx.buffer_load_to_local(smemB_right[pi], b_ptr, br_off + b_k)
+            tlx.async_load_commit_group()
 
-            tlx.async_load_commit_group([tok_a, tok_b])
+            a_k += BLOCK_SIZE_K
+            b_k += BLOCK_SIZE_K
 
-        # Make GR0 and GR1 finish
-        tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
+        # Wait for group 0 (A + B_left in buffer 0).
+        tlx.async_load_wait_group(3)
 
-        # LR 0
         a_tile = tlx.local_load(smemA[0], relaxed=True)
-        b_tile = tlx.local_load(tlx.local_trans(smemB[0]), relaxed=True)
+        b_left_tile = tlx.local_load(smemB_left[0], relaxed=True)
 
-        # Number of iterations for the hot loop
-        n_steady = k_full_chunk_iters - NUM_BUFFERS
+        # Leave two loaded K tiles for the common epilogue. If the number of
+        # full K tiles is odd, leave the final tile for a separate cold drain.
+        hot_loop_end = k_full_chunk_iters - NUM_BUFFERS - (k_full_chunk_iters % 2)
 
-        for i in tl.range(0, n_steady, disallow_acc_multi_buffer=True):
-            # Index within the multibuffered circular SMEM where we are storing the global prefetch
-            prefetch_buf = i % NUM_BUFFERS
-
-            # Index within the multibuffered circular SMEM where we will load from to transfer into regs
-            next_buf = (i + 1) % NUM_BUFFERS
-
-            # Which tile we need to prefetch globally along the k dim
-            k_prefetch = (i + NUM_BUFFERS) * BLOCK_SIZE_K
-
-            # Execute MFMA with the data we already have loaded into registers
+        # ── Main loop: step 2, four regions per body ──
+        for k in tl.range(0, hot_loop_end, 2, num_stages=1):
+            # ──── Region 0 ────
             with tlx.warp_pipeline_stage("mfma", priority=0):
-                acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
-
-            # Most recently committed buffers (GR i + NUM_BUFFERS) can be in flight
-            tlx.async_load_wait_group(max((NUM_BUFFERS - 2), 0))
+                acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
 
             with tlx.warp_pipeline_stage("mem", priority=1):
-                # Perform global prefetching (GR i + NUM_BUFFERS)
-                a_offs = a_base_off + (k_prefetch + offs_k[None, :])
-                b_offs = b_base_off + (k_prefetch + offs_k[None, :])
-                tok_a = tlx.async_load(a_ptr + a_offs, smemA[prefetch_buf], cache_modifier=".ca",
-                                       eviction_policy="evict_first")
-                tok_b = tlx.async_load(b_ptr + b_offs, smemB[prefetch_buf], cache_modifier=".ca",
-                                       eviction_policy="evict_last")
-                tlx.async_load_commit_group([tok_a, tok_b])
+                tlx.async_load_wait_group(2)
+                b_right_tile = tlx.local_load(smemB_right[0], relaxed=True)
 
-                # Perform local prefetching (LR i + 1)
-                a_tile = tlx.local_load(smemA[next_buf], relaxed=True)
-                b_tile = tlx.local_load(tlx.local_trans(smemB[next_buf]), relaxed=True)
+                tlx.buffer_load_to_local(smemA[0], a_ptr, a_off + a_k)
+                tlx.buffer_load_to_local(smemB_left[0], b_ptr, bl_off + b_k)
+                tlx.async_load_commit_group()
 
-        # Epilogue: drain the last NUM_BUFFERS K-tiles
-        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+            # ──── Region 1 ────
+            with tlx.warp_pipeline_stage("mfma", priority=0):
+                acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
+
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                tlx.async_load_wait_group(2)
+                a_tile = tlx.local_load(smemA[1], relaxed=True)
+                b_left_tile = tlx.local_load(smemB_left[1], relaxed=True)
+
+                tlx.buffer_load_to_local(smemB_right[0], b_ptr, br_off + b_k)
+                tlx.async_load_commit_group()
+
+            a_k += BLOCK_SIZE_K
+            b_k += BLOCK_SIZE_K
+
+            # ──── Region 2 ────
+            with tlx.warp_pipeline_stage("mfma", priority=0):
+                acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
+
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                tlx.async_load_wait_group(2)
+                b_right_tile = tlx.local_load(smemB_right[1], relaxed=True)
+
+                tlx.buffer_load_to_local(smemA[1], a_ptr, a_off + a_k)
+                tlx.buffer_load_to_local(smemB_left[1], b_ptr, bl_off + b_k)
+                tlx.async_load_commit_group()
+
+            # ──── Region 3 ────
+            with tlx.warp_pipeline_stage("mfma", priority=0):
+                acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
+
+            with tlx.warp_pipeline_stage("mem", priority=1):
+                tlx.async_load_wait_group(2)
+                a_tile = tlx.local_load(smemA[0], relaxed=True)
+                b_left_tile = tlx.local_load(smemB_left[0], relaxed=True)
+
+                tlx.buffer_load_to_local(smemB_right[1], b_ptr, br_off + b_k)
+                tlx.async_load_commit_group()
+
+            a_k += BLOCK_SIZE_K
+            b_k += BLOCK_SIZE_K
+
+        # ── Epilogue: drain the final two pipelined K tiles ──
+        acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
         tlx.async_load_wait_group(0)
+        b_right_tile = tlx.local_load(smemB_right[0], relaxed=True)
 
-        # Finish final set of LRs and MFMAs
-        for i in tl.static_range(0, NUM_BUFFERS - 1):
-            buf = (k_full_chunk_iters - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS
-            a_tile = tlx.local_load(smemA[buf], relaxed=True)
-            b_tile = tlx.local_load(tlx.local_trans(smemB[buf]), relaxed=True)
-            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+        acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
+        a_tile = tlx.local_load(smemA[1], relaxed=True)
+        b_left_tile = tlx.local_load(smemB_left[1], relaxed=True)
+
+        acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
+        b_right_tile = tlx.local_load(smemB_right[1], relaxed=True)
+        acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
+
+        # Grouped GEMM accepts arbitrary runtime K, so drain one additional full
+        # tile when k_full_chunk_iters is odd. a_k / b_k already point at the
+        # final full tile here.
+        if (k_full_chunk_iters % 2) != 0:
+            tlx.buffer_load_to_local(smemA[0], a_ptr, a_off + a_k)
+            tlx.buffer_load_to_local(smemB_left[0], b_ptr, bl_off + b_k)
+            tlx.async_load_commit_group()
+
+            tlx.buffer_load_to_local(smemB_right[0], b_ptr, br_off + b_k)
+            tlx.async_load_commit_group()
+            tlx.async_load_wait_group(0)
+
+            a_tile = tlx.local_load(smemA[0], relaxed=True)
+            b_left_tile = tlx.local_load(smemB_left[0], relaxed=True)
+            b_right_tile = tlx.local_load(smemB_right[0], relaxed=True)
+            acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
+            acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
+
+            a_k += BLOCK_SIZE_K
+            b_k += BLOCK_SIZE_K
     else:
-        # Small-k path: load all full K-tiles, then dot
+        # Small-K path: there can be at most one full K tile.
         for i in tl.range(0, k_full_chunk_iters):
-            k_start = i * BLOCK_SIZE_K
-            a_offs = a_base_off + (k_start + offs_k[None, :])
-            b_offs = b_base_off + (k_start + offs_k[None, :])
-            tok_a = tlx.async_load(a_ptr + a_offs, smemA[i], cache_modifier=".ca", eviction_policy="evict_first")
-            tok_b = tlx.async_load(b_ptr + b_offs, smemB[i], cache_modifier=".ca", eviction_policy="evict_last")
-            tlx.async_load_commit_group([tok_a, tok_b])
+            tlx.buffer_load_to_local(smemA[i], a_ptr, a_off + a_k)
+            tlx.buffer_load_to_local(smemB_left[i], b_ptr, bl_off + b_k)
+            tlx.async_load_commit_group()
+
+            tlx.buffer_load_to_local(smemB_right[i], b_ptr, br_off + b_k)
+            tlx.async_load_commit_group()
+
+            a_k += BLOCK_SIZE_K
+            b_k += BLOCK_SIZE_K
 
         tlx.async_load_wait_group(0)
 
         for i in tl.range(0, k_full_chunk_iters):
-            a_tile = tlx.local_load(smemA[i])
-            b_tile = tlx.local_load(tlx.local_trans(smemB[i]))
-            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+            a_tile = tlx.local_load(smemA[i], relaxed=True)
+            b_left_tile = tlx.local_load(smemB_left[i], relaxed=True)
+            b_right_tile = tlx.local_load(smemB_right[i], relaxed=True)
+            acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
+            acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
 
-    # Peel the partial last K-tile (gk % BLOCK_SIZE_K != 0)
+    # Peel the partial last K-tile (gk % BLOCK_SIZE_K != 0). a_k / b_k point here.
     if k_full_chunk_iters * BLOCK_SIZE_K < gk:
         k_start = k_full_chunk_iters * BLOCK_SIZE_K
-        a_offs = a_base_off + (k_start + offs_k[None, :])
-        # Load B directly as [BLOCK_K, BLOCK_N] so the dot needs no transpose
-        b_offs_t = (k_start + offs_k[:, None]) + offs_bn[None, :] * stride_bn
-        a_tile = tl.load(a_ptr + a_offs, mask=offs_k[None, :] < gk - k_start, other=0.0)
-        b_tile = tl.load(b_ptr + b_offs_t, mask=offs_k[:, None] < gk - k_start, other=0.0)
-        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=False)
+        k_mask = offs_k < gk - k_start
+        a_tile = tl.load(a_ptr + a_off + a_k, mask=offs_k[None, :] < gk - k_start, other=0.0)
+        b_left_tile = tl.load(b_ptr + bl_off + b_k, mask=k_mask[:, None], other=0.0)
+        b_right_tile = tl.load(b_ptr + br_off + b_k, mask=k_mask[:, None], other=0.0)
+        acc_left = tl.dot(a_tile, b_left_tile, acc_left, allow_tf32=False)
+        acc_right = tl.dot(a_tile, b_right_tile, acc_right, allow_tf32=False)
 
-    # Store to C and mask out OOB rows and columns
-    c = acc.to(c_ptr.dtype.element_ty)
+    # Store the two N halves and mask out OOB rows and columns.
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < gm) & (offs_cn[None, :] < gn)
-    tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".cs")
+    offs_cn_left = pid_n * BLOCK_SIZE_N + tl.arange(0, HALF_N)
+    c_left_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn_left[None, :]
+    c_left_mask = (offs_cm[:, None] < gm) & (offs_cn_left[None, :] < gn)
+    tl.store(c_left_ptrs, acc_left.to(c_ptr.dtype.element_ty), mask=c_left_mask, cache_modifier=".cs")
+
+    offs_cn_right = pid_n * BLOCK_SIZE_N + HALF_N + tl.arange(0, HALF_N)
+    c_right_ptrs = c_ptr + offs_cm[:, None] * stride_cm + offs_cn_right[None, :]
+    c_right_mask = (offs_cm[:, None] < gm) & (offs_cn_right[None, :] < gn)
+    tl.store(c_right_ptrs, acc_right.to(c_ptr.dtype.element_ty), mask=c_right_mask, cache_modifier=".cs")
 
 
 @triton.jit
@@ -237,10 +310,13 @@ def grouped_gemm_kernel(
     # Program id after L2 remapping
     pid = chiplet_transform_chunked(pid, NUM_SM, NUM_XCDS, XCD_CHUNK)
 
-    # LDS ring buffers reused throughout the entire program.
-    # Both A and B are [outer, K] tiles (K innermost/contiguous)
+    HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
+
+    # LDS ring buffers reused throughout the entire program. B is split into two
+    # [BLOCK_K, HALF_N] halves for the four-region N-split pipeline.
     smemA = tlx.local_alloc((BLOCK_SIZE_M, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS)
-    smemB = tlx.local_alloc((BLOCK_SIZE_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS)
+    smemB_left = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tl.float16, NUM_BUFFERS)
+    smemB_right = tlx.local_alloc((BLOCK_SIZE_K, HALF_N), tl.float16, NUM_BUFFERS)
 
     # Which global output tile we are computing
     tile_idx = pid
@@ -252,12 +328,12 @@ def grouped_gemm_kernel(
         # Load base pointers
         a_ptr = tl.multiple_of(tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
         b_ptr = tl.multiple_of(tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
-        c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16))
+        c_ptr = tl.multiple_of(tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
 
         # Load gemm sizes
         gm = tl.load(group_gemm_sizes + g * 3)
         gn = tl.load(group_gemm_sizes + g * 3 + 1)
-        gn = tl.multiple_of(gn, 16)
+        gn = tl.multiple_of(gn, 8)
         gk = tl.load(group_gemm_sizes + g * 3 + 2)
 
         # Load strides
@@ -296,8 +372,8 @@ def grouped_gemm_kernel(
 
             # Compute this (pid_m, pid_n) output tile; scheduler-agnostic logic.
             _grouped_gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn, stride_cm, smemA,
-                               smemB, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
-                               NUM_BUFFERS=NUM_BUFFERS)
+                               smemB_left, smemB_right, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                               BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_BUFFERS=NUM_BUFFERS)
 
             # Program p owns tiles p, p+NUM_SM, p+2*NUM_SM, and so on
             tile_idx += NUM_SM
@@ -309,10 +385,10 @@ def grouped_gemm_kernel(
 _CONFIG = {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
-    "BLOCK_SIZE_K": 32,
-    "GROUP_SIZE_M": 8,
-    "NUM_BUFFERS": 3,
-    "XCD_CHUNK": 32,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 4,
+    "NUM_BUFFERS": 2,
+    "XCD_CHUNK": 16,
     "num_warps": 8,
 }
 
@@ -380,7 +456,7 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
         num_warps=cfg["num_warps"],
         num_stages=1,
         matrix_instr_nonkdim=16,
-        # llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
 
 
@@ -433,6 +509,9 @@ def _bench():
     group_A, group_B = _rand_groups(spec)
     total_flops = sum(2 * M * N * K for (M, N, K) in spec)
 
+    # Host-side setup (pointer/size/stride tensors, output buffers) is built once,
+    # outside the timed region; do_bench times only _perf_fn (the kernel launch),
+    # matching blackwell-grouped-gemm_test.py.
     d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg, _ = _make_grouped_gemm_args(group_A, group_B)
     ms = triton.testing.do_bench(lambda: _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg), rep=100)
     print(f"  v3 grouped GEMM : {tflops(ms, total_flops):7.1f} TFLOPS ({ms:.3f} ms)")
