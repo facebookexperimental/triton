@@ -2162,9 +2162,9 @@ static PyObject *register_tensor_bridge(PyObject *self, PyObject *arg) {
   Py_RETURN_NONE;
 }
 
-#define TD_MAX_KERNEL_ARGS 64
+#define TD_MAX_KERNEL_ARGS 128
 #define TD_FIXED_ARGS 4          /* grid_x, grid_y, grid_z, stream */
-#define TD_MAX_TMA_DESCS 8       /* max nvTmaDesc args per kernel */
+#define TD_MAX_TMA_DESCS 16      /* max nvTmaDesc args per kernel */
 #define TD_MAX_TENSORDESC_NDIM 5 /* max dimensionality for TensorDescriptor */
 
 /* Per-TMA-slot metadata for inline expansion of TensorDescriptor objects */
