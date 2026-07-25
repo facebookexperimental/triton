@@ -631,7 +631,7 @@ This interface is unchanged.
 ```
 doMemoryPlanner(funcOp, numBuffers)
   ├── Step 0: reorderOpsBySchedule (disabled)
-  ├── Step 1: collectPostChannels
+  ├── Step 1: collectAllocChannels
   ├── Step 1.5: identify cross-stage channels
   ├── Step 2: MemoryPlanner::run(numBuffers)       ← THIS CHANGES
   │     ├── Phase 1: create WSBuffers, unique IDs, all copy=1

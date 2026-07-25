@@ -1,4 +1,4 @@
-"""Benchmark spec for case1 (simple GEMM) consumed by examples/testing/perf_engine.py.
+"""Benchmark spec for case1 (simple GEMM) consumed by examples/testing/perf_regression/perf_harness.py.
 
 Launch logic mirrors run_generated.py (generated) and handwritten.gemm (reference).
 """

@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 
@@ -371,7 +372,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
   });
 }
 
-void doTokenLowering(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
+void doTokenLowering(triton::FuncOp funcOp, unsigned numConsumerGroups) {
   ModuleOp mod = funcOp.getOperation()->getParentOfType<ModuleOp>();
   int numCTAs = ttg::TritonGPUDialect::getNumCTAs(mod);
 

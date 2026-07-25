@@ -1,5 +1,5 @@
 // RUN: triton-opt %s --tritonamdgpu-block-pingpong=num-stages=3 | FileCheck %s
-// RUN: triton-opt %s --tritonamdgpu-block-pingpong=num-stages=3 --tritonamdgpu-update-async-wait-count=arch-generation-name=gfx950 | FileCheck %s
+// RUN: triton-opt %s --tritonamdgpu-block-pingpong=num-stages=3 --tritonamdgpu-update-async-wait-count=gfx-arch=gfx950 | FileCheck %s
 
 // BlockPingpong's transformTwoClusterWithLocalLoadAndAll combines per-operand
 // ttg.async_waits into a single multi-token wait, then reorders async copies

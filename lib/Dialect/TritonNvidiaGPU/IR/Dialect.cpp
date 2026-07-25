@@ -24,7 +24,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/TritonGPUInterfaces.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 
 #include <numeric>
 
@@ -48,8 +48,6 @@ using namespace mlir::triton::nvidia_gpu;
 namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
-
-static constexpr int numTmemRows = 128;
 
 FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
   Attribute attr;
@@ -432,12 +430,17 @@ LogicalResult TensorMemoryEncodingAttr::verify(
     return emitError() << "CGALayout must have rank 2";
   }
   if (twoCTAs) {
+    // twoCTAs does not imply a sharded accumulator: num_ctas>1 shards it across
+    // the cluster (block axis = [1,0]), while ctas_per_cga with num_ctas==1
+    // keeps it single-CTA (empty block axis). Only check the shard direction
+    // when a shard exists -- never getBasis() an empty axis.
     auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
     auto cgaLL = cgaLayout.getLinearLayout();
-    if (cgaLL.getBasis(kBlock, 0) != ArrayRef{1, 0}) {
+    if (cgaLL.hasInDim(kBlock) && cgaLL.getInDimSizeLog2(kBlock) >= 1 &&
+        cgaLL.getBasis(kBlock, 0) != ArrayRef{1, 0}) {
       return emitError()
-             << "twoCTAs layout requires the first CGALayout block basis to "
-                "be [1, 0]";
+             << "twoCTAs layout with a CTA shard requires the first CGALayout "
+                "block basis to be [1, 0]";
     }
   }
   if (blockM != 64 && blockM != 128) {
@@ -506,16 +509,57 @@ LogicalResult impl::verifyMMAv5Op(Operation *op) {
 #include "triton/Dialect/TritonNvidiaGPU/IR/Types.cpp.inc"
 
 //===----------------------------------------------------------------------===//
+// TensorDescIm2ColType Printer/Parser
+//===----------------------------------------------------------------------===//
+// Format: !ttng.tensordesc_im2col<64x128xf16>
+//         !ttng.tensordesc_im2col<64x128xf16, #shared>
+Type TensorDescIm2ColType::parse(AsmParser &parser) {
+  if (failed(parser.parseLess()))
+    return Type();
+
+  SmallVector<int64_t> shape;
+  if (failed(parser.parseDimensionList(shape, /*allowDynamic=*/false)))
+    return Type();
+
+  Type elementType;
+  if (failed(parser.parseType(elementType)))
+    return Type();
+
+  Attribute sharedLayout;
+  if (succeeded(parser.parseOptionalComma())) {
+    if (failed(parser.parseAttribute(sharedLayout)))
+      return Type();
+  }
+
+  if (failed(parser.parseGreater()))
+    return Type();
+
+  Location loc = parser.getEncodedSourceLoc(parser.getCurrentLocation());
+  return TensorDescIm2ColType::getChecked(loc, parser.getContext(), shape,
+                                          elementType, sharedLayout);
+}
+
+void TensorDescIm2ColType::print(AsmPrinter &printer) const {
+  printer << "<";
+  for (auto dim : getShape())
+    printer << dim << "x";
+  printer << getElementType();
+  if (getSharedLayout())
+    printer << ", " << getSharedLayout();
+  printer << ">";
+}
+
+//===----------------------------------------------------------------------===//
 // TensorDescIm2ColType Verifier
 //===----------------------------------------------------------------------===//
 LogicalResult
 TensorDescIm2ColType::verify(function_ref<InFlightDiagnostic()> emitError,
-                             RankedTensorType blockType) {
-  // blockType must be rank 2 for im2col mode
-  if (blockType.getRank() != 2) {
+                             ArrayRef<int64_t> shape, Type elementType,
+                             Attribute sharedLayout) {
+  if (shape.size() != 2) {
     return emitError()
-           << "TensorDescIm2ColType requires rank-2 blockType, got rank "
-           << blockType.getRank();
+           << "TensorDescIm2ColType requires rank-2 shape, got rank "
+           << shape.size();
   }
   return success();
 }

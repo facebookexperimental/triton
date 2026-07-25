@@ -229,7 +229,7 @@ barrier ops is complementary — it annotates the actual `wait_barrier` /
 `arrive_barrier` ops that exist outside or after lowering.
 
 The migration path:
-1. `doCodePartitionPost` creates token annotations on SubtiledRegionOps
+1. `doCodePartition` creates token annotations on SubtiledRegionOps
 2. `doTokenLowering` converts tokens to real barrier ops with `constraints`
    encoding the subtile context (loweringMask, numBuffers)
 3. `LowerSubtiledRegionPass` reads constraints when expanding tiles

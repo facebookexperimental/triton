@@ -18,6 +18,7 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
 
     CURRENT_POWER=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES")
     MAX_POWER=$(nvidia-smi --query-gpu=power.max_limit  --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES")
+    DEFAULT_POWER=$(nvidia-smi --query-gpu=power.default_limit --format=csv,noheader,nounits -i "$CUDA_VISIBLE_DEVICES")
     MAX_SM_CLOCK=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits  -i "$CUDA_VISIBLE_DEVICES")
 
     GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 | awk '{print $2}')
@@ -27,10 +28,21 @@ if [[ "$GPU_VENDOR" == "nvidia" ]]; then
             DESIRED_POWER=700
         elif [[ "$GPU_MODEL" == "GB200" ]]; then
             DESIRED_POWER=1200
+        elif [[ "$GPU_MODEL" == "GB300" ]]; then
+            DESIRED_POWER=1400
         elif [[ "$GPU_MODEL" == "B200" ]]; then
             DESIRED_POWER=750
         else
-            DESIRED_POWER=500
+            # Unknown GPU: use the card's rated power (power.default_limit) so the
+            # locked max clock runs at the power it is designed to sustain, rather
+            # than an arbitrary 500 W that power-throttles large parts (a GB300,
+            # for example, reports default_limit = max = 1400 W). Fall back to
+            # 500 W only if the query did not return a number.
+            if [[ "$DEFAULT_POWER" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                DESIRED_POWER="$DEFAULT_POWER"
+            else
+                DESIRED_POWER=500
+            fi
         fi
     fi
 

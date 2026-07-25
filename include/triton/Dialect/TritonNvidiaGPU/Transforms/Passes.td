@@ -82,6 +82,19 @@ def TritonGPUProxyFenceInsertion : Pass<"triton-nvidia-gpu-proxy-fence-insertion
   ];
 }
 
+def TritonNvidiaGPUFuseTMEMLoadReducePass : Pass<"triton-nvidia-tmem-load-reduce", "mlir::ModuleOp"> {
+  let summary = "Fuse tmem_load and reduce";
+
+  let description = [{
+    Fuse ttng.tmem_load followed by a row reduction into ttng.tmem_load with a
+    reduction op, to generate tcgen05.ld.red.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonNvidiaGPUTMALoweringPass : Pass<"triton-nvidia-tma-lowering", "mlir::ModuleOp"> {
   let summary = "lower to TMA load/store operations";
 
@@ -238,6 +251,75 @@ def TritonNvidiaGPUCheckMatmulTwoCTAPass : Pass<"triton-nvidia-check-matmul-two-
     can access it. Compilation fails if mixed configurations are detected, or if
     one 2-CTA `tt.dot` consumes a value derived from another 2-CTA `tt.dot`.
   }];
+}
+
+def TritonNvidiaGPUCLCSplitPass : Pass<"triton-nvidia-gpu-clc-split", "mlir::ModuleOp"> {
+  let summary = "Split ttng.clc_advance into the token form (clc_try_cancel_async + clc_read)";
+
+  let description = [{
+    Stage 1 of the CLC tile-scheduler lowering. Rewrites each `ttng.clc_advance`
+    into `ttng.clc_try_cancel_async` (async issue -> !ttg.async.token) followed by
+    `ttng.clc_read` (await the token -> decoded tile). No mbarrier/buffer is
+    introduced; the token models the async dependency.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TritonNvidiaGPUCLCHoistPass : Pass<"triton-nvidia-gpu-clc-hoist", "mlir::ModuleOp"> {
+  let summary = "Hoist ttng.clc_try_cancel_async to overlap CLC latency with compute";
+
+  let description = [{
+    Stage 2 of the CLC tile-scheduler lowering. Promotes each
+    `ttng.clc_try_cancel_async` to the top of its block so the CLC round-trip
+    overlaps the tile's compute before the paired `ttng.clc_read`.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
+def TritonNvidiaGPUCLCMaterializePass : Pass<"triton-nvidia-gpu-clc-materialize", "mlir::ModuleOp"> {
+  let summary = "Materialize the CLC token form into mbarrier ops (single-CTA only)";
+
+  let description = [{
+    Stage 4 of the CLC tile-scheduler lowering. Materializes each
+    `clc_try_cancel_async` / `clc_read` pair into a response buffer + completion
+    mbarrier: the issue becomes `barrier_expect` + `clc_try_cancel`, the read
+    becomes `wait_barrier` + `clc_load_result` + `clc_is_canceled` /
+    `clc_get_program_id`, with a loop-carried, per-iteration-toggled phase.
+    Supports a single CTA only; multi-cluster / multi-CTA is rejected.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect"
+  ];
+}
+
+def TritonNvidiaGPUPromoteLoadToTMAPass : Pass<"triton-nvidia-promote-load-to-tma", "mlir::ModuleOp"> {
+  let summary = "Auto-promote eligible tt.load to a real TMA descriptor_load";
+
+  let description = [{
+    Analyze pointer-arithmetic patterns in tt.load operations. When a masked,
+    block-structured load is TMA-eligible (contiguous innermost dimension, rank
+    1-5, supported element type, >= 16 byte inner dim, zero OOB fill), rewrite it
+    into the explicit-TMA form -- tt.make_tensor_descriptor + tt.descriptor_load
+    -- so the standard nvidia TMA lowering turns it into an asynchronous TMA copy
+    on sm_90+. Non-eligible loads are left unchanged.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
+    "mlir::arith::ArithDialect"
+  ];
 }
 
 #endif

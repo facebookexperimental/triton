@@ -766,9 +766,12 @@ def test_explicit_cluster_sync_ws(device):
     # 1 user fence + 1 compiler-inserted fence from maybeInsertClusterSync
     assert ptx.count("fence.mbarrier_init.release.cluster") == 2, (
         f"Expected exactly 2 fence.mbarrier_init.release.cluster in PTX:\n{ptx}")
-    # 3 user cluster_barrier + 1 compiler-inserted + 1 WS non-default warp arrive
-    assert ptx.count("barrier.cluster.arrive.aligned") == 5, (
-        f"Expected exactly 5 barrier.cluster.arrive.aligned in PTX:\n{ptx}")
+    # 3 user cluster_barrier arrives (non-relaxed)
+    assert ptx.count("barrier.cluster.arrive.aligned") == 3, (
+        f"Expected exactly 3 barrier.cluster.arrive.aligned in PTX:\n{ptx}")
+    # 1 compiler-inserted entry arrive + 1 WS non-default warp arrive, both relaxed
+    assert ptx.count("barrier.cluster.arrive.relaxed.aligned") == 2, (
+        f"Expected exactly 2 barrier.cluster.arrive.relaxed.aligned in PTX:\n{ptx}")
     # 3 user cluster_barrier + 1 compiler-inserted
     assert ptx.count("barrier.cluster.wait.aligned") == 4, (
         f"Expected exactly 4 barrier.cluster.wait.aligned in PTX:\n{ptx}")

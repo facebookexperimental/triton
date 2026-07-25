@@ -5,6 +5,7 @@
 add_triton_library(TritonGPUModuloCore
   ModuloScheduling/LatencyModel.cpp
   ModuloScheduling/AMDLatencyModel.cpp
+  ModuloScheduling/AMDWarpPipelinePartition.cpp
   ModuloScheduling/DataDependenceGraph.cpp
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp
@@ -33,6 +34,11 @@ add_triton_library(NVHopperTransforms
   WarpSpecialization/WSLowerMem.cpp
   WarpSpecialization/WSLowerToken.cpp
   WarpSpecialization/WSMemoryPlanner.cpp
+  WarpSpecialization/WSMemoryPlanOrdering.cpp
+  WarpSpecialization/WSMemoryPlanCost.cpp
+  WarpSpecialization/WSMemoryPlanCopies.cpp
+  WarpSpecialization/WSMemoryPlanSearch.cpp
+  WarpSpecialization/WSMemoryPlanPackers.cpp
   WarpSpecialization/WSSpecialize.cpp
   WarpSpecialization/SinkBroadcast.cpp
   WarpSpecialization/WSTMAStoreLowering.cpp
@@ -51,6 +57,8 @@ add_triton_library(NVHopperTransforms
 
   DEPENDS
   NVHopperTransformsIncGen
+  NVWSTableGen
+  NVWSAttrDefsIncGen
 
   LINK_LIBS PUBLIC
   TritonIR

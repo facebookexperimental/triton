@@ -88,14 +88,14 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-LABEL: @outer_loop_with_empty_inner
 // CHECK: tt.return
 tt.func @outer_loop_with_empty_inner(
-  %a_desc: !tt.tensordesc<tensor<128x64xf16>>
+  %a_desc: !tt.tensordesc<128x64xf16>
 ) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32
   %tiles = arith.constant 4 : i32
 
   scf.for %t = %c0_i32 to %tiles step %c1_i32 : i32 {
-    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<tensor<128x64xf16>> -> tensor<128x64xf16, #blocked>
+    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf16> -> tensor<128x64xf16, #blocked>
     %a_shared = ttg.local_alloc %a : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
     "test.use"(%a_shared) : (!ttg.memdesc<128x64xf16, #shared, #smem>) -> ()
 

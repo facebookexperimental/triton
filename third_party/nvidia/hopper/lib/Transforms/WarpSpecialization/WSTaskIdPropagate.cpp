@@ -1,6 +1,7 @@
 #include "CodePartitionUtility.h"
 #include "TaskIdPropagation.h"
 #include "Utility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
@@ -177,7 +178,7 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
   });
 }
 
-int doTaskIdPropagate(triton::FuncOp &funcOp) {
+LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   // Compute the min partition to normalize to 0
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
@@ -246,7 +247,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   solver.load<SparseConstantPropagation>();
   solver.load<ttg::TaskIdBackwardPropagation>(symbolTable);
   if (failed(solver.initializeAndRun(op)))
-    return -1;
+    return failure();
 
   funcOp.walk([&](mlir::Operation *op) {
     auto taskIds = ttg::TaskId::getUninitialized();
@@ -299,7 +300,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp) {
   // We do this in a separate walk to avoid having a parent operation treated
   // like an anchor op and skipped by the first walk.
   funcOp.walk([&](mlir::Operation *op) { labelParentOps(op); });
-  return 0;
+  return success();
 }
 
 #define GEN_PASS_DEF_NVGPUTESTWSTASKIDPROPAGATE
@@ -327,8 +328,7 @@ public:
     });
     if (numWarpGroups == 0 || anchorOps.empty())
       return;
-    int retCode = doTaskIdPropagate(funcOp);
-    if (retCode != 0)
+    if (failed(doTaskIdPropagate(funcOp)))
       signalPassFailure();
   }
 

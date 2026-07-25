@@ -14,14 +14,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK-NOT: can_rotate_by_buffer_count
 // CHECK-SAME: {loop.cluster = 0 : i32, loop.stage = 1 : i32}
   tt.func public @single_buffer_reduce_token_k1(
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
       %src: tensor<128x64xf16>,
       %lb: index, %ub: index, %step: index) {
     %buf = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %c0 = arith.constant 0 : i32
     scf.for %iv = %lb to %ub step %step {
       ttg.local_store %src, %buf {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-      %tok = ttng.async_tma_reduce add, %desc[%c0, %c0] %buf {"loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      %tok = ttng.async_tma_reduce add, %desc[%c0, %c0] %buf {"loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %tok {"can_rotate_by_buffer_count" = 1 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 2 : i32} : !ttg.async.token
     } {"tt.scheduled_max_stage" = 1 : i32}
     tt.return
@@ -42,15 +42,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // CHECK: ttng.async_tma_store_token_wait [[REDTOK]]
 // CHECK-SAME: {can_rotate_by_buffer_count = 1 : i32, loop.cluster = 4 : i32, loop.stage = 0 : i32}
   tt.func public @mixed_reduce_to_copy_k1(
-      %desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
       %reduce_src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %copy_src: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
       %lb: index, %ub: index, %step: index) {
     %c0 = arith.constant 0 : i32
     scf.for %iv = %lb to %ub step %step {
-      %reduce_tok = ttng.async_tma_reduce add, %desc[%c0, %c0] %reduce_src {"loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      %reduce_tok = ttng.async_tma_reduce add, %desc[%c0, %c0] %reduce_src {"loop.stage" = 0 : i32, "loop.cluster" = 1 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       %dummy = arith.addi %c0, %c0 {"loop.stage" = 0 : i32, "loop.cluster" = 2 : i32} : i32
-      %copy_tok = ttng.async_tma_copy_local_to_global %desc[%dummy, %c0] %copy_src {"loop.stage" = 0 : i32, "loop.cluster" = 3 : i32} : !tt.tensordesc<tensor<128x64xf16, #shared>>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      %copy_tok = ttng.async_tma_copy_local_to_global %desc[%dummy, %c0] %copy_src {"loop.stage" = 0 : i32, "loop.cluster" = 3 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
       ttng.async_tma_store_token_wait %reduce_tok {"can_rotate_by_buffer_count" = 1 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 4 : i32} : !ttg.async.token
     } {"tt.scheduled_max_stage" = 1 : i32}
     tt.return

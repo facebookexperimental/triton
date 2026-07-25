@@ -135,3 +135,34 @@ regressions; confirm the other configs and the passing variants are unchanged.
 - **Lesson:** the bug was *not* where racecheck pointed (TMEM is invisible to
   it) nor where the first hypothesis aimed (TMA drain) — the
   passing-vs-failing-variant delta plus the TLX barrier diff localized it.
+
+## Worked example: FA-fwd persistent deadlock (constant staging phase)
+
+- **Symptom:** `fused_attention_ws_device_tma_dp` fwd, `ws_persistent`, non-
+  causal, hDim 128 — **deadlock**. Compile+launch returns in ~12s, then
+  `torch.cuda.synchronize()` hangs forever with GPU pinned at 100% (faulthandler
+  shows Python stuck in `synchronize`/`assert_close`).
+- **Isolation:** `git bisect` on the build — HEAD~1 (`27e57b931`) completes 4/4,
+  HEAD (`cb9d56313`, the bug #10 fix) hangs 3/3 ⇒ the top commit caused it.
+- **Diff the synchronization (step 6/7):** dumped the post-WS TTGIR at both
+  commits (`TRITON_KERNEL_DUMP=1`). The `desc_o` output-staging producer wait
+  went from `wait_barrier empty, phase=(tile_idx/2)&1` (HEAD~1, rotating) to
+  `wait_barrier empty, %c1_i32` (HEAD, **constant phase**) — the canonical
+  "constant phase ⇒ never alternates ⇒ deadlocks after tile 0" failure mode
+  (see Process §7).
+- **Root cause:** bug #10 made `getStaggeredAccumCnt` return the bare subtile
+  index for *all* `buffer.tmaStaging` allocs. Correct for **same-partition**
+  wait_group-drained staging (bwd `dk/dv/dq`), but `desc_o` is **cross-
+  partition** (compute task produces, epilogue-store task consumes) — a
+  producer/consumer mbarrier whose phase must rotate by the continuous
+  `accumCnt`. The constant index pinned the phase. `buffer.tmaStaging` alone
+  can't tell the two apart; the discriminator is producer-task == consumer-task.
+- **Fix:** gate the bare-subtile-index path on same-partition staging
+  (`getStaggeredAccumCnt`); cross-partition keeps continuous `accumCnt`. Plus a
+  defensive `K | S` cap in `increaseFusedEpilogueCopies` for same-partition
+  rings. See partition-scheduler-bugs.md #11 and `AccumulationCounters.md`
+  §"TMA Staging Buffers".
+- **Lesson:** a fix scoped by a coarse tag (`buffer.tmaStaging`) silently caught
+  a second, structurally different staging case; the persistent-vs-parent commit
+  diff + the IR phase diff localized it exactly. New compiler paths (fwd
+  persistent here) need coverage *before* a tag-based change rides over them.

@@ -32,19 +32,13 @@ namespace nvidia_gpu {
 namespace {
 
 bool isAsyncProxyWrite(Operation *op) {
-  return isa<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-             triton::nvidia_gpu::AsyncTMAGatherOp,
+  return isa<triton::nvidia_gpu::TMALoadLikeOpInterface,
              triton::nvidia_gpu::CLCTryCancelOp>(op);
 }
 
 Value getSmemDest(Operation *op) {
-  if (auto asyncTMACopyGlobalToLocalOp =
-          dyn_cast<triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op)) {
-    return asyncTMACopyGlobalToLocalOp.getResult();
-  }
-  if (auto asyncTMAGatherOp =
-          dyn_cast<triton::nvidia_gpu::AsyncTMAGatherOp>(op)) {
-    return asyncTMAGatherOp.getResult();
+  if (auto tmaLoad = dyn_cast<triton::nvidia_gpu::TMALoadLikeOpInterface>(op)) {
+    return tmaLoad.getResult();
   }
   if (auto clcTryCancelOp = dyn_cast<triton::nvidia_gpu::CLCTryCancelOp>(op)) {
     return clcTryCancelOp.getResult();
@@ -53,13 +47,16 @@ Value getSmemDest(Operation *op) {
 }
 
 bool isAsyncProxyRead(Operation *op) {
-  return isa<
-      triton::nvidia_gpu::WarpGroupDotOp, triton::nvidia_gpu::TCGen5MMAOp,
-      triton::nvidia_gpu::TCGen5MMAScaledOp, triton::nvidia_gpu::TMEMCopyOp,
-      triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp,
-      triton::nvidia_gpu::AsyncTMAScatterOp,
-      triton::nvidia_gpu::AsyncTMAReduceOp,
-      triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(op);
+  // Adopt upstream's interface-based classification (MMAv5OpInterface covers
+  // the tcgen5 MMA ops; TMAStoreLikeOpInterface covers
+  // scatter/reduce/local-to-global). Preserve beta's conservative divergence:
+  // the global-to-local TMA load is also treated as an async-proxy read so the
+  // post-allocation safety net fences it.
+  return isa<triton::nvidia_gpu::WarpGroupDotOp,
+             triton::nvidia_gpu::MMAv5OpInterface,
+             triton::nvidia_gpu::TMEMCopyOp,
+             triton::nvidia_gpu::TMAStoreLikeOpInterface,
+             triton::nvidia_gpu::AsyncTMACopyGlobalToLocalOp>(op);
 }
 
 bool isAsyncProxyReadSource(Operation *op, Value value) {
@@ -67,17 +64,9 @@ bool isAsyncProxyReadSource(Operation *op, Value value) {
   if (!memDescType ||
       !isa<triton::gpu::SharedMemorySpaceAttr>(memDescType.getMemorySpace()))
     return false;
-  if (auto asyncTMACopyLocalToGlobalOp =
-          dyn_cast<triton::nvidia_gpu::AsyncTMACopyLocalToGlobalOp>(op)) {
-    return value == asyncTMACopyLocalToGlobalOp.getSrc();
-  }
-  if (auto asyncTMAScatterOp =
-          dyn_cast<triton::nvidia_gpu::AsyncTMAScatterOp>(op)) {
-    return value == asyncTMAScatterOp.getSrc();
-  }
-  if (auto asyncTMAReduceOp =
-          dyn_cast<triton::nvidia_gpu::AsyncTMAReduceOp>(op)) {
-    return value == asyncTMAReduceOp.getSrc();
+  if (auto tmaStore =
+          dyn_cast<triton::nvidia_gpu::TMAStoreLikeOpInterface>(op)) {
+    return value == tmaStore.getSrc();
   }
   if (auto warpGroupDotOp = dyn_cast<triton::nvidia_gpu::WarpGroupDotOp>(op)) {
     return value == warpGroupDotOp.getA() || value == warpGroupDotOp.getB();

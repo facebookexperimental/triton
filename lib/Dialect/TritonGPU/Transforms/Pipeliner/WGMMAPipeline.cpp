@@ -111,8 +111,12 @@ static int minNumInterleavedCommitOps(Operation *waitOp) {
     return 0;
   };
 
+  // For AsyncWaitOp ops that do not come with a token to track the specific
+  // copy group, respect the original pending number. Such case is most likely
+  // from user code. The compiler should not generate a non-zero pending number
+  // if it does not know exactly which group to track.
   if (waitOp->getNumOperands() == 0)
-    return 0;
+    return cast<ttg::AsyncWaitOp>(waitOp).getNum();
 
   // Multi-token waits: take the min of minOverHistories across operands. Both
   // the captured `minCommitNumber` and the returned bailout-0s are folded in.

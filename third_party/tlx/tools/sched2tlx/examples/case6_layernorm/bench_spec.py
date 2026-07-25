@@ -1,4 +1,4 @@
-"""Benchmark spec for case6 (LayerNorm fwd) consumed by examples/testing/perf_engine.py.
+"""Benchmark spec for case6 (LayerNorm fwd) consumed by examples/testing/perf_regression/perf_harness.py.
 
 Launch logic mirrors perf_generated_vs_handwritten.py. Memory-bound → GB/s metric.
 The generated kernel bakes N=512 and BLOCK_M=8 in as literals.

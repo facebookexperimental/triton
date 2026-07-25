@@ -1338,6 +1338,7 @@ def _bwd_mma_dots_2cta(
     q_fulls,
     q_empties,
     k_mma_done,
+    k_empties,
     NUM_BUFFERS_Q: tl.constexpr,
     NUM_BUFFERS_DO: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
@@ -1477,6 +1478,11 @@ def _bwd_mma_dots_2cta(
         # TMEM region), and kt_fulls is now waited once before the loop, so
         # neither needs re-waiting here.
         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
+        # dq (cols 0-63) aliases the qk TMEM region, which still holds qk(j);
+        # ds_fulls above only proves compute consumed qk(j-1) (one iteration
+        # stale on the single-buffered TMEM ring). Wait for qk(j)'s release
+        # before Dot 5 overwrites it, else the write races compute's read.
+        tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase)
         dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
         tlx.async_dot(
             dsT_view,
@@ -1542,6 +1548,11 @@ def _bwd_mma_dots_2cta(
     )
     tlx.tcgen05_commit(k_mma_done[kv_buf_id], two_ctas=True)
     tlx.tcgen05_commit(kt_empties[kv_buf_id], two_ctas=True)
+    # Release k_empties from the leader's mma group (two_ctas updates each CTA's
+    # copy). CAVEAT: tracks only the last K read, not the dK/dV staging stores
+    # that alias k_tiles/v_tiles — inert today (one-tile-per-block, no refill);
+    # once the KV ring cycles, also gate refill on those staging stores.
+    tlx.tcgen05_commit(k_empties[kv_buf_id], two_ctas=True)
 
     return blk_idx
 
@@ -1986,6 +1997,12 @@ def _bwd_compute_inner_loop(
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
+    # Named-barrier rendezvous for the aliased-TMEM WAR (Hazard 1): all 8 compute
+    # warps must finish reading qk/dp before any overwrites it with P/dsT. One
+    # named_barrier_wait is a full bar.sync; indices 7-15 are free (0-6 reserved).
+    QK_READ_DONE_BAR: tl.constexpr = 10
+    DP_READ_DONE_BAR: tl.constexpr = 11
+    NUM_COMPUTE_THREADS: tl.constexpr = 8 * 32
     if num_steps_override > 0:
         num_steps = num_steps_override
     else:
@@ -2016,6 +2033,11 @@ def _bwd_compute_inner_loop(
 
         # Store P to TMEM.
         ppT = pT.to(do_out_dtype)
+        # Hazard 1 (intra-task WAR): P (f16) aliases the upper half of the qk
+        # (f32) TMEM region; tcgen05 ld/st warp->chunk maps differ, so a fast
+        # warp's P store can overwrite a 32x32 chunk a slow warp has not read as
+        # qkT. Rendezvous all 8 compute warps between the read and the store.
+        tlx.named_barrier_wait(QK_READ_DONE_BAR, NUM_COMPUTE_THREADS)
         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
         # P aliases the QK TMEM region, so qk_empties (which frees that region for
         # reuse) must be signaled after P is stored, not before. The
@@ -2037,6 +2059,9 @@ def _bwd_compute_inner_loop(
         tlx.barrier_arrive(d_empties[d_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
+        # Hazard 1 (intra-task WAR): dsT (f16) aliases dp's (f32) region -- same
+        # warp->chunk mismatch as the P store above.
+        tlx.named_barrier_wait(DP_READ_DONE_BAR, NUM_COMPUTE_THREADS)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
         # dsT aliases the dP TMEM region, so dp_empties (which frees that region
         # for reuse) must be signaled after dsT is stored, not before. The
@@ -2177,10 +2202,6 @@ def _attn_bwd_ws(
 
     # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
     # k_mma_done: signaled by MMA task after dq dot (last k_tiles read).
-    # k_empties: signaled by compute task after dKV staging stores complete
-    #            AND k_mma_done is received.  Gates both k_tiles and v_tiles
-    #            (v_tiles aliased by sdv_store_buf) since V load follows K
-    #            load in the load task.
     k_mma_done = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
@@ -2285,11 +2306,8 @@ def _attn_bwd_ws(
     qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem,
                                reuse=qk_p_storage_alias)
-    # In 2-CTA mode, P is offset to column 64 (after dQ's 64 cols at column 0).
-    # P's per-buffer stride is 64 i32 cols (128x128 f16), so num=2 + index 1
-    # naturally places P at column 64. In 1-CTA mode, P stays at column 0.
-    P_NUM_BUFFERS: tl.constexpr = 2 if USE_2CTA and not REUSE_DP_FOR_DQ else NUM_BUFFERS_TMEM
-    P_BUF_IDX: tl.constexpr = 1 if USE_2CTA and not REUSE_DP_FOR_DQ else 0
+    P_NUM_BUFFERS: tl.constexpr = NUM_BUFFERS_TMEM
+    P_BUF_IDX: tl.constexpr = 0
     p_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
@@ -2341,11 +2359,11 @@ def _attn_bwd_ws(
             ))
     else:
         if USE_2CTA:
-            # 2-CTA: dQ at column 0, P offset to column 64.
-            # dQ (64x128 f32 twocta_rhs) = 64 i32 cols at columns 0-63.
-            # P (128x128 f16) = 64 i32 cols at columns 64-127.
-            # P uses num=2 with index 1 to get the offset; P's per-buffer
-            # stride is naturally 64 from getTmemAllocSizes(128x128 f16).
+            # 2-CTA: place P and dQ explicitly via set_buffer_overlap.
+            # SWAP: P at column 0, dQ at column 64 (was the reverse). dQ's real
+            # TwoCTA_RHS footprint is 128x64 (64 i32 cols); storage-alias
+            # lowering runs after layout propagation, so it knows this and can
+            # place dQ at a non-zero column offset.
             DQ_BUF_IDX: tl.constexpr = 0
             dq_tiles = tlx.local_alloc(
                 (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
@@ -2361,6 +2379,23 @@ def _attn_bwd_ws(
                 tlx.storage_kind.tmem,
                 reuse=qk_p_storage_alias,
             )
+            # qk shares the whole region; within it, P and dQ occupy distinct
+            # 64-col halves (P first -> col 0, dQ next -> col 64). dq_tiles and
+            # dq_phys are two views of the same dQ storage (shared subgroup).
+            qk_p_storage_alias.set_buffer_overlap(
+                tlx.reuse_group(
+                    qk_tiles,
+                    tlx.reuse_group(
+                        p_tiles,
+                        tlx.reuse_group(
+                            dq_tiles,
+                            dq_phys,
+                            group_type=tlx.reuse_group_type.shared,
+                        ),
+                        group_type=tlx.reuse_group_type.distinct,
+                    ),
+                    group_type=tlx.reuse_group_type.shared,
+                ))
         else:
             # 1-CTA with bm1=64: separate dQ TMEM
             DQ_BUF_IDX: tl.constexpr = 0
@@ -2595,10 +2630,17 @@ def _attn_bwd_ws(
             tlx.async_descriptor_store_wait(0)
             # All staging stores done + MMA done reading k_tiles →
             # safe for load task to refill both k_tiles and v_tiles.
-            tlx.barrier_arrive(k_empties[kv_buf_id])
+            #
+            # 2-CTA: dk_empties funnels to the leader (remote arrive) — the
+            # leader-issued cta_group::2 K/V TMAs write both CTAs' halves, so a
+            # local-only arrive wouldn't gate the peer. k_empties is released by
+            # the MMA instead (see _bwd_mma_dots_2cta). CAVEAT: that tracks only
+            # the last K read, not these staging stores into the sdk/sdv aliases;
+            # once the KV ring cycles, also arrive k_empties here.
             if USE_2CTA:
                 tlx.barrier_arrive(dk_empties[kv_buf_id], 1, remote_cta_rank=0)
             else:
+                tlx.barrier_arrive(k_empties[kv_buf_id])
                 tlx.barrier_arrive(dk_empties[kv_buf_id])
 
         # reduction
@@ -2717,6 +2759,7 @@ def _attn_bwd_ws(
                         q_fulls=q_fulls,
                         q_empties=q_empties,
                         k_mma_done=k_mma_done,
+                        k_empties=k_empties,
                         NUM_BUFFERS_Q=NUM_BUFFERS_Q,
                         NUM_BUFFERS_DO=NUM_BUFFERS_DO,
                         NUM_BUFFERS_TMEM=NUM_BUFFERS_TMEM,

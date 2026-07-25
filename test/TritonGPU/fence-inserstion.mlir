@@ -202,7 +202,7 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
   // exists earlier in the block, separated only by pure arithmetic.
   // CHECK-LABEL: no_duplicate_fence_tma_store
   tt.func public @no_duplicate_fence_tma_store(
-      %desc: !tt.tensordesc<tensor<128x32xf16, #shared>>,
+      %desc: !tt.tensordesc<128x32xf16, #shared>,
       %data: tensor<128x32xf16, #linear>,
       %smem: !ttg.memdesc<128x32xf16, #shared, #smem, mutable>,
       %offs_am: i32, %offs_bn: i32) {
@@ -214,7 +214,7 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
     // CHECK: arith.addi
     // CHECK-NOT: ttng.fence_async_shared
     // CHECK: ttng.async_tma_copy_local_to_global
-    ttng.async_tma_copy_local_to_global %desc[%offs_am, %offs_bn_1] %smem : !tt.tensordesc<tensor<128x32xf16, #shared>>, !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    ttng.async_tma_copy_local_to_global %desc[%offs_am, %offs_bn_1] %smem : !tt.tensordesc<128x32xf16, #shared>, !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
     tt.return
   }
 }

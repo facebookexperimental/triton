@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "WarpSpecializationPipeline.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -311,7 +312,7 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer,
   return nullptr;
 }
 
-void doAnnotateTMAStoreWaits(triton::FuncOp &funcOp) {
+void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
   MLIRContext *ctx = funcOp.getContext();
   // Use walk to find TMAStoreTokenWaitOp ops inside ForOp bodies, including
   // those nested inside SubtiledRegionOp regions.
@@ -355,7 +356,7 @@ struct NVGPUTestAnnotateTMAStoreWaitsPass
 // Validate TMA store annotations (safety checks)
 // ---------------------------------------------------------------------------
 
-void doValidateTMAStoreAnnotations(triton::FuncOp &funcOp) {
+void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
     forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
       if (!waitOp->hasAttr(kCanRotateByBufferCount))
@@ -419,12 +420,12 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
   return nullptr;
 }
 
-LogicalResult doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
-  bool failedToReorder = false;
+// Best-effort reordering of annotated TMA store waits. Every case where a
+// wait cannot be repositioned leaves the schedule unchanged for that wait and
+// logs (see the LDBG sites below); there is no failure mode, so this returns
+// void rather than a LogicalResult.
+void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   funcOp.walk([&](scf::ForOp forOp) {
-    if (failedToReorder)
-      return;
-
     bool hasNestedFor = false;
     forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
     if (hasNestedFor)
@@ -559,6 +560,8 @@ LogicalResult doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
         schedule.insert(waitOp, targetStage, waitCluster);
       } else {
         // Target not found; leave the schedule unchanged for this wait.
+        LDBG("no reorder target found for TMA store wait in loop at "
+             << forOp.getLoc() << "; leaving TMA store wait unchanged");
         continue;
       }
 
@@ -569,20 +572,14 @@ LogicalResult doTMAStoreWaitReorder(triton::FuncOp &funcOp) {
     if (changed)
       schedule.serialize(forOp);
   });
-  return failure(failedToReorder);
 }
 
 struct NVGPUTestTMAStoreTokenWaitReorderPass
     : public impl::NVGPUTestTMAStoreTokenWaitReorderBase<
           NVGPUTestTMAStoreTokenWaitReorderPass> {
   void runOnOperation() override {
-    bool passFailed = false;
-    getOperation()->walk([&](triton::FuncOp funcOp) {
-      if (failed(doTMAStoreWaitReorder(funcOp)))
-        passFailed = true;
-    });
-    if (passFailed)
-      signalPassFailure();
+    getOperation()->walk(
+        [&](triton::FuncOp funcOp) { doTMAStoreWaitReorder(funcOp); });
   }
 };
 

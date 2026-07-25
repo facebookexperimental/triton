@@ -1,0 +1,222 @@
+name: Bisect Nightly Failure
+
+# Async companion to report-nightly-failure.yml. When a nightly failure issue is
+# labeled `needs-bisect`, this git-bisects the last-green..failing commit range on
+# the matching GPU runner (building + running the failing test's repro at each
+# step), then edits the issue with the confirmed blame commit/PR and @-mentions
+# the PR author. Kept out of the nightly workflow so nightly stays fast; the heavy
+# per-commit rebuild runs here on its own schedule.
+#
+# Metadata (good_sha, bad_sha, platform, repro) is read from the issue body's
+# `<!-- bisect-meta ... -->` block that the reporter embeds.
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Nightly failure issue number to bisect.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  prepare:
+    # Only react to our trigger label (or a manual dispatch).
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'needs-bisect'
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.meta.outputs.ok }}
+      runner: ${{ steps.meta.outputs.runner }}
+      mode: ${{ steps.meta.outputs.mode }}
+      good_sha: ${{ steps.meta.outputs.good_sha }}
+      bad_sha: ${{ steps.meta.outputs.bad_sha }}
+      repro: ${{ steps.meta.outputs.repro }}
+      issue_number: ${{ steps.meta.outputs.issue_number }}
+    steps:
+      - name: Parse bisect metadata from issue
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const num = context.eventName === "workflow_dispatch"
+              ? Number(${{ toJSON(github.event.inputs.issue_number) }})
+              : context.payload.issue.number;
+            let body = context.payload.issue && context.payload.issue.body;
+            if (!body) {
+              const it = await github.rest.issues.get({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: num });
+              body = it.data.body || "";
+            }
+            const m = body.match(/<!--\s*bisect-meta([\s\S]*?)-->/);
+            const kv = {};
+            if (m) {
+              for (const line of m[1].split("\n")) {
+                const i = line.indexOf("=");
+                if (i > 0) kv[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+              }
+            }
+            // Map platform -> runner label + build mode. GPU platforms only:
+            // compiler LIT bisection (per-commit LLVM+triton rebuild) is not wired.
+            const RUNNERS = {
+              b200:  { runner: "nvidia-dgx-b200",        mode: "gpu" },
+              h100:  { runner: "linux-gcp-h100",         mode: "gpu" },
+              mi350: { runner: "linux-fb-triton-mi350-1", mode: "gpu" },
+            };
+            const r = RUNNERS[kv.platform || ""];
+            const ok = !!(r && kv.good_sha && kv.bad_sha && kv.repro);
+            if (!ok) {
+              core.warning(`Cannot bisect issue #${num}: platform=${kv.platform} `
+                + `good=${kv.good_sha} bad=${kv.bad_sha} repro=${!!kv.repro}`);
+            }
+            core.setOutput("ok", String(ok));
+            core.setOutput("runner", r ? r.runner : "ubuntu-latest");
+            core.setOutput("mode", r ? r.mode : "gpu");
+            core.setOutput("good_sha", kv.good_sha || "");
+            core.setOutput("bad_sha", kv.bad_sha || "");
+            core.setOutput("repro", kv.repro || "");
+            core.setOutput("issue_number", String(num));
+
+  bisect:
+    needs: prepare
+    if: needs.prepare.outputs.ok == 'true'
+    runs-on: ${{ needs.prepare.outputs.runner }}
+    timeout-minutes: 600
+    permissions:
+      contents: read
+    outputs:
+      first_bad_sha: ${{ steps.run.outputs.first_bad_sha }}
+      subject: ${{ steps.run.outputs.subject }}
+    steps:
+      - name: Checkout (full history + submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Run git bisect
+        id: run
+        env:
+          GOOD_SHA: ${{ needs.prepare.outputs.good_sha }}
+          BAD_SHA: ${{ needs.prepare.outputs.bad_sha }}
+          BISECT_REPRO: ${{ needs.prepare.outputs.repro }}
+          BISECT_MODE: ${{ needs.prepare.outputs.mode }}
+        run: |
+          set -x
+          git bisect start "$BAD_SHA" "$GOOD_SHA" --
+          set +e
+          git bisect run bash .github/scripts/bisect_failure.sh | tee /tmp/bisect.out
+          set -e
+          # Only trust a conclusive result: git prints "<sha> is the first bad commit".
+          FIRST_BAD="$(grep -oE '[0-9a-f]{40} is the first bad commit' /tmp/bisect.out | head -1 | cut -d' ' -f1)"
+          git bisect reset || true
+          if [ -z "$FIRST_BAD" ]; then
+            echo "Bisection inconclusive (no first-bad commit)."
+            exit 0
+          fi
+          SUBJECT="$(git show -s --format=%s "$FIRST_BAD")"
+          echo "first_bad_sha=${FIRST_BAD}" >> "$GITHUB_OUTPUT"
+          {
+            echo "subject<<__SUBJ_EOF__"
+            echo "$SUBJECT"
+            echo "__SUBJ_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+  blame:
+    needs: [prepare, bisect]
+    if: always() && needs.prepare.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Record blame on the issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = Number(${{ toJSON(needs.prepare.outputs.issue_number) }});
+            const firstBad = ${{ toJSON(needs.bisect.outputs.first_bad_sha) }} || "";
+            const subject = ${{ toJSON(needs.bisect.outputs.subject) }} || "";
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const owner = context.repo.owner, repo = context.repo.repo;
+
+            const BLAME_START = "<!-- BLAME:START -->";
+            const BLAME_END = "<!-- BLAME:END -->";
+
+            // Resolve blame PR + author (if a first-bad commit was found).
+            let prNum = null, author = null;
+            const m = subject.match(/\(#(\d+)\)\s*$/);
+            if (firstBad && m) {
+              prNum = Number(m[1]);
+              try {
+                const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNum });
+                author = pr.data.user && pr.data.user.login;
+              } catch (e) { core.warning(`Could not fetch PR #${prNum}: ${e}`); }
+            }
+
+            // Build the confirmed/inconclusive blame section.
+            let blame;
+            if (firstBad && prNum) {
+              blame = [
+                BLAME_START,
+                "### 🔎 Blame analysis",
+                `**Blame commit:** \`${firstBad}\` → **#${prNum}** — ${subject.replace(/\|/g, "\\|")}`,
+                "",
+                `Confirmed by \`git bisect\` ([bisect run](${runUrl})).`,
+                BLAME_END,
+              ].join("\n");
+            } else if (firstBad) {
+              blame = [
+                BLAME_START,
+                "### 🔎 Blame analysis",
+                `**Blame commit:** \`${firstBad}\` (no PR number in subject — could not resolve a PR).`,
+                `Found by \`git bisect\` ([bisect run](${runUrl})).`,
+                BLAME_END,
+              ].join("\n");
+            } else {
+              blame = [
+                BLAME_START,
+                "### 🔎 Blame analysis",
+                `**Bisection inconclusive** ([bisect run](${runUrl})) — the failure did not reproduce `,
+                "deterministically across the range, or every candidate commit failed to build. "
+                  + "The suspect list above still applies.",
+                BLAME_END,
+              ].join("\n");
+            }
+
+            // Splice the new blame section into the issue body between markers.
+            const it = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+            let body = it.data.body || "";
+            const s = body.indexOf(BLAME_START), e = body.indexOf(BLAME_END);
+            if (s >= 0 && e > s) {
+              body = body.slice(0, s) + blame + body.slice(e + BLAME_END.length);
+            } else {
+              body = blame + "\n\n" + body;
+            }
+            await github.rest.issues.update({ owner, repo, issue_number: issueNumber, body });
+
+            // Swap the trigger label so we don't re-bisect on the next update.
+            try { await github.rest.issues.removeLabel({ owner, repo, issue_number: issueNumber, name: "needs-bisect" }); } catch (e) {}
+            await github.rest.issues.addLabels({ owner, repo, issue_number: issueNumber,
+              labels: [firstBad && prNum ? "bisected" : "bisect-inconclusive"] });
+
+            // Notify (and assign) the PR author on a confirmed blame.
+            if (firstBad && prNum && author) {
+              const repro = (body.match(/### Reproduce\n```\n([\s\S]*?)\n```/) || [])[1] || "";
+              const lines = [
+                "🔎 **Blame identified by auto-bisection**",
+                "",
+                `@${author} — this nightly failure bisected to your PR **#${prNum}** `
+                  + `(commit \`${firstBad}\`, _${subject.replace(/\|/g, "\\|")}_).`,
+                "",
+                `Confirmed by \`git bisect\` ([bisect run](${runUrl})). Please take a look.`,
+              ];
+              if (repro) lines.push("", "Reproduce:", "```", repro, "```");
+              await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body: lines.join("\n") });
+              try {
+                await github.rest.issues.addAssignees({ owner, repo, issue_number: issueNumber, assignees: [author] });
+              } catch (e) { core.warning(`Could not assign @${author}: ${e}`); }
+            }

@@ -1445,6 +1445,7 @@ public:
       rewriter.replaceOp(selectOp, newSelectOp);
       return success();
     }
+
     // If both have been traversed, then we can rewrite select of pointers as a
     // select of base and offset
     // Rewrite to select(fatBaseT, fatBaseF) and select(fatOffsetT, fatOffsetF)

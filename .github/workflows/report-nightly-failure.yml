@@ -4,6 +4,19 @@ name: Report Nightly Failure
 # CI failure identity. Callers invoke it once per normalized failing test
 # identity (typically via a matrix), so each distinct failure gets its own
 # idempotent issue keyed on the issue title + labels.
+#
+# Beyond filing the issue, it adds a "blame" section:
+#   * external-dependency failures (busy GPU, driver/toolchain, network, disk)
+#     are annotated as such and skip bisection entirely;
+#   * real regressions get an immediate ranked suspect-PR list (commits merged
+#     since the last green nightly, ranked by file-path overlap) and are labeled
+#     `needs-bisect`, which triggers bisect-nightly-failure.yml to confirm the
+#     single blame PR asynchronously and @-mention its author.
+#
+# The issue body is split by an HTML `<!-- STATUS -->` marker: the blame section
+# above it is written once (and later edited by the bisect job); the status table
+# below it is refreshed on every nightly update, so a completed bisect result is
+# never clobbered.
 
 on:
   workflow_call:
@@ -59,10 +72,26 @@ on:
         required: false
         type: string
         default: ""
+      external_dep:
+        description: "'true' if the parser classified this as an external-dependency error."
+        required: false
+        type: string
+        default: "false"
+      external_dep_reason:
+        description: Human-readable reason for the external-dependency classification.
+        required: false
+        type: string
+        default: ""
+      platform:
+        description: Platform key for the deep-bisect runner (b200|h100|mi350|compiler). Empty disables bisection.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
   issues: write
+  actions: read
 
 jobs:
   file-issue:
@@ -70,7 +99,53 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read
     steps:
+      - name: Checkout (full history for suspect range)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find last green nightly SHA
+        id: green
+        if: inputs.external_dep != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // The current run's workflow id, then its most recent successful
+            // scheduled run on main that started before it = last green nightly.
+            const run = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+            });
+            const current = new Date(run.data.created_at);
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: run.data.workflow_id,
+              branch: "main", event: "schedule", status: "success", per_page: 30,
+            });
+            let good = "";
+            for (const r of runs.data.workflow_runs) {   // newest-first
+              if (new Date(r.created_at) < current) { good = r.head_sha; break; }
+            }
+            core.info(`last green nightly SHA: ${good || "(none found)"}`);
+            core.setOutput("good_sha", good);
+
+      - name: Compute suspect PRs
+        id: suspects
+        if: inputs.external_dep != 'true' && steps.green.outputs.good_sha != ''
+        env:
+          GOOD_SHA: ${{ steps.green.outputs.good_sha }}
+          BAD_SHA: ${{ inputs.sha }}
+          NID: ${{ inputs.normalized_failure_id }}
+        run: |
+          {
+            echo "md<<__SUSPECTS_EOF__"
+            python3 .github/scripts/compute_suspects.py \
+              --good-sha "$GOOD_SHA" --bad-sha "$BAD_SHA" --normalized-id "$NID" \
+              || echo "_suspect computation failed; see run log._"
+            echo "__SUSPECTS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create or update nightly failure issue
         uses: actions/github-script@v7
         with:
@@ -88,8 +163,60 @@ jobs:
             const runAttempt = ${{ toJSON(inputs.run_attempt) }};
             const summary = ${{ toJSON(inputs.summary) }};
             const repro = ${{ toJSON(inputs.repro) }};
+            const externalDep = ${{ toJSON(inputs.external_dep) }} === "true";
+            const externalReason = ${{ toJSON(inputs.external_dep_reason) }};
+            const platform = ${{ toJSON(inputs.platform) }};
+            const goodSha = ${{ toJSON(steps.green.outputs.good_sha) }} || "";
+            const suspectsMd = ${{ toJSON(steps.suspects.outputs.md) }} || "";
 
-            // Normalize raw IDs into a readable list (accepts newline or JSON).
+            const STATUS = "<!-- STATUS -->";
+            const BLAME_START = "<!-- BLAME:START -->";
+            const BLAME_END = "<!-- BLAME:END -->";
+
+            // Deep bisection only makes sense with a runnable repro + known platform.
+            const wantBisect = !externalDep && !!repro && !!platform;
+
+            // --- Blame section (written once; later edited by the bisect job) ---
+            let blame;
+            if (externalDep) {
+              blame = [
+                BLAME_START,
+                "### ⚠️ Likely external dependency error — bisection skipped",
+                "**Reason:** `" + (externalReason || "external dependency") + "`",
+                "",
+                "This failure matched an external-dependency signature (busy/unhealthy GPU, "
+                  + "driver/toolchain, network/proxy, or disk), so it is probably **not** caused "
+                  + "by a code change in this repo. No blame PR was computed. If it recurs across "
+                  + "runs, check runner health.",
+                BLAME_END,
+              ].join("\n");
+            } else {
+              const statusLine = wantBisect
+                ? "**Status:** deep bisection queued… the confirmed blame PR (and its author) "
+                  + "will be edited in here when the bisect job finishes."
+                : "**Status:** no runnable repro for this identity — suspect list only, no deep bisect.";
+              blame = [
+                BLAME_START,
+                "### 🔎 Blame analysis",
+                statusLine,
+                "",
+                suspectsMd || "_No suspect PRs computed (no prior green nightly found)._",
+                BLAME_END,
+              ].join("\n");
+            }
+
+            // --- Machine-readable metadata for the async bisect job ---
+            const meta = [
+              "<!-- bisect-meta",
+              "good_sha=" + goodSha,
+              "bad_sha=" + sha,
+              "platform=" + platform,
+              "normalized_id=" + normalizedId,
+              "repro=" + repro,
+              "-->",
+            ].join("\n");
+
+            // --- Status table (refreshed on every update) ---
             let rawList = [];
             if (rawIds && rawIds.trim()) {
               const trimmed = rawIds.trim();
@@ -99,13 +226,9 @@ jobs:
                 rawList = trimmed.split("\n").map(s => s.trim()).filter(Boolean);
               }
             }
-            const rawBlock = rawList.length
-              ? "```\n" + rawList.join("\n") + "\n```"
-              : "_none reported_";
-
-            const body = [
-              "> Auto-filed by nightly CI. Do not edit the title — it is the dedup key.",
-              "",
+            const rawBlock = rawList.length ? "```\n" + rawList.join("\n") + "\n```" : "_none reported_";
+            const status = [
+              STATUS,
               "| Field | Value |",
               "| --- | --- |",
               "| Workflow | `" + workflowName + "` |",
@@ -113,6 +236,7 @@ jobs:
               "| Normalized failing identity | `" + normalizedId + "` |",
               "| Ref | `" + ref + "` |",
               "| SHA | `" + sha + "` |",
+              "| Last green nightly | " + (goodSha ? "`" + goodSha + "`" : "_unknown_") + " |",
               "| Event | `" + eventName + "` |",
               "| Run attempt | `" + runAttempt + "` |",
               "| Run | " + runUrl + " |",
@@ -127,12 +251,14 @@ jobs:
               "_Last updated: " + new Date().toISOString() + "_",
             ].join("\n");
 
+            const header = "> Auto-filed by nightly CI. Do not edit the title — it is the dedup key.\n";
+            const fullBody = [header, blame, "", meta, "", status].join("\n");
+
             // Find an existing OPEN issue with the exact same title + labels.
             const escapedTitle = title.replace(/"/g, '\\"');
             const q = [
               `repo:${context.repo.owner}/${context.repo.repo}`,
-              "is:issue",
-              "is:open",
+              "is:issue", "is:open",
               ...labels.map(l => `label:"${l}"`),
               `in:title "${escapedTitle}"`,
             ].join(" ");
@@ -140,20 +266,29 @@ jobs:
             const existing = search.data.items.find(i => i.title === title && !i.pull_request);
 
             if (existing) {
+              // Preserve the blame section + metadata (possibly edited by the bisect
+              // job); only refresh the status table below the STATUS marker.
+              const old = existing.body || "";
+              const idx = old.indexOf(STATUS);
+              const body = idx >= 0 ? old.slice(0, idx) + status : fullBody;
               await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.number,
-                body,
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body,
               });
               core.info(`Updated existing issue #${existing.number}: ${title}`);
             } else {
               const created = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels,
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body: fullBody, labels,
               });
               core.info(`Created issue #${created.data.number}: ${title}`);
+              // Add the bisect trigger label separately so the `issues.labeled`
+              // event reliably fires for bisect-nightly-failure.yml.
+              if (wantBisect) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: created.data.number, labels: ["needs-bisect"],
+                });
+                core.info(`Labeled #${created.data.number} needs-bisect`);
+              }
             }

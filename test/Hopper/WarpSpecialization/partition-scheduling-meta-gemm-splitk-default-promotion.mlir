@@ -36,9 +36,9 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: tt.warp_specialize
 // CHECK-SAME: ttg.partition.types = ["epilogue", "gemm", "load"
 tt.func public @persistent_splitk_gemm_default_promotion(
-  %a_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-  %b_desc: !tt.tensordesc<tensor<128x64xf16, #shared>>,
-  %ws_desc: !tt.tensordesc<tensor<128x128xf16, #shared>>,
+  %a_desc: !tt.tensordesc<128x64xf16, #shared>,
+  %b_desc: !tt.tensordesc<128x64xf16, #shared>,
+  %ws_desc: !tt.tensordesc<128x128xf16, #shared>,
   %M: i32 {tt.divisibility = 16 : i32},
   %N: i32 {tt.divisibility = 16 : i32},
   %K: i32 {tt.divisibility = 16 : i32}
@@ -82,9 +82,9 @@ tt.func public @persistent_splitk_gemm_default_promotion(
     %loop_out:2 = scf.for %ki = %k_start to %k_end_clamped step %c1_i32
         iter_args(%use_acc = %false, %loop_tok = %acc_tok) -> (i1, !ttg.async.token) : i32 {
       %offs_k = arith.muli %ki, %c64_i32 : i32
-      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked1>
+      %a = tt.descriptor_load %a_desc[%offs_am, %offs_k] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
       %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
-      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] : !tt.tensordesc<tensor<128x64xf16, #shared>> -> tensor<128x64xf16, #blocked1>
+      %b = tt.descriptor_load %b_desc[%offs_bn, %offs_k] : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked1>
       %b_smem = ttg.local_alloc %b : (tensor<128x64xf16, #blocked1>) -> !ttg.memdesc<128x64xf16, #shared, #smem>
       %b_trans = ttg.memdesc_trans %b_smem {order = array<i32: 1, 0>} : !ttg.memdesc<128x64xf16, #shared, #smem> -> !ttg.memdesc<64x128xf16, #shared1, #smem>
       %mma_tok = ttng.tc_gen5_mma %a_smem, %b_trans, %acc_mem[%loop_tok], %use_acc, %true {tt.self_latency = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem>, !ttg.memdesc<64x128xf16, #shared1, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
@@ -96,7 +96,7 @@ tt.func public @persistent_splitk_gemm_default_promotion(
     %c = arith.truncf %result : tensor<128x128xf32, #blocked> to tensor<128x128xf16, #blocked>
     %row_base = arith.muli %split_id, %M : i32
     %ws_row = arith.addi %row_base, %offs_am : i32
-    tt.descriptor_store %ws_desc[%ws_row, %offs_bn], %c : !tt.tensordesc<tensor<128x128xf16, #shared>>, tensor<128x128xf16, #blocked>
+    tt.descriptor_store %ws_desc[%ws_row, %offs_bn], %c : !tt.tensordesc<128x128xf16, #shared>, tensor<128x128xf16, #blocked>
 
     %tile_id_c_next = arith.addi %tile_id_c, %c1_i32 : i32
     scf.yield %tile_id_c_next : i32

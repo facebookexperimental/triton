@@ -181,6 +181,21 @@ int NVLatencyModel::getTMAStoreLatency(Operation *op) const {
 constexpr int kMMALatency128x128x128 = 900;
 constexpr int kMMALatency128x128x64 = 559;
 
+// Tensor-core ISSUE-TO-ISSUE throughput (MACs/cycle/SM), used for pipeline
+// occupancy. The tcgen05 unit is deeply pipelined: successive MMAs (including
+// ones accumulating into the same TMEM buffer) issue at throughput rate and
+// overlap execution — the full `latency` above is only the result-available
+// delay seen by a *reader* (tmem_load). Treating occupancy == latency modeled
+// the TC as fully serial, which doubled GEMM II (559 vs the ~256-cycle true
+// issue interval for a 128x128x64 fp16 MMA) and starved the TMA prefetch rings
+// (lifetime/II + 1 collapsed to double buffering).
+//
+// B200 dense fp16/bf16 tensor peak ≈ 2.2 PFLOPS over 148 SMs @ ~1.83 GHz
+// ≈ 8192 FLOPs/cyc/SM = 4096 MACs/cyc/SM; fp8 doubles, tf32 halves. A
+// 128x128x64 fp16 MMA = 1.05M MACs → ~256 cycles issue-to-issue, consistent
+// with the measured 559-cycle completion latency minus pipeline drain.
+constexpr int64_t kTCMacsPerCycleFp16 = 4096;
+
 int NVLatencyModel::getMMALatency(Operation *op) const {
   // Extract the K dimension of the MMA. tcgen05_mma operands A and B are
   // SMEM/TMEM memdescs (NOT RankedTensorType), so dyn_cast against tensor
@@ -200,6 +215,48 @@ int NVLatencyModel::getMMALatency(Operation *op) const {
     }
   }
   return kMMALatency128x128x128; // conservative default
+}
+
+// Issue-to-issue throughput cost of an MMA (cycles the TC pipe is reserved
+// before the next MMA can issue): MACs / MACs-per-cycle, scaled by element
+// width (fp8 runs 2x the fp16 rate, tf32 half). Floors at the SM-side issue
+// cost. See kTCMacsPerCycleFp16 for the calibration rationale.
+static int getMMAOccupancyCycles(Operation *op) {
+  auto getShapeOf = [](Value v) -> ArrayRef<int64_t> {
+    if (auto t = dyn_cast<RankedTensorType>(v.getType()))
+      return t.getShape();
+    if (auto md = dyn_cast<triton::gpu::MemDescType>(v.getType()))
+      return md.getShape();
+    return {};
+  };
+  auto getElemBits = [](Value v) -> int64_t {
+    Type ty;
+    if (auto t = dyn_cast<RankedTensorType>(v.getType()))
+      ty = t.getElementType();
+    else if (auto md = dyn_cast<triton::gpu::MemDescType>(v.getType()))
+      ty = md.getElementType();
+    if (ty && ty.isIntOrFloat())
+      return ty.getIntOrFloatBitWidth();
+    return 16;
+  };
+  if (auto mma = dyn_cast<ttng::MMAv5OpInterface>(op)) {
+    auto aShape = getShapeOf(mma->getOperand(0)); // [M, K]
+    auto bShape = getShapeOf(mma->getOperand(1)); // [K, N]
+    if (aShape.size() >= 2 && bShape.size() >= 2) {
+      int64_t M = aShape[0], K = aShape[1], N = bShape[1];
+      // Rate scales inversely with element width: fp16 → 4096 MAC/cyc,
+      // fp8 → 8192, tf32/fp32 → 2048.
+      int64_t elemBits = getElemBits(mma->getOperand(0));
+      int64_t macsPerCycle =
+          kTCMacsPerCycleFp16 * 16 / std::max<int64_t>(elemBits, 8);
+      int64_t cycles = (M * N * K + macsPerCycle - 1) / macsPerCycle;
+      return static_cast<int>(
+          std::max<int64_t>(kMMAIssueLatency, std::min<int64_t>(cycles, 4096)));
+    }
+  }
+  // Unknown shape: fall back to half the completion latency (measured drain
+  // overlap on B200 is roughly half for the tabulated shapes).
+  return kMMALatency128x128x128 / 2;
 }
 
 // Latency values refit from B200 cycle-accurate microbenchmarks
@@ -369,13 +426,27 @@ int NVLatencyModel::getCUDASelfLat(Operation *op) const {
       if (isa<arith::AddFOp>(inner))
         isSum = true;
     });
-    // Same INPUT-elems fix as getCUDALatency. NCU selfLat bases are last-axis
-    // only (639 sum / 304 max @16384); axis-aware selfLat is future NCU work.
+    // Same INPUT-elems fix as getCUDALatency. NCU selfLat bases (639 sum /
+    // 304 max @16384) were measured on LAST-axis reductions. Outer-axis
+    // occupancy is estimated by scaling with the measured serial-latency
+    // ratio from the same B200 clock64 study (getCUDALatency bases):
+    //   sum: outer 963 / last 1691 → outer occupancy ≈ 0.57x (no inter-lane
+    //        shuffle tree; each lane accumulates its own column strip)
+    //   max: outer 961 / last 461  → outer occupancy ≈ 2.08x (cross-warp
+    //        exchange dominates)
+    // This matters for ResMII of loops whose only reduce is outer-axis (e.g.
+    // wgrad's dbias = sum(dout, axis=0)): charging the last-axis base
+    // overstates CUDA pipe pressure and inflates II.
     bool lastAxis = true;
     int64_t inElems = reduceInputElements(reduceOp, lastAxis);
     if (inElems <= 0)
       inElems = elements;
-    return scaleByElements(isSum ? 639 : 304, inElems);
+    int base;
+    if (isSum)
+      base = lastAxis ? 639 : (639 * 963) / 1691;
+    else
+      base = lastAxis ? 304 : (304 * 961) / 461;
+    return scaleByElements(base, inElems);
   }
 
   // Conversions: compiler-folded in microbench, so use small selfLat.
@@ -603,7 +674,14 @@ OpLatencyInfo NVLatencyModel::getLatency(Operation *op) const {
     int occupancy;
     if (isStore) {
       latency = getTMAStoreLatency(op);
-      occupancy = latency; // bandwidth-bound: engine held for the full transfer
+      // Occupancy = the BANDWIDTH component only (52 cyc/KB HBM share).
+      // The 130-cycle fixed base in `latency` is issue/queue delay, not
+      // throughput — successive stores overlap it. Folding it into occupancy
+      // over-charged the TMA pipe per iteration (e.g. layernorm's ResMII),
+      // inflating II past the store ring's lifetime and collapsing the
+      // cross-WG output ring to a serializing single buffer.
+      occupancy = std::max(kTMAIssueLatency,
+                           static_cast<int>(52 * (totalBytes / 1024)));
     } else {
       latency = getTMALoadLatency(op);
       occupancy =
@@ -615,11 +693,14 @@ OpLatencyInfo NVLatencyModel::getLatency(Operation *op) const {
   case HWPipeline::TC:
     latency = getMMALatency(op);
     // selfLatency = issue cost (SM dispatch pipeline occupancy).
-    // Design doc: 30 cycles for tcgen05.mma. occupancy = latency: the tensor
-    // core genuinely serializes one MMA at a time (keeps GEMM/FA ResMII right).
+    // Design doc: 30 cycles for tcgen05.mma. occupancy = issue-to-issue
+    // throughput (MACs / MACs-per-cycle): the TC pipe is deeply pipelined and
+    // accepts the next MMA long before the previous one's results land — the
+    // full `latency` is only what a *reader* (tmem_load) must wait. Using
+    // latency here modeled the TC as fully serial and inflated GEMM II ~2x.
     selfLatency = kMMAIssueLatency;
     return OpLatencyInfo{pipeline, latency, selfLatency, getMinWarps(op),
-                         /*occupancy=*/latency};
+                         /*occupancy=*/getMMAOccupancyCycles(op)};
   case HWPipeline::CUDA:
     // latency  = full RAW-dep cost per op (clock64-chained microbench).
     //            Used by RecMII to size dependency recurrences.

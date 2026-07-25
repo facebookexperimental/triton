@@ -6,13 +6,20 @@
 #   - One inner K-loop with TMA loads + tc_gen5_mma
 #
 # Modulo schedule (from case1_gemm/anno_02_post_modulo.ttgir):
-#   II = 1308 cycles
 #   SMEM: 2x buffers_A (128x64 fp16) + 2x buffers_B (64x128 fp16)
 #   TMEM: 1x acc (128x128 fp32)
 #   Partitions: MEM (TMA loads) + TC (mma) + default (epilogue store)
 #
 # This file is the *spec* for the emitter — the emitter must produce
 # something structurally identical from schedule_graph.json.
+#
+# NOTE (apples-to-apples): like the emitter output, this kernel takes raw
+# pointers + strides and builds the TMA descriptors on-device via
+# `tl.make_tensor_descriptor`. The emitter cannot receive host-built
+# `TensorDescriptor` args, so matching its descriptor-build site here is what
+# makes the perf comparison isolate schedule/partition quality rather than the
+# (per-launch, on-device) tensormap-build cost. `NUM_SMEM_BUFFERS` is kept
+# equal to the generated kernel's ring depth for the same reason.
 import torch
 import triton
 import triton.language as tl
@@ -20,19 +27,25 @@ import triton.language.extra.tlx as tlx
 
 
 @triton.jit
-def gemm_kernel(a_desc, b_desc, c_desc, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                NUM_SMEM_BUFFERS: tl.constexpr,  # = 2 from modulo
+def gemm_kernel(A, B, C, M, N, K,
+                stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                NUM_SMEM_BUFFERS: tl.constexpr,  # = generated ring depth (2 from modulo)
                 NUM_TMEM_BUFFERS: tl.constexpr,  # = 1 from modulo
                 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
+    # ── On-device TMA descriptors (mirror emitter: raw ptr → make_tensor_descriptor) ──
+    a_desc = tl.make_tensor_descriptor(A, [M, K], [stride_am, 1], [BLOCK_M, BLOCK_K])
+    b_desc = tl.make_tensor_descriptor(B, [K, N], [stride_bk, 1], [BLOCK_K, BLOCK_N])
+
     # ── Allocs (one per modulo BufferInfo, count = N) ──
-    buffers_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_desc), NUM_SMEM_BUFFERS)
-    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(b_desc), NUM_SMEM_BUFFERS)
+    buffers_A = tlx.local_alloc((BLOCK_M, BLOCK_K), tl.float16, NUM_SMEM_BUFFERS)
+    buffers_B = tlx.local_alloc((BLOCK_K, BLOCK_N), tl.float16, NUM_SMEM_BUFFERS)
     acc_tmem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem)
     # SMEM staging for epilogue TMA store (depth=1 — single store per tile).
-    c_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_desc), 1)
+    c_smem = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
 
     # ── Mbarriers (one full+empty pair per channel) ──
     A_full = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
@@ -50,7 +63,8 @@ def gemm_kernel(a_desc, b_desc, c_desc, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N:
             tlx.barrier_wait(tmem_full[0], 0)
             acc_full = tlx.local_load(acc_tmem[0])
             tlx.barrier_arrive(tmem_empty[0], 1)
-            c = acc_full.to(tlx.dtype_of(c_desc))
+            c_desc = tl.make_tensor_descriptor(C, [M, N], [stride_cm, 1], [BLOCK_M, BLOCK_N])
+            c = acc_full.to(tl.float16)
             tlx.local_store(c_smem[0], c)
             tlx.fence_async_shared()
             tlx.async_descriptor_store(c_desc, c_smem[0], [pid_m * BLOCK_M, pid_n * BLOCK_N])
@@ -107,18 +121,20 @@ def gemm(a, b):
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
 
-    a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(a, [BLOCK_M, BLOCK_K])
-    b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(b, [BLOCK_K, BLOCK_N])
-    c_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(c, [BLOCK_M, BLOCK_N])
-
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     gemm_kernel[grid](
-        a_desc,
-        b_desc,
-        c_desc,
+        a,
+        b,
+        c,
         M,
         N,
         K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -129,6 +145,10 @@ def gemm(a, b):
 
 
 if __name__ == "__main__":
+    def alloc_fn(size, alignment, stream):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
     M, N, K = 1024, 1024, 1024
     a = torch.randn(M, K, device="cuda", dtype=torch.float16)

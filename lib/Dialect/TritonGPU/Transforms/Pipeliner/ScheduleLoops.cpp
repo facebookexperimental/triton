@@ -7,7 +7,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Schedule.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
-#include "triton/Tools/Sys/GetEnv.hpp"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 
@@ -798,11 +798,11 @@ CoarseSchedule getInitialSchedule(scf::ForOp forOp,
     // root at the stages of the latency ops to prune unnecessary stages.
     auto isLatencyOp = [&](Operation &op) {
       return opLatency.count(&op) ||
-             isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp, LocalStoreOp,
+             isa<LoadOp, DescriptorLoadLikeOpInterface, LocalStoreOp,
                  LocalLoadOp, ttng::TMEMLoadOp, ttng::TMEMStoreOp,
-                 AsyncCopyGlobalToLocalOp, ttng::AsyncTMACopyGlobalToLocalOp,
-                 ttng::AsyncTMAGatherOp, ttng::MMAv5OpInterface,
-                 ttng::WaitBarrierOp, ttng::ArriveBarrierOp>(op);
+                 AsyncCopyGlobalToLocalOp, ttng::TMAOpInterface,
+                 ttng::MMAv5OpInterface, ttng::WaitBarrierOp,
+                 ttng::ArriveBarrierOp>(op);
     };
 
     // If there are no latency ops or all latency ops are in the same stage, we

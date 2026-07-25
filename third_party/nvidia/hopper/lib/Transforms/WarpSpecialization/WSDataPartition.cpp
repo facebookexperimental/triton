@@ -254,8 +254,7 @@ static SmallVector<int64_t> getShape(Type type) {
   else if (auto tensorType = dyn_cast<RankedTensorType>(type))
     return {tensorType.getShape().begin(), tensorType.getShape().end()};
   else if (auto tensorDescType = dyn_cast<TensorDescType>(type))
-    return {tensorDescType.getBlockType().getShape().begin(),
-            tensorDescType.getBlockType().getShape().end()};
+    return {tensorDescType.getShape().begin(), tensorDescType.getShape().end()};
   else if (auto ptrType = dyn_cast<PointerType>(type))
     return getShape(ptrType.getPointeeType());
   return {};
@@ -581,12 +580,6 @@ static bool getBackwardSliceToPartition(Value v,
         if (!getBackwardSliceToPartition(copyOp.getSrc(), partitionScheme,
                                          *srcDim))
           return false;
-        if (auto barrier = copyOp.getBarrier()) {
-          if (!getBackwardSliceToPartition(
-                  barrier, partitionScheme,
-                  DataPartitionScheme::noOpPartitionDim))
-            return false;
-        }
       }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
@@ -639,11 +632,6 @@ static bool getBackwardSliceToPartition(Value v,
       if (!getBackwardSliceToPartition(tmemCopyOp.getDst(), partitionScheme,
                                        currentDim))
         return false;
-      if (auto barrier = tmemCopyOp.getBarrier()) {
-        if (!getBackwardSliceToPartition(barrier, partitionScheme,
-                                         DataPartitionScheme::noOpPartitionDim))
-          return false;
-      }
     } else if (auto reshapeOp = dyn_cast<ReshapeOp>(op)) {
       auto srcShape = getShape(reshapeOp.getSrc());
       auto dstShape = getShape(reshapeOp.getResult());
@@ -1039,7 +1027,6 @@ static bool computePartitionScheme(triton::FuncOp &funcOp,
     return true;
 
   // Checking if all dots can be partitioned in the same way
-  int numWarps = mlir::triton::gpu::lookupNumWarps(funcOp);
   for (auto op : dots) {
     if (partitionScheme.isPartitioned(op) || partitionScheme.isSkipped(op)) {
       continue;
@@ -1318,15 +1305,11 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
                                                type.getEncoding());
           newV.setType(newType);
         } else if (auto type = dyn_cast<TensorDescType>(v.getType())) {
-          auto blockType = type.getBlockType();
-          SmallVector<int64_t> shape{blockType.getShape().begin(),
-                                     blockType.getShape().end()};
+          SmallVector<int64_t> shape(type.getShape());
           int sliceSize = shape[dim] / numOfPartitions;
           shape[dim] = sliceSize;
-          auto newBlockType = RankedTensorType::get(
-              shape, blockType.getElementType(), blockType.getEncoding());
-          auto newType =
-              TensorDescType::get(builder.getContext(), newBlockType);
+          auto newType = TensorDescType::get(shape, type.getElementType(),
+                                             type.getSharedLayout());
           newV.setType(newType);
         }
       }
@@ -1350,7 +1333,6 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
     auto srcTy = mappings.lookupOrNull(tmemLdOp.getSrc()).getType();
     auto type = cast<MemDescType>(srcTy);
-    auto tmem = cast<nvidia_gpu::TensorMemoryEncodingAttr>(type.getEncoding());
 
     RankedTensorType oldRetType = tmemLdOp.getType();
     auto retShapePerCTA = getShapePerCTA(oldRetType);
@@ -1443,19 +1425,26 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     auto newSrc = mappings.lookupOrNull(tmemStOp.getSrc());
     assert(newSrc && "TMEMStoreOp src not found in mappings; was it "
                      "backward-sliced in getSliceToPartition?");
+    // The TMEM store needs its source in a TMEM-compatible layout, but that
+    // requirement is local to this store: the source value may be shared with
+    // other consumers (e.g. an arith.constant feeding both the store and a
+    // downstream elementwise chain) that expect the original sliced encoding.
+    // Convert only for this store and restore the shared mapping afterwards, so
+    // remapping tmemStOp.getSrc() below does not force the TMEM-compatible
+    // layout onto every other user of the value.
+    Value prevSrcMapping = newSrc;
     if (newSrc.getType() != newSrcType) {
       auto cvtOp =
           ConvertLayoutOp::create(builder, op->getLoc(), newSrcType, newSrc);
       mappings.map(tmemStOp.getSrc(), cvtOp->getResult(0));
     }
     newOp = cloneAndSetResultType(op);
+    mappings.map(tmemStOp.getSrc(), prevSrcMapping);
   } else if (auto tmemCopyOp = dyn_cast<nvidia_gpu::TMEMCopyOp>(op)) {
     sliceOp(tmemCopyOp.getDst(), offset, mappings, reverseMappings,
             partitionScheme);
     sliceOp(tmemCopyOp.getSrc(), offset, mappings, reverseMappings,
             partitionScheme);
-    if (auto barrier = tmemCopyOp.getBarrier())
-      sliceOp(barrier, offset, mappings, reverseMappings, partitionScheme);
     newOp = cloneAndSetResultType(op);
   } else if (auto tmemAllocOp = dyn_cast<nvidia_gpu::TMEMAllocOp>(op)) {
     for (Value operand : op->getOperands())
@@ -1947,22 +1936,38 @@ static Operation *sliceOp(Operation *op, int offset, IRMapping &mappings,
     for (int i = 0; i < num; i++) {
       auto operand = yieldOp.getOperand(i);
       sliceOp(operand, offset, mappings, reverseMappings, partitionScheme);
-      if (auto newV = mappings.lookupOrNull(operand)) {
-        // Only append if the parent ForOp also has a corresponding new result.
-        if ((!parentForOp || mappings.lookupOrNull(parentForOp.getResult(i))) &&
-            !parentWhileOp)
-          yieldOp->insertOperands(op->getNumOperands(), newV);
-        // scf.while: append unconditionally when the operand was sliced. Unlike
-        // scf.for there is no per-index result guard here because the while
-        // branch above appends a loop-carried arg for every sliced init, and
-        // for a while the after-yield operand k feeds before-arg k 1:1, so a
-        // sliced yield operand always has a matching appended before-arg. This
-        // holds for the loop-carried values this pass threads
-        // (accumulators/counters); slicing an after-region-only value whose
-        // init was not sliced would break the 1:1 alignment and needs a guard
-        // analogous to the for path.
-        if (parentWhileOp)
-          yieldOp->insertOperands(op->getNumOperands(), newV);
+      auto newV = mappings.lookupOrNull(operand);
+      if (parentWhileOp) {
+        // scf.while: the while slicing appends a loop-carried arg for every
+        // sliced init, and the after-yield operand k feeds before-arg k 1:1,
+        // so a sliced yield operand always has a matching appended before-arg;
+        // append unconditionally when the operand was sliced. (Slicing an
+        // after-region-only value whose init was not sliced would break the
+        // 1:1 alignment and would need a guard analogous to the for path.)
+        if (newV)
+          yieldOp->insertOperands(yieldOp->getNumOperands(), newV);
+        continue;
+      }
+      if (!parentForOp) {
+        if (newV)
+          yieldOp->insertOperands(yieldOp->getNumOperands(), newV);
+        continue;
+      }
+      // scf.for: the ForOp slicing appended one new result/iter-arg for every
+      // sliced init arg (its result i is now mapped). Keep results and yield
+      // operands 1:1 so the loop stays well-formed (numResults ==
+      // numYieldOperands): append exactly one operand per new iter-arg. Prefer
+      // the sliced yield value; if this slot's yield operand was NOT itself
+      // sliced (e.g. a token/predicate carried across a short loop), carry the
+      // appended partition-copy region iter-arg through instead. Without this,
+      // a sliced init with an unsliced yield leaves the ForOp with more results
+      // than yield operands, which later crashes ForOpDeadArgElimination.
+      if (mappings.lookupOrNull(parentForOp.getResult(i))) {
+        Value yieldVal =
+            newV ? newV
+                 : mappings.lookupOrNull(parentForOp.getRegionIterArg(i));
+        assert(yieldVal && "no yield value for sliced ForOp iter-arg");
+        yieldOp->insertOperands(yieldOp->getNumOperands(), yieldVal);
       }
     }
     newOp = op;
@@ -2543,12 +2548,10 @@ bool doDataPartition(triton::FuncOp &funcOp, unsigned numConsumerGroups) {
     for (auto &[argIndex, dim] : partitionScheme.funcArgPartitionDims) {
       auto bbArg = entryBlock.getArgument(argIndex);
       auto descType = cast<TensorDescType>(bbArg.getType());
-      auto blockType = descType.getBlockType();
-      SmallVector<int64_t> shape(blockType.getShape());
+      SmallVector<int64_t> shape(descType.getShape());
       shape[dim] /= partitionScheme.numPartitions;
-      auto newBlockType = RankedTensorType::get(
-          shape, blockType.getElementType(), blockType.getEncoding());
-      bbArg.setType(TensorDescType::get(funcOp.getContext(), newBlockType));
+      bbArg.setType(TensorDescType::get(shape, descType.getElementType(),
+                                        descType.getSharedLayout()));
     }
     // Update FuncOp signature to match.
     SmallVector<Type> argTys(entryBlock.getArgumentTypes());

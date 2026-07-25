@@ -37,24 +37,24 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
     %cst_2 = arith.constant dense<0.127517432> : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>
     %cst_3 = arith.constant dense<0.000000e+00> : tensor<256x128xf32, #blocked>
     // CHECK-COUNT-8: tt.make_tensor_descriptor
-    %q_desc = tt.make_tensor_descriptor %q, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x256x128xbf16, #shared>>
-    %k_desc = tt.make_tensor_descriptor %k, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x128x128xbf16, #shared>>
-    %v_desc = tt.make_tensor_descriptor %v, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x128x128xbf16, #shared>>
-    %lse_desc_4 = tt.make_tensor_descriptor %lse, [%c128_i32, %c8192_i32], [%lse_desc, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<tensor<1x256xf32, #shared1>>
-    %o_desc = tt.make_tensor_descriptor %o, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<tensor<1x256x128xbf16, #shared>>
+    %q_desc = tt.make_tensor_descriptor %q, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<1x256x128xbf16, #shared>
+    %k_desc = tt.make_tensor_descriptor %k, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<1x128x128xbf16, #shared>
+    %v_desc = tt.make_tensor_descriptor %v, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<1x128x128xbf16, #shared>
+    %lse_desc_4 = tt.make_tensor_descriptor %lse, [%c128_i32, %c8192_i32], [%lse_desc, %c1_i64] : !tt.ptr<f32>, !tt.tensordesc<1x256xf32, #shared1>
+    %o_desc = tt.make_tensor_descriptor %o, [%c128_i32, %c8192_i32, %c128_i32], [%c1048576_i64, %c128_i64, %c1_i64] : !tt.ptr<bf16>, !tt.tensordesc<1x256x128xbf16, #shared>
     %0 = tt.get_program_id x : i32
     scf.for %virtual_pid = %0 to %total_pids step %c148_i32  : i32 {
       %pid_0 = arith.remsi %virtual_pid, %c32_i32 : i32
       %pid_1 = arith.divsi %virtual_pid, %c32_i32 : i32
       %offset_0 = arith.muli %pid_0, %c256_i32 : i32
-      %q_i_load = tt.descriptor_load %q_desc[%pid_1, %offset_0, %c0_i32] : !tt.tensordesc<tensor<1x256x128xbf16, #shared>> -> tensor<256x128xbf16, #blocked1>
+      %q_i_load = tt.descriptor_load %q_desc[%pid_1, %offset_0, %c0_i32] : !tt.tensordesc<1x256x128xbf16, #shared> -> tensor<256x128xbf16, #blocked1>
       %q_i_load_5 = ttg.local_alloc %q_i_load : (tensor<256x128xbf16, #blocked1>) -> !ttg.memdesc<256x128xbf16, #shared2, #smem>
       %qk, %qk_6 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %acc, %acc_7 = ttng.tmem_alloc : () -> (!ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
       %acc_8 = ttng.tmem_store %cst_3, %acc[%acc_7], %true : tensor<256x128xf32, #blocked> -> !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %acc_9:4 = scf.for %acc_15 = %c0_i32 to %c8192_i32 step %c128_i32 iter_args(%arg7 = %cst_0, %arg8 = %cst, %qk_16 = %qk_6, %acc_17 = %acc_8) -> (tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>>, !ttg.async.token, !ttg.async.token)  : i32 {
-        %k_j_load = tt.descriptor_load %k_desc[%pid_1, %acc_15, %c0_i32] : !tt.tensordesc<tensor<1x128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
-        %v_j_load = tt.descriptor_load %v_desc[%pid_1, %acc_15, %c0_i32] : !tt.tensordesc<tensor<1x128x128xbf16, #shared>> -> tensor<128x128xbf16, #blocked1>
+        %k_j_load = tt.descriptor_load %k_desc[%pid_1, %acc_15, %c0_i32] : !tt.tensordesc<1x128x128xbf16, #shared> -> tensor<128x128xbf16, #blocked1>
+        %v_j_load = tt.descriptor_load %v_desc[%pid_1, %acc_15, %c0_i32] : !tt.tensordesc<1x128x128xbf16, #shared> -> tensor<128x128xbf16, #blocked1>
         %v_j_load_18 = ttg.local_alloc %v_j_load : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
         %permute = ttg.local_alloc %k_j_load : (tensor<128x128xbf16, #blocked1>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
         %permute_19 = ttg.memdesc_trans %permute {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared2, #smem> -> !ttg.memdesc<128x128xbf16, #shared3, #smem>
@@ -113,12 +113,12 @@ module attributes {ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i
       %subscript_2 = ttg.convert_layout %v_17 : tensor<256xf32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<256xf32, #ttg.slice<{dim = 0, parent = #blocked1}>>
       %subscript_2_13 = tt.expand_dims %subscript_2 {axis = 0 : i32} : tensor<256xf32, #ttg.slice<{dim = 0, parent = #blocked1}>> -> tensor<1x256xf32, #blocked1>
       // CHECK-COUNT-2: tt.descriptor_store
-      tt.descriptor_store %lse_desc_4[%pid_1, %offset_0], %subscript_2_13 : !tt.tensordesc<tensor<1x256xf32, #shared1>>, tensor<1x256xf32, #blocked1>
+      tt.descriptor_store %lse_desc_4[%pid_1, %offset_0], %subscript_2_13 : !tt.tensordesc<1x256xf32, #shared1>, tensor<1x256xf32, #blocked1>
       %subscript_3 = ttg.convert_layout %v_18_12 : tensor<256x128xf32, #blocked> -> tensor<256x128xf32, #ttg.slice<{dim = 0, parent = #blocked5}>>
       %subscript_3_14 = tt.expand_dims %subscript_3 {axis = 0 : i32} : tensor<256x128xf32, #ttg.slice<{dim = 0, parent = #blocked5}>> -> tensor<1x256x128xf32, #blocked5>
       %v_19 = arith.truncf %subscript_3_14 : tensor<1x256x128xf32, #blocked5> to tensor<1x256x128xbf16, #blocked5>
       // CHECK-COUNT-2: tt.descriptor_store
-      tt.descriptor_store %o_desc[%pid_1, %offset_0, %c0_i32], %v_19 : !tt.tensordesc<tensor<1x256x128xbf16, #shared>>, tensor<1x256x128xbf16, #blocked5>
+      tt.descriptor_store %o_desc[%pid_1, %offset_0, %c0_i32], %v_19 : !tt.tensordesc<1x256x128xbf16, #shared>, tensor<1x256x128xbf16, #blocked5>
     } {tt.warp_specialize}
     tt.return
   }

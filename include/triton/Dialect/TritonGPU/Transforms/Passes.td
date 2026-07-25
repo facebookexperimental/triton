@@ -70,7 +70,7 @@ def TritonGPUHoistTMEMAlloc : Pass<"tritongpu-hoist-tmem-alloc", "mlir::ModuleOp
                            "mlir::scf::SCFDialect",
                            "mlir::arith::ArithDialect"];
   let options = [
-    Option<"hoistOutOfIf", "hoist-out-of-if",
+    Option<"postPipeline", "post-pipeline",
            "bool", /*default*/"false",
            "Hoist TMEM allocations out of if statements">
   ];
@@ -278,6 +278,11 @@ def TritonGPUCoalesce: Pass<"tritongpu-coalesce", "mlir::ModuleOp"> {
   }];
 
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"maxVecBits", "max-vec-bits", "unsigned", /*default*/"128",
+           "Maximum vector width in bits for load/store coalescing">
+  ];
 }
 
 

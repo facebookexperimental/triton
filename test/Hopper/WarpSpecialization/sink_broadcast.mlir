@@ -25,7 +25,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @sink_broadcast_chain_through_descriptor_load
-  tt.func @sink_broadcast_chain_through_descriptor_load(%bias_desc: !tt.tensordesc<tensor<1x256xf16>>,
+  tt.func @sink_broadcast_chain_through_descriptor_load(%bias_desc: !tt.tensordesc<1x256xf16>,
                                                         %acc: !ttg.memdesc<64x256xf32, #tmem, #ttng.tensor_memory, mutable>)
                                                         -> tensor<64x256xf32, #linear> {
     // CHECK: %[[TMEM:.*]] = ttng.tmem_load
@@ -34,7 +34,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // CHECK-NEXT: %[[BCAST:.*]] = tt.broadcast %[[EXT]]
     // CHECK-NEXT: %[[ADD:.*]] = arith.addf %[[TMEM]], %[[BCAST]]
     %c0 = arith.constant 0 : i32
-    %bias = tt.descriptor_load %bias_desc[%c0, %c0] : !tt.tensordesc<tensor<1x256xf16>> -> tensor<1x256xf16>
+    %bias = tt.descriptor_load %bias_desc[%c0, %c0] : !tt.tensordesc<1x256xf16> -> tensor<1x256xf16>
     %bias_f32 = arith.extf %bias : tensor<1x256xf16> to tensor<1x256xf32>
     %bcast = tt.broadcast %bias_f32 : tensor<1x256xf32> -> tensor<64x256xf32, #linear>
     %load = ttng.tmem_load %acc : !ttg.memdesc<64x256xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<64x256xf32, #linear>

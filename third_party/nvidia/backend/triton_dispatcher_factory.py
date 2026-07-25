@@ -78,6 +78,19 @@ def _expand_schema_arg_types(schema):
                 for _ in range(ndim):
                     flat_types.append("i64")
         else:
+            # Structured (tuple / NamedTuple) arg types cannot be expressed by the
+            # C dispatcher's flat "one schema arg == one scalar leaf" model (see the
+            # flat_pos bookkeeping below and the a["index"] mapping in
+            # CompiledKernel._build_dispatcher). Their str(ty) is either a tuple
+            # literal ("('i32', 'constexpr')") or a NamedTuple class repr
+            # ("Function(fn='constexpr', captured=('*fp32',))") -- both contain "(",
+            # which scalar/pointer/tensordesc types never do. Rather than re-parse
+            # the repr (the same fragile repr blind spot that broke the launcher
+            # path), decline the C dispatcher by returning (None, None) so make_triton_dispatcher
+            # returns None and the caller falls back to the Python launcher, which
+            # flattens the object signature structurally.
+            if "(" in ty:
+                return None, None
             flat_types.append(ty)
 
     return flat_types, tensordesc_info if tensordesc_info else None

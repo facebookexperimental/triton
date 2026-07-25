@@ -65,6 +65,24 @@ LogicalResult StorageAliasSpecOp::verify() {
 
 //-- StorageAliasLocalAllocOp --
 
+// Each storage_alias_local_alloc is a distinct logical allocation. Emit an
+// unconditional Allocate effect so CSE never merges two identically-shaped
+// allocs (which would collapse `distinct` reuse_group leaves).
+void StorageAliasLocalAllocOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  OpResult alloc = getOperation()->getOpResult(0);
+  auto memDescTy =
+      cast<::mlir::triton::gpu::MemDescType>(getResult().getType());
+  if (isa<::mlir::triton::nvidia_gpu::TensorMemorySpaceAttr>(
+          memDescTy.getMemorySpace()))
+    effects.emplace_back(MemoryEffects::Allocate::get(), alloc,
+                         ::mlir::triton::nvidia_gpu::TensorMemory::get());
+  else
+    effects.emplace_back(MemoryEffects::Allocate::get(), alloc,
+                         ::mlir::triton::gpu::SharedMemory::get());
+}
+
 LogicalResult StorageAliasLocalAllocOp::verify() {
   // Verify that the storage alias and result have compatible storage kinds
   auto storageAliasType =

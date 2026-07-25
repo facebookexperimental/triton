@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 // TritonGPU depends on Triton
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -60,6 +61,10 @@ constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
 constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";
 constexpr static char AttrClusterDimY[] = "ttg.cluster-dim-y";
 constexpr static char AttrClusterDimZ[] = "ttg.cluster-dim-z";
+// Set when the module contains exactly one `ttg.warp_specialize` op. Used to
+// diverge behavior in the warp specialization lowering to LLVM.
+constexpr static char AttrSingleWarpSpecializeName[] =
+    "ttg.single-warp-specialize";
 
 // Find the contextual number of warps on which this operation is executed.
 int lookupNumWarps(Operation *op);
@@ -77,6 +82,12 @@ std::optional<int> maybeLookupNumWarps(Block *block);
 int lookupThreadsPerWarp(OpBuilder &rewriter);
 int lookupNumCTAs(OpBuilder &rewriter);
 int lookupNumCTAs(Operation *op);
+
+// Record/query whether the module contains exactly one `ttg.warp_specialize`
+// op via the `ttg.single-warp-specialize` module attribute. `hasSingle...`
+// returns false when the attribute is absent.
+void setHasSingleWarpSpecialize(ModuleOp module, bool value);
+bool hasSingleWarpSpecialize(ModuleOp module);
 
 template <typename Key, typename Value> class Cache {
 public:
@@ -123,6 +134,10 @@ unsigned getTotalElemsPerThread(Type type);
 unsigned getTotalElemsPerThread(Attribute layout, ArrayRef<int64_t> shape);
 
 SmallVector<unsigned> getElemsPerThread(Type type);
+
+FailureOr<RankedTensorType> inferFp4ToFpResultType(RankedTensorType srcType,
+                                                   Type elemType, int32_t axis,
+                                                   std::optional<Location> loc);
 
 // Returns the number of warps per CTA that have access to non-replicated
 // elements of the tensor. E.g. for a blocked layout with sizePerThread = [1,
@@ -269,10 +284,18 @@ SmallVector<unsigned> getMatrixOrder(unsigned rank, bool rowMajor);
 SmallVector<unsigned> getOrderForDotOperand(unsigned opIdx, unsigned rank,
                                             bool kContig);
 
-bool isExpensiveCat(CatOp cat, Attribute targetEncoding);
+// Return true if \p cat would be valid with result encoding \p targetEncoding.
+bool isLegalCatEncoding(CatOp cat, Attribute targetEncoding);
 
 // Return true if a view between the two types cannot be implemented as a no-op.
-bool isExpensiveView(Type srcType, Type dstType);
+bool isExpensiveView(ArrayRef<int64_t> srcShape, Attribute srcEncoding,
+                     ArrayRef<int64_t> dstShape, Attribute dstEncoding);
+inline bool isExpensiveView(Type srcType, Type dstType) {
+  auto tensorSrcType = cast<RankedTensorType>(srcType);
+  auto tensorDstType = cast<RankedTensorType>(dstType);
+  return isExpensiveView(tensorSrcType.getShape(), tensorSrcType.getEncoding(),
+                         tensorDstType.getShape(), tensorDstType.getEncoding());
+}
 
 // Return a blocked encoding where the shape is distributed contiguously amongst
 // the threads, warps, CTAs with 1 element per threads.

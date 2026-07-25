@@ -150,6 +150,14 @@ struct ScheduleNode {
   unsigned partitionCount{1};
   unsigned partitionDim{0}; // 0 = M, 1 = N
   unsigned mSize{0};        // per-partition size along partitionDim
+  // Pass A.7 epilogue subtiling. When subtileCount > 1, this op belongs to the
+  // epilogue chain (tmem_load → ... → descriptor_store) that the sched2tlx
+  // emitter renders as a `for sub_n in range(S)` loop, each iteration storing a
+  // (BM, nSize) sub-tile along N. Defaults mean "not subtiled" (full BN tile).
+  int subtileIndex{-1};
+  int subtileCount{1};
+  int nOffset{0};
+  int nSize{0}; // 0 = full BN
 
   bool isSuperNode() const { return childPipelineId != UINT_MAX; }
   bool hasBuffer() const {

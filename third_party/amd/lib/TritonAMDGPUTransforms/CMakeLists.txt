@@ -9,6 +9,7 @@ add_triton_library(TritonAMDGPUTransforms
   DotDecomposeAndSchedule.cpp
   LowerBarrierOps.cpp
   OptimizeBufferOpPtr.cpp
+  OptimizeDescriptorEncoding.cpp
   OptimizeEpilogue.cpp
   OptimizeDotOperands.cpp
   HoistLayoutConversions.cpp
@@ -31,6 +32,7 @@ add_triton_library(TritonAMDGPUTransforms
   TritonAMDGPUIR
   TritonAMDGPUTransformsIncGen
   TritonGPUIR
+  TritonGPUModuloCore
   TritonAMDUtils
   TritonAMDAnalysis
 )

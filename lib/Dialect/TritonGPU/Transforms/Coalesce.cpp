@@ -69,6 +69,8 @@ static void pickDescriptorLoadStoreLayout(
 }
 
 struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
+  using impl::TritonGPUCoalesceBase<CoalescePass>::TritonGPUCoalesceBase;
+
   static Type getNewType(Type type, Attribute encoding) {
     RankedTensorType tensorType = cast<RankedTensorType>(type);
     return tensorType.cloneWithEncoding(encoding);
@@ -95,7 +97,14 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
           return;
       } else if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(curr)) {
         // Handle local_load - we assume full contiguity for shared memory reads
-        if (!isa<RankedTensorType>(localLoad.getResult().getType()))
+        auto resultType =
+            dyn_cast<RankedTensorType>(localLoad.getResult().getType());
+        if (!resultType)
+          return;
+        // Respect a user-pinned result layout (PinnedEncodingTrait, e.g. TLX's
+        // #tlx.user_layout): don't coalesce it to a "full contiguity" blocked
+        // layout -- the user chose this register layout on purpose.
+        if (isa_and_nonnull<PinnedEncodingTrait>(resultType.getEncoding()))
           return;
       } else {
         // Not a memory operation we handle
@@ -129,9 +138,9 @@ struct CoalescePass : public impl::TritonGPUCoalesceBase<CoalescePass> {
         auto tensorType = cast<RankedTensorType>(ptr.getType());
         CGAEncodingAttr cgaLayout = getCGALayout(tensorType.getEncoding());
         SmallVector<int64_t> shapePerCTA = getShapePerCTA(tensorType);
-        auto layout =
-            buildCoalescedEncoding(axisInfoAnalysis, curr, numWarps,
-                                   threadsPerWarp, cgaLayout, shapePerCTA);
+        auto layout = buildCoalescedEncoding(axisInfoAnalysis, curr, numWarps,
+                                             threadsPerWarp, cgaLayout,
+                                             shapePerCTA, maxVecBits);
         layoutMap[curr] = layout;
       }
     });

@@ -30,15 +30,14 @@ across loop iterations (accumulation).
 
 | Type | Header | Used for |
 |------|--------|----------|
-| `TmemDataChannelPost` | `CodePartitionUtility.h` | Operand-D TMEM channels (post-scheduling) |
-| `TmemDataChannel` | `CodePartitionUtility.h` | Non-operand-D TMEM channels (pre-scheduling) |
+| `TmemAllocChannel` | `CodePartitionUtility.h` | TMEM channels in the code-partition phase (incl. operand D) |
 
-`TmemDataChannelPost` carries:
+`TmemAllocChannel` carries:
 - `isOperandD = true` — flags this as an accumulator channel
 - `allocOp` — the `ttng.tmem_alloc` that backs the TMEM buffer
-- Inherits `channelKind = DataChannelKind::TMEMPost`
+- Inherits `channelKind = DataChannelKind::TMEMAlloc`
 
-Operand D channels are `TmemDataChannelPost` objects with special flags:
+Operand D channels are `TmemAllocChannel` objects with special flags:
 
 | Flag | Meaning |
 |------|---------|
@@ -63,11 +62,11 @@ same reuse group.
 ## Channel Creation — `handleOperandD`
 
 **File**: `CodePartitionUtility.cpp`
-**Entry**: called from `createChannelPost` when a `tmem_alloc` is identified
+**Entry**: called from `createAllocChannel` when a `tmem_alloc` is identified
 as the accumulator operand of an MMAv5 op (i.e.
 `mmaOp.getAccumulator() == tmemAllocOp`).
 
-Detection in `createChannelPost()`:
+Detection in `createAllocChannel()`:
 ```cpp
 if (auto mmaOp = dyn_cast<MMAv5OpInterface>(user)) {
   if (mmaOp.getAccumulator() == allocOp->getResult(0)) {
@@ -164,7 +163,7 @@ Channels created:
   Channel B (id=N+1): gen5_mma(task 1)   → tmem_load(task 3)  "accumulate → read"
 ```
 
-Both are `TmemDataChannelPost` with `isOperandD = true` and share the same
+Both are `TmemAllocChannel` with `isOperandD = true` and share the same
 `allocOp` (the `tmem_alloc` for dk).
 
 **Important:** No back-edge channel is created from `tmem_load → tmem_store`.
@@ -201,7 +200,7 @@ these uses must be accounted for to compute correct liveness intervals.
 
 ### Region Collection
 
-In `collectRegionsWithChannelsPost()`, for operand D, the function iterates
+In `collectRegionsWithChannels()`, for operand D, the function iterates
 over **all users** of the alloc op to find enclosing regions. This ensures
 correct accumulation counter tracking when the accumulator is used in multiple
 nested regions.
@@ -221,11 +220,11 @@ Operand D (the accumulator) stays with the MMA in the consumer partition.
 Communication of the result to other partitions is handled by the channel
 mechanism described above.
 
-## Token / Barrier Allocation — `createTokenPost`
+## Token / Barrier Allocation — `createToken`
 
 **File**: `WSCodePartition.cpp`
 
-For each channel (or channel group), `createTokenPost` allocates the
+For each channel (or channel group), `createToken` allocates the
 `CommChannel` contents: tokens, `producerBarrier`, and `consumerBarriers`.
 
 ### Decision Tree per Channel
@@ -292,7 +291,7 @@ Result: `{producerBarrier=bar_B, consumerBarriers={}, tokens={task3: tok_B}}`
 **File**: `WSCodePartition.cpp`
 
 `insertAsyncComm` iterates over all channels in dependency order and inserts
-the synchronization primitives. TMEM channels (`TMEMPost`) are processed
+the synchronization primitives. TMEM channels (`TMEMAlloc`) are processed
 **after** SMEM channels.
 
 ### `desyncMMAv5Op()`
@@ -453,7 +452,7 @@ Channel A: tmem_store(task 3, computation) → gen5_mma(task 1, gemm)
 Channel B: gen5_mma(task 1, gemm) → tmem_load(task 3, computation)  [back-edge]
 ```
 
-Both channels are `TmemDataChannelPost` with `isOperandD = true`.
+Both channels are `TmemAllocChannel` with `isOperandD = true`.
 Channel B is a **deferred (back-edge) channel** — the `tmem_load`
 appears before the `tmem_store` in program order, so it has no in-loop
 producer when first encountered.
@@ -513,7 +512,7 @@ If the `tmem_store`'s producer task ID appears in the sibling
 
 The partition scheduling pass inserts `tmem.start` and `tmem.end` marker
 attributes on operations to delineate the MMA accumulator's lifecycle. These
-markers are used later by `TmemDataChannelPost` to identify the source
+markers are used later by `TmemAllocChannel` to identify the source
 (`tmem.start`) and destination (`tmem.end`) operations of operand D channels.
 
 ## Summary Table — OperandD Channels (FA BWD)
@@ -523,7 +522,7 @@ For a single TMEM accumulator (e.g. dk) with the cross-partition pattern
 
 | | Channel A | Channel B |
 |---|---|---|
-| **Kind** | `TMEMPost` (operand D) | `TMEMPost` (operand D) |
+| **Kind** | `TMEMAlloc` (operand D) | `TMEMAlloc` (operand D) |
 | **Producer** | tmem_store (reduction, task 0) | gen5 MMA (gemm, task 1) |
 | **Consumer** | gen5 MMA (gemm, task 1) | tmem_load (computation, task 3) |
 | **producerBarrier** | set (via `ProducerIsGen5` trace) | set (producer IS gen5) |
@@ -540,8 +539,8 @@ For a single TMEM accumulator (e.g. dk) with the cross-partition pattern
 |------|------|----------|
 | Channel discovery | `CodePartitionUtility.cpp` | `handleOperandD` |
 | Channel creation helper | `CodePartitionUtility.cpp` | `createChannelsForProducers` |
-| Entry point | `CodePartitionUtility.cpp` | `createChannelPost` |
-| Token/barrier alloc | `WSCodePartition.cpp` | `createTokenPost` |
+| Entry point | `CodePartitionUtility.cpp` | `createAllocChannel` |
+| Token/barrier alloc | `WSCodePartition.cpp` | `createToken` |
 | Sync insertion | `WSCodePartition.cpp` | `insertAsyncComm` |
 | MMAv5 desync helper | `WSCodePartition.cpp` | `desyncMMAv5Op` |
 | Operand-D race fix | `WSCodePartition.cpp` | `insertAsyncComm` (inline) |

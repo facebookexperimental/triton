@@ -181,6 +181,15 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
     }
   }
 
+  // NOTE: no serial-chained-MMA occupancy correction is applied here, on
+  // purpose. Chained MMAs (FA: QK → softmax → PV) DO overlap across
+  // iterations on the pipelined tensor core, so inflating TC occupancy to
+  // full latency would overstate the II (measured: 3x on FA-bwd). What a
+  // low II demands from the rest of the pipeline is handled where it
+  // belongs: the partitioner prices recurrence-bound partitions via the
+  // RecMII' floor (computePartitionRecMII), and the sched2tlx emitter
+  // software-pipelines intra-WG async results.
+
   // Phase 3: Loop-carried edges via scf.yield → iter_args.
   auto yieldOp = loop.getBody()->getTerminator();
   auto iterArgs = loop.getRegionIterArgs();
@@ -204,9 +213,22 @@ DataDependenceGraph DataDependenceGraph::build(scf::ForOp loop,
       if (userIt == ddg.opToIdx.end())
         continue;
       // Loop-carried back-edge uses full latency so RecMII reflects
-      // the true recurrence depth. For MMA with accumulator, the next
-      // iteration can't read the result until the current MMA completes.
+      // the true recurrence depth: a consumer that READS the value (e.g.
+      // tmem_load, or a CUDA op on an iter_arg tensor) can't start until the
+      // producer completes.
+      //
+      // Exception: TC→TC token chains. Successive MMAs accumulating into the
+      // same TMEM buffer are ordered and pipelined by the tensor core itself —
+      // the next MMA issues at throughput rate (occupancy), not after the
+      // previous one's full completion. Charging full latency here doubled
+      // GEMM RecMII (559 vs the ~256-cycle true issue interval) and, through
+      // II, halved the TMA prefetch ring depth.
       int backEdgeLat = ddg.nodes[srcIdx].latency;
+      const auto &srcNode = ddg.nodes[srcIdx];
+      const auto &dstNode = ddg.nodes[userIt->second];
+      if (srcNode.pipeline == HWPipeline::TC &&
+          dstNode.pipeline == HWPipeline::TC)
+        backEdgeLat = std::max(pipelineOccupancy(srcNode), 1);
       ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
                   /*distance=*/1);
     }

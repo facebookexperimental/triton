@@ -3,6 +3,8 @@
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h"
 #include "triton/Tools/LayoutUtils.h"
 
 #include <limits>
@@ -455,6 +457,13 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
   unsigned bankWrapInterval = ldsNumBanks * ldsBankWidthInBytes / elemBytes;
   unsigned padInterval =
       std::max(static_cast<unsigned>(innerDimLength), bankWrapInterval);
+
+  // TDM only supports a maximum pad interval of 256 * 32bit.
+  // TODO: this will produce conflicts for very large INNER_DIMS (>1024bytes),
+  // we could scale the pad amount if this becomes an issue.
+  unsigned maxPadIntervalElems = 256u * 32u / typeWidthInBit;
+  padInterval = std::min(padInterval, maxPadIntervalElems);
+
   auto *context = srcTy.getContext();
   return triton::gpu::PaddedSharedEncodingAttr::get(
       context, {{padInterval, padAmount}}, order, shape, CGALayout);
@@ -480,6 +489,19 @@ composePaddedLayout(const tt::AMD::TargetInfo &targetInfo, int opIdx,
   }
 
   return {};
+}
+
+ttg::SharedEncodingTrait getEncodingFromDescriptor(Operation *op,
+                                                   RankedTensorType tensorType,
+                                                   Value desc) {
+  auto descTy = cast<tt::TensorDescType>(desc.getType());
+  auto sharedLayout = descTy.getSharedLayout();
+  if (!sharedLayout) {
+    emitError(op->getLoc()) << "Missing encoding on the tensor descriptor";
+    return {};
+  }
+  auto encoding = cast<ttg::SharedEncodingTrait>(sharedLayout);
+  return ttg::updateEncodingForShape(op, encoding, tensorType);
 }
 
 Attribute buildDefaultTDMDescriptorEncoding(MLIRContext *ctx,

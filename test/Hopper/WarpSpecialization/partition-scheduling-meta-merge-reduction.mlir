@@ -32,8 +32,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK-NOT: "reduction"
 tt.func public @merge_reduction_routes_descriptor_reduce(
   %A_shared: !ttg.memdesc<128x64xf16, #shared, #smem>,
-  %B_desc: !tt.tensordesc<tensor<64x64xf16, #shared>>,
-  %D_desc: !tt.tensordesc<tensor<128x64xf32, #shared_reduce>>,
+  %B_desc: !tt.tensordesc<64x64xf16, #shared>,
+  %D_desc: !tt.tensordesc<128x64xf32, #shared_reduce>,
   %n_tiles: i32
 ) {
   %true = arith.constant true
@@ -46,7 +46,7 @@ tt.func public @merge_reduction_routes_descriptor_reduce(
   scf.for %i = %c0_i32 to %n_tiles step %c64_i32 iter_args(
     %acc = %zero
   ) -> (tensor<128x64xf32, #blocked>) : i32 {
-    %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<tensor<64x64xf16, #shared>> -> tensor<64x64xf16, #load_blocked>
+    %B = tt.descriptor_load %B_desc[%i, %c0_i32] : !tt.tensordesc<64x64xf16, #shared> -> tensor<64x64xf16, #load_blocked>
     %B_shared = ttg.local_alloc %B : (tensor<64x64xf16, #load_blocked>) -> !ttg.memdesc<64x64xf16, #shared, #smem>
     %B_trans = ttg.memdesc_trans %B_shared {order = array<i32: 1, 0>} : !ttg.memdesc<64x64xf16, #shared, #smem> -> !ttg.memdesc<64x64xf16, #shared_T, #smem>
 
@@ -56,7 +56,7 @@ tt.func public @merge_reduction_routes_descriptor_reduce(
     %result, %result_tok = ttng.tmem_load %C_tmem[%mma_tok] : !ttg.memdesc<128x64xf32, #tmem_acc, #ttng.tensor_memory, mutable> -> tensor<128x64xf32, #blocked>
     %scaled = arith.mulf %result, %scale : tensor<128x64xf32, #blocked>
     %reduced = ttg.convert_layout %scaled : tensor<128x64xf32, #blocked> -> tensor<128x64xf32, #reduce_blocked>
-    tt.descriptor_reduce add, %D_desc[%i, %c0_i32], %reduced : !tt.tensordesc<tensor<128x64xf32, #shared_reduce>>, tensor<128x64xf32, #reduce_blocked>
+    tt.descriptor_reduce add, %D_desc[%i, %c0_i32], %reduced : !tt.tensordesc<128x64xf32, #shared_reduce>, tensor<128x64xf32, #reduce_blocked>
 
     %new_acc = arith.addf %acc, %result : tensor<128x64xf32, #blocked>
     scf.yield %new_acc : tensor<128x64xf32, #blocked>
