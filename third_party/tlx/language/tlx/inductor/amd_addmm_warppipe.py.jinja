@@ -19,11 +19,11 @@
     # masked tl.load + one extra dot ("sync-load the tail"). For K that IS a multiple of BLOCK_K
     # the tail is a no-op (all-false mask), so aligned-K codegen is unchanged.
     #
-    # CAVEAT: this needs K to be a multiple of 8 (16-byte row alignment; A [M,K] and col-major
-    # B [K,N] both have row stride K, so K*2 bytes must be 16-aligned). An odd/non-8 K hits a
-    # SEPARATE limit -- B's async_copy into the swizzled padded_shared layout cannot legalize a
-    # non-16-byte-aligned row (builtin.unrealized_conversion_cast on arg_B) -- which the sync
-    # tail does NOT fix (it is an AMD-backend async_copy alignment issue).
+    # DUAL PATH (USE_ASYNC constexpr, set by the heuristic from K's alignment): K % 8 == 0 uses the
+    # async_load direct-to-LDS warp-pipe below (needs 16-byte-aligned rows: A [M,K] + col-major
+    # B [K,N] have row stride K, so K*2 B must be 16-aligned). Unaligned/odd/sliced/small/dynamic K
+    # -- which the async_copy path can't legalize on CDNA4 -- uses the register-path fallback
+    # (tl.load->tl.dot, auto-pipelined), same mechanism as the bmm template (T280910119).
     M = {{size("A", 0)}}
     N = {{size("B", 1)}}
     K = {{size("A", 1)}}
@@ -83,6 +83,8 @@
     a_base = offs_m[:, None] * stride_am
     b_base = offs_n[:, None] * stride_bn          # B as (BLOCK_N, BLOCK_K): n is the row of the [N,K] view
 
+{% if USE_ASYNC %}
+    # --- async_load direct-to-LDS warp-pipe path (USE_ASYNC=1: K % 8 == 0, 16-byte-aligned rows) ---
     K_ITERS = K // BLOCK_K   # FULL K-tiles only; the partial-K tail is handled after the pipeline
 {% if SPLIT_K > 1 %}
     # this split's contiguous K-iteration range [k_lo, k_lo + n_iters). BALANCED
@@ -179,6 +181,22 @@
     b_offs = (k_tail + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
     b_tail = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < tail_width, other=0.0)
     acc = tl.dot(a_tail, b_tail, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% else %}
+    # --- register-path fallback (USE_ASYNC=0: (K*itemsize) % 16 != 0, e.g. odd/sliced/small K) ---
+    # buffer_load (tl.load) is element-granular, so it lowers for ANY row-stride alignment where the
+    # direct-to-LDS async_load cannot -- same mechanism as the bmm register branch (T280910119).
+    # A is loaded [BLOCK_M, BLOCK_K]; col-major B [K,N] is loaded [BLOCK_K, BLOCK_N] with K along rows
+    # (same index as the sync-tail above) so it feeds tl.dot directly (no local_trans). The masked
+    # load handles K % BLOCK_K inline. num_stages>1 (set by the heuristic) auto-pipelines the loads.
+    # SPLIT_K is always 1 on this path (the heuristic only emits SPLIT_K=1 register configs).
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for k in range(0, K, BLOCK_K):
+        a_offs = a_base + (k + offs_k[None, :]) * stride_ak
+        a_reg = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < K - k, other=0.0)
+        b_offs = (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn
+        b_reg = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < K - k, other=0.0)
+        acc = tl.dot(a_reg, b_reg, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% endif %}
 
     # rematerialize rm and rn to save registers
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
