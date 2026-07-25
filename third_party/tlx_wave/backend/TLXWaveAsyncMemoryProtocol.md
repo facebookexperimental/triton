@@ -22,9 +22,9 @@ The following requirements are non-negotiable:
 6. Direct-to-LDS DMA issue never acquires a dependency from an LDS alias,
    destination, pending access, allocation history, or bridge-created release
    frontier.
-7. The bridge preserves explicit compiler barriers as synchronization
-   operations. It does not reconstruct membar analysis or insert another
-   workgroup barrier before DMA.
+7. The bridge preserves explicit source barriers and compiler barriers that
+   delimit a closed memory-issue epoch. It does not reconstruct membar analysis
+   or insert another workgroup barrier before DMA.
 8. Emission is mechanical. Queue selection, readiness, barrier coalescing, and
    structured-control-flow carries are represented in verified target IR.
 
@@ -47,11 +47,15 @@ The responsibilities are distinct:
 - other compiler barriers separate local reads/writes from later storage reuse;
 - an ordinary barrier does not complete an in-flight DMA; and
 - direct DMA issue consumes only source async-protocol issue dependencies and
-  completion-free ordering from an explicit full-memory source barrier.
+  completion-free ordering from a source/compiler barrier whose imported
+  contract explicitly orders memory issue.
 
 The bridge may coalesce an adjacent compiler barrier with a workgroup
 wait-ready operation because they represent the same physical rendezvous. It
-must preserve every other compiler barrier independently.
+may also discard a compiler barrier that does not delimit a closed memory-issue
+epoch. Examples include a barrier within one still-open async group or
+immediately before an async-wait-synchronized local load. A compiler barrier
+that does delimit a closed issue epoch remains independent.
 
 The implementation references for this compatibility baseline are:
 
@@ -123,12 +127,14 @@ barrier at the same structural point.
 A barrier may consume the preceding LDS-completion frontier so local accesses
 cannot move across it. A following direct DMA does **not** consume the raw
 barrier result or any LDS/DMA-completion token. It may consume the
-completion-free issue-order projection of an explicit full-memory barrier.
+completion-free issue-order projection of a barrier explicitly marked
+`orders_memory_issue` by source import.
 
 `wave.barrier` lowers to a hardware barrier, but it is not a WaveAMDMachine
-scheduling-region delimiter. A full-memory CTA barrier (`addrSpace = 31`)
-forbids memory issue from crossing the barrier even when no value edge exists.
-The bridge therefore builds a sparse, region-local issue frontier:
+scheduling-region delimiter. The importer marks compiler-generated membar
+barriers with `orders_memory_issue`; a full-memory CTA source barrier
+(`addrSpace = 31`) provides the same target-IR assumption. The bridge builds a
+sparse, region-local issue frontier around any barrier with that semantic:
 
 ```text
 %pre_issue = wave.issue_token %pre_memory_tokens
@@ -142,16 +148,21 @@ wave.store ... after %post_issue
 The first projection orders the barrier after preceding memory issue without
 carrying load/store/DMA completion. The second strips any completion events
 carried by the raw barrier result. Every following memory issuer consumes the
-same `%post_issue` epoch until the next full barrier, so sibling operations are
-not serialized with each other. Pure arithmetic, MFMA, reductions, and
-`wave.redistribute` receive no epoch operand and remain movable across the
-barrier when ordinary SSA dependencies allow it.
+same `%post_issue` epoch until the next issue-ordering barrier, so sibling
+operations are not serialized with each other. Pure arithmetic, MFMA,
+reductions, and `wave.redistribute` receive no epoch operand and remain movable
+across the barrier when ordinary SSA dependencies allow it.
 
-Local-memory barriers and adjacent publication barriers coalesced into a
-workgroup wait-ready barrier do not create a full-memory issue epoch. Their
-affected operations are ordered by the verified readiness/local-memory token
-graph, while independent DMA issue retains the overlap permitted by the async
-protocol.
+An ordinary local source barrier without the imported semantic does not create
+an issue epoch. An adjacent publication barrier coalesced into a workgroup
+wait-ready barrier is ordered by the verified readiness/local-memory token
+graph. Neither case gives independent DMA issue an inferred completion or
+release dependency.
+
+A compiler barrier between closed async groups is an issue-epoch boundary and
+must be retained. A compiler barrier splitting packets that are later committed
+as one async group is not such a boundary. This distinction follows explicit
+commit structure rather than an allocation, alias, kernel, or shape query.
 
 This rule is deliberately allocation- and kernel-independent:
 
@@ -185,8 +196,8 @@ There is no LDS-issue projection.
 Packets or scalar chunks in one async group are group members, not a serial
 chain. They may share the same explicit source issue prerequisites, but no
 packet receives the previous packet or an alias-derived LDS access as a new
-`after` dependency. Packets after an explicit full-memory barrier may all share
-the same completion-free barrier-issue epoch.
+`after` dependency. Packets after an issue-ordering source/compiler barrier may
+all share the same completion-free barrier-issue epoch.
 
 ### 6. Control-flow state is explicit
 
@@ -257,16 +268,17 @@ Wave mapping: `wave.issue_token`.
 ### Memory completion and issue
 
 A real global, buffer, local, or direct-DMA memory issuer exposes its raw token
-only when a later full barrier needs an ordering proof. The bridge joins those
-tokens with one `wave.issue_token` projection immediately before that barrier.
-The resulting memory-issue event carries issue prerequisites but no completion.
+only when a later issue-ordering barrier needs an ordering proof. The bridge
+joins those tokens with one `wave.issue_token` projection immediately before
+that barrier. The resulting memory-issue event carries issue prerequisites but
+no completion.
 
-### Full barrier and barrier issue
+### Memory barrier and barrier issue
 
-A full-memory barrier exposes its raw result only when a later memory issuer or
-full barrier needs it. A second `wave.issue_token` projection produces the
-barrier-issue epoch consumed by following memory issuers. The raw full-barrier
-result is never a direct-DMA `after` operand.
+An issue-ordering barrier exposes its raw result only when a later memory
+issuer or issue-ordering barrier needs it. A second `wave.issue_token`
+projection produces the barrier-issue epoch consumed by following memory
+issuers. The raw barrier result is never a direct-DMA `after` operand.
 
 ### LDS access completion and frontier
 
@@ -278,8 +290,9 @@ point, or through structured control flow. It is not a DMA issue dependency.
 
 The result of an explicit compiler/source barrier that consumes a local-access
 frontier. It may maintain local ordering through later synchronization, but it
-is never accepted directly as a DMA issue operand. Only the full-barrier
-completion-free projection is accepted in the distinct barrier-order segment.
+is never accepted directly as a DMA issue operand. Only an explicitly
+issue-ordering barrier's completion-free projection is accepted in the
+distinct barrier-order segment.
 
 ### Workgroup and wave-local readiness
 
@@ -323,12 +336,15 @@ The backend runs AMD membar before source import. An adjacent local CTA barrier
 after a workgroup wait may be coalesced into the wait-ready `wave.barrier` when
 the verifier confirms same-region adjacency and provenance.
 
-Every other compiler/source barrier remains a target `barrier` at its original
-structural point. Preceding tracked LDS tokens may be operands of that barrier;
-the bridge does not propagate completion from its result into a later direct
-DMA. A target-IR pass gives a full-memory barrier (`address_space = 31`) the
-completion-free predecessor/successor issue projections described above. This
-decision depends only on source barrier scope and target-region order, not on a
+Except for compiler barriers proven not to delimit a closed issue epoch, every
+compiler/source barrier remains a target `barrier` at its original structural
+point. Preceding tracked LDS tokens may be operands of that barrier; the bridge
+does not propagate completion from its result into a later direct DMA. Source
+import marks the barriers identified by the pre-bridge compiler membar analysis
+with `orders_memory_issue`; full-memory source barriers provide the same
+semantic from their scope. A target-IR pass gives every retained marked barrier
+the completion-free predecessor/successor issue projections described above.
+The pass consults only that explicit target-IR semantic and region order, not a
 kernel, allocation, destination, or alias query.
 
 ### Structured loops and branches
@@ -344,14 +360,14 @@ source of DMA dependencies.
 
 - ordinary address, offset, mask, and destination operands;
 - a source-protocol issue-dependency segment;
-- an optional, distinct full-barrier issue-order segment;
+- an optional, distinct barrier issue-order segment;
 - packet and commit-group provenance; and
 - one DMA-completion result.
 
 The verifier requires `source_issue_dependency_count == issue_dependency_count`
 for the source segment and accepts only DMA-issue, empty, or explicit source
 token domains there. The optional barrier-order segment accepts only a
-completion-free barrier-issue token with structurally verified full-barrier
+completion-free barrier-issue token with structurally verified memory-barrier
 provenance. There is no LDS-release segment.
 
 ### Async wait-ready operation
@@ -375,10 +391,10 @@ provenance. There is no LDS-release segment.
 
 The target barrier remains a side-effecting operation with source provenance.
 It may consume a local completion frontier and publish a local-order result.
-It never completes DMA. The full-memory form may consume a completion-free
-predecessor issue token and publish a raw result that is immediately projected
-to a completion-free successor epoch. Neither projection is a scheduler-region
-cut.
+It never completes DMA. A barrier with `orders_memory_issue` may consume a
+completion-free predecessor issue token and publish a raw result that is
+immediately projected to a completion-free successor epoch. Neither projection
+is a scheduler-region cut.
 
 ## Wave Emission
 
@@ -392,7 +408,7 @@ After verification, emission maps target events mechanically:
 | Pre-barrier memory issue projection | `wave.issue_token` |
 | Post-barrier issue epoch | `wave.issue_token` |
 | Local compiler/source barrier | `wave.barrier` |
-| Full-memory compiler/source barrier (`address_space = 31`) | `wave.barrier` with explicit issue-token edges |
+| Issue-ordering compiler/source barrier | `wave.barrier` with explicit issue-token edges |
 | Workgroup wait-ready point | `wave.barrier` |
 | Wave-local wait-ready point | `wave.after` or `wave.join` |
 | Tracked LDS access | structural load/store/gather/scatter plus token result |
@@ -406,7 +422,8 @@ Emission must not:
 - infer dependencies at MMA boundaries;
 - turn retained groups into completion dependencies; or
 - manufacture barrier ordering from an alias, allocation, or destination
-  relation instead of an explicit full-memory source/compiler barrier.
+  relation instead of an explicit source/compiler `orders_memory_issue`
+  assumption.
 
 ## Partial-Wait Example
 
@@ -438,8 +455,10 @@ The verifier rejects target IR unless all of these hold:
 3. Retained groups contribute issue order and never completion.
 4. Every direct-DMA issue operand comes from the explicit source async
    protocol; LDS completion/released domains are rejected.
-5. Compiler barriers remain explicit except for verified adjacent wait
-   publication coalescing.
+5. Compiler barriers remain explicit when they delimit a closed issue epoch.
+   Barriers without such an epoch, including barriers within one open async
+   group or immediately before an async-wait-synchronized local load, may be
+   elided.
 6. Independent DMA packets are not serialized.
 7. Loop and branch tokens dominate their uses or are carried through structured
    arguments and yields.
@@ -459,17 +478,17 @@ Coverage must include:
 - multiple circular-buffer depths and independent dynamic indices;
 - independent packets sharing only explicit source prerequisites;
 - loop/branch readiness carries; and
-- rejection of malformed DMA, memory, and full-barrier issue projections.
+- rejection of malformed DMA, memory, and barrier issue projections.
 
 ### Wave IR and assembly checks
 
 For representative pipelines:
 
 - every required source/compiler barrier remains visible;
-- every full-memory source/compiler barrier has verified completion-free issue
-  edges to surrounding memory operations, while pure/layout operations have no
-  such edge;
-- no bridge-created `wave.sched_barrier` accompanies a full-memory barrier;
+- every source/compiler barrier marked to order memory issue has verified
+  completion-free edges to surrounding memory operations, while pure/layout
+  operations have no such edge;
+- no bridge-created `wave.sched_barrier` accompanies an issue-ordering barrier;
 - no additional release barrier appears immediately before DMA;
 - no raw barrier result, LDS token, or DMA-completion token is a DMA `after`
   operand;

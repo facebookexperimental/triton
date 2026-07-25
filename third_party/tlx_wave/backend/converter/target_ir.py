@@ -30,7 +30,7 @@ EVENT_DOMAIN_DMA_GROUP = "dma_group"
 EVENT_DOMAIN_DMA_ISSUE = "dma_issue"
 EVENT_DOMAIN_MEMORY_COMPLETION = "memory_completion"
 EVENT_DOMAIN_MEMORY_ISSUE = "memory_issue"
-EVENT_DOMAIN_FULL_BARRIER = "full_barrier"
+EVENT_DOMAIN_MEMORY_BARRIER = "memory_barrier"
 EVENT_DOMAIN_BARRIER_ISSUE = "barrier_issue"
 EVENT_DOMAIN_LDS_COMPLETION = "lds_completion"
 EVENT_DOMAIN_LDS_FRONTIER = "lds_frontier"
@@ -44,7 +44,7 @@ EVENT_DOMAINS = frozenset({
     EVENT_DOMAIN_DMA_ISSUE,
     EVENT_DOMAIN_MEMORY_COMPLETION,
     EVENT_DOMAIN_MEMORY_ISSUE,
-    EVENT_DOMAIN_FULL_BARRIER,
+    EVENT_DOMAIN_MEMORY_BARRIER,
     EVENT_DOMAIN_BARRIER_ISSUE,
     EVENT_DOMAIN_LDS_COMPLETION,
     EVENT_DOMAIN_LDS_FRONTIER,
@@ -55,9 +55,9 @@ EVENT_DOMAINS = frozenset({
 })
 
 # Target operations that issue real memory instructions and therefore
-# participate in the completion-free ordering frontier around an explicit
-# full-memory barrier.  High-level value transforms such as layout_convert and
-# reduction are deliberately absent even when their eventual implementation
+# participate in the completion-free ordering frontier around a barrier with
+# an explicit memory-issue-ordering guarantee. High-level transforms and
+# reductions are deliberately absent even when their eventual implementation
 # may use private scratch memory.
 MEMORY_ISSUER_OP_KINDS = frozenset({
     "buffer_load",

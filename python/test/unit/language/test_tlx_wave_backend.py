@@ -3049,6 +3049,7 @@ def test_tlx_wave_converter_pipeline_lowers_explicit_cta_barrier(
     assert converter_target_ir.attrs_dict(barrier) == {
         "address_space": address_space,
         "dependency_count": 0,
+        "orders_memory_issue": barrier_scope == "all",
     }
     wave = output.emitted_module.text
     assert wave.count("wave.barrier") == 1
@@ -3056,6 +3057,42 @@ def test_tlx_wave_converter_pipeline_lowers_explicit_cta_barrier(
     machine = _run_waveamd_to_machine(wave)
     assert machine.count("waveamdmachine.s_barrier") == 1
     assert "waveamdmachine.sched_barrier" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_imports_compiler_membar_issue_order(tmp_path):
+    local_func = """
+  tt.func public @converter_compiler_membar() attributes {noinline = false} {
+    ttg.barrier local
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4)
+    barriers = []
+
+    def collect_barriers(op):
+        if op.get_name() == "ttg.barrier":
+            barriers.append(op)
+        return True
+
+    mod.walk(collect_barriers)
+    assert len(barriers) == 1
+
+    output = converter_pipeline.convert_ttgir_to_wave(
+        mod,
+        compiler_membar_barriers=tuple(barriers),
+    )
+
+    source_barrier = next(op for op in output.source_program.ops if op.name == "ttg.barrier")
+    assert source_barrier.attrs["tlx.compiler_membar_barrier"] is True
+    assert source_barrier.attrs["tlx.orders_memory_issue"] is True
+    target_barrier = next(op for op in output.target_program.ops if op.kind == "barrier")
+    target_attrs = converter_target_ir.attrs_dict(target_barrier)
+    assert target_attrs["compiler_membar_barrier"] is True
+    assert target_attrs["orders_memory_issue"] is True
+    # The synthetic isolated barrier has no memory epoch to delimit, so the
+    # later protocol canonicalizer correctly leaves it out of the live region.
+    assert output.emitted_module.text.count("wave.barrier") == 0
     del ctx
 
 
@@ -3376,10 +3413,86 @@ def test_tlx_wave_converter_does_not_hoist_async_wait_before_regular_local_load(
     ]
 
 
-def test_tlx_wave_converter_eliminates_dma_only_compiler_membar():
+def test_tlx_wave_converter_orders_compiler_membar_between_dma_epochs():
     builder = converter_target_ir.TargetBuilder()
+    token_type = converter_target_ir.TargetType("token", "token")
+    first_completion = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+    )
+    second_completion = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+    )
+    first_group = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
+    )
+    first_dma_id = builder.add_op(
+        "buffer_load_to_local",
+        results=(first_completion, ),
+        attrs={"mode": "dma_packet_lds"},
+    )
+    first_commit_id = builder.add_op(
+        "async_commit_group",
+        operands=(first_completion, ),
+        results=(first_group, ),
+    )
+    barrier_id = builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": True,
+            "dependency_count": 0,
+            "orders_memory_issue": True,
+        },
+    )
+    second_dma_id = builder.add_op(
+        "buffer_load_to_local",
+        results=(second_completion, ),
+        attrs={"mode": "dma_packet_lds"},
+    )
+
+    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
+    target = converter_barrier_order.thread_barrier_issue_order(target)
+
+    ordered_ops = [target.ops[op_id] for op_id in target.regions[0].op_ids]
+    assert [op.kind for op in ordered_ops] == [
+        "buffer_load_to_local",
+        "async_commit_group",
+        "issue_token",
+        "barrier",
+        "issue_token",
+        "buffer_load_to_local",
+    ]
+    first_dma = target.ops[first_dma_id]
+    assert target.ops[first_commit_id] == ordered_ops[1]
+    pre_issue = ordered_ops[2]
+    barrier = target.ops[barrier_id]
+    post_issue = ordered_ops[4]
+    second_dma = target.ops[second_dma_id]
+    assert pre_issue.operands == (first_dma.results[0], )
+    assert barrier.operands == pre_issue.results
+    assert post_issue.operands == barrier.results
+    assert second_dma.operands == post_issue.results
+    assert (target.values[barrier.results[0]].event_domain == converter_target_ir.EVENT_DOMAIN_MEMORY_BARRIER)
+
+
+def test_tlx_wave_converter_elides_compiler_membar_within_open_dma_group():
+    builder = converter_target_ir.TargetBuilder()
+    token_type = converter_target_ir.TargetType("token", "token")
+    completions = tuple(
+        builder.add_value(
+            token_type,
+            event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+        ) for _ in range(2))
+    group = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
+    )
     builder.add_op(
         "buffer_load_to_local",
+        results=(completions[0], ),
         attrs={"mode": "dma_packet_lds"},
     )
     builder.add_op(
@@ -3388,11 +3501,18 @@ def test_tlx_wave_converter_eliminates_dma_only_compiler_membar():
             "address_space": 1,
             "compiler_membar_barrier": True,
             "dependency_count": 0,
+            "orders_memory_issue": True,
         },
     )
     builder.add_op(
         "buffer_load_to_local",
+        results=(completions[1], ),
         attrs={"mode": "dma_packet_lds"},
+    )
+    builder.add_op(
+        "async_commit_group",
+        operands=completions,
+        results=(group, ),
     )
 
     target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
@@ -3400,73 +3520,30 @@ def test_tlx_wave_converter_eliminates_dma_only_compiler_membar():
     assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
         "buffer_load_to_local",
         "buffer_load_to_local",
+        "async_commit_group",
     ]
 
 
-@pytest.mark.parametrize(
-    "predecessor_kind,predecessor_attrs",
-    [
-        ("local_load", {}),
-        ("local_load_mma_payload", {}),
-        ("local_store", {}),
-        ("buffer_load_to_local", {"mode": "scalarized_load_store"}),
-    ],
-)
-def test_tlx_wave_converter_retains_compiler_membar_after_synchronous_lds(
-    predecessor_kind,
-    predecessor_attrs,
-):
+def test_tlx_wave_converter_elides_compiler_membar_before_wait_ready_load():
     builder = converter_target_ir.TargetBuilder()
-    builder.add_op(predecessor_kind, attrs=predecessor_attrs)
-    builder.add_op(
-        "barrier",
-        attrs={
-            "address_space": 1,
-            "compiler_membar_barrier": True,
-            "dependency_count": 0,
-        },
+    token_type = converter_target_ir.TargetType("token", "token")
+    completion = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
     )
-
-    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
-
-    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
-        predecessor_kind,
-        "barrier",
-    ]
-
-
-def test_tlx_wave_converter_preserves_explicit_dma_epoch_barrier():
-    builder = converter_target_ir.TargetBuilder()
+    group = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
+    )
     builder.add_op(
         "buffer_load_to_local",
+        results=(completion, ),
         attrs={"mode": "dma_packet_lds"},
     )
     builder.add_op(
-        "barrier",
-        attrs={
-            "address_space": 1,
-            "compiler_membar_barrier": False,
-            "dependency_count": 0,
-        },
-    )
-
-    target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
-
-    assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
-        "buffer_load_to_local",
-        "barrier",
-    ]
-
-
-def test_tlx_wave_converter_ignores_pure_structural_region_for_dma_membar():
-    builder = converter_target_ir.TargetBuilder()
-    nested_region = builder.add_region()
-    with builder.insertion_region(nested_region):
-        builder.add_op("binary", attrs={"operation": "addi"})
-    builder.add_op("if", region_ids=(nested_region, ))
-    builder.add_op(
-        "buffer_load_to_local",
-        attrs={"mode": "dma_packet_lds"},
+        "async_commit_group",
+        operands=(completion, ),
+        results=(group, ),
     )
     builder.add_op(
         "barrier",
@@ -3474,14 +3551,20 @@ def test_tlx_wave_converter_ignores_pure_structural_region_for_dma_membar():
             "address_space": 1,
             "compiler_membar_barrier": True,
             "dependency_count": 0,
+            "orders_memory_issue": True,
         },
+    )
+    builder.add_op(
+        "local_load_mma_payload",
+        attrs={"synced_via_async_wait": True},
     )
 
     target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
 
     assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
-        "if",
         "buffer_load_to_local",
+        "async_commit_group",
+        "local_load_mma_payload",
     ]
 
 
@@ -4211,7 +4294,7 @@ def test_tlx_wave_converter_verifier_rejects_unproven_barrier_issue_projection()
     token_type = converter_target_ir.TargetType("token", "token")
     raw_barrier = builder.add_value(
         token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_FULL_BARRIER,
+        event_domain=converter_target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
     )
     barrier_issue = builder.add_value(
         token_type,
@@ -4224,7 +4307,7 @@ def test_tlx_wave_converter_verifier_rejects_unproven_barrier_issue_projection()
         attrs={
             "input_count": 1,
             "projection_domain": (converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE),
-            "projection_provenance": "full_barrier_successors",
+            "projection_provenance": "memory_barrier_successors",
         },
     )
 
@@ -4234,11 +4317,29 @@ def test_tlx_wave_converter_verifier_rejects_unproven_barrier_issue_projection()
     assert exc_info.value.code == "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE"
 
 
+def test_tlx_wave_converter_verifier_requires_compiler_membar_issue_assumption():
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_op(
+        "barrier",
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": True,
+            "dependency_count": 0,
+            "orders_memory_issue": False,
+        },
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_BARRIER_ORDER_ASSUMPTION"
+
+
 def test_tlx_wave_converter_verifier_rejects_raw_barrier_memory_dependency():
     builder = converter_target_ir.TargetBuilder()
     raw_barrier = builder.add_value(
         converter_target_ir.TargetType("token", "token"),
-        event_domain=converter_target_ir.EVENT_DOMAIN_FULL_BARRIER,
+        event_domain=converter_target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
     )
     builder.add_op(
         "store",
@@ -5842,7 +5943,7 @@ def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: second_sha)
     second_hash = backend.hash()
 
-    assert "stage13-amd-membar-wave-scheduler-options" in first_hash
+    assert "stage14-amd-membar-issue-order" in first_hash
     assert f"wave-opt-sha256={first_sha}" in first_hash
     assert f"wave-opt-sha256={second_sha}" in second_hash
     assert first_hash != second_hash
@@ -6370,10 +6471,9 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
         assert "wave.sched_barrier" not in wave_artifact
         assert "memdesc_subslice" not in wave_artifact
     if case["version_dir"] == "wave_4wave_specialized":
-        # Match the five structural rendezvous in Wave's specialized kernel:
-        # initial publication, independent A/B reuse, steady-state
-        # publication, and final publication.
-        assert wave_artifact.count("wave.barrier") == 5
+        # Five publication/reuse rendezvous remain, plus one compiler-owned
+        # issue-epoch barrier between the two closed prologue stages.
+        assert wave_artifact.count("wave.barrier") == 6
     if case.get("id") == "v9_beyond_hotloop_transposed_b":
         barrier_lines = [line for line in wave_artifact.splitlines() if "wave.barrier" in line]
         barrier_tokens = {_ssa_result_name(line) for line in barrier_lines}
@@ -6381,22 +6481,53 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
             line for line in wave_artifact.splitlines() if "wave.load" in line and "#wave.shared" in line
         ]
         dma_lines = [line for line in wave_artifact.splitlines() if "waveamd.dma_load_lds" in line]
+        issue_lines = [line for line in wave_artifact.splitlines() if "wave.issue_token" in line]
+        join_inputs = {}
+        for line in wave_artifact.splitlines():
+            if "wave.join" not in line:
+                continue
+            result = _ssa_result_name(line)
+            operands = re.findall(r"%[A-Za-z0-9_]+", line.split(":", 1)[0])
+            join_inputs[result] = set(operands) - {result}
+
+        def flatten_join_inputs(token):
+            pending = [token]
+            inputs = set()
+            while pending:
+                current = pending.pop()
+                if current in inputs:
+                    continue
+                inputs.add(current)
+                pending.extend(join_inputs.get(current, ()))
+            return inputs
+
         # Five barriers publish explicit wait completion for LDS consumers.
-        # Compiler-owned reuse and warp-pipeline phase barriers remain
-        # explicit, but DMA issue must not acquire a bridge-synthesized LDS
-        # release barrier.
-        assert len(barrier_lines) == 11
+        # Compiler and full-memory source barriers order issue via projections;
+        # DMA never consumes their raw result or an LDS-release token.
+        assert len(barrier_lines) == 12
         assert shared_load_lines
-        load_ready_tokens = {
-            token
-            for token in barrier_tokens
-            if any(f"after {token}" in line for line in shared_load_lines)
-        }
+        shared_load_dependencies = set()
+        for line in shared_load_lines:
+            after = re.search(r"\bafter (%[A-Za-z0-9_]+)", line)
+            assert after is not None
+            shared_load_dependencies.update(flatten_join_inputs(after.group(1)))
+        load_ready_tokens = {token for token in barrier_tokens if token in shared_load_dependencies}
         dma_barrier_tokens = {token for token in barrier_tokens if any(f"after {token}" in line for line in dma_lines)}
+        barrier_issue_tokens = {
+            _ssa_result_name(line)
+            for line in issue_lines
+            if any(token in line for token in barrier_tokens)
+        }
+        dma_barrier_issue_tokens = {
+            token
+            for token in barrier_issue_tokens
+            if any(f"after {token}" in line for line in dma_lines)
+        }
         assert len(load_ready_tokens) == 5
         assert dma_barrier_tokens == set()
+        assert len(dma_barrier_issue_tokens) == 1
         other_barrier_tokens = barrier_tokens - load_ready_tokens
-        assert len(other_barrier_tokens) == 5
+        assert len(other_barrier_tokens) == 6
         assert (load_ready_tokens | other_barrier_tokens == barrier_tokens)
         dependency_free_barrier_tokens = {
             _ssa_result_name(line)
@@ -15789,7 +15920,7 @@ def _convert_ttgir_to_wave_keep_dead(
         token_program,
     )
     target_program = converter_canonicalize.canonicalize_target_program(target_program)
-    target_program = converter_barrier_order.thread_full_barrier_issue_order(target_program)
+    target_program = converter_barrier_order.thread_barrier_issue_order(target_program)
     if verify:
         converter_verifier.verify_target_program(
             target_program,
