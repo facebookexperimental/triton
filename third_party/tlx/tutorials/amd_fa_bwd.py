@@ -48,13 +48,14 @@ def _require_layout_soft(x, layout, _semantic=None):
     """Attach a temporary register-layout hint without making it a hard anchor.
 
     Upstream ``tlx.require_layout`` pins user-authored epilogue ownership so
-    layout optimization cannot rewrite it.  These FA kernels instead use a
-    non-pinned requirement for direct-to-LDS offsets, MFMA operands, and
-    intermediate arithmetic.  TLX is therefore allowed to replace this hint
-    with a conversion or propagate another compatible layout; it is not a
-    correctness guarantee.  Hard pins are reserved for explicit output-store
-    ownership.  A later soft requirement may replace this hint or materialize
-    a conversion; it does not cancel a hard pin.
+    layout optimization cannot rewrite it.  The exact D128 kernel instead uses
+    non-pinned requirements for its resource-sensitive direct-to-LDS offsets,
+    MFMA operands, and intermediate arithmetic.  TLX is therefore allowed to
+    replace these hints with conversions or propagate other compatible
+    layouts; they are not correctness guarantees.  Hard pins are reserved for
+    fixed ownership such as output stores.  A later soft requirement may
+    replace this hint or materialize a conversion; it does not cancel a hard
+    pin.
     """
     x = _semantic.to_tensor(x)
     layout = tl_core._unwrap_if_constexpr(layout)
@@ -230,9 +231,9 @@ def _attn_bwd_dkdv_d128_single_impl(
             tlx.local_store(tlx.local_view(v_buffers, 0), tl.zeros((BLOCK, D), tl.bfloat16))
             tl.debug_barrier()
         kv_offsets = row_ptrs.to(tl.int32)
-        kv_offsets = _require_layout_soft(kv_offsets, qdo_async_layout)
+        kv_offsets = tlx.require_layout(kv_offsets, qdo_async_layout)
         kv_load_mask = tl.broadcast_to(row_mask, kv_offsets.shape)
-        kv_load_mask = _require_layout_soft(kv_load_mask, qdo_async_layout)
+        kv_load_mask = tlx.require_layout(kv_load_mask, qdo_async_layout)
         k_token = tlx.buffer_load_to_local(tlx.local_view(k_buffers, 0), K, kv_offsets, mask=kv_load_mask)
         v_token = tlx.buffer_load_to_local(tlx.local_view(v_buffers, 0), V, kv_offsets, mask=kv_load_mask)
     else:
@@ -263,9 +264,9 @@ def _attn_bwd_dkdv_d128_single_impl(
                 tlx.local_store(tlx.local_view(do_buffers, 0), tl.zeros((BLOCK, D), tl.bfloat16))
                 tl.debug_barrier()
             qdo_offsets = qdo_ptrs.to(tl.int32)
-            qdo_offsets = _require_layout_soft(qdo_offsets, qdo_async_layout)
+            qdo_offsets = tlx.require_layout(qdo_offsets, qdo_async_layout)
             qdo_load_mask = tl.broadcast_to(qdo_mask, qdo_offsets.shape)
-            qdo_load_mask = _require_layout_soft(qdo_load_mask, qdo_async_layout)
+            qdo_load_mask = tlx.require_layout(qdo_load_mask, qdo_async_layout)
             q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), Q, qdo_offsets, mask=qdo_load_mask)
             do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), DO, qdo_offsets, mask=qdo_load_mask)
         else:
@@ -484,9 +485,9 @@ def _attn_bwd_dkdv_d128_rect_impl(
     first_m = tl.arange(0, BLOCK_M)
     first_mask = first_m[:, None] < N
     first_offsets = (tensor_base + first_m[:, None] * D + offs_d[None, :]).to(tl.int32)
-    first_offsets = _require_layout_soft(first_offsets, qdo_async_layout)
+    first_offsets = tlx.require_layout(first_offsets, qdo_async_layout)
     first_load_mask = tl.broadcast_to(first_mask, first_offsets.shape)
-    first_load_mask = _require_layout_soft(first_load_mask, qdo_async_layout)
+    first_load_mask = tlx.require_layout(first_load_mask, qdo_async_layout)
     q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), Q, first_offsets, mask=first_load_mask)
     do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), DO, first_offsets, mask=first_load_mask)
     tlx.async_load_commit_group([q_token, do_token])
@@ -510,9 +511,9 @@ def _attn_bwd_dkdv_d128_rect_impl(
             tlx.local_store(tlx.local_view(do_buffers, next_slot), tl.zeros((BLOCK_M, D), tl.bfloat16))
             tl.debug_barrier()
         next_offsets = (tensor_base + next_m[:, None] * D + offs_d[None, :]).to(tl.int32)
-        next_offsets = _require_layout_soft(next_offsets, qdo_async_layout)
+        next_offsets = tlx.require_layout(next_offsets, qdo_async_layout)
         next_load_mask = tl.broadcast_to(next_mask, next_offsets.shape)
-        next_load_mask = _require_layout_soft(next_load_mask, qdo_async_layout)
+        next_load_mask = tlx.require_layout(next_load_mask, qdo_async_layout)
         next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_offsets,
                                                 mask=next_load_mask)
         next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_slot), DO, next_offsets,
