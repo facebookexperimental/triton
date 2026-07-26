@@ -106,11 +106,13 @@ public:
       return;
     }
 
-    result =
-        mod.walk([&](tt::DotOp op) { return checkNoDependentTwoCTADot(op); });
-    if (result.wasInterrupted()) {
-      signalPassFailure();
-      return;
+    if (!allowDependentChains) {
+      result =
+          mod.walk([&](tt::DotOp op) { return checkNoDependentTwoCTADot(op); });
+      if (result.wasInterrupted()) {
+        signalPassFailure();
+        return;
+      }
     }
 
     bool twoCTAValue = firstMatmul ? firstTwoCTA : false;

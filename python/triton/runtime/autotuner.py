@@ -1074,6 +1074,7 @@ class Config:
         preferred_ctas_per_cga=None,
         multicast=False,
         auto_tma=None,
+        allowDependentTwoCTA=False,
     ):
         self.kwargs = kwargs
         self.num_warps = num_warps
@@ -1093,6 +1094,7 @@ class Config:
         self.generate_subtiled_region = generate_subtiled_region
         self.preferred_ctas_per_cga = preferred_ctas_per_cga
         self.multicast = multicast
+        self.allowDependentTwoCTA = allowDependentTwoCTA
         # Per-config auto-TMA toggle. None -> defer to the global TRITON_AUTO_TMA
         # knob; True/False lets the autotuner A/B auto-TMA per shape.
         self.auto_tma = auto_tma
@@ -1114,6 +1116,7 @@ class Config:
         self.generate_subtiled_region = state.get("generate_subtiled_region", None)
         self.preferred_ctas_per_cga = state.get("preferred_ctas_per_cga", None)
         self.multicast = state.get("multicast", False)
+        self.allowDependentTwoCTA = state.get("allowDependentTwoCTA", False)
         self.auto_tma = state.get("auto_tma", None)
 
     def all_kwargs(self):
@@ -1137,6 +1140,7 @@ class Config:
                     ("preferred_ctas_per_cga", self.preferred_ctas_per_cga),
                     ("multicast", self.multicast),
                     ("auto_tma", self.auto_tma),
+                    ("allowDependentTwoCTA", self.allowDependentTwoCTA),
                 ) if v is not None
             },
         }

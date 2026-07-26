@@ -157,6 +157,13 @@ createTritonGPUProxyFenceInsertionWrapper(int32_t capability) {
   return ttng::createTritonGPUProxyFenceInsertion(options);
 }
 
+static std::unique_ptr<mlir::Pass>
+createCheckMatmulTwoCTAWrapper(bool allowDependentChains) {
+  ttng::TritonNvidiaGPUCheckMatmulTwoCTAPassOptions options;
+  options.allowDependentChains = allowDependentChains;
+  return ttng::createTritonNvidiaGPUCheckMatmulTwoCTAPass(options);
+}
+
 void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_plan_cta", ttng::createTritonNvidiaGPUPlanCTAPass);
   ADD_PASS_WRAPPER_1("add_fence_insertion",
@@ -177,8 +184,8 @@ void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
                      ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
   ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
                      ttng::createTritonNvidiaGPURemoveTMEMTokensPass);
-  ADD_PASS_WRAPPER_0("add_check_matmul_two_cta",
-                     ttng::createTritonNvidiaGPUCheckMatmulTwoCTAPass);
+  ADD_PASS_WRAPPER_1("add_check_matmul_two_cta", createCheckMatmulTwoCTAWrapper,
+                     bool);
   ADD_PASS_WRAPPER_0("add_nvgpu_to_llvm",
                      mlir::triton::createConvertNVGPUToLLVM);
   ADD_PASS_WRAPPER_0("add_warp_specialize_to_llvm",
@@ -226,6 +233,12 @@ void init_triton_hopper_passes(py::module &&m) {
                      mlir::createNVGPUTMAStoreTokenWaitLowering);
   ADD_PASS_WRAPPER_0("add_partition_scheduling_meta",
                      mlir::createNVGPUPartitionSchedulingMeta);
+  ADD_PASS_WRAPPER_0("add_analyze_2cta_dependencies",
+                     mlir::createNVGPUAnalyze2CTADependencies);
+  ADD_PASS_WRAPPER_0("add_plan_2cta_exchange",
+                     mlir::createNVGPUPlan2CTAExchange);
+  ADD_PASS_WRAPPER_0("add_materialize_2cta_exchange",
+                     mlir::createNVGPUMaterialize2CTAExchange);
   ADD_PASS_WRAPPER_0("add_multi_cta_reduction",
                      mlir::createNVGPUMultiCTAReduction);
   ADD_PASS_WRAPPER_0("add_modulo_schedule", mlir::createNVGPUModuloSchedule);
