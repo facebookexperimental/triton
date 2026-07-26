@@ -2067,10 +2067,10 @@ def _attn_bwd_dkdv_d256_hoist_impl(
         tlx.async_load_commit_group(qdo_tokens)
         qdo_wait = tlx.async_load_wait_group(0)
 
-        q_lo_view = tlx.local_view(q_lo_buffer, 0)
-        q_hi_view = tlx.local_view(q_hi_buffer, 0)
-        do_lo_view = tlx.local_view(do_lo_buffer, 0)
-        do_hi_view = tlx.local_view(do_hi_buffer, 0)
+        q_lo_view = q_lo_buffer[0]
+        q_hi_view = q_hi_buffer[0]
+        do_lo_view = do_lo_buffer[0]
+        do_hi_view = do_hi_buffer[0]
         q_lo_t = tlx.local_load(tlx.local_trans(q_lo_view), token=qdo_wait)
         scores_t = tl.dot(k_lo, q_lo_t)
         q_hi_t = tlx.local_load(tlx.local_trans(q_hi_view), token=qdo_wait)
