@@ -868,17 +868,20 @@ module attributes {"ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num
 
 #blocked_fallback_m64 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.target" = "cuda:100", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-  // CHECK-LABEL: two_ctas_m64_falls_back
-  tt.func public @two_ctas_m64_falls_back(
+  // BLOCK_M=64 2-CTA is supported since the BM64 2-CTA backward landed: the
+  // accumulator is allocated with TensorMemoryCTAMode TwoCTA_RHS instead of
+  // falling back to a 1-CTA MMA. Only BLOCK_M < 64 still warns and falls back.
+  // CHECK: ctaMode = twocta_rhs
+  // CHECK-LABEL: two_ctas_m64_uses_twocta_rhs
+  tt.func public @two_ctas_m64_uses_twocta_rhs(
     %a: tensor<64x64xf16, #blocked_fallback_m64>,
     %b: tensor<64x128xf16, #blocked_fallback_m64>,
     %c: tensor<64x128xf32, #blocked_fallback_m64>) -> tensor<64x128xf32, #blocked_fallback_m64> {
     %ad = ttg.convert_layout %a : tensor<64x64xf16, #blocked_fallback_m64> -> tensor<64x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_fallback_m64}>>
     %bd = ttg.convert_layout %b : tensor<64x128xf16, #blocked_fallback_m64> -> tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_fallback_m64}>>
-    // expected-warning @+1 {{two_ctas=True with BLOCK_M < 128 is not yet supported; m=64 2-CTA requires TensorMemoryCTAMode TwoCTA_LHS/RHS. Falling back to 1-CTA MMA.}}
     %d = tt.dot %ad, %bd, %c {two_ctas} : tensor<64x64xf16, #ttg.dot_op<{opIdx = 0, parent = #blocked_fallback_m64}>> * tensor<64x128xf16, #ttg.dot_op<{opIdx = 1, parent = #blocked_fallback_m64}>> -> tensor<64x128xf32, #blocked_fallback_m64>
     // CHECK: ttng.tc_gen5_mma
-    // CHECK-NOT: two_ctas
+    // CHECK-SAME: two_ctas
     tt.return %d : tensor<64x128xf32, #blocked_fallback_m64>
   }
 }
