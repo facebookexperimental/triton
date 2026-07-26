@@ -53,9 +53,8 @@ def _require_layout_soft(x, layout, _semantic=None):
     intermediate arithmetic.  TLX is therefore allowed to replace this hint
     with a conversion or propagate another compatible layout; it is not a
     correctness guarantee.  Hard pins are reserved for explicit output-store
-    ownership, while ``tlx.release_layout`` is the operation for dropping one.
-    Requiring a second layout would add another constraint rather than cancel
-    the first one.
+    ownership.  A later soft requirement may replace this hint or materialize
+    a conversion; it does not cancel a hard pin.
     """
     x = _semantic.to_tensor(x)
     layout = tl_core._unwrap_if_constexpr(layout)
@@ -1370,11 +1369,9 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         delta_full = tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M))
         delta_full = _require_layout_soft(delta_full, mma_nm)
         ds_t = p_t * (dpt_acc - delta_full)
-        # The MFMA score result has an explicit register ownership.  Release it
-        # at the LDS handoff before narrowing; a direct cast would produce a
-        # null-layout BF16 tensor while retaining an MFMA-encoded operand, which
-        # the Triton cast verifier correctly rejects.
-        ds_bf16 = tlx.release_layout(ds_t).to(tl.bfloat16)
+        # Ordinary casts retain the score MFMA ownership.  The LDS store then
+        # reconciles that transient register layout with its shared consumer.
+        ds_bf16 = ds_t.to(tl.bfloat16)
 
         # Publish dS^T once, then consume it in both dQ and dK ownership.  The
         # barrier is required because the same LDS tile is overwritten next
@@ -1388,27 +1385,27 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         dq_scale_full = _require_layout_soft(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), mma_md)
         dq_part = dq_part * dq_scale_full
         q_ptrs = tensor_base + offs_m[:, None] * D + offs_d[None, :]
-        q_mask = offs_m[:, None] < N
-        tl.store(
-            DQ + q_ptrs,
-            tlx.release_layout(dq_part).to(tl.bfloat16),
-            mask=q_mask,
-        )
+        q_ptrs = _require_layout_soft(q_ptrs, mma_md)
+        q_mask = tl.broadcast_to(offs_m[:, None] < N, q_ptrs.shape)
+        q_mask = _require_layout_soft(q_mask, mma_md)
+        # Keep the direct dQ store in accumulator ownership.  Pinning it to the
+        # Q/dO async-load layout inserts a loop-local redistribution and raises
+        # register pressure for this persistent kernel.
+        dq_bf16 = dq_part.to(tl.bfloat16)
+        dq_ptrs = _require_layout_soft(DQ + q_ptrs, mma_md)
+        tl.store(dq_ptrs, dq_bf16, mask=q_mask)
 
-        # Reuse the score probabilities in the dK/dV operand ownership.  This
-        # is a representation change, so release the score MFMA layout before
-        # narrowing and provide a temporary BF16 layout hint for the dK/dV
-        # operand view.  This hint may be rewritten by TLX; it is not a store
-        # anchor.
-        pt_nd = _require_layout_soft(tlx.release_layout(p_t).to(tl.bfloat16), pt_op0_nd)
+        # Reuse the score probabilities in the dK/dV operand ownership.  The
+        # temporary operand requirement defines the representation change after
+        # narrowing and may still be rewritten by TLX.
+        pt_nd = _require_layout_soft(p_t.to(tl.bfloat16), pt_op0_nd)
         ds_nd = tlx.local_load(tlx.local_view(ds_buffer, 0), layout=dst_op0_nd, relaxed=True)
         dv = tl.dot(pt_nd, do_nd, acc=dv, out_dtype=dv.dtype)
         dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=dk.dtype)
 
     tlx.async_load_wait_group(0)
-    dk = tlx.release_layout(dk)
-    dv = tlx.release_layout(dv)
-    dk *= SM_SCALE
+    dk_mma = tlx.require_layout(dk, mma_nd)
+    dk_mma *= SM_SCALE
     # Causal and non-causal modes use Gluon's whole-tile epilogue: pin each
     # completed accumulator in native MFMA ownership before narrowing, then
     # pin each final store to eight contiguous BF16 values per lane.  The hard
@@ -1417,11 +1414,8 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     # MFMA -> BF16 -> vector handoff as a layout-preserving cast.
     # Gluon's newer full-attention D64-half epilogue raised TLX from 496 to 503
     # VGPR for N=200, so the lower-resource whole-tile epilogue remains used.
-    # ``release_layout`` above intentionally leaves the accumulators
-    # layout-flexible until this epilogue, so the MFMA anchors do not constrain
-    # the loop-carried arithmetic.  Pinning dV's final store ownership as well
-    # removes the non-causal spills without adding causal spills on gfx950.
-    dk_mma = tlx.require_layout(dk, mma_nd)
+    # Pinning dV's final store ownership as well removes the non-causal spills
+    # without adding causal spills on gfx950.
     dk_bf16 = dk_mma.to(tl.bfloat16)
     dk_vec = tlx.require_layout(dk_bf16, kv_async_layout)
     tl.store(DK + key_ptrs, dk_vec, mask=key_mask)

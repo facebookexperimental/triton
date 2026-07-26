@@ -158,43 +158,6 @@ def buffer_load_to_local(
 
 
 @tl.builtin
-def convert_layout(x, layout, _semantic=None):
-    """Physically redistribute a register tensor into ``layout``.
-
-    Unlike :func:`require_layout`, this emits a real ``ttg.convert_layout``
-    operation and therefore moves values between lanes/registers as needed.
-    It is intended for output epilogues where a contiguous store ownership is
-    materially different from the MFMA accumulator ownership.
-    """
-    x = _semantic.to_tensor(x)
-    layout = tl._unwrap_if_constexpr(layout)
-    assert isinstance(x, tl.tensor), "convert_layout expects a register tensor"
-    assert isinstance(layout, tlx.layout_encoding), ("convert_layout expects a TLX layout encoding")
-    encoding = layout.to_ir(_semantic.builder, x.shape, x.dtype)
-    handle = _semantic.builder.create_convert_layout(x.handle, encoding)
-    return tl.tensor(handle, tl.block_type(x.type.element_ty, x.shape))
-
-
-@tl.builtin
-def cast_layout(x, dtype, _semantic=None):
-    """Cast a floating-point tensor while preserving its register layout.
-
-    Triton's ordinary ``to`` creates a null-layout result, which is rejected
-    when the source is an AMD MFMA tensor. This helper emits a
-    layout-preserving floating-point conversion, including an F32-mediated
-    conversion for equal-width BF16/FP16 types. Same-type casts are returned
-    unchanged, allowing Gluon-style BF16 cast-before-convert epilogues without
-    creating an invalid width-changing operation.
-    """
-    x = _semantic.to_tensor(x)
-    dtype = tl._unwrap_if_constexpr(dtype)
-    assert isinstance(x, tl.tensor), "cast_layout expects a register tensor"
-    assert dtype in (tl.float16, tl.bfloat16, tl.float32), ("cast_layout expects a floating-point dtype")
-    handle = _semantic.builder.create_cast_with_layout(x.handle, dtype.to_ir(_semantic.builder))
-    return tl.tensor(handle, tl.block_type(dtype, x.shape))
-
-
-@tl.builtin
 def zeros(
     shape: tuple,
     dtype: tl.dtype,
@@ -218,21 +181,6 @@ def zeros(
     encoding = layout.to_ir(_semantic.builder, shape, dtype)
     handle = _semantic.builder.create_splat_with_layout(shape, dtype.to_ir(_semantic.builder), encoding, scalar.handle)
     return tl.tensor(handle, tl.block_type(dtype, shape))
-
-
-@tl.builtin
-def release_layout(x, _semantic=None):
-    """Release a pinned register layout at an explicit conversion boundary.
-
-    The result has the ordinary unresolved block type, allowing downstream
-    stores or elementwise consumers to choose their native layout.  This is
-    the register-side counterpart to ``require_layout`` and is needed after a
-    dot/MFMA result is handed back to a layout-flexible consumer.
-    """
-    x = _semantic.to_tensor(x)
-    assert isinstance(x, tl.tensor), "release_layout expects a register tensor"
-    handle = _semantic.builder.create_release_layout(x.handle)
-    return tl.tensor(handle, tl.block_type(x.type.element_ty, x.shape))
 
 
 @tl.builtin

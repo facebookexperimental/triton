@@ -155,53 +155,6 @@ void init_triton_tlx_ir(py::module &&m) {
             }
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false)
-      .def("create_convert_layout",
-           [](TritonOpBuilder &self, Value &v, Attribute &encoding) -> Value {
-             auto srcType = dyn_cast<RankedTensorType>(v.getType());
-             if (!srcType)
-               throw std::runtime_error(
-                   "create_convert_layout expects a ranked tensor");
-             // TLX register layouts are wrapped in no_verify while the AMD
-             // pass establishes the target's 64-lane module context. Keep the
-             // wrapper on this result until placeholder/layout resolution;
-             // unwrapping here makes the early verifier interpret the layout
-             // with Triton's 32-lane default and reject a valid CDNA4 target.
-             auto targetEncoding = encoding;
-             auto resultType = RankedTensorType::get(
-                 srcType.getShape(), srcType.getElementType(), targetEncoding);
-             return self.create<ttg::ConvertLayoutOp>(resultType, v);
-           })
-      .def("create_cast_with_layout",
-           [](TritonOpBuilder &self, Value &v,
-              Type &targetElementType) -> Value {
-             auto srcType = dyn_cast<RankedTensorType>(v.getType());
-             if (!srcType)
-               throw std::runtime_error(
-                   "create_cast_with_layout expects a ranked tensor");
-             auto srcFloat = dyn_cast<FloatType>(srcType.getElementType());
-             auto dstFloat = dyn_cast<FloatType>(targetElementType);
-             if (!srcFloat || !dstFloat)
-               throw std::runtime_error(
-                   "create_cast_with_layout expects floating-point types");
-             auto resultType = RankedTensorType::get(
-                 srcType.getShape(), targetElementType, srcType.getEncoding());
-             if (srcFloat == dstFloat)
-               return v;
-             if (srcFloat.getWidth() < dstFloat.getWidth())
-               return self.create<arith::ExtFOp>(resultType, v);
-             if (srcFloat.getWidth() > dstFloat.getWidth())
-               return self.create<arith::TruncFOp>(resultType, v);
-
-             // BF16 and FP16 are both 16-bit, but they are not bit-compatible.
-             // Route the equal-width conversion through F32 so the result is a
-             // real floating-point conversion while retaining the source
-             // register ownership on both intermediate tensors.
-             auto f32Type = self.getBuilder().getF32Type();
-             auto widenedType = RankedTensorType::get(
-                 srcType.getShape(), f32Type, srcType.getEncoding());
-             auto widened = self.create<arith::ExtFOp>(widenedType, v);
-             return self.create<arith::TruncFOp>(resultType, widened);
-           })
       .def(
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,
