@@ -1321,6 +1321,18 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
 
     # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, NUM_BUFFERS)
     WARPPIPE_CONFIGS = [
+        # BLOCK_K=32 tiles: the register-path (odd-K) winners. On the production
+        # compression bmm (1024x1195x2309, odd K -> register branch) the bare register
+        # prototype's autotune optimum is 256x256x32 (~0.80x hipBLASLt); the template
+        # previously offered only BLOCK_K in {64,128} and stalled at 256x256x64 (0.64x).
+        # Finer K granularity cuts the K%BLOCK_K tail waste and schedules the register
+        # path better. (NUM_BUFFERS is moot on the register path -- it allocates no LDS
+        # multi-buffer; matters only if the async branch selects these on an aligned-K
+        # shape, where LDS still fits gfx950's 160KB.)
+        (256, 256, 32, 8, 8, 2),
+        (128, 256, 32, 8, 8, 2),
+        (256, 128, 32, 8, 8, 2),
+        (128, 128, 32, 8, 8, 3),
         (256, 256, 64, 16, 8, 2),
         (256, 128, 64, 8, 8, 2),
         (128, 256, 64, 8, 8, 2),
