@@ -14,7 +14,10 @@ struct DDGEdge {
   unsigned srcIdx{};
   unsigned dstIdx{};
   int latency{};
-  unsigned distance{}; // 0 = intra-iteration, 1+ = loop-carried
+  // 0 = intra-iteration, 1+ = loop-carried.
+  unsigned distance{};
+  // Producer result carried by this dependence.
+  unsigned srcResultIdx{};
 };
 
 /// Pass A.5 data-partition descriptor for one MMA bundle (or its accumulator
@@ -150,7 +153,8 @@ private:
   llvm::DenseMap<Operation *, unsigned> consumerOpToIdx;
 
   unsigned addNode(Operation *op, const LatencyModel &model);
-  void addEdge(unsigned src, unsigned dst, int latency, unsigned distance);
+  void addEdge(unsigned src, unsigned dst, int latency, unsigned distance,
+               unsigned srcResultIdx = 0);
 };
 
 } // namespace mlir::triton::gpu

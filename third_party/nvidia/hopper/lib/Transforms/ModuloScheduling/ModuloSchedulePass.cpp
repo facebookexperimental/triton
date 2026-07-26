@@ -707,6 +707,7 @@ static unsigned buildScheduleLoop(
     se.dstId = dstIt->second;
     se.latency = ddgEdge.latency;
     se.distance = ddgEdge.distance;
+    se.srcResultIdx = ddgEdge.srcResultIdx;
     schedLoop.edges.push_back(se);
   }
 
@@ -3018,6 +3019,12 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
   const auto &src = loop.nodes[edge.srcId];
   const auto &dst = loop.nodes[edge.dstId];
 
+  Type resultTy;
+  if (src.op && edge.srcResultIdx < src.op->getNumResults())
+    resultTy = src.op->getResult(edge.srcResultIdx).getType();
+  if (!resultTy || !isa<ttg::MemDescType, RankedTensorType>(resultTy))
+    return spec;
+
   if (src.producesBuffer != UINT_MAX) {
     spec.pairedBuf = src.producesBuffer;
     spec.depth = loop.buffers[spec.pairedBuf].count;
@@ -3091,8 +3098,7 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
     spec.depth = 1;
   }
   // Derive shape + element width from the producer's result type.
-  if (src.op && src.op->getNumResults() > 0) {
-    Type resTy = src.op->getResult(0).getType();
+  if (resultTy) {
     auto setFromShaped = [&](llvm::ArrayRef<int64_t> shape, Type elemTy) {
       if (!elemTy.isIntOrFloat())
         return;
@@ -3104,9 +3110,9 @@ static CrossWGChannelSpec resolveCrossWGChannel(const ttg::ScheduleLoop &loop,
         spec.shape.push_back(d);
       spec.elementBitWidth = elemTy.getIntOrFloatBitWidth();
     };
-    if (auto memDesc = dyn_cast<ttg::MemDescType>(resTy))
+    if (auto memDesc = dyn_cast<ttg::MemDescType>(resultTy))
       setFromShaped(memDesc.getShape(), memDesc.getElementType());
-    else if (auto tt = dyn_cast<RankedTensorType>(resTy))
+    else if (auto tt = dyn_cast<RankedTensorType>(resultTy))
       setFromShaped(tt.getShape(), tt.getElementType());
   }
   // No usable shape (scalar or unknown) → signal-only barrier, no buffer.
@@ -3132,7 +3138,7 @@ static int64_t
 predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
                         const llvm::SmallDenseMap<unsigned, int> &nodeToWg) {
   int64_t total = 0;
-  llvm::SmallDenseSet<std::pair<unsigned, unsigned>, 8> seenPairs;
+  llvm::SmallDenseSet<std::tuple<unsigned, unsigned, unsigned>, 8> seenEdges;
   for (const auto &edge : loop.edges) {
     auto sIt = nodeToWg.find(edge.srcId);
     auto dIt = nodeToWg.find(edge.dstId);
@@ -3140,7 +3146,7 @@ predictChannelSmemBytes(const ttg::ScheduleLoop &loop,
       continue;
     if (sIt->second == dIt->second)
       continue;
-    if (!seenPairs.insert({edge.srcId, edge.dstId}).second)
+    if (!seenEdges.insert({edge.srcId, edge.dstId, edge.srcResultIdx}).second)
       continue;
     auto spec = resolveCrossWGChannel(loop, edge);
     if (!spec.synthesize)
@@ -4238,7 +4244,7 @@ static void coLocateOperandAllocsWithLoads(ttg::ScheduleLoop &loop) {
 /// SMEM transfers (MEM→TC) → mbarrier with phase cycling.
 /// TMEM transfers (TC→CUDA) → named barrier.
 static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
-  llvm::DenseSet<std::pair<unsigned, unsigned>> seenBarrierPairs;
+  llvm::DenseSet<std::tuple<unsigned, unsigned, unsigned>> seenBarrierEdges;
   // A TC-free, memory-bound loop (e.g. LayerNorm) pipelines load→compute→store
   // across warp groups. Giving the TMA-load→compute channel depth-2 lets the
   // load warp run a full iteration ahead of compute (prefetch), which is what
@@ -4254,14 +4260,15 @@ static void insertCrossGroupBarriers(ttg::ScheduleLoop &loop) {
     if (src.warpGroup == dst.warpGroup)
       continue;
 
-    // Avoid duplicate barriers for the same (producer, consumer) pair.
+    // Avoid duplicate barriers for the same producer result and consumer.
     // Deduping BEFORE channel resolution also prevents the orphaned
     // duplicate channel buffer the old order created (a second edge between
     // the same pair — e.g. an op consuming the same value through two
     // operands — synthesized a second buffer, then skipped only the barrier
-    // record), and keeps the scoring-time predictor's per-pair accounting
+    // record), and keeps the scoring-time predictor's per-edge accounting
     // exact.
-    if (!seenBarrierPairs.insert({edge.srcId, edge.dstId}).second)
+    if (!seenBarrierEdges.insert({edge.srcId, edge.dstId, edge.srcResultIdx})
+             .second)
       continue;
 
     // Determine barrier kind from the producer/consumer pipeline.
@@ -7093,6 +7100,7 @@ buildListScheduleGraph(scf::ForOp loop, const ttg::DataDependenceGraph &ddg,
     se.dstId = dstIt->second;
     se.latency = ddgEdge.latency;
     se.distance = ddgEdge.distance;
+    se.srcResultIdx = ddgEdge.srcResultIdx;
     schedLoop.edges.push_back(se);
   }
 
