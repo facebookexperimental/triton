@@ -84,6 +84,7 @@ def _grouped_gemm_tile(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
+    HAS_K_TAIL: tl.constexpr,
 ):
     """Compute one [BLOCK_SIZE_M, BLOCK_SIZE_N] output tile of ``A @ B`` as four
     128x128 quadrants and store it to C."""
@@ -259,19 +260,23 @@ def _grouped_gemm_tile(
     # Masked scalar tail: whole K-tiles past the pipelined region (an odd
     # leftover tile when n_full is odd) plus a partial final tile (gk % BLOCK_K).
     # Uses the same wrapped M/N offsets, only K is masked. Runs 0-2 iterations
-    # (and covers the whole GEMM when small K skipped the pipeline)
-    for kk in tl.range(n_pipe * BLOCK_SIZE_K, gk, BLOCK_SIZE_K, num_stages=1):
-        k_mask = offs_k < gk - kk
-        a_top_t = tl.load(a_ptr + a_top_off + kk, mask=k_mask[None, :], other=0.0)
-        a_bot_t = tl.load(a_ptr + a_bot_off + kk, mask=k_mask[None, :], other=0.0)
-        b_left_t = tl.load(b_ptr + b_left_off + kk, mask=k_mask[None, :], other=0.0)
-        b_right_t = tl.load(b_ptr + b_right_off + kk, mask=k_mask[None, :], other=0.0)
-        b_left_t = tl.trans(b_left_t)
-        b_right_t = tl.trans(b_right_t)
-        acc_tl = tl.dot(a_top_t, b_left_t, acc_tl, allow_tf32=False)
-        acc_bl = tl.dot(a_bot_t, b_left_t, acc_bl, allow_tf32=False)
-        acc_tr = tl.dot(a_top_t, b_right_t, acc_tr, allow_tf32=False)
-        acc_br = tl.dot(a_bot_t, b_right_t, acc_br, allow_tf32=False)
+    # (and covers the whole GEMM when small K skipped the pipeline).
+    #
+    # Compiled out entirely when the host can prove no group needs it, which
+    # reduces register pressure.
+    if HAS_K_TAIL:
+        for kk in tl.range(n_pipe * BLOCK_SIZE_K, gk, BLOCK_SIZE_K, num_stages=1):
+            k_mask = offs_k < gk - kk
+            a_top_t = tl.load(a_ptr + a_top_off + kk, mask=k_mask[None, :], other=0.0)
+            a_bot_t = tl.load(a_ptr + a_bot_off + kk, mask=k_mask[None, :], other=0.0)
+            b_left_t = tl.load(b_ptr + b_left_off + kk, mask=k_mask[None, :], other=0.0)
+            b_right_t = tl.load(b_ptr + b_right_off + kk, mask=k_mask[None, :], other=0.0)
+            b_left_t = tl.trans(b_left_t)
+            b_right_t = tl.trans(b_right_t)
+            acc_tl = tl.dot(a_top_t, b_left_t, acc_tl, allow_tf32=False)
+            acc_bl = tl.dot(a_bot_t, b_left_t, acc_bl, allow_tf32=False)
+            acc_tr = tl.dot(a_top_t, b_right_t, acc_tr, allow_tf32=False)
+            acc_br = tl.dot(a_bot_t, b_right_t, acc_br, allow_tf32=False)
 
     # Store the four quadrants, mask out OOB rows and columns
     offs_cm_top = pid_m * BLOCK_SIZE_M + tl.arange(0, HALF_M)
@@ -281,16 +286,81 @@ def _grouped_gemm_tile(
 
     c_tl = acc_tl.to(c_ptr.dtype.element_ty)
     tl.store(c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_left[None, :], c_tl,
-             mask=(offs_cm_top[:, None] < gm) & (offs_cn_left[None, :] < gn), cache_modifier=".cs")
+             mask=(offs_cm_top[:, None] < gm) & (offs_cn_left[None, :] < gn))
     c_bl = acc_bl.to(c_ptr.dtype.element_ty)
     tl.store(c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_left[None, :], c_bl,
-             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_left[None, :] < gn), cache_modifier=".cs")
+             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_left[None, :] < gn))
     c_tr = acc_tr.to(c_ptr.dtype.element_ty)
     tl.store(c_ptr + offs_cm_top[:, None] * stride_cm + offs_cn_right[None, :], c_tr,
-             mask=(offs_cm_top[:, None] < gm) & (offs_cn_right[None, :] < gn), cache_modifier=".cs")
+             mask=(offs_cm_top[:, None] < gm) & (offs_cn_right[None, :] < gn))
     c_br = acc_br.to(c_ptr.dtype.element_ty)
     tl.store(c_ptr + offs_cm_bot[:, None] * stride_cm + offs_cn_right[None, :], c_br,
-             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_right[None, :] < gn), cache_modifier=".cs")
+             mask=(offs_cm_bot[:, None] < gm) & (offs_cn_right[None, :] < gn))
+
+
+@triton.jit
+def _grouped_gemm_tile_generic(
+    pid_m,
+    pid_n,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    gm,
+    gn,
+    gk,
+    stride_am,
+    stride_bn,
+    stride_cm,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    HAS_K_TAIL: tl.constexpr,
+):
+    """One [BLOCK_SIZE_M, BLOCK_SIZE_N] output tile, compiler-pipelined.
+
+    Tile-shape generic, unlike the 2x2 quadrant path which is pinned to
+    256x256/BK=64. Small-M problems (MoE-style) do not have enough 256x256 tiles
+    to fill 256 CUs, so they need a tile that actually fits them. This is that
+    path. B is read through its column-major [K, N] view, so K is contiguous on
+    axis 0, the dot consumes it with no transpose, and the K-tail is a plain
+    axis-0 mask.
+    """
+    offs_am = tl.multiple_of((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % gm, BLOCK_SIZE_M)
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % gn
+    offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_SIZE_K), BLOCK_SIZE_K), BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :]
+    b_ptrs = b_ptr + offs_k[:, None] + offs_bn[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    n_full = gk // BLOCK_SIZE_K
+    for _ in tl.range(0, n_full, num_stages=NUM_STAGES):
+        tl.multiple_of(a_ptrs, [16, 16])
+        tl.multiple_of(b_ptrs, [16, 16])
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+        acc = tl.dot(a, b, acc, allow_tf32=False)
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+
+    # Partial last K-tile. Offsets are rematerialized rather than reusing the
+    # loop-carried pointers, to keep them out of the pipelined loop's live set.
+    if HAS_K_TAIL and n_full * BLOCK_SIZE_K < gk:
+        k_start = n_full * BLOCK_SIZE_K
+        k_mask = offs_k < gk - k_start
+        a_t = tl.load(a_ptr + offs_am[:, None] * stride_am + (k_start + offs_k[None, :]), mask=k_mask[None, :],
+                      other=0.0)
+        b_t = tl.load(b_ptr + (k_start + offs_k[:, None]) + offs_bn[None, :] * stride_bn, mask=k_mask[:, None],
+                      other=0.0)
+        acc = tl.dot(a_t, b_t, acc, allow_tf32=False)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c = acc.to(c_ptr.dtype.element_ty)
+    tl.store(c_ptr + offs_cm[:, None] * stride_cm + offs_cn[None, :], c,
+             mask=(offs_cm[:, None] < gm) & (offs_cn[None, :] < gn))
 
 
 @triton.jit
@@ -318,33 +388,42 @@ def grouped_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     XCD_CHUNK: tl.constexpr,
     NUM_BUFFERS: tl.constexpr,
+    # 0 = 2x2 quadrant inter-wave pipeline (pinned 256x256/BK=64, for large tiles)
+    # 1 = tile-shape-generic compiler-pipelined path (for small-M problems)
+    TILE_MODE: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    # False when the host can prove gk is exactly covered by the pipelined
+    # region for every group, letting the masked K-tail be compiled out.
+    HAS_K_TAIL: tl.constexpr,
 ):
     """Persistent, XCD-grouped scheduler over the whole group of GEMMs.
-    The per-tile compute is the 2x2 quadrant inter-wave pipeline."""
+    The per-tile compute is selected by TILE_MODE."""
     pid = tl.program_id(0)
 
     # Program id after L2 remapping
     pid = chiplet_transform_chunked(pid, NUM_SM, NUM_XCDS, XCD_CHUNK)
 
-    HALF_M: tl.constexpr = BLOCK_SIZE_M // 2
-    HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
+    if TILE_MODE == 0:
+        HALF_M: tl.constexpr = BLOCK_SIZE_M // 2
+        HALF_N: tl.constexpr = BLOCK_SIZE_N // 2
 
-    # Swizzled (row/col-permuted) LDS layout pinned to kill bank conflicts.
-    # All four half-tiles are [128, 64].
-    tl.static_assert(HALF_M == 128 and HALF_N == 128 and BLOCK_SIZE_K == 64,
-                     "pinned swizzle bases are hardcoded for [128, 64] half-tiles")
-    smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [(512, 16)],
-        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
-        [HALF_M, BLOCK_SIZE_K],
-    )
+        # Swizzled (row/col-permuted) LDS layout pinned to kill bank conflicts.
+        # All four half-tiles are [128, 64].
+        tl.static_assert(HALF_M == 128 and HALF_N == 128 and BLOCK_SIZE_K == 64,
+                         "pinned swizzle bases are hardcoded for [128, 64] half-tiles")
+        smem_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)],
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0], [1, 0], [2, 0], [4, 0],
+             [8, 0]],
+            [HALF_M, BLOCK_SIZE_K],
+        )
 
-    # Four double-buffered LDS allocations, one per operand half-tile, reused for
-    # every tile this program computes. Both A and B halves are [outer, K]
-    smem_a_top = tlx.local_alloc((HALF_M, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
-    smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
-    smem_b_left = tlx.local_alloc((HALF_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
-    smem_b_right = tlx.local_alloc((HALF_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
+        # Four double-buffered LDS allocations, one per operand half-tile, reused for
+        # every tile this program computes. Both A and B halves are [outer, K]
+        smem_a_top = tlx.local_alloc((HALF_M, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
+        smem_a_bot = tlx.local_alloc((HALF_M, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
+        smem_b_left = tlx.local_alloc((HALF_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
+        smem_b_right = tlx.local_alloc((HALF_N, BLOCK_SIZE_K), tl.float16, NUM_BUFFERS, layout=smem_layout)
 
     # Which global output tile we are computing
     tile_idx = pid
@@ -387,9 +466,15 @@ def grouped_gemm_kernel(
             pid_n = (local % num_pid_in_group) // group_size_m
 
             # Compute this (pid_m, pid_n) output tile. Scheduler-agnostic logic.
-            _grouped_gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn, stride_cm,
-                               smem_a_top, smem_a_bot, smem_b_left, smem_b_right, BLOCK_SIZE_M=BLOCK_SIZE_M,
-                               BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_BUFFERS=NUM_BUFFERS)
+            if TILE_MODE == 0:
+                _grouped_gemm_tile(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn, stride_cm,
+                                   smem_a_top, smem_a_bot, smem_b_left, smem_b_right, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                   BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_BUFFERS=NUM_BUFFERS,
+                                   HAS_K_TAIL=HAS_K_TAIL)
+            else:
+                _grouped_gemm_tile_generic(pid_m, pid_n, a_ptr, b_ptr, c_ptr, gm, gn, gk, stride_am, stride_bn,
+                                           stride_cm, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                           BLOCK_SIZE_K=BLOCK_SIZE_K, NUM_STAGES=NUM_STAGES, HAS_K_TAIL=HAS_K_TAIL)
 
             # Program p owns tiles p, p+NUM_SM, p+2*NUM_SM, and so on
             tile_idx += NUM_SM
@@ -397,7 +482,7 @@ def grouped_gemm_kernel(
         last_problem_end = last_problem_end + num_tiles
 
 
-# Best config
+# Tuned config for the large-tile quadrant path (TILE_MODE 0).
 _CONFIG = {
     "BLOCK_SIZE_M": 256,
     "BLOCK_SIZE_N": 256,
@@ -406,7 +491,116 @@ _CONFIG = {
     "NUM_BUFFERS": 2,
     "XCD_CHUNK": 16,
     "num_warps": 8,
+    "TILE_MODE": 0,
+    "NUM_STAGES": 1,
 }
+
+
+def _cdiv(a, b):
+    return -(-a // b)
+
+
+def _n_tiles(shapes, bm, bn):
+    return sum(_cdiv(M, bm) * _cdiv(N, bn) for (M, N, K) in shapes)
+
+
+def _needs_k_tail(shapes, cfg):
+    """Does any group have K the pipelined region cannot cover exactly?
+
+    Quadrant path consumes K two BLOCK_K tiles at a time, so it covers only an
+    even number of whole tiles. The generic path covers every whole tile.
+    """
+    if cfg["TILE_MODE"] == 0:
+        return True
+    bk = cfg["BLOCK_SIZE_K"]
+    for (_, _, K) in shapes:
+        if K > (K // bk) * bk:
+            return True
+    return False
+
+
+# Saturated per-tile throughput in TFLOP/s, measured on 16x4096^3 at a fixed
+# 1104 MHz deterministic clock. That shape puts 4096 equal-sized tiles on 256
+# CUs, so machine utilization and padding efficiency are both exactly 1.0 and
+# the number isolates how fast the tile itself runs. Values are (rate, BLOCK_K,
+# num_warps, NUM_STAGES) with the best (BLOCK_K, warps, stages) for that tile.
+_QUAD_RATE = 782.7
+_GENERIC_RATES = {
+    (256, 256): (683.5, 32, 8, 3),
+    (128, 256): (567.9, 32, 8, 3),
+    (256, 128): (559.6, 64, 8, 3),
+    (128, 128): (542.9, 64, 8, 3),
+    (128, 64): (441.2, 128, 8, 3),
+    (64, 128): (426.5, 128, 8, 3),
+    (64, 64): (347.7, 128, 8, 3),
+}
+
+
+def _tile_score(shapes, bm, bn, rate, nsm):
+    """Predicted delivered throughput for tiling `shapes` as bm x bn tiles.
+
+    Three independent factors, each measurable:
+      rate  -- how fast one tile runs when the machine is saturated.
+      util  -- fraction of CUs doing work. A partial final wave leaves CUs idle,
+               which is what cripples 256x256 on small-M MoE shapes.
+      pad   -- useful FLOPs / computed FLOPs. Rounding M up to bm and N up to bn
+               is real MFMA work that is then masked away by the C store.
+    """
+    tiles = sum(_cdiv(M, bm) * _cdiv(N, bn) for (M, N, _) in shapes)
+    if tiles == 0:
+        return 0.0
+    util = tiles / (_cdiv(tiles, nsm) * nsm)
+    useful = sum(M * N * K for (M, N, K) in shapes)
+    padded = sum(_cdiv(M, bm) * bm * _cdiv(N, bn) * bn * K for (M, N, K) in shapes)
+    return rate * util * (useful / padded)
+
+
+def _pick_config(shapes):
+    """Choose a launch config from the group's shapes.
+
+    The quadrant path is by far the fastest per-tile engine (782.7 vs 683.5
+    TFLOP/s for the best generic tile) but it only exists at 256x256. On small-M
+    MoE shapes that tile is too coarse in two ways. It leaves most CUs idle, and
+    it rounds every M up to 256. Score both engines on the same footing and take
+    the winner.
+    """
+    nsm = num_sms()
+
+    def entry(bm, bn, rate, cfg):
+        tiles = sum(_cdiv(M, bm) * _cdiv(N, bn) for (M, N, _) in shapes)
+        util = tiles / (_cdiv(tiles, nsm) * nsm) if tiles else 0.0
+        return (_tile_score(shapes, bm, bn, rate, nsm), bm * bn / (bm + bn), util, cfg)
+
+    # XCD_CHUNK sets how many consecutive tiles land on one chiplet. When there
+    # are many tiles per CU a long chunk keeps an A/B panel resident in that
+    # XCD's L2 across several tiles; when there is barely one wave, a long chunk
+    # just unbalances the chiplets and a short one spreads the work.
+    quad = dict(_CONFIG)
+    quad_tiles = sum(_cdiv(M, 256) * _cdiv(N, 256) for (M, N, _) in shapes)
+    quad["XCD_CHUNK"] = 32 if quad_tiles >= 2 * nsm else 8
+    cands = [entry(256, 256, _QUAD_RATE, quad)]
+    for (bm, bn), (rate, bk, warps, stages) in _GENERIC_RATES.items():
+        cands.append(
+            entry(
+                bm, bn, rate, {
+                    "BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "GROUP_SIZE_M": 8, "NUM_BUFFERS": 2,
+                    "XCD_CHUNK": 16, "num_warps": warps, "TILE_MODE": 1, "NUM_STAGES": stages
+                }))
+
+    # c[0] = predicted throughput
+    # c[1] = arithmetic intensity
+    # c[2] = machine utilization
+    # c[3] = the config dict
+    # The score model carries roughly +-10% error, so keep any candidates within
+    # 10% of the top score as selected candidates. Then break the "tie" using:
+    #   1. arithmetic intensity bm*bn/(bm+bn): least data moved per FLOP, so the
+    #      most headroom against whatever the model is not capturing.
+    #   2. machine utilization -- the score charges padding waste and idle CUs
+    #      equally, but a padded lane at least keeps its CU busy. 128x256 and
+    #      256x128 have identical intensity and score on A_deepK, but the latter
+    #      fills every CU and measures 3.7% faster.
+    top = max(c[0] for c in cands)
+    return max((c for c in cands if c[0] >= 0.9 * top), key=lambda c: (c[1], c[2]))[3]
 
 
 def _make_grouped_gemm_args(group_A, group_B, config=None):
@@ -417,9 +611,12 @@ def _make_grouped_gemm_args(group_A, group_B, config=None):
     group_A[i]: fp16 [M_i, K_i] row-major (K contiguous).
     group_B[i]: fp16 [K_i, N_i] column-major (K contiguous) == [N_i, K_i].t().
     """
-    cfg = dict(_CONFIG)
+    shapes = [(A.shape[0], B.shape[1], A.shape[1]) for A, B in zip(group_A, group_B)]
+    cfg = _pick_config(shapes)
     if config:
         cfg.update(config)
+    if not config or "HAS_K_TAIL" not in config:
+        cfg["HAS_K_TAIL"] = _needs_k_tail(shapes, cfg)
 
     G = len(group_A)
     assert len(group_B) == G, "group_A / group_B length mismatch"
@@ -469,6 +666,9 @@ def _perf_fn(d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, G, cfg):
         NUM_XCDS=NUM_XCDS,
         XCD_CHUNK=cfg["XCD_CHUNK"],
         NUM_BUFFERS=cfg["NUM_BUFFERS"],
+        TILE_MODE=cfg["TILE_MODE"],
+        NUM_STAGES=cfg["NUM_STAGES"],
+        HAS_K_TAIL=cfg["HAS_K_TAIL"],
         num_warps=cfg["num_warps"],
         num_stages=1,
         matrix_instr_nonkdim=16,
