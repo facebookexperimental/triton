@@ -3,7 +3,7 @@
 Blockwise (DeepSeek) fp8 e4m3 scaled_mm: D = (A @ B^T) * (sa[m,g] * sb[nblk,g])
 summed per 128-K group. Launch mirrors run_generated.py; reference mirrors the
 torch blockwise _ref. The hand-written WS reference is the autotuned
-blackwell_scaled_mm_ws wrapper (mirrors perf_generated_vs_handwritten.py).
+blackwell_scaled_mm_ws wrapper used by the shared performance harness.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ SHAPES = [
     (1024, 1024, 1024),
     (2048, 2048, 2048),
     (4096, 4096, 4096),
+    (8192, 8192, 8192),
 ]
 
 
