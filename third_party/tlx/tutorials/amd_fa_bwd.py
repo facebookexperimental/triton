@@ -26,7 +26,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-import triton.language.core as tl_core
 import triton.language.extra.tlx as tlx
 
 # Public correctness contract for this submission.  The kernels
@@ -41,27 +40,6 @@ SUPPORTED_SHAPES = {
 # register pressure for the D-sliced kernels and prevents the accumulator from
 # using AGPRs on gfx950.
 _CDNA4_MATRIX_INSTR_NONKDIM = 16
-
-
-@tl_core.builtin
-def _require_layout_soft(x, layout, _semantic=None):
-    """Attach a temporary register-layout hint without making it a hard anchor.
-
-    Upstream ``tlx.require_layout`` pins user-authored epilogue ownership so
-    layout optimization cannot rewrite it.  The exact D128 kernel instead uses
-    non-pinned requirements for its resource-sensitive direct-to-LDS offsets,
-    MFMA operands, and intermediate arithmetic.  TLX is therefore allowed to
-    replace these hints with conversions or propagate other compatible
-    layouts; they are not correctness guarantees.  Hard pins are reserved for
-    fixed ownership such as output stores.  A later soft requirement may
-    replace this hint or materialize a conversion; it does not cancel a hard
-    pin.
-    """
-    x = _semantic.to_tensor(x)
-    layout = tl_core._unwrap_if_constexpr(layout)
-    encoding = layout.to_ir(_semantic.builder, x.shape, x.dtype)
-    handle = _semantic.builder.create_require_layout(x.handle, encoding, pin=False)
-    return tl_core.tensor(handle, x.type)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1223,10 +1201,13 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     # the vector and leave an unresolved descriptor conversion in LLIR.
     k_offsets = tl.multiple_of(k_offsets, [1, 1, 8])
     k_offsets = tl.max_contiguous(k_offsets, [1, 1, 8])
-    k_offsets = _require_layout_soft(k_offsets.to(tl.int32), k_raw_async_layout)
-    k_load_mask = _require_layout_soft(tl.broadcast_to(k_n < N, k_offsets.shape), k_raw_async_layout)
-    key_offsets = _require_layout_soft(key_ptrs.to(tl.int32), kv_async_layout)
-    key_load_mask = _require_layout_soft(tl.broadcast_to(key_mask, key_offsets.shape), kv_async_layout)
+    # These exact-path requirements stay soft: they select the transient
+    # async/MFMA ownership but do not pin it through the loop-carried dot chain.
+    # Fixed output ownership below continues to use the pin=True default.
+    k_offsets = tlx.require_layout(k_offsets.to(tl.int32), k_raw_async_layout, pin=False)
+    k_load_mask = tlx.require_layout(tl.broadcast_to(k_n < N, k_offsets.shape), k_raw_async_layout, pin=False)
+    key_offsets = tlx.require_layout(key_ptrs.to(tl.int32), kv_async_layout, pin=False)
+    key_load_mask = tlx.require_layout(tl.broadcast_to(key_mask, key_offsets.shape), kv_async_layout, pin=False)
     k_token = tlx.buffer_load_to_local(
         tlx.local_view(k_raw_buffer, 0),
         K,
@@ -1252,8 +1233,8 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     first_m = tl.arange(0, BLOCK_M)
     first_ptrs = tensor_base + first_m[:, None] * D + offs_d[None, :]
     first_mask = first_m[:, None] < N
-    first_offsets = _require_layout_soft(first_ptrs.to(tl.int32), qdo_async_layout)
-    first_load_mask = _require_layout_soft(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout)
+    first_offsets = tlx.require_layout(first_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+    first_load_mask = tlx.require_layout(tl.broadcast_to(first_mask, first_offsets.shape), qdo_async_layout, pin=False)
     first_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 0), Q, first_offsets, mask=first_load_mask)
     first_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, 0), DO, first_offsets, mask=first_load_mask)
     if IS_CAUSAL:
@@ -1263,9 +1244,9 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         first_q1 = first_m + BLOCK_M
         first_q1_ptrs = tensor_base + first_q1[:, None] * D + offs_d[None, :]
         first_q1_mask = first_q1[:, None] < N
-        first_q1_offsets = _require_layout_soft(first_q1_ptrs.to(tl.int32), qdo_async_layout)
-        first_q1_load_mask = _require_layout_soft(tl.broadcast_to(first_q1_mask, first_q1_offsets.shape),
-                                                  qdo_async_layout)
+        first_q1_offsets = tlx.require_layout(first_q1_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+        first_q1_load_mask = tlx.require_layout(tl.broadcast_to(first_q1_mask, first_q1_offsets.shape),
+                                                qdo_async_layout, pin=False)
         first_q1_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, 1), Q, first_q1_offsets,
                                                   mask=first_q1_load_mask)
         tlx.async_load_commit_group([first_q_token, first_do_token, first_q1_token])
@@ -1296,12 +1277,12 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                 )
             if ((m_block + Q_LOOKAHEAD + 1) * BLOCK_M > N or (m_block + 2) * BLOCK_M > N):
                 tl.debug_barrier()
-            next_q_offsets = _require_layout_soft(next_q_ptrs.to(tl.int32), qdo_async_layout)
-            next_q_load_mask = _require_layout_soft(tl.broadcast_to(next_q_mask, next_q_offsets.shape),
-                                                    qdo_async_layout)
-            next_do_offsets = _require_layout_soft(next_do_ptrs.to(tl.int32), qdo_async_layout)
-            next_do_load_mask = _require_layout_soft(tl.broadcast_to(next_do_mask, next_do_offsets.shape),
-                                                     qdo_async_layout)
+            next_q_offsets = tlx.require_layout(next_q_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+            next_q_load_mask = tlx.require_layout(tl.broadcast_to(next_q_mask, next_q_offsets.shape), qdo_async_layout,
+                                                  pin=False)
+            next_do_offsets = tlx.require_layout(next_do_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+            next_do_load_mask = tlx.require_layout(tl.broadcast_to(next_do_mask, next_do_offsets.shape),
+                                                   qdo_async_layout, pin=False)
             next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_q_offsets,
                                                     mask=next_q_load_mask)
             next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_do_slot), DO, next_do_offsets,
@@ -1325,8 +1306,9 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     tlx.zeros((BLOCK_M, D), tl.bfloat16, layout=qdo_async_layout),
                 )
                 tl.debug_barrier()
-            next_offsets = _require_layout_soft(next_ptrs.to(tl.int32), qdo_async_layout)
-            next_load_mask = _require_layout_soft(tl.broadcast_to(next_mask, next_offsets.shape), qdo_async_layout)
+            next_offsets = tlx.require_layout(next_ptrs.to(tl.int32), qdo_async_layout, pin=False)
+            next_load_mask = tlx.require_layout(tl.broadcast_to(next_mask, next_offsets.shape), qdo_async_layout,
+                                                pin=False)
             next_q_token = tlx.buffer_load_to_local(tlx.local_view(q_buffers, next_slot), Q, next_offsets,
                                                     mask=next_load_mask)
             next_do_token = tlx.buffer_load_to_local(tlx.local_view(do_buffers, next_slot), DO, next_offsets,
@@ -1348,27 +1330,29 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         score_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
         score_acc = tl.dot(k_nm, q_t, acc=score_acc, out_dtype=score_acc.dtype)
         lse_full = tl.broadcast_to(lse[None, :] * log2e, (BLOCK_N, BLOCK_M))
-        lse_full = _require_layout_soft(lse_full, mma_nm)
-        qk_scale_full = _require_layout_soft(
+        lse_full = tlx.require_layout(lse_full, mma_nm, pin=False)
+        qk_scale_full = tlx.require_layout(
             tl.full((BLOCK_N, BLOCK_M), SM_SCALE * log2e, dtype=tl.float32),
             mma_nm,
+            pin=False,
         )
         scores_t = score_acc * qk_scale_full - lse_full
         valid = key_mask & (offs_m[None, :] < N)
         if IS_CAUSAL:
             valid = valid & (offs_n[:, None] <= offs_m[None, :])
-        valid = _require_layout_soft(valid, mma_nm)
-        neg_inf = _require_layout_soft(
+        valid = tlx.require_layout(valid, mma_nm, pin=False)
+        neg_inf = tlx.require_layout(
             tl.full((BLOCK_N, BLOCK_M), float("-inf"), dtype=tl.float32),
             mma_nm,
+            pin=False,
         )
         scores_t = tl.where(valid, scores_t, neg_inf)
-        p_t = _require_layout_soft(tl.math.exp2(scores_t), mma_nm)
+        p_t = tlx.require_layout(tl.math.exp2(scores_t), mma_nm, pin=False)
 
         dpt_acc = tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=mma_nm)
         dpt_acc = tl.dot(v_nm, do_t, acc=dpt_acc, out_dtype=dpt_acc.dtype)
         delta_full = tl.broadcast_to(delta[None, :], (BLOCK_N, BLOCK_M))
-        delta_full = _require_layout_soft(delta_full, mma_nm)
+        delta_full = tlx.require_layout(delta_full, mma_nm, pin=False)
         ds_t = p_t * (dpt_acc - delta_full)
         # Ordinary casts retain the score MFMA ownership.  The LDS store then
         # reconciles that transient register layout with its shared consumer.
@@ -1383,23 +1367,23 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         k_md = tlx.local_load(k_buffer, token=kv_wait, layout=k_op1_md, relaxed=True)
         dq_part = tlx.zeros((BLOCK_M, D), tl.float32, layout=mma_md)
         dq_part = tl.dot(ds_md, k_md, acc=dq_part, out_dtype=dq_part.dtype)
-        dq_scale_full = _require_layout_soft(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), mma_md)
+        dq_scale_full = tlx.require_layout(tl.full((BLOCK_M, D), SM_SCALE, dtype=tl.float32), mma_md, pin=False)
         dq_part = dq_part * dq_scale_full
         q_ptrs = tensor_base + offs_m[:, None] * D + offs_d[None, :]
-        q_ptrs = _require_layout_soft(q_ptrs, mma_md)
+        q_ptrs = tlx.require_layout(q_ptrs, mma_md, pin=False)
         q_mask = tl.broadcast_to(offs_m[:, None] < N, q_ptrs.shape)
-        q_mask = _require_layout_soft(q_mask, mma_md)
+        q_mask = tlx.require_layout(q_mask, mma_md, pin=False)
         # Keep the direct dQ store in accumulator ownership.  Pinning it to the
         # Q/dO async-load layout inserts a loop-local redistribution and raises
         # register pressure for this persistent kernel.
         dq_bf16 = dq_part.to(tl.bfloat16)
-        dq_ptrs = _require_layout_soft(DQ + q_ptrs, mma_md)
+        dq_ptrs = tlx.require_layout(DQ + q_ptrs, mma_md, pin=False)
         tl.store(dq_ptrs, dq_bf16, mask=q_mask)
 
         # Reuse the score probabilities in the dK/dV operand ownership.  The
         # temporary operand requirement defines the representation change after
         # narrowing and may still be rewritten by TLX.
-        pt_nd = _require_layout_soft(p_t.to(tl.bfloat16), pt_op0_nd)
+        pt_nd = tlx.require_layout(p_t.to(tl.bfloat16), pt_op0_nd, pin=False)
         ds_nd = tlx.local_load(tlx.local_view(ds_buffer, 0), layout=dst_op0_nd, relaxed=True)
         dv = tl.dot(pt_nd, do_nd, acc=dv, out_dtype=dv.dtype)
         dk = tl.dot(ds_nd, q_nd, acc=dk, out_dtype=dk.dtype)

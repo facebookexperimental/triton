@@ -828,6 +828,33 @@ def test_shared_linear_raw_physical_stage_compiles_on_cdna4():
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_require_layout_pin_modes_on_cdna4():
+    """pin=False keeps a soft requirement; pin=True creates a user anchor."""
+    layout = tlx.layout(
+        shape=((64, 4), (4, )),
+        stride=((4, 256), (1, )),
+    )
+
+    @triton.jit
+    def kernel(X, Y, L: tl.constexpr, PIN: tl.constexpr):
+        offsets = tl.arange(0, 1024)
+        values = tl.load(X + offsets)
+        values = tlx.require_layout(values, L, pin=PIN)
+        tl.store(Y + offsets, values)
+
+    x = torch.arange(1024, device=DEVICE, dtype=torch.float32)
+    y = torch.empty_like(x)
+    soft = kernel.warmup(x, y, layout, False, grid=(1, ), num_warps=4)
+    hard = kernel.warmup(x, y, layout, True, grid=(1, ), num_warps=4)
+    kernel[(1, )](x, y, layout, False, num_warps=4)
+    torch.testing.assert_close(y, x, atol=0, rtol=0)
+    assert "tlx.require_layout" in soft.asm["ttir"]
+    assert "#tlx.no_verify_layout<#linear>" in soft.asm["ttir"]
+    assert "#tlx.user_layout" not in soft.asm["ttir"]
+    assert "#tlx.user_layout" in hard.asm["ttir"]
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
 def test_fp_cast_preserves_explicit_mfma_layout_on_cdna4():
     """Ordinary FP casts keep concrete source ownership until a new anchor."""
     mma = tlx.amd_mfma_layout(4, [16, 16, 32], True, [4, 1])

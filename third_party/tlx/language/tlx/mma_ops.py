@@ -5,20 +5,19 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
-def require_layout(x, layout, _semantic=None):
-    """Pin a register tensor's layout as a hard user anchor.
+def require_layout(x, layout, pin: tl.constexpr = True, _semantic=None):
+    """Require a register tensor layout, optionally as a hard user anchor.
 
-    ``layout`` is a ``tlx.layout(...)`` (Shape:Stride) mapped to a ``#linear``
-    encoding and wrapped as ``#tlx.user_layout`` (PinnedEncodingTrait), so the
-    downstream layout passes (tritongpu-coalesce, remove-layout-conversions, AMD
-    optimize-epilogue) treat it as fixed and never rewrite it. Unlike a plain
-    (no_verify) require_layout, this survives to Coalesce and lets you pin an
-    epilogue ``tl.store`` to a coalesced register layout *without* staging the
-    value through LDS.
+    With the default ``pin=True``, ``layout`` is wrapped as
+    ``#tlx.user_layout`` (PinnedEncodingTrait), so downstream layout passes
+    treat it as fixed. With ``pin=False``, the requirement remains
+    optimizer-flexible and may be propagated or materialized as a conversion.
     """
     layout = tl._unwrap_if_constexpr(layout)
+    pin = tl._unwrap_if_constexpr(pin)
+    assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
     enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
-    handle = _semantic.builder.create_require_layout(x.handle, enc, pin=True)
+    handle = _semantic.builder.create_require_layout(x.handle, enc, pin=pin)
     return tl.tensor(handle, x.type)
 
 
