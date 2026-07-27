@@ -1102,10 +1102,11 @@ void printWarpSpecialize(
               DenseMap<Value, Value> argSubstitutionMap;
               if (!partitionRegion.empty()) {
                 Block &entryBlock = partitionRegion.front();
-                for (unsigned i = 0;
-                     i < entryBlock.getNumArguments() && i < wsOperands.size();
+                for (unsigned i = 0; i < entryBlock.getNumArguments() &&
+                                     i < innerOp.getNumOperands();
                      ++i) {
-                  argSubstitutionMap[entryBlock.getArgument(i)] = wsOperands[i];
+                  argSubstitutionMap[entryBlock.getArgument(i)] =
+                      innerOp.getOperand(i);
                 }
               }
 
