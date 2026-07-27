@@ -2,6 +2,7 @@
 // RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %s| FileCheck %s
 
 // CHECK: module attributes {
+// CHECK-SAME: "triton.skip_generic_pipeline"
 // CHECK-SAME: tlx.has_tlx_ops = true
 // CHECK-SAME: "ttg.num-ctas" = 1
 // CHECK-SAME: "ttg.num-warps" = 8
@@ -29,6 +30,7 @@ module {
 // -----
 
 // CHECK: module {
+// CHECK-NOT: triton.skip_generic_pipeline
 // CHECK-NOT: tlx.has_explicit_local_mem_access
 // CHECK-NOT: tlx.has_tlx_ops
 // CHECK-NOT: "ttg.num-ctas"
@@ -52,6 +54,7 @@ module {
 // -----
 
 // CHECK: module attributes {
+// CHECK-SAME: "triton.skip_generic_pipeline"
 // CHECK-SAME: tlx.has_explicit_local_mem_access = true
 // CHECK-NOT: tlx.has_tlx_ops
 // CHECK-SAME: "ttg.num-ctas" = 1
@@ -116,6 +119,7 @@ module {
 // -----
 
 // CHECK: module attributes {
+// CHECK-SAME: "triton.skip_generic_pipeline"
 // CHECK-SAME: tlx.has_warp_spec_ops = true
 // CHECK-NOT: tlx.has_explicit_local_mem_access
 // CHECK-NOT: tlx.has_tlx_ops

@@ -16,6 +16,8 @@ namespace triton {
 
 static const char *kLoopStageAttrName = "loop.stage";
 static const char *kLoopClusterAttrName = "loop.cluster";
+static const char *kSkipGenericPipelineAttrName =
+    "triton.skip_generic_pipeline";
 class CoarseSchedule;
 class ModuleAxisInfoAnalysis;
 //===----------------------------------------------------------------------===//
