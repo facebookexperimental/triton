@@ -16,8 +16,10 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // Step 4.5: Merge first (before budget check — reduces memory footprint)
-// Step 4.6: Budget check passes (SMEM ~65KB << 232KB, TMEM ~196KB << 256KB)
+// Step 4.6: Budget check passes (SMEM ~64KB << 227KB, TMEM ~128KB << 256KB)
 //
+// 6 buffers = 3 data (A/B SMEM operand rings now double-buffered + TMEM acc,
+// each count=2) plus their 3 paired barriers; they merge to 3 physical groups.
 // CHECK: [Step4.5] 6 buffers -> 3 physical groups
 // CHECK: [Step4.6] Budget: SMEM {{[0-9]+}}/{{[0-9]+}} OK, TMEM {{[0-9]+}}/{{[0-9]+}} OK
 tt.func @test_budget_and_merge(

@@ -769,6 +769,49 @@ TEST_F(LinearLayoutTest, FreeVariableMasks) {
             AR({{S("in"), 0b110}}));
 }
 
+// The pow2-only fast paths in isExpensiveView and the convert-layout no-op
+// collapse cannot distinguish two *different* modular (ADD-mod-N) register
+// maps, so they would treat a modular relayout as a cheap identity no-op and
+// scramble elements. These tests pin the two discriminators used by the
+// modular-aware guards:
+//   1. getFreeVariableMasks() is a conservative all-zero-basis check and
+//   returns
+//      the SAME masks for two different modular maps (isExpensiveView's old
+//      fast path relies on it -> false "cheap"). operator!= DOES distinguish
+//      them.
+//   2. quotient()/squareSublayoutIsIdentity() uses the pure GF(2) predicate
+//      (basis == 1<<b), which false-positives on a modular register basis, so
+//      minimalCvtLayout would quotient the register dim away and collapse to a
+//      no-op. isModular() flags the layout so the guard refuses the collapse.
+TEST_F(LinearLayoutTest, ModularRelayoutIsNotIdentity) {
+  // Two distinct modular maps over Z/6: strides 1 and 5. They are genuinely
+  // different permutations of {0..5} but the conservative free-variable mask is
+  // identical (no zero bases in either) -> the old isExpensiveView fast path
+  // would call them equal ("cheap").
+  auto modId = LinearLayout::modularStrided1D(6, 1, S("in"), S("out"));
+  auto modRev = LinearLayout::modularStrided1D(6, 5, S("in"), S("out"));
+  EXPECT_TRUE(modId.isModular());
+  EXPECT_TRUE(modRev.isModular());
+  // Old fast path: same free-variable masks despite being different maps.
+  EXPECT_EQ(to_vector(modId.getFreeVariableMasks()),
+            to_vector(modRev.getFreeVariableMasks()));
+  // The guard's discriminator: they are not equal.
+  EXPECT_NE(modId, modRev);
+  EXPECT_EQ(modId, modId);
+}
+
+TEST_F(LinearLayoutTest, ModularRegisterDimNotQuotientedAway) {
+  // A non-identity modular register map (stride 5 over Z/6). The GF(2) identity
+  // predicate used by squareSublayoutIsIdentity treats basis 5 (== 0b101) as
+  // "not identity" only for bit 0; but for a modular map the round-trip is not
+  // GF(2)-linear, so quotient must not silently drop it. Confirm isModular is
+  // set (the guard keys off it) and the map is not the identity.
+  auto modRev = LinearLayout::modularStrided1D(6, 5, S("register"), S("out"));
+  auto ident = LinearLayout::modularIdentity1D(6, S("register"), S("out"));
+  EXPECT_TRUE(modRev.isModular());
+  EXPECT_NE(modRev, ident);
+}
+
 TEST_F(LinearLayoutTest, QuotientOneDimension) {
   LinearLayout layout(
       {
@@ -1440,6 +1483,15 @@ TEST_F(LinearLayoutTest, SurjectivityTruncationRegression) {
 // Mixed-Shape Tests (pow2 + NPOT dims in the same layout)
 // Verifies that per-layout isModular is correct for mixed shapes.
 //===----------------------------------------------------------------------===//
+
+TEST_F(LinearLayoutTest, MixedShapeSurjectivityUsesPerDimAlgebra) {
+  LinearLayout layout({{S("in"), {{1, 0}, {3, 0}, {0, 1}, {0, 2}, {0, 4}}}},
+                      {{S("pow2"), 4}, {S("npot"), 6}},
+                      /*requireSurjective=*/false);
+
+  EXPECT_TRUE(layout.isModular());
+  EXPECT_TRUE(layout.isModularSurjective());
+}
 
 TEST_F(LinearLayoutTest, MixedShape_OperatorStar_SharedDim) {
   // When inner and outer share an output dim, sizes multiply (not shift).

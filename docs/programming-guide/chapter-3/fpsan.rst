@@ -96,7 +96,8 @@ What FpSan Preserves
 FpSan preserves exact identities in the payload algebra selected by each
 rewrite. The most important ones are:
 
-- ring identities for add, subtract, multiply, FMA, and dot-like accumulation
+- ring identities for add, subtract, unary negation, multiply, FMA, and
+  dot-like accumulation
 - selected exponential identities for ``exp`` and ``exp2`` (see below for details)
 - trigonometric identities for ``sin`` and ``cos``
 - payload equality through casts, loads, stores, and copies
@@ -133,24 +134,28 @@ family?"
 Common Arithmetic Ops
 ----------------------
 
-Add, Sub, Mul
-=============
+Add, Sub, Neg, Mul
+==================
 
 Supported operations:
 
 - ``x + y``
 - ``x - y``
+- ``-x``
 - ``x * y``
 
 Rewrite:
 
-- add, subtract, or multiply the embedded payloads, then unembed the result
+- add, subtract, negate, or multiply the embedded payloads, then unembed the
+  result
 
 Exact preserved properties:
 
 - ``x + 0 = x``
 - ``x - 0 = x``
 - ``x - x = 0``
+- ``x + (-x) = 0``
+- ``-(-x) = x``
 - ``x * 1 = x``
 - associativity and commutativity of add and mul
 - distributivity of mul over add
@@ -275,7 +280,7 @@ Exact preserved properties:
 - ``exp2(-x) = 1.0 / exp2(x)``
 
 ``exp``
-=======
+-------
 
 Supported operation:
 

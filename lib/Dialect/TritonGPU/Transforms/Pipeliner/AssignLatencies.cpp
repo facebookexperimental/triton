@@ -212,6 +212,11 @@ public:
               // All users are loop-carried outputs, so we don't need to
               // push users to a later stage.
               opLatency[&op] = 0;
+              // A loop-carried WS accumulator (e.g. bwd dv/dk) is drained after
+              // the loop; a self_latency=1 here only raises the shared loop's
+              // maxStage, dragging the stage-0 load-fed dots into a deeper
+              // (2-part) prologue peel. Zero it to keep the schedule shallow.
+              mmaSelfLatency[mma] = 0;
               continue;
             } else if (!ttng::requiresAccMultiBuffering(mma, forOp) ||
                        (ttng::isAccMultibufferingPossible(mma, forOp) &&

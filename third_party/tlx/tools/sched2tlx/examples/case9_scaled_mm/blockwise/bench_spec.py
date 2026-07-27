@@ -2,8 +2,8 @@
 
 Blockwise (DeepSeek) fp8 e4m3 scaled_mm: D = (A @ B^T) * (sa[m,g] * sb[nblk,g])
 summed per 128-K group. Launch mirrors run_generated.py; reference mirrors the
-torch blockwise _ref. No handwritten.py yet, so the perf table reports the
-generated kernel only (correctness is generated vs the torch reference).
+torch blockwise _ref. The hand-written WS reference is the autotuned
+blackwell_scaled_mm_ws wrapper (mirrors perf_generated_vs_handwritten.py).
 """
 
 from __future__ import annotations
@@ -53,9 +53,10 @@ def gen_call(generated, inputs):
 
 
 def hw_call(handwritten, inputs):
-    # No handwritten WS reference wired for case9 yet; perf_harness only calls this
-    # when handwritten.py exists, so it is never reached today.
-    raise NotImplementedError("case9 blockwise has no handwritten reference yet")
+    return handwritten.blackwell_scaled_mm_ws(
+        inputs["a"], inputs["b"], inputs["scale_a"], inputs["scale_b"],
+        scale_mode="blockwise",
+    )
 
 
 def metric(shape):

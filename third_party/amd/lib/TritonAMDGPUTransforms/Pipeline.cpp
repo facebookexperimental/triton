@@ -32,8 +32,26 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     auto ifOpBuilder = ifOp.getElseBodyBuilder();
     scf::YieldOp::create(ifOpBuilder, loc, dotOp->getOperand(2));
     return ifOp;
-  } else if (auto copyOp =
-                 dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
+  }
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp>(op)) {
+    auto loc = op->getLoc();
+    auto ifOp = scf::IfOp::create(rewriter, loc, op->getResultTypes(), pred,
+                                  /*withElseRegion=*/true);
+    auto thenB = ifOp.getThenBodyBuilder();
+    auto yield = scf::YieldOp::create(thenB, loc, op->getResults());
+    op->moveBefore(yield);
+
+    auto elseB = ifOp.getElseBodyBuilder();
+    SmallVector<Value> zeroValues;
+    zeroValues.reserve(op->getNumResults());
+    for (Type resultType : op->getResultTypes()) {
+      zeroValues.push_back(
+          arith::ConstantOp::create(elseB, loc, elseB.getZeroAttr(resultType)));
+    }
+    scf::YieldOp::create(elseB, loc, zeroValues);
+    return ifOp;
+  }
+  if (auto copyOp = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
     rewriter.setInsertionPoint(copyOp);
     // TDM requires the mask as I32
     auto predI32 = arith::ExtUIOp::create(rewriter, copyOp->getLoc(),
@@ -59,6 +77,12 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     return op;
   } else if (auto waitOp = dyn_cast<triton::amdgpu::AsyncTDMWait>(op)) {
     return op;
+  } else if (isa<tt::DescriptorStoreLikeOpInterface>(op)) {
+    auto loc = op->getLoc();
+    auto ifOp = scf::IfOp::create(rewriter, loc, pred,
+                                  /*withElseRegion=*/false);
+    op->moveBefore(ifOp.thenYield());
+    return ifOp;
   }
   return tt::wrapInMaskOp(rewriter, op, pred);
 }
@@ -129,6 +153,35 @@ void expandLoops(ModuleOp moduleOp) {
 
   tt::resolveMaskOp(moduleOp);
 }
+// Fold consecutive waits of the same kind into a single wait.
+void combineWaitOps(ModuleOp moduleOp, bool useAsyncCopy) {
+  llvm::SmallSetVector<Operation *, 8> asyncWaitOps;
+  llvm::SmallSetVector<Operation *, 8> tdmWaitOps;
+  moduleOp.walk([&](Operation *op) {
+    if (useAsyncCopy && isa<ttg::AsyncWaitOp>(op))
+      asyncWaitOps.insert(op);
+    else if (isa<triton::amdgpu::AsyncTDMWait>(op))
+      tdmWaitOps.insert(op);
+  });
+
+  if (useAsyncCopy) {
+    tt::combineRedundantWaitOps(
+        asyncWaitOps,
+        [](Operation *op) { return isa<ttg::AsyncCommitGroupOp>(op); },
+        [](OpBuilder &b, Location loc, ValueRange operands,
+           unsigned num) -> Operation * {
+          return ttg::AsyncWaitOp::create(b, loc, operands, num);
+        });
+  }
+
+  tt::combineRedundantWaitOps(
+      tdmWaitOps,
+      [](Operation *op) { return isa<triton::amdgpu::TDMOpInterface>(op); },
+      [](OpBuilder &b, Location loc, ValueRange operands,
+         unsigned num) -> Operation * {
+        return triton::amdgpu::AsyncTDMWait::create(b, loc, operands, num);
+      });
+}
 
 struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
   using Base::Base;
@@ -151,12 +204,9 @@ struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
       if (family == tt::AMD::ISAFamily::CDNA3 ||
           family == tt::AMD::ISAFamily::CDNA4) {
         mlir::triton::updateWaits(moduleOp);
-      } else {
-        llvm::SmallSetVector<ttg::AsyncWaitOp, 8> waitOps;
-        moduleOp.walk([&](ttg::AsyncWaitOp waitOp) { waitOps.insert(waitOp); });
-        tt::combineRedundantWaitOps(waitOps);
       }
     }
+    combineWaitOps(moduleOp, useAsyncCopy);
 
     tt::removePipeliningAttributes(moduleOp);
   }

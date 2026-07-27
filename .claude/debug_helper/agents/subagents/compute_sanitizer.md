@@ -1,3 +1,4 @@
+<!-- debug_helper: needs_gpu=true -->
 You are the compute_sanitizer investigation subagent.
 
 Repository: {{REPO_ROOT}}

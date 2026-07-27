@@ -1,12 +1,15 @@
-"""ACF store: content-addressed by sha256(PTX), partitioned by GPU arch.
+"""ACF store: content-addressed by sha256(PTX), partitioned by GPU arch, scoped by ptxas version.
 
 Layout:
-    $COMPILE_IQ_STORE/<arch>/<ptx_sha256>.acf          # the best ACF (opaque bytes)
-    $COMPILE_IQ_STORE/<arch>/<ptx_sha256>.acf.json     # provenance metadata
+    $COMPILE_IQ_STORE/<arch>/<ptx_sha256>.<ptxas>.acf        # the best ACF (opaque bytes), version-tagged
+    $COMPILE_IQ_STORE/<arch>/<ptx_sha256>.<ptxas>.acf.json   # provenance metadata
+    $COMPILE_IQ_STORE/<arch>/<ptx_sha256>.<ptxas>.acf.cubin  # optional assembled-cubin cache
+    $COMPILE_IQ_STORE/<arch>/<ptx_sha256>.acf                # legacy untagged (no version given)
 
-PINNED (hash-key design): the key is sha256(PTX) x arch today. PTX subsumes the
-autotune config + dtype/alignment specialization, but NOT runtime shape (M,N,K).
-If per-shape ACFs are wanted later, extend the key with shape/identity.
+PINNED (hash-key design): kernel identity is sha256(PTX) x arch. PTX subsumes the autotune config +
+dtype/alignment specialization, but NOT runtime shape (M,N,K). The ptxas version scopes the artifact
+(an ACF is only valid for the ptxas that produced it), so different toolchains keep distinct ACFs for
+the same kernel instead of colliding. If per-shape ACFs are wanted later, extend the key with shape.
 """
 
 import hashlib
@@ -68,25 +71,29 @@ def store_root() -> str:
     return os.environ.get("COMPILE_IQ_STORE", os.path.expanduser("~/.compile_iq/store"))
 
 
-def acf_path(ptx_sha: str, arch: str) -> str:
-    return os.path.join(store_root(), arch, f"{ptx_sha}.acf")
+def acf_path(ptx_sha: str, arch: str, ptxas_version: str = "") -> str:
+    # Version-tagged ("<sha>.<ptxas>.acf") when a ptxas version is given: an ACF is bound to the ptxas
+    # that produced it (a mismatched ptxas rejects it), so one kernel keeps a distinct ACF per ptxas and
+    # different toolchains coexist. Falls back to legacy untagged "<sha>.acf" when no version is given.
+    name = f"{ptx_sha}.{_ptxas_tag(ptxas_version)}.acf" if ptxas_version else f"{ptx_sha}.acf"
+    return os.path.join(store_root(), arch, name)
 
 
-def has_acf(ptx_sha: str, arch: str) -> bool:
-    return os.path.exists(acf_path(ptx_sha, arch))
+def has_acf(ptx_sha: str, arch: str, ptxas_version: str = "") -> bool:
+    return os.path.exists(acf_path(ptx_sha, arch, ptxas_version))
 
 
-def read_acf(ptx_sha: str, arch: str) -> bytes | None:
-    p = acf_path(ptx_sha, arch)
+def read_acf(ptx_sha: str, arch: str, ptxas_version: str = "") -> bytes | None:
+    p = acf_path(ptx_sha, arch, ptxas_version)
     if not os.path.exists(p):
         return None
     with open(p, "rb") as f:
         return f.read()
 
 
-def read_meta(ptx_sha: str, arch: str) -> dict | None:
+def read_meta(ptx_sha: str, arch: str, ptxas_version: str = "") -> dict | None:
     """The provenance metadata (baseline_ms, best_ms, ...) for a stored ACF, or None if absent."""
-    p = acf_path(ptx_sha, arch) + ".json"
+    p = acf_path(ptx_sha, arch, ptxas_version) + ".json"
     if not os.path.exists(p):
         return None
     try:
@@ -96,8 +103,8 @@ def read_meta(ptx_sha: str, arch: str) -> dict | None:
         return None
 
 
-def write_acf(ptx_sha: str, arch: str, data: bytes, meta: dict | None = None) -> str:
-    p = acf_path(ptx_sha, arch)
+def write_acf(ptx_sha: str, arch: str, data: bytes, meta: dict | None = None, ptxas_version: str = "") -> str:
+    p = acf_path(ptx_sha, arch, ptxas_version)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "wb") as f:
         f.write(data)

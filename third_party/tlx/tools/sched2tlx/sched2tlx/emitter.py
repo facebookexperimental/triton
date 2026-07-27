@@ -82,7 +82,7 @@ _DTYPE_ALT = (
     r"|f8e4m3|f8e5m2|f16|f32|f64|i1|i8|i16|i32|i64)"
 )
 _TENSOR_TYPE_RE = re.compile(rf"tensor<([0-9x]+)x({_DTYPE_ALT})\b")
-_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<tensor<([0-9x]+)x({_DTYPE_ALT})\b")
+_DESC_TYPE_RE = re.compile(rf"!tt\.tensordesc<(?:tensor<)?([0-9x]+)x({_DTYPE_ALT})\b")
 # `!ttg.memdesc<128x128xbf16, ...>` — used for hoisted SMEM/TMEM allocs.
 _MEMDESC_TYPE_RE = re.compile(rf"!ttg\.memdesc<([0-9x]+)x({_DTYPE_ALT})\b")
 
@@ -469,6 +469,22 @@ def _render_memdesc_trans(op: Op, rctx: RenderCtx) -> str:
     # ttg.memdesc_trans on an SMEM buffer becomes tlx.local_trans.
     inner = _render_operand(op.operands[0], rctx)
     return f"tlx.local_trans({inner})"
+
+
+def _underlying_memdesc_alloc_id(ref: OpRef, g: ScheduleGraph) -> str:
+    """Trace metadata-only memdesc transforms to their backing allocation."""
+    op_id = ref.op_id
+    seen: set[str] = set()
+    while op_id not in seen:
+        seen.add(op_id)
+        op = g.ops.get(op_id)
+        if op is None or op.kind != "ttg.memdesc_trans" or not op.operands:
+            break
+        inner = op.operands[0]
+        if not isinstance(inner, OpRef):
+            break
+        op_id = inner.op_id
+    return op_id
 
 
 def _subtiled_store_n_size_for_desc(op: Op, rctx: RenderCtx) -> int:
@@ -3344,7 +3360,9 @@ def _emit_warp_group(
             if len(mma_op.operands) > src_idx and isinstance(
                 mma_op.operands[src_idx], OpRef
             ):
-                mma_alloc_op_ids.add(mma_op.operands[src_idx].op_id)
+                mma_alloc_op_ids.add(
+                    _underlying_memdesc_alloc_id(mma_op.operands[src_idx], g)
+                )
     for fl in rctx.fn_scope_loads:
         load_op = fl["load_op"]
         already_emitted = fl["load_op_id"] in rctx._fn_load_emitted
@@ -5471,9 +5489,15 @@ def _emit_outer_epilogue_partitioned(
             tlx.async_descriptor_store_wait(0)
         tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
 
-    c_desc stays (BM, BN) so the launcher's `c_desc.block_shape = (BM, BN)`
-    contract is unchanged; c_smem is shrunk to (m_size, BN) at its alloc
-    site since only one group's tile is staged at a time.
+    The partition CHANGES the launcher's C descriptor contract: each
+    async_descriptor_store copies a (m_size, BN) c_smem box, and TMA
+    requires the descriptor block to equal the copied box, so the host
+    must build `c_desc.block_shape = (m_size, BN)` — NOT the ttgir's
+    (BM, BN). A/B load descriptors keep their ttgir blocks (loads are
+    not split; the MMA slices the full A tile per group). c_smem is
+    shrunk to (m_size, BN) at its alloc site since only one group's
+    tile is staged at a time. See case2's run_generated.py/bench_spec.py
+    for the contract in fixture form.
     """
     lines += (
         f"# Pass A.5 partitioned epilogue (N={N}, m_size={m_size}, per-group c_smem)"

@@ -1192,6 +1192,15 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, llDst, resElemTy, rewriter);
     auto smemLayout = ttg::toLinearLayout(dstTy);
+    if (srcLayout.isModular()) {
+      auto allocShape = ttg::getAllocationShapePerCTA(dstTy);
+      smemLayout = ttg::toLinearLayout(allocShape, dstTy.getEncoding());
+      SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+      for (auto dim : srcLayout.getOutDimNames())
+        paddedOutDims.push_back({dim, smemLayout.getOutDimSize(dim)});
+      srcLayout = LinearLayout(srcLayout.getBases(), paddedOutDims,
+                               /*requireSurjective=*/false);
+    }
     auto cvt = srcLayout.invertAndCompose(smemLayout);
     if (!cvt.isTrivialOver({str_attr("block")})) {
       return emitError(loc,
@@ -1361,10 +1370,13 @@ struct AsyncTMACopyGlobalToLocalOpConversion
           LLVM::NVIDIA::getLeaderAddress(loc, rewriter, barrierPtr, barrierTy);
     }
 
-    // Don't set cta_group::1 as it doesn't exist pre-Blackwell
     std::string ctaGroup;
     if (getModuleTwoCTAs(op)) {
-      ctaGroup = "cta_group::2.";
+      auto oneCTACGALayout = ttg::CGAEncodingAttr::get1DLayout(
+          op->getContext(), ttg::lookupNumCTAs(op));
+      bool oneCTABarrier =
+          getCGALayout(barrierTy.getEncoding()) == oneCTACGALayout;
+      ctaGroup = oneCTABarrier ? "cta_group::1." : "cta_group::2.";
     }
 
     // The bounding box inner dimension must be less than or equal to the
@@ -1925,17 +1937,27 @@ LogicalResult AsyncTMAGatherOpConversion::matchAndRewrite(
   Location loc = op.getLoc();
 
   LLVM::LLVMVoidType voidTy = void_ty(op->getContext());
+  auto barrierTy = op.getBarrier().getType();
   auto barrierMemObj = LLVM::getSharedMemoryObjectFromStruct(
       loc, adaptor.getBarrier(),
-      typeConverter->convertType(op.getBarrier().getType().getElementType()),
-      rewriter);
+      typeConverter->convertType(barrierTy.getElementType()), rewriter);
+
+  std::string ctaGroup;
+  if (getModuleTwoCTAs(op)) {
+    auto oneCTACGALayout = ttg::CGAEncodingAttr::get1DLayout(
+        op->getContext(), ttg::lookupNumCTAs(op));
+    bool oneCTABarrier =
+        getCGALayout(barrierTy.getEncoding()) == oneCTACGALayout;
+    ctaGroup = oneCTABarrier ? ".cta_group::1" : ".cta_group::2";
+  }
 
   // Callback to generate the gather4 instruction.
   auto callback = [&](Value pred, Value shMemPtr, Value yOffset,
                       ArrayRef<Value> xOffsets) {
-    std::string tmaInst = "@$0 cp.async.bulk.tensor.2d.tile::gather4.shared"
-                          "::cta.global.mbarrier::complete_tx::bytes "
-                          "[$1], [$2, {$3, $4, $5, $6, $7}], [$8];";
+    std::string tmaInst = "@$0 cp.async.bulk.tensor.2d.tile::gather4";
+    tmaInst += ctaGroup;
+    tmaInst += ".shared::cta.global.mbarrier::complete_tx::bytes "
+               "[$1], [$2, {$3, $4, $5, $6, $7}], [$8];";
 
     PTXBuilder ptxBuilder;
     SmallVector<PTXBuilder::Operand *, 9> operands{
@@ -2128,10 +2150,8 @@ struct TMAStoreWaitOpConversion
   LogicalResult
   matchAndRewrite(triton::nvidia_gpu::TMAStoreWaitOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto ctx = op.getContext();
-    auto isRead = UnitAttr::get(ctx);
     rewriter.replaceOpWithNewOp<NVVM::CpAsyncBulkWaitGroupOp>(
-        op, op.getPendingsAttr(), isRead);
+        op, op.getPendingsAttr(), op.getReadOnlyAttr());
     return success();
   }
 };

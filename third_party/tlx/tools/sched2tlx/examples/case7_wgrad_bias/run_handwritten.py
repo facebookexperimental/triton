@@ -19,7 +19,6 @@ def main() -> int:
     NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 
     BLOCK_KO, BLOCK_NI, BLOCK_M = 128, 128, 64
-    NUM_SMEM_BUFFERS, NUM_TMEM_BUFFERS = 3, 2
 
     shapes = [
         (1024, 256, 256),
@@ -47,10 +46,7 @@ def main() -> int:
                 BLOCK_KO=BLOCK_KO,
                 BLOCK_NI=BLOCK_NI,
                 BLOCK_M=BLOCK_M,
-                NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-                NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
-                num_warps=4,
-                num_ctas=1,
+                # NUM_SMEM_BUFFERS / NUM_TMEM_BUFFERS + num_warps/num_ctas/num_stages injected by @triton.autotune.
             )
         except Exception as e:
             print(

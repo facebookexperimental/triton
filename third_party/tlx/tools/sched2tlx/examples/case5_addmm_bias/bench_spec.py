@@ -12,7 +12,6 @@ import torch
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
-NUM_BUFFERS_AB, NUM_BUFFERS_ACC = 2, 2
 TOL = 5e-3
 
 SHAPES = [
@@ -64,8 +63,6 @@ def hw_call(handwritten, inputs):
         inputs["a_desc"], inputs["b_desc"], inputs["bias_desc"], inputs["c_hw_desc"],
         inputs["M"], inputs["N"], inputs["K"],
         NUM_SMS=nsms, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        NUM_BUFFERS_AB=NUM_BUFFERS_AB, NUM_BUFFERS_ACC=NUM_BUFFERS_ACC,
-        num_warps=4, num_ctas=1, num_stages=2,
     )
     return inputs["c_hw"]
 

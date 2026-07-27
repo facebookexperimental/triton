@@ -93,8 +93,8 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
         });
   }
 
-  // reduce/expand_dims produce or consume a `slice` encoding whose parent is the
-  // full-tensor encoding. The TLX wrapper must stay on the slice's *parent*
+  // reduce/expand_dims produce or consume a `slice` encoding whose parent is
+  // the full-tensor encoding. The TLX wrapper must stay on the slice's *parent*
   // (standard inference: slice<parent=user_layout<L>>) so the result is
   // structurally stable across resolve-placeholder-layouts (which strips
   // no_verify) and matches the op's own inference on both sides.

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-BLOCK_M, BLOCK_N, HEAD_DIM, NUM_BUFFERS_KV = 128, 64, 128, 2
+BLOCK_M, BLOCK_N, HEAD_DIM = 128, 64, 128
 TOL = 1e-2
 
 SHAPES = [
@@ -57,8 +57,7 @@ def hw_call(handwritten, inputs):
     handwritten.fa_fwd_kernel[_grid(inputs)](
         inputs["qf"], inputs["kf"], inputs["vf"], inputs["of"], inputs["m_lse"], inputs["sm"],
         inputs["Z"], inputs["H"], inputs["N_CTX"],
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM, NUM_BUFFERS_KV=NUM_BUFFERS_KV,
-        num_warps=4, num_ctas=1, num_stages=2,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
     )
     return inputs["out"]
 

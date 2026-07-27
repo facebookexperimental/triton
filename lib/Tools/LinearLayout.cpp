@@ -528,6 +528,22 @@ bool LinearLayout::isModularSurjective() const {
       continue; // Check next dimension
     }
 
+    // Pow2 output dimensions retain XOR semantics.
+    if (llvm::isPowerOf2_32(size)) {
+      std::vector<bool> reachable(size, false);
+      reachable[0] = true;
+      for (int32_t basis : allBases) {
+        auto next = reachable;
+        for (int32_t value = 0; value < size; ++value)
+          if (reachable[value])
+            next[value ^ basis] = true;
+        reachable.swap(next);
+      }
+      if (llvm::count(reachable, true) != size)
+        return false;
+      continue;
+    }
+
     // Use CRT factorization: check surjectivity per prime power factor.
     // For N = 2^k * p1^e1 * ... * pm^em, we check each factor separately.
     // Each factor uses DP reachability, so the total cost is

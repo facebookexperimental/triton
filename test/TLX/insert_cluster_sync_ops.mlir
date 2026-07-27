@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm --verify-diagnostics %s| FileCheck %s
+// RUN: triton-opt -split-input-file --allocate-shared-memory-nv --convert-triton-gpu-to-llvm=compute-capability=100 --verify-diagnostics %s| FileCheck %s
 
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -282,6 +282,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %2 = ttg.local_alloc : () -> !ttg.memdesc<1xui128, #shared, #smem, mutable>
     ttng.async_clc_try_cancel %1, %2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>, !ttg.memdesc<1xui128, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// The core Triton CLC scheduler materializes clc_try_cancel after barrier
+// allocation. Its multicast completion has the same cluster-init requirement.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+  // CHECK-LABEL: @core_clc_try_cancel_bar_init
+  tt.func public @core_clc_try_cancel_bar_init() attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %bars = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %bar = ttg.memdesc_index %bars[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: mbarrier.init.shared::cta.b64
+    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
+    // CHECK: nvvm.cluster.wait {aligned}
+    // CHECK: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.multicast::cluster::all
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    %result = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.clc_try_cancel %result, %bar : !ttg.memdesc<2xi64, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
 }

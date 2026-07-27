@@ -338,6 +338,34 @@ def TritonGPUOptimizeThreadLocality : Pass<"tritongpu-optimize-thread-locality",
                            "mlir::triton::TritonDialect"];
 }
 
+def TritonGPUOptimizeReductionLayout : Pass<"tritongpu-optimize-reduction-layout", "mlir::ModuleOp"> {
+  let summary = "Pick a cheaper operand layout for inner_tree reductions";
+
+  let description = [{
+    An `inner_tree` reduction is layout-invariant by construction, so its operand
+    data layout is a free performance knob. This pass rewrites the operand of such
+    reduces to a layout with `warpsPerCTA[axis] = 1` (warps moved onto a kept
+    dimension), which deletes the cross-warp shared-memory reduction stage. The
+    reduction op, axis, extent and ordering are never changed, so the numeric
+    result is bit-identical. Scope: within-CTA blocked-layout reductions.
+  }];
+
+  let options = [
+    Option<"strategy", "strategy", "std::string", /*default=*/"\"ideal\"",
+           "Relayout strategy: \"ideal\" builds the warp-synchronous reduce "
+           "layout; \"off\" disables the rewrite (no-op).">,
+    Option<"minUnderparallel", "min-underparallel", "int", /*default=*/"8",
+           "Only relayout when the reduce axis is under-parallelized across the "
+           "warp: axisExtent >= threadsPerWarp[axis] * this.">,
+    Option<"maxElemsPerThread", "max-elems-per-thread", "int", /*default=*/"256",
+           "Register-pressure cap: skip when tileElems/(warpSize*num_warps) "
+           "exceeds this (the reduce-friendly layout carries the axis per thread).">
+  ];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect"];
+}
+
 def TritonGPUReorderInstructions: Pass<"tritongpu-reorder-instructions", "mlir::ModuleOp"> {
   let summary = "Reorder instructions";
 

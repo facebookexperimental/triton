@@ -6,6 +6,30 @@
 
 namespace mlir::triton {
 
+inline constexpr StringLiteral kNumStagesAttrName = "tt.num_stages";
+inline constexpr StringLiteral kDisallowAccMultiBufferAttrName =
+    "tt.disallow_acc_multi_buffer";
+inline constexpr StringLiteral kWarpSpecializeAttrName = "tt.warp_specialize";
+inline constexpr StringLiteral kScheduledMaxStageAttrName =
+    "tt.scheduled_max_stage";
+
+enum class AutoWSLoopAttrPropagation {
+  NotForwarded,
+  ForwardToInnerLoop,
+};
+
+struct AutoWSLoopAttrInfo {
+  StringLiteral name;
+  AutoWSLoopAttrPropagation propagation;
+};
+
+// Returns every loop attribute emitted by AutoWSLoopOptions and whether it must
+// be propagated when an annotated scheduler loop is removed.
+ArrayRef<AutoWSLoopAttrInfo> getAutoWSLoopAttrs();
+
+[[nodiscard]] SmallVector<NamedAttribute>
+filterAutoWSLoopAttrs(Operation *op, AutoWSLoopAttrPropagation propagation);
+
 // Filter out attributes from the given operation that are not present in
 // the allowList.
 [[nodiscard]] SmallVector<NamedAttribute>

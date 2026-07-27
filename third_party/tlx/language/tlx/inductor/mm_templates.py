@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from torch._inductor.kernel.mm_common import mm_grid
+from torch._inductor.kernel.mm_common import mm_grid  # noqa: F401
 from torch._inductor.select_algorithm import SymbolicGridFn, TritonTemplate
 from torch._inductor.utils import load_template
 
@@ -29,6 +29,32 @@ def _persistent_mm_grid_split_k(*args, cdiv, min):
     return (min(meta["NUM_SMS"], num_mn_tiles * split_k), 1, 1)
 
 
+@SymbolicGridFn
+def _mm_grid_split_k(m, n, meta, *, cdiv):
+    """Non-persistent grid for the warp-pipe addmm: one program per (tile, K-split).
+
+    grid = grid_m * grid_n * SPLIT_K (SPLIT_K defaults to 1 = the plain data-parallel grid,
+    identical to mm_grid). Each program owns one output tile and one K-slice; partials are
+    summed by _reduce_k_kernel. Unlike _persistent_mm_grid_split_k this is NOT capped at
+    NUM_SMS -- the warp-pipe kernel is non-persistent (one tile per program).
+    """
+    return (
+        cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]) * meta.get("SPLIT_K", 1),
+        1,
+        1,
+    )
+
+
+@SymbolicGridFn
+def _bmm_grid_warppipe(b, m, n, meta, *, cdiv):
+    """1-D grid for the warp-pipe bmm: BATCH * grid_m * grid_n programs, one per (batch, tile).
+
+    The batch index is recovered in-kernel as pid // grid_mn (grid dim 0 is not 65535-limited,
+    and BATCH*grid_mn stays well under 2**31), so no grid_y/grid_z batch split is needed.
+    """
+    return (b * cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), 1, 1)
+
+
 blackwell_gemm_ws_template = TritonTemplate(
     name="tlx_blackwell_gemm_ws",
     grid=_persistent_mm_grid_split_k,
@@ -42,8 +68,21 @@ blackwell_gemm_ws_template = TritonTemplate(
 # (see registry.py); selection/gating is via TORCHINDUCTOR_TLX_MODE (tlx_config).
 amd_addmm_warppipe_template = TritonTemplate(
     name="tlx_amd_addmm_warppipe",
-    grid=mm_grid,
+    grid=_mm_grid_split_k,  # SPLIT_K=1 -> identical to mm_grid; >1 -> grid_mn*SPLIT_K
     source=load_tlx_template("amd_addmm_warppipe"),
+)
+
+# TLX warp-pipelined bmm template (AMD / MI350X gfx950). Same warp-pipe core as the addmm, plus a
+# batch axis on the grid + a per-batch int64 base advance. B is the standard torch.bmm [BATCH,K,N]
+# row-major layout (loaded as (BLOCK_K, BLOCK_N) tiles, no transpose). Selection via TLX_MODE.
+# Dual path (USE_ASYNC constexpr from the heuristic): aligned K (K % 8 for fp16/bf16) uses the fast
+# async_load direct-to-LDS warp-pipe; unaligned/odd K -- which async_copy can't legalize on CDNA4 --
+# uses a register-path fallback (tl.load->tl.dot, T280910119). Gate: int32-representable per-batch
+# offsets.
+amd_bmm_warppipe_template = TritonTemplate(
+    name="tlx_amd_bmm_warppipe",
+    grid=_bmm_grid_warppipe,
+    source=load_tlx_template("amd_bmm_warppipe"),
 )
 
 
@@ -61,6 +100,14 @@ def append_tlx(templates, op_name="mm"):
         uids = {getattr(t, "uid", None) for t in templates}
         if mm_template.uid in uids and amd_addmm_warppipe_template.uid not in uids:
             templates.append(amd_addmm_warppipe_template)
+    elif op_name == "bmm":
+        # Compete as an additional candidate alongside the stock bmm_template + aten. Inject once,
+        # gated on bmm_template already being present (the unified choice call).
+        from torch._inductor.kernel.bmm import bmm_template
+
+        uids = {getattr(t, "uid", None) for t in templates}
+        if bmm_template.uid in uids and amd_bmm_warppipe_template.uid not in uids:
+            templates.append(amd_bmm_warppipe_template)
     else:
         templates.append(blackwell_gemm_ws_template)
     return templates

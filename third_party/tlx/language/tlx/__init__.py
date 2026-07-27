@@ -37,6 +37,7 @@ from .mem_ops import (
     async_load,
     async_load_commit_group,
     async_load_wait_group,
+    assert_same_layout,
     dump_layout,
     fence,
     fence_async_shared,
@@ -60,7 +61,7 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, tcgen05_commit
+from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, require_layout, tcgen05_commit
 from .types import (
     async_token,
     buffered_tensor,
@@ -147,6 +148,7 @@ __all__ = [
     "async_load",
     "async_load_commit_group",
     "async_load_wait_group",
+    "assert_same_layout",
     "dump_layout",
     "local_load",
     "local_store",
@@ -186,6 +188,7 @@ __all__ = [
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",
+    "require_layout",
     "tcgen05_commit",
     # utility
     "cluster_cta_rank",

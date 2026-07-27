@@ -170,6 +170,23 @@ class Gemm:
             "EPILOGUE_SUBTILE": False,
             "NUM_CTAS": 1,
         },
+        "blackwell_gemm_ws_2cta_2group": {
+            "BLOCK_SIZE_M": 256,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 2,
+            "NUM_SMEM_BUFFERS": 2,
+            "NUM_TMEM_BUFFERS": 2,
+            "NUM_MMA_GROUPS": 2,
+            "EPILOGUE_SUBTILE": 2,
+            "NUM_CTAS": 2,
+            "SPLIT_K": 1,
+            "INTERLEAVE_EPILOGUE": 1,
+            "USE_WARP_BARRIER": False,
+            "num_warps": 4,
+            "num_stages": 1,
+            "ctas_per_cga": (2, 1, 1),
+        },
         "blackwell_gemm_ws_warp_barrier": {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 256,
@@ -457,6 +474,16 @@ class ScaledMM:
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
 def test_blackwell_gemm_ws(dtype):
     Gemm.run_test(_blackwell_gemm_ws, Gemm.CONFIGS["blackwell_gemm_ws"], dtype=dtype)
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_gemm_ws_2cta_2group():
+    Gemm.run_test(
+        _blackwell_gemm_ws,
+        Gemm.CONFIGS["blackwell_gemm_ws_2cta_2group"],
+        shapes=[(1024, 12800, 1152)],
+        dtype=torch.float16,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1150,6 +1177,34 @@ def test_amd_fa_cluster(causal, dtype, HEAD_DIM):
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("persistent", [False, True], ids=["direct", "persistent"])
+@pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
+@pytest.mark.parametrize("use_direct_load", [None, False, True], ids=["autotune", "lds", "direct-load"])
+@pytest.mark.parametrize(
+    "N_CTX,BLOCK_M",
+    [(128, 128), (129, 128), (257, 256)],
+    ids=["short", "short-unaligned", "pipeline-unaligned"],
+)
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_fa_cluster_block_n_boundaries(persistent, causal, use_direct_load, N_CTX, BLOCK_M):
+    torch.manual_seed(42)
+    B, H, D = 1, 4, 64
+    dtype = torch.bfloat16
+    q = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    k = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    v = torch.randn(B, H, N_CTX, D, device=DEVICE, dtype=dtype)
+    sm = 1.0 / math.sqrt(D)
+    ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm)
+    kernel = _amd_fa_cluster_persistent if persistent else _amd_fa_cluster
+    config = {"BLOCK_M": BLOCK_M, "BLOCK_N": 64}
+    if use_direct_load is not None:
+        config["USE_DIRECT_LOAD"] = use_direct_load
+    if persistent:
+        config.update({"NUM_SMS": 16, "NUM_XCDS": 4})
+    out = kernel(q, k, v, sm, causal, config=config)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["nocausal", "causal"])
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
@@ -1194,6 +1249,42 @@ def test_amd_pa_decode(num_splits, query_length):
 
     ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
                              num_kv_heads, query_length)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_page64_high_splits():
+    num_kv_heads, group = 2, 4
+    num_q_heads = num_kv_heads * group
+    head_dim, page_size = 64, 64
+    ctx_lens = [65, 257, 513]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE)
+    out = torch.empty_like(query)
+    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_splits=128)
+
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, 1)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware (CDNA4)")
+def test_amd_pa_decode_page16_tile_boundaries():
+    num_kv_heads, group = 2, 4
+    num_q_heads = num_kv_heads * group
+    head_dim, page_size = 128, 16
+    ctx_lens = [15, 16, 17, 63, 64, 65]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    query, key_cache, value_cache, context_lens, block_tables = _amd_pa_decode_build_inputs(
+        len(ctx_lens), ctx_lens, num_q_heads, num_kv_heads, head_dim, page_size, device=DEVICE)
+    out = torch.empty_like(query)
+    _amd_pa_decode(out, query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_splits=4)
+
+    ref = _amd_pa_decode_ref(query, key_cache, value_cache, context_lens, block_tables, sm_scale, num_q_heads,
+                             num_kv_heads, 1)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 

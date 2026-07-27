@@ -120,3 +120,34 @@ jobs:
       event_name: "schedule"
       run_attempt: "${{ github.run_attempt }}"
       summary: "No commit in the walked window had all four required checks green as of the cut."
+
+  # A commit was selected (status == 'ship') but the wheel build or the publish
+  # step errored out — e.g. a compiler error that the GCC-built required checks
+  # miss but the Clang wheel build catches. Files/updates one issue per broken
+  # commit (title keyed on the selected SHA), with an auto-computed suspect-PR
+  # list from the last green nightly.
+  report-build-failure:
+    needs: [select, build, publish]
+    if: >-
+      always() && needs.select.outputs.status == 'ship' &&
+      (needs.build.result == 'failure' || needs.publish.result == 'failure')
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    uses: ./.github/workflows/report-nightly-failure.yml
+    with:
+      issue_title: "Nightly fbtriton: wheel build/publish failed for ${{ needs.select.outputs.sha }}"
+      normalized_failure_id: "nightly-fbtriton-build-failure"
+      workflow_name: "Nightly fbtriton"
+      job_name: "build"
+      run_url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      ref: "refs/heads/main"
+      sha: "${{ needs.select.outputs.sha }}"
+      event_name: "schedule"
+      run_attempt: "${{ github.run_attempt }}"
+      summary: >-
+        The wheel build or publish job failed for selected commit
+        ${{ needs.select.outputs.sha }} (version ${{ needs.select.outputs.version }}).
+        See the run log for the build error (often a Clang-only compiler error that
+        the GCC-built required checks do not catch).

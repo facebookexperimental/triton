@@ -162,8 +162,18 @@ LogicalResult lowerLdStMatrix(
   if (isa<PaddedSharedEncodingAttr>(memDescType.getEncoding())) {
     return failure();
   }
+  auto activeRegLayout = regLayout;
   auto memLayout = toLinearLayout(memDescType);
-  auto cvt = regLayout.invertAndCompose(memLayout);
+  if (activeRegLayout.isModular()) {
+    auto allocShape = getAllocationShapePerCTA(memDescType);
+    memLayout = toLinearLayout(allocShape, memDescType.getEncoding());
+    SmallVector<std::pair<StringAttr, int32_t>> paddedOutDims;
+    for (auto dim : activeRegLayout.getOutDimNames())
+      paddedOutDims.push_back({dim, memLayout.getOutDimSize(dim)});
+    activeRegLayout = LinearLayout(activeRegLayout.getBases(), paddedOutDims,
+                                   /*requireSurjective=*/false);
+  }
+  auto cvt = activeRegLayout.invertAndCompose(memLayout);
   auto kBlock = StringAttr::get(loc.getContext(), "block");
   auto maybeSublayout = cvt.quotient({kBlock});
   if (!maybeSublayout) {

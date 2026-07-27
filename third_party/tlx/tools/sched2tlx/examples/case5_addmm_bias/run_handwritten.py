@@ -20,7 +20,6 @@ def main() -> int:
     triton.set_allocator(alloc_fn)
     torch.manual_seed(0)
     BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
-    NUM_BUFFERS_AB, NUM_BUFFERS_ACC = 2, 2
 
     shapes = [
         (256, 256, 128),
@@ -55,11 +54,7 @@ def main() -> int:
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
-            NUM_BUFFERS_AB=NUM_BUFFERS_AB,
-            NUM_BUFFERS_ACC=NUM_BUFFERS_ACC,
-            num_warps=4,
-            num_ctas=1,
-            num_stages=2,
+            # NUM_BUFFERS_AB / NUM_BUFFERS_ACC + num_warps/num_ctas/num_stages injected by @triton.autotune.
         )
 
         ref = (torch.matmul(a.float(), b.float()) + bias.float()).to(torch.float16)

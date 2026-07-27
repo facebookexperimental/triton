@@ -67,7 +67,14 @@ public:
 
   SmallVector<unsigned> getOrderWithAxisAtBeginning();
 
-  unsigned getScratchSizeInBytes();
+  // Callback to allow backends to specify target-specific getter for scratch
+  // elements.
+  using GetNumScratchElemsFn = std::function<unsigned(
+      const triton::LinearLayout &src, const triton::LinearLayout &dst,
+      unsigned bitwidth)>;
+
+  unsigned
+  getScratchSizeInBytes(GetNumScratchElemsFn numScratchElemsGetter = nullptr);
 
   bool isReduceWithinCTA();
 

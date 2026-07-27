@@ -2,14 +2,16 @@
 
 Triton Cluster Launch Control (CLC) tile scheduler.
 
-Status: **frontend + full lowering landed (Stages 1–4), single-CTA. Runs both
-without WS and under AutoWS (Stage 3 fused into the run-once/broadcast pass).**
+Status: **frontend + full lowering landed (Stages 1–4), including explicit
+`ctas_per_cga` clusters. Runs both without WS and under AutoWS (Stage 3 fused
+into the run-once/broadcast pass).**
 
 ## Motivation
 
 Cluster Launch Control (CLC) is a Blackwell (SM100+) hardware feature for
-dynamic persistent kernels. The grid is launched with one cluster per tile
-(over-subscribed relative to the SM count). A CTA that finishes early issues
+dynamic persistent kernels. The grid is launched with one CTA per logical tile
+and is over-subscribed relative to the SM count. With `ctas_per_cga`, adjacent
+CTA coordinates are grouped into clusters. A cluster that finishes early issues
 `clusterlaunchcontrol.try_cancel`, which atomically cancels a *pending*
 (not-yet-launched) cluster and hands the caller that cluster's program id — i.e.
 it steals the pending tile's work. This load-balances better than a static
@@ -35,8 +37,45 @@ design adds a **core Triton (`tl.`) scheduler** that hides all of that.
   (`warp_specialize=False`); WS is an orthogonal, later concern.
 - **Minimal, opaque API.** The kernel author never sees a buffer, barrier,
   phase, or the `try_cancel`/`wait` split.
-- **Single CTA only (for now).** Multi-cluster / multi-CTA is not yet supported;
-  the materialization pass rejects `num-ctas > 1`. Multi-CTA is future work.
+- **CUDA-style explicit clusters.** `ctas_per_cga` is supported: every CTA has
+  its own program id, but the CLC reservation is collective for the physical
+  cluster. Triton's separate `num_ctas > 1` program-id model remains unsupported.
+
+## PTX cluster grouping contract
+
+Clustered CLC correctness follows from the PTX ISA contract, not from a software
+reservation convention:
+
+- [`clusterlaunchcontrol.try_cancel`](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel)
+  atomically cancels the launch of a *cluster* that has not started running.
+  Two successful requests therefore cannot claim the same pending cluster or
+  split its CTAs between requesters.
+- The `multicast::cluster::all` qualifier delivers the response and completion
+  notification to every CTA in the requesting cluster. Triton emits the
+  instruction only from cluster rank zero; other CTAs wait on their local
+  completion barriers.
+- [`clusterlaunchcontrol.query_cancel`](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-query-cancel)
+  exposes `get_first_ctaid`, the first CTA coordinate of the canceled cluster.
+- PTX [`.reqnctapercluster`](https://docs.nvidia.com/cuda/parallel-thread-execution/#performance-tuning-directives-reqnctapercluster)
+  specifies the required cluster dimensions emitted for `ctas_per_cga`.
+- The PTX [`%cluster_ctarank`](https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-ctarank)
+  and [`%cluster_nctaid`](https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-cluster-nctaid)
+  special registers define the CTA's linear rank and cluster dimensions.
+  Triton delinearizes the PTX-defined X-major rank and adds that local
+  coordinate to `first_ctaid`, reconstructing a distinct program id for each
+  member.
+
+For example, `grid=(8,)` with `ctas_per_cga=(2,1,1)` creates the pending
+clusters `{0,1}`, `{2,3}`, `{4,5}`, and `{6,7}`. If two requesters receive
+`first_ctaid=4` and `first_ctaid=6`, their member CTAs process `{4,5}` and
+`{6,7}` respectively. Request order is nondeterministic, but PTX atomic cluster
+cancellation keeps each pair intact. Triton does not implement another software
+reservation queue.
+
+The grid is the total CTA grid, not the number of clusters. Every grid dimension
+must be divisible by its `ctas_per_cga` dimension, and every CTA must have valid
+cooperative work. Inactive padded CTAs are unsupported because they violate
+collective multi-CTA execution. All members must reach `advance()` uniformly.
 
 ## API
 
@@ -61,9 +100,10 @@ while sched.is_valid():              # more work to steal?
 There is intentionally **no `try_cancel` in the API.** Fetching the next tile
 *is* `advance`; the async issue/wait split (issue early, wait late, to overlap
 the CLC latency with compute) is a compiler optimization done during lowering,
-not something the user expresses. Problem-level "invalid/jagged tile" handling is
-just ordinary user control flow (a bounds `if` around the compute) — it is not a
-scheduler concept.
+not something the user expresses. In single-CTA mode, problem-level
+"invalid/jagged tile" handling is ordinary user control flow. Clustered mode
+requires divisible tile geometry; a bounds guard must not make a cluster member
+inactive or prevent it from reaching `advance()`.
 
 ## Frontend representation
 
@@ -202,8 +242,8 @@ pending cluster, and diverge → deadlock.
 *Enabling WS:* like the dynamic-persistent atomic kernel, WS is requested by
 `tl.range(..., warp_specialize=True)` on the inner K-loop (with `use_meta_ws`);
 the outer persistent `scf.while` is auto-cloned per partition and the CLC fetch
-is broadcast here. The grid launches one cluster per tile so there are pending
-clusters to steal.
+is broadcast here. The grid launches one CTA per logical tile; `ctas_per_cga`
+groups those CTAs into pending clusters that can be stolen.
 
 Primary scheme:
 
@@ -253,19 +293,27 @@ only handles the CLC-response completion barrier local to the producer.
 Materialization (producer partition, depth-1):
 
 1. Allocate the response buffer (`memdesc<2xi64>`) and one **completion mbarrier**
-   at function scope; init / inval.
+   at function scope; init / inval. For explicit clusters, also allocate an
+   **empty mbarrier** on which all CTAs arrive after consuming a response.
 2. `clc_try_cancel_async` → `ttng.clc_try_cancel(resp, bar)` + `barrier_expect(bar, 16)`.
 3. `clc_read %tok` → `wait_barrier(bar, phase)` + `ttng.clc_load_result(resp)` +
    `ttng.clc_is_canceled` (→ `isValid`) + `ttng.clc_get_program_id` (→ x/y/z).
 
-#### Phase handling (one-sided channel)
+#### Phase handling and clustered reuse
 
-The CLC response is written by hardware (`try_cancel`) and read by `clc_read` —
-there is only the **"full" (data-ready) side** of a channel; there is no "empty"
-(buffer-free) side, because the single response buffer is reused each iteration
-and reuse is naturally program-ordered (the next iteration's issue at the loop-body
-top follows this iteration's read at the bottom, in the same partition). So a
-single completion mbarrier suffices, and only its phase must be tracked.
+In single-CTA mode, the CLC response is a one-sided channel: program order
+ensures the response is read before the next iteration reuses its buffer, so only
+the full (data-ready) completion mbarrier is needed.
+
+With `ctas_per_cga`, program order within one CTA does not prevent rank zero
+from starting the next request before peer CTAs have consumed the multicast
+response. Materialization therefore adds an empty mbarrier initialized with the
+physical cluster size. After a successful `clc_read`, every CTA arrives on rank
+zero's empty barrier through a remote view. Before the next request, only rank
+zero waits on its local empty barrier. The first wait uses the opposite phase
+and passes immediately; subsequent waits prevent response-buffer reuse until
+all cluster members have finished. The final failed cancellation skips the
+remote arrivals because no later request will reuse the buffer.
 
 **Require the phase to be a loop-carried variable, toggled before each advance.**
 Materialization adds an `i32`/`i1` phase iter_arg to the persistent `scf.while`,
@@ -367,7 +415,8 @@ requires drain-on-exit because the CLC claim is destructive.
   `third_party/nvidia/hopper/lib/Transforms/WarpSpecialization/WSAtomicBroadcast.cpp`.
   Wired into the NVIDIA Blackwell `make_ttgir` — split + hoist before WS,
   materialize after; the AutoWS broadcast runs inside WS.
-- **Restriction:** single CTA only — `clc-materialize` errors on `num-ctas > 1`.
+- **Restriction:** explicit `ctas_per_cga` clusters are supported, while
+  Triton's distinct `num_ctas > 1` program-id model remains unsupported.
 - **Tests:** `python/test/unit/language/test_triton_clc.py` (frontend IR checks +
   non-WS Blackwell execution + materialized-TTGIR) and, in
   `test_tutorial09_warp_specialization.py`,
@@ -377,7 +426,7 @@ requires drain-on-exit because the CLC claim is destructive.
 
 ## Future work
 
-- Multi-cluster / multi-CTA support (lift the single-CTA restriction).
+- Support Triton's `num_ctas > 1` cluster-level program-id model.
 - Multi-stage prefetch (`depth > 1`) with drain-on-exit (loop-carried token).
 - Cross-basic-block hoist / unification in Stage 2.
 - Channel optimizations: broadcast-and-decode-per-partition; a dedicated

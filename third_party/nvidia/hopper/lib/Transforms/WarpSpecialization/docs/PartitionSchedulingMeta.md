@@ -8,9 +8,10 @@ pipeline — it determines which warp group each operation will execute on.
 
 ## Overview
 
-The pass walks all `scf.for` loops with the `tt.warp_specialize` attribute and
-assigns each operation inside the loop (and post-loop consumers) to a
-**partition**. Each partition maps to a warp group at runtime.
+The pass walks supported loop-like operations with the `tt.warp_specialize`
+attribute and assigns each operation inside the scheduled body (and post-loop
+consumers) to a **partition**. Each partition maps to a warp group at runtime.
+The supported forms are `scf.for` and ordered-subset-carry `scf.while`.
 
 ```
 Phase 1: Categorize operations         (OpCategorizer + collectMMABackwardSlices)
@@ -22,6 +23,26 @@ Phase 6: Schedule post-loop ops        (schedulePostLoopOps — epilogue routing
   ─── end of getInitialSchedule ───
 Post:    propagatePartitions + optimizeSchedule + splitDataPartitionedIfOps
 ```
+
+## Supported Loop Forms
+
+Partition scheduling uses `LoopLikeOpInterface` at its API boundary, but does
+not accept arbitrary loop-like operations. `scf.for` uses its body region and
+retains the existing induction-variable offset. `scf.while` uses its after
+region as the scheduled body and has no induction variable.
+
+An `scf.while` is schedulable when `scf.condition` forwards a direct, unique,
+non-empty, order-preserving subset of its before-region arguments. Forwarded values map
+from after-region arguments through the condition operands to their actual
+yield slots; non-forwarded values are condition-only state and do not re-enter
+the scheduled body. This supports CLC's `(valid, x)` carry, where only `x` is
+forwarded. Empty, reordered, duplicate, or computed forwarding is rejected by
+stripping loop-local warp-specialization metadata and leaving a plain while.
+
+The before region remains loop control rather than a PSM partition. Task-ID
+propagation marks the while, its condition computation, `scf.condition`, and
+`scf.yield` with the union of tasks after the single-partition PSM anchors have
+been converted to task IDs.
 
 ## Tuning Knobs
 

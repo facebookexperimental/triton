@@ -388,6 +388,25 @@ def test_dump_layout_cute(capfd, monkeypatch):
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
+def test_assert_same_layout(monkeypatch):
+    """`tlx.assert_same_layout` compares final layouts for both value/layout
+    and value/value forms, then is erased after successful assertions."""
+    monkeypatch.setattr(triton.knobs.compilation, "always_compile", True)
+
+    @triton.jit
+    def kernel(LAYOUT: tl.constexpr):
+        buf = tlx.local_alloc((128, 128), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem)
+        value = tlx.local_load(tlx.local_view(buf, 0), layout=LAYOUT)
+        other = tlx.local_load(tlx.local_view(buf, 0), layout=LAYOUT)
+        tlx.assert_same_layout(value, LAYOUT)
+        tlx.assert_same_layout(value, other)
+        tlx.local_store(tlx.local_view(buf, 0), value)
+
+    compiled = kernel.warmup(_separable_qk_layout(), grid=(1, ), num_warps=8)
+    assert "tlx.assert_same_layout" not in compiled.asm["ttgir"]
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
 def test_dump_layout_round_trips_shape_stride(capfd, monkeypatch):
     """Dumping a tensor that carries the separable `tlx.layout` reproduces the
     same CuTe (thread, value) shape/stride it was built from."""
@@ -719,3 +738,44 @@ def test_buffer_load_to_local_infers_offset_layout_amd():
     # It lowers all the way to amdgcn (the direct-to-LDS width/alignment
     # requirements are met by the inferred offset layout).
     assert compiled.asm.get("amdgcn")
+
+
+# a16w16 epilogue-store pin: the coalesced #linear register layout the inter_wave
+# kernel pins on the FP16 store so AMD OptimizeEpilogue keeps buffer_store_dwordx4
+# (a [128, 128] fp16 quadrant on num_warps=8; each thread holds 8 contiguous N).
+_A16W16_STORE_SHAPE = ((16, 4, 8), (8, 4))
+_A16W16_STORE_STRIDE = ((8, 128, 512), (1, 4096))
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_require_layout_pins_epilogue_store_amd():
+    """A store *value* pinned via tlx.require_layout survives coalesce /
+    remove-layout-conversions / optimize-epilogue as the exact coalesced #linear,
+    so the FP16 epilogue store stays a wide buffer_store_dwordx4 (the a16w16
+    scenario) instead of being narrowed to the MMA-accumulator layout. The
+    in-kernel tlx.assert_same_layout(c, L) compares final LinearLayouts and fails
+    compilation if the pin is dropped."""
+
+    @triton.jit
+    def kernel(a_ptr, b_ptr, c_ptr, K: tl.constexpr, L: tl.constexpr):
+        offs_m = tl.arange(0, 128)
+        offs_n = tl.arange(0, 128)
+        offs_k = tl.arange(0, K)
+        a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :])
+        b = tl.load(b_ptr + offs_k[:, None] * 128 + offs_n[None, :])
+        acc = tl.dot(a, b)  # MMA accumulator -> the store OptimizeEpilogue rewrites
+        c = tlx.require_layout(acc.to(tl.float16), L)  # pin the store value to L
+        tlx.assert_same_layout(c, L)  # fails compilation if the pin didn't survive
+        tl.store(c_ptr + offs_m[:, None] * 128 + offs_n[None, :], c)
+
+    L = tlx.layout(shape=_A16W16_STORE_SHAPE, stride=_A16W16_STORE_STRIDE)
+    a = torch.randn((128, 64), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((64, 128), device=DEVICE, dtype=torch.float16)
+    c = torch.empty((128, 128), device=DEVICE, dtype=torch.float16)
+    compiled = kernel.warmup(a, b, c, 64, L, grid=(1, ), num_warps=8)
+    # assert_same_layout would have failed compilation if the pin were dropped; the
+    # epilogue store lowers to the wide coalesced dwordx4, not the narrow dwordx2
+    # fallback OptimizeEpilogue would otherwise produce.
+    amdgcn = compiled.asm["amdgcn"]
+    assert "buffer_store_dwordx4" in amdgcn
+    assert "buffer_store_dwordx2" not in amdgcn

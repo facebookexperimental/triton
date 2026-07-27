@@ -1,0 +1,159 @@
+{{def_kernel("A", "B")}}
+    # TLX warp-pipelined bmm for AMD (MI350X / gfx950). C[b] = A[b] @ B[b].
+    # A:[BATCH,M,K] row-major, B:[BATCH,K,N] row-major (the standard torch.bmm layout, so B is
+    # loaded as (BLOCK_K, BLOCK_N) tiles directly -- no transpose, unlike the col-major addmm).
+    # Same warp-pipe compute core as amd_addmm_warppipe (async_load prefetch into multi-buffered
+    # LDS + tlx.warp_pipeline_stage); the only differences are a batch axis on the grid and a
+    # per-batch int64 base advance. num_stages=1.
+    #
+    # NOTE: tlx.async_load's flat offset is int32, so the heuristic restricts this template to
+    # per-batch M*K and N*K < 2**31. The per-batch base advance is done in int64 (batch*M*K can
+    # exceed 2**31).
+    #
+    # DUAL PATH (selected by the USE_ASYNC constexpr the heuristic sets from K's alignment):
+    #  * USE_ASYNC=1  (K % 8 == 0, i.e. (K*itemsize) % 16 == 0, 16-byte-aligned rows): the fast
+    #    async_load direct-to-LDS warp-pipe below; the K % BLOCK_K remainder is a synchronous sync-tail.
+    #  * USE_ASYNC=0  (unaligned K, e.g. odd K): a register-path fallback (tl.load -> registers ->
+    #    tl.dot, auto-pipelined) that lowers for ANY alignment where the async_copy path cannot
+    #    (T280910119). Same register-staged data path rocBLAS uses; ~0.76x rocBLAS on odd K.
+    M = {{size("A", -2)}}
+    N = {{size("B", -1)}}
+    K = {{size("A", -1)}}
+    BATCH = {{size("A", 0)}}
+    if M * N == 0:
+        return
+    stride_aq = {{stride("A", 0)}}
+    stride_am = {{stride("A", 1)}}
+    stride_ak = {{stride("A", 2)}}
+    stride_bq = {{stride("B", 0)}}
+    stride_bk = {{stride("B", 1)}}
+    stride_bn = {{stride("B", 2)}}
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+
+    pid = tl.program_id(0).to(INDEX_DTYPE)
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    grid_mn = grid_m * grid_n
+    batch_id = pid // grid_mn      # 1-D grid: BATCH * grid_mn programs
+    pid = pid % grid_mn
+
+    # L2 chiplet swizzle on the within-batch pid (same as amd_addmm_warppipe). NUM_XCDS is injected
+    # by the heuristic (8 for gfx942/gfx950, else 1 -> identity). Trailing remainder passes through.
+    XCD_CHUNK: tl.constexpr = 8
+    aligned = (grid_mn // (NUM_XCDS * XCD_CHUNK)) * (NUM_XCDS * XCD_CHUNK)
+    if pid < aligned:
+        xcd = pid % NUM_XCDS
+        local_pid = pid // NUM_XCDS
+        pid = (local_pid // XCD_CHUNK) * (NUM_XCDS * XCD_CHUNK) + xcd * XCD_CHUNK + (local_pid % XCD_CHUNK)
+
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)) % N
+    offs_k = tl.arange(0, BLOCK_K).to(INDEX_DTYPE)
+
+    # per-batch base advance -- int64 because batch * M*K (or N*K) can exceed 2**31; the
+    # within-tile offsets below stay int32 (heuristic-bounded), matching the addmm 32-bit path.
+    batch_i64 = batch_id.to(tl.int64)
+    A = A + batch_i64 * stride_aq
+    B = B + batch_i64 * stride_bq
+
+    a_base = offs_m[:, None] * stride_am
+    b_base = offs_n[None, :] * stride_bn          # B as (BLOCK_K, BLOCK_N): n is the col of [K,N]
+
+{% if USE_ASYNC %}
+    # --- async_load direct-to-LDS warp-pipe path (USE_ASYNC=1: K % 8 == 0, 16-byte-aligned rows) ---
+    K_ITERS = K // BLOCK_K   # FULL K-tiles (unmasked); the K % BLOCK_K remainder -> sync-tail below
+
+    smemA = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(A), NUM_BUFFERS)
+    smemB = tlx.local_alloc((BLOCK_K, BLOCK_N), tlx.dtype_of(B), NUM_BUFFERS)
+
+    # prologue: prefetch the first NUM_BUFFERS full K-tiles (heuristic guarantees K_ITERS >= NUM_BUFFERS).
+    for i in tl.range(0, NUM_BUFFERS, loop_unroll_factor=NUM_BUFFERS):
+        k_start = i * BLOCK_K
+        a_offs = a_base + (k_start + offs_k[None, :]) * stride_ak
+        b_offs = (k_start + offs_k[:, None]) * stride_bk + b_base
+        tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, i))
+        tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, i))
+        tlx.async_load_commit_group([tok_a, tok_b])
+
+    tlx.async_load_wait_group(NUM_BUFFERS - 2)
+    a_tile = tlx.local_load(tlx.local_view(smemA, 0))
+    b_tile = tlx.local_load(tlx.local_view(smemB, 0))
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+
+    for tile_id in tl.range(0, K_ITERS - NUM_BUFFERS):
+        prefetch_buf = (tile_id % NUM_BUFFERS).to(tl.int32)
+        next_buf = ((tile_id + 1) % NUM_BUFFERS).to(tl.int32)
+        k_prefetch = (tile_id + NUM_BUFFERS) * BLOCK_K
+
+        with tlx.warp_pipeline_stage("mfma", priority=0):
+            acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+        with tlx.warp_pipeline_stage("mem", priority=1):
+            a_offs = a_base + (k_prefetch + offs_k[None, :]) * stride_ak
+            b_offs = (k_prefetch + offs_k[:, None]) * stride_bk + b_base
+            tok_a = tlx.async_load(A + a_offs.to(tl.int32), tlx.local_view(smemA, prefetch_buf))
+            tok_b = tlx.async_load(B + b_offs.to(tl.int32), tlx.local_view(smemB, prefetch_buf))
+            tlx.async_load_commit_group([tok_a, tok_b])
+            a_tile = tlx.local_load(tlx.local_view(smemA, next_buf))
+            b_tile = tlx.local_load(tlx.local_view(smemB, next_buf))
+
+        tlx.async_load_wait_group(NUM_BUFFERS - 2)
+
+    acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+    tlx.async_load_wait_group(0)
+    for i in tl.range(0, NUM_BUFFERS - 1, loop_unroll_factor=NUM_BUFFERS - 1):
+        buf = ((K_ITERS - (NUM_BUFFERS - 1) + i) % NUM_BUFFERS).to(tl.int32)
+        a_tile = tlx.local_load(tlx.local_view(smemA, buf))
+        b_tile = tlx.local_load(tlx.local_view(smemB, buf))
+        acc = tl.dot(a_tile, b_tile, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+
+    # --- partial-K tail ("sync-load the tail") ---
+    # K % BLOCK_K leftover columns: a masked async_load cannot lower on gfx950, so load them with a
+    # synchronous masked tl.load + one dot. Guarded on tail_width>0 so K % BLOCK_K == 0 pays nothing.
+    k_tail = K_ITERS * BLOCK_K
+    tail_width = K - k_tail
+    if tail_width > 0:
+        a_offs = a_base + (k_tail + offs_k[None, :]) * stride_ak
+        a_tail = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < tail_width, other=0.0)
+        b_offs = (k_tail + offs_k[:, None]) * stride_bk + b_base
+        b_tail = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < tail_width, other=0.0)
+        acc = tl.dot(a_tail, b_tail, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% else %}
+    # --- register-path fallback (USE_ASYNC=0: K % 8 != 0, e.g. odd K) ---
+    # buffer_load (tl.load) is element-granular, so it lowers for ANY row-stride alignment -- no
+    # direct-to-LDS 16-byte constraint -- and the masked tail handles K % BLOCK_K in the same loop.
+    # num_stages>1 (set by the heuristic) lets Triton's auto-pipeliner overlap the loads across
+    # K-iters; this is the register-staged path rocBLAS itself uses (buffer_load->registers->MFMA).
+    # ~0.76x rocBLAS on the odd-K compression bmm (T280910119) vs the async path's near-parity -- a
+    # working Triton candidate for shapes the async_copy path cannot legalize.
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    for k in range(0, K, BLOCK_K):
+        a_offs = a_base + (k + offs_k[None, :]) * stride_ak
+        b_offs = (k + offs_k[:, None]) * stride_bk + b_base
+        a_reg = tl.load(A + a_offs.to(tl.int32), mask=offs_k[None, :] < K - k, other=0.0)
+        b_reg = tl.load(B + b_offs.to(tl.int32), mask=offs_k[:, None] < K - k, other=0.0)
+        acc = tl.dot(a_reg, b_reg, acc, allow_tf32=ALLOW_TF32, out_dtype=ACC_TYPE)
+{% endif %}
+
+    # rematerialize rm/rn to save registers
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(INDEX_DTYPE)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(INDEX_DTYPE)
+    idx_q = batch_id
+    idx_m = rm[:, None]
+    idx_n = rn[None, :]
+    mask = (idx_m < M) & (idx_n < N)
+
+    # inductor generates a suffix (cast + batched store)
+    {{store_output(("idx_q", "idx_m", "idx_n"), "acc", "mask", val_shape=("BLOCK_M", "BLOCK_N"))}}

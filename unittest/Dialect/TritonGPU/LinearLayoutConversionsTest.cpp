@@ -163,6 +163,29 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
                           {S("dim0")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, NpotFmaDotUsesModularIdentity) {
+  auto parent =
+      blocked({1, 1}, {1, 32}, {1, 4}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto encoding = dot(parent, /*idx=*/0, /*kWidth=*/0);
+  auto layout = toLinearLayout({16, 96}, encoding);
+  auto pow2Cover = toLinearLayout({16, 128}, encoding);
+  auto expected =
+      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 16}, {S("dim1"), 96}},
+                   /*requireSurjective=*/true);
+  EXPECT_EQ(layout, expected);
+}
+
+TEST_F(LinearLayoutConversionsTest, NpotMfmaUsesModularIdentity) {
+  auto encoding = mfma(/*version=*/4, /*warps=*/{4, 1},
+                       /*instrShape=*/{32, 32, 16}, /*isTransposed=*/false);
+  auto layout = toLinearLayout({128, 96}, encoding);
+  auto pow2Cover = toLinearLayout({128, 128}, encoding);
+  auto expected =
+      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 128}, {S("dim1"), 96}},
+                   /*requireSurjective=*/true);
+  EXPECT_EQ(layout, expected);
+}
+
 TEST_F(LinearLayoutConversionsTest, CTADuplication) {
   auto layout = toLinearLayout(
       {32}, blocked({1}, {4}, {4}, /*cpg=*/{4}, /*cSplit=*/{2}, {0}, {0}));
@@ -2791,6 +2814,19 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                           {S("warp"), {{0}, {8}}},
                           {S("block"), {{0}, {64}}}},
                          {S("dim0")}));
+}
+
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
+  auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto layout = toLinearLayout({48}, slice(parent, 0));
+
+  EXPECT_EQ(layout,
+            LinearLayout({{S("register"), {{1}, {2}, {32}}},
+                          {S("lane"), {{4}, {8}, {16}, {0}, {0}}},
+                          {S("warp"), {{0}, {0}}},
+                          {S("block"), {}}},
+                         {{S("dim0"), 48}}, /*requireSurjective=*/true));
+  EXPECT_TRUE(layout.isModular());
 }
 
 TEST_F(LinearLayoutConversionsTest, SliceWithShape1) {
