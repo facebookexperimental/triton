@@ -110,3 +110,40 @@ tt.func @outer_loop_with_empty_inner(
 }
 
 }
+
+// -----
+
+//===----------------------------------------------------------------------===//
+// Edge case 3: A loop-carried async token is result 1 of tmem_load, whose
+// result 0 is a large tensor. The cross-WG recurrence is signal-only and must
+// not synthesize a channel from the unrelated tensor result.
+//===----------------------------------------------------------------------===//
+
+#acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+
+// CHECK: [PassB.2] Barrier: N1{{.*}}N0{{.*}}mbarrier{{.*}}expect=0B
+tt.func @token_only_cross_wg_recurrence(
+  %a: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+  %b: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+) {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i32 = arith.constant 1 : i32
+  %k_tiles = arith.constant 4 : i32
+  %true = arith.constant true
+  %acc, %init_token = ttng.tmem_alloc : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+  %last_token = scf.for %k = %c0_i32 to %k_tiles step %c1_i32 iter_args(%token = %init_token) -> (!ttg.async.token) : i32 {
+    %mma_token = ttng.tc_gen5_mma %a, %b, %acc[%token], %true, %true : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+    %value, %read_token = ttng.tmem_load %acc[%mma_token] : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> tensor<128x128xf32, #acc_layout>
+    scf.yield %read_token : !ttg.async.token
+  }
+
+  tt.return
+}
+
+}

@@ -471,6 +471,22 @@ def _render_memdesc_trans(op: Op, rctx: RenderCtx) -> str:
     return f"tlx.local_trans({inner})"
 
 
+def _underlying_memdesc_alloc_id(ref: OpRef, g: ScheduleGraph) -> str:
+    """Trace metadata-only memdesc transforms to their backing allocation."""
+    op_id = ref.op_id
+    seen: set[str] = set()
+    while op_id not in seen:
+        seen.add(op_id)
+        op = g.ops.get(op_id)
+        if op is None or op.kind != "ttg.memdesc_trans" or not op.operands:
+            break
+        inner = op.operands[0]
+        if not isinstance(inner, OpRef):
+            break
+        op_id = inner.op_id
+    return op_id
+
+
 def _subtiled_store_n_size_for_desc(op: Op, rctx: RenderCtx) -> int:
     """Pass A.7: if `op` (a make_tensor_descriptor) feeds a subtiled
     descriptor_store, return that store's sub-tile N width (n_size); else 0.
@@ -3344,7 +3360,9 @@ def _emit_warp_group(
             if len(mma_op.operands) > src_idx and isinstance(
                 mma_op.operands[src_idx], OpRef
             ):
-                mma_alloc_op_ids.add(mma_op.operands[src_idx].op_id)
+                mma_alloc_op_ids.add(
+                    _underlying_memdesc_alloc_id(mma_op.operands[src_idx], g)
+                )
     for fl in rctx.fn_scope_loads:
         load_op = fl["load_op"]
         already_emitted = fl["load_op_id"] in rctx._fn_load_emitted
