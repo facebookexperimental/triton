@@ -28,7 +28,7 @@ from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
-from triton.language.extra.tlx.tutorials.gfx9_gemm.a4w4.bench import (
+from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import (
     compile_shape as _compile_a4w4_shape,
     generate_mxfp4_inputs as _generate_a4w4_inputs,
     launch_matmul as _launch_a4w4,
