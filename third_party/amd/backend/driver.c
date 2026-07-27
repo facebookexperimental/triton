@@ -440,12 +440,16 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
 
   // create a struct to hold device properties
   return Py_BuildValue(
-      "{s:i, s:i, s:i, s:i, s:i, s:i, s:s, s:i, s:i, s:i}", "max_shared_mem",
-      props.sharedMemPerBlock, "max_num_regs", props.regsPerBlock,
+      "{s:K, s:K, s:i, s:i, s:i, s:i, s:i, s:i, s:s, s:i, s:i, s:i, s:i}",
+      "max_shared_mem", (unsigned long long)props.sharedMemPerBlock,
+      "max_shared_mem_per_sm",
+      (unsigned long long)props.sharedMemPerMultiprocessor, "max_num_regs",
+      props.regsPerBlock, "max_num_regs_per_sm", props.regsPerMultiprocessor,
       "multiprocessor_count", props.multiProcessorCount, "sm_clock_rate",
       props.clockRate, "mem_clock_rate", props.memoryClockRate, "mem_bus_width",
       props.memoryBusWidth, "arch", props.gcnArchName, "warpSize",
       props.warpSize, "max_threads_per_sm", props.maxThreadsPerMultiProcessor,
+      "max_blocks_per_sm", props.maxBlocksPerMultiProcessor,
       "cooperativeLaunch", props.cooperativeLaunch);
 }
 
