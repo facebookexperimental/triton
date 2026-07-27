@@ -1,6 +1,7 @@
 #include "IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -21,6 +22,50 @@ namespace tlx {
 #define GEN_PASS_DEF_TLXREWRITELOCALALIAS
 
 #include "tlx/dialect/include/Transforms/Passes.h.inc"
+
+namespace {
+
+// Keep this calculation in sync with MemDescReinterpretOp::verify. The
+// physical allocation is described by the layout-ranked suffix; leading
+// dimensions represent repeated pipeline copies of that layout.
+int64_t getMemDescStorageBits(ttg::MemDescType ty) {
+  auto rank = cast<ttg::LayoutEncodingTrait>(ty.getEncoding()).getRank();
+  auto shape = ty.getAllocShape().take_back(rank);
+  LinearLayout layout = isa<ttg::PaddedSharedEncodingAttr>(ty.getEncoding())
+                            ? ttg::paddedLinearLayout(shape, ty.getEncoding())
+                            : ttg::toLinearLayout(shape, ty.getEncoding());
+  int64_t numLayoutCopies = 1;
+  for (int64_t dim : ty.getAllocShape().drop_back(rank))
+    numLayoutCopies *= dim;
+  auto *ctx = ty.getContext();
+  bool isSharedMemory = isa<ttg::SharedMemorySpaceAttr>(ty.getMemorySpace());
+  auto dim = StringAttr::get(ctx, isSharedMemory ? "offset" : "col");
+  return numLayoutCopies * layout.getInDimSize(dim) *
+         ty.getElementTypeBitWidth();
+}
+
+// Materialize a zero-copy alias view while satisfying the tightened
+// MemDescReinterpret verifier. A destination view may be smaller than the
+// backing allocation; the verifier rejects only views that expose bytes past
+// that allocation. This preserves the existing shared- and tensor-memory
+// aliasing semantics, including non-integral logical element-size ratios.
+FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
+                               Location loc, Value base,
+                               ttg::MemDescType dstTy) {
+  auto srcTy = cast<ttg::MemDescType>(base.getType());
+  int64_t srcBits = getMemDescStorageBits(srcTy);
+  int64_t dstBits = getMemDescStorageBits(dstTy);
+
+  if (dstBits <= srcBits)
+    return ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base)
+        .getResult();
+
+  return errorOp->emitError()
+         << "TLXRewriteLocalAlias cannot view a " << srcBits
+         << "-bit allocation as a " << dstBits << "-bit alias";
+}
+
+} // namespace
 
 LogicalResult rewriteLocalAlias(ModuleOp m) {
   // Build a closure of all local_alloc and local_alias ops that share the same
@@ -164,11 +209,12 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
       builder.setInsertionPoint(baseAllocOp);
       auto baseAllocType =
           dyn_cast<ttg::MemDescType>(baseAllocOp->getResult(0).getType());
-      auto newAllocToBaseAllocOp = ttg::MemDescReinterpretOp::create(
-          builder, baseAllocOp->getLoc(), baseAllocType,
-          newAllocOp->getResult(0));
-      baseAllocOp->getResult(0).replaceAllUsesWith(
-          newAllocToBaseAllocOp.getResult());
+      FailureOr<Value> newAllocToBaseAlloc =
+          emitAliasView(builder, baseAllocOp, baseAllocOp->getLoc(),
+                        newAllocOp->getResult(0), baseAllocType);
+      if (failed(newAllocToBaseAlloc))
+        return failure();
+      baseAllocOp->getResult(0).replaceAllUsesWith(*newAllocToBaseAlloc);
       baseAllocOp->erase();
       baseAllocOp = newAllocOp;
     }
@@ -182,10 +228,13 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
         aliasOp->dump();
       });
       builder.setInsertionPoint(aliasOp);
-      auto aliasType = aliasOp.getResult().getType();
-      auto baseAllocToAliasOp = ttg::MemDescReinterpretOp::create(
-          builder, baseAllocOp->getLoc(), aliasType, baseAllocOp->getResult(0));
-      aliasOp.getResult().replaceAllUsesWith(baseAllocToAliasOp.getResult());
+      auto aliasType = cast<ttg::MemDescType>(aliasOp.getResult().getType());
+      FailureOr<Value> baseAllocToAlias =
+          emitAliasView(builder, aliasOp, baseAllocOp->getLoc(),
+                        baseAllocOp->getResult(0), aliasType);
+      if (failed(baseAllocToAlias))
+        return failure();
+      aliasOp.getResult().replaceAllUsesWith(*baseAllocToAlias);
       aliasOp->erase();
     }
   }

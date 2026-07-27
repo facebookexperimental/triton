@@ -70,6 +70,22 @@ namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace ir {
 
+// Elementwise casts must keep an existing concrete tensor ownership unless
+// the caller explicitly supplies a different destination encoding.  The
+// An ordinary frontend cast may supply only shape and element type, so an
+// unencoded destination type would otherwise make arith.extf/truncf invalid
+// when its operand came from an explicit MFMA or distributed layout.
+static Type inheritTensorEncoding(Value src, Type dstType) {
+  auto srcTensorType = dyn_cast<RankedTensorType>(src.getType());
+  auto dstTensorType = dyn_cast<RankedTensorType>(dstType);
+  if (!srcTensorType || !dstTensorType || !srcTensorType.getEncoding() ||
+      dstTensorType.getEncoding())
+    return dstType;
+  return RankedTensorType::get(dstTensorType.getShape(),
+                               dstTensorType.getElementType(),
+                               srcTensorType.getEncoding());
+}
+
 // Pointer to the TritonOpBuilder class, used to register IR ops for third-party
 // dialects.
 static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
@@ -1394,11 +1410,13 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_fp_ext",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
-             return self.create<arith::ExtFOp>(dstType, src);
+             return self.create<arith::ExtFOp>(
+                 inheritTensorEncoding(src, dstType), src);
            })
       .def("create_fp_trunc",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
-             return self.create<arith::TruncFOp>(dstType, src);
+             return self.create<arith::TruncFOp>(
+                 inheritTensorEncoding(src, dstType), src);
            })
       .def("create_int_cast",
            [](TritonOpBuilder &self, Value &src, Type &dstType,

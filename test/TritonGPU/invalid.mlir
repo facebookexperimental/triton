@@ -267,6 +267,19 @@ tt.func public @memdesc_reinterpret_subview(%arg0: !ttg.memdesc<8x16xf16, #share
     tt.return
 }
 
+// -----
+
+#shared_linear_src = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [1, 0], [2, 0], [4, 0], [8, 0]]}, alignment = 16>
+#shared_linear_dst = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0]]}, alignment = 16>
+#smem = #ttg.shared_memory
+tt.func public @memdesc_reinterpret_oversized_shared_linear(%arg0: !ttg.memdesc<16x16xf16, #shared_linear_src, #smem>) {
+    // expected-error @+1 {{result logical storage size must not exceed source logical storage size}}
+    %a = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<16x16xf16, #shared_linear_src, #smem> -> !ttg.memdesc<32x16xf16, #shared_linear_dst, #smem>
+    tt.return
+}
+
+// -----
+
 #mma0 = #ttg.nvidia_mma<{versionMajor=2, warpsPerCTA=[1,1], instrShape = [16, 8]}>
 #dot_operand_a = #ttg.dot_op<{opIdx=0, parent=#mma0, kWidth=2}>
 #dot_operand_b = #ttg.dot_op<{opIdx=1, parent=#mma0, kWidth=2}>
