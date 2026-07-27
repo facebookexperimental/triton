@@ -322,26 +322,19 @@ def _a4w4_kernel(
     c_right_delta = tl.mul(HALF_N, stride_cn, sanitize_overflow=False)
     c_right_offsets = tl.add(c_left_offsets, c_right_delta, sanitize_overflow=False)
     c_tile_base = c_ptr + pid_m * BLOCK_M * stride_cm
-    # Keep this require -> cast -> release -> require ordering. The dot loop
-    # leaves its accumulator layout inferred, so the first require freezes the
-    # concrete MFMA register distribution and makes the bf16 cast register-local.
-    # Releasing only after the cast stops the coalesced store requirement from
-    # propagating back to the f32 accumulator; without this boundary, f32 is
-    # redistributed through LDS before narrowing (+32 writes and +32 reads).
+    # Pin the accumulator layout before narrowing so that the store-layout
+    # requirement redistributes bf16 rather than propagating back to f32
+    # (+32 LDS writes and +32 LDS reads).
     acc_left = tlx.require_layout(acc_left, accumulator_layout)
-    c_left = tlx.require_layout(
-        tlx.release_layout(acc_left.to(c_ptr.dtype.element_ty)),
-        store_layout_c,
-    )
+    c_left = acc_left.to(c_ptr.dtype.element_ty)
+    c_left = tlx.require_layout(c_left, store_layout_c)
     tlx.buffer_store(c_left, c_tile_base, c_left_offsets)
 
     acc_right = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
     c_right_offsets = tlx.require_layout(c_right_offsets, store_layout_c)
     acc_right = tlx.require_layout(acc_right, accumulator_layout)
-    c_right = tlx.require_layout(
-        tlx.release_layout(acc_right.to(c_ptr.dtype.element_ty)),
-        store_layout_c,
-    )
+    c_right = acc_right.to(c_ptr.dtype.element_ty)
+    c_right = tlx.require_layout(c_right, store_layout_c)
     tlx.buffer_store(c_right, c_tile_base, c_right_offsets)
 
 
