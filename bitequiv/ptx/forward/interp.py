@@ -19,7 +19,7 @@ from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
 from bitequiv.ptx.builder import collapse_balanced, tree_hash
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
-from bitequiv.ptx.treeir import FpOp, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine
+from bitequiv.ptx.treeir import FpOp, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
@@ -58,6 +58,13 @@ class ForwardInterp:
         self.ev = AffineEval(self.du, ntid)
         self.colev = AffineEval(self.du, ntid, absorb_opaque=True)
         self.regs = {}  # reg name -> value-DAG Node (or a transient _Shuffle marker)
+        # Forward shared-memory model: (stream_index, stored_value_node) for each scalar shared store,
+        # in program order. A shared load resolves to the most-recent prior store's value subtree
+        # (the single-reduction canonical cross-warp exchange), wrapped in a SmemExchange. Because we
+        # walk FORWARD, the store's value is already in the register state when the load reads it —
+        # the cross-warp fan-in is captured by construction, not inverted/guessed as in the backward
+        # resolver. (Vector shared stores + address-matched multi-buffer resolution are Phase 2b.)
+        self.smem_stores = []
         # Sound floor: set False when the walk hits a cross-thread structure this phase does not
         # model faithfully (a cross-warp shared load). The reconstructed tree is then untrustworthy
         # for the verbatim hash (it would over-merge across num_warps), so forward_descriptor falls
@@ -94,6 +101,11 @@ class ForwardInterp:
                 elts = val.elements if isinstance(val, VectorOperand) else [val]
                 roots.extend(self._node(e, at) for e in elts if isinstance(e, RegisterOperand))
                 continue
+            if op == "st" and ".shared" in mods and len(inst.operands) >= 2:
+                val = inst.operands[1]  # scalar shared store: record its value for later loads
+                if isinstance(val, RegisterOperand):
+                    self.smem_stores.append((at, self._node(val, at)))
+                continue
             defs = _def_regs(inst)
             if not defs:
                 continue
@@ -113,8 +125,13 @@ class ForwardInterp:
         """Value produced by a non-load, non-store instruction, or ``None`` when it writes no
         value-domain register (an integer/address op)."""
         op, mods = inst.opcode, inst.modifiers
-        if (op == "ld" and ".shared" in mods) or op == "ldmatrix":
-            self.faithful = False  # cross-warp shared-memory exchange not modeled yet (Phase 2)
+        if op == "ld" and ".shared" in mods:
+            src = self._match_smem(at)
+            if src is not None:
+                return SmemExchange(src)  # cross-warp exchange: read the stored partial's subtree
+            self.faithful = False  # unmatched shared load -> fail closed (opaque fallback below)
+        elif op == "ldmatrix":
+            self.faithful = False  # ldmatrix hardware-transpose relocation -> Phase 2b
         if op == "shfl" and ".bfly" in mods and len(inst.operands) >= 3:
             return _Shuffle(self._node(inst.operands[1], at), _offset(inst.operands[2]))
         if op == "mov" and len(inst.operands) == 2 and isinstance(inst.operands[1], RegisterOperand):
@@ -129,6 +146,25 @@ class ForwardInterp:
         # pure integer/address op is stored too but never pulled into a value tree (value ops read
         # value operands; addresses go through the affine domain), so this is harmless and lazy at
         # the descriptor level (the descriptor only traverses the roots' value-DAG).
+        # An unmodeled op that CONSUMES a _Shuffle (directly, or via a `mov.b64` / packed vector of
+        # shuffled halves) would have `_node` silently STRIP the butterfly partner -> the reduction
+        # ORDERING (inner_tree count-up vs unordered count-down) is lost -> OVER-MERGE. Measured at
+        # the heavy grid: sum_4d / softmax / rmsnorm do their reduction in PACKED `.f32x2` (the shfls
+        # are buried in `mov.b64`/`add.f32x2`), collapsing the two orderings to one descriptor. Fail
+        # closed here; the fingerprint's ordered shfl sequence then distinguishes them. A benign
+        # opaque with NO shuffled operand (sum's within-thread packed fold, an f64 `or.b64`, a `cvt`)
+        # keeps faithful=True and still recovers. Phase 3 (packed decomposition) will RECONSTRUCT
+        # these instead of fail-closing.
+        def _shuf(o):
+            if isinstance(o, RegisterOperand):
+                return isinstance(self._val(o, at), _Shuffle)
+            if isinstance(o, VectorOperand):
+                return any(isinstance(e, RegisterOperand) and isinstance(self._val(e, at), _Shuffle)
+                           for e in o.elements)
+            return False
+
+        if any(_shuf(o) for o in inst.operands[1:]):
+            self.faithful = False
         reg_ops = [o for o in inst.operands[1:] if isinstance(o, RegisterOperand)]
         others = [o for o in inst.operands[1:] if not isinstance(o, RegisterOperand)]
         tok = op + "".join(mods)
@@ -138,12 +174,35 @@ class ForwardInterp:
 
     def _combine(self, inst, at):
         a, b = inst.operands[1], inst.operands[2]
-        if inst.opcode == "add":  # within-warp butterfly: add(p, shfl.bfly(p, off))
-            va, vb = self._val(a, at), self._val(b, at)
-            for x, y in ((va, vb), (vb, va)):
-                if isinstance(y, _Shuffle) and y.child is x:
-                    return ShflCombine(y.offset, "add", inst.modifiers, x)
+        va, vb = self._val(a, at), self._val(b, at)
+        # within-warp butterfly `op(p, shfl.bfly(p, off))` -> ShflCombine, for ANY reduce op (add,
+        # min, max, ...), not just add. The offset + op ride verbatim into the node signature, so it
+        # is sound even before the collapse recognizes min/max as reduce ops (Phase 3) — it over-
+        # splits (no num_warps recovery for min/max yet) but never over-merges.
+        for x, y in ((va, vb), (vb, va)):
+            if isinstance(y, _Shuffle) and y.child is x:
+                return ShflCombine(y.offset, inst.opcode, inst.modifiers, x)
+        # A `_Shuffle` operand NOT consumed as a butterfly (e.g. a max/min butterfly whose source
+        # isn't the sibling, or a cross-lane idiom we don't model) would be silently stripped by
+        # `_node` -> the cross-lane structure is lost -> OVER-MERGE. Fail closed instead (this was the
+        # softmax/rmsnorm heavy over-merge: their max butterfly `max(p, shfl(p))` collapsed to
+        # `max(p,p)`). `y.child is x` above catches the real butterflies; anything else fails closed.
+        if isinstance(va, _Shuffle) or isinstance(vb, _Shuffle):
+            self.faithful = False
         return FpOp(inst.opcode, inst.modifiers, tuple(self._node(o, at) for o in (a, b)))
+
+    def _match_smem(self, at):
+        """Value subtree of the most-recent shared store before ``at`` (the single-reduction
+        canonical cross-warp exchange), or ``None`` if there is none. Because the walk is forward,
+        the stored value is already reconstructed — Phase 2b adds address-matched multi-buffer
+        resolution + vector/ldmatrix relocation; this covers the common one-buffer exchange."""
+        node = None
+        for i, n in self.smem_stores:
+            if i < at:
+                node = n
+            else:
+                break
+        return node
 
     def fingerprint(self):
         """Conservative per-config key used when the reconstruction is not faithful. Folds the
@@ -153,7 +212,7 @@ class ForwardInterp:
         scale with num_warps), the shared-store width multiset, and the fp-combine count. It
         over-splits (loses num_warps recovery on the unmodeled idiom), which later phases lift."""
         ntid = ",".join(f"{k}{v}" for k, v in sorted(self.ev.reqntid.items())) or "?"
-        shfl, stores, fp = [], {}, 0
+        shfl, stores, fp, fma = [], {}, 0, 0
         for inst in self.flat:
             is_fp = inst.modifiers and any(t in inst.modifiers[-1] for t in (".f16", ".f32", ".f64", ".bf16"))
             if inst.opcode == "shfl" and ".bfly" in inst.modifiers and len(inst.operands) >= 3:
@@ -161,10 +220,14 @@ class ForwardInterp:
             elif inst.opcode == "st" and ".shared" in inst.modifiers:
                 w = "".join(m for m in inst.modifiers if m != ".shared") or ".b32"
                 stores[w] = stores.get(w, 0) + 1
+            elif inst.opcode == "fma" and is_fp:
+                fma += 1  # counted SEPARATELY from mul+add: fp_fusion on (fma) vs off (mul+add) can
+                #           have the same TOTAL op count (a coincidental collision), so keying fma
+                #           apart is what keeps fp_fusion split in the fail-closed floor.
             elif inst.opcode in _FP_KINDS and is_fp:
                 fp += 1
         stores_s = ",".join(f"{w}x{n}" for w, n in sorted(stores.items()))
-        return f"fwd-incomplete|ntid={ntid}|shfl={','.join(shfl)}|st={stores_s}|fp={fp}"
+        return f"fwd-incomplete|ntid={ntid}|shfl={','.join(shfl)}|st={stores_s}|fp={fp}|fma={fma}"
 
 
 def forward_descriptor(func):
@@ -176,7 +239,14 @@ def forward_descriptor(func):
     roots = interp.run()
     if not interp.faithful:
         return (interp.fingerprint(), )
-    collapsed = [collapse_balanced(t) for t in roots]
+    # G3 guard (mirrors the backward `entry_signatures`): the layout-drop collapse is num_warps-
+    # INVARIANT only when ALL of the entry's threads reduce into ONE output. With MULTIPLE outputs
+    # (a 2-D / multi-axis tile reduced per row), num_warps RE-PARTITIONS the threads among the outputs
+    # and re-associates each output's reduction, so collapsing there OVER-MERGES — measured: sum_4d /
+    # softmax / rmsnorm inner_tree vs unordered collapsed to the same descriptor at the heavy grid.
+    # So collapse only a single-output entry; keep a multi-output entry's trees VERBATIM (sound,
+    # over-split — num_warps recovery for multi-output is later, layout-aware work).
+    collapsed = [collapse_balanced(roots[0])] if len(roots) == 1 else roots
     return tuple(sorted(tree_hash(t) for t in collapsed))
 
 
@@ -190,7 +260,7 @@ def forward_module_descriptor(ptx):
     from pyptx.parser import parse
     from pyptx.parser.parser import ParseError
 
-    from bitequiv.ptx_reduction import _ensure_header, _Unparseable
+    from bitequiv.ptx_reduction import _ensure_header, _loop_steps, _mma_guard, _Unparseable
     if not ptx:
         return ()
     try:
@@ -201,10 +271,15 @@ def forward_module_descriptor(ptx):
     for f in module.directives:
         if not (isinstance(f, Function) and f.is_entry):
             continue
-        sig = forward_descriptor(f)
-        if sig:
-            out.append("|".join(sig))
-        else:
+        parts = list(forward_descriptor(f))
+        if not parts:  # no reconstructed reduction -> keep launch geometry as the empty-sig guard
             ntid = reqntid_of(f)
-            out.append("ntid=" + (",".join(f"{k}{v}" for k, v in sorted(ntid.items())) if ntid else "?"))
+            parts.append("ntid=" + (",".join(f"{k}{v}" for k, v in sorted(ntid.items())) if ntid else "?"))
+        steps = _loop_steps(f)  # BLOCK_N cross-chunk fence: the straight-line walk cannot follow the
+        if steps:               # loop back-edge, so a looped/persistent reduction (sum_dim1_persistent)
+            parts.append("loops=" + ",".join(map(str, steps)))  # would over-merge without this (sound)
+        guard = _mma_guard(f)  # conservative MMA fence until Phase 4 models the collective op forward
+        if guard:
+            parts.append(guard)
+        out.append("|".join(parts))
     return tuple(sorted(out))
