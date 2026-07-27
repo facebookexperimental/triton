@@ -1,6 +1,5 @@
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Membar.h"
-#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
@@ -93,7 +92,8 @@ bool ignoreOpForProxyFence(Operation *op) {
              triton::nvidia_gpu::InvalBarrierOp>(op);
 }
 
-bool filterFn(Operation *op, Operation *other, Allocation *allocation) {
+bool filterFn(Operation *op, Operation *other, bool /*opIsRead*/,
+              bool /*otherIsRead*/, Allocation *allocation) {
   return ignoreOpForProxyFence(other);
 }
 
@@ -150,7 +150,7 @@ void ProxyFenceAnalysis::update(Operation *op, BlockInfo *blockInfo,
           for (auto bufferId : allocation->getAllBufferIdsWithAliases(value)) {
             if (bufferId != Allocation::InvalidBufferId) {
               auto interval = allocation->getAllocatedInterval(bufferId);
-              auto slice = AllocationSlice(value, interval);
+              auto slice = AllocationSlice(value, interval, bufferId);
 
               if (isAsyncProxyWrite(op) && value == getSmemDest(op)) {
                 proxyBlockInfo.syncWriteSlices[slice].insert(op);
