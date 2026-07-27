@@ -26,6 +26,21 @@ struct GetNumProgramsOpConversion
   }
 };
 
+struct Clock64OpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::Clock64Op> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::gpu::Clock64Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto readClock = LLVM::createLLVMIntrinsicCallOp(rewriter, op.getLoc(),
+                                                     "llvm.amdgcn.s.memtime",
+                                                     rewriter.getI64Type(), {});
+    rewriter.replaceOp(op, readClock.getResult(0));
+    return success();
+  }
+};
+
 struct CondBarrierOpConversion
     : public ConvertOpToLLVMPattern<triton::amdgpu::CondBarrierOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -57,5 +72,6 @@ void mlir::triton::AMD::populateSPMDOpToLLVMPattern(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
   patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);
+  patterns.add<Clock64OpConversion>(typeConverter, benefit);
   patterns.add<CondBarrierOpConversion>(typeConverter, benefit);
 }
