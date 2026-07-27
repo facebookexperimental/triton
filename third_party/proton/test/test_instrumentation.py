@@ -369,7 +369,9 @@ def test_no_scope_zero_scratch(tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_no_scope_zero_scratch.hatchet"
 
     with instrumentation(temp_file):
+        # Previously raised ZeroDivisionError in _populate_host_buffer.
         add_kernel[(1, 1, 1)](x, y, output, size, BLOCK_SIZE=1024, num_warps=4)
+        # Header is still built even though there is no profile-scratch payload.
         assert proton.hooks.InstrumentationHook.host_buffer is not None
 
 
