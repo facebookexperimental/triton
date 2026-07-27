@@ -16,10 +16,10 @@ accumulating MMA — the loop-carried recurrence.
 
 Dependences admit two order families for read(s2) inside the compute warp's
 in-order stream: coalesced with read(s1) before the chain, or deferred until
-just before the combine. Both are model-equivalent (same II / objective /
-partition); the emitted kernels differ on hardware via TMEM slot-release
-timing and TC-pipe serialization (case4 measured 292.8 vs 269.6 TF for the
-same axis).
+just before the combine. Both have the same II, partition feasibility, and
+primary objective. The joint solver's lowering secondary prefers the deferred
+read; the emitted kernels differ on hardware via TMEM slot-release timing and
+TC-pipe serialization (case4 measured 292.8 vs 269.6 TF for the same axis).
 
 Dump the pre-modulo TTGIR with (single GPU compile, small shape):
 
