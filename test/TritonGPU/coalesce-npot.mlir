@@ -14,7 +14,7 @@
 // carries the vectorized load.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
+  // CHECK: [[$COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 4], warpsPerCTA = [4, 1], order = [1, 0]}>
   // CHECK-LABEL: @npot_load_48_vec8
   tt.func public @npot_load_48_vec8(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) {
     %0 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
@@ -28,7 +28,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     %7 = arith.addi %5, %6 : tensor<64x48xi32, #blocked>
     %8 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x48x!tt.ptr<f16>, #blocked>
     %9 = tt.addptr %8, %7 : tensor<64x48x!tt.ptr<f16>, #blocked>, tensor<64x48xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x48x!tt.ptr<f16>, [[COALESCED]]>
+    // CHECK: tt.load {{.*}} : tensor<64x48x!tt.ptr<f16>, [[$COALESCED]]>
     %10 = tt.load %9 : tensor<64x48x!tt.ptr<f16>, #blocked>
     tt.return
   }
@@ -40,12 +40,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // (32) and the strided dim takes the remaining 2 lanes: threadsPerWarp = [2, 32].
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+  // CHECK: [[$COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [2, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
   // CHECK-LABEL: @npot_load_48
   tt.func public @npot_load_48(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: tensor<64x48xi32, #blocked>) {
     %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x48x!tt.ptr<f16>, #blocked>
     %1 = tt.addptr %0, %arg1 : tensor<64x48x!tt.ptr<f16>, #blocked>, tensor<64x48xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x48x!tt.ptr<f16>, [[COALESCED]]>
+    // CHECK: tt.load {{.*}} : tensor<64x48x!tt.ptr<f16>, [[$COALESCED]]>
     %2 = tt.load %1 : tensor<64x48x!tt.ptr<f16>, #blocked>
     tt.return
   }
@@ -58,12 +58,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // remaining warps spread over both dims. This case worked before the fix.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
+  // CHECK: [[$COALESCED:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [2, 2], order = [1, 0]}>
   // CHECK-LABEL: @npot_load_192
   tt.func public @npot_load_192(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: tensor<64x192xi32, #blocked>) {
     %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x192x!tt.ptr<f16>, #blocked>
     %1 = tt.addptr %0, %arg1 : tensor<64x192x!tt.ptr<f16>, #blocked>, tensor<64x192xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x192x!tt.ptr<f16>, [[COALESCED]]>
+    // CHECK: tt.load {{.*}} : tensor<64x192x!tt.ptr<f16>, [[$COALESCED]]>
     %2 = tt.load %1 : tensor<64x192x!tt.ptr<f16>, #blocked>
     tt.return
   }
@@ -77,12 +77,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // the flag is on or off (see coalesce.mlir for the flag-off pow2 suite).
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[POW2LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+  // CHECK: [[$POW2LAYOUT:#.*]] = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
   // CHECK-LABEL: @pow2_load_64
   tt.func public @pow2_load_64(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: tensor<64x64xi32, #blocked>) {
     %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<64x64x!tt.ptr<f16>, #blocked>
     %1 = tt.addptr %0, %arg1 : tensor<64x64x!tt.ptr<f16>, #blocked>, tensor<64x64xi32, #blocked>
-    // CHECK: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>, [[POW2LAYOUT]]>
+    // CHECK: tt.load {{.*}} : tensor<64x64x!tt.ptr<f16>, [[$POW2LAYOUT]]>
     %2 = tt.load %1 : tensor<64x64x!tt.ptr<f16>, #blocked>
     tt.return
   }
@@ -97,10 +97,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // warps there.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 1, 64], warpsPerCTA = [1, 4, 1], order = [2, 1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
-  // CHECK: [[RANK3:#.*]] = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 16, 4], warpsPerCTA = [1, 4, 1], order = [2, 1, 0]}>
+  // CHECK: [[$RANK3:#.*]] = #ttg.blocked<{sizePerThread = [1, 1, 1], threadsPerWarp = [1, 16, 4], warpsPerCTA = [1, 4, 1], order = [2, 1, 0]}>
   // CHECK-LABEL: @npot_rank3_uses_assigned_threads
   tt.func public @npot_rank3_uses_assigned_threads(%arg0: tensor<1x64x5x!tt.ptr<f16>, #blocked> {tt.contiguity = dense<[1, 1, 1]> : tensor<3xi32>}) {
-    // CHECK: tt.load {{.*}} : tensor<1x64x5x!tt.ptr<f16>, [[RANK3]]>
+    // CHECK: tt.load {{.*}} : tensor<1x64x5x!tt.ptr<f16>, [[$RANK3]]>
     %0 = tt.load %arg0 : tensor<1x64x5x!tt.ptr<f16>, #blocked>
     tt.return
   }

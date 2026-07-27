@@ -1195,7 +1195,11 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
         B = torch.randn((N, K), dtype=dtype, device=device)
         C = torch.empty((M, N), dtype=dtype, device=device)
 
-        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N // NUM_CTAS)
+        # Count 256-wide (BLOCK_SIZE_N) tiles, matching the kernel's num_pid_n and
+        # _unified_num_tiles. A 2-CTA cluster cooperates on ONE such tile, so the grid
+        # is the tile count (NonPersistent launches exactly one cluster per tile and,
+        # unlike the persistent schedulers, has no is_valid guard to drop the surplus).
+        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
         num_tiles = triton.cdiv(num_tiles, NUM_CTAS) * NUM_CTAS
         if SCHEDULE in (tl.NonPersistentScheduler, tl.ClcTileScheduler):
             grid_size = num_tiles
@@ -1261,8 +1265,14 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             assert "ttng.clc_try_cancel" in ttgir, "Expected CLC scheduling in IR"
             assert "tt.atomic_rmw" not in ttgir, "CLC must not use the atomic tile counter"
         if SCHEDULE in (tl.DynamicPersistent1DScheduler, tl.ClcTileScheduler):
-            assert "tt.scheduled_max_stage" in ttgir, "Expected the nested K loop to retain its stage count"
-            assert "loop.stage" in ttgir, "Expected the nested K loop operations to retain their stage assignments"
+            # A warp-specialized outer scf.while keeps its inner K loop physically
+            # warp-specialized (ttg.partition.stages, asserted via ttg.warp_specialize
+            # below) but NOT software-pipelined, so the pipeliner's stage bookkeeping
+            # is intentionally absent (see partition-scheduler bugs #14/#15). The
+            # SoftwarePipeliner also strips these attrs in removePipeliningAttributes
+            # for every schedule, so their presence is never a valid final-IR check.
+            assert "tt.scheduled_max_stage" not in ttgir, "Outer-while K loop must be left unpipelined (no stage count)"
+            assert "loop.stage" not in ttgir, "Outer-while K loop must carry no software-pipeliner stage assignments"
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
         assert "ttng.tc_gen5_mma" in ttgir or "ttng.warp_group_dot" in ttgir, "Expected an MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
