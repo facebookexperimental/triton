@@ -238,9 +238,13 @@ Required coverage:
    from an initially unpartitioned outer while, extended through code
    partitioning, physical specialization, depth-2 slot/phase rotation, and
    nested K-loop rescheduling. (`ws_atomic_broadcast_from_psm.mlir`.)
-4. **Unified E2E** [Blackwell done]: `DynamicPersistent1DScheduler` and
-   `ClcTileScheduler` with outer `tl.condition(..., warp_specialize=True)` and
-   an unannotated K loop. The dynamic scheduler remains pending on Hopper.
+4. **Unified E2E** [Blackwell done; Hopper test added, run pending]:
+   `DynamicPersistent1DScheduler` and `ClcTileScheduler` with outer
+   `tl.condition(..., warp_specialize=True)` and an unannotated K loop, on
+   Blackwell. A dedicated `is_hopper()`-gated dynamic test
+   (`test_tutorial09_..._while_loop_warp_specialize_hopper`, 5 Hopper-capable
+   configs incl. DP=2 at BLOCK_M=128) now exists but is skipped on Blackwell and
+   awaits an SM90 run.
 5. **Feature E2E** [Blackwell done]: epilogue subtiles, DP=2, separate epilogue
    store, generated subtiled regions, and broadcast depths greater than one are
    all exercised by the 16-configuration unified matrix
@@ -263,7 +267,8 @@ Required coverage:
    `bailOut`/`removeWarpSpecMetadata` teardown. ("non-carried" and
    "unrelated-replicated" are the same `getLoopCarryingWhile==null` check.)
 7. **Hopper and Blackwell**: CLC sibling correctness is covered on Blackwell;
-   unified dynamic atomic correctness remains to be run on Hopper.
+   unified dynamic atomic correctness on Hopper now has a dedicated gated test
+   (see #4) but has not yet been executed on SM90 hardware.
 8. **Performance**: compare static persistent, dynamic inner-loop AutoWS,
    dynamic outer-loop AutoWS at depth 1, and tuned broadcast depth.
 
