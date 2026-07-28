@@ -310,7 +310,8 @@ def _load_tlx_gfx9_inter_wave_bench_module(module_name="_tlx_wave_test_gfx9_inte
 
 def _load_tlx_gfx9_a4w4_module(module_name="_tlx_wave_test_gfx9_a4w4"):
     repo_root = Path(__file__).resolve().parents[4]
-    kernel_path = repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "a4w4" / "matmul_kernel.py"
+    kernel_path = (repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "intra_wave" / "a4w4" /
+                   "matmul_kernel.py")
     spec = importlib.util.spec_from_file_location(module_name, kernel_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -319,7 +320,7 @@ def _load_tlx_gfx9_a4w4_module(module_name="_tlx_wave_test_gfx9_a4w4"):
 
 def _load_tlx_gfx9_a4w4_bench_module(module_name="_tlx_wave_test_gfx9_a4w4_bench"):
     repo_root = Path(__file__).resolve().parents[4]
-    bench_dir = repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "a4w4"
+    bench_dir = repo_root / "third_party" / "tlx" / "tutorials" / "gfx9_gemm" / "intra_wave" / "a4w4"
     bench_path = bench_dir / "bench.py"
     before_path = list(sys.path)
     previous_kernel_module = sys.modules.get("matmul_kernel")
@@ -6501,7 +6502,7 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
                 pending.extend(join_inputs.get(current, ()))
             return inputs
 
-        # Five barriers publish explicit wait completion for LDS consumers.
+        # Six barriers publish explicit wait completion for LDS consumers.
         # Compiler and full-memory source barriers order issue via projections;
         # DMA never consumes their raw result or an LDS-release token.
         assert len(barrier_lines) == 12
@@ -6523,11 +6524,11 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
             for token in barrier_issue_tokens
             if any(f"after {token}" in line for line in dma_lines)
         }
-        assert len(load_ready_tokens) == 5
+        assert len(load_ready_tokens) == 6
         assert dma_barrier_tokens == set()
         assert len(dma_barrier_issue_tokens) == 1
         other_barrier_tokens = barrier_tokens - load_ready_tokens
-        assert len(other_barrier_tokens) == 6
+        assert len(other_barrier_tokens) == 5
         assert (load_ready_tokens | other_barrier_tokens == barrier_tokens)
         dependency_free_barrier_tokens = {
             _ssa_result_name(line)
