@@ -30,6 +30,12 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
                                                 int tmemColLimit = 512,
                                                 int numSamples = 1000);
 
+/// Explore exact two-stage GEMM assignments. Non-GEMM computation is
+/// contracted for ranking while the original DDG remains authoritative for
+/// dependence and resource legality.
+FailureOr<ModuloScheduleResult>
+runContractedSearch(const DataDependenceGraph &ddg, int maxII = 0);
+
 } // namespace mlir::triton::gpu
 
 #endif // TRITON_NVIDIA_HOPPER_MODULO_SCHEDULING_EXHAUSTIVE_H

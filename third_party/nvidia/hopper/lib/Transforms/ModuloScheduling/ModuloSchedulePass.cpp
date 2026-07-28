@@ -41,6 +41,7 @@ int doTaskIdPropagate(triton::FuncOp &funcOp);
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/JSON.h"
 #include <queue>
 
 #include <limits>
@@ -76,12 +77,59 @@ namespace {
 //   tt.num_buffers — buffer depth (copies needed for lifetime coverage)
 //   buffer.id      — unique buffer index within the ScheduleGraph
 //
+// STANDALONE_MODULO with an exploration scheduler: emit ONLY the SWP schedule
+// (loop.stage/loop.cluster) and let downstream PartitionSchedulingMeta derive
+// partitions, exactly like the default/list-schedule path. In this mode we skip
+// every "modulo owns partitioning" marker (per-op ttg.partition, the epilogue
+// partition, ttg.partition_num_warps / ttg.partition.stages /
+// ttg.warp_specialize.tag, tt.modulo_ii, and the tt.autows MMA annotations) so
+// the IR stays partition-free and verifies without the follow-up WS passes.
+static bool isStandaloneModulo() {
+  if (!triton::tools::getBoolEnv("STANDALONE_MODULO"))
+    return false;
+  auto scheduler = triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+  return scheduler == "exhaustive" || scheduler == "contracted";
+}
+
+// In STANDALONE mode the scheduler OWNS the loop schedule, so a tt.autows
+// annotation's stage/order fields would be a stale, conflicting schedule.
+// Strip them but KEEP the `channels` array: PromoteLHSToTMem (which runs
+// before this pass) and the downstream WS memory planner read the operand
+// memory-space hints ("opndA,tmem"/"opndA,smem") from there. If nothing but
+// the schedule was present, drop the attribute entirely so this loop reads as
+// unannotated to everything downstream.
+static void stripScheduleKeepMemtype(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return;
+  }
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return;
+  obj->erase("stage");
+  obj->erase("order");
+  auto *channelsArr = obj->getArray("channels");
+  if (!channelsArr || channelsArr->empty()) {
+    op->removeAttr("tt.autows");
+    return;
+  }
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  os << llvm::json::Value(std::move(*obj));
+  op->setAttr("tt.autows", StringAttr::get(op->getContext(), out));
+}
+
 static void emitScheduleFromGraph(scf::ForOp loop,
                                   const ttg::ScheduleGraph &graph,
                                   const ttg::DataDependenceGraph &ddg) {
   const auto &schedLoop = graph.getLoop(0);
   const int II = schedLoop.II;
   auto ctx = loop.getContext();
+  const bool standalone = isStandaloneModulo();
 
   // ── 1. Per-op: loop.stage / loop.cluster ──
   // Derive stage from cycle/II. Derive cluster from cycle ordering within
@@ -98,6 +146,18 @@ static void emitScheduleFromGraph(scf::ForOp loop,
     for (int i = 0, e = cycles.size(); i < e; ++i)
       stageAndCycleToCluster[stage][cycles[i]] = i;
   }
+  llvm::DenseMap<int, int> moduloCycleToCluster;
+  const bool contracted =
+      triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE") == "contracted";
+  if (contracted) {
+    SmallVector<int> moduloCycles;
+    for (const auto &node : schedLoop.nodes)
+      moduloCycles.push_back(node.cycle % II);
+    llvm::sort(moduloCycles);
+    moduloCycles.erase(llvm::unique(moduloCycles), moduloCycles.end());
+    for (int i = 0, e = moduloCycles.size(); i < e; ++i)
+      moduloCycleToCluster[moduloCycles[i]] = i;
+  }
 
   int maxStage = 0;
   for (const auto &node : schedLoop.nodes) {
@@ -109,7 +169,8 @@ static void emitScheduleFromGraph(scf::ForOp loop,
     if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
       continue;
     int stage = node.cycle / II;
-    int clusterId = stageAndCycleToCluster[stage][node.cycle];
+    int clusterId = contracted ? moduloCycleToCluster[node.cycle % II]
+                               : stageAndCycleToCluster[stage][node.cycle];
     maxStage = std::max(maxStage, stage);
     node.op->setAttr(tt::kLoopStageAttrName,
                      IntegerAttr::get(IntegerType::get(ctx, 32), stage));
@@ -126,6 +187,14 @@ static void emitScheduleFromGraph(scf::ForOp loop,
       op.setAttr(tt::kLoopClusterAttrName,
                  IntegerAttr::get(IntegerType::get(ctx, 32), 0));
   }
+
+  // Standalone owns the schedule (loop.stage/loop.cluster above), so drop any
+  // stage/order carried on tt.autows — the scheduler's schedule is now
+  // authoritative — while keeping the operand memtype channels for the
+  // downstream WS memory planner.
+  if (standalone)
+    for (auto &op : loop.getBody()->without_terminator())
+      stripScheduleKeepMemtype(&op);
 
   // ── Default-partition selection (register-sink rule) ──
   // Default behavior: reserve partition 0 as an empty default warp group (the
@@ -189,135 +258,146 @@ static void emitScheduleFromGraph(scf::ForOp loop,
   };
   int numParts = (regDefault && defaultWg >= 0) ? (maxWg + 1) : (maxWg + 2);
 
-  // ── 1.5. Per-op: ttg.partition (= our Phase B warp-group decision) ──
-  // Emit the WG ID as a DenseI32ArrayAttr so the downstream WS pass
-  // (PartitionSchedulingMeta) can pick it up directly instead of
-  // re-deriving partitions from scratch. Skip ops with warpGroup<0
-  // (unassigned NONE/infrastructure ops) — the downstream pass will
-  // propagate them via SSA traversal.
-  for (const auto &node : schedLoop.nodes) {
-    if (!node.op)
-      continue;
-    auto opIt = ddg.getOpToIdx().find(node.op);
-    if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
-      continue; // multi-stage super-node duplicate
-    // Reserve partition 0 as the DEFAULT warp group (runs the epilogue /
-    // non-specialized code), per the WS framework convention. Shift modulo's
-    // workers to partitions 1..N. Without this, the epilogue's tmem_load
-    // collapses into the MMA's partition (handleOperandD "Unexpected
-    // Producer").
-    int32_t wg;
-    if (node.warpGroup >= 0) {
-      wg = partOf(node.warpGroup);
-    } else if (!node.replicatedGroups.empty()) {
-      // Replicated infra op: its consumers span warp groups (e.g. case7's
-      // `iv * stride` offset feeding two parallel loads in different
-      // partitions). ttg.partition must be a SINGLE id (doTaskIdPropagate
-      // asserts size==1), so seed it with the lowest consumer partition; the
-      // backend's scalar task-id backward-propagation then clones it into the
-      // other consuming tasks (it's rematerializable scalar arith). The native
-      // backend has no per-task inlining step (unlike sched2tlx), so without a
-      // seed NVGPUWarpSpecialization rejects the loop ("op does not have
-      // expected attribute ttg.partition").
-      wg = partOf(*std::min_element(node.replicatedGroups.begin(),
-                                    node.replicatedGroups.end()));
-    } else {
-      continue; // warpGroup == -1 (no assigned consumers) — leave to backend.
-    }
-    node.op->setAttr(ttg::kPartitionAttrName,
-                     DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{wg}));
-  }
-
-  // ── 1.5b. Function-scope EPILOGUE → default partition (id 0) ──
-  // The post-loop epilogue (e.g. the accumulator tmem_load -> divide -> truncf
-  // -> store chain) lives outside any partition. It must be assigned to the
-  // reserved default partition (0) so the backend anchors it AFTER the
-  // warp_specialize region; otherwise its tmem_load has no ordering dependency
-  // on the region and gets hoisted above the loop, reading the accumulator
-  // before the MMA writes it -> garbage. We derive the epilogue by walking
-  // forward from the loop's results (the dataflow that defines "post-loop"), so
-  // modulo owns this placement and the backend honors ttg.partition verbatim —
-  // no epilogue routing is needed in PartitionSchedulingMeta.
-  {
-    SmallVector<OpOperand *> worklist;
-    for (OpResult result : loop.getResults())
-      for (OpOperand &use : result.getUses())
-        worklist.push_back(&use);
-    DenseSet<Operation *> visited;
-    auto zeroPart = DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{0});
-    while (!worklist.empty()) {
-      OpOperand *use = worklist.pop_back_val();
-      Operation *user = use->getOwner();
-      if (!visited.insert(user).second)
+  // Standalone mode skips all partition markers (§1.5–1.7 + tt.modulo_ii) so
+  // PartitionSchedulingMeta derives partitions from loop.stage/loop.cluster.
+  if (!standalone) {
+    // ── 1.5. Per-op: ttg.partition (= our Phase B warp-group decision) ──
+    // Emit the WG ID as a DenseI32ArrayAttr so the downstream WS pass
+    // (PartitionSchedulingMeta) can pick it up directly instead of
+    // re-deriving partitions from scratch. Skip ops with warpGroup<0
+    // (unassigned NONE/infrastructure ops) — the downstream pass will
+    // propagate them via SSA traversal.
+    for (const auto &node : schedLoop.nodes) {
+      if (!node.op)
         continue;
-      // Skip ops nested in a loop deeper than `loop` (those are not epilogue).
-      if (auto parent = user->getParentOfType<scf::ForOp>())
-        if (loop->isProperAncestor(parent))
+      auto opIt = ddg.getOpToIdx().find(node.op);
+      if (opIt != ddg.getOpToIdx().end() && opIt->second != node.id)
+        continue; // multi-stage super-node duplicate
+      // Reserve partition 0 as the DEFAULT warp group (runs the epilogue /
+      // non-specialized code), per the WS framework convention. Shift modulo's
+      // workers to partitions 1..N. Without this, the epilogue's tmem_load
+      // collapses into the MMA's partition (handleOperandD "Unexpected
+      // Producer").
+      int32_t wg;
+      if (node.warpGroup >= 0) {
+        wg = partOf(node.warpGroup);
+      } else if (!node.replicatedGroups.empty()) {
+        // Replicated infra op: its consumers span warp groups (e.g. case7's
+        // `iv * stride` offset feeding two parallel loads in different
+        // partitions). ttg.partition must be a SINGLE id (doTaskIdPropagate
+        // asserts size==1), so seed it with the lowest consumer partition; the
+        // backend's scalar task-id backward-propagation then clones it into the
+        // other consuming tasks (it's rematerializable scalar arith). The
+        // native backend has no per-task inlining step (unlike sched2tlx), so
+        // without a seed NVGPUWarpSpecialization rejects the loop ("op does not
+        // have expected attribute ttg.partition").
+        wg = partOf(*std::min_element(node.replicatedGroups.begin(),
+                                      node.replicatedGroups.end()));
+      } else {
+        continue; // warpGroup == -1 (no assigned consumers) — leave to backend.
+      }
+      node.op->setAttr(ttg::kPartitionAttrName,
+                       DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{wg}));
+    }
+
+    // ── 1.5b. Function-scope EPILOGUE → default partition (id 0) ──
+    // The post-loop epilogue (e.g. the accumulator tmem_load -> divide ->
+    // truncf
+    // -> store chain) lives outside any partition. It must be assigned to the
+    // reserved default partition (0) so the backend anchors it AFTER the
+    // warp_specialize region; otherwise its tmem_load has no ordering
+    // dependency on the region and gets hoisted above the loop, reading the
+    // accumulator before the MMA writes it -> garbage. We derive the epilogue
+    // by walking forward from the loop's results (the dataflow that defines
+    // "post-loop"), so modulo owns this placement and the backend honors
+    // ttg.partition verbatim — no epilogue routing is needed in
+    // PartitionSchedulingMeta.
+    {
+      SmallVector<OpOperand *> worklist;
+      for (OpResult result : loop.getResults())
+        for (OpOperand &use : result.getUses())
+          worklist.push_back(&use);
+      DenseSet<Operation *> visited;
+      auto zeroPart = DenseI32ArrayAttr::get(ctx, ArrayRef<int32_t>{0});
+      while (!worklist.empty()) {
+        OpOperand *use = worklist.pop_back_val();
+        Operation *user = use->getOwner();
+        if (!visited.insert(user).second)
           continue;
-      // Do not override an existing partition assignment.
-      if (!user->hasAttr(ttg::kPartitionAttrName))
-        user->setAttr(ttg::kPartitionAttrName, zeroPart);
-      for (OpResult result : user->getResults())
-        for (OpOperand &nextUse : result.getUses())
-          worklist.push_back(&nextUse);
+        // Skip ops nested in a loop deeper than `loop` (those are not
+        // epilogue).
+        if (auto parent = user->getParentOfType<scf::ForOp>())
+          if (loop->isProperAncestor(parent))
+            continue;
+        // Do not override an existing partition assignment.
+        if (!user->hasAttr(ttg::kPartitionAttrName))
+          user->setAttr(ttg::kPartitionAttrName, zeroPart);
+        for (OpResult result : user->getResults())
+          for (OpOperand &nextUse : result.getUses())
+            worklist.push_back(&nextUse);
+      }
     }
-  }
 
-  // ── 1.6. Per-loop: ttg.partition_num_warps ──
-  // The per-partition warp count is a real schedule decision (Layer B): each
-  // warp group's count = max(minWarps) over its ops, snapped to {1,2,4,8}.
-  // Emit it as a DenseI32ArrayAttr indexed by partition id — the SAME shape as
-  // the final ttg.warp_specialize `partitionNumWarps` attr — so the downstream
-  // WS pass can honor modulo's choice instead of re-deriving from a binary
-  // tmem-presence heuristic. (Mirrors jsonDumpWarpGroups' num_warps.)
-  {
-    if (maxWg >= 0) {
-      // partOf maps warpGroup -> partition; index 0 is the default WG.
-      SmallVector<int32_t> numWarps(numParts, 1);
-      if (!(regDefault && defaultWg >= 0))
-        numWarps[0] = 4; // reserved empty default warp group (legacy)
-      for (int wg = 0; wg <= maxWg; ++wg)
-        numWarps[partOf(wg)] =
-            snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
-      numWarps[0] = std::max<int32_t>(numWarps[0], 4); // default is a full WG
-      loop->setAttr("ttg.partition_num_warps",
-                    DenseI32ArrayAttr::get(ctx, numWarps));
+    // ── 1.6. Per-loop: ttg.partition_num_warps ──
+    // The per-partition warp count is a real schedule decision (Layer B): each
+    // warp group's count = max(minWarps) over its ops, snapped to {1,2,4,8}.
+    // Emit it as a DenseI32ArrayAttr indexed by partition id — the SAME shape
+    // as the final ttg.warp_specialize `partitionNumWarps` attr — so the
+    // downstream WS pass can honor modulo's choice instead of re-deriving from
+    // a binary tmem-presence heuristic. (Mirrors jsonDumpWarpGroups'
+    // num_warps.)
+    {
+      if (maxWg >= 0) {
+        // partOf maps warpGroup -> partition; index 0 is the default WG.
+        SmallVector<int32_t> numWarps(numParts, 1);
+        if (!(regDefault && defaultWg >= 0))
+          numWarps[0] = 4; // reserved empty default warp group (legacy)
+        for (int wg = 0; wg <= maxWg; ++wg)
+          numWarps[partOf(wg)] =
+              snapWarps(wgMaxMinWarps[wg] == 0 ? 1 : wgMaxMinWarps[wg]);
+        numWarps[0] = std::max<int32_t>(numWarps[0], 4); // default is a full WG
+        loop->setAttr("ttg.partition_num_warps",
+                      DenseI32ArrayAttr::get(ctx, numWarps));
+      }
     }
-  }
 
-  // ── 1.7. Per-loop: ttg.partition.stages + ttg.warp_specialize.tag ──
-  // These are exactly what PartitionSet::fromLoop() (the WS backend's
-  // honor-preset hook in PartitionSchedulingMeta::getInitialSchedule) requires.
-  // Emitting them makes the backend adopt modulo's ttg.partition assignment
-  // verbatim instead of re-deriving partitions from its own MMA-backward-slice
-  // heuristic — i.e. all partition decisions come from modulo. Ops modulo left
-  // unassigned (warpGroup<0 infra ops) are still filled in by the backend's
-  // propagatePartitions after fromLoop.
-  //
-  // Per-partition stage = max loop.stage over that partition's ops. This
-  // matches PSM's own convention (compute/MMA partition lands at the higher
-  // stage, loads/epilogue at stage 0); the value is otherwise only used for
-  // channel-buffering offsets. The tag is required to be present; PSM resets it
-  // to the loop's WS index during serialize.
-  {
-    if (maxWg >= 0) {
-      // Placed by partOf; index 0 (the default WG) defaults to stage 0 and is
-      // overwritten when reg-default makes a real consumer the default.
-      SmallVector<Attribute> stageAttrs(
-          numParts, IntegerAttr::get(IntegerType::get(ctx, 32), 0));
-      for (int wg = 0; wg <= maxWg; ++wg)
-        stageAttrs[partOf(wg)] =
-            IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]);
-      loop->setAttr(ttg::kPartitionStagesAttrName,
-                    ArrayAttr::get(ctx, stageAttrs));
-      loop->setAttr(ttg::kWarpSpecializeTagAttrName,
-                    IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+    // ── 1.7. Per-loop: ttg.partition.stages + ttg.warp_specialize.tag ──
+    // These are exactly what PartitionSet::fromLoop() (the WS backend's
+    // honor-preset hook in PartitionSchedulingMeta::getInitialSchedule)
+    // requires. Emitting them makes the backend adopt modulo's ttg.partition
+    // assignment verbatim instead of re-deriving partitions from its own
+    // MMA-backward-slice heuristic — i.e. all partition decisions come from
+    // modulo. Ops modulo left unassigned (warpGroup<0 infra ops) are still
+    // filled in by the backend's propagatePartitions after fromLoop.
+    //
+    // Per-partition stage = max loop.stage over that partition's ops. This
+    // matches PSM's own convention (compute/MMA partition lands at the higher
+    // stage, loads/epilogue at stage 0); the value is otherwise only used for
+    // channel-buffering offsets. The tag is required to be present; PSM resets
+    // it to the loop's WS index during serialize.
+    {
+      if (maxWg >= 0) {
+        // Placed by partOf; index 0 (the default WG) defaults to stage 0 and is
+        // overwritten when reg-default makes a real consumer the default.
+        SmallVector<Attribute> stageAttrs(
+            numParts, IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+        for (int wg = 0; wg <= maxWg; ++wg)
+          stageAttrs[partOf(wg)] =
+              IntegerAttr::get(IntegerType::get(ctx, 32), wgMaxStage[wg]);
+        loop->setAttr(ttg::kPartitionStagesAttrName,
+                      ArrayAttr::get(ctx, stageAttrs));
+        loop->setAttr(ttg::kWarpSpecializeTagAttrName,
+                      IntegerAttr::get(IntegerType::get(ctx, 32), 0));
+      }
     }
-  }
+  } // end if (!standalone): partition markers
 
   // ── 2. Per-loop: tt.modulo_ii, tt.scheduled_max_stage ──
-  loop->setAttr("tt.modulo_ii",
-                IntegerAttr::get(IntegerType::get(ctx, 32), II));
+  // tt.modulo_ii is the "modulo owns partitioning" marker for PSM; skip it in
+  // standalone so PSM derives partitions from the schedule instead.
+  if (!standalone)
+    loop->setAttr("tt.modulo_ii",
+                  IntegerAttr::get(IntegerType::get(ctx, 32), II));
   loop->setAttr(tt::kScheduledMaxStageAttrName,
                 IntegerAttr::get(IntegerType::get(ctx, 32), maxStage));
 
@@ -512,7 +592,12 @@ static void emitMMAAnnotations(scf::ForOp loop,
     mmaDepthInStage[mma.nodeIdx] = depth;
   }
 
+  // tt.autows encodes modulo's per-MMA partition/stage decision; in standalone
+  // mode PSM owns partitioning, so leave the MMAs unannotated (their schedule
+  // is still carried by loop.stage/loop.cluster).
   for (auto &mma : mmas) {
+    if (isStandaloneModulo())
+      break;
     int cluster = mmaDepthInStage[mma.nodeIdx];
     std::string json = "{\"stage\": \"" + std::to_string(mma.stage) +
                        "\", \"order\": \"" + std::to_string(cluster) + "\"}";
@@ -600,6 +685,21 @@ convertDDGNode(const ttg::DDGNode &ddgNode, unsigned nodeId,
 /// Ops in the same stage are sorted by cycle; same cycle → same cluster,
 /// different cycle → different cluster (lower cycle = lower cluster ID).
 static void computeClusterIds(ttg::ScheduleLoop &loop) {
+  if (triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE") == "contracted") {
+    SmallVector<int> moduloCycles;
+    moduloCycles.reserve(loop.nodes.size());
+    for (const auto &node : loop.nodes)
+      moduloCycles.push_back(loop.II > 0 ? node.cycle % loop.II : node.cycle);
+    llvm::sort(moduloCycles);
+    moduloCycles.erase(llvm::unique(moduloCycles), moduloCycles.end());
+    for (auto &node : loop.nodes) {
+      int cycle = loop.II > 0 ? node.cycle % loop.II : node.cycle;
+      node.cluster =
+          llvm::lower_bound(moduloCycles, cycle) - moduloCycles.begin();
+    }
+    return;
+  }
+
   // Group node indices by stage
   llvm::DenseMap<int, SmallVector<unsigned>> stageToNodes;
   for (auto &node : loop.nodes) {
@@ -1321,9 +1421,9 @@ static int computeBufferLifetime(const ttg::ScheduleLoop &loop,
   // recompute sees the same resident span the depth was derived from.
   int prodCycle = bufferOccupancyStart(loop, producerNodeId);
   llvm::DenseSet<unsigned> seen;
-  int lastConsumerEnd = walkLastConsumerEnd(
-      loop, producerNodeId, loop.getNode(producerNodeId).cycle, loop.II, 0,
-      seen);
+  int lastConsumerEnd =
+      walkLastConsumerEnd(loop, producerNodeId,
+                          loop.getNode(producerNodeId).cycle, loop.II, 0, seen);
   return lastConsumerEnd - prodCycle;
 }
 
@@ -1444,7 +1544,8 @@ buildCoConsumedGroups(const ttg::ScheduleLoop &loop) {
 static void reduceBufferGroup(
     ttg::ScheduleLoop &loop, unsigned bestIdx,
     const llvm::SmallVector<llvm::SmallVector<unsigned>> &coGroups,
-    const llvm::DenseMap<unsigned, unsigned> &bufToGroupIdx, unsigned newDepth) {
+    const llvm::DenseMap<unsigned, unsigned> &bufToGroupIdx,
+    unsigned newDepth) {
   llvm::DenseSet<unsigned> toReduce;
   llvm::SmallVector<unsigned> work;
   work.push_back(bestIdx);
@@ -1527,8 +1628,9 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
     if (bestIdx < 0)
       break;
     unsigned newDepth = loop.buffers[bestIdx].count - 1;
-    // Reduce bestIdx together with its co-consumed AND merge-group peers, so the
-    // physical footprint actually drops and the equal-count invariants hold.
+    // Reduce bestIdx together with its co-consumed AND merge-group peers, so
+    // the physical footprint actually drops and the equal-count invariants
+    // hold.
     reduceBufferGroup(loop, bestIdx, coGroups, bufToGroupIdx, newDepth);
     LLVM_DEBUG(llvm::dbgs()
                << "[Step4.6] Reduced SMEM buf" << bestIdx
@@ -1594,8 +1696,8 @@ static bool reduceBuffersForBudget(ttg::ScheduleLoop &loop,
         }
       if (lifetime < 0)
         continue;
-      trialII = std::max(trialII,
-                         static_cast<int>((lifetime + buf.count - 1) / buf.count));
+      trialII = std::max(
+          trialII, static_cast<int>((lifetime + buf.count - 1) / buf.count));
     }
     if (trialII == newII)
       break;
@@ -1853,8 +1955,8 @@ static void computeBufferLifetimes(ttg::ScheduleLoop &loop) {
       if (node.producesBuffer != buf.id)
         continue;
       // Occupancy starts at the TMA load issue for a TMA-loaded ring (see
-      // bufferOccupancyStart), not the local_alloc's data-ready cycle. Keeps the
-      // merge-analysis live interval consistent with the buffer count.
+      // bufferOccupancyStart), not the local_alloc's data-ready cycle. Keeps
+      // the merge-analysis live interval consistent with the buffer count.
       buf.liveStart = bufferOccupancyStart(loop, node.id);
       // Walk transitively through transparent view ops (memdesc_trans /
       // memdesc_subview) so the buffer's live range reaches the actual
@@ -4402,7 +4504,8 @@ static void markEpilogueSubtileNodes(ttg::ScheduleLoop &loop) {
       // staging (e.g. case5's bias). Mark them (the emitter sub-slices them at
       // their source) but don't recurse — their producer load stays a full,
       // once-per-tile load outside the sub-tile loop.
-      if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp, tt::LoadOp>(def))
+      if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp,
+              tt::LoadOp>(def))
         continue;
       for (Value operand : def->getOperands())
         worklist.push_back(operand);
@@ -4429,12 +4532,13 @@ static bool isSimpleSubtileableEpilogue(Operation *storeOp) {
       continue;
     // Memory-read boundary — sub-sliced at its source (TMEM accumulator via
     // tlx.subslice, external SMEM staging likewise). Don't recurse past it.
-    if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp, tt::LoadOp>(def))
+    if (isa<ttng::TMEMLoadOp, ttg::LocalLoadOp, tt::DescriptorLoadOp,
+            tt::LoadOp>(def))
       continue;
-    // Elementwise-along-N compute (per-column): subtiling N is exact. Broadcast/
-    // splat/expand_dims would need per-sub-tile shape adjustment the emitter
-    // doesn't do yet, so they're deliberately excluded (correct skip, not a
-    // silent wrong result).
+    // Elementwise-along-N compute (per-column): subtiling N is exact.
+    // Broadcast/ splat/expand_dims would need per-sub-tile shape adjustment the
+    // emitter doesn't do yet, so they're deliberately excluded (correct skip,
+    // not a silent wrong result).
     if (def->hasTrait<mlir::OpTrait::Elementwise>() ||
         isa<ttg::ConvertLayoutOp, tt::FpToFpOp>(def)) {
       for (Value o : def->getOperands())
@@ -4875,7 +4979,8 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
-/// Whole-nest epilogue warp-group unification (cost-model, storage-class-priced).
+/// Whole-nest epilogue warp-group unification (cost-model,
+/// storage-class-priced).
 ///
 /// A persistent outer loop's epilogue may consume a value V produced by its
 /// inner loop. If V is a REGISTER value, running the epilogue in a warp group
@@ -4896,8 +5001,10 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
 /// is scheduled either way); we price only the hand-off co-location removes.
 ///
 /// The decision is expressed by RENUMBERING the epilogue-owning outer warp
-/// group so its id is meaningful across the super-node boundary — no side field:
-///   co-locate → the inner producer's warp-group id (the epilogue now SHARES it,
+/// group so its id is meaningful across the super-node boundary — no side
+/// field:
+///   co-locate → the inner producer's warp-group id (the epilogue now SHARES
+///   it,
 ///               which is exactly the co-location signal the emitter reads),
 ///   separate  → a FRESH id above every id in the nest, guaranteed not to alias
 ///               any inner id (so "epilogue wg == an inner wg" unambiguously
@@ -4981,8 +5088,7 @@ static void unifyNestEpilogueWarpGroup(ttg::ScheduleGraph &graph) {
         for (auto d : tensorTy.getShape())
           elems *= d;
         int64_t bytes = elems * (tensorTy.getElementTypeBitWidth() / 8);
-        auto yield =
-            cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
+        auto yield = cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
         Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
         int producerWg = -1;
         if (yieldDef)
@@ -5064,9 +5170,10 @@ applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
   }
 
   // Cross-loop reconciliation: now that every loop has warp groups, unify each
-  // outer epilogue's warp-group id with its inner producer (storage-class-priced
-  // hand-off cost model). Runs before barrier insertion so the renumbered ids
-  // drive barrier synthesis and the emitter reads them directly.
+  // outer epilogue's warp-group id with its inner producer
+  // (storage-class-priced hand-off cost model). Runs before barrier insertion
+  // so the renumbered ids drive barrier synthesis and the emitter reads them
+  // directly.
   for (auto &sl : scheduledLoops)
     unifyNestEpilogueWarpGroup(sl.graph);
 
@@ -5173,7 +5280,10 @@ static SmallVector<CandidateLoop> collectCandidates(ModuleOp moduleOp) {
         c.hasTMA = true;
       if (isa<ttng::TCGen5MMAOp, ttng::TCGen5MMAScaledOp>(&op)) {
         c.hasMMA = true;
-        if (op.hasAttr("tt.autows"))
+        // STANDALONE owns the schedule: a tt.autows here carries only an
+        // operand memtype hint (already consumed by PromoteLHSToTMem before
+        // this pass), so do NOT treat it as a user-tuned schedule to skip.
+        if (op.hasAttr("tt.autows") && !isStandaloneModulo())
           c.hasExistingAnnotation = true;
       }
       if (isa<scf::ForOp>(&op))
@@ -5272,7 +5382,8 @@ searchDataPartitionPlan(ModuleOp moduleOp, const ttg::LatencyModel &model,
   // that factor even before the search (the user asked for it); every other MMA
   // is N=1. Variants (computeDataPartitionPlanForN) layer the searched N onto
   // only the un-pinned MMAs, so a pinned MMA never re-enters the search.
-  DataPartitionPlan baseline = computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
+  DataPartitionPlan baseline =
+      computeDataPartitionPlan(moduleOp, /*optionFactor=*/0);
   std::set<unsigned> factors;
   // Per-MMA per-CTA accumulator height, off the candidate surface (every
   // candidate has mSize = bm / n, so bm = n * mSize). This is the basis of
