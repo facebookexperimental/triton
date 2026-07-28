@@ -34,6 +34,8 @@ from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import 
     launch_matmul as _launch_a4w4,
     torch_reference as _a4w4_reference,
 )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
+    matmul as _a4w4_inter_wave_matmul, )
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -1015,3 +1017,28 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         actual = _launch_a4w4(a, b, a_scales, b_scales)
         expected = _a4w4_reference(a, b, a_scales, b_scales)
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
+    # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes
+    # the 8-wave 256x256 inter-wave path (K=1536 -> loop runs >= 2 trips).
+    m = n = 768
+    k = 1536
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
+    # 512x256x1536 -> 256-tile grid = 2*1 = 2 <= NUM_CU/32, so the dispatcher takes
+    # the occupancy-starved 128x128 + split-K TLX path (and its fp32 reduce).
+    m = 512
+    n = 256
+    k = 1536
+    a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
+    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    expected = _a4w4_reference(a, b, a_scales, b_scales)
+    torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
