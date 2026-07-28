@@ -67,13 +67,23 @@ machinery_of() {
       fi
     fi
     rm -f "$base" "$ours" "$theirs"
-    # conflicting file → precise deps: only commits that touched the SAME LINES the candidate edits
-    # (git log -L on each hunk's old-side range). Pure additions (count 0) depend on no prior line.
+    # conflicting file → precise deps: the commit(s) that own the lines the candidate's edit sits
+    # against, between the cut and the candidate (git log -L over each hunk).
+    #   - replace/delete hunk (old-count>0) → blame the old-side line range it rewrites.
+    #   - PURE ADDITION (old-count 0) → NOT dependency-free: an insertion still attaches to an
+    #     ANCHOR in the base (sha^). Blame a small window at/just before the insertion point, so an
+    #     append whose preceding block was created by an earlier PR surfaces that PR as machinery
+    #     (e.g. #2336's a4w4 tests append after #2337's test_tlx_gfx9_gemm_bench_* block → #2337).
     git diff -U0 "$sha^" "$sha" -- "$f" 2>/dev/null \
       | sed -nE 's/^@@ -([0-9]+),?([0-9]*) .*/\1 \2/p' | while read -r s c; do
-        c="${c:-1}"; [[ "$c" -eq 0 ]] && continue
-        git log -L "$s,$((s + c - 1)):$f" -s --format='%h%x09%s' "$CUT..$sha^" 2>/dev/null \
-          | grep -aE "^[0-9a-f]{7,}$(printf '\t')"
+        c="${c:-1}"
+        if [[ "$c" -eq 0 ]]; then
+          lo=$(( s > 3 ? s - 3 : 1 )); hi=$(( s > 0 ? s : 1 )); rng="$lo,$hi"   # anchor window in base
+        else
+          rng="$s,$((s + c - 1))"                                              # rewritten range
+        fi
+        git log -L "$rng:$f" -s --format='%h%x09%s' "$CUT..$sha^" 2>/dev/null \
+          | grep -aE "^[0-9a-f]{7,}$(printf '\t')" || true   # no-match hunk must not abort the loop (set -e)
       done
   done < <(git diff-tree --no-commit-id --name-status -r "$sha")
 }

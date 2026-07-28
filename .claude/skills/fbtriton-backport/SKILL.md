@@ -44,6 +44,13 @@ Worked case study of the nastiest dependency class:
 4. **Never re-pick a change already on release.** If release inherited an adapted form
    (pre-cut), re-picking the upstream original double-applies / regresses it. Confirm
    with the Phase 2 probe before picking.
+5. **A pick that isn't clean means diagnose before you resolve — never hand-edit blind.**
+   A conflict / empty / franken result is a *signal*: a related commit is missing (machinery)
+   or collides. Run `find-machinery.sh` + the probe to **locate the related commit(s) first**,
+   then decide — pick the missing commit (often the whole conflict vanishes, as with
+   `#2337 → #2336`), skip the candidate, or author a `[partial]`/`[shim]`. Hand-resolving a
+   conflict without first identifying the commit that caused it is the anti-pattern this whole
+   skill exists to prevent.
 
 ## Where things live
 
