@@ -45,6 +45,8 @@ struct ConvertLayoutOpConversion
     auto dstTy = op.getType();
 
     LinearLayout conversion = minimalCvtLayout(srcTy, dstTy);
+    LinearLayout srcLayout = toLinearLayout(srcTy);
+    LinearLayout dstLayout = toLinearLayout(dstTy);
 
     auto kBlock = str_attr("block");
     auto kWarp = str_attr("warp");

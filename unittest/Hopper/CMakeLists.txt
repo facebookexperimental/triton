@@ -11,4 +11,8 @@ add_triton_ut(
   SRCS modulo_schedule_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonGPUTransforms
+    TritonNvidiaGPUIR
+    TritonNvidiaGPUTransforms
+    TLXIR
 )

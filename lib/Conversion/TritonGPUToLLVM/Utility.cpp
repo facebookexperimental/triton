@@ -959,7 +959,6 @@ SmallVector<Value> lowerLdSt(
   auto quot = divideLeft(cvt, tile);
   assert(quot.has_value() && "cvt must be divisible by tile");
   LinearLayout reps = zerosLike(tile) * *quot;
-  assert(reps.hasInDim(kBlock));
   LinearLayout addrLayout =
       LinearLayout({{kLane, reps.getBases().lookup(kLane)},
                     {kWarp, reps.getBases().lookup(kWarp)},
@@ -986,8 +985,10 @@ SmallVector<Value> lowerLdSt(
   auto i8AddrLayout = i8Tile * addrLayout;
 
   Value blockId = b.i32_val(0);
+  bool isBlockLocal = reps.hasInDim(kBlock) && reps.hasOutDim(kBlock) &&
+                      reps.isTrivialOver({kBlock});
   bool useBlockId =
-      reps.hasInDim(kBlock) &&
+      reps.hasInDim(kBlock) && !isBlockLocal &&
       !reps.sublayoutIsZero({kBlock}, to_vector(reps.getOutDimNames()));
   if (useBlockId) {
     blockId = targetInfo.getClusterCTAId(rewriter, loc);
