@@ -2468,6 +2468,29 @@ void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
   }
 }
 
+// An op is cheap enough to rematerialize into a consumer partition (instead of
+// routing its value through a cross-partition channel) if it is a
+// layout/metadata rearrangement or a pure integer index/mask computation.
+// Restricting the arithmetic to integer/index results excludes float compute
+// (softmax/SiLU) and reductions, which must stay channeled (cloning those would
+// cascade expensive work into compute partitions and break channel invariants).
+static bool isRematerializableForClone(Operation *defOp) {
+  if (isa<ConvertLayoutOp, BroadcastOp, ExpandDimsOp, MakeRangeOp, SplatOp>(
+          defOp))
+    return true;
+  if (defOp->getDialect() && defOp->getDialect()->getNamespace() == "arith") {
+    for (Value res : defOp->getResults()) {
+      Type t = res.getType();
+      if (auto tt = dyn_cast<RankedTensorType>(t))
+        t = tt.getElementType();
+      if (!t.isIntOrIndex())
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 /// Walk over \p loop and clone cheap ops into each partition that uses them,
 /// rematerializing metadata-only or layout-only values instead of routing
 /// them through a cross-partition memory channel.
@@ -2502,11 +2525,16 @@ void optimizeSchedule(LoopLikeOpInterface loop, PartitionSet &schedule) {
   // passes insert a ConvertLayoutOp between ExpandDimsOp and BroadcastOp,
   // which would otherwise break the cloning chain and create a
   // cross-partition boundary.
+  // Walk backward from a cloned op and rematerialize its cross-partition cheap
+  // operand producers into the user partition. A worklist (not a single linear
+  // chain) is used so multi-operand index ops (e.g. arith.addi of a make_range
+  // and a splat, as in a causal-mask column-index chain) are fully pulled in;
+  // otherwise the un-pulled operand stays cross-partition and forces a register
+  // channel whose layout transfer can break downstream expand_dims inference.
   auto cloneOperandChain = [&](Operation *clonedOp, Partition *userPartition) {
-    Operation *current = clonedOp;
-    while (true) {
-      Operation *toPull = nullptr;
-      unsigned operandIdx = 0;
+    SmallVector<Operation *> worklist{clonedOp};
+    while (!worklist.empty()) {
+      Operation *current = worklist.pop_back_val();
       for (auto [idx, operand] : llvm::enumerate(current->getOperands())) {
         auto *defOp = operand.getDefiningOp();
         if (!defOp)
@@ -2514,18 +2542,13 @@ void optimizeSchedule(LoopLikeOpInterface loop, PartitionSet &schedule) {
         Partition *defPartition = getPartition(defOp);
         if (!defPartition || defPartition == userPartition)
           continue;
-        if (!isa<ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(defOp))
+        if (!isRematerializableForClone(defOp))
           continue;
-        toPull = defOp;
-        operandIdx = idx;
-        break;
+        Operation *pullClone = OpBuilder(defOp).clone(*defOp);
+        setPartition(pullClone, userPartition);
+        current->setOperand(idx, pullClone->getResult(0));
+        worklist.push_back(pullClone);
       }
-      if (!toPull)
-        break;
-      Operation *pullClone = OpBuilder(toPull).clone(*toPull);
-      setPartition(pullClone, userPartition);
-      current->setOperand(operandIdx, pullClone->getResult(0));
-      current = pullClone;
     }
   };
 
