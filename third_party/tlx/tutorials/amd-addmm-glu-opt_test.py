@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import concurrent.futures
+import functools
 import multiprocessing
 import time
 
@@ -38,6 +39,11 @@ DEFAULT_COMPILE_WORKERS = max(1, min(8, multiprocessing.cpu_count()))
 
 def active_torch_device():
     return triton.runtime.driver.active.get_active_torch_device()
+
+
+@functools.lru_cache(maxsize=1)
+def _device_num_cus(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 # Autotuning winning configurations for K=256, K=512, and K=1024
@@ -1169,6 +1175,8 @@ def compile_kernel_shape(kernel_name, shape, num_cus=None):
 
 def compile_kernel_shape_worker(kernel_name, shape, num_cus):
     start = time.monotonic()
+    if kernel_name == "tlx_persistent" and num_cus is None:
+        num_cus = _device_num_cus(active_torch_device())
     compile_kernel_shape(kernel_name, shape, num_cus)
     return kernel_name, shape, time.monotonic() - start
 
@@ -1192,24 +1200,24 @@ def precompile_kernels(args):
     if not jobs:
         return
 
-    num_cus = None
-    if any(kernel_name == "tlx_persistent" for kernel_name, _shape in jobs):
-        num_cus = torch.cuda.get_device_properties(active_torch_device()).multi_processor_count
+    needs_num_cus = any(kernel_name == "tlx_persistent" for kernel_name, _shape in jobs)
     workers = min(args.compile_workers, len(jobs))
     print(f"\nPrecompiling {len(jobs)} kernel/shape job(s) with {workers} worker(s):", flush=True)
 
     if workers == 1:
+        num_cus = _device_num_cus(active_torch_device()) if needs_num_cus else None
         for kernel_name, shape in jobs:
             compiled_kernel, compiled_shape, elapsed = compile_kernel_shape_worker(kernel_name, shape, num_cus)
             m, n, k = compiled_shape
             print(f"  compiled {compiled_kernel} {m}x{n}x{k} in {elapsed:.1f}s", flush=True)
         return
 
+    # Keep the parent HIP-cold: a pre-spawn HIP initialization makes
+    # rocprofiler diagnose every loaded fat binary in each child.
     context = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
         futures = [
-            executor.submit(compile_kernel_shape_worker, kernel_name, shape, num_cus)
-            for kernel_name, shape in jobs
+            executor.submit(compile_kernel_shape_worker, kernel_name, shape, None) for kernel_name, shape in jobs
         ]
         for future in concurrent.futures.as_completed(futures):
             compiled_kernel, compiled_shape, elapsed = future.result()
