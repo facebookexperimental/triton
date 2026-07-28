@@ -85,9 +85,6 @@ def create_benchmark(modes):
         ))
     def benchmark(M, N, K, provider):
         backend, mode = provider.split("-")
-        # TLX blockwise stages per-K-group scales in SMEM (~12*K bytes); it OOMs at large K.
-        if backend == "tlx" and mode == "blockwise" and K >= 12288:
-            return float("nan"), float("nan"), float("nan")
         a = (torch.randn((M, K), device=DEVICE) * 0.1).to(torch.float8_e4m3fn)
         b = (torch.randn((N, K), device=DEVICE) * 0.1).to(torch.float8_e4m3fn)
         scale_a, scale_b = _make_scales(M, N, K, mode)
