@@ -662,6 +662,110 @@ def test_tlx_fa_precompile_reuses_runtime_launch_configuration(monkeypatch):
     assert 1 <= bench.DEFAULT_COMPILE_WORKERS <= 8
 
 
+def test_tlx_glu_parallel_precompile_defers_device_query_to_worker(monkeypatch):
+    pytest.importorskip("torch")
+    bench = _load_tlx_glu_bench_module("_tlx_wave_test_glu_bench_worker_device")
+
+    class PoolCreated(Exception):
+        pass
+
+    def fail_device_query(*_args, **_kwargs):
+        pytest.fail("parallel precompile initialized HIP in the parent process")
+
+    def create_pool(*_args, **_kwargs):
+        raise PoolCreated
+
+    monkeypatch.setattr(bench.torch.cuda, "get_device_properties", fail_device_query)
+    monkeypatch.setattr(bench.concurrent.futures, "ProcessPoolExecutor", create_pool)
+    args = SimpleNamespace(
+        mode="benchmark",
+        M=[1024],
+        N=[21568],
+        K=[256],
+        kernel=["tlx_baseline", "tlx_persistent"],
+        compile_workers=2,
+    )
+    with pytest.raises(PoolCreated):
+        bench.precompile_kernels(args)
+
+    queried_devices = []
+    compile_calls = []
+
+    def get_device_properties(device):
+        queried_devices.append(device)
+        return SimpleNamespace(multi_processor_count=304)
+
+    monkeypatch.setattr(bench, "active_torch_device", lambda: "worker-device")
+    monkeypatch.setattr(bench.torch.cuda, "get_device_properties", get_device_properties)
+    monkeypatch.setattr(
+        bench,
+        "compile_kernel_shape",
+        lambda kernel_name, shape, num_cus: compile_calls.append((kernel_name, shape, num_cus)),
+    )
+    bench._device_num_cus.cache_clear()
+    shape = (1024, 21568, 256)
+    bench.compile_kernel_shape_worker("tlx_persistent", shape, None)
+    bench.compile_kernel_shape_worker("tlx_persistent", shape, None)
+
+    assert queried_devices == ["worker-device"]
+    assert compile_calls == [
+        ("tlx_persistent", shape, 304),
+        ("tlx_persistent", shape, 304),
+    ]
+
+
+def test_tlx_fa_parallel_precompile_defers_device_query_to_worker(monkeypatch):
+    pytest.importorskip("torch")
+    bench = _load_tlx_fa_bench_module("_tlx_wave_test_fa_bench_worker_device")
+
+    class PoolCreated(Exception):
+        pass
+
+    def fail_device_query(*_args, **_kwargs):
+        pytest.fail("parallel precompile initialized HIP in the parent process")
+
+    def create_pool(*_args, **_kwargs):
+        raise PoolCreated
+
+    monkeypatch.setattr(bench.torch.cuda, "get_device_properties", fail_device_query)
+    monkeypatch.setattr(bench.concurrent.futures, "ProcessPoolExecutor", create_pool)
+    args = SimpleNamespace(
+        mode="benchmark",
+        kernel=["async_simple", "persistent"],
+        b=[1],
+        hq=[64],
+        d=[128],
+        sq=[4096],
+        causal=["false"],
+        dtype="bf16",
+        compile_workers=2,
+    )
+    with pytest.raises(PoolCreated):
+        bench.precompile_kernels(args)
+
+    queried_devices = []
+    compile_calls = []
+
+    def get_device_properties(device):
+        queried_devices.append(device)
+        return SimpleNamespace(multi_processor_count=306)
+
+    monkeypatch.setattr(bench, "active_torch_device", lambda: "worker-device")
+    monkeypatch.setattr(bench.torch.cuda, "get_device_properties", get_device_properties)
+    monkeypatch.setattr(
+        bench,
+        "compile_kernel_config",
+        lambda job, num_sms: compile_calls.append((job, num_sms)),
+    )
+    bench._device_num_sms.cache_clear()
+    job = ("persistent", 1, 64, 4096, 128, False, "bf16")
+    assert bench.compile_kernel_config_worker(job, None)[2] is None
+    assert bench.compile_kernel_config_worker(job, None)[2] is None
+
+    assert queried_devices == ["worker-device"]
+    assert compile_calls == [(job, 304), (job, 304)]
+
+
 def test_tlx_perf_sweep_forwards_compile_workers_to_fa(tmp_path):
     runner = _load_tlx_perf_sweep_module()
     args = SimpleNamespace(
