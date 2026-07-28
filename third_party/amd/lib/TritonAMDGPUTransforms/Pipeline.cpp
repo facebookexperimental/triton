@@ -188,6 +188,9 @@ struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    if (moduleOp->hasAttr(tt::kSkipGenericPipelineAttrName))
+      return;
+
     lowerLoops(moduleOp, useAsyncCopy, usePingpong);
     expandLoops(moduleOp);
 
