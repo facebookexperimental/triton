@@ -26,8 +26,7 @@ namespace mlir::triton::AMD {
 //      # Requires ttg.barrier but filter will prevent it
 //     %4 = AsyncCopyGlobalToLocal %ptr_2 %tile_a
 //     scf.yield
-bool membarFilter(Operation *op1, Operation *op2, bool op1IsRead,
-                  bool op2IsRead, Allocation *allocation);
+bool membarFilter(Operation *op1, Operation *op2, Allocation *allocation);
 } // namespace mlir::triton::AMD
 
 #endif

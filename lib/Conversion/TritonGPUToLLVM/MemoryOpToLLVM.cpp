@@ -229,7 +229,7 @@ public:
       cvt = regLayout.invertAndCompose(sharedLayout);
     }
     auto kBlock = str_attr("block");
-    // We could support it by removing this check if we ever want to
+    // NYI. We would need to emit a map.shared::cluster instruction.
     if (!cvt.isTrivialOver({kBlock})) {
       return failure();
     }

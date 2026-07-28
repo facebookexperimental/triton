@@ -64,8 +64,7 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 }
 } // namespace
 
-bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
-                  bool /*op2IsRead*/, Allocation *allocation) {
+bool membarFilter(Operation *op1, Operation *op2, Allocation *allocation) {
   return (filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
           filterLDSMemoryBarriersDependencies(op1, op2));
 }

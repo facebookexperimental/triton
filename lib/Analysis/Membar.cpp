@@ -47,9 +47,8 @@ static Interval<size_t> narrowIntervalForSubview(Value value,
 }
 
 AllocationSlice::AllocationSlice(Value value,
-                                 Interval<size_t> allocationInterval,
-                                 Allocation::BufferId bufferId)
-    : allocationInterval(allocationInterval), bufferId(bufferId) {
+                                 Interval<size_t> allocationInterval)
+    : allocationInterval(allocationInterval) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 
@@ -106,9 +105,6 @@ bool AllocationSlice::intersects(const AllocationSlice &other) const {
 void AllocationSlice::print(raw_ostream &os) const {
   os << "interval=[" << allocationInterval.start() << ","
      << allocationInterval.end() << ")";
-
-  if (bufferId != Allocation::InvalidBufferId)
-    os << " buffer=" << bufferId;
 
   os << " offsets=[";
   if (!subsliceOffsets.empty()) {
@@ -318,14 +314,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     // Inter-function dependencies
     auto callOpInterface = dyn_cast<CallOpInterface>(op);
     if (auto callee =
-            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable())) {
-      auto calleeBlockInfo = funcBlockInfoMap->lookup(callee);
-      auto callBufferId = allocation->getBufferId(op);
-      size_t callOffset = 0;
-      if (callBufferId != Allocation::InvalidBufferId)
-        callOffset = allocation->getAllocatedInterval(callBufferId).start();
-      curBlockInfo = translateBlockInfoToCallsite(calleeBlockInfo, callOffset);
-    }
+            dyn_cast<FunctionOpInterface>(callOpInterface.resolveCallable()))
+      curBlockInfo = funcBlockInfoMap->lookup(callee);
   } else {
     // Intra-function dependencies
     //
@@ -352,7 +342,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                  allocation->getAllBufferIdsWithAliases(value)) {
               if (bufferId != Allocation::InvalidBufferId) {
                 auto interval = allocation->getAllocatedInterval(bufferId);
-                auto slice = AllocationSlice(value, interval, bufferId);
+                auto slice = AllocationSlice(value, interval);
 
                 if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
                   curBlockInfo.syncWriteSlices[slice].insert(op);
@@ -390,8 +380,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       auto dstTy = cast<RankedTensorType>(cvt.getType());
       auto srcLayout = triton::gpu::toLinearLayout(srcTy);
       auto dstLayout = triton::gpu::toLinearLayout(dstTy);
-      auto kWarp = StringAttr::get(op->getContext(), "warp");
-      isWarpSync = mlir::isCvtDimSync(srcLayout, dstLayout, kWarp);
+      isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
     }
 
     bool hasExplicitSharedDeps = !curBlockInfo.syncReadSlices.empty() ||

@@ -6,7 +6,6 @@
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/NVPTXAddrSpace.h"
 
@@ -154,42 +153,19 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
   b.barrier(targets);
 }
 
-void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
-  triton::nvidia_gpu::ClusterArriveOp::create(rewriter, loc, /*relaxed=*/false);
-  triton::nvidia_gpu::ClusterWaitOp::create(rewriter, loc);
-}
-
 void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   NVVM::SyncWarpOp::create(rewriter, loc, b.i32_val(0xffffffff));
 }
 
-static bool isConstantTruePred(Value pred) {
-  if (auto constOp = pred.getDefiningOp<LLVM::ConstantOp>()) {
-    return cast<IntegerAttr>(constOp.getValue()).getInt() == -1;
-  }
-  return false;
-}
-
 static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
                   Value pred) {
-  auto *ctx = rewriter.getContext();
-  auto clusterPtrTy = ptr_ty(ctx, /*addrspace=*/7);
-  if (isConstantTruePred(pred)) {
-    return NVVM::MapaOp::create(rewriter, loc, clusterPtrTy, ptr, ctaid);
-  }
-
-  PTXBuilder builder;
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
-  assert(ptrTy.getAddressSpace() == 3);
-
-  auto &mapaInstr = *builder.create("mapa");
-  mapaInstr.o("shared::cluster.u32");
-  auto *dstOpr = builder.newOperand("=r");
-  auto *ptrOpr = builder.newOperand(ptr, "r");
-  auto *ctaidOpr = builder.newOperand(ctaid, "r");
-  mapaInstr(dstOpr, ptrOpr, ctaidOpr).predicate(pred, "b");
-  return builder.launch(rewriter, loc, clusterPtrTy, /*hasSideEffect=*/false);
+  assert(ptrTy.getAddressSpace() == llvm::NVPTXAS::ADDRESS_SPACE_SHARED &&
+         "Invalid src llvm addr space for mapa");
+  MLIRContext *ctx = rewriter.getContext();
+  auto dsmPtrTy = ptr_ty(ctx, llvm::NVPTXAS::ADDRESS_SPACE_SHARED_CLUSTER);
+  return NVVM::MapaOp::create(rewriter, loc, dsmPtrTy, ptr, ctaid);
 }
 
 static std::string getConstraintForBitwidth(unsigned bitwidth) {
@@ -204,6 +180,13 @@ static std::string getConstraintForBitwidth(unsigned bitwidth) {
   default:
     llvm_unreachable("unsupported bitwidth");
   }
+}
+
+static bool isConstantTruePred(Value pred) {
+  if (auto constOp = pred.getDefiningOp<LLVM::ConstantOp>()) {
+    return cast<IntegerAttr>(constOp.getValue()).getInt() == -1;
+  }
+  return false;
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
@@ -461,7 +444,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   PTXBuilder builder;
   auto ld = builder.create("ld")
-                ->o("shared::cluster", ctaId.has_value())
+                ->o("shared::cta", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);

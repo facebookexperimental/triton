@@ -16,8 +16,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
-#include <optional>
-
 #define DEBUG_TYPE "ttgpu_to_llvm"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
@@ -334,7 +332,7 @@ namespace triton {
 namespace gpu {
 
 std::pair<SmallVector<LocalMemOpTile>, SmallVector<LocalMemOpTile>>
-getSrcDstTiles(const TargetInfoBase &targetInfo, int bitwidth, bool crossCTA);
+getSrcDstTiles(const TargetInfoBase &targetInfo, int bitwidth);
 
 Type getFunctionType(Type resultType, ValueRange operands);
 
@@ -659,8 +657,7 @@ SmallVector<Value> lowerLdSt(
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     std::optional<int> maybeMaxVecElems,
     std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
-                                     Value, int, VectorType,
-                                     std::optional<Value>)>
+                                     Value, int, VectorType)>
         lowerInst,
     std::optional<Value> barrierPtr = {});
 
@@ -728,10 +725,10 @@ void makeAllWarpGroupsIsolatedFromAbove(Operation *op);
 // Set the correct loop annotation on LLVM branch ops.
 void fixUpLoopAnnotation(ModuleOp mod);
 
-void transferSwizzlingLocalMem(triton::gpu::ConvertLayoutOp op, Value src,
-                               const TargetInfoBase &targetInfo,
-                               const LLVMTypeConverter *typeConverter,
-                               RewriterBase &rewriter);
+void transferWithinBlockSwizzling(triton::gpu::ConvertLayoutOp op, Value src,
+                                  const TargetInfoBase &targetInfo,
+                                  const LLVMTypeConverter *typeConverter,
+                                  RewriterBase &rewriter);
 
 SmallVector<Value> inlineRegionImpl(RewriterBase &rewriter, Region &region,
                                     ArrayRef<Value> args,
