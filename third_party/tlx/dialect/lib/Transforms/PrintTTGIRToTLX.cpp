@@ -766,10 +766,27 @@ bool shouldSkipOp(
       "ttng.inval_barrier",
       "tt.splat",
       "tt.broadcast",
-      "ttg.memdesc_index",
       "tt.map_elementwise.return",
       "ttng.tcgen5_global_alloc",
   };
+  // Emit ttg.memdesc_index as tlx.local_view when a real consumer needs the
+  // view (MMA, wait, local_store, loop iter-arg, ...). Skip it when it has no
+  // users, or when every user is a barrier-lifecycle op (init_barrier /
+  // inval_barrier) that folds into the alloc_barriers() for the barrier alloc.
+  if (opName == "ttg.memdesc_index") {
+    bool hasUser = false, allBarrierLifecycle = true;
+    for (Value result : op->getResults()) {
+      for (Operation *user : result.getUsers()) {
+        hasUser = true;
+        StringRef userName = user->getName().getStringRef();
+        if (userName != "ttng.init_barrier" && userName != "ttng.inval_barrier")
+          allBarrierLifecycle = false;
+      }
+    }
+    if (!hasUser || allBarrierLifecycle)
+      return true;
+    return skippedOps.count(op) > 0;
+  }
   if (opsToSkip.contains(opName)) {
     // Don't skip arith.constant with DenseElementsAttr (tensor splat constants)
     // — they need to be printed as explicit tl.full() assignments
