@@ -286,6 +286,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
   //   "exhaustive" → Exhaustive search with joint memory feasibility
   //   "random"     → Random sampling with greedy placement
+  //   "contracted" → Two-stage GEMM search on a contracted compute graph
   //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
   auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
 
@@ -297,6 +298,11 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   if (algo == "random") {
     LLVM_DEBUG(DBGS() << "Using random sampling search\n");
     return runRandomSearch(ddg, maxII);
+  }
+
+  if (algo == "contracted") {
+    LLVM_DEBUG(DBGS() << "Using contracted-graph two-stage search\n");
+    return runContractedSearch(ddg, maxII);
   }
 
   if (algo == "sms") {
