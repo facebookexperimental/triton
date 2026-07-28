@@ -3280,6 +3280,8 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         actual = _launch_a4w4(a, b, a_scales, b_scales)
         expected = _a4w4_reference(a, b, a_scales, b_scales)
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
 @pytest.mark.parametrize("k, split_k", [(1024, 1), (4096, 2)])
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_preshuffled_scale_correctness_gfx950(device, k, split_k):
