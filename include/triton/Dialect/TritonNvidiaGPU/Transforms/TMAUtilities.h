@@ -24,6 +24,8 @@ bool hasCGABroadcast(gpu::MemDescType memDescType);
 
 Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc);
 
+bool hasCGABroadcast(gpu::MemDescType memDescType);
+
 inline SmallVector<int64_t> getTMABlockShape(Attribute encoding,
                                              ArrayRef<int64_t> shapePerCTA,
                                              bool packedSize,
