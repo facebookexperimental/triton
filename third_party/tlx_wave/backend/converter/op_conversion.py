@@ -5369,14 +5369,6 @@ def _convert_dot_scaled(builder, conversion_input, type_layout_program, op):
             source_value_id=op.results[0],
         )
     instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
-    if instr_shape != (16, 16, 128):
-        fail(
-            "TLXW_OP_DOT_SCALED",
-            STAGE,
-            f"unsupported scaled MFMA instruction shape {instr_shape}",
-            source_op_index=op.index,
-            source_value_id=op.results[0],
-        )
     a_elem_type = _scale_dot_elem_type(op.attrs.get("a_elem_type"), op)
     b_elem_type = _scale_dot_elem_type(op.attrs.get("b_elem_type"), op)
     kind = _scaled_mma_kind(a_elem_type, b_elem_type, instr_shape, op)
@@ -8094,15 +8086,6 @@ def _local_component_store_plan(
     shape = tuple(int(dim) for dim in (memdesc.shape or memdesc.alloc_shape))
     total_elements = _product(shape)
     wave_count = max(1, int(conversion_input.num_warps))
-    if int(component_count) * int(lane_width) * wave_count != total_elements:
-        fail(
-            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
-            STAGE,
-            "scalarized amdg.buffer_load_to_local currently requires "
-            "all-active full per-wave components",
-            source_op_index=op.index,
-            source_value_id=memdesc_value_id,
-        )
     memdesc_layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
     memdesc_layout = (None if memdesc_layout_id is None else type_layout_program.layouts[int(memdesc_layout_id)])
     offset_layout_id = type_layout_program.values[offset_value_id].layout_map_id
@@ -8117,17 +8100,33 @@ def _local_component_store_plan(
             source_op_index=op.index,
             source_value_id=offset_value_id,
         )
+    coordinate_domain = offset_layout.properties.get("coordinate_domain", {})
+    coverage = coordinate_domain.get("coverage")
+    full_coordinate_domain = (coverage in {"exact", "replicated"}
+                              and int(coordinate_domain.get("local_elements", -1)) == total_elements
+                              and int(coordinate_domain.get("covered_elements", -1)) == total_elements
+                              and int(coordinate_domain.get("out_of_bounds_slots", -1)) == 0)
+    full_slot_domain = int(component_count) * int(lane_width) * wave_count == total_elements
+    if not full_coordinate_domain and not full_slot_domain:
+        fail(
+            "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
+            STAGE,
+            "scalarized amdg.buffer_load_to_local requires full distributed "
+            "coverage of the local destination",
+            source_op_index=op.index,
+            source_value_id=memdesc_value_id,
+        )
     linear = layouts.distributed_linear_layout(
         offset_layout,
         stage=STAGE,
         source_op_index=op.index,
     )
-    if not linear.is_injective():
+    if not linear.is_injective() and coverage != "replicated":
         fail(
             "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
             STAGE,
-            "scalarized amdg.buffer_load_to_local requires an injective "
-            "offset layout for local destination mapping",
+            "scalarized amdg.buffer_load_to_local requires an exact or "
+            "replicated offset layout for local destination mapping",
             source_op_index=op.index,
             source_value_id=offset_value_id,
         )
@@ -10668,10 +10667,9 @@ def _scalar_slot(value_id, scalar_value_ids, scalar_slots):
 def _fragment_registers(element_type, result_layout, op):
     parent = result_layout.properties.get("parent_properties", {})
     instr_shape = tuple(parent.get("instr_shape", ()))
-    if (element_type in {"f16", "bf16"} and instr_shape in {(16, 16, 32), (32, 32, 16)}):
-        return 4
-    if element_type == "i8" and instr_shape == (16, 16, 128):
-        return 4
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None and element_type in spec.operand_element_types:
+        return spec.operand_registers
     fail(
         "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         STAGE,
@@ -10750,10 +10748,9 @@ def _register_vector_payload_registers_or_none(type_layout_program, converted, o
 
 def _mfma_registers_per_component_from_properties(properties, layout, op):
     instr_shape = tuple(int(value) for value in properties.get("instr_shape", ()))
-    if instr_shape in {(16, 16, 32), (16, 16, 128)}:
-        return 4
-    if instr_shape == (32, 32, 16):
-        return 16
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None:
+        return spec.accumulator_registers
     fail(
         "TLXW_OP_UNSUPPORTED_REGISTER_PAYLOAD",
         STAGE,
@@ -10765,12 +10762,9 @@ def _mfma_registers_per_component_from_properties(properties, layout, op):
 
 def _acc_fragment_registers(result_layout, op):
     instr_shape = tuple(result_layout.properties.get("instr_shape", ()))
-    if result_layout.element_type == "f32" and instr_shape == (16, 16, 32):
-        return 4
-    if result_layout.element_type == "f32" and instr_shape == (16, 16, 128):
-        return 4
-    if result_layout.element_type == "f32" and instr_shape == (32, 32, 16):
-        return 16
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if result_layout.element_type == "f32" and spec is not None:
+        return spec.accumulator_registers
     fail(
         "TLXW_OP_FRAGMENT_CONSTANT",
         STAGE,
@@ -10799,8 +10793,13 @@ def _mma_kind(element_type, instr_shape, op):
 
 
 def _scaled_mma_kind(a_elem_type, b_elem_type, instr_shape, op):
-    if instr_shape == (16, 16, 128) and a_elem_type == "e2m1" and b_elem_type == "e2m1":
-        return "mfma.scale.f32.16x16x128.f4.f4"
+    kinds = {
+        ((16, 16, 128), "e2m1", "e2m1"): "mfma.scale.f32.16x16x128.f4.f4",
+        ((32, 32, 64), "e2m1", "e2m1"): "mfma.scale.f32.32x32x64.f4.f4",
+    }
+    kind = kinds.get((tuple(instr_shape), a_elem_type, b_elem_type))
+    if kind is not None:
+        return kind
     fail(
         "TLXW_OP_DOT_SCALED",
         STAGE,
@@ -10933,10 +10932,9 @@ def _scaled_mma_one_scale_pack_attrs(prefix, non_k_tiles, k_tiles, component_cou
 
 
 def _operand_fragment_shape(instr_shape, op):
-    if instr_shape in {(16, 16, 32), (16, 16, 128)}:
-        return 16, 16
-    if instr_shape == (32, 32, 16):
-        return 32, 32
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None:
+        return spec.rows, spec.columns
     fail(
         "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
         STAGE,
@@ -10946,10 +10944,9 @@ def _operand_fragment_shape(instr_shape, op):
 
 
 def _acc_fragment_shape(instr_shape, op):
-    if instr_shape in {(16, 16, 32), (16, 16, 128)}:
-        return 16, 16
-    if instr_shape == (32, 32, 16):
-        return 32, 32
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is not None:
+        return spec.rows, spec.columns
     fail(
         "TLXW_OP_FRAGMENT_CONSTANT",
         STAGE,
@@ -11767,20 +11764,41 @@ def _mma_access_lane_layout(
     transpose_load=False,
 ):
     op_idx = int(result_layout.properties.get("op_idx", -1))
-    if (tuple(int(value) for value in instr_shape) == (16, 16, 128) and result_layout.element_type == "i8"
-            and int(result_layout.lane_width) == 64 and int(elements_per_lane) == 16):
+    if _mma_operand_tile_is_wave_partitioned(
+            result_layout,
+            instr_shape,
+            elements_per_lane,
+    ):
         if op_idx == 0:
             return "gfx950_mfma_a"
-        if op_idx == 1:
+        if op_idx == 1 and result_layout.element_type == "i8":
             return "gfx950_mfma_b"
-    if (op_idx == 0 and tuple(int(value) for value in instr_shape) in {(16, 16, 32), (32, 32, 16)}
-            and int(result_layout.lane_width) == 64 and int(elements_per_lane) == 8):
-        return "gfx950_mfma_a"
-    if (op_idx == 1 and bool(transpose_load) and tuple(int(value) for value in instr_shape) in {(16, 16, 32),
-                                                                                                (32, 32, 16)}
-            and int(result_layout.lane_width) == 64 and int(elements_per_lane) == 8):
+    if op_idx == 1 and bool(transpose_load) and _mma_operand_tile_is_wave_partitioned(
+            result_layout,
+            instr_shape,
+            elements_per_lane,
+    ):
         return "gfx950_mfma_b_transpose"
     return "row_major_linear"
+
+
+def _mma_operand_tile_is_wave_partitioned(
+    result_layout,
+    instr_shape,
+    elements_per_lane,
+):
+    spec = layouts.mfma_instruction_spec(instr_shape)
+    if spec is None or int(result_layout.lane_width) != 64:
+        return False
+    op_idx = int(result_layout.properties.get("op_idx", -1))
+    if op_idx not in {0, 1}:
+        return False
+    k_extent = layouts.dot_operand_storage_k_tile_extent(
+        result_layout.element_type,
+        result_layout.properties,
+    )
+    non_k_extent = spec.rows if op_idx == 0 else spec.columns
+    return int(non_k_extent) * int(k_extent) == int(result_layout.lane_width) * int(elements_per_lane)
 
 
 def _indexed_mma_payload_lane_layout(layout, result_layout, instr_shape, elements_per_lane):
@@ -11791,8 +11809,7 @@ def _indexed_mma_payload_lane_layout(layout, result_layout, instr_shape, element
     # their structural offset plan proves each per-lane packet contiguous.
     if (layout is not None and tuple(layout.properties.get("order", ())) == (0, 1)
             and int(result_layout.properties.get("op_idx", -1)) == 1
-            and tuple(int(value) for value in instr_shape) in {(16, 16, 32), (32, 32, 16)}
-            and int(result_layout.lane_width) == 64 and int(elements_per_lane) == 8):
+            and _mma_operand_tile_is_wave_partitioned(result_layout, instr_shape, elements_per_lane)):
         return "gfx950_mfma_b"
     return _mma_access_lane_layout(
         result_layout,

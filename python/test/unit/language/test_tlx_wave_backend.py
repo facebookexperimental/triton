@@ -886,11 +886,10 @@ def test_tlx_perf_sweep_forwards_mxfp_batched_timing_options(tmp_path):
 
     specs = runner.build_run_specs(args, tmp_path)
 
-    assert [spec.backend for spec in specs] == ["llvm", "wave"]
+    assert [spec.backend for spec in specs] == ["llvm", "wave", "llvm", "wave"]
     expected_options = {
         "--rep": "31",
         "--warmup": "7",
-        "--compile-workers": "2",
         "--timing-mode": "batched",
         "--warmup-launches": "13",
         "--timed-launches": "103",
@@ -899,6 +898,19 @@ def test_tlx_perf_sweep_forwards_mxfp_batched_timing_options(tmp_path):
     for spec in specs:
         for option, expected in expected_options.items():
             assert spec.command[spec.command.index(option) + 1] == expected
+
+    intra_wave_llvm, intra_wave_wave, inter_wave_llvm, inter_wave_wave = specs
+    assert intra_wave_llvm.name == "mxfp-llvm"
+    assert intra_wave_wave.name == "mxfp-wave"
+    for spec in (intra_wave_llvm, intra_wave_wave):
+        assert spec.command[1].endswith("gfx9_gemm/intra_wave/a4w4/bench.py")
+        assert spec.command[spec.command.index("--compile-workers") + 1] == "2"
+
+    assert inter_wave_llvm.name == "mxfp-inter-wave-llvm"
+    assert inter_wave_wave.name == "mxfp-inter-wave-wave"
+    for spec in (inter_wave_llvm, inter_wave_wave):
+        assert spec.command[1].endswith("gfx9_gemm/inter_wave/a4w4/bench.py")
+        assert "--compile-workers" not in spec.command
 
 
 def test_tlx_wave_gfx9_a4w4_scale_loads_keep_requested_packet_layouts(tmp_path, monkeypatch):
@@ -9899,6 +9911,40 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(tmp
     del ctx
 
 
+def test_tlx_wave_converter_scalarized_buffer_load_to_local_replicated_waves(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [[0]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_replicated_wave_scalarized_dma(
+      %arg0: !tt.ptr<i8> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xi8, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #linear>
+    %token = amdg.buffer_load_to_local %arg0[%range] into %alloc : <i8>[tensor<64xi32, #linear>] -> <64xi8, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=2, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
+    attrs = converter_target_ir.attrs_dict(load_to_local_op)
+    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["destination_offset_mode"] == "affine"
+    assert attrs["destination_component_offsets"] == (0, )
+    assert attrs["destination_lane_stride_elements"] == 1
+    assert attrs["destination_wave_stride_elements"] == 0
+    assert output.emitted_module.text.count("wave.gather") == 1
+    assert output.emitted_module.text.count("wave.scatter") == 1
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
 def test_tlx_wave_converter_lowers_scalarized_swizzled_vec4_layout(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
@@ -11448,6 +11494,38 @@ def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
                 "version": 4,
                 "warps_per_cta": (2, 2),
                 "instr_shape": (32, 32, 16),
+                "is_transposed": True,
+                "tiles_per_warp": (1, 1),
+                "element_bit_width": 32,
+            },
+            (
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 1, 0),
+                (0, 16, 0),
+                (0, 0, 1),
+                (2, 7, 3),
+                (4, 31, 1),
+                (8, 63, 3),
+            ),
+            (
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (16, 0),
+                (0, 32),
+                (39, 34),
+                (31, 40),
+                (63, 52),
+            ),
+        ),
+        (
+            "mfma32_scaled_t_warps2x2",
+            (128, 128),
+            {
+                "version": 4,
+                "warps_per_cta": (2, 2),
+                "instr_shape": (32, 32, 64),
                 "is_transposed": True,
                 "tiles_per_warp": (1, 1),
                 "element_bit_width": 32,
@@ -15223,6 +15301,173 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_local_loads(tmp_path)
     ) == (1, 4, 2, 2)
     assert [op.kind for op in output.target_program.ops].count("layout_convert") == 0
     del ctx
+
+
+def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_32x32x64_local_loads(tmp_path):
+    preamble = """
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [32, 32, 64], isTransposed = true}>
+#dot0 = #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 16}>
+#dot1 = #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>
+#shared_a = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared_b = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_scaled_mfma_32x32x64_local_loads() attributes {noinline = false} {
+    %a_alloc = ttg.local_alloc : () -> !ttg.memdesc<128x128xi8, #shared_a, #smem, mutable>
+    %b_alloc = ttg.local_alloc : () -> !ttg.memdesc<128x128xi8, #shared_b, #smem, mutable>
+    %lhs = ttg.local_load %a_alloc : !ttg.memdesc<128x128xi8, #shared_a, #smem, mutable> -> tensor<128x128xi8, #dot0>
+    %rhs = ttg.local_load %b_alloc : !ttg.memdesc<128x128xi8, #shared_b, #smem, mutable> -> tensor<128x128xi8, #dot1>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    local_load_attrs = [
+        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
+    ]
+    assert [attrs["component_count"] for attrs in local_load_attrs] == [8, 4]
+    assert [attrs["source_shape"] for attrs in local_load_attrs] == [(32, 32), (32, 32)]
+    assert [attrs["mma_access_lane_layout"] for attrs in local_load_attrs] == [
+        "gfx950_mfma_a",
+        "gfx950_mfma_b",
+    ]
+    assert all(attrs["mma_access_vector_payload_width"] == 16 for attrs in local_load_attrs)
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert machine.count("waveamdmachine.ds_load_tuple_b32") == 12
+    del ctx
+
+
+def test_tlx_wave_converter_lowers_scaled_mfma_32x32x64():
+    mfma_properties = {
+        "version": 4,
+        "warps_per_cta": (2, 4),
+        "instr_shape": (32, 32, 64),
+        "is_transposed": True,
+    }
+    layouts = (
+        _fake_layout(
+            0,
+            0,
+            kind="dot_operand",
+            shape=(128, 128),
+            element_type="i8",
+            component_count=8,
+            properties={
+                "k_width": 16,
+                "op_idx": 0,
+                "parent_kind": "amd_mfma",
+                "parent_properties": mfma_properties,
+            },
+        ),
+        _fake_layout(
+            1,
+            1,
+            kind="dot_operand",
+            shape=(128, 128),
+            element_type="i8",
+            component_count=4,
+            properties={
+                "k_width": 16,
+                "op_idx": 1,
+                "parent_kind": "amd_mfma",
+                "parent_properties": mfma_properties,
+            },
+        ),
+        _fake_layout(
+            2,
+            2,
+            kind="amd_mfma",
+            shape=(128, 128),
+            element_type="f32",
+            component_count=2,
+            properties=mfma_properties,
+        ),
+        _fake_layout(3, 3, kind="linear", shape=(128, 8), element_type="i8", component_count=8),
+        _fake_layout(4, 4, kind="linear", shape=(128, 8), element_type="i8", component_count=4),
+    )
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            0:
+            _converted_value(
+                0,
+                representation="simd_packet_tuple",
+                element_type="i8",
+                component_count=8,
+                layout_map_id=0,
+            ),
+            1:
+            _converted_value(
+                1,
+                representation="simd_packet_tuple",
+                element_type="i8",
+                component_count=4,
+                layout_map_id=1,
+            ),
+            2:
+            _converted_value(
+                2,
+                representation="simd_packet_tuple",
+                element_type="f32",
+                component_count=2,
+                layout_map_id=2,
+            ),
+            3:
+            _converted_value(
+                3,
+                representation="simd_tuple",
+                element_type="i8",
+                component_count=8,
+                layout_map_id=3,
+            ),
+            4:
+            _converted_value(
+                4,
+                representation="simd_tuple",
+                element_type="i8",
+                component_count=4,
+                layout_map_id=4,
+            ),
+            5:
+            _converted_value(
+                5,
+                representation="simd_packet_tuple",
+                element_type="f32",
+                component_count=2,
+                layout_map_id=2,
+            ),
+        },
+        layouts,
+    )
+    builder = converter_target_ir.TargetBuilder()
+    for value_id in range(5):
+        converted = type_layout_program.values[value_id]
+        builder.add_value(
+            converter_target_ir.target_type_from_converted(converted.type),
+            source_value_id=value_id,
+        )
+    op = converter_source_ir.SourceOp(
+        0,
+        "tt.dot_scaled",
+        operands=(0, 1, 2, 3, 4),
+        results=(5, ),
+        attrs={"a_elem_type": 4, "b_elem_type": 4},
+    )
+
+    converter_op_conversion._convert_dot_scaled(
+        builder,
+        SimpleNamespace(),
+        type_layout_program,
+        op,
+    )
+
+    mma_attrs = converter_target_ir.attrs_dict(builder.ops[-1])
+    assert (mma_attrs["m_tiles"], mma_attrs["n_tiles"], mma_attrs["k_tiles"]) == (2, 1, 4)
+    assert mma_attrs["kind"] == "mfma.scale.f32.32x32x64.f4.f4"
+    assert mma_attrs["lhs_registers"] == mma_attrs["rhs_registers"] == 4
+    assert mma_attrs["acc_registers"] == 16
 
 
 def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_scale_transpose_loads(tmp_path):
