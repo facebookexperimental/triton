@@ -223,6 +223,41 @@ class TestTLXTemplates(TestCase):
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_split_k_cpp_wrapper(self):
+        M, K, N = 256, 4096, 256
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "cpp_wrapper": True,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("split_k_ws", code_str)
+        self.assertIn("call__reduce_k_kernel_", code_str)
+        self.assertNotIn(
+            "from triton.language.extra.tlx.inductor.reduce_k import", code_str
+        )
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_tlx_addmm_warppipe_unaligned_k(self, dtype: torch.dtype):
         """Unaligned K (K % BLOCK_K != 0) on the TLX warp-pipe addmm (gfx950).
@@ -596,7 +631,51 @@ class TestSplitK(TestCase):
 
 
 class TestReduceKKernel(TestCase):
-    """Direct unit test for the split-K reduction kernel."""
+    """Direct unit tests for the split-K reduction kernel."""
+
+    def test_aoti_reduce_k_emission(self):
+        from triton.language.extra.tlx.inductor.reduce_k import (
+            emit_aoti_reduce_k_call,
+        )
+
+        wrapper = mock.MagicMock()
+        wrapper.define_user_defined_triton_kernel.return_value = (
+            "_reduce_k_kernel_0",
+            {"signature": {}},
+            {"grid_type": "FixedGrid"},
+            [],
+        )
+        workspace = mock.MagicMock()
+        workspace.outer_name = "split_k_ws_0"
+        workspace.dtype = torch.float32
+        output = mock.MagicMock()
+        output.get_name.return_value = "buf_out"
+        output.get_dtype.return_value = torch.float16
+        output.get_device.return_value = torch.device("cuda")
+        bias = mock.MagicMock()
+        bias.get_name.return_value = "arg_bias"
+        bias.get_dtype.return_value = torch.float16
+
+        emit_aoti_reduce_k_call(
+            wrapper,
+            workspace_arg=workspace,
+            output_node=output,
+            bias_node=bias,
+            M=256,
+            N=256,
+            split_k=4,
+            output_triton_dtype="tl.float16",
+        )
+
+        wrapper.define_user_defined_triton_kernel.assert_called_once()
+        wrapper.generate_kernel_call.assert_called_once()
+        call = wrapper.generate_kernel_call.call_args
+        self.assertEqual("_reduce_k_kernel_0", call.args[0])
+        self.assertEqual(
+            ["split_k_ws_0", "buf_out", "arg_bias", 256, 256],
+            call.args[1],
+        )
+        self.assertTrue(call.kwargs["triton"])
 
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),
