@@ -1215,6 +1215,8 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
         actual = _launch_a4w4(a, b, a_scales, b_scales)
         expected = _a4w4_reference(a, b, a_scales, b_scales)
         torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
     # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes

@@ -24,6 +24,27 @@ class LayoutMap:
 
 
 @dataclass(frozen=True)
+class MfmaInstructionSpec:
+    rows: int
+    columns: int
+    operand_registers: int
+    accumulator_registers: int
+    operand_element_types: tuple[str, ...]
+
+
+_MFMA_INSTRUCTION_SPECS = {
+    (16, 16, 32): MfmaInstructionSpec(16, 16, 4, 4, ("f16", "bf16")),
+    (16, 16, 128): MfmaInstructionSpec(16, 16, 4, 4, ("i8", )),
+    (32, 32, 16): MfmaInstructionSpec(32, 32, 4, 16, ("f16", "bf16")),
+    (32, 32, 64): MfmaInstructionSpec(32, 32, 4, 16, ("i8", )),
+}
+
+
+def mfma_instruction_spec(instr_shape):
+    return _MFMA_INSTRUCTION_SPECS.get(tuple(int(value) for value in instr_shape))
+
+
+@dataclass(frozen=True)
 class PhysicalOffsetRecord:
     element_offset: int
     byte_offset: int
@@ -1740,12 +1761,9 @@ def mfma_registers_per_component(
     source_op_index=None,
 ):
     instr_shape = tuple(int(value) for value in layout.properties.get("instr_shape", ()))
-    if instr_shape == (16, 16, 32):
-        return 4
-    if instr_shape == (16, 16, 128):
-        return 4
-    if instr_shape == (32, 32, 16):
-        return 16
+    spec = mfma_instruction_spec(instr_shape)
+    if spec is not None:
+        return spec.accumulator_registers
     _layout_fail(
         "TLXW_TYPE_UNSUPPORTED_LAYOUT",
         stage,
@@ -1992,7 +2010,7 @@ def _mfma_linear_layout(
             source_value_id=source_value_id,
         )
     instr_shape = tuple(int(value) for value in properties.get("instr_shape", ()))
-    if instr_shape not in {(16, 16, 32), (16, 16, 128), (32, 32, 16)}:
+    if mfma_instruction_spec(instr_shape) is None:
         _layout_fail(
             "TLXW_TYPE_UNSUPPORTED_LAYOUT",
             stage,
