@@ -2,6 +2,7 @@
 #include "third_party/amd/include/Analysis/AxisInfoExt.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Analysis/AxisInfo.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -105,6 +106,22 @@ buildBufferOpEncoding(MLIRContext *ctx, Value ptr, Value offsets,
                                        cgaLayout);
 }
 
+static void annotateStoreOwnership(triton::amdgpu::BufferStoreOp store) {
+  auto masks = getFreeVariableMasks(store.getValue().getType());
+  MLIRContext *ctx = store.getContext();
+  for (auto [dimension, attribute] :
+       {std::pair{"register", "amdgpu.redundant_register_mask"},
+        std::pair{"lane", "amdgpu.redundant_lane_mask"},
+        std::pair{"warp", "amdgpu.redundant_wave_mask"}}) {
+    int32_t mask = masks.lookup(StringAttr::get(ctx, dimension));
+    if (mask)
+      store->setAttr(attribute,
+                     IntegerAttr::get(IntegerType::get(ctx, 32), mask));
+    else
+      store->removeAttr(attribute);
+  }
+}
+
 } // namespace
 
 class TritonAMDGPUCoalesceBufferOpsPass
@@ -173,6 +190,13 @@ public:
     for (auto &kv : layoutMap) {
       convertDistributedOpEncoding(kv.second, kv.first);
     }
+
+    // Buffer stores are effects on logical tensor elements. Record the free
+    // physical register/lane/warp variables after the final layout rewrite so
+    // non-LLVM backends can select the same canonical owners as LLVM lowering.
+    mod.walk([](triton::amdgpu::BufferStoreOp store) {
+      annotateStoreOwnership(store);
+    });
   }
 };
 

@@ -8292,6 +8292,29 @@ def _emit_buffer_load_to_local_packet_dma(
     else:
         dest_base_i32 = _ptr_cast(state, dest_base, i32_shared)
     lane = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    redundant_wave_mask = int(attrs.get("redundant_wave_mask", 0))
+    owner_condition = None
+    if redundant_wave_mask:
+        wave_id = _simd_binary_const(
+            state,
+            "divui",
+            lane,
+            lane_width,
+            lane_width,
+        )
+        masked_wave_id = _simd_binary_const(
+            state,
+            "andi",
+            wave_id,
+            redundant_wave_mask,
+            lane_width,
+        )
+        owner_condition = _cmpi(
+            state,
+            "eq",
+            masked_wave_id,
+            _simd_i32_constant(state, lane_width, 0),
+        )
     destination_wave_offset_coefficients_dwords = tuple(
         int(value) for value in attrs.get("destination_wave_offset_coefficients_dwords", ()))
     destination_wave_stride_dwords = int(attrs.get("destination_wave_stride_dwords", 0))
@@ -8390,13 +8413,39 @@ def _emit_buffer_load_to_local_packet_dma(
 
         component_dependency = dependency
         if mask_component is None:
-            token = state.builder.dma_load_lds(
-                source_ptr,
-                dest_ptr,
-                after=component_dependency,
-                bytes=packet_bytes,
-                **issue_delay_options,
-            )
+            if owner_condition is None:
+                token = state.builder.dma_load_lds(
+                    source_ptr,
+                    dest_ptr,
+                    after=component_dependency,
+                    bytes=packet_bytes,
+                    **issue_delay_options,
+                )
+            else:
+                inactive_token = (
+                    component_dependency or state.builder.token()
+                )
+
+                def emit_dma_load(
+                    source_ptr=source_ptr,
+                    dest_ptr=dest_ptr,
+                    component_dependency=component_dependency,
+                    issue_delay_options=issue_delay_options,
+                ):
+                    return state.builder.dma_load_lds(
+                        source_ptr,
+                        dest_ptr,
+                        after=component_dependency,
+                        bytes=packet_bytes,
+                        **issue_delay_options,
+                    )
+
+                token = _emit_masked_token_region(
+                    state,
+                    owner_condition,
+                    inactive_token,
+                    emit_dma_load,
+                )
             component_tokens.append(token)
             continue
         if _is_scalar_i1_value(state, mask_component):
@@ -11101,6 +11150,26 @@ def _emit_buffer_store(state, op):
         lane_width,
         op,
     )
+    redundant_register_mask = int(attrs.get("redundant_register_mask", 0))
+    if redundant_register_mask:
+        canonical_components = tuple(
+            component
+            for component in range(access_component_count)
+            if (component & redundant_register_mask) == 0
+        )
+        value_components = tuple(
+            value_components[component]
+            for component in canonical_components
+        )
+        offset_components = tuple(
+            offset_components[component]
+            for component in canonical_components
+        )
+        if mask_components is not None:
+            mask_components = tuple(
+                mask_components[component]
+                for component in canonical_components
+            )
     if has_mask and attrs.get("mask_mode", "exec_where") != "exec_where":
         fail(
             "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
@@ -11122,13 +11191,33 @@ def _emit_buffer_store(state, op):
         cache=cache,
     )
 
-    if mask_components is None:
+    owner_condition = _buffer_store_owner_condition(
+        state,
+        attrs,
+        lane_width,
+        op,
+    )
+    if mask_components is None and owner_condition is None:
         token = emit_scatter()
     else:
-        predicate_conditions = _symbolic_mask_conditions(
-            state,
-            mask_components,
-        )
+        if mask_components is None:
+            predicate_conditions = owner_condition
+        else:
+            if owner_condition is not None:
+                mask_components = tuple(
+                    _mask_and_predicate(
+                        state,
+                        component,
+                        owner_condition,
+                        lane_width,
+                        op,
+                    )
+                    for component in mask_components
+                )
+            predicate_conditions = _symbolic_mask_conditions(
+                state,
+                mask_components,
+            )
         if capture_token:
             token = _emit_masked_token_region(
                 state,
@@ -11147,6 +11236,73 @@ def _emit_buffer_store(state, op):
         op,
         () if token is None else (token, ),
     )
+
+
+def _buffer_store_owner_condition(state, attrs, lane_width, op):
+    lane_mask = int(attrs.get("redundant_lane_mask", 0))
+    wave_mask = int(attrs.get("redundant_wave_mask", 0))
+    if not lane_mask and not wave_mask:
+        return None
+    workitem = state.builder.workitem_id(
+        0,
+        state.dsl.i32(),
+        lane_width,
+    )
+    owner_condition = None
+    if lane_mask:
+        lane_id = _simd_binary_const(
+            state,
+            "remui",
+            workitem,
+            lane_width,
+            lane_width,
+        )
+        masked_lane_id = _simd_binary_const(
+            state,
+            "andi",
+            lane_id,
+            lane_mask,
+            lane_width,
+        )
+        owner_condition = _cmpi(
+            state,
+            "eq",
+            masked_lane_id,
+            _simd_i32_constant(state, lane_width, 0),
+        )
+    if wave_mask:
+        wave_id = _simd_binary_const(
+            state,
+            "divui",
+            workitem,
+            lane_width,
+            lane_width,
+        )
+        masked_wave_id = _simd_binary_const(
+            state,
+            "andi",
+            wave_id,
+            wave_mask,
+            lane_width,
+        )
+        wave_owner = _cmpi(
+            state,
+            "eq",
+            masked_wave_id,
+            _simd_i32_constant(state, lane_width, 0),
+        )
+        owner_condition = (
+            wave_owner
+            if owner_condition is None
+            else _mask_and_predicate(
+                state,
+                owner_condition,
+                wave_owner,
+                lane_width,
+                op,
+            )
+        )
+    return owner_condition
 
 
 def _simd_1d_vector_payload(state, value):

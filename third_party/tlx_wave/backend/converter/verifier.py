@@ -1166,6 +1166,95 @@ def _verify_memory_edges(op, target_program):
                 target_value_id=int(op.operands[offset_operand]),
             )
     has_mask = bool(attrs.get("has_mask", False))
+    redundant_register_mask = attrs.get("redundant_register_mask", 0)
+    redundant_lane_mask = attrs.get("redundant_lane_mask", 0)
+    redundant_wave_mask = attrs.get("redundant_wave_mask", 0)
+    ownership_masks = (
+        redundant_register_mask,
+        redundant_lane_mask,
+        redundant_wave_mask,
+    )
+    if (
+        any(
+            not isinstance(mask, int) or mask < 0
+            for mask in ownership_masks
+        )
+        or (
+            any(ownership_masks)
+            and (
+                op.kind not in {"buffer_load_to_local", "buffer_store"}
+                or (
+                    op.kind == "buffer_load_to_local"
+                    and (
+                        attrs.get("mode") != "dma_packet_lds"
+                        or has_mask
+                        or redundant_register_mask
+                        or redundant_lane_mask
+                    )
+                )
+            )
+        )
+    ):
+        fail(
+            "TLXW_VERIFY_MEMORY_EDGE",
+            STAGE,
+            "invalid canonical ownership masks on memory operation",
+            target_op_id=op.target_op_id,
+        )
+    wave_count = (
+        attrs.get("destination_wave_count")
+        if op.kind == "buffer_load_to_local"
+        else attrs.get("wave_count")
+    )
+    if (
+        redundant_wave_mask
+        and (
+            not isinstance(wave_count, int)
+            or wave_count <= 1
+            or wave_count & (wave_count - 1)
+            or redundant_wave_mask >= wave_count
+            or redundant_wave_mask & ~(wave_count - 1)
+        )
+    ):
+        fail(
+            "TLXW_VERIFY_MEMORY_EDGE",
+            STAGE,
+            "redundant-wave mask is incompatible with the memory wave count",
+            target_op_id=op.target_op_id,
+        )
+    lane_width = attrs.get("lane_width")
+    if (
+        redundant_lane_mask
+        and (
+            not isinstance(lane_width, int)
+            or lane_width <= 1
+            or lane_width & (lane_width - 1)
+            or redundant_lane_mask >= lane_width
+            or redundant_lane_mask & ~(lane_width - 1)
+        )
+    ):
+        fail(
+            "TLXW_VERIFY_MEMORY_EDGE",
+            STAGE,
+            "redundant-lane mask is incompatible with the memory lane width",
+            target_op_id=op.target_op_id,
+        )
+    access_component_count = attrs.get("access_component_count")
+    if (
+        redundant_register_mask
+        and (
+            op.kind != "buffer_store"
+            or not isinstance(access_component_count, int)
+            or access_component_count <= 1
+            or redundant_register_mask >= access_component_count
+        )
+    ):
+        fail(
+            "TLXW_VERIFY_MEMORY_EDGE",
+            STAGE,
+            "redundant-register mask is incompatible with store components",
+            target_op_id=op.target_op_id,
+        )
     mode = attrs.get(
         "mask_operand_mode",
         "operand" if has_mask else "none",
