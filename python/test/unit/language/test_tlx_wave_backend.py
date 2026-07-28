@@ -9945,6 +9945,120 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_replicated_waves(tmp
     del ctx
 
 
+def test_tlx_wave_converter_packetizes_replicated_eight_wave_i8_copy(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1]], warp = [[0, 0], [0, 2], [0, 4]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_replicated_eight_wave_i8_dma(
+      %arg0: !tt.ptr<i8> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<128x8xi8, #shared, #smem, mutable>
+    %rows = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<128xi32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<128x1xi32, #linear>
+    %rows_b = tt.broadcast %rows_2d : tensor<128x1xi32, #linear> -> tensor<128x8xi32, #linear>
+    %cols = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #linear}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #linear}>> -> tensor<1x8xi32, #linear>
+    %cols_b = tt.broadcast %cols_2d : tensor<1x8xi32, #linear> -> tensor<128x8xi32, #linear>
+    %stride = arith.constant dense<128> : tensor<128x8xi32, #linear>
+    %col_offsets = arith.muli %cols_b, %stride : tensor<128x8xi32, #linear>
+    %offset = arith.addi %rows_b, %col_offsets : tensor<128x8xi32, #linear>
+    %token = amdg.buffer_load_to_local %arg0[%offset] into %alloc {amdgpu.redundant_wave_mask = 1 : i32, contiguity = 4 : i32} : <i8>[tensor<128x8xi32, #linear>] -> <128x8xi8, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=8,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (copy_op, ) = [
+        op
+        for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(copy_op)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["packet_bytes"] == 4
+    assert attrs["component_count"] == 1
+    assert attrs["redundant_wave_mask"] == 1
+    assert attrs["destination_component_offsets"] == (0, )
+    assert attrs["destination_wave_offset_coefficients_dwords"] == (0, 64, 128)
+    wave = output.emitted_module.text
+    assert wave.count("wave.where") == 1
+    assert "scf.if" not in wave
+    assert wave.count("waveamd.dma_load_lds") == 1
+    assert "wave.gather" not in wave
+    assert "wave.scatter" not in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_lds_b32" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_packetizes_replicated_four_wave_i8_copy(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [0, 1], [0, 2]], warp = [[0, 0], [0, 4]], block = []}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_replicated_four_wave_i8_dma(
+      %arg0: !tt.ptr<i8> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64x8xi8, #shared, #smem, mutable>
+    %rows = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #linear}>>
+    %rows_2d = tt.expand_dims %rows {axis = 1 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #linear}>> -> tensor<64x1xi32, #linear>
+    %rows_b = tt.broadcast %rows_2d : tensor<64x1xi32, #linear> -> tensor<64x8xi32, #linear>
+    %cols = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #linear}>>
+    %cols_2d = tt.expand_dims %cols {axis = 0 : i32} : tensor<8xi32, #ttg.slice<{dim = 0, parent = #linear}>> -> tensor<1x8xi32, #linear>
+    %cols_b = tt.broadcast %cols_2d : tensor<1x8xi32, #linear> -> tensor<64x8xi32, #linear>
+    %stride = arith.constant dense<64> : tensor<64x8xi32, #linear>
+    %col_offsets = arith.muli %cols_b, %stride : tensor<64x8xi32, #linear>
+    %offset = arith.addi %rows_b, %col_offsets : tensor<64x8xi32, #linear>
+    %token = amdg.buffer_load_to_local %arg0[%offset] into %alloc {amdgpu.redundant_wave_mask = 1 : i32, contiguity = 4 : i32} : <i8>[tensor<64x8xi32, #linear>] -> <64x8xi8, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {num = 0 : i32}
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=4,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (copy_op, ) = [
+        op
+        for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(copy_op)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["packet_bytes"] == 4
+    assert attrs["component_count"] == 1
+    assert attrs["redundant_wave_mask"] == 1
+    assert attrs["destination_component_offsets"] == (0, )
+    assert attrs["destination_wave_offset_coefficients_dwords"] == (0, 64)
+    wave = output.emitted_module.text
+    assert wave.count("wave.where") == 1
+    assert "scf.if" not in wave
+    assert wave.count("waveamd.dma_load_lds") == 1
+    assert "wave.gather" not in wave
+    assert "wave.scatter" not in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.buffer_load_lds_b32" in machine
+    del ctx
+
+
 def test_tlx_wave_converter_lowers_scalarized_swizzled_vec4_layout(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
@@ -12644,6 +12758,60 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_where(tmp_p
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.buffer_store_b16" in machine
     assert "waveamdmachine.exec_if" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{
+  register = [[1], [0]],
+  lane = [[0], [2], [4], [8], [16], [32]],
+  warp = [[0], [0], [0]],
+  block = []
+}>
+"""
+    local_func = """
+  tt.func public @converter_owned_buffer_store(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #linear>
+    %value = arith.constant dense<0.000000e+00> : tensor<64xf16, #linear>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #linear>
+    %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #linear>
+    amdg.buffer_store %value, %arg0[%range], %mask {
+      amdgpu.redundant_lane_mask = 1 : i32,
+      amdgpu.redundant_register_mask = 2 : i32,
+      amdgpu.redundant_wave_mask = 7 : i32,
+      contiguity = 2 : i32
+    } : tensor<64xf16, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=8,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (store_op, ) = [
+        op for op in output.target_program.ops
+        if op.kind == "buffer_store"
+    ]
+    attrs = converter_target_ir.attrs_dict(store_op)
+    assert attrs["redundant_register_mask"] == 2
+    assert attrs["redundant_lane_mask"] == 1
+    assert attrs["redundant_wave_mask"] == 7
+    assert attrs["wave_count"] == 8
+    wave = output.emitted_module.text
+    assert wave.count("wave.scatter") == 1
+    assert wave.count("wave.where") == 1
+    assert "wave.binary andi" in wave
+    machine = _run_waveamd_to_machine(wave)
+    assert machine.count("waveamdmachine.buffer_store_b16") == 2
+    assert machine.count("waveamdmachine.exec_if") == 2
     del ctx
 
 
