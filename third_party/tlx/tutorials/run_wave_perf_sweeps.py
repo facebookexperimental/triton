@@ -352,6 +352,34 @@ def build_run_specs(args, cache_root):
                 command += ("--wave-split-barriers", )
             specs.append(RunSpec(f"mxfp-{backend}", f"MXFP: {backend.upper()}", backend, command, cache_dir))
 
+        script = str(SCRIPT_DIR / "gfx9_gemm/inter_wave/a4w4/bench.py")
+        for backend in ("llvm", "wave"):
+            cache_dir = cache_root / f"mxfp-inter-wave-{backend}"
+            command = (
+                python,
+                script,
+                *timing,
+                "--timing-mode",
+                args.mxfp_timing_mode,
+                "--warmup-launches",
+                str(args.mxfp_warmup_launches),
+                "--timed-launches",
+                str(args.mxfp_timed_launches),
+                "--timing-repeats",
+                str(args.mxfp_timing_repeats),
+                "--cache-dir",
+                str(cache_dir),
+            )
+            specs.append(
+                RunSpec(
+                    f"mxfp-inter-wave-{backend}",
+                    f"MXFP inter-wave: {backend.upper()}",
+                    backend,
+                    command,
+                    cache_dir,
+                )
+            )
+
     if "glu" in args.sweeps:
         script = str(SCRIPT_DIR / "amd-addmm-glu-opt_test.py")
         for backend in ("llvm", "wave"):
