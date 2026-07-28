@@ -144,6 +144,56 @@ module attributes {"ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#blocked_buffer = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#shared_buffer = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem_buffer = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // Buffer ops already carry a scalar pointer and tensor offsets, but the
+  // scalar pointer can itself be a canonicalized function-argument pointer.
+  // Every buffer-op family must materialize that fat pointer at its own pointer
+  // operand (operand 1 for store/load-to-local, operand 0 otherwise).
+  tt.func @materialize_buffer_op_bases(
+      %load_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %local_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %store_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %rmw_ptr: !tt.ptr<f32> {tt.pointer_range = 32 : i32},
+      %cas_ptr: !tt.ptr<i32> {tt.pointer_range = 32 : i32},
+      %offsets: tensor<256xi32, #blocked_buffer>,
+      %fvalue: tensor<256xf32, #blocked_buffer>,
+      %icmp: tensor<256xi32, #blocked_buffer>,
+      %ival: tensor<256xi32, #blocked_buffer>,
+      %dest: !ttg.memdesc<256xf32, #shared_buffer, #smem_buffer, mutable>) {
+    %pid = tt.get_program_id x : i32
+    %load_base = tt.addptr %load_ptr, %pid : !tt.ptr<f32>, i32
+    %local_base = tt.addptr %local_ptr, %pid : !tt.ptr<f32>, i32
+    %store_base = tt.addptr %store_ptr, %pid : !tt.ptr<f32>, i32
+    %rmw_base = tt.addptr %rmw_ptr, %pid : !tt.ptr<f32>, i32
+    %cas_base = tt.addptr %cas_ptr, %pid : !tt.ptr<i32>, i32
+    %loaded = amdg.buffer_load %load_base[%offsets] : tensor<256xf32, #blocked_buffer>
+    %token = amdg.buffer_load_to_local %local_base[%offsets] into %dest : !tt.ptr<f32>[tensor<256xi32, #blocked_buffer>] -> !ttg.memdesc<256xf32, #shared_buffer, #smem_buffer, mutable>
+    amdg.buffer_store %loaded, %store_base[%offsets] : tensor<256xf32, #blocked_buffer>
+    %rmw = amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %fvalue, %rmw_base[%offsets] : tensor<256xf32, #blocked_buffer>
+    %cas = amdg.buffer_atomic_cas acq_rel, gpu, %icmp, %ival, %cas_base[%offsets] : tensor<256xi32, #blocked_buffer>
+    tt.return
+  }
+}
+
+// CHECK-LABEL: tt.func @materialize_buffer_op_bases
+// CHECK-NOT: builtin.unrealized_conversion_cast
+// CHECK: %[[LOAD_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_load %[[LOAD_BASE]][%{{.*}}] : tensor<256xf32, #{{.*}}>
+// CHECK: %[[LOCAL_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_load_to_local %[[LOCAL_BASE]][%{{.*}}] into %{{.*}}
+// CHECK: %[[STORE_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_store %{{.*}}, %[[STORE_BASE]][%{{.*}}] : tensor<256xf32, #{{.*}}>
+// CHECK: %[[RMW_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: amdg.buffer_atomic_rmw fadd, acq_rel, gpu, %{{.*}}, %[[RMW_BASE]][%{{.*}}] : tensor<256xf32, #{{.*}}>
+// CHECK: %[[CAS_BASE:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<i32>, i32
+// CHECK: amdg.buffer_atomic_cas acq_rel, gpu, %{{.*}}, %{{.*}}, %[[CAS_BASE]][%{{.*}}] : tensor<256xi32, #{{.*}}>
+// CHECK-NOT: builtin.unrealized_conversion_cast
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
