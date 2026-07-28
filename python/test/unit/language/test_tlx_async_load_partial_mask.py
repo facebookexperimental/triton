@@ -47,7 +47,12 @@ if has_tlx():
         offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
         smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
         if USE_MASK:
-            tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K)
+            tok = tlx.async_load(
+                a_ptr + offs,
+                tlx.local_view(smem, 0),
+                mask=offs_k[None, :] < VALID_K,
+                other=0.0,
+            )
         else:
             tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))
         tlx.async_load_commit_group([tok])
@@ -80,7 +85,7 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
 
     def _a_out(self):
         a = torch.randn(self.BLOCK_M, self.BLOCK_K, device=GPU_TYPE, dtype=torch.float16)
-        return a, torch.zeros_like(a)
+        return a, torch.full_like(a, float("nan"))
 
     def test_async_load_no_mask_ok(self):
         a, out = self._a_out()
@@ -122,6 +127,7 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out[:, :5], a[:, :5])
+        torch.testing.assert_close(out[:, 5:], torch.zeros_like(out[:, 5:]))
 
     def test_sync_load_partial_mask_fix_ok(self):
         # THE FIX: the same partial mask via a synchronous tl.load compiles and is correct.
@@ -136,6 +142,7 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out[:, :5], a[:, :5])
+        torch.testing.assert_close(out[:, 5:], torch.zeros_like(out[:, 5:]))
 
 
 if __name__ == "__main__":
