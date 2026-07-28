@@ -15,6 +15,21 @@
 
 namespace mlir::triton::gpu {
 
+/// One SMEM/TMEM buffer extracted from the DDG for joint schedule+memory
+/// feasibility. Shared by the exhaustive and joint-solver backends.
+struct SchedBufferInfo {
+  unsigned allocNodeIdx;
+  bool isTmem;
+  int64_t sizeBytes; // SMEM buffers
+  int64_t tmemCols;  // TMEM accumulators
+  llvm::SmallVector<unsigned, 4> consumerNodes;
+};
+
+/// Extract SMEM (ttg.local_alloc) and TMEM (accumulator) buffers with their
+/// distance-0 consumers from the DDG.
+llvm::SmallVector<SchedBufferInfo>
+extractSchedBuffers(const DataDependenceGraph &ddg);
+
 /// Run exhaustive modulo scheduling with joint memory feasibility checking.
 /// smemBudget and tmemColLimit are hardware constraints (bytes / columns).
 FailureOr<ModuloScheduleResult>

@@ -14,10 +14,12 @@ acc += z @ v             # MMA_C, loop-carried accumulator
 
 The dependences admit two order families for `read(s2)`: coalesced with
 `read(s1)` before the chain, or deferred until just before the combine.
-Both families are model-equivalent (same II, same objective value, same
-partition feasibility), yet they emit different in-order streams. On
+Both families are equivalent under the primary schedule/partition objective
+(same II and partition feasibility), yet they emit different in-order streams.
+The joint solver's lowering-aware secondary objective now breaks this tie by
+preferring the deferred read without changing the proven primary optimum. On
 case4 FA-bwd the same axis measured a 14% spread (292.8 vs 269.6 vs
-255.8 TF at identical II/partition/objective, 2026-07-21 draw
+255.8 TF at identical II/partition/primary objective, 2026-07-21 draw
 calibration); this case distills that mechanism to 6 loop ops so draw
 experiments can be run under control.
 
@@ -37,6 +39,11 @@ The committed dumps are generated with
 every dependence satisfies the modulo constraint. The two TMEM recycle
 recurrences are signal-only barriers (`paired_buffer_id=null`,
 `expect_bytes=0`).
+
+With the 2026-07-26 Joint fixed-stage lowering shadow and deterministic
+fixed-II/v2 solves, 100 direct compile draws all kept `II=825`, selected the
+6-WG family, and reported `shadow_verified`. The previous random v2 rejection
+followed by a 7-WG v1 fallback did not recur.
 
 ## Fixture invariants
 

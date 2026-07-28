@@ -474,6 +474,36 @@ def _derive_intrawg_async_result_consumers(
             # here would serialize the async producer against its own WG.
             if skip_pairs and (loop.loop_id, prod.id, n.id) in skip_pairs:
                 continue
+            # LEGALITY: this handshake is a depth-1 mbarrier parity wait that
+            # EVERY warp of the consumer's group executes. PTX defines parity
+            # tests only for the current and immediately preceding phase, so
+            # in a multi-warp group a straggler warp that falls a full
+            # generation behind aliases the parity and the kernel WEDGES
+            # (case9b fully-merged joint partition, 2026-07-16: ~1/300
+            # launches at 4096 after a small-shape bench). Single-warp groups
+            # execute waits warp-uniformly and are safe. Refuse to emit the
+            # hazard instead of producing a kernel that hangs under load —
+            # the partitioner's intra-WG-async-reader legality (see
+            # _intrawg_async_reader_pairs in modulo_joint_solver.py) keeps
+            # such partitions from being proposed in the first place.
+            wg_warps = next(
+                (
+                    w.num_warps
+                    for w in getattr(loop, "warp_groups", [])
+                    if w.id == n.warp_group
+                ),
+                None,
+            )
+            if wg_warps is not None and wg_warps > 1:
+                raise RuntimeError(
+                    f"sched2tlx intra-WG async-result hazard: N{prod.id} "
+                    f"({prod.op_kind}) result is read by N{n.id} ({n.op_kind}) "
+                    f"inside its own multi-warp group wg{n.warp_group} "
+                    f"({wg_warps} warps). The depth-1 parity-wait handshake "
+                    f"tolerates at most one phase of intra-group warp skew and "
+                    f"wedges under load. Put the reader in a different warp "
+                    f"group, or make the producer's group single-warp."
+                )
             seen_pairs.add(pair)
             extra.append(
                 Semaphore(

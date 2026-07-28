@@ -2,8 +2,8 @@
 name: sched2tlx-perf-testing
 description: >
   Run the sched2tlx perf/correctness harness over the modulo-scheduling
-  example corpus (case1-9: GEMM, persistent GEMM, FA fwd/bwd, addmm+bias,
-  LayerNorm, wgrad+bias, multiphase GEMM, scaled_mm). Use when the user asks
+  example corpus (case1-11, including the schedule-draw wait-order fixture).
+  Use when the user asks
   to benchmark generated-vs-handwritten kernels, check corpus correctness,
   compare emitter revisions, or regenerate schedule_graph.json fixtures.
   Never run perf unless explicitly asked.
@@ -96,7 +96,7 @@ Semantics:
 
 - `bench_spec.py` files are discovered RECURSIVELY under examples/; top-level
   `case*/` dirs without any spec are listed as `(no bench_spec)`, never
-  silently dropped. All of case1–case9 currently have specs.
+  silently dropped.
 - Compare fixture identity using `generated.py`, not `schedule_graph.json`:
   JSON op ids are pointer-derived and unstable across regenerations, while
   byte-identical generated source means the kernels are identical. When the
@@ -126,6 +126,14 @@ pool-vs-sum A/B); any case's `run_*.py` runner for correctness-only
 
 The corpus fixtures (`schedule_graph.json` and the committed `generated.py`)
 are produced by the **Modulo Scheduling** pass.
+The tree also contains both heuristic Modulo Scheduling and the Joint Solver.
+They produce the same artifact shape but may select different schedules and
+warp groups. Before regenerating or comparing fixtures, determine which
+scheduler the request names and record the exact `TRITON_USE_MODULO_SCHEDULE` /
+joint-mode settings in the result. Never compare fixtures with unknown or
+mixed provenance. Case11 specifically exists to distinguish equal-primary
+schedule draws, so repeated Joint Solver generation must also report whether
+the lowering plan is `shadow_verified`, `shadow_unmodeled`, or `shadow_stale`.
 
 ## Regenerating fixtures
 
@@ -147,7 +155,9 @@ JSON op ids are pointer-derived and never byte-stable — regen always churns
 Known: case3 may need `TRITON_MODULO_SELECT_VARIANT=2`; case2 fixtures are
 ancient (fresh dumps differ, pre-existing); case8's committed generated.py
 predates the emitter's multiphase support landing (regen produces a
-single-phase kernel — don't "refresh" it casually).
+single-phase kernel — don't "refresh" it casually). Case11's committed dump
+uses the exhaustive scheduler; use an explicitly named output path for Joint
+Solver experiments instead of overwriting that baseline.
 
 ## Benchmark methodology
 
