@@ -17,8 +17,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK: %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     // CHECK: ttg.async_remote_shmem_store %arg0, rank %arg1, %0 barrier %1 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    // CHECK-LLVM: nvvm.mapa
-    // CHECK-LLVM: nvvm.mapa
+    // CHECK-LLVM: mapa.shared::cluster.u32
+    // CHECK-LLVM: mapa.shared::cluster.u32
     // CHECK-LLVM: llvm.inline_asm has_side_effects asm_dialect = att{{.*}}st.async.shared::cluster.mbarrier::complete_tx::bytes
     ttg.async_remote_shmem_store %arg0, rank %arg1, %0 barrier %1 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable> barrier_ty !ttg.memdesc<1xi64, #shared1, #smem, mutable>
     tt.return
@@ -40,7 +40,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     // CHECK: %0 = ttg.local_alloc : () -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
     // CHECK: ttg.remote_shmem_store %arg0, rank %arg1, %0 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
-    // CHECK-LLVM: nvvm.mapa
+    // CHECK-LLVM: mapa.shared::cluster.u32
     // CHECK-LLVM-NOT: llvm.inline_asm{{.*}}st.async.shared::cluster.mbarrier
     ttg.remote_shmem_store %arg0, rank %arg1, %0 : tensor<1x1xf32, #blocked> -> !ttg.memdesc<1x1xf32, #shared, #smem, mutable>
     tt.return

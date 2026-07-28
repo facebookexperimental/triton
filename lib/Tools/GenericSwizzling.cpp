@@ -469,7 +469,7 @@ LinearLayout optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
       computeSegment(bankSrc, bankDst, nonZeroBlockBases, dim, lenSbasis);
 
   // The bank is the complement of the union of the vector and the start of the
-  // segments
+  // segments and the block bases
   SmallVector<int32_t> unionBasis;
   unionBasis.append(vbasis.begin(), vbasis.end());
   unionBasis.append(sbasis.begin(), sbasis.end());
@@ -552,6 +552,7 @@ getVecBasisLdSt(const LinearLayout &srcFlat, const LinearLayout &dstFlat,
   auto regDst = flatten(dstFlat, kReg);
   auto blockSrc = srcFlat.getBases().contains(kBlock) ? flatten(srcFlat, kBlock)
                                                       : SmallVector<int32_t>{};
+
   auto dim = srcFlat.getTotalOutDimSizeBits();
   SmallVector<int32_t> vbasis = intersectionBasis(regSrc, regDst, dim);
   // Restrict the vectorisation to the maximum we can use
@@ -782,6 +783,8 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
   auto blockBases = srcFlat.getBases().contains(kBlock)
                         ? flatten(srcFlat, kBlock)
                         : SmallVector<int32_t>{};
+  auto blockSrcSet =
+      SetVector<int32_t>(llvm::from_range_t{}, blockBases);
   // Get the associated src/dst tiles for each instruction if they exist
   SmallVector<std::tuple<std::pair<int32_t, int32_t>, SmallVector<int32_t>,
                          SmallVector<int32_t>, SmallVector<int32_t>, int32_t>>
@@ -819,7 +822,8 @@ optimalSwizzling(const LinearLayout &src, const LinearLayout &dst,
     for (auto [instrs, vbasis, tileSrc, tileDst, leaveReps] : tiles) {
       auto smem =
           optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc, tileDst,
-                           blockBases, src.getOutDims(), leaveReps);
+                           blockSrcSet.getArrayRef(), src.getOutDims(),
+                           leaveReps);
       auto [read, write] = bankConflicts(tileSrc, tileDst, smem);
       smems.push_back({read + write, smem, {instrs.first, instrs.second}});
     }

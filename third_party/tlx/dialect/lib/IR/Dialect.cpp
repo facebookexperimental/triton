@@ -303,6 +303,17 @@ Attribute mlir::triton::tlx::wrapNoVerifyLayout(Attribute layout) {
     return layout;
   if (!isa<ttg::DistributedEncodingTrait>(layout))
     return layout;
+  // AMD MFMA and dot-operand encodings are concrete hardware ownerships, not
+  // unresolved Triton blocked layouts.  Gluon's CDNA MFMA path emits these
+  // attributes bare, and the early Triton-to-TritonGPU conversion must see the
+  // same concrete types before TLX's later placeholder cleanup runs.  Wrapping
+  // them in #tlx.no_verify_layout makes a live tt.dot result look like an
+  // unresolved blocked-to-MFMA materialization and fails conversion on gfx950.
+  if (isa<ttg::AMDMfmaEncodingAttr>(layout))
+    return layout;
+  if (auto dotLayout = dyn_cast<ttg::DotOperandEncodingAttr>(layout))
+    if (isa<ttg::AMDMfmaEncodingAttr>(dotLayout.getParent()))
+      return layout;
   if (auto mmaLayout = dyn_cast<ttg::NvidiaMmaEncodingAttr>(layout);
       mmaLayout && mmaLayout.isHopper())
     return layout;

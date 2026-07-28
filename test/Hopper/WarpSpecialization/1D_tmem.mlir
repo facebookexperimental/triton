@@ -242,7 +242,7 @@ module attributes {ttg.maxnreg = 168 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-w
 // -----
 
 // CHECK the ability to reuse result, as specified tmem.start_buffer to
-// reuse the same buffer via a reinterpret.
+// reuse the same buffer via a parent view and TMEM subslice.
 // CHECK-LABEL: @_dummy_repro
 
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
@@ -254,7 +254,6 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
   tt.func public @_dummy_repro(%alpha_7: tensor<128xf32, #blocked>, %out_desc: !tt.tensordesc<128x1xf32, #shared1>, %out_desc_2: i32, %out_desc_3: i32, %out_desc_4: i64, %out_desc_5: i64) attributes {noinline = false, ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32} {
     %result, %token = ttng.tmem_alloc {tmem.start_buffer = 0 : i32}  : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // CHECK: ttng.tmem_subslice
-    // CHECK: ttg.memdesc_reinterpret
     %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
     %c0_i32 = arith.constant 0 : i32
     %pid = tt.get_program_id x : i32
@@ -291,7 +290,6 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
   tt.func public @_dummy_repro_expand_dims(%alpha_7: tensor<128xf32, #blocked>) attributes {noinline = false, ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scratch_memory_size = 0 : i32} {
     %result, %token = ttng.tmem_alloc {tmem.start_buffer = 0 : i32}  : () -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
     // CHECK: ttng.tmem_subslice
-    // CHECK: ttg.memdesc_reinterpret
     %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
     // CHECK-NOT: tmem.start
     %alpha_i = arith.mulf %alpha_7, %cst {tmem.start = 0 : i32, async_task_id = array<i32: 0>} : tensor<128xf32, #blocked>
@@ -325,7 +323,6 @@ module attributes {ttg.global_scratch_memory_alignment = 1 : i32, ttg.global_scr
     // CHECK: ttg.memdesc_index
     %mem_179 = ttg.memdesc_index %result[%c0_i32] {tmem.start_buffer = 0 : i32} : !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
     // CHECK: ttng.tmem_subslice
-    // CHECK: ttg.memdesc_reinterpret
     %cst = arith.constant dense<3.000000e+00> : tensor<128xf32, #blocked>
     %pid = tt.get_program_id x : i32
     %alpha_i = arith.mulf %alpha_7, %cst : tensor<128xf32, #blocked>

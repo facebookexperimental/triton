@@ -51,8 +51,8 @@ static TMemAccessKind getTMemAccessKind(Operation *op) {
   return TMemAccessKind::None;
 }
 
-static bool filterFn(Operation *lhs, Operation *rhs,
-                     Allocation * /*allocation*/) {
+static bool filterFn(Operation *lhs, Operation *rhs, bool /*lhsIsRead*/,
+                     bool /*rhsIsRead*/, Allocation * /*allocation*/) {
   TMemAccessKind lhsKind = getTMemAccessKind(lhs);
   TMemAccessKind rhsKind = getTMemAccessKind(rhs);
 

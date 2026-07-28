@@ -1,13 +1,6 @@
 # Owner(s): ["module: inductor"]
-# Repro (gfx950 / AMD MI350X): a MASKED (partial) tlx.async_load fails to lower, and the
-# "sync-load the tail" workaround (use tl.load for the partial tile) compiles + is correct.
-#
-# Root cause of the warp-pipe addmm/bmm compile failure ("blocker 2"): when a K-tile is
-# only partially in-bounds (i.e. K is not a multiple of BLOCK_K), the template emits a
-# masked `tlx.async_load`; that `ttg.async_copy_global_to_local` into a padded_shared LDS
-# layout fails to legalize -> `builtin.unrealized_conversion_cast` / "failed to translate
-# module to LLVM IR". It is NOT int32-related (int32 offset overflow is a separate,
-# runtime fault on >2**31-element tensors). Confirmed via a standalone harness.
+# Regression (gfx950 / AMD MI350X): a partially masked tlx.async_load must lower and
+# preserve the valid values. The synchronous tail-load fallback remains covered too.
 import unittest
 
 import torch
@@ -54,9 +47,7 @@ if has_tlx():
         offs = offs_m[:, None] * BLOCK_K + offs_k[None, :]
         smem = tlx.local_alloc((BLOCK_M, BLOCK_K), tlx.dtype_of(a_ptr), 1)
         if USE_MASK:
-            tok = tlx.async_load(
-                a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K
-            )
+            tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0), mask=offs_k[None, :] < VALID_K)
         else:
             tok = tlx.async_load(a_ptr + offs, tlx.local_view(smem, 0))
         tlx.async_load_commit_group([tok])
@@ -93,37 +84,55 @@ class TlxAsyncLoadPartialMaskTest(unittest.TestCase):
 
     def test_async_load_no_mask_ok(self):
         a, out = self._a_out()
-        _async_load_kernel[(1,)](
-            a, out, VALID_K=self.BLOCK_K, USE_MASK=False,
-            BLOCK_M=self.BLOCK_M, BLOCK_K=self.BLOCK_K, num_warps=4,
+        _async_load_kernel[(1, )](
+            a,
+            out,
+            VALID_K=self.BLOCK_K,
+            USE_MASK=False,
+            BLOCK_M=self.BLOCK_M,
+            BLOCK_K=self.BLOCK_K,
+            num_warps=4,
         )
         torch.testing.assert_close(out, a)
 
     def test_async_load_all_true_mask_ok(self):
         # mask present but all-true (like an ALIGNED K, where every K-tile is full).
         a, out = self._a_out()
-        _async_load_kernel[(1,)](
-            a, out, VALID_K=self.BLOCK_K, USE_MASK=True,
-            BLOCK_M=self.BLOCK_M, BLOCK_K=self.BLOCK_K, num_warps=4,
+        _async_load_kernel[(1, )](
+            a,
+            out,
+            VALID_K=self.BLOCK_K,
+            USE_MASK=True,
+            BLOCK_M=self.BLOCK_M,
+            BLOCK_K=self.BLOCK_K,
+            num_warps=4,
         )
         torch.testing.assert_close(out, a)
 
-    def test_async_load_partial_mask_fails_to_lower(self):
-        # THE REPRO: a partial mask (some lanes compile-time false -> what an UNALIGNED K
-        # produces) makes tlx.async_load fail to translate to LLVM IR.
+    def test_async_load_partial_mask_ok(self):
         a, out = self._a_out()
-        with self.assertRaises(Exception):
-            _async_load_kernel[(1,)](
-                a, out, VALID_K=5, USE_MASK=True,
-                BLOCK_M=self.BLOCK_M, BLOCK_K=self.BLOCK_K, num_warps=4,
-            )
-            torch.cuda.synchronize()
+        _async_load_kernel[(1, )](
+            a,
+            out,
+            VALID_K=5,
+            USE_MASK=True,
+            BLOCK_M=self.BLOCK_M,
+            BLOCK_K=self.BLOCK_K,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out[:, :5], a[:, :5])
 
     def test_sync_load_partial_mask_fix_ok(self):
         # THE FIX: the same partial mask via a synchronous tl.load compiles and is correct.
         a, out = self._a_out()
-        _sync_load_kernel[(1,)](
-            a, out, VALID_K=5, BLOCK_M=self.BLOCK_M, BLOCK_K=self.BLOCK_K, num_warps=4,
+        _sync_load_kernel[(1, )](
+            a,
+            out,
+            VALID_K=5,
+            BLOCK_M=self.BLOCK_M,
+            BLOCK_K=self.BLOCK_K,
+            num_warps=4,
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(out[:, :5], a[:, :5])

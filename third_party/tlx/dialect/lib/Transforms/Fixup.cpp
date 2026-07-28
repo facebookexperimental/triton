@@ -13,6 +13,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/LogicalResult.h"
 
@@ -608,6 +609,7 @@ public:
 
     // Attach metadata to the module.
     Builder b(&getContext());
+    mod->setAttr(kSkipGenericPipelineAttrName, b.getUnitAttr());
     mod->setAttr(ttg::AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(ttg::AttrNumThreadsPerWarp,
                  b.getI32IntegerAttr(threadsPerWarp));
