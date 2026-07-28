@@ -583,7 +583,8 @@ setup(
     version=TRITON_VERSION,
     author="Philippe Tillet",
     author_email="phil@openai.com",
-    description="A language and compiler for custom Deep Learning operations (Meta fbtriton fork, with TLX + AMD gfx950/MI350 perf kernels)",
+    description=
+    "A language and compiler for custom Deep Learning operations (Meta fbtriton fork, with TLX + AMD gfx950/MI350 perf kernels)",
     long_description="",
     license="MIT",
     install_requires=[

@@ -387,9 +387,9 @@ static bool containsUserLayout(Type type) {
 // Recursively strip a chain of TLX wrapper attrs (user_layout / no_verify) down
 // to the concrete layout. AttrTypeReplacer applies each replacement only once
 // per matched attr, so a *nested* wrapper -- e.g.
-// no_verify<user_layout<no_verify<L>>>, produced when a require_layout store pin
-// also carries a tlx.assert_same_layout -- would keep an inner user_layout after
-// a single getLayout(), which the residual check below then flags as
+// no_verify<user_layout<no_verify<L>>>, produced when a require_layout store
+// pin also carries a tlx.assert_same_layout -- would keep an inner user_layout
+// after a single getLayout(), which the residual check below then flags as
 // "unresolved TLX user layout". Unwrapping the whole chain here resolves it
 // (wrappers nested inside ttg encodings are still reached by the replacer's own
 // sub-element recursion, which re-invokes this on the inner wrapper).
