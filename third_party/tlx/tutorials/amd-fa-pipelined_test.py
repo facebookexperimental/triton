@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import concurrent.futures
+import functools
 import math
 import multiprocessing
 import pytest
@@ -48,6 +49,12 @@ DEFAULT_COMPILE_WORKERS = max(1, min(8, multiprocessing.cpu_count()))
 
 def active_torch_device():
     return triton.runtime.driver.active.get_active_torch_device()
+
+
+@functools.lru_cache(maxsize=1)
+def _device_num_sms(device, num_xcds=8):
+    cu_count = torch.cuda.get_device_properties(device).multi_processor_count
+    return (cu_count // num_xcds) * num_xcds
 
 
 @triton.jit
@@ -1517,6 +1524,8 @@ def compile_kernel_config(job, num_sms=None):
 def compile_kernel_config_worker(job, num_sms):
     start = time.monotonic()
     try:
+        if job[0] == "persistent" and num_sms is None:
+            num_sms = _device_num_sms(active_torch_device())
         compile_kernel_config(job, num_sms)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -1538,12 +1547,7 @@ def precompile_kernels(args):
     if not jobs:
         return {}
 
-    num_sms = None
-    if any(job[0] == "persistent" for job in jobs):
-        num_xcds = 8
-        cu_count = torch.cuda.get_device_properties(active_torch_device()).multi_processor_count
-        num_sms = (cu_count // num_xcds) * num_xcds
-
+    needs_num_sms = any(job[0] == "persistent" for job in jobs)
     workers = min(args.compile_workers, len(jobs))
     print(f"\nPrecompiling {len(jobs)} FA configuration(s) with {workers} worker(s):", flush=True)
     failures = {}
@@ -1559,13 +1563,16 @@ def precompile_kernels(args):
         print(f"  [FAIL] {label} in {elapsed:.1f}s\n    {indented_error}", flush=True)
 
     if workers == 1:
+        num_sms = _device_num_sms(active_torch_device()) if needs_num_sms else None
         for job in jobs:
             record(compile_kernel_config_worker(job, num_sms))
         return failures
 
+    # Keep the parent HIP-cold: a pre-spawn HIP initialization makes
+    # rocprofiler diagnose every loaded fat binary in each child.
     context = multiprocessing.get_context("spawn")
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
-        futures = [executor.submit(compile_kernel_config_worker, job, num_sms) for job in jobs]
+        futures = [executor.submit(compile_kernel_config_worker, job, None) for job in jobs]
         for future in concurrent.futures.as_completed(futures):
             record(future.result())
     return failures
