@@ -199,7 +199,7 @@ public:
     addInstr(addOut, addLhs, addRhs);
     Value fullAddrb128 =
         ptxBuilder.launch(rewriter, loc, i32_ty, /*hasSideEffect=*/true);
-    Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x3FFF));
+    Value addrMasked = tb.and_(fullAddrb128, tb.i32_val(0x7FFF));
     Value addr64 = tb.zext(i64_ty, addrMasked);
     Value descVal = tb.add(tb.int_val(64, currDesc.descriptor), addr64);
     return descVal;

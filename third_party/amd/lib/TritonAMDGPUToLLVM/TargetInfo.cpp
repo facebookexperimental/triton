@@ -688,6 +688,30 @@ bool TargetInfo::supportVectorizedAtomics() const {
   return true;
 }
 
+bool TargetInfo::supportBitwidth16Elementwise() const { return true; }
+
+bool TargetInfo::supportBitwidth32Elementwise() const {
+  switch (getISAFamily()) {
+  case ISAFamily::CDNA2:
+  case ISAFamily::CDNA3:
+  case ISAFamily::CDNA4:
+  case ISAFamily::GFX1250:
+    return true;
+  default:
+    return false;
+  }
+}
+
+unsigned TargetInfo::getReductionTreeArity(Operation *combinerOp) const {
+  // AMD has native ternary max/min instructions: v_max3/v_min3 on all GFX9+,
+  // and v_maximum3/v_minimum3 additionally on GFX950 and GFX1250.
+  // Use a ternary reduction tree so these map 1:1 to hardware.
+  if (isa<arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp,
+          arith::MinNumFOp>(combinerOp))
+    return 3;
+  return 2;
+}
+
 bool TargetInfo::supportsDirectToLDSScattering() const {
   switch (getISAFamily()) {
   case ISAFamily::GFX1250:

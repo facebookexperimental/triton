@@ -325,6 +325,7 @@ class HIPBackend(BaseBackend):
             # replacing schedule_loops + add_pipeline. async_wait counts are
             # fixed by add_update_async_wait_count downstream.
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "modulo")
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
         elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")

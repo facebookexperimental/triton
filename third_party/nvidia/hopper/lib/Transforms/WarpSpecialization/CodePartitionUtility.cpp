@@ -121,14 +121,19 @@ Operation *skipIdxOp(Operation *op) {
 Operation *AllocChannel::getSrcOp() {
   if (defunct)
     return nullptr; // alloc erased by reuse folding; endpoints are dangling.
-  // Prefer the producer cached at channel-creation time. This is the only
-  // reliable source for a producer inside a ttng.subtiled_region: once a
-  // sibling channel (sharing the same in-body template store and per-tile
-  // buffer position) is lowered, insertAsyncComm rewires that store and removes
-  // the shared per-tile position, so the alloc-walk below would no longer reach
-  // it.
-  if (cachedSrcOp)
-    return cachedSrcOp;
+  // Re-derive the producer from the (stable) alloc first, and use cachedSrcOp
+  // only as a fallback. The alloc is the durable anchor: buffer creation can
+  // REWRITE a channel's producer store (erase the original local_store /
+  // tma_copy that cachedSrcOp was set to at channel-creation time and emit a
+  // fresh one into the multi-buffered alloc), which leaves cachedSrcOp dangling
+  // while the alloc stays live. Returning the stale cached pointer is a
+  // use-after-free (later deref, e.g. needAccumCntForReuse -> enclosing ->
+  // getParentOp, segfaults). The alloc-walk returns the current live producer.
+  // cachedSrcOp remains the fallback for a producer inside a
+  // ttng.subtiled_region: once a sibling channel (sharing the in-body template
+  // store and per-tile buffer position) is lowered, the store is rewired and
+  // the alloc-walk no longer reaches it, so the surviving cached template op is
+  // the only source. (Both paths agree when both resolve.)
   for (auto usr : allocOp->getUsers()) {
     Operation *user = skipIdxOp(usr);
     if (!user)
@@ -147,7 +152,7 @@ Operation *AllocChannel::getSrcOp() {
       }
     }
   }
-  return nullptr;
+  return cachedSrcOp;
 }
 
 static void getAllConsumers(AllocChannel *ch,

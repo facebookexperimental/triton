@@ -210,18 +210,28 @@ private:
     return success();
   }
 
-  SmallVector<Value>
-  treeReduceBinary(Location loc, ConversionPatternRewriter &rewriter,
-                   Region &combineOp,
-                   SmallVector<SmallVector<Value>> values) const {
-    // The number of elements is always a power of two
-    assert(llvm::isPowerOf2_64(values.size()) && !values.empty());
+  // Reduce values using a tree of the given arity. Arity=3 generates
+  // combine(combine(a, b), c) groups that LLVM folds into ternary
+  // instructions (e.g. v_maximum3_f32 on AMD).
+  SmallVector<Value> treeReduce(Location loc,
+                                ConversionPatternRewriter &rewriter,
+                                Region &combineOp,
+                                SmallVector<SmallVector<Value>> values,
+                                unsigned arity) const {
+    assert(!values.empty() && arity >= 2);
     while (values.size() > 1) {
       SmallVector<SmallVector<Value>> next;
-      for (size_t i = 0; i + 1 < values.size(); i += 2) {
-        SmallVector<Value> acc = values[i];
-        accumulate(loc, rewriter, combineOp, acc, values[i + 1]);
-        next.push_back(std::move(acc));
+      for (size_t i = 0; i < values.size(); i += arity) {
+        size_t remaining = values.size() - i;
+        size_t groupSize = std::min(static_cast<size_t>(arity), remaining);
+        if (groupSize == 1) {
+          next.push_back(std::move(values[i]));
+        } else {
+          SmallVector<Value> acc = std::move(values[i]);
+          for (size_t j = 1; j < groupSize; ++j)
+            accumulate(loc, rewriter, combineOp, acc, values[i + j]);
+          next.push_back(std::move(acc));
+        }
       }
       values = std::move(next);
     }
@@ -636,9 +646,10 @@ private:
       auto elemTy = operandType.getElementType();
       auto vectorCombineRegion = createVectorCombineRegion(
           op.getLoc(), elemTy, vectorizeKind, rewriter);
-      auto reduced =
-          treeReduceBinary(op.getLoc(), rewriter, *vectorCombineRegion,
-                           std::move(packedValues));
+      Operation &combinerOp = vectorCombineRegion->front().front();
+      unsigned arity = targetInfo.getReductionTreeArity(&combinerOp);
+      auto reduced = treeReduce(op.getLoc(), rewriter, *vectorCombineRegion,
+                                std::move(packedValues), arity);
 
       SmallVector<SmallVector<Value>> reducedByOperand(numOperands);
       for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx)
@@ -715,6 +726,10 @@ private:
     Region &combineRegion =
         vectorCombineRegion ? *vectorCombineRegion : op.getCombineOp();
 
+    Operation &combinerOp = combineRegion.front().front();
+    unsigned arity = targetInfo.getReductionTreeArity(&combinerOp);
+
+    // Perform a tree reduction
     unsigned numOperands = accs.size();
     SmallVector<SmallVector<Value>> reduced(numOperands);
     unsigned regs = accs.front().size();
@@ -727,7 +742,7 @@ private:
         vals.push_back(std::move(cur));
       }
       auto acc =
-          treeReduceBinary(loc, rewriter, combineRegion, std::move(vals));
+          treeReduce(loc, rewriter, combineRegion, std::move(vals), arity);
       for (unsigned opIdx = 0; opIdx < numOperands; ++opIdx)
         reduced[opIdx].push_back(acc[opIdx]);
     }

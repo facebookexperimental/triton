@@ -899,7 +899,7 @@ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
     TensorOf<[I16, I32]>:$dst_row_indices,
     I32:$dst_col_offset,
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    Optional<TTG_MemDescType>:$barrier
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier
   );
   let results = (outs TTG_AsyncToken:$retToken);
 

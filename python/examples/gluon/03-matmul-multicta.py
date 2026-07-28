@@ -523,8 +523,6 @@ def _matmul_kernel(
     clc_result_buffers = gl.allocate_shared_memory(gl.int64, [clc_barriers.shape[0], 2], clc_layout)
     clc_planar_pid_buffers = gl.allocate_shared_memory(gl.int64, [clc_barriers.shape[0], 1], clc_layout)
 
-    if gl.num_ctas() > 1:
-        mbarrier.sync_cluster_init()
     p = PartitionArgs(
         a_desc,
         b_desc,

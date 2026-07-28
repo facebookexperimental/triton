@@ -17,10 +17,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: init_barrier_cluster_broadcast
-  tt.func @init_barrier_cluster_broadcast(%alloc: !ttg.memdesc<1xi64, #shared0, #smem>) {
+  tt.func @init_barrier_cluster_broadcast() {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     // CHECK: nvg.cluster_id
     // CHECK: @$0 mbarrier.init.shared::cta.b64 [$1], 2;
-    ttng.init_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared0, #smem>
+    ttng.init_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
+    ttng.inval_barrier %alloc : !ttg.memdesc<1xi64, #shared0, #smem, mutable>
     tt.return
   }
 }
@@ -169,6 +171,42 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
     // CHECK: mbarrier.arrive.shared::cluster.b64
     // CHECK-NOT: mbarrier.arrive.shared::cta.b64
     ttng.arrive_barrier %alloc, 1 : !ttg.memdesc<1xi64, #shared0, #smem>
+    tt.return
+  }
+}
+
+// -----
+
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: arrive_barrier_multicast_absent
+  tt.func public @arrive_barrier_multicast_absent(%alloc: !ttg.memdesc<2xi64, #shared0, #smem, mutable>) {
+    // No ctaMask → non-multicast path.
+    // CHECK-NOT: fence.mbarrier_init.release.cluster
+    // CHECK-NOT: nvvm.cluster.arrive
+    // CHECK: mbarrier.arrive.shared::cta.b64
+    // CHECK-NOT: mbarrier.arrive.shared::cluster.multicast
+    ttng.init_barrier %alloc, 1 : !ttg.memdesc<2xi64, #shared0, #smem, mutable>
+    ttng.arrive_barrier %alloc, 1 : !ttg.memdesc<2xi64, #shared0, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: arrive_barrier_multicast
+  tt.func public @arrive_barrier_multicast(%alloc: !ttg.memdesc<2xi64, #shared0, #smem, mutable>) {
+    // CHECK: fence.mbarrier_init.release.cluster
+    // CHECK: nvvm.cluster.arrive.relaxed
+    // CHECK-NEXT: nvvm.cluster.wait
+    // CHECK: mbarrier.arrive.release.cluster.shared::cluster.multicast::cluster::32b.b64 _, [${{.*}}], ${{.*}};
+    // CHECK-NOT: mbarrier.arrive.release.cluster.shared::cta.b64
+    ttng.init_barrier %alloc, 1 : !ttg.memdesc<2xi64, #shared0, #smem, mutable>
+    ttng.arrive_barrier %alloc, 1 {ctaMask = 1 : i32} : !ttg.memdesc<2xi64, #shared0, #smem, mutable>
     tt.return
   }
 }

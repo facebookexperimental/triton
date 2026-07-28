@@ -41,6 +41,7 @@
 #include "triton/Tools/StrUtil.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir::triton::gpu;
 
@@ -200,6 +201,14 @@ LogicalResult InitBarrierOp::verify() {
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  auto barrierTy = cast<MemDescType>(getAlloc().getType());
+  // We cannot place cluster barriers inside warp-specialize regions, and we
+  // need to place a relaxed cluster barrier between barrier.init and the first
+  // barrier use.
+  bool crossCTA = barrierTy.getShape()[0] != gpu::lookupNumCTAs(getOperation());
+  if (crossCTA &&
+      getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
+    return emitOpError("cannot be used inside `ttg.warp_specialize`");
   return success();
 }
 
@@ -265,12 +274,34 @@ LogicalResult WaitBarrierOp::verify() {
   return success();
 }
 
+// Forward declaration. The single (beta-adapted) definition lives below near
+// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so we
+// keep that version rather than the upstream hard-failing one this cherry-pick
+// carried.
+static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
+                                            CGAEncodingAttr expectedCGALayout,
+                                            StringRef barrierName);
+
 // -- ArriveBarrierOp --
 LogicalResult ArriveBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
     return failure();
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
+  if (isMulticast()) {
+    if (getPerThread())
+      return emitOpError("multicast arrive does not support perThread");
+    int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+    if (numCTAs <= 1)
+      return emitOpError("multicast arrive requires num_ctas > 1");
+    if (getCtaMask() > static_cast<uint32_t>(numCTAs - 1))
+      return emitOpError("ctaMask exceeds numCTAs - 1");
+    auto expectedCGALayout =
+        CGAEncodingAttr::get1DLayout(getContext(), numCTAs);
+    if (failed(verifyBarrierCGALayout(*this, getAlloc(), expectedCGALayout,
+                                      "multicast barrier")))
+      return failure();
+  }
   return success();
 }
 
@@ -576,6 +607,9 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
                            isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
                            getCoord(), getOffsets())))
     return failure();
+  if (getMulticast() && !hasCGABroadcast(resultType))
+    return emitOpError(
+        "multicast requires the shared layout to broadcast across CTAs");
   return success();
 }
 
@@ -874,6 +908,9 @@ void TCGen5MMAOp::getEffects(
   }
   effects.emplace_back(MemoryEffects::Read::get(), &getBMutable(),
                        SharedMemory::get());
+  for (auto &barrierMutable : getBarriersMutable())
+    effects.emplace_back(MemoryEffects::Write::get(), &barrierMutable,
+                         SharedMemory::get());
 }
 
 bool TCGen5MMAOp::verifyDims() {
@@ -1014,6 +1051,28 @@ static Type getScaledMMAOperandType(Type elementType,
   llvm_unreachable("Unsupported type.");
 };
 
+static LogicalResult
+verifyScaleBlockRepOrder(TCGen5MMAScaledOp op,
+                         TensorMemoryScalesEncodingAttr encoding, bool isA) {
+  auto aScaleType = cast<MemDescType>(op.getAScale().getType());
+  auto bScaleType = cast<MemDescType>(op.getBScale().getType());
+  auto expectedOrder = getTensorMemoryScalesBlockRepOrder(
+      op.getOperation(), isA, op.getAType(), op.getBType(),
+      aScaleType.getElementType(), bScaleType.getElementType());
+  if (encoding.getBlockRepOrder() != expectedOrder) {
+    StringRef operandName = isA ? "A" : "B";
+    StringRef expectedOrderName =
+        expectedOrder == TensorMemoryScalesBlockRepOrder::K_THEN_MN ? "kThenMn"
+                                                                    : "mnThenK";
+    return op.emitOpError()
+           << operandName
+           << " scales in tensor memory must use "
+              "#ttng.tensor_memory_scales_encoding<blockRepOrder = "
+           << expectedOrderName << ">";
+  }
+  return success();
+}
+
 LogicalResult TCGen5MMAScaledOp::verify() {
   Type atype =
       getScaledMMAOperandType(getA().getType().getElementType(), getAType());
@@ -1029,6 +1088,35 @@ LogicalResult TCGen5MMAScaledOp::verify() {
   }
   if (enc.getBlockM() != 128)
     return emitOpError("only supports instruction shape blockM=128");
+  auto aScaleType = cast<MemDescType>(getAScale().getType());
+  auto bScaleType = cast<MemDescType>(getBScale().getType());
+  auto isScaleBlockRepOrderRelevant = [](MemDescType scaleType) {
+    auto shapePerCTA = getShapePerCTA(scaleType);
+    assert(shapePerCTA.size() >= 2);
+    int64_t rowsPerCTA = shapePerCTA[shapePerCTA.size() - 2];
+    int64_t scalesPerCTA = shapePerCTA.back();
+    return rowsPerCTA > 128 && scalesPerCTA > 4;
+  };
+  if (isa<TensorMemorySpaceAttr>(aScaleType.getMemorySpace()) &&
+      isScaleBlockRepOrderRelevant(aScaleType)) {
+    auto encoding =
+        dyn_cast<TensorMemoryScalesEncodingAttr>(aScaleType.getEncoding());
+    if (!encoding)
+      return emitOpError("A scales in tensor memory must use "
+                         "#ttng.tensor_memory_scales_encoding");
+    if (failed(verifyScaleBlockRepOrder(*this, encoding, /*isA=*/true)))
+      return failure();
+  }
+  if (isa<TensorMemorySpaceAttr>(bScaleType.getMemorySpace()) &&
+      isScaleBlockRepOrderRelevant(bScaleType)) {
+    auto encoding =
+        dyn_cast<TensorMemoryScalesEncodingAttr>(bScaleType.getEncoding());
+    if (!encoding)
+      return emitOpError("B scales in tensor memory must use "
+                         "#ttng.tensor_memory_scales_encoding");
+    if (failed(verifyScaleBlockRepOrder(*this, encoding, /*isA=*/false)))
+      return failure();
+  }
   return success();
 }
 
@@ -1058,6 +1146,9 @@ void TCGen5MMAScaledOp::getEffects(
                        TensorMemory::get());
   effects.emplace_back(MemoryEffects::Read::get(), &getBScaleMutable(),
                        TensorMemory::get());
+  for (auto &barrierMutable : getBarriersMutable())
+    effects.emplace_back(MemoryEffects::Write::get(), &barrierMutable,
+                         SharedMemory::get());
 }
 
 bool TCGen5MMAScaledOp::verifyDims() {

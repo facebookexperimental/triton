@@ -1,3 +1,4 @@
+import pytest
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
@@ -170,7 +171,6 @@ def test_compile_only_k_loop() -> None:
 
 
 def test_compile_only_dot_mxfp() -> None:
-
     @triton.jit
     def simple_dot_mxfp(
         a_base,
@@ -221,7 +221,11 @@ def test_compile_only_dot_mxfp() -> None:
     assert re.search(pattern, str(ttgir)), "The TTGIR does not match the expected pattern."
 
     ptx = k.asm["ptx"]
-    pattern = r"tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X"
+    version_match = re.search(r"\.version (\d+)\.(\d+)", ptx)
+    assert version_match is not None
+    ptx_version = tuple(int(component) for component in version_match.groups())
+    scale_kind = "block32" if ptx_version >= (8, 8) else "scale_vec::1X"
+    pattern = rf"tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.{scale_kind}"
     assert re.search(pattern, str(ptx)), "The PTX does not match the expected pattern."
     assert k.asm["cubin"] != b""
 
