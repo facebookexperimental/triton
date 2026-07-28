@@ -95,7 +95,6 @@ def _node(nid, op_ref, kind, stage, cycle):
         warp_group=0,
         latency=0,
         self_latency=0,
-        frequency_multiplier=1,
         schedule_cycle=cycle,
         schedule_stage=stage,
         schedule_cluster=0,

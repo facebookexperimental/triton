@@ -32,6 +32,9 @@ unsigned DataDependenceGraph::addNode(Operation *op,
   node.latency = info.latency;
   node.selfLatency = info.selfLatency;
   node.minWarps = info.minWarps;
+  node.hardMinWarps = info.hardMinWarps;
+  node.reduceAxisWarps = info.reduceAxisWarps;
+  node.reduceSyncSelfLat1w = info.reduceSyncSelfLat1w;
   node.occupancy = info.occupancy;
   node.tmemAllocCols = model.getAccumulatorAllocCols(op);
   nodes.push_back(node);

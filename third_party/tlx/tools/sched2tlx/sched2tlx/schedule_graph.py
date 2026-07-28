@@ -128,7 +128,6 @@ class Node:
     warp_group: int  # index into loop.warp_groups
     latency: int
     self_latency: int
-    frequency_multiplier: int
     schedule_cycle: int
     schedule_stage: int
     schedule_cluster: int
@@ -187,6 +186,10 @@ class WarpGroup:
     # snapped to {1,2,4,8}. Defaults to 4 for backward compatibility with
     # older JSON dumps that did not record num_warps.
     num_warps: int = 4
+    # Explicit per-thread setmaxnreg request from the pass (e.g. 232 for a
+    # 1-warp self-accumulating reduce sink). None = not dumped; the emitter
+    # falls back to its warp-count heuristic (152 if >=4 warps else 24).
+    num_regs: int | None = None
 
 
 @dataclass
@@ -287,7 +290,6 @@ def _to_node(d: dict[str, Any]) -> Node:
         warp_group=d.get("warp_group", -1),
         latency=d.get("latency", 0),
         self_latency=d.get("self_latency", 0),
-        frequency_multiplier=d.get("frequency_multiplier", 1),
         schedule_cycle=sched.get("cycle", -1),
         schedule_stage=sched.get("stage", -1),
         schedule_cluster=sched.get("cluster", -1),
