@@ -37,6 +37,13 @@ Value sextI16ToI32Indices(Value indices, OpBuilder &builder, Location loc) {
       builder, loc, indicesType.clone(builder.getI32Type()), indices);
 }
 
+bool hasCGABroadcast(ttg::MemDescType memDescType) {
+  auto kBlock = StringAttr::get(memDescType.getContext(), "block");
+  return ttg::toLinearLayout(memDescType)
+             .getFreeVariableMasks()
+             .lookup(kBlock) != 0;
+}
+
 FailureOr<int> getTMASwizzleMode(Location loc, tt::TensorDescInterface ty) {
   auto encoding = ty.getSharedLayout();
   auto mmaEncoding =

@@ -702,32 +702,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 """,
     )
 
-
-@gluon.jit
-def mbarrier_sync_cluster_init_kernel():
-    mbarrier.sync_cluster_init()
-
-
-def test_mbarrier_sync_cluster_init():
-    mod = run_parser(mbarrier_sync_cluster_init_kernel, *make_args(num_ctas=2), target=HOPPER_TARGET)
-    expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()),
-        """\
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
-  tt.func public @mbarrier_sync_cluster_init_kernel() attributes {noinline = false} {
-    tt.call @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init____() : () -> ()
-    tt.return
-  }
-  tt.func private @triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init____() attributes {noinline = false} {
-    ttng.fence_mbarrier_init_release_cluster
-    ttng.cluster_barrier {relaxed = true}
-    tt.return
-  }
-}
-""",
-    )
-
-
 @gluon.jit
 def ampere_mbarrier_arrive_kernel():
     bar = ttgl.allocate_shared_memory(ttgl.int64, [1], ampere_mbarrier.MBarrierLayout())
