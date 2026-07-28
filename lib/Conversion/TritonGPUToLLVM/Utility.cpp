@@ -959,12 +959,19 @@ SmallVector<Value> lowerLdSt(
   auto quot = divideLeft(cvt, tile);
   assert(quot.has_value() && "cvt must be divisible by tile");
   LinearLayout reps = zerosLike(tile) * *quot;
-  assert(reps.hasInDim(kBlock));
+  // D109662150 backported upstream #9317's `assert(reps.hasInDim(kBlock))`, but
+  // beta's lowerLdSt is block-optional: every other kBlock use below is guarded
+  // on reps.hasInDim(kBlock). AMD single-CTA loads/stores reach here with a
+  // block-less layout, so include kBlock in addrLayout only when present.
   LinearLayout addrLayout =
-      LinearLayout({{kLane, reps.getBases().lookup(kLane)},
-                    {kWarp, reps.getBases().lookup(kWarp)},
-                    {kBlock, reps.getBases().lookup(kBlock)}},
-                   reps.getOutDims(), false);
+      reps.hasInDim(kBlock)
+          ? LinearLayout({{kLane, reps.getBases().lookup(kLane)},
+                          {kWarp, reps.getBases().lookup(kWarp)},
+                          {kBlock, reps.getBases().lookup(kBlock)}},
+                         reps.getOutDims(), false)
+          : LinearLayout({{kLane, reps.getBases().lookup(kLane)},
+                          {kWarp, reps.getBases().lookup(kWarp)}},
+                         reps.getOutDims(), false);
   auto [nAdditive, permStrides] =
       actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset);
   reps = permStrides.apply(reps);
