@@ -1,8 +1,8 @@
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
@@ -45,15 +45,15 @@ static bool isEncodingUniformArithOp(Operation *op) {
   if (isa<arith::ConstantOp>(op))
     return false; // handled as a leaf when retyped, not as a consumer
   // Propagate the placeholder across ops whose generic MLIR verifier compares
-  // operand/result *types* (ignoring the TLX wrapper) and would otherwise reject
-  // a placeholder meeting a null/concrete sibling: same-type elementwise
+  // operand/result *types* (ignoring the TLX wrapper) and would otherwise
+  // reject a placeholder meeting a null/concrete sibling: same-type elementwise
   // (SameOperandsAndResultType), select/cmp (whose condition / i1 result differ
-  // in type), and the arith cast ops (which change the element type but preserve
-  // shape/layout). Keyed on the trait + explicit op list rather than a hard-coded
-  // dialect name. NB: deliberately NOT the broad Elementwise trait -- it also
-  // matches ops that legitimately mix a pinned and an unpinned operand, which
-  // would over-propagate the pin. The element type may differ across the op
-  // (casts); only the encoding is propagated.
+  // in type), and the arith cast ops (which change the element type but
+  // preserve shape/layout). Keyed on the trait + explicit op list rather than a
+  // hard-coded dialect name. NB: deliberately NOT the broad Elementwise trait
+  // -- it also matches ops that legitimately mix a pinned and an unpinned
+  // operand, which would over-propagate the pin. The element type may differ
+  // across the op (casts); only the encoding is propagated.
   if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultType>() &&
       !isa<arith::SelectOp, arith::CmpFOp, arith::CmpIOp, arith::ExtFOp,
            arith::TruncFOp, arith::ExtUIOp, arith::ExtSIOp, arith::TruncIOp,
@@ -97,8 +97,7 @@ static bool isPlaceholderEncoding(Attribute enc) {
     return true;
   bool found = false;
   enc.walkImmediateSubElements(
-      [&](Attribute sub) { found |= isPlaceholderEncoding(sub); },
-      [](Type) {});
+      [&](Attribute sub) { found |= isPlaceholderEncoding(sub); }, [](Type) {});
   return found;
 }
 
@@ -161,7 +160,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
     bool isCall = v.getDefiningOp<::mlir::triton::CallOp>() != nullptr;
     if (forceBridge || isConst || isCall) {
       OpBuilder b(user);
-      auto convTy = RankedTensorType::get(t.getShape(), t.getElementType(), enc);
+      auto convTy =
+          RankedTensorType::get(t.getShape(), t.getElementType(), enc);
       Value conv = RequireLayoutOp::create(b, user->getLoc(), convTy, v);
       user->setOperand(operandIdx, conv);
       changed = true;
@@ -204,10 +204,10 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
       // tt.store: value / ptr / mask must share one encoding
       // (SameLoadStoreOperandsEncoding). If the value carries a user pin,
       // propagate it to ptr/mask so make_ttir's verifier accepts the store
-      // without a per-op tolerance; concrete layouts resolve later in make_ttgir.
-      // Bridge (require_layout convert) the ptr/mask for this use only, leaving
-      // their producers (addptr / mask cmp, with their own same-encoding
-      // verifiers) untouched.
+      // without a per-op tolerance; concrete layouts resolve later in
+      // make_ttgir. Bridge (require_layout convert) the ptr/mask for this use
+      // only, leaving their producers (addptr / mask cmp, with their own
+      // same-encoding verifiers) untouched.
       if (auto store = dyn_cast<::mlir::triton::StoreOp>(op)) {
         SmallVector<Value> linked{store.getValue(), store.getPtr()};
         if (store.getMask())
@@ -231,7 +231,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
           Value iterArg = forOp.getRegionIterArg(i);
           Value yieldV = yield.getOperand(i);
           Value resV = forOp.getResult(i);
-          Attribute enc = findPlaceholder({initV, iterArg, yieldV, resV}, forOp);
+          Attribute enc =
+              findPlaceholder({initV, iterArg, yieldV, resV}, forOp);
           if (!enc)
             continue;
           // init is an external operand and the yield operand is loop-body
@@ -271,9 +272,10 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
       }
       // tt.expand_dims / tt.broadcast: their result type was fixed at build
       // time, but the operand may only receive a placeholder via the arith/scf
-      // propagation above. Re-infer the result via the op's InferTypeOpInterface
-      // (broadcast preserves the encoding; expand_dims maps slice<->parent
-      // through the TLX infer interface) so operand and result stay consistent.
+      // propagation above. Re-infer the result via the op's
+      // InferTypeOpInterface (broadcast preserves the encoding; expand_dims
+      // maps slice<->parent through the TLX infer interface) so operand and
+      // result stay consistent.
       if (isa<::mlir::triton::ExpandDimsOp, ::mlir::triton::BroadcastOp,
               ::mlir::triton::ReduceOp>(op)) {
         auto ot = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
@@ -305,10 +307,10 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
       //       does not need an explicit tlx.release_layout.
       //   (B/C) it is elementwise (fast_fma) or a reduction (standard.max/sum):
       //       specialize the callee params, then sync the call result to the
-      //       callee return -- forcing the placeholder for an elementwise result
-      //       (shape matches the arg) or mirroring the fixpoint-inferred return
-      //       for a reduction result (shape differs, slice of the pin). This
-      //       keeps the kernel on natural tl.max/tl.sum and fast_fma.
+      //       callee return -- forcing the placeholder for an elementwise
+      //       result (shape matches the arg) or mirroring the fixpoint-inferred
+      //       return for a reduction result (shape differs, slice of the pin).
+      //       This keeps the kernel on natural tl.max/tl.sum and fast_fma.
       if (auto callOp = dyn_cast<::mlir::triton::CallOp>(op)) {
         Attribute enc;
         ArrayRef<int64_t> encShape;
@@ -351,8 +353,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
 
         // (B/C) elementwise / reduction: specialize the callee.
         // If the monomorphized helper is shared with other call sites (possibly
-        // unpinned or pinned to a different layout), defer privatizing it: clone
-        // a private copy after the walk and point this call at it, so
+        // unpinned or pinned to a different layout), defer privatizing it:
+        // clone a private copy after the walk and point this call at it, so
         // specializing never changes types out from under other callers or
         // toggles a shared callee between two pins across fixpoint iterations.
         if (auto symUses = SymbolTable::getSymbolUses(callee, mod)) {
@@ -372,8 +374,9 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
         // callee body (e.g. the reduction's tt.reduce) are re-inferred by the
         // fixpoint once their params are set.
         Block &entry = callee.getBody().front();
-        SmallVector<Type> newInputs(callee.getFunctionType().getInputs().begin(),
-                                    callee.getFunctionType().getInputs().end());
+        SmallVector<Type> newInputs(
+            callee.getFunctionType().getInputs().begin(),
+            callee.getFunctionType().getInputs().end());
         bool inputsChanged = false;
         for (unsigned i = 0; i < callOp.getNumOperands(); ++i) {
           Type at = callOp.getOperand(i).getType();
@@ -400,7 +403,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
             callee.getFunctionType().getResults().end());
         bool sigChanged = inputsChanged;
         for (unsigned i = 0; i < callOp.getNumResults(); ++i) {
-          auto callRt = dyn_cast<RankedTensorType>(callOp.getResult(i).getType());
+          auto callRt =
+              dyn_cast<RankedTensorType>(callOp.getResult(i).getType());
           // Reduction: mirror the callee's return operand once the fixpoint has
           // re-inferred it to a placeholder (slice of the pin).
           RankedTensorType retT;
@@ -410,7 +414,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
           if (retT && isPlaceholderEncoding(retT.getEncoding()))
             target = retT;
           else if (callRt && callRt.getShape() == encShape)
-            // Elementwise: result shares the arg shape -> force the placeholder.
+            // Elementwise: result shares the arg shape -> force the
+            // placeholder.
             target = RankedTensorType::get(callRt.getShape(),
                                            callRt.getElementType(), enc);
           else
@@ -430,8 +435,8 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
             }
         }
         if (sigChanged) {
-          callee.setType(FunctionType::get(callee.getContext(), newInputs,
-                                           newResults));
+          callee.setType(
+              FunctionType::get(callee.getContext(), newInputs, newResults));
           changed = true;
         }
         return;
@@ -441,8 +446,9 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
     // each pinned call site its own copy of the helper, so specializing it
     // cannot change types out from under other callers.
     for (auto callOp : pendingClones) {
-      auto callee = SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
-          callOp, callOp.getCalleeAttr());
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              callOp, callOp.getCalleeAttr());
       if (!callee)
         continue;
       OpBuilder b(callee);

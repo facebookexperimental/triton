@@ -405,8 +405,8 @@ def a16w16_8wave(
             # remove-layout-conversions / AMD optimize-epilogue so the store stays
             # a wide dwordx4. Fails compilation if a future change drops the pin.
             tlx.assert_same_layout(c_tl, L)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
-                     c_tl, mask=m_top & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], c_tl,
+                     mask=m_top & n_left)
             tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
                      tlx.require_layout(acc_bl.to(et), L), mask=m_bot & n_left)
             tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
@@ -414,14 +414,14 @@ def a16w16_8wave(
             tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
                      tlx.require_layout(acc_br.to(et), L), mask=m_bot & n_right)
         else:
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :],
-                     acc_tl.to(et), mask=m_top & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :],
-                     acc_bl.to(et), mask=m_bot & n_left)
-            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :],
-                     acc_tr.to(et), mask=m_top & n_right)
-            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :],
-                     acc_br.to(et), mask=m_bot & n_right)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_left[None, :], acc_tl.to(et),
+                     mask=m_top & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_left[None, :], acc_bl.to(et),
+                     mask=m_bot & n_left)
+            tl.store(c_ptr + stride_cm * offs_cm_top[:, None] + stride_cn * offs_cn_right[None, :], acc_tr.to(et),
+                     mask=m_top & n_right)
+            tl.store(c_ptr + stride_cm * offs_cm_bot[:, None] + stride_cn * offs_cn_right[None, :], acc_br.to(et),
+                     mask=m_bot & n_right)
     else:
         # Split-K: every split writes its fp32 partial into its workspace slice
         # (rows [split_id*M, split_id*M+M)). Mask stays in relative-M coords; the
