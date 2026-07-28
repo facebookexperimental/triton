@@ -90,6 +90,9 @@ namespace mlir {
 
 namespace {
 
+constexpr StringLiteral kModuloStageAttr = "ttg.modulo_stage";
+constexpr StringLiteral kModuloOrderAttr = "ttg.modulo_order";
+
 //===----------------------------------------------------------------------===//
 // Partition plan (Phase 1a)
 //===----------------------------------------------------------------------===//
@@ -995,9 +998,9 @@ static void runAMDModuloScaffold(ModuleOp module,
       auto it = sched.nodeToCycle.find(node.idx);
       if (it == sched.nodeToCycle.end())
         continue;
-      node.op->setAttr("ttg.modulo_stage",
+      node.op->setAttr(kModuloStageAttr,
                        b.getI32IntegerAttr(sched.getStage(node.idx)));
-      node.op->setAttr("ttg.modulo_order", b.getI32IntegerAttr(it->second));
+      node.op->setAttr(kModuloOrderAttr, b.getI32IntegerAttr(it->second));
     }
     os << " II=" << sched.II << " maxStage=" << sched.getMaxStage();
 
@@ -1074,8 +1077,8 @@ static void runAMDModuloScaffold(ModuleOp module,
       int ldsCap = computeLDSStageCap(forOp, /*fallback=*/1);
       bool complete = true;
       for (Operation &op : forOp.getBody()->without_terminator())
-        complete &=
-            op.hasAttr("ttg.modulo_order") && op.hasAttr("ttg.modulo_stage");
+        complete &= op.getAttrOfType<IntegerAttr>(kModuloOrderAttr) &&
+                    op.getAttrOfType<IntegerAttr>(kModuloStageAttr);
 
       os << " ldsCap=" << ldsCap << " needed=" << maxStage;
       if (!complete || maxStage < 1 || maxStage > ldsCap) {
@@ -1103,7 +1106,7 @@ static void runAMDModuloScaffold(ModuleOp module,
         orderToCluster.emplace(order, cs.clusters.newAtBack());
 
       for (Operation &op : forOp.getBody()->without_terminator()) {
-        int stage = cast<IntegerAttr>(op.getAttr("ttg.modulo_stage")).getInt();
+        int stage = op.getAttrOfType<IntegerAttr>(kModuloStageAttr).getInt();
         int64_t order =
             cast<IntegerAttr>(op.getAttr("ttg.modulo_order")).getInt();
         cs.insert(&op, stage, orderToCluster.at(order));
@@ -1124,7 +1127,8 @@ static void runAMDModuloScaffold(ModuleOp module,
     SmallVector<Operation *> ops;
     bool allScheduled = true;
     for (Operation &op : body->without_terminator()) {
-      if (!op.hasAttr("ttg.modulo_order")) {
+      if (!op.getAttrOfType<IntegerAttr>(kModuloOrderAttr) ||
+          !op.getAttrOfType<IntegerAttr>(kModuloStageAttr)) {
         allScheduled = false;
         break;
       }
@@ -1133,10 +1137,10 @@ static void runAMDModuloScaffold(ModuleOp module,
     int nbar = 0;
     if (allScheduled && !ops.empty()) {
       auto orderOf = [](Operation *op) {
-        return cast<IntegerAttr>(op->getAttr("ttg.modulo_order")).getInt();
+        return op->getAttrOfType<IntegerAttr>(kModuloOrderAttr).getInt();
       };
       auto stageOf = [](Operation *op) {
-        return cast<IntegerAttr>(op->getAttr("ttg.modulo_stage")).getInt();
+        return op->getAttrOfType<IntegerAttr>(kModuloStageAttr).getInt();
       };
       llvm::stable_sort(ops, [&](Operation *a, Operation *b) {
         return orderOf(a) < orderOf(b);
