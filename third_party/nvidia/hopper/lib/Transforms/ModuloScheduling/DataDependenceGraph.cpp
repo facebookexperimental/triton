@@ -40,8 +40,8 @@ unsigned DataDependenceGraph::addNode(Operation *op,
 }
 
 void DataDependenceGraph::addEdge(unsigned src, unsigned dst, int latency,
-                                  unsigned distance, unsigned srcResultIdx) {
-  edges.push_back(DDGEdge{src, dst, latency, distance, srcResultIdx});
+                                  unsigned distance) {
+  edges.push_back(DDGEdge{src, dst, latency, distance});
   nodes[src].succs.push_back(dst);
   nodes[dst].preds.push_back(src);
 }
@@ -150,8 +150,7 @@ DataDependenceGraph DataDependenceGraph::build(
       // a single `latency` that captures full delivery, and edges just
       // propagate it.
       int edgeLatency = ddg.nodes[srcIdx].latency;
-      unsigned srcResultIdx = cast<OpResult>(operand).getResultNumber();
-      ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0, srcResultIdx);
+      ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0);
     }
   }
 
@@ -236,9 +235,8 @@ DataDependenceGraph DataDependenceGraph::build(
       if (srcNode.pipeline == HWPipeline::TC &&
           dstNode.pipeline == HWPipeline::TC)
         backEdgeLat = std::max(pipelineOccupancy(srcNode), 1);
-      unsigned srcResultIdx = cast<OpResult>(yieldVal).getResultNumber();
       ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
-                  /*distance=*/1, srcResultIdx);
+                  /*distance=*/1);
     }
   }
 

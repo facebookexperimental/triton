@@ -178,10 +178,7 @@ struct ScheduleEdge {
   unsigned srcId{};
   unsigned dstId{};
   int latency{};
-  // 0 = intra-iteration, 1+ = loop-carried.
-  unsigned distance{};
-  // Producer result carried by this dependence.
-  unsigned srcResultIdx{};
+  unsigned distance{}; // 0 = intra-iteration, 1+ = loop-carried
 };
 
 // ============================================================================
