@@ -90,6 +90,9 @@ namespace mlir {
 
 namespace {
 
+constexpr StringLiteral kModuloStageAttr = "ttg.modulo_stage";
+constexpr StringLiteral kModuloOrderAttr = "ttg.modulo_order";
+
 //===----------------------------------------------------------------------===//
 // Partition plan (Phase 1a)
 //===----------------------------------------------------------------------===//
@@ -842,7 +845,11 @@ static void runModuloExpand(ModuleOp module) {
     if (copies.empty())
       continue;
 
-    const int numBuffers = 2; // v1: canonical double buffer
+    auto scheduledMaxStage =
+        forOp->getAttrOfType<IntegerAttr>(triton::kScheduledMaxStageAttrName);
+    const bool useModuloSchedule = static_cast<bool>(scheduledMaxStage);
+    const int numBuffers =
+        useModuloSchedule ? scheduledMaxStage.getInt() + 1 : 2;
     IRRewriter builder(forOp);
     Location loc = forOp.getLoc();
     Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
@@ -888,6 +895,11 @@ static void runModuloExpand(ModuleOp module) {
                                            enc, numBuffers);
       OpBuilder vb(oldViewOp);
       Value newView = triton::createSingleBufferView(vb, newAlloc, ring);
+      if (auto newViewOp = newView.getDefiningOp())
+        for (StringRef attrName :
+             {triton::kLoopStageAttrName, triton::kLoopClusterAttrName})
+          if (Attribute attr = oldViewOp->getAttr(attrName))
+            newViewOp->setAttr(attrName, attr);
       oldView.replaceAllUsesWith(newView);
       oldViewOp.erase();
       // Erase the old alloc's dangling local_dealloc, then the old alloc.
@@ -899,31 +911,48 @@ static void runModuloExpand(ModuleOp module) {
       oldAlloc.erase();
     }
 
-    // Stage assignment: async_copy backward slice (within the loop) -> stage 0
-    // (load cluster); everything else -> last stage (compute cluster). The
-    // backward slice keeps each load's index/pointer math co-staged (def<=use).
-    llvm::DenseSet<Operation *> stage0;
-    SmallVector<Operation *> wl;
-    for (auto cp : copies)
-      wl.push_back(cp);
-    while (!wl.empty()) {
-      Operation *op = wl.pop_back_val();
-      if (!op || op->getBlock() != forOp.getBody())
-        continue;
-      if (!stage0.insert(op).second)
-        continue;
-      for (Value v : op->getOperands())
-        if (Operation *d = v.getDefiningOp())
-          wl.push_back(d);
-    }
     triton::CoarseSchedule cs(/*numStages=*/numBuffers);
-    auto cLoad = cs.clusters.newAtBack();
-    auto cCompute = cs.clusters.newAtBack();
-    for (Operation &op : forOp.getBody()->without_terminator()) {
-      bool s0 = stage0.contains(&op);
-      cs.insert(&op, s0 ? 0 : numBuffers - 1, s0 ? cLoad : cCompute);
+    if (useModuloSchedule) {
+      int maxCluster = 0;
+      for (Operation &op : forOp.getBody()->without_terminator())
+        if (auto cluster =
+                op.getAttrOfType<IntegerAttr>(triton::kLoopClusterAttrName))
+          maxCluster = std::max(maxCluster, static_cast<int>(cluster.getInt()));
+      SmallVector<triton::CoarseSchedule::Cluster> clusters;
+      for (int i = 0; i <= maxCluster; ++i)
+        clusters.push_back(cs.clusters.newAtBack());
+      for (Operation &op : forOp.getBody()->without_terminator()) {
+        auto stage = op.getAttrOfType<IntegerAttr>(triton::kLoopStageAttrName);
+        auto cluster =
+            op.getAttrOfType<IntegerAttr>(triton::kLoopClusterAttrName);
+        if (stage && cluster)
+          cs.insert(&op, stage.getInt(), clusters[cluster.getInt()]);
+        else
+          cs.insert(&op, 0, clusters.front());
+      }
+    } else {
+      llvm::DenseSet<Operation *> stage0;
+      SmallVector<Operation *> wl;
+      for (auto cp : copies)
+        wl.push_back(cp);
+      while (!wl.empty()) {
+        Operation *op = wl.pop_back_val();
+        if (!op || op->getBlock() != forOp.getBody())
+          continue;
+        if (!stage0.insert(op).second)
+          continue;
+        for (Value v : op->getOperands())
+          if (Operation *d = v.getDefiningOp())
+            wl.push_back(d);
+      }
+      auto cLoad = cs.clusters.newAtBack();
+      auto cCompute = cs.clusters.newAtBack();
+      for (Operation &op : forOp.getBody()->without_terminator()) {
+        bool s0 = stage0.contains(&op);
+        cs.insert(&op, s0 ? 0 : numBuffers - 1, s0 ? cLoad : cCompute);
+      }
     }
-    cs.serialize(forOp);
+    cs.serialize(forOp, /*keepExistingMaxStage=*/false);
   }
   // Run the general expander on every serialized loop (change #4 (b)).
   expandLoops(module);
@@ -933,7 +962,8 @@ static void runModuloExpand(ModuleOp module) {
 // DDG (from TritonGPUModuloCore) using AMDLatencyModel and report the
 // per-pipeline node classification. This is the scaffold for the AMD modulo
 // scheduler and the runtime test gate for AMDLatencyModel.
-static void runAMDModuloScaffold(ModuleOp module) {
+static void runAMDModuloScaffold(ModuleOp module,
+                                 bool serializeForExpansion = false) {
   triton::gpu::AMDLatencyModel model;
   // Collect loops first — E2 mutates loop bodies, so don't mutate during walk.
   SmallVector<scf::ForOp> loops;
@@ -968,9 +998,9 @@ static void runAMDModuloScaffold(ModuleOp module) {
       auto it = sched.nodeToCycle.find(node.idx);
       if (it == sched.nodeToCycle.end())
         continue;
-      node.op->setAttr("ttg.modulo_stage",
+      node.op->setAttr(kModuloStageAttr,
                        b.getI32IntegerAttr(sched.getStage(node.idx)));
-      node.op->setAttr("ttg.modulo_order", b.getI32IntegerAttr(it->second));
+      node.op->setAttr(kModuloOrderAttr, b.getI32IntegerAttr(it->second));
     }
     os << " II=" << sched.II << " maxStage=" << sched.getMaxStage();
 
@@ -1014,20 +1044,9 @@ static void runAMDModuloScaffold(ModuleOp module) {
     // order). num_stages and per-buffer copy-count then follow from modulo's
     // stage assignment. This is the cross-iteration (pipelining) axis; E2 below
     // is the complementary intra-iteration interleave axis.
-    if (triton::tools::getBoolEnv("TRITON_AMD_MODULO_SERIALIZE")) {
-      // Phase-D-lite guardrail: cap the pipeline depth. Realistic global
-      // latency
-      // (~790 cyc) makes modulo want a very deep pipeline (e.g. 52 stages) to
-      // fully hide it — infeasible (LDS holds ~2 stages). Until Phase D adds a
-      // real LDS/register feasibility model, clamp stages to a small cap
-      // (default 1 -> 2-stage pipeline, matching the stream-pipeline baseline).
+    if (!serializeForExpansion &&
+        triton::tools::getBoolEnv("TRITON_AMD_MODULO_SERIALIZE")) {
       int stageCap = 1;
-      // Change #3: LDS-capacity support for the AMD modulo scheduler. When the
-      // decomp+modulo guard is on, set the depth to min(LDS-feasible, needed):
-      //   * LDS-feasible = floor(160KB / per-iter operand bytes) - 1   (gfx950)
-      //   * needed       = max(1, modulo maxStage = ceil(latency/II))
-      // so small tiles can pipeline deeper (up to LDS) while large tiles stay
-      // protected, and we never buffer deeper than the latency actually needs.
       if (!triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE").empty()) {
         int ldsCap = computeLDSStageCap(forOp, /*fallback=*/1);
         int needed = std::max(1, sched.getMaxStage());
@@ -1035,34 +1054,65 @@ static void runAMDModuloScaffold(ModuleOp module) {
         os << " ldsCap=" << ldsCap << " needed=" << needed;
       }
       if (const char *e = std::getenv("TRITON_AMD_MODULO_MAX_STAGE"))
-        stageCap = std::atoi(e); // explicit override always wins
+        stageCap = std::atoi(e);
       triton::CoarseSchedule cs(stageCap + 1);
-      // The AMD pipeline expander's SingleDotSchedule path requires exactly the
-      // 2-cluster convention: cluster 0 = global load, cluster 1 = compute. The
-      // *multi-buffer decision* lives in the STAGE assignment (modulo owns it);
-      // the cluster is just load-vs-compute. (Finer order/slot interleave is
-      // the separate E2 axis, not consumed by this path.)
-      auto cLoad = cs.clusters.newAtBack();    // SCHED_GLOBAL_LOAD
-      auto cCompute = cs.clusters.newAtBack(); // SCHED_COMPUTE
+      auto cLoad = cs.clusters.newAtBack();
+      auto cCompute = cs.clusters.newAtBack();
       for (const auto &node : ddg.getNodes()) {
-        auto it = sched.nodeToCycle.find(node.idx);
-        if (it == sched.nodeToCycle.end())
+        if (!sched.nodeToCycle.count(node.idx))
           continue;
         bool isGlobal = node.pipeline == triton::gpu::HWPipeline::GLOBAL;
-        // Canonical double-buffer overlap: global loads are PREFETCHED one
-        // stage ahead of compute (stage 0 / cluster 0), everything else lands
-        // in the compute stage (stageCap / cluster 1). Modulo's raw stage =
-        // ceil(latency/II) under-stages when latency < II (no prefetch), so we
-        // place loads ahead explicitly; modulo still provides II (now realistic
-        // via the scaled MFMA cost), schedulability, and the load/compute
-        // split.
-        auto cluster = isGlobal ? cLoad : cCompute;
-        int stage = isGlobal ? 0 : stageCap;
-        cs.insert(node.op, stage, cluster);
+        cs.insert(node.op, isGlobal ? 0 : stageCap,
+                  isGlobal ? cLoad : cCompute);
       }
       cs.serialize(forOp);
       os << " serialized num_stages=" << cs.getNumStages()
          << " (capped from maxStage=" << sched.getMaxStage() << ")";
+      forOp.emitRemark() << os.str();
+      continue;
+    }
+
+    if (serializeForExpansion) {
+      int maxStage = sched.getMaxStage();
+      int ldsCap = computeLDSStageCap(forOp, /*fallback=*/1);
+      bool complete = true;
+      for (Operation &op : forOp.getBody()->without_terminator())
+        complete &= op.getAttrOfType<IntegerAttr>(kModuloOrderAttr) &&
+                    op.getAttrOfType<IntegerAttr>(kModuloStageAttr);
+
+      os << " ldsCap=" << ldsCap << " needed=" << maxStage;
+      if (!complete || maxStage < 1 || maxStage > ldsCap) {
+        os << " serialize=rejected(";
+        if (!complete)
+          os << "incomplete";
+        else if (maxStage < 1)
+          os << "no-overlap";
+        else
+          os << "lds-capacity";
+        os << ")";
+        forOp.emitRemark() << os.str();
+        continue;
+      }
+
+      triton::CoarseSchedule cs(maxStage + 1);
+      std::map<int64_t, triton::CoarseSchedule::Cluster> orderToCluster;
+      SmallVector<int64_t> orders;
+      for (Operation &op : forOp.getBody()->without_terminator())
+        orders.push_back(
+            cast<IntegerAttr>(op.getAttr("ttg.modulo_order")).getInt());
+      llvm::sort(orders);
+      orders.erase(std::unique(orders.begin(), orders.end()), orders.end());
+      for (int64_t order : orders)
+        orderToCluster.emplace(order, cs.clusters.newAtBack());
+
+      for (Operation &op : forOp.getBody()->without_terminator()) {
+        int stage = op.getAttrOfType<IntegerAttr>(kModuloStageAttr).getInt();
+        int64_t order =
+            cast<IntegerAttr>(op.getAttr("ttg.modulo_order")).getInt();
+        cs.insert(&op, stage, orderToCluster.at(order));
+      }
+      cs.serialize(forOp);
+      os << " serialized num_stages=" << cs.getNumStages();
       forOp.emitRemark() << os.str();
       continue;
     }
@@ -1077,7 +1127,8 @@ static void runAMDModuloScaffold(ModuleOp module) {
     SmallVector<Operation *> ops;
     bool allScheduled = true;
     for (Operation &op : body->without_terminator()) {
-      if (!op.hasAttr("ttg.modulo_order")) {
+      if (!op.getAttrOfType<IntegerAttr>(kModuloOrderAttr) ||
+          !op.getAttrOfType<IntegerAttr>(kModuloStageAttr)) {
         allScheduled = false;
         break;
       }
@@ -1086,10 +1137,10 @@ static void runAMDModuloScaffold(ModuleOp module) {
     int nbar = 0;
     if (allScheduled && !ops.empty()) {
       auto orderOf = [](Operation *op) {
-        return cast<IntegerAttr>(op->getAttr("ttg.modulo_order")).getInt();
+        return op->getAttrOfType<IntegerAttr>(kModuloOrderAttr).getInt();
       };
       auto stageOf = [](Operation *op) {
-        return cast<IntegerAttr>(op->getAttr("ttg.modulo_stage")).getInt();
+        return op->getAttrOfType<IntegerAttr>(kModuloStageAttr).getInt();
       };
       llvm::stable_sort(ops, [&](Operation *a, Operation *b) {
         return orderOf(a) < orderOf(b);
@@ -1135,7 +1186,7 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
       return;
     }
     if (m == "modulo") {
-      runAMDModuloScaffold(getOperation());
+      runAMDModuloScaffold(getOperation(), /*serializeForExpansion=*/true);
       return;
     }
     if (m == "expand") {
