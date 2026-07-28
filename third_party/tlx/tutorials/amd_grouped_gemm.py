@@ -432,10 +432,11 @@ def grouped_gemm_kernel(
     last_problem_end = 0
 
     for g in range(group_size):
-        # Load base pointers
-        a_ptr = tl.multiple_of(tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
-        b_ptr = tl.multiple_of(tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16)), 16)
-        c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16))
+        # Load base pointers. Use assume_uniform to hint to the compiler that the pointers
+        # are warp-uniform and can just be broadcasted from the first lane.
+        a_ptr = tl.multiple_of(tlx.assume_uniform(tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float16))), 16)
+        b_ptr = tl.multiple_of(tlx.assume_uniform(tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float16))), 16)
+        c_ptr = tlx.assume_uniform(tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float16)))
 
         # Load gemm sizes
         gm = tl.load(group_gemm_sizes + g * 3)
@@ -573,8 +574,8 @@ def _pick_config(shapes):
 
     # XCD_CHUNK sets how many consecutive tiles land on one chiplet. When there
     # are many tiles per CU a long chunk keeps an A/B panel resident in that
-    # XCD's L2 across several tiles; when there is barely one wave, a long chunk
-    # just unbalances the chiplets and a short one spreads the work.
+    # XCD's L2 across several tiles. When there is barely one wave, a long chunk
+    # just unbalances the chiplets while a short one spreads the work.
     quad = dict(_CONFIG)
     quad_tiles = sum(_cdiv(M, 256) * _cdiv(N, 256) for (M, N, _) in shapes)
     quad["XCD_CHUNK"] = 32 if quad_tiles >= 2 * nsm else 8

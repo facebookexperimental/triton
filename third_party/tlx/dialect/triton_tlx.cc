@@ -1244,6 +1244,10 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttag::BufferLoadToLocalOp>(
                  dest, ptr, offsets, mask.value_or(Value()),
                  other.value_or(Value()), Value() /*stride*/, cache);
+           })
+      .def("create_assume_uniform",
+           [](TritonOpBuilder &self, Value ptr) -> Value {
+             return self.create<ttag::AssumeUniformOp>(ptr.getType(), ptr);
            });
 }
 

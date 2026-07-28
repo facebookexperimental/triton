@@ -279,6 +279,26 @@ def CondBarrierOp : TT_AMDGPU_Op<"cond_barrier"> {
 }
 
 //===----------------------------------------------------------------------===//
+// AssumeUniformOp
+//===----------------------------------------------------------------------===//
+
+def AssumeUniformOp : TT_AMDGPU_Op<"assume_uniform", [Pure, SameOperandsAndResultType]> {
+  let summary = "Assert that a scalar pointer is wave-uniform";
+
+  let description = [{
+    Returns `src` unchanged, but tells the backend that its value is the same in
+    every lane of the wave. Lowers to `llvm.amdgcn.readfirstlane`, which makes
+    the result uniform by construction as far as LLVM's uniformity analysis is
+    concerned.
+  }];
+
+  let arguments = (ins TT_Ptr:$src);
+  let results = (outs TT_Ptr:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
+//===----------------------------------------------------------------------===//
 // BufferLoadOp
 //===----------------------------------------------------------------------===//
 

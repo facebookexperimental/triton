@@ -27,6 +27,7 @@ from .mem_ops import (
     async_amd_descriptor_wait,
     async_store,
     async_descriptor_load,
+    assume_uniform,
     buffer_load,
     buffer_load_to_local,
     zeros,
@@ -143,6 +144,7 @@ __all__ = [
     "tensor_descriptor_ptr",
     "tensor_descriptor_ptr_type",
     # mem_ops
+    "assume_uniform",
     "async_store",
     "buffer_load",
     "buffer_load_to_local",
