@@ -329,7 +329,7 @@ def build_run_specs(args, cache_root):
             )
 
     if "mxfp" in args.sweeps:
-        script = str(SCRIPT_DIR / "gfx9_gemm/a4w4/bench.py")
+        script = str(SCRIPT_DIR / "gfx9_gemm/intra_wave/a4w4/bench.py")
         for backend in ("llvm", "wave"):
             cache_dir = cache_root / f"mxfp-{backend}"
             command = (
