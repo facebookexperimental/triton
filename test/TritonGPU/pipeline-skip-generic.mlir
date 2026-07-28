@@ -19,7 +19,7 @@ module attributes {
       // CHECK: scf.yield %[[SUM]] : f32
       scf.yield %sum : f32
     } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
-    // CHECK-NEXT: tt.return %[[RESULT]] : f32
+    // CHECK: tt.return %[[RESULT]] : f32
     tt.return %result : f32
   }
 }

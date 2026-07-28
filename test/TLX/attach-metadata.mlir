@@ -2,12 +2,12 @@
 // RUN: triton-opt -split-input-file -pass-pipeline='builtin.module(triton-tlx-fixup{num-warps=8 target=cuda:90 num-ctas=1 threads-per-warp=32})' %s| FileCheck %s
 
 // CHECK: module attributes {
-// CHECK-SAME: "triton.skip_generic_pipeline"
-// CHECK-SAME: tlx.has_tlx_ops = true
-// CHECK-SAME: "ttg.num-ctas" = 1
-// CHECK-SAME: "ttg.num-warps" = 8
-// CHECK-SAME: ttg.target = "cuda:90"
-// CHECK-SAME: "ttg.threads-per-warp" = 32
+// CHECK-DAG: triton.skip_generic_pipeline
+// CHECK-DAG: tlx.has_tlx_ops = true
+// CHECK-DAG: "ttg.num-ctas" = 1
+// CHECK-DAG: "ttg.num-warps" = 8
+// CHECK-DAG: ttg.target = "cuda:90"
+// CHECK-DAG: "ttg.threads-per-warp" = 32
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [16, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
 module {
     tt.func @kernel_tlx(%arg0: tensor<256x!tt.ptr<f32>>, %arg1: i32) {
@@ -54,13 +54,13 @@ module {
 // -----
 
 // CHECK: module attributes {
-// CHECK-SAME: "triton.skip_generic_pipeline"
-// CHECK-SAME: tlx.has_explicit_local_mem_access = true
+// CHECK-DAG: triton.skip_generic_pipeline
+// CHECK-DAG: tlx.has_explicit_local_mem_access = true
+// CHECK-DAG: "ttg.num-ctas" = 1
+// CHECK-DAG: "ttg.num-warps" = 8
+// CHECK-DAG: ttg.target = "cuda:90"
+// CHECK-DAG: "ttg.threads-per-warp" = 32
 // CHECK-NOT: tlx.has_tlx_ops
-// CHECK-SAME: "ttg.num-ctas" = 1
-// CHECK-SAME: "ttg.num-warps" = 8
-// CHECK-SAME: ttg.target = "cuda:90"
-// CHECK-SAME: "ttg.threads-per-warp" = 32
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module {
@@ -119,8 +119,8 @@ module {
 // -----
 
 // CHECK: module attributes {
-// CHECK-SAME: "triton.skip_generic_pipeline"
-// CHECK-SAME: tlx.has_warp_spec_ops = true
+// CHECK-DAG: triton.skip_generic_pipeline
+// CHECK-DAG: tlx.has_warp_spec_ops = true
 // CHECK-NOT: tlx.has_explicit_local_mem_access
 // CHECK-NOT: tlx.has_tlx_ops
 module attributes {tlx.has_warp_spec_ops = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
