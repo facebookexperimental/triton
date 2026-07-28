@@ -7,6 +7,7 @@
 // attributes for downstream pipelining passes.
 
 #include <cmath>
+#include <map>
 #include <set>
 #include <tuple>
 
@@ -589,6 +590,9 @@ convertDDGNode(const ttg::DDGNode &ddgNode, unsigned nodeId,
     sn.cycle = cycleIt->second;
     sn.stage = cycleIt->second / sched.II;
   }
+  auto warpGroupIt = sched.nodeToWarpGroup.find(ddgNode.idx);
+  if (warpGroupIt != sched.nodeToWarpGroup.end())
+    sn.warpGroup = warpGroupIt->second;
 
   if (ddgNode.isSuperNode) {
     sn.prologueLatency = ddgNode.prologueLatency;
@@ -4812,200 +4816,321 @@ static void clampOuterStagesAndClusters(scf::ForOp outerLoop) {
   }
 }
 
-/// Whole-nest epilogue warp-group unification (cost-model, storage-class-priced).
+/// Whole-nest consumer warp-group resolution for inner-loop hand-offs.
 ///
-/// A persistent outer loop's epilogue may consume a value V produced by its
-/// inner loop. If V is a REGISTER value, running the epilogue in a warp group
-/// separate from V's producer forces V through an SMEM materialization
-/// round-trip (a local_store in the producer plus a local_load + 2 barriers in
-/// the consumer) — a real cost that scales with bytes(V). Co-locating the
-/// epilogue into the inner producer's warp group removes that hand-off.
+/// An outer loop may consume values produced by an inner loop super-node. If an
+/// inner result is a register-resident tensor, running its outer consumers in a
+/// warp group separate from the inner producer forces that value through an
+/// SMEM materialization round-trip. Co-locating the whole outer consumer group
+/// into the inner producer's warp group removes that hand-off.
 ///
-/// The decision is priced by V's storage class, NOT by a "register → same WG"
-/// rule (that would just be pattern matching):
-///   Register V  → co-locating saves the full materialization (~2·bytes),
-///                 which is otherwise pure overhead → co-locate.
-///   TMEM/SMEM V → the consumer needs a barrier to read V regardless of which
-///                 warp group runs the epilogue, so co-location saves ~nothing.
-///                 A GEMM's TMEM accumulator therefore legitimately keeps its
-///                 own epilogue WG → stay separate.
-/// Overlap benefit is left implicit in the loop II/makespan (the epilogue work
-/// is scheduled either way); we price only the hand-off co-location removes.
+/// TMEM/SMEM values keep their distinct behavior: their consumers need memory
+/// synchronization regardless of warp-group identity, so they are not treated
+/// as register hand-offs. Async tokens, memdesc values, and other
+/// non-ranked-tensor results are also not register hand-offs.
 ///
-/// The decision is expressed by RENUMBERING the epilogue-owning outer warp
-/// group so its id is meaningful across the super-node boundary — no side field:
-///   co-locate → the inner producer's warp-group id (the epilogue now SHARES it,
-///               which is exactly the co-location signal the emitter reads),
-///   separate  → a FRESH id above every id in the nest, guaranteed not to alias
-///               any inner id (so "epilogue wg == an inner wg" unambiguously
-///               means co-located, never a coincidence).
-/// The whole epilogue-owning group is renumbered together, so no intra-outer
-/// edge becomes cross-WG (no spurious barriers on super-node→epilogue or
-/// index-math→store). sched2tlx then just reads the warp-group id.
-static void unifyNestEpilogueWarpGroup(ttg::ScheduleGraph &graph) {
-  for (auto &outer : graph.loops) {
-    // Outer (persistent) loop = owns a descriptor_store AND wraps an inner-loop
-    // super-node.
-    tt::DescriptorStoreOp storeOp;
-    unsigned storeNodeId = 0;
-    scf::ForOp innerFor;
-    int innerId = -1;
-    for (auto &n : outer.nodes) {
-      if (n.op && isa<tt::DescriptorStoreOp>(n.op)) {
-        storeOp = cast<tt::DescriptorStoreOp>(n.op);
-        storeNodeId = n.id;
-      }
-      if (n.childPipelineId != UINT_MAX && n.op)
-        if (auto f = dyn_cast<scf::ForOp>(n.op)) {
-          innerFor = f;
-          innerId = static_cast<int>(n.childPipelineId);
-        }
+/// The decision is expressed by renumbering the complete outer consumer warp
+/// group so its id is meaningful across the super-node boundary:
+///   co-locate -> the inner producer's warp-group id,
+///   separate  -> a fresh id above every id in the nest.
+/// Renumbering the whole existing group preserves intra-outer dependencies and
+/// lets barrier synthesis consume the final ids directly.
+static std::optional<int>
+computeNextInnerTcIssueDeadline(const ttg::ScheduleLoop &outer,
+                                const ttg::ScheduleLoop &inner,
+                                int childPipelineId, int producerWg) {
+  std::optional<int> superNodeCycle;
+  for (const auto &n : outer.nodes)
+    if (static_cast<int>(n.childPipelineId) == childPipelineId) {
+      superNodeCycle = n.cycle;
+      break;
     }
-    if (!storeOp || !innerFor || innerId < 0)
+  if (!superNodeCycle)
+    return std::nullopt;
+
+  std::optional<int> firstInnerTcCycle;
+  for (const auto &n : inner.nodes)
+    if (n.pipeline == ttg::HWPipeline::TC && n.warpGroup == producerWg)
+      firstInnerTcCycle =
+          firstInnerTcCycle ? std::min(*firstInnerTcCycle, n.cycle) : n.cycle;
+  if (!firstInnerTcCycle)
+    return std::nullopt;
+
+  return *superNodeCycle + outer.II + *firstInnerTcCycle;
+}
+
+static int computeWarpGroupDrainCycle(const ttg::ScheduleLoop &loop, int wg) {
+  int drain = 0;
+  for (const auto &n : loop.nodes)
+    if (n.warpGroup == wg)
+      // This is the warp issue-stream drain for register hand-off safety. Keep
+      // it based on selfLatency; async-engine occupancy is enforced separately
+      // as a global pipeline constraint by the modulo scheduler.
+      drain = std::max(drain, n.cycle + std::max(n.selfLatency, 1) *
+                                            std::max(n.frequencyMultiplier, 1));
+  return drain;
+}
+
+static int64_t getRankedTensorBytes(RankedTensorType tensorTy) {
+  if (!tensorTy || !tensorTy.hasStaticShape())
+    return 0;
+  int64_t elems = 1;
+  for (int64_t d : tensorTy.getShape())
+    elems *= d;
+  return elems * (tensorTy.getElementTypeBitWidth() / 8);
+}
+
+static bool isRegisterResidentInnerResult(scf::ForOp innerFor, int resultIdx) {
+  auto tensorTy =
+      dyn_cast<RankedTensorType>(innerFor.getResult(resultIdx).getType());
+  if (!tensorTy || getRankedTensorBytes(tensorTy) <= 0)
+    return false;
+
+  auto yield = cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
+  Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
+  if (!yieldDef)
+    return false;
+
+  ttg::MemoryKind memoryKind = classifyMemoryKind(yieldDef);
+  return memoryKind != ttg::MemoryKind::TMEM &&
+         memoryKind != ttg::MemoryKind::SMEM;
+}
+
+static int getInnerResultProducerWg(const ttg::ScheduleLoop &innerLoop,
+                                    scf::ForOp innerFor, int resultIdx) {
+  auto yield = cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
+  Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
+  if (!yieldDef)
+    return -1;
+  for (const auto &n : innerLoop.nodes)
+    if (n.op == yieldDef && n.warpGroup >= 0)
+      return n.warpGroup;
+  return -1;
+}
+
+struct OuterConsumerGroupInfo {
+  std::set<int> resultIndices;
+  SmallVector<unsigned> nodeIds;
+};
+
+static std::map<int, OuterConsumerGroupInfo>
+collectOuterConsumersByWarpGroup(const ttg::ScheduleLoop &outer,
+                                 scf::ForOp innerFor) {
+  llvm::DenseMap<Operation *, int> opToWg;
+  llvm::DenseMap<Operation *, unsigned> opToNodeId;
+  for (const auto &n : outer.nodes) {
+    if (!n.op || n.warpGroup < 0)
       continue;
+    opToWg[n.op] = n.warpGroup;
+    opToNodeId[n.op] = n.id;
+  }
 
-    // The epilogue-owning outer warp group (the group that runs the store).
-    int epiWg = -1;
-    for (auto &n : outer.nodes)
-      if (n.id == storeNodeId) {
-        epiWg = n.warpGroup;
-        break;
-      }
-    if (epiWg < 0)
-      continue;
-
-    // Inner warp-group ids + a fresh id above every id in the whole nest.
-    int freshId = 0;
-    const ttg::ScheduleLoop *innerLoop = nullptr;
-    for (auto &l : graph.loops) {
-      for (auto &n : l.nodes)
-        freshId = std::max(freshId, n.warpGroup + 1);
-      if (static_cast<int>(l.id) == innerId)
-        innerLoop = &l;
-    }
-
-    // Default: SEPARATE — a fresh non-aliasing id.
-    int newWg = freshId;
-
-    // Trace the store's source back to the inner-loop result it consumes. If
-    // that result is a REGISTER tensor, co-locate into its producer partition.
-    int resultIdx = -1;
-    SmallVector<Value> work{storeOp.getSrc()};
-    llvm::SmallPtrSet<Value, 8> seen;
-    while (!work.empty()) {
-      Value v = work.pop_back_val();
-      if (!seen.insert(v).second)
+  std::map<int, OuterConsumerGroupInfo> groups;
+  for (auto result : llvm::enumerate(innerFor.getResults())) {
+    int resultIdx = static_cast<int>(result.index());
+    SmallVector<Value> worklist{result.value()};
+    llvm::SmallPtrSet<Value, 16> seenValues;
+    llvm::SmallPtrSet<Operation *, 16> seenOps;
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!seenValues.insert(v).second)
         continue;
-      if (auto res = dyn_cast<OpResult>(v))
-        if (res.getOwner() == innerFor.getOperation()) {
-          resultIdx = static_cast<int>(res.getResultNumber());
+      SmallVector<OpOperand *> uses;
+      for (OpOperand &use : v.getUses())
+        uses.push_back(&use);
+      llvm::sort(uses, [](OpOperand *a, OpOperand *b) {
+        if (a->getOwner()->isBeforeInBlock(b->getOwner()))
+          return true;
+        if (b->getOwner()->isBeforeInBlock(a->getOwner()))
+          return false;
+        return a->getOperandNumber() < b->getOperandNumber();
+      });
+      for (OpOperand *use : uses) {
+        Operation *user = use->getOwner();
+        if (user == innerFor.getOperation())
+          continue;
+        if (auto yield = dyn_cast<scf::YieldOp>(user)) {
+          // Bridge values yielded from scf.if regions back to the corresponding
+          // parent result so outer consumers after the if are discovered.
+          if (auto ifOp = dyn_cast<scf::IfOp>(yield->getParentOp())) {
+            if (ifOp->getParentRegion() == innerFor->getParentRegion()) {
+              unsigned operandIdx = use->getOperandNumber();
+              if (operandIdx < ifOp.getNumResults())
+                worklist.push_back(ifOp.getResult(operandIdx));
+            }
+          }
           continue;
         }
-      Operation *def = v.getDefiningOp();
-      if (!def || def == innerFor.getOperation())
-        continue; // block arg / iv, or the inner loop itself.
-      // Only descend ops in the outer loop body — never into the inner loop.
-      if (def->getParentRegion() != innerFor->getParentRegion())
-        continue;
-      for (Value operand : def->getOperands())
-        work.push_back(operand);
+        if (user->getParentRegion() != innerFor->getParentRegion())
+          continue;
+        if (!seenOps.insert(user).second)
+          continue;
+        auto wgIt = opToWg.find(user);
+        if (wgIt != opToWg.end()) {
+          auto &info = groups[wgIt->second];
+          info.resultIndices.insert(resultIdx);
+          info.nodeIds.push_back(opToNodeId[user]);
+        }
+        for (Value out : user->getResults())
+          worklist.push_back(out);
+      }
     }
+  }
 
-    if (resultIdx >= 0 && innerLoop) {
-      Value innerResult = innerFor.getResult(resultIdx);
-      if (auto tensorTy = dyn_cast<RankedTensorType>(innerResult.getType())) {
-        int64_t elems = 1;
-        for (auto d : tensorTy.getShape())
-          elems *= d;
-        int64_t bytes = elems * (tensorTy.getElementTypeBitWidth() / 8);
-        auto yield =
-            cast<scf::YieldOp>(innerFor.getBody()->getTerminator());
-        Operation *yieldDef = yield.getOperand(resultIdx).getDefiningOp();
-        int producerWg = -1;
-        if (yieldDef)
-          for (auto &n : innerLoop->nodes)
-            if (n.op == yieldDef && n.warpGroup >= 0) {
-              producerWg = n.warpGroup;
-              break;
-            }
-        if (bytes > 0 && producerWg >= 0) {
-          newWg = producerWg; // co-locate: share the producer's WG id.
+  for (auto &[wg, info] : groups) {
+    llvm::sort(info.nodeIds);
+    info.nodeIds.erase(llvm::unique(info.nodeIds), info.nodeIds.end());
+  }
+  return groups;
+}
+
+static void renumberWarpGroup(ttg::ScheduleLoop &loop, int oldWg, int newWg) {
+  if (oldWg == newWg)
+    return;
+  for (auto &n : loop.nodes)
+    if (n.warpGroup == oldWg)
+      n.warpGroup = newWg;
+}
+
+static void resolveNestedConsumerWarpGroups(ttg::ScheduleGraph &graph) {
+  for (auto &outer : graph.loops) {
+    SmallVector<std::pair<int, scf::ForOp>> children;
+    for (const auto &n : outer.nodes)
+      if (n.childPipelineId != UINT_MAX && n.op)
+        if (auto f = dyn_cast<scf::ForOp>(n.op))
+          children.push_back({static_cast<int>(n.childPipelineId), f});
+    llvm::sort(children,
+               [](const auto &a, const auto &b) { return a.first < b.first; });
+
+    for (auto [innerId, innerFor] : children) {
+      ttg::ScheduleLoop *innerLoop = nullptr;
+      for (auto &l : graph.loops)
+        if (static_cast<int>(l.id) == innerId) {
+          innerLoop = &l;
+          break;
+        }
+      if (!innerLoop)
+        continue;
+
+      int freshId = 0;
+      for (const auto &l : graph.loops)
+        for (const auto &n : l.nodes)
+          freshId = std::max(freshId, n.warpGroup + 1);
+
+      auto consumerGroups = collectOuterConsumersByWarpGroup(outer, innerFor);
+      llvm::SmallPtrSet<const OuterConsumerGroupInfo *, 8> processedGroups;
+      for (const auto &[consumerWg, info] : consumerGroups) {
+        if (consumerWg < 0)
+          continue;
+        bool stillCurrent = false;
+        for (unsigned nodeId : info.nodeIds)
+          if (nodeId < outer.nodes.size() &&
+              outer.nodes[nodeId].warpGroup == consumerWg) {
+            stillCurrent = true;
+            break;
+          }
+        if (!stillCurrent || !processedGroups.insert(&info).second)
+          continue;
+
+        bool sawRegister = false;
+        bool sawNonRegister = false;
+        std::optional<int> producerWg;
+        int64_t registerBytes = 0;
+        for (int resultIdx : info.resultIndices) {
+          bool isRegister = isRegisterResidentInnerResult(innerFor, resultIdx);
+          sawRegister |= isRegister;
+          sawNonRegister |= !isRegister;
+          if (!isRegister)
+            continue;
+
+          int resultProducerWg =
+              getInnerResultProducerWg(*innerLoop, innerFor, resultIdx);
+          if (resultProducerWg < 0) {
+            sawNonRegister = true;
+            continue;
+          }
+          if (producerWg && *producerWg != resultProducerWg) {
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[nested-wg] mixed-producer consumer WG "
+                       << consumerWg << " result " << resultIdx
+                       << " producer WG " << resultProducerWg << " vs "
+                       << *producerWg << "; keep separate\n");
+            producerWg = std::nullopt;
+            sawNonRegister = true;
+            break;
+          }
+          producerWg = resultProducerWg;
+          registerBytes += getRankedTensorBytes(dyn_cast<RankedTensorType>(
+              innerFor.getResult(resultIdx).getType()));
+        }
+
+        int newWg = freshId++;
+        if (!sawRegister || sawNonRegister || !producerWg) {
           LLVM_DEBUG(llvm::dbgs()
-                     << "[colocate] outer epilogue → inner WG " << producerWg
-                     << " (register hand-off " << bytes << " B removed)\n");
+                     << "[nested-wg] reject consumer WG " << consumerWg
+                     << " (register=" << sawRegister
+                     << ", non-register=" << sawNonRegister
+                     << "); keep separate as WG " << newWg << "\n");
+          renumberWarpGroup(outer, consumerWg, newWg);
+          continue;
+        }
+
+        int consumerDrain = computeWarpGroupDrainCycle(outer, consumerWg);
+        std::optional<int> nextTcDeadline = computeNextInnerTcIssueDeadline(
+            outer, *innerLoop, innerId, *producerWg);
+        if (!nextTcDeadline) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[nested-wg] no-TC consumer WG " << consumerWg
+                     << " -> inner WG " << *producerWg << " (register hand-off "
+                     << registerBytes << " B, drain=" << consumerDrain
+                     << "); co-locate\n");
+          renumberWarpGroup(outer, consumerWg, *producerWg);
+          continue;
+        }
+
+        if (consumerDrain <= *nextTcDeadline) {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[nested-wg] co-locate consumer WG " << consumerWg
+                     << " -> inner WG " << *producerWg << " (register hand-off "
+                     << registerBytes << " B, drain=" << consumerDrain
+                     << ", deadline=" << *nextTcDeadline << ")\n");
+          renumberWarpGroup(outer, consumerWg, *producerWg);
+        } else {
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[nested-wg] reject consumer WG " << consumerWg
+                     << " -> inner WG " << *producerWg << " (register hand-off "
+                     << registerBytes << " B, drain=" << consumerDrain
+                     << ", deadline=" << *nextTcDeadline
+                     << "); keep separate as WG " << newWg << "\n");
+          renumberWarpGroup(outer, consumerWg, newWg);
         }
       }
     }
-
-    if (newWg == epiWg)
-      continue; // already correct.
-
-    // Renumber the WHOLE epilogue-owning group together.
-    for (auto &n : outer.nodes)
-      if (n.warpGroup == epiWg)
-        n.warpGroup = newWg;
   }
 }
 
-/// Pass B: Per-loop warp-group partition + cross-group barriers. Each
-/// ScheduleLoop gets its own Phase 4 partition run with its own II.
-/// Nested kernels (case2/case5) get inner-partition (e.g., 3-WG GEMM
-/// split) decided at inner II without being drowned by the outer II.
-/// Single-loop kernels (case1/case3) reduce to a single partition run
-/// over that one loop. The acc_tmem TC↔default hand-off is the emitter's
-/// legacy carve-out — no cross-loop barrier rebuild needed.
-///
-/// `TRITON_MODULO_EXHAUSTIVE_PARTITION=0|off|false` opts into the greedy
-/// fallback partitioner. Default is the exhaustive Phase 4 search.
+/// Pass B: Finalize constructively selected warp groups and materialize
+/// communication. Each ScheduleLoop keeps the warp groups assigned during
+/// modulo scheduling; this pass only demotes/propagates infra ops, reconciles
+/// nested epilogues, inserts cross-group barriers, and merges channel buffers.
 static void
 applyGlobalWarpPartition(MutableArrayRef<ScheduledLoop> scheduledLoops) {
-  auto exhaustiveEnv =
-      triton::tools::getStrEnv("TRITON_MODULO_EXHAUSTIVE_PARTITION");
-  bool useGreedy = (exhaustiveEnv == "0" || exhaustiveEnv == "false" ||
-                    exhaustiveEnv == "off");
-  // Whole-kernel committed SMEM: a loop's partition candidates must fit
-  // alongside every OTHER loop's buffers (nested/sibling loops coexist in
-  // the CTA — the budget reducers already enforce the limit jointly, see
-  // reduceBuffersForGlobalBudget; the channel-capacity gate must too).
-  int64_t allLoopsSmem = 0;
-  for (auto &sl : scheduledLoops)
-    for (auto &schedLoop : sl.graph.loops)
-      allLoopsSmem += computeTotalSmem(schedLoop);
   for (auto &sl : scheduledLoops) {
     for (auto &schedLoop : sl.graph.loops) {
       if (schedLoop.II <= 0)
         continue;
-      // Every loop — inner AND outer — goes through the same cost-model
-      // partitioner: the makespan (single-iteration latency chain over each
-      // WG's pipeAvail) plus barrier cost decides the split uniformly, and
-      // all candidates carry the same RecMII'-floor / launchability terms.
-      // No env flag, no hard override, no outer-loop special case: sched2tlx
-      // lowers multi-WG outer bodies, and its task-coverage check hard-errors
-      // on any scheduled op no task owns rather than dropping it silently.
-      // This rewards warp specialization wherever it overlaps independent
-      // pipelines across groups: GEMM/FA (MEM/TC/softmax) AND memory-bound
-      // loops like LayerNorm, where putting TMA-load, compute, and TMA-store
-      // on separate warp groups frees the compute warps and removes the
-      // in-stream store drain (measured ~1.2x over 1-WG software
-      // pipelining).
-      if (useGreedy) {
-        partitionIntoWarpGroups(schedLoop);
-      } else {
-        partitionExhaustive(schedLoop,
-                            allLoopsSmem - computeTotalSmem(schedLoop));
-      }
       demoteScalarArithToInfra(schedLoop);
       propagateWarpGroupToInfraOps(schedLoop);
       coLocateOperandAllocsWithLoads(schedLoop);
     }
   }
 
-  // Cross-loop reconciliation: now that every loop has warp groups, unify each
-  // outer epilogue's warp-group id with its inner producer (storage-class-priced
+  // Cross-loop reconciliation: now that every loop has warp groups, resolve
+  // outer consumer warp-group ids against inner producers (storage-class-priced
   // hand-off cost model). Runs before barrier insertion so the renumbered ids
   // drive barrier synthesis and the emitter reads them directly.
   for (auto &sl : scheduledLoops)
-    unifyNestEpilogueWarpGroup(sl.graph);
+    resolveNestedConsumerWarpGroups(sl.graph);
 
   // Run barrier insertion per-loop using the now-globally-consistent
   // warp-group IDs. Cross-loop barriers (from Phase 2 edges) are still

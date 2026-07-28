@@ -1,4 +1,6 @@
+// REQUIRES: asserts
 // RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule -nvgpu-modulo-ws-partition | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=modulo-scheduling-rau,nvgpu-modulo-schedule 2>&1 | FileCheck %s --check-prefix=JOINT
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #acc_layout = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
@@ -19,6 +21,21 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: tt.modulo_ii = {{[0-9]+}} : i32
 // CHECK-SAME: tt.scheduled_max_stage = {{[0-9]+}} : i32
 // CHECK: tt.warp_specialize
+//
+// The scheduler constructs one `(cycle, warp group)` assignment directly for
+// this leaf/control case. This preserves coverage for candidate-free scheduling
+// output but does not directly exercise register hand-off rejection. The real
+// nested test covers non-register separation across a TMEM hand-off.
+// N0-N4 fit on wg0 at their globally ready cycles. N5 cannot issue on wg0 at
+// its required cycle, so the scheduler creates wg1 and places the remaining
+// chain there after accounting for cross-warp synchronization latency.
+// JOINT: Placed N4 {{.*}} at cycle=653 stage=0 wg=0
+// JOINT-NEXT: {{.*}} Placed N5 {{.*}} at cycle=0 stage=0 wg=1
+// JOINT-NEXT: {{.*}} Placed N6 {{.*}} at cycle=713 stage=0 wg=1
+// JOINT-NEXT: {{.*}} Placed N7 {{.*}} at cycle=1272 stage=1 wg=1
+// JOINT-NEXT: {{.*}} SUCCESS at II=1091 wgs=2 warps=9
+// JOINT-NOT: [nested-wg]
+// JOINT-NOT: cand[
 tt.func @persistent_gemm_ws_partition(
   %a_desc: !tt.tensordesc<128x64xf16>,
   %b_desc: !tt.tensordesc<64x128xf16>,

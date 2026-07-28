@@ -41,6 +41,8 @@ private:
 struct ModuloScheduleResult {
   int II{};
   llvm::DenseMap<unsigned, int> nodeToCycle; // DDG node idx -> absolute cycle
+  llvm::DenseMap<unsigned, int> nodeToWarpGroup;
+  int numWarpGroups{};
 
   int getStage(unsigned nodeIdx) const {
     auto it = nodeToCycle.find(nodeIdx);
@@ -55,13 +57,10 @@ struct ModuloScheduleResult {
   }
 };
 
-/// Run modulo scheduling on the DDG.
-/// Algorithm selected by TRITON_USE_MODULO_SCHEDULE env var value:
-///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
-///   "exhaustive" → Exhaustive search with joint memory feasibility
-///   "random"     → Random sampling with greedy placement
-///   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
-/// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
+/// Run the constructive joint Rau scheduler on the DDG.
+/// The scheduler assigns both modulo cycles and warp groups in one placement
+/// pass, so every successful result includes nodeToWarpGroup for direct
+/// partitioning. maxII defaults to 2 * MinII. maxBacktracks limits ejection.
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
                     int maxBacktracks = 20);

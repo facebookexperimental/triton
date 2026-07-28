@@ -2,13 +2,12 @@
 
 #include "ModuloReservationTable.h"
 
-#include "ExhaustiveScheduler.h"
-#include "SwingScheduler.h"
-#include "triton/Tools/Sys/GetEnv.h"
+#include "triton/Dialect/Triton/IR/Types.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>
 #include <numeric>
+#include <optional>
 
 #define DEBUG_TYPE "modulo-scheduling-rau"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -90,26 +89,294 @@ int ModuloReservationTable::findFreeSlot(int earliest, HWPipeline pipeline,
   return -1;
 }
 
-// ── Rau's Iterative Modulo Scheduling ───────────────────────────────────────
+// ── Constructive joint cycle+warp scheduling ────────────────────────────────
 
-/// Compute the earliest start time for a node given its predecessors'
-/// scheduled cycles, respecting loop-carried distances.
-static int computeEarliestStart(unsigned nodeIdx,
-                                const DataDependenceGraph &ddg,
-                                const llvm::DenseMap<unsigned, int> &scheduled,
-                                int II) {
+namespace {
+
+constexpr int kDefaultWarpGroupWarps = 4;
+constexpr int kMaxHardwareWarps = 64;
+constexpr int kRegisterSyncBaseCycles = 150;
+constexpr int kRegisterSyncCyclesPerKB = 16;
+constexpr int kOtherCrossWGSyncCycles = 60;
+
+/// Per-warp-group circular issue stream. Every instruction contends with every
+/// other instruction in the same warp group, regardless of hardware pipeline.
+class WarpIssueReservationStream {
+public:
+  explicit WarpIssueReservationStream(int II) : II{II}, slots(II, -1) {}
+
+  bool isIntervalFree(int cycle, int duration) const {
+    for (int t = cycle; t < cycle + duration; ++t) {
+      if (slots[t % II] >= 0)
+        return false;
+    }
+    return true;
+  }
+
+  void reserve(int cycle, unsigned nodeIdx, int duration) {
+    for (int t = cycle; t < cycle + duration; ++t)
+      slots[t % II] = static_cast<int>(nodeIdx);
+  }
+
+  void unreserve(int cycle, int duration) {
+    for (int t = cycle; t < cycle + duration; ++t)
+      slots[t % II] = -1;
+  }
+
+  int getOccupant(int cycle) const { return slots[cycle % II]; }
+
+private:
+  int II{};
+  llvm::SmallVector<int> slots;
+};
+
+struct JointCandidate {
+  int cycle{-1};
+  int warpGroup{-1};
+};
+
+static int getPipelineDuration(const DDGNode &node) {
+  return pipelineOccupancy(node);
+}
+
+static int getWarpIssueDuration(const DDGNode &node) {
+  return std::max(node.selfLatency, 1);
+}
+
+static int roundRequiredWarps(int minWarps) {
+  if (minWarps <= 1)
+    return 1;
+  if (minWarps <= 2)
+    return 2;
+  if (minWarps <= 4)
+    return 4;
+  return 8;
+}
+
+static int getRequiredWarpsForNode(const DDGNode &node) {
+  return roundRequiredWarps(std::max(node.minWarps, 1));
+}
+
+static int getUsedHardwareWarps(llvm::ArrayRef<int> wgRequiredWarps) {
+  return kDefaultWarpGroupWarps +
+         std::accumulate(wgRequiredWarps.begin(), wgRequiredWarps.end(), 0);
+}
+
+static bool canReplaceWarpGroupRequirement(llvm::ArrayRef<int> wgRequiredWarps,
+                                           int warpGroup,
+                                           int newRequiredWarps) {
+  int usedWarps = kDefaultWarpGroupWarps;
+  for (int wg = 0, e = wgRequiredWarps.size(); wg < e; ++wg)
+    usedWarps += (wg == warpGroup) ? newRequiredWarps : wgRequiredWarps[wg];
+  return usedWarps <= kMaxHardwareWarps;
+}
+
+static int recomputeWarpGroupRequirement(
+    int warpGroup, const DataDependenceGraph &ddg,
+    const llvm::DenseMap<unsigned, int> &nodeToWarpGroup) {
+  int requiredWarps = 0;
+  for (auto [scheduledNodeIdx, scheduledWarpGroup] : nodeToWarpGroup) {
+    if (scheduledWarpGroup != warpGroup)
+      continue;
+    requiredWarps =
+        std::max(requiredWarps, getRequiredWarpsForNode(ddg.getNode(
+                                    static_cast<unsigned>(scheduledNodeIdx))));
+  }
+  return requiredWarps;
+}
+
+static std::optional<int64_t> getRegisterTensorBytes(Value value) {
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  if (!tensorType)
+    return std::nullopt;
+
+  Type elementType = tensorType.getElementType();
+  if (isa<triton::PointerType>(elementType))
+    return std::nullopt;
+  if (!elementType.isIntOrFloat())
+    return std::nullopt;
+
+  int64_t numElements = tensorType.getNumElements();
+  if (numElements < 0)
+    return std::nullopt;
+  return llvm::divideCeil(numElements * tensorType.getElementTypeBitWidth(),
+                          int64_t{8});
+}
+
+static int getCrossWarpGroupLatency(const DDGNode &producer) {
+  if (!producer.op)
+    return kOtherCrossWGSyncCycles;
+
+  if (producer.pipeline != HWPipeline::CUDA &&
+      producer.pipeline != HWPipeline::SFU &&
+      producer.pipeline != HWPipeline::VALU)
+    return kOtherCrossWGSyncCycles;
+
+  int64_t resultBytes = 0;
+  bool sawRegisterTensor = false;
+  for (Value result : producer.op->getResults()) {
+    std::optional<int64_t> bytes = getRegisterTensorBytes(result);
+    if (!bytes)
+      continue;
+    sawRegisterTensor = true;
+    resultBytes += *bytes;
+  }
+
+  if (!sawRegisterTensor)
+    return kOtherCrossWGSyncCycles;
+
+  int64_t kilobytes = llvm::divideCeil(resultBytes, int64_t{1024});
+  return kRegisterSyncBaseCycles +
+         static_cast<int>(kilobytes * kRegisterSyncCyclesPerKB);
+}
+
+static int computeEarliestStartForWarpGroup(
+    unsigned nodeIdx, int warpGroup, const DataDependenceGraph &ddg,
+    const llvm::DenseMap<unsigned, int> &scheduled,
+    const llvm::DenseMap<unsigned, int> &nodeToWarpGroup, int II) {
   int earliest = 0;
   for (const auto *edge : ddg.getInEdges(nodeIdx)) {
-    auto it = scheduled.find(edge->srcIdx);
-    if (it == scheduled.end())
+    auto cycleIt = scheduled.find(edge->srcIdx);
+    if (cycleIt == scheduled.end())
       continue;
-    // constraint: dst_start >= src_start + latency - distance * II
+
+    int latency = edge->latency;
+    auto wgIt = nodeToWarpGroup.find(edge->srcIdx);
+    if (wgIt != nodeToWarpGroup.end() && wgIt->second != warpGroup)
+      latency += getCrossWarpGroupLatency(ddg.getNode(edge->srcIdx));
+
     int constraint =
-        it->second + edge->latency - static_cast<int>(edge->distance) * II;
+        cycleIt->second + latency - static_cast<int>(edge->distance) * II;
     earliest = std::max(earliest, constraint);
   }
   return earliest;
 }
+
+static bool
+hasScheduledConsumer(unsigned nodeIdx, const DataDependenceGraph &ddg,
+                     const llvm::DenseMap<unsigned, int> &scheduled) {
+  for (const auto *edge : ddg.getOutEdges(nodeIdx)) {
+    if (scheduled.contains(edge->dstIdx))
+      return true;
+  }
+  return false;
+}
+
+static std::optional<JointCandidate> getExactCandidate(
+    unsigned nodeIdx, int warpGroup, const DataDependenceGraph &ddg,
+    const ModuloReservationTable &globalTable,
+    ArrayRef<WarpIssueReservationStream> issueStreams,
+    ArrayRef<int> wgRequiredWarps,
+    const llvm::DenseMap<unsigned, int> &scheduled,
+    const llvm::DenseMap<unsigned, int> &nodeToWarpGroup, int II) {
+  const DDGNode &node = ddg.getNode(nodeIdx);
+  int newRequiredWarps =
+      std::max(wgRequiredWarps[warpGroup], getRequiredWarpsForNode(node));
+  if (!canReplaceWarpGroupRequirement(wgRequiredWarps, warpGroup,
+                                      newRequiredWarps))
+    return std::nullopt;
+  int earliest = computeEarliestStartForWarpGroup(
+      nodeIdx, warpGroup, ddg, scheduled, nodeToWarpGroup, II);
+  int cycle = globalTable.findFreeSlot(earliest, node.pipeline,
+                                       getPipelineDuration(node));
+  if (cycle < 0)
+    return std::nullopt;
+  if (!issueStreams[warpGroup].isIntervalFree(cycle,
+                                              getWarpIssueDuration(node)))
+    return std::nullopt;
+  return JointCandidate{cycle, warpGroup};
+}
+
+static JointCandidate
+findCandidate(unsigned nodeIdx, const DataDependenceGraph &ddg,
+              const ModuloReservationTable &globalTable,
+              ArrayRef<WarpIssueReservationStream> issueStreams,
+              ArrayRef<int> wgRequiredWarps,
+              const llvm::DenseMap<unsigned, int> &scheduled,
+              const llvm::DenseMap<unsigned, int> &nodeToWarpGroup, int II) {
+  JointCandidate best;
+  for (int wg = 0, e = issueStreams.size(); wg < e; ++wg) {
+    std::optional<JointCandidate> candidate =
+        getExactCandidate(nodeIdx, wg, ddg, globalTable, issueStreams,
+                          wgRequiredWarps, scheduled, nodeToWarpGroup, II);
+    if (!candidate)
+      continue;
+    if (best.cycle < 0 || candidate->cycle < best.cycle ||
+        (candidate->cycle == best.cycle && wg < best.warpGroup)) {
+      best = *candidate;
+    }
+  }
+  return best;
+}
+
+static int
+findEjectionVictim(unsigned nodeIdx, const DataDependenceGraph &ddg,
+                   const ModuloReservationTable &globalTable,
+                   ArrayRef<WarpIssueReservationStream> issueStreams,
+                   ArrayRef<int> wgRequiredWarps,
+                   const llvm::DenseMap<unsigned, int> &scheduled,
+                   const llvm::DenseMap<unsigned, int> &nodeToWarpGroup,
+                   const llvm::DenseMap<unsigned, int> &heights, int II) {
+  int bestVictim = -1;
+  int bestVictimHeight = INT_MAX;
+  int currentHeight = heights.lookup(nodeIdx);
+  const auto &node = ddg.getNode(nodeIdx);
+
+  for (int wg = 0, e = issueStreams.size(); wg < e; ++wg) {
+    int newRequiredWarps =
+        std::max(wgRequiredWarps[wg], getRequiredWarpsForNode(node));
+    if (!canReplaceWarpGroupRequirement(wgRequiredWarps, wg, newRequiredWarps))
+      continue;
+
+    int earliest = computeEarliestStartForWarpGroup(nodeIdx, wg, ddg, scheduled,
+                                                    nodeToWarpGroup, II);
+    int cycle = globalTable.findFreeSlot(earliest, node.pipeline,
+                                         getPipelineDuration(node));
+    if (cycle < 0)
+      continue;
+
+    int issueDuration = getWarpIssueDuration(node);
+    llvm::SmallVector<int, 8> occupants;
+    for (int t = cycle; t < cycle + issueDuration; ++t) {
+      int occupant = issueStreams[wg].getOccupant(t);
+      if (occupant >= 0)
+        occupants.push_back(occupant);
+    }
+
+    for (int occupant : occupants) {
+      unsigned occupantIdx = static_cast<unsigned>(occupant);
+      // Conservatively eject only leaves: moving a node with scheduled
+      // consumers would invalidate their cycle and warp-group constraints.
+      if (hasScheduledConsumer(occupantIdx, ddg, scheduled))
+        continue;
+
+      int occHeight = heights.lookup(occupantIdx);
+      if (occHeight < currentHeight && occHeight < bestVictimHeight) {
+        bestVictimHeight = occHeight;
+        bestVictim = occupant;
+      }
+    }
+  }
+  return bestVictim;
+}
+
+static void
+reserveNode(ModuloReservationTable &globalTable,
+            MutableArrayRef<WarpIssueReservationStream> issueStreams,
+            const DDGNode &node, unsigned nodeIdx, int cycle, int warpGroup) {
+  globalTable.reserve(cycle, node.pipeline, nodeIdx, getPipelineDuration(node));
+  issueStreams[warpGroup].reserve(cycle, nodeIdx, getWarpIssueDuration(node));
+}
+
+static void
+unreserveNode(ModuloReservationTable &globalTable,
+              MutableArrayRef<WarpIssueReservationStream> issueStreams,
+              const DDGNode &node, int cycle, int warpGroup) {
+  globalTable.unreserve(cycle, node.pipeline, getPipelineDuration(node));
+  issueStreams[warpGroup].unreserve(cycle, getWarpIssueDuration(node));
+}
+
+} // namespace
 
 static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
                                                  int minII, int maxII,
@@ -118,19 +385,12 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
   auto heights = ddg.computeCriticalPathHeights();
   LLVM_DEBUG(DBGS() << "Heights computed for " << heights.size() << " nodes\n");
 
-  // Sort ALL nodes (including NONE-pipeline) by decreasing critical-path
-  // height. NONE ops must be scheduled together with pipeline ops so that
-  // dependency constraints (e.g., load → local_alloc → MMA) are respected.
   llvm::SmallVector<unsigned> priorityOrder;
   for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
     priorityOrder.push_back(i);
   llvm::sort(priorityOrder, [&](unsigned a, unsigned b) {
     if (heights[a] != heights[b])
       return heights[a] > heights[b];
-    // Tiebreaker: lower index first (producers before consumers
-    // in program order). This ensures that when a predecessor and
-    // successor have equal heights, the predecessor is scheduled
-    // first so its cycle is known when the successor is placed.
     return a < b;
   });
 
@@ -140,106 +400,126 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
     DBGS() << "ResMII=" << ddg.computeResMII()
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
-  // Show per-pipeline resource usage for ResMII breakdown
   LLVM_DEBUG({
     llvm::DenseMap<HWPipeline, int> pipeLoad;
+    int issueLoad = 0;
     for (const auto &node : ddg.getNodes()) {
       if (node.pipeline != HWPipeline::NONE)
-        pipeLoad[node.pipeline] += std::max(node.selfLatency, 1);
+        pipeLoad[node.pipeline] += getPipelineDuration(node);
+      issueLoad += getWarpIssueDuration(node);
     }
-    for (auto &[pipe, load] : pipeLoad) {
+    for (auto &[pipe, load] : pipeLoad)
       DBGS() << "  " << getPipelineName(pipe) << " total_load=" << load << "\n";
-    }
+    DBGS() << "  warp_issue total_load=" << issueLoad << "\n";
   });
 
   for (int II = minII; II <= maxII; ++II) {
-    ModuloReservationTable table{II};
+    ModuloReservationTable globalTable{II};
+    llvm::SmallVector<WarpIssueReservationStream> issueStreams;
+    llvm::SmallVector<int> wgRequiredWarps;
     llvm::DenseMap<unsigned, int> scheduled;
+    llvm::DenseMap<unsigned, int> nodeToWarpGroup;
     bool success = true;
     int backtracks = 0;
 
-    // Use index-based iteration instead of range-for because ejection
-    // may insert evicted nodes back into priorityOrder for re-scheduling.
-    // Range-for would be UB (iterator invalidation on SmallVector insert).
+    auto addWarpGroup = [&]() {
+      issueStreams.emplace_back(II);
+      wgRequiredWarps.push_back(0);
+      return static_cast<int>(issueStreams.size()) - 1;
+    };
+
     for (unsigned i = 0; i < priorityOrder.size(); ++i) {
       unsigned nodeIdx = priorityOrder[i];
       const auto &node = ddg.getNode(nodeIdx);
-      int duration = std::max(node.selfLatency, 1); // at least 1 slot
-      if (node.pipeline == HWPipeline::NONE)
-        duration = 1; // NONE ops don't occupy any pipeline
+      JointCandidate candidate =
+          findCandidate(nodeIdx, ddg, globalTable, issueStreams,
+                        wgRequiredWarps, scheduled, nodeToWarpGroup, II);
 
-      int earliest = computeEarliestStart(nodeIdx, ddg, scheduled, II);
-      int slot = table.findFreeSlot(earliest, node.pipeline, duration);
-
-      if (slot < 0 && backtracks < maxBacktracks) {
-        // Rau's ejection: find the least-critical occupant in a
-        // conflicting slot, evict it, place current node, then
-        // re-schedule the evicted node later.
-        int bestVictim = -1;
-        int bestVictimHeight = INT_MAX;
-        int currentHeight = heights.lookup(nodeIdx);
-        for (int t = earliest; t < earliest + II; ++t) {
-          int occupant = table.getOccupant(t, node.pipeline);
-          if (occupant < 0)
-            continue;
-          int occHeight = heights.lookup(static_cast<unsigned>(occupant));
-          // Only eject nodes with strictly lower priority (smaller height)
-          // than the current node. This prevents priority inversion where
-          // a less-critical node evicts a more-critical one.
-          if (occHeight < currentHeight && occHeight < bestVictimHeight) {
-            bestVictimHeight = occHeight;
-            bestVictim = occupant;
-          }
-        }
-        if (bestVictim >= 0) {
-          // Evict the victim.
-          const auto &victim = ddg.getNode(bestVictim);
-          int victimDur = std::max(victim.selfLatency, 1);
-          if (victim.pipeline == HWPipeline::NONE)
-            victimDur = 1;
-          int victimCycle = scheduled[bestVictim];
-          table.unreserve(victimCycle, victim.pipeline, victimDur);
-          scheduled.erase(bestVictim);
-
-          // Place current node at the freed slot.
-          slot = table.findFreeSlot(earliest, node.pipeline, duration);
-          if (slot >= 0) {
-            // Insert evicted node right after current position for
-            // re-scheduling. Index-based iteration handles the growth
-            // safely (no iterator invalidation).
-            priorityOrder.insert(priorityOrder.begin() + i + 1,
-                                 static_cast<unsigned>(bestVictim));
-            ++backtracks;
-            LLVM_DEBUG(DBGS() << "  Ejected N" << bestVictim
-                              << " (height=" << bestVictimHeight
-                              << ") to place N" << nodeIdx << "\n");
-          } else {
-            // Could not place even after ejection — restore victim.
-            table.reserve(victimCycle, victim.pipeline,
-                          static_cast<unsigned>(bestVictim), victimDur);
-            scheduled[bestVictim] = victimCycle;
+      if (candidate.cycle < 0) {
+        int newWGWarps = getRequiredWarpsForNode(node);
+        if (getUsedHardwareWarps(wgRequiredWarps) + newWGWarps <=
+            kMaxHardwareWarps) {
+          int wg = addWarpGroup();
+          wgRequiredWarps[wg] = newWGWarps;
+          std::optional<JointCandidate> newCandidate = getExactCandidate(
+              nodeIdx, wg, ddg, globalTable, issueStreams, wgRequiredWarps,
+              scheduled, nodeToWarpGroup, II);
+          if (newCandidate)
+            candidate = *newCandidate;
+          if (candidate.cycle < 0) {
+            issueStreams.pop_back();
+            wgRequiredWarps.pop_back();
           }
         }
       }
-      if (slot < 0) {
+
+      if (candidate.cycle < 0 && backtracks < maxBacktracks &&
+          !issueStreams.empty()) {
+        int victim = findEjectionVictim(nodeIdx, ddg, globalTable, issueStreams,
+                                        wgRequiredWarps, scheduled,
+                                        nodeToWarpGroup, heights, II);
+        if (victim >= 0) {
+          const auto &victimNode = ddg.getNode(static_cast<unsigned>(victim));
+          int victimCycle = scheduled.lookup(static_cast<unsigned>(victim));
+          int victimWG = nodeToWarpGroup.lookup(static_cast<unsigned>(victim));
+          unreserveNode(globalTable, issueStreams, victimNode, victimCycle,
+                        victimWG);
+          scheduled.erase(static_cast<unsigned>(victim));
+          nodeToWarpGroup.erase(static_cast<unsigned>(victim));
+          wgRequiredWarps[victimWG] =
+              recomputeWarpGroupRequirement(victimWG, ddg, nodeToWarpGroup);
+
+          candidate =
+              findCandidate(nodeIdx, ddg, globalTable, issueStreams,
+                            wgRequiredWarps, scheduled, nodeToWarpGroup, II);
+          if (candidate.cycle >= 0) {
+            priorityOrder.insert(priorityOrder.begin() + i + 1,
+                                 static_cast<unsigned>(victim));
+            ++backtracks;
+            LLVM_DEBUG(DBGS() << "  Ejected N" << victim << " (height="
+                              << heights.lookup(static_cast<unsigned>(victim))
+                              << ") to place N" << nodeIdx << "\n");
+          } else {
+            reserveNode(globalTable, issueStreams, victimNode,
+                        static_cast<unsigned>(victim), victimCycle, victimWG);
+            scheduled[static_cast<unsigned>(victim)] = victimCycle;
+            nodeToWarpGroup[static_cast<unsigned>(victim)] = victimWG;
+            wgRequiredWarps[victimWG] =
+                recomputeWarpGroupRequirement(victimWG, ddg, nodeToWarpGroup);
+          }
+        }
+      }
+
+      if (candidate.cycle < 0) {
         success = false;
         break;
       }
 
-      table.reserve(slot, node.pipeline, nodeIdx, duration);
-      scheduled[nodeIdx] = slot;
+      wgRequiredWarps[candidate.warpGroup] = std::max(
+          wgRequiredWarps[candidate.warpGroup], getRequiredWarpsForNode(node));
+      reserveNode(globalTable, issueStreams, node, nodeIdx, candidate.cycle,
+                  candidate.warpGroup);
+      scheduled[nodeIdx] = candidate.cycle;
+      nodeToWarpGroup[nodeIdx] = candidate.warpGroup;
       LLVM_DEBUG(DBGS() << "  II=" << II << " Placed N" << nodeIdx << " ("
-                        << getPipelineName(node.pipeline) << " dur=" << duration
-                        << ") at cycle=" << slot << " stage=" << slot / II
-                        << "\n");
+                        << getPipelineName(node.pipeline)
+                        << " pipe_dur=" << getPipelineDuration(node)
+                        << " issue_dur=" << getWarpIssueDuration(node)
+                        << ") at cycle=" << candidate.cycle
+                        << " stage=" << candidate.cycle / II
+                        << " wg=" << candidate.warpGroup << "\n");
     }
 
     if (success) {
-      LLVM_DEBUG(DBGS() << "SUCCESS at II=" << II << "\n");
+      LLVM_DEBUG(DBGS() << "SUCCESS at II=" << II
+                        << " wgs=" << issueStreams.size() << " warps="
+                        << getUsedHardwareWarps(wgRequiredWarps) << "\n");
 
       ModuloScheduleResult result;
       result.II = II;
       result.nodeToCycle = std::move(scheduled);
+      result.nodeToWarpGroup = std::move(nodeToWarpGroup);
+      result.numWarpGroups = static_cast<int>(issueStreams.size());
       return result;
     }
 
@@ -282,29 +562,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
 
-  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
-  //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
-  //   "exhaustive" → Exhaustive search with joint memory feasibility
-  //   "random"     → Random sampling with greedy placement
-  //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
-  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
-
-  if (algo == "exhaustive") {
-    LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");
-    return runExhaustiveSearch(ddg, maxII);
-  }
-
-  if (algo == "random") {
-    LLVM_DEBUG(DBGS() << "Using random sampling search\n");
-    return runRandomSearch(ddg, maxII);
-  }
-
-  if (algo == "sms") {
-    LLVM_DEBUG(DBGS() << "Using Swing Modulo Scheduling (SMS)\n");
-    return runSMS(ddg, minII, maxII);
-  }
-
-  LLVM_DEBUG(DBGS() << "Using Rau's Iterative Modulo Scheduling (IMS)\n");
+  LLVM_DEBUG(DBGS() << "Using joint Rau cycle+warp scheduling\n");
   return runRauIMS(ddg, minII, maxII, maxBacktracks);
 }
 

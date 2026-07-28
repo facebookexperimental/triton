@@ -1,10 +1,11 @@
 // REQUIRES: asserts
-// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s --check-prefix=DBG
 
 //===----------------------------------------------------------------------===//
-// Test: Nested loop (persistent GEMM) — outer tile loop + inner K-loop
-//   Verify that both loops are scheduled and the kernel-wide SMEM budget
-//   check accounts for outer + inner buffers simultaneously.
+// Test: Nested loop GEMM with an outer tile loop and inner K-loop.
+//   Verify nested outer-loop pipelining/dataflow and that the kernel-wide
+//   SMEM budget check accounts for outer + inner buffers simultaneously.
 //===----------------------------------------------------------------------===//
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -17,20 +18,27 @@
 
 module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.max_reg_auto_ws = 152 : i32, ttg.min_reg_auto_ws = 24 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
 
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
-// CHECK: modulo.schedule @loop0 {
-//
-// CHECK: [PASS-A] === Loop ScheduleGraph ===
-// CHECK: modulo.schedule @loop0 {
-//
-// Inner loop gets tt.num_stages (no loop.stage — uses emitMMAAnnotations).
+// Inner loop gets tt.num_stages (no loop.stage; uses emitMMAAnnotations).
 // Outer loop gets loop.stage attrs via emitScheduleAttributes.
+// Regression coverage for the real nested GEMM's existing three-role
+// partition structure after scheduling:
+//   * inner tensor-core work in partition 1,
+//   * the inner loop wrapper/hand-off in partition 2,
+//   * the outer epilogue/store group in partition 3.
+// This real nested case covers non-register separation across the TMEM hand-off.
+// It does not directly exercise the register timing accept/reject branch; the
+// checks use emitted partition metadata instead of exact cycle/II values, which
+// are more sensitive to latency-model tuning.
+// DBG: [nested-wg] reject consumer WG {{.*}}register=0, non-register=1
 // CHECK-LABEL: @persistent_gemm_nested
-// Inner loop has tt.num_stages:
-// CHECK: scf.for
-// CHECK: tt.num_stages
-// Outer loop has schedule attrs:
-// CHECK: tt.modulo_ii
+// CHECK: ttng.tmem_alloc {{.*}}ttg.partition = array<i32: 3>
+// CHECK: ttng.tmem_store {{.*}}ttg.partition = array<i32: 2>
+// CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: 1>
+// CHECK: } {{.*}}ttg.partition = array<i32: 2>{{.*}}ttg.partition_num_warps
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: 3>
+// CHECK: tt.descriptor_store {{.*}}ttg.partition = array<i32: 3>
+// Outer loop has schedule attrs after the epilogue/store group.
+// CHECK: } {tt.flatten, tt.modulo_ii = {{[0-9]+}} : i32, tt.num_stages = {{[0-9]+}} : i32
   tt.func public @persistent_gemm_nested(
       %a_desc: !tt.tensordesc<256x64xf16, #shared>,
       %b_desc: !tt.tensordesc<256x64xf16, #shared>,
