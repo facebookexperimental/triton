@@ -308,6 +308,34 @@ public:
       }
       asyncCopyContiguity.insert({copyOp, contiguity});
     });
+
+    // BufferLoadToLocalOp reaches the LLVM lowering with axis analysis still
+    // available, but alternate lowerings consume the TTGIR operation
+    // directly. Preserve the same vector-width proof on the operation so every
+    // backend sees the contract used by the LLVM path.
+    m->walk([&](triton::amdgpu::BufferLoadToLocalOp loadOp) {
+      unsigned contiguity = mlir::LLVM::AMD::getVectorSize(
+          loadOp.getPtr(), loadOp.getOffsets(), axisAnalysis);
+      if (auto mask = loadOp.getMask()) {
+        contiguity =
+            std::min<unsigned>(contiguity, axisAnalysis.getMaskAlignment(mask));
+      }
+      loadOp.setContiguity(
+          std::max<unsigned>(loadOp.getContiguity(), contiguity));
+
+      Type pointerType = mlir::LLVM::AMD::getPointerTypeWithShape(
+          loadOp.getPtr(), loadOp.getOffsets());
+      auto freeVariableMasks = mlir::getFreeVariableMasks(pointerType);
+      int32_t redundantWaveMask =
+          freeVariableMasks.lookup(StringAttr::get(context, "warp"));
+      if (redundantWaveMask != 0) {
+        loadOp->setAttr(
+            "amdgpu.redundant_wave_mask",
+            IntegerAttr::get(IntegerType::get(context, 32), redundantWaveMask));
+      } else
+        loadOp->removeAttr("amdgpu.redundant_wave_mask");
+    });
+
     patterns.add<CoalesceAsyncCopyWrites>(targetInfo, asyncCopyContiguity,
                                           context);
 
