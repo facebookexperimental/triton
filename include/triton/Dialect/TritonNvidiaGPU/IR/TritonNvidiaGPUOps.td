@@ -406,7 +406,8 @@ def TTNG_InvalBarrierOp : TTNG_Op<"inval_barrier"> {
   let assemblyFormat = "$alloc attr-dict `:` qualified(type($alloc))";
 }
 
-def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect"> {
+def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect", [
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "Signal a barrier of an expected number of bytes to be copied.";
 
   let description = [{
@@ -426,7 +427,8 @@ def TTNG_BarrierExpectOp : TTNG_Op<"barrier_expect"> {
   }];
 }
 
-def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
+def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "wait until the mbarrier phase completes.";
 
   let description = [{
@@ -477,7 +479,8 @@ def TTNG_WaitBarrierOp : TTNG_Op<"wait_barrier", [AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 }
 
-def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier"> {
+def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier", [
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "perform the arrive operation on an mbarrier";
   let description = [{
     The `ttng.arrive_barrier` operation performs the "arrive" operation on an
@@ -653,7 +656,8 @@ def TTNG_VoteBallotSyncOp : TTNG_Op<"vote_ballot_sync", [Pure]> {
 }
 
 def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local", [
-    AttrSizedOperandSegments, TMALoadLikeOpInterface]> {
+    AttrSizedOperandSegments, TMALoadLikeOpInterface,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -718,6 +722,7 @@ def TTNG_AsyncTMACopyGlobalToLocalOp : TTNG_Op<"async_tma_copy_global_to_local",
     oilist(`cacheModifier` `=` $cache | `evictionPolicy` `=` $evict | `tensorMode` `=` $tensorMode)
     attr-dict `:` qualified(type($desc)) `,` qualified(type($barrier)) `->` qualified(type($result))
   }];
+
 }
 
 def TTNG_AsyncTMAPrefetchOp : TTNG_Op<"async_tma_prefetch", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
@@ -867,7 +872,9 @@ def TTNG_AsyncTMAReduceOp : TTNG_Op<"async_tma_reduce", [
   let hasVerifier = 1;
 }
 
-def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather", [TMALoadLikeOpInterface]> {
+def TTNG_AsyncTMAGatherOp : TTNG_Op<"async_tma_gather", [
+    TMALoadLikeOpInterface,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "gather data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -963,6 +970,7 @@ def TTNG_TCGen5MMAOp : TTNG_Op<"tc_gen5_mma", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
     DeclareOpInterfaceMethods<DotOpInterface, ["verifyOutputDims"]>,
     DeclareOpInterfaceMethods<MMAv5OpInterface>,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>,
     AttrSizedOperandSegments
 ]> {
   let summary = "block level op mapping to tensorcore gen5 mma";
@@ -1023,6 +1031,7 @@ def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
     DeclareOpInterfaceMethods<DotOpInterface, ["verifyDims", "verifyOutputDims"]>,
     DeclareOpInterfaceMethods<MMAv5OpInterface>,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>,
     AttrSizedOperandSegments
 ]> {
   let summary = "block level op mapping to tensorcore gen5 mma";
@@ -1091,7 +1100,8 @@ def TTNG_TCGen5MMAScaledOp : TTNG_Op<"tc_gen5_mma_scaled", [
   let hasVerifier = 1;
 }
 
-def TTNG_TCGen5CommitOp : TTNG_Op<"tc_gen5_commit", [AttrSizedOperandSegments]> {
+def TTNG_TCGen5CommitOp : TTNG_Op<"tc_gen5_commit", [AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "make an mbarrier track completion of all prior async tcgen5 ops";
 
   let description = [{
@@ -1234,7 +1244,8 @@ def TTNG_TMEMLoadOp : TTNG_Op<"tmem_load", [AttrSizedResultSegments]> {
   }];
 }
 
-def TTNG_TMEMStoreOp : TTNG_Op<"tmem_store"> {
+def TTNG_TMEMStoreOp : TTNG_Op<"tmem_store", [
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "Store a distributed tensor into a buffer in tensor memory";
 
   let description = [{
