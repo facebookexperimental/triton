@@ -10,9 +10,29 @@ if(NOT EXISTS "${TLX_WAVE_SOURCE_DIR}/CMakeLists.txt")
     "Run `git submodule update --init --recursive third_party/wave`.")
 endif()
 
-function(tlx_wave_mlir_has_python_bindings LLVM_INSTALL_DIR OUT_VAR)
+set(TLX_WAVE_LLVM_COMMIT_FILE "${TLX_WAVE_SOURCE_DIR}/llvm-commit.txt")
+file(STRINGS "${TLX_WAVE_LLVM_COMMIT_FILE}" _tlx_wave_llvm_commit_lines
+  REGEX "^[ \t]*[^# \t]" LIMIT_COUNT 1)
+if(NOT _tlx_wave_llvm_commit_lines)
+  message(FATAL_ERROR
+    "tlx_wave could not read the pinned LLVM commit from "
+    "'${TLX_WAVE_LLVM_COMMIT_FILE}'")
+endif()
+list(GET _tlx_wave_llvm_commit_lines 0 TLX_WAVE_LLVM_COMMIT)
+string(REGEX REPLACE "[ \t]*#.*$" "" TLX_WAVE_LLVM_COMMIT
+  "${TLX_WAVE_LLVM_COMMIT}")
+string(STRIP "${TLX_WAVE_LLVM_COMMIT}" TLX_WAVE_LLVM_COMMIT)
+
+function(tlx_wave_llvm_install_is_usable LLVM_INSTALL_DIR EXPECTED_COMMIT OUT_VAR)
+  set(_llvm_stamp "${LLVM_INSTALL_DIR}/.wave-mlir-commit")
   set(_mlir_config "${LLVM_INSTALL_DIR}/lib/cmake/mlir/MLIRConfig.cmake")
-  if(EXISTS "${_mlir_config}")
+  if(EXISTS "${_llvm_stamp}" AND EXISTS "${_mlir_config}")
+    file(READ "${_llvm_stamp}" _installed_commit)
+    string(STRIP "${_installed_commit}" _installed_commit)
+    if(NOT "${_installed_commit}" STREQUAL "${EXPECTED_COMMIT}")
+      set(${OUT_VAR} FALSE PARENT_SCOPE)
+      return()
+    endif()
     file(STRINGS "${_mlir_config}" _mlir_python_bindings
       REGEX "set\\(MLIR_ENABLE_BINDINGS_PYTHON[ \t]+\"?ON\"?\\)")
     if(_mlir_python_bindings)
@@ -69,8 +89,11 @@ foreach(_flag_kind
   endif()
 endforeach()
 
-tlx_wave_mlir_has_python_bindings("${TLX_WAVE_LLVM_INSTALL_DIR}" _tlx_wave_local_has_mlir_python)
-if(_tlx_wave_local_has_mlir_python)
+tlx_wave_llvm_install_is_usable(
+  "${TLX_WAVE_LLVM_INSTALL_DIR}"
+  "${TLX_WAVE_LLVM_COMMIT}"
+  _tlx_wave_local_llvm_is_usable)
+if(_tlx_wave_local_llvm_is_usable)
   add_custom_target(TLXWavePinnedLLVM)
 else()
   if(TRITON_OFFLINE_BUILD)
@@ -82,11 +105,12 @@ else()
   endif()
 
   set(_tlx_wave_llvm_stamp
-    "${TLX_WAVE_SOURCE_DIR}/build/.tlx_wave_llvm_with_python.stamp")
+    "${TLX_WAVE_SOURCE_DIR}/build/.tlx_wave_llvm_with_python_${TLX_WAVE_LLVM_COMMIT}.stamp")
   set(_tlx_wave_build_llvm_args
     "${Python3_EXECUTABLE}"
     "${TLX_WAVE_SOURCE_DIR}/build_tools/build_llvm.py"
-    "--python-bindings")
+    "--python-bindings"
+    "--wave-build-dir" "${TLX_WAVE_STANDALONE_BUILD_DIR}")
   if(NOT "${TLX_WAVE_BUILD_JOBS}" STREQUAL "")
     list(APPEND _tlx_wave_build_llvm_args "--jobs" "${TLX_WAVE_BUILD_JOBS}")
   endif()
