@@ -31,6 +31,12 @@ inferSourceLoadLayout(LinearEncodingAttr dstLayout, Operation *defOp) {
       if (curOp->getNumOperands() != 1)
         break;
       curLayout = inferSrcEncoding(curOp, curLayout);
+      // inferSrcEncoding returns a null Attribute for ops whose source
+      // encoding it cannot recover (e.g. a split/reshape/transpose chain that
+      // feeds an MXFP scale). Stop the walk instead of propagating the null
+      // into the next handler, which would dereference it and crash.
+      if (!curLayout)
+        break;
       curOp = curOp->getOperand(0).getDefiningOp();
     }
   }
