@@ -111,3 +111,27 @@ The main branch just landed a new version with some optimization here are the pe
 7    8.0  131072.0                         5.421255                           4.208248           0.776250
 ```
 The two implementation has comparable perf numbers. Next step is for a three stage
+
+# Jul 28 2026
+
+- scenario 1: Performance of 2-stage pipeline, but without async_load_to_lds
+```
+=== query_length = 1 ===
+paged-decode-performance-bf16-qlen1:
+   BATCH     N_CTX  tlx (TB/s (effective HBM read))  aiter (TB/s (effective HBM read))  aiter/tlx speedup
+0    1.0    8192.0                         1.053845                           0.735827           0.698230
+1    8.0    8192.0                         2.559453                           2.338247           0.913573
+2   32.0    8192.0                         4.267620                           4.045109           0.947860
+3  128.0    8192.0                         5.688352                           5.054282           0.888532
+4    1.0   32768.0                         2.393326                           1.427848           0.596596
+5    8.0   32768.0                         4.340771                           3.549771           0.817774
+6   32.0   32768.0                         5.673032                           4.765789           0.840078
+7    8.0  131072.0                         5.559929                           4.203795           0.756088
+```
+
+IR dumps are in folder `third_party/tlx/tutorials/testing/ir_dumps/2-stage-no_async_copy`
+
+- Scenario 2: Performance of 2-stage pipeline and with buffer_load_to_lds
+```
+
+```
