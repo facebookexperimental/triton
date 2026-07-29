@@ -45,6 +45,23 @@ namespace mlir {
 namespace triton {
 namespace gpu {
 
+bool hasPowerOfTwoBases(const LinearLayout &ll) {
+  LinearLayout flattened = ll.flattenIns().flattenOuts();
+  auto inDim = *flattened.getInDimNames().begin();
+  LinearLayout withoutBroadcast = flattened.removeZeroBasesAlongDim(inDim);
+  return llvm::all_of(
+      withoutBroadcast.getBases().lookup(inDim),
+      [](const auto &basis) { return llvm::isPowerOf2_32(basis.front()); });
+}
+
+bool isPermutationMatrixLayout(const LinearLayout &ll) {
+  if (!hasPowerOfTwoBases(ll))
+    return false;
+  LinearLayout flattened = ll.flattenIns().flattenOuts();
+  auto inDim = *flattened.getInDimNames().begin();
+  return flattened.removeZeroBasesAlongDim(inDim).isInvertible();
+}
+
 LinearEncodingAttr TritonGPUDialect::toLinearEncoding(ArrayRef<int64_t> shape,
                                                       Attribute layout) {
   // LinearEncoding is a DistributedLayout
@@ -452,6 +469,30 @@ SmallVector<int64_t> getAllocationShapePerCTA(Type type) {
   auto tensorType = cast<TensorOrMemDesc>(type);
   return getAllocationShapePerCTA(tensorType.getEncoding(),
                                   tensorType.getShape());
+}
+
+SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
+                                          int numWarps) {
+  if (shape.size() == 3)
+    return {static_cast<unsigned>(numWarps), 1, 1};
+
+  assert(shape.size() == 2);
+  SmallVector<int64_t> reps = {ceil(shape[0], int64_t{16}),
+                               ceil(shape[1], int64_t{8})};
+  SmallVector<unsigned> warps = {1, 1};
+  // Balance repetitions to reduce register pressure, breaking ties toward M
+  // because the lhs instruction tile uses more registers than the rhs.
+  while (product(warps) < numWarps) {
+    if (reps[0] >= reps[1]) {
+      warps[0] *= 2;
+      if (reps[0] != 1)
+        reps[0] /= 2;
+    } else {
+      warps[1] *= 2;
+      reps[1] /= 2;
+    }
+  }
+  return warps;
 }
 
 unsigned getNumCTAs(Attribute layout) {
@@ -3087,8 +3128,8 @@ struct TritonGPUInferLayoutInterface
         dyn_cast_or_null<NvidiaMmaEncodingAttr>(aEncoding.getParent());
     auto mmaBEncoding =
         dyn_cast_or_null<NvidiaMmaEncodingAttr>(bEncoding.getParent());
-    auto dotOp = cast<DotOp>(op);
-    auto resEnc = dotOp.getResult().getType().getEncoding();
+    auto dotOp = cast<DotOpInterface>(op);
+    auto resEnc = cast<RankedTensorType>(dotOp.getD().getType()).getEncoding();
     auto mmaResEncoding = dyn_cast<NvidiaMmaEncodingAttr>(resEnc);
     if (mmaAEncoding || mmaBEncoding || mmaResEncoding) {
       // Check that they are all set and have the same version.

@@ -616,6 +616,23 @@ SmallVector<Value> computeLocalPtrs(Location loc,
                                     ArrayRef<SmallVector<Value>> coords,
                                     unsigned axis, RewriterBase &rewriter);
 
+// Backend-agnostic preparation for lowering LocalAtomicScatterRMWOp.
+struct LocalAtomicScatterRMWInfo {
+  RankedTensorType valuesTy;
+  Type llvmElemTy;
+  LinearLayout regLayout;
+  ColumnAction removeBroadcast;
+  Value threadPred;
+  SmallVector<Value> values;
+  SmallVector<Value> maskValues;
+  SmallVector<Value> ptrs;
+};
+
+FailureOr<LocalAtomicScatterRMWInfo> prepareLocalAtomicScatterRMW(
+    triton::gpu::LocalAtomicScatterRMWOp op, Value dst, Value indices,
+    Value inputValues, Value mask, ConversionPatternRewriter &rewriter,
+    const TargetInfoBase &targetInfo, const LLVMTypeConverter *typeConverter);
+
 // Calculates the required interval chunking and padding logical-shift values
 // for shared memory padding, depending on elements' bit width and whether
 // offsets count the number of bytes or number of elements.
@@ -650,19 +667,19 @@ SmallVector<Value> lowerLdStShared(
 // calcPaddedOffset is a lambda that takes a base offset (mlir::Value)
 // and computes a new offset (mlir::Value) by applying padding based on
 // shared memory layout.
-SmallVector<Value> lowerLdSt(
-    Location loc, MLIRContext *ctx, LinearLayout cvt,
-    ArrayRef<Value> valsArray, // Input for store, output for load
-    Type llvmElemTy, ArrayRef<Value> smemBases,
-    ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
-    RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-    std::optional<int> maybeMaxVecElems,
-    std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
-                                     Value, int, VectorType,
-                                     std::optional<Value>)>
-        lowerInst,
-    std::optional<Value> barrierPtr = {});
+SmallVector<Value>
+lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
+          ArrayRef<Value> valsArray, // Input for store, output for load
+          Type llvmElemTy, ArrayRef<Value> smemBases,
+          ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
+          Value affineOffset, uint64_t maskSpanAffineOffset, Value laneId,
+          Value warpId, RewriterBase &rewriter,
+          const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems,
+          std::function<SmallVector<Value>(RewriterBase &, Location,
+                                           ArrayRef<Value>, Value, int,
+                                           VectorType, std::optional<Value>)>
+              lowerInst,
+          std::optional<Value> barrierPtr = {});
 
 // Lower local_load/local_store via ld.shared/st.shared
 SmallVector<Value> lowerLocalLdSt(

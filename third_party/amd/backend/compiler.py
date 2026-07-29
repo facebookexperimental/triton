@@ -33,12 +33,20 @@ def is_async_copy_enabled(arch):
     return ((arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy)
 
 
+def is_expert_sched_supported(arch):
+    return arch in ["gfx1250"]
+
+
 def is_fpsan_supported(arch):
     return arch in ["gfx942", "gfx950", "gfx1250"]
 
 
 def is_consan_supported(arch):
     return arch in ["gfx1250"]
+
+
+def disable_real_true16_feature(arch):
+    return '-real-true16' if arch.startswith('gfx11') else ''
 
 
 def _parse_llvm_fn_attrs(attrs):
@@ -539,6 +547,8 @@ class HIPBackend(BaseBackend):
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
         fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        if is_expert_sched_supported(options.arch) and options.num_warps <= 4:
+            fns[0].add_fn_attr("amdgpu-sched-strategy", "coexec")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
@@ -551,9 +561,10 @@ class HIPBackend(BaseBackend):
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
         # from memory.
+        #
         # TODO(tyb0807): Disabled when using MIR swap/dump because the value is
         # not serializable to/from MIR YAML
-        if options.arch != "gfx1250" and not (knobs.amd.swap_mir or knobs.amd.dump_mir):
+        if not (knobs.amd.swap_mir or knobs.amd.dump_mir):
             amd.set_all_fn_arg_inreg(fns[0])
 
         if knobs.compilation.enable_asan:
@@ -569,7 +580,8 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
+                             disable_vector_combine=True)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -607,7 +619,9 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
-        features = ""
+        if is_expert_sched_supported(options.arch):
+            flags.append("amdgpu-expert-scheduling-mode")
+        features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
         _ = llvm.translate_to_mir(
@@ -650,6 +664,7 @@ class HIPBackend(BaseBackend):
                 flags,
                 options.enable_fp_fusion,
                 False,
+                False,
             )
         if knobs.amd.dump_amdgcn:
             print("// -----// AMDGCN Dump //----- //")
@@ -658,10 +673,12 @@ class HIPBackend(BaseBackend):
 
     @staticmethod
     def make_hsaco(src, metadata, options):
-        target_features = ""
+        target_features = []
         if knobs.compilation.enable_asan:
-            target_features = "+xnack"
-        hsaco = amd.assemble_amdgcn(src, options.arch, target_features)
+            target_features.append("+xnack")
+        if true16 := disable_real_true16_feature(options.arch):
+            target_features.append(true16)
+        hsaco = amd.assemble_amdgcn(src, options.arch, ",".join(target_features))
         with tempfile.NamedTemporaryFile() as tmp_out:
             with tempfile.NamedTemporaryFile() as tmp_in:
                 with open(tmp_in.name, "wb") as fd_in:

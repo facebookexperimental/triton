@@ -2,6 +2,8 @@
 #include "Utility.h"
 
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -10,6 +12,11 @@ using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
 
 LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
+                         const LLVMTypeConverter *typeConverter,
+                         ConversionPatternRewriter &rewriter, bool isTuring);
+
+LogicalResult convertMMA(triton::instrument::DotI8Op op,
+                         triton::instrument::DotI8Op::Adaptor adaptor,
                          const LLVMTypeConverter *typeConverter,
                          ConversionPatternRewriter &rewriter, bool isTuring);
 
@@ -79,6 +86,35 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
 
 private:
   int computeCapability;
+};
+
+struct DotI8OpConversion
+    : public ConvertOpToLLVMPattern<triton::instrument::DotI8Op> {
+  using ConvertOpToLLVMPattern<
+      triton::instrument::DotI8Op>::ConvertOpToLLVMPattern;
+
+  DotI8OpConversion(LLVMTypeConverter &converter, int, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::instrument::DotI8Op>(converter,
+                                                            benefit) {}
+
+  LogicalResult
+  matchAndRewrite(triton::instrument::DotI8Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto dType = op.getD().getType();
+    auto dEncoding = dType.getEncoding();
+    if (!mlir::triton::gpu::isPermutationMatrixLayout(
+            mlir::triton::gpu::toLinearLayout(dType.getShape(), dEncoding)))
+      return rewriter.notifyMatchFailure(
+          op, "DotI8Op result encoding must have a permutation-matrix linear "
+              "layout");
+
+    auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(dEncoding);
+    if (!mmaLayout || mmaLayout.getVersionMajor() != 2)
+      return rewriter.notifyMatchFailure(op,
+                                         "DotI8Op requires an MMAv2 layout");
+    return convertMMA(op, adaptor, getTypeConverter(), rewriter,
+                      mmaLayout.isTuring());
+  }
 };
 
 struct WarpGroupDotOpConversion
@@ -157,6 +193,7 @@ void mlir::triton::NVIDIA::populateDotOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     int computeCapability, PatternBenefit benefit) {
   patterns.add<DotOpConversion>(typeConverter, computeCapability, benefit);
+  patterns.add<DotI8OpConversion>(typeConverter, computeCapability, benefit);
   patterns.add<WarpGroupDotOpConversion>(typeConverter, benefit);
   patterns.add<WarpGroupDotWaitOpConversion>(typeConverter, benefit);
   patterns.add<ScaledDotOpConversion>(typeConverter, computeCapability,

@@ -3863,12 +3863,14 @@ public:
         g.channels.push_back(c);
       }
       // Require BOTH the sound formation gate AND the loose (code-partition)
-      // gate: a group that is strict-orderable but loose-unorderable would still
-      // trip insertAsyncComm's report_fatal_error, so the residual left after a
-      // relocation must be orderable under both (mirrors canJoinReuseGroupChain).
+      // gate: a group that is strict-orderable but loose-unorderable would
+      // still trip insertAsyncComm's report_fatal_error, so the residual left
+      // after a relocation must be orderable under both (mirrors
+      // canJoinReuseGroupChain).
       return !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false)
                   .empty() &&
-             !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/true).empty();
+             !orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/true)
+                  .empty();
     };
     // Iterate owners in a stable order: state.owners is a DenseMap (pointer
     // order), so which relocation the repair picks must not depend on heap
@@ -4323,12 +4325,13 @@ public:
         // Pin the true first-fit STATE (not merely a column-signature match) to
         // rank 0, so pick 0 is byte-identical to the default topK=1 result --
         // including the physical rowOffset. tmemStateSignature deliberately
-        // excludes rowGroup, so an enumerated solution sharing firstFit's column
-        // signature may live in a different row group (a 64-row owner fits either
-        // group); rotating that solution to rank 0 would apply its rowGroup, not
-        // firstFit's. Instead drop the signature-equivalent enumerated solution
-        // (deduped to one by the column-only signature) and insert firstFit
-        // itself at rank 0, so sols[0].state == firstFit exactly.
+        // excludes rowGroup, so an enumerated solution sharing firstFit's
+        // column signature may live in a different row group (a 64-row owner
+        // fits either group); rotating that solution to rank 0 would apply its
+        // rowGroup, not firstFit's. Instead drop the signature-equivalent
+        // enumerated solution (deduped to one by the column-only signature) and
+        // insert firstFit itself at rank 0, so sols[0].state == firstFit
+        // exactly.
         uint64_t ffSig = tmemStateSignature(allocs, firstFit);
         for (unsigned i = 0; i < sols.size(); ++i) {
           if (sols[i].sig == ffSig) {

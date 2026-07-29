@@ -58,8 +58,16 @@ _DEFAULT_CFG = dict(autows=True, dp=1, pin=True)
 # to SMEM, dq via TMA reduce-add subtiled x4 -- final ttgir matches the hand-written
 # TLX bwd and its grads match torch/TLX numerics.
 _DQREDUCE_CFG = dict(
-    autows=True, dq_reduce=True, dq_reuse=True, dp=1,
-    bwd_bm=128, bwd_bn=128, bwd_stages=2, warps=4, dq_iters=4, pin=True,
+    autows=True,
+    dq_reduce=True,
+    dq_reuse=True,
+    dp=1,
+    bwd_bm=128,
+    bwd_bn=128,
+    bwd_stages=2,
+    warps=4,
+    dq_iters=4,
+    pin=True,
 )
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
@@ -170,8 +178,14 @@ def _run_autows_fwd(L, Z):
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
     ref = _torch_ref_fwd(q, k, v, so, asc)
     o = A.triton_hstu_mha(
-        max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, enable_tma=True,
+        max_seq_len=L,
+        alpha=1.0 / D,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=so,
+        attn_scale=asc,
+        enable_tma=True,
     )
     return o, ref
 
@@ -207,14 +221,15 @@ def test_self_attention_bwd_autows_dqreduce(L, Z):
     # (no HSTU_SELF_* env needed).
     r = subprocess.run(
         [sys.executable, __file__, "--run-dqreduce", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     # Surface the child's REL_L2 line (and any error) in the pytest output.
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
@@ -233,14 +248,15 @@ def test_self_attention_fwd_autows_fadp(L, Z):
     # importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fadp", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     # Surface the child's REL_L2 line (and any error) in the pytest output.
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"FA-DP autoWS fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"FA-DP autoWS fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
@@ -259,13 +275,14 @@ def test_self_attention_fwd_autows_compiler_dp2(L, Z):
     # before importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fwd", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"compiler DP=2 fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"compiler DP=2 fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 if __name__ == "__main__":
@@ -276,12 +293,9 @@ if __name__ == "__main__":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z)
-        rls = {n: _rel_l2(g_, w) for n, g_, w in
-               (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
-        print(
-            f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
-            f"(L={_L} Z={_Z})"
-        )
+        rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
+        print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
+              f"(L={_L} Z={_Z})")
         bad = {n: v for n, v in rls.items() if not (v < 1e-2)}
         if bad:
             print(f"FAIL: rel-L2 too high: {bad}")
@@ -314,7 +328,5 @@ if __name__ == "__main__":
             sys.exit(1)
         print("OK")
         sys.exit(0)
-    sys.exit(
-        "usage: test_self_attention_autows.py "
-        "--run-dqreduce|--run-fadp|--run-fwd L Z"
-    )
+    sys.exit("usage: test_self_attention_autows.py "
+             "--run-dqreduce|--run-fadp|--run-fwd L Z")

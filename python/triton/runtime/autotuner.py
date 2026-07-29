@@ -761,7 +761,15 @@ class Autotuner(KernelInterface):
                         _padded = _padded + (None, ) * (len(self.fn.params) - len(_padded))
                     native_fast_dispatch_insert(self.fn, _padded, self.fn.params, self.fn._fc_options_hash, kernel,
                                                 _disp, getattr(kernel, '_dispatch_arg_indices', None))
-            self._fc_seeded.add(_seed_key)
+                    # Only enable the meta-less steady-state fast path (self.fn[grid](*full_args)
+                    # below) once a native dispatcher exists to carry the winning config's
+                    # compilation options. Without one -- e.g. dispatcher creation failed with
+                    # "Too many kernel args" -- steady-state falls back to a plain JIT launch that
+                    # recompiles at the default num_warps/num_stages and silently drops the config's
+                    # values, miscompiling kernels pinned to a non-default num_warps. Leaving
+                    # _seed_key unseeded re-runs this seed branch (a full run(**_meta) that honors
+                    # the config) on every call instead.
+                    self._fc_seeded.add(_seed_key)
             return kernel
 
         # Steady-state: dispatch via JITCacheProxy (fastest path).

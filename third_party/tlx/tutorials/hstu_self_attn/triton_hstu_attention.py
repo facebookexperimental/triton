@@ -173,8 +173,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                                     },
                                     num_stages=num_stages,
                                     num_warps=num_warps,
-                                )
-                            )
+                                ))
     else:
         configs = [
             triton.Config(
@@ -336,13 +335,11 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
             # BLOCK_M = 128 * _dp (doubling the split dim) -> each partition tile
             # is 128 rows, matching TLX (BLOCK_M=256, 2 groups of 128).
             _bn = _AUTOWS_CFG.bn
-            return [
-                triton.Config(
-                    {"BLOCK_M": 128 * _dp, "BLOCK_N": _bn},
-                    num_stages=1,
-                    num_warps=_w,
-                )
-            ]
+            return [triton.Config(
+                {"BLOCK_M": 128 * _dp, "BLOCK_N": _bn},
+                num_stages=1,
+                num_warps=_w,
+            )]
         # DP off: pick the largest existing tile / most warps.
         cand = [c for c in configs if c.num_stages >= 1 and c.kwargs.get("BLOCK_M", 0) >= 64]
         cand.sort(
@@ -392,8 +389,7 @@ def _get_bw_configs() -> List[triton.Config]:
                                             num_stages=num_stages,
                                             num_warps=num_warps,
                                             pre_hook=_bwd_pre_hook,
-                                        )
-                                    )
+                                        ))
         return configs
 
     configs = [
@@ -820,7 +816,7 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
         # tma can only be loaded in one order, use trans afterwards
         qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32)
     else:
-        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+        k = tl.load(K_block_ptr, boundary_check=(1, ), padding_option="zero")
         qk = tl.dot(q, k, allow_tf32=ALLOW_TF32)
     valid_mask = forward_valid_mask(
         offs_m,
@@ -838,7 +834,7 @@ def _hstu_attn_fwd_one_block_0(  # noqa: C901
     if ENABLE_TMA:
         v = device_desc_v.load([(seq_start_kv + start_n).to(tl.int32), offset_vh.to(tl.int32)])
     else:
-        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+        v = tl.load(V_block_ptr, boundary_check=(0, ), padding_option="zero")
     act_qk = act_qk.to(v.dtype)
     acc += tl.dot(act_qk, v, allow_tf32=ALLOW_TF32)
     return acc
@@ -1016,15 +1012,12 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         # keeps the MMA structure meta-WS can partition. DQ is pre-zeroed; the head
         # slice is selected by the store column offset (device_desc_dq base has only
         # the seq offset). Mirrors triton_bw_cross_attention.py's autoWS dq reduce.
-        dq_trans = (
-            tl.dot(
-                tl.trans(k),
-                dqk_trans,
-                allow_tf32=ALLOW_TF32,
-                attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,5"]} if DQ_REUSE else None),
-            )
-            * alpha
-        )
+        dq_trans = (tl.dot(
+            tl.trans(k),
+            dqk_trans,
+            allow_tf32=ALLOW_TF32,
+            attrs=({"stage": "1", "order": "1", "channels": ["opndD,tmem,1,5"]} if DQ_REUSE else None),
+        ) * alpha)
         dq = tl.trans(dq_trans).to(k.dtype)
         # Subtile the dq reduce into DQ_ITERS contiguous column-subtiles
         # (matches FA bwd's DQ_SUBTILE); each is an independent store_reduce the
@@ -1154,7 +1147,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 block_shape=(BLOCK_M, BLOCK_D_Q),
                 order=(1, 0),
             )
-            q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+            q = tl.load(Q_block_ptr, boundary_check=(0, ), padding_option="zero")
 
             K_block_ptr = tl.make_block_ptr(
                 base=K + off_h * stride_kh + seq_start_kv * stride_kn,
@@ -1182,12 +1175,10 @@ def _hstu_attn_fwd_compute(  # noqa C901
                     BLOCK_D_Q,
                 ],
             )
-            q = device_desc_q.load(
-                [
-                    (seq_start_q + start_m).to(tl.int32),
-                    (off_h * stride_qh).to(tl.int32),
-                ]
-            )
+            q = device_desc_q.load([
+                (seq_start_q + start_m).to(tl.int32),
+                (off_h * stride_qh).to(tl.int32),
+            ])
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
         end_n = 0
         n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
@@ -1230,10 +1221,10 @@ def _hstu_attn_fwd_compute(  # noqa C901
         n_iters = n_uih + n_tgt
         ptr_pos = 0  # non-TMA: absolute key position the K/V block ptrs point at
         for it in tl.range(
-            0,
-            n_iters,
-            warp_specialize=AUTOWS,
-            data_partition_factor=DP,
+                0,
+                n_iters,
+                warp_specialize=AUTOWS,
+                data_partition_factor=DP,
         ):
             is_tgt = it >= n_uih
             blk = tl.where(is_tgt, it - n_uih, it)
@@ -1393,12 +1384,10 @@ def _hstu_attn_fwd_compute_dp(  # noqa C901
             block_shape=[BLOCK_M_H, BLOCK_D_Q],
         )
         q0 = device_desc_q.load([(seq_start_q + start_m).to(tl.int32), (off_h * stride_qh).to(tl.int32)])
-        q1 = device_desc_q.load(
-            [
-                (seq_start_q + start_m + BLOCK_M_H).to(tl.int32),
-                (off_h * stride_qh).to(tl.int32),
-            ]
-        )
+        q1 = device_desc_q.load([
+            (seq_start_q + start_m + BLOCK_M_H).to(tl.int32),
+            (off_h * stride_qh).to(tl.int32),
+        ])
         acc0 = tl.zeros([BLOCK_M_H, BLOCK_D_V], dtype=tl.float32)
         acc1 = tl.zeros([BLOCK_M_H, BLOCK_D_V], dtype=tl.float32)
         n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
@@ -1433,10 +1422,10 @@ def _hstu_attn_fwd_compute_dp(  # noqa C901
             tgt_lo = start_m
         n_iters = n_uih + n_tgt
         for it in tl.range(
-            0,
-            n_iters,
-            warp_specialize=AUTOWS,
-            data_partition_factor=1,
+                0,
+                n_iters,
+                warp_specialize=AUTOWS,
+                data_partition_factor=1,
         ):
             is_tgt = it >= n_uih
             blk = tl.where(is_tgt, it - n_uih, it)
@@ -1801,19 +1790,19 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         if low < contextual_block_end:
             low = contextual_block_end
     for start_m in tl.range(
-        low,
-        high,
-        BLOCK_M,
-        loop_unroll_factor=UNROLL,
-        # autoWS on the bwd compute loop (dk/dv/dq MMAs). DP=1 (bwd uses TLX
-        # replicate=1); pair with a num_warps>=8, BLOCK_M>=64, num_stages>=1
-        # config from _get_bw_configs() (HSTU_SELF_AUTOWS branch).
-        warp_specialize=AUTOWS,
-        # For the dq TMA-reduce path (which adds a reduction partition), fold the
-        # dk/dv epilogue into the computation partition (as TLX does) so the total
-        # warp count stays <= 16 (reduction4+gemm1+load1+compute8=14 vs the
-        # 5-partition 18 that overflows PSM's warp budget). No-op for the RMW path.
-        merge_epilogue_to_computation=DQ_REDUCE,
+            low,
+            high,
+            BLOCK_M,
+            loop_unroll_factor=UNROLL,
+            # autoWS on the bwd compute loop (dk/dv/dq MMAs). DP=1 (bwd uses TLX
+            # replicate=1); pair with a num_warps>=8, BLOCK_M>=64, num_stages>=1
+            # config from _get_bw_configs() (HSTU_SELF_AUTOWS branch).
+            warp_specialize=AUTOWS,
+            # For the dq TMA-reduce path (which adds a reduction partition), fold the
+            # dk/dv epilogue into the computation partition (as TLX does) so the total
+            # warp count stays <= 16 (reduction4+gemm1+load1+compute8=14 vs the
+            # 5-partition 18 that overflows PSM's warp budget). No-op for the RMW path.
+            merge_epilogue_to_computation=DQ_REDUCE,
     ):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         dk, dv = _hstu_attn_bwd_one_block_0(
@@ -2372,6 +2361,7 @@ def triton_hstu_attention_bwd(
 
 
 class _AttentionFunction(torch.autograd.Function):
+
     @staticmethod
     # pyre-ignore[14]
     def forward(
@@ -2436,20 +2426,20 @@ class _AttentionFunction(torch.autograd.Function):
     def backward(
         ctx, dout: torch.Tensor
     ) -> Tuple[
-        None,
-        None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+            None,
+            None,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
     ]:
         saved_tensors = ctx.saved_tensors
         q, k, v, seq_offsets, attn_scale = saved_tensors[:5]
