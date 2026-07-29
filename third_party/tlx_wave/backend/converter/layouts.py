@@ -126,6 +126,58 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
     )
 
 
+def build_layout_map_from_attr(
+    layout_map_id,
+    value_id,
+    shape,
+    element_type,
+    attr,
+    lane_width,
+    *,
+    encoding=None,
+):
+    """Build and validate a structural layout map from an operation attribute."""
+    kind, properties = _layout_kind_and_properties(
+        attr,
+        value_id,
+        encoding=str(attr if encoding is None else encoding),
+    )
+    if kind in {"blocked", "linear", "generic_linear"}:
+        coordinate_domain = _layout_coordinate_domain(
+            kind,
+            shape,
+            properties,
+            lane_width,
+            value_id,
+        )
+        _require_supported_coordinate_domain(
+            kind,
+            shape,
+            properties,
+            coordinate_domain,
+            value_id,
+        )
+        properties = {**properties, "coordinate_domain": coordinate_domain}
+        component_count = int(coordinate_domain["component_count"])
+    else:
+        _layout_fail(
+            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
+            STAGE,
+            f"operation layout assumption requires a distributed layout; got {kind}",
+            source_value_id=value_id,
+        )
+    return LayoutMap(
+        layout_map_id,
+        value_id,
+        kind,
+        tuple(shape),
+        element_type,
+        int(component_count),
+        int(lane_width),
+        properties,
+    )
+
+
 def _layout_kind_and_properties(attr, value_id, *, encoding=None):
     if attr is None:
         return "none", {}
@@ -271,7 +323,14 @@ def _layout_component_count(source_type, kind, properties, lane_width, value_id)
     if kind == "slice":
         parent_kind = properties.get("parent_kind")
         parent_properties = properties.get("parent_properties", {})
-        if parent_kind in {"blocked", "linear", "generic_linear", "slice", "amd_mfma"}:
+        if parent_kind in {
+                "blocked",
+                "linear",
+                "generic_linear",
+                "slice",
+                "amd_mfma",
+                "dot_operand",
+        }:
             dim = int(properties.get("dim", 0))
             shape = tuple(int(value) for value in source_type.shape)
             if dim < 0 or dim > len(shape):
@@ -1724,7 +1783,7 @@ def _require_supported_coordinate_domain(
 def _layout_warp_count_from_parts(kind, properties):
     if kind in {"linear", "generic_linear"}:
         return 1 << len(tuple(properties.get("warp_bases", ())))
-    if kind == "slice":
+    if kind in {"slice", "dot_operand"}:
         return _layout_warp_count_from_parts(
             properties.get("parent_kind"),
             properties.get("parent_properties", {}),
@@ -1893,7 +1952,14 @@ def _slice_linear_layout(
 ):
     parent_kind = properties.get("parent_kind")
     parent_properties = properties.get("parent_properties", {})
-    if parent_kind not in {"blocked", "linear", "generic_linear", "slice", "amd_mfma"}:
+    if parent_kind not in {
+            "blocked",
+            "linear",
+            "generic_linear",
+            "slice",
+            "amd_mfma",
+            "dot_operand",
+    }:
         _layout_fail(
             "TLXW_TYPE_UNSUPPORTED_LAYOUT",
             stage,

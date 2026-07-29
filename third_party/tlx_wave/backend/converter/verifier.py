@@ -1448,6 +1448,10 @@ def _verify_packet_affine_materialize(
     order = attrs.get("coordinate_order")
     coordinate_mode = attrs.get("coordinate_mode")
     linear_bases = attrs.get("linear_component_bases")
+    component_bases = attrs.get("component_coordinate_bases")
+    workitem_coefficients = attrs.get(
+        "workitem_coordinate_coefficients"
+    )
     scalar_sources = attrs.get("scalar_component_sources")
     component_thread_count = attrs.get("component_thread_count")
     packet_elements = attrs.get("packet_elements")
@@ -1496,6 +1500,31 @@ def _verify_packet_affine_materialize(
                 "TLXW_VERIFY_AFFINE_EDGE",
                 STAGE,
                 "physical packet coordinates require ranked linear bases",
+                target_op_id=op.target_op_id,
+            )
+    elif coordinate_mode == "layout_coordinates":
+        if (
+            linear_bases not in {None, ()}
+            or not isinstance(component_bases, tuple)
+            or len(component_bases) != component_count
+            or any(
+                not isinstance(base, tuple) or len(base) != rank
+                for base in component_bases
+            )
+            or not isinstance(workitem_coefficients, tuple)
+            or any(
+                not isinstance(coefficients, tuple)
+                or len(coefficients) != rank
+                for coefficients in workitem_coefficients
+            )
+            or (1 << len(workitem_coefficients))
+            != int(component_thread_count)
+        ):
+            fail(
+                "TLXW_VERIFY_AFFINE_EDGE",
+                STAGE,
+                "copy-layout packet coordinates require ranked component "
+                "bases and an exact workitem bit domain",
                 target_op_id=op.target_op_id,
             )
     else:

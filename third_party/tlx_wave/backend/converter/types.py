@@ -61,7 +61,7 @@ def _convert_type(source_type, layout, lane_width):
         component_count = 1 if layout is None else int(layout.component_count)
         scalar_component_count = component_count
         if (layout is not None and
-                (layout.kind == "amd_mfma"
+                (layout.kind in {"amd_mfma", "dot_operand"}
                  or (layout.kind == "slice"
                      and layout.properties.get("parent_kind") == "amd_mfma"))):
             # Coordinates, masks, and pointers need a scalar component for

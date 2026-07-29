@@ -13,6 +13,7 @@ from . import layout_remap
 from . import target_ir
 
 STAGE = "op_conversion"
+_COPY_LAYOUT_ATTR = "tlx.wave.copy_layout"
 
 _BINARY_OPS = {
     "arith.addi": "addi",
@@ -40,6 +41,10 @@ _FLOAT_UNARY_OPS = {
     "math.exp2": "exp2",
 }
 
+_FLOAT_TERNARY_OPS = {
+    "math.fma": "fma",
+}
+
 _FASTMATH_FLAG_ORDER = (
     "reassoc",
     "nnan",
@@ -61,8 +66,20 @@ _MMA_PACKET_REPRESENTATIONS = frozenset({
     "simd_packet_tuple",
 })
 
-_LAYOUT_PRESERVING_SIMPLE_OPS = frozenset((*_BINARY_OPS, *_FLOAT_BINARY_OPS, *_FLOAT_UNARY_OPS, *_FLOAT_CAST_OPS,
-                                           "arith.cmpi", "arith.maxsi", "arith.minsi", "arith.select", "tt.addptr"))
+_LAYOUT_PRESERVING_SIMPLE_OPS = frozenset(
+    (
+        *_BINARY_OPS,
+        *_FLOAT_BINARY_OPS,
+        *_FLOAT_TERNARY_OPS,
+        *_FLOAT_UNARY_OPS,
+        *_FLOAT_CAST_OPS,
+        "arith.cmpi",
+        "arith.maxsi",
+        "arith.minsi",
+        "arith.select",
+        "tt.addptr",
+    )
+)
 
 _MMA_PACKET_RESULT_SOURCE_OPS = frozenset({
     "arith.constant",
@@ -77,7 +94,9 @@ _MMA_PACKET_RESULT_SOURCE_OPS = frozenset({
     "arith.truncf",
     "amdg.buffer_load",
     "tt.broadcast",
+    "tt.join",
     "tt.reshape",
+    "tt.split",
     "tt.trans",
     "ttg.local_load",
     "ttg.convert_layout",
@@ -85,6 +104,7 @@ _MMA_PACKET_RESULT_SOURCE_OPS = frozenset({
     "tt.dot",
     "tt.dot_scaled",
     "math.exp2",
+    "math.fma",
     "scf.if",
     "scf.for",
 })
@@ -483,12 +503,38 @@ def _convert_source_op(
     if op.name == "arith.extf" and _has_register_vector_payload_result(builder, type_layout_program, op):
         _convert_register_vector_payload_float_cast(builder, type_layout_program, op)
         return
+    if op.name == "arith.extf":
+        register_packet_plan = _float_cast_register_packet_plan(
+            type_layout_program,
+            op,
+        )
+        if register_packet_plan is not None:
+            _convert_register_packet_float_cast(
+                builder,
+                type_layout_program,
+                op,
+                *register_packet_plan,
+            )
+            return
     if op.name == "arith.truncf" and _has_mma_packet_result(type_layout_program, op):
         _convert_mma_packet_truncf(builder, type_layout_program, op)
         return
     if op.name == "arith.truncf" and _has_register_vector_payload_result(builder, type_layout_program, op):
         _convert_register_vector_payload_float_cast(builder, type_layout_program, op)
         return
+    if op.name == "arith.truncf":
+        register_packet_plan = _float_cast_register_packet_plan(
+            type_layout_program,
+            op,
+        )
+        if register_packet_plan is not None:
+            _convert_register_packet_float_cast(
+                builder,
+                type_layout_program,
+                op,
+                *register_packet_plan,
+            )
+            return
     if op.name == "ttg.local_alloc":
         _convert_local_alloc(
             builder,
@@ -1029,6 +1075,54 @@ def _convert_float_unary(builder, view):
     )
 
 
+def _convert_float_ternary(builder, view):
+    if len(view.operand_target_ids) != 3 or len(view.result_target_ids) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_TERNARY",
+            STAGE,
+            f"{view.op_name} requires three operands and one result",
+            source_op_index=view.op_index,
+        )
+    result_type = builder.values[view.result_target_ids[0]].type
+    supported_representations = {
+        "simd",
+        "simd_tuple",
+        *_MMA_PACKET_REPRESENTATIONS,
+    }
+    for target_value_id in (*view.operand_target_ids, *view.result_target_ids):
+        target_type = builder.values[target_value_id].type
+        if (
+            target_type.representation not in supported_representations
+            or target_type.representation != result_type.representation
+            or target_type.element_type != result_type.element_type
+            or int(target_type.component_count) != int(result_type.component_count)
+            or target_type.element_type not in {"f16", "f32"}
+        ):
+            fail(
+                "TLXW_OP_UNSUPPORTED_FLOAT_TERNARY",
+                STAGE,
+                f"{view.op_name} requires matching f16/f32 SIMD or MMA packet payloads",
+                source_op_index=view.op_index,
+                target_value_id=target_value_id,
+            )
+    attrs = {"operation": _FLOAT_TERNARY_OPS[view.op_name]}
+    if "fastmath" in view.attrs:
+        fastmath = _normalize_fastmath_flags(
+            view.attrs["fastmath"],
+            source_op_index=view.op_index,
+        )
+        if fastmath:
+            attrs["fastmath"] = fastmath
+    builder.add_op(
+        "float_ternary",
+        operands=view.operand_target_ids,
+        results=view.result_target_ids,
+        attrs=attrs,
+        layout_map_ids=view.result_layout_map_ids,
+        source_op_index=view.op_index,
+    )
+
+
 def _float_binary_attrs(view):
     attrs = {"operation": _FLOAT_BINARY_OPS[view.op_name]}
     if "fastmath" in view.attrs:
@@ -1215,6 +1309,78 @@ def _convert_register_vector_payload_float_cast(builder, type_layout_program, op
             "operation": _FLOAT_CAST_OPS[op.name],
             "registers": _register_vector_payload_registers(type_layout_program, result, op),
             "result_value_mode": "register_vector_payload",
+        },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_register_packet_float_cast(
+    builder,
+    type_layout_program,
+    op,
+    register_packet_width,
+    register_packet_scalar_slots,
+):
+    """Preserve a proven same-workitem register packet through a float cast."""
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            f"register-packet {op.name} requires one operand and one result",
+            source_op_index=op.index,
+        )
+    operand = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if op.name == "arith.extf":
+        supported = (
+            operand.type.element_type in {"f16", "bf16"}
+            and result.type.element_type == "f32"
+        )
+        description = "f16/bf16 to f32"
+    else:
+        supported = (
+            operand.type.element_type == "f32"
+            and result.type.element_type in {"f16", "bf16"}
+        )
+        description = "f32 to f16/bf16"
+    if not supported:
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            f"only {description} register-packet {op.name} is converted yet",
+            source_op_index=op.index,
+        )
+    if int(operand.type.component_count) != int(result.type.component_count):
+        fail(
+            "TLXW_OP_UNSUPPORTED_FLOAT_CAST",
+            STAGE,
+            f"register-packet {op.name} component counts must match",
+            source_op_index=op.index,
+        )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        operand,
+        result,
+        f"register-packet {op.name} operand and result",
+        op,
+    )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "float_cast",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={
+            "operation": _FLOAT_CAST_OPS[op.name],
+            "register_packet_scalar_slots": tuple(
+                int(slot) for slot in register_packet_scalar_slots
+            ),
+            "register_packet_width": int(register_packet_width),
+            "result_value_mode": "register_packet_payload",
         },
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
@@ -2043,6 +2209,14 @@ def _convert_program_id(builder, view):
         "program_id",
         results=view.result_target_ids,
         attrs={"axis": _int_attr(view.attrs, "axis")},
+        source_op_index=view.op_index,
+    )
+
+
+def _convert_warp_id(builder, view):
+    builder.add_op(
+        "warp_id",
+        results=view.result_target_ids,
         source_op_index=view.op_index,
     )
 
@@ -2990,6 +3164,14 @@ def _convert_for(
         "scf.for yield and result",
         op,
     )
+    data_register_packet_widths = _for_register_packet_widths(
+        type_layout_program,
+        op.operands[3:],
+        source_region.block_arg_ids[1:],
+        yielded_source_values,
+        op.results,
+        op,
+    )
     yielded_target_ids = tuple(
         _single_source_target(builder, source_value_id, op) for source_value_id in yielded_source_values)
     with builder.insertion_region(target_region_id):
@@ -3047,6 +3229,18 @@ def _convert_for(
             )),
             "source_result_count":
             data_init_arg_count,
+            # A nonzero entry is a structural assumption that the matching
+            # distributed SIMD tuple may stay grouped as same-workitem
+            # register packets across the Wave loop edge. The loop body still
+            # observes the ordinary scalar component model.
+            "register_packet_widths": (
+                *data_register_packet_widths,
+                *((0, ) * (
+                    len(token_carries)
+                    + len(protocol_carry_specs)
+                    + len(dma_pointer_carries)
+                )),
+            ),
             "explicit_warp_pipeline_protocol":
             explicit_warp_pipeline_protocol,
         },
@@ -3073,6 +3267,152 @@ def _convert_for(
     ):
         for key in keys:
             builder.set_protocol_frontier(key, (protocol_result_target_id, ))
+
+
+def _for_register_packet_widths(
+    type_layout_program,
+    init_source_value_ids,
+    block_arg_source_value_ids,
+    yield_source_value_ids,
+    result_source_value_ids,
+    op,
+):
+    """Select generic same-workitem vector packets for loop-carried tuples.
+
+    Packetization is limited to matching linear layouts whose register bases
+    all move along one logical tensor dimension. This records a physical
+    register-grouping fact for Wave without changing TLX tensor semantics or
+    recognizing a producer/consumer pattern.
+    """
+    widths = []
+    for source_value_ids in zip(
+        init_source_value_ids,
+        block_arg_source_value_ids,
+        yield_source_value_ids,
+        result_source_value_ids,
+    ):
+        converted_values = tuple(
+            type_layout_program.values[int(source_value_id)]
+            for source_value_id in source_value_ids
+        )
+        plans = tuple(
+            _same_workitem_register_packet_plan(
+                type_layout_program,
+                converted,
+                op,
+            )
+            for converted in converted_values
+        )
+        if plans[0] is None or any(plan != plans[0] for plan in plans[1:]):
+            widths.append(0)
+            continue
+        widths.append(int(plans[0][0]))
+    return tuple(widths)
+
+
+def _float_cast_register_packet_plan(type_layout_program, op):
+    """Infer an elementwise packet cast from matching physical layout facts."""
+    if len(op.operands) != 1 or len(op.results) != 1:
+        return None
+    operand = type_layout_program.values[int(op.operands[0])]
+    result = type_layout_program.values[int(op.results[0])]
+    operand_plan = _same_workitem_register_packet_plan(
+        type_layout_program,
+        operand,
+        op,
+    )
+    result_plan = _same_workitem_register_packet_plan(
+        type_layout_program,
+        result,
+        op,
+    )
+    if operand_plan is None or operand_plan != result_plan:
+        return None
+    return int(operand_plan[0]), tuple(int(slot) for slot in operand_plan[2])
+
+
+def _same_workitem_register_packet_plan(type_layout_program, converted, op):
+    """Return a generic physical packet fact for one distributed SIMD tuple."""
+    converted_type = converted.type
+    if (
+        converted_type.kind != "tensor"
+        or converted_type.representation != "simd_tuple"
+        or converted_type.element_type not in {"bf16", "f16", "f32"}
+    ):
+        return None
+    component_count = int(converted_type.component_count)
+    if (
+        component_count < 2
+        or component_count > 16
+        or component_count & (component_count - 1)
+        or converted.layout_map_id is None
+    ):
+        return None
+    layout = type_layout_program.layouts[int(converted.layout_map_id)]
+    if layout.kind not in {"linear", "generic_linear"}:
+        return None
+    linear = layouts.distributed_linear_layout(
+        layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    register_bases = layouts.linear_layout_bases(linear, "register")
+    register_count = layouts.linear_layout_in_dim_size(linear, "register")
+    moved_dims = {
+        dim
+        for basis in register_bases
+        for dim, value in enumerate(basis)
+        if int(value)
+    }
+    if (
+        int(register_count) != component_count
+        or len(register_bases) != component_count.bit_length() - 1
+        or len(moved_dims) != 1
+        or any(
+            sum(int(value) != 0 for value in basis) != 1
+            for basis in register_bases
+        )
+    ):
+        return None
+    moved_dim = moved_dims.pop()
+    coefficients = tuple(int(basis[moved_dim]) for basis in register_bases)
+    if (
+        len(set(coefficients)) != len(coefficients)
+        or any(coefficient <= 0 or coefficient & (coefficient - 1)
+               for coefficient in coefficients)
+    ):
+        return None
+    ordered_basis_indices = tuple(
+        sorted(range(len(coefficients)), key=coefficients.__getitem__)
+    )
+    packet_scalar_slots = []
+    for packet_slot in range(component_count):
+        scalar_slot = 0
+        for packet_bit, source_bit in enumerate(ordered_basis_indices):
+            if packet_slot & (1 << packet_bit):
+                scalar_slot |= 1 << source_bit
+        packet_scalar_slots.append(scalar_slot)
+    return (
+        component_count,
+        _linear_layout_signature(linear),
+        tuple(packet_scalar_slots),
+    )
+
+
+def _linear_layout_signature(linear):
+    return (
+        tuple(
+            (
+                str(name),
+                tuple(
+                    tuple(int(value) for value in basis)
+                    for basis in bases
+                ),
+            )
+            for name, bases in linear.bases
+        ),
+        tuple((str(name), int(size)) for name, size in linear.out_dims),
+    )
 
 
 def _loop_token_init_target_id(builder, type_layout_program, op, carry):
@@ -3668,11 +4008,13 @@ def _convert_buffer_load_to_local(
             op,
             source_offset_upper,
         )
-        direct_pointer_target_id = (
-            conversion_input.direct_dma_pointer_target_ids_by_op.get(
-                int(op.index)
+        direct_pointer_target_id = None
+        if packet_plan.get("source_coordinate_mode") != "layout_coordinates":
+            direct_pointer_target_id = (
+                conversion_input.direct_dma_pointer_target_ids_by_op.get(
+                    int(op.index)
+                )
             )
-        )
         if direct_pointer_target_id is None:
             if (
                 packet_plan.get("source_coordinate_mode")
@@ -5595,7 +5937,6 @@ def _convert_mma_packet_truncf(builder, type_layout_program, op):
             "MMA packet truncf component counts must match",
             source_op_index=op.index,
         )
-    operand_layout = type_layout_program.layouts[int(operand.layout_map_id)]
     _require_same_layout_except_element_type(
         type_layout_program,
         operand,
@@ -5603,7 +5944,7 @@ def _convert_mma_packet_truncf(builder, type_layout_program, op):
         "MMA packet truncf operand and result",
         op,
     )
-    registers = _acc_fragment_registers(operand_layout, op)
+    registers = _mma_packet_registers(type_layout_program, operand, op)
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -6125,11 +6466,12 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
         )
     operand = type_layout_program.values[op.operands[0]]
     result = type_layout_program.values[op.results[0]]
-    if operand.type.representation not in _MMA_PACKET_REPRESENTATIONS:
+    if operand.type.representation not in (
+            _MMA_PACKET_REPRESENTATIONS | {"simd", "simd_tuple"}):
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
-            "tt.reduce input must be an MFMA packet payload",
+            "tt.reduce input must be a distributed SIMD payload",
             source_op_index=op.index,
             source_value_id=operand.value_id,
         )
@@ -6152,13 +6494,18 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
-            "MFMA fragment reductions currently require f32 elements",
+            "distributed reductions currently require f32 elements",
             source_op_index=op.index,
         )
     axis = _int_attr(op.attrs, "axis")
     operand_layout = _require_layout(type_layout_program, operand.layout_map_id, op)
     result_layout = _require_layout(type_layout_program, result.layout_map_id, op)
-    _require_mfma_slice_reduction_layouts(operand_layout, result_layout, axis, op)
+    _require_slice_reduction_layouts(operand_layout, result_layout, axis, op)
+    source_registers = _distributed_registers_per_component(
+        operand,
+        operand_layout,
+        op,
+    )
     combiner = _reduction_combiner(conversion_input, op)
     operations = {
         "arith.addf": "addf",
@@ -6188,6 +6535,7 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
             operand_layout,
             result_layout,
             axis,
+            source_registers,
             op,
         ),
         "lane_width":
@@ -6195,11 +6543,7 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
         "operation":
         operation,
         "source_registers":
-        int(layouts.mfma_registers_per_component(
-            operand_layout,
-            stage=STAGE,
-            source_op_index=op.index,
-        )),
+        int(source_registers),
     }
     if combiner.name in {"arith.addf", "arith.mulf"}:
         if "fastmath" in combiner.attrs:
@@ -6255,20 +6599,13 @@ def _reduction_combiner(conversion_input, op):
     return combiner
 
 
-def _require_mfma_slice_reduction_layouts(operand_layout, result_layout, axis, op):
-    if operand_layout.kind != "amd_mfma":
+def _require_slice_reduction_layouts(operand_layout, result_layout, axis, op):
+    if (result_layout.kind != "slice"
+            or result_layout.properties.get("parent_kind") != operand_layout.kind):
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
-            "tt.reduce fragment input must use an amd_mfma layout",
-            source_op_index=op.index,
-            source_value_id=operand_layout.value_id,
-        )
-    if (result_layout.kind != "slice" or result_layout.properties.get("parent_kind") != "amd_mfma"):
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce result must use an MFMA slice layout",
+            "tt.reduce result must use a slice of the input layout",
             source_op_index=op.index,
             source_value_id=result_layout.value_id,
         )
@@ -6280,17 +6617,49 @@ def _require_mfma_slice_reduction_layouts(operand_layout, result_layout, axis, o
             source_op_index=op.index,
             source_value_id=result_layout.value_id,
         )
-    if result_layout.properties.get("parent_properties", {}) != operand_layout.properties:
+    input_encoding_properties = {
+        key: value
+        for key, value in operand_layout.properties.items()
+        if key != "coordinate_domain"
+    }
+    if result_layout.properties.get("parent_properties", {}) != input_encoding_properties:
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
-            "tt.reduce result slice parent must match the input MFMA layout",
+            "tt.reduce result slice parent must match the input layout",
             source_op_index=op.index,
             source_value_id=result_layout.value_id,
         )
 
 
-def _within_wave_reduction_terms(operand, result, operand_layout, result_layout, axis, op):
+def _distributed_registers_per_component(converted, layout, op):
+    linear = layouts.distributed_linear_layout(
+        layout,
+        stage=STAGE,
+        source_op_index=op.index,
+    )
+    register_count = layouts.linear_layout_in_dim_size(linear, "register")
+    component_count = int(converted.type.component_count)
+    if component_count <= 0 or int(register_count) % component_count:
+        fail(
+            "TLXW_OP_REDUCTION",
+            STAGE,
+            "tt.reduce input registers must evenly partition layout components",
+            source_op_index=op.index,
+            source_value_id=converted.value_id,
+        )
+    return int(register_count) // component_count
+
+
+def _within_wave_reduction_terms(
+    operand,
+    result,
+    operand_layout,
+    result_layout,
+    axis,
+    registers_per_component,
+    op,
+):
     lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
     warp_count = layouts.layout_warp_count(operand_layout)
     if layouts.layout_warp_count(result_layout) != warp_count:
@@ -6325,11 +6694,6 @@ def _within_wave_reduction_terms(operand, result, operand_layout, result_layout,
         stage=STAGE,
         source_op_index=op.index,
         source_value_id=result.value_id,
-    )
-    registers_per_component = layouts.mfma_registers_per_component(
-        operand_layout,
-        stage=STAGE,
-        source_op_index=op.index,
     )
     source_slots = {}
     for warp in range(int(warp_count)):
@@ -6663,6 +7027,8 @@ _SIMPLE_OP_CONVERTERS = {
        for op_name in _BINARY_OPS},
     **{op_name: _convert_float_binary
        for op_name in _FLOAT_BINARY_OPS},
+    **{op_name: _convert_float_ternary
+       for op_name in _FLOAT_TERNARY_OPS},
     **{op_name: _convert_float_unary
        for op_name in _FLOAT_UNARY_OPS},
     **{op_name: _convert_float_cast
@@ -6673,6 +7039,7 @@ _SIMPLE_OP_CONVERTERS = {
     "tt.splat": _convert_splat,
     "tt.addptr": _convert_addptr,
     "tt.get_program_id": _convert_program_id,
+    "ttg.warp_id": _convert_warp_id,
     "gpu.thread_id": _convert_thread_id,
     "rocdl.workitem.id.x": _convert_workitem_id_x,
     "arith.index_cast": _convert_index_cast,
@@ -8420,6 +8787,18 @@ def _buffer_load_to_local_packet_plan(
     affine = fact_program.tensor_affine.get(offset_value_id)
     if affine is None:
         return None
+    assumed_plan = _buffer_load_to_local_assumed_packet_plan(
+        conversion_input,
+        type_layout_program,
+        memdesc_value_id,
+        offset_value_id,
+        memdesc,
+        lane_width,
+        op,
+        affine,
+    )
+    if assumed_plan is not None:
+        return assumed_plan
     replicated_plan = _buffer_load_to_local_replicated_packet_plan(
         conversion_input,
         type_layout_program,
@@ -8592,6 +8971,353 @@ def _buffer_load_to_local_packet_plan(
             tuple(terms),
         }
     return None
+
+
+def _buffer_load_to_local_assumed_packet_plan(
+    conversion_input,
+    type_layout_program,
+    memdesc_value_id,
+    offset_value_id,
+    memdesc,
+    lane_width,
+    op,
+    affine,
+):
+    """Verify an explicit async-copy ownership map and form DMA packets.
+
+    The attribute is an ownership assumption, not a value layout conversion:
+    logical source coordinates remain those of the original affine pointer
+    tensor.  Exhaustive checks over the finite component/lane/warp domain prove
+    both source packet contiguity and the corresponding physical LDS placement.
+    """
+    copy_layout_attr = op.attrs.get(_COPY_LAYOUT_ATTR)
+    if copy_layout_attr is None:
+        return None
+    shape = tuple(int(dim) for dim in memdesc.shape)
+    if tuple(int(dim) for dim in affine.shape) != shape or not shape:
+        fail(
+            "TLXW_OP_DMA_COPY_LAYOUT",
+            STAGE,
+            "async copy-layout assumption shape does not match its source affine map",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    assumed_layout = layouts.build_layout_map_from_attr(
+        -1,
+        int(offset_value_id),
+        shape,
+        memdesc.element_type,
+        copy_layout_attr,
+        int(lane_width),
+    )
+    coordinate_domain = assumed_layout.properties.get(
+        "coordinate_domain",
+        {},
+    )
+    wave_count = int(conversion_input.num_warps)
+    if (
+        coordinate_domain.get("coverage") != "exact"
+        or layouts.layout_warp_count(assumed_layout) != wave_count
+    ):
+        fail(
+            "TLXW_OP_DMA_COPY_LAYOUT",
+            STAGE,
+            "async copy-layout assumption must exactly cover one CTA with "
+            f"{wave_count} waves",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    source_component_count = int(assumed_layout.component_count)
+    if (
+        source_component_count <= 0
+        or source_component_count * int(lane_width) * wave_count
+        != _product(shape)
+    ):
+        fail(
+            "TLXW_OP_DMA_COPY_LAYOUT",
+            STAGE,
+            "async copy-layout assumption component domain does not match "
+            "the copied tensor",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+    coordinate_plan = coordinates.layout_coordinate_plan(
+        assumed_layout,
+        source_component_count,
+        int(lane_width),
+        wave_count,
+        op,
+        int(offset_value_id),
+    )
+    if coordinate_plan is None:
+        fail(
+            "TLXW_OP_DMA_COPY_LAYOUT",
+            STAGE,
+            "async copy-layout assumption cannot be materialized structurally",
+            source_op_index=op.index,
+            source_value_id=offset_value_id,
+        )
+
+    view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
+    physical_shape = tuple(int(dim) for dim in view.physical_shape)
+    logical_origin = tuple(int(origin) for origin in view.logical_origin)
+    if (
+        len(shape) != len(physical_shape)
+        or len(shape) != len(logical_origin)
+        or any(
+            int(origin) < 0
+            or int(origin) + int(extent) > int(physical_extent)
+            for origin, extent, physical_extent in zip(
+                logical_origin,
+                shape,
+                physical_shape,
+            )
+        )
+    ):
+        fail(
+            "TLXW_OP_DMA_COPY_LAYOUT",
+            STAGE,
+            "async copy-layout assumption does not match the destination view",
+            source_op_index=op.index,
+            source_value_id=memdesc_value_id,
+        )
+    memdesc_layout_id = type_layout_program.values[
+        int(memdesc_value_id)
+    ].layout_map_id
+    memdesc_layout = (
+        None
+        if memdesc_layout_id is None
+        else type_layout_program.layouts[int(memdesc_layout_id)]
+    )
+    component_bases = tuple(
+        tuple(int(value) for value in base)
+        for base in coordinate_plan.component_bases
+    )
+    workitem_coefficients = tuple(
+        tuple(int(value) for value in coefficients)
+        for coefficients in coordinate_plan.workitem_coefficients
+    )
+    component_thread_count = wave_count * int(lane_width)
+    total_elements = _product(shape)
+    first_mismatch = None
+    for packet_bytes in _dma_packet_byte_candidates(
+        memdesc.element_byte_width,
+        include_narrow=True,
+    ):
+        packet_elements = (
+            int(packet_bytes) // int(memdesc.element_byte_width)
+        )
+        if source_component_count % packet_elements:
+            continue
+        source_component_indices = tuple(
+            range(0, source_component_count, packet_elements)
+        )
+        destination_offsets = []
+        destination_wave_stride_dwords = None
+        destination_wave_offset_coefficients_dwords = None
+        covered_coords = set()
+        valid = True
+        for source_component in source_component_indices:
+            wave_offsets = []
+            for wave in range(wave_count):
+                wave_base = None
+                for lane in range(int(lane_width)):
+                    workitem = wave * int(lane_width) + lane
+                    start_coords = coordinates._coords_from_plan(
+                        component_bases[int(source_component)],
+                        workitem_coefficients,
+                        workitem,
+                    )
+                    start_signature = _affine_static_signature(
+                        affine,
+                        start_coords,
+                    )
+                    for element in range(packet_elements):
+                        coords = coordinates._coords_from_plan(
+                            component_bases[
+                                int(source_component) + int(element)
+                            ],
+                            workitem_coefficients,
+                            workitem,
+                        )
+                        if len(coords) != len(shape) or any(
+                            int(coord) < 0
+                            or int(coord) >= int(extent)
+                            for coord, extent in zip(coords, shape)
+                        ):
+                            first_mismatch = first_mismatch or (
+                                f"coordinate {coords} is outside shape {shape}"
+                            )
+                            valid = False
+                            break
+                        if not _affine_static_signature_delta_is_unit(
+                            start_signature,
+                            _affine_static_signature(affine, coords),
+                            element,
+                        ):
+                            first_mismatch = first_mismatch or (
+                                "source packet is not contiguous at "
+                                f"component={source_component}, "
+                                f"workitem={workitem}, element={element}"
+                            )
+                            valid = False
+                            break
+                        if coords in covered_coords:
+                            first_mismatch = first_mismatch or (
+                                f"coordinate {coords} has multiple owners"
+                            )
+                            valid = False
+                            break
+                        covered_coords.add(coords)
+                        physical_coords = tuple(
+                            int(origin) + int(coord)
+                            for origin, coord in zip(logical_origin, coords)
+                        )
+                        byte_offset = _static_shared_byte_offset(
+                            memdesc_layout,
+                            physical_shape,
+                            physical_coords,
+                            int(memdesc.element_byte_width),
+                            op,
+                            diagnostic="TLXW_OP_DMA_COPY_LAYOUT",
+                        )
+                        if byte_offset % int(memdesc.element_byte_width):
+                            first_mismatch = first_mismatch or (
+                                f"destination byte offset {byte_offset} is "
+                                "not element aligned"
+                            )
+                            valid = False
+                            break
+                        element_offset = (
+                            int(byte_offset)
+                            // int(memdesc.element_byte_width)
+                        )
+                        if wave_base is None:
+                            wave_base = int(element_offset)
+                        expected = (
+                            int(wave_base)
+                            + lane * packet_elements
+                            + element
+                        )
+                        if int(element_offset) != expected:
+                            first_mismatch = first_mismatch or (
+                                "destination packet is not contiguous at "
+                                f"component={source_component}, wave={wave}, "
+                                f"lane={lane}, element={element}; "
+                                f"expected={expected}, actual={element_offset}"
+                            )
+                            valid = False
+                            break
+                    if not valid:
+                        break
+                if not valid or wave_base is None:
+                    valid = False
+                    break
+                wave_offsets.append(int(wave_base))
+            if not valid:
+                break
+            destination_offsets.append(int(wave_offsets[0]))
+            component_deltas = []
+            for wave_offset in wave_offsets:
+                byte_delta = (
+                    int(wave_offset) - int(wave_offsets[0])
+                ) * int(memdesc.element_byte_width)
+                if byte_delta % 4:
+                    valid = False
+                    break
+                component_deltas.append(byte_delta // 4)
+            if not valid:
+                break
+            component_deltas = tuple(
+                int(delta) for delta in component_deltas
+            )
+            component_stride = _uniform_wave_stride(component_deltas)
+            component_coefficients = ()
+            if component_stride is None:
+                component_coefficients = (
+                    _bit_linear_wave_offset_coefficients(component_deltas)
+                )
+                if component_coefficients is None:
+                    valid = False
+                    break
+                component_stride = 0
+            if int(component_stride) != 0:
+                component_coefficients = ()
+            if destination_wave_stride_dwords is None:
+                destination_wave_stride_dwords = int(component_stride)
+            elif destination_wave_stride_dwords != int(component_stride):
+                valid = False
+                break
+            component_coefficients = tuple(
+                int(value) for value in component_coefficients
+            )
+            if destination_wave_offset_coefficients_dwords is None:
+                destination_wave_offset_coefficients_dwords = (
+                    component_coefficients
+                )
+            elif (
+                destination_wave_offset_coefficients_dwords
+                != component_coefficients
+            ):
+                valid = False
+                break
+        if not valid:
+            continue
+        if len(covered_coords) != total_elements:
+            continue
+        scalar_value_ids, terms = _packet_affine_terms(affine)
+        return {
+            "component_thread_count":
+            int(component_thread_count),
+            "component_count":
+            len(source_component_indices),
+            "destination_component_offsets":
+            tuple(destination_offsets),
+            "destination_wave_count":
+            int(wave_count),
+            "destination_wave_offset_coefficients_dwords":
+            tuple(destination_wave_offset_coefficients_dwords or ()),
+            "destination_wave_stride_dwords":
+            int(destination_wave_stride_dwords or 0),
+            "packet_bytes":
+            int(packet_bytes),
+            "packet_elements":
+            int(packet_elements),
+            "packet_order":
+            tuple(int(dim) for dim in layouts.default_physical_order(shape)),
+            "source_affine":
+            affine,
+            "source_component_coordinate_bases":
+            component_bases,
+            "source_component_indices":
+            tuple(int(component) for component in source_component_indices),
+            "source_contiguity_mode":
+            "assumed_layout_proven",
+            "source_coordinate_mode":
+            "layout_coordinates",
+            "source_linear_component_bases":
+            (),
+            "source_packet_coordinate_bases":
+            tuple(
+                component_bases[int(component)]
+                for component in source_component_indices
+            ),
+            "source_workitem_coordinate_coefficients":
+            workitem_coefficients,
+            "scalar_value_ids":
+            tuple(scalar_value_ids),
+            "source_offset_terms":
+            tuple(terms),
+        }
+    fail(
+        "TLXW_OP_DMA_COPY_LAYOUT",
+        STAGE,
+        "async copy-layout assumption is not packet-contiguous in both "
+        "global memory and the destination shared layout"
+        + ("" if first_mismatch is None else f"; {first_mismatch}"),
+        source_op_index=op.index,
+        source_value_id=offset_value_id,
+    )
 
 
 def _buffer_load_to_local_replicated_packet_plan(
@@ -9348,6 +10074,51 @@ def _buffer_load_to_local_packet_coordinate(packet_plan, shape, coordinate_mode,
             int(linear),
             tuple(tuple(int(value) for value in basis) for basis in packet_plan["source_linear_component_bases"]),
             len(shape),
+        )
+    if coordinate_mode == "layout_coordinates":
+        packet_elements = int(packet_plan["packet_elements"])
+        component_thread_count = int(
+            packet_plan["component_thread_count"]
+        )
+        packet_span = component_thread_count * packet_elements
+        packet_component = int(linear) // packet_span
+        within_packet = int(linear) % packet_span
+        workitem = within_packet // packet_elements
+        element = within_packet % packet_elements
+        source_component_indices = tuple(
+            int(component)
+            for component in packet_plan["source_component_indices"]
+        )
+        if packet_component >= len(source_component_indices):
+            fail(
+                "TLXW_OP_DMA_COPY_LAYOUT",
+                STAGE,
+                "packet copy-layout coordinate exceeds its component domain",
+                source_op_index=op.index,
+            )
+        source_component = (
+            source_component_indices[packet_component] + element
+        )
+        component_bases = tuple(
+            tuple(int(value) for value in base)
+            for base in packet_plan["source_component_coordinate_bases"]
+        )
+        if source_component >= len(component_bases):
+            fail(
+                "TLXW_OP_DMA_COPY_LAYOUT",
+                STAGE,
+                "packet copy-layout element exceeds its register domain",
+                source_op_index=op.index,
+            )
+        return coordinates._coords_from_plan(
+            component_bases[source_component],
+            tuple(
+                tuple(int(value) for value in coefficients)
+                for coefficients in packet_plan[
+                    "source_workitem_coordinate_coefficients"
+                ]
+            ),
+            workitem,
         )
     fail(
         "TLXW_OP_UNSUPPORTED_BUFFER_ASYNC",
@@ -10272,6 +11043,22 @@ def _materialize_packet_affine_edge(
             "linear_component_bases":
             tuple(
                 tuple(int(component) for component in basis) for basis in packet_plan["source_linear_component_bases"]),
+            "component_coordinate_bases":
+            tuple(
+                tuple(int(value) for value in base)
+                for base in packet_plan.get(
+                    "source_packet_coordinate_bases",
+                    (),
+                )
+            ),
+            "workitem_coordinate_coefficients":
+            tuple(
+                tuple(int(value) for value in coefficients)
+                for coefficients in packet_plan.get(
+                    "source_workitem_coordinate_coefficients",
+                    (),
+                )
+            ),
             "mode":
             "packet_coordinates",
             "no_signed_wrap":
@@ -11032,11 +11819,11 @@ def _fragment_registers(element_type, result_layout, op):
 
 def _mma_packet_registers(type_layout_program, converted, op):
     layout = _require_layout(type_layout_program, converted.layout_map_id, op)
-    if layout.kind != "amd_mfma":
+    if layout.kind not in {"amd_mfma", "dot_operand"}:
         fail(
             "TLXW_OP_UNSUPPORTED_MMA_PACKET",
             STAGE,
-            "MFMA packets require an amd_mfma layout",
+            "MFMA packets require an amd_mfma or dot_operand layout",
             source_op_index=op.index,
             source_value_id=converted.value_id,
         )

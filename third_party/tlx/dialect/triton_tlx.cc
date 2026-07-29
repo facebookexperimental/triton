@@ -1668,24 +1668,27 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self, std::vector<Value> &values) -> void {
              self.create<ttg::PredicateYieldOp>(values);
            })
-      .def(
-          "create_async_load",
-          [](TritonOpBuilder &self, Value ptrTensor, Value result,
-             std::optional<Value> mask, std::optional<Value> other,
-             CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-             bool isVolatile, std::optional<Value> bulkSize,
-             std::optional<Value> barrier, bool useBulk) -> mlir::Value {
-            return self.create<ttg::AsyncCopyGlobalToLocalOp>(
-                ptrTensor, result, mask.value_or(Value()),
-                other.value_or(Value()), bulkSize.value_or(Value()),
-                barrier.value_or(Value()), cacheModifier, evictionPolicy,
-                isVolatile, useBulk);
-          },
+      .def("create_async_load",
+           [](TritonOpBuilder &self, Value ptrTensor, Value result,
+              std::optional<Value> mask, std::optional<Value> other,
+              CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
+              bool isVolatile, std::optional<Value> bulkSize,
+              std::optional<Value> barrier, bool useBulk,
+              std::optional<Attribute> copyLayout) -> mlir::Value {
+             auto op = self.create<ttg::AsyncCopyGlobalToLocalOp>(
+                 ptrTensor, result, mask.value_or(Value()),
+                 other.value_or(Value()), bulkSize.value_or(Value()),
+                 barrier.value_or(Value()), cacheModifier, evictionPolicy,
+                 isVolatile, useBulk);
+             if (copyLayout)
+               op->setAttr("tlx.wave.copy_layout", *copyLayout);
+             return op;
+           },
           py::arg("ptrTensor"), py::arg("result"), py::arg("mask").none(),
           py::arg("other").none(), py::arg("cacheModifier"),
           py::arg("evictionPolicy"), py::arg("isVolatile"),
           py::arg("bulkSize").none(), py::arg("barrier").none(),
-          py::arg("useBulk"))
+          py::arg("useBulk"), py::arg("copyLayout").none())
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {
              return self.create<triton::gpu::Clock64Op>(
@@ -1718,6 +1721,18 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
              self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
              self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+           })
+      .def("create_sched_barrier",
+           [](TritonOpBuilder &self) {
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
+           })
+      .def("create_warp_id",
+           [](TritonOpBuilder &self) -> mlir::Value {
+             return self.create<ttg::WarpIdOp>();
+           })
+      .def("create_set_priority",
+           [](TritonOpBuilder &self, int priority) {
+             self.create<ROCDL::SetPrioOp>(priority);
            })
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,

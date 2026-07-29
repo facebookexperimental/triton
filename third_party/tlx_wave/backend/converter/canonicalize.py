@@ -305,6 +305,7 @@ _ASYNC_WAIT_HOIST_PURE_OPS = frozenset({
     "expand_dims",
     "float_binary",
     "float_cast",
+    "float_ternary",
     "mma_packet_truncf",
     "make_range",
     "make_buffer",
