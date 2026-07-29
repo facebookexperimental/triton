@@ -51,31 +51,18 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     scf::YieldOp::create(elseB, loc, zeroValues);
     return ifOp;
   }
-  if (auto copyOp = dyn_cast<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>(op)) {
-    rewriter.setInsertionPoint(copyOp);
-    // TDM requires the mask as I32
-    auto predI32 = arith::ExtUIOp::create(rewriter, copyOp->getLoc(),
-                                          copyOp.getPred().getType(), pred);
-    Value mask = arith::AndIOp::create(rewriter, copyOp->getLoc(),
-                                       copyOp.getPred(), predI32);
-    copyOp.getPredMutable().assign(mask);
-    return op;
-  } else if (auto gatherOp = dyn_cast<triton::amdgpu::AsyncTDMGatherOp>(op)) {
-    rewriter.setInsertionPoint(gatherOp);
-    // TDM requires the mask as I32
-    auto predI32 = arith::ExtUIOp::create(rewriter, gatherOp->getLoc(),
-                                          gatherOp.getPred().getType(), pred);
-    Value mask = arith::AndIOp::create(rewriter, gatherOp->getLoc(),
-                                       gatherOp.getPred(), predI32);
-    gatherOp.getPredMutable().assign(mask);
-    return op;
-  } else if (auto prefetchOp = dyn_cast<triton::amdgpu::TDMPrefetchOp>(op)) {
-    rewriter.setInsertionPoint(prefetchOp);
-    Value mask = arith::AndIOp::create(rewriter, prefetchOp->getLoc(),
-                                       prefetchOp.getPred(), pred);
-    prefetchOp.getPredMutable().assign(mask);
-    return op;
-  } else if (auto waitOp = dyn_cast<triton::amdgpu::AsyncTDMWait>(op)) {
+  // TDM ops with I32 predicates need explicit type conversion since the
+  // generic PredicatedOpInterface path produces I1 masks.
+  if (isa<triton::amdgpu::AsyncTDMCopyGlobalToLocalOp,
+          triton::amdgpu::AsyncTDMGatherOp>(op)) {
+    auto predicatedOp = cast<tt::PredicatedOpInterface>(op);
+    rewriter.setInsertionPoint(op);
+    auto predI32 = arith::ExtUIOp::create(
+        rewriter, op->getLoc(), predicatedOp.getPredicateOperand().getType(),
+        pred);
+    Value mask = arith::AndIOp::create(
+        rewriter, op->getLoc(), predicatedOp.getPredicateOperand(), predI32);
+    predicatedOp.setPredicateOperand(mask);
     return op;
   } else if (isa<tt::DescriptorStoreLikeOpInterface>(op)) {
     auto loc = op->getLoc();
@@ -84,6 +71,8 @@ Operation *streamPredication(RewriterBase &rewriter, Operation *op,
     op->moveBefore(ifOp.thenYield());
     return ifOp;
   }
+  if (isa<triton::amdgpu::AsyncTDMWait>(op))
+    return op;
   return tt::wrapInMaskOp(rewriter, op, pred);
 }
 } // namespace
