@@ -1246,8 +1246,8 @@ void init_triton_tlx_ir(py::module &&m) {
                  other.value_or(Value()), Value() /*stride*/, cache);
            })
       .def("create_assume_uniform",
-           [](TritonOpBuilder &self, Value ptr) -> Value {
-             return self.create<ttag::AssumeUniformOp>(ptr.getType(), ptr);
+           [](TritonOpBuilder &self, Value value) -> Value {
+             return self.create<ttag::AssumeUniformOp>(value.getType(), value);
            });
 }
 

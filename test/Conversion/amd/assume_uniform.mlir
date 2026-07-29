@@ -32,3 +32,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         tt.return
   }
 }
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+    // Non-pointer scalars go straight to the type-overloaded intrinsic.
+    // CHECK-LABEL: assume_uniform_scalars
+    tt.func @assume_uniform_scalars(%i16: i16, %i32: i32, %i64: i64,
+                                    %f16: f16, %bf16: bf16, %f32: f32, %f64: f64) {
+        // CHECK-NOT: llvm.ptrtoint
+        // CHECK: rocdl.readfirstlane %{{.*}} : i16
+        // CHECK: rocdl.readfirstlane %{{.*}} : i32
+        // CHECK: rocdl.readfirstlane %{{.*}} : i64
+        // CHECK: rocdl.readfirstlane %{{.*}} : f16
+        // CHECK: rocdl.readfirstlane %{{.*}} : bf16
+        // CHECK: rocdl.readfirstlane %{{.*}} : f32
+        // CHECK: rocdl.readfirstlane %{{.*}} : f64
+        %0 = amdg.assume_uniform %i16 : i16
+        %1 = amdg.assume_uniform %i32 : i32
+        %2 = amdg.assume_uniform %i64 : i64
+        %3 = amdg.assume_uniform %f16 : f16
+        %4 = amdg.assume_uniform %bf16 : bf16
+        %5 = amdg.assume_uniform %f32 : f32
+        %6 = amdg.assume_uniform %f64 : f64
+        tt.return
+  }
+}

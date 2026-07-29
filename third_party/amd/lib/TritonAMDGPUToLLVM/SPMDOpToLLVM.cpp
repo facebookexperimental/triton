@@ -76,10 +76,15 @@ struct AssumeUniformOpConversion
     Location loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     Value src = adaptor.getSrc();
-    Value asInt = b.ptrtoint(i64_ty, src);
-    Value uniform =
-        ROCDL::ReadfirstlaneOp::create(rewriter, loc, i64_ty, asInt);
-    rewriter.replaceOp(op, b.inttoptr(src.getType(), uniform));
+    if (isa<LLVM::LLVMPointerType>(src.getType())) {
+      Value asInt = b.ptrtoint(i64_ty, src);
+      Value uniform =
+          ROCDL::ReadfirstlaneOp::create(rewriter, loc, i64_ty, asInt);
+      rewriter.replaceOp(op, b.inttoptr(src.getType(), uniform));
+    } else {
+      rewriter.replaceOp(op, ROCDL::ReadfirstlaneOp::create(
+                                 rewriter, loc, src.getType(), src));
+    }
     return success();
   }
 };
