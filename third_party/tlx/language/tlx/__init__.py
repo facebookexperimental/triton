@@ -11,6 +11,8 @@ from .barrier import (
     named_barrier_arrive,
     named_barrier_wait,
     amd_sched_barrier,
+    sched_barrier,
+    set_priority,
 )
 from .dynamic_launch import (
     _alloc_clc_responses,
@@ -129,6 +131,7 @@ from .utility import (
     size_of,
     stoch_round,
     thread_id,
+    warp_id,
 )
 from .mxfp8_utils import _to_mxfp8_block
 from .warp_ops import vote_ballot_sync, warp_redux
@@ -246,6 +249,7 @@ __all__ = [
     "cluster_cta_rank",
     "cluster_size_1d",
     "thread_id",
+    "warp_id",
     "async_task_replica_id",
     "dtype_of",
     "get_fp8_format_name",
@@ -267,4 +271,7 @@ __all__ = [
     "vote_ballot_sync",
     # warp_pipeline
     "warp_pipeline_stage",
+    # scheduling
+    "sched_barrier",
+    "set_priority",
 ]

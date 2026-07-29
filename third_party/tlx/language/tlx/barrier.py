@@ -24,6 +24,26 @@ def cluster_barrier(_semantic=None):
 
 
 @tl.builtin
+def sched_barrier(_semantic=None):
+    """Prevent AMD machine instructions from moving across this point.
+
+    This is a compiler scheduling boundary, not a workgroup synchronization
+    primitive. It does not make shared-memory accesses visible and must not be
+    used in place of an explicit async wait or hardware barrier.
+    """
+    _semantic.builder.create_sched_barrier()
+
+
+@tl.builtin
+def set_priority(priority: tl.constexpr, _semantic=None):
+    """Set the AMD wavefront execution priority to an integer from 0 through 3."""
+    priority = tl._unwrap_if_constexpr(priority)
+    if not isinstance(priority, int) or priority not in range(4):
+        raise ValueError(f"set_priority priority must be 0, 1, 2, or 3; got {priority}")
+    _semantic.builder.create_set_priority(priority)
+
+
+@tl.builtin
 def fence_mbarrier_init_cluster(_semantic=None):
     """
     Emit a cluster fence instruction for mbarrier init.

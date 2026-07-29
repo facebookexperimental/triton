@@ -2,6 +2,7 @@ import ast
 from contextlib import contextmanager
 from dataclasses import replace
 import importlib.util
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -351,6 +352,15 @@ def _load_tlx_fa_bench_module(module_name="_tlx_wave_test_fa_bench"):
     repo_root = Path(__file__).resolve().parents[4]
     bench_path = repo_root / "third_party" / "tlx" / "tutorials" / "amd-fa-pipelined_test.py"
     spec = importlib.util.spec_from_file_location(module_name, bench_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_tlx_fa_wave_module(module_name="_tlx_wave_test_fa_wave"):
+    repo_root = Path(__file__).resolve().parents[4]
+    kernel_path = repo_root / "third_party" / "tlx" / "tutorials" / "amd_fa_wave.py"
+    spec = importlib.util.spec_from_file_location(module_name, kernel_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -778,8 +788,23 @@ def test_tlx_perf_sweep_forwards_compile_workers_to_fa(tmp_path):
 
     specs = runner.build_run_specs(args, tmp_path)
 
-    assert [spec.backend for spec in specs] == ["llvm", "wave"]
-    assert all(spec.command[-2:] == ("--compile-workers", "3") for spec in specs)
+    assert [spec.name for spec in specs] == [
+        "fa-llvm",
+        "fa-wave",
+        "fa-eight-wave-llvm",
+        "fa-eight-wave-wave",
+    ]
+    assert [spec.backend for spec in specs] == ["llvm", "wave", "llvm", "wave"]
+    assert all(spec.command[-2:] == ("--compile-workers", "3") for spec in specs[:2])
+    for spec, minimum in zip(specs[2:], ("0", "1000")):
+        assert spec.command[-6:] == (
+            "--rep",
+            "1",
+            "--warmup",
+            "0",
+            "--min-tflops",
+            minimum,
+        )
 
 
 def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
@@ -6785,6 +6810,53 @@ def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
             torch.testing.assert_close(got, expected, atol=3e-1, rtol=0)
 
 
+@pytest.mark.parametrize("backend", ["llvm", "wave"])
+def test_tlx_wave_runtime_gfx950_fa_eight_wave_e2e(tmp_path, backend):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for eight-wave FA e2e, got {arch}")
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_eight_wave_runtime_{backend}")
+
+    shape = (1, 1, 512, 128)
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+
+    def bounded_tensor():
+        values = torch.randint(
+            -8,
+            9,
+            shape,
+            dtype=torch.int8,
+            device=device,
+            generator=generator,
+        ).to(torch.bfloat16)
+        return values.mul_(0.125)
+
+    q = bounded_tensor()
+    k = bounded_tensor()
+    v = torch.rand(shape, device=device, generator=generator).mul_(2.0).sub_(1.0).to(torch.bfloat16)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        scale=1.0 / math.sqrt(shape[-1]),
+    )
+
+    driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
+    with (
+            driver_context(),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-eight-wave-runtime-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.attention(q, k, v)
+        torch.cuda.synchronize()
+
+    torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
@@ -8860,6 +8932,76 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert "wave.wait" not in output.emitted_module.text
     assert "wave.after" in output.emitted_module.text
     assert "wave.barrier" not in output.emitted_module.text
+    del ctx
+
+
+@pytest.mark.parametrize(
+    "elements,register_bases,lane_bases,expected_components",
+    [
+        (
+            512,
+            "[[1], [2], [4]]",
+            "[[8], [16], [32], [64], [128], [256]]",
+            1,
+        ),
+        (
+            1024,
+            "[[1], [2], [4], [512]]",
+            "[[8], [16], [32], [64], [128], [256]]",
+            2,
+        ),
+    ],
+)
+def test_tlx_wave_converter_lowers_assumed_async_copy_layout(
+    tmp_path,
+    elements,
+    register_bases,
+    lane_bases,
+    expected_components,
+):
+    preamble = f"""
+#blocked = #ttg.blocked<{{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}}>
+#copy = #ttg.linear<{{register = {register_bases}, lane = {lane_bases}, warp = [], block = []}}>
+#shared = #ttg.swizzled_shared<{{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}}>
+#smem = #ttg.shared_memory
+"""
+    local_func = f"""
+  tt.func public @converter_assumed_async_copy_layout(
+      %arg0: !tt.ptr<f16> {{tt.pointer_range = 32 : i32}}
+  ) attributes {{noinline = false}} {{
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<{elements}xf16, #shared, #smem, mutable>
+    %range = tt.make_range {{end = {elements} : i32, start = 0 : i32}} : tensor<{elements}xi32, #blocked>
+    %token = amdg.buffer_load_to_local %arg0[%range] into %alloc {{tlx.wave.copy_layout = #copy}} : <f16>[tensor<{elements}xi32, #blocked>] -> <{elements}xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %token
+    %wait = ttg.async_wait %group {{num = 0 : i32}}
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (dma_op, ) = [
+        op
+        for op in output.target_program.ops
+        if op.kind == "buffer_load_to_local"
+    ]
+    attrs = converter_target_ir.attrs_dict(dma_op)
+    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["component_count"] == expected_components
+    assert attrs["packet_bytes"] == 16
+    _affine_op, affine_attrs = _memory_affine_edge(
+        output.target_program,
+        dma_op,
+    )
+    assert affine_attrs["coordinate_mode"] == "layout_coordinates"
+    assert output.emitted_module.text.count("waveamd.dma_load_lds") == expected_components
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -11225,18 +11367,15 @@ def test_tlx_wave_converter_lowers_blocked_component_reorder(tmp_path):
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
+    assert attrs["mode"] == "alias"
+    assert attrs["fact_policy"] == "preserve_equivalent"
     assert attrs["source_component_count"] == 4
     assert attrs["result_component_count"] == 4
     assert attrs["source_slot_count"] == 4
     assert attrs["result_slot_count"] == 4
-    assert attrs["cross_wave"] is False
-    assert tuple(name for name, _ in attrs["relation_out_dims"]) == (
-        "register",
-        "lane",
-        "warp",
-        "block",
-    )
+    assert attrs["scalar_source_slots"] == (0, 2, 1, 3)
+    assert output.emitted_module.text.count("wave.redistribute") == 0
+    assert output.emitted_module.text.count("wave.extract") == 0
     del ctx
 
 
@@ -11404,7 +11543,7 @@ def test_tlx_wave_converter_lowers_lane_mux_register_remap(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_rejects_slice_parent_layout_remap(tmp_path):
+def test_tlx_wave_converter_lowers_slice_parent_layout_remap(tmp_path):
     preamble = """
 #parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
 #slice0 = #ttg.slice<{dim = 0, parent = #parent}>
@@ -11419,12 +11558,16 @@ def test_tlx_wave_converter_rejects_slice_parent_layout_remap(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "layout slice is not converted through linear-layout remap" in str(diagnostic)
+    (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    attrs = converter_target_ir.attrs_dict(convert_op)
+    assert attrs["mode"] == "redistribute"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
+    assert attrs["cross_wave"] is False
+    assert attrs["source_component_count"] == 1
+    assert attrs["result_component_count"] == 64
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -12713,6 +12856,59 @@ def test_tlx_wave_converter_lowers_blocked_truncf(tmp_path):
     assert "result_value_mode" not in attrs
     wave = output.emitted_module.text
     assert "arith.truncf" not in wave
+    _run_wave_verify(wave)
+    _run_waveamd_to_machine(wave)
+    del ctx
+
+
+def test_tlx_wave_converter_preserves_rotated_linear_register_packet_cast(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{
+  register = [[0, 8], [0, 1], [0, 2], [0, 4]],
+  lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+  warp = [[64, 0], [128, 0], [256, 0]],
+  block = []
+}>
+"""
+    local_func = """
+  tt.func public @converter_rotated_linear_register_packet_cast() attributes {noinline = false} {
+    %value = arith.constant dense<0.000000e+00> : tensor<512x16xf32, #linear>
+    %truncated = arith.truncf %value : tensor<512x16xf32, #linear> to tensor<512x16xbf16, #linear>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    (cast_op, ) = [op for op in output.target_program.ops if op.kind == "float_cast"]
+    attrs = converter_target_ir.attrs_dict(cast_op)
+    assert attrs["result_value_mode"] == "register_packet_payload"
+    assert attrs["register_packet_width"] == 16
+    assert attrs["register_packet_scalar_slots"] == (
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        1,
+        3,
+        5,
+        7,
+        9,
+        11,
+        13,
+        15,
+    )
+    wave = output.emitted_module.text
+    assert wave.count(
+        "wave.cast fpconvert"
+    ) == 1
+    assert "!wave.simd<vector<16xf32>, 64>" in wave
+    assert "!wave.simd<vector<16xbf16>, 64>" in wave
     _run_wave_verify(wave)
     _run_waveamd_to_machine(wave)
     del ctx
@@ -14695,7 +14891,8 @@ def test_tlx_wave_converter_pipeline_lowers_mfma_fragment_softmax_math(tmp_path)
     %lhs = arith.constant dense<1.250000e+00> : tensor<16x16xf32, #mma>
     %rhs = arith.constant dense<2.500000e+00> : tensor<16x16xf32, #mma>
     %maximum = arith.maxnumf %lhs, %rhs : tensor<16x16xf32, #mma>
-    %exponential = math.exp2 %maximum : tensor<16x16xf32, #mma>
+    %fused = math.fma %lhs, %rhs, %maximum : tensor<16x16xf32, #mma>
+    %exponential = math.exp2 %fused : tensor<16x16xf32, #mma>
     %quotient = arith.divf %exponential, %lhs : tensor<16x16xf32, #mma>
     tt.return
   }
@@ -14707,11 +14904,12 @@ def test_tlx_wave_converter_pipeline_lowers_mfma_fragment_softmax_math(tmp_path)
     operations = [
         converter_target_ir.attrs_dict(op)["operation"]
         for op in output.target_program.ops
-        if op.kind in {"float_binary", "float_unary"}
+        if op.kind in {"float_binary", "float_ternary", "float_unary"}
     ]
-    assert operations == ["maxnumf", "exp2", "divf"]
+    assert operations == ["maxnumf", "fma", "exp2", "divf"]
     wave = output.emitted_module.text
     assert "wave.fmax" in wave
+    assert "wave.fma" in wave
     assert "wave.fexp2" in wave
     assert "wave.frcp" in wave
     _run_wave_verify(wave)
@@ -16373,6 +16571,61 @@ def test_tlx_wave_emits_broadcast_component_sources():
 
     assert state.values[1] == ("a", "b", "a", "b")
     assert state.uniform_pointer_bases[1] == ("base_a", "base_b", "base_a", "base_b")
+
+
+def test_tlx_wave_emits_layout_alias_scalar_slot_expansion():
+    source_type = converter_target_ir.TargetType(
+        "tensor",
+        "simd_tuple",
+        "i32",
+        64,
+        component_count=2,
+    )
+    result_type = converter_target_ir.TargetType(
+        "tensor",
+        "simd_tuple",
+        "i32",
+        64,
+        component_count=4,
+    )
+    program = converter_target_ir.TargetProgram(
+        values=(
+            converter_target_ir.TargetValue(0, source_type),
+            converter_target_ir.TargetValue(1, result_type),
+        ),
+        ops=(),
+        regions=(converter_target_ir.TargetRegion(0), ),
+        source_value_targets={},
+        erased_source_values={},
+    )
+    state = converter_emission._EmissionState(
+        None,
+        None,
+        None,
+        program,
+        None,
+        {0: ("a", "b")},
+    )
+    op = converter_target_ir.TargetOp(
+        0,
+        "layout_convert",
+        operands=(0, ),
+        results=(1, ),
+        attrs=(
+            converter_target_ir.TargetAttr("mode", "alias"),
+            converter_target_ir.TargetAttr("source_component_count", 2),
+            converter_target_ir.TargetAttr("source_packet_width", 1),
+            converter_target_ir.TargetAttr("source_slot_count", 2),
+            converter_target_ir.TargetAttr("result_component_count", 4),
+            converter_target_ir.TargetAttr("result_packet_width", 1),
+            converter_target_ir.TargetAttr("result_slot_count", 4),
+            converter_target_ir.TargetAttr("scalar_source_slots", (0, 1, 0, 1)),
+        ),
+    )
+
+    converter_emission._emit_layout_convert(state, op)
+
+    assert state.values[1] == ("a", "b", "a", "b")
 
 
 @triton.jit
