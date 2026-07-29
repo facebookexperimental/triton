@@ -8,6 +8,9 @@
 #   2. Resolves the OpenAI frontier (see "Frontier" below) and prints how.
 #   3. Enumerates candidate commits `frontier..head` for each source.
 #   4. Classifies each (fix / amd / plumbing / revert / bundle) + a presence hint.
+#      `fix` is matched before `amd` so an AMD/gfx *fix* isn't swallowed by the arch
+#      bucket; a commit that edits a watched TLX/WS test AND compiler code is promoted to
+#      `fix` and its subject gets a `[tlx-test]` flag (a fix can hide as a "Repro"; #2285).
 #   5. Writes a candidates file and opens an INTERACTIVE Claude session for the
 #      judgment + report (HEADLESS=1 for one-shot `claude -p`; NO_CLAUDE=1 to skip).
 #      Claude is launched with --secure-internet-mode: it keeps the internet
@@ -171,20 +174,32 @@ echo "    (override: --openai-frontier / --meta-frontier <sha>; both tracked in 
 
 # reads "sha|subject" on stdin, emits "present<TAB>class<TAB>sha<TAB>subject"
 classify() {
-  local relref="$1" h s fixpr present class
+  local relref="$1" h s fixpr present class files test_touch lib_touch tflag
   while IFS='|' read -r h s; do
     fixpr="$(printf '%s' "$s" | grep -oE '#[0-9]+' | head -1 | tr -d '#' || true)"
     present="new"
     if [[ -n "$fixpr" ]] && git log "$relref" --oneline | grep -qE "#${fixpr}\b"; then present="in-fork"; fi
+    # Files the commit touches -- used to spot fix-bearing "test/repro" commits (see #2285:
+    # a CoalesceAsyncCopy fallback shipped under a "Repro: ... fails to legalize" title).
+    files="$(git diff-tree --no-commit-id --name-only -r "$h" 2>/dev/null || true)"
+    test_touch="$(printf '%s\n' "$files" | grep -cE 'test/unit/language/(test_tlx.*|test_warp_specialization|test_tutorial09_warp_specialization)\.py' || true)"
+    lib_touch="$(printf '%s\n' "$files" | grep -cE '(^|/)lib/|/lib/Transforms/|TritonAMDGPUTransforms|TritonAMDGPUToLLVM|TritonGPUToLLVM' || true)"
     case "$s" in
       *Cherry-pick*BUNDLE*|*Cherry-pick*upstream*)                                  class="bundle";;
       *[Vv]ersion*|*pypi*|*PyPI*|*Release\ Only*|*Release-only*|*wheel*|*Wheels*|*timeout*|*DOCKER*|*examples/*|*Pin\ LLVM*|*toolchain-version*) class="plumbing";;
       *Revert*|*revert*)                                                            class="revert";;
+      # fix BEFORE amd: an AMD/gfx *fix* must classify as fix, not get swallowed by the arch
+      # bucket. Keywords include lowering/legalization failures (the #2285 failure mode).
+      *[Ff]ix*|*crash*|*SIGSEGV*|*assert*|*deadlock*|*race*|*hang*|*verify*|*correct*|*legaliz*|*[Uu]nrealized*|*lower*|*translate*) class="fix";;
       *AMD*|*MFMA*|*WMMA*|*gfx*|*GFX*)                                              class="amd";;
-      *[Ff]ix*|*crash*|*SIGSEGV*|*assert*|*deadlock*|*race*|*hang*|*verify*|*correct*) class="fix";;
       *)                                                                            class="other";;
     esac
-    printf '%s\t%s\t%s\t%s\n' "$present" "$class" "$h" "$s"
+    # A commit that edits a watched TLX/WS test AND compiler code is fix-bearing even when
+    # titled "Repro"/"Test" -- promote it, and always flag any watched-test touch so triage
+    # (and the test-diff cross-check in SKILL.md) never skips it as "just a test".
+    if [[ "$class" != "bundle" && "$test_touch" -gt 0 && "$lib_touch" -gt 0 ]]; then class="fix"; fi
+    tflag=""; [[ "$test_touch" -gt 0 ]] && tflag=" [tlx-test]"
+    printf '%s\t%s\t%s\t%s\n' "$present" "$class" "$h" "$s$tflag"
   done
 }
 
