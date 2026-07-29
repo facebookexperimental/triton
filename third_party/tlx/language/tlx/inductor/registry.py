@@ -1217,14 +1217,16 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
             and _sizevar_hint(sizevars, n * k, int32_max) < int32_max
         ):
             return
-        # 16-byte (128-bit transaction) alignment: the fp16/bf16 padded direct-to-LDS async_copy
-        # lowers to 128-bit loads, so each row start must be 16-byte aligned -- i.e. the row stride
-        # K*itemsize bytes must be a multiple of 16 (K % 8 == 0 for fp16/bf16). Without this guard
-        # an unaligned K reaches the template and fails at async_copy legalization (T280910119);
-        # decline up front so it falls back to aten cleanly. Also declines dynamic/unknown K.
+        # DUAL PATH by K alignment (the USE_ASYNC constexpr picks the template branch), mirroring
+        # the bmm template: (K*itemsize) % 16 == 0 (K % 8 for fp16/bf16) -> USE_ASYNC=1, the fast
+        # direct-to-LDS async_load warp-pipe (+ optional split-K). Otherwise (unaligned/odd/sliced/
+        # small or dynamic K, which the direct-to-LDS async_copy can't legalize on CDNA4) ->
+        # USE_ASYNC=0, the register-path fallback (tl.load->tl.dot, auto-pipelined, SPLIT_K=1) so
+        # those addmm shapes still get a Triton candidate instead of only aten (T280910119).
         itemsize = torch.finfo(kernel_inputs.dtype(kernel_inputs._mat1_idx)).bits // 8
-        if not sizevars.statically_known_true(sympy.Eq(sympy.Mod(k * itemsize, 16), 0)):
-            return
+        use_async = sizevars.statically_known_true(
+            sympy.Eq(sympy.Mod(k * itemsize, 16), 0)
+        )
         num_xcds = _amd_num_xcds()
         # split-K only helps grids that leave CUs idle. NUM_SMS is the device CU count
         # (get_num_sms() maps to multi_processor_count = CUs on ROCm; 256 on gfx950/MI350X);
@@ -1250,37 +1252,37 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
             # MFMA requires block_m/block_n be multiples of matrix_instr_nonkdim (16).
             if block_m % 16 != 0 or block_n % 16 != 0:
                 continue
-            # warp-pipeline correctness guard: K_ITERS > NUM_BUFFERS.
-            if not sizevars.statically_known_true(sympy.Gt(k, num_buffers * block_k)):
-                continue
-            # SPLIT_K=1 (plain data-parallel) is always offered. Add split candidates
-            # only for undersaturated grids, and only when each split still runs
-            # K_ITERS/SPLIT_K > NUM_BUFFERS iters (statically checked via k > NB*BK*SK)
-            # so the warp-pipeline prologue/drain stays well-formed.
-            tiles = ((m_hint + block_m - 1) // block_m) * (
-                (n_hint + block_n - 1) // block_n
-            )
-            split_ks = [1]
-            if allow_split_k and tiles < NUM_SMS:
-                for sk in (2, 4, 8):
-                    # Cap at ~4 waves. For memory-bound large-K the sweet spot is
-                    # often >1 wave (more concurrent HBM requests -> higher effective
-                    # bandwidth); the standalone sweep's winners filled to 300%
-                    # (e.g. 1024x6144x22272 at SK=4 -> 768 wg / 3 waves). A 2-wave cap
-                    # excluded exactly those, so autotune fell back to a slower SK=1.
-                    if tiles * sk > 4 * NUM_SMS:
-                        break
-                    # correctness: the balanced K-partition gives each split
-                    # base = K_ITERS // SK iters; require base > NUM_BUFFERS so every
-                    # split's warp-pipeline prologue/drain is well-formed. Sufficient
-                    # static condition on K: k > (NUM_BUFFERS + 1) * BLOCK_K * SK.
-                    if sizevars.statically_known_true(
-                        sympy.Gt(k, (num_buffers + 1) * block_k * sk)
-                    ):
-                        split_ks.append(sk)
+            if use_async:
+                # async warp-pipeline correctness guard: K_ITERS > NUM_BUFFERS (well-formed
+                # prologue/drain). SPLIT_K=1 always; add split candidates for undersaturated grids
+                # only when each split still runs K_ITERS/SPLIT_K > NUM_BUFFERS iters (k > NB*BK*SK).
+                if not sizevars.statically_known_true(sympy.Gt(k, num_buffers * block_k)):
+                    continue
+                tiles = ((m_hint + block_m - 1) // block_m) * (
+                    (n_hint + block_n - 1) // block_n
+                )
+                split_ks = [1]
+                if allow_split_k and tiles < NUM_SMS:
+                    for sk in (2, 4, 8):
+                        # Cap at ~4 waves (memory-bound large-K sweet spot is often >1 wave;
+                        # e.g. 1024x6144x22272 at SK=4 -> 768 wg / 3 waves).
+                        if tiles * sk > 4 * NUM_SMS:
+                            break
+                        # correctness: balanced K-partition gives each split base = K_ITERS // SK
+                        # iters; require base > NUM_BUFFERS (k > (NUM_BUFFERS+1)*BLOCK_K*SK).
+                        if sizevars.statically_known_true(
+                            sympy.Gt(k, (num_buffers + 1) * block_k * sk)
+                        ):
+                            split_ks.append(sk)
+            else:
+                # register path: no prologue -> handles ANY K (odd/sliced/small/dynamic); no split-K
+                # (its reduction path is only wired for the async warp-pipe), so SPLIT_K=1 only.
+                split_ks = [1]
             for split_k in split_ks:
                 triton_config = self.triton_config(
-                    1,  # num_stages=1: TLX is hand-pipelined; auto software-pipelining must be off
+                    # async is hand-pipelined (num_stages=1, auto software-pipelining off); the
+                    # register path relies on the auto-pipeliner (num_stages=3) to overlap tl.loads.
+                    1 if use_async else 3,
                     num_warps,
                     BLOCK_M=block_m,
                     BLOCK_N=block_n,
@@ -1289,6 +1291,7 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
                     NUM_BUFFERS=num_buffers,
                     NUM_XCDS=num_xcds,
                     SPLIT_K=split_k,
+                    USE_ASYNC=use_async,
                     matrix_instr_nonkdim=16,
                     waves_per_eu=0,
                     kpack=get_default_kpack(block_k),
