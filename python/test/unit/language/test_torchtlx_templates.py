@@ -258,6 +258,54 @@ class TestTLXTemplates(TestCase):
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_split_k_epilogue_not_fused(self):
+        """Split-K addmm with a fused pointwise epilogue (gelu), JIT and AOTI.
+
+        The split-K reduce kernel only sums fp32 partials + re-adds bias; it cannot
+        replay a fused epilogue. Fusing an epilogue onto a split-K choice leaves the
+        epilogue's output buffer used-before-defined -- UnboundLocalError under the
+        JIT Python wrapper, "use of undeclared identifier buf###" under the AOTI C++
+        wrapper -- and would silently drop the epilogue. The MultiTemplateBuffer
+        allow_epilogue_fusion gate disables epilogue fusion for split-K choices, so
+        the epilogue runs as a separate kernel: split-K stays for the GEMM and the
+        result is correct. Regression guard for both wrappers.
+        """
+        M, K, N = 256, 4096, 256
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm_gelu(bias, a, w):
+            return torch.nn.functional.gelu(torch.addmm(bias, a, w.t()))
+
+        c_expected = torch.nn.functional.gelu(
+            a.float() @ w.t().float() + bias.float()
+        ).to(dtype)
+
+        for cpp_wrapper in (False, True):
+            with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "cpp_wrapper": cpp_wrapper,
+            }):
+                c_actual, code = run_and_get_code(
+                    torch.compile(addmm_gelu), bias, a, w
+                )
+
+            # epilogue applied correctly (not dropped) and no use-before-def crash
+            torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
+            # split-K still used for the GEMM (gelu runs in a separate kernel)
+            self.assertIn("_reduce_k_kernel", "\n".join(code))
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_tlx_addmm_warppipe_unaligned_k(self, dtype: torch.dtype):
         """Unaligned K (K % BLOCK_K != 0) on the TLX warp-pipe addmm (gfx950).

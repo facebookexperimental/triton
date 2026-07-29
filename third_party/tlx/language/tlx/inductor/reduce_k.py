@@ -121,17 +121,16 @@ def emit_aoti_reduce_k_call(
     stride_bias_n: int = 1,
 ) -> None:
     """Register and launch the split-K reducer through the AOTI C++ wrapper."""
-    from torch._inductor import ir
     from torch.utils._sympy.functions import CeilDiv
 
     has_bias = bias_node is not None
     bias_arg = bias_node if has_bias else output_node
-    workspace_buffer = ir.Buffer(
-        name=workspace_arg.outer_name,
-        layout=workspace_arg.get_layout(),
-    )
+    # Pass the WorkspaceArg itself (not an ir.Buffer wrapper) so the kernel
+    # signature carries it as a WorkspaceArg: config_of then short-circuits it
+    # instead of resolving its layout via scheduler.name_to_buf (which has no
+    # entry for a self-allocated workspace -> KeyError under cpp_wrapper).
     kwargs = {
-        "workspace_ptr": workspace_buffer,
+        "workspace_ptr": workspace_arg,
         "c_ptr": output_node,
         "bias_ptr": bias_arg,
         "M": M,
