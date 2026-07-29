@@ -130,6 +130,7 @@ public:
   bool useAsyncMarks() const;
 
   bool supportsMultiCTALaunch() const;
+  unsigned getMaxMulticastMaskPopcount() const;
   bool supportsTDM() const;
   bool supportsClusterLoadBitWidth(int biwWidth) const;
 

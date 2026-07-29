@@ -470,7 +470,7 @@ struct DirectToLdsLoadConversionBase : public LoadStoreConversionBase {
     if (isLoad && targetInfo.supportsMultiCTALaunch()) {
       ctaMulticastMask = LLVM::AMD::emitCtaMulticastMask(
           rewriter, loc, targetInfo.getClusterCTAId(rewriter, loc),
-          globalLayout);
+          globalLayout, targetInfo.getMaxMulticastMaskPopcount());
     }
 
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, llShared,
@@ -591,7 +591,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
         Value clusterCTAId = targetInfo.getClusterCTAId(rewriter, loc);
         auto regLayout = triton::gpu::toLinearLayout(tensorTy);
         multicastMask = LLVM::AMD::emitCtaMulticastMask(
-            rewriter, loc, clusterCTAId, regLayout);
+            rewriter, loc, clusterCTAId, regLayout,
+            targetInfo.getMaxMulticastMaskPopcount());
       }
     }
 
@@ -1314,7 +1315,7 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     if (targetInfo.supportsMultiCTALaunch()) {
       multicastMask = LLVM::AMD::emitCtaMulticastMask(
           rewriter, loc, targetInfo.getClusterCTAId(rewriter, loc),
-          sharedLayout);
+          sharedLayout, targetInfo.getMaxMulticastMaskPopcount());
     }
 
     SmallVector<Value> desc =
@@ -1411,7 +1412,8 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
       }
       if (targetInfo.supportsMultiCTALaunch())
         member.multicastMask = LLVM::AMD::emitCtaMulticastMask(
-            rewriter, loc, ctaId, member.sharedLayout);
+            rewriter, loc, ctaId, member.sharedLayout,
+            targetInfo.getMaxMulticastMaskPopcount());
 
       member.sharedEncoding = encoding;
       member.shapePerCTA = llvm::to_vector(
@@ -1713,8 +1715,9 @@ struct AsyncTDMGatherOpConversion
     if (targetInfo.supportsMultiCTALaunch()) {
       // Use the sharedLayout to compute the multicast mask because the index
       // layout only describes rows and misses information about columns.
-      multicastMask =
-          LLVM::AMD::emitCtaMulticastMask(rewriter, loc, ctaId, sharedLayout);
+      multicastMask = LLVM::AMD::emitCtaMulticastMask(
+          rewriter, loc, ctaId, sharedLayout,
+          targetInfo.getMaxMulticastMaskPopcount());
     }
 
     if (failed(mlir::LLVM::AMD::emitTDMGatherScatter(
