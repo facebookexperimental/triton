@@ -161,9 +161,17 @@ struct ConvertLayoutOpSwizzlingConversion
         {{kOffset, loadCvt.getTotalOutDimSize() / nBlock}, {kBlock, nBlock}});
 
     // We never do cross-CTA writes by construction. We may do cross-CTA reads,
-    // but in that case we lower to ld.shared/st.shared
-    assert(storeCvt.isTrivialOver({kBlock}));
-    assert(loadCvt.isTrivialOver({kBlock}) || idxDst == 0);
+    // but in that case we lower to ld.shared/st.shared. A write is in-CTA when
+    // the block input either acts as the identity (each CTA writes its own
+    // smem) or is dropped entirely (broadcast-only CGA, block maps to zero).
+    // Only a block that targets a *different* CTA would be a cross-CTA write.
+    assert(storeCvt.isTrivialOver({kBlock}) ||
+           storeCvt.sublayoutIsZero({kBlock},
+                                    to_vector(storeCvt.getOutDimNames())));
+    assert(loadCvt.isTrivialOver({kBlock}) ||
+           loadCvt.sublayoutIsZero({kBlock},
+                                   to_vector(loadCvt.getOutDimNames())) ||
+           idxDst == 0);
 
     auto tileSize = storeCvt.getInDimSize(kReg);
 

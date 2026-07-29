@@ -899,19 +899,19 @@ lowerLdStShared(Location loc, MLIRContext *ctx, LinearLayout cvt,
                    warpId, rewriter, targetInfo, maybeMaxVecElems, emitLdSt,
                    barrierPtr);
 }
-SmallVector<Value> lowerLdSt(
-    Location loc, MLIRContext *ctx, LinearLayout cvt,
-    ArrayRef<Value> valsArray, // Input for store, output for load
-    Type llvmElemTy, ArrayRef<Value> smemBases,
-    ArrayRef<std::pair<unsigned, unsigned>> paddingShifts, Value affineOffset,
-    uint64_t maskSpanAffineOffset, Value laneId, Value warpId,
-    RewriterBase &rewriter, const TargetInfoBase &targetInfo,
-    std::optional<int> maybeMaxVecElems,
-    std::function<SmallVector<Value>(RewriterBase &, Location, ArrayRef<Value>,
-                                     Value, int, VectorType,
-                                     std::optional<Value>)>
-        lowerInst,
-    std::optional<Value> barrierPtr) {
+SmallVector<Value>
+lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
+          ArrayRef<Value> valsArray, // Input for store, output for load
+          Type llvmElemTy, ArrayRef<Value> smemBases,
+          ArrayRef<std::pair<unsigned, unsigned>> paddingShifts,
+          Value affineOffset, uint64_t maskSpanAffineOffset, Value laneId,
+          Value warpId, RewriterBase &rewriter,
+          const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems,
+          std::function<SmallVector<Value>(RewriterBase &, Location,
+                                           ArrayRef<Value>, Value, int,
+                                           VectorType, std::optional<Value>)>
+              lowerInst,
+          std::optional<Value> barrierPtr) {
   assert(!smemBases.empty() && "smemBases cannot be empty");
   auto vals = to_vector(valsArray);
   bool isStore = !vals.empty();
@@ -959,12 +959,17 @@ SmallVector<Value> lowerLdSt(
   auto quot = divideLeft(cvt, tile);
   assert(quot.has_value() && "cvt must be divisible by tile");
   LinearLayout reps = zerosLike(tile) * *quot;
-  assert(reps.hasInDim(kBlock));
-  LinearLayout addrLayout =
-      LinearLayout({{kLane, reps.getBases().lookup(kLane)},
-                    {kWarp, reps.getBases().lookup(kWarp)},
-                    {kBlock, reps.getBases().lookup(kBlock)}},
-                   reps.getOutDims(), false);
+  // Not every layout entering lowerLdSt carries a `block` input dimension
+  // (e.g. beta's warp-specialized shared-memory transfers). Only include the
+  // block bases when present; downstream cross-CTA handling below is already
+  // guarded on `reps.hasInDim(kBlock)` / `i8AddrLayout.hasInDim(kBlock)`.
+  SmallVector<std::pair<StringAttr, std::vector<std::vector<int32_t>>>>
+      addrBases = {{kLane, reps.getBases().lookup(kLane)},
+                   {kWarp, reps.getBases().lookup(kWarp)}};
+  if (reps.hasInDim(kBlock)) {
+    addrBases.push_back({kBlock, reps.getBases().lookup(kBlock)});
+  }
+  LinearLayout addrLayout(addrBases, reps.getOutDims(), false);
   auto [nAdditive, permStrides] =
       actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset);
   reps = permStrides.apply(reps);
@@ -986,9 +991,19 @@ SmallVector<Value> lowerLdSt(
   auto i8AddrLayout = i8Tile * addrLayout;
 
   Value blockId = b.i32_val(0);
+  // Cross-CTA addressing (threading a target CTA id into the shared-memory
+  // access) is only needed when the `block` input genuinely targets a CTA other
+  // than the current one. Two in-CTA cases must NOT trigger it:
+  //   * block maps to all zeros -> broadcast, block is ignored
+  //   (sublayoutIsZero)
+  //   * block acts as the identity -> each CTA targets its own smem
+  //     (isTrivialOver). Beta's layouts retain a `block` output dim, so a
+  //     block->block identity is non-zero and would otherwise be misread as
+  //     cross-CTA (e.g. broadcast-multicast async copies, num_ctas>1).
   bool useBlockId =
       reps.hasInDim(kBlock) &&
-      !reps.sublayoutIsZero({kBlock}, to_vector(reps.getOutDimNames()));
+      !reps.sublayoutIsZero({kBlock}, to_vector(reps.getOutDimNames())) &&
+      !reps.isTrivialOver({kBlock});
   if (useBlockId) {
     blockId = targetInfo.getClusterCTAId(rewriter, loc);
   }
