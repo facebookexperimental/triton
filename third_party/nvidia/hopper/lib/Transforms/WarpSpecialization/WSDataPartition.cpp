@@ -581,6 +581,29 @@ static bool getBackwardSliceToPartition(Value v,
                                          *srcDim))
           return false;
       }
+      // Also capture stores that write this accumulator (e.g. the pre-loop
+      // zero-init store of an in-place MMA accumulator) so they get sliced
+      // per-partition. Without this, a loop-carried accumulator whose init
+      // store is not sliced keeps a single full-tile token thread: the sliced
+      // MMAs then share the original full accumulator's loop-carried token,
+      // which keeps the full pre-slice TMEM tile alive (dead data, live token)
+      // and doubles TMEM. Slicing the store gives each partition its own
+      // init/token so the full tile becomes dead and is cleaned up.
+      for (Operation *user : tmemAllocOp.getResult().getUsers()) {
+        auto storeOp = dyn_cast<ttng::TMEMStoreOp>(user);
+        if (!storeOp || storeOp.getDst() != tmemAllocOp.getResult())
+          continue;
+        if (!partitionScheme.ops.insert(storeOp)) {
+          if (!isControlFlowOp(storeOp) &&
+              partitionScheme.opPartitionDims[storeOp] != currentDim)
+            return false;
+          continue;
+        }
+        partitionScheme.opPartitionDims[storeOp] = currentDim;
+        if (!getBackwardSliceToPartition(storeOp.getSrc(), partitionScheme,
+                                         currentDim))
+          return false;
+      }
     } else if (op->hasTrait<OpTrait::Elementwise>() ||
                isa<arith::ConstantOp, arith::ExtSIOp, arith::ExtUIOp,
                    arith::ExtFOp, BroadcastOp, ExpandDimsOp, MakeRangeOp,
