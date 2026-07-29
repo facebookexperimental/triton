@@ -228,6 +228,7 @@ def TT_LoadOp : TT_Op<"load", [
   SameLoadStoreOperandsAndResultShape,
   SameLoadStoreOperandsAndResultEncoding,
   AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
   DeclareOpInterfaceMethods<InferTypeOpInterface>,
   TypesMatchWith<"result matches ptr type", "ptr", "result", "getPointeeType($_self)">,
@@ -287,6 +288,7 @@ def TT_LoadOp : TT_Op<"load", [
 def TT_StoreOp : TT_Op<"store", [
   SameLoadStoreOperandsShape,
   SameLoadStoreOperandsEncoding,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   TypesMatchWith<"value type matches ptr type", "ptr", "value",
                  "getPointeeType($_self)">,
   TypesMatchWith<"mask type matches ptr type", "ptr", "mask",
@@ -330,6 +332,7 @@ def TT_StoreOp : TT_Op<"store", [
 def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [
   SameOperandsAndResultShape,
   SameOperandsAndResultEncoding,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   TypesMatchWith<"ptr type matches value type", "val", "ptr",
                  "getPointerTypeSameShape($_self)">,
   TypesMatchWith<"mask type matches value type",
@@ -361,6 +364,7 @@ def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [
       $atomic_rmw_op `,` $sem `,` $scope `,` $ptr `,` $val (`,` $mask^)?  attr-dict `:`
       functional-type(operands, $result)
     }];
+
 }
 
 def TT_AtomicCASOp : TT_Op<"atomic_cas", [

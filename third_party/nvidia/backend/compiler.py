@@ -37,6 +37,8 @@ def min_dot_size(target: GPUTarget):
             return (1, 1, 32)
         elif lhs_bitwidth == 64:
             return (1, 1, 4)
+        elif lhs_bitwidth == 32:
+            return (1, 1, 8)
         else:
             return (1, 1, 16)
 
@@ -198,11 +200,15 @@ class CUDAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     early_tma_store_lowering: Optional[None] = None
+    tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
     multicast: bool = False
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
     # TRITON_AUTO_TMA knob when left at the default in make_ttir.
     auto_tma: bool = False
+    # Emit device-side descriptors (make_tensor_descriptor + descriptor_load/store)
+    # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
+    auto_tma_device: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -740,16 +746,16 @@ class CUDABackend(BaseBackend):
         # so the backing TMEM allocation is materialized with the resolved
         # 2-CTA (TwoCTA_RHS) storage format. See make_ttgir.
 
-        if capability // 10 < 9:
-            passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         # Auto-TMA: rewrite eligible masked block loads into descriptor_load so
         # the standard sm_90+ TMA lowering turns them into real TMA copies. The
-        # per-config option (autotunable) takes precedence; otherwise fall back
-        # to the global TRITON_AUTO_TMA knob.
+        # per-config option (autotunable) takes precedence; otherwise the global
+        # TRITON_AUTO_TMA knob. (Block pointers are already tensor descriptors in
+        # this dialect, so there is no separate rewrite_tensor_pointer pass.)
         if (opt.auto_tma or knobs.nvidia.auto_tma) and capability // 10 >= 9:
-            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm)
+            nvidia.passes.ttnvgpuir.add_promote_load_to_tma(pm, opt.auto_tma_device or knobs.nvidia.auto_tma_device)
+        if capability // 10 < 9:
+            passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
-        passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
@@ -846,6 +852,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             if knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            # Support simplify trip while after data partitioning to
+            # enable using this loop to data partition.
+            passes.ttir.add_simplify_single_trip_while(pm)
+            if knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
                 passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             nvidia.passes.hopper.add_tma_store_lowering(pm)
@@ -854,6 +864,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
             smem_budget = _max_shared_mem_for_capability(capability)
             generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+            tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
             nvidia.passes.hopper.add_hopper_warpspec(
                 pm,
                 opt.num_stages,
@@ -863,6 +874,7 @@ class CUDABackend(BaseBackend):
                 smem_budget,
                 generate_subtiled,
                 knobs.nvidia.ws_tile_prefetch_depth,
+                tma_store_pipelining,
             )
             if not knobs.nvidia.use_meta_ws:
                 passes.ttgpuir.add_assign_latencies(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
@@ -899,6 +911,7 @@ class CUDABackend(BaseBackend):
                 # the picked one (TRITON_LIST_SCHEDULE_PICK, default best).
                 nvidia.passes.hopper.add_list_schedule(pm)
             nvidia.passes.hopper.add_data_partitioning(pm, 1)
+            passes.ttir.add_simplify_single_trip_while(pm)
             # The modulo / LLM / list scheduler above already produced the full
             # loop schedule (loop.stage / loop.cluster). Re-running
             # assign_latencies + schedule_loops here would recompute and OVERRIDE
@@ -928,6 +941,7 @@ class CUDABackend(BaseBackend):
                 nvidia.passes.hopper.add_partition_scheduling_meta(pm)
                 smem_budget = _max_shared_mem_for_capability(capability)
                 generate_subtiled = (opt.generate_subtiled_region or knobs.nvidia.generate_subtiled_region)
+                tma_store_pipelining = True if opt.tma_store_pipelining is None else opt.tma_store_pipelining
                 nvidia.passes.hopper.add_hopper_warpspec(
                     pm,
                     opt.num_stages,
@@ -937,6 +951,7 @@ class CUDABackend(BaseBackend):
                     smem_budget,
                     generate_subtiled,
                     knobs.nvidia.ws_tile_prefetch_depth,
+                    tma_store_pipelining,
                 )
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
@@ -1002,6 +1017,19 @@ class CUDABackend(BaseBackend):
         # would otherwise be free to rewrite the unwrapped pinned layout). Placing
         # it here keeps the pin an anchor through the whole pipeline.
         tlx.tlx_passes.add_tlx_finalize_user_layouts(pm)
+
+        # M2 (bitequiv): reduction-layout optimization for inner_tree reduces. Placed
+        # after remove-layout-conversions so its layout choice is not reverted by a later
+        # conversion pass. Gated off by default (TRITON_SET_RED_ORDERING_LAYOUTS=1 to turn
+        # on in-pipeline); the bitequiv eval hook injects it via --opt-passes for a clean
+        # baseline-vs-optimized A/B. Tunables are pass Options driven by knobs.nvidia.*.
+        if knobs.nvidia.set_red_ordering_layouts:
+            passes.ttgpuir.add_optimize_reduction_layout(
+                pm,
+                knobs.nvidia.red_ordering_strategy,
+                knobs.nvidia.red_ordering_min_underparallel,
+                knobs.nvidia.red_ordering_max_elems_per_thread,
+            )
 
         # Print final TTGIR layouts for tlx.dump_layout diagnostics, then erase
         # the ops. Runs last so the reported layouts reflect all optimizations.
@@ -1091,6 +1119,7 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
+        nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
@@ -1151,8 +1180,13 @@ class CUDABackend(BaseBackend):
             raise RuntimeError(
                 "Address Sanitizer Error: Address sanitizer is currently only supported on the AMD backend")
         llvm_mod = llvm.to_module(mod, context)
-        proc = sm_arch_from_capability(capability)
-        features = get_features(options, self.target.arch)
+        if capability == 107:
+            cap_llvm = 100
+        else:
+            cap_llvm = capability
+
+        proc = sm_arch_from_capability(cap_llvm)
+        features = get_features(options, cap_llvm)
         triple = "nvptx64-nvidia-cuda"
         nvidia.set_short_ptr()
         llvm.attach_datalayout(llvm_mod, triple, proc, features)
@@ -1185,8 +1219,14 @@ class CUDABackend(BaseBackend):
         ptx_version = get_ptx_version_from_options(opt, self.target.arch)
 
         triple = "nvptx64-nvidia-cuda"
-        proc = sm_arch_from_capability(capability)
-        features = get_features(opt, self.target.arch)
+
+        if capability == 107:
+            cap_llvm = 100
+        else:
+            cap_llvm = capability
+
+        proc = sm_arch_from_capability(cap_llvm)
+        features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False)
         # Find kernel names (there should only be one)

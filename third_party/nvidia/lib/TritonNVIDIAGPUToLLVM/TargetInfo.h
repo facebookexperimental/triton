@@ -8,6 +8,8 @@ namespace mlir::triton::NVIDIA {
 
 class TargetInfo : public mlir::triton::TargetInfoBase {
 public:
+  explicit TargetInfo(int computeCapability)
+      : TargetInfo(computeCapability, /*ptxVersion=*/0) {}
   TargetInfo(int computeCapability, int ptxVersion)
       : targetFeatures(computeCapability), ptxVersion(ptxVersion) {}
 
@@ -20,6 +22,7 @@ public:
 
   void barrier(Location loc, RewriterBase &rewriter,
                triton::gpu::AddrSpace targets) const override;
+  void clusterBarrier(Location loc, RewriterBase &rewriter) const override;
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
@@ -44,6 +47,12 @@ public:
   }
   bool supportLdStMatrixB8() const override {
     return targetFeatures.supportLdStMatrixB8();
+  }
+  bool supportBitwidth16Elementwise() const override {
+    return targetFeatures.supportBitwidth16Elementwise();
+  }
+  bool supportBitwidth32Elementwise() const override {
+    return targetFeatures.supportBitwidth32Elementwise();
   }
 
   Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
@@ -87,6 +96,9 @@ public:
   int getPtxVersion() const { return ptxVersion; }
   int getComputeCapability() const {
     return targetFeatures.getComputeCapability();
+  }
+  const triton::nvidia_gpu::TargetFeatures &getTargetFeatures() const {
+    return targetFeatures;
   }
 
   bool isCuda() const override { return true; }

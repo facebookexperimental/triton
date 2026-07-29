@@ -23,8 +23,15 @@ import torch
 import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
-from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+
+# Local definition (matches case2/case4) instead of importing from
+# tlx.warp_spec, so the kernel is self-contained and doesn't depend on that
+# module exporting the helper.
+@triton.jit
+def get_bufidx_phase(i, n: tl.constexpr):
+    return i % n, (i // n) & 1
 
 # Register split (mirrors CUTLASS setmaxnreg 48 / 256): lean load+MMA warps
 # donate registers so the promotion warpgroup can run heavy fp32 math.

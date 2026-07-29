@@ -673,6 +673,11 @@ scf::ForOp createNewLoop(scf::ForOp forOp, scf::ForOp &parentForOp,
 void collectRegionsWithChannels(const SmallVector<Channel *> &channels,
                                 DenseSet<Operation *> &regionsWithChannels) {
   for (auto *channel : channels) {
+    // A defunct channel's alloc was folded into a reuse representative and
+    // erased; its allocOp/endpoints are dangling, so skip it (the
+    // representative already contributes its regions).
+    if (channel->defunct)
+      continue;
     if (channel->channelKind == DataChannelKind::TMEMAlloc) {
       ttng::TmemAllocChannel *tmemChannel =
           static_cast<ttng::TmemAllocChannel *>(channel);

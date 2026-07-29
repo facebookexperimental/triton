@@ -130,7 +130,7 @@ public:
       if (op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName) ||
           op->getAttrOfType<DenseI32ArrayAttr>(
               triton::gpu::kPartitionAttrName) ||
-          (isa<scf::ForOp>(op) &&
+          (isa<scf::ForOp, scf::WhileOp>(op) &&
            op->hasAttr(mlir::triton::kWarpSpecializeAttrName))) {
         enabled = true;
         return WalkResult::interrupt();
@@ -227,11 +227,13 @@ public:
       dumpAfter(moduleOp, "doGenerateSubtiledRegion");
     }
 
-    doAnnotateTMAStoreWaits(funcOp);
-    dumpAfter(moduleOp, "doAnnotateTMAStoreWaits");
+    if (tmaStorePipelining) {
+      doAnnotateTMAStoreWaits(funcOp);
+      dumpAfter(moduleOp, "doAnnotateTMAStoreWaits");
 
-    doValidateTMAStoreAnnotations(funcOp);
-    dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
+      doValidateTMAStoreAnnotations(funcOp);
+      dumpAfter(moduleOp, "doValidateTMAStoreAnnotations");
+    }
 
     doCodePartition(funcOp, numStages);
     dumpAfter(moduleOp, "doCodePartition");
@@ -261,8 +263,10 @@ public:
     }
     dumpAfter(moduleOp, "cleanupWarpSpecializedLoops");
 
-    doTMAStoreWaitReorder(funcOp);
-    dumpAfter(moduleOp, "doTMAStoreWaitReorder");
+    if (tmaStorePipelining) {
+      doTMAStoreWaitReorder(funcOp);
+      dumpAfter(moduleOp, "doTMAStoreWaitReorder");
+    }
   }
 
   void runOnOperation() override {

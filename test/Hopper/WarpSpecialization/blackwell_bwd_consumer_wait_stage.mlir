@@ -7,7 +7,9 @@
 // CHECK: nvws.consumer_wait %dsT_{{[0-9]+}}
 // CHECK-SAME: loop.stage = 1
 // The dQ MMA (dsT transposed × k) must follow at stage 1.
-// CHECK: ttng.tc_gen5_mma %dq_{{[0-9]+}}, %k_{{[0-9]+}}, %dq_{{[0-9]+}}
+// The accumulator is printed with an explicit indexed memdesc operand on
+// current TTGIR, so only constrain the dQ/K operands here.
+// CHECK: ttng.tc_gen5_mma %dq_{{[0-9]+}}, %k_{{[0-9]+}},
 // CHECK-SAME: loop.stage = 1
 // The dK MMA (dsT × q) must follow at stage 1.
 // CHECK: ttng.tc_gen5_mma %dsT_{{[0-9]+}}, %q_{{[0-9]+}}, %dk_{{[0-9]+}}

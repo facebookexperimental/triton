@@ -18,6 +18,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
 
 #include "Allocation.h"
 #include "PatternTritonGPUOpToLLVM.h"
@@ -99,6 +100,11 @@ struct ConvertTritonGPUToLLVM
     ModuleAllocation allocation(
         mod, mlir::triton::nvidia_gpu::getNvidiaAllocationAnalysisScratchSizeFn(
                  targetInfo));
+    mlir::triton::nvidia_gpu::runClusterBarrierInsertion(allocation,
+                                                         computeCapability);
+    if (failed(mlir::triton::nvidia_gpu::runCrossCTAMBarrierInitSyncInsertion(
+            allocation, computeCapability)))
+      return signalPassFailure();
     ModuleMembarAnalysis membarPass(&allocation, canSkipBarSync);
     membarPass.run();
     if (failed(maybeInsertClusterSync(mod))) {
@@ -180,12 +186,13 @@ struct ConvertTritonGPUToLLVM
         typeConverter, patterns, benefit);
     mlir::triton::populateMakeRangeOpToLLVMPattern(typeConverter, targetInfo,
                                                    patterns, benefit);
-    mlir::triton::NVIDIA::populateTCGen5MMAOpToLLVMPattern(typeConverter,
-                                                           patterns, benefit);
+    mlir::triton::NVIDIA::populateTCGen5MMAOpToLLVMPattern(
+        typeConverter, patterns, benefit, targetInfo);
     mlir::triton::NVIDIA::populateFp4ToFpToLLVMPatterns(typeConverter, patterns,
                                                         benefit);
     mlir::triton::populateInstrumentationToLLVMPatterns(typeConverter, patterns,
                                                         targetInfo);
+    mlir::triton::populateFpSanToLLVMPatterns(typeConverter, patterns);
     mlir::triton::populateGSanToLLVMPatterns(typeConverter, patterns,
                                              axisInfoAnalysis, targetInfo);
 
@@ -415,8 +422,14 @@ private:
     }
 
     bool hasRemoteBar = false;
-    // Find if we have a remote bar
+    bool hasMulticastArrive = false;
+    // Find if we have a remote bar or multicast arrive.
     mod.walk([&](Operation *op) {
+      if (auto arrive = dyn_cast<ttng::ArriveBarrierOp>(op);
+          arrive && arrive.isMulticast()) {
+        hasMulticastArrive = true;
+        return WalkResult::interrupt();
+      }
       SetVector<Operation *> ops;
       auto remoteBar = getRemoteBarrier(op);
       if (remoteBar.has_value()) {
@@ -425,10 +438,10 @@ private:
       }
       return WalkResult::advance();
     });
-
-    // If we have remote mbar/SMEM access, or if we have 2cta TMEM allocation,
-    // we need a cluster sync after mbar init and before TMEM alloc
-    bool shouldInsert = hasRemoteBar || tlx::tlxEnablePairedMMA(mod);
+    // If we have remote mbar/SMEM access, a multicast arrive, or 2cta TMEM
+    // allocation, we need a cluster sync after mbar init and before use.
+    bool shouldInsert = hasRemoteBar || hasMulticastArrive ||
+                        tlx::tlxEnablePairedMMA(mod);
     if (!shouldInsert) {
       return success();
     }
@@ -506,6 +519,7 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
 }
 
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,
+                            bool /*beforeIsRead*/, bool /*afterIsRead*/,
                             Allocation *allocation) {
   // These mbarrier ops are single threaded, so are always synchronized wrt.
   // each other.

@@ -82,7 +82,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %53 = arith.truncf %50 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
       %result_15 = ttng.tmem_alloc %53 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>
       // dv MMA: A from tmem_alloc (not pipelineable), B from descriptor_load
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32}
+      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 0 : i32}
       %54 = ttng.tc_gen5_mma %result_15, %52, %result_1[%arg47], %arg45, %true : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %55 = tt.addptr %25, %42 : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2>
       %56 = tt.load %55 : tensor<128x!tt.ptr<f32>, #blocked2>
@@ -99,7 +99,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       %64 = arith.truncf %63 : tensor<128x128xf32, #blocked> to tensor<128x128xbf16, #blocked>
       %result_18 = ttng.tmem_alloc %64 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>
       // dk MMA: A from tmem_alloc (not pipelineable), B from descriptor_load
-      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 1 : i32}
+      // CHECK: ttng.tc_gen5_mma {{.*}} {loop.cluster = 0 : i32, loop.stage = 1 : i32, tt.self_latency = 0 : i32}
       %65 = ttng.tc_gen5_mma %result_18, %39, %result_5[%arg49], %arg45, %true : !ttg.memdesc<128x128xbf16, #tmem1, #ttng.tensor_memory>, !ttg.memdesc<128x128xbf16, #shared, #smem>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
       %66 = ttg.local_alloc %64 : (tensor<128x128xbf16, #blocked>) -> !ttg.memdesc<128x128xbf16, #shared2, #smem>
       %67 = ttg.memdesc_trans %66 {order = array<i32: 1, 0>} : !ttg.memdesc<128x128xbf16, #shared2, #smem> -> !ttg.memdesc<128x128xbf16, #shared, #smem>

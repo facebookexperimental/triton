@@ -38,7 +38,10 @@ def NVGPUWarpSpecialization : Pass<"nvgpu-warp-specialization", "mlir::ModuleOp"
     Option<"tilePrefetchDepth", "tile-prefetch-depth",
              "int32_t", /*default*/"1",
              "Number of buffers for the dynamic-persistent tile-id broadcast "
-             "channel (cross-partition run-once atomic support)">
+             "channel (cross-partition run-once atomic support)">,
+    Option<"tmaStorePipelining", "tma-store-pipelining",
+             "bool", /*default*/"true",
+             "Enable TMA store wait annotation, validation, and reordering">
     ];
 }
 
@@ -101,6 +104,28 @@ def NVGPUTestWSTaskIdPropagate : Pass<"nvgpu-test-taskid-propagate", "mlir::Modu
     Option<"numWarpGroups", "num-warp-groups",
            "int32_t", /*default*/"0",
            "number of warp groups for warp specialization">
+  ];
+}
+
+def NVGPUTestWSAtomicBroadcast : Pass<"nvgpu-test-ws-atomic-broadcast", "mlir::ModuleOp"> {
+  let summary = "test warp specialization dynamic-tile atomic/CLC broadcast";
+
+  let description = [{
+    Runs the cross-partition run-once broadcast transform
+    (`doDynamicTileBroadcast`) in isolation for testing. It rewrites a
+    loop-carried scalar `tt.atomic_rmw` tile counter (or CLC fetch) so the claim
+    runs once in the owner/producer partition and the result is broadcast to
+    every partition through a shared-memory slot. Intended to be run after
+    `nvgpu-partition-scheduling-meta` and `nvgpu-test-taskid-propagate`, which
+    supply the op-level `async_task_id` metadata this transform consumes.
+  }];
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"tilePrefetchDepth", "tile-prefetch-depth",
+           "int32_t", /*default*/"1",
+           "broadcast channel depth (SMEM slot multi-buffering)">
   ];
 }
 

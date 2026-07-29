@@ -45,5 +45,12 @@ TEST_F(LayoutUtilsTest, SquareSublayoutIsIdentity) {
   EXPECT_TRUE(squareSublayoutIsIdentity(l3, {S("in1"), S("in2")}));
 }
 
+TEST_F(LayoutUtilsTest, IdentityStandardNDModular) {
+  auto actual = identityStandardND(S("in"), {4, 6}, {1, 0});
+  auto expected = LinearLayout::modularIdentity1D(6, S("in"), S("dim1")) *
+                  LinearLayout::identity1D(4, S("in"), S("dim0"));
+  EXPECT_EQ(actual, expected);
+}
+
 } // namespace
 } // namespace mlir::triton

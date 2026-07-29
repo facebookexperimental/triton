@@ -1,4 +1,5 @@
-// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm=compute-capability=100 -cse | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=87' -cse | FileCheck %s
+// RUN: triton-opt %s -split-input-file --convert-triton-gpu-to-llvm='compute-capability=100 ptx-version=88' -cse | FileCheck %s --check-prefix=PTX88
 
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
@@ -332,6 +333,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: %[[TRUE:.+]] = llvm.mlir.constant(true) : i1
   // CHECK: %[[DESC1:.+]] = llvm.mlir.constant(681579536 : i32) : i32
   // CHECK: @$7 tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [ $0 + 0 ], $1, $2, $3, [ $4 + 0 ], [ $5 + 0 ], $6;", "r,l,l,r,r,r,b,b" %[[TMEM_BASE]], %{{.+}}, %{{.+}}, %[[DESC1]], %{{.+}}, %{{.+}}, %[[TRUE]]
+  // PTX88-LABEL: @tc_gen5_mma_block_scale
+  // PTX88: tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.block32
   tt.func @tc_gen5_mma_block_scale(%a: !ttg.memdesc<128x64xf8E4M3FN, #shared, #ttg.shared_memory>,
                        %b: !ttg.memdesc<32x128xi8, #shared1, #ttg.shared_memory>,
                        %c: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
@@ -540,6 +543,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: %[[DESC0:.+]] = llvm.mlir.constant(138413184 : i32) : i32
   // CHECK: @$7 tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X [ $0 + 0 ], $1, $2, $3, [ $4 + 0 ], [ $5 + 0 ], $6;", "r,l,l,r,r,r,b,b" %[[TMEM_BASE]], %{{.+}}, %{{.+}}, %[[DESC0]]
   // CHECK: @$7 tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X [ $0 + 0 ], $1, $2, $3, [ $4 + 0 ], [ $5 + 0 ], $6;", "r,l,l,r,r,r,b,b" %[[TMEM_BASE]], %{{.+}}, %{{.+}}, %[[DESC0]]
+  // PTX88-LABEL: @tc_gen5_mma_block_scale_nvfp4
+  // PTX88: tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16
   tt.func @tc_gen5_mma_block_scale_nvfp4(%a: !ttg.memdesc<128x64xi8, #shared, #ttg.shared_memory>,
                        %b: !ttg.memdesc<64x256xi8, #shared1, #ttg.shared_memory>,
                        %c: !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>,
@@ -574,6 +579,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: @$7 tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X [ $0 + 0 ], $1, $2, $3, [ $4 + 0 ], [ $5 + 0 ], $6;", "r,l,l,r,r,r,b,b" %[[TMEM_BASE]], %{{.+}}, %{{.+}}, %[[DESC0]]
   // CHECK: %[[DESC1:.+]] = llvm.mlir.constant(1220543648 : i32) : i32
   // CHECK: @$7 tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X [ $0 + 0 ], $1, $2, $3, [ $4 + 0 ], [ $5 + 0 ], $6;", "r,l,l,r,r,r,b,b" %[[TMEM_BASE]], %{{.+}}, %{{.+}}, %[[DESC1]]
+  // PTX88-LABEL: @tc_gen5_mma_block_scale_mxfp4
+  // PTX88: tcgen05.mma.cta_group::1.kind::mxf4.block_scale.block32
   tt.func @tc_gen5_mma_block_scale_mxfp4(%a: !ttg.memdesc<128x64xi8, #shared, #ttg.shared_memory>,
                        %b: !ttg.memdesc<64x256xi8, #shared1, #ttg.shared_memory>,
                        %c: !ttg.memdesc<128x256xf32, #tmem, #ttng.tensor_memory, mutable>,
@@ -850,10 +857,10 @@ tt.func @tc_gen5_commit_elect_cse(%bar0: !ttg.memdesc<1xi64, #shared, #smem, mut
 module attributes {"ttg.num-warps" = 4 : i32} {
 
 // CHECK-LABEL: @reinterpret
-tt.func private @reinterpret(%arg0: !ttg.memdesc<128x32xf32, #tmem_f32, #ttng.tensor_memory>) -> !ttg.memdesc<256x32xf16, #tmem_f16, #ttng.tensor_memory> {
-  %0 = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x32xf32, #tmem_f32, #ttng.tensor_memory> -> !ttg.memdesc<256x32xf16, #tmem_f16, #ttng.tensor_memory>
+tt.func private @reinterpret(%arg0: !ttg.memdesc<128x32xf32, #tmem_f32, #ttng.tensor_memory>) -> !ttg.memdesc<128x32xf16, #tmem_f16, #ttng.tensor_memory> {
+  %0 = ttg.memdesc_reinterpret %arg0 : !ttg.memdesc<128x32xf32, #tmem_f32, #ttng.tensor_memory> -> !ttg.memdesc<128x32xf16, #tmem_f16, #ttng.tensor_memory>
   // CHECK-NEXT: return %arg0
-  tt.return %0 : !ttg.memdesc<256x32xf16, #tmem_f16, #ttng.tensor_memory>
+  tt.return %0 : !ttg.memdesc<128x32xf16, #tmem_f16, #ttng.tensor_memory>
 }
 
 }
@@ -1094,6 +1101,22 @@ tt.func private @load_store_16x32bx1_broadcast(%arg0: !ttg.memdesc<16x8xi8, #tme
   %true = arith.constant true
   // CHECK: @$0 tcgen05.st.sync.aligned.16x32bx2.x1.b32 [$1 + 0], 1, {$2}
   ttng.tmem_store %arg1, %arg0, %true : tensor<16x8xi8, #linear> -> !ttg.memdesc<16x8xi8, #tmem_scales, #ttng.tensor_memory, mutable>
+  tt.return
+}
+}
+
+// -----
+
+#linear = #ttg.linear<{register = [[0, 1]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]], warp = [[0, 0], [0, 0]], block = []}>
+#tmem_scales = #ttng.tensor_memory_scales_encoding<>
+
+module attributes {"ttg.num-warps" = 4 : i32} {
+// CHECK-LABEL: @load_store_16x2_scales_uses_padded_second_half
+tt.func private @load_store_16x2_scales_uses_padded_second_half(%arg0: !ttg.memdesc<16x2xi8, #tmem_scales, #ttng.tensor_memory, mutable>, %arg1: tensor<16x2xi8, #linear>) {
+  %true = arith.constant true
+  // CHECK: @$0 tcgen05.st.sync.aligned.16x32bx2.x1.unpack::16b.b32 [$1 + 0], 1, {$2}
+  // CHECK: llvm.return
+  ttng.tmem_store %arg1, %arg0, %true : tensor<16x2xi8, #linear> -> !ttg.memdesc<16x2xi8, #tmem_scales, #ttng.tensor_memory, mutable>
   tt.return
 }
 }
@@ -1353,6 +1376,55 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     %cst_0 = arith.constant dense<0.000000e+00> : tensor<128x256xf32, #blocked_256N_4w_nan>
     %0 = ttng.tmem_alloc %cst_0 {tensor_memory_col_offset = 0 : i32, tensor_memory_row_offset = 0 : i32} : (tensor<128x256xf32, #blocked_256N_4w_nan>) -> !ttg.memdesc<128x256xf32, #tmem_256N_nan, #ttng.tensor_memory, mutable>
     %result, %red = ttng.tmem_load %0 {redOp = #ttng.redOp<max>, NaN = true} : !ttg.memdesc<128x256xf32, #tmem_256N_nan, #ttng.tensor_memory, mutable> -> tensor<128x256xf32, #blocked_256N_4w_nan>, tensor<128xf32, #blocked_red_256N_4w_nan>
+    tt.return
+  }
+}
+
+// -----
+
+// Regression test for "Shorten live range of SMEM operand of MMA".
+//
+// The MMA SMEM operand base address is computed with a *side-effecting* inline
+// PTX `add.s32` instead of a plain `llvm.add`. The side effect is what stops
+// LLVM from CSE-ing the address across MMAs: two MMAs reading the same SMEM
+// operand would otherwise share one address computation, giving that value a
+// very long live range and spilling registers in MMA-heavy kernels.
+//
+// The two tc_gen5_mma ops below share the same A and B SMEM operands at the same
+// offsets, so their per-operand address computations are structurally identical
+// -- exactly what CSE folds (this file's RUN line runs -cse). Each MMA still
+// emits its own side-effecting add.s32 for A and B, so all FOUR survive: a plain
+// (non-side-effecting) add would let CSE collapse them to 2.
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], instrShape = [16, 256, 32]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 64, colStride = 1>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
+  // CHECK-LABEL: @two_mma_shared_smem_operand_no_cse
+  // Two MMAs, one side-effecting add.s32 per SMEM operand each -> 4 total, none
+  // folded by CSE despite the shared operands.
+  // CHECK-COUNT-4: llvm.inline_asm has_side_effects {{.*}}"add.s32 $0, $1, $2;", "=r,r,r"
+  // CHECK-NOT: "add.s32 $0, $1, $2;"
+  tt.func @two_mma_shared_smem_operand_no_cse(%a: !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
+                       %b: !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
+                       %c: !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+                       %useAcc: i1,
+                       %pred: i1,
+                       %barrier: !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>,
+                       %barrierPred: i1) {
+    // Both MMAs read the same %a and %b, so the operand-descriptor addresses are
+    // identical CSE candidates; the side effect keeps them separate.
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
+    ttng.tc_gen5_mma %a, %b, %c, %useAcc, %pred, %barrier[%barrierPred] {is_async} :
+       !ttg.memdesc<64x16xf16, #shared, #ttg.shared_memory>,
+       !ttg.memdesc<16x64xf16, #shared1, #ttg.shared_memory>,
+       !ttg.memdesc<64x64xf32, #tmem, #ttng.tensor_memory, mutable>,
+       !ttg.memdesc<1xi64, #shared2, #ttg.shared_memory>
     tt.return
   }
 }

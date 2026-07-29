@@ -163,6 +163,29 @@ TEST_F(LinearLayoutConversionsTest, SimpleBlocked) {
                           {S("dim0")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, NpotFmaDotUsesModularIdentity) {
+  auto parent =
+      blocked({1, 1}, {1, 32}, {1, 4}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto encoding = dot(parent, /*idx=*/0, /*kWidth=*/0);
+  auto layout = toLinearLayout({16, 96}, encoding);
+  auto pow2Cover = toLinearLayout({16, 128}, encoding);
+  auto expected =
+      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 16}, {S("dim1"), 96}},
+                   /*requireSurjective=*/true);
+  EXPECT_EQ(layout, expected);
+}
+
+TEST_F(LinearLayoutConversionsTest, NpotMfmaUsesModularIdentity) {
+  auto encoding = mfma(/*version=*/4, /*warps=*/{4, 1},
+                       /*instrShape=*/{32, 32, 16}, /*isTransposed=*/false);
+  auto layout = toLinearLayout({128, 96}, encoding);
+  auto pow2Cover = toLinearLayout({128, 128}, encoding);
+  auto expected =
+      LinearLayout(pow2Cover.getBases(), {{S("dim0"), 128}, {S("dim1"), 96}},
+                   /*requireSurjective=*/true);
+  EXPECT_EQ(layout, expected);
+}
+
 TEST_F(LinearLayoutConversionsTest, CTADuplication) {
   auto layout = toLinearLayout(
       {32}, blocked({1}, {4}, {4}, /*cpg=*/{4}, /*cSplit=*/{2}, {0}, {0}));
@@ -2793,6 +2816,19 @@ TEST_F(LinearLayoutConversionsTest, SliceOfBlocked) {
                          {S("dim0")}));
 }
 
+TEST_F(LinearLayoutConversionsTest, SliceOfBlockedPreservesNpotSize) {
+  auto parent = blocked({1, 4}, {4, 8}, {4, 1}, {1, 1}, {1, 1}, {1, 0}, {1, 0});
+  auto layout = toLinearLayout({48}, slice(parent, 0));
+
+  EXPECT_EQ(layout,
+            LinearLayout({{S("register"), {{1}, {2}, {32}}},
+                          {S("lane"), {{4}, {8}, {16}, {0}, {0}}},
+                          {S("warp"), {{0}, {0}}},
+                          {S("block"), {}}},
+                         {{S("dim0"), 48}}, /*requireSurjective=*/true));
+  EXPECT_TRUE(layout.isModular());
+}
+
 TEST_F(LinearLayoutConversionsTest, SliceWithShape1) {
   auto parent = blocked({1, 4}, {8, 4}, {2, 2}, {1, 1}, {1, 1}, {0, 1}, {1, 0});
   EXPECT_EQ(toLinearLayout({1}, slice(parent, 0)),
@@ -3330,6 +3366,32 @@ TEST_F(LinearLayoutConversionsTest, TensorMemory_CTASplit) {
   EXPECT_EQ(toLinearLayout({128, 128}, enc),
             toLinearLayout({128, 64}, enc1) *
                 LinearLayout::identity1D(2, kBlock, d1));
+}
+
+TEST_F(LinearLayoutConversionsTest, TensorMemoryScales_BlockRepOrder) {
+  auto d0 = S("dim0");
+  auto d1 = S("dim1");
+  auto kBlock = S("block");
+  auto kRow = S("row");
+  auto kCol = S("col");
+  auto cgaLayout = CGAEncodingAttr::get1CTALayout(&ctx, /*rank=*/2);
+  auto encKThenMn = TensorMemoryScalesEncodingAttr::get(
+      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::K_THEN_MN);
+  auto encMnThenK = TensorMemoryScalesEncodingAttr::get(
+      &ctx, cgaLayout, nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K);
+
+  LinearLayout expectedKThenMn = LinearLayout::identity1D(32, kRow, d0) *
+                                 LinearLayout::zeros1D(4, kRow, d0) *
+                                 LinearLayout::identity1D(4, kCol, d1) *
+                                 LinearLayout::identity1D(2, kCol, d0) *
+                                 LinearLayout::identity1D(2, kCol, d0) *
+                                 LinearLayout::identity1D(2, kCol, d1) *
+                                 LinearLayout::identity1D(2, kCol, d0) *
+                                 LinearLayout::identity1D(1, kBlock, d0);
+  EXPECT_EQ(toLinearLayout({256, 8}, encKThenMn), expectedKThenMn);
+
+  EXPECT_NE(toLinearLayout({256, 8}, encKThenMn),
+            toLinearLayout({256, 8}, encMnThenK));
 }
 
 // Tests for SM120 DotScaled Scale Layout

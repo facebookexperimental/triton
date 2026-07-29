@@ -286,6 +286,7 @@ def BufferLoadOp : TT_AMDGPU_Op<"buffer_load", [
   SameLoadStoreOperandsAndResultEncoding,
   AttrSizedOperandSegments,
   BufferOpInterface,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   TypesMatchWith<"result element type matches the pointed type of ptr", "result", "ptr", "getPointerTypeToElement($_self)">,
   TypesMatchWith<"result and offsets have the same shape", "result", "offsets", "getI32SameShape($_self)">,
   TypesMatchWith<"result and mask have the same shape", "result", "mask", "getI1SameShape($_self)",
@@ -336,6 +337,7 @@ def BufferLoadOp : TT_AMDGPU_Op<"buffer_load", [
 def BufferLoadToLocalOp : TT_AMDGPU_Op<"buffer_load_to_local", [
   AttrSizedOperandSegments,
   BufferOpInterface,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   TypesMatchWith<"dest element type matches pointee type of ptr", "dest", "ptr", "getPointerTypeToElement($_self)">,
   TypesMatchWith<"infer mask shape from offsets",
                  "offsets", "mask", "getI1SameShape($_self)",
@@ -379,6 +381,7 @@ def BufferAtomicRMWOp : TT_AMDGPU_Op<"buffer_atomic_rmw", [
   AttrSizedOperandSegments,
   SameLoadStoreOperandsAndResultEncoding,
   BufferOpInterface,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   TypesMatchWith<"result element type matches the value type", "result", "value", "$_self">,
   TypesMatchWith<"result element type matches the pointed type of ptr", "result", "ptr", "getPointerTypeToElement($_self)">,
   TypesMatchWith<"result and offsets have the same shape", "result", "offsets", "getI32SameShape($_self)">,
@@ -469,6 +472,7 @@ def BufferStoreOp : TT_AMDGPU_Op<"buffer_store", [
   AttrSizedOperandSegments,
   SameLoadStoreOperandsEncoding,
   BufferOpInterface,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   TypesMatchWith<"value element type matches the pointed type of ptr", "value", "ptr", "getPointerTypeToElement($_self)">,
   TypesMatchWith<"value and offsets have the same shape", "value", "offsets", "getI32SameShape($_self)">,
   TypesMatchWith<"value and mask have the same shape", "value", "mask", "getI1SameShape($_self)",
@@ -704,6 +708,7 @@ def LocalLoadPackedTransposedOp : TT_AMDGPU_Op<"local_load_packed_tranposed", [L
 //===----------------------------------------------------------------------===//
 
 def AsyncCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_copy_local_to_global", [
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
   OptionalTypesMatchWith<"infer mask type from dst type",
                  "dst", "mask", "getI1SameShape($_self)">,
 ]> {
@@ -776,7 +781,9 @@ def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[Mem
 // AsyncTDMCopyGlobalToLocalOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local", [AttrSizedOperandSegments]> {
+def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local", [AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<TDMOpInterface>,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "Copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -795,7 +802,8 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
     Variadic<I32>:$indices,
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
     I32:$pred,
-    Optional<TTG_MemDescType>:$barrier
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache
   );
 
   let results = (outs TTG_AsyncToken:$token);
@@ -818,7 +826,8 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 // AsyncTDMCopyLocalToGlobalOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments]> {
+def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<TDMOpInterface>]> {
   let summary = "Copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{
@@ -835,7 +844,8 @@ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global",
     Arg<TT_TensorDescType, "", [MemWrite<GlobalMemory>]>:$desc,
     Variadic<I32>:$indices,
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    Optional<TTG_MemDescType>:$barrier
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
+    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache
   );
 
   let assemblyFormat = [{
@@ -850,7 +860,8 @@ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global",
 // AsyncTDMScatterOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter"> {
+def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
+    DeclareOpInterfaceMethods<TDMOpInterface>]> {
   let summary = "Scatter data from local memory to non-contiguous global memory rows asynchronously";
 
   let description = [{
@@ -874,7 +885,7 @@ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter"> {
     TensorOf<[I16, I32]>:$dst_row_indices,
     I32:$dst_col_offset,
     Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    Optional<TTG_MemDescType>:$barrier
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier
   );
   let results = (outs TTG_AsyncToken:$retToken);
 
@@ -890,7 +901,9 @@ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter"> {
 // AsyncTDMGatherOp
 //===----------------------------------------------------------------------===//
 
-def AsyncTDMGatherOp : TT_AMDGPU_Op<"async_tdm_gather"> {
+def AsyncTDMGatherOp : TT_AMDGPU_Op<"async_tdm_gather", [
+    DeclareOpInterfaceMethods<TDMOpInterface>,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
   let summary = "Gather data from non-contiguous global memory rows to local memory asynchronously";
 
   let description = [{
@@ -977,7 +990,8 @@ def AsyncTDMIntrinsicWait : TT_AMDGPU_Op<"async_tdm_intrinsic_wait", [MemWaitOpT
 
 def TDMPrefetchOp : TT_AMDGPU_Op<"tdm_prefetch", [
     MemoryEffects<[MemWrite<L2Cache>]>,
-    DeclareOpInterfaceMethods<InferTypeOpInterface>
+    DeclareOpInterfaceMethods<InferTypeOpInterface>,
+    DeclareOpInterfaceMethods<PredicatedOpInterface>
   ]> {
   let summary = "Prefetch data based on a TDM descriptor from global memory to L2.";
 
@@ -1009,7 +1023,76 @@ def TDMPrefetchOp : TT_AMDGPU_Op<"tdm_prefetch", [
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// UpdateTensorDescriptorOp
+//===----------------------------------------------------------------------===//
 
+def UpdateTensorDescriptorOp : TT_AMDGPU_Op<"update_tensor_descriptor", [Pure,
+    AttrSizedOperandSegments,
+    TypesMatchWith<"result type matches desc type", "desc", "result", "$_self">]> {
+  let summary = "Update selected fields of a TDM descriptor; produce a new descriptor SSA value";
+
+  let description = [{
+    Returns a new TDM descriptor with selected fields rewritten.  Each
+    parameter is independently optional; only the fields the caller names
+    are written.  Everything else is inherited from the input descriptor.
+
+    | parameter      | kind        | effect on descriptor                                            |
+    |----------------|-------------|-----------------------------------------------------------------|
+    | `add_offsets`  | incremental | `global_addr += sum(add_offsets[i] * stride[i] * elem_size)`    |
+    | `set_bounds`   | rewrite     | `tensor_dim[i] = set_bounds[i]` (absolute)                      |
+    | `dest`         | rewrite     | `lds_addr = dest`                                               |
+    | `pred`         | rewrite     | `pred = pred`                                                   |
+    | `barrier`      | rewrite     | `barrier_addr = barrier`                                        |
+
+    `add_offsets` is incremental (deltas in element units) and does not
+    touch `tensor_dim` — for OOB-correct loops, set `set_bounds` once
+    outside the loop (interior tiles see a loop-invariant tensor_dim
+    that hoists), or set `set_bounds` per iteration when OOB must fire.
+
+    Examples:
+    ```
+    // K-loop interior: bump tile position only
+    %d1 = amdg.update_tensor_descriptor %d, add_offsets=[%c0, %BLOCK_K]
+            : !tt.tensordesc<64x64xf16, #shared>
+
+    // Prologue: position at first tile + wire LDS and barrier
+    %d1 = amdg.update_tensor_descriptor %d,
+            add_offsets=[%pid_m_off, %c0],
+            dest=%a_shared, barrier=%a_bar
+            : !tt.tensordesc<64x64xf16, #shared>
+
+    // Peel epilogue: install real OOB extent for the partial last tile
+    %d1 = amdg.update_tensor_descriptor %d, set_bounds=[%m_remain, %k_remain]
+            : !tt.tensordesc<64x64xf16, #shared>
+    ```
+  }];
+
+  let arguments = (ins
+    TT_TensorDescType:$desc,
+    Variadic<I32>:$add_offsets,
+    Variadic<I32>:$set_bounds,
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$dest,
+    Optional<I32>:$pred,
+    Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier
+  );
+
+  let results = (outs TT_TensorDescType:$result);
+
+  let assemblyFormat = [{
+    $desc
+    oilist(
+        `add_offsets` `=` `[` $add_offsets `]`
+      | `set_bounds` `=` `[` $set_bounds `]`
+      | `dest` `=` $dest `:` qualified(type($dest))
+      | `pred` `=` $pred
+      | `barrier` `=` $barrier `:` qualified(type($barrier))
+    )
+    attr-dict `:` qualified(type($desc))
+  }];
+
+  let hasVerifier = 1;
+}
 
 //===----------------------------------------------------------------------===//
 // AsyncWait

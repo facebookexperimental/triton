@@ -2,10 +2,10 @@
 #define TRITON_ANALYSIS_ALLOCATION_H
 
 #include "triton/Analysis/Utility.h"
+#include "triton/Tools/GenericSwizzling.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <limits>
 
@@ -22,8 +22,16 @@ using AllocationAnalysisScratchSizeFn = std::function<unsigned(Operation *)>;
 
 unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op);
 
+unsigned getNumScratchElemsSwizzledCvt(const LinearLayout &srcLayout,
+                                       const LinearLayout &dstLayout,
+                                       int bitwidth, int numBanks = 32,
+                                       gpu::LocalMemOpTile srcTile = {},
+                                       gpu::LocalMemOpTile dstTile = {});
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
-                                       RankedTensorType dstTy);
+                                       RankedTensorType dstTy,
+                                       int numBanks = 32,
+                                       gpu::LocalMemOpTile srcTile = {},
+                                       gpu::LocalMemOpTile dstTile = {});
 
 } // namespace triton
 
@@ -141,6 +149,11 @@ public:
   /// Returns if the given buffer is a virtual buffer.
   bool isVirtualBuffer(BufferId bufferId) const {
     return bufferSet.at(bufferId).kind == BufferT::BufferKind::Virtual;
+  }
+
+  /// Returns if the given buffer is an explicit buffer.
+  bool isExplicitBuffer(BufferId bufferId) const {
+    return bufferSet.at(bufferId).kind == BufferT::BufferKind::Explicit;
   }
 
   /// Returns the size of total shared memory allocated

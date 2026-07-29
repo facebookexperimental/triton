@@ -566,6 +566,15 @@ class nvidia_knobs(base_knobs):
     # Number of buffers for the dynamic-persistent tile-id broadcast channel
     # (cross-partition run-once atomic support). 1 = single-stage.
     ws_tile_prefetch_depth: env_int = env_int("TRITON_WS_TILE_PREFETCH_DEPTH", 1)
+    # TMEM memory-planner top-K packing search. topk>1 enumerates the top-K
+    # column packings; pick selects which rank to apply (0 = cost/occupancy-best,
+    # == the default first-fit result); topk_dump writes the ranked packings as
+    # JSON for a harness. Prefer these knobs over the TRITON_WS_MEM_PLAN_* env
+    # vars so tests can scope them (knobs.nvidia.scope()) without leaking global
+    # env state across a batch run.
+    ws_mem_plan_topk: env_int = env_int("TRITON_WS_MEM_PLAN_TOPK", 1)
+    ws_mem_plan_pick: env_int = env_int("TRITON_WS_MEM_PLAN_PICK", 0)
+    ws_mem_plan_topk_dump: env_opt_str = env_opt_str("TRITON_WS_MEM_PLAN_TOPK_DUMP")
     use_modulo_schedule: env_opt_str = env_opt_str("TRITON_USE_MODULO_SCHEDULE")
     use_list_schedule: env_bool = env_bool("TRITON_USE_LIST_SCHEDULE")
     use_llm_schedule: env_bool = env_bool("TRITON_USE_LLM_SCHEDULE")
@@ -573,8 +582,14 @@ class nvidia_knobs(base_knobs):
     dump_ttgir_to_tlx: env_bool = env_bool("TRITON_DUMP_TTGIR_TO_TLX")
     dump_tlx_benchmark: env_bool = env_bool("TRITON_DUMP_TLX_BENCHMARK")
     use_no_compile_launcher: env_bool = env_bool("TRITON_USE_NO_COMPILE_LAUNCHER")
-    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER")
+    # Default ON; opt out with TRITON_USE_C_DISPATCHER=0.
+    use_triton_dispatcher: env_bool = env_bool("TRITON_USE_C_DISPATCHER", True)
     auto_tma: env_bool = env_bool("TRITON_AUTO_TMA")
+    # Default ON; opt out with TRITON_AUTOTUNE_USE_C_CACHE=0.
+    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE", True)
+    # Default ON; opt out with TRITON_ENABLE_C_CACHE=0.
+    enable_c_cache: env_bool = env_bool("TRITON_ENABLE_C_CACHE", True)
+    auto_tma_device: env_bool = env_bool("TRITON_AUTO_TMA_DEVICE")
     use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
@@ -586,6 +601,13 @@ class nvidia_knobs(base_knobs):
     # Gate opt-in perf-benchmark tests (do_bench sweeps) so unit-test runs do
     # not pay the perf-sweep cost.
     run_perf: env_bool = env_bool("TRITON_RUN_PERF")
+    # M2 (bitequiv): tritongpu-optimize-reduction-layout gate + tunables. The gate
+    # adds the pass at end of make_ttgir; the tunables are forwarded as pass Options.
+    # Off by default; the eval hook can also inject the pass via --opt-passes.
+    set_red_ordering_layouts: env_bool = env_bool("TRITON_SET_RED_ORDERING_LAYOUTS")
+    red_ordering_strategy: env_str = env_str("TRITON_RED_ORDERING_STRATEGY", "ideal")
+    red_ordering_min_underparallel: env_int = env_int("TRITON_RED_ORDERING_MIN_UNDERPARALLEL", 8)
+    red_ordering_max_elems_per_thread: env_int = env_int("TRITON_RED_ORDERING_MAX_ELEMS_PER_THREAD", 256)
 
 
 class amd_knobs(base_knobs):

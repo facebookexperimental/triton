@@ -314,21 +314,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // Test that async_tma_copy_global_to_local with multicast_targets triggers cluster
 // sync after init_barrier. The multicast bitmask causes the barrier signal to be
 // sent to multiple CTAs in the cluster.
-#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
-#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#nvmma = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #smem = #ttg.shared_memory
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32, "ttg.cluster-dim-x" = 2 : i32} {
   // CHECK-LABEL: @tma_multicast_bar_init
   tt.func public @tma_multicast_bar_init(%desc: !tt.tensordesc<128x64xbf16, #nvmma>, %alloc: !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>, %x: i32, %mcast: i32, %pred: i1) attributes {noinline = false} {
-    %c0_i32 = arith.constant 0 : i32
-    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    %1 = ttg.memdesc_index %0[%c0_i32] : !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    // CHECK: mbarrier.init.shared::cta.b64
-    // CHECK: nvvm.cluster.arrive.relaxed {aligned}
-    // CHECK: nvvm.cluster.wait {aligned}
-    // CHECK: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster
-    ttng.init_barrier %1, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
-    ttng.async_tma_copy_global_to_local %desc[%x, %x] %alloc, %1, %pred, %mcast : !tt.tensordesc<128x64xbf16, #nvmma>, !ttg.memdesc<1xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>
+    %barrier = ttg.local_alloc : () -> !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    // CHECK-COUNT-1: mbarrier.init.shared::cta.b64
+    // CHECK-COUNT-1: nvvm.cluster.arrive.relaxed {aligned}
+    // CHECK-COUNT-1: nvvm.cluster.wait {aligned}
+    // CHECK-COUNT-1: cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster
+    ttng.init_barrier %barrier, 1 : !ttg.memdesc<2xi64, #shared, #smem, mutable>
+    ttng.async_tma_copy_global_to_local %desc[%x, %x] %alloc, %barrier, %pred, %mcast {multicast} : !tt.tensordesc<128x64xbf16, #nvmma>, !ttg.memdesc<2xi64, #shared, #smem, mutable> -> !ttg.memdesc<128x64xbf16, #nvmma, #smem, mutable>
     tt.return
   }
 }

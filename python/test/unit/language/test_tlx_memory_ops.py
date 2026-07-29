@@ -480,9 +480,8 @@ def test_local_gather(device):
         off_n = pid_n * BLOCK_SIZE_N
 
         # Gather once
-        buffer_in = tlx.local_view(buffers_in, 0)
         tlx.barrier_expect_bytes(bar, BLOCK_SIZE_M * BLOCK_SIZE_N * 2)
-        reinterpreted = tlx.local_reinterpret(buffer_in, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
+        reinterpreted = tlx.local_reinterpret(buffers_in, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
         tlx.async_descriptor_load(desc_in, reinterpreted, [0, off_m * N + off_n], bar)
         tlx.barrier_wait(bar=bar, phase=0)
 
@@ -493,8 +492,7 @@ def test_local_gather(device):
             in_local = tlx.local_load(buffer_in)
             tlx.local_store(buffer_out, in_local)
 
-        buffer_out = tlx.local_view(buffers_out, 0)
-        reinterpreted = tlx.local_reinterpret(buffer_out, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
+        reinterpreted = tlx.local_reinterpret(buffers_out, tl.int16, [1, BLOCK_SIZE_M * BLOCK_SIZE_N])
         tlx.async_descriptor_store(desc_out, reinterpreted, [0, off_m * N + off_n])
 
     triton.set_allocator(alloc_fn)

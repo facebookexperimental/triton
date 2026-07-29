@@ -83,18 +83,8 @@ def layernorm_3wg(X, W, B, Y, M, eps, N: tl.constexpr, BLOCK_M: tl.constexpr):
                 tlx.barrier_arrive(y_empty[slot], 1)
 
 
-def _time(fn, iters=100, warmup=20):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(iters):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    return s.elapsed_time(e) / iters
+def _time(fn):
+    return float(triton.testing.do_bench(fn, warmup=50, rep=200, return_mode="median"))
 
 
 def main() -> int:

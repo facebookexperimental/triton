@@ -1,3 +1,4 @@
+import pytest
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
@@ -24,6 +25,35 @@ def test_compile_only_sm100() -> None:
     assert ".target sm_100a" in ptx
     assert ".address_size 64" in ptx
     assert k.asm["cubin"] != b""
+
+
+def test_compile_only_expect_zero() -> None:
+
+    @triton.jit
+    def expect_zero_kernel(x_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        x = tl.load(x_ptr + offsets)
+        y = tl.expect_zero(x, offsets < 8)
+        tl.store(out_ptr + offsets, y)
+
+    src = triton.compiler.ASTSource(
+        fn=expect_zero_kernel,
+        signature={"x_ptr": "*fp32", "out_ptr": "*fp32", "BLOCK_SIZE": "constexpr"},
+        constexprs={"BLOCK_SIZE": 16},
+    )
+    target = GPUTarget("cuda", 100, 32)
+
+    regular = triton.compile(src, target=target)
+    assert "arith.select" not in regular.asm["ttir"]
+    assert "tt.assert" not in regular.asm["ttir"]
+
+    debug = triton.compile(src, target=target, options={"debug": True})
+    assert "arith.select" not in debug.asm["ttir"]
+    assert "tt.assert" in debug.asm["ttir"]
+
+    fpsan = triton.compile(src, target=target, options={"instrumentation_mode": "fpsan"})
+    assert "arith.select" in fpsan.asm["ttir"]
+    assert "tt.assert" not in fpsan.asm["ttir"]
 
 
 def test_compile_only_dot() -> None:
@@ -141,7 +171,6 @@ def test_compile_only_k_loop() -> None:
 
 
 def test_compile_only_dot_mxfp() -> None:
-
     @triton.jit
     def simple_dot_mxfp(
         a_base,
@@ -192,7 +221,11 @@ def test_compile_only_dot_mxfp() -> None:
     assert re.search(pattern, str(ttgir)), "The TTGIR does not match the expected pattern."
 
     ptx = k.asm["ptx"]
-    pattern = r"tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X"
+    version_match = re.search(r"\.version (\d+)\.(\d+)", ptx)
+    assert version_match is not None
+    ptx_version = tuple(int(component) for component in version_match.groups())
+    scale_kind = "block32" if ptx_version >= (8, 8) else "scale_vec::1X"
+    pattern = rf"tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.{scale_kind}"
     assert re.search(pattern, str(ptx)), "The PTX does not match the expected pattern."
     assert k.asm["cubin"] != b""
 

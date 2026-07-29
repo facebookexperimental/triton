@@ -528,6 +528,22 @@ bool LinearLayout::isModularSurjective() const {
       continue; // Check next dimension
     }
 
+    // Pow2 output dimensions retain XOR semantics.
+    if (llvm::isPowerOf2_32(size)) {
+      std::vector<bool> reachable(size, false);
+      reachable[0] = true;
+      for (int32_t basis : allBases) {
+        auto next = reachable;
+        for (int32_t value = 0; value < size; ++value)
+          if (reachable[value])
+            next[value ^ basis] = true;
+        reachable.swap(next);
+      }
+      if (llvm::count(reachable, true) != size)
+        return false;
+      continue;
+    }
+
     // Use CRT factorization: check surjectivity per prime power factor.
     // For N = 2^k * p1^e1 * ... * pm^em, we check each factor separately.
     // Each factor uses DP reachability, so the total cost is
@@ -1020,9 +1036,9 @@ LinearLayout operator*(LinearLayout inner, LinearLayout outer) {
 
 bool LinearLayout::isTrivialOver(ArrayRef<StringAttr> dimNames) const {
   for (StringAttr dim : dimNames) {
-    if (!llvm::is_contained(getInDimNames(), dim) &&
-        !llvm::is_contained(getOutDimNames(), dim)) {
-      return false;
+    if (!hasInDim(dim) || !hasOutDim(dim)) {
+      llvm::report_fatal_error(
+          ("dim " + dim.str() + " must be present in the layout").c_str());
     }
   }
 
@@ -1054,6 +1070,10 @@ bool LinearLayout::isTrivialOver(ArrayRef<StringAttr> dimNames) const {
 
 std::optional<LinearLayout>
 LinearLayout::quotient(ArrayRef<StringAttr> dimNames) const {
+  if (llvm::any_of(dimNames,
+                   [this](StringAttr dim) { return !hasInDim(dim); })) {
+    return std::nullopt;
+  }
   if (!isTrivialOver(dimNames)) {
     return std::nullopt;
   }

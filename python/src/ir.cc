@@ -70,6 +70,22 @@ namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace ir {
 
+// Elementwise casts must keep an existing concrete tensor ownership unless
+// the caller explicitly supplies a different destination encoding.  The
+// An ordinary frontend cast may supply only shape and element type, so an
+// unencoded destination type would otherwise make arith.extf/truncf invalid
+// when its operand came from an explicit MFMA or distributed layout.
+static Type inheritTensorEncoding(Value src, Type dstType) {
+  auto srcTensorType = dyn_cast<RankedTensorType>(src.getType());
+  auto dstTensorType = dyn_cast<RankedTensorType>(dstType);
+  if (!srcTensorType || !dstTensorType || !srcTensorType.getEncoding() ||
+      dstTensorType.getEncoding())
+    return dstType;
+  return RankedTensorType::get(dstTensorType.getShape(),
+                               dstTensorType.getElementType(),
+                               srcTensorType.getEncoding());
+}
+
 // Pointer to the TritonOpBuilder class, used to register IR ops for third-party
 // dialects.
 static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
@@ -957,16 +973,16 @@ void init_triton_ir(py::module &&m) {
       ret::take_ownership);
 
   m.def("deduce_scale_factor",
-        [](Value &lhs, std::optional<Value> &lhsScale,
-           ScaleDotElemType lhsFormat, bool lhsKPack, Value &rhs,
-           std::optional<Value> &rhsScale, ScaleDotElemType rhsFormat,
-           bool rhsKPack) -> int32_t {
+        [](std::vector<int64_t> &lhs,
+           std::optional<std::vector<int64_t>> &lhsScale,
+           ScaleDotElemType lhsFormat, bool lhsKPack, std::vector<int64_t> &rhs,
+           std::optional<std::vector<int64_t>> &rhsScale,
+           ScaleDotElemType rhsFormat, bool rhsKPack) -> int32_t {
           int32_t scaleFactor = 0;
           std::string errMsg;
-          if (failed(DotScaledOp::deduceScaleFactor(
-                  lhs, lhsScale.value_or(Value()), lhsFormat, lhsKPack, rhs,
-                  rhsScale.value_or(Value()), rhsFormat, rhsKPack, scaleFactor,
-                  errMsg)))
+          if (failed(deduceScaleFactor(lhs, lhsScale, lhsFormat, lhsKPack, rhs,
+                                       rhsScale, rhsFormat, rhsKPack,
+                                       scaleFactor, errMsg)))
             throw std::runtime_error(errMsg);
           return scaleFactor;
         });
@@ -1394,11 +1410,13 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_fp_ext",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
-             return self.create<arith::ExtFOp>(dstType, src);
+             return self.create<arith::ExtFOp>(
+                 inheritTensorEncoding(src, dstType), src);
            })
       .def("create_fp_trunc",
            [](TritonOpBuilder &self, Value &src, Type &dstType) -> Value {
-             return self.create<arith::TruncFOp>(dstType, src);
+             return self.create<arith::TruncFOp>(
+                 inheritTensorEncoding(src, dstType), src);
            })
       .def("create_int_cast",
            [](TritonOpBuilder &self, Value &src, Type &dstType,
@@ -1443,6 +1461,10 @@ void init_triton_ir(py::module &&m) {
       .def("create_fsub",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
              return self.create<arith::SubFOp>(lhs, rhs);
+           })
+      .def("create_fneg",
+           [](TritonOpBuilder &self, Value &input) -> Value {
+             return self.create<arith::NegFOp>(input);
            })
       .def("create_mul",
            [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {

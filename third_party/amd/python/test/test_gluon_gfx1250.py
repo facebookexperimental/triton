@@ -2877,6 +2877,35 @@ def test_tdm_load_pred():
     assert torch.equal(a[:, 32:], b[:, 32:]) and not torch.equal(a[:, :32], b[:, :32])
 
 
+# Check that negative TDM offsets are treated as unsigned so they will mask (zero-fill) out the whole tile.
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+def test_tdm_load_negative_offset():
+
+    @gluon.jit
+    def tdm_load_negative_offset_kernel(a_ptr, b_ptr):
+        shared_layout: ttgl.constexpr = ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+        reg_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
+
+        desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr, shape=(16, 64), strides=(64, 1),
+                                                           block_shape=(16, 64), layout=shared_layout)
+        smem = ttgl.allocate_shared_memory(desc.dtype, shape=desc.block_shape, layout=desc.layout)
+
+        ttgl.amd.gfx1250.tdm.async_load(desc, [-1, -1], smem)
+        ttgl.amd.gfx1250.tdm.async_wait(0)
+
+        b_offs_m = ttgl.arange(0, 16, layout=ttgl.SliceLayout(1, reg_layout))
+        b_offs_n = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, reg_layout))
+        b_ptrs = b_ptr + b_offs_m[:, None] * 64 + b_offs_n[None, :]
+        tile = smem.load(reg_layout)
+        ttgl.store(b_ptrs, tile)
+
+    a = torch.randint(0x0, 0xFFFF, (16, 64), dtype=torch.uint16)
+    b_device = torch.randint(0x0, 0xFFFF, (16, 64), dtype=torch.uint16).cuda()
+    tdm_load_negative_offset_kernel[(1, )](a.cuda(), b_device)
+
+    assert torch.all(b_device.cpu() == 0)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 @pytest.mark.parametrize("XBLOCK", [128])
 def test_ws_store_wait_load(XBLOCK):
@@ -4382,8 +4411,28 @@ def async_load_store_roundtrip_kernel(a_ptr, b_ptr, BLOCK: ttgl.constexpr, loadC
     ttgl.amd.gfx1250.async_copy.shared_to_global(b_ptr + offs, buffer, cache_modifier=storeCM)
 
 
+@gluon.jit
+def tdm_load_store_roundtrip_kernel(a_ptr, b_ptr, BLOCK: ttgl.constexpr, loadCM: ttgl.constexpr,
+                                    storeCM: ttgl.constexpr):
+    SHARED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK, 8]], [BLOCK], [0])
+    pid = ttgl.program_id(axis=0)
+
+    a_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=a_ptr, shape=(BLOCK, ), strides=(1, ),
+                                                         block_shape=(BLOCK, ), layout=SHARED_LAYOUT)
+    buffer = ttgl.allocate_shared_memory(ttgl.float16, shape=[BLOCK], layout=SHARED_LAYOUT)
+    ttgl.amd.gfx1250.tdm.async_load(a_desc, [pid * BLOCK], buffer, cache_modifier=loadCM)
+    ttgl.amd.gfx1250.tdm.async_wait(0)
+
+    b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_ptr, shape=(BLOCK, ), strides=(1, ),
+                                                         block_shape=(BLOCK, ), layout=SHARED_LAYOUT)
+    ttgl.amd.gfx1250.tdm.async_store(b_desc, [pid * BLOCK], buffer, cache_modifier=storeCM)
+    ttgl.amd.gfx1250.tdm.async_wait(0)
+
+
 @pytest.mark.parametrize("loadCM, storeCM", [(".ca", ".wb"), (".cg", ".cg"), (".cs", ".cs"), (".cv", ".wt")])
-@pytest.mark.parametrize("test_kernel", [buffer_load_store_roundtrip_kernel, async_load_store_roundtrip_kernel])
+@pytest.mark.parametrize(
+    "test_kernel",
+    [buffer_load_store_roundtrip_kernel, async_load_store_roundtrip_kernel, tdm_load_store_roundtrip_kernel])
 def test_cache_modifier(loadCM, storeCM, test_kernel):
     BLOCK = 256
     N = 256
@@ -4399,7 +4448,7 @@ def test_cache_modifier(loadCM, storeCM, test_kernel):
     load_found = False
     store_found = False
     for line in amdgcn.split("\n"):
-        if "buffer_load_b128" in line or "global_load_async_to_lds_b128" in line:
+        if "buffer_load_b128" in line or "global_load_async_to_lds_b128" in line or "tensor_load_to_lds" in line:
             load_found = True
             if loadCM == ".ca":
                 assert "scope" not in line and "th" not in line
@@ -4409,7 +4458,7 @@ def test_cache_modifier(loadCM, storeCM, test_kernel):
                 assert "scope" not in line and "th:TH_LOAD_NT" in line
             if loadCM == ".cv":
                 assert "scope:SCOPE_SYS" in line and "th:TH_LOAD_BYPASS" in line
-        if "buffer_store_b128" in line or "global_store_async_from_lds_b128" in line:
+        if "buffer_store_b128" in line or "global_store_async_from_lds_b128" in line or "tensor_store_from_lds" in line:
             store_found = True
             if storeCM == ".wb":
                 assert "scope" not in line and "th" not in line

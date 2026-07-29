@@ -422,6 +422,7 @@ typedef struct {
   int64_t shape[TRITON_MAX_TMA_DIMS];
   int64_t stride[TRITON_MAX_TMA_DIMS];
   int fill_mode;
+  int elem_type;
 } triton_tma_cache_entry_t;
 
 /**
@@ -453,7 +454,8 @@ static inline CUresult triton_construct_tma_desc_cached(
   }
 
   if (cache->valid && cache->ptr == cur_ptr &&
-      cache->fill_mode == recipe->fill_mode) {
+      cache->fill_mode == recipe->fill_mode &&
+      cache->elem_type == recipe->elem_type) {
     int same = 1;
     for (int d = 0; d < recipe->ndim; d++) {
       if (cache->shape[d] != cur_shape[d] ||
@@ -471,6 +473,7 @@ static inline CUresult triton_construct_tma_desc_cached(
     cache->valid = 1;
     cache->ptr = cur_ptr;
     cache->fill_mode = recipe->fill_mode;
+    cache->elem_type = recipe->elem_type;
     for (int d = 0; d < recipe->ndim; d++) {
       cache->shape[d] = cur_shape[d];
       cache->stride[d] = cur_stride[d];

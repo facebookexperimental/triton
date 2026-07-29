@@ -8,7 +8,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from triton.tools.triton_to_gluon_translator.translator import convert_triton_to_gluon
 from triton.tools.triton_to_gluon_translator.translator_helpers import convert_host_descriptor
-from triton._internal_testing import is_blackwell, is_hopper_or_newer, is_cuda
+from triton._internal_testing import is_blackwell, is_hopper_or_newer, is_cuda, is_hip_rdna
+
+pytestmark = pytest.mark.skipif(
+    is_hip_rdna(),
+    reason="triton-to-gluon translator does not support AMD RDNA3/RDNA4",
+)
 
 
 def convert_kernel(kernel, kernel_name, tmp_path):

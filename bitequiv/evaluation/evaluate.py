@@ -87,6 +87,7 @@ EXAMPLES
 import argparse
 import datetime
 import importlib
+import inspect
 import os
 import sys
 
@@ -120,6 +121,26 @@ def load_checker(spec):
     return getattr(module, func_name)
 
 
+def make_run_checker(checker):
+    """Adapt a checker to a uniform ``run(asm_text, config) -> hashable`` call.
+
+    A checker that takes a second parameter (the TTGIR checker, which folds
+    ``enable_fp_fusion`` — invisible in the IR — into its descriptor) is handed the config;
+    a one-argument checker (the PTX checker, which reads fusion straight from the PTX) is
+    called with the IR text alone, so it is completely unaffected by this plumbing."""
+    try:
+        params = [
+            p for p in inspect.signature(checker).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
+        ]
+        wants_config = len(params) >= 2 or any(p.kind == p.VAR_POSITIONAL for p in params)
+    except (TypeError, ValueError):
+        wants_config = False
+    if wants_config:
+        return lambda asm_text, config: checker(asm_text, config)
+    return lambda asm_text, config: checker(asm_text)
+
+
 def _descriptor_verdict(desc):
     """Heuristic SUPPORTED/LIMITED/UNSUPPORTED from a checker descriptor alone.
 
@@ -141,7 +162,7 @@ def _descriptor_verdict(desc):
     return "SUPPORTED", "checker reconstructed a reduction descriptor"
 
 
-def kernel_support(spec, checker, artifact="ptx"):
+def kernel_support(spec, run_checker, artifact="ptx"):
     """Stage 1 verdict for one kernel: (verdict, detail).
 
     A declared ``known_limitation`` (the author knows the checker can't model this
@@ -152,7 +173,7 @@ def kernel_support(spec, checker, artifact="ptx"):
     ref = spec.config_space("light")[0]
     try:
         ck = spec.compile(ref, spec.precision_size)
-        desc = checker(ck.asm[artifact])
+        desc = run_checker(ck.asm[artifact], ref)
     except Exception as exc:  # noqa: BLE001
         return "UNSUPPORTED", f"reference config failed to compile or check: {type(exc).__name__}"
     verdict, detail = _descriptor_verdict(desc)
@@ -174,7 +195,7 @@ def _spanned_axes(configs):
     return spans
 
 
-def evaluate_precision(spec, checker, config_effort, fuzzer_effort, artifact="ptx"):
+def evaluate_precision(spec, run_checker, config_effort, fuzzer_effort, artifact="ptx"):
     """Compile + checker-partition + fuzz one kernel; return a result dict."""
     size = spec.precision_size
     configs = spec.config_space(config_effort)
@@ -186,7 +207,7 @@ def evaluate_precision(spec, checker, config_effort, fuzzer_effort, artifact="pt
             fails += 1
             continue
         compiled[config] = ck
-        checker_key[config] = checker(ck.asm[artifact])
+        checker_key[config] = run_checker(ck.asm[artifact], config)
     ok = list(compiled)
     if not ok:
         return dict(name=spec.name, attempted=len(configs), ok=0, fails=fails)
@@ -209,7 +230,7 @@ def evaluate_precision(spec, checker, config_effort, fuzzer_effort, artifact="pt
 # --------------------------------------------------------------------------- #
 # Stage 3 — performance
 # --------------------------------------------------------------------------- #
-def evaluate_performance(spec, checker, artifact="ptx", config_effort="light"):
+def evaluate_performance(spec, run_checker, artifact="ptx", config_effort="light"):
     """Benchmark a kernel across its config space; compare within-set spread to the global ceiling."""
     size = spec.perf_size
     configs = spec.config_space(config_effort)
@@ -220,7 +241,7 @@ def evaluate_performance(spec, checker, artifact="ptx", config_effort="light"):
         except Exception:  # noqa: BLE001
             fails += 1
             continue
-        ms[config], bits[config], checker_key[config] = milliseconds, output_bytes, checker(asm[artifact])
+        ms[config], bits[config], checker_key[config] = milliseconds, output_bytes, run_checker(asm[artifact], config)
     ok = list(ms)
     if not ok:
         return dict(name=spec.name, ok=0, fails=fails)
@@ -246,7 +267,7 @@ def evaluate_performance(spec, checker, artifact="ptx", config_effort="light"):
 # --------------------------------------------------------------------------- #
 # Stage 4 — equivalence under register pressure (post-ptxas / the PTX->SASS gap)
 # --------------------------------------------------------------------------- #
-def evaluate_ptxas_robustness(spec, checker, config_effort, fuzzer_effort, artifact, maxnreg_sweep):
+def evaluate_ptxas_robustness(spec, run_checker, config_effort, fuzzer_effort, artifact, maxnreg_sweep):
     """Does the checker's equivalence verdict survive ptxas across a WHOLE diverse set?
 
     Take the full ``config_effort`` config space (diverse num_warps / num_stages /
@@ -276,7 +297,7 @@ def evaluate_ptxas_robustness(spec, checker, config_effort, fuzzer_effort, artif
                 fails += 1
                 continue
             compiled[key] = ck
-            checker_key[key] = checker(ck.asm[artifact])
+            checker_key[key] = run_checker(ck.asm[artifact], cfg)
             nregs[key], nspills[key] = getattr(ck, "n_regs", None), getattr(ck, "n_spills", None)
             items.append(key)
     attempted = len(base) * len(caps)
@@ -474,6 +495,7 @@ def main(argv=None):
     stages = {int(s) for s in args.stages.split(",") if s.strip()}
     specs = resolve_kernels(args.kernels)
     checker = load_checker(args.checker)
+    run_checker = make_run_checker(checker)
     repeats = equivalence_fuzzer.effort_repeats(args.fuzzer_effort)
     device = torch.cuda.get_device_name()
 
@@ -500,7 +522,7 @@ def main(argv=None):
         print("== Stage 1: support ==", flush=True)
         results = []
         for spec in specs:
-            verdict, detail = kernel_support(spec, checker, args.artifact)
+            verdict, detail = kernel_support(spec, run_checker, args.artifact)
             results.append(dict(name=spec.name, verdict=verdict, detail=detail))
             print(f"  {spec.name}: {verdict} — {detail}", flush=True)
         sections.append(render_stage1(results))
@@ -511,7 +533,7 @@ def main(argv=None):
         for spec in specs:
             n_configs = len(spec.config_space(args.config_effort))
             print(f"  {spec.name}: {n_configs} configs x {repeats} fuzz seeds ...", flush=True)
-            r = evaluate_precision(spec, checker, args.config_effort, args.fuzzer_effort, args.artifact)
+            r = evaluate_precision(spec, run_checker, args.config_effort, args.fuzzer_effort, args.artifact)
             results.append(r)
             if r.get("ok"):
                 total_over_merges += r["over_merges"]
@@ -532,7 +554,7 @@ def main(argv=None):
                 print(f"  {spec.name}: no perf hook; skipping.", flush=True)
                 continue
             print(f"  {spec.name}: benchmarking {len(spec.config_space(args.config_effort))} configs ...", flush=True)
-            results.append(evaluate_performance(spec, checker, args.artifact, args.config_effort))
+            results.append(evaluate_performance(spec, run_checker, args.artifact, args.config_effort))
         if results:
             sections.append(render_stage3(results))
 
@@ -545,7 +567,7 @@ def main(argv=None):
             print(
                 f"  {spec.name}: ~{members} (config x maxnreg{['none'] + maxnreg_sweep}) members "
                 f"x {repeats} fuzz seeds ...", flush=True)
-            r = evaluate_ptxas_robustness(spec, checker, args.config_effort, args.fuzzer_effort, args.artifact,
+            r = evaluate_ptxas_robustness(spec, run_checker, args.config_effort, args.fuzzer_effort, args.artifact,
                                           maxnreg_sweep)
             results.append(r)
             if r.get("ok"):

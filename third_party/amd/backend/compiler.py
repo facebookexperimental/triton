@@ -25,7 +25,7 @@ def is_pingpong_schedule_enabled(arch, use_async_copy):
 
 
 def is_in_thread_transpose_enabled(arch):
-    return (arch == "gfx942" or "gfx120" in arch) \
+    return (arch == "gfx942" or "gfx110" in arch or "gfx115" in arch or "gfx120" in arch) \
         if knobs.amd.use_in_thread_transpose is None else knobs.amd.use_in_thread_transpose
 
 
@@ -325,6 +325,7 @@ class HIPBackend(BaseBackend):
             # replacing schedule_loops + add_pipeline. async_wait counts are
             # fixed by add_update_async_wait_count downstream.
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "modulo")
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
         elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
@@ -434,13 +435,16 @@ class HIPBackend(BaseBackend):
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
-
-        amd.passes.ttgpuir.add_allocate_shared_memory(pm)
+        amd.passes.ttgpuir.add_allocate_shared_memory(pm, options.arch)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if HIPBackend.instrumentation:
             HIPBackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
+        if knobs.amd.use_buffer_ops:
+            # CSE matching assume and loop-bound expressions before range analysis.
+            passes.common.add_cse(pm)
+            amd.passes.ttgpuir.add_annotate_buffer_op_split_safety(pm)
         ## __HIP_FTZ is used to control the denorm flushing behavior of exp2 op as follows:
         ## 1. If __HIP_FTZ = 1, exp2 flushes denorms in input and output regardless
         ##    of the value of kernel arg `allow_flush_denorm`.
@@ -565,7 +569,7 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion, True)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion)
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
@@ -603,7 +607,7 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
-        features = "-real-true16" if "gfx11" in options.arch else ""
+        features = ""
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + "_" + ir_hash
         _ = llvm.translate_to_mir(
@@ -657,8 +661,6 @@ class HIPBackend(BaseBackend):
         target_features = ""
         if knobs.compilation.enable_asan:
             target_features = "+xnack"
-        if "gfx11" in options.arch:
-            target_features += ",-real-true16"
         hsaco = amd.assemble_amdgcn(src, options.arch, target_features)
         with tempfile.NamedTemporaryFile() as tmp_out:
             with tempfile.NamedTemporaryFile() as tmp_in:

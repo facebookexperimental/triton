@@ -13,6 +13,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/Support/LogicalResult.h"
 
@@ -198,6 +199,27 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
           // force a require_layout bridge for it.
           bool isSelectCond = isSelect && en.index() == 0;
           bridgeOrRetype(en.value(), enc, op, en.index(), isSelectCond);
+        }
+        return;
+      }
+      // tt.store: value / ptr / mask must share one encoding
+      // (SameLoadStoreOperandsEncoding). If the value carries a user pin,
+      // propagate it to ptr/mask so make_ttir's verifier accepts the store
+      // without a per-op tolerance; concrete layouts resolve later in
+      // make_ttgir. Bridge (require_layout convert) the ptr/mask for this use
+      // only, leaving their producers (addptr / mask cmp, with their own
+      // same-encoding verifiers) untouched.
+      if (auto store = dyn_cast<::mlir::triton::StoreOp>(op)) {
+        SmallVector<Value> linked{store.getValue(), store.getPtr()};
+        if (store.getMask())
+          linked.push_back(store.getMask());
+        Attribute enc = findPlaceholder(linked, op);
+        if (enc) {
+          bridgeOrRetype(store.getPtr(), enc, op, /*operandIdx=*/0,
+                         /*forceBridge=*/true);
+          if (store.getMask())
+            bridgeOrRetype(store.getMask(), enc, op, /*operandIdx=*/2,
+                           /*forceBridge=*/true);
         }
         return;
       }
@@ -587,6 +609,7 @@ public:
 
     // Attach metadata to the module.
     Builder b(&getContext());
+    mod->setAttr(kSkipGenericPipelineAttrName, b.getUnitAttr());
     mod->setAttr(ttg::AttrNumWarpsName, b.getI32IntegerAttr(numWarps));
     mod->setAttr(ttg::AttrNumThreadsPerWarp,
                  b.getI32IntegerAttr(threadsPerWarp));

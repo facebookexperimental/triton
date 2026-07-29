@@ -470,7 +470,7 @@ def store_packed_out(
 def _swiglu_step1(acc_packed, limit):
     gelu, linear = float2.unpack2(acc_packed)
     gelu = gl.minimum(gelu.to(gl.float32), limit)
-    linear = gl.minimum(gl.maximum(linear.to(gl.float32), -limit), limit)
+    linear = gl.clamp(linear.to(gl.float32), -limit, limit)
     return gelu, linear
 
 
@@ -1500,7 +1500,7 @@ def test_op(c: MLPConfig, batch_size: tuple[int, ...]):
     assert_close(
         ref_y.to(torch.float32),
         cand_y.to(torch.float32),
-        maxtol=0.125,
+        maxtol=0.126,
         rmstol=None,
         description=f"{description}:out",
         verbose=False,

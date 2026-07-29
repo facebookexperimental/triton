@@ -88,22 +88,27 @@ class TensorMemoryScalesLayout:
 
     Args:
         cga_layout (Optional[List[List[int]]]): CGA layout bases. Defaults to [].
+        block_rep_order (str): Order of repeated scale blocks. Must be either
+            ``"mnThenK"`` or ``"kThenMn"``. Defaults to ``"mnThenK"``.
     """
     cga_layout: List[List[int]] = field(default_factory=list)
+    block_rep_order: str = "mnThenK"
 
     def __post_init__(self):
         super().__setattr__("cga_layout", _unwrap_if_constexpr(self.cga_layout))
+        super().__setattr__("block_rep_order", _unwrap_if_constexpr(self.block_rep_order))
         assert all(len(basis) == 2 for basis in self.cga_layout)
+        assert self.block_rep_order in ("mnThenK", "kThenMn")
 
     def _to_ir(self, builder):
-        return builder.get_tensor_memory_scales_layout([list(basis) for basis in self.cga_layout])
+        return builder.get_tensor_memory_scales_layout([list(basis) for basis in self.cga_layout], self.block_rep_order)
 
     def mangle(self) -> str:
         cga_layout_str = "_".join("~".join(map(str, basis)) for basis in self.cga_layout)
-        return f"TLS{cga_layout_str}TLS"
+        return f"TLS{self.block_rep_order}_{cga_layout_str}TLS"
 
     def __hash__(self):
-        return hash(tuple(tuple(b) for b in self.cga_layout))
+        return hash((tuple(tuple(b) for b in self.cga_layout), self.block_rep_order))
 
 
 @dataclass(frozen=True)
@@ -395,21 +400,22 @@ class tensor_memory_descriptor(base_value):
         return ret
 
     @builtin
-    def _reinterpret(self, dtype, shape, layout, _semantic: GluonSemantic = None) -> tensor_memory_descriptor:
+    def _reinterpret(self, dtype=None, shape=None, layout=None,
+                     _semantic: GluonSemantic = None) -> tensor_memory_descriptor:
         """
         Reinterpret tensor memory descriptor with a new dtype, shape, and layout.
 
         Args:
-            dtype (dtype): The new data type.
-            shape (Sequence[int]): The new shape.
-            layout (TensorMemoryLayout): The new layout.
+            dtype (dtype): The new data type. Defaults to the descriptor dtype.
+            shape (Sequence[int]): The new shape. Defaults to the descriptor shape.
+            layout (TensorMemoryLayout): The new layout. Defaults to the descriptor layout.
 
         Returns:
             tensor_memory_descriptor: Descriptor with updated type and layout.
         """
-        dtype = _unwrap_if_constexpr(dtype)
-        shape = [_unwrap_if_constexpr(s) for s in shape]
-        layout = _unwrap_if_constexpr(layout)
+        dtype = self.dtype if dtype is None else _unwrap_if_constexpr(dtype)
+        shape = self.shape if shape is None else [_unwrap_if_constexpr(s) for s in shape]
+        layout = self.layout if layout is None else _unwrap_if_constexpr(layout)
 
         ty = tensor_memory_descriptor_type(dtype, shape, layout, shape)
         handle = _semantic.builder.create_memdesc_reinterpret(ty.to_ir(_semantic.builder), self.handle)

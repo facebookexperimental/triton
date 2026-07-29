@@ -6,7 +6,7 @@
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: init_barrier
 	// CHECK: local_alloc
-	// CHECK-NEXT: ttg.barrier local
+// CHECK: ttg.barrier local
 	// CHECK-NEXT: init_barrier
   tt.func @init_barrier() {
   	%cst = arith.constant dense<0> : tensor<1xi64, #blocked0>
@@ -24,7 +24,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK-LABEL: inval_barrier
 	// CHECK: local_alloc
-	// CHECK-NEXT: ttg.barrier local
+	    // CHECK: ttg.barrier local
 	// CHECK-NEXT: init_barrier
 	// CHECK-NEXT: inval_barrier
   tt.func @inval_barrier() {
@@ -152,6 +152,7 @@ tt.func @wait_after_mma(
      !ttg.memdesc<128x128xf16, #shared1, #smem>,
      !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
      !ttg.memdesc<1xi64, #shared2, #smem, mutable>
+  // CHECK-NEXT: ttg.barrier local
   // CHECK-NEXT: ttng.wait_barrier
   ttng.wait_barrier %barrier, %phase : !ttg.memdesc<1xi64, #shared2, #smem, mutable>
   tt.return

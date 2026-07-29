@@ -158,6 +158,32 @@ def buffer_load_to_local(
 
 
 @tl.builtin
+def zeros(
+    shape: tuple,
+    dtype: tl.dtype,
+    layout: tl.constexpr = None,
+    _semantic=None,
+):
+    """Create a zero tensor with an optional explicit register layout.
+
+    Triton's regular ``tl.zeros`` intentionally creates an unresolved block
+    tensor.  Gluon MFMA code instead materializes its accumulator directly in
+    the MFMA layout; the layout-aware form keeps that constant from requiring a
+    later conversion (and is useful for TLX AMD dot probes and kernels).
+    """
+    shape = [tl._unwrap_if_constexpr(s) for s in tl._unwrap_if_constexpr(shape)]
+    dtype = tl._unwrap_if_constexpr(dtype)
+    if layout is None:
+        return _semantic.full(shape, 0, dtype)
+    layout = tl._unwrap_if_constexpr(layout)
+    assert isinstance(layout, tlx.layout_encoding), "zeros layout must be a TLX layout encoding"
+    scalar = _semantic.scalar_constant(0, dtype)
+    encoding = layout.to_ir(_semantic.builder, shape, dtype)
+    handle = _semantic.builder.create_splat_with_layout(shape, dtype.to_ir(_semantic.builder), encoding, scalar.handle)
+    return tl.tensor(handle, tl.block_type(dtype, shape))
+
+
+@tl.builtin
 def storage_alias_spec(
     storage: tlx.storage_kind = tlx.storage_kind.smem,
     buffer_size_bytes: Optional[tl.constexpr] = None,
@@ -1112,26 +1138,41 @@ def local_reinterpret(
     src: tlx.buffered_tensor,
     dtype: tl.dtype,
     shape: list[tl.constexpr] = None,
+    layout: tl.constexpr = None,
     _semantic=None,
 ) -> tlx.buffered_tensor:
     """
-    Reinterpret the dtype and shape of a buffered tensor. Layout is preserved.
+    Reinterpret the dtype and shape of a buffered tensor.
+
+    When ``layout`` is supplied, the descriptor is also viewed through that
+    explicit shared-memory layout.  This is a zero-copy descriptor change used
+    by the Gluon CDNA4 transpose-read path: a row-major rank-3 physical image
+    is loaded by direct-to-LDS and then reinterpreted as a bank-aware rank-2 K
+    tile.  Without ``layout`` the source layout is preserved for compatibility.
     """
+    layout = tl._unwrap_if_constexpr(layout)
     if shape is None:
         shape = src.type.shape
     else:
         assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
             "TLX local_reinterpret with reshaping only supports SMEM")
 
+    encoding = None
+    if layout is not None:
+        assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
+            "TLX local_reinterpret with an explicit layout only supports SMEM")
+        encoding = layout.to_ir(_semantic.builder)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
-                                                                              dtype.to_ir(_semantic.builder), shape)
+                                                                              dtype.to_ir(_semantic.builder), shape,
+                                                                              encoding)
+    result_layout = layout if layout is not None else src.type.layout
     return tlx.buffered_tensor(
         reinterpreted_value_handle,
         dtype,
         shape,
         src.type.num,
         src.type.storage,
-        src.type.layout,
+        result_layout,
     )
 
 

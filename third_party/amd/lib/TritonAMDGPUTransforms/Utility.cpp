@@ -146,7 +146,7 @@ int deduceMinCountOnDefChain(Value defValue, Operation *consumerOp,
 // pad,  r1, r5,  r9, r13, r17, r21, r25
 // r29, pad, r2,  r6, r10, r14, r18, r22
 // r26, r30, pad, r3 ....
-static ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
+ttg::PaddedSharedEncodingAttr composePaddedLayoutForAsyncCopyCDNA4(
     ttg::DotOperandEncodingAttr dotOpEnc, ttg::TensorOrMemDesc srcTy,
     ArrayRef<unsigned> sharedOrder, bool useAsyncCopy, unsigned warpSize) {
   auto *ctx = srcTy.getContext();
@@ -420,8 +420,9 @@ composePaddedLayoutWMMA(int opIdx, unsigned vecWidth,
     // 2× ensures the stride (in dwords) is an odd multiple of the combined
     // row-access width, distributing all 16 lanes' bank accesses across
     // disjoint banks and eliminating conflicts for tile widths >= 32.
-    if (auto ldsParams = targetInfo.queryLDSTransLoadParams(typeWidthInBit)) {
-      padAmount = 2 * ldsParams->instBitWidth / typeWidthInBit;
+    auto ldsParamsVec = targetInfo.queryLDSTransLoadParams(typeWidthInBit);
+    if (!ldsParamsVec.empty()) {
+      padAmount = 2 * ldsParamsVec[0].instBitWidth / typeWidthInBit;
     }
   } else {
     // Non-transposed path: each cycle 16 lanes at distinct nonK rows load

@@ -29,9 +29,9 @@ recomputing it each iteration is free.
 
 The schedulers are ``@tl._aggregate`` value types, so instances flow through
 ``@triton.jit`` kernels (including the persistent ``scf.while`` loop-carried
-state). ``TileScheduler`` is a plain base holding the shared ``is_valid`` body;
-each concrete class re-declares its own fields (``@_aggregate`` reads only a
-class's own annotations) and gets the ``tile_id`` accessor attached below.
+state). The base schedulers are zero-field aggregates holding shared behavior;
+each concrete class declares its state and gets the ``tile_id`` accessor
+attached below.
 """
 import triton.language.core as tl
 from triton.language.core import builtin
@@ -46,6 +46,7 @@ __all__ = [
 ]
 
 
+@tl._aggregate
 class TileScheduler:
     """Base tile-scheduler contract.
 
@@ -71,6 +72,7 @@ class TileScheduler:
         return False
 
 
+@tl._aggregate
 class _CountingTileScheduler(TileScheduler):
     """Base for count-limited persistent schedules (static / dynamic).
 

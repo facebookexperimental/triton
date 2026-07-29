@@ -2,7 +2,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton._internal_testing import is_hopper_or_newer, is_blackwell
+from triton._internal_testing import is_blackwell, is_hip_cdna4, is_hopper_or_newer
 import triton.language.extra.tlx as tlx
 import traceback
 import gc
@@ -36,12 +36,13 @@ def test_thread_id(device):
     torch.testing.assert_close(output, expected_output)
 
 
-@pytest.mark.skipif(not is_hopper_or_newer(), reason="Need Hopper or newer")
+@pytest.mark.skipif(not (is_hopper_or_newer() or is_hip_cdna4()), reason="Need Hopper or gfx950")
 def test_clock64(device):
 
     @triton.jit
     def clock64_from_thread_0_kernel(
         output_ptr,
+        elapsed_ptr,
         value,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
@@ -55,14 +56,19 @@ def test_clock64(device):
             start = tlx.clock64()
             tl.store(output_ptr + offsets, value, mask=mask)
             end = tlx.clock64()
-            tl.device_print("Cycles elapsed: ", end - start)
+            tl.store(elapsed_ptr, end - start)
 
-    output = torch.zeros(32, dtype=torch.int32, device="cuda")
+    output = torch.zeros(32, dtype=torch.int32, device=device)
+    elapsed = torch.zeros(1, dtype=torch.int64, device=device)
     n_elements = output.numel()
     value = 42
-    kernel = clock64_from_thread_0_kernel[(1, )](output, value, n_elements, 32, num_warps=1)
+    kernel = clock64_from_thread_0_kernel[(1, )](output, elapsed, value, n_elements, 32, num_warps=1)
     assert kernel.asm["ttgir"].count("ttg.clock64") == 2
-    assert kernel.asm["ptx"].count("%clock64") == 2
+    if is_hip_cdna4():
+        assert kernel.asm["amdgcn"].count("s_memtime") == 2
+    else:
+        assert kernel.asm["ptx"].count("%clock64") == 2
+    assert elapsed.item() > 0
 
 
 def test_loop_carry_var_check(device):

@@ -1,0 +1,110 @@
+name: Release Testing
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: string
+        required: false
+        description: 'Comma-separated benchmark suite(s) to run.'
+        default: 'tritonbench'
+      runners:
+        type: choice
+        required: true
+        description: 'Runner selection'
+        default: 'all'
+        options:
+          - 'all'
+          - 'h100'
+          - 'mi350'
+          - 'b200'
+      test_type:
+        type: choice
+        required: true
+        description: 'Choose advanced testing options'
+        default: 'periodic'
+        options:
+          - 'periodic'
+          - 'single'
+          - 'abtest'
+      side_a_triton:
+        type: string
+        required: false
+        description: 'Side A Triton repo'
+        default: 'facebookexperimental/triton'
+      side_a_commit:
+        type: string
+        required: false
+        description: 'Side A Triton commit'
+        default: 'main'
+      side_b_triton:
+        type: string
+        required: false
+        description: 'Side B Triton repo (abtest only)'
+        default: 'facebookexperimental/triton'
+      side_b_commit:
+        type: string
+        required: false
+        description: 'Side B Triton commit (abtest only)'
+        default: 'main'
+
+jobs:
+  set-parameters:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      test_matrix: ${{ steps.set-parameters.outputs.test_matrix }}
+      has_test_suites: ${{ steps.set-parameters.outputs.has_test_suites }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set parameters
+        id: set-parameters
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite || 'tritonbench' }}
+          RUNNERS: ${{ inputs.runners || 'all' }}
+          TEST_TYPE: ${{ inputs.test_type || 'periodic' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -eux
+
+          python .github/scripts/generate_release_testing_matrix.py \
+            --suite "${SUITE}" \
+            --runners "${RUNNERS}" \
+            --test-type "${TEST_TYPE}" \
+            --event-name "${EVENT_NAME}"
+
+  release-testing:
+    permissions:
+      id-token: write
+      contents: read
+    needs: set-parameters
+    if: ${{ needs.set-parameters.outputs.has_test_suites == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.set-parameters.outputs.test_matrix) }}
+    uses: ./.github/workflows/_linux-release-testing.yml
+    with:
+      runner: ${{ matrix.runner }}
+      runner_full_name: ${{ matrix.runner_full_name }}
+      test_type: ${{ inputs.test_type || 'periodic' }}
+      suite: ${{ matrix.suite }}
+      side_a_triton: ${{ inputs.side_a_triton || 'facebookexperimental/triton' }}
+      side_a_commit: ${{ inputs.side_a_commit || 'main' }}
+      side_b_triton: ${{ inputs.side_b_triton || 'facebookexperimental/triton' }}
+      side_b_commit: ${{ inputs.side_b_commit || 'main' }}
+    secrets:
+      TRITONBENCH_SCRIBE_GRAPHQL_ACCESS_TOKEN: ${{ secrets.TRITONBENCH_SCRIBE_GRAPHQL_ACCESS_TOKEN }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}-${{ github.event_name }}
+  cancel-in-progress: true
