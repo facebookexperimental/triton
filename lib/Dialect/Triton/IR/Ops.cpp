@@ -283,13 +283,6 @@ LogicalResult DotOp::verify() {
                                                      bEncoding);
 }
 
-bool DotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 //-- DotScaledOp --
 bool DotScaledOp::verifyDims() {
   auto aShape = this->getA().getType().getShape();
@@ -672,8 +665,6 @@ bool ReduceOp::hasDefinedOrdering() {
   return attr && attr.getValue() != "unordered";
 }
 
-unsigned ReduceOp::getNumOperands() { return this->getOperands().size(); }
-
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
                    ValueRange operands, int axis, bool reverse) {
@@ -706,8 +697,6 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
 }
-
-unsigned ScanOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- MapElementwiseOp
 LogicalResult MapElementwiseOp::verify() {

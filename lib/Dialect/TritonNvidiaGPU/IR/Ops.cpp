@@ -172,13 +172,6 @@ bool WarpGroupDotOp::needsPartialAccumulator() {
   return isFP8 && accFP32 && maxNumImpreciseAcc <= aTensorTy.getShape()[1];
 }
 
-bool WarpGroupDotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
@@ -285,9 +278,9 @@ LogicalResult WaitBarrierOp::verify() {
 }
 
 // Forward declaration. The single (beta-adapted) definition lives below near
-// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so we
-// keep that version rather than the upstream hard-failing one this cherry-pick
-// carried.
+// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so
+// we keep that version rather than the upstream hard-failing one this
+// cherry-pick carried.
 static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
                                             CGAEncodingAttr expectedCGALayout,
                                             StringRef barrierName);
@@ -637,8 +630,7 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
                            isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
                            getCoord(), getOffsets())))
     return failure();
-  if (getMulticast() && !getMulticastTargets() &&
-      !hasCGABroadcast(resultType))
+  if (getMulticast() && !getMulticastTargets() && !hasCGABroadcast(resultType))
     return emitOpError(
         "multicast requires the shared layout to broadcast across CTAs");
   return success();
@@ -962,13 +954,6 @@ void TCGen5MMAOp::getEffects(
   for (auto &barrierMutable : getBarriersMutable())
     effects.emplace_back(MemoryEffects::Write::get(), &barrierMutable,
                          SharedMemory::get());
-}
-
-bool TCGen5MMAOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
 }
 
 bool TCGen5MMAOp::verifyOutputDims() {

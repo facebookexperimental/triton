@@ -304,7 +304,8 @@ bool isLayoutAnchor(Operation *op) {
   if (isa<triton::gpu::LocalLoadOp>(op))
     return isExpensiveLocalLoad(op);
   if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
-          AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op))
+          AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op) ||
+      op->getName().getStringRef() == "tti.dot_i8")
     return true;
   if (auto gatherOp = dyn_cast<GatherOp>(op))
     return gatherOp.getEfficientLayout();
@@ -898,7 +899,8 @@ bool canBeRemat(Operation *op) {
     return !isExpensiveLoadOrStore(op);
   if (isa<triton::gpu::LocalLoadOp>(op))
     return !isExpensiveLocalLoad(op);
-  if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op))
+  if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op) ||
+      op->getName().getStringRef() == "tti.dot_i8")
     return false;
   if (auto gather = dyn_cast<GatherOp>(op))
     return !gather.getEfficientLayout();

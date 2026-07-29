@@ -44,8 +44,8 @@ public:
       return rewriteInnerTree(op, adaptor, rewriter);
 
     ReduceOpHelper helper(op);
-    auto regLl = ReduceOpHelper::reducedRegLaneLayout(helper.getSrcTy(),
-                                                      op.getAxis());
+    auto regLl =
+        ReduceOpHelper::reducedRegLaneLayout(helper.getSrcTy(), op.getAxis());
     auto kAxis = *(regLl.getOutDimNames().begin() + op.getAxis());
     if (regLl.getOutDimSize(kAxis) != 1) {
       return rewriteInnerTree(op, adaptor, rewriter);
@@ -388,8 +388,8 @@ private:
     }
 
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
-    auto smem = triton::gpu::optimalSwizzlingLdSt(srcLayout, dstLayout,
-                                                  bitwidth);
+    auto smem =
+        triton::gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
 
     auto kReg = str_attr("register");
     auto kWarp = str_attr("warp");
@@ -401,12 +401,12 @@ private:
     auto totalStoreCvt = srcLayout.invertAndCompose(smem);
     auto totalLoadCvt = dstLayout.invertAndCompose(smem);
 
-    auto permStore = regPermForDivide(totalStoreCvt, reps, /*left=*/false)
-                         .value();
+    auto permStore =
+        regPermForDivide(totalStoreCvt, reps, /*left=*/false).value();
     totalStoreCvt = permStore.apply(totalStoreCvt);
     auto permutedInVals = permStore.apply(inVals);
-    auto permLoad = regPermForDivide(totalLoadCvt, reps, /*left=*/false)
-                        .value();
+    auto permLoad =
+        regPermForDivide(totalLoadCvt, reps, /*left=*/false).value();
     totalLoadCvt = permLoad.apply(totalLoadCvt);
 
     auto storeCvt = *divideRight(totalStoreCvt, reps);
@@ -456,9 +456,9 @@ private:
     return outVals;
   }
 
-  SmallVector<int64_t>
-  getSmemBaseOffsets(triton::ReduceOp op, const LinearLayout &srcLayout,
-                     const LinearLayout &dstLayout) const {
+  SmallVector<int64_t> getSmemBaseOffsets(triton::ReduceOp op,
+                                          const LinearLayout &srcLayout,
+                                          const LinearLayout &dstLayout) const {
     std::vector<unsigned> indices(op.getNumOperands());
     std::iota(indices.begin(), indices.end(), 0);
     llvm::stable_sort(indices, [&](unsigned lhs, unsigned rhs) {
@@ -494,8 +494,8 @@ private:
       auto inputTy = cast<RankedTensorType>(op.getInputTypes()[i]);
       auto llvmElemTy =
           getTypeConverter()->convertType(inputTy.getElementType());
-      auto smemBase = b.gep(base.getType(), i8_ty, base,
-                            b.i32_val(baseOffsets[i]));
+      auto smemBase =
+          b.gep(base.getType(), i8_ty, base, b.i32_val(baseOffsets[i]));
       outVals[i] = transferSwizzlingLocalMemImpl(
           loc, rewriter, srcLayout, dstLayout, inVals[i], llvmElemTy, smemBase);
     }
@@ -603,8 +603,8 @@ private:
         for (int idx : group)
           groupValues.push_back(srcValues[idx]);
 
-        accs[key] = reduceValueSequence(op.getLoc(), op,
-                                        std::move(groupValues), rewriter);
+        accs[key] = reduceValueSequence(op.getLoc(), op, std::move(groupValues),
+                                        rewriter);
         indices[key] = srcIndices[group.front()];
       }
       return;

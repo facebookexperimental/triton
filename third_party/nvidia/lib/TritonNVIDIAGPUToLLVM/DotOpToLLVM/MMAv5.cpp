@@ -5,6 +5,7 @@
 #include "mlir/Support/LLVM.h"
 #include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -52,20 +53,12 @@ enum class scaleKind : uint32_t { ue4m3 = 0, e8m0 = 1, ue5m3 = 2 };
 
 static bool isTransposed(Value operand) {
   auto tensorTy = cast<MemDescType>(operand.getType());
-  auto enc = tensorTy.getEncoding();
-  if (auto shared = dyn_cast<NVMMASharedEncodingAttr>(enc))
-    return shared.getTransposed();
-  if (auto tensor = dyn_cast<ttng::TensorMemoryEncodingAttr>(enc))
+  if (isa<ttng::TensorMemoryEncodingAttr>(tensorTy.getEncoding()))
     return false;
-  if (auto sharedLinear = dyn_cast<SharedLinearEncodingAttr>(enc)) {
-    // Hack. We should refactor the lowering to be able to use the
-    // result from the memory descriptor
-    auto *ctx = sharedLinear.getContext();
-    auto kOffset = StringAttr::get(ctx, "offset");
-    auto dim0 = StringAttr::get(ctx, "dim0");
-    return sharedLinear.getLinearLayout().getBasis(kOffset, 0, dim0) != 0;
-  }
-  return false;
+
+  auto attrs = ttng::getNvmmaSmemAttrs(tensorTy);
+  assert(attrs && "expected MMAv5 shared operand to have NVMMA SMEM attrs");
+  return attrs->transposed;
 }
 
 static int getScaleFactor(Type scaleType, int blockK) {
@@ -956,12 +949,12 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                         mxfpInstKind, twoCTAs, collectorB, ptxVersion);
   };
 
-  return convertDotImpl(
-      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
-      adaptor.getB(), dTensorTy, adaptor.getUseD(), adaptor.getPred(),
-      adaptor.getBarriers(), adaptor.getBarrierPreds(), twoCTAs,
-      tlx::tlxEnablePairedMMA(op), ValueRange{}, opKindIsMXFP4,
-      targetFeatures, dot);
+  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
+                        adaptor.getA(), adaptor.getB(), dTensorTy,
+                        adaptor.getUseD(), adaptor.getPred(),
+                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
+                        twoCTAs, tlx::tlxEnablePairedMMA(op), ValueRange{},
+                        opKindIsMXFP4, targetFeatures, dot);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1058,9 +1051,9 @@ void populateTCGen5MMAOpToLLVMPattern(LLVMTypeConverter &typeConverter,
                                       const TargetInfo &targetInfo) {
   patterns.add<TCGen5MMAOpConversion>(typeConverter, benefit,
                                       targetInfo.getTargetFeatures());
-  patterns.add<TCGen5MMAScaledOpConversion>(
-      typeConverter, benefit, targetInfo.getTargetFeatures(),
-      targetInfo.getPtxVersion());
+  patterns.add<TCGen5MMAScaledOpConversion>(typeConverter, benefit,
+                                            targetInfo.getTargetFeatures(),
+                                            targetInfo.getPtxVersion());
   patterns.add<TCGen5CommitOpConversion>(typeConverter, benefit);
 }
 

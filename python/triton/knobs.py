@@ -590,7 +590,6 @@ class nvidia_knobs(base_knobs):
     # Default ON; opt out with TRITON_ENABLE_C_CACHE=0.
     enable_c_cache: env_bool = env_bool("TRITON_ENABLE_C_CACHE", True)
     auto_tma_device: env_bool = env_bool("TRITON_AUTO_TMA_DEVICE")
-    use_autotune_c_cache: env_bool = env_bool("TRITON_AUTOTUNE_USE_C_CACHE")
     generate_subtiled_region: env_bool = env_bool("TRITON_GENERATE_SUBTILED_REGION")
     # When True, run the triton-nvidia-interleave-tmem pass on Blackwell.
     # Default ON; set TRITON_ENABLE_INTERLEAVE_TMEM=0 to opt out for A/B
@@ -644,6 +643,8 @@ class proton_knobs(base_knobs):
         "TRITON_CUPTI_LIB_BLACKWELL_PATH",
         str(pathlib.Path(__file__).parent.absolute() / "backends" / "nvidia" / "lib" / "cupti-blackwell"),
     )
+    rocprofiler_sdk_include_path: env_opt_str = env_opt_str("TRITON_ROCPROFILER_SDK_INCLUDE_PATH")
+    rocprofiler_sdk_lib_path: env_opt_str = env_opt_str("TRITON_ROCPROFILER_SDK_LIB_PATH")
     profile_buffer_size: env_int = env_int("TRITON_PROFILE_BUFFER_SIZE", 64 * 1024 * 1024)
     profile_metric_buffer_size: env_int = env_int("TRITON_PROFILE_METRIC_BUFFER_SIZE", 64 * 1024 * 1024)
     enable_nvtx: env_bool = env_bool("TRITON_ENABLE_NVTX", True)
