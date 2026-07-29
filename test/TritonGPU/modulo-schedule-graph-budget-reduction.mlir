@@ -98,7 +98,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //   196608 B, so the loop needs ~589896 B > 458752.
 // reduceBufferGroup must drop the WHOLE group by one step and refresh the
 // physical buffers so computeTotalSmem sees the smaller footprint. At count=2
-// the group is 262144 + 131072 = 393216 B (+ barriers) = 393272 B <= 458752, so
+// the group is 262144 + 131072 = 393216 B (+ barriers) = 393264 B <= 458752, so
 // the reducer stops — capping the ring at the largest depth that fits.
 //
 // The regression guard: BOTH members drop together to the SAME count (2), and
@@ -109,7 +109,7 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //
 // CHECK: [Step4.6] Reduced SMEM buf1 (+ co-consumed/merge peers) to count=2
 // Footprint dropped below the 458752 B budget after refreshing physical buffers:
-// CHECK: [Step4.6] Budget: SMEM 393272/458752 OK
+// CHECK: [Step4.6] Budget: SMEM 393264/458752 OK
 // Both co-consumed operands end at the SAME count=2 (not one collapsed to 1):
 // CHECK-DAG: %buf0 = modulo.alloc SMEM [2 x 128x512 x f16]
 // CHECK-DAG: %buf1 = modulo.alloc SMEM [2 x 512x64 x f16]

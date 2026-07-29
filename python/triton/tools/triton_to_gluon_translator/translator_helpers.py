@@ -582,7 +582,7 @@ def tl_obj_scatter(obj, value, x_offsets, y_offset):
         )
         x_offsets = ttgl.convert_layout(x_offsets, x_offsets_layout)
         tma_blackwell.async_scatter(desc, x_offsets, y_offset, alloc)
-        tma.store_wait(0)
+        tma.store_wait(0, read_only=False)
     else:
         obj.scatter(value, x_offsets, y_offset)
 
@@ -597,7 +597,7 @@ def tl_make_tensor_descriptor(base, shape, strides, block_shape, padding_option=
 def tl_store_tensor_descriptor(desc, offsets, value):
     alloc = ttgl.allocate_shared_memory(desc.dtype, desc.block_shape, desc.layout, value)
     tma.async_copy_shared_to_global(desc, offsets, alloc)
-    tma.store_wait(0)
+    tma.store_wait(0, read_only=False)
     alloc._keep_alive()
 
 

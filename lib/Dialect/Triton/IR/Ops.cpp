@@ -53,6 +53,12 @@ void LoadOp::build(OpBuilder &builder, OperationState &state, Value ptr,
                 isVolatile);
 }
 
+Value LoadOp::getPredicateOperand() { return getMask(); }
+
+void LoadOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
+
+Type LoadOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
 // load(ptr, splat(1), ...)        -> load(ptr, ...)
 // load(ptr, splat(0), other, ...) -> other
 struct CanonicalizeMaskedLoadPattern : public OpRewritePattern<LoadOp> {
@@ -103,6 +109,12 @@ void StoreOp::build(OpBuilder &builder, OperationState &state, Value ptr,
   return StoreOp::build(builder, state, ptr, value, /*mask=*/{}, cache, evict);
 }
 
+Value StoreOp::getPredicateOperand() { return getMask(); }
+
+void StoreOp::setPredicateOperand(Value pred) { getMaskMutable().assign(pred); }
+
+Type StoreOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
 // store(ptr, value, splat(1), ...) -> store(ptr, value, ...)
 // store(ptr, value, splat(0), ...) -> [none]
 struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
@@ -135,6 +147,14 @@ struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
     return success();
   }
 };
+
+Value AtomicRMWOp::getPredicateOperand() { return getMask(); }
+
+void AtomicRMWOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+
+Type AtomicRMWOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
 
 void StoreOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                           MLIRContext *context) {
@@ -261,13 +281,6 @@ LogicalResult DotOp::verify() {
   auto interface = cast<DialectInferLayoutInterface>(&dialect);
   return interface->verifyDotOpEncodingCompatibility(getOperation(), aEncoding,
                                                      bEncoding);
-}
-
-bool DotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
 }
 
 //-- DotScaledOp --
@@ -652,8 +665,6 @@ bool ReduceOp::hasDefinedOrdering() {
   return attr && attr.getValue() != "unordered";
 }
 
-unsigned ReduceOp::getNumOperands() { return this->getOperands().size(); }
-
 //-- ScanOp --
 void ScanOp::build(OpBuilder &builder, OperationState &state,
                    ValueRange operands, int axis, bool reverse) {
@@ -686,8 +697,6 @@ llvm::SmallVector<RankedTensorType> ScanOp::getInputTypes() {
 llvm::SmallVector<Type> ScanOp::getElementTypes() {
   return getElementTypesImpl(this->getOperands());
 }
-
-unsigned ScanOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- MapElementwiseOp
 LogicalResult MapElementwiseOp::verify() {

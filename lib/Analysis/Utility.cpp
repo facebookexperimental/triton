@@ -1366,6 +1366,12 @@ bool supportMMA(triton::DotOp op, int version) {
   return supportMMA(op.getA(), version) && supportMMA(op.getB(), version);
 }
 
+bool supportMMA(triton::DotOpInterface op, int version) {
+  if (auto dotOp = dyn_cast<triton::DotOp>(op.getOperation()))
+    return supportMMA(dotOp, version);
+  return supportMMA(op.getA(), version) && supportMMA(op.getB(), version);
+}
+
 bool supportMMA(Value value, int version) {
   // Tell whether a DotOp support MMA by the operand type(either $a or $b).
   // We cannot get both the operand types(in TypeConverter), here we assume the
@@ -1501,8 +1507,7 @@ bool isCvtDimSync(const triton::LinearLayout &srcLayout,
 
   // Broadcasting across warps requires CTA-wide synchronization. A broadcast
   // block basis does not move values between CTAs, so it remains CTA-local.
-  return dim == kBlock ||
-         (srcLayout.getFreeVariableMasks()[dim] == 0 &&
-          dstLayout.getFreeVariableMasks()[dim] == 0);
+  return dim == kBlock || (srcLayout.getFreeVariableMasks()[dim] == 0 &&
+                           dstLayout.getFreeVariableMasks()[dim] == 0);
 }
 } // namespace mlir

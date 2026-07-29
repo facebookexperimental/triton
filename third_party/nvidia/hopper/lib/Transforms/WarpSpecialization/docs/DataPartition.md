@@ -154,6 +154,30 @@ The partition dimension is tracked through shape-changing operations:
 - `SplatOp`, `BroadcastOp`: partition dim propagates unchanged
 - `MakeRangeOp`, `LoadOp`: stop — these produce fresh data
 
+### TMEM accumulator writer slicing
+
+Partitioning an in-place TMEM accumulator must also partition every operation
+that establishes its initial contents and dependency token. In particular,
+`getBackwardSliceToPartition` captures both writer forms:
+
+- `TMEMCopyOp`, whose source partition dimension is remapped with
+  `getTmemCopySrcPartitionDim`.
+- `TMEMStoreOp`, such as the zero initialization of a loop-carried MMA
+  accumulator, whose source uses the accumulator's partition dimension.
+
+Leaving an initialization store unsliced is not merely dead data: its token can
+remain threaded through the partitioned MMAs and keep the original full TMEM
+allocation live. For example, HSTU self-attention forward partitions a
+`256x128` PV accumulator into two `128x128` accumulators. The zero-init store
+must be duplicated and sliced as well, so each partition receives its own
+initial token and the full allocation can be removed.
+
+When slicing a `TMEMStoreOp`, the pass may insert a TMEM-compatible
+`ConvertLayoutOp` for that store. This conversion is private to the store. The
+source value's natural sliced mapping is restored immediately afterward so
+other partitioned users of the same value (such as an activation chain sharing
+a zero splat) do not inherit the store-specific layout.
+
 ### Function Argument Slicing
 
 When a `TensorDescType` function argument feeds a partitioned op, its block
@@ -228,6 +252,11 @@ groups each get their slice of the data.
 
 ## Regression Tests
 
+- `test/Hopper/WarpSpecialization/ws_data_partition_inplace_acc_token.mlir`
+  covers an HSTU self-attention forward accumulator initialized before its
+  loop. It checks that DP=2 produces per-partition `128x128` TMEM allocations
+  and that no original `256x128` accumulator remains live through the shared
+  token chain.
 - `test/Hopper/WarpSpecialization/ws_data_partition_scaled_memdesc_reshape_reproducer.mlir`
   covers the positive `BLOCK_M=256` scaled-MMA case. It checks that M
   partitioning produces two `128x256` accumulator TMEM allocations, two

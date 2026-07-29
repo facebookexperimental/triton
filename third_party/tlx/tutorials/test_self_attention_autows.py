@@ -16,14 +16,12 @@ Four configs are covered:
   (this same file re-invoked with `--run-dqreduce`) with the env set first.
 - The FA-style manual data-partition FWD config (HSTU_SELF_FA_DP=1, DP=2, WARPS=4):
   `test_self_attention_fwd_autows_fadp`. Splits BLOCK_M=256 into two 128-row halves
-  sharing one K/V load, warp-specialized into load + 2 MMA groups -- the working
-  alternative to the broken compiler data_partition_factor=2 path. Also
+  sharing one K/V load, warp-specialized into load + 2 MMA groups. Also
   constexpr-baked at import -> SUBPROCESS (`--run-fadp`); fwd-only output check.
 - The compiler DP=2 config (HSTU_SELF_DP=2, no FA_DP):
   `test_self_attention_fwd_autows_compiler_dp2`. The compiler's
-  data_partition_factor=2 splits the 256-row tile into two 128-row groups. Was
-  broken (TMA descriptor box_dim left at 256 -> SMEM overrun -> stall/OOB); fixed
-  in WSDataPartition by scaling box_dim by the partition factor. SUBPROCESS,
+  data_partition_factor=2 splits the 256-row tile into two 128-row groups,
+  including the loop-carried accumulator initialization and token. SUBPROCESS,
   `--run-fwd`, fwd-only output check.
 
 Notes:
@@ -60,14 +58,22 @@ _DEFAULT_CFG = dict(autows=True, dp=1, pin=True)
 # to SMEM, dq via TMA reduce-add subtiled x4 -- final ttgir matches the hand-written
 # TLX bwd and its grads match torch/TLX numerics.
 _DQREDUCE_CFG = dict(
-    autows=True, dq_reduce=True, dq_reuse=True, dp=1,
-    bwd_bm=128, bwd_bn=128, bwd_stages=2, warps=4, dq_iters=4, pin=True,
+    autows=True,
+    dq_reduce=True,
+    dq_reuse=True,
+    dp=1,
+    bwd_bm=128,
+    bwd_bn=128,
+    bwd_stages=2,
+    warps=4,
+    dq_iters=4,
+    pin=True,
 )
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
 _MANUAL_DP_CFG = dict(autows=True, manual_dp=True, dp=2, warps=4, pin=True)
-# Compiler data_partition_factor=2 fwd (no FA_DP): the compiler splits the 256 tile
-# (fixed via the WSDataPartition box_dim scaling).
+# Compiler data_partition_factor=2 fwd (no FA_DP): the compiler splits the
+# 256-row tile and its loop-carried accumulator initialization.
 _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
@@ -172,8 +178,14 @@ def _run_autows_fwd(L, Z):
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
     ref = _torch_ref_fwd(q, k, v, so, asc)
     o = A.triton_hstu_mha(
-        max_seq_len=L, alpha=1.0 / D, q=q, k=k, v=v, seq_offsets=so,
-        attn_scale=asc, enable_tma=True,
+        max_seq_len=L,
+        alpha=1.0 / D,
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=so,
+        attn_scale=asc,
+        enable_tma=True,
     )
     return o, ref
 
@@ -209,14 +221,15 @@ def test_self_attention_bwd_autows_dqreduce(L, Z):
     # (no HSTU_SELF_* env needed).
     r = subprocess.run(
         [sys.executable, __file__, "--run-dqreduce", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     # Surface the child's REL_L2 line (and any error) in the pytest output.
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
@@ -227,8 +240,7 @@ def test_self_attention_fwd_autows_fadp(L, Z):
     Runs in a SUBPROCESS because HSTU_SELF_* are constexpr-baked at import and
     cannot share an interpreter with the default (DP=1) config above. FA-DP is a
     forward-only change, so this checks the forward OUTPUT vs the torch-float
-    reference (the compiler data_partition_factor=2 path is broken on this kernel;
-    this manual split is the working, warp-specialized alternative).
+    reference.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -236,27 +248,26 @@ def test_self_attention_fwd_autows_fadp(L, Z):
     # importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fadp", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     # Surface the child's REL_L2 line (and any error) in the pytest output.
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"FA-DP autoWS fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"FA-DP autoWS fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
-@pytest.mark.skip(reason="Compiler data-partition forward path is deferred")
 def test_self_attention_fwd_autows_compiler_dp2(L, Z):
     """Compiler data-partition fwd (HSTU_SELF_DP=2, no FA_DP): the compiler splits
     the 2*BLOCK_M=256 tile into two 128-row groups. Runs in a SUBPROCESS
     (constexpr-baked config). Forward-only output check vs the torch reference.
 
-    This path was previously broken -- the DP transform left the device-side TMA
-    descriptor box_dim at the un-partitioned 256, so the TMA overran the 128-row
-    SMEM buffer (tcgen05 TMEM-alloc stall / epilogue-store OOB). Fixed in
-    WSDataPartition by scaling the tensormap box_dim by the partition factor.
+    The DP transform must slice the loop-carried PV accumulator's zero-init
+    store and dependency token so the original full TMEM tile does not remain
+    live alongside the two partition tiles.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -264,13 +275,14 @@ def test_self_attention_fwd_autows_compiler_dp2(L, Z):
     # before importing the kernel; no HSTU_SELF_* env needed.
     r = subprocess.run(
         [sys.executable, __file__, "--run-fwd", str(L), str(Z)],
-        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=900,
     )
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
-    assert r.returncode == 0, (
-        f"compiler DP=2 fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
-    )
+    assert r.returncode == 0, (f"compiler DP=2 fwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
 if __name__ == "__main__":
@@ -281,12 +293,9 @@ if __name__ == "__main__":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z)
-        rls = {n: _rel_l2(g_, w) for n, g_, w in
-               (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
-        print(
-            f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
-            f"(L={_L} Z={_Z})"
-        )
+        rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
+        print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
+              f"(L={_L} Z={_Z})")
         bad = {n: v for n, v in rls.items() if not (v < 1e-2)}
         if bad:
             print(f"FAIL: rel-L2 too high: {bad}")
@@ -307,9 +316,8 @@ if __name__ == "__main__":
         print("OK")
         sys.exit(0)
     # Generic fwd-only entry (config = whatever env was baked at import). Used by
-    # the compiler-DP=2 fwd check (now expected to pass -- fixed by the
-    # WSDataPartition box_dim scaling); _rel_l2 forces a sync so a numeric
-    # mismatch or a device fault (illegal address) surfaces here as a nonzero exit.
+    # the compiler-DP=2 fwd check; _rel_l2 forces a sync so a numeric mismatch or
+    # a device fault surfaces here as a nonzero exit.
     if len(sys.argv) >= 4 and sys.argv[1] == "--run-fwd":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         o, ref = _run_autows_fwd(_L, _Z)
@@ -320,7 +328,5 @@ if __name__ == "__main__":
             sys.exit(1)
         print("OK")
         sys.exit(0)
-    sys.exit(
-        "usage: test_self_attention_autows.py "
-        "--run-dqreduce|--run-fadp|--run-fwd L Z"
-    )
+    sys.exit("usage: test_self_attention_autows.py "
+             "--run-dqreduce|--run-fadp|--run-fwd L Z")

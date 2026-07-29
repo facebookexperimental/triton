@@ -36,7 +36,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 // NVMMASharedEncodingAttr branch in LayoutBackwardPropagation.
 
 #nvmma_src = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16}>
-#nvmma_trans = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 16}>
+#nvmma_trans = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = true, elementBitWidth = 16}>
 #nvmma_req = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 // CHECK-DAG: #[[$NVMMA_SRC:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 // CHECK-DAG: #[[$NVMMA_DST:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>

@@ -47,13 +47,13 @@ def generate_sparse_seq_len(size, max_seq_len, sparsity, device, generator=None)
     if sparsity == 0.0:
         return torch.ones(size, device=device, dtype=torch.int64)
     if sparsity == 1.0:
-        return torch.full((size,), max_seq_len, device=device, dtype=torch.int64)
+        return torch.full((size, ), max_seq_len, device=device, dtype=torch.int64)
     if sparsity >= 0.5:
         lo, hi = int((2 * sparsity - 1.0) * max_seq_len), max_seq_len
     else:
         lo, hi = 0, int(2 * sparsity * max_seq_len)
     lo, hi = max(lo, 1), max(hi, 2)
-    return torch.randint(lo, hi, (size,), device=device, dtype=torch.int64, generator=generator)
+    return torch.randint(lo, hi, (size, ), device=device, dtype=torch.int64, generator=generator)
 
 
 def make(L, Z, dtype=torch.bfloat16, sparsity=None, seed=1001):
@@ -62,7 +62,7 @@ def make(L, Z, dtype=torch.bfloat16, sparsity=None, seed=1001):
     (perf-only; torch_ref assumes uniform L). L is the per-item MAX seq-len."""
     dev = "cuda"
     if sparsity is None:
-        lens = torch.full((Z,), L, device=dev, dtype=torch.int64)
+        lens = torch.full((Z, ), L, device=dev, dtype=torch.int64)
     else:
         gen = torch.Generator(device=dev).manual_seed(seed)
         lens = generate_sparse_seq_len(Z, L, sparsity, dev, gen)
@@ -191,10 +191,17 @@ _PERF_ENV = {
     "triton": {},
     "tlx": {},
     "autows": {
-        "HSTU_SELF_AUTOWS": "1", "HSTU_SELF_DQ_REDUCE": "1", "HSTU_SELF_DQ_REUSE": "1",
-        "HSTU_SELF_DP": "1", "HSTU_SELF_AUTOWS_BWD_BM": "128", "HSTU_SELF_AUTOWS_BWD_BN": "128",
-        "HSTU_SELF_AUTOWS_BWD_STAGES": "2", "HSTU_SELF_AUTOWS_WARPS": "4",
-        "HSTU_SELF_PIN": "1", "HSTU_SELF_DQ_ITERS": "4", "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+        "HSTU_SELF_AUTOWS": "1",
+        "HSTU_SELF_DQ_REDUCE": "1",
+        "HSTU_SELF_DQ_REUSE": "1",
+        "HSTU_SELF_DP": "1",
+        "HSTU_SELF_AUTOWS_BWD_BM": "128",
+        "HSTU_SELF_AUTOWS_BWD_BN": "128",
+        "HSTU_SELF_AUTOWS_BWD_STAGES": "2",
+        "HSTU_SELF_AUTOWS_WARPS": "4",
+        "HSTU_SELF_PIN": "1",
+        "HSTU_SELF_DQ_ITERS": "4",
+        "TRITON_WS_SMEM_PLAN_SEARCH": "1",
     },
 }
 
@@ -215,7 +222,7 @@ def _bench_one(variant, L, Z, nrep):
     if _ts > 0:
         lens = so[1:] - so[:-1]
         lo = 1 if _ts < 400 else _ts // 2
-        nt = torch.randint(lo, _ts + 1, (Z,), device=so.device, dtype=torch.int64)
+        nt = torch.randint(lo, _ts + 1, (Z, ), device=so.device, dtype=torch.int64)
         kw["num_targets"] = torch.minimum(nt, lens)
     meta_ws = variant == "autows"
     with triton.knobs.nvidia.scope():
@@ -264,15 +271,19 @@ def run_perf(shapes, variants, nrep=1, heads=None, sparsity=None, timeout=3600):
                 env["BENCH_SPARSITY"] = str(sparsity)
             try:
                 r = subprocess.run(
-                    [sys.executable, os.path.abspath(__file__), "--bench-one", var,
-                     str(L), str(Z), str(nrep)],
-                    env=env, capture_output=True, text=True, timeout=timeout,
+                    [sys.executable,
+                     os.path.abspath(__file__), "--bench-one", var,
+                     str(L), str(Z),
+                     str(nrep)],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 print(f"  {var:<10} TIMEOUT/HANG")
                 continue
-            m = re.search(r"PERF \S+ L=\d+ Z=\d+ fwd=(\S+) fwd_sd=(\S+) bwd=(\S+) bwd_sd=(\S+)",
-                          r.stdout)
+            m = re.search(r"PERF \S+ L=\d+ Z=\d+ fwd=(\S+) fwd_sd=(\S+) bwd=(\S+) bwd_sd=(\S+)", r.stdout)
             if not m:
                 tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or ["(no output)"]
                 print(f"  {var:<10} ERROR: {tail[0][:70]}")
@@ -295,18 +306,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--perf", action="store_true", help="run the fwd/bwd latency benchmark")
     ap.add_argument("--acc", action="store_true", help="run the accuracy check (default)")
-    ap.add_argument("--nrep", type=int, default=1,
-                    help="do_bench repetitions per point; >1 reports mean + std")
-    ap.add_argument("--variants", default="autows,tlx,triton",
-                    help="comma subset of autows,tlx,triton (perf)")
+    ap.add_argument("--nrep", type=int, default=1, help="do_bench repetitions per point; >1 reports mean + std")
+    ap.add_argument("--variants", default="autows,tlx,triton", help="comma subset of autows,tlx,triton (perf)")
     ap.add_argument("--seqlens", default=None, help="comma L list, e.g. 256,512,1024,4096")
     ap.add_argument("--batch", type=int, default=None, help="batch Z (default 2)")
     ap.add_argument("--heads", type=int, default=None, help="num heads H (perf; default 2)")
     ap.add_argument("--sparsity", type=float, default=None,
                     help="jagged density knob (0.95 = D102650040); omit for uniform-dense")
     # hidden per-variant subprocess entry: --bench-one <variant> <L> <Z> <nrep>
-    ap.add_argument("--bench-one", nargs=4, default=None, help=argparse.SUPPRESS,
-                    metavar=("VARIANT", "L", "Z", "NREP"))
+    ap.add_argument("--bench-one", nargs=4, default=None, help=argparse.SUPPRESS, metavar=("VARIANT", "L", "Z", "NREP"))
     args = ap.parse_args()
 
     if args.bench_one:

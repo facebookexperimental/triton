@@ -238,27 +238,16 @@ Value createConvertLayout(ImplicitLocOpBuilder &b, Value tensor,
 
 Value convertAndBroadcast(ImplicitLocOpBuilder &b, Value tensor,
                           ArrayRef<int> keptDims, RankedTensorType dstType) {
-  auto loc = b.getLoc();
   auto tensorType = cast<RankedTensorType>(tensor.getType());
-  auto encoding = cast<ttg::DistributedEncodingTrait>(dstType.getEncoding());
   assert(static_cast<size_t>(tensorType.getRank()) == keptDims.size() &&
          "expected one kept dimension per source tensor rank");
-  llvm::SmallDenseSet<int> keptDimsSet(keptDims.begin(), keptDims.end());
-  Attribute sliceEncoding = encoding;
-  for (int dim = encoding.getRepOrder().size() - 1; dim >= 0; --dim) {
-    if (!keptDimsSet.contains(dim))
-      sliceEncoding = ttg::SliceEncodingAttr::get(
-          b.getContext(), dim,
-          cast<ttg::DistributedEncodingTrait>(sliceEncoding));
-  }
-  tensor = createConvertLayout(b, tensor, sliceEncoding);
-  while (cast<RankedTensorType>(tensor.getType()).getRank() < dstType.getRank())
-    tensor = tti::expandOuterSlicedDim(b, loc, tensor);
   auto resultType = RankedTensorType::get(
-      dstType.getShape(), tensorType.getElementType(), encoding);
-  if (cast<RankedTensorType>(tensor.getType()) == resultType)
-    return tensor;
-  return triton::BroadcastOp::create(b, resultType, tensor);
+      dstType.getShape(), tensorType.getElementType(), dstType.getEncoding());
+  auto sliceType = tti::getSlicedTensorType(resultType, keptDims,
+                                            tensorType.getElementType());
+  if (tensorType != sliceType)
+    tensor = ttg::ConvertLayoutOp::create(b, sliceType, tensor);
+  return tti::reshapeAndBroadcast(b, b.getLoc(), tensor, keptDims, resultType);
 }
 
 Value expandAliases(ImplicitLocOpBuilder &b, Value bufferMask,
@@ -287,17 +276,14 @@ Value createThreadColumnMask(ImplicitLocOpBuilder &b, Value threadMask,
                              RankedTensorType tensorType) {
   int columnDim = tensorType.getRank() - 1;
   auto loc = b.getLoc();
-  auto encoding = cast<ttg::DistributedEncodingTrait>(tensorType.getEncoding());
-  auto sliceEncoding = tti::getSingleDimSliceEncoding(encoding, columnDim);
   int columns = tensorType.getShape()[columnDim];
 
   RankedTensorType rangeType =
-      RankedTensorType::get({columns}, b.getI32Type(), sliceEncoding);
+      tti::getSlicedTensorType(tensorType, {columnDim}, b.getI32Type());
   Value range = triton::MakeRangeOp::create(b, rangeType, 0, columns);
 
   auto elemType = cast<IntegerType>(tensorType.getElementType());
-  RankedTensorType rangeElemType =
-      RankedTensorType::get({columns}, elemType, sliceEncoding);
+  RankedTensorType rangeElemType = rangeType.clone(elemType);
   Value rangeElem = range;
   if (elemType.getWidth() != 32)
     rangeElem = arith::ExtUIOp::create(b, rangeElemType, range);
@@ -317,10 +303,7 @@ Value createThreadColumnMask(ImplicitLocOpBuilder &b, Value threadMask,
 Value createDimMask(ImplicitLocOpBuilder &b, Value index,
                     RankedTensorType tensorType, int dim) {
   assert(dim >= 0 && dim < tensorType.getRank() && "invalid tensor dimension");
-  auto encoding = cast<ttg::DistributedEncodingTrait>(tensorType.getEncoding());
-  auto sliceEncoding = tti::getSingleDimSliceEncoding(encoding, dim);
-  auto indexType = RankedTensorType::get({tensorType.getShape()[dim]},
-                                         b.getI32Type(), sliceEncoding);
+  auto indexType = tti::getSlicedTensorType(tensorType, {dim}, b.getI32Type());
   Value range = triton::MakeRangeOp::create(b, indexType, /*start=*/0,
                                             /*end=*/tensorType.getShape()[dim]);
   Value indexTensor = triton::SplatOp::create(b, indexType, index);
