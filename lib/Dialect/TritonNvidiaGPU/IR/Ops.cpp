@@ -637,7 +637,8 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
                            isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
                            getCoord(), getOffsets())))
     return failure();
-  if (getMulticast() && !hasCGABroadcast(resultType))
+  if (getMulticast() && !getMulticastTargets() &&
+      !hasCGABroadcast(resultType))
     return emitOpError(
         "multicast requires the shared layout to broadcast across CTAs");
   return success();

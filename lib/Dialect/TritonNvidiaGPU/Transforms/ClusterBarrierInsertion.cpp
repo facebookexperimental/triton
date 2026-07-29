@@ -97,7 +97,8 @@ usesTrackedBarrierInCrossCTAConsumerOp(Operation *op,
     return ttng::getModuleTwoCTAs(op) && aliasesTracked(commit.getBarrier());
   }
   if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
-    return tma.getMulticast() && aliasesTracked(tma.getBarrier());
+    return tma.getMulticast() && !tma.getMulticastTargets() &&
+        aliasesTracked(tma.getBarrier());
   }
   return false;
 }
