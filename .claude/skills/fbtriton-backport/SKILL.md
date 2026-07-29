@@ -109,6 +109,14 @@ from two sources — `source=openai` (OpenAI's release branch) and `source=meta-
 `main`). Columns: `source  present  class  sha  subject`; the `#` header pins the range SHAs.
 Filtering the sweep down (Step "Drop"/"Scope" below) is the main work.
 
+**Freshness is not optional — regenerate, never reuse.** The `#` header pins `main_head`.
+A `candidates.tsv` produced for an earlier point release is stale the moment `main` moves:
+**re-run the sweep for every release** and confirm its `main_head` equals
+`git rev-parse origin/main` before triaging. A fix that lands between a stale `main_head`
+and the cut is invisible to triage — this is exactly how the gfx950 async-copy fix
+(#2285, `CoalesceAsyncCopy` fallback) was missed by **v3.7.3**, whose triage reused a
+candidate list frozen ~12 days before the cut.
+
 ### Candidate source (b) — specific ask: scan `CUT..main_head`
 
 Start from the user's intent (e.g. "the AMD perf work prod needs", often sourced from a chat
@@ -125,6 +133,34 @@ Capture the result in `backport_<version>.md` (format like `.backports/3.7.3/bac
 
 The `present`/scope hints are *hints* — verify against real code and real dependencies;
 never trust a PR-number grep (squashed bundles break it).
+
+### Candidate source (c) — test-diff cross-check (catches fixes hiding as tests)
+
+Run this **in addition** to (a)/(b), on every backport. A fix and its regression test
+almost always land together; a title or the classifier can hide the *fix*, but the *new
+test* is hard to hide. Diff the TLX / warp-spec test surfaces between the release branch and
+`main` — a test on `main` but not on the release is a fix candidate; read the commit that
+added it.
+
+```bash
+TESTS='python/test/unit/language/test_tlx_amd.py \
+       python/test/unit/language/test_tlx_*.py \
+       python/test/unit/language/test_warp_specialization.py \
+       python/test/unit/language/test_tutorial09_warp_specialization.py'
+for f in $TESTS; do
+  comm -13 \
+    <(git show origin/release/X.Y.z:"$f" 2>/dev/null | grep -oE '^def test_[A-Za-z0-9_]+' | sort) \
+    <(git show origin/main:"$f"           2>/dev/null | grep -oE '^def test_[A-Za-z0-9_]+' | sort)
+done
+# map each missing test back to the commit that added it, then read that commit:
+git log --oneline -S'def <missing_test_name>' -- <file>
+```
+
+`test_tlx_amd.py` is the **AMD / gfx950** surface; its **NVIDIA (Hopper/Blackwell)
+counterparts** are the rest of the `test_tlx_*.py` family plus `test_warp_specialization.py`
+and `test_tutorial09_warp_specialization.py`. A missing test in any of them is a missing
+**fix** candidate — the commit that added it is almost always fix-bearing even when titled
+`Repro:` / `Test:`.
 
 ### Read the PR + commit message for every candidate (don't decide from the diff alone)
 
@@ -144,6 +180,11 @@ and **what tests it ships**. Decide pick/skip from the message + real code, not 
   each pick adds/edits now. A test file a PR *depends on* (created by an earlier PR) is often
   the silent machinery that makes the pick conflict — Phase 2 surfaces it (e.g. #2153's
   asyncmark test ← #10081).
+- **A test-looking commit can *be* the fix.** A commit titled `Repro:` / `Test:` that also
+  edits compiler code (`lib/…`, `third_party/*/lib/…/Transforms/…`) is fix-bearing — the
+  sweep flags these `[tlx-test]` and promotes them to `class=fix`. Never skip one as "just a
+  test"; read it. (#2285 shipped its `CoalesceAsyncCopy` fallback under a `Repro: … fails to
+  legalize on gfx950` title — classified `amd`, and was missed by v3.7.3.)
 
 ### Drop what we don't need (both modes)
 
