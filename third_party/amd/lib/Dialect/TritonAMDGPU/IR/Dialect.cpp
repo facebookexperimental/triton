@@ -150,6 +150,22 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
   bool compatible =
       descLayout == allocLayout || (!descPartitioned && allocPartitioned &&
                                     descLayout == effectiveAllocLayout);
+  // Rank-reducing descriptor loads drop leading unit dimensions from the
+  // allocation, so the two swizzled encodings have different ranks even though
+  // they describe the same LDS layout. Compare the physical layouts with the
+  // dropped dimensions projected away.
+  int descRank = descTy.getShape().size();
+  int allocRank = smemTy.getRank();
+  bool projectedRankReduction =
+      descRank > allocRank &&
+      llvm::isa<gpu::SwizzledSharedEncodingAttr>(descLayout) &&
+      llvm::isa<gpu::SwizzledSharedEncodingAttr>(allocLayout);
+  if (projectedRankReduction) {
+    auto descLL = gpu::toLinearLayout(descTy.getShape(), descLayout);
+    for (int i = 0; i < descRank - allocRank; ++i)
+      descLL = triton::removeStandardDim(descLL, 0);
+    compatible = descLL == gpu::toLinearLayout(smemTy);
+  }
   // Padded encodings include the allocation shape. Compare padding here and
   // the physical address mapping over the copied tile below.
   auto descPad = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(descLayout);
@@ -159,7 +175,8 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
     compatible = descPad.getIntervals() == allocPad.getIntervals() &&
                  descPad.getPaddings() == allocPad.getPaddings();
 
-  if (!compatible && descTy.getShape() != smemTy.getShape() &&
+  if (!compatible && !projectedRankReduction &&
+      descTy.getShape() != smemTy.getShape() &&
       llvm::isa<gpu::SwizzledSharedEncodingAttr>(descLayout)) {
     auto descEncoding = llvm::cast<gpu::SharedEncodingTrait>(descLayout);
     auto smemTensorTy = RankedTensorType::get(
@@ -168,7 +185,8 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
                  effectiveAllocLayout;
   }
 
-  if (compatible && !descPartitioned && !allocPartitioned) {
+  if (compatible && !projectedRankReduction && !descPartitioned &&
+      !allocPartitioned) {
     auto tensorTy = RankedTensorType::get(smemTy.getShape(),
                                           smemTy.getElementType(), descLayout);
     auto expectedEncoding = gpu::updateEncodingForShape(
@@ -199,7 +217,9 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
            << descLayout
            << ") is inconsistent with the shared memory allocation layout ("
            << allocLayout
-           << "); TDM uses a single shared layout so they must match";
+           << "); TDM accesses shared memory through the descriptor's layout, "
+              "so the allocation must describe the same physical layout, up to "
+              "leading unit dimensions dropped by a rank-reducing access";
   return success();
 }
 
