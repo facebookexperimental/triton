@@ -129,7 +129,12 @@ analysis framework.
 ### Materialization (`doTaskIdPropagate`)
 
 1. Convert `ttg.partition` → `async_task_id` (normalize indices by subtracting
-   the minimum partition ID).
+   the minimum partition ID). A `ttg.partition` array may hold **more than one**
+   id: a no-MMA reduction annotates a scalar offset that feeds both the load and
+   the store with the union of their partitions (e.g. `array<i32: 1, 2>`). Every
+   id in the array is materialized, so the op is later replicated per-partition
+   by code partitioning. (Assuming exactly one id here used to crash no-MMA
+   reduction kernels.)
 2. Handle operand D initialization: find `TMEMStoreOp` before the loop that
    writes to the MMA's accumulator, assign it the appropriate task ID.
 3. Mark all `scf::ForOp` and `scf::WhileOp` loops with the union of all task
