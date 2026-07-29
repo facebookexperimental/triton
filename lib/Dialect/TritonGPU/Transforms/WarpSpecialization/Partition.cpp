@@ -1,9 +1,13 @@
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
+#include "PartitionAttrs.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Use.h"
@@ -11,6 +15,145 @@
 using namespace mlir;
 using namespace triton;
 using namespace triton::gpu;
+
+namespace {
+
+LogicalResult verifyPartitionIdsAttr(Operation *op, StringRef attrName,
+                                     Attribute attrValue) {
+  auto partitionIdsAttr = dyn_cast<DenseI32ArrayAttr>(attrValue);
+  if (!partitionIdsAttr) {
+    return op->emitOpError("has invalid attribute ")
+           << attrName << "; expected a dense i32 array";
+  }
+
+  SetVector<int> idSet;
+  for (auto id : partitionIdsAttr.asArrayRef()) {
+    if (idSet.contains(id))
+      return op->emitOpError("has duplicated partition ids in attribute ")
+             << attrName;
+    idSet.insert(id);
+  }
+  if (idSet.empty())
+    return op->emitOpError("has no partition ids in attribute ") << attrName;
+
+  auto ids = idSet.takeVector();
+  SmallVector<int> sortedIds(ids.begin(), ids.end());
+  llvm::sort(sortedIds);
+  if (ids != sortedIds) {
+    return op->emitOpError("partition ids not in sorted order in attribute ")
+           << attrName;
+  }
+  return success();
+}
+
+LogicalResult verifyPartitionAttrs(Operation *op) {
+  bool useMetaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
+  // META_WS_CHANGE: PSM intentionally leaves some nested operations without
+  // partition annotations for later task-id propagation.
+  if (op->hasAttr(kWarpSpecializeAttrName) && !useMetaWS) {
+    if (!isa<scf::ForOp>(op)) {
+      return op->emitOpError("has unexpected attribute ")
+             << kWarpSpecializeAttrName
+             << " which is expected only on `scf.for` ops";
+    }
+
+    Operation *failedOp = nullptr;
+    op->walk([&](Operation *childOp) {
+      if (isa<ub::PoisonOp>(childOp))
+        return WalkResult::advance();
+      if (!childOp->hasAttr(kPartitionAttrName)) {
+        failedOp = childOp;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (failedOp) {
+      return failedOp->emitOpError("does not have expected attribute ")
+             << kPartitionAttrName
+             << " which is expected on all child ops of an op with attribute `"
+             << kWarpSpecializeAttrName << "`";
+    }
+  }
+
+  if (auto partitionAttr = op->getAttr(kPartitionAttrName)) {
+    if (failed(verifyPartitionIdsAttr(op, kPartitionAttrName, partitionAttr)))
+      return failure();
+  }
+
+  if (auto outputsAttr = op->getAttr(kPartitionOutputsAttrName)) {
+    auto arrayAttr = dyn_cast<ArrayAttr>(outputsAttr);
+    if (!arrayAttr) {
+      return op->emitOpError("has invalid attribute ")
+             << kPartitionOutputsAttrName << "; expected an array attribute";
+    }
+
+    for (Attribute attr : arrayAttr) {
+      if (failed(verifyPartitionIdsAttr(op, kPartitionOutputsAttrName, attr))) {
+        return failure();
+      }
+    }
+  }
+
+  // META_WS_CHANGE: Match Meta's pre-port verifier exemptions. PSM does not
+  // guarantee complete nested annotations, and ReduceOp/MapElementwiseOp have
+  // function-like regions whose operations do not need partition annotations.
+  if (op->hasAttr(kPartitionAttrName) && op->getNumRegions() != 0 &&
+      !isa<triton::ReduceOp, triton::MapElementwiseOp>(op) && !useMetaWS) {
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region.getBlocks()) {
+        for (Operation &childOp : block.getOperations()) {
+          if (isa<scf::YieldOp, ub::PoisonOp>(childOp))
+            continue;
+          if (!childOp.hasAttr(kPartitionAttrName)) {
+            return childOp.emitOpError("does not have expected attribute ")
+                   << kPartitionAttrName
+                   << " which is expected for ops whose parent has partitions";
+          }
+        }
+      }
+    }
+    // META_WS_CHANGE: Meta's pre-port verifier did not require the parent's
+    // partition set to contain every child partition.
+  }
+
+  if (auto outputsAttr = op->getAttr(kPartitionOutputsAttrName)) {
+    if (!isa<scf::ForOp, scf::IfOp, triton::ReduceOp>(op))
+      return op->emitOpError("has unexpected attribute ")
+             << kPartitionOutputsAttrName;
+
+    size_t numResults = op->getNumResults();
+    auto arrayAttr = cast<ArrayAttr>(outputsAttr);
+    if (arrayAttr.size() != numResults) {
+      return op->emitOpError("does not have expected number of output "
+                             "partition sets in attr ")
+             << kPartitionOutputsAttrName << "; should match number of results";
+    }
+
+    if (!op->hasAttr(kPartitionAttrName)) {
+      return op->emitOpError("does not have expected attribute ")
+             << kPartitionAttrName << " which is expected for ops with attr "
+             << kPartitionOutputsAttrName;
+    }
+
+    auto partitionIds = getPartitionIds(op);
+    SetVector<int> outputPartitionIdsUnion;
+    for (auto outputPartitionIds : getPartitionOutputs(op)) {
+      outputPartitionIdsUnion.insert(outputPartitionIds.begin(),
+                                     outputPartitionIds.end());
+    }
+    if (!llvm::all_of(outputPartitionIdsUnion,
+                      [&](int id) { return partitionIds.contains(id); })) {
+      return op->emitOpError("partition ids in attr ")
+             << kPartitionAttrName
+             << " must be the union of all partition ids in "
+             << kPartitionOutputsAttrName;
+    }
+  }
+
+  return success();
+}
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Partition
@@ -194,6 +337,11 @@ FailureOr<PartitionSet> PartitionSet::fromLoop(LoopLikeOpInterface loop) {
   if (!isa<scf::ForOp, scf::WhileOp>(loop.getOperation()) ||
       !hasSupportedLoopCarry(loop))
     return failure();
+  // META_WS_CHANGE: Preserve Meta's scf.while support; the upstream verifier
+  // currently accepts scf.for only.
+  if (auto forOp = dyn_cast<scf::ForOp>(loop.getOperation());
+      forOp && failed(verifyPartitionedLoop(forOp)))
+    return failure();
   auto stages = loop->getAttrOfType<ArrayAttr>(kPartitionStagesAttrName);
   if (!stages)
     return failure();
@@ -275,6 +423,71 @@ void PartitionSet::dump() const {
 }
 
 namespace mlir::triton::gpu {
+
+SetVector<int> getPartitionIds(Operation *op) {
+  auto attrs = op->getAttr(kPartitionAttrName);
+  SmallVector<int> partitionIds;
+  for (auto id : cast<DenseI32ArrayAttr>(attrs).asArrayRef()) {
+    partitionIds.push_back(id);
+  }
+  llvm::sort(partitionIds);
+  return SetVector<int>(partitionIds.begin(), partitionIds.end());
+}
+
+SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op) {
+  SmallVector<SetVector<int>, 4> partitionOutputsIds;
+  if (op->getNumResults() == 0)
+    return partitionOutputsIds;
+
+  assert(op->hasAttr(kPartitionOutputsAttrName));
+  auto arrayAttr = cast<ArrayAttr>(op->getAttr(kPartitionOutputsAttrName));
+  for (Attribute attr : arrayAttr) {
+    auto ids = cast<DenseI32ArrayAttr>(attr).asArrayRef();
+    partitionOutputsIds.push_back(SetVector<int>(ids.begin(), ids.end()));
+  }
+  return partitionOutputsIds;
+}
+
+SetVector<int> getPartitionIds(OpOperand *use) {
+  auto owner = use->getOwner();
+  if (isa<scf::YieldOp>(owner)) {
+    return getPartitionOutputs(owner->getParentOp())[use->getOperandNumber()];
+  }
+  if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
+    int idx = use->getOperandNumber() - forOp.getNumControlOperands();
+    return idx >= 0 ? getPartitionOutputs(owner)[idx] : getPartitionIds(forOp);
+  }
+  return getPartitionIds(owner);
+}
+
+bool hasPartition(Operation *op) {
+  return op && op->hasAttr(kPartitionAttrName);
+}
+
+bool hasWarpSpecializeTag(Operation *op) {
+  return op && op->hasAttr(kWarpSpecializeTagAttrName);
+}
+
+std::optional<int> getWarpSpecializeTag(Operation *op) {
+  if (hasWarpSpecializeTag(op))
+    return cast<IntegerAttr>(op->getAttr(kWarpSpecializeTagAttrName)).getInt();
+  return std::nullopt;
+}
+
+LogicalResult verifyPartitionedLoop(scf::ForOp loop) {
+  if (failed(verifyPartitionAttrs(loop)))
+    return failure();
+
+  LogicalResult result = success();
+  loop.walk([&](Operation *op) {
+    if (failed(verifyPartitionAttrs(op))) {
+      result = failure();
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return result;
+}
 
 void setPartition(Operation *op, ArrayRef<int> partitionIds) {
   Builder b(op->getContext());

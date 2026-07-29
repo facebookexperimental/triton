@@ -1,4 +1,5 @@
 #include "CodePartitionUtility.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "TaskIdPropagation.h"
 #include "Utility.h"
 #include "WarpSpecializationPipeline.h"

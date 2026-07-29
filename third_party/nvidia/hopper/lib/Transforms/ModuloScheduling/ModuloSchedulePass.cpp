@@ -7,6 +7,7 @@
 // attributes for downstream pipelining passes.
 
 #include <cmath>
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include <set>
 #include <tuple>
 
