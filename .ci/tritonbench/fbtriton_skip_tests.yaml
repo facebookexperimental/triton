@@ -60,7 +60,8 @@ mx4_to_fp32:
     - cuda
 # cuda covers all NVIDIA (keeps existing coverage); the literal b200 entry is
 # required for the b200-only CI filter. This exercises hstu_tlx plus the
-# default, manual-DP, and DQ-reduce AutoWS self-attention backends on b200.
+# default, manual-DP, compiler-DP, and DQ-reduce AutoWS self-attention backends
+# on b200.
 ragged_attention:
   devices:
     - cuda

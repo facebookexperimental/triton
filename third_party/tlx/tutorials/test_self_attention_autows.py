@@ -16,14 +16,12 @@ Four configs are covered:
   (this same file re-invoked with `--run-dqreduce`) with the env set first.
 - The FA-style manual data-partition FWD config (HSTU_SELF_FA_DP=1, DP=2, WARPS=4):
   `test_self_attention_fwd_autows_fadp`. Splits BLOCK_M=256 into two 128-row halves
-  sharing one K/V load, warp-specialized into load + 2 MMA groups -- the working
-  alternative to the broken compiler data_partition_factor=2 path. Also
+  sharing one K/V load, warp-specialized into load + 2 MMA groups. Also
   constexpr-baked at import -> SUBPROCESS (`--run-fadp`); fwd-only output check.
 - The compiler DP=2 config (HSTU_SELF_DP=2, no FA_DP):
   `test_self_attention_fwd_autows_compiler_dp2`. The compiler's
-  data_partition_factor=2 splits the 256-row tile into two 128-row groups. Was
-  broken (TMA descriptor box_dim left at 256 -> SMEM overrun -> stall/OOB); fixed
-  in WSDataPartition by scaling box_dim by the partition factor. SUBPROCESS,
+  data_partition_factor=2 splits the 256-row tile into two 128-row groups,
+  including the loop-carried accumulator initialization and token. SUBPROCESS,
   `--run-fwd`, fwd-only output check.
 
 Notes:
@@ -66,8 +64,8 @@ _DQREDUCE_CFG = dict(
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
 _MANUAL_DP_CFG = dict(autows=True, manual_dp=True, dp=2, warps=4, pin=True)
-# Compiler data_partition_factor=2 fwd (no FA_DP): the compiler splits the 256 tile
-# (fixed via the WSDataPartition box_dim scaling).
+# Compiler data_partition_factor=2 fwd (no FA_DP): the compiler splits the
+# 256-row tile and its loop-carried accumulator initialization.
 _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
@@ -227,8 +225,7 @@ def test_self_attention_fwd_autows_fadp(L, Z):
     Runs in a SUBPROCESS because HSTU_SELF_* are constexpr-baked at import and
     cannot share an interpreter with the default (DP=1) config above. FA-DP is a
     forward-only change, so this checks the forward OUTPUT vs the torch-float
-    reference (the compiler data_partition_factor=2 path is broken on this kernel;
-    this manual split is the working, warp-specialized alternative).
+    reference.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -247,16 +244,14 @@ def test_self_attention_fwd_autows_fadp(L, Z):
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
-@pytest.mark.skip(reason="Compiler data-partition forward path is deferred")
 def test_self_attention_fwd_autows_compiler_dp2(L, Z):
     """Compiler data-partition fwd (HSTU_SELF_DP=2, no FA_DP): the compiler splits
     the 2*BLOCK_M=256 tile into two 128-row groups. Runs in a SUBPROCESS
     (constexpr-baked config). Forward-only output check vs the torch reference.
 
-    This path was previously broken -- the DP transform left the device-side TMA
-    descriptor box_dim at the un-partitioned 256, so the TMA overran the 128-row
-    SMEM buffer (tcgen05 TMEM-alloc stall / epilogue-store OOB). Fixed in
-    WSDataPartition by scaling the tensormap box_dim by the partition factor.
+    The DP transform must slice the loop-carried PV accumulator's zero-init
+    store and dependency token so the original full TMEM tile does not remain
+    live alongside the two partition tiles.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -307,9 +302,8 @@ if __name__ == "__main__":
         print("OK")
         sys.exit(0)
     # Generic fwd-only entry (config = whatever env was baked at import). Used by
-    # the compiler-DP=2 fwd check (now expected to pass -- fixed by the
-    # WSDataPartition box_dim scaling); _rel_l2 forces a sync so a numeric
-    # mismatch or a device fault (illegal address) surfaces here as a nonzero exit.
+    # the compiler-DP=2 fwd check; _rel_l2 forces a sync so a numeric mismatch or
+    # a device fault surfaces here as a nonzero exit.
     if len(sys.argv) >= 4 and sys.argv[1] == "--run-fwd":
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         o, ref = _run_autows_fwd(_L, _Z)
