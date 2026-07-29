@@ -103,6 +103,22 @@ class _VectorPacketPayload:
     packets: tuple[object, ...]
     packet_width: int
     logical_component_count: int
+    packet_scalar_slots: tuple[int, ...] | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "packets", tuple(self.packets))
+        if self.packet_scalar_slots is None:
+            return
+        packet_scalar_slots = tuple(int(slot) for slot in self.packet_scalar_slots)
+        if (
+            len(packet_scalar_slots) != int(self.logical_component_count)
+            or sorted(packet_scalar_slots)
+            != list(range(int(self.logical_component_count)))
+        ):
+            raise ValueError(
+                "vector packet scalar slots must permute its logical components"
+            )
+        object.__setattr__(self, "packet_scalar_slots", packet_scalar_slots)
 
 
 @dataclass(frozen=True)
@@ -129,6 +145,8 @@ class _LoopValueShape:
     mask_predicate_component_count: int = 0
     packet_width: int | None = None
     logical_component_count: int | None = None
+    packet_scalar_slots: tuple[int, ...] | None = None
+    register_packet_assumption: bool = False
     preserved_vector_payload_key: tuple[int, str, int] | None = None
     preserved_vector_payload_type: object | None = field(default=None, compare=False)
 
@@ -562,6 +580,133 @@ def _emit_float_unary(state, op):
     state.values[result_id] = _pack_components(tuple(emitted))
 
 
+def _emit_float_ternary(state, op):
+    attrs = target_ir.attrs_dict(op)
+    if attrs["operation"] != "fma":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_FLOAT_TERNARY",
+            STAGE,
+            f"unsupported float ternary operation {attrs['operation']}",
+            target_op_id=op.target_op_id,
+        )
+    fastmath = _fastmath_attr(state, attrs.get("fastmath"), op)
+    lhs, rhs, acc = _operand_values(state, op, 3)
+    result_id = _single_result(op)
+    target_type = state.target_program.values[result_id].type
+    count = _component_count(state, result_id)
+    lhs_components, rhs_components, acc_components = _broadcast_components(
+        state,
+        (lhs, rhs, acc),
+        count,
+        op,
+    )
+
+    def emit_component(lhs_component, rhs_component, acc_component):
+        if target_type.representation in _MMA_PACKET_REPRESENTATIONS:
+            return _emit_mma_packet_float_ternary_component(
+                state,
+                lhs_component,
+                rhs_component,
+                acc_component,
+                fastmath,
+                op,
+            )
+        return state.dsl.wave.FmaOp(
+            lhs_component.type,
+            lhs_component,
+            rhs_component,
+            acc_component,
+            fastmath=fastmath,
+        ).result
+
+    reused = []
+    state.values[result_id] = _pack_components(
+        tuple(
+            _reuse_component_result(
+                reused,
+                (lhs_component, rhs_component, acc_component),
+                lambda lhs_component=lhs_component, rhs_component=rhs_component, acc_component=acc_component:
+                emit_component(
+                    lhs_component,
+                    rhs_component,
+                    acc_component,
+                ),
+            )
+            for lhs_component, rhs_component, acc_component in zip(
+                lhs_components,
+                rhs_components,
+                acc_components,
+            )
+        )
+    )
+
+
+def _emit_mma_packet_float_ternary_component(
+    state,
+    lhs_component,
+    rhs_component,
+    acc_component,
+    fastmath,
+    op,
+):
+    payloads = tuple(
+        _simd_1d_vector_payload(state, component)
+        for component in (lhs_component, rhs_component, acc_component)
+    )
+    if any(payload is None for payload in payloads):
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_FLOAT_TERNARY",
+            STAGE,
+            "MMA packet float ternary operands must be SIMD vector payloads",
+            target_op_id=op.target_op_id,
+        )
+    payload_keys = tuple(
+        (int(width), str(element_type), int(lane_width))
+        for width, element_type, lane_width in payloads
+    )
+    if any(payload_key != payload_keys[0] for payload_key in payload_keys[1:]):
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_FLOAT_TERNARY",
+            STAGE,
+            "MMA packet float ternary operands must have matching vector payload types",
+            target_op_id=op.target_op_id,
+        )
+    width, element_type, lane_width = payloads[0]
+    scalar_type = state.dsl.simd_type(element_type, int(lane_width))
+    packed_elements = tuple(
+        _packed_vector_payload_elements(component, scalar_type, int(width))
+        for component in (lhs_component, rhs_component, acc_component)
+    )
+    result_scalars = []
+    for index in range(int(width)):
+        operands = tuple(
+            (
+                elements[index]
+                if elements is not None
+                else state.dsl.wave.ExtractOp(
+                    scalar_type,
+                    component,
+                    index,
+                ).result
+            )
+            for component, elements in zip(
+                (lhs_component, rhs_component, acc_component),
+                packed_elements,
+            )
+        )
+        result_scalars.append(
+            state.dsl.wave.FmaOp(
+                scalar_type,
+                *operands,
+                fastmath=fastmath,
+            ).result
+        )
+    return state.dsl.wave.PackOp(
+        lhs_component.type,
+        result_scalars,
+    ).result
+
+
 def _emit_wave_float_unary_component(state, operation, value, fastmath, op):
     builders = {
         "exp2": state.dsl.wave.FExp2Op,
@@ -715,6 +860,67 @@ def _emit_float_cast(state, op):
     result_id = _single_result(op)
     target_type = state.target_program.values[result_id].type
     result_value_mode = attrs.get("result_value_mode")
+    if result_value_mode == "register_packet_payload":
+        packet_width = int(attrs["register_packet_width"])
+        component_count = int(target_type.component_count)
+        packet_scalar_slots = tuple(
+            int(slot) for slot in attrs["register_packet_scalar_slots"]
+        )
+        if (
+            len(packet_scalar_slots) != component_count
+            or component_count % packet_width
+        ):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_FLOAT_CAST",
+                STAGE,
+                "register packet float cast has an inconsistent scalar slot map",
+                target_op_id=op.target_op_id,
+                target_value_id=result_id,
+            )
+        source_components = _value_components(state, source, op)
+        if len(source_components) != component_count:
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_FLOAT_CAST",
+                STAGE,
+                "register packet float cast source components do not match its result",
+                target_op_id=op.target_op_id,
+                target_value_id=result_id,
+            )
+        source_type = state.target_program.values[int(op.operands[0])].type
+        source_packet_type = state.dsl.simd_type(
+            state.dsl.vector_type(
+                packet_width,
+                _scalar_type(state.dsl, source_type.element_type),
+            ),
+            int(source_type.lane_width or 64),
+        )
+        ordered_source_components = tuple(
+            source_components[slot] for slot in packet_scalar_slots
+        )
+        source_packets = tuple(
+            state.dsl.wave.PackOp(
+                source_packet_type,
+                ordered_source_components[index:index + packet_width],
+            ).result
+            for index in range(0, component_count, packet_width)
+        )
+        result_packet_type = state.dsl.simd_type(
+            state.dsl.vector_type(
+                packet_width,
+                _scalar_type(state.dsl, target_type.element_type),
+            ),
+            int(target_type.lane_width or 64),
+        )
+        state.values[result_id] = _VectorPacketPayload(
+            tuple(
+                state.builder.fpconvert(packet, result_packet_type)
+                for packet in source_packets
+            ),
+            packet_width,
+            component_count,
+            packet_scalar_slots,
+        )
+        return
     if result_value_mode in {"mma_packet_payload", "register_vector_payload"}:
         result_type = _mma_packet_payload_type(
             state,
@@ -893,6 +1099,14 @@ def _emit_affine_materialize(state, op):
                         ),
                         linear_component_bases=attrs.get(
                             "linear_component_bases",
+                            (),
+                        ),
+                        component_coordinate_bases=attrs.get(
+                            "component_coordinate_bases",
+                            (),
+                        ),
+                        workitem_coordinate_coefficients=attrs.get(
+                            "workitem_coordinate_coefficients",
                             (),
                         ),
                     ),
@@ -3603,6 +3817,34 @@ def _emit_program_id(state, op):
     state.values[_single_result(op)] = state.builder.workgroup_id(int(attrs["axis"]))
 
 
+def _emit_warp_id(state, op):
+    result_id = _single_result(op)
+    target_type = state.target_program.values[result_id].type
+    lane_width = int(
+        target_type.lane_width
+        or state.target_program.kernel.threads_per_warp
+        or 64
+    )
+    if lane_width <= 0 or lane_width & (lane_width - 1):
+        fail(
+            "TLXW_EMIT_WARP_ID",
+            STAGE,
+            f"ttg.warp_id requires a power-of-two wave width, got {lane_width}",
+            target_op_id=op.target_op_id,
+        )
+    workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    wave_first = state.builder.read_first(workitem)
+    shift = state.builder.constant(
+        state.dsl.i32(),
+        lane_width.bit_length() - 1,
+    )
+    state.values[result_id] = state.builder.binary(
+        state.dsl.BinaryKind.ShRUI,
+        wave_first,
+        shift,
+    )
+
+
 def _emit_thread_id(state, op):
     attrs = target_ir.attrs_dict(op)
     result_id = _single_result(op)
@@ -3823,7 +4065,7 @@ def _select_vector_payload_components(
 def _emit_reduction(state, op):
     attrs = target_ir.attrs_dict(op)
     source = _operand_values(state, op, 1)[0]
-    source_components = _as_components(source)
+    source_components = _value_components(state, source, op)
     result_id = _single_result(op)
     component_terms = tuple(tuple(term for term in terms) for terms in attrs["component_terms"])
     if len(component_terms) != _component_count(state, result_id):
@@ -3865,18 +4107,34 @@ def _emit_reduction(state, op):
             value = extracted.get(key)
             if value is None:
                 payload = _simd_1d_vector_payload(state, source_components[source_component])
-                if payload is None or int(payload[0]) != registers or str(payload[1]) != "f32":
+                if payload is None:
+                    try:
+                        simd = state.dsl.SimdType(source_components[source_component].type)
+                    except Exception:
+                        simd = None
+                    if (registers != 1 or simd is None
+                            or str(simd.element_type) != "f32"
+                            or int(simd.width) != lane_width):
+                        fail(
+                            "TLXW_EMIT_REDUCTION",
+                            STAGE,
+                            "reduction input must contain f32 distributed registers",
+                            target_op_id=op.target_op_id,
+                        )
+                    value = source_components[source_component]
+                elif int(payload[0]) != registers or str(payload[1]) != "f32":
                     fail(
                         "TLXW_EMIT_REDUCTION",
                         STAGE,
-                        "reduction input must contain f32 MFMA register vectors",
+                        "reduction input must contain f32 distributed registers",
                         target_op_id=op.target_op_id,
                     )
-                value = state.dsl.wave.ExtractOp(
-                    scalar_type,
-                    source_components[source_component],
-                    source_register,
-                ).result
+                else:
+                    value = state.dsl.wave.ExtractOp(
+                        scalar_type,
+                        source_components[source_component],
+                        source_register,
+                    ).result
                 extracted[key] = value
             lane_key = (int(lane_base), tuple(int(coefficient) for coefficient in lane_coefficients))
             grouped.setdefault(lane_key, []).append(value)
@@ -4207,6 +4465,16 @@ def _emit_for_loop(state, op):
         init_values,
         op,
     )
+    register_packet_widths = tuple(
+        int(width) for width in attrs.get("register_packet_widths", ())
+    )
+    if register_packet_widths and len(register_packet_widths) != init_arg_count:
+        fail(
+            "TLXW_EMIT_FOR_REGISTER_PACKETS",
+            STAGE,
+            "for_loop register packet widths must match its init args",
+            target_op_id=op.target_op_id,
+        )
     flat_init_values, init_shapes = _flatten_structured_values(
         state,
         init_values,
@@ -4215,6 +4483,7 @@ def _emit_for_loop(state, op):
         op,
         preserve_mask_predicates=False,
         preserve_mma_packet_payloads=True,
+        register_packet_widths=register_packet_widths,
     )
     region = state.target_program.regions[op.region_ids[0]]
     if len(region.block_arg_ids) != 1 + init_arg_count:
@@ -4786,6 +5055,7 @@ def _emit_structured_branch(
         region.yield_value_ids,
         label,
         op,
+        expected_shapes=result_shapes,
         preserve_mma_packet_payloads=True,
     )
     if tuple(yield_shapes) != tuple(result_shapes):
@@ -4921,6 +5191,7 @@ def _flatten_structured_values(
     expected_shapes=None,
     preserve_mask_predicates=False,
     preserve_mma_packet_payloads=False,
+    register_packet_widths=(),
 ):
     if len(values) != len(target_value_ids):
         fail(
@@ -4936,13 +5207,50 @@ def _flatten_structured_values(
             f"{context} expected shape count does not match values",
             target_op_id=op.target_op_id,
         )
+    if register_packet_widths and len(register_packet_widths) != len(values):
+        fail(
+            "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
+            STAGE,
+            f"{context} register packet width count does not match values",
+            target_op_id=op.target_op_id,
+        )
     flat_values = []
     shapes = []
     for index, (value, target_value_id) in enumerate(zip(values, target_value_ids)):
         expected_shape = None if expected_shapes is None else expected_shapes[index]
         target_type = state.target_program.values[target_value_id].type
         component_count = int(target_type.component_count)
-        if target_type.representation in {"mask", "mask_tuple"}:
+        register_packet_width = (
+            int(register_packet_widths[index])
+            if register_packet_widths
+            else 0
+        )
+        if (
+            expected_shape is not None
+            and expected_shape.register_packet_assumption
+        ):
+            expected_width = int(expected_shape.packet_width)
+            if register_packet_width not in {0, expected_width}:
+                fail(
+                    "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
+                    STAGE,
+                    f"{context} register packet width changed",
+                    target_op_id=op.target_op_id,
+                    target_value_id=target_value_id,
+                )
+            register_packet_width = expected_width
+        if register_packet_width > 1:
+            components, shape = _flatten_register_packet_value(
+                state,
+                value,
+                target_type,
+                register_packet_width,
+                context,
+                op,
+                target_value_id,
+            )
+            shapes.append(shape)
+        elif target_type.representation in {"mask", "mask_tuple"}:
             lane_width = int(target_type.lane_width or 64)
             components, predicates = _as_mask_payload_components_with_predicates(
                 state,
@@ -4991,9 +5299,10 @@ def _flatten_structured_values(
                     len(components),
                     packet_width=int(value.packet_width),
                     logical_component_count=int(value.logical_component_count),
+                    packet_scalar_slots=value.packet_scalar_slots,
                 ))
         else:
-            components = _as_components(value)
+            components = _value_components(state, value, op)
             shape = None
             if (preserve_mma_packet_payloads and target_type.representation in _MMA_PACKET_REPRESENTATIONS):
                 components, shape = _preserve_loop_vector_payload_components(
@@ -5008,6 +5317,90 @@ def _flatten_structured_values(
             shapes.append(shape)
         flat_values.extend(components)
     return tuple(flat_values), tuple(shapes)
+
+
+def _flatten_register_packet_value(
+    state,
+    value,
+    target_type,
+    packet_width,
+    context,
+    op,
+    target_value_id,
+):
+    logical_component_count = int(target_type.component_count)
+    packet_width = int(packet_width)
+    if (
+        target_type.representation != "simd_tuple"
+        or target_type.element_type not in {"bf16", "f16", "f32"}
+        or packet_width <= 1
+        or logical_component_count % packet_width
+    ):
+        fail(
+            "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
+            STAGE,
+            f"{context} register packet assumption does not match its SIMD tuple",
+            target_op_id=op.target_op_id,
+            target_value_id=target_value_id,
+        )
+    if isinstance(value, _VectorPacketPayload):
+        if (
+            int(value.packet_width) != packet_width
+            or int(value.logical_component_count) != logical_component_count
+        ):
+            fail(
+                "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
+                STAGE,
+                f"{context} vector packet payload does not match its register packet assumption",
+                target_op_id=op.target_op_id,
+                target_value_id=target_value_id,
+            )
+        packets = tuple(value.packets)
+        packet_scalar_slots = value.packet_scalar_slots
+    else:
+        scalar_components = _as_components(value)
+        if len(scalar_components) != logical_component_count:
+            fail(
+                "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
+                STAGE,
+                f"{context} register packet source does not match its logical components",
+                target_op_id=op.target_op_id,
+                target_value_id=target_value_id,
+            )
+        if any(
+            _simd_1d_vector_payload(state, component) is not None
+            for component in scalar_components
+        ):
+            fail(
+                "TLXW_EMIT_STRUCTURED_COMPONENT_SHAPE",
+                STAGE,
+                f"{context} register packet source contains an unexpected nested vector",
+                target_op_id=op.target_op_id,
+                target_value_id=target_value_id,
+            )
+        packet_type = state.dsl.simd_type(
+            state.dsl.vector_type(
+                packet_width,
+                _scalar_type(state.dsl, target_type.element_type),
+            ),
+            int(target_type.lane_width or 64),
+        )
+        packets = tuple(
+            state.dsl.wave.PackOp(
+                packet_type,
+                scalar_components[index:index + packet_width],
+            ).result
+            for index in range(0, logical_component_count, packet_width)
+        )
+        packet_scalar_slots = None
+    shape = _LoopValueShape(
+        len(packets),
+        packet_width=packet_width,
+        logical_component_count=logical_component_count,
+        packet_scalar_slots=packet_scalar_slots,
+        register_packet_assumption=True,
+    )
+    return packets, shape
 
 
 def _preserve_loop_vector_payload_components(
@@ -5118,6 +5511,7 @@ def _pack_structured_value_components(state, components, shape, context, op):
             components,
             int(shape.packet_width),
             int(shape.logical_component_count),
+            shape.packet_scalar_slots,
         )
     if shape.preserved_vector_payload_key is not None:
         logical_component_count = int(shape.logical_component_count or 0)
@@ -10155,9 +10549,6 @@ def _emit_mma(state, op):
                     rhs_value,
                     acc_value,
                 )
-            # Fragments are only MMA-local values. The bridge state carries the
-            # accumulator as the SIMD vector payload so control-flow values do
-            # not become WaveAMD fragment carriers.
             if not state.dsl.FragmentType.isinstance(acc_value.type):
                 fail(
                     "TLXW_EMIT_FRAGMENT_TYPE",
@@ -10685,7 +11076,7 @@ def _emit_layout_convert(state, op):
 
 
 def _emit_layout_packet_alias(state, op, value, attrs):
-    """Regroup an identity layout relation without moving register bits."""
+    """Regroup or permute register slots without moving them across workitems."""
     grouping_keys = {
         "source_component_count",
         "source_packet_width",
@@ -10709,19 +11100,43 @@ def _emit_layout_packet_alias(state, op, value, attrs):
     result_count = int(attrs["result_component_count"])
     result_width = int(attrs["result_packet_width"])
     result_slots = int(attrs["result_slot_count"])
+    scalar_source_slots = attrs.get("scalar_source_slots")
     if (source_count <= 0 or source_width <= 0 or result_count <= 0 or result_width <= 0
             or source_count * source_width != source_slots or result_count * result_width != result_slots
-            or source_slots != result_slots):
+            or (scalar_source_slots is None and source_slots != result_slots)):
         fail(
             "TLXW_EMIT_LAYOUT_ALIAS",
             STAGE,
             "packet alias source/result grouping is inconsistent",
             target_op_id=op.target_op_id,
         )
-    if source_count == result_count and source_width == result_width:
+    if scalar_source_slots is not None:
+        scalar_source_slots = tuple(int(slot) for slot in scalar_source_slots)
+        if (
+            len(scalar_source_slots) != result_slots
+            or any(slot < 0 or slot >= source_slots for slot in scalar_source_slots)
+        ):
+            fail(
+                "TLXW_EMIT_LAYOUT_ALIAS",
+                STAGE,
+                "packet alias scalar source map is inconsistent",
+                target_op_id=op.target_op_id,
+            )
+    if (
+        scalar_source_slots is None
+        and source_count == result_count
+        and source_width == result_width
+    ):
         return value
 
     if isinstance(value, _RawLayoutVectorPacketPayload):
+        if scalar_source_slots is not None:
+            fail(
+                "TLXW_EMIT_LAYOUT_ALIAS",
+                STAGE,
+                "raw register packets cannot cross a scalar slot permutation",
+                target_op_id=op.target_op_id,
+            )
         if (int(value.logical_component_count) != source_slots or int(value.packet_width) != result_width
                 or len(value.packets) != result_count):
             fail(
@@ -10740,6 +11155,18 @@ def _emit_layout_packet_alias(state, op, value, attrs):
         source_count,
         source_width,
     )
+    if len(scalar_slots) != source_slots:
+        fail(
+            "TLXW_EMIT_LAYOUT_ALIAS",
+            STAGE,
+            "packet alias scalar payload does not match its source grouping",
+            target_op_id=op.target_op_id,
+        )
+    if scalar_source_slots is not None:
+        scalar_slots = tuple(
+            scalar_slots[source_slot]
+            for source_slot in scalar_source_slots
+        )
     if len(scalar_slots) != result_slots:
         fail(
             "TLXW_EMIT_LAYOUT_ALIAS",
@@ -10784,7 +11211,7 @@ def _layout_alias_scalar_slots(
             )
         return tuple(scalar_slots)
 
-    components = _as_components(value)
+    components = _value_components(state, value, op)
     if len(components) != source_count:
         fail(
             "TLXW_EMIT_LAYOUT_ALIAS",
@@ -11782,6 +12209,7 @@ _TARGET_EMITTERS = {
     "type_convert": _emit_type_convert,
     "binary": _emit_binary,
     "float_binary": _emit_float_binary,
+    "float_ternary": _emit_float_ternary,
     "float_unary": _emit_float_unary,
     "float_cast": _emit_float_cast,
     "cmpi": _emit_cmpi,
@@ -11798,6 +12226,7 @@ _TARGET_EMITTERS = {
     "make_buffer": _emit_make_buffer,
     "expand_dims": _emit_expand_dims,
     "program_id": _emit_program_id,
+    "warp_id": _emit_warp_id,
     "thread_id": _emit_thread_id,
     "barrier": _emit_barrier,
     "cond_barrier": _emit_cond_barrier,
@@ -11932,6 +12361,8 @@ def _packet_source_offset_index_expr(
         *,
         coordinate_mode="ordered_linear",
         linear_component_bases=(),
+        component_coordinate_bases=(),
+        workitem_coordinate_coefficients=(),
 ):
     wi_sym = state.dsl.sym("wi")
     scalar_symbols = tuple(state.dsl.sym(f"s{index}") for index, _ in enumerate(scalar_values))
@@ -11945,6 +12376,8 @@ def _packet_source_offset_index_expr(
         packet_order,
         coordinate_mode=coordinate_mode,
         linear_component_bases=linear_component_bases,
+        component_coordinate_bases=component_coordinate_bases,
+        workitem_coordinate_coefficients=workitem_coordinate_coefficients,
         op=op,
     )
     expr = _affine_offset_expr(state, encoded_terms, coords, scalar_symbols, op)
@@ -12023,8 +12456,46 @@ def _packet_coordinate_exprs(
         *,
         coordinate_mode="ordered_linear",
         linear_component_bases=(),
+        component_coordinate_bases=(),
+        workitem_coordinate_coefficients=(),
         op=None,
 ):
+    if coordinate_mode == "layout_coordinates":
+        component_coordinate_bases = tuple(
+            tuple(int(value) for value in base)
+            for base in component_coordinate_bases
+        )
+        workitem_coordinate_coefficients = tuple(
+            tuple(int(value) for value in coefficients)
+            for coefficients in workitem_coordinate_coefficients
+        )
+        if (
+            int(component) >= len(component_coordinate_bases)
+            or len(component_coordinate_bases[int(component)]) != len(shape)
+            or any(
+                len(coefficients) != len(shape)
+                for coefficients in workitem_coordinate_coefficients
+            )
+        ):
+            fail(
+                "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC",
+                STAGE,
+                "packet DMA copy-layout coordinate rank does not match its shape",
+                target_op_id=None if op is None else op.target_op_id,
+            )
+        component_base = component_coordinate_bases[int(component)]
+        return tuple(
+            _bit_linear_thread_coordinate_expr(
+                state,
+                wi,
+                int(base),
+                tuple(
+                    coefficients[dim]
+                    for coefficients in workitem_coordinate_coefficients
+                ),
+            )
+            for dim, base in enumerate(component_base)
+        )
     linear = wi
     if int(packet_elements) != 1:
         linear *= int(packet_elements)
@@ -12605,7 +13076,7 @@ def _value_components(state, value, op):
             "vector packet payload has invalid shape",
             target_op_id=op.target_op_id,
         )
-    components = []
+    packet_components = []
     for packet in value.packets:
         payload = _simd_1d_vector_payload(state, packet)
         if payload is None:
@@ -12625,19 +13096,27 @@ def _value_components(state, value, op):
             )
         component_type = state.dsl.simd_type(element_type, int(lane_width))
         for element in range(packet_width):
-            components.append(state.dsl.wave.ExtractOp(
+            packet_components.append(state.dsl.wave.ExtractOp(
                 component_type,
                 packet,
                 int(element),
             ).result)
-    if len(components) != logical_component_count:
+    if len(packet_components) != logical_component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
             "vector packet payload component count does not match its shape",
             target_op_id=op.target_op_id,
         )
-    return tuple(components)
+    if value.packet_scalar_slots is None:
+        return tuple(packet_components)
+    logical_components = [None] * logical_component_count
+    for packet_component, logical_slot in zip(
+        packet_components,
+        value.packet_scalar_slots,
+    ):
+        logical_components[int(logical_slot)] = packet_component
+    return tuple(logical_components)
 
 
 def _pack_components(components):

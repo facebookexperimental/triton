@@ -1218,6 +1218,12 @@ void init_triton_ir(py::module_ &m) {
       .def("get_block", &Operation::getBlock, ret::reference)
       .def("get_attrs",
            [](Operation &self) { return operationAttrsToPython(self); })
+      .def("get_attr",
+           [](Operation &self, const std::string &name) -> py::object {
+             if (Attribute attr = self.getAttr(name))
+               return py::cast(attr);
+             return py::none();
+           })
       .def("get_str_attr",
            [](Operation &self, const std::string &name) -> py::object {
              auto ret = self.getAttrOfType<StringAttr>(name);
@@ -2575,6 +2581,9 @@ void init_triton_ir(py::module_ &m) {
            [](TritonOpBuilder &self) {
              self.create<triton::gpu::BarrierOp>(triton::gpu::AddrSpace::All);
            })
+      // Scheduling barrier (AMD)
+      .def("create_sched_barrier",
+           [](TritonOpBuilder &self) { self.create<ROCDL::SchedBarrier>(0); })
       // Warp pipeline border marker (AMD)
       .def("create_warp_pipeline_border",
            [](TritonOpBuilder &self, const std::string &marker, int priority) {

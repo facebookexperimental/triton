@@ -80,7 +80,13 @@ def redistribution_plan(operand, result, operand_layout, result_layout, op):
             source_op_index=op.index,
             source_value_id=result.value_id,
         )
-    relation_bases, relation_out_dims, is_identity, cross_wave = (
+    (
+        relation_bases,
+        relation_out_dims,
+        is_identity,
+        cross_wave,
+        same_workitem_source_slots,
+    ) = (
         _redistribution_relation_plan(
             source_layout,
             destination_layout,
@@ -107,6 +113,21 @@ def redistribution_plan(operand, result, operand_layout, result_layout, op):
             return {
                 "group_size": 1,
                 "mode": "alias",
+                **packet_grouping,
+            }
+    if same_workitem_source_slots is not None:
+        packet_grouping = _identity_packet_grouping_plan(
+            operand,
+            result,
+            source_slots,
+            destination_slots,
+            op,
+        )
+        if packet_grouping is not None:
+            return {
+                "group_size": 1,
+                "mode": "alias",
+                "scalar_source_slots": same_workitem_source_slots,
                 **packet_grouping,
             }
     if (
@@ -859,7 +880,39 @@ def _redistribution_relation_plan(
                 source_op_index=op.index,
                 source_value_id=result_value_id,
             )
-    return encoded_bases, output_dims, bool(is_identity), bool(cross_wave)
+    same_workitem_source_slots = []
+    for destination_slot in range(int(destination_slots)):
+        destination_sources = tuple(
+            (destination, source)
+            for destination, source in relation.items()
+            if int(destination[0]) == destination_slot
+        )
+        sources = {
+            int(source[0])
+            for _destination, source in destination_sources
+        }
+        if (
+            len(destination_sources) != lane_width * warp_count * block_count
+            or any(
+                source[1:] != destination[1:]
+                for destination, source in destination_sources
+            )
+            or len(sources) != 1
+        ):
+            same_workitem_source_slots = None
+            break
+        same_workitem_source_slots.append(sources.pop())
+    return (
+        encoded_bases,
+        output_dims,
+        bool(is_identity),
+        bool(cross_wave),
+        (
+            None
+            if same_workitem_source_slots is None
+            else tuple(same_workitem_source_slots)
+        ),
+    )
 
 
 def _redistribution_coords(
@@ -1037,6 +1090,7 @@ def _distributed_linear_layout(layout, op):
         "blocked",
         "linear",
         "generic_linear",
+        "slice",
         "amd_mfma",
         "dot_operand",
     }:
