@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Test a locally-built meta-triton wheel (produced by .claude/skills/fbtriton-backport/build-wheel.sh).
 #
-# Installs the wheel (arg > $WHEEL > newest in dist/) into a throwaway uv venv
+# Installs the wheel (arg > $WHEEL > newest in dist/) into a version-specific uv venv
 # alongside the torch build matching the GPU on this box (auto-detected: CUDA
 # torch for NVIDIA, ROCm torch for AMD — the default PyPI torch is CUDA-only and
 # reports torch.cuda.is_available()==False on an AMD box), then runs:
@@ -84,10 +84,15 @@ fi
 # shellcheck disable=SC1091
 source "$GCC_TOOLSET/enable"
 
-# --- install the wheel into a throwaway venv ---------------------------------
-echo ">>> Installing $(basename "$WHEEL") into $REPO_ROOT/.venv"
-uv venv -p python3.13 --clear
-source .venv/bin/activate
+# --- install the wheel into a version-specific venv --------------------------
+# Per-wheel venv so we never clobber the repo's shared .venv (e.g. an editable
+# dev build). Derived from the wheel version; override with TEST_VENV.
+WHEEL_VER="$(basename "$WHEEL" | sed -E 's/^triton-([^-]+)-.*/\1/')"
+VENV="${TEST_VENV:-$REPO_ROOT/.venv-wheeltest-$WHEEL_VER}"
+echo ">>> Installing $(basename "$WHEEL") into $VENV"
+uv venv "$VENV" -p python3.13 --clear
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
 uv pip install torch --index-url "$TORCH_INDEX_URL"
 uv pip install pytest pytest-xdist numpy torchao
 

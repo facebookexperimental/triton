@@ -11,8 +11,14 @@ description: >
 # fbtriton backport — pick, map dependencies, resolve into clean shims
 
 The full arc of a release backport in one place:
-**Phase 1 triage → Phase 2 map dependencies → Phase 3 pick clean → Phase 4 resolve the
-messy ones (match-main or a documented shim) → Phase 5 build & validate → Phase 6 finalize.**
+**Phase 0 bump version FIRST → Phase 1 triage → Phase 2 map dependencies → Phase 3 pick
+clean → Phase 4 resolve the messy ones (match-main or a documented shim) → Phase 5 build &
+validate → Phase 6 document & finalize.**
+
+**Every backport starts with the version bump and ends with the doc.** The bump is the first
+commit on the branch (Phase 0) so it can never be forgotten at the end and the branch/PR is
+identifiable as `<X.Y.Z>` from commit one; documenting (`backport_<version>.md`) is the last
+step (Phase 6).
 
 **Finalizing the pick list is two steps** (Phase 1 = candidates, Phase 2 = machinery):
 1. **The candidate list** — *what we actually want*: either a point-release scan of all **fix**
@@ -56,11 +62,14 @@ Worked case study of the nastiest dependency class:
 
 Artifacts under `.backports/<version>/` (e.g. `.backports/3.7.2/`, `.backports/3.7.3/`):
 - `candidates.tsv` — sweep input (written by `backport-sync.sh`; deterministic mode only).
-- **`backport_<version>.md`** — the single living doc, **built up over multiple rounds — don't
-  try to fill it all at once.** Start it with just the purpose & scope + initial candidate list,
-  then append each phase's output as you get it: dependency stacks, pick/skip decisions, shim
-  resolutions, land order, build/test results, perf numbers. Sections left empty/TBD between
-  rounds are expected. Format it like `.backports/3.7.3/backport_3.7.3.md`.
+- **`backport_<version>.md`** — the **reader-facing record of what was picked and why**, not an
+  execution log. **Before writing, read the newest `.backports/*/backport_<version>.md` to match
+  the current pattern** (template: `.backports/3.7.4/backport_3.7.4.md`). Keep it lean:
+  1-line purpose; a **Scan range** table (frontier → head per source + commit counts); a
+  **Picked** table (PR/commit · what it is · why picked); a **Not picked** table grouped by
+  reason (already on release · new features · absent-path / needs-machinery · minor/out-of-scope)
+  each with the why; a one-line **Validated** result. **Omit** land order, dependency stacks,
+  sweep mechanics, and per-command build/perf logs — those are working notes, not the record.
 - `commit-dag.html` — an interactive pick/dependency DAG for review (same dir).
 
 Don't build during triage.
@@ -80,7 +89,7 @@ stays as local files. If a lookup is blocked, say so and stop — don't route ar
 
 ---
 
-## Phase 1 — Step 1: build the candidate list (what we want)
+## Phase 0 — Start: target, branch, version bump FIRST
 
 ### Start here — ask the user two things
 
@@ -100,6 +109,24 @@ Route on the answer:
 
 Both then funnel into the same job (drop → scope → map dependencies → order); only the
 input pool differs.
+
+### Cut the branch and bump the version — the FIRST commit
+
+Once the two answers fix the target `<X.Y.Z>`, create the throwaway branch off
+`origin/release/X.Y.z` and make the **version bump its first commit** — every backport starts
+here, so the bump can never be forgotten at finalize and the branch/PR reads as `<X.Y.Z>` from
+commit one. Two independent files — update both:
+- `python/triton/__init__.py` — `__version__ = '<X.Y.Z>+fb'` (keep the `+fb` fork marker).
+- `setup.py` — `TRITON_VERSION = "<X.Y.Z>" + get_triton_version_suffix()`. setup.py hardcodes
+  the base independently, so it won't pick up the bump on its own; on a `release/*` branch the
+  git suffix is empty (`triton-<X.Y.Z>`), off one it appends `+git<sha>`.
+Do **not** touch `docs/conf.py` (its `version`/`release` are empty; `smv_tag_whitelist` tracks
+upstream's "Advance version" cadence, not point-release backports). Commit as
+`[release/X.Y.z] Bump version to <X.Y.Z>+fb`, then do all picks on top of it.
+
+---
+
+## Phase 1 — Step 1: build the candidate list (what we want)
 
 ### Candidate source (a) — regular point update: deterministic sweep
 
@@ -129,7 +156,8 @@ git log --oneline "$CUT"..origin/main | grep -iE '<keywords>'  # e.g. amd|gfx9|m
 Cross-check the hits against the user's named PRs/diffs, then group into feature stacks. The
 pool is already goal-scoped, so the main work is **dependency mapping** (Phase 2) and
 confirming each candidate is **landable** (on `main`; flag anything "not on main yet ⏳").
-Capture the result in `backport_<version>.md` (format like `.backports/3.7.3/backport_3.7.3.md`).
+Capture the result in `backport_<version>.md` (see the template in "Where things live";
+reference `.backports/3.7.4/backport_3.7.4.md`).
 
 The `present`/scope hints are *hints* — verify against real code and real dependencies;
 never trust a PR-number grep (squashed bundles break it).
@@ -561,23 +589,19 @@ Record correctness pass/fail (with numbers + skips) and the perf signal in
 
 ---
 
-## Phase 6 — Finalize
+## Phase 6 — Document & finalize
 
-### Bump the version (two independent files — update both)
-
-- `python/triton/__init__.py` — `__version__ = '<X.Y.Z>+fb'` (keep the `+fb` fork marker).
-- `setup.py` — `TRITON_VERSION = "<X.Y.Z>" + get_triton_version_suffix()`. setup.py hardcodes
-  the base *independently*, so it won't pick up the bump on its own — miss it and the wheel
-  keeps the stale base. On a `release/*` branch the git suffix is empty (`triton-<X.Y.Z>`);
-  off a release branch it appends `+git<sha>`.
-
-Do **not** touch `docs/conf.py` (its `version`/`release` are empty and `smv_tag_whitelist`
-tracks upstream's "Advance version" cadence, not point-release backports).
+The version was already bumped as the branch's first commit (Phase 0) — verify it's still
+`<X.Y.Z>+fb` in `python/triton/__init__.py` and `setup.py`, then **documenting is the last
+step of every backport**.
 
 ### Record it
 
-Commit the bump with the backport doc (`.backports/<version>/backport_<version>.md` +
-`commit-dag.html`). That doc is the running record — every pick/skip, shim/resolution
-(target pick, conflict source, slice / omissions, `== main` verification), and build/test
-+ perf results. Keep the class of problem documented in
+Write and commit the backport doc (`.backports/<version>/backport_<version>.md`) — **follow
+the template in "Where things live" above** (read the newest `.backports/*/backport_<version>.md`
+first to match the current pattern; reference `.backports/3.7.4/backport_3.7.4.md`). It's the
+reader-facing *what & why*, kept lean: purpose, scan range, Picked / Not-picked tables, one
+Validated line. Make sure every **absent-path / needs-machinery drop** is recorded with its
+reason (the commit's target code isn't on the release branch) so it isn't re-triaged next
+release. The class of problem behind messy picks stays in
 [`partial-port-collision.md`](partial-port-collision.md).
