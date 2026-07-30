@@ -12,6 +12,8 @@ from bitequiv.ptx.builder import collapse_balanced
 from bitequiv.ptx.forward.interp import forward_module_descriptor
 from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, OpaqueOp, ShflCombine
 
+_HDR = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+
 _FIX = os.path.join(os.path.dirname(__file__), "fixtures", "ptx")
 
 
@@ -115,3 +117,38 @@ def test_squared_reduction_collapses_but_distinct_element_product_does_not():
                 (FpOp("mul", (".f32", ), (_leaf(0), _leaf(1))),
                  FpOp("mul", (".f32", ), (_leaf(2), _leaf(3)))))
     assert not isinstance(collapse_balanced(prod), ITreeReduce)
+
+
+# -- Phase 4: MMA entries take the tiling-invariant fence composition ----------
+
+
+def test_mma_entry_gets_fence_descriptor():
+    # A wgmma entry -> the tiling-invariant fence (K + dtypes kept, m/n dropped), not a tree hash or
+    # the old coarse unanalyzed-mma guard.
+    ptx = (_HDR + ".visible .entry k()\n{\n.reg .b32 %r<8>;\n"
+           "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%r1}, %r2, %r3;\nret;\n}\n")
+    (desc, ) = forward_module_descriptor(ptx)
+    assert desc.startswith("mma|tok=") and "k16" in desc and "m64" not in desc
+
+
+# -- Phase 5: data-dependent control flow fails closed (sound floor) -----------
+
+
+def test_data_dependent_branch_fails_closed():
+    # A predicate on a LOADED value -> the straight-line walk is unsound -> fingerprint with dd1.
+    ptx = (_HDR + ".visible .entry k()\n{\n.reg .b32 %r<4>;\n.reg .b64 %rd<4>;\n"
+           ".reg .pred %p<2>;\n.reg .f32 %f<4>;\n"
+           "ld.global.f32 %f1, [%rd1];\nsetp.lt.f32 %p1, %f1, 0f3F000000;\n"
+           "@%p1 add.f32 %f2, %f1, %f1;\nst.global.f32 [%rd2], %f2;\nret;\n}\n")
+    (desc, ) = forward_module_descriptor(ptx)
+    assert "fwd-incomplete" in desc and "dd1" in desc
+
+
+def test_structural_branch_does_not_fail_close():
+    # A tid-guarded (structural) predicate is safe to drop -> NOT fail-closed for control flow (dd1).
+    ptx = (_HDR + ".visible .entry k()\n{\n.reg .b32 %r<4>;\n.reg .b64 %rd<4>;\n"
+           ".reg .pred %p<2>;\n.reg .f32 %f<4>;\n"
+           "ld.global.f32 %f1, [%rd1];\nmov.u32 %r1, %tid.x;\nsetp.lt.s32 %p1, %r1, 64;\n"
+           "@%p1 add.f32 %f2, %f1, %f1;\nst.global.f32 [%rd2], %f2;\nret;\n}\n")
+    (desc, ) = forward_module_descriptor(ptx)
+    assert "dd1" not in desc

@@ -23,8 +23,11 @@ from pyptx.ir.nodes import RegisterOperand, VectorOperand
 
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
 from bitequiv.ptx.builder import collapse_balanced, tree_hash
+from bitequiv.ptx.forward.cfg import has_unknown_control
+from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
+from bitequiv.ptx.mma import _mma_fence
 from bitequiv.ptx.treeir import FpOp, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
@@ -100,6 +103,13 @@ class ForwardInterp:
         # for the verbatim hash (it would over-merge across num_warps), so forward_descriptor falls
         # back to the conservative per-config fingerprint. Phase 2 models these -> faithful stays True.
         self.faithful = True
+        # Phase 5 control-flow floor: the straight-line walk DROPS predicates / branches, which is
+        # sound only when all control flow is thread-structural. An unresolved branch (brx / computed
+        # target) or a predicate that depends on runtime DATA (a load / MMA / atomic) makes the trace
+        # untrustworthy -> fail closed. A purely tid/param/lane-derived guard stays dropped (safe).
+        self._unknown_ctrl = has_unknown_control(func)
+        self.pred = PredicateDecoder(self.ev, self.du)
+        self._ddb = None  # cached _has_data_dependent_branch() result
 
     # -- operand lookup -------------------------------------------------------
 
@@ -136,8 +146,25 @@ class ForwardInterp:
 
     # -- driver ---------------------------------------------------------------
 
+    def _has_data_dependent_branch(self):
+        """True if control flow makes the straight-line trace unsound: an unresolved branch (brx /
+        computed target), or any predicated instruction whose guard depends on runtime DATA (a load /
+        MMA / atomic). A purely thread-structural guard (tid / param / lane arithmetic) is safe to
+        drop and does not trip this. Cached — used by both :meth:`run` and :meth:`fingerprint`."""
+        if self._ddb is None:
+            self._ddb = self._unknown_ctrl
+            if not self._ddb:
+                for i, inst in enumerate(self.flat):
+                    p = getattr(inst, "predicate", None)
+                    if p is not None and not self.pred.decode(p.register, i).is_structural:
+                        self._ddb = True
+                        break
+        return self._ddb
+
     def run(self):
         """Forward-simulate the entry; return the value-DAG root of each ``st.global`` value."""
+        if self._has_data_dependent_branch():
+            self.faithful = False  # Phase 5 floor: data-dependent / unresolved control flow
         roots = []
         for at, inst in enumerate(self.flat):
             op, mods = inst.opcode, inst.modifiers
@@ -346,7 +373,12 @@ class ForwardInterp:
             elif inst.opcode in _FP_KINDS and is_fp:
                 fp += 1
         stores_s = ",".join(f"{w}x{n}" for w, n in sorted(stores.items()))
-        return f"fwd-incomplete|ntid={ntid}|shfl={','.join(shfl)}|st={stores_s}|fp={fp}|fma={fma}"
+        # Control-flow term (Phase 5): the predicated-instruction count + a data-dependent flag, so two
+        # fail-closed configs that differ in control flow still split (extra key -> monotone sound).
+        cond = sum(1 for inst in self.flat if getattr(inst, "predicate", None) is not None)
+        dd = 1 if self._has_data_dependent_branch() else 0
+        return (f"fwd-incomplete|ntid={ntid}|shfl={','.join(shfl)}|st={stores_s}"
+                f"|fp={fp}|fma={fma}|cf={cond},dd{dd}")
 
 
 def forward_descriptor(func):
@@ -369,6 +401,40 @@ def forward_descriptor(func):
     return tuple(sorted(tree_hash(t) for t in collapsed))
 
 
+def _fence_str(fence):
+    """Canonical string for an :func:`bitequiv.ptx.mma._mma_fence` tuple (frozensets sorted so the
+    string is deterministic across runs). The ratio is (mma : fma : add/mul) — fma kept apart from
+    add/mul so enable_fp_fusion on/off never collide."""
+    if fence[0] == "mma":
+        _, tokens, flags, ratio = fence
+        return (f"mma|tok={'/'.join(sorted(tokens))}|fl={','.join(sorted(flags))}"
+                f"|r={ratio[0]}:{ratio[1]}:{ratio[2]}")
+    _, counts, flags, fa = fence  # mma-fp8 fallback: raw per-token counts + (fma, add/mul) (more split)
+    counts_s = "/".join(f"{t}x{n}" for t, n in counts)
+    return f"mma-fp8|tok={counts_s}|fl={','.join(sorted(flags))}|fma_addmul={fa[0]},{fa[1]}"
+
+
+def _mma_entry_descriptor(func, fence):
+    """Descriptor for an entry containing MMA (tensor-core) ops, via the tiling-invariant fence.
+
+    A PURE GEMM (MMA, no reduction butterfly) is the fence ALONE -> num_warps + BLOCK_M/BLOCK_N are
+    free (recovered), with ``loops=`` kept (BLOCK_K is a real, bit-relevant K split). An MMA + a
+    ``shfl.bfly`` reduction (e.g. FA softmax) is FAIL-CLOSED: the fence AND the reduction fingerprint
+    both ride, so configs differing in EITHER the MMA shape OR the reduction order split (sound, never
+    over-merged). The reduction fingerprint carries num_warps back in that case; the pure GEMM drops
+    it deliberately (num_warps is a free re-tiling of the same dot products)."""
+    from bitequiv.ptx_reduction import _loop_steps
+    parts = [_fence_str(fence)]
+    if any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func)):
+        interp = ForwardInterp(func)
+        interp.run()
+        parts.append("mma+red|" + interp.fingerprint())
+    steps = _loop_steps(func)  # BLOCK_K split (+ the tcgen05 / fp8 K carried here, not in the token)
+    if steps:
+        parts.append("loops=" + ",".join(map(str, steps)))
+    return "|".join(parts)
+
+
 def forward_module_descriptor(ptx):
     """Module-level forward descriptor, mirroring :func:`bitequiv.ptx_reduction.ptx_reduction_descriptor`
     so the eval framework can drive the forward checker via ``--checker
@@ -379,7 +445,7 @@ def forward_module_descriptor(ptx):
     from pyptx.parser import parse
     from pyptx.parser.parser import ParseError
 
-    from bitequiv.ptx_reduction import _ensure_header, _loop_steps, _mma_guard, _Unparseable
+    from bitequiv.ptx_reduction import _ensure_header, _loop_steps, _Unparseable
     if not ptx:
         return ()
     try:
@@ -390,6 +456,10 @@ def forward_module_descriptor(ptx):
     for f in module.directives:
         if not (isinstance(f, Function) and f.is_entry):
             continue
+        fence = _mma_fence(f)  # Phase 4: an MMA entry takes the tiling-invariant fence composition
+        if fence is not None:
+            out.append(_mma_entry_descriptor(f, fence))
+            continue
         parts = list(forward_descriptor(f))
         if not parts:  # no reconstructed reduction -> keep launch geometry as the empty-sig guard
             ntid = reqntid_of(f)
@@ -397,8 +467,5 @@ def forward_module_descriptor(ptx):
         steps = _loop_steps(f)  # BLOCK_N cross-chunk fence: the straight-line walk cannot follow the
         if steps:               # loop back-edge, so a looped/persistent reduction (sum_dim1_persistent)
             parts.append("loops=" + ",".join(map(str, steps)))  # would over-merge without this (sound)
-        guard = _mma_guard(f)  # conservative MMA fence until Phase 4 models the collective op forward
-        if guard:
-            parts.append(guard)
         out.append("|".join(parts))
     return tuple(sorted(out))
