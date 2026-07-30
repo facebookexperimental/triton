@@ -202,7 +202,6 @@ def emit_wave_module(
                         dsl,
                         ir,
                         kernel,
-                        target_program.contract,
                         waves_per_eu=waves_per_eu,
                     ),
             ) as builder:
@@ -10417,7 +10416,6 @@ def _function_attrs(
     dsl,
     ir,
     kernel,
-    contract,
     *,
     waves_per_eu=0,
 ):
@@ -10440,8 +10438,6 @@ def _function_attrs(
         # requested CTA waves as the resident wave target per SIMD.
         "waveamdmachine.target_waves": dsl.i64_attr(target_waves),
     }
-    if contract.enable_fp_fusion:
-        attrs["wave.enable_fp_fusion"] = ir.UnitAttr.get()
     if kernel.enable_split_barriers:
         attrs["waveamdmachine.enable_split_barriers"] = ir.UnitAttr.get()
     if kernel.enable_multi_wave_specialization:
