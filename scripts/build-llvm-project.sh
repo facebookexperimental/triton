@@ -33,6 +33,7 @@ if [ -z "$CMAKE_ARGS" ]; then
               -DCMAKE_BUILD_TYPE="$LLVM_BUILD_TYPE"
               -DLLVM_CCACHE_BUILD=OFF
               -DLLVM_ENABLE_ASSERTIONS=ON
+              -DLLVM_INSTALL_UTILS=ON
               "${CLANG_LLD_ARGS[@]}"
               -DLLVM_OPTIMIZED_TABLEGEN=ON
               -DMLIR_ENABLE_BINDINGS_PYTHON=OFF

@@ -163,10 +163,12 @@ For a data-partitioned epilogue (`tt.data_partition_factor > 1`) with
 `early_tma_store_lowering`, every partition's TMA-store staging buffer targets the
 **same** descriptor. `WSMemoryPlanner.cpp` `fuseEpilogueWSBuffers` therefore keys
 the TMA-staging fusion on `(descriptor, originalLoad)` — `originalLoad` traces the
-`local_store` source back to the originating `ttng.tmem_load` / accumulator — so
-the two partitions get **distinct** `buffer.id`s instead of sharing one physical
-buffer + barrier (which aliases concurrent partitions → corruption + deadlock).
-This mirrors the non-staging `loadGroups` discriminator.
+`local_store` source back to the originating `ttng.tmem_load` / accumulator. When
+that trace is unavailable for a Hopper register accumulator, the key uses the
+producer task instead. Thus two data partitions get **distinct** `buffer.id`s
+instead of sharing one physical buffer + barrier (which aliases concurrent
+partitions → corruption + deadlock), while same-task subtiles still fuse. This
+mirrors the non-staging `loadGroups` discriminator.
 
 ## What Reuse Groups Affect
 

@@ -1381,11 +1381,17 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
   // separate: both store to the SAME descriptor but trace back to different
   // accumulators, so they must NOT share one physical staging buffer (doing so
   // makes the two concurrent partitions alias one slot/barrier -> corrupt
-  // output + deadlock). When the load can't be traced (origLoad == null), the
-  // key degenerates to the descriptor alone, preserving the prior behavior
-  // (e.g. FA backward, where each descriptor already has a single source).
-  DenseMap<std::pair<Value, Operation *>, SmallVector<unsigned>>
-      tmaStagingGroups;
+  // output + deadlock). Hopper register accumulators cannot currently be traced
+  // to a tmem_load, so fall back to the producer task instead of collapsing all
+  // untraceable sources for a descriptor into one group. Same-task epilogue
+  // subtiles still fuse, while different data partitions remain separate.
+  struct TMAStagingGroup {
+    Value desc;
+    Operation *origLoad = nullptr;
+    int producerTask = -1;
+    SmallVector<unsigned> indices;
+  };
+  SmallVector<TMAStagingGroup> tmaStagingGroups;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
     // TMA staging buffers: group per (descriptor, original load) regardless of
@@ -1403,9 +1409,21 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
         }
       }
       if (desc) {
-        Operation *origLoad =
-            findOriginalLoadForChannel(findChannelForOp(buf.allocOp, channels));
-        tmaStagingGroups[{desc, origLoad}].push_back(i);
+        Channel *channel = findChannelForOp(buf.allocOp, channels);
+        Operation *origLoad = findOriginalLoadForChannel(channel);
+        int producerTask = origLoad || !channel ? -1 : channel->relation.first;
+        auto it = llvm::find_if(tmaStagingGroups, [&](const auto &group) {
+          return group.desc == desc && group.origLoad == origLoad &&
+                 group.producerTask == producerTask;
+        });
+        if (it == tmaStagingGroups.end()) {
+          tmaStagingGroups.emplace_back();
+          it = std::prev(tmaStagingGroups.end());
+          it->desc = desc;
+          it->origLoad = origLoad;
+          it->producerTask = producerTask;
+        }
+        it->indices.push_back(i);
       }
       continue;
     }
@@ -1439,8 +1457,9 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
   for (auto &[origLoad, indices] : loadGroups)
     mergeGroup(indices, "epilogue fusion");
 
-  for (auto &[key, indices] : tmaStagingGroups)
-    mergeGroup(indices, "TMA staging per-(descriptor,load) fusion");
+  for (auto &group : tmaStagingGroups)
+    mergeGroup(group.indices,
+               "TMA staging per-(descriptor,load-or-task) fusion");
 }
 
 /// Phase 4.5: Iterative copy increase for fused P2_Other groups.
