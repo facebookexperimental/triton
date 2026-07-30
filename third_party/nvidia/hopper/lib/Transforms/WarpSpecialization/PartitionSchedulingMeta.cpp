@@ -2219,7 +2219,8 @@ static bool isScalarOp(Operation *op) {
 }
 
 void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
-                         bool createComputePartitions) {
+                         bool createComputePartitions,
+                         Partition *defaultPartition) {
   OpClusters opClusters;
 
   for (Partition &partition : schedule.getPartitions()) {
@@ -2372,6 +2373,10 @@ void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
             }
           }
         }
+        // Partition types describe semantic roles, so the logical default may
+        // be named "epilogue", "correction", or "reduction".
+        if (!fallbackPartition)
+          fallbackPartition = defaultPartition;
         if (fallbackPartition) {
           for (Operation *op : cluster.ops) {
             if (isScalarOp(op))
@@ -2875,7 +2880,8 @@ void PartitionSchedulingMeta::runOnOperation() {
     {
       PartitionSet &schedule = result->schedule;
       currentPhase = "propagate";
-      propagatePartitions(loop, schedule, result->createComputePartitions);
+      propagatePartitions(loop, schedule, result->createComputePartitions,
+                          result->layout.defaultPartition);
 
       // Assign partition to TMAStoreTokenWaitOp ops that have no partition.
       // These arise from early TMA reduce lowering: the wait's token comes
