@@ -115,6 +115,34 @@ These rules define the bridge contract:
 - Existing TLX kernel semantics are preserved. Source kernels must not need
   extra `tl.debug_barrier()` calls to become correct on this backend.
 
+### Closed symbolic handoff
+
+`TargetProgram` is the complete pre-emission contract. It has a versioned
+`TargetContract`, mechanically copied `TargetLayout` encodings,
+target-bound `TargetAssumption` records, typed values, operations, regions,
+and explicit event domains. Layout encodings contain immutable schema values,
+including serialized linear-layout dimensions and bases, rather than source
+MLIR or Python layout objects. Verification and emission do not need the
+fact-analysis or layout-analysis objects that produced those records.
+
+The contract carries each lowering family without choosing its machine form:
+
+| Source semantics | Target contract |
+| --- | --- |
+| Triton layouts and address relations | Layout IDs plus symbolic coordinate, offset, and redistribution attributes |
+| Address arithmetic | Program assumption that address arithmetic does not overflow |
+| Range and divisibility guarantees | Target-bound assumptions emitted as `wave.assume` |
+| Masks | First-class mask values and ordinary SSA operands/results |
+| Broadcast, reshape, join, split, and movement | Structural operations with source/result layout IDs |
+| Reductions | High-level reduction operation, combiner, identity, and layout metadata |
+| Global, buffer, and LDS memory | Symbolic addresses, masks, values, and explicit ordering operands |
+| Async DMA | Explicit completion, group, wait, readiness, and barrier-issue event domains |
+
+No entry may contain a source MLIR handle, converted-value wrapper, layout
+analysis object, callable, or lazy producer lookup. Missing layout,
+assumption, value, region, or event references fail target verification before
+Wave/iXSimpl runs.
+
 ### Values, layouts, and movement
 
 Distributed layouts are modeled as named-dimension maps from physical

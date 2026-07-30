@@ -173,7 +173,13 @@ def convert_ops(source_program, type_layout_program, fact_program, token_program
         fact_program,
         token_program,
     )
-    builder = target_ir.TargetBuilder(conversion_input.kernel)
+    builder = target_ir.TargetBuilder(
+        conversion_input.kernel,
+        layouts=tuple(
+            target_ir.target_layout_from_converted(layout)
+            for layout in type_layout_program.layouts
+        ),
+    )
     _seed_kernel_arguments(builder, conversion_input, type_layout_program)
     _seed_kernel_argument_facts(
         builder,
@@ -190,6 +196,12 @@ def convert_ops(source_program, type_layout_program, fact_program, token_program
         allow_yield=False,
     )
 
+    builder.set_assumptions(
+        target_ir.target_assumptions_from_facts(
+            fact_program,
+            builder.source_value_targets,
+        )
+    )
     return builder.build()
 
 
@@ -690,6 +702,7 @@ def _seed_kernel_arguments(builder, conversion_input, type_layout_program):
                 target_ir.target_type_from_converted(converted.type),
                 source_value_id=source_value_id,
                 debug_name=f"arg{source_value_id}",
+                layout_map_id=converted.layout_map_id,
             ))
     builder.set_kernel_arg_targets(tuple(arg_target_ids))
 
@@ -726,6 +739,7 @@ def _declare_results(builder, op, type_layout_program):
                 target_ir.target_type_from_converted(converted.type),
                 source_value_id=source_value_id,
                 debug_name=f"v{source_value_id}",
+                layout_map_id=converted.layout_map_id,
             ))
         if converted.layout_map_id is not None:
             result_layout_map_ids.append(converted.layout_map_id)
@@ -2453,6 +2467,7 @@ def _convert_for(
             target_ir.target_type_from_converted(type_layout_program.values[source_value_id].type),
             source_value_id=source_value_id,
             debug_name=f"r{op.region_ids[0]}_arg{index}",
+            layout_map_id=type_layout_program.values[source_value_id].layout_map_id,
         ) for index, source_value_id in enumerate(source_region.block_arg_ids))
     token_block_arg_target_ids = tuple(
         builder.add_value(

@@ -7,6 +7,7 @@ from .diagnostics import fail
 STAGE = "verification"
 
 _PROOF_DEPENDENT_OPS = frozenset({"assume", "buffer_load_to_local", "buffer_load", "buffer_store"})
+_ASSUMPTION_KINDS = frozenset({"divisible", "pointer_byte_range", "range"})
 _TARGET_REPRESENTATIONS = frozenset({
     "buffer_pointer",
     "buffer_pointer_tuple",
@@ -30,17 +31,157 @@ def verify_target_program(
     target_program,
     *,
     source_program=None,
-    fact_program=None,
     token_program=None,
 ):
+    _verify_target_contract(target_program)
+    _verify_target_layouts(target_program)
+    _verify_target_assumptions(target_program)
     _verify_target_value_ids(target_program)
     _verify_target_value_types(target_program)
-    _verify_ops(target_program, fact_program, source_program)
+    _verify_ops(target_program, source_program)
     if source_program is not None:
         _verify_source_results_covered(source_program, target_program)
     if token_program is not None and source_program is not None:
         _verify_memory_effects_tokenized(source_program, token_program)
     return True
+
+
+def _verify_target_contract(target_program):
+    contract = target_program.contract
+    if int(contract.schema_version) != target_ir.TARGET_SCHEMA_VERSION:
+        fail(
+            "TLXW_VERIFY_SCHEMA_VERSION",
+            STAGE,
+            f"unsupported target schema version {contract.schema_version}",
+        )
+    if contract.address_arithmetic != target_ir.ADDRESS_ARITHMETIC_NO_OVERFLOW:
+        fail(
+            "TLXW_VERIFY_ADDRESS_ARITHMETIC",
+            STAGE,
+            "target contract must state that address arithmetic does not overflow",
+        )
+
+
+def _verify_target_layouts(target_program):
+    for expected_id, layout in enumerate(target_program.layouts):
+        if layout.layout_map_id != expected_id:
+            fail(
+                "TLXW_VERIFY_LAYOUT_ID",
+                STAGE,
+                f"target layout id {layout.layout_map_id} does not match "
+                f"position {expected_id}",
+            )
+        if not layout.kind or any(int(dim) <= 0 for dim in layout.shape):
+            fail(
+                "TLXW_VERIFY_LAYOUT_SCHEMA",
+                STAGE,
+                f"target layout {layout.layout_map_id} has an incomplete shape or kind",
+            )
+        if int(layout.component_count) <= 0 or int(layout.lane_width) <= 0:
+            fail(
+                "TLXW_VERIFY_LAYOUT_SCHEMA",
+                STAGE,
+                f"target layout {layout.layout_map_id} has an invalid physical domain",
+            )
+        property_names = set()
+        for prop in layout.properties:
+            if (
+                not isinstance(prop, target_ir.TargetAttr)
+                or not prop.name
+                or prop.name in property_names
+                or not _is_layout_schema_value(prop.value)
+            ):
+                fail(
+                    "TLXW_VERIFY_LAYOUT_SCHEMA",
+                    STAGE,
+                    f"target layout {layout.layout_map_id} has malformed "
+                    "symbolic properties",
+                )
+            property_names.add(prop.name)
+
+
+def _verify_target_assumptions(target_program):
+    value_count = len(target_program.values)
+    for expected_id, assumption in enumerate(target_program.assumptions):
+        if assumption.assumption_id != expected_id:
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_ID",
+                STAGE,
+                f"target assumption id {assumption.assumption_id} does not "
+                f"match position {expected_id}",
+                fact_id=assumption.assumption_id,
+            )
+        if assumption.kind not in _ASSUMPTION_KINDS:
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_KIND",
+                STAGE,
+                f"unsupported target assumption kind {assumption.kind}",
+                fact_id=assumption.assumption_id,
+            )
+        if not assumption.predicate or not assumption.subject_target_ids:
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_SCHEMA",
+                STAGE,
+                f"target assumption {assumption.assumption_id} is not bound "
+                "to a predicate and target value",
+                fact_id=assumption.assumption_id,
+            )
+        if len(set(assumption.subject_target_ids)) != len(
+            assumption.subject_target_ids
+        ):
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_SCHEMA",
+                STAGE,
+                f"target assumption {assumption.assumption_id} has duplicate "
+                "target subjects",
+                fact_id=assumption.assumption_id,
+            )
+        if assumption.kind == "divisible":
+            if assumption.divisor is None or int(assumption.divisor) <= 1:
+                fail(
+                    "TLXW_VERIFY_ASSUMPTION_SCHEMA",
+                    STAGE,
+                    f"target assumption {assumption.assumption_id} has an "
+                    "invalid divisor",
+                    fact_id=assumption.assumption_id,
+                )
+        elif assumption.lower is None and assumption.upper is None:
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_SCHEMA",
+                STAGE,
+                f"target assumption {assumption.assumption_id} has no bounds",
+                fact_id=assumption.assumption_id,
+            )
+        if (
+            assumption.lower is not None
+            and assumption.upper is not None
+            and int(assumption.lower) > int(assumption.upper)
+        ):
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_SCHEMA",
+                STAGE,
+                f"target assumption {assumption.assumption_id} has an empty "
+                "range",
+                fact_id=assumption.assumption_id,
+            )
+        if assumption.width is not None and int(assumption.width) <= 0:
+            fail(
+                "TLXW_VERIFY_ASSUMPTION_SCHEMA",
+                STAGE,
+                f"target assumption {assumption.assumption_id} has an invalid "
+                "bit width",
+                fact_id=assumption.assumption_id,
+            )
+        for target_value_id in assumption.subject_target_ids:
+            if target_value_id < 0 or target_value_id >= value_count:
+                fail(
+                    "TLXW_VERIFY_ASSUMPTION_TARGET",
+                    STAGE,
+                    f"target assumption {assumption.assumption_id} references "
+                    f"missing value {target_value_id}",
+                    target_value_id=target_value_id,
+                    fact_id=assumption.assumption_id,
+                )
 
 
 def _verify_target_value_ids(target_program):
@@ -56,6 +197,10 @@ def _verify_target_value_ids(target_program):
 
 
 def _verify_target_value_types(target_program):
+    layouts = {
+        layout.layout_map_id: layout
+        for layout in target_program.layouts
+    }
     for value in target_program.values:
         representation = str(value.type.representation)
         if value.event_domain is not None:
@@ -95,12 +240,40 @@ def _verify_target_value_types(target_program):
                 "target values require a positive component count",
                 target_value_id=value.target_value_id,
             )
+        if value.layout_map_id is not None:
+            layout = layouts.get(int(value.layout_map_id))
+            if layout is None:
+                fail(
+                    "TLXW_VERIFY_UNKNOWN_LAYOUT",
+                    STAGE,
+                    f"target value {value.target_value_id} references missing "
+                    f"layout {value.layout_map_id}",
+                    target_value_id=value.target_value_id,
+                )
+            if (
+                value.type.lane_width is not None
+                and int(value.type.lane_width) != int(layout.lane_width)
+            ):
+                fail(
+                    "TLXW_VERIFY_LAYOUT_TYPE",
+                    STAGE,
+                    f"target value {value.target_value_id} lane width does not "
+                    f"match layout {value.layout_map_id}",
+                    target_value_id=value.target_value_id,
+                )
 
 
-def _verify_ops(target_program, fact_program, source_program):
+def _verify_ops(target_program, source_program):
     value_count = len(target_program.values)
     op_count = len(target_program.ops)
-    facts_by_id = _facts_by_id(fact_program)
+    facts_by_id = {
+        assumption.assumption_id: assumption
+        for assumption in target_program.assumptions
+    }
+    layout_ids = frozenset(
+        layout.layout_map_id
+        for layout in target_program.layouts
+    )
     for expected_id, op in enumerate(target_program.ops):
         if op.target_op_id != expected_id:
             fail(
@@ -125,6 +298,15 @@ def _verify_ops(target_program, fact_program, source_program):
                     f"value {target_value_id}",
                     target_op_id=op.target_op_id,
                     target_value_id=target_value_id,
+                )
+        for layout_map_id in op.layout_map_ids:
+            if layout_map_id not in layout_ids:
+                fail(
+                    "TLXW_VERIFY_UNKNOWN_LAYOUT",
+                    STAGE,
+                    f"target op {op.target_op_id} references missing layout "
+                    f"{layout_map_id}",
+                    target_op_id=op.target_op_id,
                 )
         _verify_attrs(op)
         _verify_provenance_only_target_ids(op, value_count)
@@ -993,30 +1175,17 @@ def _verify_layout_convert_source_op(op, source_program):
 
 
 def _verify_fact_target_compatible(target_program, op, fact, target_value_id):
-    value = target_program.values[target_value_id]
-    if value.source_value_id is not None:
-        if value.source_value_id == fact.subject_value_id:
-            return
-        fail(
-            "TLXW_VERIFY_FACT_TARGET",
-            STAGE,
-            f"fact {fact.fact_id} applies to source value "
-            f"{fact.subject_value_id}, not target value {target_value_id}",
-            target_op_id=op.target_op_id,
-            target_value_id=target_value_id,
-            fact_id=fact.fact_id,
-        )
-    source_targets = target_program.source_value_targets.get(fact.subject_value_id)
-    if source_targets is None or target_value_id in source_targets:
+    del target_program
+    if target_value_id in fact.subject_target_ids:
         return
     fail(
         "TLXW_VERIFY_FACT_TARGET",
         STAGE,
-        f"fact {fact.fact_id} target value {target_value_id} is not mapped "
-        f"from source value {fact.subject_value_id}",
+        f"assumption {fact.assumption_id} does not apply to target value "
+        f"{target_value_id}",
         target_op_id=op.target_op_id,
         target_value_id=target_value_id,
-        fact_id=fact.fact_id,
+        fact_id=fact.assumption_id,
     )
 
 
@@ -1831,12 +2000,6 @@ def _verify_memory_effects_tokenized(source_program, token_program):
                 )
 
 
-def _facts_by_id(fact_program):
-    if fact_program is None:
-        return {}
-    return {fact.fact_id: fact for fact in fact_program.facts}
-
-
 def _is_schema_value(value):
     if value is None or isinstance(value, (bool, int, float, str)):
         return True
@@ -1844,4 +2007,32 @@ def _is_schema_value(value):
         return all(_is_schema_value(item) for item in value)
     if isinstance(value, frozenset):
         return all(_is_schema_value(item) for item in value)
+    return False
+
+
+def _is_layout_schema_value(value):
+    if _is_schema_value(value):
+        return True
+    if isinstance(value, target_ir.TargetAttr):
+        return bool(value.name) and _is_layout_schema_value(value.value)
+    if isinstance(value, target_ir.TargetLinearLayout):
+        if (
+            not value.in_dims
+            or len(set(value.in_dims)) != len(value.in_dims)
+            or not value.out_dims
+            or len({name for name, _size in value.out_dims})
+            != len(value.out_dims)
+            or any(not name or int(size) <= 0 for name, size in value.out_dims)
+        ):
+            return False
+        out_rank = len(value.out_dims)
+        if tuple(name for name, _bases in value.bases) != value.in_dims:
+            return False
+        return all(
+            len(basis) == out_rank
+            for _name, bases in value.bases
+            for basis in bases
+        )
+    if isinstance(value, tuple):
+        return all(_is_layout_schema_value(item) for item in value)
     return False

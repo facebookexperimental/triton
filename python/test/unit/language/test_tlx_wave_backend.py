@@ -2731,10 +2731,30 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
 
     target = converter_op_conversion.convert_ops(source, converted, facts, tokens)
 
+    assert target.contract == converter_target_ir.TargetContract(
+        schema_version=converter_target_ir.TARGET_SCHEMA_VERSION,
+        address_arithmetic=converter_target_ir.ADDRESS_ARITHMETIC_NO_OVERFLOW,
+    )
+    assert target.layouts
+    assert target.assumptions
+    assert any(layout.properties for layout in target.layouts)
+    assert all(
+        isinstance(prop, converter_target_ir.TargetAttr)
+        for layout in target.layouts
+        for prop in layout.properties
+    )
+    assert all(
+        assumption.subject_target_ids
+        for assumption in target.assumptions
+    )
+    assert all(
+        value.layout_map_id is None
+        or target.layouts[value.layout_map_id].layout_map_id == value.layout_map_id
+        for value in target.values
+    )
     assert converter_verifier.verify_target_program(
         target,
         source_program=source,
-        fact_program=facts,
         token_program=tokens,
     )
     assert [op.kind for op in target.ops] == [
@@ -2823,7 +2843,13 @@ def test_tlx_wave_converter_emits_facts_without_source_provenance(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
     stripped_values = tuple(
-        converter_target_ir.TargetValue(value.target_value_id, value.type) for value in output.target_program.values)
+        converter_target_ir.TargetValue(
+            value.target_value_id,
+            value.type,
+            layout_map_id=value.layout_map_id,
+        )
+        for value in output.target_program.values
+    )
     stripped_target = converter_target_ir.TargetProgram(
         stripped_values,
         output.target_program.ops,
@@ -2831,12 +2857,13 @@ def test_tlx_wave_converter_emits_facts_without_source_provenance(tmp_path):
         {},
         {},
         output.target_program.kernel,
+        output.target_program.layouts,
+        output.target_program.assumptions,
+        output.target_program.contract,
     )
 
-    stripped_emitted = converter_emission.emit_wave_module(
-        stripped_target,
-        output.fact_program,
-    )
+    assert converter_verifier.verify_target_program(stripped_target)
+    stripped_emitted = converter_emission.emit_wave_module(stripped_target)
 
     assert stripped_emitted.text == output.emitted_module.text
     del ctx
@@ -3933,6 +3960,73 @@ def test_tlx_wave_converter_verifier_rejects_missing_fact():
     assert diagnostic.no_fallback is True
 
 
+def test_tlx_wave_converter_verifier_rejects_unknown_value_layout():
+    target = converter_target_ir.TargetProgram(
+        values=(
+            converter_target_ir.TargetValue(
+                0,
+                converter_target_ir.TargetType("tensor", "simd", "i32", 64),
+                layout_map_id=0,
+            ),
+        ),
+        ops=(),
+        regions=(converter_target_ir.TargetRegion(0), ),
+        source_value_targets={},
+        erased_source_values={},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_UNKNOWN_LAYOUT"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.target_value_id == 0
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_wrapping_address_contract():
+    target = converter_target_ir.TargetProgram(
+        values=(),
+        ops=(),
+        regions=(converter_target_ir.TargetRegion(0), ),
+        source_value_targets={},
+        erased_source_values={},
+        contract=converter_target_ir.TargetContract(
+            address_arithmetic="wrapping",
+        ),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_ADDRESS_ARITHMETIC"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_unknown_contract_version():
+    target = converter_target_ir.TargetProgram(
+        values=(),
+        ops=(),
+        regions=(converter_target_ir.TargetRegion(0), ),
+        source_value_targets={},
+        erased_source_values={},
+        contract=converter_target_ir.TargetContract(
+            schema_version=converter_target_ir.TARGET_SCHEMA_VERSION + 1,
+        ),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_SCHEMA_VERSION"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.no_fallback is True
+
+
 def test_tlx_wave_converter_verifier_rejects_missing_fact_target():
     scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
     target = converter_target_ir.TargetProgram(
@@ -3946,13 +4040,8 @@ def test_tlx_wave_converter_verifier_rejects_missing_fact_target():
         {0: (0, )},
         {},
     )
-    fact_program = converter_facts.FactProgram(
-        (converter_facts.Fact(0, "range", 0, "sge", lower=0), ),
-        {0: (0, )},
-    )
-
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_verifier.verify_target_program(target, fact_program=fact_program)
+        converter_verifier.verify_target_program(target)
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_VERIFY_FACT_TARGET_COUNT"
@@ -3977,14 +4066,19 @@ def test_tlx_wave_converter_verifier_rejects_incompatible_fact_target():
         (converter_target_ir.TargetRegion(0, (0, )), ),
         {0: (0, ), 1: (1, )},
         {},
-    )
-    fact_program = converter_facts.FactProgram(
-        (converter_facts.Fact(0, "range", 0, "sge", lower=0), ),
-        {0: (0, )},
+        assumptions=(
+            converter_target_ir.TargetAssumption(
+                0,
+                "range",
+                "sge",
+                (0, ),
+                lower=0,
+            ),
+        ),
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_verifier.verify_target_program(target, fact_program=fact_program)
+        converter_verifier.verify_target_program(target)
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_VERIFY_FACT_TARGET"
@@ -4038,12 +4132,15 @@ def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts()
         (converter_facts.Fact(0, "range", 0, "signed_width", lower=0), ),
         {0: (0, )},
     )
+    builder.set_assumptions(
+        converter_target_ir.target_assumptions_from_facts(
+            fact_program,
+            builder.source_value_targets,
+        )
+    )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_verifier.verify_target_program(
-            builder.build(),
-            fact_program=fact_program,
-        )
+        converter_verifier.verify_target_program(builder.build())
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_VERIFY_LAYOUT_FACT_POLICY"
@@ -14028,7 +14125,7 @@ def test_tlx_wave_converter_packs_glu_bias_slice_into_mfma_fragment(tmp_path):
     assert expand_attrs["source_component_count"] == 16
     assert expand_attrs["packet_source_indices"] == tuple(range(16))
 
-    wave = converter_emission.emit_wave_module(target_program, fact_program).text
+    wave = converter_emission.emit_wave_module(target_program).text
     assert wave.count("!wave.simd<vector<4xf32>, 64>") >= 4
     _run_wave_verify(wave)
     del ctx
@@ -16280,7 +16377,6 @@ def test_tlx_wave_emits_broadcast_component_sources():
         None,
         None,
         program,
-        None,
         {0: ("a", "b")},
         uniform_pointer_bases={0: ("base_a", "base_b")},
     )
@@ -16366,13 +16462,9 @@ def _convert_ttgir_to_wave_keep_dead(
         converter_verifier.verify_target_program(
             target_program,
             source_program=source_program,
-            fact_program=fact_program,
             token_program=token_program,
         )
-    emitted_module = converter_emission.emit_wave_module(
-        target_program,
-        fact_program,
-    )
+    emitted_module = converter_emission.emit_wave_module(target_program)
     return converter_pipeline.ConversionOutput(
         source_program,
         type_layout_program,

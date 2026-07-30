@@ -1,11 +1,4 @@
-"""Closed target-program schema for the TLX Wave converter.
-
-Target programs inherit Triton's layout-address contract: backend-synthesized
-index, stride, coordinate, LDS-offset, and pointer-offset expressions are only
-defined when their signed i32 layout arithmetic does not overflow.  Overflowing
-executions are outside the target IR semantics rather than cases the emitter
-must preserve with wrapping arithmetic.
-"""
+"""Closed target-program schema for the TLX Wave converter."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -13,6 +6,9 @@ from dataclasses import dataclass, field
 from .diagnostics import fail
 
 STAGE = "target_ir"
+
+TARGET_SCHEMA_VERSION = 1
+ADDRESS_ARITHMETIC_NO_OVERFLOW = "no_overflow"
 
 # Target values named by this attribute were consumed while proving or
 # constructing a structural replacement, but are not runtime operands of the
@@ -81,18 +77,59 @@ class TargetType:
 
 
 @dataclass(frozen=True)
+class TargetAttr:
+    name: str
+    value: object
+
+
+@dataclass(frozen=True)
+class TargetLinearLayout:
+    in_dims: tuple[str, ...]
+    out_dims: tuple[tuple[str, int], ...]
+    bases: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...]
+
+
+@dataclass(frozen=True)
+class TargetLayout:
+    layout_map_id: int
+    kind: str
+    shape: tuple[int, ...]
+    element_type: str | None
+    component_count: int
+    lane_width: int
+    properties: tuple[TargetAttr, ...] = ()
+
+
+@dataclass(frozen=True)
+class TargetAssumption:
+    assumption_id: int
+    kind: str
+    predicate: str
+    subject_target_ids: tuple[int, ...]
+    lower: int | None = None
+    upper: int | None = None
+    width: int | None = None
+    signedness: str | None = None
+    divisor: int | None = None
+    mask_scope: int | None = None
+    provenance: str = ""
+    source_op_index: int | None = None
+
+
+@dataclass(frozen=True)
+class TargetContract:
+    schema_version: int = TARGET_SCHEMA_VERSION
+    address_arithmetic: str = ADDRESS_ARITHMETIC_NO_OVERFLOW
+
+
+@dataclass(frozen=True)
 class TargetValue:
     target_value_id: int
     type: TargetType
     source_value_id: int | None = None
     debug_name: str | None = None
     event_domain: str | None = None
-
-
-@dataclass(frozen=True)
-class TargetAttr:
-    name: str
-    value: object
+    layout_map_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -138,11 +175,14 @@ class TargetProgram:
     source_value_targets: dict[int, tuple[int, ...]]
     erased_source_values: dict[int, str]
     kernel: TargetKernel = field(default_factory=TargetKernel)
+    layouts: tuple[TargetLayout, ...] = ()
+    assumptions: tuple[TargetAssumption, ...] = ()
+    contract: TargetContract = field(default_factory=TargetContract)
 
 
 class TargetBuilder:
 
-    def __init__(self, kernel=None):
+    def __init__(self, kernel=None, *, layouts=(), contract=None):
         self.values = []
         self.ops = []
         self.regions = [TargetRegion(0)]
@@ -150,6 +190,9 @@ class TargetBuilder:
         self.source_value_targets = {}
         self.erased_source_values = {}
         self.kernel = kernel or TargetKernel()
+        self.layouts = tuple(layouts)
+        self.assumptions = ()
+        self.contract = contract or TargetContract()
         # Conversion-only protocol state.  The final dependency graph is
         # serialized as ordinary target SSA; these maps merely make that graph
         # convenient to construct while walking structured source regions.
@@ -166,6 +209,7 @@ class TargetBuilder:
         source_value_id=None,
         debug_name=None,
         event_domain=None,
+        layout_map_id=None,
     ):
         value_id = len(self.values)
         self.values.append(TargetValue(
@@ -174,6 +218,7 @@ class TargetBuilder:
             source_value_id,
             debug_name,
             event_domain,
+            None if layout_map_id is None else int(layout_map_id),
         ))
         if source_value_id is not None:
             self.source_value_targets.setdefault(source_value_id, tuple())
@@ -192,7 +237,11 @@ class TargetBuilder:
             value.source_value_id,
             value.debug_name,
             None if event_domain is None else str(event_domain),
+            value.layout_map_id,
         )
+
+    def set_assumptions(self, assumptions):
+        self.assumptions = tuple(assumptions)
 
     def snapshot_protocol_state(self):
         return {
@@ -320,6 +369,9 @@ class TargetBuilder:
             dict(self.source_value_targets),
             dict(self.erased_source_values),
             self.kernel,
+            self.layouts,
+            self.assumptions,
+            self.contract,
         )
 
 
@@ -330,6 +382,84 @@ def target_type_from_converted(converted_type):
         converted_type.element_type,
         converted_type.lane_width,
         converted_type.component_count,
+    )
+
+
+def target_layout_from_converted(layout):
+    return TargetLayout(
+        int(layout.layout_map_id),
+        str(layout.kind),
+        tuple(int(dim) for dim in layout.shape),
+        None if layout.element_type is None else str(layout.element_type),
+        int(layout.component_count),
+        int(layout.lane_width),
+        tuple(
+            TargetAttr(str(name), _target_layout_property_value(value))
+            for name, value in layout.properties.items()
+        ),
+    )
+
+
+def _target_layout_property_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return tuple(_target_layout_property_value(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(
+            TargetAttr(str(name), _target_layout_property_value(item))
+            for name, item in value.items()
+        )
+    get_in_dim_names = getattr(value, "get_in_dim_names", None)
+    if (
+        callable(get_in_dim_names)
+        and hasattr(value, "out_dims")
+        and hasattr(value, "bases")
+    ):
+        return TargetLinearLayout(
+            tuple(str(name) for name in get_in_dim_names()),
+            tuple((str(name), int(size)) for name, size in value.out_dims),
+            tuple(
+                (
+                    str(name),
+                    tuple(
+                        tuple(int(component) for component in basis)
+                        for basis in bases
+                    ),
+                )
+                for name, bases in value.bases
+            ),
+        )
+    fail(
+        "TLXW_TARGET_LAYOUT_SCHEMA",
+        STAGE,
+        f"layout property has unsupported schema value {type(value).__name__}",
+    )
+
+
+def target_assumptions_from_facts(fact_program, source_value_targets):
+    return tuple(
+        TargetAssumption(
+            int(fact.fact_id),
+            str(fact.kind),
+            str(fact.predicate),
+            tuple(
+                int(target_id)
+                for target_id in source_value_targets.get(
+                    int(fact.subject_value_id),
+                    (),
+                )
+            ),
+            None if fact.lower is None else int(fact.lower),
+            None if fact.upper is None else int(fact.upper),
+            None if fact.width is None else int(fact.width),
+            None if fact.signedness is None else str(fact.signedness),
+            None if fact.divisor is None else int(fact.divisor),
+            None if fact.mask_scope is None else int(fact.mask_scope),
+            str(fact.provenance),
+            None if fact.source_op_index is None else int(fact.source_op_index),
+        )
+        for fact in fact_program.facts
     )
 
 
