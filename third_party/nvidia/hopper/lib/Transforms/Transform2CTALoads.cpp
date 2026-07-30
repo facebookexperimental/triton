@@ -180,6 +180,17 @@ struct Transform2CTALoads
         LDBG("Skipped MMA at " << mma.getLoc()
                                << " (B not from descriptor load)");
     }
+
+    // A 2-CTA TMA load is issued by both CTAs as one hardware CTA-group
+    // transaction. Mark every rank-2 descriptor load in the cooperative
+    // kernel, including A operands (K/V) that are not visited by B splitting.
+    // Rank-1 metadata loads remain ordinary per-CTA loads, matching TLX's raw
+    // M/D bulk-copy path.
+    moduleOp.walk([&](tt::DescriptorLoadOp descLoad) {
+      auto resultTy = dyn_cast<RankedTensorType>(descLoad.getType());
+      if (resultTy && resultTy.getRank() == 2)
+        descLoad->setAttr("two_cta_load", UnitAttr::get(moduleOp.getContext()));
+    });
   }
 
   LogicalResult transformBLoad(ttng::TCGen5MMAOp mma) {

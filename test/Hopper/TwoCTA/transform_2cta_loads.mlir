@@ -10,6 +10,8 @@
 // Two make_tensor_descriptor ops: original A and cloned half-width B
 // CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<128x64xf16>
 // CHECK: tt.make_tensor_descriptor %{{.*}} : !tt.ptr<f16>, !tt.tensordesc<64x64xf16>
+// Rank-2 A operand also uses the hardware CTA-group TMA protocol.
+// CHECK: tt.descriptor_load %{{.*}} {{.*}}two_cta_load{{.*}} : !tt.tensordesc<128x64xf16>
 // CTA offset computation inside the loop
 // CHECK: %[[CTA_ID:.*]] = nvg.cluster_id
 // CHECK: %[[C2:.*]] = arith.constant 2 : i32
@@ -17,9 +19,11 @@
 // CHECK: %[[HALF:.*]] = arith.constant 64 : i32
 // CHECK: %[[OFF:.*]] = arith.muli %[[MOD]], %[[HALF]]
 // CHECK: arith.addi %{{.*}}, %[[OFF]]
-// Half-width B load and alloc
-// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x64xf16>
+// Rank-2 B uses the same protocol. Rank-1 metadata remains per-CTA.
+// CHECK: tt.descriptor_load %{{.*}} {{.*}}two_cta_load{{.*}} : !tt.tensordesc<64x64xf16>
+// Half-width B alloc
 // CHECK: ttg.local_alloc %{{.*}} : {{.*}} -> !ttg.memdesc<64x64xf16
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<128xf32>
 // MMA with two_ctas and half-width B
 // CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
 
@@ -34,6 +38,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
   tt.func public @matmul_2cta_transform_loads(
       %a_ptr: !tt.ptr<f16>,
       %b_ptr: !tt.ptr<f16>,
+      %m_desc: !tt.tensordesc<128xf32>,
       %M: i32 {tt.divisibility = 16 : i32},
       %N: i32 {tt.divisibility = 16 : i32},
       %K: i32 {tt.divisibility = 16 : i32}) attributes {noinline = false} {
@@ -65,6 +70,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
       // B load (should be transformed to half-width with CTA offset)
       %b = tt.descriptor_load %b_desc[%offs_k, %offs_bn] : !tt.tensordesc<64x128xf16> -> tensor<64x128xf16, #blocked1>
       %b_smem = ttg.local_alloc %b : (tensor<64x128xf16, #blocked1>) -> !ttg.memdesc<64x128xf16, #shared, #smem>
+      %m = tt.descriptor_load %m_desc[%offs_am] : !tt.tensordesc<128xf32> -> tensor<128xf32>
 
       %acc_layout = ttg.convert_layout %acc : tensor<128x128xf32, #blocked> -> tensor<128x128xf32, #blocked3>
       %acc_tmem, %token = ttng.tmem_alloc %acc_layout : (tensor<128x128xf32, #blocked3>) -> (!ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.async.token)
