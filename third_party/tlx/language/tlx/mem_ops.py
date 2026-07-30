@@ -852,7 +852,6 @@ def async_load(
     bulk: bool = False,
     bulk_size: Optional = None,
     barrier: tlx.mbarrier = None,
-    copy_layout: tl.constexpr = None,
     _semantic=None,
 ) -> tlx.async_token:
     """
@@ -868,14 +867,11 @@ def async_load(
       computed from the result buffer shape and element type
     """
     bulk = tl._unwrap_if_constexpr(bulk)
-    copy_layout = tl._unwrap_if_constexpr(copy_layout)
-
     if bulk:
         assert len(result.type.shape) == 1, "bulk async_load requires a 1D result buffer"
         assert barrier is not None, "bulk async_load requires a barrier"
         assert mask is None, "bulk async_load does not support mask"
         assert other is None, "bulk async_load does not support other"
-        assert copy_layout is None, "bulk async_load does not support copy_layout"
 
         # Compute destination buffer size in bytes
         dest_bytes = result.type.shape[0] * (result.type.element_ty.primitive_bitwidth // 8)
@@ -916,7 +912,6 @@ def async_load(
                 bulk_size_handle,
                 barrier.handle,
                 True,
-                None,
             ))
 
     assert bulk_size is None, "bulk_size requires bulk=True"
@@ -940,20 +935,6 @@ def async_load(
 
     cache = _semantic._str_to_load_cache_modifier(cache_modifier)
     eviction = _semantic._str_to_eviction_policy(eviction_policy)
-    copy_layout_handle = None
-    if copy_layout is not None:
-        if not isinstance(copy_layout, tlx.layout_encoding) or isinstance(copy_layout, tlx.shared_layout_encoding):
-            raise TypeError(
-                "`copy_layout` must be a distributed tlx.layout_encoding, "
-                f"got {type(copy_layout).__name__}")
-        if isinstance(copy_layout, tlx.layout):
-            copy_layout_handle = copy_layout.to_ir(
-                _semantic.builder,
-                result.type.shape,
-                result.type.element_ty,
-            )
-        else:
-            copy_layout_handle = copy_layout.to_ir(_semantic.builder)
     return tlx.async_token(
         _semantic.builder.create_async_load(
             src.handle,
@@ -966,7 +947,6 @@ def async_load(
             None,
             None,
             False,
-            copy_layout_handle,
         ))
 
 

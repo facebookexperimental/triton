@@ -1457,16 +1457,12 @@ void init_triton_tlx_ir(py::module &&m) {
               std::optional<Value> mask, std::optional<Value> other,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
               bool isVolatile, std::optional<Value> bulkSize,
-              std::optional<Value> barrier, bool useBulk,
-              std::optional<Attribute> copyLayout) -> mlir::Value {
-             auto op = self.create<ttg::AsyncCopyGlobalToLocalOp>(
+              std::optional<Value> barrier, bool useBulk) -> mlir::Value {
+             return self.create<ttg::AsyncCopyGlobalToLocalOp>(
                  ptrTensor, result, mask.value_or(Value()),
                  other.value_or(Value()), bulkSize.value_or(Value()),
                  barrier.value_or(Value()), cacheModifier, evictionPolicy,
                  isVolatile, useBulk);
-             if (copyLayout)
-               op->setAttr("tlx.wave.copy_layout", *copyLayout);
-             return op;
            })
       .def("create_clock64",
            [](TritonOpBuilder &self) -> mlir::Value {

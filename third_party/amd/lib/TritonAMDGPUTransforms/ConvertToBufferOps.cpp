@@ -554,13 +554,6 @@ struct ConvertTritonLoadToBufferLoad : public mlir::OpRewritePattern<SourceOp> {
       }();
 
       assert(bufferLoadOp);
-      if constexpr (std::is_same_v<
-                        SourceOp,
-                        triton::gpu::AsyncCopyGlobalToLocalOp>) {
-        if (Attribute copyLayout = op->getAttr("tlx.wave.copy_layout"))
-          bufferLoadOp->setAttr("tlx.wave.copy_layout", copyLayout);
-      }
-
       rewriter.replaceOp(op, bufferLoadOp);
       return success();
     }

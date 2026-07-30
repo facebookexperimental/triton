@@ -295,9 +295,9 @@ class BoundedSoftmaxState:
         mma_layout: tl.constexpr,
     ):
         score0, score1 = _split_last_2(scores)
-        score0 = tl.fma(score0, qk_scale, -log2_score_bound)
+        score0 = score0 * qk_scale + (-log2_score_bound)
         registers0 = tl.math.exp2(_score_packet_to_registers(score0))
-        score1 = tl.fma(score1, qk_scale, -log2_score_bound)
+        score1 = score1 * qk_scale + (-log2_score_bound)
         registers1 = _score_packet_to_registers(score1)
         lower8, tail8 = _split_last_2(registers1)
         head4, upper4 = _split_last_2(lower8)
@@ -626,36 +626,10 @@ def _issue_tile(
     slot,
     LDS_PADDING: tl.constexpr,
 ):
-    # Match the standalone kernel's common K/V copy ownership without
-    # converting the pointer tensor into a long-lived register layout.
-    copy_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
-        reg_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 64],
-        ],
-        lane_bases=[
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [8, 0],
-            [16, 0],
-            [32, 0],
-        ],
-        warp_bases=[
-            [1, 0],
-            [2, 0],
-            [4, 0],
-        ],
-        block_bases=[],
-        shape=[BLOCK_N, HEAD_DIM],
-    ))
     tile_offset = tile * BLOCK_N * stride_n
     token = tlx.async_load(
         pointers + tile_offset,
         tlx.local_view(buffer, slot),
-        copy_layout=copy_layout,
     )
     return tlx.async_load_commit_group([token])
 
