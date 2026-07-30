@@ -24,6 +24,7 @@ NUM_Q_HEADS = NUM_KV_HEADS * QUERY_GROUP_SIZE
 HEAD_DIM = 64
 PAGE_SIZE = 16
 
+
 def _check_aiter_available():
     try:
         import aiter  # noqa: F401
@@ -33,7 +34,7 @@ def _check_aiter_available():
 
 
 _AITER_AVAILABLE = _check_aiter_available()
-DECODE_METHODS = ("tlx", "aiter") if _AITER_AVAILABLE else ("tlx",)
+DECODE_METHODS = ("tlx", "aiter") if _AITER_AVAILABLE else ("tlx", )
 
 DEFAULT_DECODE_VERSIONS = list(DECODE_METHODS)
 
@@ -108,7 +109,7 @@ def get_x_values():
         (32, 32768),
         (8, 131072),
     ]
-    
+
     return x_vals
 
 
@@ -132,7 +133,8 @@ def create_benchmark(versions, qlen, use_kv_cache_pool=False):
         # Bound physical KV memory for large sweeps via a shared page pool.
         pool = 4 * ((N_CTX + PAGE_SIZE - 1) // PAGE_SIZE) + 16
         q, kc, vc, ctx, bt = _build_inputs(BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
-                                           query_length=qlen, device=DEVICE, pool_pages=pool if use_kv_cache_pool else None)
+                                           query_length=qlen, device=DEVICE,
+                                           pool_pages=pool if use_kv_cache_pool else None)
         out = torch.empty_like(q)
         fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, N_CTX)
         if fn is None:
@@ -150,6 +152,7 @@ def create_benchmark(versions, qlen, use_kv_cache_pool=False):
 
     return benchmark
 
+
 @pytest.mark.parametrize("provider", list(DECODE_METHODS))
 @pytest.mark.parametrize("query_length", [1, 2, 3, 4], ids=lambda q: f"qlen{q}")
 @pytest.mark.parametrize("batch, n_ctx", get_x_values())
@@ -157,17 +160,17 @@ def create_benchmark(versions, qlen, use_kv_cache_pool=False):
 def test_correctness(batch, n_ctx, query_length, provider):
     sm_scale = 1.0 / (HEAD_DIM**0.5)
     ctx_lens = [n_ctx] * batch
-    query, key_cache, value_cache, context_lens, block_tables = _build_inputs(
-        batch, ctx_lens, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
-        query_length=query_length, device=DEVICE)
+    query, key_cache, value_cache, context_lens, block_tables = _build_inputs(batch, ctx_lens, NUM_Q_HEADS,
+                                                                              NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
+                                                                              query_length=query_length, device=DEVICE)
     out = torch.empty_like(query)
-    fn = _make_decode_fn(provider, out, query, key_cache, value_cache, context_lens, block_tables,
-                         sm_scale, query_length, n_ctx)
+    fn = _make_decode_fn(provider, out, query, key_cache, value_cache, context_lens, block_tables, sm_scale,
+                         query_length, n_ctx)
     if fn is None:
         pytest.skip(f"{provider} not available")
     fn()
-    ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale,
-                      NUM_Q_HEADS, NUM_KV_HEADS, query_length)
+    ref = _ref_decode(query, key_cache, value_cache, context_lens, block_tables, sm_scale, NUM_Q_HEADS, NUM_KV_HEADS,
+                      query_length)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
