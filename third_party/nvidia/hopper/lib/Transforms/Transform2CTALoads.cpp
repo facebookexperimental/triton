@@ -143,6 +143,17 @@ static FailureOr<BLoadTrace> traceToDescriptorLoad(Value bMemDesc) {
   return BLoadTrace{descLoad, localAlloc, memDescTrans, trans, splitDim};
 }
 
+// Return the B (RHS) operand of a tcgen05 MMAv5 op. MMAv5OpInterface does not
+// expose getB() (operand accessors are op-specific), so switch on the concrete
+// op. Both the plain and scaled MMA carry a B operand; returns null otherwise.
+static Value getBfromMMA(Operation *op) {
+  if (auto mma = dyn_cast<ttng::TCGen5MMAOp>(op))
+    return mma.getB();
+  if (auto mma = dyn_cast<ttng::TCGen5MMAScaledOp>(op))
+    return mma.getB();
+  return nullptr;
+}
+
 struct Transform2CTALoads
     : public impl::NVGPU2CTATransformLoadsBase<Transform2CTALoads> {
   DenseMap<Value, tt::TensorDescType> originalDescTypes;
@@ -163,9 +174,11 @@ struct Transform2CTALoads
       originalDescTypes.try_emplace(descLoad.getDesc(), descType);
     });
 
-    // Collect 2-CTA MMA ops.
-    SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
-    moduleOp->walk([&](ttng::TCGen5MMAOp mma) {
+    // Collect 2-CTA MMA ops. Walk the shared MMAv5 interface so both the plain
+    // (tc_gen5_mma) and scaled (tc_gen5_mma_scaled) ops are handled by one
+    // path.
+    SmallVector<ttng::MMAv5OpInterface> twoCTAMMAOps;
+    moduleOp->walk([&](ttng::MMAv5OpInterface mma) {
       if (mma.getTwoCtas())
         twoCTAMMAOps.push_back(mma);
     });
@@ -176,15 +189,24 @@ struct Transform2CTALoads
     LDBG("Found " << twoCTAMMAOps.size() << " 2-CTA MMA ops to transform");
 
     for (auto mma : twoCTAMMAOps) {
-      if (failed(transformBLoad(mma)))
-        LDBG("Skipped MMA at " << mma.getLoc()
+      Operation *op = mma.getOperation();
+      if (failed(transformBLoad(getBfromMMA(op), op)))
+        LDBG("Skipped MMA at " << op->getLoc()
                                << " (B not from descriptor load)");
+      // NOTE: the B-scale is intentionally NOT split for a scaled 2-CTA MMA.
+      // tcgen05.mma.cta_group::2.block_scale expects each CTA to hold the FULL
+      // B-scale in TMEM (the per-CTA scale addressing reads the right columns
+      // for its N-half); splitting it to N/2 produces wrong results. Only the B
+      // *operand* is split (above), for the global-load memory win. Verified
+      // exact (max_abs=0) on the simple 2-CTA MXFP8 kernel.
     }
   }
 
-  LogicalResult transformBLoad(ttng::TCGen5MMAOp mma) {
+  LogicalResult transformBLoad(Value b, Operation *mma) {
+    if (!b)
+      return failure();
     // Trace B operand back to DescriptorLoadOp.
-    FailureOr<BLoadTrace> trace = traceToDescriptorLoad(mma.getB());
+    FailureOr<BLoadTrace> trace = traceToDescriptorLoad(b);
     if (failed(trace))
       return failure();
     auto descLoad = trace->descLoad;
@@ -212,7 +234,7 @@ struct Transform2CTALoads
       return failure();
     }
 
-    MLIRContext *ctx = mma.getContext();
+    MLIRContext *ctx = mma->getContext();
     auto elemType = descType.getElementType();
     auto sharedLayout = descType.getSharedLayout();
     auto newDescType =
@@ -328,7 +350,7 @@ struct Transform2CTALoads
     if (makeDesc && makeDesc.getResult().use_empty())
       makeDesc.erase();
 
-    LDBG("Transformed B load for 2-CTA MMA at " << mma.getLoc());
+    LDBG("Transformed B load for 2-CTA MMA at " << mma->getLoc());
     return success();
   }
 };

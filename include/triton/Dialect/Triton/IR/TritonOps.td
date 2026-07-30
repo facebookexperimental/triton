@@ -694,6 +694,8 @@ def TT_DotScaledOp : TT_Op<"dot_scaled", [Pure,
     let description = [{
         $d = matrix_multiply(scale($a, $a_scale), scale($b, $b_scale)) + $c.
         Where scale(x, s) is a function that applies the scale per block following microscaling spec.
+        If $two_ctas is set the op lowers to a 2-CTA (cta_group::2) scaled MMA on
+        Blackwell (SM100+), reading operands distributed across two contiguous CTAs.
     }];
 
     let arguments = (
@@ -709,7 +711,8 @@ def TT_DotScaledOp : TT_Op<"dot_scaled", [Pure,
       TT_ScaleDotElemTypeAttr:$b_elem_type,
       BoolAttr:$fastMath,
       DefaultValuedAttr<BoolAttr, "true">:$lhs_k_pack,
-      DefaultValuedAttr<BoolAttr, "true">:$rhs_k_pack
+      DefaultValuedAttr<BoolAttr, "true">:$rhs_k_pack,
+      UnitAttr:$two_ctas
     );
 
     let results = (outs TT_FloatTensor:$d);

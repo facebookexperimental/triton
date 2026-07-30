@@ -859,10 +859,32 @@ public:
     unsigned m = 128;
     unsigned n = retShapePerCTA[1] >= 256 ? 256 : retShapePerCTA[1];
 
+    // 2-CTA (cta_group::2) scaled MMA: honor tt.dot_scaled's two_ctas flag,
+    // mirroring the plain-dot BlockedToMMAv5 path. Requires a >=2 CTA cluster
+    // (ctas_per_cga=(2,1,1)) and BLOCK_M >= 128; otherwise warn and fall back
+    // to 1-CTA so the kernel still compiles.
+    bool useTwoCTAs = false;
+    if (dotOp.getTwoCtas()) {
+      auto mod = dotOp->getParentOfType<ModuleOp>();
+      auto clusterDims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+      if (clusterDims[0] < 2) {
+        dotOp.emitWarning()
+            << "two_ctas=True requires ctas_per_cga=(2,1,1) or larger; "
+               "cluster-dim-x is "
+            << clusterDims[0] << ". Falling back to 1-CTA scaled MMA.";
+      } else if (oldRetType.getShape()[0] < 128) {
+        dotOp.emitWarning()
+            << "two_ctas=True with BLOCK_M < 128 is not yet supported for "
+               "scaled MMA. Falling back to 1-CTA scaled MMA.";
+      } else {
+        useTwoCTAs = true;
+      }
+    }
+
     auto bitwidth = oldRetType.getElementType().getIntOrFloatBitWidth();
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
-        context, m, n, colStride, CGALayout, false,
+        context, m, n, colStride, CGALayout, useTwoCTAs,
         triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
@@ -933,7 +955,7 @@ public:
         rewriter, loc, tokType, a, b, acc.getResult(), acc.getToken(),
         scaleA.getResult(), scaleB.getResult(), dotOp.getAElemType(),
         dotOp.getBElemType(),
-        /*useD=*/vTrue, /*pred=*/vTrue);
+        /*useD=*/vTrue, /*pred=*/vTrue, /*two_ctas=*/useTwoCTAs);
     // Propagate discardable attributes (e.g. tt.autows) from the original dot.
     for (auto attr : dotOp->getDiscardableAttrs())
       mmaOp->setDiscardableAttr(attr.getName(), attr.getValue());

@@ -112,10 +112,10 @@ static Value computeLinearizedLoopPhase(OpBuilder &builder, Location loc,
 // Insert the "arrive remote, wait local" cross-CTA sync ops before a 2-CTA
 // MMA. The barrier must be allocated externally (before the containing loop
 // if the MMA is in a loop).
-static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
+static void insertSyncBeforeMMA(Operation *mma, Value barrierAlloc,
                                 unsigned barrierIdx = 0) {
-  MLIRContext *ctx = mma.getContext();
-  Location loc = mma.getLoc();
+  MLIRContext *ctx = mma->getContext();
+  Location loc = mma->getLoc();
   OpBuilder builder(mma);
   auto i32Ty = builder.getI32Type();
 
@@ -171,7 +171,95 @@ static void insertSyncBeforeMMA(ttng::TCGen5MMAOp mma, Value barrierAlloc,
   LDBG("Inserted cross-CTA sync before MMA at " << loc);
 }
 
+// Synchronize the 2-CTA block-scale copy feeding a scaled MMA. lower-mma stages
+// the scales into TMEM via a leader-issued tcgen05.cp.cta_group::2 that writes
+// both CTAs' scale TMEM; nothing orders that cross-CTA write before the
+// follower CTA's MMA reads its scale TMEM (single-CTA is ordered by the
+// in-order tcgen05 pipeline, 2-CTA is not). Commit the copy and wait on both
+// CTAs before the MMA.
+static void insertScaleCpSyncBeforeMMA(Operation *mma, Value barrierAlloc,
+                                       unsigned barrierIdx = 0) {
+  Location loc = mma->getLoc();
+  OpBuilder builder(mma);
+  Value barrierView =
+      triton::createSingleBufferView(builder, barrierAlloc, barrierIdx);
+
+  // Commit the scale cp(s). Under 2-CTA this lowers to a leader-issued
+  // multicast::cluster commit that arrives on both CTAs' barrier.
+  ttng::TCGen5CommitOp::create(builder, loc, barrierView, /*pred=*/Value(),
+                               /*descs=*/ValueRange{});
+
+  // Both CTAs wait for the copy to complete before issuing the MMA.
+  Value phase;
+  if (auto forOp = mma->getParentOfType<scf::ForOp>())
+    phase = computeLinearizedLoopPhase(builder, loc, forOp);
+  else
+    phase = arith::ConstantIntOp::create(builder, loc, 0, 32);
+  Value truePred = arith::ConstantIntOp::create(builder, loc, 1, 1);
+  ttng::WaitBarrierOp::create(builder, loc, barrierView, phase, truePred);
+
+  LDBG("Inserted cross-CTA scale-cp sync before scaled MMA at " << loc);
+}
+
+// Allocate a cross-CTA barrier with `numBarriers` slots and the given
+// `arriveCount`. It is hoisted and init'd before the loop / WarpSpecializeOp so
+// the one-time cluster mbarrier-init fence covers it. Handles the three
+// placement cases (pre-WS, post-WS default region, post-WS partition capture);
+// `anchorOp` locates the partition region to capture into. Returns the barrier
+// usable at that site.
+static Value allocateLoopCrossCTABarrier(scf::ForOp forOp, Operation *anchorOp,
+                                         unsigned numBarriers,
+                                         unsigned arriveCount) {
+  auto isInDefaultRegion = [](Operation *op,
+                              ttg::WarpSpecializeOp wsOp) -> bool {
+    Region *defaultRegion = &wsOp.getDefaultRegion();
+    return defaultRegion->isAncestor(op->getParentRegion());
+  };
+
+  auto wsOp = forOp->getParentOfType<ttg::WarpSpecializeOp>();
+  if (!wsOp) {
+    // Pre-WS path: standard alloc before the for loop.
+    return triton::createBarrierAlloc(forOp, numBarriers, arriveCount);
+  }
+
+  // Post-WS path: alloc+init BEFORE the WarpSpecializeOp (so thread 0 of the
+  // producer warp group initializes it, covered by the one-time cluster fence),
+  // inval+dealloc AFTER.
+  Location loc = wsOp->getLoc();
+  ImplicitLocOpBuilder rewriter(loc, wsOp);
+  Value barrierAlloc =
+      triton::createScalarAlloc(rewriter, rewriter.getI64Type(), numBarriers);
+  for (unsigned i = 0; i < numBarriers; ++i) {
+    Value initView = triton::createSingleBufferView(rewriter, barrierAlloc, i);
+    rewriter.create<ttng::InitBarrierOp>(initView, arriveCount);
+  }
+  rewriter.setInsertionPointAfter(wsOp);
+  for (unsigned i = 0; i < numBarriers; ++i) {
+    Value invalView = triton::createSingleBufferView(rewriter, barrierAlloc, i);
+    rewriter.create<ttng::InvalBarrierOp>(invalView);
+  }
+  rewriter.create<ttg::LocalDeallocOp>(barrierAlloc);
+
+  if (isInDefaultRegion(anchorOp, wsOp)) {
+    // The default region implicitly captures values defined before wsOp.
+    return barrierAlloc;
+  }
+
+  // Partition region (IsolatedFromAbove): capture the barrier explicitly.
+  auto partOp = wsOp.getPartitionOp();
+  partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
+  Value capturedBarrier;
+  for (Region *region : wsOp.getPartitionRegions()) {
+    BlockArgument arg = region->addArgument(barrierAlloc.getType(), loc);
+    if (region->isAncestor(anchorOp->getParentRegion()))
+      capturedBarrier = arg;
+  }
+  assert(capturedBarrier && "anchor op not found in any partition region");
+  return capturedBarrier;
+}
+
 struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
+  using impl::NVGPUInsert2CTASyncBase<Insert2CTASync>::NVGPUInsert2CTASyncBase;
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
@@ -184,22 +272,31 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
     if (moduleOp->hasAttr("tlx.has_tlx_ops"))
       return;
 
-    // Collect 2-CTA MMA ops that need cross-CTA sync insertion.
-    SmallVector<ttng::TCGen5MMAOp> twoCTAMMAOps;
-    moduleOp->walk([&](ttng::TCGen5MMAOp mma) {
-      if (mma.getTwoCtas())
-        twoCTAMMAOps.push_back(mma);
+    // Two modes (see the pass doc): the default MMA rendezvous, and the
+    // scale-copy completion sync for scaled MMAs (run after lower-mma).
+    bool scaleMode = syncScaleCopy;
+
+    // Collect 2-CTA MMA ops that need sync. In scale-copy mode only scaled MMAs
+    // carry a block-scale tmem_copy, so restrict to those.
+    SmallVector<ttng::MMAv5OpInterface> twoCTAMMAOps;
+    moduleOp->walk([&](ttng::MMAv5OpInterface mma) {
+      if (!mma.getTwoCtas())
+        return;
+      if (scaleMode && !isa<ttng::TCGen5MMAScaledOp>(mma.getOperation()))
+        return;
+      twoCTAMMAOps.push_back(mma);
     });
 
     if (twoCTAMMAOps.empty())
       return;
 
-    LDBG("Found " << twoCTAMMAOps.size() << " 2-CTA MMA ops");
+    LDBG("Found " << twoCTAMMAOps.size() << " 2-CTA "
+                  << (scaleMode ? "scaled " : "") << "MMA ops");
 
     // Group MMAs by their containing scf.for loop. Allocate one cross-CTA
     // barrier slot per MMA in each loop.
-    DenseMap<Operation *, SmallVector<ttng::TCGen5MMAOp>> loopToMMAs;
-    SmallVector<ttng::TCGen5MMAOp> nonLoopMMAs;
+    DenseMap<Operation *, SmallVector<ttng::MMAv5OpInterface>> loopToMMAs;
+    SmallVector<ttng::MMAv5OpInterface> nonLoopMMAs;
 
     for (auto mma : twoCTAMMAOps) {
       auto forOp = mma->getParentOfType<scf::ForOp>();
@@ -209,96 +306,32 @@ struct Insert2CTASync : public impl::NVGPUInsert2CTASyncBase<Insert2CTASync> {
         nonLoopMMAs.push_back(mma);
     }
 
-    // Helper: check if an op is inside the default region of a
-    // WarpSpecializeOp (as opposed to a partition region).
-    auto isInDefaultRegion = [](Operation *op,
-                                ttg::WarpSpecializeOp wsOp) -> bool {
-      Region *defaultRegion = &wsOp.getDefaultRegion();
-      return defaultRegion->isAncestor(op->getParentRegion());
+    // MMA rendezvous barrier: both CTAs thread-arrive (count=2), leader waits.
+    // Scale-cp barrier: one leader-issued multicast commit arrives on both
+    // CTAs (count=1), both CTAs wait.
+    unsigned arriveCount = scaleMode ? 1 : 2;
+    auto insertSync = [&](Operation *mma, Value bar, unsigned idx) {
+      if (scaleMode)
+        insertScaleCpSyncBeforeMMA(mma, bar, idx);
+      else
+        insertSyncBeforeMMA(mma, bar, idx);
     };
 
     // Process MMAs inside loops.
     for (auto &[loopOp, mmas] : loopToMMAs) {
       auto forOp = cast<scf::ForOp>(loopOp);
-
-      // Allocate cross-CTA barrier. In the post-WS path (Meta WS),
-      // the loop is nested inside a WarpSpecializeOp. The barrier
-      // alloc+init must be placed BEFORE the WarpSpecializeOp (so thread 0
-      // from the producer warp group initializes it).
-      Value barrierAlloc;
       unsigned numBarriers = mmas.size();
-      auto wsOp = forOp->getParentOfType<ttg::WarpSpecializeOp>();
-      if (!wsOp) {
-        // Pre-WS path: standard alloc before the for loop.
-        barrierAlloc =
-            triton::createBarrierAlloc(forOp, numBarriers, /*arriveCount=*/2);
-      } else if (isInDefaultRegion(mmas[0], wsOp)) {
-        // Post-WS path, MMA in default region: The default region can
-        // implicitly capture values defined before the WarpSpecializeOp,
-        // so no explicit capture is needed. Just allocate+init before wsOp
-        // and inval+dealloc after.
-        Location loc = wsOp->getLoc();
-        ImplicitLocOpBuilder rewriter(loc, wsOp);
-        barrierAlloc = triton::createScalarAlloc(
-            rewriter, rewriter.getI64Type(), numBarriers);
-        for (unsigned i = 0; i < numBarriers; ++i) {
-          Value initView =
-              triton::createSingleBufferView(rewriter, barrierAlloc, i);
-          rewriter.create<ttng::InitBarrierOp>(initView, /*arriveCount=*/2);
-        }
-
-        // Inval and dealloc AFTER the WarpSpecializeOp.
-        rewriter.setInsertionPointAfter(wsOp);
-        for (unsigned i = 0; i < numBarriers; ++i) {
-          Value invalView =
-              triton::createSingleBufferView(rewriter, barrierAlloc, i);
-          rewriter.create<ttng::InvalBarrierOp>(invalView);
-        }
-        rewriter.create<ttg::LocalDeallocOp>(barrierAlloc);
-      } else {
-        // Post-WS path, MMA in a partition region (IsolatedFromAbove):
-        // Must capture the barrier explicitly into the partition.
-        Location loc = wsOp->getLoc();
-        ImplicitLocOpBuilder rewriter(loc, wsOp);
-        barrierAlloc = triton::createScalarAlloc(
-            rewriter, rewriter.getI64Type(), numBarriers);
-        for (unsigned i = 0; i < numBarriers; ++i) {
-          Value initView =
-              triton::createSingleBufferView(rewriter, barrierAlloc, i);
-          rewriter.create<ttng::InitBarrierOp>(initView, /*arriveCount=*/2);
-        }
-
-        // Inval and dealloc AFTER the WarpSpecializeOp.
-        rewriter.setInsertionPointAfter(wsOp);
-        for (unsigned i = 0; i < numBarriers; ++i) {
-          Value invalView =
-              triton::createSingleBufferView(rewriter, barrierAlloc, i);
-          rewriter.create<ttng::InvalBarrierOp>(invalView);
-        }
-        rewriter.create<ttg::LocalDeallocOp>(barrierAlloc);
-
-        // Capture barrier into WarpSpecializeOp partition regions.
-        auto partOp = wsOp.getPartitionOp();
-        partOp->insertOperands(partOp->getNumOperands(), barrierAlloc);
-        Value capturedBarrier;
-        for (Region *region : wsOp.getPartitionRegions()) {
-          BlockArgument arg = region->addArgument(barrierAlloc.getType(), loc);
-          if (region->isAncestor(mmas[0]->getParentRegion()))
-            capturedBarrier = arg;
-        }
-        assert(capturedBarrier && "MMA not found in any partition region");
-        barrierAlloc = capturedBarrier;
-      }
-
+      Value barrierAlloc = allocateLoopCrossCTABarrier(
+          forOp, mmas[0].getOperation(), numBarriers, arriveCount);
       for (unsigned i = 0; i < numBarriers; ++i)
-        insertSyncBeforeMMA(mmas[i], barrierAlloc, i);
+        insertSync(mmas[i].getOperation(), barrierAlloc, i);
     }
 
     // Process standalone MMAs (rare: single-iteration epilogue).
     for (auto mma : nonLoopMMAs) {
-      Value barrierAlloc =
-          triton::createBarrierAlloc(mma, /*numBarriers=*/1, /*arriveCount=*/2);
-      insertSyncBeforeMMA(mma, barrierAlloc);
+      Value barrierAlloc = triton::createBarrierAlloc(
+          mma.getOperation(), /*numBarriers=*/1, arriveCount);
+      insertSync(mma.getOperation(), barrierAlloc, 0);
     }
   }
 };
