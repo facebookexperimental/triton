@@ -106,6 +106,71 @@ class _LoopValueShape:
     preserved_vector_payload_type: object | None = field(default=None, compare=False)
 
 
+class _PerTargetOpBuilder:
+    """Hash-cons pure mechanical expansion within one target operation."""
+
+    def __init__(self, ir, builder):
+        self._ir = ir
+        self._builder = builder
+        self._constants = {}
+        self._splats = {}
+        self._binaries = {}
+
+    def __getattr__(self, name):
+        return getattr(self._builder, name)
+
+    def begin_target_op(self):
+        self._constants.clear()
+        self._splats.clear()
+        self._binaries.clear()
+
+    def _block(self):
+        return self._ir.InsertionPoint.current.block
+
+    def constant(self, result_type, value):
+        key = (self._block(), str(result_type), value)
+        result = self._constants.get(key)
+        if result is None:
+            result = self._builder.constant(result_type, value)
+            self._constants[key] = result
+        return result
+
+    def splat(self, value, element_type=None, width=32):
+        result_element_type = element_type or value.type
+        key = (
+            self._block(),
+            value,
+            str(result_element_type),
+            int(width),
+        )
+        result = self._splats.get(key)
+        if result is None:
+            result = self._builder.splat(value, element_type, width)
+            self._splats[key] = result
+        return result
+
+    def binary(self, kind, lhs, rhs, *, nsw=False, nuw=False):
+        key = (
+            self._block(),
+            kind,
+            lhs,
+            rhs,
+            bool(nsw),
+            bool(nuw),
+        )
+        result = self._binaries.get(key)
+        if result is None:
+            result = self._builder.binary(
+                kind,
+                lhs,
+                rhs,
+                nsw=bool(nsw),
+                nuw=bool(nuw),
+            )
+            self._binaries[key] = result
+        return result
+
+
 @dataclass
 class _EmissionState:
     dsl: object
@@ -167,9 +232,11 @@ def emit_wave_module(
                         dsl,
                         ir,
                         kernel,
+                        target_program.contract,
                         waves_per_eu=waves_per_eu,
                     ),
             ) as builder:
+                builder = _PerTargetOpBuilder(ir, builder)
                 state = _EmissionState(
                     dsl,
                     ir,
@@ -207,6 +274,7 @@ def _emit_region(state, region_id):
 
 
 def _emit_target_op(state, op):
+    state.builder.begin_target_op()
     emitter = _TARGET_EMITTERS.get(op.kind)
     if emitter is not None:
         emitter(state, op)
@@ -2171,8 +2239,11 @@ def _local_memory_access_dependency_token(
         if token is None:
             continue
         pending = state.local_memory_pending_accesses.get(root)
-        if (_local_memory_access_includes(pending, "async_write")
-                and (bool(ignore_async_writes) or int(root) in ready_async_write_roots)):
+        async_readiness_is_explicit = (
+            bool(ignore_async_writes) or int(root) in ready_async_write_roots
+        )
+        if (async_readiness_is_explicit
+                and _local_memory_access_includes(pending, "async_write")):
             continue
         if pending == "read" and access_kind == "read":
             continue
@@ -2490,17 +2561,6 @@ def _set_local_memory_roots_token(state, roots, token):
     for root in roots:
         state.local_memory_tokens[int(root)] = token
         state.local_memory_pending_accesses.pop(int(root), None)
-
-
-def _set_local_memory_roots_committed_token(state, roots, token):
-    # async_commit_group groups in-flight LDS writes; only async_wait/barrier
-    # makes the written LDS contents available to later local reads.
-    for root in roots:
-        root = int(root)
-        pending = state.local_memory_pending_accesses.get(root)
-        state.local_memory_tokens[root] = token
-        if pending is not None:
-            state.local_memory_pending_accesses[root] = pending
 
 
 def _set_local_memory_access_token(
@@ -3017,14 +3077,11 @@ def _local_memory_roots_touched_by_region(state, region_id, *, include_root_sets
                 touched_roots.update(roots)
                 record_implicit_access(roots, "write")
             elif current_op.kind == "buffer_load_to_local":
-                roots = roots_for(current_op.operands[0])
-                touched_roots.update(roots)
-                # All amdg.buffer_load_to_local lowering modes write LDS.  The
-                # DMA path returns an async token; scalarized fallback is a
-                # normal LDS write and must remain a hard write dependency.
                 mode = target_ir.attrs_dict(current_op).get("mode")
-                access_kind = "write" if mode == "scalarized_load_store" else "async_write"
-                record_implicit_access(roots, access_kind)
+                if mode == "scalarized_load_store":
+                    roots = roots_for(current_op.operands[0])
+                    touched_roots.update(roots)
+                    record_implicit_access(roots, "write")
             for nested_region_id in current_op.region_ids:
                 visit_region(nested_region_id)
 
@@ -6047,14 +6104,14 @@ def _emit_local_load(state, op):
             attrs,
         ),
     )
-    offsets = _local_access_offsets(
-        state,
-        attrs,
-        component_count,
-        lane_width,
-        op,
-    )
     if attrs.get("result_value_mode") == "mma_packet_payload":
+        offsets = _local_access_offsets(
+            state,
+            attrs,
+            component_count,
+            lane_width,
+            op,
+        )
         payload, token = _emit_local_load_mma_packet_payload(
             state,
             op,
@@ -6127,15 +6184,22 @@ def _emit_local_load(state, op):
             op,
         ) > 1 for index in range(component_count))
     if not uses_transpose_load:
-        loaded, token = _emit_symbolic_shared_gather(
+        packet_type = state.dsl.simd_type(
+            state.dsl.vector_type(component_count, element_type),
+            width=lane_width,
+        )
+        bit_offset = _symbolic_local_destination_bit_offset(
             state,
-            offsets,
-            base,
-            element_type,
-            lane_width,
+            attrs,
+            component_count,
             int(attrs["element_byte_width"]),
-            dependency,
             op,
+        )
+        loaded, token = state.builder.gather(
+            [base],
+            packet_type,
+            bit_offset=bit_offset,
+            after=dependency,
         )
         components = _symbolic_shared_packet_components(
             state,
@@ -6147,6 +6211,13 @@ def _emit_local_load(state, op):
         state.values[result_id] = _pack_components(components)
         _finish_local_access(state, op, memdesc_target_id, token, "read")
         return
+    offsets = _local_access_offsets(
+        state,
+        attrs,
+        component_count,
+        lane_width,
+        op,
+    )
     component_entries = []
     tokens = []
     index = 0
@@ -6969,12 +7040,6 @@ def _emit_buffer_load_to_local(state, op):
 
     result_id = _single_result(op)
     state.values[result_id] = token
-    _set_local_memory_access_token(
-        state,
-        op.operands[0],
-        token,
-        "async_write",
-    )
     _record_token_local_memory_roots(
         state,
         result_id,
@@ -7166,7 +7231,6 @@ def _emit_async_commit_group(state, op):
         state.values[result_id] = token
         roots = _local_memory_roots_for_token_values(state, op.operands)
         if roots:
-            _set_local_memory_roots_committed_token(state, roots, token)
             state.token_local_memory_root_sets[int(result_id)] = roots
 
 
@@ -11236,6 +11300,7 @@ def _function_attrs(
     dsl,
     ir,
     kernel,
+    contract,
     *,
     waves_per_eu=0,
 ):
@@ -11253,10 +11318,13 @@ def _function_attrs(
         ),
         "tlx_wave.ttgir.noinline": ir.Attribute.parse("true" if kernel.noinline else "false"),
         "wave.waves_per_workgroup": dsl.i64_attr(num_warps),
+        "wave.address_arithmetic_no_overflow": ir.UnitAttr.get(),
         # gfx9/gfx950 exposes four SIMD execution units per CU. Model the
         # requested CTA waves as the resident wave target per SIMD.
         "waveamdmachine.target_waves": dsl.i64_attr(target_waves),
     }
+    if contract.enable_fp_fusion:
+        attrs["wave.enable_fp_fusion"] = ir.UnitAttr.get()
     if kernel.enable_split_barriers:
         attrs["waveamdmachine.enable_split_barriers"] = ir.UnitAttr.get()
     if kernel.enable_multi_wave_specialization:

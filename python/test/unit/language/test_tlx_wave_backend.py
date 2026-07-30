@@ -1117,10 +1117,6 @@ def test_tlx_wave_converter_op_rewriters_do_not_accept_source_program():
         "_wait_publication_barrier_by_op",
         "_memdesc_infos",
         "_constant_ints",
-        "_layout_address_value_ids",
-        "_record_for_address_deps",
-        "_record_if_address_deps",
-        "_region_yield_value_ids",
     }
     offenders = []
     for node in ast.walk(tree):
@@ -1232,6 +1228,51 @@ def test_tlx_wave_converter_type_layout_stage_converts_source_snapshot(tmp_path)
     addptr_op = next(op for op in source.ops if op.name == "tt.addptr")
     assert converted.values[addptr_op.results[0]].type.representation == "pointer_tuple"
     assert not hasattr(converted, "target_ops")
+    del ctx
+
+
+def test_tlx_wave_converter_type_layout_reuses_equivalent_layout_analysis(
+    tmp_path,
+    monkeypatch,
+):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+"""
+    local_func = """
+  tt.func public @converter_repeated_layouts() attributes {noinline = false} {
+    %first = arith.constant dense<0> : tensor<8x8xi32, #blocked>
+    %second = arith.constant dense<1> : tensor<8x8xi32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+    source = converter_source_import.import_source_program(mod)
+    original = converter_types.build_layout_map
+    calls = 0
+
+    def counted_build_layout_map(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        converter_types,
+        "build_layout_map",
+        counted_build_layout_map,
+    )
+    converted = converter_types.convert_source_program(source)
+
+    assert calls == 1
+    assert len(converted.layouts) == 2
+    assert converted.layouts[0].layout_map_id == 0
+    assert converted.layouts[1].layout_map_id == 1
+    assert converted.layouts[0].value_id != converted.layouts[1].value_id
+    assert converted.layouts[0].properties == converted.layouts[1].properties
     del ctx
 
 
@@ -1439,7 +1480,7 @@ def test_tlx_wave_converter_fact_stage_does_not_infer_overflowing_mul(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_lowers_nonnegative_signed_div_rem_as_unsigned(tmp_path):
+def test_tlx_wave_converter_preserves_nonnegative_signed_div_rem(tmp_path):
     local_func = """
   tt.func public @converter_nonnegative_div_rem(%limit: i32) attributes {noinline = false} {
     %pid = tt.get_program_id x : i32
@@ -1473,13 +1514,14 @@ def test_tlx_wave_converter_lowers_nonnegative_signed_div_rem_as_unsigned(tmp_pa
     operations = [
         converter_target_ir.attrs_dict(op)["operation"] for op in output.target_program.ops if op.kind == "binary"
     ]
-    assert "divui" in operations
-    assert "divsi" not in operations
-    assert "remsi" not in operations
+    assert "divsi" in operations
+    assert "remsi" in operations
+    assert "divui" not in operations
+    assert "remui" not in operations
     del ctx
 
 
-def test_tlx_wave_converter_lowers_make_range_div_rem_as_unsigned(tmp_path):
+def test_tlx_wave_converter_preserves_make_range_signed_div_rem(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -1504,9 +1546,11 @@ def test_tlx_wave_converter_lowers_make_range_div_rem_as_unsigned(tmp_path):
     operations = [
         converter_target_ir.attrs_dict(op)["operation"] for op in output.target_program.ops if op.kind == "binary"
     ]
-    assert "divui" in operations
+    assert "divsi" in operations
+    assert {"muli", "subi"} <= set(operations)
     assert "remsi" not in operations
-    assert "divsi" not in operations
+    assert "divui" not in operations
+    assert "remui" not in operations
     del ctx
 
 
@@ -1537,12 +1581,12 @@ def test_tlx_wave_converter_preserves_shared_dynamic_divisor(tmp_path):
 
     div_ops = [
         op for op in output.target_program.ops
-        if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "divui"
+        if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "divsi"
     ]
     assert len(div_ops) == 1
     (div_op, ) = div_ops
     binary_ops = [op for op in output.target_program.ops if op.kind == "binary"]
-    assert not any(converter_target_ir.attrs_dict(op)["operation"] == "remui" for op in binary_ops)
+    assert not any(converter_target_ir.attrs_dict(op)["operation"] == "remsi" for op in binary_ops)
     remainder_product = next(
         op for op in binary_ops
         if converter_target_ir.attrs_dict(op)["operation"] == "muli" and op.operands == (div_op.results[0],
@@ -1557,7 +1601,7 @@ def test_tlx_wave_converter_preserves_shared_dynamic_divisor(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_lowers_nonnegative_for_iv_rem_as_unsigned(tmp_path):
+def test_tlx_wave_converter_preserves_nonnegative_for_iv_signed_div_rem(tmp_path):
     local_func = """
   tt.func public @converter_for_iv_rem_unsigned(%upper: i32) attributes {noinline = false} {
     %c0 = arith.constant 0 : i32
@@ -1589,10 +1633,10 @@ def test_tlx_wave_converter_lowers_nonnegative_for_iv_rem_as_unsigned(tmp_path):
     operations = [
         converter_target_ir.attrs_dict(op)["operation"] for op in output.target_program.ops if op.kind == "binary"
     ]
-    assert "remui" in operations
-    assert "divui" in operations
-    assert "remsi" not in operations
-    assert "divsi" not in operations
+    assert "remsi" in operations
+    assert "divsi" in operations
+    assert "remui" not in operations
+    assert "divui" not in operations
     del ctx
 
 
@@ -2734,6 +2778,7 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
     assert target.contract == converter_target_ir.TargetContract(
         schema_version=converter_target_ir.TARGET_SCHEMA_VERSION,
         address_arithmetic=converter_target_ir.ADDRESS_ARITHMETIC_NO_OVERFLOW,
+        enable_fp_fusion=False,
     )
     assert target.layouts
     assert target.assumptions
@@ -2771,7 +2816,6 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
     binary_op = next(op for op in target.ops if op.kind == "binary")
     assert converter_target_ir.attrs_dict(binary_op) == {
         "operation": "addi",
-        "nsw": True,
         "source_width": 32,
     }
     assume_op = next(op for op in target.ops if op.kind == "assume")
@@ -2887,7 +2931,7 @@ def test_tlx_wave_converter_preserves_explicit_arith_overflow_flags(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_derives_arith_nsw_from_scoped_ranges(tmp_path):
+def test_tlx_wave_converter_preserves_wrapping_arith_with_scoped_ranges(tmp_path):
     local_func = """
   tt.func public @converter_range_nsw(%arg0: i32, %arg1: i32) attributes {noinline = false} {
     %c0 = arith.constant 0 : i32
@@ -2911,14 +2955,15 @@ def test_tlx_wave_converter_derives_arith_nsw_from_scoped_ranges(tmp_path):
     add_op = next(op for op in output.target_program.ops
                   if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "addi")
     add_attrs = converter_target_ir.attrs_dict(add_op)
-    assert add_attrs["nsw"] is True
-    assert add_attrs["nuw"] is True
+    assert add_attrs == {"operation": "addi", "source_width": 32}
     assert "wave.binary addi" in output.emitted_module.text
-    assert "overflow<nsw, nuw>" in output.emitted_module.text
+    add_line = next(line for line in output.emitted_module.text.splitlines()
+                    if "wave.binary addi" in line)
+    assert "overflow" not in add_line
     del ctx
 
 
-def test_tlx_wave_converter_marks_layout_integer_math_nsw(tmp_path):
+def test_tlx_wave_converter_preserves_wrapping_layout_integer_math(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -2940,13 +2985,14 @@ def test_tlx_wave_converter_marks_layout_integer_math_nsw(tmp_path):
         for op in output.target_program.ops
         if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] in {"muli", "addi"}
     ]
-    assert any(attrs["operation"] == "muli" and attrs["nsw"] is True for attrs in layout_math)
-    assert any(attrs["operation"] == "addi" and attrs["nsw"] is True for attrs in layout_math)
-    assert output.emitted_module.text.count("overflow<nsw>") >= 2
+    assert {attrs["operation"] for attrs in layout_math} == {"muli", "addi"}
+    assert all(set(attrs) == {"operation", "source_width"}
+               for attrs in layout_math)
+    assert "overflow<" not in output.emitted_module.text
     del ctx
 
 
-def test_tlx_wave_converter_marks_scalar_address_math_nsw(tmp_path):
+def test_tlx_wave_converter_marks_only_symbolic_address_math_nsw(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -2973,7 +3019,9 @@ def test_tlx_wave_converter_marks_scalar_address_math_nsw(tmp_path):
         for op in output.target_program.ops
         if op.kind == "binary" and not op.layout_map_ids and converter_target_ir.attrs_dict(op)["operation"] == "muli"
     ]
-    assert any(attrs["nsw"] is True for attrs in scalar_mul_attrs)
+    assert scalar_mul_attrs
+    assert all(set(attrs) == {"operation", "source_width"}
+               for attrs in scalar_mul_attrs)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     affine_op, affine_attrs = _memory_affine_edge(
         output.target_program,
@@ -2985,12 +3033,12 @@ def test_tlx_wave_converter_marks_scalar_address_math_nsw(tmp_path):
     live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
     replaced_offset_producer = next(op for op in output.target_program.ops if replaced_offset in op.results)
     assert replaced_offset_producer.target_op_id not in live_op_ids
-    assert output.emitted_module.text.count("overflow<nsw>") >= 1
+    assert "wave.address_arithmetic_no_overflow" in output.emitted_module.text
     assert "wave.binary" in output.emitted_module.text
     del ctx
 
 
-def test_tlx_wave_converter_marks_loop_carried_scalar_address_math_nsw(tmp_path):
+def test_tlx_wave_converter_does_not_walk_loop_carried_address_producers(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -3024,8 +3072,9 @@ def test_tlx_wave_converter_marks_loop_carried_scalar_address_math_nsw(tmp_path)
         for op in output.target_program.ops
         if op.kind == "binary" and not op.layout_map_ids
     ]
-    assert any(attrs["operation"] == "muli" and attrs["nsw"] is True for attrs in scalar_binary_attrs)
-    assert any(attrs["operation"] == "addi" and attrs["nsw"] is True for attrs in scalar_binary_attrs)
+    assert {attrs["operation"] for attrs in scalar_binary_attrs} >= {"muli", "addi"}
+    assert all(set(attrs) == {"operation", "source_width"}
+               for attrs in scalar_binary_attrs)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     affine_op, affine_attrs = _memory_affine_edge(
         output.target_program,
@@ -3037,7 +3086,7 @@ def test_tlx_wave_converter_marks_loop_carried_scalar_address_math_nsw(tmp_path)
     live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
     replaced_offset_producer = next(op for op in output.target_program.ops if replaced_offset in op.results)
     assert replaced_offset_producer.target_op_id not in live_op_ids
-    assert output.emitted_module.text.count("overflow<nsw>") >= 2
+    assert "wave.address_arithmetic_no_overflow" in output.emitted_module.text
     assert "wave.binary" in output.emitted_module.text
     del ctx
 
@@ -3060,22 +3109,62 @@ def test_tlx_wave_converter_pipeline_lowers_float_add(tmp_path):
 
     float_op = next(op for op in output.target_program.ops if op.kind == "float_binary")
     attrs = converter_target_ir.attrs_dict(float_op)
-    assert attrs["operation"] == "addf"
-    assert attrs["fastmath"] == ("contract", )
-    assert re.search(r"wave\.fadd .* fastmath<contract>", output.emitted_module.text)
+    assert attrs == {"operation": "addf"}
+    assert re.search(r"wave\.fadd (?!.*fastmath)", output.emitted_module.text)
+    assert "wave.enable_fp_fusion" not in output.emitted_module.text
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_marks_float_mul_add_contract(tmp_path):
+def test_tlx_wave_converter_pipeline_passes_fp_fusion_contract_to_wave(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_float_mul_add() attributes {noinline = false} {
+  tt.func public @converter_float_mul_add(
+      %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %x = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
     %y = arith.constant dense<2.000000e+00> : tensor<64xf32, #blocked>
     %prod = arith.mulf %x, %y : tensor<64xf32, #blocked>
     %sum = arith.addf %x, %prod : tensor<64xf32, #blocked>
+    %offset = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    amdg.buffer_store %sum, %out[%offset] {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(
+        mod,
+        enable_fp_fusion=True,
+    )
+
+    float_attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "float_binary"]
+    assert float_attrs == [
+        {"operation": "mulf"},
+        {"operation": "addf"},
+    ]
+    assert output.target_program.contract.enable_fp_fusion is True
+    assert "wave.enable_fp_fusion" in output.emitted_module.text
+    assert "fastmath<contract>" not in output.emitted_module.text
+    canonical = _run_wave_canonicalize(output.emitted_module.text)
+    assert "wave.fma" in canonical
+    assert "fastmath<contract>" in canonical
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_preserves_source_fp_contract(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_source_float_contract(
+      %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %x = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
+    %y = arith.constant dense<2.000000e+00> : tensor<64xf32, #blocked>
+    %prod = arith.mulf %x, %y fastmath<nnan,contract> : tensor<64xf32, #blocked>
+    %sum = arith.addf %x, %prod fastmath<contract> : tensor<64xf32, #blocked>
+    %offset = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    amdg.buffer_store %sum, %out[%offset] {contiguity = 1 : i32} : tensor<64xf32, #blocked>
     tt.return
   }
 """
@@ -3083,13 +3172,46 @@ def test_tlx_wave_converter_pipeline_marks_float_mul_add_contract(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    float_attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "float_binary"]
-    assert [(attrs["operation"], attrs["fastmath"]) for attrs in float_attrs] == [
-        ("mulf", ("contract", )),
-        ("addf", ("contract", )),
+    float_attrs = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "float_binary"
     ]
-    assert re.search(r"wave\.fmul .* fastmath<contract>", output.emitted_module.text)
-    assert re.search(r"wave\.fadd .* fastmath<contract>", output.emitted_module.text)
+    assert float_attrs == [
+        {"operation": "mulf", "fastmath": ("nnan", "contract")},
+        {"operation": "addf", "fastmath": ("contract", )},
+    ]
+    assert "wave.enable_fp_fusion" not in output.emitted_module.text
+    canonical = _run_wave_canonicalize(output.emitted_module.text)
+    assert "wave.fma" in canonical
+    assert "fastmath<contract>" in canonical
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_keeps_plain_mul_add_split(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_plain_float_mul_add(
+      %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %x = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
+    %y = arith.constant dense<2.000000e+00> : tensor<64xf32, #blocked>
+    %prod = arith.mulf %x, %y : tensor<64xf32, #blocked>
+    %sum = arith.addf %x, %prod : tensor<64xf32, #blocked>
+    %offset = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    amdg.buffer_store %sum, %out[%offset] {contiguity = 1 : i32} : tensor<64xf32, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    canonical = _run_wave_canonicalize(output.emitted_module.text)
+    assert "wave.fma" not in canonical
+    assert "wave.fmul" in canonical
+    assert "wave.fadd" in canonical
     del ctx
 
 
@@ -4002,6 +4124,27 @@ def test_tlx_wave_converter_verifier_rejects_wrapping_address_contract():
 
     diagnostic = exc_info.value
     assert diagnostic.code == "TLXW_VERIFY_ADDRESS_ARITHMETIC"
+    assert diagnostic.stage == "verification"
+    assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_non_boolean_fp_fusion_contract():
+    target = converter_target_ir.TargetProgram(
+        values=(),
+        ops=(),
+        regions=(converter_target_ir.TargetRegion(0), ),
+        source_value_targets={},
+        erased_source_values={},
+        contract=converter_target_ir.TargetContract(
+            enable_fp_fusion="yes",
+        ),
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target)
+
+    diagnostic = exc_info.value
+    assert diagnostic.code == "TLXW_VERIFY_FP_FUSION"
     assert diagnostic.stage == "verification"
     assert diagnostic.no_fallback is True
 
@@ -6239,7 +6382,7 @@ def test_tlx_wave_backend_hash_includes_wave_opt_sha(monkeypatch):
     monkeypatch.setattr(tlx_wave_compiler, "_wave_opt_sha256", lambda: second_sha)
     second_hash = backend.hash()
 
-    assert "stage14-amd-membar-issue-order" in first_hash
+    assert "stage15-symbolic-arithmetic-contract" in first_hash
     assert f"wave-opt-sha256={first_sha}" in first_hash
     assert f"wave-opt-sha256={second_sha}" in second_hash
     assert first_hash != second_hash
@@ -6797,17 +6940,32 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
                 pending.extend(join_inputs.get(current, ()))
             return inputs
 
-        # Six barriers publish explicit wait completion for LDS consumers.
-        # Compiler and full-memory source barriers order issue via projections;
-        # DMA never consumes their raw result or an LDS-release token.
+        # Six readiness-frontier barriers publish explicit wait completion.
+        # Earlier publication barriers may remain transitive inputs. Compiler
+        # barriers order DMA issue only through issue-token projections.
         assert len(barrier_lines) == 12
         assert shared_load_lines
-        shared_load_dependencies = set()
+        shared_load_dependency_sets = []
         for line in shared_load_lines:
             after = re.search(r"\bafter (%[A-Za-z0-9_]+)", line)
             assert after is not None
-            shared_load_dependencies.update(flatten_join_inputs(after.group(1)))
+            shared_load_dependency_sets.append(flatten_join_inputs(after.group(1)))
+        shared_load_dependencies = set().union(*shared_load_dependency_sets)
         load_ready_tokens = {token for token in barrier_tokens if token in shared_load_dependencies}
+        transitive_ready_tokens = set()
+        for line in barrier_lines:
+            result = _ssa_result_name(line)
+            if result not in load_ready_tokens:
+                continue
+            operands = set(re.findall(
+                r"%[A-Za-z0-9_]+",
+                line.split(":", 1)[0],
+            )) - {result}
+            for operand in operands:
+                transitive_ready_tokens.update(
+                    flatten_join_inputs(operand) & load_ready_tokens
+                )
+        load_ready_frontier = load_ready_tokens - transitive_ready_tokens
         dma_barrier_tokens = {token for token in barrier_tokens if any(f"after {token}" in line for line in dma_lines)}
         barrier_issue_tokens = {
             _ssa_result_name(line)
@@ -6819,19 +6977,31 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
             for token in barrier_issue_tokens
             if any(f"after {token}" in line for line in dma_lines)
         }
-        assert len(load_ready_tokens) == 6
+        assert len(load_ready_frontier) == 6
+        assert all(
+            dependencies & load_ready_frontier
+            for dependencies in shared_load_dependency_sets
+        )
         assert dma_barrier_tokens == set()
         assert len(dma_barrier_issue_tokens) == 1
         other_barrier_tokens = barrier_tokens - load_ready_tokens
-        assert len(other_barrier_tokens) == 5
-        assert (load_ready_tokens | other_barrier_tokens == barrier_tokens)
         dependency_free_barrier_tokens = {
             _ssa_result_name(line)
             for line in barrier_lines
             if ": () -> !wave.mem.token" in line
         }
+        barrier_issue_source_tokens = barrier_tokens.intersection({
+            operand
+            for line in issue_lines
+            for operand in re.findall(
+                r"%[A-Za-z0-9_]+",
+                line.split(":", 1)[0],
+            )[1:]
+        })
         assert dependency_free_barrier_tokens
-        assert dependency_free_barrier_tokens <= other_barrier_tokens
+        assert other_barrier_tokens == (
+            dependency_free_barrier_tokens | barrier_issue_source_tokens
+        )
         assert all(all(f"after {token}" not in line for token in load_ready_tokens) for line in dma_lines)
 
 
@@ -8246,6 +8416,7 @@ def test_tlx_wave_converter_pipeline_preserves_waited_slot_carry_for_dynamic_loa
       %body_group = ttg.async_commit_group tokens %body
       %load_slot = ttg.memdesc_index %alloc[%load_buf] : !ttg.memdesc<4x512xf16, #shared, #smem, mutable> -> !ttg.memdesc<512xf16, #shared, #smem, mutable>
       %loaded = ttg.local_load %load_slot {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<512xf16, #shared, #smem, mutable> -> tensor<512xf16, #blocked>
+      amdg.buffer_store %loaded, %arg0[%range] {contiguity = 1 : i32} : tensor<512xf16, #blocked>
       %wait = ttg.async_wait {num = 2 : i32}
       %next = arith.addi %acc, %i : i32
       scf.yield %next : i32
@@ -8262,7 +8433,11 @@ def test_tlx_wave_converter_pipeline_preserves_waited_slot_carry_for_dynamic_loa
     (loop_match, ) = _scf_for_matches(wave)
     iter_args = _loop_iter_arg_names(loop_match.group(0))
     loop_body = wave[loop_match.end():]
-    load_pos = loop_body.index("wave.load")
+    load_pos = min(
+        position
+        for marker in ("wave.load", "waveamd.transpose_load")
+        if (position := loop_body.find(marker)) >= 0
+    )
     wait_ready = next(re.finditer(r"(?P<token>%\d+) = wave\.after (?P<operands>[^\n]+)", loop_body[load_pos:]))
     wait_token = wait_ready.group("token")
     yield_values = re.findall(r"%[\w#]+", re.search(r"scf\.yield (?P<values>[^\n]+?) :", loop_body).group("values"))
@@ -11149,7 +11324,9 @@ def test_tlx_wave_emits_affine_tuple_operands_componentwise():
 
     emitted = converter_emission.emit_wave_module(target)
 
-    assert emitted.text.count("wave.binary addi") == 2
+    # The two tuple components have the same affine expression, so emission
+    # may bind both components to the same structurally equivalent Wave value.
+    assert emitted.text.count("wave.binary addi") == 1
     _run_wave_verify(emitted.text)
 
 
@@ -11362,6 +11539,178 @@ def test_tlx_wave_converter_lowers_blocked_cross_lane_transpose(tmp_path):
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert machine.count("waveamdmachine.ds_bpermute_b32") == 1
     del ctx
+
+
+def test_tlx_wave_converter_reuses_equivalent_redistribution_plans(
+    tmp_path,
+    monkeypatch,
+):
+    preamble = """
+#source = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+#result = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
+"""
+    local_func = """
+  tt.func public @converter_repeated_redistribution() attributes {noinline = false} {
+    %value = arith.constant dense<0> : tensor<8x8xi32, #source>
+    %first = ttg.convert_layout %value : tensor<8x8xi32, #source> -> tensor<8x8xi32, #result>
+    %second = ttg.convert_layout %value : tensor<8x8xi32, #source> -> tensor<8x8xi32, #result>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+    original = converter_layout_remap._redistribution_relation_plan
+    calls = 0
+
+    def counted_redistribution_relation_plan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        converter_layout_remap,
+        "_redistribution_relation_plan",
+        counted_redistribution_relation_plan,
+    )
+    output = _convert_ttgir_to_wave_keep_dead(mod)
+
+    assert calls == 1
+    assert sum(
+        op.kind == "layout_convert"
+        for op in output.target_program.ops
+    ) == 2
+    del ctx
+
+
+def test_tlx_wave_converter_reuses_equivalent_fragment_local_load_plans(
+    monkeypatch,
+):
+    shared0 = _fake_layout(
+        0,
+        1,
+        kind="padded_shared",
+        shape=(128, 128),
+        element_type="bf16",
+        properties={
+            "intervals": (1, 16),
+            "paddings": (0, 1),
+            "order": (1, 0),
+        },
+    )
+    shared1 = _fake_layout(
+        1,
+        2,
+        kind="padded_shared",
+        shape=(128, 128),
+        element_type="bf16",
+        properties=shared0.properties,
+    )
+    dot_properties = {
+        "op_idx": 0,
+        "k_width": 16,
+        "parent_kind": "amd_mfma",
+        "parent_properties": {
+            "instr_shape": (32, 32, 16),
+            "warps_per_cta": (4, 2),
+        },
+    }
+    dot0 = _fake_layout(
+        2,
+        3,
+        kind="dot_operand",
+        shape=(128, 128),
+        element_type="bf16",
+        component_count=4,
+        properties=dot_properties,
+    )
+    dot1 = _fake_layout(
+        3,
+        4,
+        kind="dot_operand",
+        shape=(128, 128),
+        element_type="bf16",
+        component_count=4,
+        properties=dot_properties,
+    )
+    type_layout_program = converter_types.TypeLayoutProgram(
+        {
+            1: _converted_value(
+                1,
+                kind="memdesc",
+                representation="memdesc",
+                element_type="bf16",
+                layout_map_id=0,
+            ),
+            2: _converted_value(
+                2,
+                kind="memdesc",
+                representation="memdesc",
+                element_type="bf16",
+                layout_map_id=1,
+            ),
+        },
+        (shared0, shared1),
+    )
+    conversion_input = SimpleNamespace(
+        memdescs={
+            value_id: converter_op_conversion.MemdescInfo(
+                value_id,
+                "bf16",
+                2,
+                (128, 128),
+                (128, 136),
+                34816,
+            )
+            for value_id in (1, 2)
+        },
+        memdesc_views={
+            value_id: converter_op_conversion.MemdescViewInfo(
+                value_id,
+                (0, 0),
+                (128, 136),
+            )
+            for value_id in (1, 2)
+        },
+        fragment_local_load_plans={},
+        coordinate_plans={},
+    )
+    calls = 0
+
+    def fake_symbolic_plan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"load_mode": "symbolic_mma_payload_load"}
+
+    monkeypatch.setattr(
+        converter_op_conversion,
+        "_noncontiguous_mma_payload_gather_plan",
+        fake_symbolic_plan,
+    )
+    first = converter_op_conversion._fragment_local_load_plan(
+        conversion_input,
+        type_layout_program,
+        1,
+        dot0,
+        4,
+        4,
+        SimpleNamespace(index=10),
+    )
+    second = converter_op_conversion._fragment_local_load_plan(
+        conversion_input,
+        type_layout_program,
+        2,
+        dot1,
+        4,
+        4,
+        SimpleNamespace(index=11),
+    )
+
+    assert calls == 1
+    assert first is second
 
 
 def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
@@ -12000,7 +12349,11 @@ def test_tlx_wave_converter_rejects_blocked_to_mfma_without_fragment_plan():
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
         converter_op_conversion._convert_layout(
             converter_target_ir.TargetBuilder(),
-            SimpleNamespace(value_element_byte_widths={}, lds_size=0),
+            SimpleNamespace(
+                value_element_byte_widths={},
+                lds_size=0,
+                layout_remap_plans={},
+            ),
             type_layout_program,
             op,
         )
@@ -12575,7 +12928,6 @@ def test_tlx_wave_converter_rejects_if_yield_layout_relabel():
         token_nodes_by_op={},
         token_groups_by_id={},
         if_token_carries_by_op={},
-        layout_address_value_ids=frozenset(),
     )
     builder = converter_target_ir.TargetBuilder()
     builder.add_value(
@@ -14669,7 +15021,12 @@ def test_tlx_wave_converter_fuses_distributed_compare_select_components(
     compare_select_lines = [
         line for line in output.emitted_module.text.splitlines() if "wave.cmpi slt" in line or "wave.select" in line
     ]
-    assert len(compare_select_lines) == 2 * component_count
+    assert compare_select_lines
+    assert len(compare_select_lines) % 2 == 0
+    emitted_component_count = len(compare_select_lines) // 2
+    # Structurally equivalent components may share one emitted compare/select
+    # pair, but distinct components must still respect the mask budget.
+    assert emitted_component_count <= component_count
     live_mask_components = 0
     max_live_mask_components = 0
     for line in compare_select_lines:
@@ -14687,7 +15044,7 @@ def test_tlx_wave_converter_fuses_distributed_compare_select_components(
     mask_dwords = max(1, lane_width // 32)
     mask_budget_dwords = converter_emission._COMPARE_SELECT_MASK_BUDGET_DWORDS
     assert max_live_mask_components * mask_dwords <= mask_budget_dwords
-    assert max_live_mask_components == min(
+    assert 0 < max_live_mask_components <= min(
         component_count,
         mask_budget_dwords // mask_dwords,
     )
@@ -14857,6 +15214,96 @@ def test_tlx_wave_converter_partial_wait_keeps_retained_group_issue_only(tmp_pat
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.issue_token" in machine
     del ctx
+
+
+def test_tlx_wave_emission_dma_commit_does_not_enter_lds_hazard_state():
+    builder = converter_target_ir.TargetBuilder()
+    token_type = converter_target_ir.TargetType("token", "token")
+    completion_target_id = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+    )
+    group_target_id = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
+    )
+    program = builder.build()
+    completion_token = object()
+    group_token = object()
+    synchronous_token = object()
+    local_root = 17
+
+    state = converter_emission._EmissionState(
+        None,
+        None,
+        SimpleNamespace(
+            join=lambda *tokens: group_token,
+        ),
+        program,
+        {completion_target_id: completion_token},
+    )
+    state.token_local_memory_root_sets[completion_target_id] = frozenset({
+        local_root,
+    })
+    state.local_memory_tokens[local_root] = synchronous_token
+    state.local_memory_pending_accesses[local_root] = "write"
+    op = converter_target_ir.TargetOp(
+        0,
+        "async_commit_group",
+        operands=(completion_target_id, ),
+        results=(group_target_id, ),
+    )
+
+    converter_emission._emit_async_commit_group(state, op)
+
+    assert state.values[group_target_id] is group_token
+    assert state.token_local_memory_root_sets[group_target_id] == frozenset({
+        local_root,
+    })
+    assert state.local_memory_tokens[local_root] is synchronous_token
+    assert state.local_memory_pending_accesses[local_root] == "write"
+
+
+def test_tlx_wave_emission_region_hazard_scan_excludes_async_dma():
+    builder = converter_target_ir.TargetBuilder()
+    memdesc_type = converter_target_ir.TargetType("memdesc", "memdesc", "f16")
+    payload_type = converter_target_ir.TargetType("tensor", "simd", "f16", 64)
+    token_type = converter_target_ir.TargetType("token", "token")
+    dma_alloc = builder.add_value(memdesc_type)
+    store_alloc = builder.add_value(memdesc_type)
+    payload = builder.add_value(payload_type)
+    dma_token = builder.add_value(
+        token_type,
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+    )
+    builder.add_op("local_alloc", results=(dma_alloc, ))
+    builder.add_op("local_alloc", results=(store_alloc, ))
+    builder.add_op(
+        "buffer_load_to_local",
+        operands=(dma_alloc, ),
+        results=(dma_token, ),
+        attrs={"mode": "symbolic_copy"},
+    )
+    builder.add_op(
+        "local_store",
+        operands=(payload, store_alloc),
+    )
+    program = builder.build()
+    state = converter_emission._EmissionState(
+        None,
+        None,
+        None,
+        program,
+        {},
+    )
+
+    touched, accesses = converter_emission._local_memory_roots_touched_by_region(
+        state,
+        0,
+    )
+
+    assert touched == frozenset({store_alloc})
+    assert accesses == {store_alloc: "write"}
 
 
 def test_tlx_wave_converter_threads_dominating_wait_without_relaxing_ordinary_load(tmp_path):
@@ -16576,6 +17023,19 @@ def _run_waveamd_to_machine(wave_artifact):
 def _run_wave_verify(wave_artifact):
     result = subprocess.run(
         [wave_bridge_tools._wave_opt(), "-", "--verify-diagnostics"],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
+def _run_wave_canonicalize(wave_artifact):
+    result = subprocess.run(
+        [wave_bridge_tools._wave_opt(), "-", "--canonicalize"],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,

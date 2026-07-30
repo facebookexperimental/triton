@@ -14,6 +14,44 @@ _DISTRIBUTED_REMAP_REPRESENTATIONS = frozenset({
     "simd",
     "simd_tuple",
 })
+
+
+def _layout_signature(layout):
+    if layout is None:
+        return None
+    return (
+        layout.kind,
+        tuple(layout.shape),
+        layout.element_type,
+        int(layout.component_count),
+        int(layout.lane_width),
+        repr(layout.properties),
+    )
+
+
+def _value_type_signature(value):
+    value_type = value.type
+    return (
+        value_type.kind,
+        value_type.representation,
+        value_type.element_type,
+        value_type.lane_width,
+        int(value_type.component_count),
+    )
+
+
+def _cached_plan(cache, key):
+    if cache is None:
+        return None
+    return cache.get(key)
+
+
+def _remember_plan(cache, key, plan):
+    if cache is not None and key is not None:
+        cache[key] = plan
+    return plan
+
+
 def redistribution_plan(
     operand,
     result,
@@ -22,6 +60,7 @@ def redistribution_plan(
     op,
     *,
     source_coordinate_transform=None,
+    cache=None,
 ):
     """Build the complete destination-to-source packet relation.
 
@@ -38,6 +77,18 @@ def redistribution_plan(
         and tuple(operand_layout.shape) != tuple(result_layout.shape)
     ):
         return None
+    cache_key = None
+    if source_coordinate_transform is None:
+        cache_key = (
+            "redistribute",
+            _value_type_signature(operand),
+            _value_type_signature(result),
+            _layout_signature(operand_layout),
+            _layout_signature(result_layout),
+        )
+        cached = _cached_plan(cache, cache_key)
+        if cached is not None:
+            return cached
 
     source_layout = _redistribution_linear_layout(operand_layout, op)
     destination_layout = _redistribution_linear_layout(result_layout, op)
@@ -95,7 +146,7 @@ def redistribution_plan(
         result.value_id,
         source_coordinate_transform=source_coordinate_transform,
     )
-    return {
+    plan = {
         "mode": "redistribute",
         "block_count": source_blocks,
         "cta_thread_count": lane_width * source_warps,
@@ -109,6 +160,7 @@ def redistribution_plan(
         "result_registers_per_component": destination_slots // destination_components,
         "result_slot_count": destination_slots,
     }
+    return _remember_plan(cache, cache_key, plan)
 
 
 def structural_view_redistribution_plan(
@@ -117,6 +169,8 @@ def structural_view_redistribution_plan(
     operand_layout,
     result_layout,
     op,
+    *,
+    cache=None,
 ):
     """Translate a structural view to the generic symbolic layout relation."""
     if operand_layout is None or result_layout is None:
@@ -153,6 +207,18 @@ def structural_view_redistribution_plan(
         )
 
     order = _structural_view_order(op, source_shape, result_shape)
+    cache_key = (
+        "structural_view",
+        op.name,
+        order,
+        _value_type_signature(operand),
+        _value_type_signature(result),
+        _layout_signature(operand_layout),
+        _layout_signature(result_layout),
+    )
+    cached = _cached_plan(cache, cache_key)
+    if cached is not None:
+        return cached
     plan = redistribution_plan(
         operand,
         result,
@@ -173,7 +239,7 @@ def structural_view_redistribution_plan(
             result.value_id,
             f"{op.name} cannot be represented as a symbolic layout relation",
         )
-    return plan
+    return _remember_plan(cache, cache_key, plan)
 
 
 def structural_join_plan(
@@ -182,6 +248,8 @@ def structural_join_plan(
     operand_layouts,
     result_layout,
     op,
+    *,
+    cache=None,
 ):
     """Describe a same-workitem ``tt.join`` as scalar register selection.
 
@@ -227,6 +295,16 @@ def structural_join_plan(
     lane_width = int(result.type.lane_width or 64)
     if any(int(value.type.lane_width or 64) != lane_width for value in operands):
         _structural_join_fail(op, result.value_id, "tt.join changed its wave width")
+    cache_key = (
+        "structural_join",
+        tuple(_value_type_signature(value) for value in operands),
+        _value_type_signature(result),
+        tuple(_layout_signature(layout) for layout in operand_layouts),
+        _layout_signature(result_layout),
+    )
+    cached = _cached_plan(cache, cache_key)
+    if cached is not None:
+        return cached
     source_linears = tuple(
         _redistribution_linear_layout(layout, op) for layout in operand_layouts
     )
@@ -330,7 +408,7 @@ def structural_join_plan(
             )
         scalar_sources.append(sources.pop())
 
-    return {
+    plan = {
         "scalar_sources": tuple(scalar_sources),
         "source_component_counts": source_components,
         "source_packet_widths": tuple(
@@ -342,6 +420,7 @@ def structural_join_plan(
         "result_packet_width": result_slots // result_components,
         "result_slot_count": result_slots,
     }
+    return _remember_plan(cache, cache_key, plan)
 
 
 def _structural_join_fail(op, value_id, message):
@@ -360,6 +439,8 @@ def structural_split_plan(
     operand_layout,
     result_layouts,
     op,
+    *,
+    cache=None,
 ):
     """Describe a same-workitem ``tt.split`` as scalar register selection.
 
@@ -416,6 +497,16 @@ def structural_split_plan(
     lane_width = int(operand.type.lane_width or 64)
     if any(int(result.type.lane_width or 64) != lane_width for result in results):
         _structural_split_fail(op, operand.value_id, "tt.split changed its wave width")
+    cache_key = (
+        "structural_split",
+        _value_type_signature(operand),
+        tuple(_value_type_signature(result) for result in results),
+        _layout_signature(operand_layout),
+        tuple(_layout_signature(layout) for layout in result_layouts),
+    )
+    cached = _cached_plan(cache, cache_key)
+    if cached is not None:
+        return cached
     source_linear = _redistribution_linear_layout(operand_layout, op)
     result_linears = tuple(
         _redistribution_linear_layout(layout, op) for layout in result_layouts
@@ -524,7 +615,7 @@ def structural_split_plan(
             result_sources.append(sources.pop())
         scalar_source_slots.append(tuple(result_sources))
 
-    return {
+    plan = {
         "source_component_count": source_components,
         "source_packet_width": source_slots // source_components,
         "source_slot_count": source_slots,
@@ -536,6 +627,7 @@ def structural_split_plan(
         ),
         "result_slot_counts": result_slots,
     }
+    return _remember_plan(cache, cache_key, plan)
 
 
 def _structural_split_fail(op, value_id, message):

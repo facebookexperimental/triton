@@ -381,7 +381,8 @@ emission and name the missing field.
 ## Target IR
 
 Target IR is self-contained before emission. `TargetContract` versions the
-schema and states that address arithmetic does not overflow. `TargetLayout`
+schema, states that address arithmetic does not overflow, and carries the
+compiler's FP-fusion permission. `TargetLayout`
 records mechanically copy layout identity, kind, shape, element type,
 component count, lane width, encoding parameters, and serialized linear-layout
 dimensions and bases. `TargetAssumption` records bind proven range or

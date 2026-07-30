@@ -1,6 +1,6 @@
 """Type and layout conversion for the TLX Wave converter."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import layouts
 from .layouts import LayoutMap, build_layout_map
@@ -34,8 +34,27 @@ def convert_source_program(program):
     lane_width = int(program.kernel.threads_per_warp or 64)
     layouts = []
     converted_values = {}
+    layout_templates = {}
     for value_id, source_value in program.values.items():
-        layout = build_layout_map(len(layouts), value_id, source_value.type, lane_width)
+        source_type = source_value.type
+        layout_key = (source_type.raw, lane_width)
+        if layout_key not in layout_templates:
+            layout_templates[layout_key] = build_layout_map(
+                0,
+                value_id,
+                source_type,
+                lane_width,
+            )
+        template = layout_templates[layout_key]
+        layout = (
+            None
+            if template is None
+            else replace(
+                template,
+                layout_map_id=len(layouts),
+                value_id=value_id,
+            )
+        )
         layout_id = None
         if layout is not None:
             layout_id = layout.layout_map_id

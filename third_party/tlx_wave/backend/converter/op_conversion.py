@@ -110,13 +110,10 @@ class OpConversionView:
     operand_target_ids: tuple[int, ...]
     result_target_ids: tuple[int, ...]
     result_layout_map_ids: tuple[int, ...]
-    result_source_value_ids: tuple[int, ...]
-    layout_address_value_ids: frozenset[int]
     fact_ids: tuple[int, ...]
     fact_target_ids: tuple[int, ...]
     operand_fact_ids: tuple[int, ...]
     operand_fact_target_ids: tuple[int, ...]
-    operand_ranges: tuple[tuple[int | None, int | None], ...]
 
 
 @dataclass(frozen=True)
@@ -163,10 +160,19 @@ class ConversionInput:
     wait_publication_barrier_by_op: dict[int, int]
     async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
     static_memdesc_byte_offsets: dict[int, int]
-    layout_address_value_ids: frozenset[int]
+    layout_remap_plans: dict[tuple, dict]
+    fragment_local_load_plans: dict[tuple, dict]
+    coordinate_plans: dict[tuple, object]
 
 
-def convert_ops(source_program, type_layout_program, fact_program, token_program):
+def convert_ops(
+    source_program,
+    type_layout_program,
+    fact_program,
+    token_program,
+    *,
+    contract=None,
+):
     conversion_input = _build_conversion_input(
         source_program,
         type_layout_program,
@@ -179,6 +185,7 @@ def convert_ops(source_program, type_layout_program, fact_program, token_program
             target_ir.target_layout_from_converted(layout)
             for layout in type_layout_program.layouts
         ),
+        contract=contract,
     )
     _seed_kernel_arguments(builder, conversion_input, type_layout_program)
     _seed_kernel_argument_facts(
@@ -286,7 +293,9 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         wait_publication_barriers,
         {},
         static_memdesc_byte_offsets,
-        _layout_address_value_ids(source_program),
+        {},
+        {},
+        {},
     )
 
 
@@ -326,106 +335,6 @@ def _wait_publication_barrier_by_op(
             if (barrier_op.name == "ttg.barrier" and int(barrier_op.attrs.get("addrSpace", -1)) == 1):
                 result[int(wait_op.index)] = int(barrier_op.index)
     return result
-
-
-def _layout_address_value_ids(source_program):
-    deps = {int(value_id): set() for value_id in source_program.values}
-    roots = set()
-
-    for op in source_program.ops:
-        roots.update(_layout_address_root_value_ids(op))
-        if op.name == "scf.for":
-            _record_for_address_deps(deps, source_program, op)
-            continue
-        if op.name == "scf.if":
-            _record_if_address_deps(deps, source_program, op)
-            continue
-        for result_value_id in op.results:
-            _add_address_deps(deps, result_value_id, op.operands)
-
-    address_value_ids = set()
-    worklist = list(roots)
-    while worklist:
-        value_id = int(worklist.pop())
-        if value_id in address_value_ids:
-            continue
-        address_value_ids.add(value_id)
-        worklist.extend(
-            int(dep_value_id) for dep_value_id in deps.get(value_id, ()) if int(dep_value_id) not in address_value_ids)
-    return frozenset(address_value_ids)
-
-
-def _layout_address_root_value_ids(op):
-    if op.name == "amdg.buffer_load_to_local":
-        fields = _buffer_load_to_local_fields(op)
-        roots = [fields["offset_value_id"]]
-        if fields["stride_value_id"] is not None:
-            roots.append(fields["stride_value_id"])
-        return tuple(roots)
-    if op.name == "amdg.buffer_load":
-        fields = _buffer_load_fields(op)
-        roots = [fields["offset_value_id"]]
-        if fields["stride_value_id"] is not None:
-            roots.append(fields["stride_value_id"])
-        return tuple(roots)
-    if op.name == "amdg.buffer_store":
-        fields = _buffer_store_fields(op)
-        roots = [fields["offset_value_id"]]
-        if fields["boundary_check_value_id"] is not None:
-            roots.append(fields["boundary_check_value_id"])
-        return tuple(roots)
-    if op.name == "tt.load":
-        return (_load_fields(op)["pointer_value_id"], )
-    if op.name == "tt.store":
-        return (_store_fields(op)["pointer_value_id"], )
-    if op.name == "ttg.memdesc_index" and len(op.operands) >= 2:
-        return (op.operands[1], )
-    return ()
-
-
-def _record_for_address_deps(deps, source_program, op):
-    if not op.region_ids:
-        return
-    yielded_value_ids = _region_yield_value_ids(source_program, op.region_ids[0])
-    region = source_program.regions[op.region_ids[0]]
-    if region.block_arg_ids:
-        _add_address_deps(deps, region.block_arg_ids[0], op.operands[:3])
-        for index, block_arg_value_id in enumerate(region.block_arg_ids[1:]):
-            iter_arg_value_ids = []
-            init_operand_index = 3 + index
-            if init_operand_index < len(op.operands):
-                iter_arg_value_ids.append(op.operands[init_operand_index])
-            if index < len(yielded_value_ids):
-                iter_arg_value_ids.append(yielded_value_ids[index])
-            _add_address_deps(deps, block_arg_value_id, iter_arg_value_ids)
-    for index, result_value_id in enumerate(op.results):
-        if index < len(yielded_value_ids):
-            _add_address_deps(deps, result_value_id, (yielded_value_ids[index], ))
-
-
-def _record_if_address_deps(deps, source_program, op):
-    yielded_by_region = tuple(_region_yield_value_ids(source_program, region_id) for region_id in op.region_ids)
-    for index, result_value_id in enumerate(op.results):
-        _add_address_deps(
-            deps,
-            result_value_id,
-            tuple(yielded_value_ids[index]
-                  for yielded_value_ids in yielded_by_region
-                  if index < len(yielded_value_ids)),
-        )
-
-
-def _region_yield_value_ids(source_program, region_id):
-    region = source_program.regions[region_id]
-    for op_index in reversed(region.op_indices):
-        op = source_program.ops[op_index]
-        if op.name == "scf.yield":
-            return tuple(op.operands)
-    return ()
-
-
-def _add_address_deps(deps, value_id, dep_value_ids):
-    deps.setdefault(int(value_id), set()).update(int(dep_value_id) for dep_value_id in dep_value_ids)
 
 
 def _convert_region(
@@ -548,7 +457,12 @@ def _convert_source_op(
         _convert_layout(builder, conversion_input, type_layout_program, op)
         return
     if op.name in {"tt.reshape", "tt.trans"}:
-        _convert_structural_tensor_view(builder, type_layout_program, op)
+        _convert_structural_tensor_view(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
         return
     if op.name == "tt.dot":
         _convert_dot(builder, conversion_input, type_layout_program, op)
@@ -618,7 +532,12 @@ def _convert_source_op(
         _convert_set_priority(builder, op)
         return
     if op.name == "tt.make_range":
-        _convert_make_range(builder, type_layout_program, op)
+        _convert_make_range(
+            builder,
+            conversion_input,
+            type_layout_program,
+            op,
+        )
         return
     if op.name == "tt.expand_dims":
         _convert_expand_dims(builder, type_layout_program, op)
@@ -627,10 +546,10 @@ def _convert_source_op(
         _convert_broadcast(builder, type_layout_program, op)
         return
     if op.name == "tt.join":
-        _convert_join(builder, type_layout_program, op)
+        _convert_join(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "tt.split":
-        _convert_split(builder, type_layout_program, op)
+        _convert_split(builder, conversion_input, type_layout_program, op)
         return
     if op.name == "arith.cmpi":
         _convert_cmpi(
@@ -674,13 +593,10 @@ def _convert_source_op(
         operand_target_ids,
         result_target_ids,
         result_layout_map_ids,
-        tuple(op.results),
-        conversion_input.layout_address_value_ids,
         fact_ids,
         _fact_target_ids(builder, fact_program, fact_ids, op),
         operand_fact_ids,
         _fact_target_ids(builder, fact_program, operand_fact_ids, op),
-        _operand_ranges(conversion_input, fact_program, op),
     )
     converter(builder, view)
 
@@ -848,20 +764,12 @@ def _convert_constant(builder, view):
 
 def _convert_binary(builder, view):
     operation = _BINARY_OPS[view.op_name]
-    if operation in {"divsi", "remsi"} and _can_use_unsigned_div_rem(view):
-        operation = "divui" if operation == "divsi" else "remui"
     source_width = _target_int_width(builder, view.result_target_ids)
     attrs = {
         "operation": operation,
         "source_width": source_width,
     }
     nsw, nuw = _arith_overflow_flags(view)
-    if not nsw and _layout_address_binary_no_signed_wrap(view, operation, source_width):
-        nsw = True
-    if not nsw and _range_proves_no_signed_wrap(view, operation, source_width):
-        nsw = True
-    if not nuw and _range_proves_no_unsigned_wrap(view, operation, source_width):
-        nuw = True
     if nsw:
         attrs["nsw"] = True
     if nuw:
@@ -876,97 +784,6 @@ def _convert_binary(builder, view):
         layout_map_ids=view.result_layout_map_ids,
         source_op_index=view.op_index,
     )
-
-
-def _layout_address_binary_no_signed_wrap(view, operation, source_width):
-    if operation not in {"addi", "subi", "muli"}:
-        return False
-    if source_width is None or int(source_width) <= 0:
-        return False
-    if view.result_layout_map_ids:
-        # Integer tensors with layout maps are layout-address values in the TLX
-        # Wave target contract. Their add/sub/mul overflow is UB, so the bridge
-        # records the no-wrap provenance where the layout association is still
-        # explicit.
-        return True
-    if any(int(value_id) in view.layout_address_value_ids for value_id in view.result_source_value_ids):
-        # Scalar layout bases often lose the explicit layout map before they are
-        # splatted or attached as affine bindings.  Keep the same address
-        # no-overflow provenance for arithmetic in the transitive backward slice
-        # from load/store/DMA offsets and memdesc indices.
-        return True
-    return False
-
-
-def _can_use_unsigned_div_rem(view):
-    if len(view.operand_ranges) != 2:
-        return False
-    lhs_range, rhs_range = view.operand_ranges
-    lhs_lower = lhs_range[0]
-    rhs_lower = rhs_range[0]
-    return (lhs_lower is not None and lhs_lower >= 0 and rhs_lower is not None and rhs_lower > 0)
-
-
-def _range_proves_no_signed_wrap(view, operation, source_width):
-    if operation not in {"addi", "subi", "muli"}:
-        return False
-    if source_width is None or int(source_width) <= 0:
-        return False
-    if len(view.operand_ranges) != 2:
-        return False
-    lhs_range, rhs_range = view.operand_ranges
-    if any(bound is None for bound in (*lhs_range, *rhs_range)):
-        return False
-    lhs_lower, lhs_upper = (int(lhs_range[0]), int(lhs_range[1]))
-    rhs_lower, rhs_upper = (int(rhs_range[0]), int(rhs_range[1]))
-    if operation == "addi":
-        lower = lhs_lower + rhs_lower
-        upper = lhs_upper + rhs_upper
-    elif operation == "subi":
-        lower = lhs_lower - rhs_upper
-        upper = lhs_upper - rhs_lower
-    else:
-        products = (
-            lhs_lower * rhs_lower,
-            lhs_lower * rhs_upper,
-            lhs_upper * rhs_lower,
-            lhs_upper * rhs_upper,
-        )
-        lower = min(products)
-        upper = max(products)
-    signed_min = -(1 << (int(source_width) - 1))
-    signed_max = (1 << (int(source_width) - 1)) - 1
-    return signed_min <= lower and upper <= signed_max
-
-
-def _range_proves_no_unsigned_wrap(view, operation, source_width):
-    if operation not in {"addi", "subi", "muli"}:
-        return False
-    if source_width is None or int(source_width) <= 0:
-        return False
-    if len(view.operand_ranges) != 2:
-        return False
-    lhs_range, rhs_range = view.operand_ranges
-    if any(bound is None for bound in (*lhs_range, *rhs_range)):
-        return False
-    lhs_lower, lhs_upper = (int(lhs_range[0]), int(lhs_range[1]))
-    rhs_lower, rhs_upper = (int(rhs_range[0]), int(rhs_range[1]))
-    if operation == "addi":
-        lower = lhs_lower + rhs_lower
-        upper = lhs_upper + rhs_upper
-    elif operation == "subi":
-        lower = lhs_lower - rhs_upper
-        upper = lhs_upper - rhs_lower
-    else:
-        products = (
-            lhs_lower * rhs_lower,
-            lhs_lower * rhs_upper,
-            lhs_upper * rhs_lower,
-            lhs_upper * rhs_upper,
-        )
-        lower = min(products)
-        upper = max(products)
-    return 0 <= lower and upper < (1 << int(source_width))
 
 
 def _convert_float_binary(builder, view):
@@ -1054,23 +871,9 @@ def _float_binary_attrs(view):
             view.attrs["fastmath"],
             source_op_index=view.op_index,
         )
-        if not flags:
-            flags = _default_float_binary_fastmath_flags(view.op_name)
-    else:
-        flags = _default_float_binary_fastmath_flags(view.op_name)
-    if flags:
-        attrs["fastmath"] = flags
+        if flags:
+            attrs["fastmath"] = flags
     return attrs
-
-
-def _default_float_binary_fastmath_flags(op_name):
-    # AMD LLVM lowers plain fadd/fmul and relies on AMDGPU instruction
-    # selection to contract them where legal for Triton. Wave's local fma
-    # combine is gated by arith fastmath, so the bridge records that same
-    # contraction permission explicitly on Wave fadd/fmul ops.
-    if op_name in {"arith.addf", "arith.mulf"}:
-        return ("contract", )
-    return ()
 
 
 def _normalize_fastmath_flags(value, *, source_op_index):
@@ -1319,7 +1122,12 @@ def _arith_overflow_flags(view):
     return "nsw" in text, "nuw" in text
 
 
-def _convert_make_range(builder, type_layout_program, op):
+def _convert_make_range(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -1329,7 +1137,13 @@ def _convert_make_range(builder, type_layout_program, op):
         "start": _int_attr(op.attrs, "start"),
         "end": _int_attr(op.attrs, "end"),
     }
-    attrs.update(_make_range_coordinate_attrs(type_layout_program, op))
+    attrs.update(
+        _make_range_coordinate_attrs(
+            conversion_input,
+            type_layout_program,
+            op,
+        )
+    )
     builder.add_op(
         "make_range",
         results=result_target_ids,
@@ -1339,7 +1153,11 @@ def _convert_make_range(builder, type_layout_program, op):
     )
 
 
-def _make_range_coordinate_attrs(type_layout_program, op):
+def _make_range_coordinate_attrs(
+    conversion_input,
+    type_layout_program,
+    op,
+):
     if len(op.results) != 1:
         fail(
             "TLXW_OP_MAKE_RANGE",
@@ -1368,6 +1186,7 @@ def _make_range_coordinate_attrs(type_layout_program, op):
         warp_count,
         op,
         result.value_id,
+        cache=conversion_input.coordinate_plans,
     )
     if coordinates.is_default_flat_make_range(plan, lane_width):
         return {}
@@ -1618,7 +1437,7 @@ def _convert_broadcast(builder, type_layout_program, op):
     )
 
 
-def _convert_join(builder, type_layout_program, op):
+def _convert_join(builder, conversion_input, type_layout_program, op):
     if len(op.operands) != 2 or len(op.results) != 1:
         fail(
             "TLXW_OP_STRUCTURAL_JOIN",
@@ -1645,6 +1464,7 @@ def _convert_join(builder, type_layout_program, op):
         operand_layouts,
         result_layout,
         op,
+        cache=conversion_input.layout_remap_plans,
     )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -1661,7 +1481,7 @@ def _convert_join(builder, type_layout_program, op):
     )
 
 
-def _convert_split(builder, type_layout_program, op):
+def _convert_split(builder, conversion_input, type_layout_program, op):
     if len(op.operands) != 1 or len(op.results) != 2:
         fail(
             "TLXW_OP_STRUCTURAL_SPLIT",
@@ -1688,6 +1508,7 @@ def _convert_split(builder, type_layout_program, op):
         operand_layout,
         result_layouts,
         op,
+        cache=conversion_input.layout_remap_plans,
     )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -3343,6 +3164,7 @@ def _local_tensor_access_attrs(
         int(warp_count),
         op,
         tensor_value.value_id,
+        cache=conversion_input.coordinate_plans,
     )
     return {
         "component_count":
@@ -4669,6 +4491,7 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
         operand_layout,
         result_layout,
         op,
+        cache=conversion_input.layout_remap_plans,
     )
     if redistribution_remap is None:
         layout_remap.reject_unsupported_pair(
@@ -4690,7 +4513,12 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
     )
 
 
-def _convert_structural_tensor_view(builder, type_layout_program, op):
+def _convert_structural_tensor_view(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
     """Translate reshape/transpose coordinates to a Wave symbolic relation."""
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
@@ -4717,6 +4545,7 @@ def _convert_structural_tensor_view(builder, type_layout_program, op):
         operand_layout,
         result_layout,
         op,
+        cache=conversion_input.layout_remap_plans,
     )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -5212,10 +5041,8 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
                 combiner.attrs["fastmath"],
                 source_op_index=combiner.index,
             )
-        else:
-            fastmath = _default_float_binary_fastmath_flags(combiner.name)
-        if fastmath:
-            attrs["fastmath"] = fastmath
+            if fastmath:
+                attrs["fastmath"] = fastmath
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -5968,42 +5795,6 @@ def _op_precedes_in_region(
         return region_ops.index(lhs_op_index) < region_ops.index(rhs_op_index)
     except (IndexError, ValueError):
         return False
-
-
-def _operand_ranges(conversion_input, fact_program, op):
-    return tuple(
-        _combined_range_for_value(
-            conversion_input,
-            fact_program,
-            source_value_id,
-            op.index,
-        ) for source_value_id in op.operands)
-
-
-def _combined_range_for_value(conversion_input, fact_program, value_id, user_op_index):
-    lower = None
-    upper = None
-    for fact_id in fact_program.by_value.get(value_id, ()):
-        fact = fact_program.facts[fact_id]
-        if fact.kind != "range":
-            continue
-        if not _range_fact_is_in_scope(conversion_input, fact, user_op_index):
-            continue
-        if fact.lower is not None:
-            lower = fact.lower if lower is None else max(lower, fact.lower)
-        if fact.upper is not None:
-            upper = fact.upper if upper is None else min(upper, fact.upper)
-    return lower, upper
-
-
-def _range_fact_is_in_scope(conversion_input, fact, user_op_index):
-    if fact.source_op_index is None:
-        return fact.provenance != "llvm.intr.assume"
-    return _source_fact_is_in_scope(
-        conversion_input,
-        fact.source_op_index,
-        user_op_index,
-    )
 
 
 def _pointer_byte_range_fact(fact_program, value_id, op):
@@ -7176,6 +6967,7 @@ def _local_component_store_plan(
         wave_count,
         op,
         offset_value_id,
+        coordinate_cache=conversion_input.coordinate_plans,
     )
 
 
@@ -7191,6 +6983,8 @@ def _coordinate_local_component_store_plan(
     wave_count,
     op,
     offset_value_id,
+    *,
+    coordinate_cache=None,
 ):
     plan = coordinates.layout_coordinate_plan(
         offset_layout,
@@ -7199,6 +6993,7 @@ def _coordinate_local_component_store_plan(
         int(wave_count),
         op,
         offset_value_id,
+        cache=coordinate_cache,
     )
     return {
         "offset_mode":
@@ -7477,6 +7272,7 @@ def _buffer_affine_offset_plan(
             _layout_warp_count(layout),
             op,
             source_value_id,
+            cache=conversion_input.coordinate_plans,
         )
     except Diagnostic:
         return None
@@ -8129,6 +7925,22 @@ def _fragment_local_load_plan(
     view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
     layout_id = type_layout_program.values[memdesc_value_id].layout_map_id
     layout = (None if layout_id is None else type_layout_program.layouts[int(layout_id)])
+    cache_key = (
+        memdesc.element_type,
+        memdesc.element_byte_width,
+        tuple(memdesc.shape),
+        tuple(memdesc.alloc_shape),
+        int(memdesc.allocation_bytes),
+        tuple(view.logical_origin),
+        tuple(view.physical_shape),
+        _layout_cache_signature(layout),
+        _layout_cache_signature(result_layout),
+        int(component_count),
+        int(registers),
+    )
+    cached = conversion_input.fragment_local_load_plans.get(cache_key)
+    if cached is not None:
+        return cached
     symbolic_plan = _noncontiguous_mma_payload_gather_plan(
         memdesc,
         view,
@@ -8137,8 +7949,10 @@ def _fragment_local_load_plan(
         component_count,
         registers,
         op,
+        coordinate_cache=conversion_input.coordinate_plans,
     )
     if symbolic_plan is not None:
+        conversion_input.fragment_local_load_plans[cache_key] = symbolic_plan
         return symbolic_plan
     transpose_plan = _transpose_mma_payload_load_plan(
         memdesc,
@@ -8150,6 +7964,7 @@ def _fragment_local_load_plan(
         op,
     )
     if transpose_plan is not None:
+        conversion_input.fragment_local_load_plans[cache_key] = transpose_plan
         return transpose_plan
     indexed_plan = _indexed_mma_payload_load_plan(
         memdesc,
@@ -8161,6 +7976,7 @@ def _fragment_local_load_plan(
         op,
     )
     if indexed_plan is not None:
+        conversion_input.fragment_local_load_plans[cache_key] = indexed_plan
         return indexed_plan
     offset_plan = _fragment_component_dword_offsets(
         conversion_input,
@@ -8171,13 +7987,28 @@ def _fragment_local_load_plan(
         registers,
         op,
     )
-    return {
+    plan = {
         "component_dword_offsets": tuple(offset_plan["component_dword_offsets"]),
         "load_mode": "mma_payload_load",
         "warps_per_cta": tuple(offset_plan["warps_per_cta"]),
         "wave_tile_axis": offset_plan["wave_tile_axis"],
         "wave_tile_stride_dwords": int(offset_plan["wave_tile_stride_dwords"]),
     }
+    conversion_input.fragment_local_load_plans[cache_key] = plan
+    return plan
+
+
+def _layout_cache_signature(layout):
+    if layout is None:
+        return None
+    return (
+        layout.kind,
+        tuple(layout.shape),
+        layout.element_type,
+        int(layout.component_count),
+        int(layout.lane_width),
+        repr(layout.properties),
+    )
 
 
 def _noncontiguous_mma_payload_gather_plan(
@@ -8188,6 +8019,8 @@ def _noncontiguous_mma_payload_gather_plan(
     component_count,
     registers,
     op,
+    *,
+    coordinate_cache=None,
 ):
     """Represent non-contiguous register packets as symbolic gathers."""
     element_byte_width = int(memdesc.element_byte_width or 0)
@@ -8204,6 +8037,7 @@ def _noncontiguous_mma_payload_gather_plan(
         int(warp_count),
         op,
         result_layout.value_id,
+        cache=coordinate_cache,
     )
     op_idx = int(result_layout.properties.get("op_idx", -1))
     k_dim = 1 if op_idx == 0 else 0 if op_idx == 1 else -1
