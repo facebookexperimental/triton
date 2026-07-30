@@ -67,6 +67,8 @@ TDMDescriptor createTDMDescriptor(RewriterBase &rewriter, Location loc,
 // address and pred in a given TDM descriptor for regular load/store (1D-5D).
 // For partitioned shared memory, dstPtrs contains multiple base pointers and
 // the correct one is selected based on sharedLayout's partition dimension.
+// `warpUsedHint` selects an axis-aligned subset of active warps; see
+// TritonAMDGPUOps.td.
 void fillTDMDescriptor(
     RewriterBase &rewriter, Location loc,
     const LLVMTypeConverter *typeConverter, Type elementType,
@@ -77,7 +79,8 @@ void fillTDMDescriptor(
     SmallVector<Value> offset, ArrayRef<Value> dstPtrs, Value pred,
     Value multicastMask, Value barrierPtr,
     const triton::LinearLayout &sharedLayout, Value ctaId, bool isStore,
-    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA);
+    bool isRowMajor, ArrayRef<unsigned> warpsPerCTA,
+    std::optional<uint32_t> warpUsedHint = std::nullopt);
 
 // Fill TDM descriptor for gather/scatter operations (2D only).
 // Gather reads from non-contiguous rows in global memory to LDS.
@@ -103,7 +106,8 @@ void fillTDMDescriptorForGatherScatter(
 // the warp distribution is adjusted so each wave's tile fits within a single
 // LDS partition.  If the warps cannot cover all logical pieces in one
 // instruction, the operation is automatically split into multiple sequential
-// TDM instructions.
+// TDM instructions. A warp hint guarantees single-instruction emission; see
+// TritonAMDGPUOps.td.
 //
 // - offset: starting position in global memory for each dimension
 // - dstPtrs: base pointers to LDS (multiple for partitioned encoding)
@@ -119,7 +123,8 @@ void emitTDMLoadStore(RewriterBase &rewriter, Location loc,
                       Value barrierPtr, bool isLoad,
                       const triton::LinearLayout &sharedLayout,
                       Attribute encoding, Value ctaId, bool isRowMajor,
-                      int32_t auxBits);
+                      int32_t auxBits,
+                      std::optional<uint32_t> warpUsedHint = std::nullopt);
 
 // Returns (warpsPerCTA, numTDMInstructions) for a given shared encoding.
 // For PartitionedSharedEncodingAttr, computes a partition-aligned warp
