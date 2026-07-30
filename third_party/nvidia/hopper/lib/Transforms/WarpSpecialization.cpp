@@ -6,6 +6,7 @@
 #include "nvidia/hopper/include/Transforms/Passes.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/CodePartitionUtility.h"
 #include "nvidia/hopper/lib/Transforms/WarpSpecialization/WarpSpecializationPipeline.h"
+#include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Partition.h"
