@@ -95,6 +95,7 @@ Epilogue store ops are independent of these knobs — they always go to
 |------|-------|------------|
 | Blackwell FA fwd | mergeEpilogue + separateEpilogueStore | correction, gemm, load, epilogue_store, comp×2 |
 | Blackwell FA bwd | mergeEpilogueToComputation (merge_epilogue=true) | reduction, gemm, load, computation |
+| Blackwell FA bwd, dependent 2-CTA | mergeEpilogueToComputation + relay | computation(default), reduction, gemm, load, relay |
 | Blackwell flex fwd | mergeEpilogue | correction, gemm, load, comp×2 |
 | Hopper FA fwd | mergeCorrection + mergeEpilogue | load, comp×2 |
 | Simple GEMM | separateEpilogueStore | gemm, load, epilogue, epilogue_store |
