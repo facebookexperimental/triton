@@ -248,6 +248,10 @@ LogicalResult ClusterBarrierOp::verify() {
   // has no TargetInfo::clusterBarrier creator), so the full upstream check
   // applies; it never runs on real beta IR.
   int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
+  if (auto mod = getOperation()->getParentOfType<ModuleOp>()) {
+    auto dims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+    numCTAs = std::max(numCTAs, dims[0] * dims[1] * dims[2]);
+  }
   if (numCTAs <= 1)
     return emitOpError("requires ttg.num-ctas > 1");
   if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())

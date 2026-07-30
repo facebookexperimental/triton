@@ -7,6 +7,7 @@
 // COUNT-COUNT-1: ttng.two_cta_peer_gather
 // PLAN: %[[GATHER:.*]] = ttng.two_cta_peer_gather %{{.*}} split_dim = 0 num_ctas = 2
 // PLAN: ttg.local_alloc %[[GATHER]]
+// PLAN-NOT: ttng.two_cta_peer_relay
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
