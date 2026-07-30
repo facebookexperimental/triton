@@ -32,6 +32,57 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// A dQ-style four-subtile loop rotates over two staging slots. The wait for
+// store 0 must use store 2 as its reuse point, not store 0 merely because both
+// write equivalent slot-0 memdescs. Same-iteration rotation is also reflected
+// in block order for merged epilogue loops that are not later pipelined.
+// CHECK-LABEL: k2_four_stores_use_nearest_future_writer
+// CHECK: scf.for
+// CHECK-NEXT: ttng.async_tma_store_wait {{.*}}pendings = 1 : i32
+// CHECK: %[[TOK0:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK: ttng.async_tma_store_wait {{.*}}pendings = 1 : i32
+// CHECK: %[[TOK1:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK: arith.addf
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK0]]
+// CHECK-NEXT: ttg.local_store {{.*}}, %[[BUF0:[^ ]+]]
+// CHECK: %[[TOK2:.*]] = ttng.async_tma_copy_local_to_global {{.*}} %[[BUF0]]
+// CHECK: arith.addf
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK1]]
+// CHECK-NEXT: ttg.local_store {{.*}}, %[[BUF1:[^ ]+]]
+// CHECK: %[[TOK3:.*]] = ttng.async_tma_copy_local_to_global {{.*}} %[[BUF1]]
+// CHECK: ttng.async_tma_store_wait {{.*}}pendings = 0 : i32
+  tt.func public @k2_four_stores_use_nearest_future_writer(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src: tensor<128x64xf16>,
+      %buf0: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %buf1: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %lb: index, %ub: index, %step: index, %i: i32, %x: f32) {
+    scf.for %iv = %lb to %ub step %step {
+      ttg.local_store %src, %buf0 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok0 {"can_rotate_by_buffer_count" = 2 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.async.token
+      %x1 = arith.addf %x, %x {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : f32
+      ttg.local_store %src, %buf1 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok1 {"can_rotate_by_buffer_count" = 2 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.async.token
+      %x2 = arith.addf %x1, %x {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : f32
+      ttg.local_store %src, %buf0 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok2 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf0 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok2 {"can_rotate_by_buffer_count" = 2 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.async.token
+      %x3 = arith.addf %x2, %x {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : f32
+      ttg.local_store %src, %buf1 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok3 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf1 {"loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok3 {"can_rotate_by_buffer_count" = 2 : i32, "loop.stage" = 0 : i32, "loop.cluster" = 0 : i32} : !ttg.async.token
+    } {"tt.merge_epilogue_to_computation", "tt.scheduled_max_stage" = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // TMA wait_group is queue-wide. The final wait for dV can move across
 // independent dK preparation and stop at dK's staging-buffer write.
 // CHECK-LABEL: straight_line_wait_before_next_staging_buffer

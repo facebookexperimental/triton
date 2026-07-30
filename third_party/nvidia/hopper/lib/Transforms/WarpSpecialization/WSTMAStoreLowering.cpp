@@ -301,16 +301,19 @@ static bool sameMemDescValue(Value lhs, Value rhs) {
 }
 
 static Operation *
-findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer,
+findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer, Operation *before,
                             const tt::CoarseSchedule &schedule) {
+  Operation *writer = nullptr;
   for (auto &op : forOp.getBody()->without_terminator()) {
+    if (&op == before)
+      break;
     auto localStore = dyn_cast<ttg::LocalStoreOp>(&op);
     if (!localStore || !schedule.count(&op))
       continue;
     if (sameMemDescValue(localStore.getDst(), buffer))
-      return &op;
+      writer = &op;
   }
-  return nullptr;
+  return writer;
 }
 
 void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
@@ -528,7 +531,10 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
     }
 
     bool changed = false;
+    bool needsFinalQueueDrain = false;
+    Attribute finalDrainTaskIds;
     for (auto waitOp : waits) {
+      bool erasedWait = false;
       auto attr = waitOp->getAttrOfType<IntegerAttr>(kCanRotateByBufferCount);
       if (!attr)
         continue;
@@ -583,9 +589,9 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
 
         Value targetBuffer = getTMAStoreSource(targetTMAStore);
         Operation *targetWriter =
-            targetBuffer
-                ? findLocalStoreWritingBuffer(forOp, targetBuffer, schedule)
-                : nullptr;
+            targetBuffer ? findLocalStoreWritingBuffer(forOp, targetBuffer,
+                                                       targetTMAStore, schedule)
+                         : nullptr;
         if (targetWriter) {
           insertionTarget = targetWriter;
         } else {
@@ -612,7 +618,50 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
             schedule.splitClusterBefore(insertionTarget, forOp);
         // Insert a new cluster for our wait between the split halves.
         auto waitCluster = schedule.clusters.newBefore(targetCluster);
-        schedule.insert(waitOp, targetStage, waitCluster);
+
+        // A same-iteration reuse does not need software-pipeline expansion to
+        // realize the rotation. Keep the block order consistent with the
+        // coarse schedule so loops that are deliberately not pipelined (for
+        // example a merged FA backward epilogue) still place the wait after
+        // the target writer's dependency slice and immediately before the
+        // staging write. Cross-iteration targets remain schedule-only because
+        // their token must be carried through the pipeline boundary.
+        auto targetIt = schedule.find(targetTMAStore);
+        bool sameIteration =
+            targetIt != schedule.end() && targetStage == targetIt->second.first;
+        if (targetWriter && sameIteration) {
+          schedule.insert(waitOp, targetStage, waitCluster);
+          waitOp->moveBefore(targetWriter);
+        } else if (targetWriter && !sameIteration &&
+                   forOp->hasAttr("tt.merge_epilogue_to_computation") &&
+                   waitOp.getBarriers().empty() &&
+                   waitOp.getBarrierPreds().empty() &&
+                   waitOp.getNvwsTokens().empty() &&
+                   waitOp.getNvwsTokenIndices().empty()) {
+          // Merged epilogue loops are intentionally not expanded by the GPU
+          // pipeliner. Materialize a wraparound token wait as the equivalent
+          // queue-wide wait_group before the next iteration's staging writer,
+          // then add one queue drain after the loop. This is the concrete
+          // prologue/steady-state/epilogue protocol used by TLX.
+          int pendings = k - 1;
+          if (auto planned =
+                  waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
+            pendings = planned.getInt();
+          OpBuilder builder(targetWriter);
+          auto queueWait =
+              ttng::TMAStoreWaitOp::create(builder, waitOp.getLoc(), pendings);
+          if (Attribute taskIds = waitOp->getAttr("async_task_id")) {
+            queueWait->setAttr("async_task_id", taskIds);
+            finalDrainTaskIds = taskIds;
+          }
+          schedule.erase(waitOp);
+          schedule.insert(queueWait, targetIt->second.first, waitCluster);
+          waitOp.erase();
+          erasedWait = true;
+          needsFinalQueueDrain = true;
+        } else {
+          schedule.insert(waitOp, targetStage, waitCluster);
+        }
       } else {
         // Target not found; leave the schedule unchanged for this wait.
         LDBG("no reorder target found for TMA store wait in loop at "
@@ -620,12 +669,21 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
         continue;
       }
 
-      waitOp->removeAttr(kCanRotateByBufferCount);
+      if (!erasedWait)
+        waitOp->removeAttr(kCanRotateByBufferCount);
       changed = true;
     }
 
     if (changed)
       schedule.serialize(forOp);
+
+    if (needsFinalQueueDrain) {
+      OpBuilder builder(forOp);
+      builder.setInsertionPointAfter(forOp);
+      auto drain = ttng::TMAStoreWaitOp::create(builder, forOp.getLoc(), 0);
+      if (finalDrainTaskIds)
+        drain->setAttr("async_task_id", finalDrainTaskIds);
+    }
   });
 }
 
