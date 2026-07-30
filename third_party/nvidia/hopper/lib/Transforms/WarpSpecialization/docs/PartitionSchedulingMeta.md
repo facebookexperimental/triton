@@ -428,7 +428,11 @@ cross-partition channels.
 
 **Cloneable ops**:
 - `MemDescTransOp`: metadata-only reinterpretation of shared memory layout
-- `ConvertLayoutOp`, `BroadcastOp`, `ExpandDimsOp`: cheap element rearrangement
+- `ConvertLayoutOp`, `BroadcastOp`, `ExpandDimsOp`, `MakeRangeOp`, `SplatOp`:
+  cheap element rearrangement or index construction
+- integer/index `arith` operations: cheap index and mask construction. Floating
+  point tensor arithmetic remains excluded so reductions and activation work
+  are not duplicated into multiple partitions.
 
 **Not cloned**: `LocalAllocOp`. When a shared SMEM buffer (e.g., K/V in
 Flash Attention) is consumed by ops in multiple partitions, the correct
@@ -445,12 +449,15 @@ The cloning walks in reverse post-order so that an `ExpandDimsOp` feeding a
 `ExpandDimsOp` E feeds B, then E is also cloned into P in the same pass
 (because E's user — the cloned B — is now in P).
 
-**Operand chain cloning**: After cloning a `BroadcastOp`/`ExpandDimsOp`,
+**Operand chain cloning**: After cloning any cloneable root,
 `optimizeSchedule` walks backward through the clone's operand chain and
-also clones any `ConvertLayoutOp`, `BroadcastOp`, or `ExpandDimsOp` that
-feeds it from a different partition. This handles the case where upstream
-layout passes insert a `ConvertLayoutOp` between `ExpandDimsOp` and
-`BroadcastOp` (e.g., `expand_dims -> convert_layout -> broadcast`).
+also clones cloneable producers that feed it from a different partition. This
+handles both layout chains (for example,
+`expand_dims -> convert_layout -> broadcast`) and causal-mask index chains
+such as `make_range -> addi -> expand_dims -> broadcast`. Starting the walk
+from integer arithmetic users is necessary when the broadcast itself feeds an
+unassigned mask cluster; otherwise the full broadcasted index tensor becomes a
+cross-partition SMEM channel.
 
 When a `MemDescTransOp` clone references a `LocalAllocOp` from a different
 partition (e.g., `local_alloc -> memdesc_trans -> dot`), the backward walk

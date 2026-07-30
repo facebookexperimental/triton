@@ -1128,23 +1128,33 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   // per-region counters. Mirrors createNewLoopWrapper. The while is outermost,
   // so the prior value resolves to a constant 0.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    if (config->getGroup(idx)->channels.size() <= 1)
+    auto *group = config->getGroup(idx);
+    // A collapsed both-endpoints-subtiled channel is the sole member of its
+    // group but still needs the shared numTiles-stride counter. Keep this in
+    // sync with getAccumCnts() and the scf.for wrapper above.
+    if (group->channels.size() <= 1 &&
+        !channelIsCollapsedBothSubtiled(group->channels[0]))
       continue;
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+    if (group->channels[0]->getNumBuffers() <= 1 &&
+        !channelIsCollapsedBothSubtiled(group->channels[0]))
       continue;
-    SmallVector<Operation *> chList;
-    getReuseChannels(config->getGroup(idx), origWhileOp.getOperation(), chList);
-    if (chList.empty())
+
+    bool enclosed = false;
+    for (auto *ch : group->channels) {
+      if (ch->defunct)
+        continue;
+      Operation *src = ch->getSrcOp();
+      Operation *dst = ch->getDstOp();
+      if ((src && enclosing(origWhileOp, src)) ||
+          (dst && enclosing(origWhileOp, dst))) {
+        enclosed = true;
+        break;
+      }
+    }
+    if (!enclosed)
       continue;
-    Operation *parentOp = origWhileOp->getParentOp();
-    SmallVector<Operation *> parentChList;
-    getReuseChannels(config->getGroup(idx), parentOp, parentChList);
-    if (parentChList.empty())
-      parentChList.push_back(origWhileOp.getOperation());
-    Value prevAccum =
-        getAccumForReuseGroup(origWhileOp.getOperation(), parentChList,
-                              regionsWithChannels, config, idx, true);
-    initialAccums.push_back(prevAccum);
+    initialAccums.push_back(
+        builder.createWithAsyncTaskIds<arith::ConstantIntOp>(loc, 0, 64));
   }
 
   unsigned totalCnts = initialAccums.size();

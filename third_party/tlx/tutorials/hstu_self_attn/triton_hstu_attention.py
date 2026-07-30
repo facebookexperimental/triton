@@ -63,6 +63,7 @@ class HSTUAutoWSConfig:
     dq_reduce: bool = False  # bwd dq via TMA reduce-add (vs in-loop RMW)
     dq_reuse: bool = False  # FA-style TMEM reuse for the dq-reduce bwd
     dq_iters: int = 1  # dq TMA-reduce column subtiles
+    dkdv_subtile: int = 1  # dK/dV output-store column subtiles
     warps: int = 8  # num_warps for the autoWS config
     bn: int = 128  # fwd DP BLOCK_N
     bwd_bm: int = 64  # bwd autoWS BLOCK_M
@@ -84,6 +85,7 @@ class HSTUAutoWSConfig:
             dq_reduce=g("HSTU_SELF_DQ_REDUCE") == "1",
             dq_reuse=g("HSTU_SELF_DQ_REUSE", "0") == "1",
             dq_iters=int(g("HSTU_SELF_DQ_ITERS", "1")),
+            dkdv_subtile=int(g("HSTU_SELF_BWD_DKDV_SUBTILE", "1")),
             warps=int(g("HSTU_SELF_AUTOWS_WARPS", "8")),
             bn=int(g("HSTU_SELF_AUTOWS_BN", "128")),
             bwd_bm=int(g("HSTU_SELF_AUTOWS_BWD_BM", "64")),
@@ -610,6 +612,7 @@ def _get_bw_configs() -> List[triton.Config]:
                 num_stages=_ns,
                 num_warps=_w,
                 pre_hook=_bwd_pre_hook,
+                generate_subtiled_region=_AUTOWS_CFG.dkdv_subtile > 1,
             )
         ]
     # HSTU_SELF_PIN=1 shrinks the bwd autotune to one config so tritonbench
@@ -1709,6 +1712,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
+    DKDV_SUBTILE: tl.constexpr = 1,
 ):
     offs_m = tl.arange(0, BLOCK_M)
     offs_qk_d = tl.arange(0, BLOCK_D_Q)
@@ -1878,10 +1882,22 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     # write-back
     dk = dk * alpha
     if ENABLE_TMA:
-        device_desc_dv.store([(desc_row_kv + start_n).to(tl.int32),
-                              (off_h * stride_dvh).to(tl.int32)], dv.to(k.dtype))
-        device_desc_dk.store([(desc_row_kv + start_n).to(tl.int32),
-                              (off_h * stride_dkh).to(tl.int32)], dk.to(k.dtype))
+        dv_slices = _split_n_2D(dv, DKDV_SUBTILE)
+        dv_slice_size: tl.constexpr = BLOCK_D_V // DKDV_SUBTILE
+        for slice_id in tl.static_range(DKDV_SUBTILE):
+            device_desc_dv.store(
+                [(desc_row_kv + start_n).to(tl.int32),
+                 (off_h * stride_dvh + slice_id * dv_slice_size).to(tl.int32)],
+                dv_slices[slice_id].to(k.dtype),
+            )
+        dk_slices = _split_n_2D(dk, DKDV_SUBTILE)
+        dk_slice_size: tl.constexpr = BLOCK_D_Q // DKDV_SUBTILE
+        for slice_id in tl.static_range(DKDV_SUBTILE):
+            device_desc_dk.store(
+                [(desc_row_kv + start_n).to(tl.int32),
+                 (off_h * stride_dkh + slice_id * dk_slice_size).to(tl.int32)],
+                dk_slices[slice_id].to(k.dtype),
+            )
     else:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
@@ -1956,6 +1972,7 @@ def _hstu_attn_bwd(  # noqa C901
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
+    DKDV_SUBTILE: tl.constexpr = 1,
     NUM_SMS: tl.constexpr = 0,
 ):
     off_hz = tl.program_id(0)
@@ -2128,6 +2145,7 @@ def _hstu_attn_bwd(  # noqa C901
             DQ_REDUCE=DQ_REDUCE,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
+            DKDV_SUBTILE=DKDV_SUBTILE,
         )
     else:
         for start_n in range(0, seq_len_kv, BLOCK_N):
@@ -2191,6 +2209,7 @@ def _hstu_attn_bwd(  # noqa C901
                 DQ_REDUCE=DQ_REDUCE,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
+                DKDV_SUBTILE=DKDV_SUBTILE,
             )
 
 
@@ -2255,6 +2274,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
     DQ_REDUCE: tl.constexpr,
     DQ_ITERS: tl.constexpr,
     DQ_REUSE: tl.constexpr,
+    DKDV_SUBTILE: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
     tl.static_assert(ENABLE_TMA)
@@ -2283,10 +2303,16 @@ def _hstu_attn_bwd_clc(  # noqa C901
         block_shape=[BLOCK_M, BLOCK_D_Q // DQ_ITERS],
     )
     desc_dk = tl.make_tensor_descriptor(
-        DK, shape=[total_kv, H * DimQ], strides=[H * DimQ, 1], block_shape=[BLOCK_N, BLOCK_D_Q]
+        DK,
+        shape=[total_kv, H * DimQ],
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_N, BLOCK_D_Q // DKDV_SUBTILE],
     )
     desc_dv = tl.make_tensor_descriptor(
-        DV, shape=[total_kv, H * DimV], strides=[H * DimV, 1], block_shape=[BLOCK_N, BLOCK_D_V]
+        DV,
+        shape=[total_kv, H * DimV],
+        strides=[H * DimV, 1],
+        block_shape=[BLOCK_N, BLOCK_D_V // DKDV_SUBTILE],
     )
 
     num_n_tiles = tl.cdiv(max_q_len, BLOCK_N)
@@ -2380,6 +2406,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
                 DQ_REDUCE=DQ_REDUCE,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
+                DKDV_SUBTILE=DKDV_SUBTILE,
             )
         sched = sched.advance()
 
@@ -2604,6 +2631,7 @@ def triton_hstu_attention_bwd(
         DQ_REDUCE=_AUTOWS_CFG.dq_reduce,
         DQ_ITERS=_AUTOWS_CFG.dq_iters,
         DQ_REUSE=_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse,
+        DKDV_SUBTILE=_AUTOWS_CFG.dkdv_subtile,
         NUM_SMS=num_sms,
     )
 

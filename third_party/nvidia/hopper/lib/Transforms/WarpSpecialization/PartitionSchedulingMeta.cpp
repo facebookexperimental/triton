@@ -2509,7 +2509,9 @@ static bool isRematerializableForClone(Operation *defOp) {
 /// them through a cross-partition memory channel.
 ///
 /// Cloneable: MemDescTransOp (metadata-only SMEM-layout reinterpretation),
-/// ConvertLayoutOp, BroadcastOp, ExpandDimsOp (cheap element rearrangement).
+/// cheap integer index arithmetic, and ConvertLayoutOp/BroadcastOp/
+/// ExpandDimsOp/MakeRangeOp/SplatOp (cheap element rearrangement or index
+/// construction).
 /// LocalAllocOp is NOT cloned: a shared SMEM buffer (e.g. K/V in FA) is one
 /// producer feeding N consumer partitions, so cloning would duplicate the
 /// buffer. separateLocalAllocWithSrc instead tags the local_store with the
@@ -2569,8 +2571,7 @@ void optimizeSchedule(LoopLikeOpInterface loop, PartitionSet &schedule) {
   // operands.
   getLoopBodyRegion(loop).walk<WalkOrder::PostOrder, ReverseIterator>(
       [&](Operation *op) {
-        if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(
-                op))
+        if (!isa<MemDescTransOp>(op) && !isRematerializableForClone(op))
           return;
 
         Partition *partition = getPartition(op);

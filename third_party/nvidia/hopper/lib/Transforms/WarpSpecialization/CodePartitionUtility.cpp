@@ -758,7 +758,19 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     // carried across persistent iterations.
     if (auto parentWhileOp = op->getParentOfType<scf::WhileOp>()) {
       Block *afterBlk = parentWhileOp.getAfterBody();
-      auto *pOp = op->getParentOp();
+      // An op may be nested in a non-control wrapper such as
+      // ttng.subtiled_region directly under the while. Such wrappers do not
+      // own an accumCnt entry. Resolve the nearest channel-bearing region;
+      // for a direct while channel this is the while itself.
+      Operation *pOp = parentWhileOp.getOperation();
+      for (Operation *ancestor = op->getParentOp();
+           ancestor && ancestor != parentWhileOp.getOperation();
+           ancestor = ancestor->getParentOp()) {
+        if (regionsWithChannels.contains(ancestor)) {
+          pOp = ancestor;
+          break;
+        }
+      }
       unsigned tSize = afterBlk->getNumArguments();
       unsigned parentTCnts =
           getAccumCnts(parentWhileOp, regionsWithChannels, config);
