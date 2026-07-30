@@ -8,7 +8,7 @@ chunk size bit-relevant — and expose the loop-carried accumulator register(s) 
 instruction, which the forward interpreter uses to emit a ``LoopReduce`` (fold summary) instead of
 unrolling.
 """
-from pyptx.ir.nodes import Block, Label
+from pyptx.ir.nodes import Block, ImmediateOperand, Label, RegisterOperand
 
 from bitequiv.ptx.mma import _is_mma
 
@@ -95,6 +95,26 @@ def loop_accumulates(insts, loop, loops):
         if _is_mma(insts[k]) or _self_accumulate(insts[k]) is not None:
             return True
     return False
+
+
+def loop_self_increments(insts, loop, loops):
+    """Sorted immediates of self-increment ``add R, R, IMM`` (dst==src0, IMM != 0) in ``loop``'s own
+    body — the chunk step(s): BLOCK_K for a GEMM K-loop, BLOCK_N for a chunked reduction. Used as the
+    forward ``LoopReduce`` key so different chunk sizes get different keys (split, sound)."""
+    out = []
+    for k in own_body(insts, loop, loops):
+        inst = insts[k]
+        if inst.opcode == "add" and len(inst.operands) == 3:
+            d, a, b = inst.operands
+            if (isinstance(d, RegisterOperand) and isinstance(a, RegisterOperand) and d.name == a.name
+                    and isinstance(b, ImmediateOperand)):
+                try:
+                    v = int(b.text, 0)
+                except (ValueError, TypeError):
+                    continue
+                if v != 0:
+                    out.append(v)
+    return tuple(sorted(out))
 
 
 def loop_carried_accumulators(insts, loop, loops):
