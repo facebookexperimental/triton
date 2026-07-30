@@ -200,6 +200,30 @@ The emitter groups sibling sub-ops by `subtile_count` and emits a single
 }
 ```
 
+### `graph.cross_wg_barriers`
+
+Each cross-warp-group dependence has an explicit synchronization record. The
+`distance` field is authoritative for distinguishing an intra-iteration
+channel from a loop-carried release; node cycle order is not dependence
+semantics.
+
+```json
+{
+  "producer_node": 0,
+  "consumer_node": 1,
+  "producer_wg": 0,
+  "consumer_wg": 1,
+  "kind": "mbarrier",
+  "depth": 2,
+  "paired_buffer_id": 3,
+  "expect_bytes": 16384,
+  "distance": 0
+}
+```
+
+Readers may recover a missing `distance` from the matching `graph.edges`
+entry for legacy schema-v0.1 dumps. New writers must emit it.
+
 ## What the emitter does with this
 
 1. **Preamble** = walk all `scope == "function"` ops in source order, emit each
@@ -207,9 +231,8 @@ The emitter groups sibling sub-ops by `subtile_count` and emits a single
    builder over `operands`.
 2. **Per-loop allocs** = walk loop nodes whose op has `attributes.buffer`,
    group by `buffer_id`, emit one `tlx.local_alloc` per group.
-3. **Mbarriers** = walk `graph.edges` with `kind=="data"` between nodes whose
-   pipelines differ, group by destination buffer, emit one full+empty pair
-   per channel.
+3. **Mbarriers** = lower `graph.cross_wg_barriers`, using each record's
+   dependence distance, routing buffer, depth, and producer/consumer groups.
 4. **Per-warpgroup task body** = for each pipeline P in `warp_groups`, filter
    nodes with `pipeline == P`, sort by `(cycle, cluster)`, emit a `for IV in ...:`
    loop containing one TLX op per node (recursive operand expansion).

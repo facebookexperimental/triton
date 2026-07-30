@@ -165,6 +165,13 @@ def _classify_consumer_access(op_kind: str) -> AccessKind:
     return AccessKind.READ
 
 
+def _is_loop_carried(sched: Any, src: int, dst: int) -> bool:
+    return any(
+        edge.src == src and edge.dst == dst and edge.distance > 0
+        for edge in sched.edges
+    )
+
+
 def derive_semaphores(
     loop: Any, graph: Any = None, intra_wg_skip_pairs: set | None = None
 ) -> list[Semaphore]:
@@ -187,7 +194,7 @@ def derive_semaphores(
       - kind ∈ {mbarrier, named}: BOTH become Semaphore — uniform IR
       - producer.op_kind → AsyncKind (TMA/MMA/etc)
       - consumer.op_kind → AccessKind initial guess (refined in AssignStagePhase)
-      - producer cycle > consumer cycle → loop-carry → is_released=True
+      - dependence distance > 0 → loop-carry → is_released=True
     """
     sched = loop.schedule
     nodes_by_id = {n.id: n for n in sched.nodes}
@@ -212,12 +219,14 @@ def derive_semaphores(
             if paired is not None and paired.def_op is None:
                 continue
 
-        # Loop-carry edges (producer cycle > consumer cycle within an iter)
-        # carry a SIGNAL, not data — their "buffer" in the schedule is a
-        # ghost that exists only for tracking. Strip the buffer reference
-        # so the lowerer treats it as signal-only and the emitter doesn't
-        # fabricate a spurious local_load/local_store.
-        is_loop_carry = src.schedule_cycle > dst.schedule_cycle
+        # Legacy graphs omitted distance. New writers make dependence distance
+        # authoritative; retain cycle-order fallback only for unmatched legacy
+        # barrier records.
+        is_loop_carry = (
+            cb.distance > 0
+            if cb.distance is not None
+            else src.schedule_cycle > dst.schedule_cycle
+        )
         has_buffer = (
             cb.paired_buffer_id is not None
             and cb.paired_buffer_id in bufs_by_id
@@ -480,7 +489,7 @@ def _derive_intrawg_async_result_consumers(
                     sem_id=len(existing_sems) + len(extra),
                     buffer=None,  # signal-only completion handshake
                     depth=1,
-                    is_released=prod.schedule_cycle > n.schedule_cycle,
+                    is_released=_is_loop_carried(sched, prod.id, n.id),
                     producers=[
                         ReleaseSite(
                             node=NodeRef(loop.loop_id, prod.id),
@@ -570,7 +579,7 @@ def _derive_intrawg_async_consumers(
                 sem_id=len(existing_sems) + len(extra),
                 buffer=BufferRef(loop.loop_id, buf.id),
                 depth=buf.count,
-                is_released=prod.schedule_cycle > alloc_node.schedule_cycle,
+                is_released=_is_loop_carried(sched, prod.id, alloc_node.id),
                 producers=[
                     ReleaseSite(
                         node=NodeRef(loop.loop_id, prod.id),
