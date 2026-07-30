@@ -440,8 +440,8 @@ private:
     });
     // If we have remote mbar/SMEM access, a multicast arrive, or 2cta TMEM
     // allocation, we need a cluster sync after mbar init and before use.
-    bool shouldInsert = hasRemoteBar || hasMulticastArrive ||
-                        tlx::tlxEnablePairedMMA(mod);
+    bool shouldInsert =
+        hasRemoteBar || hasMulticastArrive || tlx::tlxEnablePairedMMA(mod);
     if (!shouldInsert) {
       return success();
     }

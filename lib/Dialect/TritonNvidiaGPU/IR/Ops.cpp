@@ -172,13 +172,6 @@ bool WarpGroupDotOp::needsPartialAccumulator() {
   return isFP8 && accFP32 && maxNumImpreciseAcc <= aTensorTy.getShape()[1];
 }
 
-bool WarpGroupDotOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 // -- WarpGroupDotWaitOp --
 LogicalResult WarpGroupDotWaitOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
@@ -285,9 +278,9 @@ LogicalResult WaitBarrierOp::verify() {
 }
 
 // Forward declaration. The single (beta-adapted) definition lives below near
-// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so we
-// keep that version rather than the upstream hard-failing one this cherry-pick
-// carried.
+// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so
+// we keep that version rather than the upstream hard-failing one this
+// cherry-pick carried.
 static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
                                             CGAEncodingAttr expectedCGALayout,
                                             StringRef barrierName);
@@ -637,8 +630,7 @@ LogicalResult AsyncTMACopyGlobalToLocalOp::verify() {
                            isIm2Col ? TensorMode::IM2COL : TensorMode::TILED,
                            getCoord(), getOffsets())))
     return failure();
-  if (getMulticast() && !getMulticastTargets() &&
-      !hasCGABroadcast(resultType))
+  if (getMulticast() && !getMulticastTargets() && !hasCGABroadcast(resultType))
     return emitOpError(
         "multicast requires the shared layout to broadcast across CTAs");
   return success();
@@ -836,6 +828,19 @@ static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
   return success();
 }
 
+static LogicalResult verifyCompletionBarrierLayout(Operation *op,
+                                                   Value barrier) {
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  auto expectedCGALayout =
+      CGAEncodingAttr::get1DLayout(op->getContext(), gpu::lookupNumCTAs(op));
+  auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
+  if (actualCGALayout != expectedCGALayout)
+    return op->emitOpError("completion barrier cga_layout must be ")
+           << formatCGALayout(expectedCGALayout) << ", got "
+           << formatCGALayout(actualCGALayout);
+  return success();
+}
+
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -848,6 +853,8 @@ LogicalResult TCGen5MMAOp::verify() {
     // #9474) does not understand. Only verify the rank-1 form; leave beta's
     // higher-rank barriers unchecked here as they were before #9474.
     if (barrierTy.getRank() == 1 && failed(verifyBarrierType(*this, barrierTy)))
+      return failure();
+    if (failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
       return failure();
   }
   Type atype = getA().getType().getElementType();
@@ -964,13 +971,6 @@ void TCGen5MMAOp::getEffects(
                          SharedMemory::get());
 }
 
-bool TCGen5MMAOp::verifyDims() {
-  auto aShape = this->getA().getType().getShape();
-  auto bShape = this->getB().getType().getShape();
-
-  return aShape[aShape.size() - 1] == bShape[aShape.size() - 2];
-}
-
 bool TCGen5MMAOp::verifyOutputDims() {
   if (getTwoCtas()) {
     // Here we have to relax the verification to support two possibilities
@@ -1002,6 +1002,21 @@ void TCGen5MMAOp::setUseAccumulator(Value flag) {
 ValueRange TCGen5MMAOp::getCompletionBarriers() { return getBarriers(); }
 ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
   return getBarrierPreds();
+}
+
+static void appendMulticastDesc(SmallVectorImpl<Value> &descs,
+                                TypedValue<MemDescType> desc) {
+  if (isa<SharedEncodingTrait>(desc.getType().getEncoding()))
+    descs.push_back(desc);
+}
+
+SmallVector<Value> TCGen5MMAOp::getCompletionDescs() {
+  SmallVector<Value> descs;
+  if (getMulticast()) {
+    appendMulticastDesc(descs, getA());
+    appendMulticastDesc(descs, getB());
+  }
+  return descs;
 }
 
 void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
@@ -1074,10 +1089,12 @@ bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
 // -- TCGen5CommitOp --
 LogicalResult TCGen5CommitOp::verify() {
   auto numDescs = getDescs().size();
-  if (numDescs > 2)
-    return emitOpError("expected 0, 1, or 2 descriptors, got ") << numDescs;
+  if (numDescs > 4)
+    return emitOpError("expected 0 to 4 descriptors, got ") << numDescs;
   auto barrierTy = getBarrier().getType();
   if (failed(verifyBarrierType(*this, barrierTy)))
+    return failure();
+  if (failed(verifyCompletionBarrierLayout(getOperation(), getBarrier())))
     return failure();
   return success();
 }
@@ -1141,6 +1158,16 @@ verifyScaleBlockRepOrder(TCGen5MMAScaledOp op,
 }
 
 LogicalResult TCGen5MMAScaledOp::verify() {
+  if (!getIsAsync() && !getBarriers().empty()) {
+    return emitOpError("The op is synchronous but a barrier is present.");
+  }
+  for (auto barrier : getBarriers()) {
+    auto barrierTy = cast<MemDescType>(barrier.getType());
+    if (failed(verifyBarrierType(*this, barrierTy)))
+      return failure();
+    if (failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
+      return failure();
+  }
   Type atype =
       getScaledMMAOperandType(getA().getType().getElementType(), getAType());
   Type btype =
@@ -1287,6 +1314,17 @@ ValueRange TCGen5MMAScaledOp::getCompletionBarrierPreds() {
   return getBarrierPreds();
 }
 
+SmallVector<Value> TCGen5MMAScaledOp::getCompletionDescs() {
+  SmallVector<Value> descs;
+  if (getMulticast()) {
+    appendMulticastDesc(descs, getA());
+    appendMulticastDesc(descs, getB());
+    appendMulticastDesc(descs, getAScale());
+    appendMulticastDesc(descs, getBScale());
+  }
+  return descs;
+}
+
 void TCGen5MMAScaledOp::addCompletionBarrier(Value barrier, Value pred) {
   getBarrierPredsMutable().append(pred);
   getBarriersMutable().append(barrier);
@@ -1357,7 +1395,7 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
                               ScaleDotElemType aType, ScaleDotElemType bType,
                               Value useD, Value pred, bool twoCTAs,
                               ValueRange barriers, ValueRange barrierPreds,
-                              bool isAsync) {
+                              bool isAsync, bool multicast) {
   MLIRContext *ctx = builder.getContext();
   if (!barriers.empty()) {
     isAsync = true;
@@ -1366,7 +1404,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
         ScaleDotElemTypeAttr::get(ctx, aType),
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
-        twoCTAs ? builder.getUnitAttr() : UnitAttr());
+        twoCTAs ? builder.getUnitAttr() : UnitAttr(),
+        multicast ? builder.getUnitAttr() : UnitAttr());
 }
 
 bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
@@ -1999,11 +2038,25 @@ static LogicalResult verifyCLCResultMemdesc(Location loc, MemDescType desc) {
                              "single dimension equal to 2, but got "
                           << desc.getShape() << ".";
   }
+  auto cgaLayout = getCGALayout(layout);
+  auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
+  if (!llvm::all_of(cgaLayout.getLinearLayout().getBases().lookup(kBlock),
+                    [](const auto &basis) {
+                      return llvm::all_of(basis,
+                                          [](auto base) { return base == 0; });
+                    }))
+    return emitError(loc) << "Expected CLC result buffer cga_layout bases to "
+                             "be all zeros. Got "
+                          << formatCGALayout(cgaLayout);
   return success();
 }
 
 LogicalResult CLCTryCancelOp::verify() {
-  return verifyCLCResultMemdesc(getLoc(), getResult().getType());
+  if (failed(verifyCLCResultMemdesc(getLoc(), getResult().getType())))
+    return failure();
+  if (failed(verifyBarrierType(*this, getMbarrier().getType())))
+    return failure();
+  return verifyCompletionBarrierLayout(getOperation(), getMbarrier());
 }
 
 LogicalResult CLCLoadResultOp::verify() {

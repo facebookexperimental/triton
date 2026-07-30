@@ -86,19 +86,16 @@ struct BufferDescriptorsOpConversion
     assert(offsets.size() == lengths.size() && "Mismatched descriptor arrays");
 
     auto totalTensorType = cast<RankedTensorType>(op.getResult().getType());
-    // The totalEncoding is of shape [CTAs, Descriptors]
-    auto totalEncoding =
-        cast<ttg::DistributedEncodingTrait>(totalTensorType.getEncoding());
     assert(totalTensorType.getRank() == 2 &&
            "descriptor tables must have shape [cta, descriptor]");
     assert(static_cast<int64_t>(offsets.size()) ==
                totalTensorType.getShape().back() &&
            "Descriptor data must match the descriptor dimension");
     // Get a slice of shape [Descriptors] that will be broadcasted at the end
-    auto encoding = tti::getSingleDimSliceEncoding(totalEncoding, /*dim=*/1);
-    auto tensorType =
-        RankedTensorType::get({totalTensorType.getShape().back()},
-                              totalTensorType.getElementType(), encoding);
+    auto tensorType = tti::getSlicedTensorType(
+        totalTensorType, {1}, totalTensorType.getElementType());
+    auto encoding =
+        cast<ttg::DistributedEncodingTrait>(tensorType.getEncoding());
 
     SmallVector<uint64_t> offsetVals;
     offsetVals.reserve(offsets.size());
@@ -145,9 +142,8 @@ struct BufferDescriptorsOpConversion
     Value bufDescriptors =
         arith::OrIOp::create(rewriter, loc, trimmedPointers.getType(),
                              trimmedPointers, lengthTensor);
-    bufDescriptors = tti::expandOuterSlicedDim(rewriter, loc, bufDescriptors);
-    bufDescriptors = triton::BroadcastOp::create(rewriter, loc, totalTensorType,
-                                                 bufDescriptors);
+    bufDescriptors = tti::reshapeAndBroadcast(rewriter, loc, bufDescriptors,
+                                              {1}, totalTensorType);
     rewriter.replaceOp(op, bufDescriptors);
     return success();
   }

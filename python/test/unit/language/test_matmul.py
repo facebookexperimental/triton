@@ -114,8 +114,7 @@ def get_src_element_ty_size(dtype_str):
         (512, 64, 32, 2),
         (64, 16, 32, 4),
         (64, 16, 64, 4),
-    ]
-    + ([(256, 128, 128, 3)] if is_rubin() else []),
+    ] + ([(256, 128, 128, 3)] if is_rubin() else []),
 )
 @pytest.mark.parametrize("NUM_CTAS", [1, 2])
 @pytest.mark.parametrize("NUM_WARPS", [4, 8])

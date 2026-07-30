@@ -1,4 +1,5 @@
 #include "Utilities.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -807,6 +808,7 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
 
   for (auto ifOp : ifs) {
     ImplicitLocOpBuilder b(ifOp.getLoc(), ifOp);
+    auto originalOutputs = getPartitionOutputs(ifOp);
 
     // move putExitOp
     b.setInsertionPoint(ifOp);
@@ -847,20 +849,22 @@ void workaroundForLoopScheduler(triton::FuncOp funcOp) {
     assignStage(b, enterIf, getStageCluster(putEnterOp));
     assignStage(b, exitIf, getStageCluster(putExitOp));
 
-    SetVector<int> enterExitIds, middleIds;
-    enterExitIds.insert(1);
-    middleIds.insert(0);
+    auto enterExitIds = originalOutputs[pos];
+    auto middleIds = getPartitionIds(ifOp);
+    for (auto id : enterExitIds)
+      middleIds.remove(id);
+    if (middleIds.empty())
+      middleIds = getPartitionIds(ifOp);
+
     setPartition(enterIf, enterExitIds);
     setPartition(exitIf, enterExitIds);
     setPartition(ifOp, middleIds);
 
-    SetVector<int> p0array, p1array;
-    p0array.insert(0);
-    p1array.insert(1);
     setPartitionOutputs(exitIf, {});
-    setPartitionOutputs(enterIf, {p1array});
-    SmallVector<SetVector<int>> outputs(ifOp->getNumResults(), p0array);
-    setPartitionOutputs(ifOp, outputs);
+    setPartitionOutputs(enterIf, {enterExitIds});
+    auto middleOutputs = originalOutputs;
+    middleOutputs[pos] = middleIds;
+    setPartitionOutputs(ifOp, middleOutputs);
   }
 }
 

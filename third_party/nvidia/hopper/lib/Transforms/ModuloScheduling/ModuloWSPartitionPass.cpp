@@ -9,6 +9,7 @@
 //    Replaces PartitionScheduling for modulo-scheduled kernels.
 
 #include "DataDependenceGraph.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "LatencyModel.h"
 #include "ModuloReservationTable.h"
 

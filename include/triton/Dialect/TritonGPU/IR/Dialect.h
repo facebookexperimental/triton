@@ -51,11 +51,6 @@ constexpr static char AttrNumWarpsName[] = "ttg.num-warps";
 constexpr static char AttrNumCTAsName[] = "ttg.num-ctas";
 constexpr static char AttrTargetName[] = "ttg.target";
 constexpr static char AttrNumThreadsPerWarp[] = "ttg.threads-per-warp";
-// FIXME: rename to match above
-constexpr static char kPartitionAttrName[] = "ttg.partition";
-constexpr static char kPartitionOutputsAttrName[] = "ttg.partition.outputs";
-constexpr static char kPartitionStagesAttrName[] = "ttg.partition.stages";
-constexpr static char kWarpSpecializeTagAttrName[] = "ttg.warp_specialize.tag";
 constexpr static char AttrMinRegAutoWSName[] = "ttg.min_reg_auto_ws";
 constexpr static char AttrMaxRegAutoWSName[] = "ttg.max_reg_auto_ws";
 constexpr static char AttrClusterDimX[] = "ttg.cluster-dim-x";
@@ -123,6 +118,9 @@ struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
   StringRef getName() const final { return "<SharedMemory>"; }
   SideEffects::Resource *getParent() const override { return nullptr; }
 };
+
+bool hasPowerOfTwoBases(const LinearLayout &ll);
+bool isPermutationMatrixLayout(const LinearLayout &ll);
 
 // Convert a distributed layout to a linear encoding
 LinearEncodingAttr toLinearEncoding(RankedTensorType type);
@@ -277,6 +275,12 @@ SmallVector<int64_t> getAllocationShapePerCTA(Type type);
 
 unsigned getNumCTAs(Attribute layout);
 
+// Returns the MMAv2 warp distribution for a matrix tile. This does not apply
+// dot-chain policy and may oversubscribe tiles with fewer instruction
+// repetitions than warps.
+SmallVector<unsigned> getMmaV2WarpsPerCTA(ArrayRef<int64_t> shape,
+                                          int numWarps);
+
 // Return the order that represents that the batch is in row-major or
 // column-major order for a batch of matrices of shape [*, m, n] with
 // len(shape) == rank.
@@ -362,12 +366,6 @@ LogicalResult verifyMemoryOpTypes(Operation *op, ShapedType srcTy,
 // Verify a memory allocation operation.
 LogicalResult verifyAllocOp(Operation *op, Value src, MemDescType dstTy);
 
-SetVector<int> getPartitionIds(Operation *op);
-SmallVector<SetVector<int>, 4> getPartitionOutputs(Operation *op);
-SetVector<int> getPartitionIds(OpOperand *use);
-bool hasPartition(Operation *op);
-bool hasWarpSpecializeTag(Operation *op);
-std::optional<int> getWarpSpecializeTag(Operation *op);
 /// Returns the size in bytes of a scalar type when stored in shared memory.
 size_t getSharedMemorySize(Type type);
 

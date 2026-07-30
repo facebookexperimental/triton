@@ -1,4 +1,3 @@
-import pytest
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
@@ -171,6 +170,7 @@ def test_compile_only_k_loop() -> None:
 
 
 def test_compile_only_dot_mxfp() -> None:
+
     @triton.jit
     def simple_dot_mxfp(
         a_base,

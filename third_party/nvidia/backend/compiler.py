@@ -1090,7 +1090,7 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_global_sanitizer(pm)
 
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
-        passes.ttgpuir.add_allocate_warp_groups(pm)
+        passes.ttgpuir.add_allocate_warp_groups(pm, "consan" in options.instrumentation_mode)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
@@ -1228,7 +1228,8 @@ class CUDABackend(BaseBackend):
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
-        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False)
+        canonicalize_gep = "fpsan" in opt.instrumentation_mode
+        ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
         # Find kernel names (there should only be one)
         names = re.findall(r".visible .entry ([a-zA-Z_][a-zA-Z0-9_]*)", ret)
         assert len(names) == 1

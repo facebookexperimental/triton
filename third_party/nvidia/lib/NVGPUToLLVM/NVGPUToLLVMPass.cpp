@@ -660,8 +660,8 @@ static Value initTensorMemory(LLVM::LLVMFuncOp func,
   // This code is only executed by the default warp group.
   Value threadId = NVVM::ThreadIdXOp::create(rewriter, loc, i32_ty);
   Value pred = b.icmp_ult(threadId, b.i32_val(32));
-  Value alloc = createTMAlloc(rewriter, func, exclusive, size, pred,
-                              useTwoCTAs, smemOffset);
+  Value alloc = createTMAlloc(rewriter, func, exclusive, size, pred, useTwoCTAs,
+                              smemOffset);
   createRelinquishAlloc(rewriter, loc, pred, useTwoCTAs);
   // TODO: pred will have a long liverange, we need to check if this is a
   // problem and how it can be fixed.
