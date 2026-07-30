@@ -3115,7 +3115,7 @@ def test_tlx_wave_converter_pipeline_lowers_float_add(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_passes_fp_fusion_contract_to_wave(tmp_path):
+def test_tlx_wave_converter_pipeline_translates_global_fp_fusion_to_fastmath(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -3124,7 +3124,7 @@ def test_tlx_wave_converter_pipeline_passes_fp_fusion_contract_to_wave(tmp_path)
       %out: !tt.ptr<f32> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %x = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
     %y = arith.constant dense<2.000000e+00> : tensor<64xf32, #blocked>
-    %prod = arith.mulf %x, %y : tensor<64xf32, #blocked>
+    %prod = arith.mulf %x, %y fastmath<nnan> : tensor<64xf32, #blocked>
     %sum = arith.addf %x, %prod : tensor<64xf32, #blocked>
     %offset = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
     amdg.buffer_store %sum, %out[%offset] {contiguity = 1 : i32} : tensor<64xf32, #blocked>
@@ -3138,14 +3138,17 @@ def test_tlx_wave_converter_pipeline_passes_fp_fusion_contract_to_wave(tmp_path)
         enable_fp_fusion=True,
     )
 
-    float_attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "float_binary"]
+    float_attrs = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "float_binary"
+    ]
     assert float_attrs == [
-        {"operation": "mulf"},
-        {"operation": "addf"},
+        {"operation": "mulf", "fastmath": ("nnan", "contract")},
+        {"operation": "addf", "fastmath": ("contract", )},
     ]
     assert output.target_program.contract.enable_fp_fusion is True
-    assert "wave.enable_fp_fusion" in output.emitted_module.text
-    assert "fastmath<contract>" not in output.emitted_module.text
+    assert "wave.enable_fp_fusion" not in output.emitted_module.text
     canonical = _run_wave_canonicalize(output.emitted_module.text)
     assert "wave.fma" in canonical
     assert "fastmath<contract>" in canonical
