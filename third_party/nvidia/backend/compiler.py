@@ -967,7 +967,7 @@ class CUDABackend(BaseBackend):
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
             if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
-                nvidia.passes.hopper.add_insert_2cta_sync(pm)
+                nvidia.passes.hopper.add_insert_2cta_sync(pm, False)
         else:
             passes.ttir.add_triton_licm(pm)
         passes.common.add_canonicalizer(pm)
@@ -998,6 +998,10 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_optimize_partition_warps(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
         nvidia.passes.ttnvgpuir.add_lower_mma(pm)
+        # lower_mma created the 2-CTA block-scale tmem_copy (a leader-issued
+        # cross-CTA write); sync its completion before the MMA reads the scales.
+        if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+            nvidia.passes.hopper.add_insert_2cta_sync(pm, True)
         passes.common.add_sccp(pm)
         passes.common.add_cse(pm)
         passes.common.add_canonicalizer(pm)

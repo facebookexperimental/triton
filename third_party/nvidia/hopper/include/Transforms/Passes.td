@@ -363,7 +363,20 @@ def NVGPUInsert2CTASync : Pass<"nvgpu-insert-2cta-sync", "mlir::ModuleOp"> {
     This pattern is compatible with warp specialization because the sync
     ops are inserted after the pipeline pass, and the MMA hardware handles
     the actual cross-CTA execution synchronization.
+
+    When `sync-scale-copy` is set, the pass instead synchronizes the 2-CTA
+    block-scale copy (`tcgen05.cp.cta_group::2`) for scaled MMAs. That copy is
+    leader-issued and writes both CTAs' scale TMEM, so the follower's MMA could
+    read scale TMEM before the copy completes. The pass emits a `tc_gen5_commit`
+    on a hoisted, phase-tracked barrier and a wait before each MMA. Must run
+    AFTER lower-mma, which creates the scale copy.
   }];
+
+  let options = [
+    Option<"syncScaleCopy", "sync-scale-copy", "bool", /*default*/"false",
+           "Synchronize the 2-CTA scale tmem_copy (tcgen05.cp) cross-CTA "
+           "completion instead of the MMA cross-CTA rendezvous.">
+  ];
 
   let dependentDialects = [
     "mlir::triton::gpu::TritonGPUDialect",

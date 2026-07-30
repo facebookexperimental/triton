@@ -240,7 +240,8 @@ void init_triton_hopper_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_llm_schedule", mlir::createNVGPULLMSchedule);
   ADD_PASS_WRAPPER_0("add_modulo_ws_partition",
                      mlir::createNVGPUModuloWSPartition);
-  ADD_PASS_WRAPPER_0("add_insert_2cta_sync", mlir::createNVGPUInsert2CTASync);
+  ADD_PASS_OPTION_WRAPPER_1("add_insert_2cta_sync",
+                            mlir::createNVGPUInsert2CTASync, bool);
   ADD_PASS_WRAPPER_0("add_2cta_transform_loads",
                      mlir::createNVGPU2CTATransformLoads);
 }
