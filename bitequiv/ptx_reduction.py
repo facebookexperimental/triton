@@ -48,25 +48,101 @@ different launch geometries or un-modeled accumulations never collapse to an emp
 contract/reorder. PTX is the practical check, not absolute ground truth (SASS via
 ``cuobjdump`` would be); ``--fmad=false`` pins the fusion decision. See ``design-doc.md``.
 """
-from pyptx.ir.nodes import Function, ImmediateOperand, RegisterOperand
+from pyptx.ir.nodes import Block, Function, ImmediateOperand, Label, RegisterOperand
 from pyptx.parser import parse
 from pyptx.parser.parser import ParseError
 
 from bitequiv.ptx.affine import reqntid_of
 from bitequiv.ptx.builder import entry_signatures
 from bitequiv.ptx.linker import linearize
+from bitequiv.ptx.mma import _is_mma
+
+# fp combine ops + widths, used to detect a loop-carried floating-point accumulation.
+_FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f32x2", ".f64", ".bf16", ".bf16x2"})
+_FP_COMBINE = frozenset({"add", "sub", "mul", "div", "min", "max", "fma"})
+
+
+def _instrs_and_labels(func):
+    """Linearized instructions (recursing into ``Block`` scopes, like :func:`linearize`) PLUS a map
+    ``label name -> index of the instruction at/after that label``. ``linearize`` drops labels; we
+    need their positions to find loop back-edges."""
+    insts, label_at, pending = [], {}, []
+
+    def walk(stmts):
+        for s in stmts:
+            if isinstance(s, Block):
+                walk(s.body)
+            elif isinstance(s, Label):
+                pending.append(s.name)
+            elif type(s).__name__ == "Instruction":
+                while pending:
+                    label_at[pending.pop()] = len(insts)
+                insts.append(s)
+
+    walk(func.body)
+    for name in pending:  # a trailing label points just past the last instruction
+        label_at[name] = len(insts)
+    return insts, label_at
+
+
+def _back_edges(insts, label_at):
+    """(header_idx, latch_idx) for each backward branch — a ``bra`` to a label at/before it = a loop."""
+    loops = []
+    for i, inst in enumerate(insts):
+        if inst.opcode == "bra":
+            for o in inst.operands:
+                name = getattr(o, "name", None) or getattr(o, "text", None)
+                j = label_at.get(name)
+                if j is not None and j <= i:
+                    loops.append((j, i))
+    return loops
+
+
+def _innermost_loop(idx, loops):
+    """The smallest loop range (header, latch) containing ``idx``, or None."""
+    best = None
+    for lp in loops:
+        if lp[0] <= idx <= lp[1] and (best is None or (lp[1] - lp[0]) < (best[1] - best[0])):
+            best = lp
+    return best
+
+
+def _loop_accumulates(insts, loop, loops):
+    """True iff the loop's OWN body (its range MINUS nested loops) carries a floating-point
+    accumulation: an MMA, or an fp combine whose destination is also one of its sources (a
+    loop-carried running total). This is what separates a K-reduction loop (its chunk size is
+    bit-relevant) from an output-tiling / parallelization loop (each iteration is an independent
+    output; its step is bit-free). Conservative direction is 'accumulates' -> keep."""
+    h, latch = loop
+    for k in range(h, latch + 1):
+        if _innermost_loop(k, loops) != loop:  # this instruction belongs to a NESTED loop
+            continue
+        inst = insts[k]
+        if _is_mma(inst):
+            return True
+        if inst.opcode in _FP_COMBINE and inst.modifiers and inst.modifiers[-1] in _FP_WIDTHS and inst.operands:
+            dname = getattr(inst.operands[0], "name", None)
+            if dname and any(getattr(s, "name", None) == dname for s in inst.operands[1:]):
+                return True
+    return False
 
 
 def _loop_steps(func):
-    """Sorted multiset of loop-induction SELF-INCREMENT constants: every ``add R, R, IMM``
-    where dst==src0 is a loop counter stepped by a compile-time constant (for a chunked
-    reduction this is exactly BLOCK_N — the cross-chunk column stride). This is a LAYOUT-/
-    num_warps-INVARIANT, BLOCK_N-FAITHFUL fence: the reconstruction cannot follow the loop
-    back-edge, so a collapsed per-chunk reduction loses the chunk SIZE; folding the loop step
-    into the entry signature restores it. Adding it can only SPLIT classes further (it is extra
-    distinguishing info), so it is monotonically sound — it never causes an over-merge."""
+    """Sorted multiset of loop-induction SELF-INCREMENT constants (``add R, R, IMM``, dst==src0),
+    but ONLY for loops that carry a floating-point ACCUMULATION. A self-increment inside an
+    output-tiling / parallelization loop (no loop-carried fp total in its own body) is bit-free and
+    dropped — so the fence stops over-splitting on BLOCK_M / num_warps — while the reduction chunk
+    step (BLOCK_N for a chunked reduction, BLOCK_K for a GEMM K-loop) is kept.
+
+    Sound / monotone: a step is DROPPED only when its self-increment sits inside a DETECTED loop
+    that provably does not accumulate. If no loop is recovered around a self-increment (loops
+    unrolled, or structure not recovered), the step is KEPT — so this can only reduce over-split,
+    never introduce an over-merge (dropping a bit-relevant chunk step)."""
+    insts, label_at = _instrs_and_labels(func)
+    loops = _back_edges(insts, label_at)
+    accumulates = {lp: _loop_accumulates(insts, lp, loops) for lp in set(loops)}
     steps = []
-    for inst in linearize(func):
+    for i, inst in enumerate(insts):
         if inst.opcode == "add" and len(inst.operands) == 3:
             d, a, b = inst.operands
             if (isinstance(d, RegisterOperand) and isinstance(a, RegisterOperand) and d.name == a.name
@@ -75,8 +151,12 @@ def _loop_steps(func):
                     v = int(b.text, 0)
                 except (ValueError, TypeError):
                     continue
-                if v != 0:
-                    steps.append(v)
+                if v == 0:
+                    continue
+                lp = _innermost_loop(i, loops)
+                if lp is not None and not accumulates[lp]:
+                    continue  # self-increment in a non-accumulating (tiling / parallel) loop -> drop
+                steps.append(v)
     return tuple(sorted(steps))
 
 
