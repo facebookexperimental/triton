@@ -56,13 +56,11 @@ def convert_ttgir_to_wave(
         verifier.verify_target_program(
             target_program,
             source_program=source_program,
-            fact_program=fact_program,
             token_program=token_program,
         )
     target_program = canonicalize.eliminate_dead_target_ops(target_program)
     emitted_module = emission.emit_wave_module(
         target_program,
-        fact_program,
         waves_per_eu=waves_per_eu,
     )
     return ConversionOutput(

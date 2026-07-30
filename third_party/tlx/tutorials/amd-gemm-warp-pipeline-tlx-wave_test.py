@@ -178,16 +178,23 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_wave_builder == "staged-converter"
     assert compiled.metadata.tlx_wave_num_mmas == 128
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 16
+    # The bridge emits symbolic gathers.  Wave selects the 16 direct-to-LDS
+    # transactions checked below when lowering to the machine dialect.
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
     assert wave.count("wave.index_expr") < 1_900
     assert wave.count("wave.cast fpconvert") == 32
-    # The symbolic bridge keeps the output as two masked scatters.  Check the
-    # structural path rather than the pre-gather/scatter scalar store form.
-    assert wave.count("wave.scatter") == 2
+    # Shared-memory copies are symbolic scatters too.  Check only the two
+    # masked global output scatters here.
+    global_scatter_lines = [
+        line
+        for line in wave.splitlines()
+        if "wave.scatter" in line and "#waveamd.buffer" in line
+    ]
+    assert len(global_scatter_lines) == 2
     assert "wave.store" not in wave
     assert wave.count("wave.where") == 2
     assert wave.count("wave.join") <= 20
-    assert wave.count("wave.barrier") == 1
+    assert wave.count("wave.barrier") == 3
     assert wave.count("wave.extract") < 512
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
     assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 64
@@ -209,8 +216,7 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert asm.count("buffer_load") == amd_asm.count("buffer_load") == 16
     assert asm.count("buffer_store") == amd_asm.count("buffer_store") == 32
     assert asm.count("v_cvt_pk_f16_f32") == amd_asm.count("v_cvt_pk_f16_f32") == 64
-    assert asm.count("s_barrier") == 1
-    assert amd_asm.count("s_barrier") == 2
+    assert asm.count("s_barrier") == amd_asm.count("s_barrier") == 3
     assert "global_load" not in asm
     assert "global_load" not in amd_asm
     assert "global_store" not in asm
@@ -249,16 +255,16 @@ def test_gfx9_v9_tlx_wave_hot_loop_waits_are_not_full_drains(monkeypatch, tmp_pa
 
     assert compiled.metadata.tlx_wave_status == "emitted_wave_staged_converter"
     assert compiled.metadata.tlx_wave_num_mmas == 256
-    assert compiled.metadata.tlx_wave_num_dma_load_lds == 32
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
     assert asm.count("v_mfma") == amd_asm.count("v_mfma") == 256
     assert asm.count("buffer_load") == amd_asm.count("buffer_load") == 32
     assert asm.count("buffer_store") == amd_asm.count("buffer_store") == 32
     assert wave.count("wave.wait") == 0
-    assert wave.count("wave.barrier") == 11
-    assert asm.count("s_barrier") == 11
-    assert machine.count("waveamdmachine.s_waitcnt vmcnt(10)") == 0
+    assert wave.count("wave.barrier") == 12
+    assert asm.count("s_barrier") == amd_asm.count("s_barrier") == 12
+    assert machine.count("waveamdmachine.s_waitcnt vmcnt(10)") == 1
     assert machine.count("waveamdmachine.s_waitcnt vmcnt(8)") == 4
-    assert asm.count("s_waitcnt vmcnt(10)") == 0
+    assert asm.count("s_waitcnt vmcnt(10)") == 1
     assert asm.count("s_waitcnt vmcnt(8)") == 4
     assert asm.count("s_waitcnt vmcnt(0)") == 1
     assert asm.count("s_waitcnt vmcnt(0)") < amd_asm.count("s_waitcnt vmcnt(0)")

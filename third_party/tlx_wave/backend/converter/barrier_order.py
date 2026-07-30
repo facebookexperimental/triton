@@ -145,13 +145,11 @@ def thread_barrier_issue_order(target_program):
             region.yield_value_ids,
         ))
 
-    return target_ir.TargetProgram(
-        tuple(values),
-        tuple(ops),
-        tuple(regions),
-        dict(target_program.source_value_targets),
-        dict(target_program.erased_source_values),
-        target_program.kernel,
+    return replace(
+        target_program,
+        values=tuple(values),
+        ops=tuple(ops),
+        regions=tuple(regions),
     )
 
 

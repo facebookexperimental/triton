@@ -112,7 +112,6 @@ class _EmissionState:
     ir: object
     builder: object
     target_program: target_ir.TargetProgram
-    fact_program: object | None
     values: dict[int, object]
     uniform_pointer_bases: dict[int, tuple[object, ...]] = field(default_factory=dict)
     shared_pointer_dword_bases: dict[int, _SharedPointerDwordBase] = field(default_factory=dict)
@@ -147,7 +146,6 @@ class _EmissionState:
 
 def emit_wave_module(
     target_program,
-    fact_program=None,
     *,
     waves_per_eu=0,
 ):
@@ -177,7 +175,6 @@ def emit_wave_module(
                     ir,
                     builder,
                     target_program,
-                    fact_program,
                     {},
                 )
                 for target_value_id, arg in zip(kernel.arg_target_ids, builder.args):
@@ -1137,14 +1134,10 @@ def _materialize_fact_ids(state, op):
             "fact materialization requires one target value per fact",
             target_op_id=op.target_op_id,
         )
-    if state.fact_program is None:
-        fail(
-            "TLXW_EMIT_MISSING_FACT_PROGRAM",
-            STAGE,
-            "fact materialization requires verified fact records",
-            target_op_id=op.target_op_id,
-        )
-    facts = {fact.fact_id: fact for fact in state.fact_program.facts}
+    facts = {
+        assumption.assumption_id: assumption
+        for assumption in state.target_program.assumptions
+    }
     for fact_id, target_value_id in zip(op.fact_ids, op.fact_target_ids):
         fact = facts.get(fact_id)
         if fact is None:

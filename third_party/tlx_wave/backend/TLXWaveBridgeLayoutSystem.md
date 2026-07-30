@@ -380,7 +380,14 @@ emission and name the missing field.
 
 ## Target IR
 
-Target IR carries only schema data needed for emission:
+Target IR is self-contained before emission. `TargetContract` versions the
+schema and states that address arithmetic does not overflow. `TargetLayout`
+records mechanically copy layout identity, kind, shape, element type,
+component count, lane width, encoding parameters, and serialized linear-layout
+dimensions and bases. `TargetAssumption` records bind proven range or
+divisibility predicates directly to target value IDs.
+
+Target operations carry only schema data needed for emission:
 
 - chosen Wave representation kind from type conversion;
 - expression records: expression payload, binding names, binding target IDs,
@@ -393,8 +400,10 @@ Target IR carries only schema data needed for emission:
 - DMA proof data: packet width, alignment, contiguity, mask behavior, boundary
   proof, and machine address obligations.
 
-Target IR must not carry source MLIR objects, Python layout objects, lazy
-resolvers, callables, emitter state, or unverified analysis objects.
+Target IR must not carry source MLIR objects, Python layout objects, fact or
+layout analysis records, lazy resolvers, callables, emitter state, or
+unverified analysis objects. Verification and emission consume the target
+program without a side-channel fact or layout program.
 
 Emission may switch on verified target modes. It must not inspect source layouts
 or choose lowering families.
@@ -403,6 +412,10 @@ or choose lowering families.
 
 Verifier checks required for this model:
 
+- schema version and no-overflow address contract are supported;
+- every target layout and assumption ID is local, dense, and well formed;
+- every value and operation layout reference names a target layout;
+- every assumption use names one of its target subjects;
 - every layout-sensitive op has expression records, physical-offset records, or
   an explicit movement mode;
 - every expression binding is present and has a compatible Wave type;
