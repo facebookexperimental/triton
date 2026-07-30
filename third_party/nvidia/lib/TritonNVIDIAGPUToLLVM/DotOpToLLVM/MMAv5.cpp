@@ -701,15 +701,8 @@ LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
   MemDescType aTensorTy = op.getA().getType();
   MemDescType bTensorTy = op.getB().getType();
   MemDescType dTensorTy = op.getD().getType();
-  auto dLayout = cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
   bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
-  SmallVector<Value> commitDescs;
-  if (op.getMulticast()) {
-    if (isa<SharedEncodingTrait>(aTensorTy.getEncoding())) {
-      commitDescs.push_back(op.getA());
-    }
-    commitDescs.push_back(op.getB());
-  }
+  SmallVector<Value> commitDescs = op.getCompletionDescs();
 
   DotConversion dot;
 
@@ -889,6 +882,7 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
   Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());
   Value baseScaleB = tb.ptrtoint(i32_ty, adaptor.getBScale());
   bool twoCTAs = ttng::getModuleTwoCTAs(op) || tlx::tlxEnablePairedMMA(op);
+  SmallVector<Value> commitDescs = op.getCompletionDescs();
 
   int numRows = 128;
   int colSizeInBits = 32;
@@ -949,12 +943,12 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                         mxfpInstKind, twoCTAs, collectorB, ptxVersion);
   };
 
-  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
-                        adaptor.getA(), adaptor.getB(), dTensorTy,
-                        adaptor.getUseD(), adaptor.getPred(),
-                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
-                        twoCTAs, tlx::tlxEnablePairedMMA(op), ValueRange{},
-                        opKindIsMXFP4, targetFeatures, dot);
+  return convertDotImpl(
+      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
+      adaptor.getB(), dTensorTy, adaptor.getUseD(), adaptor.getPred(),
+      adaptor.getBarriers(), adaptor.getBarrierPreds(), twoCTAs,
+      tlx::tlxEnablePairedMMA(op), commitDescs, opKindIsMXFP4,
+      targetFeatures, dot);
 }
 
 //===----------------------------------------------------------------------===//
