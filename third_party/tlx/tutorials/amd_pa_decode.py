@@ -146,9 +146,9 @@ def _pa_decode_partition_kernel(
             nxt = tidx + 1
             if nxt < num_tiles:
                 nslot = nxt % BUFFER_DEPTH
-                n_page_of_row = start_page + (nxt + 1) * PAGES_PER_TILE + row_page
+                n_page_of_row = start_page + nxt * PAGES_PER_TILE + row_page
                 n_physical = tl.load(BlockTables + seq * stride_bt_s +
-                                        tl.where(n_page_of_row < end_page, n_page_of_row, end_page - 1) * stride_bt_p)
+                                     tl.where(n_page_of_row < end_page, n_page_of_row, end_page - 1) * stride_bt_p)
                 ntok_k = tlx.async_load(
                     Kc + n_physical[:, None] * stride_kc_b + kv_head * stride_kc_h +
                     row_in_page[:, None] * stride_kc_p + offs_d[None, :] * stride_kc_d, tlx.local_view(k_buf, nslot))
@@ -290,7 +290,6 @@ def get_num_splits(num_seqs, num_kv_heads, max_ctx_len=None, page_size=None, pag
         by_tail = max(1, num_tiles // 32)  # keep the serial tail <= ~32 tiles/split
         hi = max(1, (num_cu * 8) // progs)  # never exceed ~eight waves
         splits = max(splits, min(hi, by_tail))
-    # return 128
     return max(1, min(cap, splits))
 
 
