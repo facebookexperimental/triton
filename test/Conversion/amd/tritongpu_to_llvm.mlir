@@ -234,24 +234,24 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
     // stride 8: ROW_ROR:8 (0x128 = 296)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 296, 15, 15, false : i32
+    // CHECK-SAME: with 296, 15, 15, true : i32
     // CHECK: llvm.intr.maxnum
 
     // stride 4: ROW_HALF_MIRROR (0x141 = 321) + quad_perm xor 3 (27)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 321, 15, 15, false : i32
+    // CHECK-SAME: with 321, 15, 15, true : i32
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 27, 15, 15, false : i32
+    // CHECK-SAME: with 27, 15, 15, true : i32
     // CHECK: llvm.intr.maxnum
 
     // stride 2: quad_perm xor 2 (78)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 78, 15, 15, false : i32
+    // CHECK-SAME: with 78, 15, 15, true : i32
     // CHECK: llvm.intr.maxnum
 
     // stride 1: quad_perm xor 1 (177)
     // CHECK: rocdl.update.dpp
-    // CHECK-SAME: with 177, 15, 15, false : i32
+    // CHECK-SAME: with 177, 15, 15, true : i32
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %1 = arith.maxnumf %arg1, %arg2 : f32
@@ -274,19 +274,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
     // stride 8: ROW_XMASK:8
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 360, 15, 15, false
+    // GFX1250-SAME: with 360, 15, 15, true
 
     // stride 4: ROW_XMASK:4
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 356, 15, 15, false
+    // GFX1250-SAME: with 356, 15, 15, true
 
     // stride 2: ROW_XMASK:2
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 354, 15, 15, false
+    // GFX1250-SAME: with 354, 15, 15, true
 
     // stride 1: ROW_XMASK:1
     // GFX1250: rocdl.update.dpp
-    // GFX1250-SAME: with 353, 15, 15, false
+    // GFX1250-SAME: with 353, 15, 15, true
     %0 = "tt.reduce"(%arg0) <{axis = 0 : i32}> ({
     ^bb0(%arg1: f32, %arg2: f32):
       %1 = arith.maxnumf %arg1, %arg2 : f32
