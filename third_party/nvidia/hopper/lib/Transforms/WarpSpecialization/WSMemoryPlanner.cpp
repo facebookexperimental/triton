@@ -876,6 +876,13 @@ struct WSBuffer {
   int reuseTargetBufferId = -1; // bufferId of the reuse target, -1 = no reuse.
 };
 
+struct TMAStagingGroup {
+  Value desc;
+  Operation *origLoad = nullptr;
+  int producerTask = -1;
+  SmallVector<unsigned> indices;
+};
+
 static unsigned
 getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
                       const DenseMap<Operation *, unsigned> &opOrder) {
@@ -1385,12 +1392,6 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
   // to a tmem_load, so fall back to the producer task instead of collapsing all
   // untraceable sources for a descriptor into one group. Same-task epilogue
   // subtiles still fuse, while different data partitions remain separate.
-  struct TMAStagingGroup {
-    Value desc;
-    Operation *origLoad = nullptr;
-    int producerTask = -1;
-    SmallVector<unsigned> indices;
-  };
   SmallVector<TMAStagingGroup> tmaStagingGroups;
   for (unsigned i = 0; i < wsBuffers.size(); ++i) {
     auto &buf = wsBuffers[i];
