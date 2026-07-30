@@ -5,7 +5,7 @@ from typing import Any
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
 from triton.experimental.gluon.language.nvidia.ampere import mma_v2
-from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
+from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared, mbarrier, tma
 from triton.language.core import _unwrap_if_constexpr
 
 from triton.tools.triton_to_gluon_translator.common_helpers import *  # noqa: F401,F403
@@ -381,7 +381,8 @@ def tl_make_tensor_descriptor(base, shape, strides, block_shape, padding_option=
 @gluon.jit
 def tl_store_tensor_descriptor(desc, offsets, value):
     alloc = ttgl.allocate_shared_memory(desc.dtype, desc.block_shape, desc.layout, value)
-    tma.async_copy_shared_to_global(desc, offsets, alloc)
+    fence_async_shared()
+    tma.async_store(desc, offsets, alloc)
     tma.store_wait(0, read_only=False)
     alloc._keep_alive()
 
@@ -392,7 +393,7 @@ def tl_load_tensor_descriptor(desc, offsets):
     bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar, count=1)
     mbarrier.expect(bar, desc.block_type.nbytes)
-    tma.async_copy_global_to_shared(desc, offsets, bar, smem)
+    tma.async_load(desc, offsets, bar, smem)
     mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
     ret_layout: ttgl.constexpr = default_blocked_layout(desc.block_shape, ttgl.num_warps())
