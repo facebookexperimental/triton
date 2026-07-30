@@ -1180,7 +1180,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 (off_h * stride_qh).to(tl.int32),
             ])
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
-        end_n = 0
         n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
         uih_end = forward_uih_common_preprocess(n_targets, seq_len_q, HAS_NUM_TARGETS)
         if HAS_CONTEXTUAL_SEQ_LEN is True and start_m < contextual_seq_len:
@@ -1347,7 +1346,6 @@ def _hstu_attn_fwd_compute_dp(  # noqa C901
     off_z = off_z.to(tl.int64)
     seq_start_kv = tl.load(seq_offsets + off_z).to(tl.int64)
     seq_end_kv = tl.load(seq_offsets + off_z + 1)
-    seq_len_kv = (seq_end_kv - seq_start_kv).to(tl.int32)
     seq_start_q = tl.load(seq_offsets_q + off_z).to(tl.int64)
     seq_end_q = tl.load(seq_offsets_q + off_z + 1)
     seq_len_q = (seq_end_q - seq_start_q).to(tl.int32)
