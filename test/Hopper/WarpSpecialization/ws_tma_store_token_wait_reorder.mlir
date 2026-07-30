@@ -32,6 +32,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// A straight-line epilogue can overlap independent work with the first TMA
+// store.  Delay its wait until immediately before the staging view is reused,
+// while preserving the wait after the final store as a drain.
+// CHECK-LABEL: straight_line_wait_before_staging_reuse
+// CHECK: %[[TOK0:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: arith.addf
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK0]]
+// CHECK-NEXT: ttg.local_store
+// CHECK: %[[TOK1:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[TOK1]]
+  tt.func public @straight_line_wait_before_staging_reuse(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src0: tensor<128x64xf16>, %src1: tensor<128x64xf16>,
+      %buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %i: i32, %x: f32) {
+    ttg.local_store %src0, %buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %tok0 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %tok0 : !ttg.async.token
+    %y = arith.addf %x, %x : f32
+    ttg.local_store %src1, %buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %tok1 = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %tok1 : !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // Double-buffered (K=2). One TMA copy at stage 1. Counting 2 copies forward
 // wraps twice to the copy at stage 1 + 2*numStages = stage 3 (with numStages=1
 // per wrap). Wait lands at stage 3.

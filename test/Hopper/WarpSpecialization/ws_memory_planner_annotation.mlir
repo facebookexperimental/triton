@@ -10,7 +10,7 @@
 // Annotations per MMA:
 //   qkT: opndA,smem,1,0 / opndB,smem,2,1 / opndD,tmem,1,2
 //   dpT: opndA,smem,1,3 / opndB,smem,1,4 / opndD,tmem,1,5
-//   dv:  opndA,tmem,1,2 / opndD,tmem,1,7
+//   dv:  opndA,tmem,1,2,64 / opndD,tmem,1,7
 //   dq:  opndA,smem,1,8 / opndD,tmem,1,5
 //   dk:  opndD,tmem,1,10
 //
@@ -25,7 +25,7 @@
 //
 // TMEM buffers (pre-assigned):
 //   qkT opndD: tmem,1,2 (owner)
-//   ppT (dv opndA): tmem,1,2 (reuses qkT, offset=0)
+//   ppT (dv opndA): tmem,1,2,64 (spatially packed in qkT, offset=64)
 //   dpT opndD: tmem,1,5 (owner)
 //   dq  opndD: tmem,1,5 (reuses dpT, offset=0)
 //   dv  opndD: tmem,1,7
@@ -43,7 +43,7 @@
 // CHECK: %dpT, %dpT_{{[0-9]+}} = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 5 : i32}
 //
 // TMEM: ppT pre-assigned by annotation (dv opndA) → buffer.id=2, reuses qkT
-// CHECK: %ppT = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 0 : i32}
+// CHECK: %ppT = ttng.tmem_alloc {buffer.copy = 1 : i32, buffer.id = 2 : i32, buffer.offset = 64 : i32}
 //
 // SMEM: do pinned by annotation (dpT opndB) → buffer.id=4, buffer.copy=1
 // CHECK: %do = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 4 : i32}
@@ -200,7 +200,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
         %dpT_111 = ttng.tc_gen5_mma %v, %dpT_110, %dpT[%dpT_88], %false, %true {async_task_id = array<i32: 1>, loop.cluster = 4 : i32, loop.stage = 0 : i32, tt.autows = "{\22stage\22: \220\22, \22order\22: \222\22, \22channels\22: [\22opndA,smem,1,3\22, \22opndB,smem,1,4\22, \22opndD,tmem,1,5\22]}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared3, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc195)
         %Di_112 = tt.addptr %Di, %offs_m_97 {async_task_id = array<i32: 3>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x!tt.ptr<f32>, #blocked2>, tensor<128xi32, #blocked2> loc(#loc204)
         %Di_113 = tt.load %Di_112 {async_task_id = array<i32: 3>, loop.cluster = 1 : i32, loop.stage = 0 : i32} : tensor<128x!tt.ptr<f32>, #blocked2> loc(#loc215)
-        %dv_114 = ttng.tc_gen5_mma %ppT, %do, %dv[%dv_89], %arg48, %true {async_task_id = array<i32: 1>, loop.cluster = 4 : i32, loop.stage = 0 : i32, tt.autows = "{\22stage\22: \220\22, \22order\22: \222\22, \22channels\22: [\22opndA,tmem,1,2\22, \22opndD,tmem,1,7\22]}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc200)
+        %dv_114 = ttng.tc_gen5_mma %ppT, %do, %dv[%dv_89], %arg48, %true {async_task_id = array<i32: 1>, loop.cluster = 4 : i32, loop.stage = 0 : i32, tt.autows = "{\22stage\22: \220\22, \22order\22: \222\22, \22channels\22: [\22opndA,tmem,1,2,64\22, \22opndD,tmem,1,7\22]}", tt.self_latency = 1 : i32} : !ttg.memdesc<128x128xf16, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc(#loc200)
         %dsT_115 = ttg.convert_layout %Di_113 {async_task_id = array<i32: 3>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128xf32, #blocked2> -> tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> loc(#loc216)
         %dsT_116 = tt.expand_dims %dsT_115 {async_task_id = array<i32: 3>, axis = 0 : i32, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<128xf32, #ttg.slice<{dim = 0, parent = #blocked}>> -> tensor<1x128xf32, #blocked> loc(#loc217)
         %dsT_117 = tt.broadcast %dsT_116 {async_task_id = array<i32: 3>, loop.cluster = 2 : i32, loop.stage = 1 : i32} : tensor<1x128xf32, #blocked> -> tensor<128x128xf32, #blocked> loc(#loc216)

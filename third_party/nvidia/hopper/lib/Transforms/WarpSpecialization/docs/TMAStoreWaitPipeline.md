@@ -100,12 +100,25 @@ into a reinterpret view of the host alloc (see
 [CodePartition: Realizing `allocation.reuseTarget`](#code-partition-realizing-allocationreuetarget)
 below).
 
-### Phase 4.5: Epilogue Group Copy Increase
+### Phase 3.7: Epilogue Group Copy Increase
 
 Each fused P2_Other group (including TMA staging groups) is treated as
 an epilogue group. `increaseFusedEpilogueCopies` iteratively bumps
 `numCopies` from the current value up to `numBuffers`, accepting each
 bump as long as `computeTotalSmem ≤ smemBudget`.
+
+This reservation runs before the general Phase 4 P0/P1 copy increase. TMA
+store/reduce staging is on the output critical path and must get first claim on
+the discretionary budget; otherwise small operand buffers can consume the last
+few KiB before a high-value staging ring (for example FA-bwd dQ) is considered.
+
+Groups whose members all reuse another allocation (`isAllocated=false`) are
+bumped only when every Phase 3.6 host has enough physical capacity for the
+enlarged ring (`stagingSize × copies ≤ hostSize × hostCopies`). Their apparent
+cost in `computeTotalSmem` is zero, so omitting this capacity check makes an
+increase look free even when reuse realization must reject the alias and
+materialize a separate allocation, which can make the final physical layout
+exceed the planner budget.
 
 #### `K | S` cap for same-partition (wait_group-drained) staging
 
@@ -125,7 +138,7 @@ are *correct* — depends on the channel's producer/consumer topology:
   `desc_o`): the slot/phase come from a continuous `accumCnt` producer/consumer
   mbarrier rotation and tolerate **any** K.
 
-Phase 4.5 therefore detects same-partition staging via
+Phase 3.7 therefore detects same-partition staging via
 `getAsyncTaskIds(ch->getSrcOp()) == getAsyncTaskIds(ch->getDstOp())` and, for
 those groups, only accepts a `tryCopies` that divides S (others are skipped).
 This is a **defensive backstop**: in all shipped configs `num_stages = 2` and
@@ -196,12 +209,19 @@ then looks at the SMEM buffer used by that store:
 2. Read the `buffer.copy` attribute (set earlier by the memory planner),
    which records how many physical copies of this buffer exist.
 3. If `buffer.copy = K`, set `can_rotate_by_buffer_count = K`
-   on the wait op.
+   and `planned_pending_count = K - 1` on the wait op.
 
 The attribute means: "K buffer copies exist, so this wait can be delayed
 until the K-th subsequent TMA store to the same buffer — at that point
 the buffer slot is about to be overwritten and the earlier store must
 have finished reading."
+
+`planned_pending_count` is stable lowering metadata for the equivalent
+`cp.async.bulk.wait_group(K-1)` protocol. Software-pipeline schedule
+serialization can move token waits through clusters without retaining enough
+linear IR context to reconstruct K reliably; final wait lowering therefore
+uses this explicit count when present and falls back to program-order counting
+for unplanned waits.
 
 ### Token Tracing
 

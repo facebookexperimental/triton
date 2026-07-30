@@ -193,6 +193,7 @@ struct NVGPUWSTMAStoreLoweringPass
 
 static constexpr const char *kCanRotateByBufferCount =
     "can_rotate_by_buffer_count";
+static constexpr const char *kPlannedPendingCount = "planned_pending_count";
 
 static bool isTMAStoreLikeOp(Operation *op) {
   return isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(op);
@@ -339,6 +340,12 @@ void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
 
       waitOp->setAttr(kCanRotateByBufferCount,
                       IntegerAttr::get(IntegerType::get(ctx, 32), k));
+      // The canonical wait_group count for a K-slot same-task staging ring is
+      // K-1. Keep it as stable lowering metadata: schedule serialization can
+      // move the token wait through pipeline clusters without leaving enough
+      // linear IR context for computePendings() to reconstruct the ring depth.
+      waitOp->setAttr(kPlannedPendingCount,
+                      IntegerAttr::get(IntegerType::get(ctx, 32), k - 1));
     });
   });
 }
@@ -366,12 +373,14 @@ void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
       auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
       if (!tmaOp) {
         waitOp->removeAttr(kCanRotateByBufferCount);
+        waitOp->removeAttr(kPlannedPendingCount);
         return;
       }
 
       auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
       if (!allocOp) {
         waitOp->removeAttr(kCanRotateByBufferCount);
+        waitOp->removeAttr(kPlannedPendingCount);
         return;
       }
     });
@@ -425,6 +434,34 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
 // logs (see the LDBG sites below); there is no failure mode, so this returns
 // void rather than a LogicalResult.
 void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
+  // Straight-line epilogues are not software-pipelined, but can still overlap
+  // a TMA store with independent work.  Delay a token wait until immediately
+  // before the next write to the same staging view.  This is deliberately
+  // limited to direct tokens and an exact memdesc match: the wait after the
+  // final use remains a drain, and no staging-buffer reuse can cross the wait.
+  SmallVector<ttng::TMAStoreTokenWaitOp> straightLineWaits;
+  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+    if (!waitOp->getParentOfType<scf::ForOp>())
+      straightLineWaits.push_back(waitOp);
+  });
+  for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
+    Operation *tmaStore = waitOp.getToken().getDefiningOp();
+    if (!tmaStore || !isTMAStoreLikeOp(tmaStore) ||
+        tmaStore->getBlock() != waitOp->getBlock())
+      continue;
+
+    Value buffer = getTMAStoreSource(tmaStore);
+    for (auto it = std::next(waitOp->getIterator()),
+              end = waitOp->getBlock()->end();
+         it != end; ++it) {
+      auto localStore = dyn_cast<ttg::LocalStoreOp>(&*it);
+      if (!localStore || !sameMemDescValue(localStore.getDst(), buffer))
+        continue;
+      waitOp->moveBefore(localStore);
+      break;
+    }
+  }
+
   funcOp.walk([&](scf::ForOp forOp) {
     bool hasNestedFor = false;
     forOp.getBody()->walk([&](scf::ForOp) { hasNestedFor = true; });
@@ -795,6 +832,10 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
 // pendings = number of TMA store-like ops issued after the token's defining
 // store and before this wait, in program execution order.
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
+  if (auto planned =
+          waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
+    return planned.getInt();
+
   ConditionContext context = getConditionContext(waitOp);
   if (std::optional<int> count =
           computePendingsFromToken(waitOp.getToken(), waitOp, context))

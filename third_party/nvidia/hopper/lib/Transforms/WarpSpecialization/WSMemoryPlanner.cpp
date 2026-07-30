@@ -897,16 +897,18 @@ getWSBufferUsageOrder(const WSBuffer &buf, SmallVector<Channel *> &channels,
 /// Parsed channel annotation from tt.autows JSON on an MMA op.
 /// Two forms:
 ///   "opndA,smem,2,0"  → full pin: memType=smem, numCopies=2, bufferId=0.
+///   "opndA,tmem,1,0,64" → full pin with an explicit TMEM column offset.
 ///   "opndA,smem"      → memtype-only: mark the operand's memory space
 ///   (consumed
 ///                       by PromoteLHSToTMem for opndA promotion) and let the
 ///                       memory planner decide copies/id/grouping. hasBufferPin
 ///                       is false and numCopies/bufferId are unset.
 struct ChannelAnnotation {
-  std::string operand;      // "opndA", "opndB", "opndD", or scaled-MMA scales
-  std::string memType;      // "smem", "tmem"
-  unsigned numCopies = 0;   // valid only if hasBufferPin
-  unsigned bufferId = 0;    // valid only if hasBufferPin
+  std::string operand;    // "opndA", "opndB", "opndD", or scaled-MMA scales
+  std::string memType;    // "smem", "tmem"
+  unsigned numCopies = 0; // valid only if hasBufferPin
+  unsigned bufferId = 0;  // valid only if hasBufferPin
+  std::optional<unsigned> bufferOffset; // optional TMEM column offset
   bool hasBufferPin = true; // false for memtype-only ("opndA,smem") annotations
 };
 
@@ -965,16 +967,17 @@ parseChannelAnnotations(Operation *parentOp) {
       auto str = elem.getAsString();
       if (!str)
         continue;
-      SmallVector<StringRef, 4> parts;
+      SmallVector<StringRef, 5> parts;
       StringRef(*str).split(parts, ',');
-      // Two accepted forms: full pin "opnd,mem,copies,id" (4 fields) or
-      // memtype-only "opnd,mem" (2 fields — planner decides copies/id).
-      if (parts.size() != 4 && parts.size() != 2)
+      // Three accepted forms: full pin "opnd,mem,copies,id" (4 fields),
+      // full TMEM pin with column offset (5 fields), or memtype-only
+      // "opnd,mem" (2 fields — planner decides copies/id).
+      if (parts.size() != 5 && parts.size() != 4 && parts.size() != 2)
         continue;
       ChannelAnnotation ann;
       ann.operand = parts[0].str();
       ann.memType = parts[1].str();
-      ann.hasBufferPin = (parts.size() == 4);
+      ann.hasBufferPin = (parts.size() >= 4);
       if (ann.hasBufferPin) {
         std::optional<unsigned> numCopies =
             parseUnsignedAnnotationField(parts[2]);
@@ -987,6 +990,14 @@ parseChannelAnnotations(Operation *parentOp) {
         }
         ann.numCopies = *numCopies;
         ann.bufferId = *bufferId;
+        if (parts.size() == 5) {
+          ann.bufferOffset = parseUnsignedAnnotationField(parts[4]);
+          if (!ann.bufferOffset) {
+            LDBG("WARNING: invalid buffer offset in channel annotation '"
+                 << *str << "'");
+            continue;
+          }
+        }
       }
 
       // Validate operand name.
@@ -1443,15 +1454,15 @@ static void fuseEpilogueWSBuffers(SmallVector<WSBuffer> &wsBuffers,
     mergeGroup(indices, "TMA staging per-(descriptor,load) fusion");
 }
 
-/// Phase 4.5: Iterative copy increase for fused P2_Other groups.
+/// Phase 3.7: Iterative copy increase for fused P2_Other groups.
 /// Epilogue buffers merged in Phase 3.5 share a single bufferId but are
 /// left at numCopies=1 by Phase 4. Increase copies uniformly for each
 /// fused group while staying within the SMEM budget.
-/// Phase 4.5: Iterative copy increase for fused groups eligible for epilogue-
+/// Phase 3.7: Iterative copy increase for fused groups eligible for epilogue-
 /// style budget bumping. Inner-loop TMA staging is tried first (highest pay-
 /// off per slot), then outer-loop TMA staging, then regular P4_Other groups.
 // Optional cap on the fused TMA-staging pipeline depth, exposing staging copies
-// as a search/autotune axis. TRITON_WS_STAGING_COPIES=K bounds Phase 4.5's bump
+// as a search/autotune axis. TRITON_WS_STAGING_COPIES=K bounds Phase 3.7's bump
 // target to min(numBuffers, K); the K|S divisibility and budget checks still
 // apply, so a harness sweeping K over {1,2,4,...} explores only legal staging
 // depths (the copy actually applied is the largest K|S-valid depth <= this cap
@@ -1471,7 +1482,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
   // Staging-depth search axis: cap the bump target (K|S/budget still enforced).
   if (unsigned cap = getStagingCopiesCap())
     numBuffers = std::min(numBuffers, cap);
-  // Eligible priority tiers, in the order Phase 4.5 should try to bump them.
+  // Eligible priority tiers, in the order Phase 3.7 should try to bump them.
   static const WSBufferPriority kPhase45Order[] = {
       WSBufferPriority::P2_InnerTMAStaging, // dq \u2014 highest payoff per slot
       WSBufferPriority::P3_OuterTMAStaging, // dk / dv
@@ -1538,6 +1549,31 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
         continue;
       }
 
+      // A fully reused group has no independently allocated footprint in
+      // computeTotalSmem, so increasing its copy count appears free. Track
+      // whether it is reused so each candidate depth can also be checked
+      // against the physical capacity of its Phase 3.6 host.
+      bool fullyReused = llvm::none_of(
+          indices, [&](unsigned idx) { return wsBuffers[idx].isAllocated; });
+      auto reusedGroupFitsHosts = [&](unsigned copies) {
+        if (!fullyReused)
+          return true;
+        for (unsigned idx : indices) {
+          const auto &buf = wsBuffers[idx];
+          unsigned hostBytes = 0;
+          for (const auto &host : wsBuffers) {
+            if (!host.isAllocated ||
+                host.bufferId != buf.reuseTargetBufferId)
+              continue;
+            hostBytes = std::max(hostBytes,
+                                 host.sizeBytes * host.numCopies);
+          }
+          if (hostBytes < buf.sizeBytes * copies)
+            return false;
+        }
+        return true;
+      };
+
       unsigned currentCopies = wsBuffers[indices[0]].numCopies;
       unsigned firstSize = wsBuffers[indices[0]].sizeBytes;
       unsigned firstTmaStaging = wsBuffers[indices[0]].tmaStaging;
@@ -1566,7 +1602,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       }
 
       // Respect the enforced cross-stage floor from Phase 2 (the real stage
-      // span via WSBuffer::minCopies, not a hardcoded 2). Phase 4.5 copy
+      // span via WSBuffer::minCopies, not a hardcoded 2). Phase 3.7 copy
       // bumps must never undercut this floor.
       unsigned minCopies = currentCopies;
       bool anyCrossStage = false;
@@ -1594,7 +1630,7 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
       }
 
       // The cross-stage floor is a hard correctness floor; if it already
-      // violates K | S for a wait_group ring there is nothing Phase 4.5 can do
+      // violates K | S for a wait_group ring there is nothing Phase 3.7 can do
       // (it must not drop below the floor) — warn so the condition is visible.
       if (sameTaskStaging && currentCopies > 1 &&
           (subtileCount % currentCopies != 0))
@@ -1605,6 +1641,13 @@ static void increaseFusedEpilogueCopies(SmallVector<WSBuffer> &wsBuffers,
 
       unsigned tryCopies = currentCopies + 1;
       while (tryCopies <= numBuffers) {
+        if (!reusedGroupFitsHosts(tryCopies)) {
+          LDBG("Phase 4.5:     bufferId="
+               << bufferId << " copies=" << tryCopies
+               << " exceeds reuse-host capacity — kept at copies="
+               << currentCopies);
+          break;
+        }
         // For same-partition (wait_group-drained) staging, only depths that
         // divide the subtile count keep the fixed-count rotation correct
         // (K | S); skip the rest. Cross-partition staging is unconstrained.
@@ -2355,7 +2398,7 @@ static unsigned allocateSmemBuffers(
   // TMA staging buffers (buf.tmaStaging > 0) behave like rotating epilogue
   // slots regardless of innermost-ness: their `numCopies` controls pipeline
   // overlap between successive store / reduce iterations rather than channel
-  // depth. They are split into inner vs outer tiers so Phase 4.5 can bump the
+  // depth. They are split into inner vs outer tiers so Phase 3.7 can bump the
   // inner-loop ones first — those pay the per-iteration cost and have the
   // higher payoff from one more rotating slot.
   for (auto &buf : wsBuffers) {
@@ -2480,6 +2523,15 @@ static unsigned allocateSmemBuffers(
                                      << smemBudget
                                      << " - preserving correctness floors");
   }
+
+  // ── Phase 3.7: Reserve fused epilogue staging depth ─────────────────
+  // TMA store/reduce staging is on the output critical path. Reserve its
+  // legal copy depth before discretionary P0/P1 operand buffering consumes
+  // the remaining budget (notably FA-bwd dQ versus the small m/Di buffers).
+  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, smemBudget);
+
+  LDBG("Phase 3.7 epilogue copies complete: totalSmem="
+       << computeTotalSmem(wsBuffers));
 
   // ── Phase 4: Iterative copy increase ────────────────────────────────
   // Process P0 then P1. P2 is never increased.
@@ -2664,11 +2716,6 @@ static unsigned allocateSmemBuffers(
   }
 
   LDBG("Phase 4 complete: totalSmem=" << computeTotalSmem(wsBuffers));
-
-  // ── Phase 4.5: Iterative copy increase for fused eligible groups ────
-  increaseFusedEpilogueCopies(wsBuffers, channels, numBuffers, smemBudget);
-
-  LDBG("Phase 4.5 complete: totalSmem=" << computeTotalSmem(wsBuffers));
 
   // ── Phase 5: Emit buffer.id and buffer.copy attributes ──────────────
   auto i32Type = IntegerType::get(funcOp.getContext(), 32);
@@ -3285,16 +3332,20 @@ public:
              << ownerBuf->colSize);
 
         // Reusers: subsequent allocs in the group.
-        size_t nextColOffset = 0;
         for (size_t i = 1; i < group.size(); ++i) {
           auto reuserAlloc = group[i];
           auto *reuserBuf = getBuffer(reuserAlloc.getOperation());
 
-          // Validate: reuser columns must fit in owner.
-          if (reuserBuf->colSize > ownerBuf->colSize) {
+          auto annotation = tmemAnnotations.find(reuserAlloc.getOperation());
+          assert(annotation != tmemAnnotations.end());
+          size_t colOffset = annotation->second.bufferOffset.value_or(0);
+
+          // Validate: reuser columns at the requested offset must fit in owner.
+          if (colOffset + reuserBuf->colSize > ownerBuf->colSize) {
             LDBG("WARNING: annotated TMEM reuse buffer.id="
                  << bid << " reuser colSize=" << reuserBuf->colSize
-                 << " > owner colSize=" << ownerBuf->colSize
+                 << " at offset=" << colOffset
+                 << " exceeds owner colSize=" << ownerBuf->colSize
                  << " — skipping reuse, treating as separate owner");
             reuserBuf->rowOffset = preAssignRowOffset;
             reuserBuf->colOffset = 0;
@@ -3323,26 +3374,23 @@ public:
             continue;
           }
 
-          // Assign reuser at nextColOffset within owner's column space.
+          // Assign the reuser at its explicit offset, or at the legacy
+          // temporal-reuse offset zero when no offset was specified.
           reuserBuf->rowOffset = ownerBuf->rowOffset;
-          reuserBuf->colOffset = nextColOffset;
+          reuserBuf->colOffset = colOffset;
           reuserBuf->isOwnerOfSpace = false;
           reuserBuf->reuseOwner = ownerBuf;
           reuserAlloc->setAttr("buffer.id", IntegerAttr::get(i32Type, bid));
           reuserAlloc->setAttr("buffer.copy", IntegerAttr::get(i32Type, 1));
           reuserAlloc->setAttr("buffer.offset",
-                               IntegerAttr::get(i32Type, nextColOffset));
+                               IntegerAttr::get(i32Type, colOffset));
           handledAllocs.insert(reuserAlloc.getOperation());
           LDBG("TMEM pre-assign: reuser \""
                << getLocName(reuserAlloc.getOperation())
                << "\" buffer.id=" << bid << " reuses owner \""
                << getLocName(ownerAlloc.getOperation())
-               << "\" colOffset=" << nextColOffset
-               << " size=" << reuserBuf->rowSize << "x" << reuserBuf->colSize);
-          // When we have 3 buffers sharing one space, we don't move the
-          // colOffset. As moving the colOffset can make it exceed the size of
-          // the owner buffer.
-          nextColOffset += 0; // reuserBuf->colSize;
+               << "\" colOffset=" << colOffset << " size=" << reuserBuf->rowSize
+               << "x" << reuserBuf->colSize);
         }
       }
 
@@ -4308,12 +4356,13 @@ public:
         // Pin the true first-fit STATE (not merely a column-signature match) to
         // rank 0, so pick 0 is byte-identical to the default topK=1 result --
         // including the physical rowOffset. tmemStateSignature deliberately
-        // excludes rowGroup, so an enumerated solution sharing firstFit's column
-        // signature may live in a different row group (a 64-row owner fits either
-        // group); rotating that solution to rank 0 would apply its rowGroup, not
-        // firstFit's. Instead drop the signature-equivalent enumerated solution
-        // (deduped to one by the column-only signature) and insert firstFit
-        // itself at rank 0, so sols[0].state == firstFit exactly.
+        // excludes rowGroup, so an enumerated solution sharing firstFit's
+        // column signature may live in a different row group (a 64-row owner
+        // fits either group); rotating that solution to rank 0 would apply its
+        // rowGroup, not firstFit's. Instead drop the signature-equivalent
+        // enumerated solution (deduped to one by the column-only signature) and
+        // insert firstFit itself at rank 0, so sols[0].state == firstFit
+        // exactly.
         uint64_t ffSig = tmemStateSignature(allocs, firstFit);
         for (unsigned i = 0; i < sols.size(); ++i) {
           if (sols[i].sig == ffSig) {

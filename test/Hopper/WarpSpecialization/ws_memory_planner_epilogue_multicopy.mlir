@@ -1,33 +1,28 @@
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=220000" | FileCheck %s --check-prefix=LARGE
 // RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=3 smem-alloc-algo=1 smem-budget=200000" | FileCheck %s --check-prefix=TIGHT
 
-// Test: Phase 4.5 multi-copy for fused epilogue buffers.
+// Test: Phase 3.7 reserves fused epilogue copies before Phase 4 operand copies.
 // Two epilogue SMEM buffers (128x128xf16 = 32768 bytes each) are fused into
-// the same buffer.id by Phase 3.5. Phase 4 gives innermost-loop buffers
-// (A: 128x64xf16 = 16384, B: 64x256xf16 = 32768) up to 3 copies.
+// the same buffer.id by Phase 3.5. The epilogue gets first claim on the budget,
+// then Phase 4 gives the innermost-loop buffers as many copies as still fit.
 //
 // With a large budget (220000):
-//   Innermost: (16384 + 32768) * 3 = 147456
-//   Epilogue fused (2 copies): 32768 * 2 = 65536
-//   Total: 212992 ≤ 220000 → epilogue gets buffer.copy=2.
+//   Epilogue fused: 32768 * 3 = 98304
+//   Innermost: A has 3 copies, B has 2 = 49152 + 65536
+//   Total: 212992 ≤ 220000.
 //
 // With a tight budget (200000):
-//   Innermost: 147456
-//   Epilogue fused (1 copy): 32768
-//   Total: 180224 ≤ 200000, but 2 copies → 212992 > 200000
-//   → epilogue stays at buffer.copy=1.
+//   Epilogue fused: 98304
+//   Innermost: A and B have 2 copies = 32768 + 65536
+//   Total: 196608 ≤ 200000.
 
 // LARGE-LABEL: @epilogue_multicopy
-// LARGE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[ID:[0-9]+]] : i32}
-// LARGE-SAME: 128x128xf16
-// LARGE: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = [[ID]] : i32}
-// LARGE-SAME: 128x128xf16
+// LARGE: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]] : i32}{{.*}}128x128xf16
+// LARGE: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID]] : i32}{{.*}}128x128xf16
 
 // TIGHT-LABEL: @epilogue_multicopy
-// TIGHT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[ID:[0-9]+]] : i32}
-// TIGHT-SAME: 128x128xf16
-// TIGHT: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = [[ID]] : i32}
-// TIGHT-SAME: 128x128xf16
+// TIGHT: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID:[0-9]+]] : i32}{{.*}}128x128xf16
+// TIGHT: ttg.local_alloc {buffer.copy = 3 : i32, buffer.id = [[ID]] : i32}{{.*}}128x128xf16
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
