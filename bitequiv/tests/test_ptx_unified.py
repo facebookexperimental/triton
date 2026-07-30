@@ -2,9 +2,9 @@
 interpreter loop-carried add-accumulation -> LoopReduce. CPU-only."""
 from pyptx.parser import parse
 
-from bitequiv.ptx.builder import collapse_balanced, tree_hash
+from bitequiv.ptx.builder import collapse_balanced, output_coordfree_key, tree_hash
 from bitequiv.ptx.forward.interp import ForwardInterp, forward_module_descriptor
-from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, LoopReduce, Mma
+from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp
 from bitequiv.ptx_reduction import _ensure_header
 
 
@@ -119,3 +119,36 @@ def test_loop_step_splits_and_is_deterministic():
     d256 = forward_module_descriptor(_LOOP_SUM.format(step=256))
     assert d256 == forward_module_descriptor(_LOOP_SUM.format(step=256))    # deterministic
     assert d256 != forward_module_descriptor(_LOOP_SUM.format(step=128))    # different BLOCK_N -> split
+
+
+# -- multi-output coord-free dedup key (num_warps recovery for softmax/layernorm/rmsnorm) ------------
+
+
+def test_coordfree_key_blanks_leaf_coord():
+    # same per-element structure, different leaf coords (a different thread owns the element) -> one key
+    a = FpOp("add", (".f32", ), (Leaf("row3col5", frozenset({5})), ITreeReduce("add.f32", "L[]", 4)))
+    b = FpOp("add", (".f32", ), (Leaf("row9col2", frozenset({2})), ITreeReduce("add.f32", "L[]", 4)))
+    assert output_coordfree_key(a) is not None
+    assert output_coordfree_key(a) == output_coordfree_key(b)   # coord blanked -> num_warps-invariant
+
+
+def test_coordfree_key_allows_pure_opaque_and_const_leaf():
+    # softmax shape: div(ex2(...), sum) with a pure OpaqueOp + a CONSTANT OpaqueLeaf (log2e) -> allowed
+    t = OpaqueOp("ex2.approx.f32", (OpaqueLeaf("mov.b32{opq(imm(0f3FB8AA3B))}"), Leaf("c0", frozenset({0}))))
+    assert output_coordfree_key(t) is not None
+
+
+def test_coordfree_key_rejects_unmodeled():
+    assert output_coordfree_key(OpaqueOp("weird.op", (Leaf("c0", frozenset({0})), ))) is None  # unmodeled op
+    assert output_coordfree_key(OpaqueLeaf("%r5")) is None                # lost-provenance (non-const) value
+
+
+def test_coordfree_key_rejects_shfl_bearing():
+    # an UNORDERED per-row reduction keeps its cross-thread ShflCombine -> its coord-free string carries
+    # the num_warps-bearing offset, so two num_warps still differ (correctly NOT recovered). Here we just
+    # confirm the key exists (it is the verbatim-ish coordfree, not None) so the SET still splits by offset.
+    from bitequiv.ptx.treeir import ShflCombine
+    t = ShflCombine(16, "add", (".f32", ), Leaf("c0", frozenset({0})))
+    k16 = output_coordfree_key(t)
+    k8 = output_coordfree_key(ShflCombine(8, "add", (".f32", ), Leaf("c1", frozenset({1}))))
+    assert k16 is not None and k16 != k8   # different butterfly offset -> different key -> stays split
