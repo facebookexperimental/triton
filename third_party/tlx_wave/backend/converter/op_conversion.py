@@ -672,12 +672,14 @@ def _declare_protocol_token(
     event_domain,
     debug_name,
     source_value_id=None,
+    resource_target_ids=(),
 ):
     target_id = builder.add_value(
         _protocol_token_type(),
         source_value_id=source_value_id,
         debug_name=debug_name,
         event_domain=event_domain,
+        resource_target_ids=resource_target_ids,
     )
     return target_id
 
@@ -695,6 +697,7 @@ def _join_protocol_tokens(
         builder,
         event_domain=(target_ir.EVENT_DOMAIN_EMPTY if not target_ids else event_domain),
         debug_name=debug_name,
+        resource_target_ids=_resource_target_ids(builder, target_ids),
     )
     if target_ids:
         builder.add_op(
@@ -739,6 +742,22 @@ def _operand_target_ids(builder, op):
             )
         operand_target_ids.append(targets[0])
     return tuple(operand_target_ids)
+
+
+def _resource_target_ids(builder, target_value_ids):
+    return tuple(
+        dict.fromkeys(
+            resource_target_id
+            for target_value_id in target_value_ids
+            for resource_target_id in builder.values[int(target_value_id)].resource_target_ids
+        )
+    )
+
+
+def _set_result_resource_targets(builder, result_target_ids, operand_target_ids):
+    resources = _resource_target_ids(builder, operand_target_ids)
+    for result_target_id in result_target_ids:
+        builder.set_value_resource_targets(result_target_id, resources)
 
 
 def _converter_for_op(op_name):
@@ -2011,15 +2030,57 @@ def _convert_if(
                 op,
                 debug_name=f"if_else_lds_frontier_{op.index}_{index}",
             ) for index, (_keys, _then_target_ids, else_target_ids) in enumerate(protocol_carry_specs))
+    then_data_target_ids = tuple(
+        _single_source_target(builder, source_value_id, op)
+        for source_value_id in then_yields
+    )
+    else_data_target_ids = tuple(
+        _single_source_target(builder, source_value_id, op)
+        for source_value_id in else_yields
+    )
+    for result_target_id, then_target_id, else_target_id in zip(
+        data_result_target_ids,
+        then_data_target_ids,
+        else_data_target_ids,
+    ):
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(
+                builder,
+                (then_target_id, else_target_id),
+            ),
+        )
+    for result_target_id, then_target_id, else_target_id in zip(
+        token_result_target_ids,
+        then_token_yields,
+        else_token_yields,
+    ):
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(
+                builder,
+                (then_target_id, else_target_id),
+            ),
+        )
+    for result_target_id, then_target_id, else_target_id in zip(
+        protocol_result_target_ids,
+        then_protocol_yields,
+        else_protocol_yields,
+    ):
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(
+                builder,
+                (then_target_id, else_target_id),
+            ),
+        )
     builder.set_region_yields(
         then_region_id,
-        (*tuple(_single_source_target(builder, source_value_id, op)
-                for source_value_id in then_yields), *then_token_yields, *then_protocol_yields),
+        (*then_data_target_ids, *then_token_yields, *then_protocol_yields),
     )
     builder.set_region_yields(
         else_region_id,
-        (*tuple(_single_source_target(builder, source_value_id, op)
-                for source_value_id in else_yields), *else_token_yields, *else_protocol_yields),
+        (*else_data_target_ids, *else_token_yields, *else_protocol_yields),
     )
     data_result_packet_registers = tuple(
         _mma_packet_registers(type_layout_program, type_layout_program.values[source_value_id], op)
@@ -2260,6 +2321,7 @@ def _convert_for(
         op,
         type_layout_program,
     )
+    data_result_target_ids = result_target_ids
     token_result_target_ids = tuple(
         builder.add_value(
             target_ir.target_type_from_converted(type_layout_program.values[_loop_token_carry_type_source_value_id(
@@ -2279,7 +2341,7 @@ def _convert_for(
             init_target_ids,
         ) in enumerate(protocol_carry_specs))
     result_target_ids = (
-        *result_target_ids,
+        *data_result_target_ids,
         *token_result_target_ids,
         *protocol_result_target_ids,
     )
@@ -2290,6 +2352,7 @@ def _convert_for(
             debug_name=f"r{op.region_ids[0]}_arg{index}",
             layout_map_id=type_layout_program.values[source_value_id].layout_map_id,
         ) for index, source_value_id in enumerate(source_region.block_arg_ids))
+    data_block_arg_target_ids = block_arg_target_ids
     token_block_arg_target_ids = tuple(
         builder.add_value(
             target_ir.target_type_from_converted(type_layout_program.values[_loop_token_carry_type_source_value_id(
@@ -2309,10 +2372,34 @@ def _convert_for(
             init_target_ids,
         ) in enumerate(protocol_carry_specs))
     block_arg_target_ids = (
-        *block_arg_target_ids,
+        *data_block_arg_target_ids,
         *token_block_arg_target_ids,
         *protocol_block_arg_target_ids,
     )
+    for block_arg_target_id, init_target_id in zip(
+        data_block_arg_target_ids[1:],
+        source_loop_operands[3:],
+    ):
+        builder.set_value_resource_targets(
+            block_arg_target_id,
+            builder.values[int(init_target_id)].resource_target_ids,
+        )
+    for block_arg_target_id, init_target_id in zip(
+        token_block_arg_target_ids,
+        token_init_target_ids,
+    ):
+        builder.set_value_resource_targets(
+            block_arg_target_id,
+            builder.values[int(init_target_id)].resource_target_ids,
+        )
+    for block_arg_target_id, init_target_id in zip(
+        protocol_block_arg_target_ids,
+        protocol_init_target_ids,
+    ):
+        builder.set_value_resource_targets(
+            block_arg_target_id,
+            builder.values[int(init_target_id)].resource_target_ids,
+        )
     target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
     induction_fact_ids = tuple(fact_id for fact_id in fact_program.by_value.get(source_region.block_arg_ids[0], ())
                                if fact_program.facts[fact_id].source_op_index == op.index
@@ -2418,6 +2505,42 @@ def _convert_for(
                 yield_key,
                 _init_target_ids,
             ) in enumerate(protocol_carry_specs))
+    for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
+        data_result_target_ids,
+        data_block_arg_target_ids[1:],
+        source_loop_operands[3:],
+        yielded_target_ids,
+    ):
+        resources = _resource_target_ids(
+            builder,
+            (init_target_id, yield_target_id),
+        )
+        builder.set_value_resource_targets(block_arg_target_id, resources)
+        builder.set_value_resource_targets(result_target_id, resources)
+    for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
+        token_result_target_ids,
+        token_block_arg_target_ids,
+        token_init_target_ids,
+        yielded_token_target_ids,
+    ):
+        resources = _resource_target_ids(
+            builder,
+            (init_target_id, yield_target_id),
+        )
+        builder.set_value_resource_targets(block_arg_target_id, resources)
+        builder.set_value_resource_targets(result_target_id, resources)
+    for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
+        protocol_result_target_ids,
+        protocol_block_arg_target_ids,
+        protocol_init_target_ids,
+        yielded_protocol_target_ids,
+    ):
+        resources = _resource_target_ids(
+            builder,
+            (init_target_id, yield_target_id),
+        )
+        builder.set_value_resource_targets(block_arg_target_id, resources)
+        builder.set_value_resource_targets(result_target_id, resources)
     builder.set_region_yields(
         target_region_id,
         (
@@ -2701,6 +2824,11 @@ def _convert_local_alloc(
         op,
         type_layout_program,
     )
+    for result_target_id in result_target_ids:
+        builder.set_value_resource_targets(
+            result_target_id,
+            (result_target_id,),
+        )
     memdesc = _memdesc_info(conversion_input, op.results[0], op)
     shape = tuple(memdesc.shape or memdesc.alloc_shape)
     builder.add_op(
@@ -2763,9 +2891,15 @@ def _convert_memdesc_index(
         )
     element_count = slot_size_bytes // int(element_byte_width)
     static_byte_offset = conversion_input.static_memdesc_byte_offsets.get(op.results[0])
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        operand_target_ids[:1],
+    )
     builder.add_op(
         "memdesc_index",
-        operands=_operand_target_ids(builder, op),
+        operands=operand_target_ids,
         results=result_target_ids,
         attrs={
             "element_byte_width": memdesc.element_byte_width,
@@ -2800,9 +2934,11 @@ def _convert_memdesc_trans(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
     builder.add_op(
         "memdesc_view",
-        operands=_operand_target_ids(builder, op),
+        operands=operand_target_ids,
         results=result_target_ids,
         attrs={"view": "transpose"},
         layout_map_ids=result_layout_map_ids,
@@ -2832,9 +2968,11 @@ def _convert_memdesc_reshape(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
     builder.add_op(
         "memdesc_view",
-        operands=_operand_target_ids(builder, op),
+        operands=operand_target_ids,
         results=result_target_ids,
         attrs={"view": "reshape"},
         layout_map_ids=result_layout_map_ids,
@@ -2864,9 +3002,11 @@ def _convert_memdesc_reinterpret(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
     builder.add_op(
         "memdesc_view",
-        operands=_operand_target_ids(builder, op),
+        operands=operand_target_ids,
         results=result_target_ids,
         attrs={"view": "reinterpret"},
         layout_map_ids=result_layout_map_ids,
@@ -2893,9 +3033,11 @@ def _convert_memdesc_subslice(
         op,
         type_layout_program,
     )
+    operand_target_ids = _operand_target_ids(builder, op)
+    _set_result_resource_targets(builder, result_target_ids, operand_target_ids)
     builder.add_op(
         "memdesc_view",
-        operands=_operand_target_ids(builder, op),
+        operands=operand_target_ids,
         results=result_target_ids,
         attrs={
             "view": "subslice",
@@ -3032,6 +3174,11 @@ def _convert_buffer_load_to_local(
         builder,
         fields["memdesc_value_id"],
         op,
+    )
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        (destination_target_id,),
     )
     base_target_id = _single_source_target(
         builder,
@@ -3861,6 +4008,7 @@ def _declare_lds_completion(
     builder,
     op,
     dominating_wait_value_ids,
+    resource_target_ids,
 ):
     if not dominating_wait_value_ids:
         return ()
@@ -3868,6 +4016,10 @@ def _declare_lds_completion(
         builder,
         event_domain=target_ir.EVENT_DOMAIN_LDS_COMPLETION,
         debug_name=f"lds_completion_{op.index}",
+        resource_target_ids=_resource_target_ids(
+            builder,
+            resource_target_ids,
+        ),
     )
     builder.append_protocol_frontier(
         dominating_wait_value_ids,
@@ -3933,6 +4085,7 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
             builder,
             op,
             dominating_wait_value_ids,
+            target_operands[:1],
         )
         attrs = _local_tensor_access_attrs(
             conversion_input,
@@ -3971,6 +4124,7 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
         builder,
         op,
         dominating_wait_value_ids,
+        target_operands[:1],
     )
     load_plan = _fragment_local_load_plan(
         conversion_input,
@@ -4042,6 +4196,7 @@ def _convert_local_store(builder, conversion_input, type_layout_program, op):
         builder,
         op,
         dominating_wait_value_ids,
+        (memdesc_target_id,),
     )
     attrs = _local_tensor_access_attrs(
         conversion_input,
@@ -4703,6 +4858,11 @@ def _convert_async_commit_group(builder, type_layout_program, token_groups_by_co
             target_ir.EVENT_DOMAIN_DMA_GROUP,
         )
     operands = tuple(_single_source_target(builder, token_value_id, op) for token_value_id in group.member_token_ids)
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        operands,
+    )
     issue_group_size = _int_attr_or_default(op.attrs, "tlx.async_issue_group_size", 0)
     issue_delay_cycles = _int_attr_or_default(op.attrs, "tlx.async_issue_delay_cycles", 0)
     issue_delay_overlap_cycles = _int_attr_or_default(op.attrs, "tlx.async_issue_delay_overlap_cycles", 0)
@@ -4803,6 +4963,10 @@ def _convert_async_wait(
             builder,
             event_domain=target_ir.EVENT_DOMAIN_DMA_ISSUE,
             debug_name=f"retained_issue_{op.index}",
+            resource_target_ids=_resource_target_ids(
+                builder,
+                retained_group_operand_ids,
+            ),
         )
         builder.add_op(
             "issue_token",
@@ -4829,6 +4993,10 @@ def _convert_async_wait(
                     if publication_mode == "workgroup" else target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY)
     for result_target_id in result_target_ids:
         builder.set_value_event_domain(result_target_id, ready_domain)
+        builder.set_value_resource_targets(
+            result_target_id,
+            _resource_target_ids(builder, group_operand_ids),
+        )
     operands = (
         *group_operand_ids,
         *retained_issue_operand_ids,
@@ -5378,6 +5546,11 @@ def _convert_select(
         )
         return
 
+    _set_result_resource_targets(
+        builder,
+        result_target_ids,
+        (true_target_id, false_target_id),
+    )
     builder.add_op(
         "select",
         operands=(condition_target_id, true_target_id, false_target_id),
@@ -5560,6 +5733,10 @@ def _convert_barrier(builder, conversion_input, op):
             builder,
             event_domain=target_ir.EVENT_DOMAIN_LDS_RELEASED,
             debug_name=f"barrier_lds_release_{op.index}",
+            resource_target_ids=_resource_target_ids(
+                builder,
+                dependency_target_ids,
+            ),
         ), )
     attrs = {
         "address_space": int(op.attrs.get("addrSpace", 0)),

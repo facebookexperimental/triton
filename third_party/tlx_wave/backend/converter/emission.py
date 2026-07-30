@@ -43,30 +43,6 @@ class _SharedPointerDwordBase:
 
 
 @dataclass(frozen=True)
-class _SharedMemdescLoopCarry:
-    allocation_base: object
-    allocation_bytes: int | None = None
-
-
-@dataclass(frozen=True)
-class _SharedMemdescOffsetRecurrence:
-    current_target_id: int
-    ring_base_dwords: int
-    slot_stride_dwords: int
-    slot_count: int
-    advance_slots: int
-
-
-@dataclass(frozen=True)
-class _CircularLocalMemoryRegion:
-    base_root: int
-    index_base_target_id: int
-    phase: int
-    slot_count: int
-    slot_stride_bytes: int
-
-
-@dataclass(frozen=True)
 class _I32MaskPayload:
     components: tuple[object, ...]
     predicates: tuple[object, ...] | None = None
@@ -180,9 +156,6 @@ class _EmissionState:
     values: dict[int, object]
     uniform_pointer_bases: dict[int, tuple[object, ...]] = field(default_factory=dict)
     shared_pointer_dword_bases: dict[int, _SharedPointerDwordBase] = field(default_factory=dict)
-    shared_memdesc_offset_recurrences: dict[
-        int, _SharedMemdescOffsetRecurrence
-    ] = field(default_factory=dict)
     shared_pointer_offset_cache: dict[tuple[object, ...], object] = field(default_factory=dict)
     wave_offset_i32_cache: dict[tuple[object, ...], object] = field(default_factory=dict)
     lane_mask_loop_phase: object | None = None
@@ -197,15 +170,12 @@ class _EmissionState:
     token_local_memory_root_sets: dict[int, frozenset[int]] = field(default_factory=dict)
     static_local_memory_roots: dict[tuple[int, int, int], int] = field(default_factory=dict)
     static_local_memory_root_intervals: dict[int, tuple[int, int, int]] = field(default_factory=dict)
-    circular_local_memory_roots: dict[tuple[int, int, int, int, int], int] = field(default_factory=dict)
-    circular_local_memory_root_regions: dict[int, _CircularLocalMemoryRegion] = field(default_factory=dict)
     local_memory_allocations: dict[int, object] = field(default_factory=dict)
     released_local_memory_allocations: set[int] = field(default_factory=set)
     local_memory_release_unsafe_roots: set[int] = field(default_factory=set)
     local_memory_descendants: dict[int, frozenset[int]] = field(default_factory=dict)
     local_memory_access_tokens: dict[int, tuple[object, ...]] = field(default_factory=dict)
     local_memory_read_tokens: dict[int, tuple[object, ...]] = field(default_factory=dict)
-    target_value_def_ops: dict[int, object] = field(default_factory=dict)
     next_local_memory_root: int = -1
 
 
@@ -683,20 +653,8 @@ def _emit_mma_packet_float_binary_component(state, operation, fastmath, lhs_comp
             target_op_id=op.target_op_id,
         )
     scalar_type = state.dsl.simd_type(lhs_element_type, int(lhs_lane_width))
-    lhs_elements = _packed_vector_payload_elements(
-        lhs_component,
-        scalar_type,
-        int(lhs_width),
-    )
-    rhs_elements = _packed_vector_payload_elements(
-        rhs_component,
-        scalar_type,
-        int(rhs_width),
-    )
-    packed_splat_operand = (_packed_vector_payload_is_splat(lhs_elements)
-                            or _packed_vector_payload_is_splat(rhs_elements))
     if (operation in {"addf", "mulf"} and str(lhs_element_type) == "f32" and int(lhs_width) >= 2
-            and int(lhs_width) % 2 == 0 and not packed_splat_operand):
+            and int(lhs_width) % 2 == 0):
         return _emit_wave_float_binary_component(
             state,
             operation,
@@ -707,16 +665,16 @@ def _emit_mma_packet_float_binary_component(state, operation, fastmath, lhs_comp
         )
     result_scalars = []
     for element in range(int(lhs_width)):
-        lhs_scalar = (lhs_elements[element] if lhs_elements is not None else state.dsl.wave.ExtractOp(
+        lhs_scalar = state.dsl.wave.ExtractOp(
             scalar_type,
             lhs_component,
             element,
-        ).result)
-        rhs_scalar = (rhs_elements[element] if rhs_elements is not None else state.dsl.wave.ExtractOp(
+        ).result
+        rhs_scalar = state.dsl.wave.ExtractOp(
             scalar_type,
             rhs_component,
             element,
-        ).result)
+        ).result
         result_scalars.append(
             _emit_wave_float_binary_component(
                 state,
@@ -1112,18 +1070,12 @@ def _emit_type_convert(state, op):
                     "packet edge source has the wrong physical vector width",
                     target_op_id=op.target_op_id,
                 )
-            known_elements = _packed_vector_payload_elements(
-                packet,
-                result_type,
-                packet_width,
-            )
-            if known_elements is None:
-                known_elements = tuple(
-                    state.dsl.wave.ExtractOp(
-                        result_type,
-                        packet,
-                        element,
-                    ).result for element in range(packet_width))
+            known_elements = tuple(
+                state.dsl.wave.ExtractOp(
+                    result_type,
+                    packet,
+                    element,
+                ).result for element in range(packet_width))
             components.extend(known_elements)
         state.values[result_id] = _pack_components(tuple(components))
         return
@@ -2683,7 +2635,6 @@ def _local_memory_dependency_roots(state, roots):
         root = int(root)
         dependency_roots.add(root)
         root_interval = state.static_local_memory_root_intervals.get(root)
-        circular_region = state.circular_local_memory_root_regions.get(root)
         if root_interval is not None:
             base_root, offset, size = root_interval
             dependency_roots.add(int(base_root))
@@ -2693,39 +2644,12 @@ def _local_memory_dependency_roots(state, roots):
                     continue
                 if _byte_intervals_overlap(int(offset), int(size), int(other_offset), int(other_size)):
                     dependency_roots.add(int(static_root))
-            dependency_roots.update(
-                int(dynamic_root)
-                for dynamic_root, region in state.circular_local_memory_root_regions.items()
-                if int(region.base_root) == int(base_root))
-            continue
-        if circular_region is not None:
-            base_root = int(circular_region.base_root)
-            dependency_roots.add(base_root)
-            dependency_roots.update(
-                int(static_root)
-                for static_root, (other_base, _offset, _size) in state.static_local_memory_root_intervals.items()
-                if int(other_base) == base_root)
-            for dynamic_root, other_region in state.circular_local_memory_root_regions.items():
-                if int(other_region.base_root) != base_root:
-                    continue
-                if not _circular_local_memory_regions_disjoint(circular_region, other_region):
-                    dependency_roots.add(int(dynamic_root))
             continue
         dependency_roots.update(
             int(static_root)
             for static_root, (base_root, _offset, _size) in state.static_local_memory_root_intervals.items()
             if int(base_root) == root)
-        dependency_roots.update(
-            int(dynamic_root)
-            for dynamic_root, region in state.circular_local_memory_root_regions.items()
-            if int(region.base_root) == root)
     return frozenset(dependency_roots)
-
-
-def _circular_local_memory_regions_disjoint(lhs, rhs):
-    return (int(lhs.base_root) == int(rhs.base_root) and int(lhs.index_base_target_id) == int(rhs.index_base_target_id)
-            and int(lhs.slot_count) == int(rhs.slot_count) and int(lhs.slot_stride_bytes) == int(rhs.slot_stride_bytes)
-            and int(lhs.phase) != int(rhs.phase))
 
 
 def _is_aggregate_local_memory_root(state, root):
@@ -2768,175 +2692,6 @@ def _static_local_memory_roots(state, source_roots, static_byte_offset, byte_siz
     return frozenset(roots)
 
 
-def _circular_local_memory_roots(
-    state,
-    source_roots,
-    index_base_target_id,
-    phase,
-    slot_count,
-    slot_stride_bytes,
-):
-    roots = []
-    for source_root in source_roots:
-        source_root = int(source_root)
-        if (source_root in state.static_local_memory_root_intervals
-                or source_root in state.circular_local_memory_root_regions):
-            return frozenset(int(root) for root in source_roots)
-        key = (
-            source_root,
-            int(index_base_target_id),
-            int(phase),
-            int(slot_count),
-            int(slot_stride_bytes),
-        )
-        root = state.circular_local_memory_roots.get(key)
-        if root is None:
-            root = int(state.next_local_memory_root)
-            state.next_local_memory_root -= 1
-            state.circular_local_memory_roots[key] = root
-            state.circular_local_memory_root_regions[root] = _CircularLocalMemoryRegion(*key)
-        roots.append(root)
-    return frozenset(roots)
-
-
-def _target_value_def_op(state, target_value_id):
-    if not state.target_value_def_ops:
-        for op in state.target_program.ops:
-            for result_id in op.results:
-                state.target_value_def_ops[int(result_id)] = op
-    return state.target_value_def_ops.get(int(target_value_id))
-
-
-def _target_constant_int(state, target_value_id):
-    op = _target_value_def_op(state, target_value_id)
-    if op is None or op.kind != "constant":
-        return None
-    value = target_ir.attrs_dict(op).get("value")
-    return int(value) if type(value) is int else None
-
-
-def _target_integer_range(state, target_value_id, seen=None):
-    """Infer a closed integer interval from target SSA arithmetic.
-
-    Keep this deliberately structural: target integer operations already carry
-    the source overflow contract, so emission can retain useful bounds without
-    reaching back into source-level layout or kernel semantics.  The result is
-    currently used to preserve dynamic shared-memory subview bounds.
-    """
-    target_value_id = int(target_value_id)
-    seen = set() if seen is None else set(seen)
-    if target_value_id in seen:
-        return None
-    seen.add(target_value_id)
-    op = _target_value_def_op(state, target_value_id)
-    if op is None:
-        return None
-    if op.kind == "constant":
-        value = target_ir.attrs_dict(op).get("value")
-        if type(value) is int:
-            return int(value), int(value)
-        return None
-    if op.kind != "binary" or len(op.operands) != 2:
-        return None
-    attrs = target_ir.attrs_dict(op)
-    operation = attrs.get("operation")
-    lhs = _target_integer_range(state, op.operands[0], seen)
-    rhs = _target_integer_range(state, op.operands[1], seen)
-    if operation == "remui" and rhs is not None and rhs[0] == rhs[1] and rhs[0] > 0:
-        return 0, int(rhs[0]) - 1
-    if operation == "divui" and lhs is not None and rhs is not None and rhs[0] > 0:
-        return int(lhs[0]) // int(rhs[1]), int(lhs[1]) // int(rhs[0])
-    if lhs is None or rhs is None:
-        return None
-    if operation == "addi":
-        result = int(lhs[0]) + int(rhs[0]), int(lhs[1]) + int(rhs[1])
-    elif operation == "subi":
-        result = int(lhs[0]) - int(rhs[1]), int(lhs[1]) - int(rhs[0])
-    elif operation == "muli":
-        products = tuple(
-            int(left) * int(right)
-            for left in lhs
-            for right in rhs
-        )
-        result = min(products), max(products)
-    else:
-        return None
-    if not attrs.get("nsw") and not attrs.get("nuw"):
-        return None
-    if attrs.get("nuw") and result[0] < 0:
-        return None
-    return result
-
-
-def _target_additive_base(state, target_value_id, seen=None):
-    target_value_id = int(target_value_id)
-    seen = set() if seen is None else set(seen)
-    if target_value_id in seen:
-        return target_value_id, 0
-    seen.add(target_value_id)
-    op = _target_value_def_op(state, target_value_id)
-    if op is None or op.kind != "binary" or len(op.operands) != 2:
-        return target_value_id, 0
-    attrs = target_ir.attrs_dict(op)
-    operation = attrs.get("operation")
-    # remui phase equivalence needs unsigned no-wrap. Signed no-wrap alone is
-    # insufficient when the circular depth does not divide the integer range.
-    if operation not in {"addi", "subi"} or not attrs.get("nuw"):
-        return target_value_id, 0
-    lhs, rhs = (int(operand) for operand in op.operands)
-    lhs_constant = _target_constant_int(state, lhs)
-    rhs_constant = _target_constant_int(state, rhs)
-    if operation == "addi" and rhs_constant is not None:
-        base, offset = _target_additive_base(state, lhs, seen)
-        return base, int(offset) + int(rhs_constant)
-    if operation == "addi" and lhs_constant is not None:
-        base, offset = _target_additive_base(state, rhs, seen)
-        return base, int(offset) + int(lhs_constant)
-    if operation == "subi" and rhs_constant is not None:
-        base, offset = _target_additive_base(state, lhs, seen)
-        return base, int(offset) - int(rhs_constant)
-    return target_value_id, 0
-
-
-def _circular_index_phase(state, target_value_id, slot_count, seen=None):
-    target_value_id = int(target_value_id)
-    slot_count = int(slot_count)
-    if slot_count <= 1:
-        return None
-    seen = set() if seen is None else set(seen)
-    if target_value_id in seen:
-        return None
-    seen.add(target_value_id)
-    op = _target_value_def_op(state, target_value_id)
-    if op is None or op.kind != "binary" or len(op.operands) != 2:
-        return None
-    attrs = target_ir.attrs_dict(op)
-    operation = attrs.get("operation")
-    lhs, rhs = (int(operand) for operand in op.operands)
-    # In a two-slot ring, complementing a normalized phase is exactly the
-    # other phase: 1 - (x mod 2) == (x + 1) mod 2.  This does not require an
-    # arithmetic no-wrap flag because remui proves that the subtrahend is 0 or
-    # 1.  Recognizing the identity keeps double-buffer reads and refills in
-    # distinct structural alias classes.
-    if (operation == "subi" and slot_count == 2 and _target_constant_int(state, lhs) == 1):
-        nested = _circular_index_phase(state, rhs, slot_count, seen)
-        if nested is None:
-            return None
-        base, nested_phase = nested
-        return int(base), (int(nested_phase) + 1) % slot_count
-    if operation != "remui":
-        return None
-    modulus = _target_constant_int(state, rhs)
-    if modulus != slot_count:
-        return None
-    base, offset = _target_additive_base(state, lhs)
-    nested = _circular_index_phase(state, base, slot_count, seen)
-    if nested is not None:
-        base, nested_phase = nested
-        offset += int(nested_phase)
-    return int(base), int(offset) % slot_count
-
-
 def _memdesc_index_result_roots(state, source_roots, attrs, index_target_id=None):
     static_byte_offset = attrs.get("static_byte_offset")
     element_byte_width = attrs.get("element_byte_width")
@@ -2953,22 +2708,8 @@ def _memdesc_index_result_roots(state, source_roots, attrs, index_target_id=None
             int(static_byte_offset),
             byte_size,
         )
-    slot_count = attrs.get("slot_count")
-    if (index_target_id is None or element_byte_width is None or elements_per_slot is None or slot_count is None):
-        return frozenset(int(root) for root in source_roots)
-    slot_stride_bytes = int(element_byte_width) * int(elements_per_slot)
-    circular_index = _circular_index_phase(state, index_target_id, slot_count)
-    if slot_stride_bytes <= 0 or circular_index is None:
-        return frozenset(int(root) for root in source_roots)
-    index_base_target_id, phase = circular_index
-    return _circular_local_memory_roots(
-        state,
-        source_roots,
-        index_base_target_id,
-        phase,
-        int(slot_count),
-        slot_stride_bytes,
-    )
+    del index_target_id
+    return frozenset(int(root) for root in source_roots)
 
 
 def _record_token_local_memory_roots(state, token_target_id, memdesc_target_id):
@@ -3102,7 +2843,8 @@ def _target_token_local_memory_roots(
     *,
     token_root_sets=None,
 ):
-    """Infer the LDS destinations represented by a target async token."""
+    """Map explicit token resource identities to emitted LDS roots."""
+    del seen
     target_value_id = int(target_value_id)
     if token_root_sets is not None:
         known = token_root_sets.get(target_value_id)
@@ -3111,68 +2853,20 @@ def _target_token_local_memory_roots(
     known = state.token_local_memory_root_sets.get(target_value_id)
     if known is not None:
         return known
-    seen = set() if seen is None else set(seen)
-    if target_value_id in seen:
-        return None
-    seen.add(target_value_id)
-    op = _target_value_def_op(state, target_value_id)
-    if op is None:
-        return None
-    if op.kind == "buffer_load_to_local":
-        return root_sets.get(int(op.operands[0]), _local_memory_roots(state, op.operands[0]))
-    if op.kind in {"async_commit_group", "token_join", "issue_token"}:
-        roots = set()
-        for operand in op.operands:
-            operand_roots = _target_token_local_memory_roots(
-                state,
-                operand,
-                root_sets,
-                seen,
-                token_root_sets=token_root_sets,
+    roots = set()
+    resources = state.target_program.values[target_value_id].resource_target_ids
+    for resource_target_id in resources:
+        resource_target_id = int(resource_target_id)
+        roots.update(
+            root_sets.get(
+                resource_target_id,
+                state.local_memory_root_sets.get(
+                    resource_target_id,
+                    (resource_target_id,),
+                ),
             )
-            if operand_roots is None:
-                return None
-            roots.update(operand_roots)
-        return frozenset(roots)
-    if op.kind == "async_wait":
-        completed_count = int(target_ir.attrs_dict(op)["completed_group_dependency_count"])
-        roots = set()
-        for operand in op.operands[:completed_count]:
-            operand_roots = _target_token_local_memory_roots(
-                state,
-                operand,
-                root_sets,
-                seen,
-                token_root_sets=token_root_sets,
-            )
-            if operand_roots is None:
-                return None
-            roots.update(operand_roots)
-        return frozenset(roots)
-    if op.kind == "token":
-        return frozenset()
-    return None
-
-
-def _local_memory_root_interval_at_loop_iteration(
-    state,
-    root,
-    induction_target_id,
-    induction_value,
-):
-    root = int(root)
-    static_interval = state.static_local_memory_root_intervals.get(root)
-    if static_interval is not None:
-        return tuple(int(value) for value in static_interval)
-    circular = state.circular_local_memory_root_regions.get(root)
-    if circular is None or int(circular.index_base_target_id) != int(induction_target_id):
-        return None
-    slot = (int(induction_value) + int(circular.phase)) % int(circular.slot_count)
-    return (
-        int(circular.base_root),
-        slot * int(circular.slot_stride_bytes),
-        int(circular.slot_stride_bytes),
-    )
+        )
+    return frozenset(roots)
 
 
 def _loop_carried_token_roots(
@@ -3183,62 +2877,13 @@ def _loop_carried_token_roots(
     lower_target_id,
     step_target_id,
 ):
-    """Express a yielded circular destination in the next iteration's phase."""
+    """Carry explicit resource identities across a loop token edge."""
+    del state, induction_target_id, lower_target_id, step_target_id
     init_roots = frozenset(int(root) for root in init_roots)
     yield_roots = frozenset(int(root) for root in yield_roots)
-    # Stable destinations do not need the induction-value interval proof used
-    # below for circular aliases.  In particular, a token for an aggregate LDS
-    # allocation remains a token for that allocation when carried through a
-    # loop.  Dropping this identity made an explicit async group lose its LDS
-    # destination at the block boundary and forced later loads onto a redundant
-    # bridge-owned state token.
-    if (init_roots == yield_roots
-            and all(int(root) not in state.circular_local_memory_root_regions for root in init_roots)):
+    if init_roots == yield_roots:
         return init_roots
-    lower = _target_constant_int(state, lower_target_id)
-    step = _target_constant_int(state, step_target_id)
-    if lower is None or step is None:
-        return None
-    carried_roots = []
-    for root in yield_roots:
-        root = int(root)
-        circular = state.circular_local_memory_root_regions.get(root)
-        if circular is None:
-            carried_roots.append(root)
-            continue
-        if int(circular.index_base_target_id) != int(induction_target_id):
-            return None
-        carried_roots.extend(
-            _circular_local_memory_roots(
-                state,
-                (int(circular.base_root), ),
-                induction_target_id,
-                (int(circular.phase) - int(step)) % int(circular.slot_count),
-                int(circular.slot_count),
-                int(circular.slot_stride_bytes),
-            ))
-    carried_roots = frozenset(carried_roots)
-    init_intervals = {
-        _local_memory_root_interval_at_loop_iteration(
-            state,
-            root,
-            induction_target_id,
-            lower,
-        )
-        for root in init_roots
-    }
-    carried_intervals = {
-        _local_memory_root_interval_at_loop_iteration(
-            state,
-            root,
-            induction_target_id,
-            lower,
-        )
-        for root in carried_roots
-    }
-    if None in init_intervals or init_intervals != carried_intervals:
-        return None
-    return carried_roots
+    return None
 
 
 def _loop_exit_token_roots(
@@ -3249,31 +2894,9 @@ def _loop_exit_token_roots(
     upper_target_id,
     step_target_id,
 ):
-    """Resolve circular destinations to static slots for a constant-trip loop."""
-    lower = _target_constant_int(state, lower_target_id)
-    upper = _target_constant_int(state, upper_target_id)
-    step = _target_constant_int(state, step_target_id)
-    if lower is None or upper is None or step is None or step <= 0 or lower >= upper:
-        return yield_roots
-    last_induction = lower + ((upper - lower - 1) // step) * step
-    exit_roots = []
-    for root in yield_roots:
-        root = int(root)
-        circular = state.circular_local_memory_root_regions.get(root)
-        if circular is None:
-            exit_roots.append(root)
-            continue
-        if int(circular.index_base_target_id) != int(induction_target_id):
-            return yield_roots
-        slot = (last_induction + int(circular.phase)) % int(circular.slot_count)
-        exit_roots.extend(
-            _static_local_memory_roots(
-                state,
-                (int(circular.base_root), ),
-                slot * int(circular.slot_stride_bytes),
-                int(circular.slot_stride_bytes),
-            ))
-    return frozenset(exit_roots)
+    del state, induction_target_id, lower_target_id, upper_target_id
+    del step_target_id
+    return frozenset(int(root) for root in yield_roots)
 
 
 def _loop_token_root_sets(state, op, region, region_root_sets):
@@ -3711,30 +3334,18 @@ def _select_vector_payload_components(
     ):
         _width, element_type, lane_width = payload
         scalar_type = state.dsl.simd_type(element_type, int(lane_width))
-        true_elements = _packed_vector_payload_elements(
-            true_component,
-            scalar_type,
-            width,
-        )
-        if true_elements is None:
-            true_elements = tuple(
-                state.dsl.wave.ExtractOp(
-                    scalar_type,
-                    true_component,
-                    element,
-                ).result for element in range(width))
-        false_elements = _packed_vector_payload_elements(
-            false_component,
-            scalar_type,
-            width,
-        )
-        if false_elements is None:
-            false_elements = tuple(
-                state.dsl.wave.ExtractOp(
-                    scalar_type,
-                    false_component,
-                    element,
-                ).result for element in range(width))
+        true_elements = tuple(
+            state.dsl.wave.ExtractOp(
+                scalar_type,
+                true_component,
+                element,
+            ).result for element in range(width))
+        false_elements = tuple(
+            state.dsl.wave.ExtractOp(
+                scalar_type,
+                false_component,
+                element,
+            ).result for element in range(width))
         selected = []
         for condition, true_element, false_element in zip(
                 conditions[cursor:cursor + width],
@@ -4150,12 +3761,6 @@ def _emit_for_loop(state, op):
     lower, upper, step = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands[:3])
     init_target_ids = op.operands[3:]
     init_values = tuple(_require_value(state, target_value_id, op) for target_value_id in init_target_ids)
-    init_values, shared_memdesc_carries = _prepare_shared_memdesc_loop_carries(
-        state,
-        init_target_ids,
-        init_values,
-        op,
-    )
     flat_init_values, init_shapes = _flatten_structured_values(
         state,
         init_values,
@@ -4180,20 +3785,8 @@ def _emit_for_loop(state, op):
             "result-bearing for_loop requires init args",
             target_op_id=op.target_op_id,
         )
-    shared_memdesc_offset_recurrences = (
-        _prepare_shared_memdesc_offset_recurrences(
-            state,
-            op,
-            region,
-            init_target_ids,
-            shared_memdesc_carries,
-        )
-    )
     outer_values = dict(state.values)
     outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
-    outer_shared_memdesc_offset_recurrences = dict(
-        state.shared_memdesc_offset_recurrences
-    )
     outer_shared_pointer_offset_cache = dict(state.shared_pointer_offset_cache)
     outer_wave_offset_i32_cache = dict(state.wave_offset_i32_cache)
     outer_lane_mask_loop_phase = state.lane_mask_loop_phase
@@ -4400,21 +3993,10 @@ def _emit_for_loop(state, op):
             flat_iter_values,
             init_shapes,
             init_target_ids,
-            shared_memdesc_carries,
             op=op,
-        )
-        state.shared_memdesc_offset_recurrences.update(
-            shared_memdesc_offset_recurrences
         )
         state.token_local_memory_root_sets.update(loop_token_block_root_sets)
         yielded_values = _emit_region(state, op.region_ids[0])
-        yielded_values = _prepare_shared_memdesc_loop_yields(
-            state,
-            region.yield_value_ids,
-            yielded_values,
-            shared_memdesc_carries,
-            op,
-        )
         flat_yield_values, yield_shapes = _flatten_structured_values(
             state,
             yielded_values,
@@ -4482,9 +4064,6 @@ def _emit_for_loop(state, op):
     inner_token_local_memory_root_sets = dict(state.token_local_memory_root_sets)
     state.values = outer_values
     state.shared_pointer_dword_bases = outer_shared_pointer_dword_bases
-    state.shared_memdesc_offset_recurrences = (
-        outer_shared_memdesc_offset_recurrences
-    )
     state.shared_pointer_offset_cache = outer_shared_pointer_offset_cache
     state.wave_offset_i32_cache = outer_wave_offset_i32_cache
     state.lane_mask_loop_phase = outer_lane_mask_loop_phase
@@ -4605,31 +4184,25 @@ def _emit_for_loop(state, op):
                 target_op_id=op.target_op_id,
             )
         cursor = 0
-        for yield_index, (result_id, shape, memdesc_carry) in enumerate(
-                zip(op.results, init_shapes, shared_memdesc_carries)):
+        for yield_index, (result_id, shape, init_target_id) in enumerate(
+                zip(op.results, init_shapes, init_target_ids)):
             result_components = source_flat_results[cursor:cursor + shape.component_count]
-            if memdesc_carry is None:
-                state.values[result_id] = _pack_loop_value_components(
-                    state,
-                    result_components,
-                    shape,
-                    op,
-                )
-            else:
-                if shape.component_count != 1 or len(result_components) != 1:
-                    fail(
-                        "TLXW_EMIT_FOR_MEMDESC_COMPONENTS",
-                        STAGE,
-                        "shared memdesc loop carry must have one scalar offset component",
-                        target_op_id=op.target_op_id,
-                        target_value_id=result_id,
+            value = _pack_loop_value_components(
+                state,
+                result_components,
+                shape,
+                op,
+            )
+            state.values[result_id] = value
+            _propagate_local_memory_roots(state, init_target_id, result_id)
+            plan = outer_shared_pointer_dword_bases.get(int(init_target_id))
+            if plan is not None:
+                state.shared_pointer_dword_bases[int(result_id)] = (
+                    _SharedPointerDwordBase(
+                        value,
+                        allocation_base=plan.allocation_base,
+                        allocation_bytes=plan.allocation_bytes,
                     )
-                _bind_shared_memdesc_loop_value(
-                    state,
-                    result_id,
-                    memdesc_carry,
-                    result_components[0],
-                    op,
                 )
             if yield_index < len(region.yield_value_ids):
                 roots = loop_token_result_root_sets.get(int(result_id))
@@ -4950,28 +4523,6 @@ def _preserve_loop_vector_payload_components(
     return components, shape
 
 
-def _packed_vector_payload_elements(component, scalar_type, width):
-    """Fold scalarization through a matching wave.pack producer."""
-    owner = getattr(component, "owner", None)
-    operation = getattr(owner, "operation", owner)
-    if operation is None or str(getattr(operation, "name", "")) != "wave.pack":
-        return None
-    operands = tuple(operation.operands)
-    if len(operands) != int(width):
-        return None
-    if any(str(operand.type) != str(scalar_type) for operand in operands):
-        return None
-    return operands
-
-
-def _packed_vector_payload_is_splat(elements):
-    """Return whether packed payload elements all reference the same value."""
-    if not elements:
-        return False
-    first = elements[0]
-    return all(element == first for element in elements[1:])
-
-
 def _pack_structured_value_components(state, components, shape, context, op):
     components = tuple(components)
     if len(components) != int(shape.component_count):
@@ -5039,333 +4590,6 @@ def _pack_loop_value_components(state, components, shape, op=None):
     return _pack_structured_value_components(state, components, shape, "for_loop", op)
 
 
-def _shared_memdesc_loop_offset(state, target_value_id, op):
-    target_type = state.target_program.values[int(target_value_id)].type
-    if target_type.representation != "memdesc":
-        return None
-    plan = state.shared_pointer_dword_bases.get(int(target_value_id))
-    if plan is None or plan.allocation_base is None:
-        return None
-    offset = plan.allocation_dword_offset
-    if offset is None:
-        offset = state.builder.constant(state.dsl.i32(), 0)
-    if str(offset.type) != str(state.dsl.i32()):
-        fail(
-            "TLXW_EMIT_FOR_MEMDESC_OFFSET",
-            STAGE,
-            "shared memdesc loop carry requires a scalar i32 allocation offset",
-            target_op_id=op.target_op_id,
-            target_value_id=target_value_id,
-        )
-    return _SharedMemdescLoopCarry(
-        plan.allocation_base,
-        plan.allocation_bytes,
-    ), offset
-
-
-def _memdesc_index_origin(state, target_value_id):
-    """Return the structural memdesc_index defining a yielded view."""
-    target_value_id = int(target_value_id)
-    seen = set()
-    while target_value_id not in seen:
-        seen.add(target_value_id)
-        defining_op = _target_value_def_op(state, target_value_id)
-        if defining_op is None:
-            return None
-        if defining_op.kind == "memdesc_index":
-            return defining_op
-        if defining_op.kind != "memdesc_view" or len(defining_op.operands) != 1:
-            return None
-        target_value_id = int(defining_op.operands[0])
-    return None
-
-
-def _prepare_shared_memdesc_offset_recurrences(
-    state,
-    op,
-    region,
-    init_target_ids,
-    shared_memdesc_carries,
-):
-    """Recognize circular subview recurrences from loop structure.
-
-    A yielded ``base[(iv + phase) % slots]`` is the successor of a carried
-    subview initialized to the corresponding pre-loop phase.  Expressing that
-    successor from the carried allocation offset preserves one SSA recurrence
-    for both shared-memory accesses and the loop backedge.  This is independent
-    of the source spelling of the circular index.
-    """
-    lower = _target_constant_int(state, op.operands[0])
-    step = _target_constant_int(state, op.operands[2])
-    if lower is None or step is None or int(step) <= 0:
-        return {}
-    induction_target_id = int(region.block_arg_ids[0])
-    representatives = {}
-    recurrences = {}
-    for index, (init_target_id, carry) in enumerate(zip(
-        init_target_ids,
-        shared_memdesc_carries,
-    )):
-        if carry is None or index >= len(region.yield_value_ids):
-            continue
-        init_op = _memdesc_index_origin(state, init_target_id)
-        yielded_op = _memdesc_index_origin(
-            state,
-            region.yield_value_ids[index],
-        )
-        if init_op is None or yielded_op is None:
-            continue
-        init_attrs = target_ir.attrs_dict(init_op)
-        yielded_attrs = target_ir.attrs_dict(yielded_op)
-        slot_count = yielded_attrs.get("slot_count")
-        elements_per_slot = yielded_attrs.get("elements_per_slot")
-        element_byte_width = yielded_attrs.get("element_byte_width")
-        if (
-            not isinstance(slot_count, int)
-            or int(slot_count) <= 1
-            or not isinstance(elements_per_slot, int)
-            or int(elements_per_slot) <= 0
-            or not isinstance(element_byte_width, int)
-            or int(element_byte_width) <= 0
-            or int(elements_per_slot) * int(element_byte_width) % 4
-            or init_attrs.get("slot_count") != slot_count
-            or init_attrs.get("elements_per_slot") != elements_per_slot
-            or init_attrs.get("element_byte_width") != element_byte_width
-            or len(init_op.operands) != 2
-            or len(yielded_op.operands) != 2
-        ):
-            continue
-        phase = _circular_index_phase(
-            state,
-            yielded_op.operands[1],
-            int(slot_count),
-        )
-        if phase is None or int(phase[0]) != induction_target_id:
-            continue
-        init_slot = _target_constant_int(state, init_op.operands[1])
-        if init_slot is None or not 0 <= int(init_slot) < int(slot_count):
-            continue
-        current_slot = (
-            int(lower) - int(step) + int(phase[1])
-        ) % int(slot_count)
-        if int(init_slot) != current_slot:
-            continue
-        init_plan = state.shared_pointer_dword_bases.get(int(init_target_id))
-        yielded_base_plan = state.shared_pointer_dword_bases.get(
-            int(yielded_op.operands[0])
-        )
-        if (
-            init_plan is None
-            or init_plan.allocation_dword_range is None
-            or int(init_plan.allocation_dword_range[0])
-            != int(init_plan.allocation_dword_range[1])
-            or yielded_base_plan is None
-            or yielded_base_plan.allocation_base is not carry.allocation_base
-        ):
-            continue
-        slot_stride_dwords = (
-            int(elements_per_slot) * int(element_byte_width) // 4
-        )
-        ring_base_dwords = (
-            int(init_plan.allocation_dword_range[0])
-            - int(init_slot) * slot_stride_dwords
-        )
-        if ring_base_dwords < 0:
-            continue
-        advance_slots = int(step) % int(slot_count)
-        key = (
-            id(carry.allocation_base),
-            ring_base_dwords,
-            slot_stride_dwords,
-            int(slot_count),
-            advance_slots,
-            int(yielded_op.operands[1]),
-            int(init_slot),
-        )
-        current_target_id = representatives.setdefault(
-            key,
-            int(region.block_arg_ids[index + 1]),
-        )
-        recurrences[int(yielded_op.results[0])] = (
-            _SharedMemdescOffsetRecurrence(
-                current_target_id,
-                ring_base_dwords,
-                slot_stride_dwords,
-                int(slot_count),
-                advance_slots,
-            )
-        )
-    return recurrences
-
-
-def _materialize_shared_memdesc_offset_recurrence(state, recurrence):
-    current_plan = state.shared_pointer_dword_bases.get(
-        int(recurrence.current_target_id)
-    )
-    if current_plan is None or current_plan.allocation_dword_offset is None:
-        return None
-    current = state.builder.assume_range(
-        current_plan.allocation_dword_offset,
-        int(recurrence.ring_base_dwords),
-        int(recurrence.ring_base_dwords)
-        + (int(recurrence.slot_count) - 1)
-        * int(recurrence.slot_stride_dwords),
-    )
-    advance_slots = int(recurrence.advance_slots)
-    if advance_slots == 0:
-        return current
-    if int(recurrence.slot_count) == 2 and advance_slots == 1:
-        complement = state.builder.constant(
-            state.dsl.i32(),
-            2 * int(recurrence.ring_base_dwords)
-            + int(recurrence.slot_stride_dwords),
-        )
-        value = state.builder.binary(
-            state.dsl.BinaryKind.SubI,
-            complement,
-            current,
-            nsw=_LAYOUT_MATH_NSW,
-        )
-    else:
-        value = current
-        if int(recurrence.ring_base_dwords):
-            value = _scalar_binary_const_i32(
-                state,
-                "subi",
-                value,
-                int(recurrence.ring_base_dwords),
-                nsw=_LAYOUT_MATH_NSW,
-            )
-        value = _scalar_binary_const_i32(
-            state,
-            "addi",
-            value,
-            advance_slots * int(recurrence.slot_stride_dwords),
-            nsw=_LAYOUT_MATH_NSW,
-        )
-        value = _scalar_binary_const_i32(
-            state,
-            "remui",
-            value,
-            int(recurrence.slot_count)
-            * int(recurrence.slot_stride_dwords),
-        )
-        if int(recurrence.ring_base_dwords):
-            value = _scalar_binary_const_i32(
-                state,
-                "addi",
-                value,
-                int(recurrence.ring_base_dwords),
-                nsw=_LAYOUT_MATH_NSW,
-            )
-    return state.builder.assume_range(
-        value,
-        int(recurrence.ring_base_dwords),
-        int(recurrence.ring_base_dwords)
-        + (int(recurrence.slot_count) - 1)
-        * int(recurrence.slot_stride_dwords),
-    )
-
-
-def _prepare_shared_memdesc_loop_carries(
-        state,
-        init_target_ids,
-        init_values,
-        op,
-):
-    values = []
-    carries = []
-    for target_value_id, value in zip(init_target_ids, init_values):
-        prepared = _shared_memdesc_loop_offset(state, target_value_id, op)
-        if prepared is None:
-            values.append(value)
-            carries.append(None)
-            continue
-        carry, offset = prepared
-        values.append(offset)
-        carries.append(carry)
-    return tuple(values), tuple(carries)
-
-
-def _prepare_shared_memdesc_loop_yields(
-        state,
-        yield_target_ids,
-        yield_values,
-        carries,
-        op,
-):
-    values = []
-    for target_value_id, value, carry in zip(
-            yield_target_ids,
-            yield_values,
-            carries,
-    ):
-        if carry is None:
-            values.append(value)
-            continue
-        prepared = _shared_memdesc_loop_offset(state, target_value_id, op)
-        if prepared is None:
-            fail(
-                "TLXW_EMIT_FOR_MEMDESC_OFFSET",
-                STAGE,
-                "shared memdesc loop yield lost its allocation-relative offset",
-                target_op_id=op.target_op_id,
-                target_value_id=target_value_id,
-            )
-        yielded_carry, offset = prepared
-        if yielded_carry.allocation_base is not carry.allocation_base:
-            fail(
-                "TLXW_EMIT_FOR_MEMDESC_BASE",
-                STAGE,
-                "shared memdesc loop yield must preserve its allocation base",
-                target_op_id=op.target_op_id,
-                target_value_id=target_value_id,
-            )
-        values.append(offset)
-    return tuple(values)
-
-
-def _bind_shared_memdesc_loop_value(
-        state,
-        target_value_id,
-        carry,
-        offset,
-        op,
-):
-    if str(offset.type) != str(state.dsl.i32()):
-        fail(
-            "TLXW_EMIT_FOR_MEMDESC_OFFSET",
-            STAGE,
-            "shared memdesc loop component must be a scalar i32 offset",
-            target_op_id=op.target_op_id,
-            target_value_id=target_value_id,
-        )
-    dword_pointer = _shared_pointer_with_dword_offset(
-        state,
-        carry.allocation_base,
-        offset,
-        cache_key=("loop_memdesc", int(target_value_id), id(offset)),
-    )
-    target_type = state.target_program.values[int(target_value_id)].type
-    pointer_type = state.dsl.ptr_type(
-        _scalar_type(state.dsl, target_type.element_type),
-        state.dsl.shared_address_space(),
-    )
-    state.values[int(target_value_id)] = _ptr_cast(
-        state,
-        dword_pointer,
-        pointer_type,
-    )
-    state.shared_pointer_dword_bases[int(target_value_id)] = (
-        _SharedPointerDwordBase(
-            carry.allocation_base,
-            offset,
-            carry.allocation_base,
-            offset,
-            carry.allocation_bytes,
-        ))
-
-
 def _bind_loop_region_args(
         state,
         block_arg_ids,
@@ -5373,41 +4597,33 @@ def _bind_loop_region_args(
         flat_iter_values,
         init_shapes,
         init_target_ids,
-        shared_memdesc_carries,
         *,
         op,
 ):
     state.values[block_arg_ids[0]] = induction_value
     cursor = 0
-    for block_arg_id, shape, init_target_id, memdesc_carry in zip(
+    for block_arg_id, shape, init_target_id in zip(
             block_arg_ids[1:],
             init_shapes,
             init_target_ids,
-            shared_memdesc_carries,
     ):
         components = flat_iter_values[cursor:cursor + shape.component_count]
-        if memdesc_carry is None:
-            state.values[block_arg_id] = _pack_loop_value_components(
-                state,
-                components,
-                shape,
-                op,
-            )
-        else:
-            if shape.component_count != 1 or len(components) != 1:
-                fail(
-                    "TLXW_EMIT_FOR_MEMDESC_COMPONENTS",
-                    STAGE,
-                    "shared memdesc loop carry must have one scalar offset component",
-                    target_op_id=op.target_op_id,
-                    target_value_id=block_arg_id,
+        value = _pack_loop_value_components(
+            state,
+            components,
+            shape,
+            op,
+        )
+        state.values[block_arg_id] = value
+        _propagate_local_memory_roots(state, init_target_id, block_arg_id)
+        plan = state.shared_pointer_dword_bases.get(int(init_target_id))
+        if plan is not None:
+            state.shared_pointer_dword_bases[int(block_arg_id)] = (
+                _SharedPointerDwordBase(
+                    value,
+                    allocation_base=plan.allocation_base,
+                    allocation_bytes=plan.allocation_bytes,
                 )
-            _bind_shared_memdesc_loop_value(
-                state,
-                block_arg_id,
-                memdesc_carry,
-                components[0],
-                op,
             )
         _propagate_token_local_memory_roots(
             state,
@@ -5567,113 +4783,19 @@ def _record_dynamic_memdesc_dword_base(
     if slot_bytes % 4:
         return
     slot_dwords = slot_bytes // 4
-    recurrence = state.shared_memdesc_offset_recurrences.get(int(result_id))
-    if (
-        recurrence is not None
-        and int(recurrence.slot_stride_dwords) == slot_dwords
-        and base_plan.allocation_base is not None
-    ):
-        allocation_dword_offset = (
-            _materialize_shared_memdesc_offset_recurrence(
-                state,
-                recurrence,
-            )
-        )
-        if allocation_dword_offset is not None:
-            dword_pointer = _shared_pointer_with_dword_offset(
-                state,
-                base_plan.allocation_base,
-                allocation_dword_offset,
-                cache_key=(
-                    "memdesc_loop_recurrence",
-                    int(result_id),
-                    id(allocation_dword_offset),
-                ),
-            )
-            target_type = state.target_program.values[int(result_id)].type
-            pointer_type = state.dsl.ptr_type(
-                _scalar_type(state.dsl, target_type.element_type),
-                state.dsl.shared_address_space(),
-            )
-            state.values[int(result_id)] = _ptr_cast(
-                state,
-                dword_pointer,
-                pointer_type,
-            )
-            state.shared_pointer_dword_bases[int(result_id)] = (
-                _SharedPointerDwordBase(
-                    base_plan.allocation_base,
-                    allocation_dword_offset,
-                    base_plan.allocation_base,
-                    allocation_dword_offset,
-                    base_plan.allocation_bytes,
-                    (
-                        int(recurrence.ring_base_dwords),
-                        int(recurrence.ring_base_dwords)
-                        + (int(recurrence.slot_count) - 1)
-                        * int(recurrence.slot_stride_dwords),
-                    ),
-                )
-            )
-            return
-    static_index = _target_constant_int(state, op.operands[1])
-    if static_index is None:
-        index_base_target_id, static_slot_offset = _target_additive_base(
-            state,
-            op.operands[1],
-        )
-        dynamic_index = state.values.get(int(index_base_target_id), index)
-    else:
-        static_slot_offset = int(static_index)
-        dynamic_index = None
-    if dynamic_index is None:
-        dword_offset = None
-        dynamic_dword_range = (0, 0)
-    elif slot_dwords == 1:
-        dword_offset = dynamic_index
-        dynamic_dword_range = _target_integer_range(
-            state,
-            index_base_target_id,
-        )
+    del op
+    if slot_dwords == 1:
+        dword_offset = index
     else:
         dword_offset = _scalar_binary_const_i32(
             state,
             "muli",
-            dynamic_index,
+            index,
             slot_dwords,
             nsw=_LAYOUT_MATH_NSW,
         )
-        index_range = _target_integer_range(state, index_base_target_id)
-        dynamic_dword_range = (
-            int(index_range[0]) * slot_dwords,
-            int(index_range[1]) * slot_dwords,
-        ) if index_range is not None else None
-    base = _shared_pointer_with_dword_offset(
-        state,
-        base_plan.base,
-        int(static_slot_offset) * slot_dwords,
-        cache_key=(
-            "memdesc_dynamic_static",
-            int(static_slot_offset),
-            int(slot_dwords),
-        ),
-    )
-    allocation_dword_range = None
-    if (
-        base_plan.allocation_dword_range is not None
-        and dynamic_dword_range is not None
-    ):
-        static_dword_offset = int(static_slot_offset) * slot_dwords
-        allocation_dword_range = (
-            int(base_plan.allocation_dword_range[0])
-            + int(dynamic_dword_range[0])
-            + static_dword_offset,
-            int(base_plan.allocation_dword_range[1])
-            + int(dynamic_dword_range[1])
-            + static_dword_offset,
-        )
     state.shared_pointer_dword_bases[result_id] = _SharedPointerDwordBase(
-        base,
+        base_plan.base,
         _combine_optional_i32_offsets(
             state,
             base_plan.dword_offset,
@@ -5684,15 +4806,10 @@ def _record_dynamic_memdesc_dword_base(
         _combine_optional_i32_offsets(
             state,
             base_plan.allocation_dword_offset,
-            _add_constant_to_optional_i32_offset(
-                state,
-                dword_offset,
-                int(static_slot_offset) * slot_dwords,
-            ),
+            dword_offset,
             nsw=_LAYOUT_MATH_NSW,
         ),
         base_plan.allocation_bytes,
-        allocation_dword_range,
     )
 
 
