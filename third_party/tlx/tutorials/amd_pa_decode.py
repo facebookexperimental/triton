@@ -324,7 +324,6 @@ def pa_decode_tlx(
     target_block_n = 8192 // head_dim
     pages_per_tile = max(1, (target_block_n + page_size - 1) // page_size)
     block_n = pages_per_tile * page_size
-    # print(f"pages_per_tile = {pages_per_tile}")
 
     if num_splits is None:
         num_splits = get_num_splits(num_seqs, num_kv_heads, max_context_len, page_size, pages_per_tile)
@@ -349,8 +348,6 @@ def pa_decode_tlx(
         lse = torch.empty((num_seqs, num_kv_heads, num_splits, m_pow2), dtype=torch.float32, device=query.device)
         mid_strides = (mid.stride(0), mid.stride(1), mid.stride(2), mid.stride(3), mid.stride(4))
         lse_strides = (lse.stride(0), lse.stride(1), lse.stride(2), lse.stride(3))
-
-    # print(f"fused = {fused}, num_kv_heads = {num_kv_heads}, num_splits = {num_splits}, num_warps = {num_warps}, batch = {num_seqs}, max_context_len = {max_context_len}, page_size = {page_size}, block_n = {block_n}")
 
     grid_p = (num_seqs, num_kv_heads, num_splits)
     _pa_decode_partition_kernel[grid_p](
