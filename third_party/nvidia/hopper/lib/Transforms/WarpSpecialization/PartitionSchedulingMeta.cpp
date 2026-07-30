@@ -2217,6 +2217,19 @@ static bool isScalarOp(Operation *op) {
   });
 }
 
+// A primitive scalar value can be cloned into multiple async tasks without a
+// communication buffer.  Keep this deliberately narrower than isScalarOp:
+// descriptor, token, and other opaque results are not ranked tensors either,
+// but duplicating their task ownership changes synchronization semantics.
+static bool isRematerializablePrimitiveScalarOp(Operation *op) {
+  if (op->getNumResults() == 0 || op->getNumRegions() != 0)
+    return false;
+  return llvm::all_of(op->getResults(), [](Value value) {
+    Type type = value.getType();
+    return type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type);
+  });
+}
+
 void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
                          bool createComputePartitions) {
   OpClusters opClusters;
@@ -2931,6 +2944,33 @@ void PartitionSchedulingMeta::runOnOperation() {
             }
           });
         }
+      }
+
+      // Scalar values are rematerializable and must not become cross-partition
+      // channels: WS buffer allocation only materializes ranked tensor values.
+      // This matters for persistent jagged kernels where a scalar seq-offset
+      // load is initially anchored in the load partition but its length/offset
+      // users span reduction, GEMM, load, and computation tasks. Expand scalar
+      // producers to the union of their users' partitions so specialization
+      // clones the scalar chain into each consuming task.
+      bool scalarPartitionsChanged = true;
+      while (scalarPartitionsChanged) {
+        scalarPartitionsChanged = false;
+        getLoopBodyRegion(loop).walk([&](Operation *op) {
+          if (!isRematerializablePrimitiveScalarOp(op))
+            return;
+          SetVector<int> unionIds;
+          SetVector<int> currentIds = safeGetPartitionIds(op);
+          unionIds.insert(currentIds.begin(), currentIds.end());
+          for (Operation *user : op->getUsers()) {
+            SetVector<int> userIds = safeGetPartitionIds(user);
+            unionIds.insert(userIds.begin(), userIds.end());
+          }
+          if (unionIds.empty() || unionIds.size() == currentIds.size())
+            return;
+          setPartition(op, unionIds);
+          scalarPartitionsChanged = true;
+        });
       }
 
       // Backstop: verify no two accumulator-chained MMAs were assigned to

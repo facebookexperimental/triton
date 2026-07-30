@@ -178,16 +178,24 @@ static void handleOperandDTaskIdPropagation(triton::FuncOp &funcOp) {
   });
 }
 
+static bool isPrimitiveScalarLoad(Operation *op) {
+  return isa<triton::LoadOp>(op) &&
+         llvm::all_of(op->getResultTypes(), [](Type type) {
+           return type.isIntOrIndexOrFloat() ||
+                  isa<triton::PointerType>(type);
+         });
+}
+
 LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   // Compute the min partition to normalize to 0
   int64_t minPartition = INT64_MAX;
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0];
-      assert(idx >= 0);
-      minPartition = std::min(idx, minPartition);
+      for (int32_t idx : attr.asArrayRef()) {
+        assert(idx >= 0);
+        minPartition = std::min<int64_t>(idx, minPartition);
+      }
     }
   });
   DenseSet<AsyncTaskId> totalTaskIds;
@@ -195,11 +203,14 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0] - minPartition;
-      totalTaskIds.insert(idx);
-      assert(idx >= 0);
-      setAsyncTaskIds(op, idx);
+      SmallVector<AsyncTaskId> taskIds;
+      for (int32_t partition : attr.asArrayRef()) {
+        int64_t idx = partition - minPartition;
+        assert(idx >= 0);
+        totalTaskIds.insert(idx);
+        taskIds.push_back(idx);
+      }
+      setAsyncTaskIds(op, taskIds);
       op->removeAttr(ttg::kPartitionAttrName);
     }
   });
@@ -239,6 +250,15 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   });
   funcOp.walk([&](scf::WhileOp op) { setAsyncTaskIds(op, allTasks); });
 
+  // Scalar loads are rematerialized according to their consumers.  Remove the
+  // initial scheduling anchor before data-flow analysis; otherwise the anchor
+  // fixes the load to the load task and a scalar cross-task REG channel is
+  // formed later, which cannot be materialized by WS buffer allocation.
+  funcOp.walk([&](Operation *op) {
+    if (isPrimitiveScalarLoad(op))
+      op->removeAttr("async_task_id");
+  });
+
   SymbolTableCollection symbolTable;
   Operation *op = funcOp.getOperation();
   DataFlowSolver solver;
@@ -273,7 +293,12 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
         isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
         llvm::none_of(op->getResultTypes(),
                       [](Type t) { return isa<RankedTensorType>(t); });
-    bool isAnchor = !isScalarArithOrMath && op->hasAttr("async_task_id");
+    // A primitive scalar load is safe to rematerialize in every consuming
+    // task.  Keeping it as an anchor would force a cross-task REG channel,
+    // but WS channel allocation only materializes ranked tensors.  Tensor
+    // loads remain anchors, as do descriptor/token-producing operations.
+    bool isAnchor = !isScalarArithOrMath && !isPrimitiveScalarLoad(op) &&
+                    op->hasAttr("async_task_id");
     if (!taskIds.isUninitialized() &&
         (isa<arith::ConstantOp>(op) || !isAnchor)) {
       // For non-anchor ops with existing annotations, merge the lattice

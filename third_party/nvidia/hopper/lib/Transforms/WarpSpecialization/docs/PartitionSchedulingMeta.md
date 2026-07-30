@@ -400,6 +400,14 @@ rematerialized in any partition and should not force partition assignment.
 Clusters with empty `defPartitions` (containing only scalar ops) are also
 skipped.
 
+After schedule optimization, a scalar closure expands every scalar producer to
+the union of its consumers' partitions. This includes scalar ops that already
+have an anchor partition, such as a jagged sequence-offset `tt.load` initially
+assigned to the load task. Code specialization then clones the scalar chain in
+each consuming task instead of attempting an unsupported cross-partition scalar
+channel. The closure runs to a fixpoint so pointer arithmetic feeding a scalar
+load inherits the same task set.
+
 Cluster assignment rules:
 
 1. **Multiple def or sink partitions**: The cluster sits between multiple

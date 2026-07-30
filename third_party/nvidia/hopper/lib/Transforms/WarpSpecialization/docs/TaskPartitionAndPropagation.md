@@ -128,8 +128,10 @@ analysis framework.
 
 ### Materialization (`doTaskIdPropagate`)
 
-1. Convert `ttg.partition` → `async_task_id` (normalize indices by subtracting
-   the minimum partition ID).
+1. Convert `ttg.partition` → `async_task_id` (normalize every index by
+   subtracting the minimum partition ID). Multi-partition attributes are
+   preserved as multi-task IDs; code specialization uses these to clone shared
+   scalar/rematerializable operations into each consuming task.
 2. Handle operand D initialization: find `TMEMStoreOp` before the loop that
    writes to the MMA's accumulator, assign it the appropriate task ID.
 3. Mark all `scf::ForOp` and `scf::WhileOp` loops with the union of all task
