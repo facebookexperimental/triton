@@ -1,5 +1,7 @@
 """Target-program canonicalization for the TLX Wave converter."""
 
+from dataclasses import replace
+
 from . import target_ir
 
 
@@ -31,14 +33,7 @@ def eliminate_redundant_compiler_membar_barriers(target_program):
     )
     if regions == target_program.regions:
         return target_program
-    return target_ir.TargetProgram(
-        target_program.values,
-        target_program.ops,
-        regions,
-        dict(target_program.source_value_targets),
-        dict(target_program.erased_source_values),
-        target_program.kernel,
-    )
+    return replace(target_program, regions=regions)
 
 
 def _eliminate_redundant_compiler_membar_barriers_in_region(
@@ -210,14 +205,7 @@ def eliminate_dead_target_ops(target_program):
         ) for region in target_program.regions)
     if regions == target_program.regions:
         return target_program
-    return target_ir.TargetProgram(
-        target_program.values,
-        target_program.ops,
-        regions,
-        dict(target_program.source_value_targets),
-        dict(target_program.erased_source_values),
-        target_program.kernel,
-    )
+    return replace(target_program, regions=regions)
 
 
 def _is_dead_eliminable(op, provenance_slice_ops):
@@ -352,14 +340,7 @@ def _hoist_async_waits_before_mma_payload_loads(target_program):
             ))
     if not changed:
         return target_program
-    return target_ir.TargetProgram(
-        target_program.values,
-        target_program.ops,
-        tuple(regions),
-        dict(target_program.source_value_targets),
-        dict(target_program.erased_source_values),
-        target_program.kernel,
-    )
+    return replace(target_program, regions=tuple(regions))
 
 
 def _can_hoist_async_wait_over(target_program, wait_op, previous_op):
@@ -483,14 +464,7 @@ def _fuse_single_use_cmpi_selects(target_program):
         )
         for region in target_program.regions
     )
-    return target_ir.TargetProgram(
-        target_program.values,
-        tuple(ops),
-        regions,
-        dict(target_program.source_value_targets),
-        dict(target_program.erased_source_values),
-        target_program.kernel,
-    )
+    return replace(target_program, ops=tuple(ops), regions=regions)
 
 
 def _share_div_rem_pairs(target_program):
@@ -576,13 +550,11 @@ def _share_div_rem_pairs(target_program):
             attrs={**binary_attrs, "operation": "subi"},
         )
 
-    return target_ir.TargetProgram(
-        tuple(values),
-        tuple(ops),
-        _renumber_regions(target_program, ops),
-        dict(target_program.source_value_targets),
-        dict(target_program.erased_source_values),
-        target_program.kernel,
+    return replace(
+        target_program,
+        values=tuple(values),
+        ops=tuple(ops),
+        regions=_renumber_regions(target_program, ops),
     )
 
 
