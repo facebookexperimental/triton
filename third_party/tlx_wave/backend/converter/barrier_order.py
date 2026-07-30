@@ -27,13 +27,23 @@ def thread_barrier_issue_order(target_program):
     ops = list(target_program.ops)
     regions = []
 
-    def add_token_value(domain, debug_name):
+    def resource_targets(target_value_ids):
+        return tuple(
+            dict.fromkeys(
+                resource_target_id
+                for target_value_id in target_value_ids
+                for resource_target_id in values[int(target_value_id)].resource_target_ids
+            )
+        )
+
+    def add_token_value(domain, debug_name, resource_target_ids=()):
         value_id = len(values)
         values.append(target_ir.TargetValue(
             value_id,
             target_ir.TargetType("token", "token"),
             debug_name=str(debug_name),
             event_domain=str(domain),
+            resource_target_ids=tuple(resource_target_ids),
         ))
         return value_id
 
@@ -49,6 +59,7 @@ def thread_barrier_issue_order(target_program):
         result_id = add_token_value(
             domain,
             f"{domain}_{source_op_index}_{len(ops)}",
+            resource_targets(operands),
         )
         op_id = len(ops)
         ops.append(target_ir.TargetOp(
@@ -208,6 +219,13 @@ def _ensure_memory_completion_result(op, values):
         target_ir.TargetType("token", "token"),
         debug_name=f"memory_completion_{op.target_op_id}",
         event_domain=target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+        resource_target_ids=tuple(
+            dict.fromkeys(
+                resource_target_id
+                for target_value_id in op.operands
+                for resource_target_id in values[int(target_value_id)].resource_target_ids
+            )
+        ),
     ))
     attrs["issue_order_result_count"] = 1
     if op.kind in {
@@ -289,5 +307,12 @@ def _ensure_ordering_barrier_result(op, values):
         target_ir.TargetType("token", "token"),
         debug_name=f"memory_barrier_{op.target_op_id}",
         event_domain=target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
+        resource_target_ids=tuple(
+            dict.fromkeys(
+                resource_target_id
+                for target_value_id in op.operands
+                for resource_target_id in values[int(target_value_id)].resource_target_ids
+            )
+        ),
     ))
     return replace(op, results=(result_id, )), result_id

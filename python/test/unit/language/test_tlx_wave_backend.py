@@ -8861,7 +8861,7 @@ def test_tlx_wave_converter_lowers_memdesc_subslice_as_physical_parent_view(
     del ctx
 
 
-def test_tlx_wave_converter_carries_shared_memdescs_as_structural_offsets(tmp_path):
+def test_tlx_wave_converter_carries_shared_memdescs_as_structural_pointers(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -8890,10 +8890,11 @@ def test_tlx_wave_converter_carries_shared_memdescs_as_structural_offsets(tmp_pa
     wave = output.emitted_module.text
     (loop_match, ) = _scf_for_matches(wave)
     loop_header = loop_match.group(0)
-    assert "!wave.ptr<#wave.shared" not in loop_header
-    assert loop_header.count("i32") >= 5
+    assert loop_header.count("!wave.ptr<#wave.shared") >= 2
     assert "wave.gather" in wave or "wave.load" in wave
     _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.uniform_loop" in machine
     del ctx
 
 
@@ -14920,7 +14921,7 @@ def test_tlx_wave_converter_pipeline_lowers_typed_mfma_fragment_constants(tmp_pa
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_scalarizes_mfma_fragment_splat_math(tmp_path):
+def test_tlx_wave_converter_pipeline_keeps_mfma_fragment_math_structural(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [16, 16, 32], isTransposed = true}>
 """
@@ -14939,12 +14940,8 @@ def test_tlx_wave_converter_pipeline_scalarizes_mfma_fragment_splat_math(tmp_pat
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     wave = output.emitted_module.text
-    scalar_fmul = re.findall(
-        r"wave\.fmul .* -> !wave\.simd<f32, 64>",
-        wave,
-    )
-    assert len(scalar_fmul) == 4
-    assert not re.search(r"wave\.fmul .*vector<4xf32>", wave)
+    assert not re.search(r"wave\.fmul .* -> !wave\.simd<f32, 64>", wave)
+    assert re.search(r"wave\.fmul .*vector<4xf32>", wave)
     assert re.search(r"wave\.fadd .*vector<4xf32>", wave)
     _run_wave_verify(wave)
     del ctx
