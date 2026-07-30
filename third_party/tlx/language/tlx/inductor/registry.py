@@ -1995,7 +1995,7 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
     split_k = getattr(self, "_tlx_split_k", 1)
     if split_k > 1 and self.workspace_arg is not None:
         from torch._inductor.codegen.triton import triton_type
-        from .reduce_k import emit_reduce_k_call
+        from .reduce_k import emit_aoti_reduce_k_call, emit_reduce_k_call
 
         # Determine output buffer name and dtype
         out_name = self.output_node.get_name()
@@ -2012,6 +2012,7 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
         # split-K bypasses -> it must be re-added in the reduction. For addmm the bias is
         # the prefix input node (input_nodes[0], prefix_args=1); plain mm has none.
         bias_name = None
+        bias_node = None
         stride_bias_m = 0
         stride_bias_n = 1
         if getattr(self, "prefix_args", 0) >= 1 and self.input_nodes:
@@ -2033,18 +2034,32 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
             else:
                 bias_name = None  # unexpected rank; skip (should not happen for addmm)
 
-        emit_reduce_k_call(
-            wrapper,
-            ws_name=self.workspace_arg.outer_name,
-            output_name=out_name,
-            M_expr=M_expr,
-            N_expr=N_expr,
-            split_k=split_k,
-            output_triton_dtype=output_triton_dtype,
-            bias_name=bias_name,
-            stride_bias_m=stride_bias_m,
-            stride_bias_n=stride_bias_n,
-        )
+        if config.cpp_wrapper:
+            emit_aoti_reduce_k_call(
+                wrapper,
+                workspace_arg=self.workspace_arg,
+                output_node=self.output_node,
+                bias_node=bias_node if bias_name is not None else None,
+                M=self.call_sizes[0],
+                N=self.call_sizes[1],
+                split_k=split_k,
+                output_triton_dtype=output_triton_dtype,
+                stride_bias_m=stride_bias_m,
+                stride_bias_n=stride_bias_n,
+            )
+        else:
+            emit_reduce_k_call(
+                wrapper,
+                ws_name=self.workspace_arg.outer_name,
+                output_name=out_name,
+                M_expr=M_expr,
+                N_expr=N_expr,
+                split_k=split_k,
+                output_triton_dtype=output_triton_dtype,
+                bias_name=bias_name,
+                stride_bias_m=stride_bias_m,
+                stride_bias_n=stride_bias_n,
+            )
     _orig_emit_post_kernel(self, wrapper, kernel_name)
 
 

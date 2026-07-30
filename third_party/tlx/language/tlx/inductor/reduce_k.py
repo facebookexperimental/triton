@@ -14,8 +14,10 @@ Ported from upstream:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
+import sympy
+import torch
 import triton
 import triton.language as tl
 
@@ -103,4 +105,80 @@ def emit_reduce_k_call(
         f" OUTPUT_DTYPE={output_triton_dtype},"
         f" HAS_BIAS={has_bias}, STRIDE_BIAS_M={stride_bias_m},"
         f" STRIDE_BIAS_N={stride_bias_n})"
+    )
+
+
+def emit_aoti_reduce_k_call(
+    wrapper: "WrapperCodeGen",
+    workspace_arg: Any,
+    output_node: Any,
+    bias_node: Any | None,
+    M: Any,
+    N: Any,
+    split_k: int,
+    output_triton_dtype: str,
+    stride_bias_m: int = 0,
+    stride_bias_n: int = 1,
+) -> None:
+    """Register and launch the split-K reducer through the AOTI C++ wrapper."""
+    from torch._inductor import ir
+    from torch.utils._sympy.functions import CeilDiv
+
+    has_bias = bias_node is not None
+    bias_arg = bias_node if has_bias else output_node
+    workspace_buffer = ir.Buffer(
+        name=workspace_arg.outer_name,
+        layout=workspace_arg.get_layout(),
+    )
+    kwargs = {
+        "workspace_ptr": workspace_buffer,
+        "c_ptr": output_node,
+        "bias_ptr": bias_arg,
+        "M": M,
+        "N": N,
+        "SPLIT_K": split_k,
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "OUTPUT_DTYPE": getattr(tl, output_triton_dtype.removeprefix("tl.")),
+        "HAS_BIAS": has_bias,
+        "STRIDE_BIAS_M": stride_bias_m,
+        "STRIDE_BIAS_N": stride_bias_n,
+    }
+    grid = [[CeilDiv(M, 32), CeilDiv(N, 32), sympy.Integer(1)]]
+    name, triton_meta, inductor_meta, grid_args = (
+        wrapper.define_user_defined_triton_kernel(
+            _reduce_k_kernel,
+            [triton.Config({})],
+            kwargs,
+            restore_value_args=(),
+            reset_to_zero_args=(),
+            grids=grid,
+            epilogue_fusion=None,
+            launch_kwargs=(),
+        )
+    )
+    call_args = [
+        workspace_arg.outer_name,
+        output_node.get_name(),
+        bias_arg.get_name(),
+        M,
+        N,
+        *grid_args,
+    ]
+    arg_types = [
+        workspace_arg.dtype,
+        output_node.get_dtype(),
+        bias_arg.get_dtype(),
+        type(M),
+        type(N),
+        *map(type, grid_args),
+    ]
+    wrapper.generate_kernel_call(
+        name,
+        call_args,
+        arg_types=arg_types,
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        triton=True,
+        device=output_node.get_device(),
     )
