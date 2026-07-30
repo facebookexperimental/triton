@@ -665,6 +665,24 @@ def _gemm_num_warps_filter(config):
     return config.num_warps in (4, 8)
 
 
+def _gemm_all_filter(config):
+    """num_warps filter PLUS a Blackwell TMEM (512-column) guard for the combined gemm_all
+    cross-product: the accumulator (block_m x block_n) plus the K-pipeline (block_k x num_stages)
+    can overflow tensor memory, and unlike a compile error a run/launch OOM is NOT caught by
+    evaluate_precision. The dropped boundary (block_k=64 with num_stages>=3; the 256-wide accumulator
+    with num_stages>=5) is calibrated for this spec's default precision_size (256^3), where it leaves
+    0 launch-OOM. NOTE: TMEM use is TENSOR-dependent -- a large K runs the full num_stages pipeline
+    (short K-loops collapse it), so at a much bigger tensor some surviving configs still OOM; a driver
+    that overrides the tensor size must skip run-OOM configs itself (this filter cannot see the size)."""
+    if not _gemm_num_warps_filter(config):
+        return False
+    if config.gemm_block_k == 64 and (config.num_stages or 1) >= 3:
+        return False
+    if config.gemm_block_n == 256 and (config.num_stages or 1) >= 5:
+        return False
+    return True
+
+
 def _gemm_blocks(config, default_bk):
     """Resolve the tile from the config, defaulting axes the spec does not sweep."""
     bm = config.gemm_block_m if config.gemm_block_m is not None else 128
@@ -996,6 +1014,25 @@ REGISTRY = {
         compile_fn=_gemm_tma_store_compile,
         run_fn=_gemm_tma_store_run,
         config_filter=_gemm_num_warps_filter,
+    ),
+    "gemm_all":
+    KernelSpec(
+        name="gemm_all",
+        description=("f32 GEMM varying ALL co-existing knobs together (M/N/K tiling x input_precision x "
+                     "enable_fp_fusion x num_warps x num_stages) -- the real autotuner cross-product, to "
+                     "stress the MMA fence with cross-knob interactions. The per-knob GEMM specs above "
+                     "isolate one knob each for clean attribution; this crosses them (~1300 configs at heavy). "
+                     "fp8 stays a separate spec (a distinct dtype path that cannot co-vary with input_precision)."),
+        output_arity=1,
+        axes=("enable_fp_fusion", "num_warps", "num_stages", "gemm_block_m", "gemm_block_n", "gemm_block_k",
+              "input_precision"),
+        precision_size=(256, 256, 256),
+        perf_size=(256, 256, 256),
+        known_limitation="",
+        compile_fn=_gemm_prec_compile,
+        run_fn=_gemm_prec_run,
+        config_filter=_gemm_all_filter,
+        axis_values={"gemm_block_k": (16, 32, 64), "enable_fp_fusion": (True, False)},
     ),
 }
 
