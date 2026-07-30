@@ -272,24 +272,18 @@ class TestTLXTemplates(TestCase):
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
-    def test_tlx_addmm_warppipe_odd_k_async_copy_alignment_repro(self):
-        """REPRO of the residual odd-K async_copy 16-byte-alignment failure (gfx950).
+    def test_tlx_addmm_warppipe_regpath_odd_k(self):
+        """Odd K on the TLX addmm template -> register-path branch (USE_ASYNC=0), T280910119.
 
-        The sync-load-the-tail fix handles K % BLOCK_K != 0, but ONLY when the row stride is
-        16-byte aligned (K a multiple of 8). K=2309 (odd; the production compression bmm's K) is
-        NOT: A [M,K] and col-major B [K,N] both have row stride K, so a row spans 2309*2 = 4618 B,
-        not a multiple of 16. The col-major B's async_copy into the swizzled #ttg.padded_shared
-        LDS layout then cannot legalize -> builtin.unrealized_conversion_cast on arg_B -> "failed
-        to translate module to LLVM IR". In tlx_mode=force (TRITON-only) every config fails to
-        compile, so select_algorithm raises NoValidChoicesError.
-
-        This documents a KNOWN residual -- an AMD-backend async_copy alignment fix, out of scope
-        for the sync-tail kernel change. When that fix lands this test will start passing
-        (NoValidChoicesError no longer raised); convert it to a correctness check then.
-        compile_threads=1 keeps the compile in-process so the real MLIR error is visible in the
-        test log (subprocess autotune otherwise swallows it behind NoValidChoicesError).
+        K=2309 (odd) has a 2309*2 = 4618 B row stride that is never 16-byte aligned, so the
+        direct-to-LDS async_load path cannot legalize on CDNA4 (col-major B's async_copy into the
+        swizzled #ttg.padded_shared LDS layout). The heuristic sets USE_ASYNC=0 and the template
+        takes the register-path fallback (tl.load -> tl.dot, auto-pipelined), which lowers for ANY
+        alignment -- same mechanism as the bmm template. In tlx_mode=force (TRITON-only) this must
+        lower to the Triton template (never extern/aten) and be numerically correct. (Previously
+        this shape declined -> NoValidChoicesError; the addmm register-path fallback fixed it.)
         """
-        M, K, N = 4096, 2309, 192  # odd K -> 2309*2 = 4618 B row stride, NOT 16-byte aligned
+        M, K, N = 4096, 2309, 192  # odd K -> 4618 B row stride, not 16-byte aligned -> register path
         a = torch.randn(M, K, device=GPU_TYPE, dtype=torch.float16)
         w = torch.randn(N, K, device=GPU_TYPE, dtype=torch.float16)
         bias = torch.randn(N, device=GPU_TYPE, dtype=torch.float16)
@@ -303,10 +297,13 @@ class TestTLXTemplates(TestCase):
                 "max_autotune": True,
                 "max_autotune_gemm_backends": "TRITON",
                 "enable_caching_generated_triton_templates": False,
-                "compile_threads": 1,
         }):
-            with self.assertRaises(Exception):
-                run_and_get_code(torch.compile(addmm), bias, a, w)
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(torch.float16)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+        # force mode keeps only the TLX template -> odd-K addmm must lower via the register branch.
+        self.assertIn("triton_tem", "\n".join(code))
 
     @unittest.skipIf(
         not is_gfx950(),
@@ -423,8 +420,8 @@ class TestWarpPipeSplitKCodegen(TestCase):
             "store_output": lambda *a, **k: "# store_output(...)",
         }
         tmpl = jinja2.Environment().from_string(source)
-        split = tmpl.render(SPLIT_K=2, **hooks)
-        nosplit = tmpl.render(SPLIT_K=1, **hooks)
+        split = tmpl.render(SPLIT_K=2, USE_ASYNC=True, **hooks)
+        nosplit = tmpl.render(SPLIT_K=1, USE_ASYNC=True, **hooks)
 
         # SPLIT_K > 1 must emit: split-id decode, balanced K-partition, fp32 workspace store.
         self.assertIn("split_id = (pid % SPLIT_K)", split)
