@@ -489,6 +489,13 @@ LogicalResult ClusterWaitOp::verify() {
 
 static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
   int numCTAs = triton::gpu::lookupNumCTAs(op);
+  // A two-CTA AutoWS kernel forms its pair through the module's cluster dims
+  // rather than ttg.num-ctas, so take the larger of the two: the op is legal
+  // whenever the launch actually has more than one CTA per cluster.
+  if (auto mod = op->getParentOfType<ModuleOp>()) {
+    auto dims = triton::gpu::TritonGPUDialect::getClusterDims(mod);
+    numCTAs = std::max(numCTAs, dims[0] * dims[1] * dims[2]);
+  }
   if (numCTAs <= 1)
     return op->emitOpError("requires ttg.num-ctas > 1");
   return success();

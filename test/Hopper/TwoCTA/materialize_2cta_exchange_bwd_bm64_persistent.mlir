@@ -959,7 +959,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
           ttng.tmem_store %296, %300, %true {async_task_id = array<i32: 3>} : tensor<128x64xf16, #linear8> -> !ttg.memdesc<128x64xf16, #tmem1, #ttng.tensor_memory, mutable>
           %303 = ttg.memdesc_index %arg131[%c0_i32_8] {async_task_id = array<i32: 3>} : !ttg.memdesc<1x1xi64, #shared3, #smem, mutable> -> !ttg.memdesc<1xi64, #shared3, #smem, mutable>
           ttng.arrive_barrier %303, 1 {async_task_id = array<i32: 3>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 1 : i32, maxRegionId = 1 : i32, minRegionId = 1 : i32, parentId = 2 : i32}}} : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
-          %304 = ttng.two_cta_peer_gather %297 split_dim = 0 num_ctas = 2 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked3>
+          %304 = ttng.two_cta_peer_gather %297 split_dim = 0 num_ctas = 2 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked3> -> tensor<128x64xf16, #blocked3>
           %305 = ttg.memdesc_index %arg87[%c0_i32_8] {async_task_id = array<i32: 3>} : !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
           %306 = arith.andi %arg142, %c1_i64_15 {async_task_id = array<i32: 3>} : i64
           %307 = arith.trunci %306 {async_task_id = array<i32: 3>} : i64 to i1
@@ -1060,7 +1060,7 @@ module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32,
           ttng.tmem_store %296, %300, %true {async_task_id = array<i32: 3>} : tensor<128x64xf16, #linear8> -> !ttg.memdesc<128x64xf16, #tmem1, #ttng.tensor_memory, mutable>
           %303 = ttg.memdesc_index %arg131[%c0_i32_8] {async_task_id = array<i32: 3>} : !ttg.memdesc<1x1xi64, #shared3, #smem, mutable> -> !ttg.memdesc<1xi64, #shared3, #smem, mutable>
           ttng.arrive_barrier %303, 1 {async_task_id = array<i32: 3>, constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 1 : i32, maxRegionId = 1 : i32, minRegionId = 1 : i32, parentId = 2 : i32}}} : !ttg.memdesc<1xi64, #shared3, #smem, mutable>
-          %304 = ttng.two_cta_peer_gather %297 split_dim = 0 num_ctas = 2 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked3>
+          %304 = ttng.two_cta_peer_gather %297 split_dim = 0 num_ctas = 2 {async_task_id = array<i32: 3>} : tensor<128x64xf16, #blocked3> -> tensor<128x64xf16, #blocked3>
           %305 = ttg.memdesc_index %arg87[%c0_i32_8] {async_task_id = array<i32: 3>} : !ttg.memdesc<1x128x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
           %306 = arith.andi %232#0, %c1_i64_15 {async_task_id = array<i32: 3>} : i64
           %307 = arith.trunci %306 {async_task_id = array<i32: 3>} : i64 to i1

@@ -127,7 +127,6 @@ def TTNG_ClusterArriveOp : TTNG_Op<"cluster_arrive", []> {
 }
 
 def TTNG_TwoCTAPeerGatherOp : TTNG_Op<"two_cta_peer_gather", [
-    SameOperandsAndResultType,
     MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
   ]> {
   let summary = "Abstract peer gather for a dependent 2-CTA MMA operand";
@@ -148,8 +147,28 @@ def TTNG_TwoCTAPeerGatherOp : TTNG_Op<"two_cta_peer_gather", [
 
   let assemblyFormat = [{
     $src `split_dim` `=` $splitDim `num_ctas` `=` $numCTAs attr-dict
-    `:` type($src)
+    `:` type($src) `->` type($result)
   }];
+}
+
+def TTNG_TwoCTAPeerRelayOp : TTNG_Op<"two_cta_peer_relay", [
+    MemoryEffects<[MemRead<SharedMemory>, MemWrite<SharedMemory>]>
+  ]> {
+  let summary = "Relay completion of a dependent 2-CTA peer gather";
+
+  let description = [{
+    Marks the shared-memory destination of a two-CTA peer gather for a
+    dedicated one-warp relay partition. AutoWS creates an independent channel
+    from the gather producer to this consumer. The post-WS materialization
+    pass redirects remote DSMEM completion to that channel and lowers this op
+    to publication on the MMA consumer channel.
+  }];
+
+  let arguments = (ins
+    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src
+  );
+
+  let assemblyFormat = "$src attr-dict `:` type($src)";
 }
 
 def TTNG_ClusterWaitOp : TTNG_Op<"cluster_wait", []> {
