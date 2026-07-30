@@ -248,6 +248,14 @@ This pass runs **after** `scheduleLoops` has assigned pipeline stages and
 clusters to every op. It uses the SWP `CoarseSchedule` to move waits
 forward in the linearized pipeline order.
 
+Straight-line epilogues use the same reuse-point rule without a coarse
+schedule. A direct-token wait moves to immediately before the next
+`local_store` that feeds any TMA store in the block. TMA `wait_group` is
+queue-wide rather than descriptor- or allocation-specific, so the final wait
+for one output (for example dV) may cross independent preparation for the next
+output (dK) and stop at dK's staging write. The last wait in the block remains
+the final drain.
+
 ### Algorithm
 
 For each annotated `TMAStoreTokenWaitOp` with `can_rotate_by_buffer_count = K`:

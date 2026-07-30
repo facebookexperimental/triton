@@ -32,6 +32,38 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+// TMA wait_group is queue-wide. The final wait for dV can move across
+// independent dK preparation and stop at dK's staging-buffer write.
+// CHECK-LABEL: straight_line_wait_before_next_staging_buffer
+// CHECK: %[[DVTOK:.*]] = ttng.async_tma_copy_local_to_global
+// CHECK-NEXT: arith.addf
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[DVTOK]]
+// CHECK-NEXT: ttg.local_store {{.*}}, %[[DKBUF:[^ ]+]]
+// CHECK: %[[DKTOK:.*]] = ttng.async_tma_copy_local_to_global {{.*}} %[[DKBUF]]
+// CHECK-NEXT: ttng.async_tma_store_token_wait %[[DKTOK]]
+  tt.func public @straight_line_wait_before_next_staging_buffer(
+      %dv_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %dk_desc: !tt.tensordesc<128x64xf16, #shared>,
+      %dv_src: tensor<128x64xf16>, %dk_src: tensor<128x64xf16>,
+      %dv_buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %dk_buf: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+      %i: i32, %x: f32) {
+    ttg.local_store %dv_src, %dv_buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %dv_tok = ttng.async_tma_copy_local_to_global %dv_desc[%i, %i] %dv_buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %dv_tok : !ttg.async.token
+    %y = arith.addf %x, %x : f32
+    ttg.local_store %dk_src, %dk_buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %dk_tok = ttng.async_tma_copy_local_to_global %dk_desc[%i, %i] %dk_buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %dk_tok : !ttg.async.token
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // A straight-line epilogue can overlap independent work with the first TMA
 // store.  Delay its wait until immediately before the staging view is reused,
 // while preserving the wait after the final store as a drain.

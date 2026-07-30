@@ -436,9 +436,12 @@ findScheduledWaitBarrierBetween(Operation *producer, Operation *insertionTarget,
 void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   // Straight-line epilogues are not software-pipelined, but can still overlap
   // a TMA store with independent work.  Delay a token wait until immediately
-  // before the next write to the same staging view.  This is deliberately
-  // limited to direct tokens and an exact memdesc match: the wait after the
-  // final use remains a drain, and no staging-buffer reuse can cross the wait.
+  // before the next write to a TMA staging view. A wait_group applies to the
+  // warp's TMA store queue, not to one descriptor or SMEM allocation, so the
+  // final wait for one output can overlap independent setup for the next
+  // output and land immediately before that output starts reusing the queue.
+  // This is deliberately limited to direct tokens and staging writers in the
+  // same block. The final use remains a drain.
   SmallVector<ttng::TMAStoreTokenWaitOp> straightLineWaits;
   funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
     if (!waitOp->getParentOfType<scf::ForOp>())
@@ -455,7 +458,22 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
               end = waitOp->getBlock()->end();
          it != end; ++it) {
       auto localStore = dyn_cast<ttg::LocalStoreOp>(&*it);
-      if (!localStore || !sameMemDescValue(localStore.getDst(), buffer))
+      if (!localStore)
+        continue;
+
+      bool writesTMAStaging = sameMemDescValue(localStore.getDst(), buffer);
+      if (!writesTMAStaging) {
+        for (auto next = std::next(localStore->getIterator()); next != end;
+             ++next) {
+          if (!isTMAStoreLikeOp(&*next))
+            continue;
+          writesTMAStaging =
+              sameMemDescValue(localStore.getDst(), getTMAStoreSource(&*next));
+          if (writesTMAStaging)
+            break;
+        }
+      }
+      if (!writesTMAStaging)
         continue;
       waitOp->moveBefore(localStore);
       break;
@@ -832,8 +850,7 @@ computePendingsFromToken(Value token, ttng::TMAStoreTokenWaitOp waitOp,
 // pendings = number of TMA store-like ops issued after the token's defining
 // store and before this wait, in program execution order.
 static int computePendings(ttng::TMAStoreTokenWaitOp waitOp) {
-  if (auto planned =
-          waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
+  if (auto planned = waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount))
     return planned.getInt();
 
   ConditionContext context = getConditionContext(waitOp);
