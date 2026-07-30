@@ -80,6 +80,7 @@
 using namespace mlir;
 namespace tt = ::mlir::triton;
 namespace ttg = ::mlir::triton::gpu;
+namespace ttng = ::mlir::triton::nvidia_gpu;
 
 namespace mlir {
 namespace triton {
@@ -107,6 +108,10 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Wait on named hardware barrier"},
     {"ttng.named_barrier_arrive", "tlx.named_barrier_arrive",
      "Arrive at named hardware barrier"},
+    {"ttng.wait_barrier_named", "tlx.named_barrier_wait",
+     "Wait on named hardware barrier"},
+    {"ttng.arrive_barrier_named", "tlx.named_barrier_arrive",
+     "Arrive at named hardware barrier"},
 
     // Memory allocation operations - local_alloc is handled specially
     // ttng.tmem_alloc: handled specially in printSimplifiedOp
@@ -133,10 +138,13 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Reinterpret buffer dtype/shape"},
     {"ttng.tmem_subslice", "tlx.subslice", "TMEM subslice (Blackwell)"},
     {"ttg.memdesc_index", "tlx.local_view", "Index into memdesc"},
+    {"ttg.memdesc_subslice", "tlx.subslice", "Slice a memory descriptor"},
 
     // Async copy operations (cp.async)
     {"ttg.async_load", "tlx.async_load",
      "Async load from global to shared memory"},
+    {"ttg.async_copy_global_to_local", "tlx.async_load",
+     "Async bulk copy from global to shared memory"},
     {"ttg.async_commit_group", "tlx.async_load_commit_group",
      "Commit async load group"},
     {"ttg.async_wait", "tlx.async_load_wait_group",
@@ -155,6 +163,8 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Wait for TMA stores to complete"},
     {"ttng.async_tma_store_wait", "tlx.async_descriptor_store_wait",
      "Wait for TMA stores to complete"},
+    {"ttng.async_tma_store_token_wait", "tlx.async_descriptor_store_wait",
+     "Wait for a token-tracked TMA store"},
     {"tt.make_tensor_descriptor", "tlx.make_tensor_descriptor",
      "Create TMA descriptor on device"},
     {"ttng.tensormap_create", "tlx.make_tensor_descriptor",
@@ -194,6 +204,8 @@ static const TTGIRToTLXMapping opMappings[] = {
      "Store to remote CTA's shared memory"},
     {"ttng.async_remote_store", "tlx.async_remote_shmem_store",
      "Async store to remote CTA's shared memory"},
+    {"ttg.async_remote_shmem_copy", "tlx.async_remote_shmem_copy",
+     "Async copy to a remote CTA's shared memory"},
 
     // Warp specialization
     {"ttg.warp_specialize", "tlx.warp_specialize",
@@ -245,6 +257,8 @@ static const TTGIRToTLXMapping opMappings[] = {
     {"tt.get_num_programs", "tl.num_programs", "Get number of programs"},
     {"tt.map_elementwise", "tl.map_elementwise", "Map elementwise operation"},
     {"tt.return", "return", "Return from function"},
+    {"tt.elementwise_inline_asm", "tl.inline_asm_elementwise",
+     "Elementwise inline assembly"},
 
     // Math dialect operations
     {"math.exp", "tl.math.exp", "Natural exponential"},
@@ -265,6 +279,7 @@ static const TTGIRToTLXMapping opMappings[] = {
 
     // GPU operations
     {"gpu.barrier", "gpu.barrier", "GPU barrier"},
+    {"nvg.cluster_id", "tlx.cluster_cta_rank", "CTA rank in cluster"},
 };
 
 // Infix operator mapping for binary arith ops
@@ -374,8 +389,8 @@ static std::string formatSSAName(StringRef raw) {
     name.pop_back();
   if (!name.empty() && name[0] == '%')
     name = name.substr(1);
-  if (!name.empty() && std::all_of(name.begin(), name.end(),
-                                   [](char c) { return std::isdigit(c); }))
+  std::replace(name.begin(), name.end(), '#', '_');
+  if (!name.empty() && std::isdigit(name.front()))
     name = "var_" + name;
   return name;
 }
@@ -1467,7 +1482,11 @@ void printSimplifiedOp(
         os << ", ";
       os << getValueName(coords[i], argSubstitutionMap);
     }
-    os << "], " << getValueName(barrier, argSubstitutionMap) << ")";
+    os << "], " << getValueName(barrier, argSubstitutionMap);
+    if (auto twoCTA = op->getAttrOfType<BoolAttr>("two_cta");
+        twoCTA && twoCTA.getValue())
+      os << ", two_ctas=True";
+    os << ")";
     printLocComment(op, os);
     return;
   }
@@ -1515,6 +1534,64 @@ void printSimplifiedOp(
     return;
   }
 
+  // ttng.async_tma_reduce: the TLX API represents a TMA reduction as an
+  // async descriptor store with store_reduce set.
+  if (opName == "ttng.async_tma_reduce" && op->getNumOperands() >= 3) {
+    Value desc = op->getOperand(0);
+    Value src = op->getOperand(op->getNumOperands() - 1);
+    os << "tlx.async_descriptor_store("
+       << getValueName(desc, argSubstitutionMap) << ", "
+       << getValueName(src, argSubstitutionMap) << ", [";
+    for (unsigned i = 1; i + 1 < op->getNumOperands(); ++i) {
+      if (i > 1)
+        os << ", ";
+      os << getValueName(op->getOperand(i), argSubstitutionMap);
+    }
+    StringRef kind = "unknown";
+    if (auto reduce = dyn_cast<ttng::AsyncTMAReduceOp>(op))
+      kind = tt::stringifyDescriptorReduceKind(reduce.getKind());
+    os << "], store_reduce=\"" << kind << "\")";
+    printLocComment(op, os);
+    return;
+  }
+
+  // Token waits are the lowered form of TLX descriptor-store waits.
+  if (opName == "ttng.async_tma_store_token_wait") {
+    int pendings = 0;
+    if (auto planned = op->getAttrOfType<IntegerAttr>("planned_pending_count"))
+      pendings = planned.getInt();
+    os << "tlx.async_descriptor_store_wait(" << pendings << ")";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (opName == "ttg.memdesc_subslice" && op->getNumResults() == 1) {
+    auto dstType = dyn_cast<ttg::MemDescType>(op->getResult(0).getType());
+    auto offsets = op->getAttrOfType<DenseI32ArrayAttr>("offsets");
+    os << getValueName(op->getResult(0), argSubstitutionMap)
+       << " = tlx.local_slice("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", [";
+    if (offsets) {
+      llvm::interleaveComma(offsets.asArrayRef(), os);
+    }
+    os << "], [";
+    if (dstType)
+      llvm::interleaveComma(dstType.getShape(), os);
+    os << "])";
+    printLocComment(op, os);
+    return;
+  }
+
+  if (opName == "ttg.async_remote_shmem_copy" && op->getNumOperands() == 4) {
+    os << "tlx.async_remote_shmem_copy("
+       << getValueName(op->getOperand(0), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(1), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(2), argSubstitutionMap) << ", "
+       << getValueName(op->getOperand(3), argSubstitutionMap) << ")";
+    printLocComment(op, os);
+    return;
+  }
+
   // tma_store_wait: emit with pendings attribute
   if (opName == "ttng.tma_store_wait" ||
       opName == "ttng.async_tma_store_wait") {
@@ -1540,7 +1617,9 @@ void printSimplifiedOp(
       int idx = 3 + sizes[3]; // skip a,b,d,acc_dep
       os << ", use_acc="
          << getValueName(op->getOperand(idx), argSubstitutionMap);
-      idx += 2; // skip useD, pred
+      ++idx;
+      os << ", pred=" << getValueName(op->getOperand(idx), argSubstitutionMap);
+      ++idx;
       int numBarriers = sizes[6];
       if (numBarriers > 0) {
         os << ", mBarriers=[";
@@ -1551,6 +1630,10 @@ void printSimplifiedOp(
         }
         os << "]";
       }
+      if (op->hasAttr("two_ctas"))
+        os << ", two_ctas=True";
+      if (op->hasAttr("is_async"))
+        os << ", force_async=True";
     }
     os << ")";
     printLocComment(op, os);
@@ -1560,7 +1643,10 @@ void printSimplifiedOp(
   // ttng.tc_gen5_commit: emit tcgen05_commit(barrier)
   if (opName == "ttng.tc_gen5_commit") {
     os << "tlx.tcgen05_commit("
-       << getValueName(op->getOperand(0), argSubstitutionMap) << ")";
+       << getValueName(op->getOperand(0), argSubstitutionMap);
+    if (op->getNumOperands() > 1)
+      os << ", two_ctas=True";
+    os << ")";
     printLocComment(op, os);
     return;
   }
@@ -1763,7 +1849,8 @@ void printBlock(Block &block, llvm::raw_ostream &os,
       }
       bool first = true;
       for (auto &name : argNames) {
-        if (skipArgs.count(name))
+        if (skipArgs.count(name) || name.find(".shape.") != std::string::npos ||
+            name.find(".stride.") != std::string::npos)
           continue;
         if (!first)
           os << ", ";
