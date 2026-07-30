@@ -112,7 +112,7 @@ def get_x_values():
     return x_vals
 
 
-def create_benchmark(versions, qlen):
+def create_benchmark(versions, qlen, use_kv_cache_pool=False):
     line_vals = list(versions)
     line_names = list(versions)
 
@@ -132,7 +132,7 @@ def create_benchmark(versions, qlen):
         # Bound physical KV memory for large sweeps via a shared page pool.
         pool = 4 * ((N_CTX + PAGE_SIZE - 1) // PAGE_SIZE) + 16
         q, kc, vc, ctx, bt = _build_inputs(BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
-                                           query_length=qlen, device=DEVICE, pool_pages=pool)
+                                           query_length=qlen, device=DEVICE, pool_pages=pool if use_kv_cache_pool else None)
         out = torch.empty_like(q)
         fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, N_CTX)
         if fn is None:
@@ -187,6 +187,11 @@ if __name__ == "__main__":
         default=[1],
         help="Query lengths to sweep (multi-token prediction: 1-4).",
     )
+    parser.add_argument(
+        "--use_cache_pool",
+        action='store_true',
+        help="use pool for kv cache to reduce kv cache size",
+    )
     args = parser.parse_args()
 
     if is_hip():
@@ -194,7 +199,7 @@ if __name__ == "__main__":
         print(f"Running paged-decode benchmarks for: {versions}, qlens={args.qlens}")
         for qlen in args.qlens:
             print(f"\n=== query_length = {qlen} ===")
-            report = create_benchmark(versions, qlen)
+            report = create_benchmark(versions, qlen, use_kv_cache_pool=args.use_cache_pool)
             if "tlx" in versions and "aiter" in versions:
                 df = report.run(return_df=True)
                 ylabel = "TB/s (effective HBM read)"
