@@ -22,6 +22,7 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 from stubs import switch_to_contiguous_if_needed
 from stubs import (
     is_sm90,
@@ -36,10 +37,14 @@ from stubs import (
 from stubs import get_full_autotune
 from triton_attention_utils import (
     backward_softmax_activation_scaled_alpha,
+    fast_fma,
+    fast_mul,
     fast_silu,
     forward_softmax_activation_scaled_alpha,
     forward_softmax_activation_trans_scaled_alpha,
 )
+
+
 from triton_hstu_cross_attention import (
     _attn_bwd_preprocess,
     backward_common_preprocess,
@@ -57,6 +62,40 @@ from triton_hstu_cross_attention import (
 
 # Check for on-device TMA API availability (requires Triton 3.5+)
 HAS_TENSOR_DESCRIPTOR = hasattr(tl, "make_tensor_descriptor")
+
+
+@triton.jit
+def _backward_softmax_activation_scaled_alpha_f32x2(
+    qk_trans,
+    scaled_alpha,
+    valid_mask_trans,
+    M_off,
+    offs_m,
+    stride_mm,
+    mask_m,
+    k,
+):
+    """B200 packed-FP32 form matching the TLX 2-KV backward kernel."""
+    m = tl.load(M_off + offs_m * stride_mm, mask=mask_m)
+    qk_trans = fast_fma(qk_trans, scaled_alpha, -m[None, :])
+    pT = tl.math.exp2(qk_trans)
+    pT = tl.where(valid_mask_trans, pT, 0.0)
+    act_qk_trans = pT.to(k.dtype)
+    return qk_trans, act_qk_trans, pT
+
+
+@triton.jit
+def _backward_d_softmax_activation_f32x2(
+    dact_qk_trans,
+    Delta_off,
+    offs_m,
+    stride_mm,
+    mask_m,
+    pT,
+):
+    """B200 packed-FP32 multiply matching the TLX 2-KV backward kernel."""
+    Di = tl.load(Delta_off + offs_m * stride_mm, mask=mask_m)
+    return fast_mul(pT, dact_qk_trans - Di[None, :])
 
 
 # Frozen (hashable) wrapper for the autoWS per-dot schedule attrs, usable in a
@@ -253,6 +292,9 @@ class BwdVariant(Enum):
     # parallelism WITHOUT triggering the compiler's automatic DP pass. Shared-KV +
     # compute-fold only. Milestone 1: WS off.
     TRITON_AUTOWS_2KV = "triton_autows_2kv"
+    # Same 2-KV autoWS kernel, but Q/K/V/DO TMA descriptors are constructed on
+    # the host, matching TLX. Dynamic DQ/DK bounds still require device TMA.
+    TRITON_AUTOWS_2KV_HOST_TMA = "triton_autows_2kv_host_tma"
 
 
 # Global variables for variant selection, can be overridden in unit tests
@@ -1546,6 +1588,11 @@ def _bwd_pre_hook_redq_v3(nargs):
         nargs["DK"].zero_()
         if not nargs["SHARED_KV"]:
             nargs["DV"].zero_()
+    if isinstance(nargs.get("desc_q_host"), TensorDescriptor):
+        nargs["desc_q_host"].block_shape = [nargs["BLOCK_M"], nargs["DimQ"]]
+        nargs["desc_k_host"].block_shape = [nargs["BLOCK_N"], nargs["DimQ"]]
+        nargs["desc_v_host"].block_shape = [nargs["BLOCK_N"], nargs["DimV"]]
+        nargs["desc_do_host"].block_shape = [nargs["BLOCK_M"], nargs["DimV"]]
 
 
 def _get_triton_bw_redq_configs() -> List[triton.Config]:
@@ -2036,16 +2083,15 @@ def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
             },
             num_stages=ns,
             num_warps=nw,
+            maxRegAutoWS=192,
             pre_hook=_bwd_pre_hook_redq_v3,
         )
-        # BLOCK_M=64, BLOCK_N=64. The compute fold MMA-accumulates BOTH KV blocks'
-        # dk in TMEM (each [BLOCK_N, DimQ]); at BLOCK_N=64 the two dk tiles stack
-        # in TMEM's two 64-row groups at the SAME columns (128 cols for both, not
-        # 256), which -- with dq as a single shared accumulator -- keeps the peak
-        # at ~480 < 512 cols and lets BLOCK_M reach 64. BLOCK_N=128 would need 256
-        # dk cols and overflows at BLOCK_M=64 (608 > 512).
+        # Match the hand-TLX 2-KV tile: each explicit half handles 128 KV rows,
+        # so one outer iteration covers 256 rows.  The merged four-partition
+        # layout plus an elevated maxRegAutoWS avoids the large spill seen when
+        # this tile is compiled with the old five-partition/default-budget setup.
         for M in [64]
-        for N in [64]
+        for N in [128]
         for ns in [1]
         for nw in [4]
         for pick in inner_picks
@@ -2067,6 +2113,10 @@ def _get_triton_bw_redq_2kv_configs() -> List[triton.Config]:
 )
 @triton.jit
 def _hstu_attn_bwd_redq_2kv(  # noqa C901
+    desc_q_host,
+    desc_k_host,
+    desc_v_host,
+    desc_do_host,
     Q,
     K,
     V,
@@ -2121,6 +2171,7 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
     # pyrefly: ignore [bad-function-definition]
     AUTOWS: tl.constexpr = False,
     WS_ON: tl.constexpr = False,
+    HOST_TMA: tl.constexpr = False,
     # Inner (start_m) loop list-schedule rank; swept by autotune under
     # TRITON_USE_LIST_SCHEDULE=1. See _get_triton_bw_redq_2kv_configs.
     # pyrefly: ignore [bad-function-definition]
@@ -2159,34 +2210,40 @@ def _hstu_attn_bwd_redq_2kv(  # noqa C901
     if seq_len_kv == 0:
         return
     H_kv = H // G
-    desc_q = tl.make_tensor_descriptor(
-        Q,
-        shape=[total_seq_len_q, H * DimQ],
-        # pyrefly: ignore [bad-argument-type]
-        strides=[H * DimQ, 1],
-        block_shape=[BLOCK_M, DimQ],
-    )
-    desc_k = tl.make_tensor_descriptor(
-        K,
-        shape=[total_seq_len_kv, H_kv * DimQ],
-        # pyrefly: ignore [bad-argument-type]
-        strides=[H_kv * DimQ, 1],
-        block_shape=[BLOCK_N, DimQ],
-    )
-    desc_v = tl.make_tensor_descriptor(
-        V,
-        shape=[total_seq_len_kv, H_kv * DimV],
-        # pyrefly: ignore [bad-argument-type]
-        strides=[H_kv * DimV, 1],
-        block_shape=[BLOCK_N, DimV],
-    )
-    desc_do = tl.make_tensor_descriptor(
-        DO,
-        shape=[total_seq_len_q, H * DimV],
-        # pyrefly: ignore [bad-argument-type]
-        strides=[H * DimV, 1],
-        block_shape=[BLOCK_M, DimV],
-    )
+    if HOST_TMA:
+        desc_q = desc_q_host
+        desc_k = desc_k_host
+        desc_v = desc_v_host
+        desc_do = desc_do_host
+    else:
+        desc_q = tl.make_tensor_descriptor(
+            Q,
+            shape=[total_seq_len_q, H * DimQ],
+            # pyrefly: ignore [bad-argument-type]
+            strides=[H * DimQ, 1],
+            block_shape=[BLOCK_M, DimQ],
+        )
+        desc_k = tl.make_tensor_descriptor(
+            K,
+            shape=[total_seq_len_kv, H_kv * DimQ],
+            # pyrefly: ignore [bad-argument-type]
+            strides=[H_kv * DimQ, 1],
+            block_shape=[BLOCK_N, DimQ],
+        )
+        desc_v = tl.make_tensor_descriptor(
+            V,
+            shape=[total_seq_len_kv, H_kv * DimV],
+            # pyrefly: ignore [bad-argument-type]
+            strides=[H_kv * DimV, 1],
+            block_shape=[BLOCK_N, DimV],
+        )
+        desc_do = tl.make_tensor_descriptor(
+            DO,
+            shape=[total_seq_len_q, H * DimV],
+            # pyrefly: ignore [bad-argument-type]
+            strides=[H * DimV, 1],
+            block_shape=[BLOCK_M, DimV],
+        )
     end_kv = seq_start_kv + seq_len_kv
     desc_dk = tl.make_tensor_descriptor(
         DK,
@@ -3475,8 +3532,11 @@ def _hstu_attn_bwd_inner(  # noqa C901
             v,
             tl.trans(do),
             allow_tf32=ALLOW_TF32,
-            attrs=(_HSTU_ATTRS_DPT_2KV if (SHARED_KV and _HSTU_COMPUTE_FOLD) else _HSTU_ATTRS_DPT) if
-            (WS_ON and not _HSTU_MODULO_TOPK) else None,
+            # This kernel processes one KV block per iteration, even when the
+            # shared-KV compute fold is enabled.  Keep TLX's dP<->dq TMEM reuse
+            # (id 11); the separate id 5 is only needed by the manual 2-KV
+            # kernel where dP and the shared dq accumulator overlap in time.
+            attrs=_HSTU_ATTRS_DPT if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if SHARED_KV:
             dk = tl.dot(
@@ -3679,21 +3739,11 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
     else:
         low_q = 0
 
-    # warp_specialize is OFF for the 2-KV inner loop. WS produces an incorrect
-    # dq here (rel-L2 ~89): the two-block shared dq accumulator is written in the
-    # gemm partition but loaded/stored (store_reduce="add") in the reduction
-    # partition, and that cross-partition gemm->reduction handoff over-counts dq.
-    # This is independent of MMA placement (all dq dots already co-locate in the
-    # gemm partition) -- see T279388065. Until that handoff is fixed, run the
-    # 2-KV inner loop unspecialized (correct via the non-WS fallback).
-    #
-    # NOTE: previously WS was effectively suppressed here by the warp budget
-    # (18/16); the accumulator-chain dpFactor collapse now fits the budget
-    # (14/16), so WS would fire and expose the dq bug -- hence the explicit OFF.
-    #
-    # merge_epilogue is also OFF (unlike the single-KV inner): folding the dq
-    # epilogue store into the computation partition duplicates/misplaces the
-    # store for the shared dq accumulator, over-counting dq.
+    # The chained-accumulator and reduce-store co-location fixes now make the
+    # two-block shared dq handoff correct under WS (see T279388065).  Merge the
+    # epilogue to match TLX's four roles and keep the computation partition on
+    # the maxRegAutoWS budget; the older five-partition shape spills heavily at
+    # the TLX-aligned BLOCK_N=128 tile.
     #
     # num_stages=1: software pipelining the two-block loop (num_stages>=2) trips
     # the pipeliner ("local_alloc can't predicate") on the doubled operand
@@ -3704,7 +3754,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             BLOCK_M,
             num_stages=1,
             warp_specialize=WS_ON,
-            merge_epilogue=False,
+            merge_epilogue=True,
     ):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         mask_m = offs_m < seq_len_q
@@ -3726,7 +3776,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         else:
             valid_mask_trans0 = offs_m[None, :] < seq_len_q
         if num_softmax_heads > 0:
-            qk_trans0, act_qk_trans0, pT0 = (backward_softmax_activation_scaled_alpha(
+            qk_trans0, act_qk_trans0, pT0 = (_backward_softmax_activation_scaled_alpha_f32x2(
                 qk_trans0,
                 scaled_alpha,
                 valid_mask_trans0,
@@ -3746,7 +3796,9 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if num_softmax_heads > 0:
-            dqk_trans0 = backward_d_softmax_activation(dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0)
+            dqk_trans0 = _backward_d_softmax_activation_f32x2(
+                dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0
+            )
         else:
             dqk_trans0 = backward_d_silu_activation(dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0)
         ######### computation/activation for P1
@@ -3764,7 +3816,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             valid_mask_trans1 = offs_m[None, :] < seq_len_q
         # calculate pT
         if num_softmax_heads > 0:
-            qk_trans1, act_qk_trans1, pT1 = (backward_softmax_activation_scaled_alpha(
+            qk_trans1, act_qk_trans1, pT1 = (_backward_softmax_activation_scaled_alpha_f32x2(
                 qk_trans1,
                 scaled_alpha,
                 valid_mask_trans1,
@@ -3785,12 +3837,14 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         )
         # calculate dqk_trans
         if num_softmax_heads > 0:
-            dqk_trans1 = backward_d_softmax_activation(dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1)
+            dqk_trans1 = _backward_d_softmax_activation_f32x2(
+                dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1
+            )
         else:
             dqk_trans1 = backward_d_silu_activation(dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1)
 
         # compute fold: pre-scale alpha into dqk so both dq and dk_attn carry it.
-        dqk_trans0 = (dqk_trans0 * alpha).to(k0.dtype)
+        dqk_trans0 = fast_mul(dqk_trans0, alpha).to(k0.dtype)
         # dq is a SINGLE accumulator over both KV blocks: b0 fresh-writes it, b1
         # accumulates into the same TMEM tile (opndD id 11) below. This avoids a
         # cross-partition register sum (dq0 and dq1 land in different warp
@@ -3819,7 +3873,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         # ---- KV block b1 (SHARED_KV + compute fold) ----
         # WS on: b1 uses DISJOINT buffer.ids (_B1) so its concurrently-live
         # tiles never alias b0's (which stays on _2KV).
-        dqk_trans1 = (dqk_trans1 * alpha).to(k1.dtype)
+        dqk_trans1 = fast_mul(dqk_trans1, alpha).to(k1.dtype)
         # Accumulate b1's dq into the SAME dq_trans TMEM tile (opndD id 11 via
         # _B1), reducing both KV blocks' contributions in TMEM.
         dq_trans = tl.dot(
@@ -4210,13 +4264,53 @@ def triton_hstu_cross_attn_v3_bwd(
             # loop STRUCTURE with warp specialization DISABLED (isolation reference).
             WS_ON=((bwd_variant == BwdVariant.TRITON_AUTOWS) and os.environ.get("HSTU_AUTOWS_WS_OFF", "0") != "1"),
         )
-    elif bwd_variant == BwdVariant.TRITON_AUTOWS_2KV:
+    elif bwd_variant in (
+        BwdVariant.TRITON_AUTOWS_2KV,
+        BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA,
+    ):
         # MANUAL 2-KV-block data-partition variant. Shared-KV only; G == 1
         # (self-attn) so no per-kv-head atomic path is needed.
         assert shared_kv, "BwdVariant.TRITON_AUTOWS_2KV requires shared_kv"
         assert G == 1, "BwdVariant.TRITON_AUTOWS_2KV requires G == 1"
+        host_tma = bwd_variant == BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA
+        if host_tma:
+            dummy_block = [1, 1]
+            desc_q_host = TensorDescriptor(
+                q,
+                shape=[total_seq_len_q, H * DimQ],
+                strides=[H * DimQ, 1],
+                block_shape=dummy_block,
+            )
+            desc_k_host = TensorDescriptor(
+                k,
+                shape=[total_seq_len_kv, (H // G) * DimQ],
+                strides=[(H // G) * DimQ, 1],
+                block_shape=dummy_block,
+            )
+            desc_v_host = TensorDescriptor(
+                v,
+                shape=[total_seq_len_kv, (H // G) * DimV],
+                strides=[(H // G) * DimV, 1],
+                block_shape=dummy_block,
+            )
+            desc_do_host = TensorDescriptor(
+                dout,
+                shape=[total_seq_len_q, H * DimV],
+                strides=[H * DimV, 1],
+                block_shape=dummy_block,
+            )
+        else:
+            # These arguments are compile-time dead in the device-TMA variant.
+            # Passing existing tensors avoids host descriptor construction and
+            # preserves its current launch/timing behavior.
+            desc_q_host, desc_k_host = q, k
+            desc_v_host, desc_do_host = v, dout
         grid = lambda meta: (Z * H, 1)  # noqa E731
         _hstu_attn_bwd_redq_2kv[grid](
+            desc_q_host=desc_q_host,
+            desc_k_host=desc_k_host,
+            desc_v_host=desc_v_host,
+            desc_do_host=desc_do_host,
             Q=q,
             K=k,
             V=v,
@@ -4270,6 +4364,7 @@ def triton_hstu_cross_attn_v3_bwd(
             AUTOWS=False,
             # Milestone 2: warp specialization ON.
             WS_ON=True,
+            HOST_TMA=host_tma,
         )
     else:
         grid = lambda meta: (Z * H, 1)  # noqa E731
