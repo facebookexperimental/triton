@@ -3423,11 +3423,9 @@ def test_tlx_wave_converter_coalesces_adjacent_wait_publication_barrier(
     else:
         assert coalesced_index == -1
         assert len(target_barrier_ops) == 1
-    # The workgroup case also publishes the tracked LDS read at function exit;
-    # the adjacent source barrier itself is represented only by the wait-ready
-    # barrier checked above.
-    expected_wave_barriers = 2 if expect_coalesced else 1
-    assert output.emitted_module.text.count("wave.barrier") == expected_wave_barriers
+    # Only the explicit source protocol is represented. Function exit does not
+    # manufacture an additional publication from LDS access history.
+    assert output.emitted_module.text.count("wave.barrier") == 1
     assert "wave.sched_barrier" not in output.emitted_module.text
     _run_wave_verify(output.emitted_module.text)
     del ctx
@@ -3474,7 +3472,11 @@ def test_tlx_wave_converter_explicit_barrier_consumes_live_lds_frontier(tmp_path
     assert barrier_attrs["dependency_count"] == 1
 
     wave = output.emitted_module.text
-    load_line = next(line for line in wave.splitlines() if "wave.gather" in line)
+    load_line = next(
+        line
+        for line in wave.splitlines()
+        if "wave.gather" in line and "#wave.shared" in line
+    )
     load_token = _ssa_second_result_name(load_line)
     explicit_barrier_line = [line for line in wave.splitlines() if "wave.barrier" in line][-1]
     assert load_token in explicit_barrier_line
@@ -3573,7 +3575,7 @@ def test_tlx_wave_converter_orders_compiler_membar_between_dma_epochs():
     first_dma_id = builder.add_op(
         "buffer_load_to_local",
         results=(first_completion, ),
-        attrs={"mode": "dma_packet_lds"},
+        attrs={"mode": "symbolic_copy"},
     )
     first_commit_id = builder.add_op(
         "async_commit_group",
@@ -3592,7 +3594,7 @@ def test_tlx_wave_converter_orders_compiler_membar_between_dma_epochs():
     second_dma_id = builder.add_op(
         "buffer_load_to_local",
         results=(second_completion, ),
-        attrs={"mode": "dma_packet_lds"},
+        attrs={"mode": "symbolic_copy"},
     )
 
     target = converter_canonicalize.eliminate_redundant_compiler_membar_barriers(builder.build())
@@ -3635,7 +3637,7 @@ def test_tlx_wave_converter_elides_compiler_membar_within_open_dma_group():
     builder.add_op(
         "buffer_load_to_local",
         results=(completions[0], ),
-        attrs={"mode": "dma_packet_lds"},
+        attrs={"mode": "symbolic_copy"},
     )
     builder.add_op(
         "barrier",
@@ -3649,7 +3651,7 @@ def test_tlx_wave_converter_elides_compiler_membar_within_open_dma_group():
     builder.add_op(
         "buffer_load_to_local",
         results=(completions[1], ),
-        attrs={"mode": "dma_packet_lds"},
+        attrs={"mode": "symbolic_copy"},
     )
     builder.add_op(
         "async_commit_group",
@@ -3680,7 +3682,7 @@ def test_tlx_wave_converter_elides_compiler_membar_before_wait_ready_load():
     builder.add_op(
         "buffer_load_to_local",
         results=(completion, ),
-        attrs={"mode": "dma_packet_lds"},
+        attrs={"mode": "symbolic_copy"},
     )
     builder.add_op(
         "async_commit_group",
@@ -4002,7 +4004,7 @@ def test_tlx_wave_converter_verifier_rejects_layout_convert_without_fact_policy(
         "layout_convert",
         operands=(operand, ),
         results=(result, ),
-        attrs={"mode": "alias", "result_component_count": 1},
+        attrs={"mode": "redistribute", "result_component_count": 1},
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4086,9 +4088,9 @@ def test_tlx_wave_converter_verifier_rejects_non_convert_layout_source():
         operands=(operand, ),
         results=(result, ),
         attrs={
-            "fact_policy": "preserve_equivalent",
+            "fact_policy": "invalidate_layout_sensitive",
             "group_size": 1,
-            "mode": "alias",
+            "mode": "redistribute",
             "result_component_count": 1,
         },
         source_op_index=0,
@@ -4262,7 +4264,7 @@ def test_tlx_wave_converter_verifier_rejects_i32_memory_offset_edges():
         converter_verifier.verify_target_program(target)
 
     assert exc_info.value.code == "TLXW_VERIFY_MEMORY_EDGE"
-    assert "SIMD index representation" in str(exc_info.value)
+    assert "SIMD i32 or index representation" in str(exc_info.value)
 
 
 def test_tlx_wave_converter_verifier_rejects_unknown_target_op():
@@ -4532,11 +4534,20 @@ def _dense_f32_local_access_attrs():
         "component_count": 1,
         "destination_component_coordinate_bases": ((0, ), ),
         "destination_coordinate_shape": (64, ),
+        "destination_logical_origin": (0, ),
         "destination_offset_mode": "layout_coordinates",
         "destination_physical_element_byte_width": 4,
         "destination_physical_offset_plan": "dense_row_major",
         "destination_physical_offset_unit": "element",
-        "destination_workitem_coordinate_coefficients": ((1, ), ),
+        "destination_physical_shape": (64, ),
+        "destination_workitem_coordinate_coefficients": (
+            (1, ),
+            (2, ),
+            (4, ),
+            (8, ),
+            (16, ),
+            (32, ),
+        ),
         "element_byte_width": 4,
         "element_type": "f32",
         "lane_width": 64,
@@ -4547,10 +4558,22 @@ def _dense_f32_dma_attrs():
     return {
         "cache_modifier": 1,
         "component_count": 1,
-        "destination_component_offsets": (0, ),
-        "destination_lane_stride_elements": 1,
-        "destination_offset_mode": "affine",
-        "destination_wave_stride_elements": 0,
+        "destination_component_coordinate_bases": ((0, ), ),
+        "destination_coordinate_shape": (64, ),
+        "destination_logical_origin": (0, ),
+        "destination_offset_mode": "layout_coordinates",
+        "destination_physical_element_byte_width": 4,
+        "destination_physical_offset_plan": "dense_row_major",
+        "destination_physical_offset_unit": "element",
+        "destination_physical_shape": (64, ),
+        "destination_workitem_coordinate_coefficients": (
+            (1, ),
+            (2, ),
+            (4, ),
+            (8, ),
+            (16, ),
+            (32, ),
+        ),
         "element_byte_width": 4,
         "element_type": "f32",
         "has_mask": False,
@@ -4559,9 +4582,41 @@ def _dense_f32_dma_attrs():
         "source_issue_dependency_count": 0,
         "lane_width": 64,
         "mask_mode": "none",
-        "mode": "dma_load_lds",
-        "packet_bytes": 16,
+        "mode": "symbolic_copy",
         "range_bytes": 256,
+    }
+
+
+def _dense_f16_symbolic_copy_attrs():
+    return {
+        "cache_modifier": 1,
+        "component_count": 1,
+        "destination_component_coordinate_bases": ((0, ), ),
+        "destination_coordinate_shape": (512, ),
+        "destination_logical_origin": (0, ),
+        "destination_offset_mode": "layout_coordinates",
+        "destination_physical_element_byte_width": 2,
+        "destination_physical_offset_plan": "dense_row_major",
+        "destination_physical_offset_unit": "element",
+        "destination_physical_shape": (512, ),
+        "destination_workitem_coordinate_coefficients": (
+            (1, ),
+            (2, ),
+            (4, ),
+            (8, ),
+            (16, ),
+            (32, ),
+        ),
+        "element_byte_width": 2,
+        "element_type": "f16",
+        "has_mask": False,
+        "has_stride_operand": False,
+        "issue_dependency_count": 0,
+        "source_issue_dependency_count": 0,
+        "lane_width": 64,
+        "mask_mode": "none",
+        "mode": "symbolic_copy",
+        "range_bytes": 1024,
     }
 
 
@@ -5000,8 +5055,6 @@ def _build_lds_read_then_scratch_exchange_target(
         attrs={
             "block_count":
             1,
-            "cross_wave":
-            True,
             "cta_thread_count":
             128,
             "element_type":
@@ -5065,7 +5118,6 @@ def _build_mma_read_then_dma_reuse_target(
     reload_after_boundary=False,
     add_refill=True,
     second_root=False,
-    refill_mode="dma_load_lds",
     loop_refill=False,
     defer_group_read_to_wait=False,
 ):
@@ -5236,26 +5288,7 @@ def _build_mma_read_then_dma_reuse_target(
                 "buffer_load_to_local",
                 operands=(alloc, source, offset),
                 results=(dma_token, ),
-                attrs={
-                    "cache_modifier": 1,
-                    "component_count": 1,
-                    "destination_component_offsets": (0, ),
-                    "destination_lane_stride_elements": 1,
-                    "destination_offset_mode": "affine",
-                    "destination_wave_stride_elements": 0,
-                    "element_byte_width": 2,
-                    "element_type": "f16",
-                    "has_mask": False,
-                    "has_stride_operand": False,
-                    "issue_dependency_count": 0,
-                    "source_issue_dependency_count": 0,
-                    "lds_release_dependency_count": 0,
-                    "lane_width": 64,
-                    "mask_mode": "none",
-                    "mode": str(refill_mode),
-                    "packet_bytes": 16,
-                    "range_bytes": 1024,
-                },
+                attrs=_dense_f16_symbolic_copy_attrs(),
             )
             builder.add_op(
                 "local_load_mma_payload",
@@ -5289,25 +5322,8 @@ def _build_mma_read_then_dma_reuse_target(
                 operands=(destination, source, offset),
                 results=(result_token, ),
                 attrs={
+                    **_dense_f16_symbolic_copy_attrs(),
                     **({"async_group_id": 0} if defer_group_read_to_wait else {}),
-                    "cache_modifier": 1,
-                    "component_count": 1,
-                    "destination_component_offsets": (0, ),
-                    "destination_lane_stride_elements": 1,
-                    "destination_offset_mode": "affine",
-                    "destination_wave_stride_elements": 0,
-                    "element_byte_width": 2,
-                    "element_type": "f16",
-                    "has_mask": False,
-                    "has_stride_operand": False,
-                    "issue_dependency_count": 0,
-                    "source_issue_dependency_count": 0,
-                    "lds_release_dependency_count": 0,
-                    "lane_width": 64,
-                    "mask_mode": "none",
-                    "mode": str(refill_mode),
-                    "packet_bytes": 16,
-                    "range_bytes": 1024,
                 },
             )
         if defer_group_read_to_wait:
@@ -5351,6 +5367,20 @@ def _ssa_result_name(line):
 
 def _ssa_second_result_name(line):
     return line.strip().split("=", 1)[0].split(",")[1].strip()
+
+
+def _ssa_value_is_used(line, value):
+    return re.search(
+        rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])",
+        line.split("=", 1)[-1],
+    ) is not None
+
+
+def _ssa_after_uses(line, value):
+    return re.search(
+        rf"\bafter\s+{re.escape(value)}(?![A-Za-z0-9_])",
+        line,
+    ) is not None
 
 
 def test_tlx_wave_converter_emission_keeps_distinct_lds_tokens_independent():
@@ -5456,8 +5486,12 @@ def test_tlx_wave_converter_emission_keeps_disjoint_circular_slots_independent(
 
     assert "wave.barrier" not in emitted.text
     load_line = next(line for line in emitted.text.splitlines() if "wave.gather" in line)
-    dma_line = next(line for line in emitted.text.splitlines() if "waveamd.dma_load_lds" in line)
-    assert _ssa_second_result_name(load_line) not in dma_line
+    copy_line = next(
+        line
+        for line in emitted.text.splitlines()
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
+    assert not _ssa_value_is_used(copy_line, _ssa_second_result_name(load_line))
     _run_wave_verify(emitted.text)
 
 
@@ -5473,12 +5507,16 @@ def test_tlx_wave_converter_emission_does_not_infer_dma_dependency_for_unproven_
     emitted = converter_emission.emit_wave_module(_build_circular_memdesc_read_refill_target(**kwargs))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
 
     read_token = _ssa_second_result_name(lines[load_index])
-    assert load_index < dma_index
+    assert load_index < copy_index
     assert "wave.barrier" not in emitted.text
-    assert read_token not in lines[dma_index]
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5499,15 +5537,9 @@ def test_tlx_wave_converter_emission_barriers_pending_lds_read_before_redistribu
     emitted = converter_emission.emit_wave_module(_build_lds_read_then_scratch_exchange_target())
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    release_index = next(index for index, line in enumerate(lines) if "wave.alloc_release" in line)
-    barrier_index = next(index for index, line in enumerate(lines[release_index + 1:], release_index + 1)
-                         if "wave.barrier" in line)
     redistribute_index = next(index for index, line in enumerate(lines) if "wave.redistribute" in line)
-    assert emitted.text.count("wave.barrier") == 2
-    assert emitted.text.count("wave.alloc_release") == 1
-    assert load_index < release_index < barrier_index < redistribute_index
-    release_token = _ssa_result_name(lines[release_index])
-    assert release_token in lines[barrier_index]
+    assert load_index < redistribute_index
+    assert "wave.alloc_release" not in emitted.text
     _run_wave_verify(emitted.text)
     _run_waveamd_to_machine(emitted.text)
 
@@ -5527,15 +5559,10 @@ def test_tlx_wave_converter_emission_merges_conditional_lds_access_before_releas
     emitted = converter_emission.emit_wave_module(_build_lds_read_then_scratch_exchange_target(conditional_reload=True))
     lines = emitted.text.splitlines()
     if_index = next(index for index, line in enumerate(lines) if "scf.if" in line)
-    release_index = next(index for index, line in enumerate(lines) if "wave.alloc_release" in line)
-    barrier_index = next(index for index, line in enumerate(lines[release_index + 1:], release_index + 1)
-                         if "wave.barrier" in line)
     redistribute_index = next(index for index, line in enumerate(lines) if "wave.redistribute" in line)
 
-    assert if_index < release_index < barrier_index < redistribute_index
-    assert "!wave.mem.token" in lines[if_index]
-    release_token = _ssa_result_name(lines[release_index])
-    assert release_token in lines[barrier_index]
+    assert if_index < redistribute_index
+    assert "wave.alloc_release" not in emitted.text
     _run_wave_verify(emitted.text)
     _run_waveamd_to_machine(emitted.text)
 
@@ -5544,15 +5571,10 @@ def test_tlx_wave_converter_emission_carries_loop_lds_history_before_release():
     emitted = converter_emission.emit_wave_module(_build_lds_read_then_scratch_exchange_target(loop_reload=True))
     lines = emitted.text.splitlines()
     loop_index = next(index for index, line in enumerate(lines) if "scf.for" in line)
-    release_index = next(index for index, line in enumerate(lines) if "wave.alloc_release" in line)
-    barrier_index = next(index for index, line in enumerate(lines[release_index + 1:], release_index + 1)
-                         if "wave.barrier" in line)
     redistribute_index = next(index for index, line in enumerate(lines) if "wave.redistribute" in line)
 
-    assert loop_index < release_index < barrier_index < redistribute_index
-    assert lines[loop_index].count("!wave.mem.token") >= 2
-    release_token = _ssa_result_name(lines[release_index])
-    assert release_token in lines[barrier_index]
+    assert loop_index < redistribute_index
+    assert "wave.alloc_release" not in emitted.text
     _run_wave_verify(emitted.text)
     _run_waveamd_to_machine(emitted.text)
 
@@ -5561,11 +5583,15 @@ def test_tlx_wave_converter_emission_does_not_add_mma_read_dependency_to_dma():
     emitted = converter_emission.emit_wave_module(_build_mma_read_then_dma_reuse_target())
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
     read_token = _ssa_second_result_name(lines[load_index])
 
-    assert "wave.barrier" not in "\n".join(lines[load_index + 1:dma_index])
-    assert read_token not in lines[dma_index]
+    assert "wave.barrier" not in "\n".join(lines[load_index + 1:copy_index])
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5573,12 +5599,16 @@ def test_tlx_wave_converter_emission_does_not_barrier_multi_wave_mma_read_before
     emitted = converter_emission.emit_wave_module(_build_mma_read_then_dma_reuse_target(num_warps=4))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
     read_token = _ssa_second_result_name(lines[load_index])
 
     assert emitted.text.count("wave.barrier") == 0
-    assert load_index < dma_index
-    assert read_token not in lines[dma_index]
+    assert load_index < copy_index
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5590,15 +5620,24 @@ def test_tlx_wave_converter_emission_does_not_carry_mma_read_dependency_to_loop_
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
     loop_index = next(index for index, line in enumerate(lines) if "scf.for" in line)
-    dma_index = next(index for index, line in enumerate(lines) if index > loop_index and "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if index > loop_index
+        and "wave.gather" in line
+        and "#waveamd.buffer" in line
+    )
     read_token = _ssa_second_result_name(lines[load_index])
     loop_token_args = _loop_iter_arg_names(lines[loop_index])
 
-    assert load_index < loop_index < dma_index
+    assert load_index < loop_index < copy_index
     assert lines[loop_index].count("!wave.mem.token") == 2
     assert read_token in lines[loop_index]
     assert "wave.barrier" not in emitted.text
-    assert all(token not in lines[dma_index] for token in loop_token_args)
+    assert all(
+        not _ssa_value_is_used(lines[copy_index], token)
+        for token in loop_token_args
+    )
     _run_wave_verify(emitted.text)
 
 
@@ -5610,41 +5649,20 @@ def test_tlx_wave_converter_emission_keeps_group_wait_separate_from_mma_read_fro
         ))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
     barrier_indices = [index for index, line in enumerate(lines) if "wave.barrier" in line]
     barrier_index = barrier_indices[0]
     read_token = _ssa_second_result_name(lines[load_index])
     barrier_token = _ssa_result_name(lines[barrier_index])
 
     assert len(barrier_indices) == 1
-    assert load_index < dma_index < barrier_index
-    assert read_token not in lines[dma_index]
+    assert load_index < copy_index < barrier_index
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     assert not _wave_token_depends_on(emitted.text, barrier_token, read_token)
-    _run_wave_verify(emitted.text)
-
-
-def test_tlx_wave_converter_emission_barriers_multi_wave_mma_read_reuse_before_scalarized_refill():
-    emitted = converter_emission.emit_wave_module(
-        _build_mma_read_then_dma_reuse_target(
-            num_warps=4,
-            refill_mode="scalarized_load_store",
-        ))
-    lines = emitted.text.splitlines()
-    local_load_index = next(index for index, line in enumerate(lines)
-                            if "wave.gather" in line and "#wave.shared" in line)
-    barrier_index = next(index for index, line in enumerate(lines)
-                         if index > local_load_index and "wave.barrier" in line)
-    refill_load_index = next(index for index, line in enumerate(lines)
-                             if index > barrier_index and "wave.gather" in line and "#wave.global" in line)
-    refill_store_index = next(index for index, line in enumerate(lines)
-                              if index > refill_load_index and "wave.scatter" in line)
-    read_token = _ssa_second_result_name(lines[local_load_index])
-    barrier_token = _ssa_result_name(lines[barrier_index])
-
-    assert emitted.text.count("wave.barrier") == 1
-    assert local_load_index < barrier_index < refill_load_index < refill_store_index
-    assert _wave_token_depends_on(emitted.text, barrier_token, read_token)
-    assert f"after {barrier_token}" in lines[refill_load_index]
     _run_wave_verify(emitted.text)
 
 
@@ -5656,12 +5674,16 @@ def test_tlx_wave_converter_emission_does_not_materialize_mfma_boundary_for_dma(
         ))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
     read_token = _ssa_second_result_name(lines[load_index])
 
-    assert load_index < dma_index
+    assert load_index < copy_index
     assert "wave.barrier" not in emitted.text
-    assert read_token not in lines[dma_index]
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5685,12 +5707,23 @@ def test_tlx_wave_converter_emission_does_not_materialize_mfma_boundaries_for_dm
             second_root=True,
         ))
     lines = emitted.text.splitlines()
-    dma_lines = [line for line in lines if "waveamd.dma_load_lds" in line]
-    read_tokens = [_ssa_second_result_name(line) for line in lines if "wave.gather" in line]
+    copy_lines = [
+        line
+        for line in lines
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    ]
+    read_tokens = [
+        _ssa_second_result_name(line)
+        for line in lines
+        if "wave.gather" in line and "#wave.shared" in line
+    ]
 
     assert emitted.text.count("wave.barrier") == 0
-    assert len(dma_lines) == 2
-    assert all(all(token not in line for token in read_tokens) for line in dma_lines)
+    assert len(copy_lines) == 2
+    assert all(
+        all(not _ssa_value_is_used(line, token) for token in read_tokens)
+        for line in copy_lines
+    )
     _run_wave_verify(emitted.text)
 
 
@@ -5704,13 +5737,17 @@ def test_tlx_wave_converter_emission_does_not_use_dominating_barrier_as_dma_depe
         ))
     lines = emitted.text.splitlines()
     barrier_lines = [line for line in lines if "wave.barrier" in line]
-    dma_lines = [line for line in lines if "waveamd.dma_load_lds" in line]
+    copy_lines = [
+        line
+        for line in lines
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    ]
 
     assert len(barrier_lines) == 1
-    assert len(dma_lines) == 2
+    assert len(copy_lines) == 2
     assert "wave.barrier : ()" not in barrier_lines[0]
     barrier_token = _ssa_result_name(barrier_lines[0])
-    assert all(f"after {barrier_token}" not in line for line in dma_lines)
+    assert all(f"after {barrier_token}" not in line for line in copy_lines)
     _run_wave_verify(emitted.text)
 
 
@@ -5723,17 +5760,25 @@ def test_tlx_wave_converter_emission_does_not_add_dma_barrier_after_new_mma_read
             reload_after_boundary=True,
         ))
     lines = emitted.text.splitlines()
-    load_indices = [index for index, line in enumerate(lines) if "wave.gather" in line]
+    load_indices = [
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#wave.shared" in line
+    ]
     barrier_indices = [index for index, line in enumerate(lines) if "wave.barrier" in line]
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
 
     assert len(load_indices) == 2
     assert len(barrier_indices) == 1
-    assert load_indices[0] < barrier_indices[0] < load_indices[1] < dma_index
+    assert load_indices[0] < barrier_indices[0] < load_indices[1] < copy_index
     second_read_token = _ssa_second_result_name(lines[load_indices[1]])
     barrier_token = _ssa_result_name(lines[barrier_indices[0]])
-    assert second_read_token not in lines[dma_index]
-    assert f"after {barrier_token}" not in lines[dma_index]
+    assert not _ssa_value_is_used(lines[copy_index], second_read_token)
+    assert f"after {barrier_token}" not in lines[copy_index]
     _run_wave_verify(emitted.text)
 
 
@@ -5745,13 +5790,21 @@ def test_tlx_wave_converter_emission_drops_mfma_boundary_before_dma_after_new_re
             reload_after_boundary=True,
         ))
     lines = emitted.text.splitlines()
-    load_indices = [index for index, line in enumerate(lines) if "wave.gather" in line]
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    load_indices = [
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#wave.shared" in line
+    ]
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
     second_read_token = _ssa_second_result_name(lines[load_indices[-1]])
 
     assert emitted.text.count("wave.barrier") == 0
-    assert load_indices[0] < load_indices[-1] < dma_index
-    assert second_read_token not in lines[dma_index]
+    assert load_indices[0] < load_indices[-1] < copy_index
+    assert not _ssa_value_is_used(lines[copy_index], second_read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5764,12 +5817,16 @@ def test_tlx_wave_converter_emission_ignores_masked_mfma_boundary():
         ))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    dma_index = next(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
+    copy_index = next(
+        index
+        for index, line in enumerate(lines)
+        if "wave.gather" in line and "#waveamd.buffer" in line
+    )
     read_token = _ssa_second_result_name(lines[load_index])
 
     assert emitted.text.count("wave.barrier") == 0
-    assert load_index < dma_index
-    assert read_token not in lines[dma_index]
+    assert load_index < copy_index
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5799,13 +5856,13 @@ def test_tlx_wave_converter_emission_carries_implicit_lds_token_across_for(tmp_p
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     loop_result = _ssa_result_name(loop_match.group(0))
     loop_token_args = _loop_iter_arg_names(loop_match.group(0))
     assert len(loop_token_args) == 1
     loop_body = wave[loop_match.end():wave.index("scf.yield", loop_match.end())]
-    inner_store_line = next(line for line in loop_body.splitlines() if "wave.scatter" in line)
+    inner_store_line = next(line for line in loop_body.splitlines() if "wave.store" in line)
     inner_barrier_line = next(line for line in loop_body.splitlines() if "wave.barrier" in line)
     inner_barrier = _ssa_result_name(inner_barrier_line)
     (loop_token_arg, ) = loop_token_args
@@ -5817,7 +5874,7 @@ def test_tlx_wave_converter_emission_carries_implicit_lds_token_across_for(tmp_p
     post_loop_barrier_line = next(line for line in after_loop.splitlines() if "wave.barrier" in line)
     post_loop_barrier = _ssa_result_name(post_loop_barrier_line)
     assert f"wave.barrier {loop_result}" in post_loop_barrier_line
-    post_loop_load_line = next(line for line in after_loop.splitlines() if "wave.gather" in line)
+    post_loop_load_line = next(line for line in after_loop.splitlines() if "wave.load" in line)
     assert f"after {post_loop_barrier}" in post_loop_load_line
     _run_wave_verify(wave)
     del ctx
@@ -6603,10 +6660,9 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
     assert ("tlx_wave.enable_multi_wave_specialization" in ttgir_artifact) is enable_multi_wave_specialization
     assert ("waveamdmachine.enable_multi_wave_specialization" in wave_artifact) is enable_multi_wave_specialization
     assert (compiled.metadata.tlx_wave_enable_multi_wave_specialize is enable_multi_wave_specialization)
-    if "expected_dma_load_lds" in case:
-        assert (compiled.metadata.tlx_wave_num_dma_load_lds == case["expected_dma_load_lds"])
-    else:
-        assert compiled.metadata.tlx_wave_num_dma_load_lds > 0
+    # The bridge records semantic gather/scatter copies; packetization and
+    # direct-to-LDS selection happen later in Wave.
+    assert compiled.metadata.tlx_wave_num_dma_load_lds == 0
     if case["version_dir"] == "v9_beyond_hotloop":
         assert "layout_convert" not in wave_artifact
     if case["version_dir"] in {"wave_8wave", "wave_4wave_specialized"}:
@@ -6617,15 +6673,16 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
         # issue-epoch barrier between the two closed prologue stages.
         assert wave_artifact.count("wave.barrier") == 6
     if case.get("id") == "v9_beyond_hotloop_transposed_b":
-        barrier_lines = [line for line in wave_artifact.splitlines() if "wave.barrier" in line]
+        lowered_wave = _run_wave_lower_symbolic_memory(wave_artifact)
+        barrier_lines = [line for line in lowered_wave.splitlines() if "wave.barrier" in line]
         barrier_tokens = {_ssa_result_name(line) for line in barrier_lines}
         shared_load_lines = [
-            line for line in wave_artifact.splitlines() if "wave.load" in line and "#wave.shared" in line
+            line for line in lowered_wave.splitlines() if "wave.load" in line and "#wave.shared" in line
         ]
-        dma_lines = [line for line in wave_artifact.splitlines() if "waveamd.dma_load_lds" in line]
-        issue_lines = [line for line in wave_artifact.splitlines() if "wave.issue_token" in line]
+        dma_lines = [line for line in lowered_wave.splitlines() if "waveamd.dma_load_lds" in line]
+        issue_lines = [line for line in lowered_wave.splitlines() if "wave.issue_token" in line]
         join_inputs = {}
-        for line in wave_artifact.splitlines():
+        for line in lowered_wave.splitlines():
             if "wave.join" not in line:
                 continue
             result = _ssa_result_name(line)
@@ -7782,10 +7839,10 @@ def test_tlx_wave_converter_pipeline_carries_async_token_across_dynamic_for(tmp_
         op for op in output.target_program.ops if op.kind == "buffer_load_to_local" and op.source_op_index is not None
     ][1]
     attrs = converter_target_ir.attrs_dict(body_dma)
-    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["mode"] == "symbolic_copy"
     assert attrs["issue_dependency_count"] == 0
     (for_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     dma_issue_token_args, hidden_local_token_args = _loop_explicit_and_hidden_token_args(for_op, loop_match.group(0))
     assert len(dma_issue_token_args) == 1
@@ -7846,7 +7903,7 @@ def test_tlx_wave_converter_loop_dma_group_is_not_an_implicit_ds_dependency(tmp_
     queue_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_DMA_GROUP)
     ready_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY)
 
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     iter_args = _loop_iter_arg_names(loop_match.group(0))
     queue_arg = iter_args[queue_index]
@@ -7894,10 +7951,10 @@ def test_tlx_wave_converter_pipeline_carries_loop_issued_async_token_to_final_wa
     assert [op.kind for op in output.target_program.ops].count("token") == 1
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["mode"] == "symbolic_copy"
     assert attrs["issue_dependency_count"] == 0
     (for_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     dma_issue_token_args, hidden_local_token_args = _loop_explicit_and_hidden_token_args(for_op, loop_match.group(0))
     assert len(dma_issue_token_args) == 1
@@ -7958,7 +8015,7 @@ def test_tlx_wave_converter_pipeline_carries_async_tokens_through_nested_for(tmp
     ]
     assert len(dma_ops) == 4
     assert [converter_target_ir.attrs_dict(op)["issue_dependency_count"] for op in dma_ops] == [0, 0, 0, 0]
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     loop_matches = _scf_for_matches(wave)
     assert len(loop_matches) == 2
     dma_issue_token_args, hidden_local_token_args = _loop_explicit_and_hidden_token_args(
@@ -8037,7 +8094,7 @@ def test_tlx_wave_converter_pipeline_carries_multiple_async_groups_across_for(tm
     assert for_attrs["init_arg_count"] == 4
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     assert [converter_target_ir.attrs_dict(op)["issue_dependency_count"] for op in dma_ops] == [0] * 8
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     iter_args = _loop_iter_arg_names(loop_match.group(0))
     assert len(iter_args) == 4
@@ -8104,11 +8161,11 @@ def test_tlx_wave_converter_pipeline_preserves_waited_slot_carry_for_dynamic_loa
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     iter_args = _loop_iter_arg_names(loop_match.group(0))
     loop_body = wave[loop_match.end():]
-    load_pos = loop_body.index("wave.gather")
+    load_pos = loop_body.index("wave.load")
     wait_ready = next(re.finditer(r"(?P<token>%\d+) = wave\.after (?P<operands>[^\n]+)", loop_body[load_pos:]))
     wait_token = wait_ready.group("token")
     yield_values = re.findall(r"%[\w#]+", re.search(r"scf\.yield (?P<values>[^\n]+?) :", loop_body).group("values"))
@@ -8205,10 +8262,10 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_circular_refill(
     ]
     assert dynamic_views
     assert all(attrs["slot_count"] == slot_count for attrs in dynamic_views)
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     loop_body = wave[loop_match.end():]
-    load_index = loop_body.index("wave.gather")
+    load_index = loop_body.index("wave.load")
     dma_index = loop_body.index("waveamd.dma_load_lds")
     barrier_indices = [match.start() for match in re.finditer(r"wave\.barrier", loop_body[:dma_index])]
     sched_barrier_indices = [match.start() for match in re.finditer(r"wave\.sched_barrier", loop_body[:dma_index])]
@@ -8259,10 +8316,10 @@ def test_tlx_wave_converter_pipeline_does_not_infer_dma_dependency_from_circular
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     loop_body = wave[loop_match.end():]
-    load_index = loop_body.index("wave.gather")
+    load_index = loop_body.index("wave.load")
     dma_index = loop_body.index("waveamd.dma_load_lds")
     barrier_indices = [match.start() for match in re.finditer(r"wave\.barrier", loop_body[:dma_index])]
     sched_barrier_indices = [match.start() for match in re.finditer(r"wave\.sched_barrier", loop_body[:dma_index])]
@@ -8310,10 +8367,10 @@ def test_tlx_wave_converter_keeps_compiler_reuse_barrier_with_warp_pipeline(tmp_
 
     (loop_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
     assert converter_target_ir.attrs_dict(loop_op)["explicit_warp_pipeline_protocol"] is True
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
     loop_body = wave[loop_match.end():]
-    load_index = loop_body.index("wave.gather")
+    load_index = loop_body.index("wave.load")
     dma_index = loop_body.index("waveamd.dma_load_lds")
     barrier_indices = [match.start() for match in re.finditer(r"wave\.barrier", loop_body)]
     assert len(barrier_indices) == 3
@@ -8364,7 +8421,7 @@ def test_tlx_wave_converter_pipeline_orders_wait_consumed_body_issue(tmp_path, )
 
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     assert [converter_target_ir.attrs_dict(op)["issue_dependency_count"] for op in dma_ops] == [0, 0, 0]
-    wave = output.emitted_module.text
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     assert wave.count("waveamd.dma_load_lds") == 3
     machine = _run_waveamd_to_machine(wave)
     assert machine.count("waveamdmachine.s_waitcnt") <= 2
@@ -8627,10 +8684,7 @@ def test_tlx_wave_converter_scalarizes_async_copy_into_memdesc_subslice(tmp_path
 
     (copy_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(copy_op)
-    assert attrs["mode"] == "scalarized_load_store"
-    assert attrs["destination_offset_mode"] == "affine"
-    assert attrs["destination_component_offsets"] == (64, )
-    assert attrs["destination_lane_stride_elements"] == 1
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" not in wave
     assert wave.count("wave.gather") == 1
@@ -8663,16 +8717,12 @@ def test_tlx_wave_converter_packetizes_padded_dma_into_memdesc_subslice(tmp_path
 
     (copy_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(copy_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == 1
-    # The view starts after four padded 512-element lines in the parent
-    # allocation: 2048 + 4 * 8 = 2080 f16 elements.
-    assert attrs["destination_component_offsets"] == (2080, )
-    assert attrs["destination_wave_count"] == 4
-    assert attrs["destination_wave_stride_dwords"] == 260
-    wave = output.emitted_module.text
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert wave.count("waveamd.dma_load_lds") == 1
-    assert "wave.read_first" in wave
     _run_wave_verify(wave)
     del ctx
 
@@ -8903,7 +8953,6 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert [op.kind for op in output.target_program.ops] == [
         "local_alloc",
         "make_range",
-        "affine_materialize",
         "buffer_load_to_local",
         "async_commit_group",
         "async_wait",
@@ -8911,97 +8960,22 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     ]
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == 1
-    assert attrs["destination_component_offsets"] == (0, )
-    assert attrs["packet_bytes"] == 16
-    assert attrs["packet_elements"] == 8
-    assert attrs["range_bytes"] == 2147483647
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        dma_op,
-    )
-    assert affine_attrs["mode"] == "packet_coordinates"
-    assert affine_attrs["value_range"] == (0, 1073741816)
-    assert affine_attrs["no_signed_wrap"] is True
+    assert attrs["mode"] == "symbolic_copy"
+    assert attrs["component_count"] == 8
+    assert attrs["destination_offset_mode"] == "layout_coordinates"
     assert "waveamd.make_buffer" in output.emitted_module.text
-    assert "wave.assume" in output.emitted_module.text
+    assert "wave.gather" in output.emitted_module.text
+    assert "wave.scatter" in output.emitted_module.text
     assert "wave.load" not in output.emitted_module.text
     assert "wave.store" not in output.emitted_module.text
-    assert "waveamd.dma_load_lds" in output.emitted_module.text
+    assert "waveamd.dma_load_lds" not in output.emitted_module.text
     assert "wave.wait" not in output.emitted_module.text
     assert "wave.after" in output.emitted_module.text
     assert "wave.barrier" not in output.emitted_module.text
-    del ctx
-
-
-@pytest.mark.parametrize(
-    "elements,register_bases,lane_bases,expected_components",
-    [
-        (
-            512,
-            "[[1], [2], [4]]",
-            "[[8], [16], [32], [64], [128], [256]]",
-            1,
-        ),
-        (
-            1024,
-            "[[1], [2], [4], [512]]",
-            "[[8], [16], [32], [64], [128], [256]]",
-            2,
-        ),
-    ],
-)
-def test_tlx_wave_converter_lowers_assumed_async_copy_layout(
-    tmp_path,
-    elements,
-    register_bases,
-    lane_bases,
-    expected_components,
-):
-    preamble = f"""
-#blocked = #ttg.blocked<{{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}}>
-#copy = #ttg.linear<{{register = {register_bases}, lane = {lane_bases}, warp = [], block = []}}>
-#shared = #ttg.swizzled_shared<{{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}}>
-#smem = #ttg.shared_memory
-"""
-    local_func = f"""
-  tt.func public @converter_assumed_async_copy_layout(
-      %arg0: !tt.ptr<f16> {{tt.pointer_range = 32 : i32}}
-  ) attributes {{noinline = false}} {{
-    %alloc = ttg.local_alloc : () -> !ttg.memdesc<{elements}xf16, #shared, #smem, mutable>
-    %range = tt.make_range {{end = {elements} : i32, start = 0 : i32}} : tensor<{elements}xi32, #blocked>
-    %token = amdg.buffer_load_to_local %arg0[%range] into %alloc {{tlx.wave.copy_layout = #copy}} : <f16>[tensor<{elements}xi32, #blocked>] -> <{elements}xf16, #shared, #smem, mutable>
-    %group = ttg.async_commit_group tokens %token
-    %wait = ttg.async_wait %group {{num = 0 : i32}}
-    tt.return
-  }}
-"""
-    mod, ctx = _parse_ttgir(
-        tmp_path,
-        local_func,
-        num_warps=1,
-        preamble=preamble,
-    )
-
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
-
-    (dma_op, ) = [
-        op
-        for op in output.target_program.ops
-        if op.kind == "buffer_load_to_local"
-    ]
-    attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == expected_components
-    assert attrs["packet_bytes"] == 16
-    _affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        dma_op,
-    )
-    assert affine_attrs["coordinate_mode"] == "layout_coordinates"
-    assert output.emitted_module.text.count("waveamd.dma_load_lds") == expected_components
-    _run_wave_verify(output.emitted_module.text)
+    lowered = _run_wave_lower_symbolic_memory(output.emitted_module.text)
+    assert lowered.count("waveamd.dma_load_lds") == 1
+    assert "wave.gather" not in lowered
+    assert "wave.scatter" not in lowered
     del ctx
 
 
@@ -9029,13 +9003,13 @@ def test_tlx_wave_converter_pipeline_preserves_pointer_range_through_addptr_dma(
 
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
+    assert attrs["mode"] == "symbolic_copy"
     assert attrs["range_bytes"] == 2147483647
     assert "waveamd.make_buffer" in output.emitted_module.text
     del ctx
 
 
-def test_tlx_wave_converter_carries_packet_dma_pointers_through_loop(tmp_path):
+def test_tlx_wave_converter_keeps_dma_pointer_conversion_inside_loop(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -9075,32 +9049,35 @@ def test_tlx_wave_converter_carries_packet_dma_pointers_through_loop(tmp_path):
         if op.kind == "buffer_load_to_local"
     ]
     dma_attrs = converter_target_ir.attrs_dict(dma_op)
-    assert dma_attrs["mode"] == "dma_packet_lds"
-    assert dma_attrs["source_pointer_mode"] == "direct"
+    _assert_mechanical_symbolic_copy(dma_attrs, masked=False)
+    assert "source_pointer_mode" not in dma_attrs
     pointer_type = output.target_program.values[dma_op.operands[1]].type
-    assert pointer_type.representation == "buffer_pointer"
+    assert pointer_type.representation == "uniform_pointer"
     assert pointer_type.component_count == 1
-    assert len([
+    assert not [
         op for op in output.target_program.ops if op.kind == "make_buffer"
-    ]) == 1
+    ]
 
     (for_op,) = [
         op for op in output.target_program.ops if op.kind == "for_loop"
     ]
     region = output.target_program.regions[for_op.region_ids[0]]
-    assert any(
+    assert all(
         output.target_program.values[value_id].type.representation
-        == "buffer_pointer"
+        != "buffer_pointer"
         for value_id in for_op.operands[3:]
     )
-    assert any(
+    assert all(
         output.target_program.values[value_id].type.representation
-        == "buffer_pointer"
+        != "buffer_pointer"
         for value_id in region.block_arg_ids[1:]
     )
 
-    wave = output.emitted_module.text
-    assert "!wave.simd<!wave.ptr<#waveamd.buffer, f16>, 64>" in wave
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("waveamd.make_buffer") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.reg_after" not in machine
@@ -9140,29 +9117,14 @@ def test_tlx_wave_converter_dma_affine_offset_marks_layout_math_nsw(tmp_path):
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    affine_op = next(op for op in output.target_program.ops
-                     if op.kind == "affine_materialize" and load_to_local_op.operands[2] in op.results)
-    affine_attrs = converter_target_ir.attrs_dict(affine_op)
-    assert affine_attrs["mode"] == "packet_coordinates"
-    assert affine_attrs["no_signed_wrap"] is True
-    provenance_ids = affine_attrs[converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR]
-    live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
-    provenance_producers = [
-        op for op in output.target_program.ops if any(value_id in op.results for value_id in provenance_ids)
-    ]
-    replaced_offset_producer = next(op for op in provenance_producers if op.kind == "binary")
-    assert replaced_offset_producer.kind == "binary"
-    assert replaced_offset_producer.target_op_id not in live_op_ids
-    assert all(value_id not in load_to_local_op.operands for value_id in provenance_ids)
-    assert affine_attrs["terms"] == (
-        ("dim", 1, 1, ()),
-        ("dim_scalar", 1, 0, (0, )),
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    assert all(
+        op.kind != "affine_materialize"
+        for op in output.target_program.ops
     )
-    # Symbolic index expressions carry their range contract as predicates
-    # instead of integer-op overflow flags.
-    assert "wave.index_expr" in output.emitted_module.text
-    assert " assuming [#wave.pred" in output.emitted_module.text
+    wave = output.emitted_module.text
+    assert wave.count("wave.gather") == 1
+    assert wave.count("wave.scatter") == 1
     del ctx
 
 
@@ -9193,7 +9155,6 @@ def test_tlx_wave_converter_lowers_dynamic_memdesc_index_packet_dma_destination(
         "local_alloc",
         "memdesc_index",
         "make_range",
-        "affine_materialize",
         "buffer_load_to_local",
         "async_commit_group",
         "async_wait",
@@ -9206,11 +9167,12 @@ def test_tlx_wave_converter_lowers_dynamic_memdesc_index_packet_dma_destination(
     assert memdesc_attrs["static_byte_offset"] is None
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     load_attrs = converter_target_ir.attrs_dict(load_op)
-    assert load_attrs["mode"] == "dma_packet_lds"
-    wave = output.emitted_module.text
+    _assert_mechanical_symbolic_copy(load_attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
-    assert "wave.index_expr" in wave
-    assert "wave.assume" in wave
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_lds_b128" in machine
     del ctx
@@ -9265,18 +9227,14 @@ def test_tlx_wave_converter_lowers_dynamic_padded_memdesc_index_packet_dma_desti
     assert memdesc_attrs["static_byte_offset"] is None
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["packet_bytes"] == 4
-    assert attrs["destination_component_offsets"] == (0, 1056)
-    wave = output.emitted_module.text
-    assert "arith.constant 1056 : i32" in wave
-    assert "arith.constant 1048 : i32" not in wave
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert wave.count("zero_fill_inactive") == attrs["component_count"]
-    assert wave.count("waveamd.dma_load_lds") == attrs["component_count"]
-    machine = _run_waveamd_to_machine(wave)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
     del ctx
@@ -9327,27 +9285,18 @@ def test_tlx_wave_converter_lowers_bit_affine_padded_dot_dma_packet(tmp_path, ):
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["packet_bytes"] == 4
-    assert attrs["packet_elements"] == 2
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    affine_op = next(op for op in output.target_program.ops
-                     if op.kind == "affine_materialize" and load_to_local_op.operands[2] in op.results)
-    affine_attrs = converter_target_ir.attrs_dict(affine_op)
-    assert affine_attrs["mode"] == "packet_coordinates"
-    assert affine_attrs["coordinate_mode"] == "physical_linear_component"
-    assert affine_attrs["scalar_component_sources"] == ((0, 2), )
-    assert attrs["destination_component_offsets"] == (0, 1056)
-    assert attrs["destination_wave_offset_coefficients_dwords"] == (64, 128, 264)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
     local_alloc = next(op for op in output.target_program.ops if op.kind == "local_alloc")
     assert converter_target_ir.attrs_dict(local_alloc)["allocation_bytes"] == 16896
     memdesc_index_ops = [op for op in output.target_program.ops if op.kind == "memdesc_index"]
     assert [converter_target_ir.attrs_dict(op)["elements_per_slot"] for op in memdesc_index_ops] == [2112, 2112]
-    assert "wave.where" not in output.emitted_module.text
-    assert "wave.select" in output.emitted_module.text
-    assert output.emitted_module.text.count("zero_fill_inactive") == attrs["component_count"]
-    assert output.emitted_module.text.count("waveamd.dma_load_lds") == attrs["component_count"]
-    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
     del ctx
@@ -9395,20 +9344,17 @@ def test_tlx_wave_converter_keeps_padded_dot_b_dma_packet(tmp_path, ):
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["packet_bytes"] == 16
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        load_to_local_op,
-    )
-    assert affine_attrs["coordinate_mode"] == "physical_linear_component"
-    assert attrs["destination_wave_offset_coefficients_dwords"] == ()
-    assert "wave.where" not in output.emitted_module.text
-    assert "wave.select" in output.emitted_module.text
-    assert output.emitted_module.text.count("zero_fill_inactive") == attrs["component_count"]
-    assert output.emitted_module.text.count("waveamd.dma_load_lds") == attrs["component_count"]
-    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert sum(
+        "wave.gather" in line and "#waveamd.buffer" in line
+        for line in raw_wave.splitlines()
+    ) == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
     del ctx
@@ -9438,24 +9384,8 @@ def test_tlx_wave_converter_keeps_partial_masked_buffer_load_to_local_scalar(tmp
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
-    assert attrs["has_mask"] is True
-    assert attrs["mask_mode"] == "exec_where"
-    assert attrs["component_count"] == 1
-    assert attrs["destination_component_offsets"] == (0, )
-    offset_edge = _target_value_producer(
-        output.target_program,
-        load_to_local_op.operands[2],
-        kind="type_convert",
-    )
-    assert converter_target_ir.attrs_dict(offset_edge)["component_sources"] == (0, )
-    mask_edge = _memory_mask_edge(output.target_program, load_to_local_op)
-    assert converter_target_ir.attrs_dict(mask_edge)["component_sources"] == (0, )
-    _affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        load_to_local_op,
-    )
-    assert affine_attrs["value_range"] == (0, 0)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    assert attrs["component_count"] == 8
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" not in wave
     assert "wave.gather" in wave
@@ -9465,7 +9395,7 @@ def test_tlx_wave_converter_keeps_partial_masked_buffer_load_to_local_scalar(tmp
     assert wave.count("wave.where") == 1
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
-    assert wave.index("wave.assume") < wave.index("wave.where") < wave.index("wave.gather")
+    assert wave.index("wave.where") < wave.index("wave.gather")
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_b16" in machine
     assert machine.count("waveamdmachine.exec_if") == 1
@@ -9498,19 +9428,16 @@ def test_tlx_wave_converter_lowers_aligned_masked_buffer_load_to_local_dma(tmp_p
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["has_mask"] is True
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    assert attrs["mask_alignment"] == 8
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
     assert attrs["mask_component_count"] == attrs["component_count"]
-    mask_edge = _memory_mask_edge(output.target_program, load_to_local_op)
-    assert converter_target_ir.attrs_dict(mask_edge)["mode"] == "component_remap"
-    wave = output.emitted_module.text
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert wave.count("zero_fill_inactive") == attrs["component_count"]
-    assert wave.count("waveamd.dma_load_lds") == attrs["component_count"]
-    machine = _run_waveamd_to_machine(wave)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert wave.count("waveamd.dma_load_lds") == 1
+    assert "zero_fill_inactive" in wave
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b128" in machine
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
@@ -9553,27 +9480,15 @@ def test_tlx_wave_converter_lowers_broadcast_masked_2d_buffer_load_to_local_dma(
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["has_mask"] is True
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    assert attrs["mask_alignment"] == 8
-    mask_edge = _memory_mask_edge(output.target_program, load_to_local_op)
-    mask_attrs = converter_target_ir.attrs_dict(mask_edge)
-    assert mask_attrs["mode"] == "component_remap"
-    assert len(mask_attrs["component_sources"]) == attrs["component_count"]
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        load_to_local_op,
-    )
-    assert affine_attrs["coordinate_mode"] == "physical_linear_component"
-    assert affine_attrs["scalar_component_sources"] == ((0, 8), )
-    wave = output.emitted_module.text
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert "wave.cmpi slt" in wave
-    assert wave.count("zero_fill_inactive") == attrs["component_count"]
-    assert wave.count("waveamd.dma_load_lds") == attrs["component_count"]
-    machine = _run_waveamd_to_machine(wave)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
+    assert "zero_fill_inactive" in wave
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b128" in machine
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
@@ -9616,26 +9531,15 @@ def test_tlx_wave_converter_lowers_masked_narrow_padded_buffer_load_to_local_dma
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["has_mask"] is True
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    assert attrs["mask_alignment"] == 2
-    assert attrs["packet_bytes"] == 4
-    assert attrs["packet_elements"] == 2
-    assert attrs["component_count"] == 2
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        load_to_local_op,
-    )
-    assert affine_attrs["coordinate_mode"] == "physical_linear_component"
-    assert affine_attrs["scalar_component_sources"] == ((0, 0), )
-    wave = output.emitted_module.text
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert wave.count("zero_fill_inactive") == attrs["component_count"]
-    assert wave.count("waveamd.dma_load_lds") == attrs["component_count"]
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
-    machine = _run_waveamd_to_machine(wave)
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b32" in machine
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
@@ -9681,29 +9585,15 @@ def test_tlx_wave_converter_lowers_glu_like_masked_narrow_padded_buffer_load_to_
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["has_mask"] is True
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    assert attrs["mask_alignment"] == 2
-    assert attrs["packet_bytes"] == 4
-    assert attrs["packet_elements"] == 2
-    assert attrs["component_count"] == 2
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        load_to_local_op,
-    )
-    assert affine_attrs["coordinate_mode"] == "physical_linear_component"
-    assert affine_attrs["scalar_component_sources"] == ((0, 2), )
-    assert attrs["destination_component_offsets"] == (0, 1056)
-    assert attrs["destination_wave_offset_coefficients_dwords"] == (64, 128, 264)
-    assert attrs["destination_wave_stride_dwords"] == 0
-    wave = output.emitted_module.text
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert wave.count("zero_fill_inactive") == attrs["component_count"]
-    assert wave.count("waveamd.dma_load_lds") == attrs["component_count"]
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
-    machine = _run_waveamd_to_machine(wave)
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b32" in machine
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
@@ -9752,24 +9642,14 @@ def test_tlx_wave_converter_lowers_contiguous_modulo_2d_buffer_load_to_local_dma
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == 4
-    assert attrs["packet_elements"] == 8
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        load_to_local_op,
-    )
-    assert affine_attrs["scalar_component_sources"] == (
-        (0, 0, 0, 0),
-        (0, 0, 0, 0),
-    )
-    assert attrs["mask_mode"] == "zero_fill_inactive"
-    wave = output.emitted_module.text
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert wave.count("zero_fill_inactive") == attrs["component_count"]
-    assert wave.count("waveamd.dma_load_lds") == attrs["component_count"]
-    machine = _run_waveamd_to_machine(wave)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 1
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b128" in machine
     assert "waveamdmachine.buffer_load_b16" not in machine
     assert "waveamdmachine.ds_store_b16" not in machine
@@ -9800,7 +9680,7 @@ def test_tlx_wave_converter_lowers_masked_scalar_buffer_load_to_local_fallback(t
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["mode"] == "symbolic_copy"
     assert attrs["has_mask"] is True
     assert attrs["component_count"] == 1
     wave = output.emitted_module.text
@@ -9848,24 +9728,9 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_uses_affine_source_o
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
-    affine_op = next(op for op in output.target_program.ops
-                     if op.kind == "affine_materialize" and load_to_local_op.operands[2] in op.results)
-    affine_attrs = converter_target_ir.attrs_dict(affine_op)
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["scalar_count"] == 1
-    provenance_ids = affine_attrs[converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR]
-    live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
-    replaced_offset_producer = next(op for op in output.target_program.ops
-                                    if op.kind == "binary" and any(value_id in op.results
-                                                                   for value_id in provenance_ids))
-    assert replaced_offset_producer.kind == "binary"
-    assert replaced_offset_producer.target_op_id not in live_op_ids
-    assert all(value_id not in load_to_local_op.operands for value_id in provenance_ids)
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" not in wave
-    assert "wave.index_expr" in wave
-    assert "wave.assume" in wave
     assert "wave.gather" in wave
     assert "wave.scatter" in wave
     assert "wave.ptr_add" not in wave
@@ -10023,8 +9888,7 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(tmp
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
-    assert attrs["destination_offset_mode"] == "layout_coordinates"
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
     assert attrs["destination_coordinate_shape"] == (8, 8)
     assert attrs["destination_physical_offset_plan"] == "swizzled_xor"
     assert attrs["destination_physical_offset_unit"] == "element"
@@ -10043,7 +9907,6 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_swizzled_order01(tmp
     assert "destination_swizzled_order" not in attrs
     wave = output.emitted_module.text
     assert "waveamd.dma_load_lds" not in wave
-    assert "overflow<nsw>" in wave
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
     assert "wave.load" not in wave
@@ -10076,11 +9939,7 @@ def test_tlx_wave_converter_scalarized_buffer_load_to_local_replicated_waves(tmp
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
-    assert attrs["destination_offset_mode"] == "affine"
-    assert attrs["destination_component_offsets"] == (0, )
-    assert attrs["destination_lane_stride_elements"] == 1
-    assert attrs["destination_wave_stride_elements"] == 0
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
     assert output.emitted_module.text.count("wave.gather") == 1
     assert output.emitted_module.text.count("wave.scatter") == 1
     _run_wave_verify(output.emitted_module.text)
@@ -10127,19 +9986,13 @@ def test_tlx_wave_converter_packetizes_replicated_eight_wave_i8_copy(tmp_path):
         if op.kind == "buffer_load_to_local"
     ]
     attrs = converter_target_ir.attrs_dict(copy_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["packet_bytes"] == 4
-    assert attrs["component_count"] == 1
-    assert attrs["redundant_wave_mask"] == 1
-    assert attrs["destination_component_offsets"] == (0, )
-    assert attrs["destination_wave_offset_coefficients_dwords"] == (0, 64, 128)
-    wave = output.emitted_module.text
-    assert wave.count("wave.where") == 1
-    assert "scf.if" not in wave
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert wave.count("waveamd.dma_load_lds") == 1
-    assert "wave.gather" not in wave
-    assert "wave.scatter" not in wave
-    machine = _run_waveamd_to_machine(wave)
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b32" in machine
     del ctx
 
@@ -10184,19 +10037,13 @@ def test_tlx_wave_converter_packetizes_replicated_four_wave_i8_copy(tmp_path):
         if op.kind == "buffer_load_to_local"
     ]
     attrs = converter_target_ir.attrs_dict(copy_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["packet_bytes"] == 4
-    assert attrs["component_count"] == 1
-    assert attrs["redundant_wave_mask"] == 1
-    assert attrs["destination_component_offsets"] == (0, )
-    assert attrs["destination_wave_offset_coefficients_dwords"] == (0, 64)
-    wave = output.emitted_module.text
-    assert wave.count("wave.where") == 1
-    assert "scf.if" not in wave
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert wave.count("waveamd.dma_load_lds") == 1
-    assert "wave.gather" not in wave
-    assert "wave.scatter" not in wave
-    machine = _run_waveamd_to_machine(wave)
+    machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_lds_b32" in machine
     del ctx
 
@@ -10224,7 +10071,7 @@ def test_tlx_wave_converter_lowers_scalarized_swizzled_vec4_layout(tmp_path, ):
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
+    assert attrs["mode"] == "symbolic_copy"
     assert attrs["destination_physical_offset_plan"] == "swizzled_xor"
     assert attrs["destination_physical_proof_status"] == "symbolic_verified"
     assert attrs["destination_physical_order"] == (0, 1)
@@ -10317,10 +10164,8 @@ def test_tlx_wave_converter_pipeline_joins_independent_dma_packets(tmp_path):
 
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == 2
-    assert attrs["destination_component_offsets"] == (0, 512)
-    wave = output.emitted_module.text
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     dma_matches = _dma_load_lds_matches(wave)
     assert len(dma_matches) == 2
     assert dma_matches[1].group("after") == dma_matches[0].group("after")
@@ -10355,8 +10200,12 @@ def test_tlx_wave_converter_pipeline_orders_independent_dma_load_lds_issues(tmp_
 
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     assert len(dma_ops) == 2
-    assert [converter_target_ir.attrs_dict(op)["mode"] for op in dma_ops] == ["dma_packet_lds", "dma_packet_lds"]
-    wave = output.emitted_module.text
+    for dma_op in dma_ops:
+        _assert_mechanical_symbolic_copy(
+            converter_target_ir.attrs_dict(dma_op),
+            masked=False,
+        )
+    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     dma_matches = _dma_load_lds_matches(wave)
     assert len(dma_matches) == 2
     assert not _wave_token_depends_on(wave, dma_matches[1].group("after"), dma_matches[0].group("token"))
@@ -11334,18 +11183,18 @@ def test_tlx_wave_converter_lowers_blocked_to_linear_same_lane_payloads(tmp_path
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    output = _convert_ttgir_to_wave_keep_dead(mod)
 
     convert_ops = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     assert len(convert_ops) == 3
     for convert_op in convert_ops:
         attrs = converter_target_ir.attrs_dict(convert_op)
-        assert attrs["mode"] == "alias"
-        assert attrs["fact_policy"] == "preserve_equivalent"
+        assert attrs["mode"] == "redistribute"
+        assert attrs["fact_policy"] == "invalidate_layout_sensitive"
         assert attrs["result_component_count"] == 1
-    assert "wave.redistribute" not in output.emitted_module.text
-    assert "wave.shuffle" not in output.emitted_module.text
-    assert "wave.extract" not in output.emitted_module.text
+    assert output.emitted_module.text.count("wave.redistribute") == 3
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
 
 
@@ -11363,19 +11212,25 @@ def test_tlx_wave_converter_lowers_blocked_component_reorder(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "alias"
-    assert attrs["fact_policy"] == "preserve_equivalent"
+    assert attrs["mode"] == "redistribute"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
     assert attrs["source_component_count"] == 4
     assert attrs["result_component_count"] == 4
     assert attrs["source_slot_count"] == 4
     assert attrs["result_slot_count"] == 4
-    assert attrs["scalar_source_slots"] == (0, 2, 1, 3)
-    assert output.emitted_module.text.count("wave.redistribute") == 0
-    assert output.emitted_module.text.count("wave.extract") == 0
+    assert tuple(name for name, _ in attrs["relation_bases"]) == (
+        "register",
+        "lane",
+        "warp",
+        "block",
+    )
+    assert output.emitted_module.text.count("wave.redistribute") == 1
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
 
 
@@ -11399,7 +11254,7 @@ def test_tlx_wave_converter_lowers_blocked_cross_lane_transpose(tmp_path):
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "redistribute"
     assert attrs["cta_thread_count"] == 64
-    assert attrs["cross_wave"] is False
+    assert "cross_wave" not in attrs
     assert tuple(name for name, _ in attrs["relation_bases"]) == (
         "register",
         "lane",
@@ -11426,13 +11281,15 @@ def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    output = converter_pipeline.convert_ttgir_to_wave(mod)
+    output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "alias"
-    assert attrs["fact_policy"] == "preserve_equivalent"
-    assert "wave.shuffle" not in output.emitted_module.text
+    assert attrs["mode"] == "redistribute"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
+    assert output.emitted_module.text.count("wave.redistribute") == 1
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
 
 
@@ -11456,7 +11313,7 @@ def test_tlx_wave_converter_lowers_generic_multi_warp_linear_remap(tmp_path):
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "redistribute"
     assert attrs["cta_thread_count"] == 128
-    assert attrs["cross_wave"] is False
+    assert "cross_wave" not in attrs
     assert attrs["source_slot_count"] == attrs["result_slot_count"] == 2
     del ctx
 
@@ -11480,33 +11337,10 @@ def test_tlx_wave_converter_lowers_bit_reversed_linear_lane_remap(tmp_path):
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "redistribute"
-    assert attrs["cross_wave"] is False
+    assert "cross_wave" not in attrs
     lane_bases = dict(attrs["relation_bases"])["lane"]
     assert tuple(basis[1] for basis in lane_bases) == (32, 16, 8, 4, 2, 1)
     del ctx
-
-
-def test_tlx_wave_converter_rejects_lane_mux_as_cta_exchange():
-    result_sources = (tuple((0, lane, lane & 1) for lane in range(64)), )
-
-    assert (converter_layout_remap._distributed_movement_class(
-        result_sources,
-        64,
-        1,
-    ) == "lane_mux")
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_layout_remap._reject_distributed_movement(
-            result_sources,
-            64,
-            1,
-            SimpleNamespace(index=0),
-            11,
-            "linear to linear convert_layout",
-        )
-
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "per-lane source component selection" in str(diagnostic)
 
 
 def test_tlx_wave_converter_lowers_lane_mux_register_remap(tmp_path):
@@ -11564,7 +11398,7 @@ def test_tlx_wave_converter_lowers_slice_parent_layout_remap(tmp_path):
     attrs = converter_target_ir.attrs_dict(convert_op)
     assert attrs["mode"] == "redistribute"
     assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["cross_wave"] is False
+    assert "cross_wave" not in attrs
     assert attrs["source_component_count"] == 1
     assert attrs["result_component_count"] == 64
     _run_wave_verify(output.emitted_module.text)
@@ -12194,7 +12028,7 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     assert attrs["result_registers_per_component"] == 1
     assert attrs["source_slot_count"] == attrs["result_slot_count"] == 256
     assert attrs["cta_thread_count"] == 256
-    assert attrs["cross_wave"] is True
+    assert "cross_wave" not in attrs
     assert output.emitted_module.lds_size == 0
     assert output.emitted_module.text.count("wave.redistribute") == 1
     assert "wave.alloc" not in output.emitted_module.text
@@ -12244,7 +12078,7 @@ def test_tlx_wave_converter_lowers_mfma_epilogue_convert_before_buffer_store(tmp
     (convert_op, ) = [op for op in live_ops if op.kind == "layout_convert"]
     convert_attrs = converter_target_ir.attrs_dict(convert_op)
     assert convert_attrs["mode"] == "redistribute"
-    assert convert_attrs["cross_wave"] is True
+    assert "cross_wave" not in convert_attrs
     assert output.emitted_module.text.count("wave.redistribute") == 1
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
@@ -12339,7 +12173,7 @@ def test_tlx_wave_converter_composes_blocked_to_mfma_metadata_remap(tmp_path):
         assert remap["result_registers_per_component"] == 1
         assert remap["cta_thread_count"] == 256
         assert remap["source_slot_count"] == remap["result_slot_count"] == 128
-        assert remap["cross_wave"] is True
+        assert "cross_wave" not in remap
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -12737,13 +12571,15 @@ def test_tlx_wave_converter_aliases_same_lane_mfma_packet_to_blocked_slots(tmp_p
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "alias"
-    assert attrs["fact_policy"] == "preserve_equivalent"
+    assert attrs["mode"] == "redistribute"
+    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
     assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
-    assert attrs["source_packet_width"] == 4
-    assert attrs["result_packet_width"] == 1
-    assert output.emitted_module.text.count("wave.redistribute") == 0
+    assert attrs["source_registers_per_component"] == 4
+    assert attrs["result_registers_per_component"] == 1
+    assert output.emitted_module.text.count("wave.redistribute") == 1
     assert output.emitted_module.text.count("wave.extract") == 4
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
 
 
@@ -12781,7 +12617,7 @@ def test_tlx_wave_converter_lowers_cross_lane_mfma_to_blocked_remap(tmp_path):
     assert attrs["mode"] == "redistribute"
     assert attrs["fact_policy"] == "invalidate_layout_sensitive"
     assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
-    assert attrs["cross_wave"] is False
+    assert "cross_wave" not in attrs
     assert output.emitted_module.text.count("wave.redistribute") == 1
     assert output.emitted_module.text.count("wave.extract") == 4
     machine = _run_waveamd_to_machine(output.emitted_module.text)
@@ -12883,32 +12719,15 @@ def test_tlx_wave_converter_preserves_rotated_linear_register_packet_cast(tmp_pa
 
     (cast_op, ) = [op for op in output.target_program.ops if op.kind == "float_cast"]
     attrs = converter_target_ir.attrs_dict(cast_op)
-    assert attrs["result_value_mode"] == "register_packet_payload"
-    assert attrs["register_packet_width"] == 16
-    assert attrs["register_packet_scalar_slots"] == (
-        0,
-        2,
-        4,
-        6,
-        8,
-        10,
-        12,
-        14,
-        1,
-        3,
-        5,
-        7,
-        9,
-        11,
-        13,
-        15,
-    )
+    assert "result_value_mode" not in attrs
+    assert "register_packet_width" not in attrs
+    assert "register_packet_scalar_slots" not in attrs
     wave = output.emitted_module.text
     assert wave.count(
         "wave.cast fpconvert"
     ) == 1
-    assert "!wave.simd<vector<16xf32>, 64>" in wave
-    assert "!wave.simd<vector<16xbf16>, 64>" in wave
+    assert "!wave.simd<vector<16xf32>, 64>" not in wave
+    assert "!wave.simd<vector<16xbf16>, 64>" not in wave
     _run_wave_verify(wave)
     _run_waveamd_to_machine(wave)
     del ctx
@@ -14168,68 +13987,6 @@ def test_tlx_wave_converter_zero_fills_masked_buffer_load_without_other(tmp_path
     del ctx
 
 
-def test_tlx_wave_converter_buffer_load_requires_scalar_offsets_for_register_payload():
-    layout = _fake_layout(
-        0,
-        0,
-        kind="slice",
-        shape=(128, ),
-        element_type="f32",
-        component_count=16,
-        properties={
-            "dim": 1,
-            "parent_kind": "amd_mfma",
-            "parent_properties": {
-                "instr_shape": (16, 16, 32),
-            },
-        },
-    )
-    loaded = _converted_value(
-        0,
-        representation="simd_tuple",
-        element_type="f32",
-        component_count=16,
-        layout_map_id=0,
-    )
-    scalar_offsets = _converted_value(
-        1,
-        element_type="i32",
-        component_count=16,
-        layout_map_id=0,
-    )
-    register_offsets = _converted_value(
-        2,
-        element_type="i32",
-        component_count=64,
-        layout_map_id=0,
-    )
-    type_layout_program = converter_types.TypeLayoutProgram(
-        {0: loaded, 1: scalar_offsets, 2: register_offsets},
-        (layout, ),
-    )
-    op = SimpleNamespace(index=0)
-
-    assert converter_op_conversion._buffer_load_register_vector_result_value_attrs(
-        type_layout_program,
-        loaded,
-        scalar_offsets,
-        False,
-        op,
-    ) == {}
-    attrs = converter_op_conversion._buffer_load_register_vector_result_value_attrs(
-        type_layout_program,
-        loaded,
-        register_offsets,
-        False,
-        op,
-    )
-    assert attrs == {
-        "registers": 4,
-        "result_packet_width": 4,
-        "result_value_mode": "register_vector_payload",
-    }
-
-
 def test_tlx_wave_converter_packs_glu_bias_slice_into_mfma_fragment(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 4], instrShape = [16, 16, 32], isTransposed = true}>
@@ -14461,18 +14218,12 @@ def test_tlx_wave_converter_pipeline_groups_mult_warp_padded_dma(tmp_path):
 
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == 1
-    assert attrs["component_thread_count"] == 512
-    assert attrs["destination_component_offsets"] == (0, )
-    assert attrs["destination_wave_count"] == 8
-    assert attrs["destination_wave_stride_dwords"] == 264
-    assert output.emitted_module.text.count("waveamd.dma_load_lds") == 1
-    assert "wave.read_first" in output.emitted_module.text
-    assert "wave.index_expr" in output.emitted_module.text
-    assert "wave.assume" in output.emitted_module.text
-    assert 'wave.index_expr <"264*floor(1/64*wi_first)">' in output.emitted_module.text
-    assert "wave.binary" not in output.emitted_module.text
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert wave.count("waveamd.dma_load_lds") == 1
     del ctx
 
 
@@ -14508,44 +14259,17 @@ def test_tlx_wave_converter_pipeline_groups_2d_padded_dma_physical_linear_slots(
 
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["component_count"] == 8
-    assert attrs["component_thread_count"] == 256
-    assert attrs["destination_component_offsets"] == (0, 4224, 8448, 12672, 16896, 21120, 25344, 29568)
-    assert attrs["destination_wave_count"] == 4
-    assert attrs["destination_wave_stride_dwords"] == 264
-    assert attrs["destination_wave_offset_coefficients_dwords"] == ()
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        dma_op,
-    )
-    assert affine_attrs["coordinate_mode"] == "physical_linear_component"
-    assert affine_attrs["linear_component_bases"] == (
-        (0, 1),
-        (0, 2),
-        (0, 4),
-        (0, 8),
-        (0, 16),
-        (0, 32),
-        (0, 64),
-        (16, 0),
-        (32, 0),
-        (64, 0),
-        (1, 0),
-        (2, 0),
-        (4, 0),
-        (8, 0),
-        (128, 0),
-    )
-    assert output.emitted_module.text.count("waveamd.dma_load_lds") == 8
-    assert "wave.load" not in output.emitted_module.text
-    assert "wave.store" not in output.emitted_module.text
-    assert 'wave.index_expr <"264*floor(1/64*wi_first)">' in output.emitted_module.text
-    _run_waveamd_to_machine(output.emitted_module.text)
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" in wave
+    _run_waveamd_to_machine(raw_wave)
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_selects_narrow_padded_dma_packet(tmp_path):
+def test_tlx_wave_converter_pipeline_does_not_assume_runtime_modulo_contiguity(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [[0, 1], [8, 0], [16, 0], [32, 0], [64, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], warp = [[1, 0], [2, 0], [4, 0]], block = []}>
 #shared = #ttg.padded_shared<[128:+4] {order = [1, 0], shape = [128, 128]}>
@@ -14589,18 +14313,13 @@ def test_tlx_wave_converter_pipeline_selects_narrow_padded_dma_packet(tmp_path):
 
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
-    assert attrs["mode"] == "dma_packet_lds"
-    assert attrs["packet_bytes"] == 4
-    assert attrs["packet_elements"] == 2
-    assert attrs["component_count"] == 16
-    affine_op, affine_attrs = _memory_affine_edge(
-        output.target_program,
-        dma_op,
-    )
-    assert affine_attrs["mode"] == "packet_coordinates"
-    assert attrs["destination_wave_stride_dwords"] == 66
-    assert output.emitted_module.text.count("waveamd.dma_load_lds") == 16
-    _run_waveamd_to_machine(output.emitted_module.text)
+    _assert_mechanical_symbolic_copy(attrs, masked=False)
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.scatter") == 1
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    assert "waveamd.dma_load_lds" not in wave
+    _run_waveamd_to_machine(raw_wave)
     del ctx
 
 
@@ -14628,13 +14347,10 @@ def test_tlx_wave_converter_scalarized_masked_dma_preserves_rank1_padded_offsets
 
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
-    assert attrs["mode"] == "scalarized_load_store"
+    _assert_mechanical_symbolic_copy(attrs, masked=True)
     assert attrs["component_count"] == 8
-    assert attrs["destination_component_offsets"] == tuple(range(8))
-    assert attrs["destination_lane_stride_elements"] == 8
-    assert attrs["destination_wave_stride_elements"] == 528
-    assert output.emitted_module.text.count("wave.gather") == 8
-    assert output.emitted_module.text.count("wave.scatter") == 8
+    assert output.emitted_module.text.count("wave.gather") == 1
+    assert output.emitted_module.text.count("wave.scatter") == 1
     assert "wave.load" not in output.emitted_module.text
     assert "wave.store" not in output.emitted_module.text
     del ctx
@@ -14891,8 +14607,9 @@ def test_tlx_wave_converter_pipeline_lowers_mfma_fragment_softmax_math(tmp_path)
     %lhs = arith.constant dense<1.250000e+00> : tensor<16x16xf32, #mma>
     %rhs = arith.constant dense<2.500000e+00> : tensor<16x16xf32, #mma>
     %maximum = arith.maxnumf %lhs, %rhs : tensor<16x16xf32, #mma>
-    %fused = math.fma %lhs, %rhs, %maximum : tensor<16x16xf32, #mma>
-    %exponential = math.exp2 %fused : tensor<16x16xf32, #mma>
+    %product = arith.mulf %lhs, %rhs fastmath<contract> : tensor<16x16xf32, #mma>
+    %sum = arith.addf %product, %maximum fastmath<contract> : tensor<16x16xf32, #mma>
+    %exponential = math.exp2 %sum : tensor<16x16xf32, #mma>
     %quotient = arith.divf %exponential, %lhs : tensor<16x16xf32, #mma>
     tt.return
   }
@@ -14904,12 +14621,12 @@ def test_tlx_wave_converter_pipeline_lowers_mfma_fragment_softmax_math(tmp_path)
     operations = [
         converter_target_ir.attrs_dict(op)["operation"]
         for op in output.target_program.ops
-        if op.kind in {"float_binary", "float_ternary", "float_unary"}
+        if op.kind in {"float_binary", "float_unary"}
     ]
-    assert operations == ["maxnumf", "fma", "exp2", "divf"]
+    assert operations == ["maxnumf", "mulf", "addf", "exp2", "divf"]
     wave = output.emitted_module.text
     assert "wave.fmax" in wave
-    assert "wave.fma" in wave
+    assert "wave.fma " not in wave
     assert "wave.fexp2" in wave
     assert "wave.frcp" in wave
     _run_wave_verify(wave)
@@ -15131,7 +14848,7 @@ def test_tlx_wave_converter_dominating_wait_avoids_duplicate_dma_ready_barrier(t
     (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
-    assert converter_target_ir.attrs_dict(dma_op)["mode"] == "dma_packet_lds"
+    assert converter_target_ir.attrs_dict(dma_op)["mode"] == "symbolic_copy"
     load_attrs = converter_target_ir.attrs_dict(load_op)
     assert load_attrs["synced_via_async_wait"] is False
     assert load_attrs["readiness_dependency_count"] == 1
@@ -15139,7 +14856,11 @@ def test_tlx_wave_converter_dominating_wait_avoids_duplicate_dma_ready_barrier(t
 
     wave = output.emitted_module.text
     barrier_lines = [line for line in wave.splitlines() if "wave.barrier" in line]
-    load_line = next(line for line in wave.splitlines() if "wave.gather" in line)
+    load_line = next(
+        line
+        for line in wave.splitlines()
+        if "wave.gather" in line and "#wave.shared" in line
+    )
     assert len(barrier_lines) == 1
     barrier_token = _ssa_result_name(barrier_lines[0])
     assert f"after {barrier_token}" in load_line
@@ -15480,25 +15201,29 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = output.emitted_module.text
-    lines = wave.splitlines()
+    raw_wave = output.emitted_module.text
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
-    assert [converter_target_ir.attrs_dict(op)["mode"] for op in dma_ops] == ["dma_packet_lds", "dma_packet_lds"]
+    assert [converter_target_ir.attrs_dict(op)["mode"] for op in dma_ops] == ["symbolic_copy", "symbolic_copy"]
     assert [converter_target_ir.attrs_dict(op)["issue_dependency_count"] for op in dma_ops] == [0, 0]
     assert [converter_target_ir.attrs_dict(op)["source_issue_dependency_count"] for op in dma_ops] == [0, 0]
     assert all("lds_release_dependency_count" not in converter_target_ir.attrs_dict(op) for op in dma_ops)
     assert all(op.kind != "lds_release" for op in output.target_program.ops)
     assert [converter_target_ir.attrs_dict(op)["mask_mode"] for op in dma_ops] == [
-        "zero_fill_inactive",
-        "zero_fill_inactive",
+        "exec_where",
+        "exec_where",
     ]
     assert [(converter_target_ir.attrs_dict(op)["border"], converter_target_ir.attrs_dict(op)["mask"])
             for op in output.target_program.ops
             if op.kind == "sched_barrier"] == [("mfma", 0)]
-    assert "wave.where" not in wave
-    assert "wave.select" in wave
-    assert wave.count("zero_fill_inactive") == sum(
-        converter_target_ir.attrs_dict(op)["component_count"] for op in dma_ops)
+    assert raw_wave.count("wave.where") == 2
+    assert sum(
+        "wave.gather" in line and "#waveamd.buffer" in line
+        for line in raw_wave.splitlines()
+    ) == 2
+    assert raw_wave.count("wave.scatter") == 2
+    wave = _run_wave_lower_symbolic_memory(raw_wave)
+    lines = wave.splitlines()
+    assert "zero_fill_inactive" in wave
     mma_index = next(index for index, line in enumerate(lines) if "waveamd.mma" in line)
     refill_index = max(index for index, line in enumerate(lines) if "waveamd.dma_load_lds" in line)
     barrier_indices = [
@@ -16057,7 +15782,7 @@ def test_tlx_wave_converter_packs_blocked_dot_operand_parent_layout(tmp_path):
     assert [attrs["result_component_count"] for attrs in layout_converts] == [16, 16]
     assert all(attrs["result_registers_per_component"] == 8 for attrs in layout_converts)
     assert all(attrs["cta_thread_count"] == 256 for attrs in layout_converts)
-    assert all(attrs["cross_wave"] for attrs in layout_converts)
+    assert all("cross_wave" not in attrs for attrs in layout_converts)
     assert all("scratch_allocation_bytes" not in attrs for attrs in layout_converts)
     wave = output.emitted_module.text
     assert wave.count("wave.redistribute") == 2
@@ -16105,7 +15830,7 @@ def test_tlx_wave_converter_preserves_typed_f16_packets_into_redistribute(tmp_pa
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     convert_attrs = converter_target_ir.attrs_dict(convert_op)
     assert convert_attrs["mode"] == "redistribute"
-    assert convert_attrs["cross_wave"] is True
+    assert "cross_wave" not in convert_attrs
     assert "scratch_allocation_bytes" not in convert_attrs
     wave = output.emitted_module.text
     assert "!wave.simd<vector<8xf16>, 64>" in wave
@@ -16142,7 +15867,7 @@ def test_tlx_wave_converter_lowers_chunked_blocked_dot_operand_pack(tmp_path):
     assert attrs["mode"] == "redistribute"
     assert attrs["source_registers_per_component"] == 1
     assert attrs["result_registers_per_component"] == 8
-    assert attrs["cross_wave"] is True
+    assert "cross_wave" not in attrs
     assert "scratch_allocation_bytes" not in attrs
     wave = output.emitted_module.text
     assert wave.count("wave.redistribute") == 1
@@ -16155,7 +15880,7 @@ def test_tlx_wave_converter_lowers_chunked_blocked_dot_operand_pack(tmp_path):
     "instr_shape,k_width,tensor_shape,source_components,source_registers,"
     "result_components,result_scalars,expected_mode",
     [
-        ((32, 32, 16), 4, (256, 64), 4, 16, 8, 64, "alias"),
+        ((32, 32, 16), 4, (256, 64), 4, 16, 8, 64, "redistribute"),
         ((16, 16, 32), 8, (128, 64), 8, 4, 4, 32, "redistribute"),
     ],
     ids=["mfma32", "mfma16"],
@@ -16198,20 +15923,20 @@ def test_tlx_wave_converter_lowers_mfma_fragment_to_dot_operand(
     wave = output.emitted_module.text
     assert f"vector<{source_registers}xbf16>" in wave
     assert "vector<8xbf16>" in wave
-    assert wave.count("wave.redistribute") == (expected_mode == "redistribute")
+    assert wave.count("wave.redistribute") == 1
     assert "wave.alloc" not in wave
     assert "wave.barrier" not in wave
     assert "wave.store" not in wave
     assert "wave.load" not in wave
     machine = _run_waveamd_to_machine(wave)
-    if expected_mode == "alias":
-        assert attrs["source_packet_width"] == source_registers
-        assert attrs["result_packet_width"] == 8
+    if instr_shape == (32, 32, 16):
+        assert attrs["source_registers_per_component"] == source_registers
+        assert attrs["result_registers_per_component"] == 8
         assert "waveamdmachine.ds_bpermute_b32" not in machine
     else:
         assert attrs["result_registers_per_component"] == 8
         assert attrs["source_registers_per_component"] == source_registers
-        assert attrs["cross_wave"] is False
+        assert "cross_wave" not in attrs
         assert "waveamdmachine.ds_bpermute_b32" in machine
     assert "waveamdmachine.ds_store" not in machine
     assert "waveamdmachine.ds_load" not in machine
@@ -16573,61 +16298,6 @@ def test_tlx_wave_emits_broadcast_component_sources():
     assert state.uniform_pointer_bases[1] == ("base_a", "base_b", "base_a", "base_b")
 
 
-def test_tlx_wave_emits_layout_alias_scalar_slot_expansion():
-    source_type = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        component_count=2,
-    )
-    result_type = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        component_count=4,
-    )
-    program = converter_target_ir.TargetProgram(
-        values=(
-            converter_target_ir.TargetValue(0, source_type),
-            converter_target_ir.TargetValue(1, result_type),
-        ),
-        ops=(),
-        regions=(converter_target_ir.TargetRegion(0), ),
-        source_value_targets={},
-        erased_source_values={},
-    )
-    state = converter_emission._EmissionState(
-        None,
-        None,
-        None,
-        program,
-        None,
-        {0: ("a", "b")},
-    )
-    op = converter_target_ir.TargetOp(
-        0,
-        "layout_convert",
-        operands=(0, ),
-        results=(1, ),
-        attrs=(
-            converter_target_ir.TargetAttr("mode", "alias"),
-            converter_target_ir.TargetAttr("source_component_count", 2),
-            converter_target_ir.TargetAttr("source_packet_width", 1),
-            converter_target_ir.TargetAttr("source_slot_count", 2),
-            converter_target_ir.TargetAttr("result_component_count", 4),
-            converter_target_ir.TargetAttr("result_packet_width", 1),
-            converter_target_ir.TargetAttr("result_slot_count", 4),
-            converter_target_ir.TargetAttr("scalar_source_slots", (0, 1, 0, 1)),
-        ),
-    )
-
-    converter_emission._emit_layout_convert(state, op)
-
-    assert state.values[1] == ("a", "b", "a", "b")
-
-
 @triton.jit
 def _tlx_wave_stage_only_kernel():
     pid = tl.program_id(0)
@@ -16798,6 +16468,7 @@ def _run_waveamd_to_machine(wave_artifact):
             "--wave-lower-redistribute",
             "--wave-expand-integer-div-rem",
             "--wave-resolve-allocs",
+            "--waveamd-dma-zero-fill",
             "--waveamd-to-machine",
         ],
         input=wave_artifact,
@@ -16821,6 +16492,48 @@ def _run_wave_verify(wave_artifact):
     )
     assert result.returncode == 0, result.stderr or result.stdout
     return result.stdout
+
+
+def _run_wave_lower_symbolic_memory(wave_artifact):
+    result = subprocess.run(
+        [
+            wave_bridge_tools._wave_opt(),
+            "-",
+            "--wave-lower-symbolic-memory",
+        ],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
+def _assert_mechanical_symbolic_copy(attrs, *, masked=None):
+    assert attrs["mode"] == "symbolic_copy"
+    assert attrs["destination_offset_mode"] == "layout_coordinates"
+    assert attrs["component_count"] > 0
+    assert attrs["destination_coordinate_shape"]
+    assert len(attrs["destination_component_coordinate_bases"]) == attrs[
+        "component_count"
+    ]
+    for policy_attr in (
+        "packet_bytes",
+        "packet_elements",
+        "mask_alignment",
+        "redundant_wave_mask",
+        "destination_component_offsets",
+        "destination_lane_stride_elements",
+        "destination_wave_stride_elements",
+        "destination_wave_stride_dwords",
+        "destination_wave_offset_coefficients_dwords",
+    ):
+        assert policy_attr not in attrs
+    if masked is not None:
+        assert attrs["has_mask"] is masked
+        assert attrs["mask_mode"] == ("exec_where" if masked else "none")
 
 
 def _run_wave_compile_kernels(wave_artifact):
