@@ -807,7 +807,7 @@ def _convert_binary(builder, view):
 
 def _convert_float_binary(builder, view):
     result_type = builder.values[view.result_target_ids[0]].type
-    attrs = _float_binary_attrs(view)
+    attrs = _float_binary_attrs(builder, view)
     if result_type.representation in _MMA_PACKET_REPRESENTATIONS:
         _require_mma_packet_float_binary_type(builder, view, result_type)
         builder.add_op(
@@ -866,13 +866,13 @@ def _convert_float_unary(builder, view):
             source_op_index=view.op_index,
         )
     attrs = {"operation": _FLOAT_UNARY_OPS[view.op_name]}
-    if "fastmath" in view.attrs:
-        fastmath = _normalize_fastmath_flags(
-            view.attrs["fastmath"],
-            source_op_index=view.op_index,
-        )
-        if fastmath:
-            attrs["fastmath"] = fastmath
+    fastmath = _translated_fastmath_flags(
+        view.attrs,
+        source_op_index=view.op_index,
+        enable_fp_fusion=builder.contract.enable_fp_fusion,
+    )
+    if fastmath:
+        attrs["fastmath"] = fastmath
     builder.add_op(
         "float_unary",
         operands=view.operand_target_ids,
@@ -883,16 +883,29 @@ def _convert_float_unary(builder, view):
     )
 
 
-def _float_binary_attrs(view):
+def _float_binary_attrs(builder, view):
     attrs = {"operation": _FLOAT_BINARY_OPS[view.op_name]}
-    if "fastmath" in view.attrs:
-        flags = _normalize_fastmath_flags(
-            view.attrs["fastmath"],
-            source_op_index=view.op_index,
-        )
-        if flags:
-            attrs["fastmath"] = flags
+    flags = _translated_fastmath_flags(
+        view.attrs,
+        source_op_index=view.op_index,
+        enable_fp_fusion=builder.contract.enable_fp_fusion,
+    )
+    if flags:
+        attrs["fastmath"] = flags
     return attrs
+
+
+def _translated_fastmath_flags(source_attrs, *, source_op_index, enable_fp_fusion):
+    flags = ()
+    if "fastmath" in source_attrs:
+        flags = _normalize_fastmath_flags(
+            source_attrs["fastmath"],
+            source_op_index=source_op_index,
+        )
+    if not enable_fp_fusion or "fast" in flags:
+        return flags
+    enabled = {*flags, "contract"}
+    return tuple(flag for flag in _FASTMATH_FLAG_ORDER if flag in enabled)
 
 
 def _normalize_fastmath_flags(value, *, source_op_index):
@@ -5204,13 +5217,13 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
         int(source_registers),
     }
     if combiner.name in {"arith.addf", "arith.mulf"}:
-        if "fastmath" in combiner.attrs:
-            fastmath = _normalize_fastmath_flags(
-                combiner.attrs["fastmath"],
-                source_op_index=combiner.index,
-            )
-            if fastmath:
-                attrs["fastmath"] = fastmath
+        fastmath = _translated_fastmath_flags(
+            combiner.attrs,
+            source_op_index=combiner.index,
+            enable_fp_fusion=builder.contract.enable_fp_fusion,
+        )
+        if fastmath:
+            attrs["fastmath"] = fastmath
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
