@@ -209,6 +209,36 @@ def _verify_target_value_types(target_program):
     }
     for value in target_program.values:
         representation = str(value.type.representation)
+        resources = tuple(int(target_id) for target_id in value.resource_target_ids)
+        if len(resources) != len(set(resources)):
+            fail(
+                "TLXW_VERIFY_RESOURCE_TARGETS",
+                STAGE,
+                "target value resource identities must be unique",
+                target_value_id=value.target_value_id,
+            )
+        if resources and representation not in {"memdesc", "token"}:
+            fail(
+                "TLXW_VERIFY_RESOURCE_REPRESENTATION",
+                STAGE,
+                "only memdesc and token values may carry resource identities",
+                target_value_id=value.target_value_id,
+            )
+        for resource_target_id in resources:
+            if not 0 <= resource_target_id < len(target_program.values):
+                fail(
+                    "TLXW_VERIFY_RESOURCE_TARGET",
+                    STAGE,
+                    f"target value references missing resource {resource_target_id}",
+                    target_value_id=value.target_value_id,
+                )
+            if target_program.values[resource_target_id].type.representation != "memdesc":
+                fail(
+                    "TLXW_VERIFY_RESOURCE_TARGET",
+                    STAGE,
+                    "resource identity must name a memdesc value",
+                    target_value_id=value.target_value_id,
+                )
         if value.event_domain is not None:
             if value.event_domain not in target_ir.EVENT_DOMAINS:
                 fail(

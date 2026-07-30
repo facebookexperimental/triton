@@ -7,7 +7,7 @@ from .diagnostics import fail
 
 STAGE = "target_ir"
 
-TARGET_SCHEMA_VERSION = 2
+TARGET_SCHEMA_VERSION = 3
 ADDRESS_ARITHMETIC_NO_OVERFLOW = "no_overflow"
 
 # Target values named by this attribute were consumed while proving or
@@ -131,6 +131,7 @@ class TargetValue:
     debug_name: str | None = None
     event_domain: str | None = None
     layout_map_id: int | None = None
+    resource_target_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -211,6 +212,7 @@ class TargetBuilder:
         debug_name=None,
         event_domain=None,
         layout_map_id=None,
+        resource_target_ids=(),
     ):
         value_id = len(self.values)
         self.values.append(TargetValue(
@@ -220,6 +222,7 @@ class TargetBuilder:
             debug_name,
             event_domain,
             None if layout_map_id is None else int(layout_map_id),
+            tuple(dict.fromkeys(int(target_id) for target_id in resource_target_ids)),
         ))
         if source_value_id is not None:
             self.source_value_targets.setdefault(source_value_id, tuple())
@@ -239,6 +242,20 @@ class TargetBuilder:
             value.debug_name,
             None if event_domain is None else str(event_domain),
             value.layout_map_id,
+            value.resource_target_ids,
+        )
+
+    def set_value_resource_targets(self, target_value_id, resource_target_ids):
+        target_value_id = int(target_value_id)
+        value = self.values[target_value_id]
+        self.values[target_value_id] = TargetValue(
+            value.target_value_id,
+            value.type,
+            value.source_value_id,
+            value.debug_name,
+            value.event_domain,
+            value.layout_map_id,
+            tuple(dict.fromkeys(int(target_id) for target_id in resource_target_ids)),
         )
 
     def set_assumptions(self, assumptions):
