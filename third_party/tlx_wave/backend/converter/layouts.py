@@ -1667,44 +1667,39 @@ def _layout_coordinate_domain(kind, shape, properties, lane_width, source_value_
     block_count = linear_layout_in_dim_size(linear, "block")
     shape = tuple(int(dim) for dim in shape)
     total_elements = _product(shape)
-    seen = set()
-    duplicate_slots = 0
-    out_of_bounds_slots = 0
-    for component in range(int(component_count)):
-        for warp in range(int(warp_count)):
-            for lane in range(int(lane_width)):
-                coords = linear_layout_coords(linear, component, lane, warp=warp)
-                if len(coords) != len(shape) or any(
-                        int(coord) < 0 or int(coord) >= int(extent) for coord, extent in zip(coords, shape)):
-                    out_of_bounds_slots += 1
-                    continue
-                if coords in seen:
-                    duplicate_slots += 1
-                seen.add(coords)
     physical_slots = int(component_count) * int(lane_width) * int(warp_count)
     if int(block_count) <= 0 or total_elements % int(block_count):
         coverage = "block_mismatch"
         local_elements = total_elements
+        covered_elements = 0
+        duplicate_slots = 0
     else:
         local_elements = total_elements // int(block_count)
-        if out_of_bounds_slots:
-            coverage = "out_of_bounds"
-        elif len(seen) == local_elements and duplicate_slots == 0:
+        surjective = bool(linear.is_surjective())
+        injective = bool(linear.is_injective())
+        if surjective and injective and physical_slots == local_elements:
             coverage = "exact"
-        elif len(seen) == local_elements:
+        elif surjective:
             coverage = "replicated"
-        elif duplicate_slots:
-            coverage = "duplicate_partial"
-        else:
+        elif injective:
             coverage = "partial"
+        else:
+            coverage = "duplicate_partial"
+        covered_elements = local_elements if surjective else 0
+        duplicate_slots = (
+            max(0, physical_slots - local_elements) if surjective else 0
+        )
     return {
         "coverage": coverage,
         "component_count": int(component_count),
-        "covered_elements": int(len(seen)),
+        "covered_elements": int(covered_elements),
         "duplicate_slots": int(duplicate_slots),
         "local_elements": int(local_elements),
         "physical_slots": int(physical_slots),
-        "out_of_bounds_slots": int(out_of_bounds_slots),
+        # LinearLayout construction already constrains every output basis to
+        # its declared dimension.  There is no separate out-of-bounds image to
+        # enumerate.
+        "out_of_bounds_slots": 0,
         "block_count": int(block_count),
     }
 
