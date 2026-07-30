@@ -14,18 +14,15 @@ _DISTRIBUTED_REMAP_REPRESENTATIONS = frozenset({
     "simd",
     "simd_tuple",
 })
-_MMA_PACKET_REPRESENTATIONS = frozenset({
-    "simd_packet",
-    "simd_packet_tuple",
-})
-_STRUCTURAL_TENSOR_REPRESENTATIONS = frozenset({
-    "simd",
-    "simd_tuple",
-    *_MMA_PACKET_REPRESENTATIONS,
-})
-
-
-def redistribution_plan(operand, result, operand_layout, result_layout, op):
+def redistribution_plan(
+    operand,
+    result,
+    operand_layout,
+    result_layout,
+    op,
+    *,
+    source_coordinate_transform=None,
+):
     """Build the complete destination-to-source packet relation.
 
     Layout coordinates are the semantic witness for a layout conversion.  The
@@ -36,7 +33,10 @@ def redistribution_plan(operand, result, operand_layout, result_layout, op):
         return None
     if operand.type.element_type != result.type.element_type:
         return None
-    if tuple(operand_layout.shape) != tuple(result_layout.shape):
+    if (
+        source_coordinate_transform is None
+        and tuple(operand_layout.shape) != tuple(result_layout.shape)
+    ):
         return None
 
     source_layout = _redistribution_linear_layout(operand_layout, op)
@@ -80,72 +80,25 @@ def redistribution_plan(operand, result, operand_layout, result_layout, op):
             source_op_index=op.index,
             source_value_id=result.value_id,
         )
-    (
-        relation_bases,
-        relation_out_dims,
-        is_identity,
-        cross_wave,
-        same_workitem_source_slots,
-    ) = (
-        _redistribution_relation_plan(
-            source_layout,
-            destination_layout,
-            source_slots,
-            destination_slots,
-            lane_width,
-            source_warps,
-            source_blocks,
-            len(result_layout.shape),
-            op,
-            operand.value_id,
-            result.value_id,
-        )
+    relation_bases, relation_out_dims = _redistribution_relation_plan(
+        source_layout,
+        destination_layout,
+        source_slots,
+        destination_slots,
+        lane_width,
+        source_warps,
+        source_blocks,
+        len(operand_layout.shape),
+        len(result_layout.shape),
+        op,
+        operand.value_id,
+        result.value_id,
+        source_coordinate_transform=source_coordinate_transform,
     )
-    if is_identity and source_slots == destination_slots:
-        packet_grouping = _identity_packet_grouping_plan(
-            operand,
-            result,
-            source_slots,
-            destination_slots,
-            op,
-        )
-        if packet_grouping is not None:
-            return {
-                "group_size": 1,
-                "mode": "alias",
-                **packet_grouping,
-            }
-    if same_workitem_source_slots is not None:
-        packet_grouping = _identity_packet_grouping_plan(
-            operand,
-            result,
-            source_slots,
-            destination_slots,
-            op,
-        )
-        if packet_grouping is not None:
-            return {
-                "group_size": 1,
-                "mode": "alias",
-                "scalar_source_slots": same_workitem_source_slots,
-                **packet_grouping,
-            }
-    if (
-        is_identity
-        and operand.type.representation == result.type.representation
-        and source_components == destination_components
-        and source_slots == destination_slots
-    ):
-        return {
-            "group_size": 1,
-            "mode": "alias",
-            "result_component_count": destination_components,
-        }
     return {
         "mode": "redistribute",
         "block_count": source_blocks,
         "cta_thread_count": lane_width * source_warps,
-        "cross_wave": cross_wave,
         "element_type": result.type.element_type,
         "relation_bases": relation_bases,
         "relation_out_dims": relation_out_dims,
@@ -158,21 +111,14 @@ def redistribution_plan(operand, result, operand_layout, result_layout, op):
     }
 
 
-def structural_view_alias_plan(
+def structural_view_redistribution_plan(
     operand,
     result,
     operand_layout,
     result_layout,
     op,
 ):
-    """Prove and describe a zero-cost reshape/transpose packet regrouping.
-
-    TritonGPU tensor views preserve the physical ``register/lane/warp/block``
-    inputs while changing only their logical output coordinates.  Prove that
-    relation explicitly, then describe any ordinary-SIMD packet grouping the
-    Wave emitter must reconstruct at the view boundary.  WaveAMD fragment
-    types are deliberately not part of this contract.
-    """
+    """Translate a structural view to the generic symbolic layout relation."""
     if operand_layout is None or result_layout is None:
         _structural_view_fail(
             op,
@@ -206,87 +152,28 @@ def structural_view_alias_plan(
             f"{op.name} source and result element counts must match",
         )
 
-    source_linear = _redistribution_linear_layout(operand_layout, op)
-    result_linear = _redistribution_linear_layout(result_layout, op)
-    source_slots = layouts.linear_layout_in_dim_size(source_linear, "register")
-    result_slots = layouts.linear_layout_in_dim_size(result_linear, "register")
-    source_warps = _redistribution_warp_count(operand_layout)
-    result_warps = _redistribution_warp_count(result_layout)
-    source_blocks = layouts.linear_layout_in_dim_size(source_linear, "block")
-    result_blocks = layouts.linear_layout_in_dim_size(result_linear, "block")
-    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
-    if (
-        source_slots != result_slots
-        or source_warps != result_warps
-        or source_blocks != result_blocks
-    ):
-        _structural_view_fail(
-            op,
-            result.value_id,
-            f"{op.name} changed its physical register packet dimensions",
-        )
-
     order = _structural_view_order(op, source_shape, result_shape)
-    description = f"{op.name} structural packet alias"
-    for block in range(int(source_blocks)):
-        for warp in range(int(source_warps)):
-            for lane in range(lane_width):
-                for slot in range(int(source_slots)):
-                    source_coords = _redistribution_coords(
-                        source_linear,
-                        slot,
-                        lane,
-                        warp,
-                        block,
-                        len(source_shape),
-                        op,
-                        operand.value_id,
-                        description,
-                    )
-                    result_coords = _redistribution_coords(
-                        result_linear,
-                        slot,
-                        lane,
-                        warp,
-                        block,
-                        len(result_shape),
-                        op,
-                        result.value_id,
-                        description,
-                    )
-                    expected = _structural_view_result_coords(
-                        op.name,
-                        source_coords,
-                        source_shape,
-                        result_shape,
-                        order,
-                    )
-                    if result_coords != expected:
-                        _structural_view_fail(
-                            op,
-                            result.value_id,
-                            f"{op.name} changed physical register ownership",
-                        )
-
-    packet_grouping = _identity_packet_grouping_plan(
+    plan = redistribution_plan(
         operand,
         result,
-        source_slots,
-        result_slots,
+        operand_layout,
+        result_layout,
         op,
+        source_coordinate_transform=lambda coords: _structural_view_result_coords(
+            op.name,
+            coords,
+            source_shape,
+            result_shape,
+            order,
+        ),
     )
-    if packet_grouping is None:
+    if plan is None:
         _structural_view_fail(
             op,
             result.value_id,
-            f"{op.name} has unsupported tensor packet representations "
-            f"{operand.type.representation} -> {result.type.representation}",
+            f"{op.name} cannot be represented as a symbolic layout relation",
         )
-    return {
-        "group_size": 1,
-        "mode": "alias",
-        **packet_grouping,
-    }
+    return plan
 
 
 def structural_join_plan(
@@ -661,48 +548,6 @@ def _structural_split_fail(op, value_id, message):
     )
 
 
-def _identity_packet_grouping_plan(
-    operand,
-    result,
-    source_slots,
-    result_slots,
-    op,
-):
-    source_components = int(operand.type.component_count)
-    result_components = int(result.type.component_count)
-    if source_components <= 0 or result_components <= 0:
-        return None
-    if source_slots % source_components or result_slots % result_components:
-        return None
-    source_width = int(source_slots) // source_components
-    result_width = int(result_slots) // result_components
-    source_representation = operand.type.representation
-    result_representation = result.type.representation
-    if (
-        source_representation not in _STRUCTURAL_TENSOR_REPRESENTATIONS
-        or result_representation not in _STRUCTURAL_TENSOR_REPRESENTATIONS
-    ):
-        return None
-    if (
-        source_representation not in _MMA_PACKET_REPRESENTATIONS
-        and source_width != 1
-    ):
-        return None
-    if (
-        result_representation not in _MMA_PACKET_REPRESENTATIONS
-        and result_width != 1
-    ):
-        return None
-    return {
-        "source_component_count": source_components,
-        "source_packet_width": source_width,
-        "source_slot_count": int(source_slots),
-        "result_component_count": result_components,
-        "result_packet_width": result_width,
-        "result_slot_count": int(result_slots),
-    }
-
-
 def _structural_view_order(op, source_shape, result_shape):
     if op.name == "tt.reshape":
         return ()
@@ -765,10 +610,13 @@ def _redistribution_relation_plan(
     lane_width,
     warp_count,
     block_count,
-    rank,
+    source_rank,
+    destination_rank,
     op,
     source_value_id,
     result_value_id,
+    *,
+    source_coordinate_transform=None,
 ):
     description = "wave.redistribute layout conversion"
     dimensions = {
@@ -791,24 +639,27 @@ def _redistribution_relation_plan(
         for warp in range(int(warp_count)):
             for lane in range(int(lane_width)):
                 for slot in range(int(source_slots)):
-                    coords = _redistribution_coords(
+                    source_coords = _redistribution_coords(
                         source_layout,
                         slot,
                         lane,
                         warp,
                         block,
-                        rank,
+                        source_rank,
                         op,
                         source_value_id,
                         description,
+                    )
+                    coords = (
+                        source_coords
+                        if source_coordinate_transform is None
+                        else tuple(source_coordinate_transform(source_coords))
                     )
                     source_by_coord.setdefault(coords, []).append(
                         (int(slot), int(lane), int(warp), int(block))
                     )
 
     relation = {}
-    is_identity = int(source_slots) == int(destination_slots)
-    cross_wave = False
     for block in range(int(block_count)):
         for warp in range(int(warp_count)):
             for lane in range(int(lane_width)):
@@ -819,7 +670,7 @@ def _redistribution_relation_plan(
                         lane,
                         warp,
                         block,
-                        rank,
+                        destination_rank,
                         op,
                         result_value_id,
                         description,
@@ -843,8 +694,6 @@ def _redistribution_relation_plan(
                         ),
                     )
                     relation[destination] = source
-                    is_identity = is_identity and source == destination
-                    cross_wave = cross_wave or source[2:] != destination[2:]
 
     output_dims = (
         ("register", int(source_slots)),
@@ -880,39 +729,7 @@ def _redistribution_relation_plan(
                 source_op_index=op.index,
                 source_value_id=result_value_id,
             )
-    same_workitem_source_slots = []
-    for destination_slot in range(int(destination_slots)):
-        destination_sources = tuple(
-            (destination, source)
-            for destination, source in relation.items()
-            if int(destination[0]) == destination_slot
-        )
-        sources = {
-            int(source[0])
-            for _destination, source in destination_sources
-        }
-        if (
-            len(destination_sources) != lane_width * warp_count * block_count
-            or any(
-                source[1:] != destination[1:]
-                for destination, source in destination_sources
-            )
-            or len(sources) != 1
-        ):
-            same_workitem_source_slots = None
-            break
-        same_workitem_source_slots.append(sources.pop())
-    return (
-        encoded_bases,
-        output_dims,
-        bool(is_identity),
-        bool(cross_wave),
-        (
-            None
-            if same_workitem_source_slots is None
-            else tuple(same_workitem_source_slots)
-        ),
-    )
+    return encoded_bases, output_dims
 
 
 def _redistribution_coords(
@@ -1003,79 +820,10 @@ def reject_unsupported_pair(operand_layout, result_layout, op):
     fail(
         "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
         STAGE,
-        f"{operand_kind} to {result_kind} convert_layout has unknown "
-        "movement class",
+        f"{operand_kind} to {result_kind} convert_layout cannot be represented "
+        "as a symbolic layout relation",
         source_op_index=op.index,
     )
-
-
-def _apply_bit_linear_offset(base, coefficients, thread):
-    result = int(base)
-    for bit, coefficient in enumerate(coefficients):
-        if int(thread) & (1 << bit):
-            result ^= int(coefficient)
-    return int(result)
-
-
-def _reject_distributed_movement(
-    result_sources,
-    lane_width,
-    cta_warp_count,
-    op,
-    result_value_id,
-    description,
-):
-    for sources in result_sources:
-        for result_warp in range(int(cta_warp_count)):
-            for lane in range(int(lane_width)):
-                source_warp, _source_lane, _source_register = sources[result_warp * int(lane_width) + lane]
-                if int(source_warp) != int(result_warp):
-                    fail(
-                        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-                        STAGE,
-                        f"{description} requires cross-warp movement",
-                        source_op_index=op.index,
-                        source_value_id=result_value_id,
-                    )
-        source_registers = {int(source[2]) for source in sources}
-        if len(source_registers) > 1:
-            fail(
-                "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-                STAGE,
-                f"{description} requires per-lane source component selection",
-                source_op_index=op.index,
-                source_value_id=result_value_id,
-            )
-    fail(
-        "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT",
-        STAGE,
-        f"{description} has unknown movement class",
-        source_op_index=op.index,
-        source_value_id=result_value_id,
-    )
-
-
-def _distributed_movement_class(
-    result_sources,
-    lane_width,
-    cta_warp_count,
-):
-    has_cross_warp = False
-    has_lane_mux = False
-    for sources in result_sources:
-        for result_warp in range(int(cta_warp_count)):
-            for lane in range(int(lane_width)):
-                source_warp, _source_lane, _source_register = sources[result_warp * int(lane_width) + lane]
-                if int(source_warp) != int(result_warp):
-                    has_cross_warp = True
-        source_registers = {int(source[2]) for source in sources}
-        if len(source_registers) > 1:
-            has_lane_mux = True
-    if has_cross_warp:
-        return "cross_warp"
-    if has_lane_mux:
-        return "lane_mux"
-    return "unknown"
 
 
 def _product(values):

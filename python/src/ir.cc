@@ -1218,12 +1218,6 @@ void init_triton_ir(py::module_ &m) {
       .def("get_block", &Operation::getBlock, ret::reference)
       .def("get_attrs",
            [](Operation &self) { return operationAttrsToPython(self); })
-      .def("get_attr",
-           [](Operation &self, const std::string &name) -> py::object {
-             if (Attribute attr = self.getAttr(name))
-               return py::cast(attr);
-             return py::none();
-           })
       .def("get_str_attr",
            [](Operation &self, const std::string &name) -> py::object {
              auto ret = self.getAttrOfType<StringAttr>(name);

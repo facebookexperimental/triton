@@ -109,7 +109,7 @@ def _eliminate_redundant_compiler_membar_barriers_in_region(
             continue
         if (
             op.kind == "buffer_load_to_local"
-            and attrs.get("mode") == "dma_packet_lds"
+            and attrs.get("mode") == "symbolic_copy"
         ):
             has_open_dma_group = True
             continue
@@ -305,7 +305,6 @@ _ASYNC_WAIT_HOIST_PURE_OPS = frozenset({
     "expand_dims",
     "float_binary",
     "float_cast",
-    "float_ternary",
     "mma_packet_truncf",
     "make_range",
     "make_buffer",

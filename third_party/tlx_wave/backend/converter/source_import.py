@@ -228,9 +228,6 @@ def _collect_region(
 
 def _source_attrs(op):
     attrs = dict(op.get_attrs())
-    copy_layout = op.get_attr("tlx.wave.copy_layout")
-    if copy_layout is not None:
-        attrs["tlx.wave.copy_layout"] = copy_layout
     for name in ("axis", "end", "num", "predicate", "start"):
         value = op.get_int_attr(name)
         if value is not None:

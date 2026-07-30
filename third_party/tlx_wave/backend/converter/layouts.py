@@ -126,58 +126,6 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
     )
 
 
-def build_layout_map_from_attr(
-    layout_map_id,
-    value_id,
-    shape,
-    element_type,
-    attr,
-    lane_width,
-    *,
-    encoding=None,
-):
-    """Build and validate a structural layout map from an operation attribute."""
-    kind, properties = _layout_kind_and_properties(
-        attr,
-        value_id,
-        encoding=str(attr if encoding is None else encoding),
-    )
-    if kind in {"blocked", "linear", "generic_linear"}:
-        coordinate_domain = _layout_coordinate_domain(
-            kind,
-            shape,
-            properties,
-            lane_width,
-            value_id,
-        )
-        _require_supported_coordinate_domain(
-            kind,
-            shape,
-            properties,
-            coordinate_domain,
-            value_id,
-        )
-        properties = {**properties, "coordinate_domain": coordinate_domain}
-        component_count = int(coordinate_domain["component_count"])
-    else:
-        _layout_fail(
-            "TLXW_TYPE_UNSUPPORTED_LAYOUT",
-            STAGE,
-            f"operation layout assumption requires a distributed layout; got {kind}",
-            source_value_id=value_id,
-        )
-    return LayoutMap(
-        layout_map_id,
-        value_id,
-        kind,
-        tuple(shape),
-        element_type,
-        int(component_count),
-        int(lane_width),
-        properties,
-    )
-
-
 def _layout_kind_and_properties(attr, value_id, *, encoding=None):
     if attr is None:
         return "none", {}

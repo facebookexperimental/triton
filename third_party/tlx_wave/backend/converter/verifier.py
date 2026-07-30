@@ -929,11 +929,11 @@ def _verify_coalesced_wait_publication_barrier(
 
 def _verify_layout_convert_mode(op):
     mode = _attrs_dict(op).get("mode")
-    if mode not in {"alias", "redistribute"}:
+    if mode != "redistribute":
         fail(
             "TLXW_VERIFY_LAYOUT_MODE",
             STAGE,
-            "layout_convert mode must be alias or redistribute",
+            "layout_convert mode must be redistribute",
             target_op_id=op.target_op_id,
         )
 
@@ -941,14 +941,14 @@ def _verify_layout_convert_mode(op):
 def _verify_layout_convert_fact_policy(op):
     attrs = _attrs_dict(op)
     policy = attrs.get("fact_policy")
-    if policy not in {"preserve_equivalent", "invalidate_layout_sensitive"}:
+    if policy != "invalidate_layout_sensitive":
         fail(
             "TLXW_VERIFY_LAYOUT_FACT_POLICY",
             STAGE,
-            "layout_convert requires an explicit fact_policy",
+            "layout_convert must invalidate layout-sensitive facts",
             target_op_id=op.target_op_id,
         )
-    if policy == "invalidate_layout_sensitive" and op.fact_ids:
+    if op.fact_ids:
         fail(
             "TLXW_VERIFY_LAYOUT_FACT_POLICY",
             STAGE,
@@ -1105,66 +1105,40 @@ def _verify_memory_edges(op, target_program):
             target_op_id=op.target_op_id,
         )
     source_pointer_mode = attrs.get("source_pointer_mode", "base_offset")
-    if source_pointer_mode not in {"base_offset", "direct"}:
+    if source_pointer_mode != "base_offset":
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
             f"unsupported memory source pointer mode {source_pointer_mode!r}",
             target_op_id=op.target_op_id,
         )
-    if source_pointer_mode == "direct":
-        if (
-            op.kind != "buffer_load_to_local"
-            or attrs.get("mode") != "dma_packet_lds"
-            or len(op.operands) < 2
-        ):
-            fail(
-                "TLXW_VERIFY_MEMORY_EDGE",
-                STAGE,
-                "only packet direct-to-LDS DMA may consume a direct buffer pointer",
-                target_op_id=op.target_op_id,
-            )
-        pointer_type = target_program.values[int(op.operands[1])].type
-        if (
-            pointer_type.representation
-            not in {"buffer_pointer", "buffer_pointer_tuple"}
-            or int(pointer_type.component_count)
-            != int(attrs.get("component_count", 0))
-        ):
-            fail(
-                "TLXW_VERIFY_MEMORY_EDGE",
-                STAGE,
-                "direct DMA pointer components must match the memory op",
-                target_op_id=op.target_op_id,
-                target_value_id=int(op.operands[1]),
-            )
-    else:
-        offset_operand = {
-            "buffer_load": 1,
-            "buffer_load_to_local": 2,
-            "buffer_store": 2,
-        }[op.kind]
-        if len(op.operands) <= offset_operand:
-            fail(
-                "TLXW_VERIFY_MEMORY_EDGE",
-                STAGE,
-                "memory operation is missing its typed offset operand",
-                target_op_id=op.target_op_id,
-            )
-        offset_type = target_program.values[
-            int(op.operands[offset_operand])
-        ].type
-        if (
-            offset_type.element_type != "index"
-            or offset_type.representation not in {"simd", "simd_tuple"}
-        ):
-            fail(
-                "TLXW_VERIFY_MEMORY_EDGE",
-                STAGE,
-                "memory offset operands must use the SIMD index representation",
-                target_op_id=op.target_op_id,
-                target_value_id=int(op.operands[offset_operand]),
-            )
+    offset_operand = {
+        "buffer_load": 1,
+        "buffer_load_to_local": 2,
+        "buffer_store": 2,
+    }[op.kind]
+    if len(op.operands) <= offset_operand:
+        fail(
+            "TLXW_VERIFY_MEMORY_EDGE",
+            STAGE,
+            "memory operation is missing its typed offset operand",
+            target_op_id=op.target_op_id,
+        )
+    offset_type = target_program.values[
+        int(op.operands[offset_operand])
+    ].type
+    if (
+        offset_type.element_type not in {"i32", "index"}
+        or offset_type.representation not in {"simd", "simd_tuple"}
+    ):
+        fail(
+            "TLXW_VERIFY_MEMORY_EDGE",
+            STAGE,
+            "memory offset operands must use a SIMD i32 or index "
+            "representation",
+            target_op_id=op.target_op_id,
+            target_value_id=int(op.operands[offset_operand]),
+        )
     has_mask = bool(attrs.get("has_mask", False))
     redundant_register_mask = attrs.get("redundant_register_mask", 0)
     redundant_lane_mask = attrs.get("redundant_lane_mask", 0)
@@ -1182,16 +1156,7 @@ def _verify_memory_edges(op, target_program):
         or (
             any(ownership_masks)
             and (
-                op.kind not in {"buffer_load_to_local", "buffer_store"}
-                or (
-                    op.kind == "buffer_load_to_local"
-                    and (
-                        attrs.get("mode") != "dma_packet_lds"
-                        or has_mask
-                        or redundant_register_mask
-                        or redundant_lane_mask
-                    )
-                )
+                op.kind != "buffer_store"
             )
         )
     ):
@@ -1201,11 +1166,7 @@ def _verify_memory_edges(op, target_program):
             "invalid canonical ownership masks on memory operation",
             target_op_id=op.target_op_id,
         )
-    wave_count = (
-        attrs.get("destination_wave_count")
-        if op.kind == "buffer_load_to_local"
-        else attrs.get("wave_count")
-    )
+    wave_count = attrs.get("wave_count")
     if (
         redundant_wave_mask
         and (
@@ -1271,13 +1232,6 @@ def _verify_memory_edges(op, target_program):
             "TLXW_VERIFY_MASK_EDGE",
             STAGE,
             "memory mask operand mode does not match has_mask",
-            target_op_id=op.target_op_id,
-        )
-    if source_pointer_mode == "direct" and has_mask:
-        fail(
-            "TLXW_VERIFY_MASK_EDGE",
-            STAGE,
-            "direct loop-carried DMA pointers currently require an unmasked access",
             target_op_id=op.target_op_id,
         )
     forbidden = tuple(
@@ -1362,21 +1316,6 @@ def _verify_affine_materialize(op, target_program):
             target_op_id=op.target_op_id,
         )
     mode = attrs.get("mode")
-    if mode == "packet_coordinates":
-        if result_type.element_type != "index":
-            fail(
-                "TLXW_VERIFY_AFFINE_EDGE",
-                STAGE,
-                "packet-coordinate affine materialization must produce index values",
-                target_op_id=op.target_op_id,
-            )
-        _verify_packet_affine_materialize(
-            op,
-            target_program,
-            attrs,
-            result_type,
-        )
-        return
     if mode != "layout_coordinates":
         fail(
             "TLXW_VERIFY_AFFINE_EDGE",
@@ -1436,117 +1375,6 @@ def _verify_affine_materialize(op, target_program):
             scalar_sources,
             int(result_type.component_count),
         )
-
-
-def _verify_packet_affine_materialize(
-    op,
-    target_program,
-    attrs,
-    result_type,
-):
-    shape = attrs.get("coordinate_shape")
-    order = attrs.get("coordinate_order")
-    coordinate_mode = attrs.get("coordinate_mode")
-    linear_bases = attrs.get("linear_component_bases")
-    component_bases = attrs.get("component_coordinate_bases")
-    workitem_coefficients = attrs.get(
-        "workitem_coordinate_coefficients"
-    )
-    scalar_sources = attrs.get("scalar_component_sources")
-    component_thread_count = attrs.get("component_thread_count")
-    packet_elements = attrs.get("packet_elements")
-    value_range = attrs.get("value_range")
-    component_count = int(result_type.component_count)
-    rank = len(shape) if isinstance(shape, tuple) else -1
-    if (
-        rank <= 0
-        or not isinstance(order, tuple)
-        or tuple(sorted(order)) != tuple(range(rank))
-        or not isinstance(component_thread_count, int)
-        or component_thread_count <= 0
-        or not isinstance(packet_elements, int)
-        or packet_elements <= 0
-        or not isinstance(value_range, tuple)
-        or len(value_range) != 2
-        or not all(isinstance(bound, int) for bound in value_range)
-        or int(value_range[0]) < 0
-        or int(value_range[0]) > int(value_range[1])
-    ):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "packet-coordinate affine materialization has an invalid "
-            "coordinate or range schema",
-            target_op_id=op.target_op_id,
-        )
-    if coordinate_mode == "ordered_linear":
-        if linear_bases not in {None, ()}:
-            fail(
-                "TLXW_VERIFY_AFFINE_EDGE",
-                STAGE,
-                "ordered packet coordinates must not carry linear bases",
-                target_op_id=op.target_op_id,
-            )
-    elif coordinate_mode == "physical_linear_component":
-        if (
-            not isinstance(linear_bases, tuple)
-            or not linear_bases
-            or any(
-                not isinstance(basis, tuple) or len(basis) != rank
-                for basis in linear_bases
-            )
-        ):
-            fail(
-                "TLXW_VERIFY_AFFINE_EDGE",
-                STAGE,
-                "physical packet coordinates require ranked linear bases",
-                target_op_id=op.target_op_id,
-            )
-    elif coordinate_mode == "layout_coordinates":
-        if (
-            linear_bases not in {None, ()}
-            or not isinstance(component_bases, tuple)
-            or len(component_bases) != component_count
-            or any(
-                not isinstance(base, tuple) or len(base) != rank
-                for base in component_bases
-            )
-            or not isinstance(workitem_coefficients, tuple)
-            or any(
-                not isinstance(coefficients, tuple)
-                or len(coefficients) != rank
-                for coefficients in workitem_coefficients
-            )
-            or (1 << len(workitem_coefficients))
-            != int(component_thread_count)
-        ):
-            fail(
-                "TLXW_VERIFY_AFFINE_EDGE",
-                STAGE,
-                "copy-layout packet coordinates require ranked component "
-                "bases and an exact workitem bit domain",
-                target_op_id=op.target_op_id,
-            )
-    else:
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            f"unsupported packet coordinate mode {coordinate_mode!r}",
-            target_op_id=op.target_op_id,
-        )
-    if not isinstance(scalar_sources, tuple):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "packet affine scalar maps must match its operands",
-            target_op_id=op.target_op_id,
-        )
-    _verify_affine_scalar_component_sources(
-        op,
-        target_program,
-        scalar_sources,
-        component_count,
-    )
 
 
 def _verify_affine_scalar_component_sources(
