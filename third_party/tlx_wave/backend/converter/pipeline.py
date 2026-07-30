@@ -8,6 +8,7 @@ from . import emission
 from . import facts
 from . import op_conversion
 from . import source_import
+from . import target_ir
 from . import tokens
 from . import types
 from . import verifier
@@ -30,6 +31,7 @@ def convert_ttgir_to_wave(
     verify=True,
     compiler_membar_barriers=(),
     waves_per_eu=0,
+    enable_fp_fusion=False,
 ):
     source_program = source_import.import_source_program(
         mod,
@@ -44,6 +46,9 @@ def convert_ttgir_to_wave(
         type_layout_program,
         fact_program,
         token_program,
+        contract=target_ir.TargetContract(
+            enable_fp_fusion=bool(enable_fp_fusion),
+        ),
     )
     target_program = canonicalize.canonicalize_target_program(target_program)
     target_program = canonicalize.eliminate_redundant_compiler_membar_barriers(

@@ -130,7 +130,9 @@ The contract carries each lowering family without choosing its machine form:
 | Source semantics | Target contract |
 | --- | --- |
 | Triton layouts and address relations | Layout IDs plus symbolic coordinate, offset, and redistribution attributes |
-| Address arithmetic | Program assumption that address arithmetic does not overflow |
+| Ordinary arithmetic | Source opcode, width, overflow flags, and fast-math flags unchanged |
+| Address arithmetic | Symbolic-boundary assumption that address arithmetic does not overflow |
+| FP contraction | Program-level compiler permission plus literal source fast-math flags |
 | Range and divisibility guarantees | Target-bound assumptions emitted as `wave.assume` |
 | Masks | First-class mask values and ordinary SSA operands/results |
 | Broadcast, reshape, join, split, and movement | Structural operations with source/result layout IDs |

@@ -249,6 +249,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             src,
             compiler_membar_barriers=compiler_membar_barriers,
             waves_per_eu=getattr(options, "waves_per_eu", 0),
+            enable_fp_fusion=bool(getattr(options, "enable_fp_fusion", True)),
         )
         _validate_staged_converter_output(output, options)
 
@@ -281,7 +282,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
             knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     def hash(self):
-        return (f"{self.target}:stage14-amd-membar-issue-order:"
+        return (f"{self.target}:stage15-symbolic-arithmetic-contract:"
                 f"wave-opt-sha256={_wave_opt_sha256()}:"
                 f"wave-pipelines-sha256={_wave_pipelines_sha256()}")
 
@@ -295,6 +296,9 @@ def _validate_staged_converter_output(output, options):
     if int(kernel.threads_per_warp or options.warp_size) != int(options.warp_size):
         raise ValueError("tlx_wave staged converter saw inconsistent wave size: "
                          f"TTGIR={kernel.threads_per_warp}, options={options.warp_size}")
+    if output.target_program.contract.enable_fp_fusion != bool(
+            getattr(options, "enable_fp_fusion", True)):
+        raise ValueError("tlx_wave staged converter saw inconsistent FP-fusion semantics")
 
 
 def _populate_staged_converter_metadata(metadata, output, options, wave_opt):

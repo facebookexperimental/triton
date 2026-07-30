@@ -30,6 +30,8 @@ def layout_coordinate_plan(
     warp_count,
     op,
     source_value_id,
+    *,
+    cache=None,
 ):
     if layout.kind not in {
             "blocked",
@@ -39,6 +41,15 @@ def layout_coordinate_plan(
             "amd_mfma",
     }:
         return None
+    cache_key = (
+        "layout",
+        _layout_signature(layout),
+        int(component_count),
+        int(lane_width),
+        int(warp_count),
+    )
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     shape = tuple(int(dim) for dim in layout.shape)
     if not shape:
         _fail(
@@ -93,12 +104,15 @@ def layout_coordinate_plan(
         source_value_id,
         component_registers,
     )
-    return CoordinatePlan(
+    plan = CoordinatePlan(
         shape=shape,
         component_bases=tuple(tuple(int(value) for value in bases) for bases in component_bases),
         workitem_coefficients=tuple(
             tuple(int(value) for value in coefficients) for coefficients in workitem_coefficients),
     )
+    if cache is not None:
+        cache[cache_key] = plan
+    return plan
 
 
 def packet_layout_coordinate_plan(
@@ -109,6 +123,8 @@ def packet_layout_coordinate_plan(
     warp_count,
     op,
     source_value_id,
+    *,
+    cache=None,
 ):
     """Split a distributed register basis into component, slot, and item."""
     if layout.kind not in {
@@ -120,6 +136,16 @@ def packet_layout_coordinate_plan(
         "dot_operand",
     }:
         return None
+    cache_key = (
+        "packet",
+        _layout_signature(layout),
+        int(component_count),
+        int(packet_width),
+        int(lane_width),
+        int(warp_count),
+    )
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     shape = tuple(int(dim) for dim in layout.shape)
     component_count = int(component_count)
     packet_width = int(packet_width)
@@ -185,33 +211,16 @@ def packet_layout_coordinate_plan(
         for component in range(component_count)
     )
 
-    for component, component_base in enumerate(component_bases):
-        for slot in range(packet_width):
-            register = component * packet_width + slot
-            for warp in range(warp_count):
-                for lane in range(lane_width):
-                    workitem = warp * lane_width + lane
-                    planned = _coords_from_packet_plan(
-                        component_base,
-                        slot_coefficients,
-                        workitem_coefficients,
-                        slot,
-                        workitem,
-                    )
-                    actual = layouts.linear_layout_coords(
-                        linear,
-                        register,
-                        lane,
-                        warp=warp,
-                    )
-                    if planned != actual:
-                        _packet_fail(
-                            "packet coordinate plan does not match linear layout bases",
-                            layout,
-                            op,
-                            source_value_id,
-                        )
-    return PacketCoordinatePlan(
+    _validate_plan_ranks(
+        shape,
+        component_bases,
+        (*slot_coefficients, *workitem_coefficients),
+        layout,
+        op,
+        source_value_id,
+        packet=True,
+    )
+    plan = PacketCoordinatePlan(
         shape=shape,
         component_bases=tuple(
             tuple(int(value) for value in base) for base in component_bases
@@ -224,6 +233,20 @@ def packet_layout_coordinate_plan(
             tuple(int(value) for value in basis)
             for basis in workitem_coefficients
         ),
+    )
+    if cache is not None:
+        cache[cache_key] = plan
+    return plan
+
+
+def _layout_signature(layout):
+    return (
+        layout.kind,
+        tuple(int(dim) for dim in layout.shape),
+        layout.element_type,
+        int(layout.component_count),
+        int(layout.lane_width),
+        repr(layout.properties),
     )
 
 
@@ -339,50 +362,21 @@ def _validate_physical_domain(
     source_value_id,
     component_registers,
 ):
-    seen = set()
-    duplicate_seen = False
-    physical_slots = 0
-    for component, component_base in enumerate(component_bases):
-        component_register = int(component_registers[component])
-        for warp in range(int(warp_count)):
-            for lane in range(int(lane_width)):
-                physical_slots += 1
-                workitem = warp * int(lane_width) + lane
-                planned = _coords_from_plan(
-                    component_base,
-                    workitem_coefficients,
-                    workitem,
-                )
-                actual = layouts.linear_layout_coords(
-                    linear,
-                    component_register,
-                    lane,
-                    warp=warp,
-                )
-                if tuple(planned) != tuple(actual):
-                    _fail(
-                        "layout coordinate plan does not match linear layout bases",
-                        layout,
-                        op,
-                        source_value_id,
-                    )
-                if len(actual) != len(shape):
-                    _fail(
-                        "layout coordinate rank does not match tensor rank",
-                        layout,
-                        op,
-                        source_value_id,
-                    )
-                for coord, extent in zip(actual, shape):
-                    if int(coord) < 0 or int(coord) >= int(extent):
-                        _fail(
-                            "layout coordinate map produces out-of-bounds coordinates",
-                            layout,
-                            op,
-                            source_value_id,
-                        )
-                duplicate_seen = duplicate_seen or tuple(actual) in seen
-                seen.add(tuple(actual))
+    if len(component_bases) != len(component_registers):
+        _fail(
+            "layout coordinate component count does not match register bases",
+            layout,
+            op,
+            source_value_id,
+        )
+    _validate_plan_ranks(
+        shape,
+        component_bases,
+        workitem_coefficients,
+        layout,
+        op,
+        source_value_id,
+    )
     block_count = layouts.linear_layout_in_dim_size(linear, "block")
     total_logical_slots = _product(shape)
     if total_logical_slots % int(block_count):
@@ -395,16 +389,49 @@ def _validate_physical_domain(
     local_logical_slots = total_logical_slots // int(block_count)
     if _is_mfma_component_layout(layout):
         return
-    if len(seen) != local_logical_slots:
-        if duplicate_seen and int(physical_slots) <= int(local_logical_slots):
-            _fail(
-                "layout coordinate map is non-injective over physical lanes",
-                layout,
-                op,
-                source_value_id,
-            )
+    physical_slots = (
+        len(component_bases) * int(lane_width) * int(warp_count)
+    )
+    if physical_slots < local_logical_slots:
         _fail(
             "layout coordinate map does not cover the tensor shape exactly",
+            layout,
+            op,
+            source_value_id,
+        )
+
+
+def _validate_plan_ranks(
+    shape,
+    component_bases,
+    coefficients,
+    layout,
+    op,
+    source_value_id,
+    *,
+    packet=False,
+):
+    rank = len(shape)
+    if any(len(base) != rank for base in component_bases):
+        message = (
+            "packet coordinate rank does not match tensor rank"
+            if packet
+            else "layout coordinate rank does not match tensor rank"
+        )
+        (_packet_fail if packet else _fail)(
+            message,
+            layout,
+            op,
+            source_value_id,
+        )
+    if any(len(basis) != rank for basis in coefficients):
+        message = (
+            "packet coordinate coefficient rank does not match tensor rank"
+            if packet
+            else "layout coordinate coefficient rank does not match tensor rank"
+        )
+        (_packet_fail if packet else _fail)(
+            message,
             layout,
             op,
             source_value_id,

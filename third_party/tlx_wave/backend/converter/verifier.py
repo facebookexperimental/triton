@@ -60,6 +60,12 @@ def _verify_target_contract(target_program):
             STAGE,
             "target contract must state that address arithmetic does not overflow",
         )
+    if type(contract.enable_fp_fusion) is not bool:
+        fail(
+            "TLXW_VERIFY_FP_FUSION",
+            STAGE,
+            "target FP-fusion contract must be boolean",
+        )
 
 
 def _verify_target_layouts(target_program):

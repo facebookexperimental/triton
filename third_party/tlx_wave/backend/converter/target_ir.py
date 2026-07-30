@@ -7,7 +7,7 @@ from .diagnostics import fail
 
 STAGE = "target_ir"
 
-TARGET_SCHEMA_VERSION = 1
+TARGET_SCHEMA_VERSION = 2
 ADDRESS_ARITHMETIC_NO_OVERFLOW = "no_overflow"
 
 # Target values named by this attribute were consumed while proving or
@@ -120,6 +120,7 @@ class TargetAssumption:
 class TargetContract:
     schema_version: int = TARGET_SCHEMA_VERSION
     address_arithmetic: str = ADDRESS_ARITHMETIC_NO_OVERFLOW
+    enable_fp_fusion: bool = False
 
 
 @dataclass(frozen=True)
