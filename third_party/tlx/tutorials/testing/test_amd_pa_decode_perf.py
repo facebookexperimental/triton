@@ -132,7 +132,7 @@ def create_benchmark(versions, qlen):
         # Bound physical KV memory for large sweeps via a shared page pool.
         pool = 4 * ((N_CTX + PAGE_SIZE - 1) // PAGE_SIZE) + 16
         q, kc, vc, ctx, bt = _build_inputs(BATCH, [N_CTX] * BATCH, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE,
-                                           query_length=qlen, device=DEVICE, pool_pages=None)
+                                           query_length=qlen, device=DEVICE, pool_pages=pool)
         out = torch.empty_like(q)
         fn = _make_decode_fn(provider, out, q, kc, vc, ctx, bt, sm_scale, qlen, N_CTX)
         if fn is None:
@@ -144,8 +144,7 @@ def create_benchmark(versions, qlen):
         # HBM read bandwidth, the meaningful metric for this memory-bound op.
         # Use actual tensor sizes: with pool_pages sharing, multiple sequences
         # map to the same physical pages, so BATCH*N_CTX overcounts HBM bytes.
-        # kv_bytes = (kc.numel() + vc.numel()) * kc.element_size()
-        kv_bytes = 2 * BATCH * NUM_KV_HEADS * N_CTX * HEAD_DIM * 2
+        kv_bytes = (kc.numel() + vc.numel()) * kc.element_size()
         tbps = lambda ms: kv_bytes * 1e-12 / (ms * 1e-3)
         return tbps(ms), tbps(min_ms), tbps(max_ms)
 
