@@ -63,6 +63,46 @@ static bool hasMMAv5WaitsInLastStage(scf::ForOp forOp,
   return hasMMAv5 && hasWaitInLastStage;
 }
 
+static std::optional<StringRef>
+getWarpSpecializedPartitionType(scf::ForOp forOp) {
+  auto wsOp = forOp->getParentOfType<triton::gpu::WarpSpecializeOp>();
+  if (!wsOp)
+    return std::nullopt;
+  auto typesAttr =
+      wsOp->getAttrOfType<ArrayAttr>("ttg.partition.types");
+  if (!typesAttr)
+    return std::nullopt;
+
+  Operation *ancestor = forOp;
+  while (ancestor && ancestor->getParentOp() != wsOp)
+    ancestor = ancestor->getParentOp();
+  if (!ancestor)
+    return std::nullopt;
+
+  SmallVector<StringRef> partitionTypes;
+  for (Attribute attr : typesAttr) {
+    auto type = dyn_cast<StringAttr>(attr);
+    if (!type)
+      return std::nullopt;
+    partitionTypes.push_back(type.getValue());
+  }
+
+  Region *region = ancestor->getParentRegion();
+  if (region == &wsOp.getDefaultRegion())
+    return partitionTypes.empty() ? std::nullopt
+                                  : std::optional(partitionTypes.front());
+
+  auto partitionRegions = wsOp.getPartitionRegions();
+  if (partitionTypes.size() < partitionRegions.size())
+    return std::nullopt;
+  size_t typeOffset = partitionTypes.size() - partitionRegions.size();
+  for (auto [idx, partitionRegion] : llvm::enumerate(partitionRegions)) {
+    if (region == partitionRegion)
+      return partitionTypes[idx + typeOffset];
+  }
+  return std::nullopt;
+}
+
 static void expandLoops(ModuleOp moduleOp) {
   DenseSet<MaskOp> peeledMaskOps;
   auto processPeeledEpilogueOp = [&](RewriterBase &rewriter, Operation *op,
@@ -102,6 +142,11 @@ static void expandLoops(ModuleOp moduleOp) {
   auto metaWS = triton::tools::getBoolEnv("TRITON_USE_META_WS");
 
   for (scf::ForOp forOp : loops) {
+    if (metaWS) {
+      auto partitionType = getWarpSpecializedPartitionType(forOp);
+      if (partitionType && *partitionType != "gemm")
+        continue;
+    }
     CoarseSchedule schedule;
     if (failed(schedule.deSerialize(forOp))) {
       continue;

@@ -283,12 +283,14 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   // With reduction=4 (TMEM floor), gemm=1, load=1, computation=8,
   // total = 14, within the 16 warp budget.
   //
-  // Note: the types array comes from the scheduler and may be longer than
-  // partitionNumWarps (the WarpSpecializeOp may have fewer regions). We scan
-  // the full types array to detect the BWD pattern, then apply the override
-  // to the last partition (which is computation in BWD).
+  // The types array comes from the scheduler and may be longer than
+  // partitionNumWarps when empty partitions were removed. Match the surviving
+  // regions by type instead of assuming computation is last; dependent 2-CTA
+  // attention appends a one-warp relay partition after computation.
   bool hasReduction = false;
   bool hasComputation = false;
+  ModuleOp mod = axisInfo.getModuleOp();
+  bool isTwoCTA = mod->hasAttr("ttng.two-ctas");
   for (StringRef type : partitionTypes) {
     if (type == "reduction")
       hasReduction = true;
@@ -296,11 +298,21 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
       hasComputation = true;
   }
 
-  if (hasReduction && hasComputation && !partitionNumWarps.empty()) {
-    partitionNumWarps.back() = 8;
+  if (hasReduction && hasComputation && !partitionNumWarps.empty() &&
+      partitionTypes.size() >= partitionNumWarps.size()) {
+    // Partition types include the default region, while partitionNumWarps
+    // describes only the non-default regions. Align the trailing entries so
+    // the default type does not shift every specialized partition by one.
+    size_t typeOffset = partitionTypes.size() - partitionNumWarps.size();
+    for (size_t idx = 0; idx < partitionNumWarps.size(); ++idx) {
+      StringRef type = partitionTypes[idx + typeOffset];
+      if (type == "computation" && !isTwoCTA)
+        partitionNumWarps[idx] = 8;
+      else if (type == "relay")
+        partitionNumWarps[idx] = 1;
+    }
   }
 
-  ModuleOp mod = axisInfo.getModuleOp();
   auto minRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMinRegAutoWSName);
   auto maxRegAttr = mod->getAttrOfType<IntegerAttr>(AttrMaxRegAutoWSName);
   bool hasMax = !!maxRegAttr;
@@ -308,6 +320,10 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
   int maxRegAutoWS = hasMax ? maxRegAttr.getInt() : -1;
 
   SmallVector<int32_t> estRegUsage(partitionNumWarps.size());
+  size_t typeOffset = partitionTypes.size() >= partitionNumWarps.size()
+                          ? partitionTypes.size() - partitionNumWarps.size()
+                          : 0;
+  size_t partitionIdx = 0;
   for (auto [partition, newNumWarps, prevNumWarps, tensorRegs, hasTensor,
              estRegs] : llvm::zip(wsOp.getPartitionRegions(), partitionNumWarps,
                                   wsOp.getPartitionNumWarps(), maxTensorRegs,
@@ -318,6 +334,15 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     // get the fixed minRegAutoWS allocation.
     estRegs = hasMax ? (tensorRegs ? maxRegAutoWS : minRegAutoWS)
                      : (tensorRegs ? -1 : minRegAutoWS);
+    StringRef partitionType =
+        partitionIdx + typeOffset < partitionTypes.size()
+            ? partitionTypes[partitionIdx + typeOffset]
+            : StringRef();
+    ++partitionIdx;
+    // The 2-CTA relay only waits, fences, and publishes completion. Matching
+    // TLX's 40-register relay avoids reserving the GEMM budget for one warp.
+    if (partitionType == "relay")
+      estRegs = 40;
 
     // Layouts need to be reassigned if the number of warps changed and the
     // partition contains any tensor (even a single-element broadcast tensor,

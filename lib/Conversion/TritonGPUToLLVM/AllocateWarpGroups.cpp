@@ -11,6 +11,26 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+// AutoWS emits one persistent warp-specialize region per kernel. Mark that
+// shape for the lower-overhead LLVM lowering without changing manual TLX,
+// which remains explicitly controlled by async_tasks(exclusive=True).
+static void enableSingleWarpSpecializeForAutoWS(ModuleOp mod) {
+  if (mod->hasAttr(AttrSingleWarpSpecializeName))
+    return;
+
+  SmallVector<WarpSpecializeOp> wsOps;
+  mod.walk([&](WarpSpecializeOp op) { wsOps.push_back(op); });
+  if (wsOps.size() != 1)
+    return;
+
+  bool hasAutoWSTag = false;
+  wsOps.front()->walk([&](Operation *op) {
+    hasAutoWSTag |= op->hasAttr(kWarpSpecializeTagAttrName);
+  });
+  if (hasAutoWSTag)
+    setHasSingleWarpSpecialize(mod, true);
+}
+
 // Given a `ttg.warp_specialize` with a certain number of existing warps, pad it
 // with extra warps until it has the same number of full warp groups as the
 // largest partitioning. This ensures that all threads can be present to
@@ -74,6 +94,7 @@ struct AllocateWarpGroups
           AllocateWarpGroups> {
   void runOnOperation() override {
     ModuleOp mod = getOperation();
+    enableSingleWarpSpecializeForAutoWS(mod);
 
     // First determine the maximum number of extra warps.
     int maxExtraWarps = 0;
