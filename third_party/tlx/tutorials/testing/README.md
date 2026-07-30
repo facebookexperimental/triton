@@ -195,4 +195,16 @@ paged-decode-performance-bf16-qlen1:
 7    8.0  131072.0                         5.562219                           4.198856           0.754889
 ```
 
-
+- With some modifications in the order of loading lds and global memory, we got the following perf numbers:
+```
+paged-decode-performance-bf16-qlen1:
+   BATCH     N_CTX  tlx (TB/s (effective HBM read))
+0    1.0    8192.0                         1.161857
+1    8.0    8192.0                         2.836385
+2   32.0    8192.0                         4.543554
+3  128.0    8192.0                         5.655380
+4    1.0   32768.0                         2.872811
+5    8.0   32768.0                         4.628158
+6   32.0   32768.0                         5.934833
+7    8.0  131072.0                         5.970473
+```
