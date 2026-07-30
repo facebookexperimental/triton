@@ -365,6 +365,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// An explicit CUDA-style physical cluster is also a valid multi-CTA cluster,
+// even though the logical Triton layout remains single-CTA.
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, ttg.target = "cuda:90"} {
+  tt.func @cluster_barrier_explicit_cluster_valid() {
+    ttng.cluster_barrier
+    tt.return
+  }
+}
+
+// -----
+
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
   tt.func @cluster_barrier_in_default_region_invalid() {
     ttg.warp_specialize()
