@@ -1122,6 +1122,7 @@ configs_bwd_persist = [
         pre_hook=_bwd_host_descriptor_pre_hook,
         ctas_per_cga=(2, 1, 1),
         allowDependentTwoCTA=True,
+        generate_subtiled_region=True,
     ),
     triton.Config(
         {
