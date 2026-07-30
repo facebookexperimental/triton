@@ -9,7 +9,9 @@ using namespace mlir;
 using namespace mlir::triton;
 
 using ::mlir::triton::gpu::getShapePerCTA;
+using ::mlir::triton::gpu::isPermutationMatrixLayout;
 using ::mlir::triton::gpu::NvidiaMmaEncodingAttr;
+using ::mlir::triton::gpu::toLinearLayout;
 
 LogicalResult convertMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
                          const LLVMTypeConverter *typeConverter,
@@ -43,6 +45,12 @@ struct ScaledDotOpConversion
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, triton::DotScaledOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto rty = cast<RankedTensorType>(op.getResult().getType());
+    if (!isPermutationMatrixLayout(
+            toLinearLayout(rty.getShape(), rty.getEncoding())))
+      return rewriter.notifyMatchFailure(
+          op, "ScaledDotOp result encoding must have a permutation-matrix "
+              "linear layout");
     return convertMMADotScaled(op, adaptor, getTypeConverter(), rewriter);
   }
 
@@ -63,9 +71,16 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
                   ConversionPatternRewriter &rewriter) const override {
     // D = A * B + C
     Value D = op.getResult();
+    auto dType = op.getResult().getType();
+    auto dEncoding = dType.getEncoding();
 
-    NvidiaMmaEncodingAttr mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(
-        cast<RankedTensorType>(D.getType()).getEncoding());
+    if (!isPermutationMatrixLayout(toLinearLayout(dType.getShape(), dEncoding)))
+      return rewriter.notifyMatchFailure(
+          op,
+          "DotOp result encoding must have a permutation-matrix linear layout");
+
+    NvidiaMmaEncodingAttr mmaLayout =
+        dyn_cast<NvidiaMmaEncodingAttr>(dEncoding);
     if (mmaLayout) {
       if (mmaLayout.getVersionMajor() == 2) {
         return convertMMA(op, adaptor, getTypeConverter(), rewriter,
@@ -76,8 +91,7 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
           "Unsupported MMA kind found when converting DotOp to LLVM.");
     }
 
-    if (isa<BlockedEncodingAttr>(
-            cast<RankedTensorType>(D.getType()).getEncoding()))
+    if (isa<BlockedEncodingAttr>(dEncoding))
       return convertFMADot(op, adaptor, getTypeConverter(), rewriter);
 
     llvm::report_fatal_error(
