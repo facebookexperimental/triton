@@ -18,7 +18,8 @@ from pyptx.ir.nodes import RegisterOperand, VectorOperand
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import Def, DefUse
-from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.treeir import (FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp,
+                                 ShflCombine, SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
@@ -320,8 +321,8 @@ def _leaf_layout_invariant(node):
     and a single product mul(L,L) / fma(L,L;const) while refusing anything whose value could
     depend on the thread/lane layout."""
     for n in _postorder(node):
-        if isinstance(n, (ShflCombine, SmemExchange)):
-            return False
+        if isinstance(n, (ShflCombine, SmemExchange, Mma, LoopReduce)):
+            return False  # cross-thread / opaque-chunk / loop-fold node: not a per-element leaf
         if isinstance(n, OpaqueLeaf):
             return False
         if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
@@ -406,6 +407,10 @@ def _rebuild(n, kids):
         return ShflCombine(n.offset, n.kind, n.mods, kids[0])
     if isinstance(n, SmemExchange):
         return SmemExchange(kids[0])
+    if isinstance(n, Mma):
+        return Mma(n.token, n.flags, tuple(kids))
+    if isinstance(n, LoopReduce):
+        return LoopReduce(n.op, kids[0], n.key)
     return n
 
 
