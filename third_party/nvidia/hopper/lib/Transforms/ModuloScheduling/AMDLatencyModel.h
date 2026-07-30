@@ -16,12 +16,14 @@ namespace mlir::triton::gpu {
 /// are needed, this should move into the AMD backend once the core is relocated
 /// to a neutral path.
 ///
-/// Cycle counts (gfx950): GLOBAL latency=790 is MEASURED
-/// (claude/amd_latency_microbench.py, pointer-chase ~360 ns x 2.2 GHz). MFMA =
-/// 16 cyc PER hardware MFMA (LLIR 16x16x32 anchor) SCALED by the dot's per-wave
-/// MFMA count, so a block-level tt.dot's cost reflects real compute (critical:
-/// the un-scaled single-MFMA cost made II tiny -> the scheduler over-staged the
-/// prefetch). LDS=30 / VALU=16 are still coarse CDNA estimates (refine later).
+/// Cycle counts (gfx950): `third_party/tlx/tools/microbench/amd_latency.py`
+/// measures s_memtime at 2.183 GHz versus a 2.2 GHz shader clock (1.008
+/// cycles/tick). A dependent 16x16x32 fp16 MFMA measures ~18 cycles and four
+/// independent streams measure ~17 cycles/MFMA. A dependent fp32 VALU FMA
+/// measures ~8 cycles. A dependent LDS `tlx.local_gather` pointer chase
+/// over a preinitialized 1D i32 LDS table measures ~69 cycles with no timed
+/// ds_write. GLOBAL latency=790 remains the conservative DRAM estimate; the
+/// new pointer-chase result is a warm/self-pointer load and is not substituted.
 /// The accumulator hooks intentionally use the base no-op defaults: AMD
 /// accumulates MFMA results in registers, so there is no TMEM-style cross-loop
 /// hazard.
