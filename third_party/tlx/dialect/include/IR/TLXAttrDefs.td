@@ -3,6 +3,7 @@
 
 include "mlir/IR/AttrTypeBase.td"
 include "TLXDialect.td"
+include "TLXLayoutInterface.td"
 
 class TLX_Attr<string name, list<Trait> traits = [],
                      string baseCppClass = "::mlir::Attribute">
@@ -133,7 +134,7 @@ def TLX_DummyTMEMLayoutAttr : TLX_Attr<"DummyTMEMLayout"> {
 def TLX_NoVerifyLayoutAttr
     : TLX_Attr<"NoVerifyLayout",
                [TLX_DistributedEncodingTrait, TLX_LayoutEncodingTrait,
-                TLX_DeclareLayoutEncodingMethods]> {
+                TLX_LayoutAttrInterface, TLX_DeclareLayoutEncodingMethods]> {
   let mnemonic = "no_verify_layout";
   let summary = "TLX-owned wrapper for distributed layouts that defer layout verification";
 
@@ -152,6 +153,7 @@ def TLX_NoVerifyLayoutAttr
   let extraClassDeclaration = [{
     SmallVector<unsigned> getRepOrder() const;
     ::mlir::triton::LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
+    ::mlir::Attribute getUnderlyingLayout() const { return getLayout(); }
   }];
 
   let genVerifyDecl = 1;
@@ -166,7 +168,7 @@ def TLX_UserLayoutAttr
     : TLX_Attr<"UserLayout",
                [TLX_DistributedEncodingTrait, TLX_SharedEncodingTrait,
                 TLX_PinnedEncodingTrait, TLX_LayoutEncodingTrait,
-                TLX_DeclareLayoutEncodingMethods,
+                TLX_LayoutAttrInterface, TLX_DeclareLayoutEncodingMethods,
                 TLX_DeclareSharedEncodingMethods]> {
   let mnemonic = "user_layout";
   let summary = "TLX wrapper marking a user-specified layout (register or shared)";
@@ -194,6 +196,7 @@ def TLX_UserLayoutAttr
     SmallVector<unsigned> getRepOrder() const;
     ::mlir::triton::LinearLayout toLinearLayout(ArrayRef<int64_t> shape) const;
     ::mlir::Attribute getPinnedLayout() const { return getLayout(); }
+    ::mlir::Attribute getUnderlyingLayout() const { return getLayout(); }
   }];
 
   let genVerifyDecl = 1;

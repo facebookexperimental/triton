@@ -331,10 +331,13 @@ struct CanonicalizeConvertFromConvert
 
     // We don't handle conversions to DotOperandEncodingAttr.  This is a
     // heuristic to accommodate fused attention.
+    // Use isa_and_nonnull: a TLX convert_layout emitted in the TTIR stage (e.g.
+    // tlx.convert_layout to a raw dot_op<mfma>) has an operand with no encoding
+    // yet, so getEncoding() is null; plain isa<> would deref-crash on it.
     auto srcType = op.getSrc().getType();
     auto dstType = op.getType();
-    if (mlir::isa<DotOperandEncodingAttr>(dstType.getEncoding()) &&
-        mlir::isa<NvidiaMmaEncodingAttr>(srcType.getEncoding()))
+    if (mlir::isa_and_nonnull<DotOperandEncodingAttr>(dstType.getEncoding()) &&
+        mlir::isa_and_nonnull<NvidiaMmaEncodingAttr>(srcType.getEncoding()))
       return failure();
 
     Operation *arg = op.getSrc().getDefiningOp();
