@@ -148,7 +148,11 @@ _AUTOWS_2KV_SHAPES = [(256, 256, 2), (256, 320, 2), (256, 384, 2), (256, 512, 2)
 
 @pytest.mark.parametrize("ns", [1])
 @pytest.mark.parametrize("Lq,Lkv,Z", _AUTOWS_2KV_SHAPES)
-def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
+@pytest.mark.parametrize(
+    "variant",
+    [xa.BwdVariant.TRITON_AUTOWS_2KV, xa.BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA],
+)
+def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, variant, monkeypatch):
     """MANUAL 2-KV-block data-partition reduce_dq (BwdVariant.TRITON_AUTOWS_2KV),
     shared-KV + compute fold, warp specialization ON (milestone 2). Two KV blocks
     are processed per step explicitly in Triton, with DISJOINT per-block
@@ -179,7 +183,7 @@ def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
         t.grad = None
     # ws="1" -> TRITON_USE_META_WS=1 (meta warp specialization enabled), required
     # now that the kernel is dispatched with WS_ON=True.
-    bb._fwd(xa.BwdVariant.TRITON_AUTOWS_2KV, "1", q, k, v, so_kv, so_q, Lkv, Lq, asc, shared=True).backward(do)
+    bb._fwd(variant, "1", q, k, v, so_kv, so_q, Lkv, Lq, asc, shared=True).backward(do)
     dq, dk = q.grad.clone(), k.grad.clone()
     for name, got, want in (("dq", dq, rq), ("dk", dk, rk)):
         rl2 = bb.rel_l2(got, want)
