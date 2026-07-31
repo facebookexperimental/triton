@@ -363,8 +363,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
           }
         }
       }
-      // If this op may be signalling other threads asynchronously, make sure
-      // all shared memory transactions are complete beforehand.
+      // If this op may signal other threads asynchronously, make sure all
+      // shared-memory transactions in this partition are complete first.
       if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
         Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
         auto allMemorySlice = AllocationSlice(allIntervals);

@@ -745,7 +745,9 @@ def AsyncCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_copy_local_to_global", [
 //===----------------------------------------------------------------------===//
 // InitBarrierOp
 //===----------------------------------------------------------------------===//
-def InitBarrierOp : TT_AMDGPU_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>]> {
+def InitBarrierOp : TT_AMDGPU_Op<"init_barrier", [
+    MemoryEffects<[MemWrite<SharedMemory>]>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "Initialize a barrier in the given shared memory allocation.";
   let description = [{
       Initializes a shared memory allocation with mbarrier information.
@@ -783,7 +785,8 @@ def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[Mem
 
 def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local", [AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<TDMOpInterface>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+    DeclareOpInterfaceMethods<PredicatedOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -868,7 +871,8 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 //===----------------------------------------------------------------------===//
 
 def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments,
-    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+    DeclareOpInterfaceMethods<TDMOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{
@@ -902,7 +906,8 @@ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global",
 //===----------------------------------------------------------------------===//
 
 def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
-    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+    DeclareOpInterfaceMethods<TDMOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Scatter data from local memory to non-contiguous global memory rows asynchronously";
 
   let description = [{
@@ -944,7 +949,8 @@ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
 
 def AsyncTDMGatherOp : TT_AMDGPU_Op<"async_tdm_gather", [
     DeclareOpInterfaceMethods<TDMOpInterface>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+    DeclareOpInterfaceMethods<PredicatedOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Gather data from non-contiguous global memory rows to local memory asynchronously";
 
   let description = [{
@@ -1182,7 +1188,8 @@ def MemoryCounterWaitOp : TT_AMDGPU_Op<"memory_counter_wait"> {
 // WaitBarrierOp
 //===----------------------------------------------------------------------===//
 
-def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier"> {
+def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "wait until the mbarrier phase completes.";
 
   let description = [{
@@ -1204,7 +1211,8 @@ def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier"> {
 //===----------------------------------------------------------------------===//
 // ArriveBarrierOp
 //===----------------------------------------------------------------------===//
-def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier"> {
+def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "perform the arrive operation on an mbarrier";
   let description = [{
     Performs the "arrive" operation on an mbarrier object in shared memory. The operation requires a `count` attribute
@@ -1237,7 +1245,8 @@ def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier"> {
 // AsyncCopyMbarrierArriveOp
 //===----------------------------------------------------------------------===//
 
-def AsyncCopyMbarrierArriveOp : TT_AMDGPU_Op<"async_copy_mbarrier_arrive"> {
+def AsyncCopyMbarrierArriveOp : TT_AMDGPU_Op<"async_copy_mbarrier_arrive", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "arrive on mbarrier once all previously issued copies are completed";
   let description = [{
     Performs the "async arrive" operation by decrementing pending account by 1 when all previous async load to LDS (particularly, not TDM) have completed.

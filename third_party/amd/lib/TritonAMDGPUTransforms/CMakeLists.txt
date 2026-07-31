@@ -5,6 +5,7 @@ add_triton_library(TritonAMDGPUTransforms
   CanonicalizePointers.cpp
   CoalesceAsyncCopy.cpp
   CoalesceBufferOps.cpp
+  ConSanAMD.cpp
   ConvertToBufferOps.cpp
   ConvertToTensorOps.cpp
   DotDecomposeAndSchedule.cpp
@@ -36,6 +37,8 @@ add_triton_library(TritonAMDGPUTransforms
   TritonGPUModuloCore
   TritonAMDUtils
   TritonAMDAnalysis
+  TritonInstrumentTransforms
+  TritonInstrumentIR
 )
 
 target_include_directories(TritonAMDGPUTransforms PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
