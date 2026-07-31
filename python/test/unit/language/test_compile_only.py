@@ -6,6 +6,22 @@ import re
 from triton.compiler import ASTSource
 
 
+def test_range_assume_nonempty_attr() -> None:
+
+    @triton.jit
+    def kernel(out, n: tl.constexpr):
+        for i in tl.range(0, n, assume_nonempty=True):
+            tl.store(out + i, i)
+
+    src = ASTSource(
+        fn=kernel,
+        signature={"out": "*i32", "n": "constexpr"},
+        constexprs={"n": 4},
+    )
+    compiled = triton.compile(src, target=GPUTarget("cuda", 100, 32))
+    assert "tt.assume_nonempty" in compiled.asm["ttir"]
+
+
 def test_compile_only_sm100() -> None:
 
     @triton.jit
