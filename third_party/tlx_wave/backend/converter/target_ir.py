@@ -7,7 +7,7 @@ from .diagnostics import fail
 
 STAGE = "target_ir"
 
-TARGET_SCHEMA_VERSION = 3
+TARGET_SCHEMA_VERSION = 4
 ADDRESS_ARITHMETIC_NO_OVERFLOW = "no_overflow"
 
 # Token representations all lower to ``!wave.mem.token``, but protocol
@@ -82,6 +82,7 @@ class TargetLayout:
     component_count: int
     lane_width: int
     properties: tuple[TargetAttr, ...] = ()
+    linear_layout: TargetLinearLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +362,7 @@ def target_layout_from_converted(layout):
         int(layout.component_count),
         int(layout.lane_width),
         tuple(TargetAttr(str(name), _target_layout_property_value(value)) for name, value in layout.properties.items()),
+        (None if layout.linear_layout is None else _target_layout_property_value(layout.linear_layout)),
     )
 
 

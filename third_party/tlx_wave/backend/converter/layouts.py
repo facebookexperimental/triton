@@ -21,6 +21,7 @@ class LayoutMap:
     component_count: int
     lane_width: int
     properties: dict
+    linear_layout: object | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,21 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
         value_id,
         encoding=str(source_type.encoding or ""),
     )
+    distributed_kinds = {
+        "amd_mfma",
+        "blocked",
+        "dot_operand",
+        "generic_linear",
+        "linear",
+        "slice",
+    }
+    linear_layout = (distributed_linear_layout_from_parts(
+        kind,
+        source_type.shape,
+        properties,
+        lane_width,
+        source_value_id=value_id,
+    ) if kind in distributed_kinds else None)
     if kind in {"blocked", "linear", "generic_linear"}:
         coordinate_domain = _layout_coordinate_domain(
             kind,
@@ -96,6 +112,7 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
             properties,
             lane_width,
             value_id,
+            linear=linear_layout,
         )
         _require_supported_coordinate_domain(
             kind,
@@ -123,6 +140,7 @@ def build_layout_map(layout_map_id, value_id, source_type, lane_width):
         int(component_count),
         int(lane_width),
         properties,
+        linear_layout,
     )
 
 
@@ -437,12 +455,11 @@ def optimal_swizzled_ldst_plan(source, result, bitwidth, target):
     else:
         raise ValueError(f"unsupported AMD LDS swizzle target {target!r}")
 
-    vector_bitwidth = int(
-        _linear_layout.get_vec_bitwidth_ld_st(
-            source,
-            result,
-            int(bitwidth),
-        ))
+    vector_bitwidth = int(_linear_layout.get_vec_bitwidth_ld_st(
+        source,
+        result,
+        int(bitwidth),
+    ))
     # Match AMD TargetInfo::getSharedLdStTiles. Stores use the regular lane
     # tile; 128-bit loads use the architecture-specific ds_read_b128 tile.
     load_lane_addr = load_lane_addr_128 if vector_bitwidth == 128 else ()
@@ -639,10 +656,7 @@ def shared_physical_offset(
             minor = int(coords[minor_dim])
             phase = (major // int(per_phase)) % int(max_phase)
             if int(vec) * int(max_phase) <= minor_extent:
-                swizzled_minor = (
-                    ((minor // int(vec)) ^ phase) * int(vec)
-                    + (minor % int(vec))
-                )
+                swizzled_minor = (((minor // int(vec)) ^ phase) * int(vec) + (minor % int(vec)))
             else:
                 phase_offset = (int(vec) * int(phase)) % minor_extent
                 swizzled_minor = int(minor) ^ int(phase_offset)
@@ -950,8 +964,7 @@ def physical_offset_expression_plan_attrs(plan, prefix):
             tuple(int(value) for value in basis) for basis in plan.linear_component_bases)
     if plan.linear_inverse_offset_bases:
         attrs[f"{prefix}_physical_linear_inverse_offset_bases"] = tuple(
-            tuple(int(value) for value in bases)
-            for bases in plan.linear_inverse_offset_bases)
+            tuple(int(value) for value in bases) for bases in plan.linear_inverse_offset_bases)
     return attrs
 
 
@@ -1063,8 +1076,7 @@ def shared_linear_inverse_offset_bases(
             source_value_id=source_value_id,
         )
     out_dims = tuple((str(name), int(size)) for name, size in linear.out_dims)
-    expected_out_dims = tuple(
-        (f"dim{dim}", int(extent)) for dim, extent in enumerate(shape))
+    expected_out_dims = tuple((f"dim{dim}", int(extent)) for dim, extent in enumerate(shape))
     if out_dims != expected_out_dims:
         _shared_layout_fail(
             diagnostic,
@@ -1615,8 +1627,7 @@ def is_identity_swizzled_shared(layout, shape):
     props = layout.properties
     order = tuple(props.get("order", ()))
     return (int(props.get("vec", 0)) == 1 and int(props.get("per_phase", 0)) == 1
-            and int(props.get("max_phase", 0)) == 1
-            and order == default_physical_order(shape))
+            and int(props.get("max_phase", 0)) == 1 and order == default_physical_order(shape))
 
 
 def swizzled_shared_description(layout):
@@ -1654,14 +1665,23 @@ def _shared_layout_fail(
     )
 
 
-def _layout_coordinate_domain(kind, shape, properties, lane_width, source_value_id):
-    linear = distributed_linear_layout_from_parts(
-        kind,
-        shape,
-        properties,
-        lane_width,
-        source_value_id=source_value_id,
-    )
+def _layout_coordinate_domain(
+    kind,
+    shape,
+    properties,
+    lane_width,
+    source_value_id,
+    *,
+    linear=None,
+):
+    if linear is None:
+        linear = distributed_linear_layout_from_parts(
+            kind,
+            shape,
+            properties,
+            lane_width,
+            source_value_id=source_value_id,
+        )
     component_count = linear_layout_in_dim_size(linear, "register")
     warp_count = _layout_warp_count_from_parts(kind, properties)
     block_count = linear_layout_in_dim_size(linear, "block")
@@ -1686,9 +1706,7 @@ def _layout_coordinate_domain(kind, shape, properties, lane_width, source_value_
         else:
             coverage = "duplicate_partial"
         covered_elements = local_elements if surjective else 0
-        duplicate_slots = (
-            max(0, physical_slots - local_elements) if surjective else 0
-        )
+        duplicate_slots = (max(0, physical_slots - local_elements) if surjective else 0)
     return {
         "coverage": coverage,
         "component_count": int(component_count),
@@ -1872,8 +1890,7 @@ def _linear_layout_from_bases_for_shape(
     combineCtaCgaWithShape.
     """
     shape = tuple(int(size) for size in shape)
-    construction_shape = tuple(
-        max(shape[dim], _minimum_linear_basis_extent(bases, dim)) for dim in range(len(shape)))
+    construction_shape = tuple(max(shape[dim], _minimum_linear_basis_extent(bases, dim)) for dim in range(len(shape)))
     linear = LinearLayout.from_bases(bases, list(out_dims), list(construction_shape), False)
     return _ensure_layout_matches_shape(
         linear,
@@ -2133,12 +2150,8 @@ def _mfma_dot_operand_linear_layout(
     k_width = int(properties.get("k_width", 0) or 0)
     non_k_extent = int(instr_shape[op_idx])
     lane_width = int(lane_width)
-    if (
-        not _is_power_of_two(k_width)
-        or not _is_power_of_two(non_k_extent)
-        or not _is_power_of_two(lane_width)
-        or lane_width % non_k_extent
-    ):
+    if (not _is_power_of_two(k_width) or not _is_power_of_two(non_k_extent) or not _is_power_of_two(lane_width)
+            or lane_width % non_k_extent):
         _layout_fail(
             "TLXW_TYPE_MALFORMED_LAYOUT",
             stage,
@@ -2155,14 +2168,11 @@ def _mfma_dot_operand_linear_layout(
     k_size = int(shape[k_dim_index])
 
     registers = LinearLayout.identity_1d(k_width, "register", dim_k)
-    lanes = (
-        LinearLayout.identity_1d(non_k_extent, "lane", dim_non_k)
-        * LinearLayout.identity_1d(
-            lane_width // non_k_extent,
-            "lane",
-            dim_k,
-        )
-    )
+    lanes = (LinearLayout.identity_1d(non_k_extent, "lane", dim_non_k) * LinearLayout.identity_1d(
+        lane_width // non_k_extent,
+        "lane",
+        dim_k,
+    ))
     tile = registers * lanes
     k_tile_size = (lane_width // non_k_extent) * k_width
 
@@ -2170,8 +2180,7 @@ def _mfma_dot_operand_linear_layout(
     # MMA emitter supports only the symmetric MFMA families.  The layout model
     # itself should stay faithful as support expands.
     m_dim, n_dim = int(instr_shape[0]), int(instr_shape[1])
-    if ((m_dim, n_dim, op_idx) == (64, 4, 0) or
-            (m_dim, n_dim, op_idx) == (4, 64, 1)):
+    if ((m_dim, n_dim, op_idx) == (64, 4, 0) or (m_dim, n_dim, op_idx) == (4, 64, 1)):
         tile *= LinearLayout.identity_1d(16, "register", dim_k)
         k_tile_size *= 16
 
@@ -2190,9 +2199,7 @@ def _mfma_dot_operand_linear_layout(
             dim_k,
         )
 
-    tiles_per_warp = tuple(
-        int(value) for value in parent.get("tiles_per_warp", (1, 1))
-    )
+    tiles_per_warp = tuple(int(value) for value in parent.get("tiles_per_warp", (1, 1)))
     if len(tiles_per_warp) < 2:
         tiles_per_warp = (1, 1)
     tile *= LinearLayout.identity_1d(
@@ -2202,9 +2209,7 @@ def _mfma_dot_operand_linear_layout(
     )
     tile = _linear_layout_transpose_outs(tile, (dim_k, dim_non_k))
 
-    warps_per_cta = tuple(
-        int(value) for value in parent.get("warps_per_cta", ())
-    )
+    warps_per_cta = tuple(int(value) for value in parent.get("warps_per_cta", ()))
     if len(warps_per_cta) != 2:
         _layout_fail(
             "TLXW_TYPE_MALFORMED_LAYOUT",
@@ -2271,9 +2276,7 @@ def _ensure_layout_matches_shape(
             source_op_index=source_op_index,
             source_value_id=source_value_id,
         )
-    shape_by_dim = {
-        f"dim{dim}": int(shape[dim]) for dim in extension_order
-    }
+    shape_by_dim = {f"dim{dim}": int(shape[dim]) for dim in extension_order}
     linear = _ensure_layout_not_smaller_than(
         linear,
         shape_by_dim,
