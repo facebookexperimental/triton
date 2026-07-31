@@ -12,11 +12,14 @@ Modeled so far: ``ld.global`` (scalar + vector slots) -> leaves; the fp combines
 ``ShflCombine`` for any reduce op; ``mov`` pass-through; the cross-warp shared exchange
 (``st.shared`` -> ``ld.shared`` -> ``SmemExchange``, the forward SmemModel); and packed ``.f32x2``
 reductions (``mov.b64`` pack/unpack + ``.f32x2`` combine/fma decomposed per lane). ``st.global``
-values are the roots (a packed store expands to one root per f32 lane). MMA, data-dependent branches,
-and loop back-edges are later phases; anything unmodeled becomes an ``Opaque`` and, if it would strip
-a transient marker (losing a reduction ordering / packed structure), trips ``faithful=False`` — the
-sound floor that falls back to the conservative fingerprint. Integer/address ops do not touch the
-value state (their values live in the affine domain, resolved on demand for leaf coordinates).
+values are the roots (a packed store expands to one root per f32 lane). A loop-carried
+``acc = acc + chunk`` (a chunked / persistent reduction) is summarized as a ``LoopReduce`` fold over
+one iteration's chunk (via :mod:`bitequiv.ptx.forward.loops`), recovering num_warps for looped
+reductions. MMA-accumulation loops (GEMM K-fold) and data-dependent branches are later phases;
+anything unmodeled becomes an ``Opaque`` and, if it would strip a transient marker (losing a
+reduction ordering / packed structure), trips ``faithful=False`` — the sound floor that falls back to
+the conservative fingerprint. Integer/address ops do not touch the value state (their values live in
+the affine domain, resolved on demand for leaf coordinates).
 """
 
 from pyptx.ir.nodes import RegisterOperand, VectorOperand
@@ -24,11 +27,14 @@ from pyptx.ir.nodes import RegisterOperand, VectorOperand
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
 from bitequiv.ptx.builder import collapse_balanced, tree_hash
 from bitequiv.ptx.forward.cfg import has_unknown_control
+from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
+                                        loop_self_increments)
 from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
 from bitequiv.ptx.mma import _mma_fence
-from bitequiv.ptx.treeir import FpOp, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, OpaqueLeaf, OpaqueOp, ShflCombine,
+                                 SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
@@ -110,6 +116,19 @@ class ForwardInterp:
         self._unknown_ctrl = has_unknown_control(func)
         self.pred = PredicateDecoder(self.ev, self.du)
         self._ddb = None  # cached _has_data_dependent_branch() result
+        # Phase 5 (loops): a loop-carried `acc = acc + chunk` is summarized as a LoopReduce fold
+        # instead of the one-iteration DAG the straight-line walk would leave. Map the accumulating
+        # instruction -> (acc register, LoopReduce key = the loop's chunk step). Only ACCUMULATING
+        # loops (a running fp total), so an output-tiling loop is untouched. `linearize` and
+        # `find_loops` walk `func.body` identically, so the accumulating `inst` objects are shared.
+        self._acc = {}
+        insts, loops = find_loops(func)
+        for lp in set(loops):
+            if not loop_accumulates(insts, lp, loops):
+                continue
+            key = (loop_self_increments(insts, lp, loops), )
+            for acc_name, inst in loop_carried_accumulators(insts, lp, loops):
+                self._acc[id(inst)] = (acc_name, key)
 
     # -- operand lookup -------------------------------------------------------
 
@@ -220,6 +239,9 @@ class ForwardInterp:
         if op == "fma" and _is_fp(inst) and len(inst.operands) == 4:
             return FpOp("fma", mods, tuple(self._node(o, at) for o in inst.operands[1:]), fused=True)
         if op in _FP_KINDS and _is_fp(inst) and len(inst.operands) == 3:
+            acc = self._acc.get(id(inst))
+            if acc is not None and op == "add":
+                return self._loop_reduce(inst, acc, at)  # loop-carried add-accumulation -> fold summary
             return self._combine(inst, at)
         # Any other unmodeled op (an f64 half-assembly `or.b64`, a `cvt`, ...): keep it as an
         # OpaqueOp NODE with its register operands as children + non-register operands in the token,
@@ -249,6 +271,22 @@ class ForwardInterp:
         if others:
             tok += "{" + ",".join(canon(self.ev.of_operand(o, at)) for o in others) + "}"
         return OpaqueOp(tok, tuple(self._node(o, at) for o in reg_ops))
+
+    def _loop_reduce(self, inst, acc, at):
+        """A loop-carried ``acc = acc + chunk`` -> ``LoopReduce(add, chunk, key)``, summarizing the
+        whole fold instead of leaving the one-iteration ``add(seed, chunk)`` the straight-line walk
+        produces. The pre-loop SEED is dropped: when autotuning a single kernel every config shares
+        it, so it can never separate two configs (the module docstring's identical-outside-the-
+        computation assumption). This RECOVERS num_warps for a chunked / persistent reduction — the
+        chunk's within-block reduction collapses to a num_warps-invariant ITreeReduce and the key
+        (chunk step) is num_warps-invariant, so configs differing only in num_warps get one LoopReduce.
+        The key is chunk-BEARING (the step multiset), so a different BLOCK_N still splits (sound)."""
+        acc_name, key = acc
+        chunk = next((o for o in inst.operands[1:]
+                      if not (isinstance(o, RegisterOperand) and o.name == acc_name)), None)
+        if chunk is None:  # `acc = acc + acc` (not a chunk fold) -> fall back to a plain combine
+            return self._combine(inst, at)
+        return LoopReduce(inst.opcode + "".join(inst.modifiers), self._node(chunk, at), key)
 
     def _combine(self, inst, at):
         """Scalar fp binary combine — see :meth:`_combine_nodes`."""

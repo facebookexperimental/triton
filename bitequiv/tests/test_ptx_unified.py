@@ -1,6 +1,11 @@
-"""Unified per-element model — Step 1: Mma + LoopReduce nodes + builder guards. CPU-only."""
+"""Unified per-element model — Step 1: Mma + LoopReduce nodes + builder guards; Step 3: forward
+interpreter loop-carried add-accumulation -> LoopReduce. CPU-only."""
+from pyptx.parser import parse
+
 from bitequiv.ptx.builder import collapse_balanced, tree_hash
+from bitequiv.ptx.forward.interp import ForwardInterp, forward_module_descriptor
 from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, LoopReduce, Mma
+from bitequiv.ptx_reduction import _ensure_header
 
 
 def _leaf(i):
@@ -62,3 +67,55 @@ def test_loopreduce_root_survives_collapse():
     lr = LoopReduce("add.f32", Mma("tcgen05|.kind::f16", (), (_leaf(0), )), ())
     c = collapse_balanced(lr)
     assert isinstance(c, LoopReduce) and c.sig() == lr.sig()
+
+
+# -- Step 3: forward interpreter loop-carried add-accumulation -> LoopReduce ---
+
+# A chunked sum: each iteration loads one element and adds it to the running total `%f1`; the
+# induction var steps by {step} (BLOCK_N). The forward walk should summarize this as one LoopReduce.
+_LOOP_SUM = """
+.visible .entry k(.param .u64 pin, .param .u64 pout) {{
+  .reg .f32 %f<4>;
+  .reg .b32 %r<4>;
+  .reg .pred %p<2>;
+  .reg .b64 %rd<8>;
+  ld.param.u64 %rd1, [pin];
+  ld.param.u64 %rd2, [pout];
+  mov.b32 %r1, 0;
+  mov.f32 %f1, 0f00000000;
+  cvta.to.global.u64 %rd3, %rd1;
+$L__BB0_1:
+  mul.wide.s32 %rd4, %r1, 4;
+  add.s64 %rd5, %rd3, %rd4;
+  ld.global.f32 %f2, [%rd5];
+  add.f32 %f1, %f1, %f2;
+  add.s32 %r1, %r1, {step};
+  setp.lt.s32 %p1, %r1, 4096;
+  @%p1 bra $L__BB0_1;
+  cvta.to.global.u64 %rd6, %rd2;
+  st.global.f32 [%rd6], %f1;
+  ret;
+}}
+"""
+
+
+def _interp(ptx):
+    m = parse(_ensure_header(ptx))
+    f = next(d for d in m.directives if getattr(d, "is_entry", False))
+    interp = ForwardInterp(f)
+    interp.run()
+    return interp
+
+
+def test_loop_add_emits_loopreduce():
+    interp = _interp(_LOOP_SUM.format(step=256))
+    lrs = [v for v in interp.regs.values() if isinstance(v, LoopReduce)]
+    assert len(lrs) == 1                                       # the accumulator became a fold summary
+    lr = lrs[0]
+    assert lr.op == "add.f32" and isinstance(lr.chunk, Leaf) and lr.key == ((256, ), )  # chunk step key
+
+
+def test_loop_step_splits_and_is_deterministic():
+    d256 = forward_module_descriptor(_LOOP_SUM.format(step=256))
+    assert d256 == forward_module_descriptor(_LOOP_SUM.format(step=256))    # deterministic
+    assert d256 != forward_module_descriptor(_LOOP_SUM.format(step=128))    # different BLOCK_N -> split
