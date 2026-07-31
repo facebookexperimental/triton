@@ -702,28 +702,6 @@ def _emit_type_convert(state, op):
                               str(cast_type) else state.builder.index_cast(component, cast_type))
         state.values[result_id] = _pack_components(tuple(components))
         return
-    if mode == "component_remap":
-        source_components = _as_components(source)
-        component_sources = tuple(int(component) for component in attrs.get("component_sources", ()))
-        if not component_sources or any(component < 0 or component >= len(source_components)
-                                        for component in component_sources):
-            fail(
-                "TLXW_EMIT_TYPE_CONVERT",
-                STAGE,
-                "component remap references an invalid source component",
-                target_op_id=op.target_op_id,
-            )
-        result_type = state.target_program.values[result_id].type
-        if len(component_sources) != int(result_type.component_count):
-            fail(
-                "TLXW_EMIT_COMPONENT_COUNT",
-                STAGE,
-                "component remap does not match its result type",
-                target_op_id=op.target_op_id,
-            )
-        remapped_components = tuple(source_components[component] for component in component_sources)
-        state.values[result_id] = _pack_components(remapped_components)
-        return
     packet_count = int(attrs.get("packet_component_count", 0))
     packet_width = int(attrs.get("packet_width", 0))
     if packet_count <= 0 or packet_width <= 0:
@@ -1191,309 +1169,100 @@ def _emit_splat(state, op):
 
 
 def _emit_broadcast(state, op):
-    attrs = target_ir.attrs_dict(op)
-    operand = _operand_values(state, op, 1)[0]
-    operand_id = op.operands[0]
-    result_id = _single_result(op)
-    target_count = _component_count(state, result_id)
-    source_components = _value_components(state, operand, op)
-    if "register_payload_source_slots" in attrs:
-        state.values[result_id] = _emit_broadcast_register_payload(
-            state,
-            op,
-            source_components,
-            attrs,
-        )
-        return
-    component_sources = attrs.get("component_sources")
-    if component_sources is not None:
-        component_sources = tuple(int(source) for source in component_sources)
-        if len(component_sources) != target_count:
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-                STAGE,
-                "tt.broadcast component source map does not match the result "
-                "component count",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        if any(source < 0 or source >= len(source_components) for source in component_sources):
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-                STAGE,
-                "tt.broadcast component source map references an out-of-range "
-                "source component",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        state.values[result_id] = _pack_components(tuple(source_components[source] for source in component_sources))
-        source_bases = state.uniform_pointer_bases.get(operand_id)
-        if source_bases is not None:
-            state.uniform_pointer_bases[result_id] = tuple(source_bases[source] for source in component_sources)
-        return
-    if target_count == len(source_components):
-        state.values[result_id] = operand
-        _propagate_uniform_pointer_bases(state, operand_id, result_id)
-        return
-    if target_count % len(source_components) != 0:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-            STAGE,
-            "tt.broadcast requires the result component count to be a "
-            "multiple of the source component count",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    repeat = target_count // len(source_components)
-    state.values[result_id] = tuple(component for source_component in source_components
-                                    for component in (source_component, ) * repeat)
-    source_bases = state.uniform_pointer_bases.get(operand_id)
-    if source_bases is not None:
-        state.uniform_pointer_bases[result_id] = tuple(base for source_base in source_bases
-                                                       for base in (source_base, ) * repeat)
-
-
-def _emit_broadcast_register_payload(state, op, source_components, attrs):
-    result_id = _single_result(op)
-    result_type = state.target_program.values[result_id].type
-    lane_width = int(result_type.lane_width or 64)
-    element_type = _scalar_type(state.dsl, result_type.element_type)
-    scalar_type = state.dsl.simd_type(element_type, lane_width)
-    source_component_count = int(attrs["source_component_count"])
-    source_registers = int(attrs["source_registers_per_component"])
-    result_registers = int(attrs["result_registers_per_component"])
-    if len(source_components) != source_component_count:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-            STAGE,
-            "tt.broadcast source component count does not match register payload attrs",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    source_slots = []
-    for component in source_components:
-        if state.dsl.FragmentType.isinstance(component.type):
-            fail(
-                "TLXW_EMIT_FRAGMENT_BOUNDARY",
-                STAGE,
-                "WaveAMD fragments must not cross a broadcast boundary",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        payload = _simd_1d_vector_payload(state, component)
-        if source_registers == 1:
-            if payload is None:
-                source_slots.append(component)
-                continue
-            if int(payload[0]) == 1:
-                source_slots.append(state.dsl.wave.ExtractOp(scalar_type, component, 0).result)
-                continue
-        elif payload is not None and int(payload[0]) == source_registers:
-            source_slots.extend(
-                state.dsl.wave.ExtractOp(
-                    scalar_type,
-                    component,
-                    register,
-                ).result for register in range(source_registers))
-            continue
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-            STAGE,
-            "tt.broadcast source component does not match its register payload width",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    source_map = tuple(int(source) for source in attrs["register_payload_source_slots"])
-    if any(source < 0 or source >= len(source_slots) for source in source_map):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-            STAGE,
-            "tt.broadcast register payload map references an invalid source slot",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    result_component_count = int(result_type.component_count)
-    if len(source_map) != result_component_count * result_registers:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_BROADCAST",
-            STAGE,
-            "tt.broadcast register payload map does not cover the result",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    components = []
-    for component in range(result_component_count):
-        first = component * result_registers
-        values = tuple(source_slots[source] for source in source_map[first:first + result_registers])
-        if result_registers == 1:
-            components.append(values[0])
-            continue
-        payload_type = state.dsl.simd_type(
-            state.dsl.vector_type(result_registers, element_type),
-            lane_width,
-        )
-        components.append(state.dsl.wave.PackOp(payload_type, values).result)
-    return _pack_components(tuple(components))
-
-
-def _emit_component_join(state, op):
-    attrs = target_ir.attrs_dict(op)
-    operands = _operand_values(state, op, len(op.operands))
-    source_counts = tuple(int(value) for value in attrs["source_component_counts"])
-    source_widths = tuple(int(value) for value in attrs["source_packet_widths"])
-    source_slots = tuple(int(value) for value in attrs["source_slot_counts"])
-    scalar_sources = tuple(
-        (int(operand_index), int(slot_index)) for operand_index, slot_index in attrs["scalar_sources"])
-    if not (len(operands) == len(source_counts) == len(source_widths) == len(source_slots)):
-        fail(
-            "TLXW_EMIT_COMPONENT_JOIN",
-            STAGE,
-            "tt.join source packet metadata is inconsistent",
-            target_op_id=op.target_op_id,
-        )
-
-    scalar_groups = tuple(
-        _layout_alias_scalar_slots(
-            state,
-            op,
-            value,
-            count,
-            width,
-        ) for value, count, width in zip(operands, source_counts, source_widths))
-    if any(len(group) != slots for group, slots in zip(scalar_groups, source_slots)):
-        fail(
-            "TLXW_EMIT_COMPONENT_JOIN",
-            STAGE,
-            "tt.join source payload does not match its register slots",
-            target_op_id=op.target_op_id,
-        )
-    if any(operand_index < 0 or operand_index >= len(scalar_groups) or slot_index < 0
-           or slot_index >= len(scalar_groups[operand_index]) for operand_index, slot_index in scalar_sources):
-        fail(
-            "TLXW_EMIT_COMPONENT_JOIN",
-            STAGE,
-            "tt.join scalar map references an invalid source slot",
-            target_op_id=op.target_op_id,
-        )
-    joined = tuple(scalar_groups[operand_index][slot_index] for operand_index, slot_index in scalar_sources)
-    result_count = int(attrs["result_component_count"])
-    result_width = int(attrs["result_packet_width"])
-    result_slots = int(attrs["result_slot_count"])
-    if (len(joined) != result_slots or result_count <= 0 or result_width <= 0
-            or result_count * result_width != result_slots):
-        fail(
-            "TLXW_EMIT_COMPONENT_JOIN",
-            STAGE,
-            "tt.join result packet metadata is inconsistent",
-            target_op_id=op.target_op_id,
-        )
-    if result_width == 1:
-        result = _pack_components(joined)
-    else:
-        result_type = state.target_program.values[_single_result(op)].type
-        packet_type = state.dsl.simd_type(
-            state.dsl.vector_type(
-                result_width,
-                _scalar_type(state.dsl, result_type.element_type),
-            ),
-            int(result_type.lane_width or 64),
-        )
-        result = _pack_components(
-            tuple(
-                state.dsl.wave.PackOp(
-                    packet_type,
-                    joined[index:index + result_width],
-                ).result for index in range(0, result_slots, result_width)))
-    result_id = _single_result(op)
-    state.values[result_id] = result
-
-    source_bases = tuple(state.uniform_pointer_bases.get(int(operand_id)) for operand_id in op.operands)
-    if (all(bases is not None for bases in source_bases) and all(width == 1 for width in source_widths)
-            and result_width == 1):
-        state.uniform_pointer_bases[result_id] = tuple(source_bases[operand_index][slot_index]
-                                                       for operand_index, slot_index in scalar_sources)
-
-
-def _emit_component_split(state, op):
-    attrs = target_ir.attrs_dict(op)
-    operand = _operand_values(state, op, 1)[0]
-    source_count = int(attrs["source_component_count"])
-    source_width = int(attrs["source_packet_width"])
-    source_slot_count = int(attrs["source_slot_count"])
-    result_counts = tuple(int(value) for value in attrs["result_component_counts"])
-    result_widths = tuple(int(value) for value in attrs["result_packet_widths"])
-    result_slot_counts = tuple(int(value) for value in attrs["result_slot_counts"])
-    scalar_source_slots = tuple(tuple(int(slot) for slot in sources) for sources in attrs["scalar_source_slots"])
-    if not (len(op.results) == len(result_counts) == len(result_widths) == len(result_slot_counts) ==
-            len(scalar_source_slots)):
-        fail(
-            "TLXW_EMIT_COMPONENT_SPLIT",
-            STAGE,
-            "tt.split result packet metadata is inconsistent",
-            target_op_id=op.target_op_id,
-        )
-
-    source_scalars = _layout_alias_scalar_slots(
+    _emit_packet_layout_transform(
         state,
         op,
-        operand,
-        source_count,
-        source_width,
+        state.dsl.PacketTransform.broadcast(),
     )
-    if len(source_scalars) != source_slot_count:
-        fail(
-            "TLXW_EMIT_COMPONENT_SPLIT",
-            STAGE,
-            "tt.split source payload does not match its register slots",
-            target_op_id=op.target_op_id,
-        )
-    if any(slot < 0 or slot >= source_slot_count for sources in scalar_source_slots for slot in sources):
-        fail(
-            "TLXW_EMIT_COMPONENT_SPLIT",
-            STAGE,
-            "tt.split scalar map references an invalid source slot",
-            target_op_id=op.target_op_id,
-        )
 
-    for result_id, count, width, slot_count, sources in zip(
-            op.results,
-            result_counts,
-            result_widths,
-            result_slot_counts,
-            scalar_source_slots,
-    ):
-        selected = tuple(source_scalars[slot] for slot in sources)
-        if (len(selected) != slot_count or count <= 0 or width <= 0 or count * width != slot_count):
+
+def _emit_join(state, op):
+    values = _operand_values(state, op, 2)
+    source_ids = tuple(int(value_id) for value_id in op.operands)
+    result_id = int(_single_result(op))
+    source_layouts = tuple(_packet_layout(state, source_id, op) for source_id in source_ids)
+    source_packets = tuple(
+        _pack_layout_value(state, op, source_id, value, layout)
+        for source_id, value, layout in zip(source_ids, values, source_layouts))
+    try:
+        joined_layout = state.dsl.join_packet_layout(*source_layouts)
+    except ValueError as exc:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            str(exc),
+            target_op_id=op.target_op_id,
+            target_value_id=result_id,
+        )
+    joined_type = _layout_packet_type(
+        state,
+        state.target_program.values[source_ids[0]].type,
+        joined_layout,
+        op,
+    )
+    joined_packet = state.dsl.wave.PackOp(
+        joined_type,
+        source_packets,
+    ).result
+    result_layout = _packet_layout(state, result_id, op)
+    result_type = _layout_packet_type(
+        state,
+        state.target_program.values[result_id].type,
+        result_layout,
+        op,
+    )
+    try:
+        result_packet = state.builder.redistribute_layout(
+            joined_packet,
+            result_type,
+            source_layout=joined_layout,
+            result_layout=result_layout,
+            transform=state.dsl.PacketTransform.identity(),
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            str(exc),
+            target_op_id=op.target_op_id,
+            target_value_id=result_id,
+        )
+    _unpack_layout_value(state, op, result_id, result_packet, result_layout)
+    _propagate_common_uniform_pointer_base(state, source_ids, (result_id, ))
+
+
+def _emit_split(state, op):
+    (value, ) = _operand_values(state, op, 1)
+    source_id = int(op.operands[0])
+    source_layout = _packet_layout(state, source_id, op)
+    source_packet = _pack_layout_value(state, op, source_id, value, source_layout)
+    for selector, result_id in enumerate(op.results):
+        result_id = int(result_id)
+        result_layout = _packet_layout(state, result_id, op)
+        result_type = _layout_packet_type(
+            state,
+            state.target_program.values[result_id].type,
+            result_layout,
+            op,
+        )
+        try:
+            result_packet = state.builder.redistribute_layout(
+                source_packet,
+                result_type,
+                source_layout=source_layout,
+                result_layout=result_layout,
+                transform=state.dsl.PacketTransform.split(selector),
+            )
+        except ValueError as exc:
             fail(
-                "TLXW_EMIT_COMPONENT_SPLIT",
+                "TLXW_EMIT_LAYOUT_REMAP",
                 STAGE,
-                "tt.split selected payload does not match result packets",
+                str(exc),
                 target_op_id=op.target_op_id,
-                target_value_id=int(result_id),
+                target_value_id=result_id,
             )
-        if width == 1:
-            result = _pack_components(selected)
-        else:
-            result_type = state.target_program.values[int(result_id)].type
-            packet_type = state.dsl.simd_type(
-                state.dsl.vector_type(
-                    width,
-                    _scalar_type(state.dsl, result_type.element_type),
-                ),
-                int(result_type.lane_width or 64),
-            )
-            result = _pack_components(
-                tuple(
-                    state.dsl.wave.PackOp(
-                        packet_type,
-                        selected[index:index + width],
-                    ).result for index in range(0, slot_count, width)))
-        state.values[int(result_id)] = result
-
-    source_bases = state.uniform_pointer_bases.get(int(op.operands[0]))
-    if (source_bases is not None and source_width == 1 and all(width == 1 for width in result_widths)):
-        for result_id, sources in zip(op.results, scalar_source_slots):
-            state.uniform_pointer_bases[int(result_id)] = tuple(source_bases[slot] for slot in sources)
+        _unpack_layout_value(state, op, result_id, result_packet, result_layout)
+    _propagate_common_uniform_pointer_base(state, (source_id, ), tuple(int(value_id) for value_id in op.results))
 
 
 def _emit_addptr(state, op):
@@ -1541,89 +1310,11 @@ def _emit_make_buffer(state, op):
 
 def _emit_expand_dims(state, op):
     attrs = target_ir.attrs_dict(op)
-    operand = _operand_values(state, op, 1)[0]
-    operand_id = op.operands[0]
-    result_id = _single_result(op)
-    target_type = state.target_program.values[result_id].type
-    target_count = _component_count(state, result_id)
-    if target_type.representation in _MMA_PACKET_REPRESENTATIONS:
-        if attrs.get("result_value_mode") != "mma_packet_remap":
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims to an MMA packet requires packet remap attrs",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        components = _value_components(state, operand, op)
-        source_component_count = int(attrs.get("source_component_count", 0))
-        if len(components) != source_component_count:
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims MMA packet source component count does not match attrs",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        result_payload_type = _mma_packet_payload_type(
-            state,
-            attrs,
-            target_type.element_type,
-            target_type.lane_width,
-            op,
-        )
-        scalar_type = state.dsl.simd_type(
-            _scalar_type(state.dsl, target_type.element_type),
-            int(target_type.lane_width or attrs.get("lane_width", 64) or 64),
-        )
-        registers = int(attrs["registers"])
-        source_indices = tuple(int(index) for index in attrs.get("packet_source_indices", ()))
-        if len(source_indices) != target_count * registers:
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims MMA packet source map does not match result payload",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        packed = []
-        if any(str(component.type) != str(scalar_type) for component in components):
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims MMA packet remap requires scalar SIMD components",
-                target_op_id=op.target_op_id,
-                target_value_id=result_id,
-            )
-        for result_component in range(target_count):
-            first = result_component * registers
-            packed.append(
-                state.dsl.wave.PackOp(
-                    result_payload_type,
-                    [components[index] for index in source_indices[first:first + registers]],
-                ).result)
-        state.values[result_id] = _pack_components(tuple(packed))
-        return
-    result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
-    components = _value_components(state, operand, op)
-    if any(str(component.type) != str(result_type) for component in components):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_REMAP",
-            STAGE,
-            "tt.expand_dims changed the emitted Wave type; explicit remap is required",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    if len(components) != target_count:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_REMAP",
-            STAGE,
-            "tt.expand_dims changed component count; explicit remap is required",
-            target_op_id=op.target_op_id,
-            target_value_id=result_id,
-        )
-    state.values[result_id] = operand
-    _propagate_uniform_pointer_bases(state, operand_id, result_id)
+    _emit_packet_layout_transform(
+        state,
+        op,
+        state.dsl.PacketTransform.expand_dims(int(attrs["axis"])),
+    )
 
 
 def _ptr_add_base_component(state, base_component, offset_component, uniform_base):
@@ -5564,147 +5255,205 @@ def _emit_mma_packet_truncf(state, op):
     state.values[_single_result(op)] = _pack_components(tuple(packed))
 
 
-def _emit_redistribute_layout_convert(state, op, value, attrs):
-    """Pack bridge components, emit one semantic redistribution, and unpack."""
-    result_id = _single_result(op)
-    source_type = state.target_program.values[op.operands[0]].type
-    result_type = state.target_program.values[result_id].type
-    lane_width = int(result_type.lane_width or source_type.lane_width or 64)
-    mask_value = result_type.representation in {"mask", "mask_tuple"}
-    pointer_payload = result_type.representation in {
-        "per_lane_pointer",
-        "pointer_tuple",
-        "buffer_pointer",
-        "buffer_pointer_tuple",
-    }
-    if mask_value:
-        element_type = state.dsl.i32()
-    elif pointer_payload:
-        address_space = (state.dsl.buffer_address_space() if result_type.representation in {
-            "buffer_pointer",
-            "buffer_pointer_tuple",
-        } else state.dsl.global_address_space())
-        element_type = state.dsl.ptr_type(
-            _scalar_type(state.dsl, attrs["element_type"]),
-            address_space,
-        )
-    else:
-        element_type = _scalar_type(state.dsl, attrs["element_type"])
-    source_count = int(attrs["source_component_count"])
-    source_registers = int(attrs["source_registers_per_component"])
-    source_slots = int(attrs["source_slot_count"])
-    result_count = int(attrs["result_component_count"])
-    result_registers = int(attrs["result_registers_per_component"])
-    result_slots = int(attrs["result_slot_count"])
-    if pointer_payload and (source_count != 1 or source_registers != 1 or source_slots != 1 or result_count != 1
-                            or result_registers != 1 or result_slots != 1):
+def _packet_layout(state, target_value_id, op):
+    target_value = state.target_program.values[int(target_value_id)]
+    layout_id = target_value.layout_map_id
+    if layout_id is None or not 0 <= int(layout_id) < len(state.target_program.layouts):
         fail(
             "TLXW_EMIT_LAYOUT_REMAP",
             STAGE,
-            "pointer redistribution requires one scalar packet slot",
+            "layout transform value is missing its symbolic layout",
             target_op_id=op.target_op_id,
+            target_value_id=int(target_value_id),
         )
-    components = _value_components(state, value, op)
-    if len(components) != source_count:
+    layout = state.target_program.layouts[int(layout_id)]
+    linear = layout.linear_layout
+    if linear is None:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            "layout transform requires a symbolic linear layout",
+            target_op_id=op.target_op_id,
+            target_value_id=int(target_value_id),
+        )
+    try:
+        return state.dsl.PacketLayout(
+            int(layout.lane_width),
+            tuple((str(name), int(size)) for name, size in linear.out_dims),
+            tuple((
+                str(name),
+                tuple(tuple(int(component) for component in basis) for basis in bases),
+            ) for name, bases in linear.bases),
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            str(exc),
+            target_op_id=op.target_op_id,
+            target_value_id=int(target_value_id),
+        )
+
+
+def _layout_packet_element_type(state, target_type, slot_count, op):
+    mask_value = target_type.representation in {"mask", "mask_tuple"}
+    pointer_payload = target_type.representation in {
+        "buffer_pointer",
+        "buffer_pointer_tuple",
+        "per_lane_pointer",
+        "pointer_tuple",
+    }
+    if mask_value:
+        return state.dsl.i32(), True
+    if pointer_payload:
+        if int(slot_count) != 1:
+            fail(
+                "TLXW_EMIT_LAYOUT_REMAP",
+                STAGE,
+                "pointer layout transforms require one packet slot",
+                target_op_id=op.target_op_id,
+            )
+        address_space = (state.dsl.buffer_address_space() if target_type.representation
+                         in {"buffer_pointer", "buffer_pointer_tuple"} else state.dsl.global_address_space())
+        return (
+            state.dsl.ptr_type(
+                _scalar_type(state.dsl, target_type.element_type),
+                address_space,
+            ),
+            False,
+        )
+    return _scalar_type(state.dsl, target_type.element_type), False
+
+
+def _layout_packet_type(state, target_type, layout, op):
+    element_type, _mask_value = _layout_packet_element_type(state, target_type, layout.slot_count, op)
+    payload_type = (element_type if int(layout.slot_count) == 1 else state.dsl.vector_type(
+        int(layout.slot_count), element_type))
+    return state.dsl.simd_type(payload_type, int(layout.lane_width))
+
+
+def _pack_layout_value(state, op, target_value_id, value, layout):
+    target_type = state.target_program.values[int(target_value_id)].type
+    component_count = int(target_type.component_count)
+    slot_count = int(layout.slot_count)
+    if component_count <= 0 or slot_count % component_count:
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
-            "redistribution source components do not match packet attrs",
+            "layout packet slots do not evenly partition bridge components",
             target_op_id=op.target_op_id,
+            target_value_id=int(target_value_id),
         )
+    width = slot_count // component_count
+    components = _value_components(state, value, op)
+    if len(components) != component_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "layout packet source components do not match its target type",
+            target_op_id=op.target_op_id,
+            target_value_id=int(target_value_id),
+        )
+    element_type, mask_value = _layout_packet_element_type(state, target_type, slot_count, op)
     if mask_value:
-        components = tuple(_mask_to_redistribution_value(state, component, lane_width) for component in components)
-    source_chunk_type = (state.dsl.simd_type(element_type, lane_width)
-                         if source_registers == 1 else state.dsl.simd_type(
-                             state.dsl.vector_type(source_registers, element_type),
-                             lane_width,
-                         ))
+        components = tuple(
+            _mask_to_redistribution_value(state, component, int(layout.lane_width)) for component in components)
+    chunk_type = state.dsl.simd_type(
+        element_type if width == 1 else state.dsl.vector_type(width, element_type),
+        int(layout.lane_width),
+    )
     chunks = tuple(
         _redistribution_component_chunk(
             state,
             component,
-            source_chunk_type,
-            source_registers,
+            chunk_type,
+            width,
             op,
         ) for component in components)
-    if pointer_payload:
-        source_packet = chunks[0]
-        result_packet_type = _wave_type(state.dsl, result_type)
-    else:
-        source_packet_type = state.dsl.simd_type(
-            state.dsl.vector_type(source_slots, element_type),
-            lane_width,
+    if slot_count == 1:
+        return chunks[0]
+    return state.dsl.wave.PackOp(
+        _layout_packet_type(state, target_type, layout, op),
+        chunks,
+    ).result
+
+
+def _unpack_layout_value(state, op, target_value_id, packet, layout):
+    target_type = state.target_program.values[int(target_value_id)].type
+    component_count = int(target_type.component_count)
+    slot_count = int(layout.slot_count)
+    if component_count <= 0 or slot_count % component_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "layout result slots do not evenly partition bridge components",
+            target_op_id=op.target_op_id,
+            target_value_id=int(target_value_id),
         )
-        source_packet = state.dsl.wave.PackOp(source_packet_type, chunks).result
-        result_packet_type = state.dsl.simd_type(
-            state.dsl.vector_type(result_slots, element_type),
-            lane_width,
-        )
-    item = state.dsl.sym("item")
-    slot = state.dsl.sym("slot")
-    block = state.dsl.sym("block")
-    inputs = {
-        "register": slot,
-        "lane": state.dsl.mod(item, lane_width),
-        "warp": state.dsl.floor(item / lane_width),
-        "block": block,
-    }
-    source_slot = _redistribution_relation_expr(
-        state,
-        attrs,
-        "register",
-        inputs,
-        op,
+    width = slot_count // component_count
+    element_type, mask_value = _layout_packet_element_type(state, target_type, slot_count, op)
+    chunk_type = state.dsl.simd_type(
+        element_type if width == 1 else state.dsl.vector_type(width, element_type),
+        int(layout.lane_width),
     )
-    source_lane = _redistribution_relation_expr(
-        state,
-        attrs,
-        "lane",
-        inputs,
-        op,
-    )
-    source_warp = _redistribution_relation_expr(
-        state,
-        attrs,
-        "warp",
-        inputs,
-        op,
-    )
-    out_names = {str(name) for name, _size in attrs["relation_out_dims"]}
-    source_block = (_redistribution_relation_expr(
-        state,
-        attrs,
-        "block",
-        inputs,
-        op,
-    ) if "block" in out_names else block)
-    redistributed = state.builder.redistribute(
-        source_packet,
-        result_packet_type,
-        blocks=int(attrs.get("block_count", 1)),
-        items=int(attrs["cta_thread_count"]),
-        source_block=source_block,
-        source_item=source_lane + lane_width * source_warp,
-        source_slot=source_slot,
-    )
-    if pointer_payload:
-        result_components = (redistributed, )
+    if slot_count == 1:
+        components = (packet, )
     else:
-        result_chunk_type = (state.dsl.simd_type(element_type, lane_width)
-                             if result_registers == 1 else state.dsl.simd_type(
-                                 state.dsl.vector_type(result_registers, element_type),
-                                 lane_width,
-                             ))
-        result_components = tuple(
+        components = tuple(
             state.dsl.wave.ExtractOp(
-                result_chunk_type,
-                redistributed,
-                component * result_registers,
-            ).result for component in range(result_count))
+                chunk_type,
+                packet,
+                component * width,
+            ).result for component in range(component_count))
     if mask_value:
-        result_components = tuple(
-            _redistribution_value_to_mask(state, component, lane_width) for component in result_components)
-    state.values[result_id] = _pack_components(result_components)
+        components = tuple(
+            _redistribution_value_to_mask(state, component, int(layout.lane_width)) for component in components)
+    state.values[int(target_value_id)] = _pack_components(components)
+
+
+def _propagate_common_uniform_pointer_base(state, source_ids, result_ids):
+    source_bases = tuple(state.uniform_pointer_bases.get(int(source_id)) for source_id in source_ids)
+    if not source_bases or any(bases is None or not bases for bases in source_bases):
+        return
+    first = source_bases[0][0]
+    if any(base is not first for bases in source_bases for base in bases):
+        return
+    for result_id in result_ids:
+        count = _component_count(state, int(result_id))
+        state.uniform_pointer_bases[int(result_id)] = (first, ) * count
+
+
+def _emit_packet_layout_transform(state, op, transform):
+    (value, ) = _operand_values(state, op, 1)
+    source_id = int(op.operands[0])
+    result_id = int(_single_result(op))
+    source_layout = _packet_layout(state, source_id, op)
+    result_layout = _packet_layout(state, result_id, op)
+    source_packet = _pack_layout_value(state, op, source_id, value, source_layout)
+    result_type = _layout_packet_type(
+        state,
+        state.target_program.values[result_id].type,
+        result_layout,
+        op,
+    )
+    try:
+        result_packet = state.builder.redistribute_layout(
+            source_packet,
+            result_type,
+            source_layout=source_layout,
+            result_layout=result_layout,
+            transform=transform,
+        )
+    except ValueError as exc:
+        fail(
+            "TLXW_EMIT_LAYOUT_REMAP",
+            STAGE,
+            str(exc),
+            target_op_id=op.target_op_id,
+            target_value_id=result_id,
+        )
+    _unpack_layout_value(state, op, result_id, result_packet, result_layout)
+    _propagate_common_uniform_pointer_base(state, (source_id, ), (result_id, ))
 
 
 def _redistribution_component_chunk(state, component, chunk_type, width, op):
@@ -5724,110 +5473,23 @@ def _redistribution_component_chunk(state, component, chunk_type, width, op):
     )
 
 
-def _redistribution_relation_expr(state, attrs, output_name, inputs, op):
-    out_names = tuple(str(name) for name, _size in attrs["relation_out_dims"])
-    if output_name not in out_names:
-        return state.dsl.sym_ctx.int_(0)
-    output_index = out_names.index(output_name)
-    result = state.dsl.sym_ctx.int_(0)
-    for input_name, bases in attrs["relation_bases"]:
-        if input_name not in inputs:
-            fail(
-                "TLXW_EMIT_LAYOUT_REMAP",
-                STAGE,
-                f"redistribution relation has unsupported input {input_name!r}",
-                target_op_id=op.target_op_id,
-            )
-        source = inputs[input_name]
-        for bit, basis in enumerate(bases):
-            coefficient = int(basis[output_index])
-            if coefficient == 0:
-                continue
-            value = state.dsl.mod(
-                state.dsl.floor(source / (1 << bit)),
-                2,
-            )
-            if coefficient != 1:
-                value *= coefficient
-            result = state.dsl.xor(result, value)
-    return result
-
-
 def _emit_layout_convert(state, op):
     attrs = target_ir.attrs_dict(op)
-    (value, ) = _operand_values(state, op, 1)
-    mode = attrs["mode"]
-    if mode == "redistribute":
-        _emit_redistribute_layout_convert(state, op, value, attrs)
-        return
-    fail(
-        "TLXW_EMIT_UNSUPPORTED_LAYOUT_CONVERT",
-        STAGE,
-        f"unsupported layout_convert mode {mode}",
-        target_op_id=op.target_op_id,
-    )
-
-
-def _layout_alias_scalar_slots(
-    state,
-    op,
-    value,
-    source_count,
-    source_width,
-):
-    if isinstance(value, _VectorPacketPayload):
-        scalar_slots = _value_components(state, value, op)
-        if len(scalar_slots) != source_count * source_width:
-            fail(
-                "TLXW_EMIT_LAYOUT_ALIAS",
-                STAGE,
-                "vector packet alias payload has an inconsistent shape",
-                target_op_id=op.target_op_id,
-            )
-        return tuple(scalar_slots)
-
-    components = _value_components(state, value, op)
-    if len(components) != source_count:
+    transform = str(attrs.get("transform", "identity"))
+    if transform == "identity":
+        packet_transform = state.dsl.PacketTransform.identity()
+    elif transform == "reshape":
+        packet_transform = state.dsl.PacketTransform.reshape()
+    elif transform == "trans":
+        packet_transform = state.dsl.PacketTransform.transpose(tuple(int(dim) for dim in attrs.get("order", ())))
+    else:
         fail(
-            "TLXW_EMIT_LAYOUT_ALIAS",
+            "TLXW_EMIT_UNSUPPORTED_LAYOUT_CONVERT",
             STAGE,
-            "packet alias source component count does not match its payload",
+            f"unsupported layout transform {transform!r}",
             target_op_id=op.target_op_id,
         )
-    scalar_slots = []
-    for component in components:
-        payload = _simd_1d_vector_payload(state, component)
-        if source_width == 1:
-            if payload is None:
-                scalar_slots.append(component)
-                continue
-            width, element_type, lane_width = payload
-            if int(width) != 1:
-                fail(
-                    "TLXW_EMIT_LAYOUT_ALIAS",
-                    STAGE,
-                    "scalar packet alias component contains multiple elements",
-                    target_op_id=op.target_op_id,
-                )
-            scalar_type = state.dsl.simd_type(element_type, int(lane_width))
-            scalar_slots.append(state.dsl.wave.ExtractOp(scalar_type, component, 0).result)
-            continue
-        if payload is None or int(payload[0]) != source_width:
-            fail(
-                "TLXW_EMIT_LAYOUT_ALIAS",
-                STAGE,
-                "packet alias source component has the wrong vector width",
-                target_op_id=op.target_op_id,
-            )
-        _width, element_type, lane_width = payload
-        scalar_type = state.dsl.simd_type(element_type, int(lane_width))
-        scalar_slots.extend(
-            state.dsl.wave.ExtractOp(
-                scalar_type,
-                component,
-                element,
-            ).result for element in range(source_width))
-    return tuple(scalar_slots)
+    _emit_packet_layout_transform(state, op, packet_transform)
 
 
 def _bit_linear_thread_offset_index_expr(state, workitem, base, coefficients):
@@ -6744,8 +6406,8 @@ _TARGET_EMITTERS = {
     "make_range": _emit_make_range,
     "splat": _emit_splat,
     "broadcast": _emit_broadcast,
-    "component_join": _emit_component_join,
-    "component_split": _emit_component_split,
+    "join": _emit_join,
+    "split": _emit_split,
     "addptr": _emit_addptr,
     "make_buffer": _emit_make_buffer,
     "expand_dims": _emit_expand_dims,

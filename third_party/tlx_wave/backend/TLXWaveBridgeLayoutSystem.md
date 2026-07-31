@@ -103,11 +103,13 @@ layouts. These enter the same query model as named-dimension `LinearLayout`
 values with side metadata. If a helper layout cannot be imported structurally,
 the bridge must reject the operation that requires it.
 
-## Bridge Queries
+## Symbolic Queries
 
-These are bridge APIs. They are not new Wave IR operations. Successful queries
-produce expression records, movement records, or MMA access metadata that emission
-turns into ordinary Wave/WaveAMD operations.
+The bridge mechanically serializes Triton's layout maps. It may apply a layout
+in its forward direction when importing coordinates that are already explicit
+in the source contract, but it does not invert, compose, enumerate, classify, or
+lower distributed layout movement. Wave/iXSimpl owns those operations over its
+frontend-neutral packet-layout representation.
 
 ### `coords(layout, hw)`
 
@@ -130,23 +132,22 @@ solve(register_layout, (m, n), lane = active_lane)
 solve(shared_layout, (m, n), block = active_block)
 ```
 
-The result is one of:
+The Wave-side result is one of:
 
 - no solution: masked-out element or unsupported relation;
 - one solution: direct movement or address;
 - multiple solutions: choose a specified representative or reject.
 
 When matching Triton's `invertAndCompose` semantics for non-injective maps, the
-representative must be the deterministic Triton representative: the smallest
-hardware point/offset unless the caller requires uniqueness.
+Wave model chooses a deterministic physical representative while preserving
+matching physical dimensions when possible. The bridge never computes or
+serializes that representative.
 
-`solve` is bridge logic. Use `LinearLayout` inversion/composition,
-finite-domain enumeration, or generated symbolic expressions as appropriate.
-For Triton-equivalent layout conversions, representative choice must match
-Triton's RREF/least-squares behavior: free variables take the deterministic zero
-representative, while broadcast dimensions that are equal in source/result stay
-identity. Use ixsimpl for equality, range, divisibility, contiguity, and
-field-fit proofs; do not assume ixsimpl is itself a general layout solver.
+Wave's packet-layout solver uses the imported named bases plus structural
+operation semantics. It derives symbolic `source_block`, `source_item`, and
+`source_slot` expressions for `wave.redistribute`; Wave lowering then decides
+whether those expressions are aliases, register extracts, shuffles, or require
+another generic redistribution mechanism.
 
 ### `physical_offset(shared_layout, logical, unit)`
 
@@ -259,8 +260,16 @@ explicit scalar/vector fallback or reject.
 
 ### `ttg.convert_layout`
 
-`ttg.convert_layout` is the relation between source and result layout algebra
-plus the required Wave value type.
+`ttg.convert_layout` crosses the bridge as one structural operation with source
+and result layout IDs. The operation carries no movement mode, physical source
+map, scratch plan, register permutation, or component-source table. Reshape and
+transpose additionally carry only their literal structural transform, while
+broadcast, expand, join, and split retain their source operation semantics.
+
+Emission mechanically converts each serialized `TargetLinearLayout` into a
+frontend-neutral Wave `PacketLayout`, packs the already selected Wave value
+representation, and asks Wave to build a symbolic `wave.redistribute`. It does
+not inspect producers or users and does not select a lowering family.
 
 For distributed tensor layouts, define:
 
@@ -277,59 +286,20 @@ contains the same logical tensor element:
 D(result_hw) == S(C(result_hw))
 ```
 
-Then quotient common slow dimensions when the conversion is identity over those
-dimensions. This is the same minimal conversion relation used by Triton:
+Wave derives `C` symbolically from the two packet layouts and the structural
+transform. Matching physical dimensions remain direct when that is a valid
+solution; otherwise the generic solver constructs the required relation. The
+`wave-lower-redistribute` pass alone classifies and lowers the result:
 
-1. Compare source and result input dimensions from slowest to fastest.
-2. For each matching dimension, quotient it only if the conversion is trivial
-   over that dimension.
-3. Dispatch on the remaining conversion dimensions.
+- an identity relation folds to an alias;
+- register-only relations become ordinary pack/extract operations;
+- lane relations become generic Wave shuffles;
+- warp or block relations use Wave's generic cross-wave redistribution path;
+- unsupported or non-total relations are diagnosed by Wave.
 
-The movement classes are derived from `C`, not from tuple length or component
-count:
-
-- no remaining dimensions: alias;
-- `register` only: same-lane component permutation;
-- `lane`: cross-lane permutation if the source-lane map is emit-compatible;
-- `lane` with an unsupported shuffle map: shared-memory exchange if the scratch
-  relation can be proven;
-- `warp` or `block`: shared-memory exchange;
-- distributed -> `dot_operand`: remap into the SIMD/vector payload order required
-  by the dot operand;
-- `dot_operand`/MMA-shaped payload -> distributed: SIMD/vector remap through
-  the same coordinate relation;
-- MMA accumulator native/result mismatch: SIMD/vector repack through the MMA
-  layout relation;
-- otherwise: diagnostic.
-
-The finite enumeration implementation is valid when it enumerates this relation:
-
-1. Enumerate result hardware points for the statically required domain.
-2. Compute result logical coordinates with `coords(D, result_hw)`.
-3. Solve or look up source hardware coordinates that produce the same logical
-   coordinate under `S`.
-4. Reject if the source does not cover the result coordinate.
-5. Reject or choose the specified representative for replicated/non-injective
-   source coordinates.
-6. Classify the resulting source map as same-lane, cross-lane, shared exchange,
-   dot-operand vector pack, MMA repack, or unsupported.
-7. Validate Wave representation and component counts after the movement is known.
-
-Generic-linear encodings require explicit semantics. If a conversion involves
-`#ttg.generic_linear`, the bridge must preserve that fact and either prove that
-the minimal relation has a supported representative or reject. Ambiguous
-cross-lane, cross-warp, or cross-block generic conversions must not be guessed.
-
-Shared-memory exchange for layout conversion is its own scratch layout problem.
-It is not the same as loading from the result memdesc layout. The exchange
-planner must produce:
-
-- scratch element count and byte allocation;
-- store offset expression for each source group;
-- load offset expression for each result group;
-- required barrier scope;
-- bit-affine or otherwise emit-compatible workitem expressions;
-- fallback/reject reason when the relation cannot be expressed.
+The same solver handles blocked, linear, generic-linear, slice, dot-operand,
+and MMA-derived packet layouts. Component count affects only the mechanical
+Wave packet type. It never chooses a source component or a movement class.
 
 ### Dot / MMA
 
@@ -392,8 +362,9 @@ Target operations carry only schema data needed for emission:
 - chosen Wave representation kind from type conversion;
 - expression records: expression payload, binding names, binding target IDs,
   binding types, and assumptions;
-- convert-layout movement mode and per-mode attrs;
-- scratch exchange attrs when a conversion uses LDS;
+- structural transform kind and literal axis/order where the source operation
+  has one;
+- source and result IDs that mechanically reference serialized symbolic layouts;
 - physical-offset records with units and proof status;
 - MMA access metadata: operand role, instruction shape, element type, wave size,
   vector payload width, target family, and metadata ID;
@@ -405,8 +376,8 @@ layout analysis records, lazy resolvers, callables, emitter state, or
 unverified analysis objects. Verification and emission consume the target
 program without a side-channel fact or layout program.
 
-Emission may switch on verified target modes. It must not inspect source layouts
-or choose lowering families.
+Emission may switch on verified structural operation kinds. It must not inspect
+source layouts, derive a physical map, or choose a lowering family.
 
 ## Verifier Requirements
 
@@ -417,18 +388,16 @@ Verifier checks required for this model:
 - every value and operation layout reference names a target layout;
 - every assumption use names one of its target subjects;
 - every layout-sensitive op has expression records, physical-offset records, or
-  an explicit movement mode;
+  source/result serialized symbolic layouts;
 - every expression binding is present and has a compatible Wave type;
 - coordinate expression rank matches tensor rank;
 - shared offsets declare units and element byte width;
-- `layout_convert` mode attrs match the source/result Wave representations;
-- shared exchange attrs include scratch size, store/load offset expressions, and
-  barrier scope;
+- layout-changing operations carry only their closed structural attr set;
+- distributed source/result layouts have well-formed named dimensions and bases;
 - DMA attrs include alignment, contiguity, mask, boundary, packet-width, and
   machine-address proof data;
 - MMA attrs match the selected SIMD/vector operand contract and the on-demand
   WaveAMD fragment construction requirements;
-- generic-linear conversions declare representative semantics or reject;
 - named layout dimensions in target attrs match the imported layout metadata;
 - target IR contains no raw layout objects or source objects.
 
@@ -454,13 +423,13 @@ diagnostics.
 
 - No bridge-owned replacement for Wave uniform/SIMD/vector types.
 - WaveAMD fragments are constructed only on demand inside MMA emission.
-- Triton layouts lower to `coords`, `solve`, `physical_offset`, and
-  `mma_access` query data.
+- Triton distributed layouts are mechanically serialized into Wave's symbolic
+  packet-layout representation.
 - Shared memory, DMA, scalar fallback, and MMA operand local-load paths share the
   same physical-offset query.
-- `ttg.convert_layout` is derived from `D.invertAndCompose(S)` plus quotienting,
-  not from component count.
+- Wave/iXSimpl derives layout movement from source/result symbolic layouts plus
+  structural operation semantics, never from bridge component tables.
 - Dot operands, MMA operand packs, and accumulator repacks use AMD MMA layout
   metadata over SIMD/vector payloads, not tuple-length guesses.
-- Unsupported layouts fail before emission with a diagnostic naming the missing
-  query, metadata field, movement class, or proof.
+- Unsupported layouts fail with a diagnostic naming the missing symbolic
+  layout, metadata field, or proof.

@@ -9,7 +9,6 @@ from .diagnostics import Diagnostic, fail
 from . import domains
 from . import layouts
 from . import coordinates
-from . import layout_remap
 from . import target_ir
 
 STAGE = "op_conversion"
@@ -158,7 +157,6 @@ class ConversionInput:
     async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
     async_wait_entry_dependency_target_ids_by_value_id: dict[int, tuple[int, ...]]
     static_memdesc_byte_offsets: dict[int, int]
-    layout_remap_plans: dict[tuple, dict]
     fragment_local_load_plans: dict[tuple, dict]
     coordinate_plans: dict[tuple, object]
 
@@ -281,7 +279,6 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         {},
         {},
         static_memdesc_byte_offsets,
-        {},
         {},
         {},
     )
@@ -496,10 +493,10 @@ def _convert_source_op(
         _convert_broadcast(builder, type_layout_program, op)
         return
     if op.name == "tt.join":
-        _convert_join(builder, conversion_input, type_layout_program, op)
+        _convert_join(builder, type_layout_program, op)
         return
     if op.name == "tt.split":
-        _convert_split(builder, conversion_input, type_layout_program, op)
+        _convert_split(builder, type_layout_program, op)
         return
     if op.name == "arith.cmpi":
         _convert_cmpi(
@@ -1211,419 +1208,17 @@ def _convert_expand_dims(builder, type_layout_program, op):
         op,
         type_layout_program,
     )
-    operand = type_layout_program.values[op.operands[0]]
-    result = type_layout_program.values[op.results[0]]
-    axis = _int_attr(op.attrs, "axis")
-    attrs = {"axis": axis}
-    operand_type = operand.type
-    result_type = result.type
-    if result_type.representation in _MMA_PACKET_REPRESENTATIONS:
-        if operand_type.representation not in {"simd", "simd_tuple"}:
-            fail(
-                "TLXW_OP_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims to an MMA packet requires SIMD input",
-                source_op_index=op.index,
-                source_value_id=operand.value_id,
-            )
-        if operand_type.element_type != result_type.element_type:
-            fail(
-                "TLXW_OP_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims to an MMA packet requires matching element types",
-                source_op_index=op.index,
-                source_value_id=result.value_id,
-            )
-        registers = _mma_packet_registers(type_layout_program, result, op)
-        source_indices = _expand_dims_mma_packet_source_indices(
-            type_layout_program,
-            operand,
-            result,
-            axis,
-            registers,
-            op,
-        )
-        attrs.update({
-            "packet_source_indices": source_indices,
-            "registers": registers,
-            "result_value_mode": "mma_packet_remap",
-            "source_component_count": int(operand_type.component_count),
-        })
     builder.add_op(
         "expand_dims",
         operands=_operand_target_ids(builder, op),
         results=result_target_ids,
-        attrs=attrs,
+        attrs={"axis": _int_attr(op.attrs, "axis")},
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
-
-
-def _expand_dims_mma_packet_source_indices(
-    type_layout_program,
-    operand,
-    result,
-    axis,
-    registers,
-    op,
-):
-    operand_layout = _require_layout(type_layout_program, operand.layout_map_id, op)
-    result_layout = _require_layout(type_layout_program, result.layout_map_id, op)
-    if result_layout.kind != "amd_mfma":
-        fail(
-            "TLXW_OP_UNSUPPORTED_REMAP",
-            STAGE,
-            "tt.expand_dims MMA packet result requires an amd_mfma layout",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    source_linear = layouts.distributed_linear_layout(
-        operand_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    result_linear = layouts.distributed_linear_layout(
-        result_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    source_register_count = layouts.linear_layout_in_dim_size(source_linear, "register")
-    result_register_count = layouts.linear_layout_in_dim_size(result_linear, "register")
-    if source_register_count != int(operand.type.component_count):
-        fail(
-            "TLXW_OP_UNSUPPORTED_REMAP",
-            STAGE,
-            "tt.expand_dims source payload does not match its distributed register layout",
-            source_op_index=op.index,
-            source_value_id=operand.value_id,
-        )
-    if result_register_count != int(result.type.component_count) * int(registers):
-        fail(
-            "TLXW_OP_UNSUPPORTED_REMAP",
-            STAGE,
-            "tt.expand_dims MMA packet does not match its distributed register layout",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-
-    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
-    warp_count = max(_layout_warp_count(operand_layout), _layout_warp_count(result_layout))
-    source_by_coordinate = {}
-    for warp in range(warp_count):
-        for lane in range(lane_width):
-            for source_register in range(source_register_count):
-                coordinate = layouts.linear_layout_coords(
-                    source_linear,
-                    source_register,
-                    lane,
-                    warp=warp,
-                )
-                source_by_coordinate.setdefault(coordinate, []).append((warp, lane, source_register))
-
-    source_indices = []
-    for result_register in range(result_register_count):
-        source_registers = set()
-        for warp in range(warp_count):
-            for lane in range(lane_width):
-                coordinate = layouts.linear_layout_coords(
-                    result_linear,
-                    result_register,
-                    lane,
-                    warp=warp,
-                )
-                if axis < 0 or axis >= len(coordinate):
-                    fail(
-                        "TLXW_OP_UNSUPPORTED_REMAP",
-                        STAGE,
-                        "tt.expand_dims axis is outside the result layout rank",
-                        source_op_index=op.index,
-                        source_value_id=result.value_id,
-                    )
-                source_coordinate = coordinate[:axis] + coordinate[axis + 1:]
-                candidates = source_by_coordinate.get(source_coordinate, ())
-                same_item = [
-                    source_register for source_warp, source_lane, source_register in candidates
-                    if source_warp == warp and source_lane == lane
-                ]
-                if not same_item:
-                    fail(
-                        "TLXW_OP_UNSUPPORTED_REMAP",
-                        STAGE,
-                        "tt.expand_dims MMA packet remap requires cross-lane movement",
-                        source_op_index=op.index,
-                        source_value_id=result.value_id,
-                    )
-                source_registers.add(int(same_item[0]))
-        if len(source_registers) != 1:
-            fail(
-                "TLXW_OP_UNSUPPORTED_REMAP",
-                STAGE,
-                "tt.expand_dims MMA packet remap has a lane-varying source register",
-                source_op_index=op.index,
-                source_value_id=result.value_id,
-            )
-        source_indices.append(source_registers.pop())
-    return tuple(source_indices)
 
 
 def _convert_broadcast(builder, type_layout_program, op):
-    result_target_ids, result_layout_map_ids = _declare_results(
-        builder,
-        op,
-        type_layout_program,
-    )
-    attrs = {}
-    register_payload_remap = _broadcast_register_payload_remap(
-        type_layout_program,
-        op,
-    )
-    if register_payload_remap is not None:
-        attrs.update(register_payload_remap)
-    else:
-        component_sources = _broadcast_component_sources(type_layout_program, op)
-        if component_sources is not None:
-            attrs["component_sources"] = component_sources
-    builder.add_op(
-        "broadcast",
-        operands=_operand_target_ids(builder, op),
-        results=result_target_ids,
-        attrs=attrs,
-        layout_map_ids=result_layout_map_ids,
-        source_op_index=op.index,
-    )
-
-
-def _convert_join(builder, conversion_input, type_layout_program, op):
-    if len(op.operands) != 2 or len(op.results) != 1:
-        fail(
-            "TLXW_OP_STRUCTURAL_JOIN",
-            STAGE,
-            "tt.join requires two operands and one result",
-            source_op_index=op.index,
-        )
-    operands = tuple(type_layout_program.values[value_id] for value_id in op.operands)
-    result = type_layout_program.values[op.results[0]]
-    operand_layouts = tuple(_require_layout(type_layout_program, operand.layout_map_id, op) for operand in operands)
-    result_layout = _require_layout(
-        type_layout_program,
-        result.layout_map_id,
-        op,
-    )
-    attrs = layout_remap.structural_join_plan(
-        operands,
-        result,
-        operand_layouts,
-        result_layout,
-        op,
-        cache=conversion_input.layout_remap_plans,
-    )
-    result_target_ids, result_layout_map_ids = _declare_results(
-        builder,
-        op,
-        type_layout_program,
-    )
-    builder.add_op(
-        "component_join",
-        operands=_operand_target_ids(builder, op),
-        results=result_target_ids,
-        attrs=attrs,
-        layout_map_ids=result_layout_map_ids,
-        source_op_index=op.index,
-    )
-
-
-def _convert_split(builder, conversion_input, type_layout_program, op):
-    if len(op.operands) != 1 or len(op.results) != 2:
-        fail(
-            "TLXW_OP_STRUCTURAL_SPLIT",
-            STAGE,
-            "tt.split requires one operand and two results",
-            source_op_index=op.index,
-        )
-    operand = type_layout_program.values[op.operands[0]]
-    results = tuple(type_layout_program.values[value_id] for value_id in op.results)
-    operand_layout = _require_layout(
-        type_layout_program,
-        operand.layout_map_id,
-        op,
-    )
-    result_layouts = tuple(_require_layout(type_layout_program, result.layout_map_id, op) for result in results)
-    attrs = layout_remap.structural_split_plan(
-        operand,
-        results,
-        operand_layout,
-        result_layouts,
-        op,
-        cache=conversion_input.layout_remap_plans,
-    )
-    result_target_ids, result_layout_map_ids = _declare_results(
-        builder,
-        op,
-        type_layout_program,
-    )
-    builder.add_op(
-        "component_split",
-        operands=_operand_target_ids(builder, op),
-        results=result_target_ids,
-        attrs=attrs,
-        layout_map_ids=result_layout_map_ids,
-        source_op_index=op.index,
-    )
-
-
-def _broadcast_register_payload_remap(type_layout_program, op):
-    operand = type_layout_program.values[op.operands[0]]
-    result = type_layout_program.values[op.results[0]]
-    if operand.layout_map_id is None or result.layout_map_id is None:
-        return None
-    if operand.type.representation in {
-            "mask",
-            "mask_tuple",
-            "per_lane_pointer",
-            "pointer_tuple",
-    }:
-        return None
-    operand_layout = type_layout_program.layouts[int(operand.layout_map_id)]
-    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
-    supported = {"amd_mfma", "blocked", "generic_linear", "linear", "slice"}
-    if operand_layout.kind not in supported or result_layout.kind not in supported:
-        return None
-    source_linear = layouts.distributed_linear_layout(
-        operand_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    result_linear = layouts.distributed_linear_layout(
-        result_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    source_slot_count = layouts.linear_layout_in_dim_size(
-        source_linear,
-        "register",
-    )
-    result_slot_count = layouts.linear_layout_in_dim_size(
-        result_linear,
-        "register",
-    )
-    source_component_count = int(operand.type.component_count)
-    result_component_count = int(result.type.component_count)
-    if (source_slot_count % source_component_count or result_slot_count % result_component_count):
-        fail(
-            "TLXW_OP_BROADCAST",
-            STAGE,
-            "tt.broadcast register slots must evenly partition components",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    source_registers = source_slot_count // source_component_count
-    result_registers = result_slot_count // result_component_count
-    if source_registers == 1 and result_registers == 1:
-        return None
-    source_bases = layouts.linear_layout_component_registers(
-        source_linear,
-        operand_layout,
-        source_component_count,
-        stage=STAGE,
-        source_op_index=op.index,
-        source_value_id=operand.value_id,
-    )
-    result_bases = layouts.linear_layout_component_registers(
-        result_linear,
-        result_layout,
-        result_component_count,
-        stage=STAGE,
-        source_op_index=op.index,
-        source_value_id=result.value_id,
-    )
-    if source_bases != tuple(component * source_registers for component in range(source_component_count)):
-        fail(
-            "TLXW_OP_BROADCAST",
-            STAGE,
-            "tt.broadcast source register packets are not contiguous",
-            source_op_index=op.index,
-            source_value_id=operand.value_id,
-        )
-    if result_bases != tuple(component * result_registers for component in range(result_component_count)):
-        fail(
-            "TLXW_OP_BROADCAST",
-            STAGE,
-            "tt.broadcast result register packets are not contiguous",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
-    source_warps = layouts.layout_warp_count(operand_layout)
-    result_warps = layouts.layout_warp_count(result_layout)
-    if source_warps != result_warps:
-        fail(
-            "TLXW_OP_BROADCAST",
-            STAGE,
-            "tt.broadcast source and result warp counts must match",
-            source_op_index=op.index,
-        )
-    source_by_coordinate = {}
-    for warp in range(source_warps):
-        for lane in range(lane_width):
-            for source_slot in range(source_slot_count):
-                coordinate = layouts.linear_layout_coords(
-                    source_linear,
-                    source_slot,
-                    lane,
-                    warp=warp,
-                )
-                source_by_coordinate.setdefault(
-                    (warp, lane, coordinate),
-                    [],
-                ).append(source_slot)
-
-    source_slots = []
-    for result_slot in range(result_slot_count):
-        slots = set()
-        for warp in range(result_warps):
-            for lane in range(lane_width):
-                result_coordinate = layouts.linear_layout_coords(
-                    result_linear,
-                    result_slot,
-                    lane,
-                    warp=warp,
-                )
-                source_coordinate = tuple(0 if int(source_extent) == 1 else int(coordinate)
-                                          for source_extent, coordinate in zip(
-                                              operand_layout.shape,
-                                              result_coordinate,
-                                          ))
-                candidates = source_by_coordinate.get(
-                    (warp, lane, source_coordinate),
-                    (),
-                )
-                if not candidates:
-                    fail(
-                        "TLXW_OP_BROADCAST",
-                        STAGE,
-                        "tt.broadcast result register is not covered by the source layout",
-                        source_op_index=op.index,
-                        source_value_id=result.value_id,
-                    )
-                slots.add(min(int(candidate) for candidate in candidates))
-        if len(slots) != 1:
-            fail(
-                "TLXW_OP_BROADCAST",
-                STAGE,
-                "tt.broadcast register mapping varies across threads",
-                source_op_index=op.index,
-                source_value_id=result.value_id,
-            )
-        source_slots.append(slots.pop())
-    return {
-        "register_payload_source_slots": tuple(source_slots),
-        "result_registers_per_component": int(result_registers),
-        "source_component_count": int(source_component_count),
-        "source_registers_per_component": int(source_registers),
-    }
-
-
-def _broadcast_component_sources(type_layout_program, op):
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
             "TLXW_OP_BROADCAST",
@@ -1631,131 +1226,62 @@ def _broadcast_component_sources(type_layout_program, op):
             "tt.broadcast requires one operand and one result",
             source_op_index=op.index,
         )
-    operand = type_layout_program.values[op.operands[0]]
-    result = type_layout_program.values[op.results[0]]
-    if operand.layout_map_id is None or result.layout_map_id is None:
-        return None
-    operand_layout = type_layout_program.layouts[int(operand.layout_map_id)]
-    result_layout = type_layout_program.layouts[int(result.layout_map_id)]
-    if len(operand_layout.shape) != len(result_layout.shape):
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "broadcast",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_join(builder, type_layout_program, op):
+    if len(op.operands) != 2 or len(op.results) != 1:
         fail(
-            "TLXW_OP_BROADCAST",
+            "TLXW_OP_STRUCTURAL_JOIN",
             STAGE,
-            "tt.broadcast requires rank-matched source and result layouts",
+            "tt.join requires two operands and one result",
             source_op_index=op.index,
         )
-    if operand_layout.kind not in {
-            "blocked",
-            "linear",
-            "generic_linear",
-            "slice",
-            "amd_mfma",
-    }:
-        return None
-    if result_layout.kind not in {
-            "blocked",
-            "linear",
-            "generic_linear",
-            "slice",
-            "amd_mfma",
-    }:
-        return None
-    if int(operand.type.component_count) == int(result.type.component_count):
-        return tuple(range(int(result.type.component_count)))
-    for source_extent, result_extent in zip(operand_layout.shape, result_layout.shape):
-        if int(source_extent) not in {1, int(result_extent)}:
-            fail(
-                "TLXW_OP_BROADCAST",
-                STAGE,
-                "tt.broadcast source dimensions must either match the result "
-                "or have extent one",
-                source_op_index=op.index,
-            )
-
-    lane_width = int(result.type.lane_width or operand.type.lane_width or result_layout.lane_width
-                     or operand_layout.lane_width or 64)
-    warp_count = max(
-        layouts.layout_warp_count(operand_layout),
-        layouts.layout_warp_count(result_layout),
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
     )
-    source_linear = layouts.distributed_linear_layout(
-        operand_layout,
-        stage=STAGE,
+    builder.add_op(
+        "join",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
-    )
-    result_linear = layouts.distributed_linear_layout(
-        result_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    source_registers = layouts.linear_layout_component_registers(
-        source_linear,
-        operand_layout,
-        operand.type.component_count,
-        stage=STAGE,
-        source_op_index=op.index,
-        source_value_id=operand.value_id,
-    )
-    result_registers = layouts.linear_layout_component_registers(
-        result_linear,
-        result_layout,
-        result.type.component_count,
-        stage=STAGE,
-        source_op_index=op.index,
-        source_value_id=result.value_id,
     )
 
-    source_by_thread_coord = {}
-    for warp in range(int(warp_count)):
-        for source_component, source_register in enumerate(source_registers):
-            for lane in range(int(lane_width)):
-                coords = layouts.linear_layout_coords(
-                    source_linear,
-                    source_register,
-                    lane,
-                    warp=warp,
-                )
-                key = (int(warp), int(lane), tuple(int(coord) for coord in coords))
-                source_by_thread_coord.setdefault(key, []).append(int(source_component))
 
-    component_sources = []
-    for result_register in result_registers:
-        source_registers = set()
-        for warp in range(int(warp_count)):
-            for lane in range(int(lane_width)):
-                result_coords = layouts.linear_layout_coords(
-                    result_linear,
-                    result_register,
-                    lane,
-                    warp=warp,
-                )
-                source_coords = tuple(0 if int(source_extent) == 1 else int(coord)
-                                      for source_extent, coord in zip(operand_layout.shape, result_coords))
-                source_components = source_by_thread_coord.get((int(warp), int(lane), source_coords))
-                if not source_components:
-                    fail(
-                        "TLXW_OP_BROADCAST",
-                        STAGE,
-                        "tt.broadcast result coordinate is not covered by the "
-                        "source layout",
-                        source_op_index=op.index,
-                        source_value_id=result.value_id,
-                    )
-                # Shape application can leave replicated register slots in an
-                # explicit linear layout.  They name the same logical tensor
-                # element, so use the canonical lowest component just as the
-                # register-payload broadcast path does above.
-                source_registers.add(min(int(component) for component in source_components))
-        if len(source_registers) != 1:
-            fail(
-                "TLXW_OP_BROADCAST",
-                STAGE,
-                "tt.broadcast requires a component-invariant source mapping",
-                source_op_index=op.index,
-                source_value_id=result.value_id,
-            )
-        component_sources.append(next(iter(source_registers)))
-    return tuple(int(source) for source in component_sources)
+def _convert_split(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 2:
+        fail(
+            "TLXW_OP_STRUCTURAL_SPLIT",
+            STAGE,
+            "tt.split requires one operand and two results",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "split",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
 
 
 def _convert_program_id(builder, view):
@@ -3969,6 +3495,7 @@ def _convert_mma_packet_truncf(builder, type_layout_program, op):
 
 
 def _convert_layout(builder, conversion_input, type_layout_program, op):
+    del conversion_input
     if len(op.operands) != 1 or len(op.results) != 1:
         fail(
             "TLXW_OP_CONVERT_LAYOUT",
@@ -3976,78 +3503,6 @@ def _convert_layout(builder, conversion_input, type_layout_program, op):
             "ttg.convert_layout requires one operand and one result",
             source_op_index=op.index,
         )
-    operand = type_layout_program.values[op.operands[0]]
-    result = type_layout_program.values[op.results[0]]
-    operand_layout = (None
-                      if operand.layout_map_id is None else type_layout_program.layouts[int(operand.layout_map_id)])
-    result_layout = (None if result.layout_map_id is None else type_layout_program.layouts[int(result.layout_map_id)])
-    result_target_ids, result_layout_map_ids = _declare_results(
-        builder,
-        op,
-        type_layout_program,
-    )
-    redistribution_remap = layout_remap.redistribution_plan(
-        operand,
-        result,
-        operand_layout,
-        result_layout,
-        op,
-        cache=conversion_input.layout_remap_plans,
-    )
-    if redistribution_remap is None:
-        layout_remap.reject_unsupported_pair(
-            operand_layout,
-            result_layout,
-            op,
-        )
-    attrs = {
-        "fact_policy": "invalidate_layout_sensitive",
-        **redistribution_remap,
-    }
-    builder.add_op(
-        "layout_convert",
-        operands=_operand_target_ids(builder, op),
-        results=result_target_ids,
-        attrs=attrs,
-        layout_map_ids=result_layout_map_ids,
-        source_op_index=op.index,
-    )
-
-
-def _convert_structural_tensor_view(
-    builder,
-    conversion_input,
-    type_layout_program,
-    op,
-):
-    """Translate reshape/transpose coordinates to a Wave symbolic relation."""
-    if len(op.operands) != 1 or len(op.results) != 1:
-        fail(
-            "TLXW_OP_STRUCTURAL_VIEW",
-            STAGE,
-            f"{op.name} requires one operand and one result",
-            source_op_index=op.index,
-        )
-    operand = type_layout_program.values[op.operands[0]]
-    result = type_layout_program.values[op.results[0]]
-    operand_layout = _require_layout(
-        type_layout_program,
-        operand.layout_map_id,
-        op,
-    )
-    result_layout = _require_layout(
-        type_layout_program,
-        result.layout_map_id,
-        op,
-    )
-    redistribution_plan = layout_remap.structural_view_redistribution_plan(
-        operand,
-        result,
-        operand_layout,
-        result_layout,
-        op,
-        cache=conversion_input.layout_remap_plans,
-    )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -4059,8 +3514,44 @@ def _convert_structural_tensor_view(
         results=result_target_ids,
         attrs={
             "fact_policy": "invalidate_layout_sensitive",
-            **redistribution_plan,
+            "transform": "identity",
         },
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
+def _convert_structural_tensor_view(
+    builder,
+    conversion_input,
+    type_layout_program,
+    op,
+):
+    """Translate reshape/transpose as a literal structural target operation."""
+    del conversion_input
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_STRUCTURAL_VIEW",
+            STAGE,
+            f"{op.name} requires one operand and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    attrs = {
+        "fact_policy": "invalidate_layout_sensitive",
+        "transform": op.name.removeprefix("tt."),
+    }
+    if op.name == "tt.trans":
+        attrs["order"] = tuple(int(dim) for dim in op.attrs.get("order", ()))
+    builder.add_op(
+        "layout_convert",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs=attrs,
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )

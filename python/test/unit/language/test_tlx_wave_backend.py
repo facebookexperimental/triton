@@ -32,7 +32,6 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave.converter import facts as converter_facts
     from triton.backends.tlx_wave.converter import coordinates as converter_coordinates
     from triton.backends.tlx_wave.converter import layouts as converter_layouts
-    from triton.backends.tlx_wave.converter import layout_remap as converter_layout_remap
     from triton.backends.tlx_wave.converter import op_conversion as converter_op_conversion
     from triton.backends.tlx_wave.converter import pipeline as converter_pipeline
     from triton.backends.tlx_wave.converter import source_import as converter_source_import
@@ -53,7 +52,6 @@ else:
     converter_facts = None
     converter_coordinates = None
     converter_layouts = None
-    converter_layout_remap = None
     converter_op_conversion = None
     converter_pipeline = None
     converter_source_import = None
@@ -68,6 +66,28 @@ pytestmark = pytest.mark.skipif("tlx_wave" not in backends, reason="tlx_wave bac
 GFX942_WAVE = GPUTarget("tlx_wave", "gfx942", 64)
 GFX950_WAVE = GPUTarget("tlx_wave", "gfx950", 64)
 _TLX_WAVE_RUNTIME_ARCHES = {"gfx942", "gfx950"}
+_LEGACY_LAYOUT_PLAN_ATTRS = frozenset({
+    "block_count",
+    "component_sources",
+    "cta_thread_count",
+    "mode",
+    "packet_source_indices",
+    "register_payload_source_slots",
+    "registers",
+    "relation_bases",
+    "relation_out_dims",
+    "result_component_count",
+    "result_packet_width",
+    "result_registers_per_component",
+    "result_slot_count",
+    "result_value_mode",
+    "scalar_source_slots",
+    "scalar_sources",
+    "source_component_count",
+    "source_packet_width",
+    "source_registers_per_component",
+    "source_slot_count",
+})
 
 
 def _fake_layout(
@@ -113,6 +133,53 @@ def _converted_value(
         ),
         layout_map_id,
     )
+
+
+def _identity_target_layout(layout_map_id=0, *, shape=(64, ), element_type="i32"):
+    assert tuple(shape) == (64, )
+    linear = converter_target_ir.TargetLinearLayout(
+        ("lane", ),
+        (("dim0", 64), ),
+        (("lane", ((1, ), (2, ), (4, ), (8, ), (16, ), (32, ))), ),
+    )
+    return converter_target_ir.TargetLayout(
+        int(layout_map_id),
+        "linear",
+        tuple(shape),
+        element_type,
+        1,
+        64,
+        linear_layout=linear,
+    )
+
+
+def _cross_wave_target_layouts():
+    source = converter_target_ir.TargetLinearLayout(
+        ("lane", "warp"),
+        (("dim0", 128), ),
+        (
+            ("lane", ((1, ), (2, ), (4, ), (8, ), (16, ), (32, ))),
+            ("warp", ((64, ), )),
+        ),
+    )
+    result = converter_target_ir.TargetLinearLayout(
+        ("lane", "warp"),
+        (("dim0", 128), ),
+        (
+            ("lane", ((1, ), (2, ), (4, ), (8, ), (16, ), (64, ))),
+            ("warp", ((32, ), )),
+        ),
+    )
+    return tuple(
+        converter_target_ir.TargetLayout(
+            layout_map_id,
+            "linear",
+            (128, ),
+            "f32",
+            1,
+            64,
+            linear_layout=linear,
+        ) for layout_map_id, linear in enumerate((source, result)))
 
 
 def _asm_text(compiled, artifact):
@@ -161,6 +228,43 @@ def _target_value_producer(target_program, target_value_id, *, kind=None):
     ]
     assert len(producers) == 1, (target_value_id, kind, producers)
     return producers[0]
+
+
+def _assert_mechanical_layout_transform(
+    target_program,
+    op,
+    *,
+    transform=None,
+    axis=None,
+    order=None,
+):
+    if op.kind == "layout_convert":
+        expected = {
+            "fact_policy": "invalidate_layout_sensitive",
+            "transform": transform or "identity",
+        }
+        if order is not None:
+            expected["order"] = tuple(order)
+    elif op.kind == "expand_dims":
+        expected = {"axis": int(axis)}
+    else:
+        expected = {}
+    attrs = converter_target_ir.attrs_dict(op)
+    assert attrs == expected
+    assert not _LEGACY_LAYOUT_PLAN_ATTRS.intersection(attrs)
+    for target_value_id in (*op.operands, *op.results):
+        target_value = target_program.values[int(target_value_id)]
+        assert target_value.layout_map_id is not None
+        layout = target_program.layouts[int(target_value.layout_map_id)]
+        assert layout.linear_layout is not None
+        assert tuple(size for _name, size in layout.linear_layout.out_dims) == layout.shape
+
+
+def _assert_layout_transforms_reach_wave(output):
+    expected = sum(2 if op.kind == "split" else 1
+                   for op in output.target_program.ops
+                   if op.kind in {"broadcast", "expand_dims", "join", "layout_convert", "split"})
+    assert output.emitted_module.text.count("wave.redistribute") == expected
 
 
 def _packetized_local_load_attrs(output):
@@ -3460,7 +3564,7 @@ def test_tlx_wave_full_barrier_orders_memory_issue_without_blocking_redistribute
     assert store_op.operands[-1] == post_issue.results[0]
     assert converter_target_ir.attrs_dict(store_op)["barrier_order_dependency_count"] == 1
     assert post_issue.results[0] not in convert_op.operands
-    assert converter_target_ir.attrs_dict(convert_op)["mode"] == "redistribute"
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
 
     wave = output.emitted_module.text
     assert wave.count("wave.issue_token") == 1
@@ -4158,7 +4262,7 @@ def test_tlx_wave_converter_verifier_rejects_layout_convert_without_fact_policy(
         "layout_convert",
         operands=(operand, ),
         results=(result, ),
-        attrs={"mode": "redistribute", "result_component_count": 1},
+        attrs={"transform": "identity"},
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4182,8 +4286,7 @@ def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts()
         results=(result, ),
         attrs={
             "fact_policy": "invalidate_layout_sensitive",
-            "mode": "redistribute",
-            "result_component_count": 1,
+            "transform": "identity",
         },
         fact_ids=(0, ),
         fact_target_ids=(operand, ),
@@ -4208,7 +4311,7 @@ def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts()
     assert diagnostic.no_fallback is True
 
 
-def test_tlx_wave_converter_verifier_rejects_legacy_layout_convert_mode():
+def test_tlx_wave_converter_verifier_rejects_physical_layout_convert_attrs():
     builder = converter_target_ir.TargetBuilder()
     tensor = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
     operand = builder.add_value(tensor, source_value_id=0)
@@ -4219,8 +4322,8 @@ def test_tlx_wave_converter_verifier_rejects_legacy_layout_convert_mode():
         results=(result, ),
         attrs={
             "fact_policy": "invalidate_layout_sensitive",
+            "transform": "identity",
             "mode": "same_lane_register_remap",
-            "result_component_count": 1,
         },
     )
 
@@ -4228,26 +4331,24 @@ def test_tlx_wave_converter_verifier_rejects_legacy_layout_convert_mode():
         converter_verifier.verify_target_program(builder.build())
 
     diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_VERIFY_LAYOUT_MODE"
+    assert diagnostic.code == "TLXW_VERIFY_LAYOUT_ATTRS"
     assert diagnostic.stage == "verification"
     assert diagnostic.target_op_id == 0
     assert diagnostic.no_fallback is True
 
 
 def test_tlx_wave_converter_verifier_rejects_non_convert_layout_source():
-    builder = converter_target_ir.TargetBuilder()
+    builder = converter_target_ir.TargetBuilder(layouts=(_identity_target_layout(), ), )
     tensor = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
-    operand = builder.add_value(tensor, source_value_id=0)
-    result = builder.add_value(tensor, source_value_id=1)
+    operand = builder.add_value(tensor, source_value_id=0, layout_map_id=0)
+    result = builder.add_value(tensor, source_value_id=1, layout_map_id=0)
     builder.add_op(
         "layout_convert",
         operands=(operand, ),
         results=(result, ),
         attrs={
             "fact_policy": "invalidate_layout_sensitive",
-            "group_size": 1,
-            "mode": "redistribute",
-            "result_component_count": 1,
+            "transform": "identity",
         },
         source_op_index=0,
     )
@@ -5142,11 +5243,14 @@ def _build_lds_read_then_scratch_exchange_target(
     conditional_reload=False,
     loop_reload=False,
 ):
-    builder = converter_target_ir.TargetBuilder(kernel=converter_target_ir.TargetKernel(
-        name="converter_lds_read_then_scratch_exchange",
-        num_warps=2,
-        threads_per_warp=64,
-    ))
+    builder = converter_target_ir.TargetBuilder(
+        kernel=converter_target_ir.TargetKernel(
+            name="converter_lds_read_then_scratch_exchange",
+            num_warps=2,
+            threads_per_warp=64,
+        ),
+        layouts=_cross_wave_target_layouts(),
+    )
     scalar_f32 = converter_target_ir.TargetType("scalar", "scalar", "f32")
     scalar_i1 = converter_target_ir.TargetType("scalar", "scalar", "i1")
     scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
@@ -5155,8 +5259,8 @@ def _build_lds_read_then_scratch_exchange_target(
     memdesc_f32 = converter_target_ir.TargetType("memdesc", "memdesc", "f32")
     value = builder.add_value(scalar_f32)
     alloc = builder.add_value(memdesc_f32)
-    loaded = builder.add_value(simd_f32)
-    converted = builder.add_value(simd_tuple_f32)
+    loaded = builder.add_value(simd_f32, layout_map_id=0)
+    converted = builder.add_value(simd_tuple_f32, layout_map_id=1)
     future_loaded = builder.add_value(simd_f32) if future_load else None
     condition = builder.add_value(scalar_i1) if conditional_reload else None
     conditional_loaded = builder.add_value(simd_f32) if conditional_reload else None
@@ -5262,47 +5366,8 @@ def _build_lds_read_then_scratch_exchange_target(
         operands=(loaded, ),
         results=(converted, ),
         attrs={
-            "block_count":
-            1,
-            "cta_thread_count":
-            128,
-            "element_type":
-            "f32",
-            "fact_policy":
-            "invalidate_layout_sensitive",
-            "mode":
-            "redistribute",
-            "relation_bases": (
-                ("register", ()),
-                ("lane", (
-                    (0, 1, 0, 0),
-                    (0, 2, 0, 0),
-                    (0, 4, 0, 0),
-                    (0, 8, 0, 0),
-                    (0, 16, 0, 0),
-                    (0, 32, 1, 0),
-                )),
-                ("warp", ((0, 0, 1, 0), )),
-                ("block", ()),
-            ),
-            "relation_out_dims": (
-                ("register", 1),
-                ("lane", 64),
-                ("warp", 2),
-                ("block", 1),
-            ),
-            "result_component_count":
-            1,
-            "result_registers_per_component":
-            1,
-            "result_slot_count":
-            1,
-            "source_component_count":
-            1,
-            "source_registers_per_component":
-            1,
-            "source_slot_count":
-            1,
+            "fact_policy": "invalidate_layout_sensitive",
+            "transform": "identity",
         },
         source_op_index=layout_source_index,
     )
@@ -7640,7 +7705,8 @@ def test_tlx_wave_converter_keeps_redistribute_scratch_internal_in_loop(tmp_path
     (for_line, ) = [line for line in wave.splitlines() if "scf.for" in line]
     assert "!wave.mem.token" not in for_line
     assert all("!wave.mem.token" not in line for line in wave.splitlines() if "scf.yield" in line)
-    assert wave.count("wave.redistribute") == 2
+    _assert_layout_transforms_reach_wave(output)
+    assert sum(op.kind == "layout_convert" for op in output.target_program.ops) == 2
     assert "waveamd.mma" in wave
     _run_wave_verify(wave)
     _run_waveamd_to_machine(wave)
@@ -11219,10 +11285,7 @@ def test_tlx_wave_converter_lowers_blocked_to_linear_same_lane_payloads(tmp_path
     convert_ops = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     assert len(convert_ops) == 3
     for convert_op in convert_ops:
-        attrs = converter_target_ir.attrs_dict(convert_op)
-        assert attrs["mode"] == "redistribute"
-        assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-        assert attrs["result_component_count"] == 1
+        _assert_mechanical_layout_transform(output.target_program, convert_op)
     assert output.emitted_module.text.count("wave.redistribute") == 3
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_bpermute_b32" not in machine
@@ -11246,20 +11309,8 @@ def test_tlx_wave_converter_lowers_blocked_component_reorder(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["source_component_count"] == 4
-    assert attrs["result_component_count"] == 4
-    assert attrs["source_slot_count"] == 4
-    assert attrs["result_slot_count"] == 4
-    assert tuple(name for name, _ in attrs["relation_bases"]) == (
-        "register",
-        "lane",
-        "warp",
-        "block",
-    )
-    assert output.emitted_module.text.count("wave.redistribute") == 1
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    _assert_layout_transforms_reach_wave(output)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
@@ -11282,26 +11333,104 @@ def test_tlx_wave_converter_lowers_blocked_cross_lane_transpose(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["cta_thread_count"] == 64
-    assert "cross_wave" not in attrs
-    assert tuple(name for name, _ in attrs["relation_bases"]) == (
-        "register",
-        "lane",
-        "warp",
-        "block",
-    )
-    assert output.emitted_module.text.count("wave.redistribute") == 1
-    machine = _run_waveamd_to_machine(output.emitted_module.text)
-    assert machine.count("waveamdmachine.ds_bpermute_b32") == 1
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    _assert_layout_transforms_reach_wave(output)
+    lowered = _run_wave_lower_redistribute(output.emitted_module.text)
+    assert "wave.shuffle" in lowered
     del ctx
 
 
-def test_tlx_wave_converter_reuses_equivalent_redistribution_plans(
+@pytest.mark.parametrize(
+    "elements,size_per_thread",
+    [(64, 1), (128, 2)],
+    ids=["one-register", "two-register"],
+)
+def test_tlx_wave_converter_keeps_join_split_structural(
     tmp_path,
-    monkeypatch,
+    elements,
+    size_per_thread,
 ):
+    preamble = f"""
+#source = #ttg.blocked<{{sizePerThread = [{size_per_thread}], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}}>
+#joined = #ttg.blocked<{{sizePerThread = [{size_per_thread}, 2], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [1, 0]}}>
+"""
+    local_func = f"""
+  tt.func public @converter_join_split() attributes {{noinline = false}} {{
+    %first = arith.constant dense<1> : tensor<{elements}xi32, #source>
+    %second = arith.constant dense<2> : tensor<{elements}xi32, #source>
+    %joined = tt.join %first, %second : tensor<{elements}xi32, #source> -> tensor<{elements}x2xi32, #joined>
+    %low, %high = tt.split %joined : tensor<{elements}x2xi32, #joined> -> tensor<{elements}xi32, #source>
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = _convert_ttgir_to_wave_keep_dead(mod)
+
+    (join_op, ) = [op for op in output.target_program.ops if op.kind == "join"]
+    (split_op, ) = [op for op in output.target_program.ops if op.kind == "split"]
+    _assert_mechanical_layout_transform(output.target_program, join_op)
+    _assert_mechanical_layout_transform(output.target_program, split_op)
+    _assert_layout_transforms_reach_wave(output)
+    lowered = _run_wave_lower_redistribute(output.emitted_module.text)
+    assert "wave.redistribute" not in lowered
+    assert "wave.shuffle" not in lowered
+    _run_wave_verify(lowered)
+    del ctx
+
+
+def test_tlx_wave_converter_keeps_reshape_transpose_structural(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{register = [], lane = [[1], [2], [4], [8], [16], [32]], warp = [], block = []}>
+#reordered = #ttg.linear<{register = [], lane = [[1, 0], [2, 0], [4, 0], [0, 1], [0, 2], [0, 4]], warp = [], block = []}>
+#transposed = #ttg.linear<{register = [], lane = [[0, 1], [0, 2], [0, 4], [1, 0], [2, 0], [4, 0]], warp = [], block = []}>
+"""
+    local_func = """
+  tt.func public @converter_reshape_transpose() attributes {noinline = false} {
+    %source = arith.constant dense<1> : tensor<64xi32, #linear>
+    %reshaped = tt.reshape %source allow_reorder : tensor<64xi32, #linear> -> tensor<8x8xi32, #reordered>
+    %transposed_value = tt.trans %reshaped {order = array<i32: 1, 0>} : tensor<8x8xi32, #reordered> -> tensor<8x8xi32, #transposed>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = _convert_ttgir_to_wave_keep_dead(mod)
+
+    convert_ops = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    assert len(convert_ops) == 2
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        convert_ops[0],
+        transform="reshape",
+    )
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        convert_ops[1],
+        transform="trans",
+        order=(1, 0),
+    )
+    assert output.emitted_module.text.count("wave.redistribute") == 2
+    lowered = _run_wave_lower_redistribute(output.emitted_module.text)
+    # Wave proves the transpose is an alias and lowers only the reordered
+    # reshape to movement.
+    assert "wave.redistribute" not in lowered
+    assert "wave.shuffle" in lowered
+    _run_wave_verify(lowered)
+    del ctx
+
+
+def test_tlx_wave_converter_serializes_equivalent_symbolic_layouts(tmp_path):
     preamble = """
 #source = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #result = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [0, 1]}>
@@ -11320,23 +11449,19 @@ def test_tlx_wave_converter_reuses_equivalent_redistribution_plans(
         num_warps=1,
         preamble=preamble,
     )
-    original = converter_layout_remap._redistribution_relation_plan
-    calls = 0
-
-    def counted_redistribution_relation_plan(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        converter_layout_remap,
-        "_redistribution_relation_plan",
-        counted_redistribution_relation_plan,
-    )
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
-    assert calls == 1
-    assert sum(op.kind == "layout_convert" for op in output.target_program.ops) == 2
+    convert_ops = tuple(op for op in output.target_program.ops if op.kind == "layout_convert")
+    assert len(convert_ops) == 2
+    for convert_op in convert_ops:
+        _assert_mechanical_layout_transform(output.target_program, convert_op)
+    first_layout_ids = tuple(output.target_program.values[value_id].layout_map_id
+                             for value_id in (*convert_ops[0].operands, *convert_ops[0].results))
+    second_layout_ids = tuple(output.target_program.values[value_id].layout_map_id
+                              for value_id in (*convert_ops[1].operands, *convert_ops[1].results))
+    assert first_layout_ids[0] == second_layout_ids[0]
+    assert (output.target_program.layouts[first_layout_ids[1]].linear_layout == output.target_program.layouts[
+        second_layout_ids[1]].linear_layout)
     del ctx
 
 
@@ -11482,10 +11607,8 @@ def test_tlx_wave_converter_lowers_linear_alias_convert_layout(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert output.emitted_module.text.count("wave.redistribute") == 1
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    _assert_layout_transforms_reach_wave(output)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
@@ -11508,11 +11631,7 @@ def test_tlx_wave_converter_lowers_generic_multi_warp_linear_remap(tmp_path):
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["cta_thread_count"] == 128
-    assert "cross_wave" not in attrs
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 2
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     del ctx
 
 
@@ -11533,11 +11652,11 @@ def test_tlx_wave_converter_lowers_bit_reversed_linear_lane_remap(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert "cross_wave" not in attrs
-    lane_bases = dict(attrs["relation_bases"])["lane"]
-    assert tuple(basis[1] for basis in lane_bases) == (32, 16, 8, 4, 2, 1)
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    result_value = output.target_program.values[convert_op.results[0]]
+    result_layout = output.target_program.layouts[result_value.layout_map_id]
+    lane_bases = dict(result_layout.linear_layout.bases)["lane"]
+    assert tuple(basis[0] for basis in lane_bases) == (32, 16, 8, 4, 2, 1)
     del ctx
 
 
@@ -11562,14 +11681,7 @@ def test_tlx_wave_converter_lowers_lane_mux_register_remap(tmp_path):
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["source_component_count"] == 2
-    assert attrs["source_registers_per_component"] == 1
-    assert attrs["result_component_count"] == 2
-    assert attrs["source_slot_count"] == 2
-    assert attrs["result_slot_count"] == 2
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     assert output.emitted_module.text.count("wave.redistribute") == 1
     _run_wave_verify(output.emitted_module.text)
     del ctx
@@ -11593,12 +11705,7 @@ def test_tlx_wave_converter_lowers_slice_parent_layout_remap(tmp_path):
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert "cross_wave" not in attrs
-    assert attrs["source_component_count"] == 1
-    assert attrs["result_component_count"] == 64
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -11629,14 +11736,7 @@ def test_tlx_wave_converter_dispatches_blocked_to_mfma_base_remap(tmp_path):
     )
 
     (convert_op, ) = [op for op in target.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["result_component_count"] == 1
-    assert attrs["source_component_count"] == 4
-    assert attrs["source_registers_per_component"] == 1
-    assert attrs["result_registers_per_component"] == 4
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
+    _assert_mechanical_layout_transform(target, convert_op)
     del ctx
 
 
@@ -11657,13 +11757,7 @@ def test_tlx_wave_converter_dispatches_tiled_blocked_to_mfma_base_remap(tmp_path
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["result_component_count"] == 16
-    assert attrs["source_component_count"] == 64
-    assert attrs["source_registers_per_component"] == 1
-    assert attrs["result_registers_per_component"] == 4
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 64
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -11975,146 +12069,6 @@ def test_tlx_wave_mfma_linear_layout_logical_coordinates_match_native_samples():
         assert all(0 <= coord[0] < shape[0] and 0 <= coord[1] < shape[1] for coord in all_coords), name
 
 
-def test_tlx_wave_converter_lowers_same_count_mfma_layout_relabel():
-    source_layout = _fake_layout(
-        0,
-        0,
-        kind="amd_mfma",
-        shape=(16, 16),
-        element_type="f32",
-        properties={
-            "element_bit_width": 32,
-            "instr_shape": (16, 16, 32),
-            "is_transposed": True,
-            "tiles_per_warp": (1, 1),
-            "version": 4,
-            "warps_per_cta": (1, 1),
-        },
-    )
-    result_layout = _fake_layout(
-        1,
-        1,
-        kind="amd_mfma",
-        shape=(16, 16),
-        element_type="f32",
-        properties={
-            "element_bit_width": 32,
-            "instr_shape": (16, 16, 32),
-            "is_transposed": False,
-            "tiles_per_warp": (1, 1),
-            "version": 4,
-            "warps_per_cta": (1, 1),
-        },
-    )
-    type_layout_program = converter_types.TypeLayoutProgram(
-        {
-            0: _converted_value(
-                0,
-                representation="simd_packet",
-                element_type="f32",
-                layout_map_id=0,
-            ),
-            1: _converted_value(
-                1,
-                representation="simd_packet",
-                element_type="f32",
-                layout_map_id=1,
-            ),
-        },
-        (source_layout, result_layout),
-    )
-    op = converter_source_ir.SourceOp(
-        0,
-        "ttg.convert_layout",
-        operands=(0, ),
-        results=(1, ),
-    )
-
-    attrs = converter_layout_remap.redistribution_plan(
-        type_layout_program.values[0],
-        type_layout_program.values[1],
-        source_layout,
-        result_layout,
-        op,
-    )
-
-    assert attrs["mode"] == "redistribute"
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
-    assert attrs["source_registers_per_component"] == 4
-    assert attrs["result_registers_per_component"] == 4
-
-
-def test_tlx_wave_converter_rejects_blocked_to_mfma_without_fragment_plan():
-    blocked_layout = _fake_layout(
-        0,
-        0,
-        kind="blocked",
-        shape=(16, 16),
-        element_type="f32",
-        component_count=3,
-        properties={
-            "size_per_thread": (1, 4),
-            "threads_per_warp": (16, 4),
-            "warps_per_cta": (1, 1),
-            "order": (1, 0),
-        },
-    )
-    mfma_layout = _fake_layout(
-        1,
-        1,
-        kind="amd_mfma",
-        shape=(16, 16),
-        element_type="f32",
-        component_count=1,
-        properties={
-            "instr_shape": (16, 16, 32),
-            "is_transposed": True,
-            "warps_per_cta": (1, 1),
-        },
-    )
-    type_layout_program = converter_types.TypeLayoutProgram(
-        {
-            0: _converted_value(
-                0,
-                representation="simd_tuple",
-                element_type="f32",
-                component_count=3,
-                layout_map_id=0,
-            ),
-            1: _converted_value(
-                1,
-                representation="simd",
-                element_type="f32",
-                component_count=1,
-                layout_map_id=1,
-            ),
-        },
-        (blocked_layout, mfma_layout),
-    )
-    op = converter_source_ir.SourceOp(
-        0,
-        "ttg.convert_layout",
-        operands=(0, ),
-        results=(1, ),
-    )
-
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_op_conversion._convert_layout(
-            converter_target_ir.TargetBuilder(),
-            SimpleNamespace(
-                value_element_byte_widths={},
-                lds_size=0,
-                layout_remap_plans={},
-            ),
-            type_layout_program,
-            op,
-        )
-
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_CONVERT_LAYOUT"
-    assert "redistribution packet slots must evenly partition bridge components" in str(diagnostic)
-
-
 def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
@@ -12140,21 +12094,15 @@ def test_tlx_wave_converter_packs_blocked_accumulator_remap_for_dot(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    convert_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "layout_convert"
-    ]
-    (attrs, ) = convert_attrs
-    assert attrs["mode"] == "redistribute"
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
+    (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     dot_layout_convert_ops = [
         op for op in output.target_program.ops
         if op.kind == "layout_convert" and output.source_program.ops[op.source_op_index].name == "tt.dot"
     ]
     assert dot_layout_convert_ops == []
     (mma_op, ) = [op for op in output.target_program.ops if op.kind == "mma"]
-    explicit_convert_ops = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    assert len(explicit_convert_ops) == 1
-    assert explicit_convert_ops[0].results[0] == mma_op.operands[2]
+    assert convert_op.results[0] == mma_op.operands[2]
     mma_attrs = converter_target_ir.attrs_dict(mma_op)
     assert mma_attrs["swap_operands_for_transposed_result"] is True
     dot_source_op = next(op for op in output.source_program.ops if op.name == "tt.dot")
@@ -12184,12 +12132,7 @@ def test_tlx_wave_converter_emits_mfma32_vector_accumulator_remap(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["result_component_count"] == 1
-    assert attrs["result_registers_per_component"] == 16
-    assert attrs["source_slot_count"] == 4
-    assert attrs["result_slot_count"] == 16
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     wave = output.emitted_module.text
     assert wave.count("wave.redistribute") == 1
     assert "waveamd.fragment_pack" not in wave
@@ -12221,16 +12164,7 @@ def test_tlx_wave_converter_classifies_mfma_to_blocked_epilogue_remap(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["result_component_count"] == 256
-    assert attrs["source_component_count"] == 64
-    assert attrs["source_registers_per_component"] == 4
-    assert attrs["result_registers_per_component"] == 1
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 256
-    assert attrs["cta_thread_count"] == 256
-    assert "cross_wave" not in attrs
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     assert output.emitted_module.lds_size == 0
     assert output.emitted_module.text.count("wave.redistribute") == 1
     assert "wave.alloc" not in output.emitted_module.text
@@ -12278,10 +12212,8 @@ def test_tlx_wave_converter_lowers_mfma_epilogue_convert_before_buffer_store(tmp
         output.target_program.ops[int(op_id)] for region in output.target_program.regions for op_id in region.op_ids
     ]
     (convert_op, ) = [op for op in live_ops if op.kind == "layout_convert"]
-    convert_attrs = converter_target_ir.attrs_dict(convert_op)
-    assert convert_attrs["mode"] == "redistribute"
-    assert "cross_wave" not in convert_attrs
-    assert output.emitted_module.text.count("wave.redistribute") == 1
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    _assert_layout_transforms_reach_wave(output)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "access_element_count" not in attrs
@@ -12322,10 +12254,7 @@ def test_tlx_wave_converter_preserves_generic_epilogue_convert_before_buffer_sto
         output.target_program.ops[int(op_id)] for region in output.target_program.regions for op_id in region.op_ids
     ]
     (convert_op, ) = [op for op in live_ops if op.kind == "layout_convert"]
-    convert_attrs = converter_target_ir.attrs_dict(convert_op)
-    assert convert_attrs["mode"] == "redistribute"
-    assert convert_attrs["source_slot_count"] == 2
-    assert convert_attrs["result_slot_count"] == 2
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "value_mode" not in attrs
@@ -12361,18 +12290,10 @@ def test_tlx_wave_converter_composes_blocked_to_mfma_metadata_remap(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "layout_convert"]
-    assert len(attrs) == 2
-    for remap in attrs:
-        assert remap["mode"] == "redistribute"
-        assert remap["fact_policy"] == "invalidate_layout_sensitive"
-        assert remap["result_component_count"] == 128
-        assert remap["source_component_count"] == 128
-        assert remap["source_registers_per_component"] == 1
-        assert remap["result_registers_per_component"] == 1
-        assert remap["cta_thread_count"] == 256
-        assert remap["source_slot_count"] == remap["result_slot_count"] == 128
-        assert "cross_wave" not in remap
+    convert_ops = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    assert len(convert_ops) == 2
+    for convert_op in convert_ops:
+        _assert_mechanical_layout_transform(output.target_program, convert_op)
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -12768,14 +12689,8 @@ def test_tlx_wave_converter_aliases_same_lane_mfma_packet_to_blocked_slots(tmp_p
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
-    assert attrs["source_registers_per_component"] == 4
-    assert attrs["result_registers_per_component"] == 1
-    assert output.emitted_module.text.count("wave.redistribute") == 1
-    assert output.emitted_module.text.count("wave.extract") == 4
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    _assert_layout_transforms_reach_wave(output)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_bpermute_b32" not in machine
     del ctx
@@ -12811,13 +12726,8 @@ def test_tlx_wave_converter_lowers_cross_lane_mfma_to_blocked_remap(tmp_path):
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["source_slot_count"] == attrs["result_slot_count"] == 4
-    assert "cross_wave" not in attrs
-    assert output.emitted_module.text.count("wave.redistribute") == 1
-    assert output.emitted_module.text.count("wave.extract") == 4
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
+    _assert_layout_transforms_reach_wave(output)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert machine.count("waveamdmachine.ds_bpermute_b32") == 2
     del ctx
@@ -12855,12 +12765,7 @@ def test_tlx_wave_converter_lowers_fragment_f32_mfma_to_blocked_remap(tmp_path):
         if op.kind == "layout_convert" and output.source_program.ops[op.source_op_index].name == "ttg.convert_layout"
         and output.source_program.ops[op.source_op_index].operands[0] == dot_result
     ]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["fact_policy"] == "invalidate_layout_sensitive"
-    assert attrs["source_component_count"] == 1
-    assert attrs["source_registers_per_component"] == 4
-    assert attrs["result_component_count"] == 4
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     wave = output.emitted_module.text
     # Both source convert_layout operations remain structural conversions.
     # The bridge does not recover producer provenance to erase the accumulator
@@ -14194,10 +14099,13 @@ def test_tlx_wave_converter_packs_glu_bias_slice_into_mfma_fragment(tmp_path):
     (cast_op, ) = [op for op in target_program.ops if op.kind == "float_cast"]
     assert "result_value_mode" not in converter_target_ir.attrs_dict(cast_op)
     (expand_op, ) = [op for op in target_program.ops if op.kind == "expand_dims"]
-    expand_attrs = converter_target_ir.attrs_dict(expand_op)
-    assert expand_attrs["result_value_mode"] == "mma_packet_remap"
-    assert expand_attrs["source_component_count"] == 16
-    assert expand_attrs["packet_source_indices"] == tuple(range(16))
+    _assert_mechanical_layout_transform(
+        target_program,
+        expand_op,
+        axis=0,
+    )
+    (broadcast_op, ) = [op for op in target_program.ops if op.kind == "broadcast"]
+    _assert_mechanical_layout_transform(target_program, broadcast_op)
 
     wave = converter_emission.emit_wave_module(target_program).text
     assert wave.count("!wave.simd<vector<4xf32>, 64>") >= 4
@@ -14227,11 +14135,14 @@ def test_tlx_wave_converter_broadcasts_scalar_mfma_slice_into_register_payload(t
     expand_op = next(op for op in output.target_program.ops if op.kind == "expand_dims")
     expand_type = output.target_program.values[expand_op.results[0]].type
     assert expand_type.representation == "simd_packet_tuple"
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        expand_op,
+        axis=1,
+    )
     broadcast_op = next(op for op in output.target_program.ops if op.kind == "broadcast")
-    attrs = converter_target_ir.attrs_dict(broadcast_op)
-    assert attrs["source_registers_per_component"] == 1
-    assert attrs["result_registers_per_component"] == 16
-    assert len(attrs["register_payload_source_slots"]) == 64
+    _assert_mechanical_layout_transform(output.target_program, broadcast_op)
+    _assert_layout_transforms_reach_wave(output)
     wave = output.emitted_module.text
     assert wave.count("!wave.simd<vector<16xf32>, 64>") >= 4
     assert "!waveamd.fragment" not in wave
@@ -14280,11 +14191,7 @@ def test_tlx_wave_converter_fragment_masked_load_preserves_andi_predicates(tmp_p
     assert attrs["result_value_mode"] == "mma_packet_payload"
     assert attrs["has_mask"] is True
     mask_target_id = load_op.operands[2]
-    mask_edge = next(
-        (op for op in output.target_program.ops if op.kind == "type_convert" and mask_target_id in op.results), None)
-    if mask_edge is not None:
-        assert converter_target_ir.attrs_dict(mask_edge)["mode"] == "component_remap"
-        mask_target_id = mask_edge.operands[0]
+    assert not any(op.kind == "type_convert" and mask_target_id in op.results for op in output.target_program.ops)
     mask_binary = next(op for op in output.target_program.ops if op.kind == "binary" and mask_target_id in op.results)
     assert converter_target_ir.attrs_dict(mask_binary)["operation"] == "andi"
     wave = output.emitted_module.text
@@ -14294,10 +14201,7 @@ def test_tlx_wave_converter_fragment_masked_load_preserves_andi_predicates(tmp_p
     assert wave.count("wave.where") == 1
     assert "wave.select" in wave
     assert wave.count("wave.gather") == 1
-    machine = _run_waveamd_to_machine(wave)
-    assert "waveamdmachine.buffer_load_b16" in machine
-    assert "waveamdmachine.buffer_load_tuple_b32" not in machine
-    assert "waveamdmachine.exec_if" in machine
+    _run_wave_verify(wave)
     del ctx
 
 
@@ -15949,18 +15853,10 @@ def test_tlx_wave_converter_packs_blocked_dot_operand_parent_layout(tmp_path):
 
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
-    layout_converts = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "layout_convert"
-    ]
-    assert [attrs["mode"] for attrs in layout_converts] == [
-        "redistribute",
-        "redistribute",
-    ]
-    assert [attrs["result_component_count"] for attrs in layout_converts] == [16, 16]
-    assert all(attrs["result_registers_per_component"] == 8 for attrs in layout_converts)
-    assert all(attrs["cta_thread_count"] == 256 for attrs in layout_converts)
-    assert all("cross_wave" not in attrs for attrs in layout_converts)
-    assert all("scratch_allocation_bytes" not in attrs for attrs in layout_converts)
+    layout_converts = [op for op in output.target_program.ops if op.kind == "layout_convert"]
+    assert len(layout_converts) == 2
+    for convert_op in layout_converts:
+        _assert_mechanical_layout_transform(output.target_program, convert_op)
     wave = output.emitted_module.text
     assert wave.count("wave.redistribute") == 2
     assert "wave.alloc" not in wave
@@ -16005,13 +15901,10 @@ def test_tlx_wave_converter_preserves_typed_f16_packets_into_redistribute(tmp_pa
     assert "result_value_mode" not in load_attrs
     assert "result_packet_width" not in load_attrs
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    convert_attrs = converter_target_ir.attrs_dict(convert_op)
-    assert convert_attrs["mode"] == "redistribute"
-    assert "cross_wave" not in convert_attrs
-    assert "scratch_allocation_bytes" not in convert_attrs
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     wave = output.emitted_module.text
     assert "!wave.simd<vector<8xf16>, 64>" in wave
-    assert wave.count("wave.redistribute") == 1
+    _assert_layout_transforms_reach_wave(output)
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_tuple_b32" in machine
     assert "waveamdmachine.ds_store_tuple_b32" in machine
@@ -16040,12 +15933,7 @@ def test_tlx_wave_converter_lowers_chunked_blocked_dot_operand_pack(tmp_path):
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == "redistribute"
-    assert attrs["source_registers_per_component"] == 1
-    assert attrs["result_registers_per_component"] == 8
-    assert "cross_wave" not in attrs
-    assert "scratch_allocation_bytes" not in attrs
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     wave = output.emitted_module.text
     assert wave.count("wave.redistribute") == 1
     assert "vector<8xf16>" in wave
@@ -16054,11 +15942,10 @@ def test_tlx_wave_converter_lowers_chunked_blocked_dot_operand_pack(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "instr_shape,k_width,tensor_shape,source_components,source_registers,"
-    "result_components,result_scalars,expected_mode",
+    "instr_shape,k_width,tensor_shape,source_registers",
     [
-        ((32, 32, 16), 4, (256, 64), 4, 16, 8, 64, "redistribute"),
-        ((16, 16, 32), 8, (128, 64), 8, 4, 4, 32, "redistribute"),
+        ((32, 32, 16), 4, (256, 64), 16),
+        ((16, 16, 32), 8, (128, 64), 4),
     ],
     ids=["mfma32", "mfma16"],
 )
@@ -16067,11 +15954,7 @@ def test_tlx_wave_converter_lowers_mfma_fragment_to_dot_operand(
     instr_shape,
     k_width,
     tensor_shape,
-    source_components,
     source_registers,
-    result_components,
-    result_scalars,
-    expected_mode,
 ):
     preamble = f"""
 #mma = #ttg.amd_mfma<{{version = 4, warpsPerCTA = [4, 1], instrShape = [{instr_shape[0]}, {instr_shape[1]}, {instr_shape[2]}], isTransposed = true}}>
@@ -16090,34 +15973,24 @@ def test_tlx_wave_converter_lowers_mfma_fragment_to_dot_operand(
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
-    attrs = converter_target_ir.attrs_dict(convert_op)
-    assert attrs["mode"] == expected_mode
-    assert attrs["result_component_count"] == result_components
-    assert attrs["result_slot_count"] == result_scalars
-    assert attrs["source_component_count"] == source_components
-    assert attrs["source_slot_count"] == source_components * source_registers
-    assert "scratch_allocation_bytes" not in attrs
+    _assert_mechanical_layout_transform(output.target_program, convert_op)
     wave = output.emitted_module.text
     assert f"vector<{source_registers}xbf16>" in wave
     assert "vector<8xbf16>" in wave
-    assert wave.count("wave.redistribute") == 1
+    _assert_layout_transforms_reach_wave(output)
     assert "wave.alloc" not in wave
     assert "wave.barrier" not in wave
     assert "wave.store" not in wave
     assert "wave.load" not in wave
-    machine = _run_waveamd_to_machine(wave)
+    lowered = _run_wave_lower_redistribute(wave)
     if instr_shape == (32, 32, 16):
-        assert attrs["source_registers_per_component"] == source_registers
-        assert attrs["result_registers_per_component"] == 8
-        assert "waveamdmachine.ds_bpermute_b32" not in machine
+        assert "wave.shuffle" not in lowered
     else:
-        assert attrs["result_registers_per_component"] == 8
-        assert attrs["source_registers_per_component"] == source_registers
-        assert "cross_wave" not in attrs
-        assert "waveamdmachine.ds_bpermute_b32" in machine
-    assert "waveamdmachine.ds_store" not in machine
-    assert "waveamdmachine.ds_load" not in machine
-    assert "waveamdmachine.s_barrier" not in machine
+        assert "wave.shuffle" in lowered
+    assert "wave.alloc" not in lowered
+    assert "wave.barrier" not in lowered
+    assert "wave.store" not in lowered
+    assert "wave.load" not in lowered
     del ctx
 
 
@@ -16286,64 +16159,15 @@ def test_tlx_wave_converter_pipeline_lowers_same_representation_expand_dims(tmp_
         "expand_dims",
         "return",
     ]
+    (expand_op, ) = [op for op in output.target_program.ops if op.kind == "expand_dims"]
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        expand_op,
+        axis=0,
+    )
+    _assert_layout_transforms_reach_wave(output)
     assert "tt.expand_dims" not in output.emitted_module.text
     del ctx
-
-
-def test_tlx_wave_emit_expand_dims_preserves_component_count_diagnostic():
-    source_type = converter_target_ir.TargetType(
-        "tensor",
-        "simd",
-        "i32",
-        64,
-        component_count=1,
-    )
-    result_type = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        component_count=2,
-    )
-    target = converter_target_ir.TargetProgram(
-        values=(
-            converter_target_ir.TargetValue(0, source_type),
-            converter_target_ir.TargetValue(1, result_type),
-        ),
-        ops=(
-            converter_target_ir.TargetOp(
-                0,
-                "constant",
-                results=(0, ),
-                attrs=(converter_target_ir.TargetAttr("value", 0), ),
-            ),
-            converter_target_ir.TargetOp(
-                1,
-                "expand_dims",
-                operands=(0, ),
-                results=(1, ),
-            ),
-        ),
-        regions=(converter_target_ir.TargetRegion(0, (0, 1)), ),
-        source_value_targets={},
-        erased_source_values={},
-        kernel=converter_target_ir.TargetKernel(
-            "converter_expand_dims_mismatch",
-            "hip:gfx950",
-            num_warps=1,
-            threads_per_warp=64,
-        ),
-    )
-
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_emission.emit_wave_module(target)
-
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_EMIT_UNSUPPORTED_REMAP"
-    assert diagnostic.stage == "emission"
-    assert diagnostic.target_op_id == 1
-    assert diagnostic.target_value_id == 1
-    assert "tt.expand_dims changed component count" in str(diagnostic)
 
 
 def test_tlx_wave_converter_pipeline_lowers_pointer_splat_expand_dims(tmp_path):
@@ -16367,6 +16191,13 @@ def test_tlx_wave_converter_pipeline_lowers_pointer_splat_expand_dims(tmp_path):
         "expand_dims",
         "return",
     ]
+    (expand_op, ) = [op for op in output.target_program.ops if op.kind == "expand_dims"]
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        expand_op,
+        axis=0,
+    )
+    _assert_layout_transforms_reach_wave(output)
     assert "tt.expand_dims" not in output.emitted_module.text
     assert "wave.splat" in output.emitted_module.text
     assert "!wave.simd<!wave.ptr<#wave.global" in output.emitted_module.text
@@ -16396,6 +16227,15 @@ def test_tlx_wave_converter_pipeline_lowers_blocked_broadcast(tmp_path):
         "broadcast",
         "return",
     ]
+    expand_op = next(op for op in output.target_program.ops if op.kind == "expand_dims")
+    broadcast_op = next(op for op in output.target_program.ops if op.kind == "broadcast")
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        expand_op,
+        axis=1,
+    )
+    _assert_mechanical_layout_transform(output.target_program, broadcast_op)
+    _assert_layout_transforms_reach_wave(output)
     assert "tt.broadcast" not in output.emitted_module.text
     del ctx
 
@@ -16417,58 +16257,17 @@ def test_tlx_wave_converter_pipeline_lowers_blocked_column_broadcast_components(
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
+    (expand_op, ) = [op for op in output.target_program.ops if op.kind == "expand_dims"]
     (broadcast_op, ) = [op for op in output.target_program.ops if op.kind == "broadcast"]
-    attrs = converter_target_ir.attrs_dict(broadcast_op)
-    assert attrs["component_sources"] == tuple(index % 8 for index in range(64))
+    _assert_mechanical_layout_transform(
+        output.target_program,
+        expand_op,
+        axis=0,
+    )
+    _assert_mechanical_layout_transform(output.target_program, broadcast_op)
+    _assert_layout_transforms_reach_wave(output)
     assert "tt.broadcast" not in output.emitted_module.text
     del ctx
-
-
-def test_tlx_wave_emits_broadcast_component_sources():
-    source_type = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        component_count=2,
-    )
-    result_type = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        component_count=4,
-    )
-    program = converter_target_ir.TargetProgram(
-        values=(
-            converter_target_ir.TargetValue(0, source_type),
-            converter_target_ir.TargetValue(1, result_type),
-        ),
-        ops=(),
-        regions=(converter_target_ir.TargetRegion(0), ),
-        source_value_targets={},
-        erased_source_values={},
-    )
-    state = converter_emission._EmissionState(
-        None,
-        None,
-        None,
-        program,
-        {0: ("a", "b")},
-        uniform_pointer_bases={0: ("base_a", "base_b")},
-    )
-    op = converter_target_ir.TargetOp(
-        0,
-        "broadcast",
-        operands=(0, ),
-        results=(1, ),
-        attrs=(converter_target_ir.TargetAttr("component_sources", (0, 1, 0, 1)), ),
-    )
-
-    converter_emission._emit_broadcast(state, op)
-
-    assert state.values[1] == ("a", "b", "a", "b")
-    assert state.uniform_pointer_bases[1] == ("base_a", "base_b", "base_a", "base_b")
 
 
 @triton.jit
@@ -16631,9 +16430,9 @@ def _run_waveamd_to_machine(wave_artifact):
         [
             wave_opt,
             "-",
+            "--wave-lower-redistribute",
             "--wave-lower-symbolic-memory",
             "--wave-promote-global-to-buffer",
-            "--wave-lower-redistribute",
             "--wave-expand-integer-div-rem",
             "--wave-resolve-allocs",
             "--waveamd-dma-zero-fill",
@@ -16675,11 +16474,25 @@ def _run_wave_canonicalize(wave_artifact):
     return result.stdout
 
 
+def _run_wave_lower_redistribute(wave_artifact):
+    result = subprocess.run(
+        [wave_bridge_tools._wave_opt(), "-", "--wave-lower-redistribute"],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
 def _run_wave_lower_symbolic_memory(wave_artifact):
     result = subprocess.run(
         [
             wave_bridge_tools._wave_opt(),
             "-",
+            "--wave-lower-redistribute",
             "--wave-lower-symbolic-memory",
         ],
         input=wave_artifact,

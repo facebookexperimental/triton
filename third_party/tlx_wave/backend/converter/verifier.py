@@ -100,6 +100,13 @@ def _verify_target_layouts(target_program):
                     "symbolic properties",
                 )
             property_names.add(prop.name)
+        if layout.linear_layout is not None and not _is_layout_schema_value(layout.linear_layout):
+            fail(
+                "TLXW_VERIFY_LAYOUT_SCHEMA",
+                STAGE,
+                f"target layout {layout.layout_map_id} has a malformed "
+                "symbolic linear layout",
+            )
 
 
 def _verify_target_assumptions(target_program):
@@ -343,10 +350,16 @@ def _verify_ops(target_program, source_program):
             _verify_type_convert(op, target_program)
         if op.kind == "make_buffer":
             _verify_make_buffer(op, target_program)
-        if op.kind == "component_join":
-            _verify_component_join(op, target_program)
-        if op.kind == "component_split":
-            _verify_component_split(op, target_program)
+        if op.kind == "layout_convert":
+            _verify_layout_convert_fact_policy(op)
+        if op.kind in {
+                "broadcast",
+                "expand_dims",
+                "join",
+                "layout_convert",
+                "split",
+        }:
+            _verify_layout_transform(op, target_program)
         if len(op.fact_target_ids) != len(op.fact_ids):
             fail(
                 "TLXW_VERIFY_FACT_TARGET_COUNT",
@@ -382,8 +395,6 @@ def _verify_ops(target_program, source_program):
                 target_value_id,
             )
         if op.kind == "layout_convert":
-            _verify_layout_convert_mode(op)
-            _verify_layout_convert_fact_policy(op)
             if source_program is not None:
                 _verify_layout_convert_source_op(op, source_program)
         if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
@@ -1039,17 +1050,6 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         )
 
 
-def _verify_layout_convert_mode(op):
-    mode = _attrs_dict(op).get("mode")
-    if mode != "redistribute":
-        fail(
-            "TLXW_VERIFY_LAYOUT_MODE",
-            STAGE,
-            "layout_convert mode must be redistribute",
-            target_op_id=op.target_op_id,
-        )
-
-
 def _verify_layout_convert_fact_policy(op):
     attrs = _attrs_dict(op)
     policy = attrs.get("fact_policy")
@@ -1307,7 +1307,6 @@ def _verify_type_convert(op, target_program):
         )
     mode = attrs.get("mode")
     if mode not in {
-            "component_remap",
             "index_cast",
             "packet_to_scalar_components",
             "scalar_components_to_packet",
@@ -1329,21 +1328,6 @@ def _verify_type_convert(op, target_program):
                 "TLXW_VERIFY_TYPE_CONVERT",
                 STAGE,
                 "index cast has inconsistent types or value distribution",
-                target_op_id=op.target_op_id,
-            )
-        return
-    if mode == "component_remap":
-        component_sources = attrs.get("component_sources")
-        if (not isinstance(component_sources, tuple) or not component_sources
-                or len(component_sources) != int(result_type.component_count)
-                or any(not isinstance(component, int) or component < 0 or component >= int(operand_type.component_count)
-                       for component in component_sources) or operand_type.kind != result_type.kind
-                or operand_type.element_type != result_type.element_type
-                or operand_type.lane_width != result_type.lane_width):
-            fail(
-                "TLXW_VERIFY_TYPE_CONVERT",
-                STAGE,
-                "component remap types or source map are inconsistent",
                 target_op_id=op.target_op_id,
             )
         return
@@ -1375,109 +1359,107 @@ def _verify_type_convert(op, target_program):
         )
 
 
-def _verify_component_join(op, target_program):
+def _verify_layout_transform(op, target_program):
     attrs = _attrs_dict(op)
-    if len(op.operands) != 2 or len(op.results) != 1:
+    allowed_attrs = {
+        "broadcast": frozenset(),
+        "expand_dims": frozenset({"axis"}),
+        "join": frozenset(),
+        "split": frozenset(),
+    }
+    if op.kind == "layout_convert":
+        allowed = {"fact_policy", "transform"}
+        if attrs.get("transform") == "trans":
+            allowed.add("order")
+        allowed_attrs["layout_convert"] = frozenset(allowed)
+    leaked_attrs = tuple(sorted(set(attrs) - allowed_attrs[op.kind]))
+    if leaked_attrs:
         fail(
-            "TLXW_VERIFY_COMPONENT_JOIN",
+            "TLXW_VERIFY_LAYOUT_ATTRS",
             STAGE,
-            "component_join requires two operands and one result",
+            f"{op.kind} carries non-structural layout attrs {leaked_attrs}",
             target_op_id=op.target_op_id,
         )
-    operand_types = tuple(target_program.values[int(value_id)].type for value_id in op.operands)
-    result_type = target_program.values[int(op.results[0])].type
-    source_counts = attrs.get("source_component_counts")
-    source_widths = attrs.get("source_packet_widths")
-    source_slots = attrs.get("source_slot_counts")
-    scalar_sources = attrs.get("scalar_sources")
-    result_count = attrs.get("result_component_count")
-    result_width = attrs.get("result_packet_width")
-    result_slots = attrs.get("result_slot_count")
-    valid_source_metadata = (isinstance(source_counts, tuple) and isinstance(source_widths, tuple)
-                             and isinstance(source_slots, tuple)
-                             and len(source_counts) == len(source_widths) == len(source_slots) == 2
-                             and all(isinstance(value, int) and value > 0 for value in source_counts)
-                             and all(isinstance(value, int) and value > 0 for value in source_widths)
-                             and all(isinstance(value, int) and value > 0 for value in source_slots)
-                             and all(count == int(operand_type.component_count) and count * width == slots
-                                     for count, width, slots, operand_type in zip(
-                                         source_counts,
-                                         source_widths,
-                                         source_slots,
-                                         operand_types,
-                                     )))
-    valid_result_metadata = (isinstance(result_count, int) and isinstance(result_width, int)
-                             and isinstance(result_slots, int) and result_count == int(result_type.component_count)
-                             and result_count > 0 and result_width > 0 and result_count * result_width == result_slots)
-    valid_sources = (isinstance(scalar_sources, tuple) and isinstance(result_slots, int)
-                     and len(scalar_sources) == result_slots and all(
-                         isinstance(source, tuple) and len(source) == 2 and all(
-                             isinstance(index, int)
-                             for index in source) and 0 <= source[0] < len(operand_types) and isinstance(
-                                 source_slots, tuple) and 0 <= source[1] < source_slots[source[0]]
-                         for source in scalar_sources))
-    valid_types = (all(operand_type.kind == result_type.kind for operand_type in operand_types)
-                   and all(operand_type.element_type == result_type.element_type for operand_type in operand_types)
-                   and all(operand_type.lane_width == result_type.lane_width for operand_type in operand_types))
-    if not (valid_source_metadata and valid_result_metadata and valid_sources and valid_types):
+    expected_counts = {
+        "broadcast": (1, 1),
+        "expand_dims": (1, 1),
+        "join": (2, 1),
+        "layout_convert": (1, 1),
+        "split": (1, 2),
+    }
+    expected_operands, expected_results = expected_counts[op.kind]
+    if (len(op.operands) != expected_operands or len(op.results) != expected_results):
         fail(
-            "TLXW_VERIFY_COMPONENT_JOIN",
+            "TLXW_VERIFY_LAYOUT_TRANSFORM",
             STAGE,
-            "component_join packet metadata or types are inconsistent",
+            f"{op.kind} has an invalid operand or result count",
+            target_op_id=op.target_op_id,
+        )
+    value_ids = tuple(int(value_id) for value_id in (*op.operands, *op.results))
+    values = tuple(target_program.values[value_id] for value_id in value_ids)
+    types = tuple(value.type for value in values)
+    if (any(value.layout_map_id is None for value in values)
+            or any(type_.element_type != types[0].element_type for type_ in types)
+            or any(type_.lane_width != types[0].lane_width for type_ in types)):
+        fail(
+            "TLXW_VERIFY_LAYOUT_TRANSFORM",
+            STAGE,
+            f"{op.kind} requires layout-bearing tensor values with matching "
+            "element and lane types",
+            target_op_id=op.target_op_id,
+        )
+    layouts = tuple(target_program.layouts[int(value.layout_map_id)] for value in values)
+    if any(layout.linear_layout is None for layout in layouts):
+        fail(
+            "TLXW_VERIFY_LAYOUT_TRANSFORM",
+            STAGE,
+            f"{op.kind} requires symbolic linear layouts",
+            target_op_id=op.target_op_id,
+        )
+    shapes = tuple(tuple(int(dim) for dim in layout.shape) for layout in layouts)
+    valid = True
+    if op.kind == "broadcast":
+        source_shape, result_shape = shapes
+        valid = len(source_shape) == len(result_shape) and all(source in {1, result}
+                                                               for source, result in zip(source_shape, result_shape))
+    elif op.kind == "expand_dims":
+        source_shape, result_shape = shapes
+        axis = attrs.get("axis")
+        valid = (isinstance(axis, int) and 0 <= axis < len(result_shape) and result_shape[axis] == 1
+                 and result_shape[:axis] + result_shape[axis + 1:] == source_shape)
+    elif op.kind == "join":
+        first_shape, second_shape, result_shape = shapes
+        valid = first_shape == second_shape and result_shape == first_shape + (2, )
+    elif op.kind == "split":
+        source_shape, first_shape, second_shape = shapes
+        valid = (bool(source_shape) and source_shape[-1] == 2 and first_shape == second_shape == source_shape[:-1])
+    else:
+        source_shape, result_shape = shapes
+        transform = attrs.get("transform")
+        if transform == "identity":
+            valid = source_shape == result_shape
+        elif transform == "reshape":
+            valid = _shape_product(source_shape) == _shape_product(result_shape)
+        elif transform == "trans":
+            order = attrs.get("order")
+            valid = (isinstance(order, tuple) and sorted(order) == list(range(len(source_shape)))
+                     and tuple(source_shape[dim] for dim in order) == result_shape)
+        else:
+            valid = False
+    if not valid:
+        fail(
+            "TLXW_VERIFY_LAYOUT_TRANSFORM",
+            STAGE,
+            f"{op.kind} has incompatible structural layout semantics",
             target_op_id=op.target_op_id,
         )
 
 
-def _verify_component_split(op, target_program):
-    attrs = _attrs_dict(op)
-    if len(op.operands) != 1 or len(op.results) != 2:
-        fail(
-            "TLXW_VERIFY_COMPONENT_SPLIT",
-            STAGE,
-            "component_split requires one operand and two results",
-            target_op_id=op.target_op_id,
-        )
-    operand_type = target_program.values[int(op.operands[0])].type
-    result_types = tuple(target_program.values[int(value_id)].type for value_id in op.results)
-    source_count = attrs.get("source_component_count")
-    source_width = attrs.get("source_packet_width")
-    source_slots = attrs.get("source_slot_count")
-    result_counts = attrs.get("result_component_counts")
-    result_widths = attrs.get("result_packet_widths")
-    result_slots = attrs.get("result_slot_counts")
-    scalar_sources = attrs.get("scalar_source_slots")
-    valid_source_metadata = (isinstance(source_count, int) and isinstance(source_width, int)
-                             and isinstance(source_slots, int) and source_count == int(operand_type.component_count)
-                             and source_count > 0 and source_width > 0 and source_count * source_width == source_slots)
-    valid_result_metadata = (isinstance(result_counts, tuple) and isinstance(result_widths, tuple)
-                             and isinstance(result_slots, tuple)
-                             and len(result_counts) == len(result_widths) == len(result_slots) == 2
-                             and all(isinstance(value, int) and value > 0 for value in result_counts)
-                             and all(isinstance(value, int) and value > 0 for value in result_widths)
-                             and all(isinstance(value, int) and value > 0 for value in result_slots)
-                             and all(count == int(result_type.component_count) and count * width == slots
-                                     for count, width, slots, result_type in zip(
-                                         result_counts,
-                                         result_widths,
-                                         result_slots,
-                                         result_types,
-                                     )))
-    valid_sources = (isinstance(scalar_sources, tuple) and isinstance(result_slots, tuple)
-                     and len(scalar_sources) == len(result_slots) == 2 and all(
-                         isinstance(sources, tuple) and len(sources) == slots and all(
-                             isinstance(source, int) and isinstance(source_slots, int) and 0 <= source < source_slots
-                             for source in sources)
-                         for sources, slots in zip(scalar_sources, result_slots)))
-    valid_types = (all(result_type.kind == operand_type.kind for result_type in result_types)
-                   and all(result_type.element_type == operand_type.element_type for result_type in result_types)
-                   and all(result_type.lane_width == operand_type.lane_width for result_type in result_types))
-    if not (valid_source_metadata and valid_result_metadata and valid_sources and valid_types):
-        fail(
-            "TLXW_VERIFY_COMPONENT_SPLIT",
-            STAGE,
-            "component_split packet metadata or types are inconsistent",
-            target_op_id=op.target_op_id,
-        )
+def _shape_product(shape):
+    result = 1
+    for dim in shape:
+        result *= int(dim)
+    return result
 
 
 def _attrs_dict(op):
