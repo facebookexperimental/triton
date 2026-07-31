@@ -262,10 +262,8 @@ bool canSinkUseChainPast(Value buffer, ArrayRef<Operation *> useChain,
     // WS arrive: both operations only delay signals.  This mirrors
     // sinkWSArrives, but is deliberately limited to the one epilogue chain.
     bool arrivesCanSwap =
-        isa<ArriveBarrierOp>(useChain.back()) &&
-        isa<ArriveBarrierOp>(next) &&
-        hasWSBarrierConstraints(
-            cast<ArriveBarrierOp>(next).getConstraints());
+        isa<ArriveBarrierOp>(useChain.back()) && isa<ArriveBarrierOp>(next) &&
+        hasWSBarrierConstraints(cast<ArriveBarrierOp>(next).getConstraints());
     if (!arrivesCanSwap && !canAdvanceWSBarrier(opConstraints, next))
       return false;
   } else {
@@ -701,6 +699,129 @@ DenseMap<Operation *, DictionaryAttr> buildTMemLoadConstraints(Block &block) {
   return memOpConstraints;
 }
 
+// Prefer materializing a TMEM operand before an independent SMEM operand when
+// both feed the same pure operation.  Code partitioning places each channel
+// consumer immediately before its first use, which can otherwise leave the
+// SMEM load/broadcast live across a wide TMEM load.  Delay the complete SMEM
+// consumer channel until the TMEM channel has completed.  Both the wait and
+// release are allowed to cross the intervening channel only when the WS
+// ordered-region metadata proves that reordering safe.
+bool prioritizeTMemOperand(Block &block) {
+  bool changed = false;
+  SmallVector<TMEMLoadOp> tmemLoads;
+  for (Operation &op : block)
+    if (auto load = dyn_cast<TMEMLoadOp>(&op))
+      tmemLoads.push_back(load);
+
+  for (TMEMLoadOp tmemLoad : tmemLoads) {
+    Value tmemValue = tmemLoad.getResult();
+    Operation *commonUser = nullptr;
+    while (tmemValue.hasOneUse()) {
+      Operation *user = *tmemValue.user_begin();
+      if (!isPure(user))
+        break;
+      if (user->getNumOperands() != 1 || user->getNumResults() != 1) {
+        commonUser = user;
+        break;
+      }
+      tmemValue = user->getResult(0);
+    }
+    if (!commonUser || !isPure(commonUser) || commonUser->getBlock() != &block)
+      continue;
+
+    for (Value operand : commonUser->getOperands()) {
+      if (operand == tmemValue)
+        continue;
+
+      SmallVector<Operation *> reverseChain;
+      Value current = operand;
+      ttg::LocalLoadOp localLoad;
+      while (Operation *def = current.getDefiningOp()) {
+        if (def->getBlock() != &block || !def->hasOneUse())
+          break;
+        if (auto load = dyn_cast<ttg::LocalLoadOp>(def)) {
+          localLoad = load;
+          break;
+        }
+        if (!isPure(def) || def->getNumOperands() != 1 ||
+            def->getNumResults() != 1)
+          break;
+        reverseChain.push_back(def);
+        current = def->getOperand(0);
+      }
+      if (!localLoad || !localLoad->isBeforeInBlock(tmemLoad))
+        continue;
+
+      auto acquire = dyn_cast_or_null<WaitBarrierOp>(localLoad->getPrevNode());
+      if (!acquire || !hasWSBarrierConstraints(acquire.getConstraints()))
+        continue;
+      SmallVector<Operation *> acquirePrefix;
+      llvm::SmallPtrSet<Operation *, 8> movingOps{acquire, localLoad};
+      for (Operation *op = acquire->getPrevNode(); op && isPure(op);
+           op = op->getPrevNode()) {
+        bool usedOnlyByMovingOps =
+            llvm::all_of(op->getUsers(), [&](Operation *user) {
+              return movingOps.contains(user);
+            });
+        if (!usedOnlyByMovingOps)
+          break;
+        acquirePrefix.push_back(op);
+        movingOps.insert(op);
+      }
+
+      SmallVector<Operation *> releasePrefix;
+      Operation *releaseCandidate = localLoad->getNextNode();
+      while (releaseCandidate && isPure(releaseCandidate)) {
+        releasePrefix.push_back(releaseCandidate);
+        releaseCandidate = releaseCandidate->getNextNode();
+      }
+      auto release = dyn_cast_or_null<ArriveBarrierOp>(releaseCandidate);
+      if (!release || !hasWSBarrierConstraints(release.getConstraints()))
+        continue;
+
+      bool safe = true;
+      for (Operation *op = release->getNextNode(); op && op != commonUser;
+           op = op->getNextNode()) {
+        if (auto arrive = dyn_cast<ArriveBarrierOp>(op)) {
+          if (!hasWSBarrierConstraints(arrive.getConstraints()) ||
+              !canAdvanceWSBarrierArrivePastWait(arrive.getConstraints(),
+                                                 acquire.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (auto wait = dyn_cast<WaitBarrierOp>(op)) {
+          if (!hasWSBarrierConstraints(wait.getConstraints())) {
+            safe = false;
+            break;
+          }
+          continue;
+        }
+        if (!canAdvanceWSBarrier(release.getConstraints(), op)) {
+          safe = false;
+          break;
+        }
+      }
+      if (!safe)
+        continue;
+
+      for (Operation *op : llvm::reverse(acquirePrefix))
+        op->moveBefore(commonUser);
+      acquire->moveBefore(commonUser);
+      localLoad->moveBefore(commonUser);
+      for (Operation *op : releasePrefix)
+        op->moveBefore(commonUser);
+      release->moveBefore(commonUser);
+      for (Operation *op : llvm::reverse(reverseChain))
+        op->moveBefore(commonUser);
+      changed = true;
+      break;
+    }
+  }
+  return changed;
+}
+
 void processBlock(BlockInterleaveInfo &info) {
   Block &block = *info.block;
   SmallVector<Operation *> originalOrder = getBlockOpOrder(block);
@@ -791,6 +912,8 @@ struct TritonNvidiaGPUInterleaveTMemPass
     SmallVector<BlockInterleaveInfo> blocksToProcess;
     m.walk([&](Block *block) {
       BlockInterleaveInfo info = collectBlockInterleaveInfo(block);
+      if (info.tmemLoadCount > 0)
+        prioritizeTMemOperand(*block);
       if (info.tmemLoadCount < 2)
         return;
       blocksToProcess.push_back(std::move(info));
