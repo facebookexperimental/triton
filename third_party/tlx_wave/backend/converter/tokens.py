@@ -92,7 +92,7 @@ class TokenProgram:
     users_by_value_id: dict[int, tuple[int, ...]]
     loop_token_carries_by_op: dict[int, tuple[LoopTokenCarry, ...]]
     if_token_carries_by_op: dict[int, tuple[IfTokenCarry, ...]]
-    async_protocol_dependency_value_ids_by_op: dict[int, tuple[int, ...]]
+    implicit_wait_readiness_value_ids_by_op: dict[int, tuple[int, ...]]
 
     def node_for_value(self, value_id):
         node_id = self.node_ids_by_value_id.get(value_id)
@@ -162,22 +162,18 @@ def build_token_program(source_program, type_layout_program):
     groups = tuple(
         replace(
             group,
-            next_same_region_wait_op_index=next_wait_by_commit.get(
-                int(group.commit_op_index)
-            ),
-        )
-        for group in groups
-    )
+            next_same_region_wait_op_index=next_wait_by_commit.get(int(group.commit_op_index)),
+        ) for group in groups)
     loop_token_carries_by_op = _loop_token_carries_by_op(
         source_program,
         nodes,
         groups,
     )
     (
-        async_protocol_dependency_value_ids_by_op,
+        implicit_wait_readiness_value_ids_by_op,
         readiness_loop_carries_by_op,
         readiness_if_carries_by_op,
-    ) = _async_protocol_dependencies_by_op(source_program)
+    ) = _implicit_wait_readiness_by_op(source_program)
     loop_token_carries_by_op = _merge_loop_token_carries(
         loop_token_carries_by_op,
         readiness_loop_carries_by_op,
@@ -200,181 +196,198 @@ def build_token_program(source_program, type_layout_program):
          for value_id, node_ids in users_by_value.items()},
         loop_token_carries_by_op,
         if_token_carries_by_op,
-        async_protocol_dependency_value_ids_by_op,
+        implicit_wait_readiness_value_ids_by_op,
     )
 
 
-def _async_protocol_dependencies_by_op(source_program):
-    """Thread explicit waits through their dominated local-memory operations.
+def _implicit_wait_readiness_by_op(source_program):
+    """Make AMD's implicit wait/load protocol explicit in target SSA.
 
-    The wait result is the structural source-level proof that earlier async
-    copies are ready.  Record it as an explicit operand of every dominated DS
-    operation.  When the next explicit wait is reached, also record the prior
-    wait as a release dependency if that epoch contained DS operations.  This
-    gives the bridge the complete wait -> DS -> next-wait token chain without
-    consulting DMA destinations or LDS alias state.
-
-    The load's AMD readiness annotation separately decides whether the emitter
-    may ignore ordinary LDS access state; domination alone must not turn a
-    synchronous local-store/load path into a relaxed DMA consumer.
-
-    Async DMA issue is not a consumer of this relation and must never acquire
-    a destination-based or inferred dependency here.
+    ``syncedViaAsyncWait`` is a source protocol marker, not an aliasing fact:
+    it says that the current async-wait epoch is the load's readiness edge.
+    Preserve exactly that edge.  Pipelined loops place the next wait at the
+    loop backedge, so the readiness value is an ordinary loop-carried token.
+    No DMA destination or local-memory access is inspected here.
     """
     dependencies = {}
-    loop_carries = {}
-    if_carries = {}
+    loop_carry_candidates = []
+    if_carry_candidates = []
 
     def visit_region(region_id, inherited_wait_value_ids=()):
         wait_value_ids = tuple(int(value_id) for value_id in inherited_wait_value_ids)
         used_wait_value_ids = set()
-        pending_release_value_ids = set()
         region = source_program.regions[int(region_id)]
         for op_index in region.op_indices:
             op = source_program.ops[int(op_index)]
             if op.name == "ttg.async_wait":
-                release_value_ids = tuple(
-                    value_id
-                    for value_id in wait_value_ids
-                    if value_id in pending_release_value_ids
-                )
-                if release_value_ids:
-                    dependencies[int(op.index)] = release_value_ids
-                    pending_release_value_ids.difference_update(release_value_ids)
                 wait_result = _first_token_result(source_program, op)
                 wait_value_ids = (() if wait_result is None else (int(wait_result), ))
-            elif wait_value_ids and op.name in {"ttg.local_load", "ttg.local_store"}:
+                continue
+
+            if (_consumes_implicit_wait_readiness(op) and wait_value_ids):
                 dependencies[int(op.index)] = wait_value_ids
                 used_wait_value_ids.update(wait_value_ids)
-                pending_release_value_ids.update(wait_value_ids)
+
             if op.name == "scf.for" and len(op.region_ids) == 1:
                 (
                     body_wait_value_ids,
                     body_used_wait_value_ids,
-                    body_pending_release_value_ids,
-                ) = visit_region(
-                    op.region_ids[0],
-                    wait_value_ids,
-                )
-                # A DS operation before the body's wait consumes the preheader
-                # wait on the first iteration and the body wait later.
-                # Represent that recurrence with a hidden token iter_arg; it
-                # is a DS readiness edge and never a DMA issue dependency.
-                if (
-                    len(wait_value_ids) == 1
-                    and len(body_wait_value_ids) == 1
-                    and wait_value_ids != body_wait_value_ids
-                    and wait_value_ids[0] in body_used_wait_value_ids
-                ):
-                    loop_carries.setdefault(int(op.index), []).append(
+                ) = visit_region(op.region_ids[0], wait_value_ids)
+                if (len(wait_value_ids) <= 1 and len(body_wait_value_ids) <= 1 and wait_value_ids != body_wait_value_ids
+                        and (wait_value_ids or body_wait_value_ids)):
+                    loop_carry_candidates.append((
                         LoopTokenCarry(
                             loop_op_index=int(op.index),
-                            init_source_value_id=int(wait_value_ids[0]),
-                            yield_source_value_id=int(body_wait_value_ids[0]),
+                            init_source_value_id=(None if not wait_value_ids else int(wait_value_ids[0])),
+                            yield_source_value_id=(None if not body_wait_value_ids else int(body_wait_value_ids[0])),
                             add_issue_dependency=False,
                             issue_dependency_op_indices=(),
                             readiness_carry=True,
-                        )
-                    )
+                        ),
+                        _region_op_indices_recursive(
+                            source_program,
+                            op.region_ids[0],
+                        ),
+                    ))
                 used_wait_value_ids.update(body_used_wait_value_ids)
-                pending_release_value_ids.update(
-                    value_id
-                    for value_id in body_pending_release_value_ids
-                    if value_id in wait_value_ids
-                )
+                wait_value_ids = body_wait_value_ids
                 continue
+
             if op.name == "scf.if" and len(op.region_ids) == 2:
                 branch_results = tuple(
-                    visit_region(child_region_id, wait_value_ids)
-                    for child_region_id in op.region_ids
-                )
-                for (
-                    _,
-                    branch_used_wait_value_ids,
-                    _,
-                ) in branch_results:
+                    visit_region(child_region_id, wait_value_ids) for child_region_id in op.region_ids)
+                for _, branch_used_wait_value_ids in branch_results:
                     used_wait_value_ids.update(branch_used_wait_value_ids)
-                then_wait_value_ids, else_wait_value_ids = (
-                    branch_wait_value_ids
-                    for branch_wait_value_ids, _, _ in branch_results
-                )
+                then_wait_value_ids, else_wait_value_ids = (branch_wait_value_ids
+                                                            for branch_wait_value_ids, _ in branch_results)
                 if then_wait_value_ids == else_wait_value_ids:
                     wait_value_ids = then_wait_value_ids
-                    for _, _, branch_pending_release_value_ids in branch_results:
-                        pending_release_value_ids.update(
-                            value_id
-                            for value_id in branch_pending_release_value_ids
-                            if value_id in wait_value_ids
-                        )
                     continue
-                then_source_value_id = (
-                    None
-                    if not then_wait_value_ids
-                    else int(then_wait_value_ids[0])
-                )
-                else_source_value_id = (
-                    None
-                    if not else_wait_value_ids
-                    else int(else_wait_value_ids[0])
-                )
-                if then_source_value_id is None and else_source_value_id is None:
+                then_source_value_id = (None if not then_wait_value_ids else int(then_wait_value_ids[0]))
+                else_source_value_id = (None if not else_wait_value_ids else int(else_wait_value_ids[0]))
+                if (then_source_value_id is None and else_source_value_id is None):
                     wait_value_ids = ()
                     continue
-                # The scf.if result is the path-sensitive readiness proof.
-                # _convert_if supplies a neutral token for a path with no
-                # wait, then rewrites either source wait to the merged result
-                # for following DS consumers.
-                if_carries.setdefault(int(op.index), []).append(
+                if_carry_candidates.append((
                     IfTokenCarry(
                         if_op_index=int(op.index),
                         then_source_value_id=then_source_value_id,
                         else_source_value_id=else_source_value_id,
-                    )
-                )
-                wait_value_ids = (
-                    then_source_value_id
-                    if then_source_value_id is not None
-                    else else_source_value_id,
-                )
-                if any(
-                    branch_pending_release_value_ids
-                    for _, _, branch_pending_release_value_ids in branch_results
-                ):
-                    pending_release_value_ids.update(wait_value_ids)
+                    ),
+                    frozenset().union(*(_region_op_indices_recursive(
+                        source_program,
+                        child_region_id,
+                    ) for child_region_id in op.region_ids)),
+                ))
+                wait_value_ids = (then_source_value_id if then_source_value_id is not None else else_source_value_id, )
                 continue
+
             for child_region_id in op.region_ids:
-                (
-                    _,
-                    child_used_wait_value_ids,
-                    child_pending_release_value_ids,
-                ) = visit_region(
+                _, child_used_wait_value_ids = visit_region(
                     child_region_id,
                     wait_value_ids,
                 )
                 used_wait_value_ids.update(child_used_wait_value_ids)
-                pending_release_value_ids.update(
-                    value_id
-                    for value_id in child_pending_release_value_ids
-                    if value_id in wait_value_ids
-                )
-        return (
-            wait_value_ids,
-            frozenset(used_wait_value_ids),
-            frozenset(pending_release_value_ids),
-        )
+
+        return wait_value_ids, frozenset(used_wait_value_ids)
 
     visit_region(source_program.top_region_id)
+    dependency_ops_by_value_id = {}
+    for op_index, value_ids in dependencies.items():
+        for value_id in value_ids:
+            dependency_ops_by_value_id.setdefault(
+                int(value_id),
+                set(),
+            ).add(int(op_index))
+    selected_loop_candidates = set()
+    selected_if_candidates = set()
+    # A selected structured carry is itself an SSA use of its source values.
+    # Close that relation transitively so a branch- or body-local wait can
+    # escape only through every enclosing structured result.
+    changed = True
+    while changed:
+        changed = False
+        for candidate_index, (carry, body_op_indices) in enumerate(loop_carry_candidates):
+            if candidate_index in selected_loop_candidates:
+                continue
+            entry_uses = dependency_ops_by_value_id.get(
+                carry.init_source_value_id,
+                (),
+            )
+            exit_uses = dependency_ops_by_value_id.get(
+                carry.yield_source_value_id,
+                (),
+            )
+            if (not any(op_index in body_op_indices for op_index in entry_uses)
+                    and not any(op_index not in body_op_indices for op_index in exit_uses)):
+                continue
+            selected_loop_candidates.add(candidate_index)
+            changed = True
+            for source_value_id in (
+                    carry.init_source_value_id,
+                    carry.yield_source_value_id,
+            ):
+                if source_value_id is None:
+                    continue
+                dependency_ops_by_value_id.setdefault(
+                    int(source_value_id),
+                    set(),
+                ).add(int(carry.loop_op_index))
+
+        for candidate_index, (carry, branch_op_indices) in enumerate(if_carry_candidates):
+            if candidate_index in selected_if_candidates:
+                continue
+            branch_value_ids = (
+                carry.then_source_value_id,
+                carry.else_source_value_id,
+            )
+            if not any(op_index not in branch_op_indices for value_id in branch_value_ids if value_id is not None
+                       for op_index in dependency_ops_by_value_id.get(value_id, ())):
+                continue
+            selected_if_candidates.add(candidate_index)
+            changed = True
+            for source_value_id in branch_value_ids:
+                if source_value_id is None:
+                    continue
+                dependency_ops_by_value_id.setdefault(
+                    int(source_value_id),
+                    set(),
+                ).add(int(carry.if_op_index))
+
+    loop_carries = {}
+    for candidate_index in sorted(selected_loop_candidates):
+        carry, _body_op_indices = loop_carry_candidates[candidate_index]
+        loop_carries.setdefault(carry.loop_op_index, []).append(carry)
+    if_carries = {}
+    for candidate_index in sorted(selected_if_candidates):
+        carry, _branch_op_indices = if_carry_candidates[candidate_index]
+        if_carries.setdefault(carry.if_op_index, []).append(carry)
     return (
         dependencies,
-        {
-            op_index: tuple(carries)
-            for op_index, carries in loop_carries.items()
-        },
-        {
-            op_index: tuple(carries)
-            for op_index, carries in if_carries.items()
-        },
+        {op_index: tuple(carries)
+         for op_index, carries in loop_carries.items()},
+        {op_index: tuple(carries)
+         for op_index, carries in if_carries.items()},
     )
+
+
+def _is_implicit_wait_ready_load(op):
+    return (op.name == "ttg.local_load" and len(op.operands) == 1
+            and _bool_attr(op.attrs.get("ttg.amdg.syncedViaAsyncWait")))
+
+
+def _consumes_implicit_wait_readiness(op):
+    # A source barrier following a tokenless wait is a distinct operation, but
+    # source program order still requires the wait to precede it. Preserve that
+    # edge exactly like the syncedViaAsyncWait load edge; neither case needs
+    # allocation or alias recovery.
+    return (_is_implicit_wait_ready_load(op) or op.name in {"ttg.barrier", "rocdl.s.barrier"})
+
+
+def _bool_attr(value):
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "1"}
 
 
 def _merge_loop_token_carries(*carry_maps):
@@ -433,44 +446,36 @@ def _if_token_carries_by_op(
         if op.name != "scf.if" or len(op.region_ids) != 2:
             continue
         branch_op_indices = tuple(
-            _region_op_indices_recursive(source_program, region_id)
-            for region_id in op.region_ids
-        )
+            _region_op_indices_recursive(source_program, region_id) for region_id in op.region_ids)
         all_branch_op_indices = frozenset().union(*branch_op_indices)
         groups_by_branch = tuple(
-            tuple(sorted(
-                (group for group in groups if group.commit_op_index in op_indices),
-                key=lambda group: group.commit_op_index,
-            ))
-            for op_indices in branch_op_indices
-        )
+            tuple(
+                sorted(
+                    (group for group in groups if group.commit_op_index in op_indices),
+                    key=lambda group: group.commit_op_index,
+                )) for op_indices in branch_op_indices)
         if not any(groups_by_branch):
             continue
         externally_used_token_ids = {
             group.token_value_id
-            for node in nodes
-            if (node.op_name == "ttg.async_wait"
-                and node.op_index not in all_branch_op_indices
-                and node.op_index > op.index)
+            for node in nodes if (node.op_name == "ttg.async_wait" and node.op_index not in all_branch_op_indices
+                                  and node.op_index > op.index)
             for group_id in node.waited_group_ids
-            for group in (groups_by_id[group_id], )
-            if group.token_value_id is not None
+            for group in (groups_by_id[group_id], ) if group.token_value_id is not None
         }
         externally_used_token_ids.update(
-            source_value_id
-            for loop_op_index, loop_carries in loop_token_carries_by_op.items()
-            if loop_op_index not in all_branch_op_indices
-            for carry in loop_carries
-            for source_value_id in (
+            source_value_id for loop_op_index, loop_carries in loop_token_carries_by_op.items()
+            if loop_op_index not in all_branch_op_indices for carry in loop_carries for source_value_id in (
                 carry.init_source_value_id,
                 carry.yield_source_value_id,
-            )
-            if source_value_id is not None
-        )
+            ) if source_value_id is not None)
         carries = []
-        for slot in range(max(len(branch) for branch in groups_by_branch)):
-            then_group = groups_by_branch[0][slot] if slot < len(groups_by_branch[0]) else None
-            else_group = groups_by_branch[1][slot] if slot < len(groups_by_branch[1]) else None
+        slot_count = max(len(branch) for branch in groups_by_branch)
+        for slot in range(slot_count):
+            then_index = slot - (slot_count - len(groups_by_branch[0]))
+            else_index = slot - (slot_count - len(groups_by_branch[1]))
+            then_group = groups_by_branch[0][then_index] if then_index >= 0 else None
+            else_group = groups_by_branch[1][else_index] if else_index >= 0 else None
             slot_token_ids = {
                 group.token_value_id
                 for group in (then_group, else_group)
@@ -482,11 +487,12 @@ def _if_token_carries_by_op(
             else_token_id = None if else_group is None else else_group.token_value_id
             if then_token_id is None and else_token_id is None:
                 continue
-            carries.append(IfTokenCarry(
-                if_op_index=op.index,
-                then_source_value_id=then_token_id,
-                else_source_value_id=else_token_id,
-            ))
+            carries.append(
+                IfTokenCarry(
+                    if_op_index=op.index,
+                    then_source_value_id=then_token_id,
+                    else_source_value_id=else_token_id,
+                ))
         if carries:
             carries_by_op[op.index] = tuple(carries)
     return carries_by_op
@@ -569,16 +575,8 @@ def _committed_queue_before_op(nodes, groups, op_index):
 
 
 def _loop_body_end_queue(initial_queue, nodes, groups, body_op_indices):
-    groups_by_commit = {
-        group.commit_op_index: group
-        for group in groups
-        if group.commit_op_index in body_op_indices
-    }
-    nodes_by_op = {
-        node.op_index: node
-        for node in nodes
-        if node.op_index in body_op_indices
-    }
+    groups_by_commit = {group.commit_op_index: group for group in groups if group.commit_op_index in body_op_indices}
+    nodes_by_op = {node.op_index: node for node in nodes if node.op_index in body_op_indices}
     committed_queue = list(initial_queue)
     for token_op_index in sorted(set(groups_by_commit) | set(nodes_by_op)):
         group = groups_by_commit.get(token_op_index)
@@ -772,11 +770,9 @@ def _build_token_node(
         if not input_token_ids:
             waited_group_ids = _waited_group_ids(next_committed_groups, wait_group)
             waited = set(waited_group_ids)
-            retained_group_ids = tuple(
-                group.group_id
-                for group in next_committed_groups
-                if group.group_id not in waited
-            )
+            retained_group_ids = tuple(group.group_id
+                                       for group in next_committed_groups
+                                       if group.group_id not in waited)
             if waited_group_ids:
                 next_committed_groups = [group for group in next_committed_groups if group.group_id not in waited]
 

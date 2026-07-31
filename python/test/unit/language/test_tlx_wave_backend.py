@@ -1300,8 +1300,8 @@ def test_tlx_wave_converter_type_layout_unwraps_tlx_layout_markers(tmp_path):
         value = converted.values[range_op.results[0]]
         layout = converted.layouts[value.layout_map_id]
         assert layout.kind == "linear"
-        assert layout.properties["register_bases"] == ((1,), )
-        assert layout.properties["lane_bases"] == ((2,), (4,), (8,), (16,), (32,), (64,))
+        assert layout.properties["register_bases"] == ((1, ), )
+        assert layout.properties["lane_bases"] == ((2, ), (4, ), (8, ), (16, ), (32, ), (64, ))
         assert value.type.representation == "simd_tuple"
         assert value.type.component_count == 2
     del ctx
@@ -1840,6 +1840,49 @@ def test_tlx_wave_converter_token_stage_builds_async_groups_and_effects(tmp_path
     del ctx
 
 
+def test_tlx_wave_converter_materializes_implicit_async_group_fifo(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    local_func = """
+  tt.func public @converter_implicit_async_fifo(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<64xf16, #shared, #smem, mutable>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %copy = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<64xi32, #blocked>] -> <64xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group
+    %wait = ttg.async_wait {num = 0 : i32}
+    %loaded = ttg.local_load %alloc {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<64xf16, #shared, #smem, mutable> -> tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    source_commit = next(op for op in output.source_program.ops if op.name == "ttg.async_commit_group")
+    source_wait = next(op for op in output.source_program.ops if op.name == "ttg.async_wait")
+    assert not source_commit.operands
+    assert not source_wait.operands
+    copy_op = next(op for op in output.target_program.ops if op.kind == "buffer_load_to_local")
+    commit_op = next(op for op in output.target_program.ops if op.kind == "async_commit_group")
+    wait_op = next(op for op in output.target_program.ops if op.kind == "async_wait")
+    load_op = next(op for op in output.target_program.ops if op.kind == "local_load")
+    assert commit_op.operands[-1:] == copy_op.results[-1:]
+    assert wait_op.operands == commit_op.results
+    assert load_op.operands[1:] == wait_op.results
+    assert converter_target_ir.attrs_dict(load_op)["explicit_dependency_count"] == 1
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
 def test_tlx_wave_converter_token_stage_records_loop_async_issue_carry(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -1941,9 +1984,20 @@ def test_tlx_wave_converter_token_stage_shifts_async_queue_across_loop(tmp_path)
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
     (for_target_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    target_region = output.target_program.regions[for_target_op.region_ids[0]]
+    target_region_ops = tuple(output.target_program.ops[op_id] for op_id in target_region.op_ids)
+    (body_wait_op, ) = [op for op in target_region_ops if op.kind == "async_wait"]
+    commit_ops = [op for op in output.target_program.ops if op.kind == "async_commit_group"]
     final_wait_op = [op for op in output.target_program.ops if op.kind == "async_wait"][-1]
     assert converter_target_ir.attrs_dict(for_target_op)["init_arg_count"] == 3
+    body_wait_attrs = converter_target_ir.attrs_dict(body_wait_op)
+    assert body_wait_attrs["completed_group_dependency_count"] == 2
+    assert body_wait_op.operands[:2] == (
+        target_region.block_arg_ids[-2],
+        commit_ops[2].results[0],
+    )
     assert final_wait_op.operands == for_target_op.results[1:]
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -2003,9 +2057,14 @@ def test_tlx_wave_converter_token_stage_pads_drained_loop_queue_with_neutral_tok
     target_region = output.target_program.regions[target_for_op.region_ids[0]]
     target_region_ops = tuple(output.target_program.ops[op_id] for op_id in target_region.op_ids)
     (body_wait_op, ) = [op for op in target_region_ops if op.kind == "async_wait"]
+    target_commit_ops = [op for op in output.target_program.ops if op.kind == "async_commit_group"]
     final_wait_op = [op for op in output.target_program.ops if op.kind == "async_wait"][-1]
     assert converter_target_ir.attrs_dict(target_for_op)["init_arg_count"] == 1 + warmup_count
-    assert body_wait_op.operands == target_region.block_arg_ids[-warmup_count:]
+    assert body_wait_op.operands == (
+        *target_region.block_arg_ids[-warmup_count:],
+        *(op.results[0] for op in target_commit_ops[:warmup_count]),
+    )
+    assert converter_target_ir.attrs_dict(body_wait_op)["completed_group_dependency_count"] == 2 * warmup_count
     assert final_wait_op.operands == (target_for_op.results[1], )
     assert len([op for op in target_region_ops if op.kind == "token"]) == warmup_count - 1
     _run_wave_verify(output.emitted_module.text)
@@ -2068,7 +2127,12 @@ def test_tlx_wave_converter_token_stage_merges_conditional_group_before_loop_car
     target_for_region = output.target_program.regions[target_for_op.region_ids[0]]
     assert len(target_if_op.results) == 1
     assert target_for_region.yield_value_ids[-1] == target_if_op.results[0]
-    assert target_wait_ops[0].operands == (target_for_region.block_arg_ids[-1], )
+    target_commit_ops = [op for op in output.target_program.ops if op.kind == "async_commit_group"]
+    assert target_wait_ops[0].operands == (
+        target_for_region.block_arg_ids[-1],
+        target_commit_ops[0].results[0],
+    )
+    assert converter_target_ir.attrs_dict(target_wait_ops[0])["completed_group_dependency_count"] == 2
     assert target_wait_ops[-1].operands == (target_for_op.results[-1], )
     _run_wave_verify(output.emitted_module.text)
     del ctx
@@ -2784,19 +2848,10 @@ def test_tlx_wave_converter_op_stage_lowers_basic_dataflow(tmp_path):
     assert target.assumptions
     assert any(layout.properties for layout in target.layouts)
     assert all(
-        isinstance(prop, converter_target_ir.TargetAttr)
-        for layout in target.layouts
-        for prop in layout.properties
-    )
-    assert all(
-        assumption.subject_target_ids
-        for assumption in target.assumptions
-    )
-    assert all(
-        value.layout_map_id is None
-        or target.layouts[value.layout_map_id].layout_map_id == value.layout_map_id
-        for value in target.values
-    )
+        isinstance(prop, converter_target_ir.TargetAttr) for layout in target.layouts for prop in layout.properties)
+    assert all(assumption.subject_target_ids for assumption in target.assumptions)
+    assert all(value.layout_map_id is None or target.layouts[value.layout_map_id].layout_map_id == value.layout_map_id
+               for value in target.values)
     assert converter_verifier.verify_target_program(
         target,
         source_program=source,
@@ -2891,9 +2946,7 @@ def test_tlx_wave_converter_emits_facts_without_source_provenance(tmp_path):
             value.target_value_id,
             value.type,
             layout_map_id=value.layout_map_id,
-        )
-        for value in output.target_program.values
-    )
+        ) for value in output.target_program.values)
     stripped_target = converter_target_ir.TargetProgram(
         stripped_values,
         output.target_program.ops,
@@ -2957,8 +3010,7 @@ def test_tlx_wave_converter_preserves_wrapping_arith_with_scoped_ranges(tmp_path
     add_attrs = converter_target_ir.attrs_dict(add_op)
     assert add_attrs == {"operation": "addi", "source_width": 32}
     assert "wave.binary addi" in output.emitted_module.text
-    add_line = next(line for line in output.emitted_module.text.splitlines()
-                    if "wave.binary addi" in line)
+    add_line = next(line for line in output.emitted_module.text.splitlines() if "wave.binary addi" in line)
     assert "overflow" not in add_line
     del ctx
 
@@ -2986,8 +3038,7 @@ def test_tlx_wave_converter_preserves_wrapping_layout_integer_math(tmp_path):
         if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] in {"muli", "addi"}
     ]
     assert {attrs["operation"] for attrs in layout_math} == {"muli", "addi"}
-    assert all(set(attrs) == {"operation", "source_width"}
-               for attrs in layout_math)
+    assert all(set(attrs) == {"operation", "source_width"} for attrs in layout_math)
     assert "overflow<" not in output.emitted_module.text
     del ctx
 
@@ -3020,8 +3071,7 @@ def test_tlx_wave_converter_marks_only_symbolic_address_math_nsw(tmp_path):
         if op.kind == "binary" and not op.layout_map_ids and converter_target_ir.attrs_dict(op)["operation"] == "muli"
     ]
     assert scalar_mul_attrs
-    assert all(set(attrs) == {"operation", "source_width"}
-               for attrs in scalar_mul_attrs)
+    assert all(set(attrs) == {"operation", "source_width"} for attrs in scalar_mul_attrs)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     affine_op, affine_attrs = _memory_affine_edge(
         output.target_program,
@@ -3073,8 +3123,7 @@ def test_tlx_wave_converter_does_not_walk_loop_carried_address_producers(tmp_pat
         if op.kind == "binary" and not op.layout_map_ids
     ]
     assert {attrs["operation"] for attrs in scalar_binary_attrs} >= {"muli", "addi"}
-    assert all(set(attrs) == {"operation", "source_width"}
-               for attrs in scalar_binary_attrs)
+    assert all(set(attrs) == {"operation", "source_width"} for attrs in scalar_binary_attrs)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     affine_op, affine_attrs = _memory_affine_edge(
         output.target_program,
@@ -3138,11 +3187,7 @@ def test_tlx_wave_converter_pipeline_translates_global_fp_fusion_to_fastmath(tmp
         enable_fp_fusion=True,
     )
 
-    float_attrs = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind == "float_binary"
-    ]
+    float_attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "float_binary"]
     assert float_attrs == [
         {"operation": "mulf", "fastmath": ("nnan", "contract")},
         {"operation": "addf", "fastmath": ("contract", )},
@@ -3175,11 +3220,7 @@ def test_tlx_wave_converter_pipeline_preserves_source_fp_contract(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    float_attrs = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind == "float_binary"
-    ]
+    float_attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "float_binary"]
     assert float_attrs == [
         {"operation": "mulf", "fastmath": ("nnan", "contract")},
         {"operation": "addf", "fastmath": ("contract", )},
@@ -3384,9 +3425,9 @@ def test_tlx_wave_converter_imports_compiler_membar_issue_order(tmp_path):
     target_attrs = converter_target_ir.attrs_dict(target_barrier)
     assert target_attrs["compiler_membar_barrier"] is True
     assert target_attrs["orders_memory_issue"] is True
-    # The synthetic isolated barrier has no memory epoch to delimit, so the
-    # later protocol canonicalizer correctly leaves it out of the live region.
-    assert output.emitted_module.text.count("wave.barrier") == 0
+    # Compiler-selected barriers remain literal source operations even when
+    # there is no bridge-owned memory epoch to attach to them.
+    assert output.emitted_module.text.count("wave.barrier") == 1
     del ctx
 
 
@@ -3422,15 +3463,12 @@ def test_tlx_wave_full_barrier_orders_memory_issue_without_blocking_redistribute
     (convert_op, ) = [op for op in output.target_program.ops if op.kind == "layout_convert"]
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "local_store"]
     issue_ops = [op for op in output.target_program.ops if op.kind == "issue_token"]
-    assert len(issue_ops) == 2
-    pre_issue = next(
-        op for op in issue_ops
-        if converter_target_ir.attrs_dict(op)["projection_domain"] == converter_target_ir.EVENT_DOMAIN_MEMORY_ISSUE)
-    post_issue = next(
-        op for op in issue_ops
-        if converter_target_ir.attrs_dict(op)["projection_domain"] == converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE)
-    assert pre_issue.operands == (load_op.results[-1], )
-    assert barrier_op.operands[-1] == pre_issue.results[0]
+    assert len(issue_ops) == 1
+    (post_issue, ) = issue_ops
+    assert converter_target_ir.attrs_dict(post_issue)["projection_domain"] == (
+        converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE)
+    assert converter_target_ir.attrs_dict(barrier_op)["lds_read_dependency_count"] == 1
+    assert barrier_op.operands == (load_op.results[-1], )
     assert post_issue.operands == barrier_op.results
     assert store_op.operands[-1] == post_issue.results[0]
     assert converter_target_ir.attrs_dict(store_op)["barrier_order_dependency_count"] == 1
@@ -3438,12 +3476,12 @@ def test_tlx_wave_full_barrier_orders_memory_issue_without_blocking_redistribute
     assert converter_target_ir.attrs_dict(convert_op)["mode"] == "redistribute"
 
     wave = output.emitted_module.text
-    assert wave.count("wave.issue_token") == 2
+    assert wave.count("wave.issue_token") == 1
     assert "wave.sched_barrier" not in wave
     assert wave.count("wave.redistribute") == 1
     _run_wave_verify(wave)
     machine = _run_waveamd_to_machine(wave)
-    assert machine.count("waveamdmachine.issue_token") == 2
+    assert machine.count("waveamdmachine.issue_token") == 1
     assert "waveamdmachine.sched_barrier" not in machine
     del ctx
 
@@ -3498,6 +3536,8 @@ def test_tlx_wave_full_barrier_orders_generic_and_buffer_memory_siblings(tmp_pat
     (store_epoch, ) = store_epochs
     assert output.target_program.values[store_epoch].event_domain == (converter_target_ir.EVENT_DOMAIN_BARRIER_ISSUE)
     assert all(converter_target_ir.attrs_dict(op)["barrier_order_dependency_count"] == 1 for op in stores)
+    barriers = [op for op in output.target_program.ops if op.kind == "barrier"]
+    assert len(barriers) == 2
     memory_issue_ops = [
         op for op in output.target_program.ops if op.kind == "issue_token"
         and converter_target_ir.attrs_dict(op)["projection_domain"] == converter_target_ir.EVENT_DOMAIN_MEMORY_ISSUE
@@ -3519,18 +3559,10 @@ def test_tlx_wave_full_barrier_orders_generic_and_buffer_memory_siblings(tmp_pat
     del ctx
 
 
-@pytest.mark.parametrize(
-    "num_warps,expected_mode,expect_coalesced",
-    [
-        (4, "workgroup", True),
-        (1, "wave_local", False),
-    ],
-)
-def test_tlx_wave_converter_coalesces_adjacent_wait_publication_barrier(
+@pytest.mark.parametrize("num_warps", (1, 4))
+def test_tlx_wave_converter_preserves_adjacent_wait_and_barrier(
     tmp_path,
     num_warps,
-    expected_mode,
-    expect_coalesced,
 ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [NUM_WARPS], order = [0]}>
@@ -3561,29 +3593,33 @@ def test_tlx_wave_converter_coalesces_adjacent_wait_publication_barrier(
 
     (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
     wait_attrs = converter_target_ir.attrs_dict(wait_op)
-    assert wait_attrs["publication_mode"] == expected_mode
-    coalesced_index = wait_attrs["coalesced_source_barrier_op_index"]
+    assert set(wait_attrs) >= {
+        "completed_group_dependency_count",
+        "retained_issue_dependency_count",
+    }
+    assert "publication_mode" not in wait_attrs
+    assert "coalesced_source_barrier_op_index" not in wait_attrs
     source_barrier_ops = [op for op in output.source_program.ops if op.name == "ttg.barrier"]
     assert len(source_barrier_ops) == 1
     source_barrier_index = source_barrier_ops[0].index
     target_barrier_ops = [
         op for op in output.target_program.ops if op.kind == "barrier" and op.source_op_index == source_barrier_index
     ]
-    if expect_coalesced:
-        assert coalesced_index == source_barrier_index
-        assert target_barrier_ops == []
-    else:
-        assert coalesced_index == -1
-        assert len(target_barrier_ops) == 1
-    # Only the explicit source protocol is represented. Function exit does not
-    # manufacture an additional publication from LDS access history.
+    assert len(target_barrier_ops) == 1
+    (barrier_op, ) = target_barrier_ops
+    (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
+    assert barrier_op.operands == wait_op.results
+    assert converter_target_ir.attrs_dict(barrier_op)["dependency_count"] == 1
+    assert load_op.operands[1:] == wait_op.results
+    # The wait remains an SSA readiness edge and the source barrier remains a
+    # distinct barrier. Neither operation is synthesized from the other.
     assert output.emitted_module.text.count("wave.barrier") == 1
     assert "wave.sched_barrier" not in output.emitted_module.text
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_explicit_barrier_consumes_live_lds_frontier(tmp_path):
+def test_tlx_wave_converter_explicit_barrier_preserves_structural_lds_read_completion(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -3615,23 +3651,21 @@ def test_tlx_wave_converter_explicit_barrier_consumes_live_lds_frontier(tmp_path
     (barrier_op, ) = [
         op for op in output.target_program.ops if op.kind == "barrier" and op.source_op_index is not None
     ][-1:]
-    load_completion = load_op.results[-1]
-    assert barrier_op.operands == (load_completion, )
+    (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
+    assert load_op.operands[1:] == wait_op.results
+    assert barrier_op.operands == (
+        *wait_op.results,
+        load_op.results[-1],
+    )
     assert len(barrier_op.results) == 1
-    assert output.target_program.values[
-        barrier_op.results[0]].event_domain == converter_target_ir.EVENT_DOMAIN_LDS_RELEASED
     barrier_attrs = converter_target_ir.attrs_dict(barrier_op)
     assert barrier_attrs["dependency_count"] == 1
+    assert barrier_attrs["lds_read_dependency_count"] == 1
+    assert barrier_attrs["lds_completion_result_count"] == 1
 
     wave = output.emitted_module.text
-    load_line = next(
-        line
-        for line in wave.splitlines()
-        if "wave.gather" in line and "#wave.shared" in line
-    )
-    load_token = _ssa_second_result_name(load_line)
     explicit_barrier_line = [line for line in wave.splitlines() if "wave.barrier" in line][-1]
-    assert load_token in explicit_barrier_line
+    assert "wave.barrier %" in explicit_barrier_line
     _run_wave_verify(wave)
     del ctx
 
@@ -3966,9 +4000,6 @@ def _target_async_wait_local_load_program(load_kind):
         attrs={
             "completed_group_dependency_count": 1,
             "retained_issue_dependency_count": 0,
-            "lds_release_dependency_count": 0,
-            "publication_mode": "wave_local",
-            "publication_provenance": "single_wave_ownership",
         },
     )
     return builder.build()
@@ -4087,13 +4118,11 @@ def test_tlx_wave_converter_verifier_rejects_missing_fact():
 
 def test_tlx_wave_converter_verifier_rejects_unknown_value_layout():
     target = converter_target_ir.TargetProgram(
-        values=(
-            converter_target_ir.TargetValue(
-                0,
-                converter_target_ir.TargetType("tensor", "simd", "i32", 64),
-                layout_map_id=0,
-            ),
-        ),
+        values=(converter_target_ir.TargetValue(
+            0,
+            converter_target_ir.TargetType("tensor", "simd", "i32", 64),
+            layout_map_id=0,
+        ), ),
         ops=(),
         regions=(converter_target_ir.TargetRegion(0), ),
         source_value_targets={},
@@ -4117,9 +4146,7 @@ def test_tlx_wave_converter_verifier_rejects_wrapping_address_contract():
         regions=(converter_target_ir.TargetRegion(0), ),
         source_value_targets={},
         erased_source_values={},
-        contract=converter_target_ir.TargetContract(
-            address_arithmetic="wrapping",
-        ),
+        contract=converter_target_ir.TargetContract(address_arithmetic="wrapping", ),
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4138,9 +4165,7 @@ def test_tlx_wave_converter_verifier_rejects_non_boolean_fp_fusion_contract():
         regions=(converter_target_ir.TargetRegion(0), ),
         source_value_targets={},
         erased_source_values={},
-        contract=converter_target_ir.TargetContract(
-            enable_fp_fusion="yes",
-        ),
+        contract=converter_target_ir.TargetContract(enable_fp_fusion="yes", ),
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4159,9 +4184,7 @@ def test_tlx_wave_converter_verifier_rejects_unknown_contract_version():
         regions=(converter_target_ir.TargetRegion(0), ),
         source_value_targets={},
         erased_source_values={},
-        contract=converter_target_ir.TargetContract(
-            schema_version=converter_target_ir.TARGET_SCHEMA_VERSION + 1,
-        ),
+        contract=converter_target_ir.TargetContract(schema_version=converter_target_ir.TARGET_SCHEMA_VERSION + 1, ),
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4212,15 +4235,13 @@ def test_tlx_wave_converter_verifier_rejects_incompatible_fact_target():
         (converter_target_ir.TargetRegion(0, (0, )), ),
         {0: (0, ), 1: (1, )},
         {},
-        assumptions=(
-            converter_target_ir.TargetAssumption(
-                0,
-                "range",
-                "sge",
-                (0, ),
-                lower=0,
-            ),
-        ),
+        assumptions=(converter_target_ir.TargetAssumption(
+            0,
+            "range",
+            "sge",
+            (0, ),
+            lower=0,
+        ), ),
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
@@ -4282,8 +4303,7 @@ def test_tlx_wave_converter_verifier_rejects_invalidating_layout_convert_facts()
         converter_target_ir.target_assumptions_from_facts(
             fact_program,
             builder.source_value_targets,
-        )
-    )
+        ))
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
         converter_verifier.verify_target_program(builder.build())
@@ -4569,7 +4589,7 @@ def test_tlx_wave_converter_verifier_rejects_issue_event_as_wait_completion():
     )
     ready = builder.add_value(
         token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY,
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
     )
     builder.add_op(
         "async_wait",
@@ -4578,9 +4598,6 @@ def test_tlx_wave_converter_verifier_rejects_issue_event_as_wait_completion():
         attrs={
             "completed_group_dependency_count": 1,
             "retained_issue_dependency_count": 0,
-            "lds_release_dependency_count": 0,
-            "publication_mode": "workgroup",
-            "publication_provenance": "amd_membar_compatibility",
         },
     )
 
@@ -4599,7 +4616,7 @@ def test_tlx_wave_converter_verifier_rejects_malformed_wait_segments():
     )
     ready = builder.add_value(
         token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY,
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
     )
     builder.add_op(
         "async_wait",
@@ -4608,9 +4625,6 @@ def test_tlx_wave_converter_verifier_rejects_malformed_wait_segments():
         attrs={
             "completed_group_dependency_count": 0,
             "retained_issue_dependency_count": 0,
-            "lds_release_dependency_count": 0,
-            "publication_mode": "workgroup",
-            "publication_provenance": "amd_membar_compatibility",
         },
     )
 
@@ -4625,7 +4639,7 @@ def test_tlx_wave_converter_verifier_rejects_non_dma_issue_projection():
     token_type = converter_target_ir.TargetType("token", "token")
     completion = builder.add_value(
         token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_LDS_COMPLETION,
+        event_domain=converter_target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
     )
     issue = builder.add_value(
         token_type,
@@ -4648,12 +4662,12 @@ def test_tlx_wave_converter_verifier_rejects_non_dma_issue_projection():
     assert exc_info.value.code == "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN"
 
 
-def test_tlx_wave_converter_verifier_rejects_lds_completion_as_dma_issue():
+def test_tlx_wave_converter_verifier_rejects_memory_completion_as_dma_issue():
     builder = converter_target_ir.TargetBuilder()
     token_type = converter_target_ir.TargetType("token", "token")
     completion = builder.add_value(
         token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_LDS_COMPLETION,
+        event_domain=converter_target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
     )
     issue = builder.add_value(
         token_type,
@@ -4720,6 +4734,82 @@ def test_tlx_wave_converter_verifier_requires_compiler_membar_issue_assumption()
         converter_verifier.verify_target_program(builder.build())
 
     assert exc_info.value.code == "TLXW_VERIFY_BARRIER_ORDER_ASSUMPTION"
+
+
+def test_tlx_wave_converter_verifier_accepts_wait_order_loop_block_arg():
+    builder = converter_target_ir.TargetBuilder()
+    ready = builder.add_value(
+        converter_target_ir.TargetType("token", "token"),
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
+    )
+    body = builder.add_region(block_arg_ids=(ready, ))
+    with builder.insertion_region(body):
+        builder.add_op(
+            "barrier",
+            operands=(ready, ),
+            attrs={
+                "address_space": 1,
+                "dependency_count": 1,
+                "orders_memory_issue": False,
+            },
+        )
+    builder.add_op("for_loop", region_ids=(body, ))
+
+    assert converter_verifier.verify_target_program(builder.build())
+
+
+def test_tlx_wave_converter_verifier_accepts_dominating_wait_in_nested_region():
+    builder = converter_target_ir.TargetBuilder()
+    ready = builder.add_value(
+        converter_target_ir.TargetType("token", "token"),
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
+    )
+    builder.add_op(
+        "async_wait",
+        results=(ready, ),
+        attrs={
+            "completed_group_dependency_count": 0,
+            "retained_issue_dependency_count": 0,
+        },
+    )
+    body = builder.add_region()
+    with builder.insertion_region(body):
+        builder.add_op(
+            "barrier",
+            operands=(ready, ),
+            attrs={
+                "address_space": 1,
+                "dependency_count": 1,
+                "orders_memory_issue": False,
+            },
+        )
+    builder.add_op("for_loop", region_ids=(body, ))
+
+    assert converter_verifier.verify_target_program(builder.build())
+
+
+def test_tlx_wave_converter_verifier_rejects_dma_as_barrier_lds_read():
+    builder = converter_target_ir.TargetBuilder()
+    dma_completion = builder.add_value(
+        converter_target_ir.TargetType("token", "token"),
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+    )
+    builder.add_op(
+        "barrier",
+        operands=(dma_completion, ),
+        attrs={
+            "address_space": 1,
+            "compiler_membar_barrier": True,
+            "dependency_count": 0,
+            "lds_read_dependency_count": 1,
+            "orders_memory_issue": True,
+        },
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN"
 
 
 def test_tlx_wave_converter_verifier_rejects_raw_barrier_memory_dependency():
@@ -5116,7 +5206,7 @@ def _build_independent_async_dma_wait_target():
         ) for _ in range(2))
     wait_token = builder.add_value(
         token,
-        event_domain=converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY,
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
     )
 
     builder.set_kernel_arg_targets((source, ))
@@ -5161,9 +5251,6 @@ def _build_independent_async_dma_wait_target():
         attrs={
             "completed_group_dependency_count": 1,
             "retained_issue_dependency_count": 0,
-            "lds_release_dependency_count": 0,
-            "publication_mode": "workgroup",
-            "publication_provenance": "amd_membar_compatibility",
         },
     )
     builder.add_op("return")
@@ -5391,7 +5478,7 @@ def _build_mma_read_then_dma_reuse_target(
     ) if add_dominating_barrier else None)
     barrier_wait_token = (builder.add_value(
         token,
-        event_domain=converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY,
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
     ) if add_dominating_barrier else None)
     dma_token = (builder.add_value(
         token,
@@ -5405,13 +5492,9 @@ def _build_mma_read_then_dma_reuse_target(
         token,
         event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
     ) if defer_group_read_to_wait else None)
-    wait_seed_token = (builder.add_value(
-        token,
-        event_domain=converter_target_ir.EVENT_DOMAIN_EMPTY,
-    ) if defer_group_read_to_wait else None)
     wait_result_token = (builder.add_value(
         token,
-        event_domain=converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY,
+        event_domain=converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
     ) if defer_group_read_to_wait else None)
     loop_lower = builder.add_value(scalar_i32) if loop_refill else None
     loop_upper = builder.add_value(scalar_i32) if loop_refill else None
@@ -5498,9 +5581,6 @@ def _build_mma_read_then_dma_reuse_target(
             attrs={
                 "completed_group_dependency_count": 1,
                 "retained_issue_dependency_count": 0,
-                "lds_release_dependency_count": 0,
-                "publication_mode": "workgroup",
-                "publication_provenance": "amd_membar_compatibility",
             },
         )
     if reload_after_boundary:
@@ -5584,19 +5664,15 @@ def _build_mma_read_then_dma_reuse_target(
                     "issue_delay_skip_thread_threshold": 0,
                 },
             )
-            builder.add_op("token", results=(wait_seed_token, ))
             builder.add_op(
                 "async_wait",
-                operands=(wait_seed_token, ),
+                operands=(commit_token, ),
                 results=(wait_result_token, ),
                 attrs={
                     "wait_group": 1,
                     "waited_group_ids": (),
                     "completed_group_dependency_count": 1,
                     "retained_issue_dependency_count": 0,
-                    "lds_release_dependency_count": 0,
-                    "publication_mode": "workgroup",
-                    "publication_provenance": "amd_membar_compatibility",
                 },
                 source_op_index=9001,
             )
@@ -5626,40 +5702,47 @@ def _ssa_after_uses(line, value):
     ) is not None
 
 
-def test_tlx_wave_converter_emission_keeps_distinct_lds_tokens_independent():
+def test_tlx_wave_converter_emission_does_not_infer_distinct_lds_dependencies():
     emitted = converter_emission.emit_wave_module(_build_two_lds_store_target())
     lines = emitted.text.splitlines()
     store_indices = [index for index, line in enumerate(lines) if "wave.scatter" in line]
     assert len(store_indices) == 2
     first_store, second_store = store_indices
-    assert "wave.barrier" not in "\n".join(lines[first_store + 1:second_store])
-    barrier_lines = [line for line in lines[second_store + 1:] if "wave.barrier" in line]
-    assert len(barrier_lines) == 2
+    assert "wave.barrier" not in emitted.text
     first_store_token = _ssa_result_name(lines[first_store])
     second_store_token = _ssa_result_name(lines[second_store])
-    assert first_store_token in barrier_lines[0]
-    assert second_store_token not in barrier_lines[0]
-    assert second_store_token in barrier_lines[1]
-    assert first_store_token not in barrier_lines[1]
     load_lines = [line for line in lines if "wave.gather" in line]
     assert len(load_lines) == 2
-    assert f"after {_ssa_result_name(barrier_lines[0])}" in load_lines[0]
-    assert f"after {_ssa_result_name(barrier_lines[1])}" in load_lines[1]
+    for line in load_lines:
+        dependency = re.search(r"\bafter (?P<token>%[\w#]+)", line)
+        assert dependency is not None
+        assert not _wave_token_depends_on(
+            emitted.text,
+            dependency.group("token"),
+            first_store_token,
+        )
+        assert not _wave_token_depends_on(
+            emitted.text,
+            dependency.group("token"),
+            second_store_token,
+        )
     _run_wave_verify(emitted.text)
 
 
-def test_tlx_wave_converter_emission_joins_may_alias_lds_roots_for_selected_memdesc():
+def test_tlx_wave_converter_emission_does_not_infer_selected_memdesc_alias():
     emitted = converter_emission.emit_wave_module(_build_two_lds_store_target(select_load=True))
     lines = emitted.text.splitlines()
     load_line = next(line for line in lines if "wave.gather" in line)
-    load_index = lines.index(load_line)
-    store_tokens = [_ssa_result_name(line) for line in lines[:load_index] if "wave.scatter" in line]
-    barrier_lines = [line for line in lines[:load_index] if "wave.barrier" in line]
+    store_tokens = [_ssa_result_name(line) for line in lines if "wave.scatter" in line]
     assert len(store_tokens) == 2
-    assert len(barrier_lines) == 1
-    for token in store_tokens:
-        assert token in barrier_lines[0]
-    assert f"after {_ssa_result_name(barrier_lines[0])}" in load_line
+    assert "wave.barrier" not in emitted.text
+    load_dependency = re.search(r"\bafter (?P<token>%[\w#]+)", load_line)
+    assert load_dependency is not None
+    assert all(not _wave_token_depends_on(
+        emitted.text,
+        load_dependency.group("token"),
+        store_token,
+    ) for store_token in store_tokens)
     _run_wave_verify(emitted.text)
 
 
@@ -5674,39 +5757,56 @@ def test_tlx_wave_converter_emission_keeps_disjoint_static_memdesc_views_indepen
     _run_wave_verify(emitted.text)
 
 
-def test_tlx_wave_converter_emission_keeps_parent_memdesc_conservative_for_static_views():
+def test_tlx_wave_converter_emission_does_not_infer_parent_view_alias():
     emitted = converter_emission.emit_wave_module(_build_static_memdesc_view_store_target(parent_load=True))
     lines = emitted.text.splitlines()
     load_line = next(line for line in lines if "wave.gather" in line)
-    load_index = lines.index(load_line)
-    store_tokens = [_ssa_result_name(line) for line in lines[:load_index] if "wave.scatter" in line]
-    barrier_lines = [line for line in lines[:load_index] if "wave.barrier" in line]
+    store_tokens = [_ssa_result_name(line) for line in lines if "wave.scatter" in line]
     assert len(store_tokens) == 2
-    assert len(barrier_lines) == 1
-    for token in store_tokens:
-        assert token in barrier_lines[0]
-    assert f"after {_ssa_result_name(barrier_lines[0])}" in load_line
+    assert "wave.barrier" not in emitted.text
+    load_dependency = re.search(r"\bafter (?P<token>%[\w#]+)", load_line)
+    assert load_dependency is not None
+    assert all(not _wave_token_depends_on(
+        emitted.text,
+        load_dependency.group("token"),
+        store_token,
+    ) for store_token in store_tokens)
     _run_wave_verify(emitted.text)
 
 
 def test_tlx_wave_converter_verifier_rejects_dma_lds_release_segment():
-    target = _build_circular_memdesc_read_refill_target()
-    (dma_op, ) = [op for op in target.ops if op.kind == "buffer_load_to_local"]
-    values = list(target.values)
-    dma_result_id = dma_op.results[0]
-    values[dma_result_id] = replace(
-        values[dma_result_id],
+    builder = converter_target_ir.TargetBuilder()
+    memdesc = builder.add_value(converter_target_ir.TargetType("memdesc", "memdesc", "f32"), )
+    source = builder.add_value(converter_target_ir.TargetType(
+        "pointer",
+        "uniform_pointer",
+        "f32",
+    ), )
+    offsets = builder.add_value(converter_target_ir.TargetType(
+        "tensor",
+        "simd",
+        "index",
+        64,
+        1,
+    ), )
+    completion = builder.add_value(
+        converter_target_ir.TargetType("token", "token"),
         event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
     )
-    target = replace(target, values=tuple(values))
-    target = _with_target_op_attrs(
-        target,
-        dma_op.target_op_id,
-        lds_release_dependency_count=0,
+    builder.set_kernel_arg_targets((memdesc, source, offsets))
+    builder.add_op(
+        "buffer_load_to_local",
+        operands=(memdesc, source, offsets),
+        results=(completion, ),
+        attrs={
+            "issue_dependency_count": 0,
+            "source_issue_dependency_count": 0,
+            "lds_release_dependency_count": 0,
+        },
     )
 
     with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_verifier.verify_target_program(target)
+        converter_verifier.verify_target_program(builder.build())
 
     assert exc_info.value.code == "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS"
 
@@ -5729,11 +5829,7 @@ def test_tlx_wave_converter_emission_keeps_disjoint_circular_slots_independent(
 
     assert "wave.barrier" not in emitted.text
     load_line = next(line for line in emitted.text.splitlines() if "wave.gather" in line)
-    copy_line = next(
-        line
-        for line in emitted.text.splitlines()
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    copy_line = next(line for line in emitted.text.splitlines() if "wave.gather" in line and "#waveamd.buffer" in line)
     assert not _ssa_value_is_used(copy_line, _ssa_second_result_name(load_line))
     _run_wave_verify(emitted.text)
 
@@ -5750,11 +5846,7 @@ def test_tlx_wave_converter_emission_does_not_infer_dma_dependency_for_unproven_
     emitted = converter_emission.emit_wave_module(_build_circular_memdesc_read_refill_target(**kwargs))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
 
     read_token = _ssa_second_result_name(lines[load_index])
     assert load_index < copy_index
@@ -5766,13 +5858,14 @@ def test_tlx_wave_converter_emission_does_not_infer_dma_dependency_for_unproven_
 def test_tlx_wave_converter_emission_waits_only_explicit_async_dma_groups():
     emitted = converter_emission.emit_wave_module(_build_independent_async_dma_wait_target())
     join_lines = [line for line in emitted.text.splitlines() if "wave.join" in line]
-    barrier_lines = [line for line in emitted.text.splitlines() if "wave.barrier" in line]
+    wait_lines = [line for line in emitted.text.splitlines() if "wave.after" in line]
 
     assert len(join_lines) == 2
-    assert len(barrier_lines) == 1
+    assert len(wait_lines) == 1
+    assert "wave.barrier" not in emitted.text
     waited_group_token, live_group_token = map(_ssa_result_name, join_lines)
-    assert waited_group_token in barrier_lines[0]
-    assert live_group_token not in barrier_lines[0]
+    assert waited_group_token in wait_lines[0]
+    assert live_group_token not in wait_lines[0]
     _run_wave_verify(emitted.text)
 
 
@@ -5826,11 +5919,7 @@ def test_tlx_wave_converter_emission_does_not_add_mma_read_dependency_to_dma():
     emitted = converter_emission.emit_wave_module(_build_mma_read_then_dma_reuse_target())
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
     read_token = _ssa_second_result_name(lines[load_index])
 
     assert "wave.barrier" not in "\n".join(lines[load_index + 1:copy_index])
@@ -5842,11 +5931,7 @@ def test_tlx_wave_converter_emission_does_not_barrier_multi_wave_mma_read_before
     emitted = converter_emission.emit_wave_module(_build_mma_read_then_dma_reuse_target(num_warps=4))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
     read_token = _ssa_second_result_name(lines[load_index])
 
     assert emitted.text.count("wave.barrier") == 0
@@ -5863,24 +5948,16 @@ def test_tlx_wave_converter_emission_does_not_carry_mma_read_dependency_to_loop_
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
     loop_index = next(index for index, line in enumerate(lines) if "scf.for" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if index > loop_index
-        and "wave.gather" in line
-        and "#waveamd.buffer" in line
-    )
+    copy_index = next(index for index, line in enumerate(lines)
+                      if index > loop_index and "wave.gather" in line and "#waveamd.buffer" in line)
     read_token = _ssa_second_result_name(lines[load_index])
-    loop_token_args = _loop_iter_arg_names(lines[loop_index])
 
     assert load_index < loop_index < copy_index
-    assert lines[loop_index].count("!wave.mem.token") == 2
-    assert read_token in lines[loop_index]
+    assert "iter_args" not in lines[loop_index]
+    assert "!wave.mem.token" not in lines[loop_index]
+    assert read_token not in lines[loop_index]
     assert "wave.barrier" not in emitted.text
-    assert all(
-        not _ssa_value_is_used(lines[copy_index], token)
-        for token in loop_token_args
-    )
+    assert not _ssa_value_is_used(lines[copy_index], read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5892,20 +5969,18 @@ def test_tlx_wave_converter_emission_keeps_group_wait_separate_from_mma_read_fro
         ))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
-    barrier_indices = [index for index, line in enumerate(lines) if "wave.barrier" in line]
-    barrier_index = barrier_indices[0]
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
+    wait_indices = [index for index, line in enumerate(lines) if "wave.after" in line]
+    (wait_index, ) = wait_indices
     read_token = _ssa_second_result_name(lines[load_index])
-    barrier_token = _ssa_result_name(lines[barrier_index])
+    wait_token = _ssa_result_name(lines[wait_index])
+    commit_token = _ssa_result_name(next(line for line in lines if "wave.join" in line))
 
-    assert len(barrier_indices) == 1
-    assert load_index < copy_index < barrier_index
+    assert "wave.barrier" not in emitted.text
+    assert load_index < copy_index < wait_index
     assert not _ssa_value_is_used(lines[copy_index], read_token)
-    assert not _wave_token_depends_on(emitted.text, barrier_token, read_token)
+    assert f"{wait_token} = wave.after {commit_token}" in lines[wait_index]
+    assert not _wave_token_depends_on(emitted.text, wait_token, read_token)
     _run_wave_verify(emitted.text)
 
 
@@ -5917,11 +5992,7 @@ def test_tlx_wave_converter_emission_does_not_materialize_mfma_boundary_for_dma(
         ))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
     read_token = _ssa_second_result_name(lines[load_index])
 
     assert load_index < copy_index
@@ -5950,27 +6021,16 @@ def test_tlx_wave_converter_emission_does_not_materialize_mfma_boundaries_for_dm
             second_root=True,
         ))
     lines = emitted.text.splitlines()
-    copy_lines = [
-        line
-        for line in lines
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    ]
-    read_tokens = [
-        _ssa_second_result_name(line)
-        for line in lines
-        if "wave.gather" in line and "#wave.shared" in line
-    ]
+    copy_lines = [line for line in lines if "wave.gather" in line and "#waveamd.buffer" in line]
+    read_tokens = [_ssa_second_result_name(line) for line in lines if "wave.gather" in line and "#wave.shared" in line]
 
     assert emitted.text.count("wave.barrier") == 0
     assert len(copy_lines) == 2
-    assert all(
-        all(not _ssa_value_is_used(line, token) for token in read_tokens)
-        for line in copy_lines
-    )
+    assert all(all(not _ssa_value_is_used(line, token) for token in read_tokens) for line in copy_lines)
     _run_wave_verify(emitted.text)
 
 
-def test_tlx_wave_converter_emission_does_not_use_dominating_barrier_as_dma_dependency():
+def test_tlx_wave_converter_emission_does_not_use_dominating_wait_as_dma_dependency():
     emitted = converter_emission.emit_wave_module(
         _build_mma_read_then_dma_reuse_target(
             num_warps=4,
@@ -5979,22 +6039,18 @@ def test_tlx_wave_converter_emission_does_not_use_dominating_barrier_as_dma_depe
             second_root=True,
         ))
     lines = emitted.text.splitlines()
-    barrier_lines = [line for line in lines if "wave.barrier" in line]
-    copy_lines = [
-        line
-        for line in lines
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    ]
+    wait_lines = [line for line in lines if "wave.after" in line]
+    copy_lines = [line for line in lines if "wave.gather" in line and "#waveamd.buffer" in line]
 
-    assert len(barrier_lines) == 1
+    assert len(wait_lines) == 1
     assert len(copy_lines) == 2
-    assert "wave.barrier : ()" not in barrier_lines[0]
-    barrier_token = _ssa_result_name(barrier_lines[0])
-    assert all(f"after {barrier_token}" not in line for line in copy_lines)
+    assert "wave.barrier" not in emitted.text
+    wait_token = _ssa_result_name(wait_lines[0])
+    assert all(f"after {wait_token}" not in line for line in copy_lines)
     _run_wave_verify(emitted.text)
 
 
-def test_tlx_wave_converter_emission_does_not_add_dma_barrier_after_new_mma_read():
+def test_tlx_wave_converter_emission_does_not_add_dma_wait_after_new_mma_read():
     emitted = converter_emission.emit_wave_module(
         _build_mma_read_then_dma_reuse_target(
             num_warps=4,
@@ -6003,25 +6059,17 @@ def test_tlx_wave_converter_emission_does_not_add_dma_barrier_after_new_mma_read
             reload_after_boundary=True,
         ))
     lines = emitted.text.splitlines()
-    load_indices = [
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#wave.shared" in line
-    ]
-    barrier_indices = [index for index, line in enumerate(lines) if "wave.barrier" in line]
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    load_indices = [index for index, line in enumerate(lines) if "wave.gather" in line and "#wave.shared" in line]
+    wait_indices = [index for index, line in enumerate(lines) if "wave.after" in line]
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
 
     assert len(load_indices) == 2
-    assert len(barrier_indices) == 1
-    assert load_indices[0] < barrier_indices[0] < load_indices[1] < copy_index
+    assert len(wait_indices) == 1
+    assert load_indices[0] < wait_indices[0] < load_indices[1] < copy_index
     second_read_token = _ssa_second_result_name(lines[load_indices[1]])
-    barrier_token = _ssa_result_name(lines[barrier_indices[0]])
+    wait_token = _ssa_result_name(lines[wait_indices[0]])
     assert not _ssa_value_is_used(lines[copy_index], second_read_token)
-    assert f"after {barrier_token}" not in lines[copy_index]
+    assert f"after {wait_token}" not in lines[copy_index]
     _run_wave_verify(emitted.text)
 
 
@@ -6033,16 +6081,8 @@ def test_tlx_wave_converter_emission_drops_mfma_boundary_before_dma_after_new_re
             reload_after_boundary=True,
         ))
     lines = emitted.text.splitlines()
-    load_indices = [
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#wave.shared" in line
-    ]
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    load_indices = [index for index, line in enumerate(lines) if "wave.gather" in line and "#wave.shared" in line]
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
     second_read_token = _ssa_second_result_name(lines[load_indices[-1]])
 
     assert emitted.text.count("wave.barrier") == 0
@@ -6060,11 +6100,7 @@ def test_tlx_wave_converter_emission_ignores_masked_mfma_boundary():
         ))
     lines = emitted.text.splitlines()
     load_index = next(index for index, line in enumerate(lines) if "wave.gather" in line)
-    copy_index = next(
-        index
-        for index, line in enumerate(lines)
-        if "wave.gather" in line and "#waveamd.buffer" in line
-    )
+    copy_index = next(index for index, line in enumerate(lines) if "wave.gather" in line and "#waveamd.buffer" in line)
     read_token = _ssa_second_result_name(lines[load_index])
 
     assert emitted.text.count("wave.barrier") == 0
@@ -6074,7 +6110,10 @@ def test_tlx_wave_converter_emission_ignores_masked_mfma_boundary():
 
 
 @pytest.mark.parametrize("prestore", [False, True])
-def test_tlx_wave_converter_emission_carries_implicit_lds_token_across_for(tmp_path, prestore):
+def test_tlx_wave_converter_does_not_carry_implicit_lds_token_across_for(
+    tmp_path,
+    prestore,
+):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -6099,26 +6138,16 @@ def test_tlx_wave_converter_emission_carries_implicit_lds_token_across_for(tmp_p
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
-    (loop_match, ) = _scf_for_matches(wave)
-    loop_result = _ssa_result_name(loop_match.group(0))
-    loop_token_args = _loop_iter_arg_names(loop_match.group(0))
-    assert len(loop_token_args) == 1
-    loop_body = wave[loop_match.end():wave.index("scf.yield", loop_match.end())]
-    inner_store_line = next(line for line in loop_body.splitlines() if "wave.store" in line)
-    inner_barrier_line = next(line for line in loop_body.splitlines() if "wave.barrier" in line)
-    inner_barrier = _ssa_result_name(inner_barrier_line)
-    (loop_token_arg, ) = loop_token_args
-    assert f"wave.barrier {loop_token_arg}" in inner_barrier_line
-    assert f"after {inner_barrier}" in inner_store_line
-    inner_store = _ssa_result_name(inner_store_line)
-    assert f"scf.yield {inner_store} : !wave.mem.token" in wave
-    after_loop = wave[wave.index("}", loop_match.end()):]
-    post_loop_barrier_line = next(line for line in after_loop.splitlines() if "wave.barrier" in line)
-    post_loop_barrier = _ssa_result_name(post_loop_barrier_line)
-    assert f"wave.barrier {loop_result}" in post_loop_barrier_line
-    post_loop_load_line = next(line for line in after_loop.splitlines() if "wave.load" in line)
-    assert f"after {post_loop_barrier}" in post_loop_load_line
+    (loop_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    assert converter_target_ir.attrs_dict(loop_op)["init_arg_count"] == 0
+    assert not loop_op.results
+    local_ops = [op for op in output.target_program.ops if op.kind in {"local_load", "local_store"}]
+    assert all(converter_target_ir.attrs_dict(op)["explicit_dependency_count"] == 0 for op in local_ops)
+    assert all(len(op.operands) == (2 if op.kind == "local_store" else 1) for op in local_ops)
+    wave = output.emitted_module.text
+    loop_line = next(line for line in wave.splitlines() if "scf.for" in line)
+    assert "iter_args" not in loop_line
+    assert "wave.barrier" not in wave
     _run_wave_verify(wave)
     del ctx
 
@@ -6911,10 +6940,6 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
     if case["version_dir"] in {"wave_8wave", "wave_4wave_specialized"}:
         assert "wave.sched_barrier" not in wave_artifact
         assert "memdesc_subslice" not in wave_artifact
-    if case["version_dir"] == "wave_4wave_specialized":
-        # Five publication/reuse rendezvous remain, plus one compiler-owned
-        # issue-epoch barrier between the two closed prologue stages.
-        assert wave_artifact.count("wave.barrier") == 6
     if case.get("id") == "v9_beyond_hotloop_transposed_b":
         lowered_wave = _run_wave_lower_symbolic_memory(wave_artifact)
         barrier_lines = [line for line in lowered_wave.splitlines() if "wave.barrier" in line]
@@ -6924,88 +6949,29 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
         ]
         dma_lines = [line for line in lowered_wave.splitlines() if "waveamd.dma_load_lds" in line]
         issue_lines = [line for line in lowered_wave.splitlines() if "wave.issue_token" in line]
-        join_inputs = {}
-        for line in lowered_wave.splitlines():
-            if "wave.join" not in line:
-                continue
-            result = _ssa_result_name(line)
-            operands = re.findall(r"%[A-Za-z0-9_]+", line.split(":", 1)[0])
-            join_inputs[result] = set(operands) - {result}
-
-        def flatten_join_inputs(token):
-            pending = [token]
-            inputs = set()
-            while pending:
-                current = pending.pop()
-                if current in inputs:
-                    continue
-                inputs.add(current)
-                pending.extend(join_inputs.get(current, ()))
-            return inputs
-
-        # Six readiness-frontier barriers publish explicit wait completion.
-        # Earlier publication barriers may remain transitive inputs. Compiler
-        # barriers order DMA issue only through issue-token projections.
-        assert len(barrier_lines) == 12
+        # Source barriers remain literal barriers. Implicit wait readiness is
+        # represented by SSA dependencies on the loads, not bridge-created
+        # publication barriers.
+        assert barrier_lines
         assert shared_load_lines
-        shared_load_dependency_sets = []
-        for line in shared_load_lines:
-            after = re.search(r"\bafter (%[A-Za-z0-9_]+)", line)
-            assert after is not None
-            shared_load_dependency_sets.append(flatten_join_inputs(after.group(1)))
-        shared_load_dependencies = set().union(*shared_load_dependency_sets)
-        load_ready_tokens = {token for token in barrier_tokens if token in shared_load_dependencies}
-        transitive_ready_tokens = set()
-        for line in barrier_lines:
-            result = _ssa_result_name(line)
-            if result not in load_ready_tokens:
-                continue
-            operands = set(re.findall(
-                r"%[A-Za-z0-9_]+",
-                line.split(":", 1)[0],
-            )) - {result}
-            for operand in operands:
-                transitive_ready_tokens.update(
-                    flatten_join_inputs(operand) & load_ready_tokens
-                )
-        load_ready_frontier = load_ready_tokens - transitive_ready_tokens
+        assert all(re.search(r"\bafter %[A-Za-z0-9_]+", line) for line in shared_load_lines)
         dma_barrier_tokens = {token for token in barrier_tokens if any(f"after {token}" in line for line in dma_lines)}
         barrier_issue_tokens = {
             _ssa_result_name(line)
             for line in issue_lines
-            if any(token in line for token in barrier_tokens)
+            if any(_wave_token_depends_on(
+                lowered_wave,
+                _ssa_result_name(line),
+                token,
+            ) for token in barrier_tokens)
         }
         dma_barrier_issue_tokens = {
             token
             for token in barrier_issue_tokens
             if any(f"after {token}" in line for line in dma_lines)
         }
-        assert len(load_ready_frontier) == 6
-        assert all(
-            dependencies & load_ready_frontier
-            for dependencies in shared_load_dependency_sets
-        )
         assert dma_barrier_tokens == set()
-        assert len(dma_barrier_issue_tokens) == 1
-        other_barrier_tokens = barrier_tokens - load_ready_tokens
-        dependency_free_barrier_tokens = {
-            _ssa_result_name(line)
-            for line in barrier_lines
-            if ": () -> !wave.mem.token" in line
-        }
-        barrier_issue_source_tokens = barrier_tokens.intersection({
-            operand
-            for line in issue_lines
-            for operand in re.findall(
-                r"%[A-Za-z0-9_]+",
-                line.split(":", 1)[0],
-            )[1:]
-        })
-        assert dependency_free_barrier_tokens
-        assert other_barrier_tokens == (
-            dependency_free_barrier_tokens | barrier_issue_source_tokens
-        )
-        assert all(all(f"after {token}" not in line for token in load_ready_tokens) for line in dma_lines)
+        assert dma_barrier_issue_tokens
 
 
 @pytest.mark.parametrize(
@@ -7629,21 +7595,22 @@ def test_tlx_wave_converter_handles_alternative_if_async_groups(
     assert carry.then_source_value_id == then_group_op.results[0]
     assert carry.else_source_value_id == else_group_op.results[0]
 
-    if wait_group:
-        with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-            converter_pipeline.convert_ttgir_to_wave(mod)
-        diagnostic = exc_info.value
-        assert diagnostic.code == "TLXW_OP_UNSUPPORTED_IF_TOKENS"
-        assert "path-sensitive branch queue lengths" in str(diagnostic)
-        del ctx
-        return
-
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (target_if_op, ) = [op for op in output.target_program.ops if op.kind == "if"]
     (target_wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
+    wait_attrs = converter_target_ir.attrs_dict(target_wait_op)
     assert len(target_if_op.results) == 1
-    assert target_wait_op.operands == target_if_op.results
+    if wait_group:
+        (issue_op, ) = [op for op in output.target_program.ops if op.kind == "issue_token"]
+        assert issue_op.operands == target_if_op.results
+        assert target_wait_op.operands == issue_op.results
+        assert wait_attrs["completed_group_dependency_count"] == 0
+        assert wait_attrs["retained_issue_dependency_count"] == 1
+    else:
+        assert target_wait_op.operands == target_if_op.results
+        assert wait_attrs["completed_group_dependency_count"] == 1
+        assert wait_attrs["retained_issue_dependency_count"] == 0
     assert all("token" not in
                [output.target_program.ops[op_id].kind
                 for op_id in output.target_program.regions[region_id].op_ids]
@@ -7652,7 +7619,7 @@ def test_tlx_wave_converter_handles_alternative_if_async_groups(
     del ctx
 
 
-def test_tlx_wave_converter_rejects_if_wait_on_sibling_async_group(tmp_path):
+def test_tlx_wave_converter_scopes_implicit_wait_to_its_if_branch(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -7680,13 +7647,26 @@ def test_tlx_wave_converter_rejects_if_wait_on_sibling_async_group(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
 
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_pipeline.convert_ttgir_to_wave(mod)
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_OP_UNSUPPORTED_IF_TOKENS"
-    assert diagnostic.stage == "op_conversion"
-    assert diagnostic.no_fallback is True
+    (target_if_op, ) = [op for op in output.target_program.ops if op.kind == "if"]
+    then_region, else_region = (output.target_program.regions[region_id] for region_id in target_if_op.region_ids)
+    then_ops = tuple(output.target_program.ops[op_id] for op_id in then_region.op_ids)
+    else_ops = tuple(output.target_program.ops[op_id] for op_id in else_region.op_ids)
+    assert not target_if_op.results
+    assert [op.kind for op in then_ops] == [
+        "buffer_load_to_local",
+        "async_commit_group",
+    ]
+    assert [op.kind for op in else_ops] == [
+        "buffer_load_to_local",
+        "async_commit_group",
+        "async_wait",
+    ]
+    else_group = next(op for op in else_ops if op.kind == "async_commit_group")
+    else_wait = next(op for op in else_ops if op.kind == "async_wait")
+    assert else_wait.operands == else_group.results
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -8039,7 +8019,9 @@ def _wave_token_depends_on(wave, token, dependency):
             continue
         seen.add(current)
         match = re.search(
-            rf"{re.escape(current)} = wave\.(?:join|barrier) (?P<operands>[^\n]*)-> !wave\.mem\.token",
+            rf"{re.escape(current)} = wave\."
+            rf"(?:join|barrier|after|issue_token) "
+            rf"(?P<operands>[^\n]*)-> !wave\.mem\.token",
             wave,
         )
         if match is None:
@@ -8166,12 +8148,9 @@ def test_tlx_wave_converter_loop_dma_group_is_not_an_implicit_ds_dependency(tmp_
 
     (for_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
     region = output.target_program.regions[for_op.region_ids[0]]
-    block_arg_domains = [
-        output.target_program.values[target_id].event_domain
-        for target_id in region.block_arg_ids[1:]
-    ]
+    block_arg_domains = [output.target_program.values[target_id].event_domain for target_id in region.block_arg_ids[1:]]
     queue_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_DMA_GROUP)
-    ready_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_WORKGROUP_READY)
+    ready_index = block_arg_domains.index(converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY)
 
     wave = _run_wave_lower_symbolic_memory(output.emitted_module.text)
     (loop_match, ) = _scf_for_matches(wave)
@@ -8179,8 +8158,7 @@ def test_tlx_wave_converter_loop_dma_group_is_not_an_implicit_ds_dependency(tmp_
     queue_arg = iter_args[queue_index]
     ready_arg = iter_args[ready_index]
     loop_body = wave[loop_match.end():]
-    load_line = next(line for line in loop_body.splitlines()
-                     if "wave.gather" in line or "wave.load" in line)
+    load_line = next(line for line in loop_body.splitlines() if "wave.gather" in line or "wave.load" in line)
     load_dependency = re.search(r"after (?P<token>%[\w#]+)", load_line)
     assert load_dependency is not None
     load_dependency = load_dependency.group("token")
@@ -8436,11 +8414,8 @@ def test_tlx_wave_converter_pipeline_preserves_waited_slot_carry_for_dynamic_loa
     (loop_match, ) = _scf_for_matches(wave)
     iter_args = _loop_iter_arg_names(loop_match.group(0))
     loop_body = wave[loop_match.end():]
-    load_pos = min(
-        position
-        for marker in ("wave.load", "waveamd.transpose_load")
-        if (position := loop_body.find(marker)) >= 0
-    )
+    load_pos = min(position for marker in ("wave.load", "waveamd.transpose_load")
+                   if (position := loop_body.find(marker)) >= 0)
     wait_ready = next(re.finditer(r"(?P<token>%\d+) = wave\.after (?P<operands>[^\n]+)", loop_body[load_pos:]))
     wait_token = wait_ready.group("token")
     yield_values = re.findall(r"%[\w#]+", re.search(r"scf\.yield (?P<values>[^\n]+?) :", loop_body).group("values"))
@@ -8544,9 +8519,9 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_circular_refill(
     dma_index = loop_body.index("waveamd.dma_load_lds")
     barrier_indices = [match.start() for match in re.finditer(r"wave\.barrier", loop_body[:dma_index])]
     sched_barrier_indices = [match.start() for match in re.finditer(r"wave\.sched_barrier", loop_body[:dma_index])]
-    assert len(barrier_indices) == 2
+    assert len(barrier_indices) == 1
     assert not sched_barrier_indices
-    assert barrier_indices[0] < load_index < barrier_indices[1] < dma_index
+    assert load_index < barrier_indices[0] < dma_index
     assert all(op.kind != "lds_release" for op in output.target_program.ops)
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     assert len(dma_ops) == 2
@@ -8572,7 +8547,7 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_circular_refill(
     _run_wave_verify(wave)
     if slot_count == 2:
         machine = _run_waveamd_to_machine(wave)
-        assert machine.count("waveamdmachine.s_barrier") == 2
+        assert machine.count("waveamdmachine.s_barrier") == 1
     del ctx
 
 
@@ -8598,9 +8573,9 @@ def test_tlx_wave_converter_pipeline_does_not_infer_dma_dependency_from_circular
     dma_index = loop_body.index("waveamd.dma_load_lds")
     barrier_indices = [match.start() for match in re.finditer(r"wave\.barrier", loop_body[:dma_index])]
     sched_barrier_indices = [match.start() for match in re.finditer(r"wave\.sched_barrier", loop_body[:dma_index])]
-    assert len(barrier_indices) == 2
+    assert len(barrier_indices) == 1
     assert not sched_barrier_indices
-    assert barrier_indices[0] < load_index < barrier_indices[1] < dma_index
+    assert load_index < barrier_indices[0] < dma_index
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     dma_attrs = converter_target_ir.attrs_dict(dma_ops[-1])
     assert dma_attrs["issue_dependency_count"] == 0
@@ -8648,8 +8623,8 @@ def test_tlx_wave_converter_keeps_compiler_reuse_barrier_with_warp_pipeline(tmp_
     load_index = loop_body.index("wave.load")
     dma_index = loop_body.index("waveamd.dma_load_lds")
     barrier_indices = [match.start() for match in re.finditer(r"wave\.barrier", loop_body)]
-    assert len(barrier_indices) == 3
-    assert (barrier_indices[0] < load_index < barrier_indices[1] < dma_index < barrier_indices[2])
+    assert len(barrier_indices) == 2
+    assert load_index < barrier_indices[0] < dma_index < barrier_indices[1]
     dma_ops = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     assert converter_target_ir.attrs_dict(dma_ops[-1])["issue_dependency_count"] == 0
     assert all(op.kind != "lds_release" for op in output.target_program.ops)
@@ -8657,7 +8632,7 @@ def test_tlx_wave_converter_keeps_compiler_reuse_barrier_with_warp_pipeline(tmp_
     assert "waveamd.set_priority 0" in loop_body
     _run_wave_verify(wave)
     machine = _run_waveamd_to_machine(wave)
-    assert machine.count("waveamdmachine.s_barrier") == 3
+    assert machine.count("waveamdmachine.s_barrier") == 2
     del ctx
 
 
@@ -9320,34 +9295,21 @@ def test_tlx_wave_converter_keeps_dma_pointer_conversion_inside_loop(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    (dma_op,) = [
-        op for op in output.target_program.ops
-        if op.kind == "buffer_load_to_local"
-    ]
+    (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     dma_attrs = converter_target_ir.attrs_dict(dma_op)
     _assert_mechanical_symbolic_copy(dma_attrs, masked=False)
     assert "source_pointer_mode" not in dma_attrs
     pointer_type = output.target_program.values[dma_op.operands[1]].type
     assert pointer_type.representation == "uniform_pointer"
     assert pointer_type.component_count == 1
-    assert not [
-        op for op in output.target_program.ops if op.kind == "make_buffer"
-    ]
+    assert not [op for op in output.target_program.ops if op.kind == "make_buffer"]
 
-    (for_op,) = [
-        op for op in output.target_program.ops if op.kind == "for_loop"
-    ]
+    (for_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
     region = output.target_program.regions[for_op.region_ids[0]]
-    assert all(
-        output.target_program.values[value_id].type.representation
-        != "buffer_pointer"
-        for value_id in for_op.operands[3:]
-    )
-    assert all(
-        output.target_program.values[value_id].type.representation
-        != "buffer_pointer"
-        for value_id in region.block_arg_ids[1:]
-    )
+    assert all(output.target_program.values[value_id].type.representation != "buffer_pointer"
+               for value_id in for_op.operands[3:])
+    assert all(output.target_program.values[value_id].type.representation != "buffer_pointer"
+               for value_id in region.block_arg_ids[1:])
 
     raw_wave = output.emitted_module.text
     assert raw_wave.count("waveamd.make_buffer") == 1
@@ -9394,10 +9356,7 @@ def test_tlx_wave_converter_dma_affine_offset_marks_layout_math_nsw(tmp_path):
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
-    assert all(
-        op.kind != "affine_materialize"
-        for op in output.target_program.ops
-    )
+    assert all(op.kind != "affine_materialize" for op in output.target_program.ops)
     wave = output.emitted_module.text
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
@@ -9623,10 +9582,7 @@ def test_tlx_wave_converter_keeps_padded_dot_b_dma_packet(tmp_path, ):
     _assert_mechanical_symbolic_copy(attrs, masked=True)
     raw_wave = output.emitted_module.text
     assert raw_wave.count("wave.where") == 1
-    assert sum(
-        "wave.gather" in line and "#waveamd.buffer" in line
-        for line in raw_wave.splitlines()
-    ) == 1
+    assert sum("wave.gather" in line and "#waveamd.buffer" in line for line in raw_wave.splitlines()) == 1
     assert raw_wave.count("wave.scatter") == 1
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
@@ -10256,11 +10212,7 @@ def test_tlx_wave_converter_packetizes_replicated_eight_wave_i8_copy(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    (copy_op, ) = [
-        op
-        for op in output.target_program.ops
-        if op.kind == "buffer_load_to_local"
-    ]
+    (copy_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(copy_op)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
     raw_wave = output.emitted_module.text
@@ -10307,11 +10259,7 @@ def test_tlx_wave_converter_packetizes_replicated_four_wave_i8_copy(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    (copy_op, ) = [
-        op
-        for op in output.target_program.ops
-        if op.kind == "buffer_load_to_local"
-    ]
+    (copy_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(copy_op)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
     raw_wave = output.emitted_module.text
@@ -11583,16 +11531,11 @@ def test_tlx_wave_converter_reuses_equivalent_redistribution_plans(
     output = _convert_ttgir_to_wave_keep_dead(mod)
 
     assert calls == 1
-    assert sum(
-        op.kind == "layout_convert"
-        for op in output.target_program.ops
-    ) == 2
+    assert sum(op.kind == "layout_convert" for op in output.target_program.ops) == 2
     del ctx
 
 
-def test_tlx_wave_converter_reuses_equivalent_fragment_local_load_plans(
-    monkeypatch,
-):
+def test_tlx_wave_converter_reuses_equivalent_fragment_local_load_plans(monkeypatch, ):
     shared0 = _fake_layout(
         0,
         1,
@@ -13176,9 +13119,7 @@ def test_tlx_wave_converter_preserves_rotated_linear_register_packet_cast(tmp_pa
     assert "register_packet_width" not in attrs
     assert "register_packet_scalar_slots" not in attrs
     wave = output.emitted_module.text
-    assert wave.count(
-        "wave.cast fpconvert"
-    ) == 1
+    assert wave.count("wave.cast fpconvert") == 1
     assert "!wave.simd<vector<16xf32>, 64>" not in wave
     assert "!wave.simd<vector<16xbf16>, 64>" not in wave
     _run_wave_verify(wave)
@@ -13264,10 +13205,7 @@ def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    (store_op, ) = [
-        op for op in output.target_program.ops
-        if op.kind == "buffer_store"
-    ]
+    (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert attrs["redundant_register_mask"] == 2
     assert attrs["redundant_lane_mask"] == 1
@@ -15157,7 +15095,7 @@ def test_tlx_wave_converter_preserves_explicit_local_load_wait_token(tmp_path):
     (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load_mma_payload"]
     assert load_op.operands[1:] == wait_op.results
-    assert converter_target_ir.attrs_dict(load_op)["synced_via_async_wait"] is True
+    assert converter_target_ir.attrs_dict(load_op)["explicit_dependency_count"] == 1
     load_lines = [line for line in output.emitted_module.text.splitlines() if "wave.gather" in line]
     assert load_lines
     assert all(" after " in line for line in load_lines)
@@ -15200,7 +15138,7 @@ def test_tlx_wave_converter_partial_wait_keeps_retained_group_issue_only(tmp_pat
     assert wait_attrs["waited_group_ids"] != wait_attrs["retained_group_ids"]
     assert wait_attrs["completed_group_dependency_count"] == 1
     assert wait_attrs["retained_issue_dependency_count"] == 1
-    assert wait_attrs["lds_release_dependency_count"] == 0
+    assert "lds_release_dependency_count" not in wait_attrs
     assert wait_op.operands == (commit_ops[0].results[0], issue_op.results[0])
     assert issue_op.operands == commit_ops[1].results
     assert output.target_program.values[issue_op.results[0]].event_domain == (
@@ -15209,101 +15147,11 @@ def test_tlx_wave_converter_partial_wait_keeps_retained_group_issue_only(tmp_pat
     assert wave.count("wave.issue_token") == 1
     issue_line = next(line for line in wave.splitlines() if "wave.issue_token" in line)
     issue_token = _ssa_result_name(issue_line)
-    assert any("wave.barrier" in line and issue_token in line for line in wave.splitlines())
+    assert any("wave.after" in line and issue_token in line for line in wave.splitlines())
     _run_wave_verify(wave)
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.issue_token" in machine
     del ctx
-
-
-def test_tlx_wave_emission_dma_commit_does_not_enter_lds_hazard_state():
-    builder = converter_target_ir.TargetBuilder()
-    token_type = converter_target_ir.TargetType("token", "token")
-    completion_target_id = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-    )
-    group_target_id = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_GROUP,
-    )
-    program = builder.build()
-    completion_token = object()
-    group_token = object()
-    synchronous_token = object()
-    local_root = 17
-
-    state = converter_emission._EmissionState(
-        None,
-        None,
-        SimpleNamespace(
-            join=lambda *tokens: group_token,
-        ),
-        program,
-        {completion_target_id: completion_token},
-    )
-    state.token_local_memory_root_sets[completion_target_id] = frozenset({
-        local_root,
-    })
-    state.local_memory_tokens[local_root] = synchronous_token
-    state.local_memory_pending_accesses[local_root] = "write"
-    op = converter_target_ir.TargetOp(
-        0,
-        "async_commit_group",
-        operands=(completion_target_id, ),
-        results=(group_target_id, ),
-    )
-
-    converter_emission._emit_async_commit_group(state, op)
-
-    assert state.values[group_target_id] is group_token
-    assert state.token_local_memory_root_sets[group_target_id] == frozenset({
-        local_root,
-    })
-    assert state.local_memory_tokens[local_root] is synchronous_token
-    assert state.local_memory_pending_accesses[local_root] == "write"
-
-
-def test_tlx_wave_emission_region_hazard_scan_excludes_async_dma():
-    builder = converter_target_ir.TargetBuilder()
-    memdesc_type = converter_target_ir.TargetType("memdesc", "memdesc", "f16")
-    payload_type = converter_target_ir.TargetType("tensor", "simd", "f16", 64)
-    token_type = converter_target_ir.TargetType("token", "token")
-    dma_alloc = builder.add_value(memdesc_type)
-    store_alloc = builder.add_value(memdesc_type)
-    payload = builder.add_value(payload_type)
-    dma_token = builder.add_value(
-        token_type,
-        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-    )
-    builder.add_op("local_alloc", results=(dma_alloc, ))
-    builder.add_op("local_alloc", results=(store_alloc, ))
-    builder.add_op(
-        "buffer_load_to_local",
-        operands=(dma_alloc, ),
-        results=(dma_token, ),
-        attrs={"mode": "symbolic_copy"},
-    )
-    builder.add_op(
-        "local_store",
-        operands=(payload, store_alloc),
-    )
-    program = builder.build()
-    state = converter_emission._EmissionState(
-        None,
-        None,
-        None,
-        program,
-        {},
-    )
-
-    touched, accesses = converter_emission._local_memory_roots_touched_by_region(
-        state,
-        0,
-    )
-
-    assert touched == frozenset({store_alloc})
-    assert accesses == {store_alloc: "write"}
 
 
 def test_tlx_wave_converter_threads_dominating_wait_without_relaxing_ordinary_load(tmp_path):
@@ -15336,33 +15184,20 @@ def test_tlx_wave_converter_threads_dominating_wait_without_relaxing_ordinary_lo
     relaxed_store, ordinary_store = [op for op in output.target_program.ops if op.kind == "local_store"]
     (ordinary_load, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
     assert relaxed_load.operands[1:] == wait_op.results
-    assert relaxed_store.operands[2:] == wait_op.results
-    assert ordinary_store.operands[2:] == wait_op.results
-    assert ordinary_load.operands[1:] == wait_op.results
-    assert converter_target_ir.attrs_dict(relaxed_load)["synced_via_async_wait"] is True
-    assert converter_target_ir.attrs_dict(ordinary_load)["synced_via_async_wait"] is False
-    load_lines = [line for line in output.emitted_module.text.splitlines() if "wave.gather" in line]
-    store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
-    assert len(load_lines) == 2
-    assert len(store_lines) == 2
-    assert all(" after " in line for line in load_lines)
-    assert all(" after " in line for line in store_lines)
-    barrier_lines = [line for line in output.emitted_module.text.splitlines() if "wave.barrier" in line]
-    assert len(barrier_lines) == 2
-    for store_line, load_line in zip(store_lines, load_lines):
-        store_token = _ssa_result_name(store_line)
-        load_dependency = re.search(r"after (?P<token>%[\w#]+)", load_line)
-        assert load_dependency is not None
-        assert _wave_token_depends_on(
-            output.emitted_module.text,
-            load_dependency.group("token"),
-            store_token,
-        )
+    assert relaxed_store.operands[2:] == ()
+    assert ordinary_store.operands[2:] == ()
+    assert ordinary_load.operands[1:] == ()
+    relaxed_attrs = converter_target_ir.attrs_dict(relaxed_load)
+    ordinary_attrs = converter_target_ir.attrs_dict(ordinary_load)
+    assert relaxed_attrs["synced_via_async_wait"] is True
+    assert relaxed_attrs["explicit_dependency_count"] == 1
+    assert ordinary_attrs["synced_via_async_wait"] is False
+    assert ordinary_attrs["explicit_dependency_count"] == 0
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_dominating_wait_avoids_duplicate_dma_ready_barrier(tmp_path):
+def test_tlx_wave_converter_marked_tokenless_load_consumes_wait_once(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -15376,7 +15211,7 @@ def test_tlx_wave_converter_dominating_wait_avoids_duplicate_dma_ready_barrier(t
     %copy = amdg.buffer_load_to_local %arg0[%range] into %alloc : <f16>[tensor<512xi32, #blocked>] -> <512xf16, #shared, #smem, mutable>
     %group = ttg.async_commit_group tokens %copy
     %wait = ttg.async_wait %group {num = 0 : i32}
-    %loaded = ttg.local_load %alloc : !ttg.memdesc<512xf16, #shared, #smem, mutable> -> tensor<512xf16, #blocked>
+    %loaded = ttg.local_load %alloc {ttg.amdg.syncedViaAsyncWait = true} : !ttg.memdesc<512xf16, #shared, #smem, mutable> -> tensor<512xf16, #blocked>
     tt.return
   }
 """
@@ -15394,25 +15229,18 @@ def test_tlx_wave_converter_dominating_wait_avoids_duplicate_dma_ready_barrier(t
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
     assert converter_target_ir.attrs_dict(dma_op)["mode"] == "symbolic_copy"
     load_attrs = converter_target_ir.attrs_dict(load_op)
-    assert load_attrs["synced_via_async_wait"] is False
-    assert load_attrs["readiness_dependency_count"] == 1
+    assert load_attrs["synced_via_async_wait"] is True
+    assert load_attrs["explicit_dependency_count"] == 1
     assert load_op.operands[1:] == wait_op.results
 
     wave = output.emitted_module.text
-    barrier_lines = [line for line in wave.splitlines() if "wave.barrier" in line]
-    load_line = next(
-        line
-        for line in wave.splitlines()
-        if "wave.gather" in line and "#wave.shared" in line
-    )
-    assert len(barrier_lines) == 1
-    barrier_token = _ssa_result_name(barrier_lines[0])
-    assert f"after {barrier_token}" in load_line
+    load_line = next(line for line in wave.splitlines() if "wave.gather" in line and "#wave.shared" in line)
+    assert " after " in load_line
     _run_wave_verify(wave)
     del ctx
 
 
-def test_tlx_wave_converter_closes_wait_dominated_ds_epochs_across_loop(tmp_path):
+def test_tlx_wave_converter_carries_implicit_wait_readiness_across_loop(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -15439,42 +15267,101 @@ def test_tlx_wave_converter_closes_wait_dominated_ds_epochs_across_loop(tmp_path
     converted = converter_types.convert_source_program(source)
     token_program = converter_tokens.build_token_program(source, converted)
     (source_loop, ) = [op for op in source.ops if op.name == "scf.for"]
+    source_waits = [op for op in source.ops if op.name == "ttg.async_wait"]
     readiness_carries = [
         carry for carry in token_program.loop_token_carries_by_op[source_loop.index] if carry.readiness_carry
     ]
-    assert len(readiness_carries) == 1
+    assert readiness_carries == [
+        converter_tokens.LoopTokenCarry(
+            loop_op_index=source_loop.index,
+            init_source_value_id=source_waits[0].results[0],
+            yield_source_value_id=source_waits[1].results[0],
+            add_issue_dependency=False,
+            issue_dependency_op_indices=(),
+            readiness_carry=True,
+        )
+    ]
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (loop_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
     loop_attrs = converter_target_ir.attrs_dict(loop_op)
-    assert loop_attrs["protocol_frontier_init_arg_indices"] == (1, )
-    assert len(loop_attrs["protocol_frontier_key_mappings"]) == 1
     wait_ops = [op for op in output.target_program.ops if op.kind == "async_wait"]
-    assert [converter_target_ir.attrs_dict(op)["lds_release_dependency_count"] for op in wait_ops] == [0, 2]
+    load_ops = [op for op in output.target_program.ops if op.kind == "local_load"]
+    target_region = output.target_program.regions[loop_op.region_ids[0]]
+    assert loop_attrs["source_result_count"] == 0
+    assert loop_attrs["init_arg_count"] == 1
+    assert loop_op.operands[-1:] == wait_ops[0].results
     assert output.target_program.values[loop_op.results[-1]].event_domain == (
-        converter_target_ir.EVENT_DOMAIN_LDS_FRONTIER)
-
-    wave = output.emitted_module.text
-    lines = wave.splitlines()
-    loop_index = next(index for index, line in enumerate(lines) if "scf.for" in line)
-    load_lines = [line for line in lines if "wave.gather" in line]
-    barrier_lines = [line for line in lines if "wave.barrier" in line]
-    assert len(load_lines) == 2
-    assert len(barrier_lines) == 2
-    assert lines.index(barrier_lines[0]) < lines.index(load_lines[0]) < loop_index
-    assert loop_index < lines.index(load_lines[1]) < lines.index(barrier_lines[1])
-    body_load_token = _ssa_second_result_name(load_lines[1])
-    assert _wave_token_depends_on(
-        wave,
-        _ssa_result_name(barrier_lines[1]),
-        body_load_token,
-    )
-    _run_wave_verify(wave)
+        converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY)
+    assert output.target_program.values[target_region.block_arg_ids[-1]].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY)
+    assert load_ops[0].operands[1:] == wait_ops[0].results
+    assert load_ops[1].operands[1:] == target_region.block_arg_ids[-1:]
+    assert target_region.yield_value_ids[-1:] == wait_ops[1].results
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_carries_open_wait_ds_epoch_out_of_loop(tmp_path):
+def test_tlx_wave_converter_closes_sequential_loop_wait_carries(tmp_path):
+    local_func = """
+  tt.func public @converter_sequential_wait_loop_epochs() attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    scf.for %i = %c0 to %c2 step %c1 {
+      %first_wait = ttg.async_wait {num = 0 : i32}
+      ttg.barrier all
+    }
+    scf.for %i = %c0 to %c2 step %c1 {
+      %second_wait = ttg.async_wait {num = 0 : i32}
+      ttg.barrier all
+    }
+    ttg.barrier all
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4)
+
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    token_program = converter_tokens.build_token_program(source, converted)
+    source_loops = [op for op in source.ops if op.name == "scf.for"]
+    source_waits = [op for op in source.ops if op.name == "ttg.async_wait"]
+    assert [
+        tuple(carry
+              for carry in token_program.loop_token_carries_by_op[loop.index]
+              if carry.readiness_carry)
+        for loop in source_loops
+    ] == [
+        (converter_tokens.LoopTokenCarry(
+            loop_op_index=source_loops[0].index,
+            init_source_value_id=None,
+            yield_source_value_id=source_waits[0].results[0],
+            add_issue_dependency=False,
+            issue_dependency_op_indices=(),
+            readiness_carry=True,
+        ), ),
+        (converter_tokens.LoopTokenCarry(
+            loop_op_index=source_loops[1].index,
+            init_source_value_id=source_waits[0].results[0],
+            yield_source_value_id=source_waits[1].results[0],
+            add_issue_dependency=False,
+            issue_dependency_op_indices=(),
+            readiness_carry=True,
+        ), ),
+    ]
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    target_loops = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    assert target_loops[1].operands[-1:] == target_loops[0].results[-1:]
+    assert all(converter_target_ir.attrs_dict(loop)["source_result_count"] == 0 for loop in target_loops)
+    _run_wave_verify(output.emitted_module.text)
+    del ctx
+
+
+def test_tlx_wave_converter_does_not_carry_readiness_without_backedge_wait(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -15496,23 +15383,30 @@ def test_tlx_wave_converter_carries_open_wait_ds_epoch_out_of_loop(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
 
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    token_program = converter_tokens.build_token_program(source, converted)
+    (source_loop, ) = [op for op in source.ops if op.name == "scf.for"]
+    assert not [
+        carry for carry in token_program.loop_token_carries_by_op.get(
+            source_loop.index,
+            (),
+        ) if carry.readiness_carry
+    ]
+
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = output.emitted_module.text
-    lines = wave.splitlines()
-    loop_line = next(line for line in lines if "scf.for" in line)
-    barrier_line = [line for line in lines if "wave.barrier" in line][-1]
-    loop_result = _ssa_result_name(loop_line)
-    assert _wave_token_depends_on(
-        wave,
-        _ssa_result_name(barrier_line),
-        loop_result,
-    )
-    _run_wave_verify(wave)
+    wait_ops = [op for op in output.target_program.ops if op.kind == "async_wait"]
+    (loop_op, ) = [op for op in output.target_program.ops if op.kind == "for_loop"]
+    (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
+    assert not loop_op.results
+    assert load_op.operands[1:] == wait_ops[0].results
+    assert not wait_ops[1].operands
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_merges_wait_dominated_ds_epoch_across_if(tmp_path):
+def test_tlx_wave_converter_does_not_merge_readiness_when_wait_precedes_if(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -15531,22 +15425,21 @@ def test_tlx_wave_converter_merges_wait_dominated_ds_epoch_across_if(tmp_path):
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
 
+    source = converter_source_import.import_source_program(mod)
+    converted = converter_types.convert_source_program(source)
+    token_program = converter_tokens.build_token_program(source, converted)
+    (source_if, ) = [op for op in source.ops if op.name == "scf.if"]
+    assert not token_program.if_token_carries_by_op.get(source_if.index)
+
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    wave = output.emitted_module.text
-    lines = wave.splitlines()
-    if_line = next(line for line in lines if "scf.if" in line)
-    load_line = next(line for line in lines if "wave.gather" in line)
-    barrier_lines = [line for line in lines if "wave.barrier" in line]
-    assert "!wave.mem.token" in if_line
-    assert len(barrier_lines) == 2
-    assert lines.index(barrier_lines[0]) < lines.index(load_line) < lines.index(barrier_lines[1])
-    assert _wave_token_depends_on(
-        wave,
-        _ssa_result_name(barrier_lines[1]),
-        _ssa_result_name(if_line),
-    )
-    _run_wave_verify(wave)
+    wait_ops = [op for op in output.target_program.ops if op.kind == "async_wait"]
+    (if_op, ) = [op for op in output.target_program.ops if op.kind == "if"]
+    (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
+    assert not if_op.results
+    assert load_op.operands[1:] == wait_ops[0].results
+    assert not wait_ops[1].operands
+    _run_wave_verify(output.emitted_module.text)
     del ctx
 
 
@@ -15760,10 +15653,7 @@ def test_tlx_wave_converter_pipeline_uses_compiler_barrier_for_async_refill(tmp_
             for op in output.target_program.ops
             if op.kind == "sched_barrier"] == [("mfma", 0)]
     assert raw_wave.count("wave.where") == 2
-    assert sum(
-        "wave.gather" in line and "#waveamd.buffer" in line
-        for line in raw_wave.splitlines()
-    ) == 2
+    assert sum("wave.gather" in line and "#waveamd.buffer" in line for line in raw_wave.splitlines()) == 2
     assert raw_wave.count("wave.scatter") == 2
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     lines = wave.splitlines()
@@ -17068,19 +16958,17 @@ def _assert_mechanical_symbolic_copy(attrs, *, masked=None):
     assert attrs["destination_offset_mode"] == "layout_coordinates"
     assert attrs["component_count"] > 0
     assert attrs["destination_coordinate_shape"]
-    assert len(attrs["destination_component_coordinate_bases"]) == attrs[
-        "component_count"
-    ]
+    assert len(attrs["destination_component_coordinate_bases"]) == attrs["component_count"]
     for policy_attr in (
-        "packet_bytes",
-        "packet_elements",
-        "mask_alignment",
-        "redundant_wave_mask",
-        "destination_component_offsets",
-        "destination_lane_stride_elements",
-        "destination_wave_stride_elements",
-        "destination_wave_stride_dwords",
-        "destination_wave_offset_coefficients_dwords",
+            "packet_bytes",
+            "packet_elements",
+            "mask_alignment",
+            "redundant_wave_mask",
+            "destination_component_offsets",
+            "destination_lane_stride_elements",
+            "destination_wave_stride_elements",
+            "destination_wave_stride_dwords",
+            "destination_wave_offset_coefficients_dwords",
     ):
         assert policy_attr not in attrs
     if masked is not None:
