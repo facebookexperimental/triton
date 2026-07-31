@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 from . import barrier_order
-from . import canonicalize
 from . import emission
 from . import facts
 from . import op_conversion
@@ -55,7 +54,6 @@ def convert_ttgir_to_wave(
             source_program=source_program,
             token_program=token_program,
         )
-    target_program = canonicalize.eliminate_dead_target_ops(target_program)
     emitted_module = emission.emit_wave_module(
         target_program,
         waves_per_eu=waves_per_eu,

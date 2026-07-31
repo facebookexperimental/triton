@@ -10,13 +10,6 @@ STAGE = "target_ir"
 TARGET_SCHEMA_VERSION = 3
 ADDRESS_ARITHMETIC_NO_OVERFLOW = "no_overflow"
 
-# Target values named by this attribute were consumed while proving or
-# constructing a structural replacement, but are not runtime operands of the
-# target operation.  Keeping the IDs as provenance lets verification and
-# diagnostics retain the source graph while target DCE can remove that graph
-# when it has no other semantic users.
-PROVENANCE_ONLY_TARGET_IDS_ATTR = "provenance_only_target_ids"
-
 # Token representations all lower to ``!wave.mem.token``, but protocol
 # verification must not confuse completion, issue ordering, LDS release, and
 # publication.  These domains are deliberately target-IR data rather than

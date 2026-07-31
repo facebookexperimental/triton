@@ -66,7 +66,6 @@ LOWERING_DOMAINS = (
         ),
         (
             "constant",
-            "affine_materialize",
             "type_convert",
             "binary",
             "float_binary",
