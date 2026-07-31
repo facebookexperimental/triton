@@ -262,14 +262,24 @@ static void emitClusterPriority(OpBuilder &r, Location loc,
 // backend scheduler cannot move ops across it, and emit the cluster's
 // priority just before the barrier.  Used in place of inserting a fresh
 // cluster barrier when one already exists at the cluster boundary.
+static bool providesLocalFence(Operation *op) {
+  if (isa<gpu::BarrierOp>(op))
+    return true;
+  if (auto barrier = dyn_cast<triton::gpu::BarrierOp>(op))
+    return barrier.hasLocal();
+  return false;
+}
+
 static void wrapExistingBarrier(OpBuilder &b, Location loc,
                                 Operation *clusterOp,
-                                Operation *existingBarrier,
-                                bool anyHasPriority) {
+                                Operation *existingBarrier, bool anyHasPriority,
+                                bool needLocal) {
   b.setInsertionPoint(existingBarrier);
   emitClusterPriority(b, loc, clusterOp, anyHasPriority);
   ROCDL::SchedBarrier::create(b, loc, 0);
   b.setInsertionPointAfter(existingBarrier);
+  if (needLocal && !providesLocalFence(existingBarrier))
+    mlir::triton::gpu::BarrierOp::create(b, loc, triton::gpu::AddrSpace::Local);
   ROCDL::SchedBarrier::create(b, loc, 0);
 }
 
@@ -415,12 +425,8 @@ private:
 
       if (auto exBar = existingBarrierMap.find(i);
           exBar != existingBarrierMap.end()) {
-        // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing
-        // barrier is not enough to satisfy LDS ordering.  For now we rely on
-        // the producer to place such barriers only where no local fence is
-        // needed.
         wrapExistingBarrier(b, loc, clusterOps[i], exBar->second,
-                            anyHasPriority);
+                            anyHasPriority, /*needLocal=*/bars[i]);
       } else {
         b.setInsertionPoint(clusterOps[i]);
         // The first one wraps back to the last of the loop
@@ -547,11 +553,8 @@ static void emitPipelinedFlat(SmallVector<scf::ExecuteRegionOp> &clusterOps,
     }
 
     if (existingBarrier) {
-      // FIXME: If bars[i] is true, wrapping a non-LOCAL pre-existing barrier
-      // is not enough to satisfy LDS ordering.  For now we rely on the
-      // producer to place such barriers only where no local fence is needed.
       wrapExistingBarrier(b, loc, clusterOps[i], existingBarrier,
-                          anyHasPriority);
+                          anyHasPriority, /*needLocal=*/bars[i]);
     } else {
       b.setInsertionPoint(clusterOps[i]);
       emitClusterPriority(b, loc, clusterOps[i], anyHasPriority);

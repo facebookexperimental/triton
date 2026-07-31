@@ -237,8 +237,7 @@ class TLXWaveBackend(amd_compiler.HIPBackend):
         # direct-to-LDS epochs; they do not complete an async DMA group, which
         # remains the sole responsibility of ttg.async_wait.
         existing_barriers = frozenset(_barrier_ops(src))
-        allocation = passes.analysis.allocation(src)
-        passes.analysis.membar(allocation).run()
+        amd.run_membar(src, options.arch)
         compiler_membar_barriers = tuple(
             op for op in _barrier_ops(src)
             if op not in existing_barriers
