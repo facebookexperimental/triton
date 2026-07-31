@@ -510,12 +510,14 @@ static void searchRecursive(SearchState &state, unsigned depth) {
 
 FailureOr<ModuloScheduleResult>
 runExhaustiveSearch(const DataDependenceGraph &ddg, int maxII, int smemBudget,
-                    int tmemColLimit) {
-  const int minII = ddg.computeMinII();
+                    int tmemColLimit, int minIIOverride) {
+  const int minII = std::max(ddg.computeMinII(), minIIOverride);
   if (minII <= 0)
     return failure();
   if (maxII <= 0)
     maxII = 2 * minII;
+  else if (maxII < minII)
+    return failure();
 
   LLVM_DEBUG({
     DBGS() << "MinII=" << minII << " MaxII=" << maxII
@@ -676,12 +678,15 @@ static uint64_t hashStageSig(const llvm::SmallVector<int> &s) {
 FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
                                                 int maxII, int smemBudget,
                                                 int tmemColLimit,
-                                                int numSamples) {
-  const int minII = ddg.computeMinII();
+                                                int numSamples,
+                                                int minIIOverride) {
+  const int minII = std::max(ddg.computeMinII(), minIIOverride);
   if (minII <= 0)
     return failure();
   if (maxII <= 0)
     maxII = 2 * minII;
+  else if (maxII < minII)
+    return failure();
 
   // For large DDGs, reduce samples to stay within time budget.
   // Also cap maxII to minII + a few — most schedules succeed at MinII.
