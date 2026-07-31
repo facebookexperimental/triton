@@ -1053,7 +1053,18 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         act_qk_trans,
         do,
         allow_tf32=ALLOW_TF32,
-        attrs=({"stage": "0", "order": "2", "channels": ["opndA,tmem,1,2", "opndD,tmem,1,7"]} if DQ_REUSE else None),
+        attrs=(
+            {
+                "stage": "0",
+                "order": "2",
+                "channels": [
+                    "opndA,smem,1,11" if MASK_IF else "opndA,tmem,1,2",
+                    "opndD,tmem,1,7",
+                ],
+            }
+            if DQ_REUSE
+            else None
+        ),
     )
 
     # compute dk and dq

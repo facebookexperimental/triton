@@ -1771,10 +1771,61 @@ void replaceUsesAndPropagateType(
   OpBuilder::InsertionGuard guard(builder);
   SmallVector<Operation *> opsToDelete;
   SmallVector<OpOperand *> operandsToReplace;
+  ttg::MemDescType oldType;
+  if (oldUse->getNumResults() == 1)
+    oldType = dyn_cast<ttg::MemDescType>(oldUse->getResult(0).getType());
+  auto newType = dyn_cast<ttg::MemDescType>(val.getType());
+  bool changesOnlyMutability =
+      oldType && newType && oldType.getShape() == newType.getShape() &&
+      oldType.getElementType() == newType.getElementType() &&
+      oldType.getEncoding() == newType.getEncoding() &&
+      oldType.getMemorySpace() == newType.getMemorySpace() &&
+      oldType.getAllocShape() == newType.getAllocShape() &&
+      oldType.getMutableMemory() != newType.getMutableMemory();
+  DenseSet<Value> visitedViews;
+  auto propagateViewTypes = [&](auto &&self, Value source) -> void {
+    if (!visitedViews.insert(source).second)
+      return;
+    auto sourceType = dyn_cast<ttg::MemDescType>(source.getType());
+    if (!sourceType)
+      return;
+    for (Operation *user : source.getUsers()) {
+      if (!user->hasTrait<OpTrait::MemDescViewTrait>())
+        continue;
+      for (Value result : user->getResults()) {
+        auto resultType = dyn_cast<ttg::MemDescType>(result.getType());
+        if (!resultType)
+          continue;
+        result.setType(ttg::MemDescType::get(
+            resultType.getShape(), resultType.getElementType(),
+            resultType.getEncoding(), resultType.getMemorySpace(),
+            sourceType.getMutableMemory(), resultType.getAllocShape()));
+        self(self, result);
+      }
+    }
+  };
 
   // Save the operand to replace / delete later (avoid iterator invalidation).
   // TODO: can we use an early_inc iterator?
   for (OpOperand &use : oldUse->getUses()) {
+    // A pipelined value may be carried through an scf.for. If lowering changes
+    // a memdesc from immutable to mutable, keep every value tied to the yield
+    // operand type-consistent. The init value and result can be defined/used
+    // outside the loop, so updating only the yield and region argument leaves
+    // invalid control-flow edges.
+    if (auto yieldOp = dyn_cast<scf::YieldOp>(use.getOwner());
+        changesOnlyMutability && yieldOp) {
+      if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
+        unsigned index = use.getOperandNumber();
+        forOp.getInitArgs()[index].setType(val.getType());
+        forOp.getRegionIterArg(index).setType(val.getType());
+        forOp.getResult(index).setType(val.getType());
+        propagateViewTypes(propagateViewTypes, forOp.getInitArgs()[index]);
+        propagateViewTypes(propagateViewTypes, forOp.getRegionIterArg(index));
+        propagateViewTypes(propagateViewTypes, forOp.getResult(index));
+      }
+    }
+
     // Propagate through `ttg.warp_specialize`.
     if (auto wsOp = dyn_cast<ttg::WarpSpecializePartitionsOp>(use.getOwner())) {
       for (Region &region : wsOp.getPartitionRegions())

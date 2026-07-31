@@ -668,6 +668,13 @@ struct HoistTMEMAlloc
         if (!alloc || alloc->getParentRegion() != mmaOp->getParentRegion()) {
           continue;
         }
+        // An MMA that does not use its accumulator fully overwrites this TMEM
+        // allocation on every iteration.  Keep that scratch allocation scoped
+        // to the loop instead of turning it into loop-carried state; hoisting
+        // several such temporaries can make their otherwise disjoint TMEM
+        // lifetimes overlap after software pipelining.
+        if (isConstBool(mmaOp.useAccumulator(), false))
+          continue;
         hoistTMEMAlloc(alloc, forOp);
       }
     }
