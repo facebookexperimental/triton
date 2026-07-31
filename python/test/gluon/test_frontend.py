@@ -5,8 +5,10 @@ import re
 from triton.backends.compiler import GPUTarget
 from triton.experimental import gluon
 from triton.experimental.gluon import language as ttgl
+from triton.experimental.gluon.language._core import _unwrap_if_constexpr, builtin
 from triton.experimental.gluon.language.nvidia import blackwell
 from triton.experimental.gluon.language.nvidia import hopper
+from triton.experimental.gluon.language.nvidia import rubin
 from triton.experimental.gluon.language.nvidia.ampere import mbarrier as ampere_mbarrier
 from triton.experimental.gluon.language.nvidia.hopper import cluster
 from triton.experimental.gluon.language.nvidia.blackwell import (
@@ -23,6 +25,10 @@ from triton.experimental.gluon.language.amd.gfx1250 import (
     async_copy as gfx1250_async_copy, )
 from triton.experimental.gluon.language.amd.gfx1250 import mbarrier as gfx1250_mbarrier
 from triton.experimental.gluon.language.amd.gfx1250 import cluster as gfx1250_cluster
+from triton.experimental.gluon.language.amd.gfx1250 import (
+    PartitionedSharedLayout,
+    make_partitioned_dot_layouts,
+)
 from triton.experimental.gluon.language.extra import libdevice
 
 from triton._filecheck import filecheck_test, run_parser
@@ -36,6 +42,7 @@ PTRRANGE_PAT = re.compile("(, )?tt.pointer_range = 32 : i32")
 LIBDEVICE_PAT = re.compile('{libname = "", libpath = "", pure = true, symbol = "__.*"}')
 
 BLACKWELL_TARGET = GPUTarget("cuda", 100, 32)
+RUBIN_TARGET = GPUTarget("cuda", 107, 32)
 HOPPER_TARGET = GPUTarget("cuda", 90, 32)
 AMPERE_TARGET = GPUTarget("cuda", 80, 32)
 HIP_TARGET_RDNA3 = GPUTarget("hip", "gfx1100", 32)
@@ -702,6 +709,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 """,
     )
 
+def test_rubin_namespace_extends_blackwell():
+    assert ttgl.nvidia.rubin is rubin
+    assert rubin.TensorMemoryLayout is blackwell.TensorMemoryLayout
+    assert rubin.allocate_tensor_memory is blackwell.allocate_tensor_memory
+    assert rubin.tcgen05_mma_scaled is blackwell.tcgen05_mma_scaled
+    assert rubin.tma is blackwell.tma
+    assert rubin.mbarrier is not blackwell.mbarrier
+    assert rubin.mbarrier.allocate_mbarrier is blackwell.mbarrier.allocate_mbarrier
+
+    with pytest.raises(TypeError, match="block_rep_order"):
+        blackwell.TensorMemoryScalesLayout(block_rep_order="kThenMn")
+
+
 @gluon.jit
 def ampere_mbarrier_arrive_kernel():
     bar = ttgl.allocate_shared_memory(ttgl.int64, [1], ampere_mbarrier.MBarrierLayout())
@@ -719,28 +739,26 @@ def test_ampere_mbarrier_arrive(target):
     run_parser(ampere_mbarrier_arrive_kernel, target=target)
 
 
-def test_mbarrier_arrive_multicast_unsupported_target():
+def test_mbarrier_arrive_multicast_not_exposed_on_blackwell():
 
     @gluon.jit
     def kernel():
         bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
         mbarrier.arrive(bar, count=1, cta_mask=0x1)
 
-    with pytest.raises(CompilationError) as e:
+    with pytest.raises(CompilationError, match="cta_mask"):
         run_parser(kernel, *make_args(num_ctas=2), target=BLACKWELL_TARGET)
-
-    assert "multicast arrive requires Rubin" in str(e.value)
 
 
 def test_mbarrier_arrive_multicast_negative_mask():
 
     @gluon.jit
     def kernel():
-        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
-        mbarrier.arrive(bar, count=1, cta_mask=-1)
+        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], rubin.mbarrier.MBarrierLayout())
+        rubin.mbarrier.arrive(bar, count=1, cta_mask=-1)
 
     with pytest.raises(CompilationError) as e:
-        run_parser(kernel, *make_args(num_ctas=2), target=BLACKWELL_TARGET)
+        run_parser(kernel, *make_args(num_ctas=2), target=RUBIN_TARGET)
 
     assert "cta_mask must be positive" in str(e.value)
 
@@ -749,11 +767,11 @@ def test_mbarrier_arrive_multicast_mask_too_large():
 
     @gluon.jit
     def kernel():
-        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
-        mbarrier.arrive(bar, count=1, cta_mask=2)
+        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], rubin.mbarrier.MBarrierLayout())
+        rubin.mbarrier.arrive(bar, count=1, cta_mask=2)
 
     with pytest.raises(CompilationError) as e:
-        run_parser(kernel, *make_args(num_ctas=2), target=BLACKWELL_TARGET)
+        run_parser(kernel, *make_args(num_ctas=2), target=RUBIN_TARGET)
 
     assert "cta_mask must be <= num_ctas - 1" in str(e.value)
 
@@ -762,11 +780,11 @@ def test_mbarrier_arrive_multicast_non_int_mask():
 
     @gluon.jit
     def kernel():
-        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
-        mbarrier.arrive(bar, count=1, cta_mask=1.5)
+        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], rubin.mbarrier.MBarrierLayout())
+        rubin.mbarrier.arrive(bar, count=1, cta_mask=1.5)
 
     with pytest.raises(CompilationError) as e:
-        run_parser(kernel, *make_args(num_ctas=2), target=BLACKWELL_TARGET)
+        run_parser(kernel, *make_args(num_ctas=2), target=RUBIN_TARGET)
 
     assert "cta_mask must be an int" in str(e.value)
 
@@ -821,6 +839,35 @@ def tcgen05_mma_scaled_kernel(
     scale_b = blackwell.allocate_tensor_memory(ttgl.int8, [128, 32], scale_layout)
     acc = blackwell.allocate_tensor_memory(ttgl.float16, [128, 128], acc_layout)
     blackwell.tcgen05_mma_scaled(a, b, acc, scale_a, scale_b, "e5m2", "e5m2")
+
+
+@builtin
+def assert_tmem_scales_layout_roundtrip(memdesc, expected_layout, _semantic=None):
+    expected_layout = _unwrap_if_constexpr(expected_layout)
+    actual_layout = _semantic.builder.get_gluon_layout_from_memdesc(memdesc.handle)
+    assert actual_layout == expected_layout, f"expected {expected_layout}, got {actual_layout}"
+
+
+@gluon.jit
+def tmem_scales_layout_roundtrip_kernel(scale_layout: ttgl.constexpr):
+    scale = blackwell.allocate_tensor_memory(ttgl.int8, [128, 8], scale_layout)
+    assert_tmem_scales_layout_roundtrip(scale, scale_layout)
+
+
+@pytest.mark.parametrize(
+    "target,scale_layout",
+    [
+        pytest.param(BLACKWELL_TARGET, blackwell.TensorMemoryScalesLayout(), id="blackwell-mn-then-k"),
+        pytest.param(RUBIN_TARGET, rubin.TensorMemoryScalesLayout(), id="rubin-mn-then-k"),
+        pytest.param(
+            RUBIN_TARGET,
+            rubin.TensorMemoryScalesLayout(block_rep_order="kThenMn"),
+            id="rubin-k-then-mn",
+        ),
+    ],
+)
+def test_tmem_scales_layout_roundtrip(target, scale_layout):
+    run_parser(tmem_scales_layout_roundtrip_kernel, *make_args(scale_layout), target=target)
 
 
 def test_tcgen05_mma_scaled():
@@ -911,13 +958,8 @@ def test_tcgen05_commit():
 
 @gluon.jit
 def tcgen05_commit_multicast_two_ctas_kernel():
-    cga_layout: ttgl.constexpr = [[1, 0]]
-    nvmma_layout: ttgl.constexpr = ttgl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16, rank=2,
-                                                          cga_layout=cga_layout)
-    a = ttgl.allocate_shared_memory(ttgl.float16, [128, 128], nvmma_layout)
-    b = ttgl.allocate_shared_memory(ttgl.float16, [128, 128], nvmma_layout)
     barrier = mbarrier.allocate_mbarrier(two_ctas=True)
-    blackwell.tcgen05_commit(barrier, descs=[a, b])
+    mbarrier.expect(barrier, 4)
 
 
 def test_tcgen05_commit_multicast_two_ctas():
@@ -927,26 +969,22 @@ def test_tcgen05_commit_multicast_two_ctas():
         target=BLACKWELL_TARGET,
     )
     expecttest.assert_expected_inline(
-        anonymize_ir(mod.str_nodebug()),
-        """\
-#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
-#shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+        anonymize_ir(mod.str_nodebug()), """\
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
   tt.func public @tcgen05_commit_multicast_two_ctas_kernel() attributes {noinline = false} {
-    %0 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    %1 = ttg.local_alloc : () -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
-    %2 = tt.call @"triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier____(0,)cNone_(1,)cconstexpr_True_"() : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %0 = tt.call @"triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier____(0,)cNone_(1,)cconstexpr_True_"() : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
     %true = arith.constant true
-    ttng.tc_gen5_commit %2, %true descs %0, %1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    ttng.barrier_expect %0, 4, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
     tt.return
   }
-  tt.func private @"triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier____(0,)cNone_(1,)cconstexpr_True_"() -> !ttg.memdesc<1xi64, #shared1, #smem, mutable> attributes {noinline = false} {
-    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    tt.return %0 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+  tt.func private @"triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier____(0,)cNone_(1,)cconstexpr_True_"() -> !ttg.memdesc<1xi64, #shared, #smem, mutable> attributes {noinline = false} {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return %0 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
   ^bb1:  // no predecessors
-    %1 = ub.poison : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
-    tt.return %1 : !ttg.memdesc<1xi64, #shared1, #smem, mutable>
+    %1 = ub.poison : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return %1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
   }
 }
 """,
@@ -2482,6 +2520,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 }
 """,
     )
+
+
+@pytest.mark.parametrize("num_warps", [4, 8])
+@pytest.mark.parametrize("block_m,block_n", [(64, 64), (64, 128), (128, 128)])
+@pytest.mark.parametrize("a_transposed", [False, True])
+@pytest.mark.parametrize("b_transposed", [False, True])
+def test_make_partitioned_dot_layouts(num_warps, block_m, block_n, a_transposed, b_transposed):
+    block_k = 32
+    INSTR_M, INSTR_N, INSTR_K = 16, 16, 32
+    # WARP_TILES_M=4 and WARP_TILES_N=2 for both 4- and 8-warp cases (different
+    # warp/reg base layouts but same per-warp tile extents).
+    warp_coverage_m = 4 * INSTR_M
+    warp_coverage_n = 2 * INSTR_N
+
+    a_shape = [block_k, block_m] if a_transposed else [block_m, block_k]
+    b_shape = [block_n, block_k] if b_transposed else [block_k, block_n]
+    pa = ttgl.PaddedSharedLayout.with_identity_for([[a_shape[1], 8]], a_shape, [1, 0])
+    pb = ttgl.PaddedSharedLayout.with_identity_for([[b_shape[1], 8]], b_shape, [1, 0])
+    sla, slb, wmma = make_partitioned_dot_layouts(block_m, block_n, pa, pb, num_warps=num_warps,
+                                                  instr_shape=[INSTR_M, INSTR_N, INSTR_K], a_transposed=a_transposed,
+                                                  b_transposed=b_transposed)
+
+    a_num_groups = block_m // warp_coverage_m
+    b_num_groups = block_n // warp_coverage_n
+    a_partition_dim = 1 if a_transposed else 0
+    b_partition_dim = 0 if b_transposed else 1
+    # The non-partitioned axis of each piece is block_k, the partitioned axis is
+    # divided down to (block / num_partitions / num_groups).
+    a_inner = [block_m / 2 / a_num_groups, block_k]
+    b_inner = [block_n / 2 / b_num_groups, block_k] if b_transposed else [block_k, block_n / 2 / b_num_groups]
+    for layout, num_groups, partition_dim, inner_shape in [
+        (sla, a_num_groups, a_partition_dim, a_inner),
+        (slb, b_num_groups, b_partition_dim, b_inner),
+    ]:
+        assert isinstance(layout, PartitionedSharedLayout)
+        assert layout.num_partitions == 2
+        assert layout.num_groups == num_groups
+        assert layout.partition_dim == partition_dim
+        assert layout.partition_layout.shape == inner_shape
+
+    if num_warps == 4:
+        expected_warp_bases, expected_reg_bases = [[2, 1], [1, 0]], [[2, 0]]
+    else:
+        expected_warp_bases, expected_reg_bases = [[2, 1], [1, 0], [2, 0]], []
+    assert isinstance(wmma, amd_layouts.AMDWMMALayout)
+    assert wmma.warp_bases == expected_warp_bases
+    assert wmma.reg_bases == expected_reg_bases
+    assert wmma.instr_shape == [INSTR_M, INSTR_N, INSTR_K]
 
 
 @gluon.jit

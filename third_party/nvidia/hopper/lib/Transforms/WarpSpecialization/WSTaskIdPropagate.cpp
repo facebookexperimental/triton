@@ -2,6 +2,7 @@
 #include "TaskIdPropagation.h"
 #include "Utility.h"
 #include "WarpSpecializationPipeline.h"
+#include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlowFramework.h"
@@ -184,10 +185,13 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0];
-      assert(idx >= 0);
-      minPartition = std::min(idx, minPartition);
+      // An op may belong to more than one partition: a no-MMA reduction
+      // annotates a scalar offset op with the union of its load and store
+      // users' partitions (e.g. array<i32: 1, 2>). Take the min over all ids.
+      for (int32_t idx : attr.asArrayRef()) {
+        assert(idx >= 0);
+        minPartition = std::min<int64_t>(idx, minPartition);
+      }
     }
   });
   DenseSet<AsyncTaskId> totalTaskIds;
@@ -195,11 +199,18 @@ LogicalResult doTaskIdPropagate(triton::FuncOp funcOp) {
   funcOp.walk([&](mlir::Operation *op) {
     if (auto attr =
             op->getAttrOfType<DenseI32ArrayAttr>(ttg::kPartitionAttrName)) {
-      assert(attr.size() == 1 && "expected exactly 1 partition element");
-      int64_t idx = attr[0] - minPartition;
-      totalTaskIds.insert(idx);
-      assert(idx >= 0);
-      setAsyncTaskIds(op, idx);
+      // Materialize every partition id. An op assigned to multiple partitions
+      // (e.g. a replicated scalar offset in a no-MMA reduction) is later cloned
+      // into each partition by code partitioning.
+      SmallVector<AsyncTaskId> taskIds;
+      for (int32_t rawIdx : attr.asArrayRef()) {
+        int64_t idx = static_cast<int64_t>(rawIdx) - minPartition;
+        assert(idx >= 0);
+        auto taskId = static_cast<AsyncTaskId>(idx);
+        totalTaskIds.insert(taskId);
+        taskIds.push_back(taskId);
+      }
+      setAsyncTaskIds(op, taskIds);
       op->removeAttr(ttg::kPartitionAttrName);
     }
   });

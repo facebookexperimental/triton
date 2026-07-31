@@ -341,6 +341,54 @@ def test_async_load_row_stride_gfx950(device, K):
 
 
 # ---------------------------------------------------------------------------
+# Test: non-contiguous gather-pointer async_load (bf16).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _noncontiguous_gather_async_load_kernel(V, out_ptr, stride_b, stride_po, stride_d, stride_x, N: tl.constexpr,
+                                            HEAD_DIM: tl.constexpr, PAGE: tl.constexpr):
+    n = tl.arange(0, N)
+    d = tl.arange(0, HEAD_DIM)
+    page = n // PAGE
+    token = n % PAGE
+    # V is laid out [block, page // 8, head_dim, 8]. Reconstructing the logical
+    # [token, head_dim] tile makes the async-load pointer tensor non-contiguous
+    # (a gather: sizePerThread=[1,1]).
+    ptrs = (V + page[:, None] * stride_b + (token[:, None] // 8) * stride_po + d[None, :] * stride_d +
+            (token[:, None] % 8) * stride_x)
+    smem = tlx.local_alloc((N, HEAD_DIM), tlx.dtype_of(V), 2)
+    tok = tlx.async_load(ptrs, tlx.local_view(smem, 0))
+    tlx.async_load_commit_group([tok])
+    tlx.async_load_wait_group(0)
+    value = tlx.local_load(tlx.local_view(smem, 0))
+    tl.store(out_ptr + n[:, None] * HEAD_DIM + d[None, :], value)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_async_load_noncontiguous_gather_gfx950(device):
+    """Non-contiguous gather-pointer async_load in bf16 (P2440272260).
+
+    A third way (besides a partial-K mask or a non-16-aligned row stride) to collapse the
+    direct-to-LDS vector width to 16-bit on CDNA4: a genuinely non-contiguous pointer tensor.
+    The gather offsets force the async src blocked layout to sizePerThread=[1,1] (vec=1), so
+    bf16 -> 16-bit, canLoadDirectToLDS() rejects it (loadContig == 0), and CoalesceAsyncCopy
+    falls back to a synchronous tt.load + ttg.local_store. Previously this aborted make_llir
+    with an unrealized_conversion_cast. Uses bfloat16 -- the other 16-bit dtype; the mask and
+    row-stride tests cover fp16.
+    """
+    N, HEAD_DIM, PAGE = 128, 64, 64
+    v = torch.randn((2, 8, HEAD_DIM, 8), device=device, dtype=torch.bfloat16)
+    out = torch.empty((N, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    _noncontiguous_gather_async_load_kernel[(1, )](v, out, *v.stride(), N=N, HEAD_DIM=HEAD_DIM, PAGE=PAGE, num_warps=4)
+    n = torch.arange(N, device=device)
+    page = n // PAGE
+    token = n % PAGE
+    ref = v[page, token // 8, :, token % 8]
+    torch.testing.assert_close(out, ref)
+
+
+# ---------------------------------------------------------------------------
 # Test: local_load after async_wait compiles and runs correctly.
 # ---------------------------------------------------------------------------
 

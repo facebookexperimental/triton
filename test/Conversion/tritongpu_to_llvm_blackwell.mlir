@@ -168,7 +168,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [8, 1], CGALayout = [[0, 0]], instrShape = [16, 256, 32]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16, CGALayout = [[0, 0]]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = true, elementBitWidth = 16, CGALayout = [[0, 1]]}>
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1, CGALayout = [[0, 1]]>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32} {
   // CHECK-LABEL: @tc_gen5_mma_multi_ctas
@@ -210,6 +210,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: %[[TMEM_SUBSLICE_BASE:.+]] = llvm.ptrtoint %[[TMEM_SUBSLICE_PTR]] : !llvm.ptr<3> to i32
   // CHECK-COUNT-4: @$5 tcgen05.mma.cta_group::1.kind::f16 [ $0 + 0 ], $1, $2, $3, $4;", "r,l,l,r,b,b" %[[TMEM_SUBSLICE_BASE]]
   // CHECK-COUNT-4: @$5 tcgen05.mma.cta_group::1.kind::f16 [ $0 + 128 ], $1, $2, $3, $4;", "r,l,l,r,b,b" %[[TMEM_SUBSLICE_BASE]]
+  // CHECK-NOT: nvvm.barrier
   tt.func @tc_gen5_mma_subslice_acc(%a: !ttg.memdesc<256x64xf16, #shared, #ttg.shared_memory>,
                                     %b: !ttg.memdesc<64x64xf16, #shared1, #ttg.shared_memory>,
                                     %c: !ttg.memdesc<256x128xf32, #tmem, #ttng.tensor_memory, mutable>) {
@@ -424,7 +425,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[1, 0]]}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16, CGALayout = [[0, 1]]}>
-#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#shared2 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]], twoCTAs = true>
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.two-ctas" = true} {
   // CHECK-LABEL: @tc_gen5_mma_2ctas
@@ -451,7 +452,7 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 8 : i32, "ttng.tw
 
 #shared_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 8, CGALayout = [[1, 0]]}>
 #shared1_scales = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = true, elementBitWidth = 8, CGALayout = [[0, 1]]}>
-#shared2_scales = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[0]]}>
+#shared2_scales = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0], CGALayout = [[1]]}>
 
 #tmem_scales_2ctas = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1, CGALayout = [[1, 0]]>
 #tmem_scales_enc = #ttng.tensor_memory_scales_encoding<CGALayout = [[1, 0]]>

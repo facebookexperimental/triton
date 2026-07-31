@@ -413,7 +413,7 @@ Value getAccumForReuseGroup(Operation *op, SmallVector<Operation *> &chList,
         getAccumCnts(whileOp.getOperation(), regionsWithChannels, config);
     Value arg = whileOp.getAfterBody()->getArgument(numArgs - tCnts + argIdx);
     Value lit = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
-        whileOp.getLoc(), before ? opIdx : opIdx + 1, 64);
+        whileOp.getLoc(), (before ? opIdx : opIdx + 1) * stride, 64);
     Value endAccum = builder.createWithAsyncTaskIds<arith::AddIOp>(
         accumCntLoc(whileOp.getLoc()), arg, lit);
     return endAccum;
@@ -852,18 +852,7 @@ scf::ForOp createNewLoopWrapper(scf::ForOp origForOp,
   }
   // Handle reuse groups.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    // A collapsed both-subtiled channel is the sole member of its group but
-    // still carries a shared accumCnt (numTiles stride); keep it. This must
-    // match getAccumCnts / getReuseChannels, which also special-case size-1
-    // subtiled groups, or the loop arg count and accumCnt indices disagree.
-    if (config->getGroup(idx)->channels.size() <= 1 &&
-        !channelIsSubtiled(config->getGroup(idx)->channels[0]))
-      continue;
-    // A collapsed subtiled channel carries its shared accumCnt (numTiles
-    // stride) even at buffer.copy == 1; keep its loop arg so the count matches
-    // getAccumCnts / getReuseChannels. Plain single-buffered groups skip.
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1 &&
-        !channelIsCollapsedBothSubtiled(config->getGroup(idx)->channels[0]))
+    if (!reuseGroupNeedsAccumCnt(config->getGroup(idx)))
       continue;
     Operation *parentOp = origForOp->getParentOp();
 #if 0
@@ -1109,8 +1098,6 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   getAccumCntsPreOrder(origWhileOp.getOperation(), regionsWithChannels,
                        preOrderOps);
   unsigned tCnts = preOrderOps.size();
-  if (tCnts == 0)
-    return origWhileOp;
 
   OpBuilderWithAsyncTaskIds builder(origWhileOp->getContext());
   builder.setAsynTaskIdsFromArray(getNestedAsyncTaskIds(origWhileOp));
@@ -1128,9 +1115,7 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
   // per-region counters. Mirrors createNewLoopWrapper. The while is outermost,
   // so the prior value resolves to a constant 0.
   for (unsigned idx = 0; idx < config->getGroupSize(); ++idx) {
-    if (config->getGroup(idx)->channels.size() <= 1)
-      continue;
-    if (config->getGroup(idx)->channels[0]->getNumBuffers() <= 1)
+    if (!reuseGroupNeedsAccumCnt(config->getGroup(idx)))
       continue;
     SmallVector<Operation *> chList;
     getReuseChannels(config->getGroup(idx), origWhileOp.getOperation(), chList);
@@ -1146,6 +1131,12 @@ scf::WhileOp createNewWhileWrapper(scf::WhileOp origWhileOp,
                               regionsWithChannels, config, idx, true);
     initialAccums.push_back(prevAccum);
   }
+
+  // A same-task generated subtiled region can need only a reuse-group counter,
+  // with no ordinary channel-bearing region in preOrderOps. Do not skip that
+  // counter merely because tCnts is zero.
+  if (initialAccums.empty())
+    return origWhileOp;
 
   unsigned totalCnts = initialAccums.size();
   scf::WhileOp newWhileOp = createNewWhileLoop(origWhileOp, initialAccums);

@@ -225,8 +225,11 @@ full story.
   `test/Hopper/WarpSpecialization/ws_mem_plan_verify_reuse_groups.mlir`.
 - **LDBG** (`TRITON_LLVM_DEBUG_ONLY=nvgpu-ws-memory-planner`): buffer allocation
   order, the `hasPotentialReuse` matrix, `tryAllocate` decisions, and the Final
-  Allocation. `nvgpu-ws-utility` prints `verifyReuseGroup2`/`orderReuseGroupChain`
-  verdicts (also used by `verify_reuse_group_decisions.mlir`).
+  Allocation. Debug builds expose `verifyReuseGroup2`/`orderReuseGroupChain`
+  verdicts through `nvgpu-ws-utility`; release-safe decision coverage lives in
+  `reuse_group_2buffer.mlir`, `reuse_group_2buffer_multibuf.mlir`,
+  `ws_code_partition_tmem_3group_chain.mlir`, and
+  `ws_code_partition_tmem_3group_no_chain.mlir`.
 
 ## 8. Invariants
 

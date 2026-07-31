@@ -1,4 +1,5 @@
 // RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: env TRITON_WS_MEM_PLAN_VERIFY_GROUPS=1 triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-budget=231000" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=VERIFY
 
 // BWD FA persistent kernel (BLOCK_M1=128, EPILOGUE_SUBTILE=2) with TMA
 // descriptor_load for M/Di and early_tma_store_lowering for dQ/dK/dV.
@@ -31,6 +32,13 @@
 
 // dK staging: reuses dO, NOT V (allocation.shareGroup = 22)
 // CHECK: ttg.local_alloc {allocation.reuseTarget = 4 : i32, allocation.shareGroup = 22 : i32, buffer.copy = 2 : i32, buffer.id = 22 : i32, buffer.tmaStaging = 1 : i32}
+
+// The verify harness enumerates every candidate pair/triple of a loop's TMEM
+// allocs and runs the reuse-group ordering predicate without changing the plan.
+// VERIFY-DAG: [ws-mem-plan-verify] group {dk,dpT,dsT_0} => ACCEPT order=dpT->dsT_0->dk
+// VERIFY-DAG: [ws-mem-plan-verify] group {qkT,dpT,dq} => REJECT
+// VERIFY-DAG: [ws-mem-plan-verify] group {qkT,ppT,dsT_0} => REJECT
+// VERIFY-DAG: [ws-mem-plan-verify] group {dpT,dq,dsT_0} => REJECT
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>

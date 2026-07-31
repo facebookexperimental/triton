@@ -89,7 +89,7 @@ _DOT_LOGSPACE = (0, 6)
 # are None (e.g. welford has no reduction_ordering; single-tile kernels have no
 # block_n). Full names, no abbreviations.
 _AXIS_ORDER = ("reduction_ordering", "num_warps", "num_stages", "enable_fp_fusion", "block_n", "gemm_block_m",
-               "gemm_block_n", "gemm_block_k", "input_precision", "max_num_imprecise_acc")
+               "gemm_block_n", "gemm_block_k", "input_precision", "max_num_imprecise_acc", "gemm_num_splits")
 Config = namedtuple("Config", _AXIS_ORDER)
 
 # Per-effort value lists. "light" (~10 configs) is the quick smoke / CI grid;
@@ -109,6 +109,7 @@ _AXIS_VALUES = {
         "gemm_block_k": (32, ),
         "input_precision": ("tf32", "ieee", "tf32x3"),
         "max_num_imprecise_acc": (32, 128),
+        "gemm_num_splits": (1, 2, 4),  # split-K: K split into this many partials then combined (bit-relevant)
     },
     "heavy": {
         "reduction_ordering": ("unordered", "inner_tree"),
@@ -121,6 +122,7 @@ _AXIS_VALUES = {
         "gemm_block_k": (16, 32, 64),
         "input_precision": ("tf32", "ieee", "tf32x3"),
         "max_num_imprecise_acc": (32, 64, 128),
+        "gemm_num_splits": (1, 2, 4, 8),  # split-K: K split into this many partials then combined
     },
 }
 
@@ -153,7 +155,8 @@ def config_label(config):
         parts.append(f"enable_fp_fusion={'on' if config.enable_fp_fusion else 'off'}")
     if config.block_n is not None:
         parts.append(f"block_n={config.block_n}")
-    for axis in ("gemm_block_m", "gemm_block_n", "gemm_block_k", "input_precision", "max_num_imprecise_acc"):
+    for axis in ("gemm_block_m", "gemm_block_n", "gemm_block_k", "input_precision", "max_num_imprecise_acc",
+                 "gemm_num_splits"):
         value = getattr(config, axis)
         if value is not None:
             parts.append(f"{axis}={value}")
@@ -656,6 +659,38 @@ def gemm_tma_store_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, st
     c_desc.store([pid_m * BLOCK_M, pid_n * BLOCK_N], acc.to(OUT_DTYPE))
 
 
+@triton.jit
+def gemm_splitk_kernel(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, OUT_DTYPE: tl.constexpr,
+                       NUM_SPLITS: tl.constexpr):
+    """Split-K GEMM: the K contraction is cut into NUM_SPLITS contiguous slices, each summed into its
+    OWN partial accumulator, and the partials are then combined into the output. Unlike BLOCK_K (which
+    only re-chunks the SAME sequential K order and is therefore bit-free), NUM_SPLITS changes the
+    GROUPING of the K sum -- ((s0)+(s1))+... instead of a single left-fold -- so with order-sensitive
+    operands it DOES change the result bits. This is the one tiling-like GEMM knob that is genuinely
+    bit-relevant, so it exercises the checker's must-not-over-merge on GEMM (soundness), not just
+    recovery. Fused into a single kernel so it emits one st.global root the PTX checker can read."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    split_k = K // NUM_SPLITS
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for s in range(NUM_SPLITS):
+        partial = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        k0 = s * split_k
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k0 + offs_k)[None, :] * stride_ak
+        b_ptrs = b_ptr + (k0 + offs_k)[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        for _k in range(0, split_k, BLOCK_K):
+            partial = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), partial, out_dtype=tl.float32)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+        acc += partial  # combine this split's partial (the NUM_SPLITS-dependent grouping)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc.to(OUT_DTYPE))
+
+
 # --------------------------------------------------------------------------- #
 # GEMM compile / run
 # --------------------------------------------------------------------------- #
@@ -663,6 +698,24 @@ def _gemm_num_warps_filter(config):
     """wgmma v3 needs num_warps % 4 == 0; 1/2 fall back to MMAv2/FMA and would
     leave the wgmma path (and merge into the wrong equivalence class)."""
     return config.num_warps in (4, 8)
+
+
+def _gemm_all_filter(config):
+    """num_warps filter PLUS a Blackwell TMEM (512-column) guard for the combined gemm_all
+    cross-product: the accumulator (block_m x block_n) plus the K-pipeline (block_k x num_stages)
+    can overflow tensor memory, and unlike a compile error a run/launch OOM is NOT caught by
+    evaluate_precision. The dropped boundary (block_k=64 with num_stages>=3; the 256-wide accumulator
+    with num_stages>=5) is calibrated for this spec's default precision_size (256^3), where it leaves
+    0 launch-OOM. NOTE: TMEM use is TENSOR-dependent -- a large K runs the full num_stages pipeline
+    (short K-loops collapse it), so at a much bigger tensor some surviving configs still OOM; a driver
+    that overrides the tensor size must skip run-OOM configs itself (this filter cannot see the size)."""
+    if not _gemm_num_warps_filter(config):
+        return False
+    if config.gemm_block_k == 64 and (config.num_stages or 1) >= 3:
+        return False
+    if config.gemm_block_n == 256 and (config.num_stages or 1) >= 5:
+        return False
+    return True
 
 
 def _gemm_blocks(config, default_bk):
@@ -786,6 +839,28 @@ def _gemm_tma_store_run(config, ck, seed, size):
     bm, bn, _bk = _gemm_blocks(config, 32)
     a, b = _gemm_operands(M, N, K, seed, torch.float16)
     c = torch.empty((M, N), device=DEVICE, dtype=torch.float16)
+    ck[(M // bm, N // bn, 1)](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
+                              c.stride(1))
+    torch.cuda.synchronize()
+    return _to_bytes(c)
+
+
+def _gemm_splitk_compile(config, size, maxnreg=None):
+    M, N, K = size
+    bm, bn, bk = _gemm_blocks(config, 32)
+    splits = config.gemm_num_splits if config.gemm_num_splits is not None else 1
+    a, b = _gemm_operands(M, N, K, 0, torch.bfloat16)
+    c = torch.empty((M, N), device=DEVICE, dtype=torch.float32)
+    return gemm_splitk_kernel.warmup(a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
+                                     c.stride(1), grid=(M // bm, N // bn), BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
+                                     OUT_DTYPE=tl.float32, NUM_SPLITS=splits, maxnreg=maxnreg, **_gemm_launch_kwargs(config))
+
+
+def _gemm_splitk_run(config, ck, seed, size):
+    M, N, K = size
+    bm, bn, _bk = _gemm_blocks(config, 32)
+    a, b = _gemm_operands(M, N, K, seed, torch.bfloat16)
+    c = torch.empty((M, N), device=DEVICE, dtype=torch.float32)
     ck[(M // bm, N // bn, 1)](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
                               c.stride(1))
     torch.cuda.synchronize()
@@ -996,6 +1071,42 @@ REGISTRY = {
         compile_fn=_gemm_tma_store_compile,
         run_fn=_gemm_tma_store_run,
         config_filter=_gemm_num_warps_filter,
+    ),
+    "gemm_splitk":
+    KernelSpec(
+        name="gemm_splitk",
+        description=("bf16 split-K GEMM; gemm_num_splits regroups the K sum into that many partials then combines "
+                     "them -> a genuinely BIT-RELEVANT tiling-like knob (a distinct class per split value), unlike "
+                     "the bit-free block_k. Order-sensitive operands (wide range + alternating sign along K). This is "
+                     "the GEMM kernel that stresses the checker's must-not-over-merge on tiling (soundness)."),
+        output_arity=1,
+        axes=("num_warps", "gemm_block_m", "gemm_block_n", "gemm_num_splits"),
+        precision_size=(256, 256, 2048),
+        perf_size=(256, 256, 2048),
+        known_limitation="",
+        compile_fn=_gemm_splitk_compile,
+        run_fn=_gemm_splitk_run,
+        config_filter=_gemm_num_warps_filter,
+        axis_values={"gemm_num_splits": (1, 2, 4, 8)},  # sweep the splitting knob at every effort
+    ),
+    "gemm_all":
+    KernelSpec(
+        name="gemm_all",
+        description=("f32 GEMM varying ALL co-existing knobs together (M/N/K tiling x input_precision x "
+                     "enable_fp_fusion x num_warps x num_stages) -- the real autotuner cross-product, to "
+                     "stress the MMA fence with cross-knob interactions. The per-knob GEMM specs above "
+                     "isolate one knob each for clean attribution; this crosses them (~1300 configs at heavy). "
+                     "fp8 stays a separate spec (a distinct dtype path that cannot co-vary with input_precision)."),
+        output_arity=1,
+        axes=("enable_fp_fusion", "num_warps", "num_stages", "gemm_block_m", "gemm_block_n", "gemm_block_k",
+              "input_precision"),
+        precision_size=(256, 256, 256),
+        perf_size=(256, 256, 256),
+        known_limitation="",
+        compile_fn=_gemm_prec_compile,
+        run_fn=_gemm_prec_run,
+        config_filter=_gemm_all_filter,
+        axis_values={"gemm_block_k": (16, 32, 64), "enable_fp_fusion": (True, False)},
     ),
 }
 

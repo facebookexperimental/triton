@@ -21,6 +21,15 @@
 // enforced; see PSM-related design discussion).
 // CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = 19 : i32, buffer.tmaStaging = 1 : i32} : () -> !ttg.memdesc<128x64xf16
 
+// Hopper register accumulators do not trace back to a tmem_load. When two data
+// partitions stage stores to the same descriptor, the producer task must keep
+// their fallback fusion groups distinct.
+// CHECK-LABEL: tt.func public @hopper_dp_staging
+// CHECK: %[[STAGE0:.*]] = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 0 : i32, buffer.tmaStaging = 1 : i32}
+// CHECK: ttg.local_store %{{.*}}, %[[STAGE0]] {async_task_id = array<i32: 0>}
+// CHECK: %[[STAGE1:.*]] = ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = 1 : i32, buffer.tmaStaging = 1 : i32}
+// CHECK: ttg.local_store %{{.*}}, %[[STAGE1]] {async_task_id = array<i32: 1>}
+
 // -----// WarpSpec internal IR Dump After: doBufferAllocation
 #blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -213,6 +222,20 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     } {async_task_id = array<i32: 0, 1, 2, 3>, tt.merge_epilogue_to_computation = true, tt.smem_alloc_algo = 1 : i32, tt.smem_budget = 200000 : i32, tt.tmem_alloc_algo = 2 : i32, tt.warp_specialize, ttg.partition.stages = [0 : i32, 1 : i32, 0 : i32, 0 : i32], ttg.partition.types = ["reduction", "gemm", "load", "computation"], ttg.warp_specialize.tag = 0 : i32} loc(#loc118)
     tt.return loc(#loc77)
   } loc(#loc)
+
+  tt.func public @hopper_dp_staging(%desc: !tt.tensordesc<64x128xf16, #shared>, %src0: tensor<64x128xf16, #blocked4>, %src1: tensor<64x128xf16, #blocked4>) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %c64 = arith.constant 64 : i32
+    %stage0 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    ttg.local_store %src0, %stage0 {async_task_id = array<i32: 0>} : tensor<64x128xf16, #blocked4> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    %token0 = ttng.async_tma_copy_local_to_global %desc[%c0, %c0] %stage0 {async_task_id = array<i32: 0>} : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %token0 {async_task_id = array<i32: 0>} : !ttg.async.token
+    %stage1 = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    ttg.local_store %src1, %stage1 {async_task_id = array<i32: 1>} : tensor<64x128xf16, #blocked4> -> !ttg.memdesc<64x128xf16, #shared, #smem, mutable>
+    %token1 = ttng.async_tma_copy_local_to_global %desc[%c64, %c0] %stage1 {async_task_id = array<i32: 1>} : !tt.tensordesc<64x128xf16, #shared>, !ttg.memdesc<64x128xf16, #shared, #smem, mutable> -> !ttg.async.token
+    ttng.async_tma_store_token_wait %token1 {async_task_id = array<i32: 1>} : !ttg.async.token
+    tt.return
+  }
 } loc(#loc)
 #loc1 = loc("/data/users/mren/MetaMain2/triton/python/tutorials/fused-attention-ws-device-tma.py":763:35)
 #loc2 = loc("/data/users/mren/MetaMain2/triton/python/tutorials/fused-attention-ws-device-tma.py":877:16)

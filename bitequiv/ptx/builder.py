@@ -18,14 +18,19 @@ from pyptx.ir.nodes import RegisterOperand, VectorOperand
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import Def, DefUse
-from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.treeir import (FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp,
+                                 ShflCombine, SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
 
 # Reduce combine ops whose BALANCED tree we collapse to a layout-invariant signature.
-# Restricted to add (sum-style) for now; mul/min/max are future work.
-_REDUCE_FP = frozenset({"add"})
+# add (sum), min, max: all associative + commutative, so a balanced (inner_tree) tree of them is
+# layout-invariant. min/max are DELIBERATELY not in treeir._COMMUTATIVE (their children are never
+# sorted) so a NaN payload rides positionally — inner_tree fixes ONE balanced tree at any layout,
+# so the pairing (hence NaN propagation) is identical -> bit-identical. mul is excluded (product
+# reductions are rare + carry an fma-contraction ambiguity).
+_REDUCE_FP = frozenset({"add", "min", "max"})
 
 
 def _is_fp(inst):
@@ -136,11 +141,11 @@ class _Builder:
 
     def _plan_fp_binary(self, inst, at):
         a, b = inst.operands[1], inst.operands[2]
-        if inst.opcode == "add":
+        if inst.opcode in _REDUCE_FP:  # a butterfly `op(p, shfl.bfly(p,off))` for any reduce op
             shf = self._shuffle_of(a, b, at) or self._shuffle_of(b, a, at)
             if shf is not None:
                 partial_reg, off = shf
-                return ("shfl", (off, inst.modifiers), [self._resolve(partial_reg, at)])
+                return ("shfl", (off, inst.opcode, inst.modifiers), [self._resolve(partial_reg, at)])
         return (inst.opcode, inst.modifiers, [self._child(a, at), self._child(b, at)])
 
     def _shuffle_of(self, maybe_shfl, partial, at):
@@ -182,8 +187,8 @@ class _Builder:
         if tag == "smem":
             return SmemExchange(kids[0])
         if tag == "shfl":
-            off, mods = aux
-            return ShflCombine(off, "add", mods, kids[0])
+            off, kind, mods = aux
+            return ShflCombine(off, kind, mods, kids[0])
         if tag == "fma":
             return FpOp("fma", aux, tuple(kids), fused=True)
         if tag == "opaqueop":
@@ -292,10 +297,20 @@ def _has_opaque(node):
     return any(isinstance(n, (OpaqueLeaf, OpaqueOp)) for n in _postorder(node))
 
 
-# Pure per-element ops that are safe to keep VERBATIM inside a collapsed reduction's leaf: they
-# are deterministic functions of one element (cast/copy/abs/neg), hence layout-invariant. Their
-# token rides verbatim into leaf_sig (compared, never dropped), so equal leaf_sig => same op.
-_PURE_ELT = ("cvt", "mov", "abs", "neg")
+# Pure per-element ops that are safe to keep VERBATIM inside a collapsed reduction's leaf: each is
+# a deterministic function of ONE element (cast/copy/abs/neg + the transcendentals a softmax /
+# rmsnorm / layernorm applies before the reduce), hence layout-invariant. Its token rides verbatim
+# into leaf_sig (compared, never dropped), so equal leaf_sig => same op; a config WITHOUT the op
+# gets a different leaf_sig and never merges.
+_PURE_ELT = ("cvt", "mov", "abs", "neg", "ex2", "lg2", "exp", "log",
+             "sqrt", "rsqrt", "rcp", "sin", "cos", "tanh")
+
+
+def _tok_is_pure(token):
+    """True iff ``token``'s OPCODE (the part before the first '.') is a pure per-element op. Matched
+    at the opcode boundary (``token == p`` or ``token.startswith(p + '.')``), never a bare prefix,
+    so 'neg' cannot alias a hypothetical 'negX' and 'exp' cannot alias an unrelated 'expand'."""
+    return any(token == p or token.startswith(p + ".") for p in _PURE_ELT)
 
 
 def _leaf_layout_invariant(node):
@@ -306,11 +321,11 @@ def _leaf_layout_invariant(node):
     and a single product mul(L,L) / fma(L,L;const) while refusing anything whose value could
     depend on the thread/lane layout."""
     for n in _postorder(node):
-        if isinstance(n, (ShflCombine, SmemExchange)):
-            return False
+        if isinstance(n, (ShflCombine, SmemExchange, Mma, LoopReduce)):
+            return False  # cross-thread / opaque-chunk / loop-fold node: not a per-element leaf
         if isinstance(n, OpaqueLeaf):
             return False
-        if isinstance(n, OpaqueOp) and not any(n.token.startswith(p) for p in _PURE_ELT):
+        if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
             return False
         if isinstance(n, FpOp) and n.fused and len(n.children) == 3 and isinstance(
                 n.children[2], (FpOp, ShflCombine, SmemExchange, ITreeReduce)):
@@ -333,35 +348,84 @@ def _shfl_dir(node, ht):
     return tuple(sorted({off for h, off in shfls if h == lo}))
 
 
+def _single_element(node):
+    """True iff every ``Leaf`` under a boundary subtree reads the SAME element (identical coord) —
+    i.e. the boundary is a per-element function ``f(x_i)`` (``exp(L)``, ``mul(L,L)`` of one element,
+    a bare ``L``). Then the multiset ``{f(x_i)}`` is layout-invariant, so a balanced reduction over
+    it is bit-identical at any layout and MAY collapse. A boundary combining DISTINCT elements
+    (``mul(L_i, L_j)``, i != j) is layout-invariant only if the PAIRING is data-fixed, which the
+    coord-blanking ``_coordfree_sig`` cannot prove — so refuse it (sound; stays over-split)."""
+    coords = {n.coord for n in _postorder(node) if isinstance(n, Leaf)}
+    return len(coords) == 1
+
+
 def _collapse_info(node):
     """(reduce_op_token, uniform_coord_free_leaf_sig) for a balanced reduction, or None if it
-    cannot be SOUNDLY collapsed. Guards: a single consistent reduce op; >= 2 boundary leaves;
-    every boundary leaf has the SAME coord-free computation (so dropping coords is safe); and NO
-    opaque/unmodelled node anywhere (we only collapse fully-understood reductions). Soundness
-    also relies on the column image being recoverable for every leaf (proves the addressing is
-    understood), even though the size key itself uses the layout-invariant tree height."""
+    cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of reduce nodes
+    (NOT every non-reduce postorder node — collecting the latter double-counts a boundary's own
+    internal nodes, e.g. it sees both ``cvt(L)`` and its child ``L`` -> two coord-free sigs -> a
+    spurious bail; that is why the baseline never collapsed cvt/exp/mul-fed reductions). Guards: a
+    single consistent reduce op; >= 2 boundary leaves; every boundary is layout-invariant
+    (pure-elt) AND single-element AND has the SAME coord-free computation (dropping coords is then
+    safe); and the column image is recoverable for every leaf (addressing understood)."""
     op, leaves = None, []
     for n in _postorder(node):
-        if isinstance(n, FpOp) and not n.fused and n.kind in _REDUCE_FP and len(n.children) == 2:
+        if not _is_reduce_node(n):
+            continue
+        if isinstance(n, FpOp) and not n.fused and len(n.children) == 2:
             tok = n.kind + "".join(n.mods)
             if op is None:
                 op = tok
             elif op != tok:
                 return None
-        elif _is_reduce_node(n):
-            continue  # shfl / smem structural reduce node
-        else:
-            leaves.append(n)  # boundary leaf computation
+        for c in n.children:  # a boundary leaf is a non-reduce child of a reduce node
+            if not _is_reduce_node(c):
+                leaves.append(c)
     if op is None or len(leaves) < 2:
         return None
     if not all(_leaf_layout_invariant(l) for l in leaves):
         return None  # a layout-dependent / lost-provenance leaf -> do not collapse
+    if not all(_single_element(l) for l in leaves):
+        return None  # a boundary over DISTINCT elements: pairing may be layout-dependent
     if len({_coordfree_sig(l) for l in leaves}) != 1:
         return None  # non-uniform leaf computations -> conservative
     for l in leaves:  # require addressing understood for every leaf (column image recoverable)
         if _leaf_cols_union(l) is None:
             return None
     return (op, _coordfree_sig(leaves[0]))
+
+
+def output_coordfree_key(node):
+    """Coord-free dedup key for one output of a MULTI-output entry (a COLLAPSED tree), or None if the
+    tree is not safe to coord-blank.
+
+    A multi-output entry (softmax / layernorm / rmsnorm: one output per row, many rows per block) is
+    kept VERBATIM by the descriptor today, so num_warps (which redistributes rows across threads)
+    never merges. But when EVERY output is a clean per-element function of its own element over
+    num_warps-invariant reductions — ``out[i] = f(x_i, ITreeReduce(row_i))`` — blanking the leaf coord
+    makes all outputs share ONE key, and deduping that key across the entry gives a num_warps-invariant
+    descriptor (the per-thread output COUNT varies with num_warps, but the SET of distinct output
+    computations does not). An unordered per-row reduction keeps its ShflCombine offsets in the
+    coord-free string (num_warps-bearing) so it still splits — inner_tree recovers, unordered does not.
+
+    SAFE only when the output's VALUE structure is fully modeled: no lost-provenance ``OpaqueLeaf``
+    (except a CONSTANT immediate, which is num_warps-invariant), and every ``OpaqueOp`` is a pure
+    per-element op (cvt / exp / mov / ...). A Leaf's COORD may be opaque (a swizzle / multi-dim address
+    the affine pass could not pin) — that is only ADDRESSING (which element), and blanking it is the
+    whole point; faithful reconstruction already guarantees the value DEPENDENCY is captured, so what
+    remains is an elementwise map over num_warps-invariant reductions. A tree with an unmodeled value
+    op / lost non-constant leaf returns None and the caller falls back to the verbatim (sound,
+    over-split) descriptor. This blanks more than the guarded reduction collapse (in particular it does
+    not re-prove the elementwise assumption for a swizzled address), so it is gated on the empirical
+    fuzzer (0 over-merge) rather than statically proven."""
+    for n in _postorder(node):
+        if isinstance(n, OpaqueLeaf) and "imm(" not in n.token:
+            return None  # a lost-provenance (non-constant) value -> unsafe to coord-blank
+        if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
+            return None  # an unmodeled value op -> unsafe
+        if isinstance(n, Leaf) and n.coord is None:
+            return None  # no coord at all (not even opaque) -> nothing to blank soundly
+    return _coordfree_sig(node)
 
 
 def _rebuild(n, kids):
@@ -376,6 +440,10 @@ def _rebuild(n, kids):
         return ShflCombine(n.offset, n.kind, n.mods, kids[0])
     if isinstance(n, SmemExchange):
         return SmemExchange(kids[0])
+    if isinstance(n, Mma):
+        return Mma(n.token, n.flags, tuple(kids))
+    if isinstance(n, LoopReduce):
+        return LoopReduce(n.op, kids[0], n.key)
     return n
 
 

@@ -275,6 +275,71 @@ def matmul_kernel_tma_dynamic_persistent_ws_while(
 
 
 # ============================================================================
+# Kernel 2c-bailout: matmul_kernel_tma_dynamic_persistent_ws_while_scatter
+# Same dynamic-persistent shape as matmul_kernel_tma_dynamic_persistent_ws_while,
+# but (1) the outer while requests AutoWS via tl.condition(warp_specialize=True)
+# and (2) the tile claim is a NON-scalar (scatter) atomic: a 1-element tensor
+# atomic reduced back to a scalar. AutoWS cannot broadcast a scatter atomic, so
+# doDynamicTileBroadcast rejects and the orchestrator gracefully strips WS
+# metadata -- the kernel must still compile and compute the correct GEMM as a
+# plain (non-WS) dynamic-persistent kernel.
+# ============================================================================
+@triton.jit
+def matmul_kernel_tma_dynamic_persistent_ws_while_scatter(
+    a_desc,
+    b_desc,
+    c_desc,
+    tile_counter,
+    M,
+    N,
+    K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    dtype = tl.float16
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    tile_id = start_pid
+
+    # Outer while requests AutoWS; the scatter tile claim below forces a graceful
+    # bail-out to a non-WS kernel.
+    while tl.condition(tile_id < num_tiles, warp_specialize=True):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
+            accumulator = tl.dot(a, b.T, accumulator)
+
+        acc_slices = _split_n_2D(accumulator, EPILOGUE_SUBTILE)
+        slice_size: tl.constexpr = BLOCK_SIZE_N // EPILOGUE_SUBTILE
+        for slice_id in tl.static_range(0, EPILOGUE_SUBTILE):
+            c_desc.store(
+                [offs_am, offs_bn + slice_id * slice_size],
+                acc_slices[slice_id].to(dtype),
+            )
+        # Scatter (non-scalar) atomic tile claim: a 1-element tensor atomic that is
+        # reduced back to a scalar. Same work-stealing semantics as the scalar
+        # claim, but classifyAtomic sees a non-scalar atomic replicated across
+        # partitions and rejects AutoWS (graceful bail-out).
+        claimed = tl.atomic_add(tile_counter + tl.arange(0, 1), 1)
+        tile_id = tl.sum(claimed, axis=0)
+
+
+# ============================================================================
 # Kernel 2d: matmul_kernel_tma_clc_persistent_ws_while
 # Dynamic (work-stealing) persistent TMA matmul whose while-loop tile id is
 # claimed via the core CLC tile scheduler (tl.clc_tile_scheduler) instead of a
@@ -1073,11 +1138,91 @@ def test_tutorial09_matmul_tma_clc_persistent_while_loop_warp_specialize(EPILOGU
 
 
 # ============================================================================
+# Test 2c-bailout: dynamic-persistent outer-while AutoWS must gracefully bail out
+# (leave a compilable, correct non-WS kernel) when the atomic tile claim is an
+# unsupported shape. Here the claim is a scatter (non-scalar) atomic, which
+# classifyAtomic rejects -> removeWarpSpecMetadata strips all WS metadata.
+# ============================================================================
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
+@pytest.mark.parametrize("EPILOGUE_SUBTILE", [1, 2])
+def test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize_bailout(EPILOGUE_SUBTILE, capfd):
+    """A scatter-atomic tile claim forces AutoWS to bail out to a non-WS kernel."""
+    M, N, K = 2048, 2048, 256
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+        # Work counter seeded to NUM_SMS: CTAs claim initial tiles 0..NUM_SMS-1 by
+        # program id, then atomically claim NUM_SMS, NUM_SMS+1, ...
+        tile_counter = torch.full((1, ), NUM_SMS, dtype=torch.int32, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        grid = lambda META: (min(
+            NUM_SMS,
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        ), )
+
+        kernel = matmul_kernel_tma_dynamic_persistent_ws_while_scatter[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            tile_counter,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+
+        ttgir = kernel.asm["ttgir"]
+        # The dynamic-persistent path was exercised...
+        assert "scf.while" in ttgir, "Expected persistent outer loop to lower to scf.while"
+        assert "atomic" in ttgir, "Expected the (unsupported) atomic tile claim to remain"
+        # ...but AutoWS gracefully bailed out: no warp specialization / partition
+        # metadata survives, and the kernel still compiled.
+        assert "ttg.warp_specialize" not in ttgir, "Expected AutoWS to bail out (no warp specialization)"
+        assert "async_task_id" not in ttgir, "Expected WS metadata to be stripped on bail-out"
+
+        # The bailed-out kernel still computes the correct GEMM.
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
 # Test 2e: Outer-loop AutoWS through a unified scheduler while;
 # dynamic persistent keeps the outer while and pipelines its nested K loop.
 # ============================================================================
 _UNIFIED_OUTER_AUTOWS_CONFIGS = [
-    pytest.param(tl.NonPersistentScheduler, 128, 128, 1, 1, 1, False, False, id="nonpersistent-baseline"),
+    pytest.param(tl.NonPersistentScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="nonpersistent-baseline"),
     pytest.param(
         tl.NonPersistentScheduler,
         128,
@@ -1086,6 +1231,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         1,
         1,
         False,
+        False,
+        1,
         True,
         id="nonpersistent-epilogue-subtile-4",
     ),
@@ -1097,6 +1244,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         2,
         1,
         False,
+        False,
+        1,
         True,
         id="nonpersistent-data-partition-2-subtile-2",
     ),
@@ -1108,10 +1257,12 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         2,
         2,
         False,
+        False,
+        1,
         True,
         id="nonpersistent-2cta-data-partition-2",
     ),
-    pytest.param(tl.StaticPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, id="static-baseline"),
+    pytest.param(tl.StaticPersistent1DScheduler, 128, 128, 1, 1, 1, False, True, 1, False, id="static-baseline"),
     pytest.param(
         tl.StaticPersistent1DScheduler,
         128,
@@ -1120,6 +1271,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         1,
         1,
         True,
+        True,
+        1,
         True,
         id="static-epilogue-subtile-4",
     ),
@@ -1132,6 +1285,8 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         1,
         True,
         True,
+        1,
+        True,
         id="static-data-partition-2-subtile-2",
     ),
     pytest.param(
@@ -1143,21 +1298,35 @@ _UNIFIED_OUTER_AUTOWS_CONFIGS = [
         2,
         False,
         True,
+        1,
+        True,
         id="static-2cta-data-partition-2",
     ),
-    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, id="dynamic-subtile-1"),
-    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, id="dynamic-subtile-2"),
-    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, id="dynamic-subtile-4"),
-    pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, True, id="clc-subtile-1"),
-    pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, True, id="clc-subtile-2"),
-    pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, True, id="clc-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 1, False, id="dynamic-subtile-1"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="dynamic-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="dynamic-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, False, 1, True,
+                 id="dynamic-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, False, True, 1, True,
+                 id="dynamic-separate-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, True, False, 1, True,
+                 id="dynamic-generated-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, 1, True, True, 1, True,
+                 id="dynamic-generated-separate-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 256, 128, 2, 2, 1, True, True, 1, True,
+                 id="dynamic-dp2-generated-separate-subtile-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, 1, False, False, 2, False,
+                 id="dynamic-broadcast-depth-2"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 1, 1, 1, False, False, 1, True, id="clc-subtile-1"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 2, 1, 1, False, False, 1, True, id="clc-subtile-2"),
+    pytest.param(tl.ClcTileScheduler, 128, 128, 4, 1, 1, False, False, 1, True, id="clc-subtile-4"),
 ]
 
 
 @pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 @pytest.mark.parametrize(
     "SCHEDULE,BLOCK_SIZE_M,BLOCK_SIZE_N,EPILOGUE_SUBTILE,DATA_PARTITION_FACTOR,NUM_CTAS,"
-    "generate_subtiled_region,blackwell_only",
+    "generate_subtiled_region,separate_epilogue_store,tile_prefetch_depth,blackwell_only",
     _UNIFIED_OUTER_AUTOWS_CONFIGS,
 )
 def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
@@ -1168,6 +1337,8 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
     DATA_PARTITION_FACTOR,
     NUM_CTAS,
     generate_subtiled_region,
+    separate_epilogue_store,
+    tile_prefetch_depth,
     blackwell_only,
 ):
     """Exercise outer-loop AutoWS with each unified scheduler."""
@@ -1185,6 +1356,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
     with triton.knobs.nvidia.scope():
         triton.knobs.nvidia.use_meta_ws = True
         triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.ws_tile_prefetch_depth = tile_prefetch_depth
 
         dtype = torch.float16
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1243,7 +1415,7 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             NUM_CTAS=NUM_CTAS,
             TWO_CTAS=NUM_CTAS == 2,
             SMEM_ALLOC_ALGO=1 if NUM_CTAS == 2 else None,
-            SEPARATE_EPILOGUE_STORE=SCHEDULE is tl.StaticPersistent1DScheduler,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
             **launch_options,
         )
 
@@ -1288,6 +1460,136 @@ def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize(
             "Expected every epilogue subtile and data partition to emit a TMA store")
         if NUM_CTAS == 2:
             assert ttgir.count("two_ctas") >= DATA_PARTITION_FACTOR, "Expected 2-CTA MMA per data partition"
+
+        ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
+        torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)
+
+
+# ============================================================================
+# Test 2f: Hopper dynamic outer-while AutoWS. The unified matrix above marks its
+# dynamic feature configs blackwell_only, so the dynamic outer-`scf.while` path
+# has no explicit Hopper (SM90) coverage. These configs exercise the
+# Hopper-capable feature set on the SAME kernel
+# (matmul_kernel_tma_unified_persistent_ws_while): the dynamic atomic scheduler,
+# epilogue subtiling, separate epilogue store, broadcast depth > 1, and data
+# partitioning. Hopper-only differences vs the Blackwell matrix:
+#   - NUM_CTAS is always 1 (2-CTA MMA is a tcgen5 cta_group feature);
+#   - generate_subtiled_region stays False (subtiled regions are a TMEM opt);
+#   - DATA_PARTITION_FACTOR=2 uses BLOCK_M=128 (wgmma min-M=64), not 256;
+#   - the MMA lowers to wgmma (ttng.warp_group_dot), not ttng.tc_gen5_mma.
+# ClcTileScheduler is Blackwell-only and is intentionally excluded.
+_HOPPER_DYNAMIC_OUTER_AUTOWS_CONFIGS = [
+    # SCHEDULE, BLOCK_M, BLOCK_N, EPILOGUE_SUBTILE, DATA_PARTITION_FACTOR,
+    # generate_subtiled_region, separate_epilogue_store, tile_prefetch_depth
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, False, False, 1, id="hopper-dynamic-baseline"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, False, False, 1,
+                 id="hopper-dynamic-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 4, 1, False, True, 1,
+                 id="hopper-dynamic-separate-epilogue-subtile-4"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 1, 1, False, False, 2,
+                 id="hopper-dynamic-broadcast-depth-2"),
+    pytest.param(tl.DynamicPersistent1DScheduler, 128, 128, 2, 2, False, True, 1,
+                 id="hopper-dynamic-dp2-separate-subtile-2"),
+]
+
+
+@pytest.mark.skipif(not is_hopper(), reason="Requires Hopper")
+@pytest.mark.parametrize(
+    "SCHEDULE,BLOCK_SIZE_M,BLOCK_SIZE_N,EPILOGUE_SUBTILE,DATA_PARTITION_FACTOR,"
+    "generate_subtiled_region,separate_epilogue_store,tile_prefetch_depth",
+    _HOPPER_DYNAMIC_OUTER_AUTOWS_CONFIGS,
+)
+def test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize_hopper(
+    SCHEDULE,
+    BLOCK_SIZE_M,
+    BLOCK_SIZE_N,
+    EPILOGUE_SUBTILE,
+    DATA_PARTITION_FACTOR,
+    generate_subtiled_region,
+    separate_epilogue_store,
+    tile_prefetch_depth,
+    capfd,
+):
+    """Exercise the dynamic outer-while AutoWS feature set on Hopper (wgmma).
+
+    Local note: this is skipped on Blackwell (B200); it runs on SM90 hardware/CI.
+    """
+    M, N, K = 2048, 2048, 256
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    num_stages = 3
+    num_warps = 4
+    NUM_CTAS = 1
+
+    with triton.knobs.nvidia.scope():
+        triton.knobs.nvidia.use_meta_ws = True
+        triton.knobs.nvidia.use_meta_partition = True
+        triton.knobs.nvidia.ws_tile_prefetch_depth = tile_prefetch_depth
+
+        dtype = torch.float16
+        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+        device = "cuda"
+
+        torch.manual_seed(42)
+        A = torch.randn((M, K), dtype=dtype, device=device)
+        B = torch.randn((N, K), dtype=dtype, device=device)
+        C = torch.empty((M, N), dtype=dtype, device=device)
+
+        num_tiles = triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)
+        num_clusters = min(max(NUM_SMS, 1), num_tiles)
+        grid_size = num_clusters
+        tile_counter = torch.full((1, ), grid_size, dtype=torch.int32, device=device)
+
+        def alloc_fn(size, align, stream):
+            return torch.empty(size, dtype=torch.int8, device="cuda")
+
+        triton.set_allocator(alloc_fn)
+
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+        b_desc = TensorDescriptor(B, B.shape, B.stride(), [BLOCK_SIZE_N, BLOCK_SIZE_K])
+        c_desc = TensorDescriptor(C, C.shape, C.stride(), [BLOCK_SIZE_M, BLOCK_SIZE_N // EPILOGUE_SUBTILE])
+
+        kernel = matmul_kernel_tma_unified_persistent_ws_while[(grid_size, )](
+            a_desc,
+            b_desc,
+            c_desc,
+            tile_counter,
+            M,
+            N,
+            K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+            NUM_SMS=NUM_SMS,
+            SCHEDULE=SCHEDULE,
+            DATA_PARTITION_FACTOR=DATA_PARTITION_FACTOR,
+            NUM_CTAS=NUM_CTAS,
+            TWO_CTAS=False,
+            SMEM_ALLOC_ALGO=None,
+            SEPARATE_EPILOGUE_STORE=separate_epilogue_store,
+            num_stages=num_stages,
+            num_warps=num_warps,
+            generate_subtiled_region=generate_subtiled_region,
+        )
+        compiler_output = capfd.readouterr()
+
+        ttgir = kernel.asm["ttgir"]
+        assert "scf.while" in ttgir, "Expected dynamic persistent outer loop to remain an scf.while"
+        assert "atomic" in ttgir, "Expected an atomic op driving the dynamic tile id"
+        assert "not assigned a pipeline stage" not in compiler_output.err
+        assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
+        # Hopper lowers the MMA to wgmma; the Blackwell tcgen5 path must be absent.
+        assert "ttng.warp_group_dot" in ttgir, "Expected a Hopper wgmma instruction"
+        assert "ttng.tc_gen5_mma" not in ttgir, "Did not expect a Blackwell tcgen5 MMA on Hopper"
+        assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        assert "ttng.clc_" not in ttgir, "Expected dynamic atomic scheduling, not CLC"
+
+        assert ttgir.count("ttng.warp_group_dot") >= DATA_PARTITION_FACTOR, "Expected one MMA per data partition"
+        expected_stores = EPILOGUE_SUBTILE * DATA_PARTITION_FACTOR
+        assert ttgir.count("ttng.async_tma_copy_local_to_global") >= expected_stores, (
+            "Expected every epilogue subtile and data partition to emit a TMA store")
 
         ref_out = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(dtype)
         torch.testing.assert_close(ref_out, C, atol=0.03, rtol=0.03)

@@ -1,5 +1,5 @@
-// REQUIRES: asserts
-// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s --check-prefix=GRAPH
+// RUN: TRITON_MODULO_SMEM_BUDGET_KB=448 triton-opt %s -allow-unregistered-dialect -split-input-file -nvgpu-modulo-schedule | FileCheck %s --check-prefix=IR
 
 //===----------------------------------------------------------------------===//
 // Regression tests for Step 4.6 budget reduction (reduceBufferGroup +
@@ -36,12 +36,15 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 //       2*II >= 1714 + II  =>  II >= 1714,
 //     converging to II = 1714, where 2*1714 = 3428 >= 1714+1714 = 3428.
 //
-// CHECK: [Step4.6] Reduced SMEM buf2 (+ co-consumed/merge peers) to count=2
-// CHECK: [Step4.6] Raising II from 1166 to 1714 due to buffer depth reduction
 // The schedule graph carries the fixed-point II, and the loop-carried operand
 // ring is double-buffered (count=2) at that raised II:
-// CHECK: ii = 1714, max_stage = 1
-// CHECK: %buf2 = modulo.alloc SMEM [2 x 128x512 x f16]
+// GRAPH-LABEL: [PASS-A] === Inner ScheduleGraph ===
+// GRAPH: ii = 1714, max_stage = 1
+// GRAPH: %buf2 = modulo.alloc SMEM [2 x 128x512 x f16]
+// The emitted IR records the same fixed-point II and reduced ring depth.
+// IR-LABEL: tt.func @prefetch_carried_ii(
+// IR: ttg.local_alloc {{.*}}tt.num_buffers = 2 : i32{{.*}}!ttg.memdesc<128x512xf16
+// IR: } {tt.modulo_ii = 1714 : i32
 tt.func @prefetch_carried_ii(
   %a_desc: !tt.tensordesc<128x512xf16>,
   %b_desc: !tt.tensordesc<512x64xf16>
@@ -101,18 +104,19 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // the group is 262144 + 131072 = 393216 B (+ barriers) = 393264 B <= 458752, so
 // the reducer stops — capping the ring at the largest depth that fits.
 //
-// The regression guard: BOTH members drop together to the SAME count (2), and
-// the reported footprint actually falls below budget. Before the fix (reduce a
-// single member, no physical refresh) one member would be hammered down to
-// count=1 while its peer stayed high and the shared physical footprint never
-// dropped.
+// The regression guard: BOTH members drop together to the SAME count (2), with
+// operand allocations totaling 393216 B and leaving room for barriers below
+// budget. Before the fix (reduce a single member, no physical refresh) one
+// member would be hammered down to count=1 while its peer stayed high and the
+// shared physical footprint never dropped.
 //
-// CHECK: [Step4.6] Reduced SMEM buf1 (+ co-consumed/merge peers) to count=2
-// Footprint dropped below the 458752 B budget after refreshing physical buffers:
-// CHECK: [Step4.6] Budget: SMEM 393264/458752 OK
 // Both co-consumed operands end at the SAME count=2 (not one collapsed to 1):
-// CHECK-DAG: %buf0 = modulo.alloc SMEM [2 x 128x512 x f16]
-// CHECK-DAG: %buf1 = modulo.alloc SMEM [2 x 512x64 x f16]
+// GRAPH-LABEL: [PASS-A] === Inner ScheduleGraph ===
+// GRAPH-DAG: %buf0 = modulo.alloc SMEM [2 x 128x512 x f16]{{.*}}262144 bytes total
+// GRAPH-DAG: %buf1 = modulo.alloc SMEM [2 x 512x64 x f16]{{.*}}131072 bytes total
+// IR-LABEL: tt.func @coconsumed_group_reduce(
+// IR-DAG: ttg.local_alloc {{.*}}tt.num_buffers = 2 : i32{{.*}}!ttg.memdesc<128x512xf16
+// IR-DAG: ttg.local_alloc {{.*}}tt.num_buffers = 2 : i32{{.*}}!ttg.memdesc<512x64xf16
 tt.func @coconsumed_group_reduce(
   %a_desc: !tt.tensordesc<128x512xf16>,
   %b_desc: !tt.tensordesc<512x64xf16>

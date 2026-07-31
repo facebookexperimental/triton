@@ -205,6 +205,8 @@ LogicalResult InitBarrierOp::verify() {
   return success();
 }
 
+TypedValue<MemDescType> InitBarrierOp::getBarrier() { return getAlloc(); }
+
 // -- InvalBarrierOp --
 LogicalResult InvalBarrierOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
@@ -253,6 +255,8 @@ LogicalResult ClusterBarrierOp::verify() {
   return success();
 }
 
+TypedValue<MemDescType> InvalBarrierOp::getBarrier() { return getAlloc(); }
+
 // -- BarrierExpectOp --
 LogicalResult BarrierExpectOp::verify() {
   if (failed(verifyBarrierType(*this, getAlloc().getType())))
@@ -269,6 +273,7 @@ void BarrierExpectOp::setPredicateOperand(Value pred) {
 Type BarrierExpectOp::getPredicateOperandTypeLike() {
   return getPred().getType();
 }
+TypedValue<MemDescType> BarrierExpectOp::getBarrier() { return getAlloc(); }
 
 // -- WaitBarrierOp --
 LogicalResult WaitBarrierOp::verify() {
@@ -294,6 +299,7 @@ void WaitBarrierOp::setPredicateOperand(Value pred) {
 Type WaitBarrierOp::getPredicateOperandTypeLike() {
   return IntegerType::get(getContext(), 1);
 }
+TypedValue<MemDescType> WaitBarrierOp::getBarrier() { return getAlloc(); }
 
 // -- ArriveBarrierOp --
 LogicalResult ArriveBarrierOp::verify() {
@@ -328,6 +334,7 @@ Type ArriveBarrierOp::getPredicateOperandTypeLike() {
   return IntegerType::get(getContext(), 1);
 }
 
+TypedValue<MemDescType> ArriveBarrierOp::getBarrier() { return getAlloc(); }
 // -- VoteBallotSyncOp --
 LogicalResult VoteBallotSyncOp::verify() {
   Type predType = getPred().getType();
@@ -828,6 +835,23 @@ static LogicalResult verifyMMADType(Operation *op, Type a, Type b, Type d) {
   return success();
 }
 
+static LogicalResult verifyCompletionBarrierLayout(Operation *op,
+                                                   Value barrier) {
+  auto ctx = op->getContext();
+  auto numCTAs = gpu::lookupNumCTAs(op);
+  auto barrierTy = cast<MemDescType>(barrier.getType());
+  auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
+  auto kBlock = StringAttr::get(ctx, "block");
+  auto dim = standardOutDimNames(ctx, /*rank=*/1)[0];
+  auto localLayout =
+      CGAEncodingAttr::get(ctx, LinearLayout::zeros1D(numCTAs, kBlock, dim));
+  if (actualCGALayout == localLayout)
+    return success();
+  return verifyBarrierCGALayout(op, barrier,
+                                CGAEncodingAttr::get1DLayout(ctx, numCTAs),
+                                "completion barrier");
+}
+
 LogicalResult TCGen5MMAOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -839,8 +863,11 @@ LogicalResult TCGen5MMAOp::verify() {
     // models only the rank-1 `Nxi64` mbarrier form introduced upstream by
     // #9474) does not understand. Only verify the rank-1 form; leave beta's
     // higher-rank barriers unchecked here as they were before #9474.
-    if (barrierTy.getRank() == 1 && failed(verifyBarrierType(*this, barrierTy)))
-      return failure();
+    if (barrierTy.getRank() == 1) {
+      if (failed(verifyBarrierType(*this, barrierTy)) ||
+          failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
+        return failure();
+    }
   }
   Type atype = getA().getType().getElementType();
   Type btype = getB().getType().getElementType();
@@ -989,6 +1016,21 @@ ValueRange TCGen5MMAOp::getCompletionBarrierPreds() {
   return getBarrierPreds();
 }
 
+static void appendMulticastDesc(SmallVectorImpl<Value> &descs,
+                                TypedValue<MemDescType> desc) {
+  if (isa<SharedEncodingTrait>(desc.getType().getEncoding()))
+    descs.push_back(desc);
+}
+
+SmallVector<Value> TCGen5MMAOp::getCompletionDescs() {
+  SmallVector<Value> descs;
+  if (getMulticast()) {
+    appendMulticastDesc(descs, getA());
+    appendMulticastDesc(descs, getB());
+  }
+  return descs;
+}
+
 void TCGen5MMAOp::addCompletionBarrier(Value barrier, Value pred) {
   getBarrierPredsMutable().append(pred);
   getBarriersMutable().append(barrier);
@@ -1059,10 +1101,12 @@ bool TCGen5MMAOp::isAsync() { return getIsAsync(); }
 // -- TCGen5CommitOp --
 LogicalResult TCGen5CommitOp::verify() {
   auto numDescs = getDescs().size();
-  if (numDescs > 2)
-    return emitOpError("expected 0, 1, or 2 descriptors, got ") << numDescs;
+  if (numDescs > 4)
+    return emitOpError("expected 0 to 4 descriptors, got ") << numDescs;
   auto barrierTy = getBarrier().getType();
   if (failed(verifyBarrierType(*this, barrierTy)))
+    return failure();
+  if (failed(verifyCompletionBarrierLayout(getOperation(), getBarrier())))
     return failure();
   return success();
 }
@@ -1126,6 +1170,17 @@ verifyScaleBlockRepOrder(TCGen5MMAScaledOp op,
 }
 
 LogicalResult TCGen5MMAScaledOp::verify() {
+  if (!getIsAsync() && !getBarriers().empty()) {
+    return emitOpError("The op is synchronous but a barrier is present.");
+  }
+  for (auto barrier : getBarriers()) {
+    auto barrierTy = cast<MemDescType>(barrier.getType());
+    if (barrierTy.getRank() == 1) {
+      if (failed(verifyBarrierType(*this, barrierTy)) ||
+          failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
+        return failure();
+    }
+  }
   Type atype =
       getScaledMMAOperandType(getA().getType().getElementType(), getAType());
   Type btype =
@@ -1149,26 +1204,28 @@ LogicalResult TCGen5MMAScaledOp::verify() {
     int64_t scalesPerCTA = shapePerCTA.back();
     return rowsPerCTA > 128 && scalesPerCTA > 4;
   };
-  if (isa<TensorMemorySpaceAttr>(aScaleType.getMemorySpace()) &&
-      isScaleBlockRepOrderRelevant(aScaleType)) {
+  auto verifyScaleEncoding = [&](MemDescType scaleType,
+                                 bool isA) -> LogicalResult {
+    if (!isa<TensorMemorySpaceAttr>(scaleType.getMemorySpace()))
+      return success();
+    bool isOrderRelevant = isScaleBlockRepOrderRelevant(scaleType);
     auto encoding =
-        dyn_cast<TensorMemoryScalesEncodingAttr>(aScaleType.getEncoding());
-    if (!encoding)
-      return emitOpError("A scales in tensor memory must use "
-                         "#ttng.tensor_memory_scales_encoding");
-    if (failed(verifyScaleBlockRepOrder(*this, encoding, /*isA=*/true)))
-      return failure();
-  }
-  if (isa<TensorMemorySpaceAttr>(bScaleType.getMemorySpace()) &&
-      isScaleBlockRepOrderRelevant(bScaleType)) {
-    auto encoding =
-        dyn_cast<TensorMemoryScalesEncodingAttr>(bScaleType.getEncoding());
-    if (!encoding)
-      return emitOpError("B scales in tensor memory must use "
-                         "#ttng.tensor_memory_scales_encoding");
-    if (failed(verifyScaleBlockRepOrder(*this, encoding, /*isA=*/false)))
-      return failure();
-  }
+        dyn_cast<TensorMemoryScalesEncodingAttr>(scaleType.getEncoding());
+    if (!encoding) {
+      if (!isOrderRelevant)
+        return success();
+      return emitOpError() << (isA ? "A" : "B")
+                           << " scales in tensor memory must use "
+                              "#ttng.tensor_memory_scales_encoding";
+    }
+    if (!isOrderRelevant && encoding.getBlockRepOrder() ==
+                                TensorMemoryScalesBlockRepOrder::MN_THEN_K)
+      return success();
+    return verifyScaleBlockRepOrder(*this, encoding, isA);
+  };
+  if (failed(verifyScaleEncoding(aScaleType, /*isA=*/true)) ||
+      failed(verifyScaleEncoding(bScaleType, /*isA=*/false)))
+    return failure();
   return success();
 }
 
@@ -1272,6 +1329,17 @@ ValueRange TCGen5MMAScaledOp::getCompletionBarrierPreds() {
   return getBarrierPreds();
 }
 
+SmallVector<Value> TCGen5MMAScaledOp::getCompletionDescs() {
+  SmallVector<Value> descs;
+  if (getMulticast()) {
+    appendMulticastDesc(descs, getA());
+    appendMulticastDesc(descs, getB());
+    appendMulticastDesc(descs, getAScale());
+    appendMulticastDesc(descs, getBScale());
+  }
+  return descs;
+}
+
 void TCGen5MMAScaledOp::addCompletionBarrier(Value barrier, Value pred) {
   getBarrierPredsMutable().append(pred);
   getBarriersMutable().append(barrier);
@@ -1342,7 +1410,7 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
                               ScaleDotElemType aType, ScaleDotElemType bType,
                               Value useD, Value pred, bool twoCTAs,
                               ValueRange barriers, ValueRange barrierPreds,
-                              bool isAsync) {
+                              bool isAsync, bool multicast) {
   MLIRContext *ctx = builder.getContext();
   if (!barriers.empty()) {
     isAsync = true;
@@ -1351,7 +1419,8 @@ void TCGen5MMAScaledOp::build(OpBuilder &builder, OperationState &state,
         ScaleDotElemTypeAttr::get(ctx, aType),
         ScaleDotElemTypeAttr::get(ctx, bType), useD, pred, barriers,
         barrierPreds, isAsync ? builder.getUnitAttr() : UnitAttr(),
-        twoCTAs ? builder.getUnitAttr() : UnitAttr());
+        twoCTAs ? builder.getUnitAttr() : UnitAttr(),
+        multicast ? builder.getUnitAttr() : UnitAttr());
 }
 
 bool TCGen5MMAScaledOp::isAsync() { return getIsAsync(); }
@@ -1984,15 +2053,64 @@ static LogicalResult verifyCLCResultMemdesc(Location loc, MemDescType desc) {
                              "single dimension equal to 2, but got "
                           << desc.getShape() << ".";
   }
+  auto cgaLayout = getCGALayout(layout);
+  auto kBlock = StringAttr::get(cgaLayout.getContext(), "block");
+  if (!llvm::all_of(cgaLayout.getLinearLayout().getBases().lookup(kBlock),
+                    [](const auto &basis) {
+                      return llvm::all_of(basis,
+                                          [](auto base) { return base == 0; });
+                    }))
+    return emitError(loc) << "Expected CLC result buffer cga_layout bases to "
+                             "be all zeros. Got "
+                          << formatCGALayout(cgaLayout);
   return success();
 }
 
 LogicalResult CLCTryCancelOp::verify() {
-  return verifyCLCResultMemdesc(getLoc(), getResult().getType());
+  if (failed(verifyCLCResultMemdesc(getLoc(), getResult().getType())))
+    return failure();
+  if (failed(verifyBarrierType(*this, getMbarrier().getType())))
+    return failure();
+  return verifyCompletionBarrierLayout(getOperation(), getMbarrier());
 }
+
+TypedValue<MemDescType> CLCTryCancelOp::getBarrier() { return getMbarrier(); }
 
 LogicalResult CLCLoadResultOp::verify() {
   return verifyCLCResultMemdesc(getLoc(), getSrc().getType());
+}
+
+SmallVector<uint16_t> getCTABroadcastMasks(bool twoCTAs, ValueRange descs) {
+  SmallVector<uint16_t> broadcastMasks;
+  if (!descs.empty()) {
+    auto kBlock = StringAttr::get(descs.front().getContext(), "block");
+    for (Value desc : descs) {
+      auto descTy = cast<gpu::MemDescType>(desc.getType());
+      uint16_t broadcastBits =
+          toLinearLayout(descTy).getFreeVariableMasks().lookup(kBlock);
+      if (twoCTAs)
+        broadcastBits |= 1;
+      if (broadcastBits)
+        broadcastMasks.push_back(broadcastBits);
+    }
+  } else if (twoCTAs) {
+    broadcastMasks.push_back(1);
+  }
+  return broadcastMasks;
+}
+
+TMAMulticastMaskEncoding getTMAMulticastMaskEncoding(int numCTAs,
+                                                     uint16_t broadcastBits) {
+  // Compute the map that goes from cta_id to lead_cta_id (fixedBits)
+  // and the pattern that goes from cta_id to the multicast group (pattern).
+  int blockBits = llvm::Log2_32(numCTAs);
+  uint32_t fixedBits = (~broadcastBits) & (numCTAs - 1);
+  uint32_t pattern = 1;
+  for (int i = 0; i < blockBits; ++i) {
+    if ((fixedBits & (1u << i)) == 0)
+      pattern |= (pattern << (1u << i));
+  }
+  return {fixedBits, pattern};
 }
 
 } // namespace nvidia_gpu

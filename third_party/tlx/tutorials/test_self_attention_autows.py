@@ -92,6 +92,7 @@ os.environ["TRITON_DISABLE_WSBARRIER_REORDER"] = "1"
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
+from triton._internal_testing import is_blackwell, is_hopper  # noqa: E402
 
 import triton_hstu_attention as A  # noqa: E402
 
@@ -191,6 +192,7 @@ def _run_autows_fwd(L, Z):
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_self_attention_fwd_autows(L, Z):
     """DEFAULT autoWS config (in-process): fwd + grads vs torch reference."""
     if not torch.cuda.is_available():
@@ -205,6 +207,7 @@ def test_self_attention_fwd_autows(L, Z):
 
 
 @pytest.mark.parametrize("L,Z", [(256, 2)])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU for TMEM reuse")
 def test_self_attention_bwd_autows_dqreduce(L, Z):
     """TLX-matching dq-reduce config (BM=BN=128, ns=2, TMEM reuse, dsT-in-SMEM).
 
@@ -233,6 +236,7 @@ def test_self_attention_bwd_autows_dqreduce(L, Z):
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_self_attention_fwd_autows_fadp(L, Z):
     """FA-style manual data-partition fwd (split BLOCK_M=256 -> 2x128, shared K/V,
     warp-specialized 2 MMA groups; env HSTU_SELF_FA_DP=1 + HSTU_SELF_DP=2).
@@ -260,6 +264,7 @@ def test_self_attention_fwd_autows_fadp(L, Z):
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_self_attention_fwd_autows_compiler_dp2(L, Z):
     """Compiler data-partition fwd (HSTU_SELF_DP=2, no FA_DP): the compiler splits
     the 2*BLOCK_M=256 tile into two 128-row groups. Runs in a SUBPROCESS

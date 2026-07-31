@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 //
 // Orderable complement of ws_code_partition_tmem_3group_no_chain.mlir. {dpT, dsT,
 // dq} share one TMEM slot (buffer.id = 8):
@@ -10,6 +10,9 @@
 // the shared (dpT) reuse token so dq waits for dsT's consumer before overwriting.
 //
 // CHECK-NOT: no unique dependency-chain order
+// CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
+// CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
+// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>

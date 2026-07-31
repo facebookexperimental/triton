@@ -768,7 +768,9 @@ def AsyncCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_copy_local_to_global", [
 //===----------------------------------------------------------------------===//
 // InitBarrierOp
 //===----------------------------------------------------------------------===//
-def InitBarrierOp : TT_AMDGPU_Op<"init_barrier", [MemoryEffects<[MemWrite<SharedMemory>]>]> {
+def InitBarrierOp : TT_AMDGPU_Op<"init_barrier", [
+    MemoryEffects<[MemWrite<SharedMemory>]>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "Initialize a barrier in the given shared memory allocation.";
   let description = [{
       Initializes a shared memory allocation with mbarrier information.
@@ -806,7 +808,8 @@ def ReadBarrierPhaseOp : TT_AMDGPU_Op<"read_barrier_phase",  [MemoryEffects<[Mem
 
 def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local", [AttrSizedOperandSegments,
     DeclareOpInterfaceMethods<TDMOpInterface>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+    DeclareOpInterfaceMethods<PredicatedOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Copy data based on descriptor from global memory to local memory asynchronously";
 
   let description = [{
@@ -818,6 +821,33 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
     swizzling.
     The operation can also take an optional 64bit LDS barrier address, in which case
     it sends an "LDS atomic arrive" to signal its completion.
+
+    `warp_used_hint` is an optional i32 bitmask performance hint for
+    partial TDM copy: bit `n` (LSB = warp 0) means warp `n` issues the
+    instruction; bits above `num_warps - 1` must be zero.  Same data
+    lands in shared memory either way -- only emission changes:
+    `K = popcount(hint)` warps cover the block, the rest are pred-off.
+
+    For "all warps participate", omit the attribute (preferred) or pass
+    a full bitmask `K = num_warps`; an explicit `warp_used_hint = 0` is
+    rejected by the verifier.
+
+    Restriction: the hint must be *axis-aligned*.  Pin some warpId bit
+    positions to fixed values and leave the others free; the active
+    warps are exactly those with the pinned bits set accordingly.
+    K = `popcount(hint)` is therefore a power of two (= 2^(number of
+    free bits)).  Legal: `0x0F` (warps 0..3), `0xF0` (warps 4..7),
+    `0x55` / `0xAA` / `0xCC` (stride-by-`2^j`).  Rejected: non
+    axis-aligned patterns like `0x69` or `0x1B`.
+
+    Why this shape: power-of-two K keeps the per-warp tile recalc
+    (`block / K`) integer-clean, and the bit-pinning shape lets the
+    per-warp offset and active-mask predicate fall out of the same
+    `getFreeVariableMasks` LL machinery the no-hint path uses.
+
+    PartitionedSharedEncoding additionally requires `K = popcount(hint)`
+    to be a multiple of `numLogicalPieces` (the hinted path doesn't
+    support multi-instruction slicing).
   }];
 
   let arguments = (ins
@@ -826,14 +856,28 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
     Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
     I32:$pred,
     Arg<Optional<TTG_MemDescType>, "", [MemWrite<SharedMemory>]>:$barrier,
-    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache
+    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
+    OptionalAttr<I32Attr>:$warp_used_hint
   );
 
   let results = (outs TTG_AsyncToken:$token);
 
   let builders = [
     OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$result, "Value":$pred), [{
-      return build($_builder, $_state, desc, indices, result, pred, /*barrier=*/static_cast<mlir::Value>(nullptr));
+      return build($_builder, $_state, desc, indices, result, pred,
+                   /*barrier=*/static_cast<mlir::Value>(nullptr),
+                   /*cache=*/triton::CacheModifier::NONE,
+                   /*warp_used_hint=*/IntegerAttr());
+    }]>,
+    OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$result, "Value":$pred, "Value":$barrier), [{
+      return build($_builder, $_state, desc, indices, result, pred, barrier,
+                   /*cache=*/triton::CacheModifier::NONE,
+                   /*warp_used_hint=*/IntegerAttr());
+    }]>,
+    OpBuilder<(ins "Value":$desc, "ValueRange":$indices, "Value":$result, "Value":$pred,
+                   "Value":$barrier, "::mlir::triton::CacheModifier":$cache), [{
+      return build($_builder, $_state, desc, indices, result, pred, barrier, cache,
+                   /*warp_used_hint=*/IntegerAttr());
     }]>
   ];
 
@@ -850,7 +894,8 @@ def AsyncTDMCopyGlobalToLocalOp : TT_AMDGPU_Op<"async_tdm_copy_global_to_local",
 //===----------------------------------------------------------------------===//
 
 def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global", [AttrSizedOperandSegments,
-    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+    DeclareOpInterfaceMethods<TDMOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Copy data based on descriptor from local memory to global memory asynchronously";
 
   let description = [{
@@ -884,7 +929,8 @@ def AsyncTDMCopyLocalToGlobalOp : TT_AMDGPU_Op<"async_tdm_copy_local_to_global",
 //===----------------------------------------------------------------------===//
 
 def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
-    DeclareOpInterfaceMethods<TDMOpInterface>]> {
+    DeclareOpInterfaceMethods<TDMOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Scatter data from local memory to non-contiguous global memory rows asynchronously";
 
   let description = [{
@@ -926,7 +972,8 @@ def AsyncTDMScatterOp : TT_AMDGPU_Op<"async_tdm_scatter", [
 
 def AsyncTDMGatherOp : TT_AMDGPU_Op<"async_tdm_gather", [
     DeclareOpInterfaceMethods<TDMOpInterface>,
-    DeclareOpInterfaceMethods<PredicatedOpInterface>]> {
+    DeclareOpInterfaceMethods<PredicatedOpInterface>,
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "Gather data from non-contiguous global memory rows to local memory asynchronously";
 
   let description = [{
@@ -1164,7 +1211,8 @@ def MemoryCounterWaitOp : TT_AMDGPU_Op<"memory_counter_wait"> {
 // WaitBarrierOp
 //===----------------------------------------------------------------------===//
 
-def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier"> {
+def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "wait until the mbarrier phase completes.";
 
   let description = [{
@@ -1186,7 +1234,8 @@ def WaitBarrierOp : TT_AMDGPU_Op<"wait_barrier"> {
 //===----------------------------------------------------------------------===//
 // ArriveBarrierOp
 //===----------------------------------------------------------------------===//
-def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier"> {
+def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface, ["getBarrier"]>]> {
   let summary = "perform the arrive operation on an mbarrier";
   let description = [{
     Performs the "arrive" operation on an mbarrier object in shared memory. The operation requires a `count` attribute
@@ -1219,7 +1268,8 @@ def ArriveBarrierOp : TT_AMDGPU_Op<"arrive_barrier"> {
 // AsyncCopyMbarrierArriveOp
 //===----------------------------------------------------------------------===//
 
-def AsyncCopyMbarrierArriveOp : TT_AMDGPU_Op<"async_copy_mbarrier_arrive"> {
+def AsyncCopyMbarrierArriveOp : TT_AMDGPU_Op<"async_copy_mbarrier_arrive", [
+    DeclareOpInterfaceMethods<MBarrierOpInterface>]> {
   let summary = "arrive on mbarrier once all previously issued copies are completed";
   let description = [{
     Performs the "async arrive" operation by decrementing pending account by 1 when all previous async load to LDS (particularly, not TDM) have completed.
