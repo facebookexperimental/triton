@@ -1,7 +1,6 @@
 // (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 //
-// AMD CDNA (gfx9) latency model. See AMDLatencyModel.h. Cycle counts are
-// PLACEHOLDERS pending an AMD latency microbenchmark (refactor plan Phase C).
+// AMD CDNA (gfx9) latency model. See AMDLatencyModel.h.
 
 #include "AMDLatencyModel.h"
 
@@ -40,8 +39,7 @@ HWPipeline AMDLatencyModel::classifyPipeline(Operation *op) const {
 }
 
 OpLatencyInfo AMDLatencyModel::getLatency(Operation *op) const {
-  // PLACEHOLDER cycle counts — calibrate via an AMD microbench before using for
-  // real scheduling. `latency` = result-ready delay (drives RecMII);
+  // `latency` = result-ready delay (drives RecMII);
   // `selfLatency`/`occupancy` = pipe-hold (drives ResMII).
   HWPipeline pipe = classifyPipeline(op);
   switch (pipe) {
@@ -67,35 +65,58 @@ OpLatencyInfo AMDLatencyModel::getLatency(Operation *op) const {
           int64_t iK = std::max<int64_t>(1, (int64_t)instr[2]);
           int64_t M = rt.getShape()[0], N = rt.getShape()[1];
           int64_t K = aT.getShape()[1];
-          nMfma = ((M + tileM - 1) / tileM) * ((N + tileN - 1) / tileN) *
-                  ((K + iK - 1) / iK);
+          auto saturatingMul = [](int64_t lhs, int64_t rhs) {
+            if (lhs == 0 || rhs == 0)
+              return int64_t{0};
+            if (lhs > std::numeric_limits<int64_t>::max() / rhs)
+              return std::numeric_limits<int64_t>::max();
+            return lhs * rhs;
+          };
+          int64_t mCount = (M + tileM - 1) / tileM;
+          int64_t nCount = (N + tileN - 1) / tileN;
+          int64_t kCount = (K + iK - 1) / iK;
+          nMfma = saturatingMul(saturatingMul(mCount, nCount), kCount);
           if (nMfma < 1)
             nMfma = 1;
         }
       }
     }
-    // ~16 cyc per 16x16x32 MFMA (LLIR anchor). Clamp before narrowing to the
-    // int `latency` field: nMfma is int64 (product of M/N/K tile counts), so a
-    // very large dot could overflow int and wrap to a tiny/negative value,
-    // silently defeating the MFMA-count scaling.
-    int lat =
-        (int)std::min<int64_t>(nMfma * 16, std::numeric_limits<int>::max());
-    return OpLatencyInfo{pipe, /*latency=*/lat, /*selfLatency=*/lat,
-                         /*minWarps=*/1, /*occupancy=*/lat};
+    // gfx950 measurement using tlx.clock64/s_memtime and a runtime loop:
+    //   dependent v_mfma_f32_16x16x32_f16: 18.25 ticks ~= 18 cycles
+    //   four independent streams:          16.62 ticks/MFMA ~= 17 cycles
+    // s_memtime measured at 2.183 GHz while the gfx950 shader clock reached
+    // 2.2 GHz (1.008 cycles/tick). Scale the block-level dot by its per-wave
+    // hardware MFMA count and keep dependency latency distinct from occupancy.
+    int64_t intMax = std::numeric_limits<int>::max();
+    int latency = (int)std::min<int64_t>(nMfma, intMax / 18) * 18;
+    int occupancy = (int)std::min<int64_t>(nMfma, intMax / 17) * 17;
+    return OpLatencyInfo{pipe, /*latency=*/latency,
+                         /*selfLatency=*/occupancy, /*minWarps=*/1,
+                         /*occupancy=*/occupancy};
   }
   case HWPipeline::LDS:
-    return OpLatencyInfo{pipe, /*latency=*/30, /*selfLatency=*/4,
+    // gfx950 pure LDS read measurement using tlx.local_gather over a
+    // preinitialized 1D i32 LDS table:
+    //   dependent idx_{i+1}=table[idx_i]: 68.16 ticks ~= 69 cycles
+    //   four independent streams:         28.17 ticks/gather ~= 28 cycles
+    // A CTA barrier separates table initialization from timing. The dependent
+    // case isolates result-ready ds_read latency: the timed s_memtime region
+    // contains ds_read_b32 and no ds_write. Keep occupancy at the prior
+    // conservative value because x4 does not establish the issue-rate floor.
+    return OpLatencyInfo{pipe, /*latency=*/69, /*selfLatency=*/4,
                          /*minWarps=*/1, /*occupancy=*/4};
   case HWPipeline::GLOBAL:
     // Multi-outstanding async global (HBM) load: long round-trip, short
-    // occupancy. latency=790 measured on gfx950 by
-    // claude/amd_latency_microbench.py (pointer-chase: ~360 ns/load x 2.2 GHz,
-    // stable across runs).
+    // occupancy. Keep the conservative 790-cycle estimate: the current
+    // microbenchmark measures a warm self-pointer load, not DRAM latency.
     return OpLatencyInfo{pipe, /*latency=*/790, /*selfLatency=*/8,
                          /*minWarps=*/1, /*occupancy=*/8};
   case HWPipeline::VALU:
-    return OpLatencyInfo{pipe, /*latency=*/16, /*selfLatency=*/4,
-                         /*minWarps=*/4, /*occupancy=*/4};
+    // A dependent v_fma_f32 chain measures 8.30 s_memtime ticks ~= 8 cycles.
+    // The existing four-cycle occupancy remains conservative until a dedicated
+    // instruction-counted independent-stream benchmark is available.
+    return OpLatencyInfo{pipe, /*latency=*/8, /*selfLatency=*/4,
+                         /*minWarps=*/2, /*occupancy=*/4};
   default:
     return OpLatencyInfo{HWPipeline::NONE, /*latency=*/0, /*selfLatency=*/0,
                          /*minWarps=*/1, /*occupancy=*/0};

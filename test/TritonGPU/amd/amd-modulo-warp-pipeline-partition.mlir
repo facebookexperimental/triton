@@ -7,8 +7,8 @@
 // Test 1: Two pipelines (LDS + MFMA).
 // A minimal GEMM loop with LDS local_loads feeding a dot.
 //
-// CHECK: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA={{[0-9]+}} LDS={{[0-9]+}}
-// CHECK-SAME: clusters=
+// CHECK-DAG: remark: amd-modulo: DDG {{[0-9]+}} nodes MFMA={{[0-9]+}} LDS={{[0-9]+}}{{.*}}clusters=
+// CHECK-DAG: remark: amd-modulo: DDG {{[0-9]+}} nodes{{.*}}GLOBAL={{[1-9]}}{{.*}}clusters=
 // Step 4.7/4.8 annotate each op with its cluster ID and derived s_setprio: the
 // LDS local_loads and the MFMA dot land in different clusters.
 // CHECK:      ttg.local_load {{.*}}ttg.warp_pipeline_cluster = {{[0-9]+}}{{.*}}ttg.warp_pipeline_priority = {{[0-9]+}}
@@ -45,8 +45,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 // Test 2: Three pipelines (GLOBAL + LDS + MFMA).
 // A GEMM loop with global loads, local stores/loads, and a dot.
 //
-// CHECK: remark: amd-modulo: DDG {{[0-9]+}} nodes{{.*}}GLOBAL={{[1-9]}}
-// CHECK-SAME: clusters=
 // GLOBAL/LDS ops and the MFMA dot are annotated with cluster + priority.
 // CHECK:      tt.load {{.*}}ttg.warp_pipeline_cluster = {{[0-9]+}}{{.*}}ttg.warp_pipeline_priority = {{[0-9]+}}
 // CHECK:      tt.dot {{.*}}ttg.warp_pipeline_cluster = {{[0-9]+}}{{.*}}ttg.warp_pipeline_priority = {{[0-9]+}}
