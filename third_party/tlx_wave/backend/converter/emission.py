@@ -23,7 +23,6 @@ _MMA_PACKET_REPRESENTATIONS = frozenset({
     "simd_packet",
     "simd_packet_tuple",
 })
-_COMPARE_SELECT_MASK_BUDGET_DWORDS = 8
 
 
 @dataclass(frozen=True)
@@ -737,72 +736,6 @@ def _emit_cmpi(state, op):
             ),
         ) for lhs_component, rhs_component in zip(lhs_components, rhs_components))
     state.values[result_id] = _pack_components(components)
-
-
-def _emit_cmpi_select(state, op):
-    attrs = target_ir.attrs_dict(op)
-    lhs, rhs, true_value, false_value = _operand_values(state, op, 4)
-    result_id = _single_result(op)
-    count = _component_count(state, result_id)
-    lhs_components, rhs_components, true_components, false_components = (_broadcast_components(
-        state,
-        (lhs, rhs, true_value, false_value),
-        count,
-        op,
-    ))
-    # Keep the transient tuple of materialized scalar masks bounded without
-    # forcing every compare/select pair through VCC back-to-back.  The latter
-    # creates a long fixed-register hazard chain that the machine scheduler
-    # fills with otherwise-late data operations, extending their VGPR live
-    # ranges.  Budget in SGPR dwords so the policy is independent of wave32 vs
-    # wave64 mask width.
-    lane_width = int(state.target_program.values[result_id].type.lane_width or 64)
-    mask_dwords = max(1, lane_width // 32)
-    batch_components = max(
-        1,
-        _COMPARE_SELECT_MASK_BUDGET_DWORDS // mask_dwords,
-    )
-    component_operands = tuple(zip(
-        lhs_components,
-        rhs_components,
-        true_components,
-        false_components,
-    ))
-    components = [None] * count
-    reused = []
-    for batch_start in range(0, count, batch_components):
-        batch = component_operands[batch_start:batch_start + batch_components]
-        pending = []
-        for component_index, operands in enumerate(batch, start=batch_start):
-            existing = _find_reused_component_result(reused, operands)
-            if existing is not None:
-                components[component_index] = existing
-                continue
-            matching = next(
-                (indices for pending_operands, indices in pending
-                 if _same_component_operands(pending_operands, operands)),
-                None,
-            )
-            if matching is not None:
-                matching.append(component_index)
-                continue
-            pending.append((operands, [component_index]))
-        masks = tuple(_cmpi(
-            state,
-            attrs["predicate"],
-            operands[0],
-            operands[1],
-        ) for operands, _ in pending)
-        for (operands, indices), mask in zip(pending, masks):
-            selected = state.builder.select(
-                mask,
-                operands[2],
-                operands[3],
-            )
-            reused.append((operands, selected))
-            for component_index in indices:
-                components[component_index] = selected
-    state.values[result_id] = _pack_components(tuple(components))
 
 
 def _emit_affine_materialize(state, op):
@@ -7657,7 +7590,6 @@ _TARGET_EMITTERS = {
     "float_unary": _emit_float_unary,
     "float_cast": _emit_float_cast,
     "cmpi": _emit_cmpi,
-    "cmpi_select": _emit_cmpi_select,
     "maxsi": _emit_maxsi,
     "minsi": _emit_minsi,
     "assume": _emit_assume,
