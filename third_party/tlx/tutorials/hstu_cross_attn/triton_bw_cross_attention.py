@@ -44,7 +44,6 @@ from triton_attention_utils import (
     forward_softmax_activation_trans_scaled_alpha,
 )
 
-
 from triton_hstu_cross_attention import (
     _attn_bwd_preprocess,
     backward_common_preprocess,
@@ -3796,9 +3795,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
             attrs=_HSTU_ATTRS_DPT_2KV if (WS_ON and not _HSTU_MODULO_TOPK) else None,
         )
         if num_softmax_heads > 0:
-            dqk_trans0 = _backward_d_softmax_activation_f32x2(
-                dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0
-            )
+            dqk_trans0 = _backward_d_softmax_activation_f32x2(dact_qk_trans0, Delta_off, offs_m, stride_mm, mask_m, pT0)
         else:
             dqk_trans0 = backward_d_silu_activation(dact_qk_trans0, pT0, qk_trans0, scale, valid_mask_trans0)
         ######### computation/activation for P1
@@ -3837,9 +3834,7 @@ def _hstu_attn_bwd_inner_2kv(  # noqa C901
         )
         # calculate dqk_trans
         if num_softmax_heads > 0:
-            dqk_trans1 = _backward_d_softmax_activation_f32x2(
-                dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1
-            )
+            dqk_trans1 = _backward_d_softmax_activation_f32x2(dact_qk_trans1, Delta_off, offs_m, stride_mm, mask_m, pT1)
         else:
             dqk_trans1 = backward_d_silu_activation(dact_qk_trans1, pT1, qk_trans1, scale, valid_mask_trans1)
 
@@ -4265,8 +4260,8 @@ def triton_hstu_cross_attn_v3_bwd(
             WS_ON=((bwd_variant == BwdVariant.TRITON_AUTOWS) and os.environ.get("HSTU_AUTOWS_WS_OFF", "0") != "1"),
         )
     elif bwd_variant in (
-        BwdVariant.TRITON_AUTOWS_2KV,
-        BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA,
+            BwdVariant.TRITON_AUTOWS_2KV,
+            BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA,
     ):
         # MANUAL 2-KV-block data-partition variant. Shared-KV only; G == 1
         # (self-attn) so no per-kv-head atomic path is needed.

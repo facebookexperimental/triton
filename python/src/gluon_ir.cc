@@ -157,8 +157,8 @@ struct GluonLayouts {
         py::module::import("triton.experimental.gluon.language.amd._layouts");
     auto blackwellLayouts = py::module::import(
         "triton.experimental.gluon.language.nvidia.blackwell");
-    auto rubinLayouts = py::module::import(
-        "triton.experimental.gluon.language.nvidia.rubin");
+    auto rubinLayouts =
+        py::module::import("triton.experimental.gluon.language.nvidia.rubin");
     AutoLayout = py::object(layouts.attr("AutoLayout")).release();
     CoalescedLayout = py::object(layouts.attr("CoalescedLayout")).release();
     BlockedLayout = py::object(layouts.attr("BlockedLayout")).release();
