@@ -14713,6 +14713,11 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
       %value = arith.addf %lhs, %rhs : f32
       tt.reduce.return %value : f32
     }) : (tensor<256x64xf32, #mma>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mma}>>
+    %difference = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %value = arith.subf %lhs, %rhs : f32
+      tt.reduce.return %value : f32
+    }) : (tensor<256x64xf32, #mma>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mma}>>
     tt.return
   }
 """
@@ -14721,20 +14726,71 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     reductions = [op for op in output.target_program.ops if op.kind == "reduction"]
-    assert [converter_target_ir.attrs_dict(op)["operation"] for op in reductions] == [
+    assert all(converter_target_ir.attrs_dict(op) == {"axis": 1} for op in reductions)
+    combiner_regions = [output.target_program.regions[op.region_ids[0]] for op in reductions]
+    assert all(len(region.block_arg_ids) == 2 and len(region.yield_value_ids) == 1 for region in combiner_regions)
+    combiner_ops = [output.target_program.ops[region.op_ids[0]] for region in combiner_regions]
+    assert [converter_target_ir.attrs_dict(op)["operation"] for op in combiner_ops] == [
         "maximumf",
         "maxnumf",
         "addf",
+        "subf",
     ]
-    assert all(len(converter_target_ir.attrs_dict(op)["component_terms"]) == 2 for op in reductions)
-    assert all(
-        all(len(terms) == 64 for terms in converter_target_ir.attrs_dict(op)["component_terms"]) for op in reductions)
+    assert all(op.kind == "float_binary" for op in combiner_ops)
     wave = output.emitted_module.text
-    assert "wave.shuffle" in wave
+    assert wave.count("wave.reduce") == 4
+    assert "wave.shuffle" not in wave
     assert "wave.fmax" in wave
     assert "wave.fadd" in wave
+    assert "wave.fsub" in wave
+    lowered = _run_wave_lower_redistribute(wave)
+    assert "wave.reduce" not in lowered
+    assert "wave.shuffle" in lowered
+    assert "wave.fmax" in lowered
+    assert "wave.fadd" in lowered
+    assert "wave.fsub" in lowered
     _run_wave_verify(wave)
-    _run_waveamd_to_machine(wave)
+    _run_waveamd_to_machine(lowered)
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_reduces_integer_packets(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+"""
+    local_func = """
+  tt.func public @converter_reduce_integer_packets() attributes {noinline = false} {
+    %input = arith.constant dense<1> : tensor<1x64xi32, #blocked>
+    %sum = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+    ^bb0(%lhs: i32, %rhs: i32):
+      %value = arith.addi %lhs, %rhs : i32
+      tt.reduce.return %value : i32
+    }) : (tensor<1x64xi32, #blocked>) -> tensor<1xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=1,
+        preamble=preamble,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    reduction = next(op for op in output.target_program.ops if op.kind == "reduction")
+    combiner = output.target_program.regions[reduction.region_ids[0]]
+    combiner_op = output.target_program.ops[combiner.op_ids[0]]
+    assert combiner_op.kind == "binary"
+    assert converter_target_ir.attrs_dict(combiner_op)["operation"] == "addi"
+    wave = output.emitted_module.text
+    assert "wave.reduce" in wave
+    lowered = _run_wave_lower_redistribute(wave)
+    assert "wave.reduce" not in lowered
+    assert "wave.binary addi" in lowered
+    assert "wave.shuffle" in lowered
+    _run_wave_verify(wave)
+    _run_waveamd_to_machine(lowered)
     del ctx
 
 

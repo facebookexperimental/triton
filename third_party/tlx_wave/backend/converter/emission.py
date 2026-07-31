@@ -1537,140 +1537,99 @@ def _select_vector_payload_components(
 
 def _emit_reduction(state, op):
     attrs = target_ir.attrs_dict(op)
-    source = _operand_values(state, op, 1)[0]
-    source_components = _value_components(state, source, op)
-    result_id = _single_result(op)
-    component_terms = tuple(tuple(term for term in terms) for terms in attrs["component_terms"])
-    if len(component_terms) != _component_count(state, result_id):
+    if len(op.region_ids) != 1:
         fail(
             "TLXW_EMIT_REDUCTION",
             STAGE,
-            "reduction term groups do not match the result component count",
+            "reduction requires one combiner region",
+            target_op_id=op.target_op_id,
+        )
+    region = state.target_program.regions[int(op.region_ids[0])]
+    if len(region.block_arg_ids) != 2:
+        fail(
+            "TLXW_EMIT_REDUCTION",
+            STAGE,
+            "reduction combiner requires two block arguments",
+            target_op_id=op.target_op_id,
+        )
+    (source, ) = _operand_values(state, op, 1)
+    source_id = int(op.operands[0])
+    result_id = int(_single_result(op))
+    source_layout = _packet_layout(state, source_id, op)
+    result_layout = _packet_layout(state, result_id, op)
+    source_packet = _pack_layout_value(
+        state,
+        op,
+        source_id,
+        source,
+        source_layout,
+    )
+    result_type = _layout_packet_type(
+        state,
+        state.target_program.values[result_id].type,
+        result_layout,
+        op,
+    )
+    outer_values = dict(state.values)
+    outer_uniform_pointer_bases = dict(state.uniform_pointer_bases)
+    outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
+    outer_shared_pointer_offset_cache = dict(state.shared_pointer_offset_cache)
+    outer_wave_offset_i32_cache = dict(state.wave_offset_i32_cache)
+    try:
+        with state.builder.reduce_layout(
+                source_packet,
+                result_type,
+                source_layout=source_layout,
+                result_layout=result_layout,
+                axis=int(attrs["axis"]),
+        ) as reduction:
+            _restore_structural_emission_state(
+                state,
+                outer_values,
+                outer_uniform_pointer_bases,
+                outer_shared_pointer_dword_bases,
+                outer_shared_pointer_offset_cache,
+                outer_wave_offset_i32_cache,
+            )
+            for target_value_id, argument in zip(
+                    region.block_arg_ids,
+                    reduction.arguments,
+            ):
+                state.values[int(target_value_id)] = argument
+            yielded = _emit_region(state, op.region_ids[0])
+            if len(yielded) != 1:
+                fail(
+                    "TLXW_EMIT_REDUCTION",
+                    STAGE,
+                    "reduction combiner must yield one value",
+                    target_op_id=op.target_op_id,
+                )
+            state.builder.yield_(yielded)
+        result_packet = reduction.result
+    except ValueError as exc:
+        fail(
+            "TLXW_EMIT_REDUCTION",
+            STAGE,
+            str(exc),
             target_op_id=op.target_op_id,
             target_value_id=result_id,
         )
-    lane_width = int(attrs["lane_width"])
-    registers = int(attrs["source_registers"])
-    scalar_type = state.dsl.simd_type(state.dsl.f32(), lane_width)
-    lane = state.builder.lane_id(state.dsl.i32(), lane_width)
-    identity_lane_map = (0, tuple(1 << bit for bit in range(lane_width.bit_length() - 1)))
-    extracted = {}
-    lane_maps = {}
-    results = []
-    for terms in component_terms:
-        grouped = {}
-        for source_component, source_register, lane_base, lane_coefficients in terms:
-            source_component = int(source_component)
-            source_register = int(source_register)
-            if source_component < 0 or source_component >= len(source_components):
-                fail(
-                    "TLXW_EMIT_REDUCTION",
-                    STAGE,
-                    "reduction term references an out-of-range source component",
-                    target_op_id=op.target_op_id,
-                )
-            if source_register < 0 or source_register >= registers:
-                fail(
-                    "TLXW_EMIT_REDUCTION",
-                    STAGE,
-                    "reduction term references an out-of-range fragment register",
-                    target_op_id=op.target_op_id,
-                )
-            key = (source_component, source_register)
-            value = extracted.get(key)
-            if value is None:
-                payload = _simd_1d_vector_payload(state, source_components[source_component])
-                if payload is None:
-                    try:
-                        simd = state.dsl.SimdType(source_components[source_component].type)
-                    except Exception:
-                        simd = None
-                    if (registers != 1 or simd is None or str(simd.element_type) != "f32"
-                            or int(simd.width) != lane_width):
-                        fail(
-                            "TLXW_EMIT_REDUCTION",
-                            STAGE,
-                            "reduction input must contain f32 distributed registers",
-                            target_op_id=op.target_op_id,
-                        )
-                    value = source_components[source_component]
-                elif int(payload[0]) != registers or str(payload[1]) != "f32":
-                    fail(
-                        "TLXW_EMIT_REDUCTION",
-                        STAGE,
-                        "reduction input must contain f32 distributed registers",
-                        target_op_id=op.target_op_id,
-                    )
-                else:
-                    value = state.dsl.wave.ExtractOp(
-                        scalar_type,
-                        source_components[source_component],
-                        source_register,
-                    ).result
-                extracted[key] = value
-            lane_key = (int(lane_base), tuple(int(coefficient) for coefficient in lane_coefficients))
-            grouped.setdefault(lane_key, []).append(value)
-        group_results = []
-        for lane_key, values in grouped.items():
-            value = _emit_reduction_tree(state, attrs, values, op)
-            if lane_key != identity_lane_map:
-                source_lane = lane_maps.get(lane_key)
-                if source_lane is None:
-                    source_lane = _bit_linear_thread_offset_index_expr(
-                        state,
-                        lane,
-                        lane_key[0],
-                        lane_key[1],
-                    )
-                    lane_maps[lane_key] = source_lane
-                value = state.dsl.wave.ShuffleOp(
-                    value.type,
-                    value,
-                    source_lane,
-                ).result
-            group_results.append(value)
-        results.append(_emit_reduction_tree(state, attrs, group_results, op))
-    state.values[result_id] = _pack_components(tuple(results))
-
-
-def _emit_reduction_tree(state, attrs, values, op):
-    values = list(values)
-    if not values:
-        fail(
-            "TLXW_EMIT_REDUCTION",
-            STAGE,
-            "reduction requires at least one input value",
-            target_op_id=op.target_op_id,
+    finally:
+        _restore_structural_emission_state(
+            state,
+            outer_values,
+            outer_uniform_pointer_bases,
+            outer_shared_pointer_dword_bases,
+            outer_shared_pointer_offset_cache,
+            outer_wave_offset_i32_cache,
         )
-    fastmath = _fastmath_attr(state, attrs.get("fastmath"), op)
-    operation = attrs["operation"]
-    while len(values) > 1:
-        next_values = []
-        for index in range(0, len(values), 2):
-            if index + 1 == len(values):
-                next_values.append(values[index])
-                continue
-            lhs, rhs = values[index:index + 2]
-            if operation in {"maximumf", "maxnumf"}:
-                next_values.append(state.builder.fmax(lhs, rhs))
-            elif operation in {"addf", "mulf"}:
-                next_values.append(_emit_wave_float_binary_component(
-                    state,
-                    operation,
-                    lhs,
-                    rhs,
-                    fastmath,
-                    op,
-                ))
-            else:
-                fail(
-                    "TLXW_EMIT_REDUCTION",
-                    STAGE,
-                    f"unsupported reduction operation {operation}",
-                    target_op_id=op.target_op_id,
-                )
-        values = next_values
-    return values[0]
+    _unpack_layout_value(
+        state,
+        op,
+        result_id,
+        result_packet,
+        result_layout,
+    )
 
 
 def _emit_if(state, op):

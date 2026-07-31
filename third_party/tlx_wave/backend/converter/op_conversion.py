@@ -285,22 +285,23 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
 
 
 def _convert_region(
-    builder,
-    conversion_input,
-    type_layout_program,
-    fact_program,
-    region_id,
-    *,
-    allow_yield,
+        builder,
+        conversion_input,
+        type_layout_program,
+        fact_program,
+        region_id,
+        *,
+        allow_yield,
+        yield_op_names=("scf.yield", ),
 ):
     for op_index in conversion_input.regions[region_id].op_indices:
         op = conversion_input.ops[op_index]
-        if op.name == "scf.yield":
-            if not allow_yield:
+        if op.name in {"scf.yield", "tt.reduce.return"}:
+            if not allow_yield or op.name not in yield_op_names:
                 fail(
                     "TLXW_OP_UNEXPECTED_YIELD",
                     STAGE,
-                    "scf.yield is only valid inside a converted region",
+                    f"{op.name} is not valid in this converted region",
                     source_op_index=op.index,
                 )
             return op.operands
@@ -349,6 +350,7 @@ def _convert_source_op(
             builder,
             conversion_input,
             type_layout_program,
+            fact_program,
             op,
         )
         return
@@ -3878,7 +3880,13 @@ def _convert_return(builder, view):
     )
 
 
-def _convert_reduce(builder, conversion_input, type_layout_program, op):
+def _convert_reduce(
+    builder,
+    conversion_input,
+    type_layout_program,
+    fact_program,
+    op,
+):
     if len(op.operands) != 1 or len(op.results) != 1 or len(op.region_ids) != 1:
         fail(
             "TLXW_OP_REDUCTION",
@@ -3911,69 +3919,55 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
             "tt.reduce input and result element types must match",
             source_op_index=op.index,
         )
-    if result.type.element_type != "f32":
+    axis = _int_attr(op.attrs, "axis")
+
+    source_region = conversion_input.regions[op.region_ids[0]]
+    if len(source_region.block_arg_ids) != 2:
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
-            "distributed reductions currently require f32 elements",
+            "tt.reduce combiner region must have two block arguments",
             source_op_index=op.index,
         )
-    axis = _int_attr(op.attrs, "axis")
-    operand_layout = _require_layout(type_layout_program, operand.layout_map_id, op)
-    result_layout = _require_layout(type_layout_program, result.layout_map_id, op)
-    _require_slice_reduction_layouts(operand_layout, result_layout, axis, op)
-    source_registers = _distributed_registers_per_component(
-        operand,
-        operand_layout,
+    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
+    combiner_type_layout_program = _lift_reduction_region_types(
+        conversion_input,
+        type_layout_program,
+        op.region_ids[0],
+        lane_width,
         op,
     )
-    combiner = _reduction_combiner(conversion_input, op)
-    operations = {
-        "arith.addf": "addf",
-        "arith.maximumf": "maximumf",
-        "arith.maxnumf": "maxnumf",
-        "arith.mulf": "mulf",
-    }
-    operation = operations.get(combiner.name)
-    if operation is None:
+    block_arg_target_ids = tuple(
+        builder.add_value(
+            target_ir.target_type_from_converted(combiner_type_layout_program.values[source_value_id].type),
+            source_value_id=source_value_id,
+            debug_name=f"reduce_{op.index}_arg{index}",
+        ) for index, source_value_id in enumerate(source_region.block_arg_ids))
+    target_region_id = builder.add_region(block_arg_ids=block_arg_target_ids)
+    with builder.insertion_region(target_region_id):
+        yielded_source_values = _convert_region(
+            builder,
+            conversion_input,
+            combiner_type_layout_program,
+            fact_program,
+            op.region_ids[0],
+            allow_yield=True,
+            yield_op_names=("tt.reduce.return", ),
+        )
+    if len(yielded_source_values) != 1:
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
-            f"unsupported tt.reduce combiner {combiner.name}",
+            "tt.reduce combiner region must return one value",
             source_op_index=op.index,
         )
-    builder.erase_source_value(
-        combiner.results[0],
-        f"folded {combiner.name} into tt.reduce target operation",
+    yielded_target_id = _single_source_target(
+        builder,
+        yielded_source_values[0],
+        op,
     )
-    attrs = {
-        "axis":
-        int(axis),
-        "component_terms":
-        _within_wave_reduction_terms(
-            operand,
-            result,
-            operand_layout,
-            result_layout,
-            axis,
-            source_registers,
-            op,
-        ),
-        "lane_width":
-        int(result.type.lane_width or operand.type.lane_width or 64),
-        "operation":
-        operation,
-        "source_registers":
-        int(source_registers),
-    }
-    if combiner.name in {"arith.addf", "arith.mulf"}:
-        fastmath = _translated_fastmath_flags(
-            combiner.attrs,
-            source_op_index=combiner.index,
-            enable_fp_fusion=builder.contract.enable_fp_fusion,
-        )
-        if fastmath:
-            attrs["fastmath"] = fastmath
+    builder.set_region_yields(target_region_id, (yielded_target_id, ))
+
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -3983,233 +3977,71 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
         "reduction",
         operands=(_single_source_target(builder, operand.value_id, op), ),
         results=result_target_ids,
-        attrs=attrs,
+        attrs={"axis": int(axis)},
         layout_map_ids=result_layout_map_ids,
+        region_ids=(target_region_id, ),
         source_op_index=op.index,
     )
 
 
-def _reduction_combiner(conversion_input, op):
-    region = conversion_input.regions[op.region_ids[0]]
-    region_ops = tuple(conversion_input.ops[index] for index in region.op_indices)
-    if len(region.block_arg_ids) != 2 or len(region_ops) != 2:
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce combiner must contain two block arguments, one binary op, and tt.reduce.return",
-            source_op_index=op.index,
-        )
-    combiner, terminator = region_ops
-    if (len(combiner.operands) != 2 or len(combiner.results) != 1
-            or tuple(combiner.operands) != tuple(region.block_arg_ids)):
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce combiner must apply one binary op directly to its block arguments",
-            source_op_index=op.index,
-        )
-    if (terminator.name != "tt.reduce.return" or tuple(terminator.operands) != tuple(combiner.results)):
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce combiner must return its binary result",
-            source_op_index=op.index,
-        )
-    return combiner
-
-
-def _require_slice_reduction_layouts(operand_layout, result_layout, axis, op):
-    if (result_layout.kind != "slice" or result_layout.properties.get("parent_kind") != operand_layout.kind):
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce result must use a slice of the input layout",
-            source_op_index=op.index,
-            source_value_id=result_layout.value_id,
-        )
-    if int(result_layout.properties.get("dim", -1)) != int(axis):
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce axis must match the result slice dimension",
-            source_op_index=op.index,
-            source_value_id=result_layout.value_id,
-        )
-    input_encoding_properties = {
-        key: value
-        for key, value in operand_layout.properties.items()
-        if key != "coordinate_domain"
-    }
-    if result_layout.properties.get("parent_properties", {}) != input_encoding_properties:
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce result slice parent must match the input layout",
-            source_op_index=op.index,
-            source_value_id=result_layout.value_id,
-        )
-
-
-def _distributed_registers_per_component(converted, layout, op):
-    linear = layouts.distributed_linear_layout(
-        layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    register_count = layouts.linear_layout_in_dim_size(linear, "register")
-    component_count = int(converted.type.component_count)
-    if component_count <= 0 or int(register_count) % component_count:
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce input registers must evenly partition layout components",
-            source_op_index=op.index,
-            source_value_id=converted.value_id,
-        )
-    return int(register_count) // component_count
-
-
-def _within_wave_reduction_terms(
-    operand,
-    result,
-    operand_layout,
-    result_layout,
-    axis,
-    registers_per_component,
-    op,
+def _lift_reduction_region_types(
+    conversion_input,
+    type_layout_program,
+    region_id,
+    lane_width,
+    parent_op,
 ):
-    lane_width = int(result.type.lane_width or operand.type.lane_width or 64)
-    warp_count = layouts.layout_warp_count(operand_layout)
-    if layouts.layout_warp_count(result_layout) != warp_count:
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce input and result layouts must have the same warp count",
-            source_op_index=op.index,
-        )
-    source_linear = layouts.distributed_linear_layout(
-        operand_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    result_linear = layouts.distributed_linear_layout(
-        result_layout,
-        stage=STAGE,
-        source_op_index=op.index,
-    )
-    source_component_registers = layouts.linear_layout_component_registers(
-        source_linear,
-        operand_layout,
-        operand.type.component_count,
-        stage=STAGE,
-        source_op_index=op.index,
-        source_value_id=operand.value_id,
-    )
-    result_component_registers = layouts.linear_layout_component_registers(
-        result_linear,
-        result_layout,
-        result.type.component_count,
-        stage=STAGE,
-        source_op_index=op.index,
-        source_value_id=result.value_id,
-    )
-    source_slots = {}
-    for warp in range(int(warp_count)):
-        for component, component_register in enumerate(source_component_registers):
-            for register in range(int(registers_per_component)):
-                for lane in range(lane_width):
-                    coords = layouts.linear_layout_coords(
-                        source_linear,
-                        int(component_register) + int(register),
-                        lane,
-                        warp=warp,
-                    )
-                    key = (int(warp), tuple(int(coord) for coord in coords))
-                    source_slots.setdefault(key, set()).add((int(component), int(register), int(lane)))
-
-    component_terms = []
-    reduction_extent = int(operand_layout.shape[int(axis)])
-    for result_register in result_component_registers:
-        terms = []
-        for reduction_coord in range(reduction_extent):
-            source_component_registers_for_term = set()
-            lane_maps = []
-            for warp in range(int(warp_count)):
-                lane_map = []
-                for lane in range(lane_width):
-                    result_coords = list(layouts.linear_layout_coords(
-                        result_linear,
-                        result_register,
-                        lane,
-                        warp=warp,
-                    ))
-                    result_coords.insert(int(axis), int(reduction_coord))
-                    candidates = source_slots.get((int(warp), tuple(result_coords)))
-                    if not candidates:
-                        fail(
-                            "TLXW_OP_REDUCTION",
-                            STAGE,
-                            "tt.reduce axis crosses waves or is not covered by the input layout",
-                            source_op_index=op.index,
-                            source_value_id=operand.value_id,
-                        )
-                    source_component, source_register, source_lane = min(candidates)
-                    source_component_registers_for_term.add((source_component, source_register))
-                    lane_map.append(source_lane)
-                lane_maps.append(tuple(lane_map))
-            if len(source_component_registers_for_term) != 1 or len(set(lane_maps)) != 1:
-                fail(
-                    "TLXW_OP_REDUCTION",
-                    STAGE,
-                    "tt.reduce requires a uniform within-wave source register map",
-                    source_op_index=op.index,
-                    source_value_id=operand.value_id,
-                )
-            source_component, source_register = next(iter(source_component_registers_for_term))
-            lane_base, lane_coefficients = _bit_linear_lane_map(lane_maps[0], lane_width, op)
-            terms.append((
-                int(source_component),
-                int(source_register),
-                int(lane_base),
-                tuple(int(value) for value in lane_coefficients),
-            ))
-        component_terms.append(tuple(terms))
-    return tuple(component_terms)
-
-
-def _bit_linear_lane_map(lane_map, lane_width, op):
-    lane_width = int(lane_width)
-    if lane_width <= 0 or lane_width & (lane_width - 1):
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            f"tt.reduce requires a power-of-two lane width, got {lane_width}",
-            source_op_index=op.index,
-        )
-    lane_map = tuple(int(value) for value in lane_map)
-    if len(lane_map) != lane_width:
-        fail(
-            "TLXW_OP_REDUCTION",
-            STAGE,
-            "tt.reduce source lane map width does not match the target wave",
-            source_op_index=op.index,
-        )
-    base = lane_map[0]
-    bit_count = lane_width.bit_length() - 1
-    coefficients = tuple(base ^ lane_map[1 << bit] for bit in range(bit_count))
-    for lane, source_lane in enumerate(lane_map):
-        expected = base
-        for bit, coefficient in enumerate(coefficients):
-            if lane & (1 << bit):
-                expected ^= coefficient
-        if expected != source_lane:
+    values = dict(type_layout_program.values)
+    for source_value_id in _reduction_region_value_ids(
+            conversion_input,
+            region_id,
+    ):
+        converted = values[source_value_id]
+        if converted.type.representation != "scalar":
             fail(
                 "TLXW_OP_REDUCTION",
                 STAGE,
-                "tt.reduce source lane map is not bit-linear",
-                source_op_index=op.index,
+                "tt.reduce combiner values must have scalar source types",
+                source_op_index=parent_op.index,
+                source_value_id=source_value_id,
             )
-    return int(base), tuple(int(value) for value in coefficients)
+        element_type = converted.type.element_type
+        if element_type == "i1":
+            lifted_type = replace(
+                converted.type,
+                kind="mask",
+                representation="mask",
+                lane_width=int(lane_width),
+                component_count=1,
+            )
+        else:
+            lifted_type = replace(
+                converted.type,
+                kind="tensor",
+                representation="simd",
+                lane_width=int(lane_width),
+                component_count=1,
+            )
+        values[source_value_id] = replace(
+            converted,
+            type=lifted_type,
+            layout_map_id=None,
+        )
+    return replace(type_layout_program, values=values)
+
+
+def _reduction_region_value_ids(conversion_input, region_id):
+    region = conversion_input.regions[int(region_id)]
+    value_ids = list(region.block_arg_ids)
+    for op_index in region.op_indices:
+        nested_op = conversion_input.ops[int(op_index)]
+        value_ids.extend(nested_op.results)
+        for child_region_id in nested_op.region_ids:
+            value_ids.extend(_reduction_region_value_ids(
+                conversion_input,
+                child_region_id,
+            ))
+    return tuple(dict.fromkeys(int(value_id) for value_id in value_ids))
 
 
 def _convert_select(
