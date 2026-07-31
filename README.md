@@ -1184,6 +1184,32 @@ def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
 
 For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
 
+## Wave Uniformity (AMD)
+
+### `tlx.assume_uniform`
+
+Assert that a scalar holds the same value in every lane of the wave.
+
+```python
+value = tlx.assume_uniform(value)
+```
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `value` | scalar pointer, or 16/32/64-bit int or float | Value asserted to be wave-uniform. Narrower types are not supported. |
+
+**Returns**: `value`, unchanged.
+
+The main use is buffer operations, which keep their base pointer in the scalar (SGPR) resource descriptor, so it has to be wave-uniform. When the backend cannot prove that it is — most commonly because the pointer was loaded from memory — it falls back to a per-lane waterfall loop around every access. `tlx.assume_uniform` tells the backend to take uniformity as given:
+
+```python
+base = tl.load(ptr_array + gid).to(tl.pointer_type(tl.float16))
+base = tlx.assume_uniform(base)
+data = tlx.buffer_load(base, offsets)
+```
+
+Lowers to `amdg.assume_uniform`, which is eventually lowered to `llvm.amdgcn.readfirstlane` — that makes the result uniform by construction as far as LLVM's uniformity analysis is concerned. On non-AMD backends it is a no-op that returns its argument. Nothing verifies the assertion: if the value is not actually uniform, every lane silently gets lane 0's value.
+
 ## AMD TDM Descriptor Loads
 
 `tlx.async_amd_descriptor_load(desc, result, offsets, pred=None)` issues an AMD
