@@ -146,7 +146,6 @@ LOWERING_DOMAINS = (
             "memdesc_view",
             "local_load",
             "local_store",
-            "local_load_mma_payload",
             "layout_convert",
         ),
     ),

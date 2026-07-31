@@ -2874,6 +2874,7 @@ def _local_tensor_access_attrs(
             "generic_linear",
             "slice",
             "amd_mfma",
+            "dot_operand",
     }:
         fail(
             "TLXW_OP_LOCAL_MEMORY",
@@ -2897,9 +2898,20 @@ def _local_tensor_access_attrs(
     view = _memdesc_view_info(conversion_input, memdesc_value_id, op)
     lane_width = int(tensor_value.type.lane_width or tensor_layout.lane_width or conversion_input.threads_per_warp)
     warp_count = _layout_warp_count(tensor_layout)
-    plan = coordinates.layout_coordinate_plan(
+    packet_count = (
+        int(tensor_value.type.component_count)
+        if tensor_value.type.representation in _MMA_PACKET_REPRESENTATIONS
+        else 1
+    )
+    packet_width = (
+        _mma_packet_registers(type_layout_program, tensor_value, op)
+        if tensor_value.type.representation in _MMA_PACKET_REPRESENTATIONS
+        else int(tensor_value.type.component_count)
+    )
+    plan = coordinates.packet_layout_coordinate_plan(
         tensor_layout,
-        int(tensor_value.type.component_count),
+        int(packet_count),
+        int(packet_width),
         int(lane_width),
         int(warp_count),
         op,
@@ -2909,13 +2921,17 @@ def _local_tensor_access_attrs(
     return {
         "component_count":
         int(tensor_value.type.component_count),
-        "destination_component_coordinate_bases":
+        "packet_coordinate_bases":
         tuple(tuple(int(value) for value in bases) for bases in plan.component_bases),
-        "destination_coordinate_shape":
+        "coordinate_shape":
         tuple(int(dim) for dim in plan.shape),
-        "destination_offset_mode":
-        "layout_coordinates",
-        "destination_workitem_coordinate_coefficients":
+        "packet_count":
+        int(packet_count),
+        "packet_width":
+        int(packet_width),
+        "slot_coordinate_coefficients":
+        tuple(tuple(int(value) for value in coefficients) for coefficients in plan.slot_coefficients),
+        "workitem_coordinate_coefficients":
         tuple(tuple(int(value) for value in coefficients) for coefficients in plan.workitem_coefficients),
         "element_byte_width":
         int(memdesc.element_byte_width),
@@ -2923,12 +2939,19 @@ def _local_tensor_access_attrs(
         memdesc.element_type,
         "lane_width":
         int(lane_width),
-        **_scalarized_shared_layout_attrs(
+        "memdesc_logical_origin":
+        tuple(int(value) for value in view.logical_origin),
+        "memdesc_shape":
+        tuple(int(dim) for dim in shape),
+        "memdesc_physical_shape":
+        tuple(int(dim) for dim in view.physical_shape),
+        "source_shape":
+        tuple(int(dim) for dim in plan.shape),
+        **_encoded_shared_layout_attrs(
             memdesc_layout,
             view.physical_shape,
             memdesc.element_byte_width,
             op,
-            logical_origin=view.logical_origin,
         ),
     }
 
@@ -2957,104 +2980,6 @@ def _buffer_load_mma_packet_result_value_attrs(type_layout_program, loaded, has_
         "result_value_mode": "mma_packet_payload",
         "registers": int(registers),
     }
-
-
-def _local_load_result_value_attrs(attrs, result):
-    if result.type.element_type != "i8":
-        return {}
-    if int(attrs.get("element_byte_width", 0)) != 1:
-        return {}
-    if _local_load_transpose_vector_packet_indices(attrs, int(result.type.component_count)) is None:
-        return {}
-    return {
-        "result_packet_width": 4,
-        "result_transpose_packet_width": 8,
-        "result_value_mode": "transpose_vector_packets",
-    }
-
-
-def _local_load_mma_packet_result_value_attrs(type_layout_program, result, op):
-    if result.type.representation not in _MMA_PACKET_REPRESENTATIONS:
-        return {}
-    if result.type.element_type not in {"f16", "bf16", "f32"}:
-        fail(
-            "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "MMA packet ttg.local_load requires f16, bf16, or f32 results",
-            source_op_index=op.index,
-            source_value_id=result.value_id,
-        )
-    registers = _mma_packet_registers(type_layout_program, result, op)
-    return {
-        "registers": int(registers),
-        "result_packet_width": int(registers),
-        "result_value_mode": "mma_packet_payload",
-    }
-
-
-def _local_load_transpose_vector_packet_indices(attrs, component_count):
-    indices = []
-    index = 0
-    while index < int(component_count):
-        transpose_packet = _local_load_transpose_packet_elements(attrs, index, component_count)
-        if transpose_packet != 8:
-            return None
-        indices.append(index)
-        index += int(transpose_packet)
-    return tuple(indices)
-
-
-def _local_load_transpose_packet_elements(attrs, index, component_count):
-    if int(index) + 8 > int(component_count):
-        return 1
-    if attrs.get("destination_offset_mode") != "layout_coordinates":
-        return 1
-    if attrs.get("element_type") != "i8":
-        return 1
-    if int(attrs.get("element_byte_width", 0)) != 1:
-        return 1
-    if int(attrs.get("lane_width", 0)) != 64:
-        return 1
-    if attrs.get("destination_physical_offset_plan") != "swizzled_xor":
-        return 1
-    if attrs.get("destination_physical_offset_unit") != "element":
-        return 1
-    if int(attrs.get("destination_physical_element_byte_width", 0)) != 1:
-        return 1
-    if tuple(int(value) for value in attrs.get("destination_physical_order", ())) != (0, 1):
-        return 1
-    if int(attrs.get("destination_physical_swizzled_vec", 0)) != 1:
-        return 1
-    if int(attrs.get("destination_physical_swizzled_per_phase", 0)) != 1:
-        return 1
-    if int(attrs.get("destination_physical_swizzled_max_phase", 0)) != 1:
-        return 1
-    shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
-    if len(shape) != 2:
-        return 1
-    component_bases = tuple(
-        tuple(int(value) for value in bases) for bases in attrs["destination_component_coordinate_bases"])
-    if int(index) + 8 > len(component_bases):
-        return 1
-    workitem_coefficients = tuple(
-        tuple(int(value)
-              for value in coefficients)
-        for coefficients in attrs["destination_workitem_coordinate_coefficients"])
-    if any(len(coefficients) != len(shape) for coefficients in workitem_coefficients):
-        return 1
-    packet_bases = component_bases[int(index):int(index) + 8]
-    first_row, first_col = packet_bases[0]
-    if int(first_row) % 32 or int(first_col) % 4:
-        return 1
-    expected = []
-    for row_group in range(4):
-        for col_group in range(2):
-            expected.append((int(first_row) + row_group * 32, int(first_col) + col_group * 4))
-    if tuple(expected) != tuple(packet_bases):
-        return 1
-    if int(first_row) + 96 >= int(shape[0]) or int(first_col) + 4 >= int(shape[1]):
-        return 1
-    return 8
 
 
 def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_program, op):
@@ -3609,7 +3534,6 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
     result = type_layout_program.values[result_value_id]
     result_layout = (None if result.layout_map_id is None else type_layout_program.layouts[int(result.layout_map_id)])
     memdesc_value_id = op.operands[0]
-    memdesc = _memdesc_info(conversion_input, memdesc_value_id, op)
     token_value_id = None if len(op.operands) == 1 else op.operands[1]
     if token_value_id is not None and type_layout_program.values[token_value_id].type.representation != "token":
         fail(
@@ -3640,71 +3564,28 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
             source_value_id=result_value_id,
         )
-    if result_layout.kind != "dot_operand":
-        result_target_ids, result_layout_map_ids = _declare_results(
-            builder,
-            op,
-            type_layout_program,
-        )
-        attrs = _local_tensor_access_attrs(
-            conversion_input,
-            type_layout_program,
-            memdesc_value_id,
-            result,
-            "ttg.local_load result",
-            op,
-        )
-        attrs["synced_via_async_wait"] = synced_via_async_wait
-        attrs["explicit_dependency_count"] = len(dependency_target_ids)
-        attrs["data_result_count"] = len(result_target_ids)
-        attrs["completion_result_count"] = 0
-        attrs.update(_local_load_result_value_attrs(attrs, result))
-        attrs.update(_local_load_mma_packet_result_value_attrs(type_layout_program, result, op))
-        builder.add_op(
-            "local_load",
-            operands=target_operands,
-            results=result_target_ids,
-            attrs=attrs,
-            layout_map_ids=result_layout_map_ids,
-            source_op_index=op.index,
-        )
-        return
-    registers = _fragment_registers(memdesc.element_type, result_layout, op)
-    parent = result_layout.properties.get("parent_properties", {})
-    instr_shape = tuple(parent.get("instr_shape", ()))
-    fragment_rows, fragment_columns = _operand_fragment_shape(instr_shape, op)
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
         type_layout_program,
     )
-    load_plan = _fragment_local_load_plan(
+    attrs = _local_tensor_access_attrs(
         conversion_input,
         type_layout_program,
         memdesc_value_id,
-        result_layout,
-        int(result.type.component_count),
-        registers,
+        result,
+        "ttg.local_load result",
         op,
     )
+    attrs["synced_via_async_wait"] = synced_via_async_wait
+    attrs["explicit_dependency_count"] = len(dependency_target_ids)
+    attrs["data_result_count"] = len(result_target_ids)
+    attrs["completion_result_count"] = 0
     builder.add_op(
-        "local_load_mma_payload",
+        "local_load",
         operands=target_operands,
         results=result_target_ids,
-        attrs={
-            "columns": int(fragment_columns),
-            "component_count": int(result.type.component_count),
-            "element_type": memdesc.element_type,
-            "lane_width": int(result.type.lane_width or 64),
-            "registers": int(registers),
-            "role": int(result_layout.properties["op_idx"]),
-            "rows": int(fragment_rows),
-            "synced_via_async_wait": synced_via_async_wait,
-            "explicit_dependency_count": len(dependency_target_ids),
-            "data_result_count": len(result_target_ids),
-            "completion_result_count": 0,
-            **load_plan,
-        },
+        attrs=attrs,
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
@@ -7549,7 +7430,7 @@ def _fragment_local_load_plan(
     cached = conversion_input.fragment_local_load_plans.get(cache_key)
     if cached is not None:
         return cached
-    symbolic_plan = _noncontiguous_mma_payload_gather_plan(
+    symbolic_plan = _symbolic_mma_payload_gather_plan(
         memdesc,
         view,
         layout,
@@ -7619,7 +7500,7 @@ def _layout_cache_signature(layout):
     )
 
 
-def _noncontiguous_mma_payload_gather_plan(
+def _symbolic_mma_payload_gather_plan(
     memdesc,
     view,
     layout,
@@ -7630,7 +7511,7 @@ def _noncontiguous_mma_payload_gather_plan(
     *,
     coordinate_cache=None,
 ):
-    """Represent non-contiguous register packets as symbolic gathers."""
+    """Represent an MMA register packet as one exact symbolic memory relation."""
     element_byte_width = int(memdesc.element_byte_width or 0)
     if element_byte_width <= 0 or 4 % element_byte_width:
         return None
@@ -7647,10 +7528,6 @@ def _noncontiguous_mma_payload_gather_plan(
         result_layout.value_id,
         cache=coordinate_cache,
     )
-    op_idx = int(result_layout.properties.get("op_idx", -1))
-    k_dim = 1 if op_idx == 0 else 0 if op_idx == 1 else -1
-    if coordinates.packet_slots_are_contiguous_along_dimension(plan, k_dim):
-        return None
     if memdesc.element_type != result_layout.element_type:
         fail(
             "TLXW_OP_UNSUPPORTED_LOCAL_LOAD",

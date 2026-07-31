@@ -163,6 +163,15 @@ def _target_value_producer(target_program, target_value_id, *, kind=None):
     return producers[0]
 
 
+def _packetized_local_load_attrs(output):
+    attrs = [
+        converter_target_ir.attrs_dict(op)
+        for op in output.target_program.ops
+        if op.kind == "local_load"
+    ]
+    return [entry for entry in attrs if int(entry.get("packet_count", 1)) > 1]
+
+
 def _memory_affine_edge(target_program, memory_op):
     offset_operand_index = {
         "buffer_load": 1,
@@ -1097,7 +1106,7 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
     assert converter_domains.source_domains_for_op("tt.load") == ("generic_memory", )
     assert converter_domains.source_domains_for_op("tt.store") == ("generic_memory", )
     assert converter_domains.source_domains_for_op("rocdl.sched.barrier") == ("arithmetic_control", )
-    assert converter_domains.target_domain_for_op("local_load_mma_payload") == ("local_memory_layout")
+    assert converter_domains.target_domain_for_op("local_load") == ("local_memory_layout")
     assert converter_domains.target_domain_for_op("mma") == "mfma_fragment"
     assert converter_domains.target_domain_for_op("load") == "generic_memory"
     assert converter_domains.target_domain_for_op("store") == "generic_memory"
@@ -2394,7 +2403,8 @@ def test_tlx_wave_converter_vectorizes_dense_i8_local_store(tmp_path):
     store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
     assert len(store_lines) == 1
     assert "!wave.simd<vector<8xi8>, 64>" in store_lines[0]
-    assert 'packet_bindings ["offset"]' in store_lines[0]
+    assert "packet_bindings []()" in store_lines[0]
+    assert "bit_offset" in store_lines[0]
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_store_tuple_b32" in machine
     assert "waveamdmachine.ds_store_b8" not in machine
@@ -2421,7 +2431,8 @@ def test_tlx_wave_converter_vectorizes_swizzled_i8_local_store(tmp_path):
     store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
     assert len(store_lines) == 1
     assert "!wave.simd<vector<8xi8>, 64>" in store_lines[0]
-    assert 'packet_bindings ["offset"]' in store_lines[0]
+    assert "packet_bindings []()" in store_lines[0]
+    assert "bit_offset" in store_lines[0]
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert "waveamdmachine.ds_store_tuple_b32" in machine
     assert "waveamdmachine.ds_store_b8" not in machine
@@ -2448,7 +2459,8 @@ def test_tlx_wave_converter_vectorizes_swizzled_f16_local_store(tmp_path):
     store_lines = [line for line in output.emitted_module.text.splitlines() if "wave.scatter" in line]
     assert len(store_lines) == 1
     assert "!wave.simd<vector<32xf16>, 64>" in store_lines[0]
-    assert 'packet_bindings ["offset"]' in store_lines[0]
+    assert "packet_bindings []()" in store_lines[0]
+    assert "bit_offset" in store_lines[0]
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert machine.count("waveamdmachine.ds_store_tuple_b32") == 4
     assert "waveamdmachine.ds_store_b16" not in machine
@@ -3700,9 +3712,8 @@ def test_tlx_wave_converter_preserves_div_rem_source_order(operations):
             if op.kind == "binary"] == list(operations)
 
 
-@pytest.mark.parametrize("load_kind", ("local_load_mma_payload", "local_load"))
-def test_tlx_wave_converter_preserves_async_wait_source_order(load_kind):
-    target = _target_async_wait_local_load_program(load_kind)
+def test_tlx_wave_converter_preserves_async_wait_source_order():
+    target = _target_async_wait_local_load_program("local_load")
 
     ordered = converter_barrier_order.thread_barrier_issue_order(target)
 
@@ -3710,7 +3721,7 @@ def test_tlx_wave_converter_preserves_async_wait_source_order(load_kind):
     assert [ordered.ops[op_id].kind for op_id in op_ids] == [
         "async_commit_group",
         "memdesc_index",
-        load_kind,
+        "local_load",
         "async_wait",
     ]
 
@@ -3857,7 +3868,7 @@ def test_tlx_wave_converter_elides_compiler_membar_before_wait_ready_load():
         },
     )
     builder.add_op(
-        "local_load_mma_payload",
+        "local_load",
         attrs={"synced_via_async_wait": True},
     )
 
@@ -3866,7 +3877,7 @@ def test_tlx_wave_converter_elides_compiler_membar_before_wait_ready_load():
     assert [target.ops[op_id].kind for op_id in target.regions[0].op_ids] == [
         "buffer_load_to_local",
         "async_commit_group",
-        "local_load_mma_payload",
+        "local_load",
     ]
 
 
@@ -4837,15 +4848,12 @@ def test_tlx_wave_converter_emission_stage_emits_basic_wave_module(tmp_path):
 def _dense_f32_local_access_attrs():
     return {
         "component_count": 1,
-        "destination_component_coordinate_bases": ((0, ), ),
-        "destination_coordinate_shape": (64, ),
-        "destination_logical_origin": (0, ),
-        "destination_offset_mode": "layout_coordinates",
-        "destination_physical_element_byte_width": 4,
-        "destination_physical_offset_plan": "dense_row_major",
-        "destination_physical_offset_unit": "element",
-        "destination_physical_shape": (64, ),
-        "destination_workitem_coordinate_coefficients": (
+        "coordinate_shape": (64, ),
+        "packet_coordinate_bases": ((0, ), ),
+        "packet_count": 1,
+        "packet_width": 1,
+        "slot_coordinate_coefficients": (),
+        "workitem_coordinate_coefficients": (
             (1, ),
             (2, ),
             (4, ),
@@ -4853,8 +4861,46 @@ def _dense_f32_local_access_attrs():
             (16, ),
             (32, ),
         ),
+        "memdesc_logical_origin": (0, ),
+        "memdesc_physical_shape": (64, ),
+        "memdesc_shape": (64, ),
+        "shared_physical_element_byte_width": 4,
+        "shared_physical_offset_plan": "dense_row_major",
+        "shared_physical_offset_unit": "element",
+        "source_shape": (64, ),
         "element_byte_width": 4,
         "element_type": "f32",
+        "lane_width": 64,
+    }
+
+
+def _dense_f16_mma_local_access_attrs():
+    return {
+        "component_count": 1,
+        "coordinate_shape": (512, ),
+        "packet_coordinate_bases": ((0, ), ),
+        "packet_count": 1,
+        "packet_width": 2,
+        "slot_coordinate_coefficients": ((1, ), ),
+        "workitem_coordinate_coefficients": (
+            (2, ),
+            (4, ),
+            (8, ),
+            (16, ),
+            (32, ),
+            (64, ),
+            (128, ),
+            (256, ),
+        ),
+        "memdesc_logical_origin": (0, ),
+        "memdesc_physical_shape": (512, ),
+        "memdesc_shape": (512, ),
+        "shared_physical_element_byte_width": 2,
+        "shared_physical_offset_plan": "dense_row_major",
+        "shared_physical_offset_unit": "element",
+        "source_shape": (512, ),
+        "element_byte_width": 2,
+        "element_type": "f16",
         "lane_width": 64,
     }
 
@@ -5497,20 +5543,10 @@ def _build_mma_read_then_dma_reuse_target(
         },
     )
     builder.add_op(
-        "local_load_mma_payload",
+        "local_load",
         operands=(alloc, ),
         results=(payload, ),
-        attrs={
-            "component_count": 1,
-            "component_dword_offsets": (0, ),
-            "element_type": "f16",
-            "lane_width": 64,
-            "load_mode": "mma_payload_load",
-            "registers": 1,
-            "warps_per_cta": (1, 1),
-            "wave_tile_axis": "none",
-            "wave_tile_stride_dwords": 0,
-        },
+        attrs=_dense_f16_mma_local_access_attrs(),
     )
     if second_root:
         builder.add_op(
@@ -5524,20 +5560,10 @@ def _build_mma_read_then_dma_reuse_target(
             },
         )
         builder.add_op(
-            "local_load_mma_payload",
+            "local_load",
             operands=(second_alloc, ),
             results=(second_payload, ),
-            attrs={
-                "component_count": 1,
-                "component_dword_offsets": (0, ),
-                "element_type": "f16",
-                "lane_width": 64,
-                "load_mode": "mma_payload_load",
-                "registers": 1,
-                "warps_per_cta": (1, 1),
-                "wave_tile_axis": "none",
-                "wave_tile_stride_dwords": 0,
-            },
+            attrs=_dense_f16_mma_local_access_attrs(),
         )
     if add_mfma_boundary:
         builder.add_op(
@@ -5557,20 +5583,10 @@ def _build_mma_read_then_dma_reuse_target(
         )
     if reload_after_boundary:
         builder.add_op(
-            "local_load_mma_payload",
+            "local_load",
             operands=(alloc, ),
             results=(reloaded_payload, ),
-            attrs={
-                "component_count": 1,
-                "component_dword_offsets": (0, ),
-                "element_type": "f16",
-                "lane_width": 64,
-                "load_mode": "mma_payload_load",
-                "registers": 1,
-                "warps_per_cta": (1, 1),
-                "wave_tile_axis": "none",
-                "wave_tile_stride_dwords": 0,
-            },
+            attrs=_dense_f16_mma_local_access_attrs(),
         )
     if loop_refill:
         assert add_refill and not second_root
@@ -5586,20 +5602,10 @@ def _build_mma_read_then_dma_reuse_target(
                 attrs=_dense_f16_symbolic_copy_attrs(),
             )
             builder.add_op(
-                "local_load_mma_payload",
+                "local_load",
                 operands=(alloc, ),
                 results=(loop_payload, ),
-                attrs={
-                    "component_count": 1,
-                    "component_dword_offsets": (0, ),
-                    "element_type": "f16",
-                    "lane_width": 64,
-                    "load_mode": "mma_payload_load",
-                    "registers": 1,
-                    "warps_per_cta": (1, 1),
-                    "wave_tile_axis": "none",
-                    "wave_tile_stride_dwords": 0,
-                },
+                attrs=_dense_f16_mma_local_access_attrs(),
             )
         builder.add_op(
             "for_loop",
@@ -7413,7 +7419,7 @@ def test_tlx_wave_converter_pipeline_keeps_if_stores_in_branches(tmp_path):
     ] == ["store"]
     wave = output.emitted_module.text
     assert "wave.store" not in wave.split("scf.if", 1)[0]
-    assert wave.count("wave.store") == 2
+    assert wave.count("wave.scatter") == 2
     _run_wave_verify(wave)
     del ctx
 
@@ -7441,7 +7447,7 @@ def test_tlx_wave_converter_pipeline_lowers_result_free_if_without_else(tmp_path
     then_region, else_region = (output.target_program.regions[region_id] for region_id in if_op.region_ids)
     assert [output.target_program.ops[op_id].kind for op_id in then_region.op_ids] == ["store"]
     assert else_region.op_ids == ()
-    assert output.emitted_module.text.count("wave.store") == 1
+    assert output.emitted_module.text.count("wave.scatter") == 1
     _run_wave_verify(output.emitted_module.text)
     del ctx
 
@@ -8856,9 +8862,7 @@ def test_tlx_wave_converter_lowers_memdesc_subslice_as_physical_parent_view(
             "view": "subslice",
         },
     ]
-    load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
+    load_attrs = _packetized_local_load_attrs(output)
     assert [attrs["memdesc_shape"] for attrs in load_attrs] == [(256, 32), (32, 256)]
     assert [attrs["memdesc_physical_shape"] for attrs in load_attrs] == [(256, 64), (64, 256)]
     assert [attrs["memdesc_logical_origin"] for attrs in load_attrs] == [(0, 32), (32, 0)]
@@ -8934,8 +8938,8 @@ def test_tlx_wave_converter_applies_memdesc_subslice_to_local_load_store(tmp_pat
         if op.kind in {"local_store", "local_load"}
     ]
     assert len(accesses) == 2
-    assert [attrs["destination_logical_origin"] for attrs in accesses] == [(64, ), (64, )]
-    assert [attrs["destination_physical_shape"] for attrs in accesses] == [(128, ), (128, )]
+    assert [attrs["memdesc_logical_origin"] for attrs in accesses] == [(64, ), (64, )]
+    assert [attrs["memdesc_physical_shape"] for attrs in accesses] == [(128, ), (128, )]
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert wave.count("wave.gather") == 1
@@ -9172,9 +9176,7 @@ def test_tlx_wave_converter_pipeline_sizes_three_slot_padded_dot_buffers(tmp_pat
     ]
     assert [attrs["elements_per_slot"] for attrs in memdesc_index_attrs] == [4224, 4224]
     assert all(attrs["static_byte_offset"] is None for attrs in memdesc_index_attrs)
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
+    local_load_attrs = _packetized_local_load_attrs(output)
     assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
         "padded_linear",
         "padded_linear",
@@ -9559,7 +9561,7 @@ def test_tlx_wave_converter_lowers_bit_affine_padded_dot_dma_packet(tmp_path, ):
     assert [converter_target_ir.attrs_dict(op)["elements_per_slot"] for op in memdesc_index_ops] == [2112, 2112]
     raw_wave = output.emitted_module.text
     assert raw_wave.count("wave.where") == 1
-    assert raw_wave.count("wave.gather") == 1
+    assert raw_wave.count("wave.gather") == 3
     assert raw_wave.count("wave.scatter") == 1
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
@@ -11666,7 +11668,7 @@ def test_tlx_wave_converter_reuses_equivalent_fragment_local_load_plans(monkeypa
 
     monkeypatch.setattr(
         converter_op_conversion,
-        "_noncontiguous_mma_payload_gather_plan",
+        "_symbolic_mma_payload_gather_plan",
         fake_symbolic_plan,
     )
     first = converter_op_conversion._fragment_local_load_plan(
@@ -14067,8 +14069,10 @@ def test_tlx_wave_converter_pipeline_lowers_raw_masked_load_store(tmp_path):
     assert store_attrs["mask_mode"] == "exec_where"
     wave = output.emitted_module.text
     assert "waveamd.make_buffer" not in wave
-    assert wave.count("wave.load") == 1
-    assert wave.count("wave.store") == 1
+    assert wave.count("wave.gather") == 1
+    assert wave.count("wave.scatter") == 1
+    assert "base = <\"slot\">" in wave
+    assert "bit_offset = <\"0\">" in wave
     assert wave.count("wave.where") == 2
     assert wave.count("otherwise") == 1
     assert "wave.select" not in wave
@@ -14811,27 +14815,21 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
     assert attrs_by_kind["mma"]["m_tiles"] == 4
     assert attrs_by_kind["mma"]["n_tiles"] == 4
     assert attrs_by_kind["mma"]["k_tiles"] == 2
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
+    local_load_attrs = _packetized_local_load_attrs(output)
     assert [attrs["component_count"] for attrs in local_load_attrs] == [8, 8]
-    assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "indexed_mma_payload_load",
-        "indexed_mma_payload_load",
-    ]
+    assert [attrs["packet_count"] for attrs in local_load_attrs] == [8, 8]
+    assert [attrs["packet_width"] for attrs in local_load_attrs] == [8, 8]
     assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
         "dense_row_major",
         "dense_row_major",
     ]
     assert all("shared_layout_kind" not in attrs for attrs in local_load_attrs)
-    assert local_load_attrs[1]["source_shape"] == (32, 16)
-    assert local_load_attrs[1]["memdesc_shape"] == (64, 128)
-    assert [attrs["wave_tile_axis"] for attrs in local_load_attrs] == ["m", "n"]
-    assert [attrs["wave_tile_stride_elements"] for attrs in local_load_attrs] == [
-        1024,
-        16,
+    assert [attrs["coordinate_shape"] for attrs in local_load_attrs] == [
+        (256, 64),
+        (64, 128),
     ]
-    assert local_load_attrs[0]["component_tile_offsets"] == (
+    assert local_load_attrs[1]["memdesc_shape"] == (64, 128)
+    assert local_load_attrs[0]["packet_coordinate_bases"] == (
         (0, 0),
         (0, 32),
         (64, 0),
@@ -14841,7 +14839,7 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
         (192, 0),
         (192, 32),
     )
-    assert local_load_attrs[1]["component_tile_offsets"] == (
+    assert local_load_attrs[1]["packet_coordinate_bases"] == (
         (0, 0),
         (32, 0),
         (0, 32),
@@ -14851,9 +14849,11 @@ def test_tlx_wave_converter_pipeline_lowers_warp_tiled_mfma_dot(tmp_path):
         (0, 96),
         (32, 96),
     )
+    assert all("load_mode" not in attrs for attrs in local_load_attrs)
+    assert all("wave_tile_axis" not in attrs for attrs in local_load_attrs)
     assert [op.kind for op in output.target_program.ops].count("layout_convert") == 0
     wave = output.emitted_module.text
-    assert "128*floor(1/2*Mod(wi, 64))" in wave
+    assert wave.count("wave.gather") == sum(attrs["packet_count"] for attrs in local_load_attrs)
     assert "vector<8xf16>" in wave
     assert "native_register_layout" not in wave
     assert "waveamd.fragment_fill" not in wave
@@ -15110,7 +15110,7 @@ def test_tlx_wave_converter_preserves_explicit_local_load_wait_token(tmp_path):
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
-    (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load_mma_payload"]
+    (load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
     assert load_op.operands[1:] == wait_op.results
     assert converter_target_ir.attrs_dict(load_op)["explicit_dependency_count"] == 1
     load_lines = [line for line in output.emitted_module.text.splitlines() if "wave.gather" in line]
@@ -15197,9 +15197,16 @@ def test_tlx_wave_converter_threads_dominating_wait_without_relaxing_ordinary_lo
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
-    (relaxed_load, ) = [op for op in output.target_program.ops if op.kind == "local_load_mma_payload"]
     relaxed_store, ordinary_store = [op for op in output.target_program.ops if op.kind == "local_store"]
-    (ordinary_load, ) = [op for op in output.target_program.ops if op.kind == "local_load"]
+    local_loads = [op for op in output.target_program.ops if op.kind == "local_load"]
+    (relaxed_load, ) = [
+        op for op in local_loads
+        if converter_target_ir.attrs_dict(op)["synced_via_async_wait"]
+    ]
+    (ordinary_load, ) = [
+        op for op in local_loads
+        if not converter_target_ir.attrs_dict(op)["synced_via_async_wait"]
+    ]
     assert relaxed_load.operands[1:] == wait_op.results
     assert relaxed_store.operands[2:] == ()
     assert ordinary_store.operands[2:] == ()
@@ -15530,31 +15537,22 @@ def test_tlx_wave_converter_pipeline_lowers_glu_b_swizzle_transpose_load(tmp_pat
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    (attrs, ) = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
-    assert attrs["load_mode"] == "transpose_mma_payload_load"
-    assert attrs["mma_access_lane_layout"] == "gfx950_mfma_b_transpose"
-    assert attrs["chunk_elements"] == 4
-    assert attrs["chunks_per_component"] == 2
-    assert attrs["source_shape"] == (32, 16)
+    (attrs, ) = _packetized_local_load_attrs(output)
+    assert attrs["component_count"] == 8
+    assert attrs["packet_count"] == 8
+    assert attrs["packet_width"] == 8
+    assert len(attrs["packet_coordinate_bases"]) == attrs["packet_count"]
+    assert attrs["coordinate_shape"] == (64, 128)
     assert attrs["memdesc_shape"] == (64, 128)
     assert attrs["shared_physical_offset_plan"] == "swizzled_xor"
     assert attrs["shared_physical_swizzled_vec"] == 8
     assert attrs["shared_physical_swizzled_per_phase"] == 1
     assert attrs["shared_physical_swizzled_max_phase"] == 16
-    assert attrs["component_tile_offsets"] == (
-        (0, 0),
-        (32, 0),
-        (0, 32),
-        (32, 32),
-        (0, 64),
-        (32, 64),
-        (0, 96),
-        (32, 96),
-    )
+    assert "load_mode" not in attrs
+    assert "mma_access_lane_layout" not in attrs
+    assert "component_tile_offsets" not in attrs
     wave = output.emitted_module.text
-    assert wave.count("wave.gather") == 16
+    assert wave.count("wave.gather") == attrs["packet_count"]
     assert "waveamd.transpose_load" not in wave
     machine = _run_waveamd_to_machine(wave)
     assert machine.count("waveamdmachine.ds_read_tr_b64_b16") == 16
@@ -15593,7 +15591,9 @@ def test_tlx_wave_converter_pipeline_keeps_mma_payload_read_tokens_out_of_barrie
             r"%[\w#]+,\s*(?P<token>%[\w#]+)\s*=\s*wave\.(?:gather|load)",
             wave,
         ))
-    assert len(read_tokens) == 24
+    assert len(read_tokens) == sum(
+        attrs["packet_count"] for attrs in _packetized_local_load_attrs(output)
+    )
     token_consumers = [
         line for line in wave.splitlines() if "wave.barrier" in line if any(
             re.search(rf"(?<![\w#]){re.escape(token)}(?![\w#])", line) for token in read_tokens)
@@ -15781,27 +15781,21 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_local_loads(tmp_path)
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
+    local_load_attrs = _packetized_local_load_attrs(output)
     assert [attrs["component_count"] for attrs in local_load_attrs] == [16, 4]
-    assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "indexed_mma_payload_load",
-        "swizzled_mma_payload_load",
-    ]
-    assert [attrs["source_shape"] for attrs in local_load_attrs] == [(16, 64), (64, 16)]
+    assert [attrs["packet_count"] for attrs in local_load_attrs] == [16, 4]
+    assert [attrs["packet_width"] for attrs in local_load_attrs] == [16, 16]
+    assert [attrs["coordinate_shape"] for attrs in local_load_attrs] == [(256, 128), (128, 64)]
     assert [attrs["memdesc_shape"] for attrs in local_load_attrs] == [(256, 128), (128, 64)]
-    assert [attrs["mma_access_lane_layout"] for attrs in local_load_attrs] == [
-        "gfx950_mfma_a",
-        "gfx950_mfma_b",
-    ]
-    assert all(attrs["mma_access_vector_payload_width"] == 16 for attrs in local_load_attrs)
+    assert all(len(attrs["packet_coordinate_bases"]) == attrs["packet_count"] for attrs in local_load_attrs)
+    assert all("load_mode" not in attrs for attrs in local_load_attrs)
+    assert all("mma_access_lane_layout" not in attrs for attrs in local_load_attrs)
     assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
         "dense_row_major",
         "swizzled_xor",
     ]
     assert [attrs["shared_physical_order"] for attrs in local_load_attrs] == [(1, 0), (0, 1)]
-    assert local_load_attrs[0]["component_tile_offsets"] == (
+    assert local_load_attrs[0]["packet_coordinate_bases"] == (
         (0, 0),
         (0, 64),
         (32, 0),
@@ -15819,7 +15813,7 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_local_loads(tmp_path)
         (224, 0),
         (224, 64),
     )
-    assert local_load_attrs[1]["component_tile_offsets"] == (
+    assert local_load_attrs[1]["packet_coordinate_bases"] == (
         (0, 0),
         (64, 0),
         (0, 32),
@@ -15867,16 +15861,14 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_32x32x64_local_loads(tmp
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
+    local_load_attrs = _packetized_local_load_attrs(output)
     assert [attrs["component_count"] for attrs in local_load_attrs] == [8, 4]
-    assert [attrs["source_shape"] for attrs in local_load_attrs] == [(32, 32), (32, 32)]
-    assert [attrs["mma_access_lane_layout"] for attrs in local_load_attrs] == [
-        "gfx950_mfma_a",
-        "gfx950_mfma_b",
-    ]
-    assert all(attrs["mma_access_vector_payload_width"] == 16 for attrs in local_load_attrs)
+    assert [attrs["packet_count"] for attrs in local_load_attrs] == [8, 4]
+    assert [attrs["packet_width"] for attrs in local_load_attrs] == [16, 16]
+    assert [attrs["coordinate_shape"] for attrs in local_load_attrs] == [(128, 128), (128, 128)]
+    assert all(len(attrs["packet_coordinate_bases"]) == attrs["packet_count"] for attrs in local_load_attrs)
+    assert all("load_mode" not in attrs for attrs in local_load_attrs)
+    assert all("mma_access_lane_layout" not in attrs for attrs in local_load_attrs)
     machine = _run_waveamd_to_machine(output.emitted_module.text)
     assert machine.count("waveamdmachine.ds_load_tuple_b32") == 12
     del ctx
@@ -16065,17 +16057,21 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_scale_transpose_loads
     scale_load_attrs = [
         converter_target_ir.attrs_dict(op)
         for op in output.target_program.ops
-        if op.kind == "local_load" and converter_target_ir.attrs_dict(op)["element_type"] == "i8"
+        if op.kind == "local_load"
+        and converter_target_ir.attrs_dict(op)["element_type"] == "i8"
+        and int(converter_target_ir.attrs_dict(op)["packet_count"]) == 1
     ]
     assert [attrs["component_count"] for attrs in scale_load_attrs] == [16, 8]
-    assert all(attrs["destination_physical_offset_plan"] == "swizzled_xor" for attrs in scale_load_attrs)
-    assert all(attrs["result_value_mode"] == "transpose_vector_packets" for attrs in scale_load_attrs)
-    assert all(attrs["result_packet_width"] == 4 for attrs in scale_load_attrs)
-    assert all(attrs["result_transpose_packet_width"] == 8 for attrs in scale_load_attrs)
+    assert [attrs["packet_count"] for attrs in scale_load_attrs] == [1, 1]
+    assert [attrs["packet_width"] for attrs in scale_load_attrs] == [16, 8]
+    assert all(attrs["shared_physical_offset_plan"] == "swizzled_xor" for attrs in scale_load_attrs)
+    assert all(len(attrs["packet_coordinate_bases"]) == 1 for attrs in scale_load_attrs)
+    assert all("result_value_mode" not in attrs for attrs in scale_load_attrs)
+    assert all("result_packet_width" not in attrs for attrs in scale_load_attrs)
     assert all("semantic_role" not in attrs for attrs in scale_load_attrs)
     wave = output.emitted_module.text
     transpose_gathers = [line for line in wave.splitlines() if "wave.gather" in line and "vector<8xi8>" in line]
-    assert len(transpose_gathers) == 3
+    assert len(transpose_gathers) == 1
     assert "waveamd.transpose_load" not in wave
     mma_scale_lines = [line for line in wave.splitlines() if "waveamd.mma_scale" in line]
     assert mma_scale_lines
@@ -16129,8 +16125,7 @@ def test_tlx_wave_converter_pipeline_carries_scaled_mfma_i8_scale_packets_across
     wave = output.emitted_module.text
     loop_lines = [line for line in wave.splitlines() if "scf.for" in line and "iter_args" in line]
     assert loop_lines
-    assert "!wave.simd<vector<4xi8>, 64>" in loop_lines[0]
-    assert "!wave.simd<i8, 64>" not in loop_lines[0]
+    assert "!wave.simd<i8, 64>" in loop_lines[0]
     mma_scale_lines = [line for line in wave.splitlines() if "waveamd.mma_scale" in line]
     assert mma_scale_lines
     assert all("!wave.simd<vector<4xi8>, 64>" in line for line in mma_scale_lines)
@@ -16183,17 +16178,13 @@ def test_tlx_wave_converter_pipeline_lowers_transposed_scaled_mfma_i8_load(tmp_p
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
-    assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "indexed_mma_payload_load",
-        "indexed_mma_payload_load",
-    ]
+    local_load_attrs = _packetized_local_load_attrs(output)
+    assert [attrs["packet_count"] for attrs in local_load_attrs] == [16, 8]
+    assert [attrs["packet_width"] for attrs in local_load_attrs] == [16, 16]
     assert local_load_attrs[1]["element_type"] == "i8"
-    assert local_load_attrs[1]["elements_per_lane"] == 16
-    assert local_load_attrs[1]["mma_access_lane_layout"] == "gfx950_mfma_b"
     assert local_load_attrs[1]["shared_physical_offset_plan"] == "padded_linear"
+    assert all("load_mode" not in attrs for attrs in local_load_attrs)
+    assert all("mma_access_lane_layout" not in attrs for attrs in local_load_attrs)
     wave = output.emitted_module.text
     assert "waveamd.transpose_load" not in wave
     assert "vector<16xi8>" in wave
@@ -16417,13 +16408,11 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=4, preamble=preamble)
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
+    local_load_attrs = _packetized_local_load_attrs(output)
+    assert [attrs["packet_count"] for attrs in local_load_attrs] == [
+        attrs["component_count"] for attrs in local_load_attrs
     ]
-    assert [attrs["load_mode"] for attrs in local_load_attrs] == [
-        "symbolic_mma_payload_load",
-        "symbolic_mma_payload_load",
-    ]
+    assert all(attrs["packet_width"] == 8 for attrs in local_load_attrs)
     assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
         "swizzled_xor",
         "swizzled_xor",
@@ -16474,12 +16463,12 @@ def test_tlx_wave_converter_uses_physical_minor_k_order_for_swizzled_mfma_b_load
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    (local_load_op, ) = [op for op in output.target_program.ops if op.kind == "local_load_mma_payload"]
-    attrs = converter_target_ir.attrs_dict(local_load_op)
-    assert attrs["load_mode"] == "swizzled_mma_payload_load"
-    assert attrs["mma_access_lane_layout"] == "gfx950_mfma_b"
+    (attrs, ) = _packetized_local_load_attrs(output)
     assert attrs["shared_physical_order"] == (0, 1)
-    assert attrs["elements_per_lane"] == 8
+    assert attrs["packet_width"] == 8
+    assert len(attrs["packet_coordinate_bases"]) == attrs["packet_count"]
+    assert "load_mode" not in attrs
+    assert "mma_access_lane_layout" not in attrs
     assert f"vector<8x{element_type}>" in output.emitted_module.text
     _run_waveamd_to_machine(output.emitted_module.text)
     del ctx
@@ -16502,12 +16491,12 @@ def test_tlx_wave_converter_records_b16_transpose_chunk_deltas(tmp_path):
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
-    local_load_attrs = [
-        converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load_mma_payload"
-    ]
+    local_load_attrs = _packetized_local_load_attrs(output)
 
     assert len(local_load_attrs) == 1
-    assert local_load_attrs[0]["load_mode"] == "symbolic_mma_payload_load"
+    assert local_load_attrs[0]["packet_count"] == local_load_attrs[0]["component_count"]
+    assert local_load_attrs[0]["packet_width"] == 8
+    assert "load_mode" not in local_load_attrs[0]
     assert local_load_attrs[0]["shared_physical_offset_plan"] == "padded_linear"
     assert local_load_attrs[0]["shared_physical_intervals"] == (4, )
     assert local_load_attrs[0]["shared_physical_paddings"] == (16, )

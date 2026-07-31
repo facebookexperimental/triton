@@ -323,7 +323,7 @@ def _thread_structured_lds_read_completion(target_program):
             return cached
         # Break impossible malformed recursive-region cycles defensively.
         region_has_local_read_cache[region_id] = False
-        result = any(op.kind in {"local_load", "local_load_mma_payload"} or any(
+        result = any(op.kind == "local_load" or any(
             region_has_local_read(child_region_id)
             for child_region_id in op.region_ids)
                      for op_id in regions[region_id].op_ids
@@ -351,7 +351,7 @@ def _thread_structured_lds_read_completion(target_program):
             op_id = int(op_id)
             op = ops[op_id]
 
-            if op.kind in {"local_load", "local_load_mma_payload"}:
+            if op.kind == "local_load":
                 op, completion_id = _ensure_memory_completion_result(
                     op,
                     values,
@@ -558,7 +558,7 @@ def _requires_barrier_completion(op):
     # wave to overwrite the storage. Other memory operations need only remain
     # issued before the barrier; in particular, direct DMA completion is owned
     # exclusively by the explicit async_wait protocol.
-    return op.kind in {"local_load", "local_load_mma_payload"}
+    return op.kind == "local_load"
 
 
 def _append_barrier_lds_read_dependencies(op, target_value_ids):
@@ -642,7 +642,6 @@ def _ensure_memory_completion_result(op, values):
     attrs["issue_order_result_count"] = 1
     if op.kind in {
             "local_load",
-            "local_load_mma_payload",
             "local_store",
     }:
         attrs["completion_result_count"] = (int(attrs.get("completion_result_count", 0)) + 1)
@@ -666,7 +665,6 @@ def _existing_memory_completion_result(op, values):
 
     if op.kind not in {
             "local_load",
-            "local_load_mma_payload",
             "local_store",
     }:
         return None

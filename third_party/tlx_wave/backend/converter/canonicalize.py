@@ -56,7 +56,6 @@ def _eliminate_redundant_compiler_membar_barriers_in_region(
                 next_op is not None
                 and next_op.kind in {
                     "local_load",
-                    "local_load_mma_payload",
                 }
                 and bool(
                     target_ir.attrs_dict(next_op).get(
@@ -146,7 +145,6 @@ def _synchronous_lds_region_ids(target_program):
 def _is_synchronous_lds_op(op):
     if op.kind in {
         "local_load",
-        "local_load_mma_payload",
         "local_store",
     }:
         return True
