@@ -427,6 +427,64 @@ class TestTLXTemplates(TestCase):
         self.assertIn("tlx.async_load", src)  # aligned-K async path
         self.assertIn("a_reg = tl.load", src)  # register-path fallback load
 
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_addmm_persistent_warppipe(self, dtype: torch.dtype):
+        """Persistent TLX warp-pipe addmm template (AMD MI350X / gfx950), col-major B.
+
+        De-risks the persistent tile-loop + tlx.warp_pipeline_stage nesting (the exact
+        pattern that failed to lower on beta triton 3.6). ``append_tlx`` is patched to
+        offer ONLY the persistent template, so force mode is guaranteed to select and
+        compile it (not the per-tile warp-pipe) -- proving it lowers and is numerically
+        correct. The shape has many more MN tiles than SMs, so each program's persistent
+        loop iterates over several output tiles.
+        """
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        M, K, N = 4096, 2048, 512  # many MN tiles -> persistent loop iterates per program
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        # w.t() => B is [K, N] col-major (stride_bk == 1) -- the nn.Linear weight layout.
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        def _only_persistent(templates, op_name="mm"):
+            # Offer only the persistent template (drop the per-tile warp-pipe) so force
+            # mode is guaranteed to select and compile the persistent kernel.
+            from torch._inductor.kernel.mm import mm_template
+
+            uids = {getattr(t, "uid", None) for t in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                if _tlx_mm.amd_addmm_persistent_warppipe_template.uid not in uids:
+                    templates.append(_tlx_mm.amd_addmm_persistent_warppipe_template)
+            return templates
+
+        with (
+            mock.patch.object(_tlx_mm, "append_tlx", _only_persistent),
+            config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+            }),
+        ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+
+        # Only the persistent template is offered, so force mode must lower addmm
+        # through it (triton_tem), never an extern/aten kernel.
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem", code_str)
+
 
 class TestWarpPipeSplitKCodegen(TestCase):
     """Deterministic codegen check for the AMD warp-pipe split-K template.

@@ -51,6 +51,7 @@ def _sizevar_hint(sizevars, expr, fallback):
 
 from . import tlx_config
 from .mm_templates import (
+    amd_addmm_persistent_warppipe_template,
     amd_addmm_warppipe_template,
     amd_bmm_warppipe_template,
     blackwell_gemm_ws_template,
@@ -1419,6 +1420,33 @@ class ROCmBMMWarpPipeTemplateConfigHeuristic(ROCmMMTemplateConfigHeuristic):
             yield self._convert_config_to_template_kwargs(
                 triton_config, m, n, k, out_dtype
             )
+
+
+@register_template_heuristic(
+    amd_addmm_persistent_warppipe_template.uid,
+    "cuda",
+    register=IS_ROCM,
+    op_name="addmm",
+)
+class ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic(
+    ROCmAddMMWarpPipeTemplateConfigHeuristic
+):
+    """Persistent variant of the AMD warp-pipe addmm heuristic (MI350X / gfx950).
+
+    Reuses the per-tile heuristic's col-major-B ``adjust_kernel_inputs``, the
+    fp16/bf16 + int32-offset gating, the ``K_ITERS > NUM_BUFFERS`` correctness guard,
+    and the tuned ``WARPPIPE_CONFIGS`` pool. The only delta is that the persistent
+    template's grid (``_persistent_mm_grid_split_k``) is capped at NUM_SMS, so NUM_SMS
+    must be threaded into the template kwargs (it becomes a constexpr; the kernel
+    strides over output tiles by it).
+    """
+
+    def _get_template_configs_impl(self, kernel_inputs, op_name):
+        num_sms = get_num_sms()
+        for template_kwargs in super()._get_template_configs_impl(
+            kernel_inputs, op_name
+        ):
+            yield {**template_kwargs, "NUM_SMS": num_sms}
 
 
 @register_template_heuristic(
