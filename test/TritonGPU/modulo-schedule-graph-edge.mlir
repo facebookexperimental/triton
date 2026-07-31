@@ -1,5 +1,4 @@
-// REQUIRES: asserts
-// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+// RUN: triton-opt %s -split-input-file -allow-unregistered-dialect -nvgpu-modulo-schedule 2>&1 | FileCheck %s
 
 //===----------------------------------------------------------------------===//
 // Edge case 0: Single-stage schedule (maxStage=0).
@@ -16,10 +15,11 @@
 
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
-// Verify the maxStage=0 dump and the loop's tt.num_stages=1 attribute.
-// CHECK: ii = 256, max_stage = 0
-// CHECK: @maxstage_0_mma_only
-// CHECK: tt.num_stages = 1 : i32
+// Verify the maxStage=0 schedule attributes.
+// CHECK-LABEL: @maxstage_0_mma_only
+// CHECK: tt.modulo_ii = 256 : i32
+// CHECK-SAME: tt.num_stages = 1 : i32
+// CHECK-SAME: tt.scheduled_max_stage = 0 : i32
 tt.func @maxstage_0_mma_only(
   %a: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
   %b: !ttg.memdesc<64x128xf16, #shared, #smem, mutable>,

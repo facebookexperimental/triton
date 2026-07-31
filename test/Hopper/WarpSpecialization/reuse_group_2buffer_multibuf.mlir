@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 //
 // Multi-buffer variant of reuse_group_2buffer.mlir: the shared dsT buffer is a
 // MULTI-buffered alloc (1x128x128) accessed through memdesc_index slot views.
@@ -17,6 +17,9 @@
 // dpT's consumer (through dsT) feeds dq's producer, so dpT is the early channel;
 // dq's producer_acquire must come before dpT's producer.
 //
+// CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
+// CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
+// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 // CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
 // CHECK: %dpT_{{[0-9]+}} = ttng.tc_gen5_mma

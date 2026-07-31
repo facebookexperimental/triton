@@ -12,6 +12,10 @@
 // compile-time error instead.
 //
 // CHECK: TMEM reuse group with >= 3 buffers has no unique dependency-chain order
+// CHECK-SAME: buffer.id=8
+// CHECK-SAME: dpT
+// CHECK-SAME: dsT
+// CHECK-SAME: dq
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 32], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
