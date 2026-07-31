@@ -891,11 +891,13 @@ def test_tlx_perf_sweep_forwards_compile_workers_to_fa(tmp_path):
     assert [spec.backend for spec in specs] == ["llvm", "wave", "llvm", "wave"]
     assert all(spec.command[-2:] == ("--compile-workers", "3") for spec in specs[:2])
     for spec, minimum in zip(specs[2:], ("0", "1000")):
-        assert spec.command[-6:] == (
+        assert spec.command[-8:] == (
             "--rep",
             "1",
             "--warmup",
             "0",
+            "--qk-max-abs",
+            "1",
             "--min-tflops",
             minimum,
         )
@@ -6472,7 +6474,8 @@ def test_tlx_wave_runtime_gfx950_wave_4wave_specialized_e2e(
 
 
 @pytest.mark.parametrize("backend", ["llvm", "wave"])
-def test_tlx_wave_runtime_gfx950_fa_eight_wave_e2e(tmp_path, backend):
+@pytest.mark.parametrize("qk_max_abs", [None, 1.0], ids=["adaptive", "bounded"])
+def test_tlx_wave_runtime_gfx950_fa_eight_wave_e2e(tmp_path, backend, qk_max_abs):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
         pytest.skip(f"requires physical gfx950 hardware for eight-wave FA e2e, got {arch}")
@@ -6510,9 +6513,10 @@ def test_tlx_wave_runtime_gfx950_fa_eight_wave_e2e(tmp_path, backend):
             triton.knobs.cache.scope(),
             triton.knobs.runtime.scope(),
     ):
-        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-eight-wave-runtime-cache")
+        mode = "adaptive" if qk_max_abs is None else "bounded"
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-eight-wave-{mode}-runtime-cache")
         triton.knobs.runtime.override_arch = "gfx950"
-        got = tutorial.attention(q, k, v)
+        got = tutorial.attention(q, k, v, qk_max_abs=qk_max_abs)
         torch.cuda.synchronize()
 
     torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
