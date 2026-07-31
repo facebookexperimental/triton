@@ -209,7 +209,9 @@ tt.func @flat_pipeline_example(%n: index) {
 // async_wait at the start of iter N+1, which would otherwise poison cluster
 // building.  The sink pre-pass moves scalar ops past adjacent ignorable ops so
 // they join the next cluster naturally.
-tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
+tt.func @unroll_iv_remap_sunk_past_async_wait(
+    %n: index, %ptr: !tt.ptr<f32>,
+    %tensor: tensor<256x32xf32, #linear>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -226,6 +228,7 @@ tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
     // IV remap injected by unroller; sits between iter-0 last border and
     // iter-1 async_wait -- the poisonous spot.
     %i_1 = arith.addi %i, %c1 : index
+    %converted = ttg.convert_layout %tensor : tensor<256x32xf32, #linear> -> tensor<256x32xf32, #mma>
 
     // iter 1: async_wait FIRST, then stage1 (uses %i_1) / stage2.
     ttg.async_wait {num = 0 : i32}
@@ -252,6 +255,7 @@ tt.func @unroll_iv_remap_sunk_past_async_wait(%n: index, %ptr: !tt.ptr<f32>) {
 // CHECK:   ttg.async_wait
 // CHECK:   scf.execute_region {{.*}} {
 // CHECK-NEXT: arith.addi
+// CHECK-NEXT: ttg.convert_layout
 // CHECK-NEXT: arith.muli
 // CHECK:     tt.store
 // CHECK:   scf.execute_region

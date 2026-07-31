@@ -5572,6 +5572,14 @@ def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch
 """
     mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1)
     metadata = {}
+    membar_arches = []
+    run_membar = tlx_wave_compiler.amd.run_membar
+
+    def record_membar(module, arch):
+        membar_arches.append(arch)
+        return run_membar(module, arch)
+
+    monkeypatch.setattr(tlx_wave_compiler.amd, "run_membar", record_membar)
 
     wave_artifact = tlx_wave_compiler.TLXWaveBackend.make_wave(
         mod,
@@ -5593,6 +5601,7 @@ def test_tlx_wave_backend_wave_stage_uses_staged_converter(tmp_path, monkeypatch
     assert metadata["tlx_wave_num_scalar_args"] == 1
     assert metadata["tlx_wave_num_pointer_args"] == 0
     assert metadata["tlx_wave_workgroup_size"] == 64
+    assert membar_arches == ["gfx950"]
     _run_wave_verify(wave_artifact)
     del ctx
 
