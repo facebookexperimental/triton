@@ -87,7 +87,7 @@ closed responsibility:
 | Fact analysis | [`facts.py`](backend/converter/facts.py) | Record proven ranges, divisibility, affine coordinates, and pointer byte ranges with provenance. It does not assume integer arithmetic is non-overflowing without proof. |
 | Token analysis | [`tokens.py`](backend/converter/tokens.py) | Build async groups, memory effects, users, and structured-control-flow token carries. This is the sole owner of source dependency analysis. |
 | Operation conversion | [`op_conversion.py`](backend/converter/op_conversion.py), [`domains.py`](backend/converter/domains.py) | Rewrite source operations into a schema-closed `TargetProgram` with explicit operands, results, attributes, regions, facts, layouts, and event domains. |
-| Target cleanup and ordering | [`canonicalize.py`](backend/converter/canonicalize.py), [`barrier_order.py`](backend/converter/barrier_order.py) | Apply target-level canonicalization and encode sparse issue ordering around full barriers. |
+| Target cleanup and ordering | [`canonicalize.py`](backend/converter/canonicalize.py), [`barrier_order.py`](backend/converter/barrier_order.py) | Remove dead bridge-only provenance scaffolding and encode explicit sparse issue ordering around full barriers without reordering source operations. |
 | Verification | [`verifier.py`](backend/converter/verifier.py) | Reject incomplete plans, invalid representations, escaped fragments, malformed token domains, or unsupported semantics before emission. |
 | Structural emission | [`emission.py`](backend/converter/emission.py) | Mechanically create Wave/WaveAMD operations with Wave's builders. It does not inspect the source graph or choose a lowering family. |
 
@@ -192,14 +192,18 @@ The token plan preserves the source async protocol explicitly:
 - Readiness produced by a wait is threaded through local-memory consumers and
   through `scf.for`/`scf.if` arguments, results, and yields. An absent branch
   event is represented by a neutral token.
-- Compiler-inserted membars are preserved unless target canonicalization proves
-  that a specific compiler barrier is redundant with an adjacent wait
-  publication barrier. User/source barriers are not removed by that rule.
+- Compiler-inserted membars and user/source barriers are preserved
+  structurally. The bridge does not infer that a barrier is redundant with a
+  wait or reorder either operation.
 - A full-memory barrier uses sparse issue ordering: pre-barrier memory issuers
   feed the barrier through issue tokens, and later memory issuers consume the
   post-barrier issue epoch. This orders issue without pretending to complete
   DMA. Pure arithmetic, MMA, reductions, and layout redistribution are not
   pinned by the full-barrier epoch.
+
+Arithmetic canonicalization, div/rem sharing, compare-mask lifetime handling,
+wait placement, and register-pressure decisions belong to Wave's legality
+checked canonicalization and machine-scheduling pipeline.
 
 Although these event classes eventually use `!wave.mem.token`, the target plan
 keeps distinct domains for DMA completion, DMA groups and issue, ordinary

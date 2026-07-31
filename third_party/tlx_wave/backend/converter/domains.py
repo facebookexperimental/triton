@@ -73,7 +73,6 @@ LOWERING_DOMAINS = (
             "float_unary",
             "float_cast",
             "cmpi",
-            "cmpi_select",
             "maxsi",
             "minsi",
             "assume",
