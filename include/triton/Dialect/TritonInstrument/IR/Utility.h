@@ -1,6 +1,7 @@
 #ifndef TRITONINSTRUMENT_UTILITY_H
 #define TRITONINSTRUMENT_UTILITY_H
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Analysis/BufferRegion.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -28,6 +29,42 @@ namespace CommitKind {
 enum Kind { None = -1, AsyncCp = 0, Wgmma, TmaStore, NumCommitKinds };
 }
 
+// -- ConSan capture-count constants -----------------------------------------
+// Each constant corresponds to specific passToWarpSpecialize() calls in
+// populateAndPassToWarpSpecialize().  Keep in sync with that function and
+// with estimateConSanCaptureCount() below.
+
+// writeVisibility + readVisibility per active memory type.
+constexpr int kCapturesPerMemType = 2;
+
+// barrierStates + waiting + barrierWriteRecipients (only when barriers exist).
+constexpr int kBarrierBaseCaptures = 3;
+
+// writeTracking + readTracking per active memory type (only when barriers
+// exist and the memory type has buffers).
+constexpr int kBarrierTrackingCapturesPerMemType = 2;
+
+// The lock variable (always present).
+constexpr int kFixedCaptures = 1;
+
+// Size in bytes of each capture (a global-scratch pointer).
+constexpr int kCaptureSizeBytes = 8;
+
+/// Estimate the number of WarpSpecialize captures that the
+/// ConcurrencySanitizer pass will add via passToWarpSpecialize().
+/// \p numActiveMemTypes  Number of memory types with buffers.
+/// \p hasBarriers        Whether barriers exist in the module.
+/// \p numCommitKinds     Number of distinct commit kinds required.
+inline int estimateConSanCaptureCount(int numActiveMemTypes, bool hasBarriers,
+                                      int numCommitKinds) {
+  int perMemType = kCapturesPerMemType * numActiveMemTypes;
+  int barrierCaptures =
+      hasBarriers ? kBarrierBaseCaptures +
+                        kBarrierTrackingCapturesPerMemType * numActiveMemTypes
+                  : 0;
+  return perMemType + barrierCaptures + kFixedCaptures + numCommitKinds;
+}
+
 void createAssertInThread(ImplicitLocOpBuilder &b, Value condition,
                           StringRef message);
 Operation *createStoreScratchMemory(OpBuilder &b, Location loc, Value alloc,
@@ -51,6 +88,14 @@ TypedValue<RankedTensorType> createConstIntTensor(OpBuilder &builder,
                                                   bool isSigned = false);
 uint32_t getMemDescLength(Value buf);
 FuncOp getEntryPoint(ModuleOp module);
+
+inline Value maybeAnd(ImplicitLocOpBuilder &b, Value lhs, Value rhs) {
+  if (!lhs)
+    return rhs;
+  if (!rhs)
+    return lhs;
+  return arith::AndIOp::create(b, lhs, rhs);
+}
 
 struct ValueType {
   Value value;
@@ -105,7 +150,6 @@ struct AuxDataMap {
   // Per-memory-type packed buffer descriptors. Each i64 stores the 32-bit base
   // offset and 32-bit length of one shared-memory or tensor-memory region.
   RegionToValueMap buffers[numMemTypes];
-
   // tensor, <C x K x i64>
   // Packed descriptors for tracked mbarrier allocations. Barriers are shared
   // memory descriptors.
@@ -116,6 +160,10 @@ struct AuxDataMap {
   // phase, bits [1..20] are the initial arrival count, bits [21..40] are the
   // current arrival count, and bits [41..61] hold a signed tx-count.
   RegionToValueMap barrierStates;
+
+  // tensor, <C x K x C x i1>
+  // Recipient CTA mask for writes tracked by each barrier.
+  RegionToValueMap barrierWriteRecipients;
 
   // scratch, <C x B x i64>
   // Per-memory-type write frontier. Bit i means logical ConSan thread i can see
@@ -171,7 +219,7 @@ private:
       SmallVector<SmallVector<triton::BufferRegion>, 2> &bufRegions,
       SmallVector<triton::BufferRegion> &barrierRegions);
   void passToWarpSpecialize(triton::FuncOp func, ValueType value,
-                            RegionToValueMap &map);
+                            RegionToValueMap &map, int &captureCounter);
   void createInWarpSpecialize(
       triton::FuncOp func, RegionToValueMap &map,
       std::function<ValueType(ImplicitLocOpBuilder &)> createFn);
