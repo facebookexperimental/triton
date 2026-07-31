@@ -1,16 +1,14 @@
 """Fact analysis for the TLX Wave converter."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 import re
 
 STAGE = "facts"
 
 # These operations only change how integer elements are represented or laid
-# out.  They do not change the set of element values, so scalar bounds remain
-# valid across them.  Keep this separate from tensor-affine analysis: a layout
-# conversion may destroy a useful affine coordinate description while still
-# preserving the value range exactly.
+# out. They do not change the set of element values, so scalar bounds remain
+# valid across them.
 _RANGE_PRESERVING_OPS = frozenset({
     "tt.broadcast",
     "tt.expand_dims",
@@ -41,22 +39,6 @@ class Fact:
 class FactProgram:
     facts: tuple[Fact, ...]
     by_value: dict[int, tuple[int, ...]]
-    tensor_affine: dict[int, object] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class TensorAffineTerm:
-    kind: str
-    coefficient: int = 1
-    dim: int | None = None
-    scalar_value_ids: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class TensorAffine:
-    value_id: int
-    shape: tuple[int, ...]
-    terms: tuple[TensorAffineTerm, ...]
 
 
 def analyze_facts(source_program, type_layout_program):
@@ -68,7 +50,6 @@ def analyze_facts(source_program, type_layout_program):
     _add_assume_facts(source_program, facts)
     _add_derived_range_facts(source_program, facts)
     _add_derived_pointer_range_facts(source_program, facts)
-    tensor_affine = _analyze_tensor_affine(source_program)
     by_value = {}
     for fact in facts:
         by_value.setdefault(fact.subject_value_id, []).append(fact.fact_id)
@@ -76,7 +57,6 @@ def analyze_facts(source_program, type_layout_program):
         tuple(facts),
         {value_id: tuple(fact_ids)
          for value_id, fact_ids in by_value.items()},
-        tensor_affine,
     )
 
 
@@ -546,232 +526,6 @@ def _fits_signed_range(lower, upper, bounds):
     if bounds is None:
         return True
     return lower >= bounds[0] and upper <= bounds[1]
-
-
-def _analyze_tensor_affine(source_program):
-    tensor_affine = {}
-    scalar_constants = {}
-    for op in source_program.ops:
-        if op.name == "arith.constant":
-            _record_constant_affine(source_program, op, tensor_affine, scalar_constants)
-            continue
-        if op.name == "tt.make_range":
-            _record_make_range_affine(source_program, op, tensor_affine)
-            continue
-        if op.name == "tt.splat":
-            _record_splat_affine(source_program, op, tensor_affine, scalar_constants)
-            continue
-        if op.name == "tt.expand_dims":
-            _record_expand_dims_affine(source_program, op, tensor_affine)
-            continue
-        if op.name == "tt.broadcast":
-            _record_broadcast_affine(source_program, op, tensor_affine)
-            continue
-        if op.name in {"arith.addi", "arith.muli"}:
-            _record_binary_affine(source_program, op, tensor_affine, scalar_constants)
-            continue
-    return tensor_affine
-
-
-def _record_constant_affine(source_program, op, tensor_affine, scalar_constants):
-    if len(op.results) != 1:
-        return
-    value_id = op.results[0]
-    value = _constant_literal(op.attrs.get("value"))
-    if value is None:
-        return
-    source_type = source_program.values[value_id].type
-    if source_type.kind == "scalar" and isinstance(value, int):
-        scalar_constants[value_id] = value
-        return
-    if source_type.kind == "tensor" and isinstance(value, int):
-        tensor_affine[value_id] = TensorAffine(
-            value_id,
-            tuple(source_type.shape),
-            (TensorAffineTerm("const", value), ),
-        )
-
-
-def _record_make_range_affine(source_program, op, tensor_affine):
-    if len(op.results) != 1:
-        return
-    value_id = op.results[0]
-    source_type = source_program.values[value_id].type
-    if source_type.kind != "tensor" or len(source_type.shape) != 1:
-        return
-    start = int(op.attrs.get("start", 0))
-    terms = []
-    if start:
-        terms.append(TensorAffineTerm("const", start))
-    terms.append(TensorAffineTerm("dim", 1, 0))
-    tensor_affine[value_id] = TensorAffine(value_id, tuple(source_type.shape), tuple(terms))
-
-
-def _record_splat_affine(source_program, op, tensor_affine, scalar_constants):
-    if len(op.operands) != 1 or len(op.results) != 1:
-        return
-    value_id = op.results[0]
-    source_type = source_program.values[value_id].type
-    if source_type.kind != "tensor":
-        return
-    operand = op.operands[0]
-    constant = scalar_constants.get(operand)
-    term = (TensorAffineTerm("const", constant) if constant is not None else TensorAffineTerm(
-        "scalar", 1, None, (operand, )))
-    tensor_affine[value_id] = TensorAffine(value_id, tuple(source_type.shape), (term, ))
-
-
-def _record_expand_dims_affine(source_program, op, tensor_affine):
-    if len(op.operands) != 1 or len(op.results) != 1:
-        return
-    source = tensor_affine.get(op.operands[0])
-    if source is None:
-        return
-    value_id = op.results[0]
-    result_type = source_program.values[value_id].type
-    axis = int(op.attrs.get("axis", 0))
-    terms = []
-    for term in source.terms:
-        if term.dim is None:
-            terms.append(term)
-            continue
-        dim = int(term.dim)
-        terms.append(
-            TensorAffineTerm(
-                term.kind,
-                term.coefficient,
-                dim if dim < axis else dim + 1,
-                term.scalar_value_ids,
-            ))
-    tensor_affine[value_id] = TensorAffine(value_id, tuple(result_type.shape), tuple(terms))
-
-
-def _record_broadcast_affine(source_program, op, tensor_affine):
-    if len(op.operands) != 1 or len(op.results) != 1:
-        return
-    source = tensor_affine.get(op.operands[0])
-    if source is None:
-        return
-    value_id = op.results[0]
-    result_shape = tuple(source_program.values[value_id].type.shape)
-    if len(source.shape) != len(result_shape):
-        return
-    tensor_affine[value_id] = TensorAffine(value_id, result_shape, source.terms)
-
-
-def _record_binary_affine(source_program, op, tensor_affine, scalar_constants):
-    if len(op.operands) != 2 or len(op.results) != 1:
-        return
-    result_type = source_program.values[op.results[0]].type
-    if result_type.kind != "tensor":
-        return
-    lhs = tensor_affine.get(op.operands[0])
-    rhs = tensor_affine.get(op.operands[1])
-    if op.name == "arith.addi":
-        terms = _add_affine_terms(
-            lhs,
-            rhs,
-            op.operands,
-            scalar_constants,
-        )
-    else:
-        terms = _mul_affine_terms(lhs, rhs)
-    if terms is None:
-        return
-    tensor_affine[op.results[0]] = TensorAffine(
-        op.results[0],
-        tuple(result_type.shape),
-        _canonical_terms(terms),
-    )
-
-
-def _add_affine_terms(lhs, rhs, operands, scalar_constants):
-    terms = []
-    if lhs is not None:
-        terms.extend(lhs.terms)
-    else:
-        term = _scalar_operand_term(operands[0], scalar_constants)
-        if term is None:
-            return None
-        terms.append(term)
-    if rhs is not None:
-        terms.extend(rhs.terms)
-    else:
-        term = _scalar_operand_term(operands[1], scalar_constants)
-        if term is None:
-            return None
-        terms.append(term)
-    return terms
-
-
-def _mul_affine_terms(lhs, rhs):
-    if lhs is None or rhs is None:
-        return None
-    lhs_uniform = _uniform_affine_term(lhs)
-    rhs_uniform = _uniform_affine_term(rhs)
-    if lhs_uniform is not None:
-        return _scale_affine_terms(rhs, lhs_uniform)
-    if rhs_uniform is not None:
-        return _scale_affine_terms(lhs, rhs_uniform)
-    return None
-
-
-def _scalar_operand_term(value_id, scalar_constants):
-    constant = scalar_constants.get(value_id)
-    if constant is not None:
-        return TensorAffineTerm("const", constant)
-    return TensorAffineTerm("scalar", 1, None, (value_id, ))
-
-
-def _uniform_affine_term(affine):
-    if len(affine.terms) != 1:
-        return None
-    term = affine.terms[0]
-    return term if term.dim is None else None
-
-
-def _scale_affine_terms(affine, factor):
-    result = []
-    for term in affine.terms:
-        scaled = _scale_affine_term(term, factor)
-        if scaled is None:
-            return None
-        result.append(scaled)
-    return result
-
-
-def _scale_affine_term(term, factor):
-    if factor.kind == "const":
-        return TensorAffineTerm(
-            term.kind,
-            term.coefficient * factor.coefficient,
-            term.dim,
-            term.scalar_value_ids,
-        )
-    if factor.kind != "scalar":
-        return None
-    scalar = factor.scalar_value_ids[0]
-    if term.kind == "const":
-        return TensorAffineTerm("scalar", term.coefficient * factor.coefficient, None, (scalar, ))
-    if term.kind == "dim":
-        return TensorAffineTerm("dim_scalar", term.coefficient * factor.coefficient, term.dim, (scalar, ))
-    if term.kind == "scalar":
-        ids = (*term.scalar_value_ids, scalar)
-        return TensorAffineTerm("scalar_product", term.coefficient * factor.coefficient, None, ids)
-    return None
-
-
-def _canonical_terms(terms):
-    merged = {}
-    for term in terms:
-        key = (term.kind, term.dim, term.scalar_value_ids)
-        merged[key] = merged.get(key, 0) + int(term.coefficient)
-    result = []
-    for (kind, dim, scalar_value_ids), coefficient in merged.items():
-        if coefficient:
-            result.append(TensorAffineTerm(kind, coefficient, dim, scalar_value_ids))
-    result.sort(key=lambda term: (term.kind, -1 if term.dim is None else term.dim, term.scalar_value_ids))
-    return tuple(result)
 
 
 def _assume_compare_fact(source_program, op_by_result, predicate_id, assume_op_index):
