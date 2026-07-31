@@ -31,7 +31,6 @@ def verify_target_program(
     target_program,
     *,
     source_program=None,
-    token_program=None,
 ):
     _verify_target_contract(target_program)
     _verify_target_layouts(target_program)
@@ -41,8 +40,6 @@ def verify_target_program(
     _verify_ops(target_program, source_program)
     if source_program is not None:
         _verify_source_results_covered(source_program, target_program)
-    if token_program is not None and source_program is not None:
-        _verify_memory_effects_tokenized(source_program, token_program)
     return True
 
 
@@ -1570,28 +1567,6 @@ def _verify_source_results_covered(source_program, target_program):
                     "target values",
                     source_op_index=op.index,
                     source_value_id=source_value_id,
-                )
-
-
-def _verify_memory_effects_tokenized(source_program, token_program):
-    effect_op_indices = {effect.op_index for effect in token_program.memory_effects}
-    for op in source_program.ops:
-        if op.name in {
-                "tt.load",
-                "tt.store",
-                "ttg.async_copy_global_to_local",
-                "amdg.buffer_load",
-                "amdg.buffer_load_to_local",
-                "amdg.buffer_store",
-                "ttg.local_load",
-                "ttg.local_store",
-        }:
-            if op.index not in effect_op_indices:
-                fail(
-                    "TLXW_VERIFY_UNTOKENIZED_MEMORY_EFFECT",
-                    STAGE,
-                    f"memory op {op.name} has no memory effect",
-                    source_op_index=op.index,
                 )
 
 
