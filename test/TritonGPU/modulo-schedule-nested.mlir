@@ -1,5 +1,4 @@
-// REQUIRES: asserts
-// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule -debug-only=nvgpu-modulo-schedule 2>&1 | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-modulo-schedule="print-schedule-graph" 2>&1 | FileCheck %s
 
 //===----------------------------------------------------------------------===//
 // Test: Nested loop (persistent GEMM) — outer tile loop + inner K-loop
