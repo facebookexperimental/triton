@@ -31,12 +31,17 @@ class DownloadAndExtractTest(unittest.TestCase):
 
     def test_matching_checksum_extracts_archive(self) -> None:
         expected_sha256 = hashlib.sha256(self.archive).hexdigest()
-        with tempfile.TemporaryDirectory() as output_dir, patch.object(build_helpers, "open_url",
-                                                                       side_effect=self._open_url):
+        with tempfile.TemporaryDirectory() as base_dir, patch.object(build_helpers, "open_url",
+                                                                     side_effect=self._open_url), patch.object(
+                                                                         build_helpers.shutil, "which",
+                                                                         return_value=None):
+            output_dir = Path(base_dir) / "output"
+            archives_dir = Path(base_dir) / "archives"
             build_helpers._download_and_extract(
                 "https://example.com/llvm.tar.gz",
                 output_dir,
                 "LLVM",
+                archives_dir,
                 expected_sha256,
             )
 
@@ -44,36 +49,65 @@ class DownloadAndExtractTest(unittest.TestCase):
                 b"verified payload",
                 (Path(output_dir) / "payload.txt").read_bytes(),
             )
+            self.assertFalse((archives_dir / "llvm.tar.gz").exists())
 
-    def test_mismatched_checksum_rejects_archive(self) -> None:
-        with tempfile.TemporaryDirectory() as output_dir, patch.object(build_helpers, "open_url",
-                                                                       side_effect=self._open_url), patch.dict(
-                                                                           os.environ,
-                                                                           {"TRITON_UNSAFE_DISABLE_SHA_CHECK": ""}):
+    def test_mismatched_checksum_preserves_destination_and_deletes_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as base_dir, patch.object(
+                build_helpers, "open_url", side_effect=self._open_url), patch.object(
+                    build_helpers.shutil, "which",
+                    return_value=None), patch.dict(os.environ, {"TRITON_UNSAFE_DISABLE_SHA_CHECK": ""}):
+            output_dir = Path(base_dir) / "output"
+            output_dir.mkdir()
+            existing_file = output_dir / "existing.txt"
+            existing_file.write_bytes(b"existing payload")
+            archives_dir = Path(base_dir) / "archives"
+
             with self.assertRaisesRegex(RuntimeError, "failed checksum validation"):
                 build_helpers._download_and_extract(
                     "https://example.com/llvm.tar.gz",
                     output_dir,
                     "LLVM",
+                    archives_dir,
                     "0" * 64,
                 )
 
-            self.assertFalse((Path(output_dir) / "payload.txt").exists())
+            self.assertEqual(b"existing payload", existing_file.read_bytes())
+            self.assertFalse((archives_dir / "llvm.tar.gz").exists())
 
     def test_unsafe_override_extracts_mismatched_archive(self) -> None:
         stderr = io.StringIO()
-        with tempfile.TemporaryDirectory() as output_dir, patch.object(
-                build_helpers, "open_url", side_effect=self._open_url), patch.dict(
+        with tempfile.TemporaryDirectory() as base_dir, patch.object(
+                build_helpers, "open_url",
+                side_effect=self._open_url), patch.object(build_helpers.shutil, "which", return_value=None), patch.dict(
                     os.environ, {"TRITON_UNSAFE_DISABLE_SHA_CHECK": "1"}), patch("sys.stderr", stderr):
+            output_dir = Path(base_dir) / "output"
+            archives_dir = Path(base_dir) / "archives"
             build_helpers._download_and_extract(
                 "https://example.com/llvm.tar.gz",
                 output_dir,
                 "LLVM",
+                archives_dir,
                 "0" * 64,
             )
 
             self.assertTrue((Path(output_dir) / "payload.txt").exists())
+            self.assertFalse((archives_dir / "llvm.tar.gz").exists())
             self.assertIn("WARNING:", stderr.getvalue())
+
+    def test_curl_resumes_azure_download_with_range_capable_api(self) -> None:
+        with patch.object(build_helpers.subprocess, "run") as run:
+            build_helpers._download_file_with_curl(
+                "/usr/bin/curl",
+                "https://example.blob.core.windows.net/container/llvm.tar.gz",
+                "/cache/archives/llvm.tar.gz",
+                "downloading LLVM",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--continue-at", command)
+        self.assertEqual("-", command[command.index("--continue-at") + 1])
+        self.assertIn("x-ms-version: 2011-08-18", command)
+        self.assertEqual("/cache/archives/llvm.tar.gz", command[command.index("--output") + 1])
 
     def test_llvm_package_uses_platform_checksum(self) -> None:
         with tempfile.TemporaryDirectory() as base_dir:
