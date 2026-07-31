@@ -7791,12 +7791,52 @@ def test_tlx_wave_converter_keeps_redistribute_scratch_internal_in_loop(tmp_path
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_carries_mask_payload_across_dynamic_for(tmp_path, ):
+def test_tlx_wave_converter_pipeline_carries_symbolic_mask_across_if(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_dynamic_for_mask_payload(%limit: i32) attributes {noinline = false} {
+  tt.func public @converter_if_symbolic_mask(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %limit: i32) attributes {noinline = false} {
+    %c0 = arith.constant 0 : i32
+    %positive = arith.cmpi sgt, %limit, %c0 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
+    %limit_splat = tt.splat %limit : i32 -> tensor<64xi32, #blocked>
+    %active = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #blocked>
+    %selected = scf.if %positive -> (tensor<64xi1, #blocked>) {
+      scf.yield %active : tensor<64xi1, #blocked>
+    } else {
+      %inactive = arith.constant dense<false> : tensor<64xi1, #blocked>
+      scf.yield %inactive : tensor<64xi1, #blocked>
+    }
+    %other = arith.constant dense<0.000000e+00> : tensor<64xf16, #blocked>
+    %loaded = amdg.buffer_load %arg0[%range], %selected, %other {contiguity = 1 : i32} : tensor<64xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    if_line = next(line for line in wave.splitlines() if "scf.if" in line)
+    assert "-> (!wave.mask<64>)" in if_line
+    assert "wave.where" in wave
+    assert "wave.gather" in wave
+    _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.uniform_if" in machine
+    assert "waveamdmachine.exec_if" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_pipeline_carries_symbolic_mask_across_dynamic_for(tmp_path, ):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_dynamic_for_symbolic_mask(%limit: i32) attributes {noinline = false} {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c64 = arith.constant 64 : index
@@ -7814,13 +7854,19 @@ def test_tlx_wave_converter_pipeline_carries_mask_payload_across_dynamic_for(tmp
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    assert "scf.for" in output.emitted_module.text
-    assert "scf.yield" in output.emitted_module.text
-    assert "arith.andi" not in output.emitted_module.text
+    wave = output.emitted_module.text
+    (for_line, ) = [line for line in wave.splitlines() if "scf.for" in line]
+    (yield_line, ) = [line for line in wave.splitlines() if "scf.yield" in line]
+    assert "iter_args" in for_line
+    assert "-> (!wave.mask<64>)" in for_line
+    assert ": !wave.mask<64>" in yield_line
+    assert "arith.andi" not in wave
+    _run_wave_verify(wave)
+    _run_waveamd_to_machine(wave)
     del ctx
 
 
-def test_tlx_wave_converter_preserves_loop_carried_mask_predicate_for_buffer_load(tmp_path, ):
+def test_tlx_wave_converter_preserves_loop_carried_symbolic_mask_for_buffer_load(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -7853,12 +7899,22 @@ def test_tlx_wave_converter_preserves_loop_carried_mask_predicate_for_buffer_loa
     assert "wave.gather" in wave
     assert "otherwise" in wave
     assert "wave.select" in wave
-    assert wave.count("wave.cmpi eq") == 1
+    for_line = next(line for line in wave.splitlines() if "scf.for" in line)
+    assert "iter_args" in for_line
+    assert "-> (!wave.mask<64>)" in for_line
+    assert "wave.cmpi eq" not in wave
+    assert "wave.cmpi ne" not in wave
     _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert "waveamdmachine.uniform_loop carries" in machine
+    assert "waveamdmachine.s_and_b64" in machine
+    assert "waveamdmachine.continue_if" in machine
+    assert "waveamdmachine.exec_if" in machine
+    assert "waveamdmachine.v_cmp_eq_u32_vcc" not in machine
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_normalizes_carried_mask_init_to_payload(tmp_path, ):
+def test_tlx_wave_converter_pipeline_carries_constant_symbolic_mask_init(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -7882,13 +7938,17 @@ def test_tlx_wave_converter_pipeline_normalizes_carried_mask_init_to_payload(tmp
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    assert "scf.for" in output.emitted_module.text
-    assert "scf.yield" in output.emitted_module.text
-    assert "arith.andi" not in output.emitted_module.text
+    wave = output.emitted_module.text
+    (for_line, ) = [line for line in wave.splitlines() if "scf.for" in line]
+    assert "-> (!wave.mask<64>)" in for_line
+    assert "scf.yield" in wave
+    assert "arith.andi" not in wave
+    _run_wave_verify(wave)
+    _run_waveamd_to_machine(wave)
     del ctx
 
 
-def test_tlx_wave_converter_preserves_select_mask_predicate_for_buffer_load(tmp_path):
+def test_tlx_wave_converter_preserves_selected_symbolic_mask_for_buffer_load(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
