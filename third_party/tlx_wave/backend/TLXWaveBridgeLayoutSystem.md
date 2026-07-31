@@ -17,8 +17,7 @@ by Wave value types:
 
 - uniform scalar or pointer: ordinary scalar MLIR value;
 - lane-varying scalar: `!wave.simd<T, W>`;
-- lane-varying predicate: `!wave.mask<W>` or integer SIMD mask payload when an
-  op contract requires ballot bits;
+- lane-varying predicate: `!wave.mask<W>`;
 - per-lane vector/register packet: `!wave.simd<vector<NxT>, W>`.
 
 WaveAMD fragment values do not participate in layout handling. MMA lowering may
