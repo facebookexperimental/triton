@@ -8,12 +8,152 @@
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <climits>
+#include <cstdint>
 #include <numeric>
 
 #define DEBUG_TYPE "modulo-scheduling-rau"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 
 namespace mlir::triton::gpu {
+
+static bool
+hasValidScheduleDomain(int II, const llvm::DenseMap<unsigned, int> &nodeToCycle,
+                       unsigned numNodes, llvm::ArrayRef<DDGEdge> edges) {
+  if (II <= 0 || nodeToCycle.size() != numNodes)
+    return false;
+  for (unsigned nodeIdx = 0; nodeIdx < numNodes; ++nodeIdx) {
+    auto it = nodeToCycle.find(nodeIdx);
+    if (it == nodeToCycle.end() || it->second < 0)
+      return false;
+  }
+  for (const auto &edge : edges)
+    if (edge.srcIdx >= numNodes || edge.dstIdx >= numNodes || edge.latency < 0)
+      return false;
+  return true;
+}
+
+bool isValidModuloSchedule(int II,
+                           const llvm::DenseMap<unsigned, int> &nodeToCycle,
+                           unsigned numNodes, llvm::ArrayRef<DDGEdge> edges) {
+  if (!hasValidScheduleDomain(II, nodeToCycle, numNodes, edges))
+    return false;
+
+  for (const auto &edge : edges) {
+    int64_t consumerStart =
+        static_cast<int64_t>(nodeToCycle.lookup(edge.dstIdx)) +
+        static_cast<int64_t>(edge.distance) * static_cast<int64_t>(II);
+    int64_t producerReady =
+        static_cast<int64_t>(nodeToCycle.lookup(edge.srcIdx)) +
+        static_cast<int64_t>(edge.latency);
+    if (consumerStart < producerReady)
+      return false;
+  }
+  return true;
+}
+
+bool isValidModuloSchedule(const DataDependenceGraph &ddg,
+                           const ModuloScheduleResult &schedule) {
+  return isValidModuloSchedule(schedule.II, schedule.nodeToCycle,
+                               ddg.getNumNodes(), ddg.getEdges());
+}
+
+static int getReservationDuration(const DDGNode &node) {
+  if (node.pipeline == HWPipeline::NONE)
+    return 1;
+  return std::max(node.selfLatency, 1);
+}
+
+bool tryRepairModuloSchedule(int II, llvm::DenseMap<unsigned, int> &nodeToCycle,
+                             llvm::ArrayRef<DDGNode> nodes,
+                             llvm::ArrayRef<DDGEdge> edges) {
+  if (!hasValidScheduleDomain(II, nodeToCycle, nodes.size(), edges))
+    return false;
+  if (isValidModuloSchedule(II, nodeToCycle, nodes.size(), edges))
+    return true;
+
+  ModuloReservationTable table(II);
+  for (unsigned nodeIdx = 0; nodeIdx < nodes.size(); ++nodeIdx) {
+    int cycle = nodeToCycle.lookup(nodeIdx);
+    int duration = getReservationDuration(nodes[nodeIdx]);
+    if (!table.isIntervalFree(cycle, nodes[nodeIdx].pipeline, duration))
+      return false;
+    table.reserve(cycle, nodes[nodeIdx].pipeline, nodeIdx, duration);
+  }
+
+  for (unsigned iteration = 0; iteration < nodes.size(); ++iteration) {
+    bool changed = false;
+    for (unsigned dstIdx = 0; dstIdx < nodes.size(); ++dstIdx) {
+      int64_t earliest = nodeToCycle.lookup(dstIdx);
+      for (const auto &edge : edges) {
+        if (edge.dstIdx != dstIdx)
+          continue;
+        int64_t required =
+            static_cast<int64_t>(nodeToCycle.lookup(edge.srcIdx)) +
+            static_cast<int64_t>(edge.latency) -
+            static_cast<int64_t>(edge.distance) * static_cast<int64_t>(II);
+        earliest = std::max(earliest, required);
+      }
+      if (earliest == nodeToCycle.lookup(dstIdx))
+        continue;
+      if (earliest > INT_MAX)
+        return false;
+
+      int64_t latest = INT_MAX;
+      for (const auto &edge : edges) {
+        if (edge.srcIdx != dstIdx)
+          continue;
+        if (edge.dstIdx == dstIdx) {
+          if (static_cast<int64_t>(edge.distance) * II < edge.latency)
+            return false;
+          continue;
+        }
+        int64_t allowed =
+            static_cast<int64_t>(nodeToCycle.lookup(edge.dstIdx)) +
+            static_cast<int64_t>(edge.distance) * static_cast<int64_t>(II) -
+            static_cast<int64_t>(edge.latency);
+        latest = std::min(latest, allowed);
+      }
+      if (earliest > latest)
+        return false;
+
+      const auto &node = nodes[dstIdx];
+      int oldCycle = nodeToCycle.lookup(dstIdx);
+      int duration = getReservationDuration(node);
+      table.unreserve(oldCycle, node.pipeline, duration);
+
+      int64_t searchEnd =
+          std::min<int64_t>(latest, earliest + static_cast<int64_t>(II) - 1);
+      int newCycle = -1;
+      for (int64_t candidate = earliest; candidate <= searchEnd; ++candidate) {
+        if (table.isIntervalFree(static_cast<int>(candidate), node.pipeline,
+                                 duration)) {
+          newCycle = static_cast<int>(candidate);
+          break;
+        }
+      }
+      if (newCycle < 0) {
+        table.reserve(oldCycle, node.pipeline, dstIdx, duration);
+        return false;
+      }
+
+      nodeToCycle[dstIdx] = newCycle;
+      table.reserve(newCycle, node.pipeline, dstIdx, duration);
+      changed = true;
+    }
+
+    if (isValidModuloSchedule(II, nodeToCycle, nodes.size(), edges))
+      return true;
+    if (!changed)
+      return false;
+  }
+  return false;
+}
+
+bool tryRepairModuloSchedule(const DataDependenceGraph &ddg,
+                             ModuloScheduleResult &schedule) {
+  return tryRepairModuloSchedule(schedule.II, schedule.nodeToCycle,
+                                 ddg.getNodes(), ddg.getEdges());
+}
 
 // ── ModuloReservationTable ──────────────────────────────────────────────────
 
@@ -121,10 +261,10 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
   // Sort ALL nodes (including NONE-pipeline) by decreasing critical-path
   // height. NONE ops must be scheduled together with pipeline ops so that
   // dependency constraints (e.g., load → local_alloc → MMA) are respected.
-  llvm::SmallVector<unsigned> priorityOrder;
+  llvm::SmallVector<unsigned> basePriorityOrder;
   for (unsigned i = 0; i < ddg.getNumNodes(); ++i)
-    priorityOrder.push_back(i);
-  llvm::sort(priorityOrder, [&](unsigned a, unsigned b) {
+    basePriorityOrder.push_back(i);
+  llvm::sort(basePriorityOrder, [&](unsigned a, unsigned b) {
     if (heights[a] != heights[b])
       return heights[a] > heights[b];
     // Tiebreaker: lower index first (producers before consumers
@@ -136,7 +276,7 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
 
   LLVM_DEBUG({
     DBGS() << "MinII=" << minII << " MaxII=" << maxII
-           << " Nodes=" << priorityOrder.size() << "\n";
+           << " Nodes=" << basePriorityOrder.size() << "\n";
     DBGS() << "ResMII=" << ddg.computeResMII()
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
@@ -153,6 +293,7 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
   });
 
   for (int II = minII; II <= maxII; ++II) {
+    auto priorityOrder = basePriorityOrder;
     ModuloReservationTable table{II};
     llvm::DenseMap<unsigned, int> scheduled;
     bool success = true;
@@ -235,12 +376,15 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
     }
 
     if (success) {
-      LLVM_DEBUG(DBGS() << "SUCCESS at II=" << II << "\n");
-
       ModuloScheduleResult result;
       result.II = II;
       result.nodeToCycle = std::move(scheduled);
-      return result;
+      if (tryRepairModuloSchedule(ddg, result)) {
+        LLVM_DEBUG(DBGS() << "SUCCESS at II=" << II << "\n");
+        return result;
+      }
+      LLVM_DEBUG(DBGS() << "II=" << II
+                        << ": rejected dependency-invalid schedule\n");
     }
 
     LLVM_DEBUG(DBGS() << "FAILED at II=" << II << "\n");
@@ -290,28 +434,43 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   //   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
   auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
 
+  auto validateResult = [&](FailureOr<ModuloScheduleResult> result)
+      -> FailureOr<ModuloScheduleResult> {
+    if (failed(result))
+      return failure();
+    if (!tryRepairModuloSchedule(ddg, *result)) {
+      LLVM_DEBUG(DBGS() << "Rejecting invalid final schedule\n");
+      return failure();
+    }
+    return std::move(result);
+  };
+
   if (algo == "exhaustive") {
     LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");
-    return runExhaustiveSearch(ddg, maxII);
+    return validateResult(runExhaustiveSearch(ddg, maxII));
   }
 
   if (algo == "random") {
     LLVM_DEBUG(DBGS() << "Using random sampling search\n");
-    return runRandomSearch(ddg, maxII);
+    return validateResult(runRandomSearch(ddg, maxII));
   }
 
   if (algo == "contracted") {
     LLVM_DEBUG(DBGS() << "Using contracted-graph two-stage search\n");
+    // Contracted mode assigns cycles with a reduced (contracted) latency model
+    // and validates its own dependences (see ContractedGraphScheduler.md). The
+    // full-latency validator would reject its intended stage-0→stage-1 wrap
+    // schedules, so it is deliberately not applied here.
     return runContractedSearch(ddg, maxII);
   }
 
   if (algo == "sms") {
     LLVM_DEBUG(DBGS() << "Using Swing Modulo Scheduling (SMS)\n");
-    return runSMS(ddg, minII, maxII);
+    return validateResult(runSMS(ddg, minII, maxII));
   }
 
   LLVM_DEBUG(DBGS() << "Using Rau's Iterative Modulo Scheduling (IMS)\n");
-  return runRauIMS(ddg, minII, maxII, maxBacktracks);
+  return validateResult(runRauIMS(ddg, minII, maxII, maxBacktracks));
 }
 
 } // namespace mlir::triton::gpu

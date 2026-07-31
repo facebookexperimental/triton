@@ -255,11 +255,15 @@ FailureOr<ModuloScheduleResult> runSMS(const DataDependenceGraph &ddg,
     }
 
     if (success) {
-      LLVM_DEBUG(DBGS() << "SUCCESS at II=" << II << "\n");
       ModuloScheduleResult result;
       result.II = II;
       result.nodeToCycle = std::move(scheduled);
-      return result;
+      if (tryRepairModuloSchedule(ddg, result)) {
+        LLVM_DEBUG(DBGS() << "SUCCESS at II=" << II << "\n");
+        return result;
+      }
+      LLVM_DEBUG(DBGS() << "II=" << II
+                        << ": rejected dependency-invalid schedule\n");
     }
 
     LLVM_DEBUG(DBGS() << "FAILED at II=" << II << "\n");

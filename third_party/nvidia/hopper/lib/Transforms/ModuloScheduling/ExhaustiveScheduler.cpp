@@ -349,7 +349,16 @@ static void searchRecursive(SearchState &state, unsigned depth) {
   // Base case: all ops placed — evaluate this complete schedule.
   if (depth == state.topoOrder.size()) {
     state.candidatesExplored++;
-    auto liveness = computeLiveness(state.buffers, state.scheduled);
+    ModuloScheduleResult candidate;
+    candidate.II = state.II;
+    candidate.nodeToCycle = state.scheduled;
+    if (!tryRepairModuloSchedule(state.ddg, candidate)) {
+      LLVM_DEBUG(DBGS() << "  Reject #" << state.candidatesExplored
+                        << ": dependency-invalid schedule\n");
+      return;
+    }
+    const auto &schedule = candidate.nodeToCycle;
+    auto liveness = computeLiveness(state.buffers, schedule);
     auto feas = checkFeasibility(state.buffers, liveness, state.II,
                                  state.smemBudget, state.tmemColLimit);
     if (!state.ignoreBudget && !feas.feasible)
@@ -371,9 +380,9 @@ static void searchRecursive(SearchState &state, unsigned depth) {
     for (const auto &edge : state.ddg.getEdges()) {
       if (edge.distance > 0)
         continue;
-      auto srcIt = state.scheduled.find(edge.srcIdx);
-      auto dstIt = state.scheduled.find(edge.dstIdx);
-      if (srcIt == state.scheduled.end() || dstIt == state.scheduled.end())
+      auto srcIt = schedule.find(edge.srcIdx);
+      auto dstIt = schedule.find(edge.dstIdx);
+      if (srcIt == schedule.end() || dstIt == schedule.end())
         continue;
       int srcStage = srcIt->second / state.II;
       int dstStage = dstIt->second / state.II;
@@ -405,23 +414,22 @@ static void searchRecursive(SearchState &state, unsigned depth) {
     // bonus for leaving room for downstream passes.
 
     int maxStage = 0;
-    for (auto &[_, c] : state.scheduled)
+    for (auto &[_, c] : schedule)
       maxStage = std::max(maxStage, c / state.II);
 
     int regPressure = 0;
     for (const auto &edge : state.ddg.getEdges()) {
       if (edge.distance > 0)
         continue;
-      auto srcIt = state.scheduled.find(edge.srcIdx);
-      auto dstIt = state.scheduled.find(edge.dstIdx);
-      if (srcIt != state.scheduled.end() && dstIt != state.scheduled.end())
+      auto srcIt = schedule.find(edge.srcIdx);
+      auto dstIt = schedule.find(edge.dstIdx);
+      if (srcIt != schedule.end() && dstIt != schedule.end())
         regPressure += dstIt->second - srcIt->second;
     }
 
     int64_t headroomTerm =
-        state.ignoreBudget
-            ? 0
-            : (state.smemBudget - feas.totalSmemBytes) / 1024;
+        state.ignoreBudget ? 0
+                           : (state.smemBudget - feas.totalSmemBytes) / 1024;
 
     int64_t score = -static_cast<int64_t>(maxStage) * 10000 // shallow > deep
                     + feas.totalBufferingDepth * 100        // more overlap
@@ -430,17 +438,17 @@ static void searchRecursive(SearchState &state, unsigned depth) {
 
     if (state.standalone) {
       if (state.seenSigs
-              .insert(hashStageSig(stageSignature(state.ddg, state.scheduled,
-                                                 state.II)))
+              .insert(
+                  hashStageSig(stageSignature(state.ddg, schedule, state.II)))
               .second) {
-        state.cands.push_back({score, state.scheduled});
+        state.cands.push_back({score, schedule});
         LLVM_DEBUG(DBGS() << "  Standalone cand #" << state.cands.size()
                           << ": score=" << score << " maxStage=" << maxStage
                           << " depth=" << feas.totalBufferingDepth << "\n");
       }
     } else if (score > state.bestScore) {
       state.bestScore = score;
-      state.bestSchedule = state.scheduled;
+      state.bestSchedule = schedule;
       LLVM_DEBUG(DBGS() << "  Candidate #" << state.candidatesExplored
                         << ": score=" << score << " maxStage=" << maxStage
                         << " depth=" << feas.totalBufferingDepth << " regP="
@@ -792,32 +800,19 @@ FailureOr<ModuloScheduleResult> runRandomSearch(const DataDependenceGraph &ddg,
         continue;
       }
 
+      if (!tryRepairModuloSchedule(II, scheduled, ddg.getNodes(),
+                                   ddg.getEdges())) {
+        LLVM_DEBUG(if (sample < 5) DBGS() << "  Random sample " << sample
+                                          << ": dependency-invalid schedule\n");
+        continue;
+      }
+
       // Evaluate.
       auto liveness = computeLiveness(buffers, scheduled);
       auto feas =
           checkFeasibility(buffers, liveness, II, smemBudget, tmemColLimit);
       if (!feas.feasible)
         continue;
-
-      // Dataflow check: intra-iteration def before use.
-      bool valid = true;
-      for (const auto &edge : ddg.getEdges()) {
-        if (edge.distance > 0)
-          continue;
-        auto srcIt = scheduled.find(edge.srcIdx);
-        auto dstIt = scheduled.find(edge.dstIdx);
-        if (srcIt == scheduled.end() || dstIt == scheduled.end())
-          continue;
-        if (srcIt->second / II > dstIt->second / II) {
-          valid = false;
-          break;
-        }
-      }
-      if (!valid) {
-        LLVM_DEBUG(if (sample < 5) DBGS() << "  Random sample " << sample
-                                          << ": dataflow check failed\n");
-        continue;
-      }
 
       // Score.
       int maxStage = 0;
