@@ -11,7 +11,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton._internal_testing import is_blackwell
+from triton._internal_testing import is_blackwell, is_hopper
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -105,7 +105,7 @@ def addmm_kernel_tma_persistent_ws(
 @pytest.mark.parametrize("B_col_major", [False, True])
 @pytest.mark.parametrize("DATA_PARTITION_FACTOR", [1, 2])
 @pytest.mark.parametrize("generate_subtiled_region", [True, False])
-@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell")
 def test_autows_addmm_tma_persistent(
     M,
     N,
@@ -125,6 +125,13 @@ def test_autows_addmm_tma_persistent(
     """Test addmm kernel (bias + matmul) with warp_specialize=True."""
     if FLATTEN:
         pytest.skip("FLATTEN will not WarpSpecialize although it will otherwise pass.")
+
+    if is_hopper():
+        if EPILOGUE_SUBTILE != 1:
+            pytest.skip("EPILOGUE_SUBTILE is only supported for Blackwell.")
+
+        if BLOCK_SIZE_M == 256:
+            pytest.skip("BLOCK_SIZE_M == 256 runs out of shared memory for Hopper")
 
     # DATA_PARTITION_FACTOR != 1 requires BLOCK_SIZE_M == 256
     if DATA_PARTITION_FACTOR != 1 and BLOCK_SIZE_M != 256:
@@ -208,8 +215,11 @@ def test_autows_addmm_tma_persistent(
         # Verify IR contains expected ops
         ttgir = kernel.asm["ttgir"]
         assert "ttg.warp_specialize" in ttgir, "Expected warp specialization in IR"
-        assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
         assert "ttng.async_tma_copy_global_to_local" in ttgir, "Expected TMA copy"
+        if is_blackwell():
+            assert "ttng.tc_gen5_mma" in ttgir, "Expected Blackwell MMA instruction"
+        else:
+            assert "ttng.warp_group_dot" in ttgir, "Expected Hopper MMA instruction"
 
         # Verify correctness: bias + A @ B.T
         ref_out = (torch.matmul(A.to(torch.float32), B.T.to(torch.float32)) + bias.to(torch.float32)).to(dtype)
