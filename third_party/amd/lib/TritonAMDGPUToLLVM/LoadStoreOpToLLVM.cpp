@@ -1298,9 +1298,7 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     // the descriptor's dimensionality. For rank-reducing loads, destination
     // shared memory may have fewer dimensions than the descriptor block type.
     triton::LinearLayout sharedLayout =
-        isPaddedEncoding(encoding)
-            ? paddedLinearLayout(tensorDescTy.getShape(), encoding)
-            : toLinearLayout(tensorDescTy.getShape(), encoding);
+        toLinearLayoutIgnoringPadding(tensorDescTy.getShape(), encoding);
     // Extract padding information if present
     unsigned padInterval = 0;
     unsigned padAmount = 0;
@@ -1401,9 +1399,7 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
       member.elementType =
           getTypeConverter()->convertType(descTy.getElementType());
       member.sharedLayout =
-          isPaddedEncoding(encoding)
-              ? paddedLinearLayout(descTy.getShape(), encoding)
-              : toLinearLayout(descTy.getShape(), encoding);
+          toLinearLayoutIgnoringPadding(descTy.getShape(), encoding);
       if (auto padded = getPaddedEncoding(encoding)) {
         assert(padded.getIntervals().size() == 1 &&
                padded.getPaddings().size() == 1);
@@ -1516,9 +1512,7 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
       padAmount = paddedEnc.getPaddings()[0];
     }
 
-    triton::LinearLayout sharedLayout = isPaddedEncoding(encoding)
-                                            ? paddedLinearLayout(smemTy)
-                                            : toLinearLayout(smemTy);
+    triton::LinearLayout sharedLayout = toLinearLayoutIgnoringPadding(smemTy);
 
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
 

@@ -769,16 +769,10 @@ LogicalResult MemDescReinterpretOp::verify() {
               nvidia_gpu::TensorMemorySpaceAttr>(srcTy.getMemorySpace()) &&
           "expected shared or tensor memory"));
 
-  auto allocationLayout = [](MemDescType ty) {
-    return isPaddedEncoding(ty.getEncoding())
-               ? paddedLinearLayout(ty)
-               : toLinearLayout(
-                     dropPipeliningDim(ty.getAllocShape(), ty.getEncoding()),
-                     ty.getEncoding());
-  };
-
-  auto srcAllocation = allocationLayout(srcTy);
-  auto dstAllocation = allocationLayout(dstTy);
+  auto srcAllocation = toLinearLayoutIgnoringPadding(
+      dropPipeliningDim(srcTy.getAllocShape(), srcEnc), srcEnc);
+  auto dstAllocation = toLinearLayoutIgnoringPadding(
+      dropPipeliningDim(dstTy.getAllocShape(), dstEnc), dstEnc);
   auto srcShape = dropPipeliningDim(srcTy.getShape(), srcEnc);
   auto blockDim = StringAttr::get(getContext(), "block");
   for (const auto &basis : srcAllocation.getBases().lookup(blockDim))
@@ -1344,16 +1338,14 @@ LogicalResult MemDescSubsliceOp::verify() {
   // (which only accepts concrete TritonGPU encodings).
   Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
   auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), concreteSrcEnc);
-  LinearLayout ll;
   if (auto paddedEncoding = triton::gpu::getPaddedEncoding(concreteSrcEnc)) {
     if (paddedEncoding.getRank() < layoutRank) {
       return emitError("SubSlice of low rank PaddedSharedEncoding from higher "
                        "rank tensors is not supported yet");
     }
-    ll = triton::gpu::paddedLinearLayout(allocShape, concreteSrcEnc);
-  } else {
-    ll = triton::gpu::toLinearLayout(allocShape, concreteSrcEnc);
   }
+  LinearLayout ll =
+      triton::gpu::toLinearLayoutIgnoringPadding(allocShape, concreteSrcEnc);
 
   auto llInv = ll.pseudoinvert();
   for (auto dim : splitDims) {

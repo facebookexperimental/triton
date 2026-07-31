@@ -76,7 +76,8 @@ LogicalResult lowerLocalStore(
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
   LinearLayout cvt = LinearLayout::empty();
   if (isPaddedEncoding(memDescTy.getEncoding())) {
-    cvt = invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
+    cvt = invertAndComposeBlockLocal(toLinearLayoutIgnoringPadding(memDescTy),
+                                     regLayout);
   } else {
     auto [physicalRegLayout, sharedLayout] =
         getPhysicalLayouts(regLayout, memDescTy);
@@ -215,8 +216,8 @@ public:
         toLinearLayout(regTy).removeZeroBasesAlongDim(str_attr("register"));
     LinearLayout cvt = LinearLayout::empty();
     if (isPaddedEncoding(memDescTy.getEncoding())) {
-      cvt =
-          invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
+      cvt = invertAndComposeBlockLocal(toLinearLayoutIgnoringPadding(memDescTy),
+                                       regLayout);
     } else {
       auto [physicalRegLayout, sharedLayout] =
           getPhysicalLayouts(regLayout, memDescTy);
