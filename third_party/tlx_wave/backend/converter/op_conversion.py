@@ -64,10 +64,10 @@ _LAYOUT_PRESERVING_SIMPLE_OPS = frozenset((
     *_FLOAT_BINARY_OPS,
     *_FLOAT_UNARY_OPS,
     *_FLOAT_CAST_OPS,
+    "arith.cmpf",
     "arith.cmpi",
     "arith.maxsi",
     "arith.minsi",
-    "arith.select",
     "tt.addptr",
 ))
 
@@ -508,6 +508,12 @@ def _convert_source_op(
             fact_program,
             op,
         )
+        return
+    if op.name == "arith.cmpf":
+        _convert_cmpf(builder, type_layout_program, op)
+        return
+    if op.name == "ttg.warp_ballot":
+        _convert_warp_ballot(builder, type_layout_program, op)
         return
     if op.name == "arith.select":
         _convert_select(
@@ -1035,6 +1041,30 @@ def _convert_cmpi(
     )
 
 
+def _convert_cmpf(builder, type_layout_program, op):
+    _require_simple_op_layout_contract(type_layout_program, op)
+    if len(op.operands) != 2 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_CMPF",
+            STAGE,
+            "arith.cmpf requires two operands and one result",
+            source_op_index=op.index,
+        )
+    result_target_ids, result_layout_map_ids = _declare_results(
+        builder,
+        op,
+        type_layout_program,
+    )
+    builder.add_op(
+        "cmpf",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        attrs={"predicate": _cmpf_predicate(op.attrs.get("predicate"))},
+        layout_map_ids=result_layout_map_ids,
+        source_op_index=op.index,
+    )
+
+
 def _convert_minsi(builder, view):
     builder.add_op(
         "minsi",
@@ -1300,6 +1330,41 @@ def _convert_warp_id(builder, view):
         "warp_id",
         results=view.result_target_ids,
         source_op_index=view.op_index,
+    )
+
+
+def _convert_warp_ballot(builder, type_layout_program, op):
+    if len(op.operands) != 1 or len(op.results) != 1:
+        fail(
+            "TLXW_OP_WARP_BALLOT",
+            STAGE,
+            "ttg.warp_ballot requires one predicate and one result",
+            source_op_index=op.index,
+        )
+    predicate = type_layout_program.values[op.operands[0]]
+    result = type_layout_program.values[op.results[0]]
+    if (predicate.type.representation != "mask" or int(predicate.type.component_count) != 1):
+        fail(
+            "TLXW_OP_WARP_BALLOT",
+            STAGE,
+            "ttg.warp_ballot predicate must map exactly one i1 element to each lane",
+            source_op_index=op.index,
+            source_value_id=predicate.value_id,
+        )
+    if (result.type.representation != "scalar" or result.type.element_type != "i64"):
+        fail(
+            "TLXW_OP_WARP_BALLOT",
+            STAGE,
+            "ttg.warp_ballot result must be a scalar i64",
+            source_op_index=op.index,
+            source_value_id=result.value_id,
+        )
+    result_target_ids, _ = _declare_results(builder, op, type_layout_program)
+    builder.add_op(
+        "ballot",
+        operands=_operand_target_ids(builder, op),
+        results=result_target_ids,
+        source_op_index=op.index,
     )
 
 
@@ -4051,7 +4116,6 @@ def _convert_select(
     fact_program,
     op,
 ):
-    _require_simple_op_layout_contract(type_layout_program, op)
     if len(op.operands) != 3 or len(op.results) != 1:
         fail(
             "TLXW_OP_SELECT",
@@ -4059,6 +4123,23 @@ def _convert_select(
             "arith.select requires one condition, two values, and one result",
             source_op_index=op.index,
         )
+    true_value = type_layout_program.values[int(op.operands[1])]
+    false_value = type_layout_program.values[int(op.operands[2])]
+    result = type_layout_program.values[int(op.results[0])]
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        true_value,
+        result,
+        "arith.select true value and result",
+        op,
+    )
+    _require_same_layout_except_element_type(
+        type_layout_program,
+        false_value,
+        result,
+        "arith.select false value and result",
+        op,
+    )
     condition = type_layout_program.values[int(op.operands[0])]
     if condition.type.element_type != "i1":
         fail(
@@ -4075,9 +4156,6 @@ def _convert_select(
     )
     true_target_id = _single_source_target(builder, int(op.operands[1]), op)
     false_target_id = _single_source_target(builder, int(op.operands[2]), op)
-    true_value = type_layout_program.values[int(op.operands[1])]
-    false_value = type_layout_program.values[int(op.operands[2])]
-    result = type_layout_program.values[int(op.results[0])]
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
         op,
@@ -4244,6 +4322,7 @@ _SIMPLE_OP_CONVERTERS = {
 }
 
 _SPECIALIZED_SOURCE_OPS = frozenset({
+    "arith.cmpf",
     "arith.cmpi",
     "arith.select",
     "arith.truncf",
@@ -4252,6 +4331,7 @@ _SPECIALIZED_SOURCE_OPS = frozenset({
     "rocdl.s.setprio",
     "rocdl.sched.barrier",
     "ttg.barrier",
+    "ttg.warp_ballot",
     "scf.for",
     "scf.if",
     "tt.broadcast",
@@ -7907,6 +7987,32 @@ def _cmpi_predicate(value):
         7: "ule",
         8: "ugt",
         9: "uge",
+    }
+    if value is None:
+        return "unknown"
+    if isinstance(value, str) and value in predicates.values():
+        return value
+    return predicates.get(int(value), str(value))
+
+
+def _cmpf_predicate(value):
+    predicates = {
+        0: "false",
+        1: "oeq",
+        2: "ogt",
+        3: "oge",
+        4: "olt",
+        5: "ole",
+        6: "one",
+        7: "ord",
+        8: "ueq",
+        9: "ugt",
+        10: "uge",
+        11: "ult",
+        12: "ule",
+        13: "une",
+        14: "uno",
+        15: "true",
     }
     if value is None:
         return "unknown"
