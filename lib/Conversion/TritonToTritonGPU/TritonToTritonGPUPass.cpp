@@ -636,6 +636,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::LocalScatterOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       GenericOpPattern<triton::nvidia_gpu::VoteBallotSyncOp>,
+      GenericOpPattern<triton::gpu::WarpBallotOp>,
       TTNGPrefetchPattern>(typeConverter, context);
 }
 

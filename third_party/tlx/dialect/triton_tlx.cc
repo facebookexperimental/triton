@@ -1484,6 +1484,10 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self) -> mlir::Value {
              return self.create<ttg::WarpIdOp>();
            })
+      .def("create_warp_ballot",
+           [](TritonOpBuilder &self, Value pred) -> mlir::Value {
+             return self.create<ttg::WarpBallotOp>(pred);
+           })
       .def("create_set_priority",
            [](TritonOpBuilder &self, int priority) {
              self.create<ROCDL::SetPrioOp>(priority);

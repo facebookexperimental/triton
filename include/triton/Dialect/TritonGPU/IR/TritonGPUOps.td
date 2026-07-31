@@ -882,4 +882,23 @@ def TTG_WarpIdOp : TTG_Op<"warp_id", [Pure]> {
   let assemblyFormat = "attr-dict";
 }
 
+def TTG_WarpBallotOp : TTG_Op<"warp_ballot", [Pure]> {
+  let summary = "Collect one predicate per lane into a warp bit mask";
+
+  let description = [{
+    Each lane contributes its single distributed `i1` value. Bit N of the
+    uniform i64 result is set when lane N's predicate is true. Wave32 targets
+    zero-extend their 32-bit hardware ballot into the i64 result.
+
+    The predicate tensor must distribute exactly one element to each lane.
+    Keeping that mapping explicit avoids assigning reduction or layout
+    inference semantics to this operation.
+  }];
+
+  let arguments = (ins TT_BoolTensor:$pred);
+  let results = (outs I64:$result);
+
+  let assemblyFormat = "$pred attr-dict `:` type($pred) `->` type($result)";
+}
+
 #endif // TRITONGPU_OPS
