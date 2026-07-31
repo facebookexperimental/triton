@@ -395,6 +395,39 @@ def _collapse_info(node):
     return (op, _coordfree_sig(leaves[0]))
 
 
+def output_coordfree_key(node):
+    """Coord-free dedup key for one output of a MULTI-output entry (a COLLAPSED tree), or None if the
+    tree is not safe to coord-blank.
+
+    A multi-output entry (softmax / layernorm / rmsnorm: one output per row, many rows per block) is
+    kept VERBATIM by the descriptor today, so num_warps (which redistributes rows across threads)
+    never merges. But when EVERY output is a clean per-element function of its own element over
+    num_warps-invariant reductions — ``out[i] = f(x_i, ITreeReduce(row_i))`` — blanking the leaf coord
+    makes all outputs share ONE key, and deduping that key across the entry gives a num_warps-invariant
+    descriptor (the per-thread output COUNT varies with num_warps, but the SET of distinct output
+    computations does not). An unordered per-row reduction keeps its ShflCombine offsets in the
+    coord-free string (num_warps-bearing) so it still splits — inner_tree recovers, unordered does not.
+
+    SAFE only when the output's VALUE structure is fully modeled: no lost-provenance ``OpaqueLeaf``
+    (except a CONSTANT immediate, which is num_warps-invariant), and every ``OpaqueOp`` is a pure
+    per-element op (cvt / exp / mov / ...). A Leaf's COORD may be opaque (a swizzle / multi-dim address
+    the affine pass could not pin) — that is only ADDRESSING (which element), and blanking it is the
+    whole point; faithful reconstruction already guarantees the value DEPENDENCY is captured, so what
+    remains is an elementwise map over num_warps-invariant reductions. A tree with an unmodeled value
+    op / lost non-constant leaf returns None and the caller falls back to the verbatim (sound,
+    over-split) descriptor. This blanks more than the guarded reduction collapse (in particular it does
+    not re-prove the elementwise assumption for a swizzled address), so it is gated on the empirical
+    fuzzer (0 over-merge) rather than statically proven."""
+    for n in _postorder(node):
+        if isinstance(n, OpaqueLeaf) and "imm(" not in n.token:
+            return None  # a lost-provenance (non-constant) value -> unsafe to coord-blank
+        if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
+            return None  # an unmodeled value op -> unsafe
+        if isinstance(n, Leaf) and n.coord is None:
+            return None  # no coord at all (not even opaque) -> nothing to blank soundly
+    return _coordfree_sig(node)
+
+
 def _rebuild(n, kids):
     """Reconstruct node n with already-processed children kids."""
     if isinstance(n, (Leaf, OpaqueLeaf, ITreeReduce)):

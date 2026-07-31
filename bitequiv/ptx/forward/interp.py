@@ -22,10 +22,12 @@ the conservative fingerprint. Integer/address ops do not touch the value state (
 the affine domain, resolved on demand for leaf coordinates).
 """
 
+import hashlib
+
 from pyptx.ir.nodes import RegisterOperand, VectorOperand
 
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
-from bitequiv.ptx.builder import collapse_balanced, tree_hash
+from bitequiv.ptx.builder import collapse_balanced, output_coordfree_key, tree_hash
 from bitequiv.ptx.forward.cfg import has_unknown_control
 from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
                                         loop_self_increments)
@@ -428,14 +430,20 @@ def forward_descriptor(func):
     roots = interp.run()
     if not interp.faithful:
         return (interp.fingerprint(), )
-    # G3 guard (mirrors the backward `entry_signatures`): the layout-drop collapse is num_warps-
-    # INVARIANT only when ALL of the entry's threads reduce into ONE output. With MULTIPLE outputs
-    # (a 2-D / multi-axis tile reduced per row), num_warps RE-PARTITIONS the threads among the outputs
-    # and re-associates each output's reduction, so collapsing there OVER-MERGES — measured: sum_4d /
-    # softmax / rmsnorm inner_tree vs unordered collapsed to the same descriptor at the heavy grid.
-    # So collapse only a single-output entry; keep a multi-output entry's trees VERBATIM (sound,
-    # over-split — num_warps recovery for multi-output is later, layout-aware work).
-    collapsed = [collapse_balanced(roots[0])] if len(roots) == 1 else roots
+    if len(roots) == 1:
+        return (tree_hash(collapse_balanced(roots[0])), )
+    # MULTI-output: num_warps redistributes the entry's rows across threads, so the forward per-thread
+    # trees (and their COUNT) are num_warps-bearing -> a verbatim descriptor over-splits. When every
+    # output is a CLEAN per-element function of its own element over num_warps-invariant reductions
+    # (softmax / layernorm / rmsnorm), coord-blank each output + dedup: the SET of distinct output
+    # computations is num_warps-invariant even though the per-thread count is not. An unordered per-row
+    # reduction keeps its ShflCombine offsets in the key -> stays split (correct). If ANY output is not
+    # cleanly reconstructed (opaque leaf / unrecovered coord), fall back to the verbatim trees (sound,
+    # over-split). Replaces the old blanket multi-output G3 guard; gated on the fuzzer (0 over-merge).
+    collapsed = [collapse_balanced(r) for r in roots]
+    keys = [output_coordfree_key(t) for t in collapsed]
+    if all(k is not None for k in keys):
+        return tuple(sorted({hashlib.sha1(k.encode()).hexdigest()[:16] for k in keys}))
     return tuple(sorted(tree_hash(t) for t in collapsed))
 
 
