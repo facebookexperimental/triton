@@ -895,8 +895,8 @@ def _hstu_attn_fwd_subtile(  # noqa: C901
 @triton.jit
 def _hstu_attn_bwd_one_block_0(  # noqa C901
     start_m,
+    start_n,
     desc_row_q,
-    offs_n,
     offs_m,
     q_ptrs_trans,
     dq_ptrs_trans,
@@ -925,14 +925,13 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     max_attn_len,
     contextual_seq_len,
     n_targets,
-    max_ids,
-    pos_offs_n,
     HAS_NUM_TARGETS: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
     ATTN_SCALE_TYPE: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
     BLOCK_D_Q: tl.constexpr,
@@ -942,6 +941,18 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     DQ_REUSE: tl.constexpr = False,
 ):
     offs_m = offs_m + start_m
+    # Keep the integer KV-index/mask chain inside the warp-specialized loop.
+    # Building it in the enclosing scope makes AutoWS transfer the 128x128 i32
+    # value through a 64 KiB shared-memory channel.
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    max_ids, pos_offs_n = backward_off_common_preprocess(
+        seq_len_q,
+        contextual_seq_len,
+        n_targets,
+        offs_n,
+        HAS_CONTEXTUAL_SEQ_LEN,
+        HAS_NUM_TARGETS,
+    )
     mask_m = offs_m < seq_len_q
     if ATTN_SCALE_TYPE == "scalar":
         scale = tl.load(attn_scale).to(tl.float32)
@@ -1736,14 +1747,6 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
     n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
-    max_ids, pos_offs_n = backward_off_common_preprocess(
-        seq_len_q,
-        contextual_seq_len,
-        n_targets,
-        offs_n,
-        HAS_CONTEXTUAL_SEQ_LEN,
-        HAS_NUM_TARGETS,
-    )
     if HAS_CONTEXTUAL_SEQ_LEN:
         low = 0
         high = contextual_seq_len
@@ -1751,8 +1754,8 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             start_m = tl.multiple_of(start_m, BLOCK_M)
             dk, dv = _hstu_attn_bwd_one_block_0(
                 start_m=start_m,
+                start_n=start_n,
                 desc_row_q=desc_row_q,
-                offs_n=offs_n,
                 offs_m=offs_m,
                 q_ptrs_trans=q_ptrs_trans,
                 dq_ptrs_trans=dq_ptrs_trans,
@@ -1781,14 +1784,13 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 max_attn_len=max_attn_len,
                 contextual_seq_len=contextual_seq_len,
                 n_targets=n_targets,
-                max_ids=max_ids,
-                pos_offs_n=pos_offs_n,
                 HAS_NUM_TARGETS=HAS_NUM_TARGETS,
                 HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
                 HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
                 ATTN_SCALE_TYPE=ATTN_SCALE_TYPE,
                 ALLOW_TF32=ALLOW_TF32,
                 BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
                 ATOMIC_ADD=ATOMIC_ADD,
                 ENABLE_TMA=ENABLE_TMA,
                 BLOCK_D_Q=BLOCK_D_Q,
@@ -1833,8 +1835,8 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         start_m = tl.multiple_of(start_m, BLOCK_M)
         dk, dv = _hstu_attn_bwd_one_block_0(
             start_m=start_m,
+            start_n=start_n,
             desc_row_q=desc_row_q,
-            offs_n=offs_n,
             offs_m=offs_m,
             q_ptrs_trans=q_ptrs_trans,
             dq_ptrs_trans=dq_ptrs_trans,
@@ -1863,14 +1865,13 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             n_targets=n_targets,
-            max_ids=max_ids,
-            pos_offs_n=pos_offs_n,
             HAS_NUM_TARGETS=HAS_NUM_TARGETS,
             HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
             HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
             ATTN_SCALE_TYPE=ATTN_SCALE_TYPE,
             ALLOW_TF32=ALLOW_TF32,
             BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
             ATOMIC_ADD=ATOMIC_ADD,
             ENABLE_TMA=ENABLE_TMA,
             BLOCK_D_Q=BLOCK_D_Q,
