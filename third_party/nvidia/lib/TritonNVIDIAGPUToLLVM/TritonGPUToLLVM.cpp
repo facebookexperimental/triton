@@ -19,6 +19,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 
 #include "Allocation.h"
 #include "PatternTritonGPUOpToLLVM.h"
@@ -27,8 +28,6 @@
 #include "triton/Conversion/TritonGPUToLLVM/TypeConverter.h"
 
 namespace ttg = mlir::triton::gpu;
-namespace ttng = mlir::triton::nvidia_gpu;
-
 namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace mlir {
@@ -110,6 +109,7 @@ struct ConvertTritonGPUToLLVM
     if (failed(maybeInsertClusterSync(mod))) {
       return signalPassFailure();
     }
+    mlir::triton::nvidia_gpu::runClusterBarrierMbarAllocator(mod);
 
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
@@ -157,7 +157,8 @@ struct ConvertTritonGPUToLLVM
                                                  targetInfo, benefit);
     populateBarrierOpToLLVMPatterns(typeConverter, patterns, benefit,
                                     targetInfo);
-    populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit);
+    populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit,
+                                     targetInfo);
     mlir::triton::populateHistogramOpToLLVMPatterns(typeConverter, patterns,
                                                     targetInfo, benefit);
     mlir::triton::populatePrintOpToLLVMPattern(typeConverter, patterns,

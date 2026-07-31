@@ -242,15 +242,20 @@ LogicalResult ClusterWaitOp::verify() {
 
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
-  // ClusterBarrierOp is backend-inserted (not emitted by beta lowering, which
-  // has no TargetInfo::clusterBarrier creator), so the full upstream check
-  // applies; it never runs on real beta IR.
   int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
   if (numCTAs <= 1)
     return emitOpError("requires ttg.num-ctas > 1");
-  if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
-    return emitOpError("cannot be used inside `ttg.warp_specialize`");
-  return success();
+  auto func = getOperation()->getParentOfType<FunctionOpInterface>();
+  if (!func)
+    return emitOpError("must be inside a kernel function");
+  if (func.isPublic())
+    return success();
+  if (auto tritonFunc = dyn_cast<triton::FuncOp>(func.getOperation())) {
+    auto noinline = tritonFunc->getAttrOfType<BoolAttr>("noinline");
+    if (!noinline || !noinline.getValue())
+      return success();
+  }
+  return emitOpError("must be inside a kernel function");
 }
 
 // -- BarrierExpectOp --

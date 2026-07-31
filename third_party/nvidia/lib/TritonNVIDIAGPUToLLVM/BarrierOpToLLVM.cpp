@@ -42,6 +42,14 @@ namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace ttg = mlir::triton::gpu;
 
+void mlir::triton::NVIDIA::createFenceMBarrierInitReleaseCluster(
+    OpBuilder &builder, Location loc, Value pred) {
+  PTXBuilder ptxBuilder;
+  auto &fence = *ptxBuilder.create("fence.mbarrier_init.release.cluster");
+  fence().predicate(pred);
+  ptxBuilder.launch(builder, loc, void_ty(builder.getContext()));
+}
+
 namespace {
 
 struct PhysicalClusterInfo {
@@ -129,11 +137,7 @@ struct FenceMBarrierInitReleaseClusterOpConversion
     Value tid = getThreadId(rewriter, loc);
     Value pred = b.icmp_eq(tid, b.i32_val(0));
 
-    PTXBuilder ptxBuilder;
-    auto &fence = *ptxBuilder.create("fence.mbarrier_init.release.cluster");
-    fence().predicate(pred);
-    auto voidTy = void_ty(op->getContext());
-    ptxBuilder.launch(rewriter, loc, voidTy);
+    NVIDIA::createFenceMBarrierInitReleaseCluster(rewriter, loc, pred);
 
     rewriter.eraseOp(op);
     return success();
