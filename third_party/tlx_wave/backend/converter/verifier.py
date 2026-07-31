@@ -1,5 +1,7 @@
 """Target-program verifier for the TLX Wave converter."""
 
+import re
+
 from . import domains
 from . import target_ir
 from .diagnostics import fail
@@ -8,6 +10,16 @@ STAGE = "verification"
 
 _PROOF_DEPENDENT_OPS = frozenset({"assume", "buffer_load_to_local", "buffer_load", "buffer_store"})
 _ASSUMPTION_KINDS = frozenset({"divisible", "pointer_byte_range", "range"})
+_FASTMATH_FLAGS = frozenset({
+    "afn",
+    "arcp",
+    "contract",
+    "fast",
+    "ninf",
+    "nnan",
+    "nsz",
+    "reassoc",
+})
 _TARGET_REPRESENTATIONS = frozenset({
     "buffer_pointer",
     "buffer_pointer_tuple",
@@ -95,6 +107,13 @@ def _verify_target_layouts(target_program):
                     STAGE,
                     f"target layout {layout.layout_map_id} has malformed "
                     "symbolic properties",
+                )
+            policy = _bridge_policy_attr(prop.name)
+            if policy is not None:
+                fail(
+                    "TLXW_VERIFY_BRIDGE_POLICY_ATTR",
+                    STAGE,
+                    f"target layout property {prop.name} encodes {policy}",
                 )
             property_names.add(prop.name)
         if layout.linear_layout is not None and not _is_layout_schema_value(layout.linear_layout):
@@ -246,6 +265,21 @@ def _verify_target_value_types(target_program):
                     "target event domains require token representation",
                     target_value_id=value.target_value_id,
                 )
+        mask_representation = representation in {"mask", "mask_tuple"}
+        if (value.type.element_type == "i1" and value.type.lane_width is not None and not mask_representation):
+            fail(
+                "TLXW_VERIFY_PHYSICAL_MASK_PAYLOAD",
+                STAGE,
+                "distributed i1 values must remain first-class symbolic masks",
+                target_value_id=value.target_value_id,
+            )
+        if mask_representation and value.type.element_type != "i1":
+            fail(
+                "TLXW_VERIFY_PHYSICAL_MASK_PAYLOAD",
+                STAGE,
+                "symbolic mask representations require i1 elements",
+                target_value_id=value.target_value_id,
+            )
         if representation in {"fragment", "fragment_tuple"}:
             fail(
                 "TLXW_VERIFY_FRAGMENT_BOUNDARY",
@@ -396,6 +430,8 @@ def _verify_ops(target_program, source_program):
         if op.kind == "layout_convert":
             if source_program is not None:
                 _verify_layout_convert_source_op(op, source_program)
+        if source_program is not None:
+            _verify_source_semantic_attrs(target_program, op, source_program)
         if op.kind in _PROOF_DEPENDENT_OPS and not op.fact_ids:
             fail(
                 "TLXW_VERIFY_MISSING_FACT",
@@ -1129,6 +1165,14 @@ def _verify_attrs(op):
                 target_op_id=op.target_op_id,
             )
         names.add(attr.name)
+        policy = _bridge_policy_attr(attr.name)
+        if policy is not None:
+            fail(
+                "TLXW_VERIFY_BRIDGE_POLICY_ATTR",
+                STAGE,
+                f"target op attr {attr.name} encodes {policy}",
+                target_op_id=op.target_op_id,
+            )
         if not _is_schema_value(attr.value):
             fail(
                 "TLXW_VERIFY_NON_SCHEMA_ATTR",
@@ -1136,6 +1180,127 @@ def _verify_attrs(op):
                 f"target op {op.target_op_id} attr {attr.name} is not schema data",
                 target_op_id=op.target_op_id,
             )
+
+
+def _identifier_tokens(name):
+    split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
+    return frozenset(token for token in re.split(r"[^A-Za-z0-9]+", split_camel.lower()) if token)
+
+
+def _bridge_policy_attr(name):
+    tokens = _identifier_tokens(name)
+    if tokens & {"transaction", "transactions", "coalesce", "coalescing"}:
+        return "target memory transaction selection"
+    if tokens & {"bank", "banks"} and tokens & {"count", "num", "number"}:
+        return "target memory-bank selection"
+    if tokens & {"optimal", "preference", "selected", "strategy"} and tokens & {
+            "chunk",
+            "tile",
+            "vector",
+            "width",
+    }:
+        return "target width or tile selection"
+    if {"target", "waves"} <= tokens:
+        return "derived target occupancy"
+    if tokens & {"repack", "repacking"}:
+        return "bridge-local repacking"
+    if {"copy", "layout"} <= tokens:
+        return "bridge-local layout copy"
+    if {"scratch", "layout"} <= tokens:
+        return "bridge-local scratch layout"
+    if "shuffle" in tokens and tokens & {"mode", "plan", "steps", "strategy"}:
+        return "bridge-local shuffle plan"
+    if "plan" in tokens and "layout" in tokens and tokens & {
+            "optimal",
+            "preference",
+            "selected",
+            "strategy",
+    }:
+        return "bridge-local layout selection plan"
+    return None
+
+
+def _verify_source_semantic_attrs(target_program, op, source_program):
+    attrs = _attrs_dict(op)
+    semantic_names = {"fastmath", "nsw", "nuw"}.intersection(attrs)
+    if not semantic_names:
+        return
+    if op.source_op_index is None:
+        fail(
+            "TLXW_VERIFY_INVENTED_SEMANTICS",
+            STAGE,
+            "semantic target attrs require a source operation",
+            target_op_id=op.target_op_id,
+        )
+    try:
+        source_op_index = int(op.source_op_index)
+    except (TypeError, ValueError):
+        source_op_index = -1
+    if not 0 <= source_op_index < len(source_program.ops):
+        fail(
+            "TLXW_VERIFY_INVENTED_SEMANTICS",
+            STAGE,
+            "semantic target attrs reference an unknown source operation",
+            target_op_id=op.target_op_id,
+            source_op_index=op.source_op_index,
+        )
+    source_op = source_program.ops[source_op_index]
+
+    source_overflow = _identifier_tokens(source_op.attrs.get("overflowFlags", ""))
+    for flag in ("nsw", "nuw"):
+        if flag not in attrs:
+            continue
+        if type(attrs[flag]) is not bool or attrs[flag] and flag not in source_overflow:
+            fail(
+                "TLXW_VERIFY_INVENTED_SEMANTICS",
+                STAGE,
+                f"target {flag} is not present on the source operation",
+                target_op_id=op.target_op_id,
+                source_op_index=op.source_op_index,
+            )
+
+    if "fastmath" not in attrs:
+        return
+    target_flags = _fastmath_flags(attrs["fastmath"])
+    unknown = tuple(sorted(set(target_flags) - _FASTMATH_FLAGS))
+    if unknown:
+        fail(
+            "TLXW_VERIFY_INVENTED_SEMANTICS",
+            STAGE,
+            f"target fastmath flags are not structural schema values: {unknown}",
+            target_op_id=op.target_op_id,
+            source_op_index=op.source_op_index,
+        )
+    source_flags = _fastmath_flags(source_op.attrs.get("fastmath"))
+    allowed_flags = set(source_flags)
+    if target_program.contract.enable_fp_fusion and "fast" not in allowed_flags:
+        allowed_flags.add("contract")
+    invented = tuple(sorted(set(target_flags) - allowed_flags))
+    if invented:
+        fail(
+            "TLXW_VERIFY_INVENTED_SEMANTICS",
+            STAGE,
+            f"target fastmath flags are absent from source/global policy: {invented}",
+            target_op_id=op.target_op_id,
+            source_op_index=op.source_op_index,
+        )
+
+
+def _fastmath_flags(value):
+    if value is None:
+        return ()
+    if isinstance(value, (tuple, frozenset, list)):
+        flags = tuple(str(flag) for flag in value)
+    else:
+        text = str(value)
+        match = re.search(r"fastmath<([^>]*)>", text)
+        if match is None:
+            flags = tuple(part.strip() for part in text.split(",") if part.strip())
+        else:
+            flags = tuple(part.strip() for part in match.group(1).split(",") if part.strip())
+    if "fast" in flags:
+        flags = ("fast", )
+    return flags
 
 
 def _verify_memory_edges(op, target_program):
