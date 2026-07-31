@@ -25,13 +25,13 @@ class ConversionOutput:
 
 
 def convert_ttgir_to_wave(
-    mod,
-    *,
-    kernel_name=None,
-    verify=True,
-    compiler_membar_barriers=(),
-    waves_per_eu=0,
-    enable_fp_fusion=False,
+        mod,
+        *,
+        kernel_name=None,
+        verify=True,
+        compiler_membar_barriers=(),
+        waves_per_eu=0,
+        enable_fp_fusion=False,
 ):
     source_program = source_import.import_source_program(
         mod,
@@ -46,17 +46,10 @@ def convert_ttgir_to_wave(
         type_layout_program,
         fact_program,
         token_program,
-        contract=target_ir.TargetContract(
-            enable_fp_fusion=bool(enable_fp_fusion),
-        ),
+        contract=target_ir.TargetContract(enable_fp_fusion=bool(enable_fp_fusion), ),
     )
     target_program = canonicalize.canonicalize_target_program(target_program)
-    target_program = canonicalize.eliminate_redundant_compiler_membar_barriers(
-        target_program
-    )
-    target_program = barrier_order.thread_barrier_issue_order(
-        target_program
-    )
+    target_program = barrier_order.thread_barrier_issue_order(target_program)
     if verify:
         verifier.verify_target_program(
             target_program,

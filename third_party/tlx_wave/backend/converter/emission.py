@@ -159,24 +159,6 @@ class _EmissionState:
     shared_pointer_offset_cache: dict[tuple[object, ...], object] = field(default_factory=dict)
     wave_offset_i32_cache: dict[tuple[object, ...], object] = field(default_factory=dict)
     lane_mask_loop_phase: object | None = None
-    scratch_token: object | None = None
-    scratch_token_needs_write_barrier: bool = False
-    local_memory_tokens: dict[int, object] = field(default_factory=dict)
-    local_memory_pending_accesses: dict[int, str] = field(default_factory=dict)
-    pending_mma_read_boundaries: dict[int, int] = field(default_factory=dict)
-    materialized_mma_read_boundaries: dict[int, object] = field(default_factory=dict)
-    next_mma_read_boundary_id: int = 0
-    local_memory_root_sets: dict[int, frozenset[int]] = field(default_factory=dict)
-    token_local_memory_root_sets: dict[int, frozenset[int]] = field(default_factory=dict)
-    static_local_memory_roots: dict[tuple[int, int, int], int] = field(default_factory=dict)
-    static_local_memory_root_intervals: dict[int, tuple[int, int, int]] = field(default_factory=dict)
-    local_memory_allocations: dict[int, object] = field(default_factory=dict)
-    released_local_memory_allocations: set[int] = field(default_factory=set)
-    local_memory_release_unsafe_roots: set[int] = field(default_factory=set)
-    local_memory_descendants: dict[int, frozenset[int]] = field(default_factory=dict)
-    local_memory_access_tokens: dict[int, tuple[object, ...]] = field(default_factory=dict)
-    local_memory_read_tokens: dict[int, tuple[object, ...]] = field(default_factory=dict)
-    next_local_memory_root: int = -1
 
 
 def emit_wave_module(
@@ -1153,10 +1135,7 @@ def _materialize_fact_ids(state, op):
             "fact materialization requires one target value per fact",
             target_op_id=op.target_op_id,
         )
-    facts = {
-        assumption.assumption_id: assumption
-        for assumption in state.target_program.assumptions
-    }
+    facts = {assumption.assumption_id: assumption for assumption in state.target_program.assumptions}
     for fact_id, target_value_id in zip(op.fact_ids, op.fact_target_ids):
         fact = facts.get(fact_id)
         if fact is None:
@@ -1516,8 +1495,7 @@ def _emit_splat(state, op):
         )
     component_count = _component_count(state, result_id)
     state.values[result_id] = _pack_components(tuple(splat for _ in range(component_count)))
-    if (target_type.representation in {"per_lane_pointer", "pointer_tuple"}
-            and not _is_simd_value(state.dsl, operand)):
+    if (target_type.representation in {"per_lane_pointer", "pointer_tuple"} and not _is_simd_value(state.dsl, operand)):
         state.uniform_pointer_bases[result_id] = tuple(operand for _ in range(component_count))
 
 
@@ -1725,15 +1703,8 @@ def _emit_component_join(state, op):
     source_widths = tuple(int(value) for value in attrs["source_packet_widths"])
     source_slots = tuple(int(value) for value in attrs["source_slot_counts"])
     scalar_sources = tuple(
-        (int(operand_index), int(slot_index))
-        for operand_index, slot_index in attrs["scalar_sources"]
-    )
-    if not (
-        len(operands)
-        == len(source_counts)
-        == len(source_widths)
-        == len(source_slots)
-    ):
+        (int(operand_index), int(slot_index)) for operand_index, slot_index in attrs["scalar_sources"])
+    if not (len(operands) == len(source_counts) == len(source_widths) == len(source_slots)):
         fail(
             "TLXW_EMIT_COMPONENT_JOIN",
             STAGE,
@@ -1741,16 +1712,10 @@ def _emit_component_join(state, op):
             target_op_id=op.target_op_id,
         )
 
-    mask_payloads = tuple(
-        value if isinstance(value, _I32MaskPayload) else None
-        for value in operands
-    )
+    mask_payloads = tuple(value if isinstance(value, _I32MaskPayload) else None for value in operands)
     if any(payload is not None for payload in mask_payloads):
-        if (
-            any(payload is None for payload in mask_payloads)
-            or any(width != 1 for width in source_widths)
-            or int(attrs["result_packet_width"]) != 1
-        ):
+        if (any(payload is None for payload in mask_payloads) or any(width != 1 for width in source_widths)
+                or int(attrs["result_packet_width"]) != 1):
             fail(
                 "TLXW_EMIT_COMPONENT_JOIN",
                 STAGE,
@@ -1760,18 +1725,9 @@ def _emit_component_join(state, op):
         scalar_groups = tuple(tuple(payload.components) for payload in mask_payloads)
         predicate_groups = tuple(payload.predicates for payload in mask_payloads)
         have_predicates = all(group is not None for group in predicate_groups)
-        joined = tuple(
-            scalar_groups[operand_index][slot_index]
-            for operand_index, slot_index in scalar_sources
-        )
-        joined_predicates = (
-            tuple(
-                predicate_groups[operand_index][slot_index]
-                for operand_index, slot_index in scalar_sources
-            )
-            if have_predicates
-            else None
-        )
+        joined = tuple(scalar_groups[operand_index][slot_index] for operand_index, slot_index in scalar_sources)
+        joined_predicates = (tuple(predicate_groups[operand_index][slot_index]
+                                   for operand_index, slot_index in scalar_sources) if have_predicates else None)
         state.values[_single_result(op)] = _I32MaskPayload(
             joined,
             predicates=joined_predicates,
@@ -1785,9 +1741,7 @@ def _emit_component_join(state, op):
             value,
             count,
             width,
-        )
-        for value, count, width in zip(operands, source_counts, source_widths)
-    )
+        ) for value, count, width in zip(operands, source_counts, source_widths))
     if any(len(group) != slots for group, slots in zip(scalar_groups, source_slots)):
         fail(
             "TLXW_EMIT_COMPONENT_JOIN",
@@ -1795,32 +1749,20 @@ def _emit_component_join(state, op):
             "tt.join source payload does not match its register slots",
             target_op_id=op.target_op_id,
         )
-    if any(
-        operand_index < 0
-        or operand_index >= len(scalar_groups)
-        or slot_index < 0
-        or slot_index >= len(scalar_groups[operand_index])
-        for operand_index, slot_index in scalar_sources
-    ):
+    if any(operand_index < 0 or operand_index >= len(scalar_groups) or slot_index < 0
+           or slot_index >= len(scalar_groups[operand_index]) for operand_index, slot_index in scalar_sources):
         fail(
             "TLXW_EMIT_COMPONENT_JOIN",
             STAGE,
             "tt.join scalar map references an invalid source slot",
             target_op_id=op.target_op_id,
         )
-    joined = tuple(
-        scalar_groups[operand_index][slot_index]
-        for operand_index, slot_index in scalar_sources
-    )
+    joined = tuple(scalar_groups[operand_index][slot_index] for operand_index, slot_index in scalar_sources)
     result_count = int(attrs["result_component_count"])
     result_width = int(attrs["result_packet_width"])
     result_slots = int(attrs["result_slot_count"])
-    if (
-        len(joined) != result_slots
-        or result_count <= 0
-        or result_width <= 0
-        or result_count * result_width != result_slots
-    ):
+    if (len(joined) != result_slots or result_count <= 0 or result_width <= 0
+            or result_count * result_width != result_slots):
         fail(
             "TLXW_EMIT_COMPONENT_JOIN",
             STAGE,
@@ -1838,29 +1780,20 @@ def _emit_component_join(state, op):
             ),
             int(result_type.lane_width or 64),
         )
-        result = _pack_components(tuple(
-            state.dsl.wave.PackOp(
-                packet_type,
-                joined[index:index + result_width],
-            ).result
-            for index in range(0, result_slots, result_width)
-        ))
+        result = _pack_components(
+            tuple(
+                state.dsl.wave.PackOp(
+                    packet_type,
+                    joined[index:index + result_width],
+                ).result for index in range(0, result_slots, result_width)))
     result_id = _single_result(op)
     state.values[result_id] = result
 
-    source_bases = tuple(
-        state.uniform_pointer_bases.get(int(operand_id))
-        for operand_id in op.operands
-    )
-    if (
-        all(bases is not None for bases in source_bases)
-        and all(width == 1 for width in source_widths)
-        and result_width == 1
-    ):
-        state.uniform_pointer_bases[result_id] = tuple(
-            source_bases[operand_index][slot_index]
-            for operand_index, slot_index in scalar_sources
-        )
+    source_bases = tuple(state.uniform_pointer_bases.get(int(operand_id)) for operand_id in op.operands)
+    if (all(bases is not None for bases in source_bases) and all(width == 1 for width in source_widths)
+            and result_width == 1):
+        state.uniform_pointer_bases[result_id] = tuple(source_bases[operand_index][slot_index]
+                                                       for operand_index, slot_index in scalar_sources)
 
 
 def _emit_component_split(state, op):
@@ -1872,17 +1805,9 @@ def _emit_component_split(state, op):
     result_counts = tuple(int(value) for value in attrs["result_component_counts"])
     result_widths = tuple(int(value) for value in attrs["result_packet_widths"])
     result_slot_counts = tuple(int(value) for value in attrs["result_slot_counts"])
-    scalar_source_slots = tuple(
-        tuple(int(slot) for slot in sources)
-        for sources in attrs["scalar_source_slots"]
-    )
-    if not (
-        len(op.results)
-        == len(result_counts)
-        == len(result_widths)
-        == len(result_slot_counts)
-        == len(scalar_source_slots)
-    ):
+    scalar_source_slots = tuple(tuple(int(slot) for slot in sources) for sources in attrs["scalar_source_slots"])
+    if not (len(op.results) == len(result_counts) == len(result_widths) == len(result_slot_counts) ==
+            len(scalar_source_slots)):
         fail(
             "TLXW_EMIT_COMPONENT_SPLIT",
             STAGE,
@@ -1904,11 +1829,8 @@ def _emit_component_split(state, op):
         for result_id, sources in zip(op.results, scalar_source_slots):
             state.values[int(result_id)] = _I32MaskPayload(
                 tuple(source_scalars[slot] for slot in sources),
-                predicates=(
-                    tuple(source_predicates[slot] for slot in sources)
-                    if source_predicates is not None
-                    else None
-                ),
+                predicates=(tuple(source_predicates[slot]
+                                  for slot in sources) if source_predicates is not None else None),
             )
         return
 
@@ -1926,11 +1848,7 @@ def _emit_component_split(state, op):
             "tt.split source payload does not match its register slots",
             target_op_id=op.target_op_id,
         )
-    if any(
-        slot < 0 or slot >= source_slot_count
-        for sources in scalar_source_slots
-        for slot in sources
-    ):
+    if any(slot < 0 or slot >= source_slot_count for sources in scalar_source_slots for slot in sources):
         fail(
             "TLXW_EMIT_COMPONENT_SPLIT",
             STAGE,
@@ -1939,19 +1857,14 @@ def _emit_component_split(state, op):
         )
 
     for result_id, count, width, slot_count, sources in zip(
-        op.results,
-        result_counts,
-        result_widths,
-        result_slot_counts,
-        scalar_source_slots,
+            op.results,
+            result_counts,
+            result_widths,
+            result_slot_counts,
+            scalar_source_slots,
     ):
         selected = tuple(source_scalars[slot] for slot in sources)
-        if (
-            len(selected) != slot_count
-            or count <= 0
-            or width <= 0
-            or count * width != slot_count
-        ):
+        if (len(selected) != slot_count or count <= 0 or width <= 0 or count * width != slot_count):
             fail(
                 "TLXW_EMIT_COMPONENT_SPLIT",
                 STAGE,
@@ -1970,25 +1883,18 @@ def _emit_component_split(state, op):
                 ),
                 int(result_type.lane_width or 64),
             )
-            result = _pack_components(tuple(
-                state.dsl.wave.PackOp(
-                    packet_type,
-                    selected[index:index + width],
-                ).result
-                for index in range(0, slot_count, width)
-            ))
+            result = _pack_components(
+                tuple(
+                    state.dsl.wave.PackOp(
+                        packet_type,
+                        selected[index:index + width],
+                    ).result for index in range(0, slot_count, width)))
         state.values[int(result_id)] = result
 
     source_bases = state.uniform_pointer_bases.get(int(op.operands[0]))
-    if (
-        source_bases is not None
-        and source_width == 1
-        and all(width == 1 for width in result_widths)
-    ):
+    if (source_bases is not None and source_width == 1 and all(width == 1 for width in result_widths)):
         for result_id, sources in zip(op.results, scalar_source_slots):
-            state.uniform_pointer_bases[int(result_id)] = tuple(
-                source_bases[slot] for slot in sources
-            )
+            state.uniform_pointer_bases[int(result_id)] = tuple(source_bases[slot] for slot in sources)
 
 
 def _emit_addptr(state, op):
@@ -2017,7 +1923,7 @@ def _emit_addptr(state, op):
 
 def _emit_make_buffer(state, op):
     attrs = target_ir.attrs_dict(op)
-    (base,) = _operand_values(state, op, 1)
+    (base, ) = _operand_values(state, op, 1)
     result_id = _single_result(op)
     result_type = _wave_type(
         state.dsl,
@@ -2145,242 +2051,8 @@ def _propagate_uniform_pointer_bases(state, source_id, result_id):
         state.uniform_pointer_bases[result_id] = source_bases
 
 
-def _record_local_memory_root(state, result_id):
-    state.local_memory_root_sets[int(result_id)] = frozenset({int(result_id)})
-
-
-def _propagate_local_memory_roots(state, source_id, result_id):
-    state.local_memory_root_sets[int(result_id)] = _local_memory_roots(state, source_id)
-
-
-def _propagate_selected_local_memory_roots(state, source_ids, result_id):
-    target_type = state.target_program.values[result_id].type
-    if target_type.representation != "memdesc":
-        return
-    roots = set()
-    for source_id in source_ids:
-        roots.update(_local_memory_roots(state, source_id))
-    state.local_memory_root_sets[int(result_id)] = frozenset(roots)
-
-
-def _local_memory_roots(state, target_value_id):
-    roots = state.local_memory_root_sets.get(int(target_value_id))
-    if roots is not None:
-        return roots
-    return frozenset({int(target_value_id)})
-
-
-def _local_memory_access_dependency_token(
-        state,
-        target_value_id,
-        access_kind,
-        extra_tokens=(),
-        *,
-        ignore_async_writes=False,
-        ready_async_write_roots=(),
-):
-    roots = _local_memory_roots(state, target_value_id)
-    dependency_roots = _local_memory_dependency_roots(state, roots)
-    ready_async_write_roots = frozenset(int(root) for root in ready_async_write_roots)
-    tokens = []
-    barrier_roots = []
-    token_roots = []
-    for root in sorted(dependency_roots):
-        token = state.local_memory_tokens.get(root)
-        if token is None:
-            continue
-        pending = state.local_memory_pending_accesses.get(root)
-        async_readiness_is_explicit = (
-            bool(ignore_async_writes) or int(root) in ready_async_write_roots
-        )
-        if (async_readiness_is_explicit
-                and _local_memory_access_includes(pending, "async_write")):
-            continue
-        if pending == "read" and access_kind == "read":
-            continue
-        has_mma_boundary = root in state.pending_mma_read_boundaries
-        if ((_local_memory_access_includes(pending, "mma_read") or has_mma_boundary)
-                and access_kind in {"write", "async_write"}):
-            token_roots.append(root)
-            continue
-        if pending is not None and _local_memory_access_needs_barrier(pending, access_kind):
-            barrier_roots.append(root)
-        else:
-            tokens.append(token)
-    if barrier_roots:
-        barrier_token = _sync_pending_local_memory_accesses(state, roots=barrier_roots)
-        tokens.append(barrier_token)
-    if token_roots:
-        tokens.extend(_consume_pending_local_memory_tokens(state, token_roots, "mma_read"))
-    tokens.extend(tuple(extra_tokens))
-    return _memory_dependency_token(state, tokens)
-
-
-def _local_load_ready_async_write_roots(state, op, attrs):
-    """Return LDS roots made ready by this load's dominating explicit wait.
-
-    Readiness operands are inserted structurally by the token analysis.  They
-    identify the completed DMA groups precisely, so a local load need not emit
-    a second CTA barrier for those writes.  Other asynchronous or synchronous
-    LDS hazards remain in the ordinary access state and are still honored.
-    """
-    readiness_count = int(attrs.get("readiness_dependency_count", 0))
-    barrier_order_count = int(attrs.get("barrier_order_dependency_count", 0))
-    dependency_ids = tuple(int(target_id) for target_id in op.operands[1:])
-    if barrier_order_count:
-        dependency_ids = dependency_ids[:-barrier_order_count]
-    if readiness_count <= 0:
-        return frozenset()
-    if readiness_count > len(dependency_ids):
-        fail(
-            "TLXW_EMIT_LOCAL_READINESS",
-            STAGE,
-            "local load readiness segment exceeds its dependency operands",
-            target_op_id=op.target_op_id,
-        )
-    readiness_ids = dependency_ids[-readiness_count:]
-    # Keep this set exact.  Alias expansion belongs to the access side: a wait
-    # for one slice must not make a different overlapping in-flight write look
-    # completed merely because both share an aggregate allocation root.
-    return _local_memory_roots_for_token_values(state, readiness_ids)
-
-
-def _local_memory_access_needs_barrier(pending_access, access_kind):
-    if _local_memory_access_includes(pending_access, "mma_read"):
-        return False
-    return (_local_memory_access_includes(pending_access, "write")
-            or _local_memory_access_includes(pending_access, "async_write") or access_kind in {"write", "async_write"})
-
-
-def _local_memory_access_includes(access_kind, expected_kind):
-    if access_kind == expected_kind:
-        return True
-    if access_kind == "write":
-        return expected_kind in {"read", "write"}
-    if access_kind == "read_async_write":
-        return expected_kind in {"read", "async_write"}
-    if access_kind == "mma_read":
-        return expected_kind == "mma_read"
-    if access_kind == "mma_read_async_write":
-        return expected_kind in {"mma_read", "async_write"}
-    return False
-
-
-def _emit_cta_barrier(state, *tokens, boundary_ids=()):
-    """Emit a CTA barrier and record the MFMA read boundaries it satisfies.
-
-    An MFMA scheduling boundary is kept virtual until LDS is reused.  Any
-    intervening CTA-wide barrier already orders every earlier MFMA payload read,
-    though, regardless of why that barrier was emitted.  Remember the first
-    such barrier for every boundary that dominates this emission point so a
-    later LDS write can depend on it instead of materializing a duplicate.
-
-    Structured control-flow emission snapshots these maps, which naturally
-    limits reuse to barriers that dominate the later operation.
-    """
-    barrier_token = state.builder.barrier(*tokens)
-    materialized_boundary_ids = tuple(
-        dict.fromkeys((
-            *(int(boundary_id) for boundary_id in boundary_ids),
-            *(int(boundary_id) for boundary_id in state.pending_mma_read_boundaries.values()),
-        )))
-    for boundary_id in materialized_boundary_ids:
-        state.materialized_mma_read_boundaries.setdefault(boundary_id, barrier_token)
-    return barrier_token
-
-
-def _consume_pending_local_memory_tokens(state, roots, expected_kind):
-    # MMA payload values carry the LDS dependency into MFMA. A pipeline MFMA
-    # boundary proves those reads have reached the consuming MFMA, but it is a
-    # scheduling marker rather than a memory operation. Materialize the
-    # input-free CTA barrier only when a later write actually reuses the slot;
-    # this keeps the barrier late without making it consume the read tokens.
-    if expected_kind == "mma_read":
-        tokens, boundary_ids = _take_local_memory_read_frontier(state, roots)
-        _clear_pending_local_memory_accesses(state, roots, expected_kind)
-        _clear_pending_mma_read_boundaries(state, roots)
-        return _materialize_mma_read_reuse_dependencies(
-            state,
-            tokens,
-            boundary_ids,
-        )
-
-    tokens = []
-    boundary_ids = []
-    for root in roots:
-        root = int(root)
-        token = state.local_memory_tokens.get(root)
-        # A dominating CTA barrier can clear the pending access while leaving
-        # its materialized MFMA boundary available for a later LDS reuse.
-        if expected_kind == "mma_read" and root in state.pending_mma_read_boundaries:
-            boundary_ids.append(state.pending_mma_read_boundaries.pop(root))
-        elif token is not None:
-            tokens.append(token)
-    _clear_pending_local_memory_accesses(state, roots, expected_kind)
-    tokens = _unique_tokens(tokens)
-    boundary_ids = tuple(dict.fromkeys(boundary_ids))
-    if not tokens and not boundary_ids:
-        return ()
-    if expected_kind == "mma_read" and _kernel_has_multiple_waves(state):
-        return _materialize_mma_read_reuse_dependencies(
-            state,
-            tokens,
-            boundary_ids,
-        )
-    return (_join_memory_tokens(state, tokens), )
-
-
-def _materialize_mma_read_reuse_dependencies(state, tokens, boundary_ids):
-    """Resolve the LDS read frontier before its storage is overwritten.
-
-    A read token only proves completion in the issuing wave.  Reusing LDS in a
-    multi-wave workgroup therefore needs CTA convergence before the later write
-    is issued.  This barrier orders readers against the write; it does not wait
-    for async DMA completion, which remains exclusive to explicit wait_group.
-    """
-    tokens = _unique_tokens(tokens)
-    boundary_ids = tuple(dict.fromkeys(int(boundary_id) for boundary_id in boundary_ids))
-    if not tokens and not boundary_ids:
-        return ()
-
-    barrier_tokens = [
-        state.materialized_mma_read_boundaries[boundary_id]
-        for boundary_id in boundary_ids
-        if boundary_id in state.materialized_mma_read_boundaries
-    ]
-    missing_boundary_ids = tuple(boundary_id for boundary_id in boundary_ids
-                                 if boundary_id not in state.materialized_mma_read_boundaries)
-    if missing_boundary_ids or (tokens and _kernel_has_multiple_waves(state)):
-        barrier_tokens.append(_emit_cta_barrier(
-            state,
-            *tokens,
-            boundary_ids=missing_boundary_ids,
-        ))
-        tokens = ()
-    dependencies = _unique_tokens((*tokens, *barrier_tokens))
-    return ((_join_memory_tokens(state, dependencies), ) if dependencies else ())
-
-
-def _kernel_has_multiple_waves(state):
-    return int(state.target_program.kernel.num_warps or 1) > 1
-
-
 def _emit_sched_barrier(state, op):
-    attrs = target_ir.attrs_dict(op)
-    mask = int(attrs.get("mask", 0))
     state.builder.sched_barrier()
-    if (attrs.get("border") != "mfma" or mask != 0 or not _kernel_has_multiple_waves(state)):
-        return
-    roots = tuple(
-        int(root)
-        for root, access_kind in sorted(state.local_memory_pending_accesses.items())
-        if _local_memory_access_includes(access_kind, "mma_read") and int(root) in state.local_memory_tokens)
-    if not roots:
-        return
-    boundary_id = state.next_mma_read_boundary_id
-    state.next_mma_read_boundary_id += 1
-    for root in roots:
-        state.pending_mma_read_boundaries[int(root)] = boundary_id
 
 
 def _emit_cond_barrier(state, op):
@@ -2407,722 +2079,30 @@ def _emit_set_priority(state, op):
 
 
 def _emit_barrier(state, op):
-    tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in op.operands)
-    barrier_token = _emit_cta_barrier(state, *tokens)
+    attrs = target_ir.attrs_dict(op)
+    issue_count = int(attrs.get("barrier_order_dependency_count", 0))
+    if issue_count < 0 or issue_count > len(op.operands):
+        fail(
+            "TLXW_EMIT_BARRIER_OPERANDS",
+            STAGE,
+            "barrier issue-order segment exceeds its target operands",
+            target_op_id=op.target_op_id,
+        )
+    completion_target_ids = (op.operands[:-issue_count] if issue_count else op.operands)
+    issue_target_ids = op.operands[-issue_count:] if issue_count else ()
+    completion_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in completion_target_ids)
+    issue_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in issue_target_ids)
+    barrier_token = state.builder.barrier(*completion_tokens)
+    if issue_tokens:
+        barrier_token = state.builder.after(barrier_token, *issue_tokens)
     if op.results:
         state.values[_single_result(op)] = barrier_token
-        roots = _local_memory_roots_for_token_values(state, op.operands)
-        if roots:
-            state.token_local_memory_root_sets[int(op.results[0])] = roots
-    synchronized_roots = []
-    for root, pending in tuple(state.local_memory_pending_accesses.items()):
-        if pending == "async_write":
-            continue
-        synchronized_roots.append(int(root))
-        if pending in {"read_async_write", "mma_read_async_write"}:
-            state.local_memory_pending_accesses[int(root)] = "async_write"
-            continue
-        state.local_memory_tokens[int(root)] = barrier_token
-        state.local_memory_pending_accesses.pop(int(root), None)
-    _clear_local_memory_read_tokens(state, synchronized_roots)
-
-
-def _clear_pending_local_memory_accesses(state, roots, expected_kind):
-    for root in roots:
-        root = int(root)
-        pending = state.local_memory_pending_accesses.get(root)
-        if pending is None or not _local_memory_access_includes(pending, expected_kind):
-            continue
-        if pending == expected_kind:
-            state.local_memory_pending_accesses.pop(root, None)
-        elif pending == "mma_read_async_write" and expected_kind == "mma_read":
-            state.local_memory_pending_accesses[root] = "async_write"
-        elif pending == "read_async_write" and expected_kind == "read":
-            state.local_memory_pending_accesses[root] = "async_write"
-
-
-def _clear_pending_mma_read_boundaries(state, roots):
-    for root in _local_memory_dependency_roots(state, roots):
-        state.pending_mma_read_boundaries.pop(int(root), None)
-
-
-def _sync_pending_local_memory_accesses(state, extra_tokens=(), roots=None):
-    if roots is None:
-        roots_to_sync = tuple(int(root) for root in sorted(state.local_memory_pending_accesses))
-    else:
-        roots_to_sync = tuple(int(root) for root in sorted({int(root) for root in roots}))
-    sync_roots = tuple(int(root) for root in roots_to_sync if root in state.local_memory_tokens)
-    read_roots = tuple(
-        int(root) for root in roots_to_sync if (_local_memory_access_includes(
-            state.local_memory_pending_accesses.get(int(root)),
-            "read",
-        ) or _local_memory_access_includes(
-            state.local_memory_pending_accesses.get(int(root)),
-            "mma_read",
-        )))
-    read_tokens, boundary_ids = _take_local_memory_read_frontier(
-        state,
-        read_roots,
-    )
-    state_tokens = tuple(state.local_memory_tokens[root] for root in sync_roots if (_local_memory_access_includes(
-        state.local_memory_pending_accesses.get(int(root)),
-        "write",
-    ) or _local_memory_access_includes(
-        state.local_memory_pending_accesses.get(int(root)),
-        "async_write",
-    )))
-    tokens = _unique_tokens((*state_tokens, *read_tokens, *tuple(extra_tokens)))
-    if not tokens and not boundary_ids:
-        if roots is None:
-            state.local_memory_pending_accesses.clear()
-        else:
-            for root in roots_to_sync:
-                state.local_memory_pending_accesses.pop(int(root), None)
-        _clear_local_memory_read_tokens(state, roots_to_sync)
-        return state.builder.token()
-    if boundary_ids:
-        boundary_dependencies = _materialize_mma_read_reuse_dependencies(
-            state,
-            read_tokens,
-            boundary_ids,
-        )
-        non_read_tokens = _unique_tokens((*state_tokens, *tuple(extra_tokens)))
-        if boundary_dependencies and not non_read_tokens:
-            barrier_token = _join_memory_tokens(state, boundary_dependencies)
-        elif boundary_dependencies or non_read_tokens:
-            barrier_token = _emit_cta_barrier(
-                state,
-                *boundary_dependencies,
-                *non_read_tokens,
-            )
-        else:
-            barrier_token = state.builder.token()
-    else:
-        barrier_token = _emit_cta_barrier(state, *tokens)
-    for root in sync_roots:
-        state.local_memory_tokens[int(root)] = barrier_token
-        state.local_memory_pending_accesses.pop(int(root), None)
-    if roots is None:
-        state.local_memory_pending_accesses.clear()
-    _clear_local_memory_read_tokens(state, roots_to_sync)
-    return barrier_token
-
-
-def _set_local_memory_roots_token(state, roots, token):
-    for root in roots:
-        state.local_memory_tokens[int(root)] = token
-        state.local_memory_pending_accesses.pop(int(root), None)
-
-
-def _set_local_memory_access_token(
-    state,
-    target_value_id,
-    token,
-    access_kind,
-):
-    roots = _local_memory_roots(state, target_value_id)
-    _record_local_memory_access_token(state, roots, token)
-    if access_kind in {"read", "mma_read"}:
-        _record_local_memory_read_token(state, roots, token)
-    else:
-        # The write dependency has consumed every earlier read of the aliased
-        # storage.  A later overwrite must wait only for reads after this one.
-        _clear_local_memory_read_tokens(state, roots)
-    if access_kind == "mma_read":
-        # A new payload read supersedes any older MFMA-boundary marker for an
-        # aliased LDS slot. The older boundary cannot prove this read complete.
-        _clear_pending_mma_read_boundaries(state, roots)
-    for root in roots:
-        root = int(root)
-        pending = state.local_memory_pending_accesses.get(root)
-        previous_token = state.local_memory_tokens.get(root)
-        # Reads do not change the contents or availability of the LDS slot.
-        # Keep their completion tokens solely in local_memory_read_tokens so
-        # independent reads remain siblings of the same write/wait frontier.
-        # A later overwrite consumes that separate read frontier.
-        stored_token = (previous_token if access_kind in {"read", "mma_read"} and previous_token is not None else token)
-        state.local_memory_tokens[root] = stored_token
-        state.local_memory_pending_accesses[root] = _merge_local_memory_pending_access(pending, access_kind)
-
-
-def _record_local_memory_access_token(state, roots, token):
-    for dependency_root in _local_memory_dependency_roots(state, roots):
-        dependency_root = int(dependency_root)
-        if dependency_root not in state.local_memory_allocations:
-            continue
-        tokens = state.local_memory_access_tokens.get(dependency_root, ())
-        if any(existing is token for existing in tokens):
-            continue
-        state.local_memory_access_tokens[dependency_root] = (*tokens, token)
-
-
-def _record_local_memory_read_token(state, roots, token):
-    for root in roots:
-        root = int(root)
-        tokens = state.local_memory_read_tokens.get(root, ())
-        if any(existing is token for existing in tokens):
-            continue
-        state.local_memory_read_tokens[root] = (*tokens, token)
-
-
-def _clear_local_memory_read_tokens(state, roots):
-    for dependency_root in _local_memory_dependency_roots(state, roots):
-        state.local_memory_read_tokens.pop(int(dependency_root), None)
-
-
-def _take_local_memory_read_frontier(state, roots):
-    tokens = []
-    boundary_ids = []
-    for dependency_root in _local_memory_dependency_roots(state, roots):
-        dependency_root = int(dependency_root)
-        boundary_id = state.pending_mma_read_boundaries.get(dependency_root)
-        if boundary_id is not None:
-            # The MFMA scheduling boundary supersedes raw LDS read tokens for
-            # this alias. Materializing it as an input-free CTA barrier avoids
-            # turning a scheduling fact into an LDS wait.
-            boundary_ids.append(int(boundary_id))
-        else:
-            tokens.extend(state.local_memory_read_tokens.get(dependency_root, ()))
-        state.local_memory_read_tokens.pop(dependency_root, None)
-    return _unique_tokens(tokens), tuple(dict.fromkeys(boundary_ids))
-
-
-def _local_memory_allocation_read_dependency(state, root):
-    return _join_memory_tokens(
-        state,
-        tuple(token for dependency_root in sorted(_local_memory_dependency_roots(state, (int(root), )))
-              for token in state.local_memory_read_tokens.get(int(dependency_root), ())),
-    )
-
-
-def _local_memory_allocation_access_dependency(state, root):
-    root = int(root)
-    tokens = list(state.local_memory_access_tokens.get(root, ()))
-    tokens.extend(state.local_memory_tokens[dependency_root]
-                  for dependency_root in sorted(_local_memory_dependency_roots(state, (root, )))
-                  if dependency_root in state.local_memory_tokens)
-    return _join_memory_tokens(state, tokens)
-
-
-def _merge_local_memory_pending_access(lhs, rhs):
-    if lhs is None:
-        return rhs
-    if rhs is None:
-        return lhs
-    if lhs == "write" or rhs == "write":
-        return "write"
-    if {lhs, rhs} == {"read", "async_write"}:
-        return "read_async_write"
-    if lhs == "read_async_write" or rhs == "read_async_write":
-        return "read_async_write"
-    if lhs == "read" or rhs == "read":
-        return "read"
-    if {lhs, rhs} == {"mma_read", "async_write"}:
-        return "mma_read_async_write"
-    if lhs == "mma_read_async_write" or rhs == "mma_read_async_write":
-        return "mma_read_async_write"
-    if lhs == "mma_read" or rhs == "mma_read":
-        return "mma_read"
-    if lhs == "async_write" or rhs == "async_write":
-        return "async_write"
-    return lhs
-
-
-def _local_memory_dependency_roots(state, roots):
-    dependency_roots = set()
-    for root in roots:
-        root = int(root)
-        dependency_roots.add(root)
-        root_interval = state.static_local_memory_root_intervals.get(root)
-        if root_interval is not None:
-            base_root, offset, size = root_interval
-            dependency_roots.add(int(base_root))
-            for static_root, other_interval in state.static_local_memory_root_intervals.items():
-                other_base, other_offset, other_size = other_interval
-                if int(other_base) != int(base_root):
-                    continue
-                if _byte_intervals_overlap(int(offset), int(size), int(other_offset), int(other_size)):
-                    dependency_roots.add(int(static_root))
-            continue
-        dependency_roots.update(
-            int(static_root)
-            for static_root, (base_root, _offset, _size) in state.static_local_memory_root_intervals.items()
-            if int(base_root) == root)
-    return frozenset(dependency_roots)
-
-
-def _is_aggregate_local_memory_root(state, root):
-    root = int(root)
-    if root in state.static_local_memory_root_intervals:
-        return False
-    return any(
-        int(base_root) == root for base_root, _offset, _size in state.static_local_memory_root_intervals.values())
-
-
-def _is_static_descendant_local_memory_root(state, root, candidate):
-    interval = state.static_local_memory_root_intervals.get(int(candidate))
-    if interval is None:
-        return False
-    base_root, _offset, _size = interval
-    return int(base_root) == int(root)
-
-
-def _byte_intervals_overlap(lhs_offset, lhs_size, rhs_offset, rhs_size):
-    return int(lhs_offset) < int(rhs_offset) + int(rhs_size) and int(rhs_offset) < int(lhs_offset) + int(lhs_size)
-
-
-def _static_local_memory_roots(state, source_roots, static_byte_offset, byte_size):
-    static_byte_offset = int(static_byte_offset)
-    byte_size = int(byte_size)
-    roots = []
-    for source_root in source_roots:
-        base_root, base_offset, _base_size = state.static_local_memory_root_intervals.get(
-            int(source_root),
-            (int(source_root), 0, None),
-        )
-        key = (int(base_root), int(base_offset) + static_byte_offset, byte_size)
-        root = state.static_local_memory_roots.get(key)
-        if root is None:
-            root = int(state.next_local_memory_root)
-            state.next_local_memory_root -= 1
-            state.static_local_memory_roots[key] = root
-            state.static_local_memory_root_intervals[root] = key
-        roots.append(root)
-    return frozenset(roots)
-
-
-def _memdesc_index_result_roots(state, source_roots, attrs, index_target_id=None):
-    static_byte_offset = attrs.get("static_byte_offset")
-    element_byte_width = attrs.get("element_byte_width")
-    elements_per_slot = attrs.get("elements_per_slot")
-    if static_byte_offset is not None:
-        if element_byte_width is None or elements_per_slot is None:
-            return frozenset(int(root) for root in source_roots)
-        byte_size = int(element_byte_width) * int(elements_per_slot)
-        if byte_size <= 0:
-            return frozenset(int(root) for root in source_roots)
-        return _static_local_memory_roots(
-            state,
-            source_roots,
-            int(static_byte_offset),
-            byte_size,
-        )
-    del index_target_id
-    return frozenset(int(root) for root in source_roots)
-
-
-def _record_token_local_memory_roots(state, token_target_id, memdesc_target_id):
-    state.token_local_memory_root_sets[int(token_target_id)] = _local_memory_roots(state, memdesc_target_id)
-
-
-def _propagate_token_local_memory_roots(
-        state,
-        source_token_id,
-        result_token_id,
-):
-    """Propagate token destination metadata across a structured SSA edge.
-
-    A token's LDS roots describe which explicit async group or readiness event
-    it represents.  They do not make the token an implicit LDS completion
-    frontier.  In particular, a loop-carried ``dma_group`` must remain usable
-    only by an explicit async wait; installing it in ``local_memory_tokens``
-    would make an ordinary DS dependency consume DMA completion.
-
-    Physical LDS access state has its own structured carries in
-    ``_emit_for_loop``.  Explicit wait readiness is already an operand of each
-    protocol-tracked DS consumer, so metadata propagation is sufficient here.
-    """
-    roots = state.token_local_memory_root_sets.get(int(source_token_id))
-    if not roots:
-        return
-    state.token_local_memory_root_sets[int(result_token_id)] = roots
-
-
-def _local_memory_roots_for_token_values(state, token_target_ids):
-    roots = set()
-    for token_target_id in token_target_ids:
-        roots.update(state.token_local_memory_root_sets.get(int(token_target_id), ()))
-    return frozenset(roots)
-
-
-def _local_memory_roots_touched_by_region(state, region_id, *, include_root_sets=False):
-    root_sets = dict(state.local_memory_root_sets)
-    touched_roots = set()
-    read_roots = set()
-    implicit_root_accesses = {}
-
-    def record_implicit_access(roots, access_kind):
-        for root in roots:
-            root = int(root)
-            implicit_root_accesses[root] = _merge_local_memory_pending_access(
-                implicit_root_accesses.get(root),
-                access_kind,
-            )
-
-    def roots_for(target_value_id):
-        target_value_id = int(target_value_id)
-        roots = root_sets.get(target_value_id)
-        if roots is not None:
-            return roots
-        target_type = state.target_program.values[target_value_id].type
-        if target_type.representation == "memdesc":
-            return frozenset({target_value_id})
-        return frozenset()
-
-    def visit_region(current_region_id):
-        region = state.target_program.regions[int(current_region_id)]
-        for op_id in region.op_ids:
-            current_op = state.target_program.ops[int(op_id)]
-            if current_op.kind == "local_alloc":
-                for result_id in current_op.results:
-                    root_sets[int(result_id)] = frozenset({int(result_id)})
-                continue
-            if current_op.kind in {"memdesc_index", "memdesc_view"}:
-                if current_op.results:
-                    source_roots = roots_for(current_op.operands[0])
-                    if current_op.kind == "memdesc_index":
-                        root_sets[int(current_op.results[0])] = _memdesc_index_result_roots(
-                            state,
-                            source_roots,
-                            target_ir.attrs_dict(current_op),
-                            current_op.operands[1],
-                        )
-                    else:
-                        root_sets[int(current_op.results[0])] = source_roots
-                continue
-            if current_op.kind == "select" and current_op.results:
-                result_id = int(current_op.results[0])
-                target_type = state.target_program.values[result_id].type
-                if target_type.representation == "memdesc":
-                    roots = set()
-                    for source_id in current_op.operands[1:]:
-                        roots.update(roots_for(source_id))
-                    root_sets[result_id] = frozenset(roots)
-                continue
-            if current_op.kind in {"local_load", "local_load_mma_payload"}:
-                current_attrs = target_ir.attrs_dict(current_op)
-                if (bool(current_attrs.get("protocol_tracked", False))
-                        and bool(current_attrs.get("synced_via_async_wait", False))):
-                    # Its completion is an explicit target result carried by
-                    # SCF.  Do not synthesize a duplicate emitter-only read
-                    # frontier for the same access.
-                    continue
-                roots = roots_for(current_op.operands[0])
-                touched_roots.update(roots)
-                read_roots.update(roots)
-                access_kind = ("mma_read" if current_op.kind == "local_load_mma_payload" else "read")
-                record_implicit_access(roots, access_kind)
-            elif current_op.kind == "local_store":
-                roots = roots_for(current_op.operands[1])
-                touched_roots.update(roots)
-                record_implicit_access(roots, "write")
-            elif current_op.kind == "buffer_load_to_local":
-                mode = target_ir.attrs_dict(current_op).get("mode")
-                if mode == "scalarized_load_store":
-                    roots = roots_for(current_op.operands[0])
-                    touched_roots.update(roots)
-                    record_implicit_access(roots, "write")
-            for nested_region_id in current_op.region_ids:
-                visit_region(nested_region_id)
-
-    visit_region(region_id)
-    result = (frozenset(touched_roots),
-              {int(root): access_kind
-               for root, access_kind in implicit_root_accesses.items()})
-    if include_root_sets:
-        return (*result, root_sets, frozenset(read_roots))
-    return result
-
-
-def _target_token_local_memory_roots(
-    state,
-    target_value_id,
-    root_sets,
-    seen=None,
-    *,
-    token_root_sets=None,
-):
-    """Map explicit token resource identities to emitted LDS roots."""
-    del seen
-    target_value_id = int(target_value_id)
-    if token_root_sets is not None:
-        known = token_root_sets.get(target_value_id)
-        if known is not None:
-            return known
-    known = state.token_local_memory_root_sets.get(target_value_id)
-    if known is not None:
-        return known
-    roots = set()
-    resources = state.target_program.values[target_value_id].resource_target_ids
-    for resource_target_id in resources:
-        resource_target_id = int(resource_target_id)
-        roots.update(
-            root_sets.get(
-                resource_target_id,
-                state.local_memory_root_sets.get(
-                    resource_target_id,
-                    (resource_target_id,),
-                ),
-            )
-        )
-    return frozenset(roots)
-
-
-def _loop_carried_token_roots(
-    state,
-    init_roots,
-    yield_roots,
-    induction_target_id,
-    lower_target_id,
-    step_target_id,
-):
-    """Carry explicit resource identities across a loop token edge."""
-    del state, induction_target_id, lower_target_id, step_target_id
-    init_roots = frozenset(int(root) for root in init_roots)
-    yield_roots = frozenset(int(root) for root in yield_roots)
-    if init_roots == yield_roots:
-        return init_roots
-    return None
-
-
-def _loop_exit_token_roots(
-    state,
-    yield_roots,
-    induction_target_id,
-    lower_target_id,
-    upper_target_id,
-    step_target_id,
-):
-    del state, induction_target_id, lower_target_id, upper_target_id
-    del step_target_id
-    return frozenset(int(root) for root in yield_roots)
-
-
-def _loop_token_root_sets(state, op, region, region_root_sets):
-    block_root_sets = {}
-    result_root_sets = {}
-    induction_target_id = int(region.block_arg_ids[0])
-    for init_id, block_arg_id, yield_id, result_id in zip(
-            op.operands[3:],
-            region.block_arg_ids[1:],
-            region.yield_value_ids,
-            op.results,
-    ):
-        target_type = state.target_program.values[int(init_id)].type
-        if target_type.representation != "token":
-            continue
-        init_roots = state.token_local_memory_root_sets.get(int(init_id))
-        yield_roots = _target_token_local_memory_roots(
-            state,
-            yield_id,
-            region_root_sets,
-        )
-        if init_roots is None or yield_roots is None:
-            continue
-        carried_roots = _loop_carried_token_roots(
-            state,
-            init_roots,
-            yield_roots,
-            induction_target_id,
-            op.operands[0],
-            op.operands[2],
-        )
-        if carried_roots is not None:
-            block_root_sets[int(block_arg_id)] = carried_roots
-        result_root_sets[int(result_id)] = _loop_exit_token_roots(
-            state,
-            yield_roots,
-            induction_target_id,
-            op.operands[0],
-            op.operands[1],
-            op.operands[2],
-        )
-    return block_root_sets, result_root_sets
-
-
-def _loop_local_memory_state_carry_required(
-    state,
-    region,
-    candidate_roots,
-    implicit_root_accesses,
-    outer_pending_accesses,
-    region_root_sets,
-    loop_token_block_root_sets,
-):
-    """Return whether the loop body can consume its incoming LDS slot state.
-
-    Async DMA queue state is carried explicitly by the source loop.  LDS read
-    completion is carried separately as the overwrite frontier.  The bridge's
-    per-slot state is therefore needed only when a synchronous access can see
-    the backedge state before an explicit wait/barrier replaces it.  Keeping
-    this as a target-IR dataflow fact avoids leaking a recurrent token merely
-    because the region happens to mention LDS.
-    """
-    candidate_roots = frozenset(int(root) for root in candidate_roots)
-    if not candidate_roots:
-        return False
-
-    synchronized_roots = set()
-    directly_synchronized_roots = set()
-    token_root_sets = dict(state.token_local_memory_root_sets)
-    token_root_sets.update({
-        int(target_id): frozenset(int(root)
-                                  for root in roots)
-        for target_id, roots in loop_token_block_root_sets.items()
-    })
-
-    def roots_for(target_value_id):
-        target_value_id = int(target_value_id)
-        roots = region_root_sets.get(target_value_id)
-        if roots is not None:
-            return frozenset(int(root) for root in roots)
-        target_type = state.target_program.values[target_value_id].type
-        if target_type.representation == "memdesc":
-            return frozenset({target_value_id})
-        return frozenset()
-
-    def aliases_candidates(roots):
-        for root in roots:
-            dependencies = _local_memory_dependency_roots(state, (int(root), ))
-            if not candidate_roots.isdisjoint(dependencies):
-                return True
-            if any(int(root) in _local_memory_dependency_roots(state, (candidate, )) for candidate in candidate_roots):
-                return True
-        return False
-
-    def is_synchronized(roots):
-        if not roots:
-            return False
-        for root in roots:
-            root = int(root)
-            # An exact slot wait can mention its aggregate allocation as an
-            # alias dependency, but does not prove that every byte of an
-            # aggregate memdesc is ready.
-            if _is_aggregate_local_memory_root(state, root):
-                if root not in directly_synchronized_roots:
-                    return False
-            elif root not in synchronized_roots:
-                return False
-        return True
-
-    def has_backedge_synchronous_write(roots):
-        for root in roots:
-            for dependency_root in _local_memory_dependency_roots(state, (int(root), )):
-                access = _merge_local_memory_pending_access(
-                    outer_pending_accesses.get(int(dependency_root)),
-                    implicit_root_accesses.get(int(dependency_root)),
-                )
-                if _local_memory_access_includes(access, "write"):
-                    return True
-        return False
-
-    for op_id in region.op_ids:
-        current_op = state.target_program.ops[int(op_id)]
-        if current_op.kind == "async_wait":
-            waited_roots = set()
-            complete = True
-            for operand in current_op.operands:
-                operand_roots = _target_token_local_memory_roots(
-                    state,
-                    operand,
-                    region_root_sets,
-                    token_root_sets=token_root_sets,
-                )
-                if operand_roots is None:
-                    complete = False
-                    break
-                waited_roots.update(int(root) for root in operand_roots)
-            if complete and waited_roots:
-                directly_synchronized_roots.update(waited_roots)
-                synchronized_roots.update(_local_memory_dependency_roots(state, waited_roots))
-            continue
-        if current_op.kind == "barrier":
-            directly_synchronized_roots.update(candidate_roots)
-            synchronized_roots.update(candidate_roots)
-            continue
-
-        if current_op.region_ids:
-            nested_roots = set()
-            for nested_region_id in current_op.region_ids:
-                touched, _accesses = _local_memory_roots_touched_by_region(
-                    state,
-                    nested_region_id,
-                )
-                nested_roots.update(int(root) for root in touched)
-            if aliases_candidates(nested_roots):
-                # Branch/loop path coverage needs a proper structured join.
-                # Retain the incoming state until such a proof is available.
-                return True
-
-        access_roots = frozenset()
-        synchronous_access = False
-        if current_op.kind in {"local_load", "local_load_mma_payload"}:
-            current_attrs = target_ir.attrs_dict(current_op)
-            if (bool(current_attrs.get("protocol_tracked", False))
-                    and bool(current_attrs.get("synced_via_async_wait", False))):
-                continue
-            access_roots = roots_for(current_op.operands[0])
-            synchronous_access = True
-        elif current_op.kind == "local_store":
-            access_roots = roots_for(current_op.operands[1])
-            synchronous_access = True
-        elif current_op.kind == "buffer_load_to_local":
-            access_roots = roots_for(current_op.operands[0])
-            mode = target_ir.attrs_dict(current_op).get("mode")
-            synchronous_access = mode == "scalarized_load_store"
-            if not synchronous_access and has_backedge_synchronous_write(access_roots):
-                # DMA issues never depend on earlier async DMA completion, but
-                # they still cannot bypass a synchronous writer to the same LDS.
-                synchronous_access = True
-        if (synchronous_access and aliases_candidates(access_roots) and not is_synchronized(access_roots)):
-            return True
-    return False
-
-
-def _carried_local_memory_pending_access(state, root, implicit_root_accesses, outer_pending_accesses):
-    root = int(root)
-    pending = outer_pending_accesses.get(int(root))
-    for dep_root in _local_memory_dependency_roots(state, (root, )):
-        dep_root = int(dep_root)
-        # Aggregate roots represent dynamic LDS indices. Access emission already
-        # expands them to the precise static aliases, so carrying descendant
-        # pending state on the aggregate as well only adds redundant token deps.
-        if (dep_root != root and _is_aggregate_local_memory_root(state, root)
-                and _is_static_descendant_local_memory_root(state, root, dep_root)):
-            continue
-        pending = _merge_local_memory_pending_access(
-            pending,
-            outer_pending_accesses.get(dep_root),
-        )
-        pending = _merge_local_memory_pending_access(
-            pending,
-            implicit_root_accesses.get(dep_root),
-        )
-    return pending
 
 
 _SCRATCH_LAYOUT_CONVERT_MODES = frozenset({
     "cta_exchange_register_remap",
     "mfma_vector_register_remap",
 })
-
-
-def _region_uses_scratch_memory(state, region_id):
-
-    def visit(current_region_id):
-        region = state.target_program.regions[int(current_region_id)]
-        for op_id in region.op_ids:
-            current_op = state.target_program.ops[int(op_id)]
-            if current_op.kind == "layout_convert":
-                attrs = target_ir.attrs_dict(current_op)
-                if (attrs.get("mode") in _SCRATCH_LAYOUT_CONVERT_MODES
-                        and int(attrs.get("scratch_allocation_bytes", 0)) > 0):
-                    return True
-            if any(visit(nested_region_id) for nested_region_id in current_op.region_ids):
-                return True
-        return False
-
-    return visit(region_id)
 
 
 def _emit_program_id(state, op):
@@ -3133,11 +2113,7 @@ def _emit_program_id(state, op):
 def _emit_warp_id(state, op):
     result_id = _single_result(op)
     target_type = state.target_program.values[result_id].type
-    lane_width = int(
-        target_type.lane_width
-        or state.target_program.kernel.threads_per_warp
-        or 64
-    )
+    lane_width = int(target_type.lane_width or state.target_program.kernel.threads_per_warp or 64)
     if lane_width <= 0 or lane_width & (lane_width - 1):
         fail(
             "TLXW_EMIT_WARP_ID",
@@ -3178,7 +2154,6 @@ def _emit_select(state, op):
     count = _component_count(state, result_id)
     lane_width = int(result_type.lane_width or 64)
     condition, true_value, false_value = _operand_values(state, op, 3)
-    selected_operand_ids = op.operands[1:]
     if result_type.representation in {"mask", "mask_tuple"}:
         cond_components = _as_mask_predicate_components(
             state,
@@ -3236,7 +2211,6 @@ def _emit_select(state, op):
                     false_predicates,
                 ))
         state.values[result_id] = _I32MaskPayload(payload_components, predicates=predicates)
-        _propagate_selected_local_memory_roots(state, selected_operand_ids, result_id)
         return
     true_components, false_components = _broadcast_components(
         state,
@@ -3257,7 +2231,6 @@ def _emit_select(state, op):
     )
     if expanded is not None:
         state.values[result_id] = _pack_components(expanded)
-        _propagate_selected_local_memory_roots(state, selected_operand_ids, result_id)
         return
     if condition_payloads is not None:
         raw_cond_components = tuple(
@@ -3285,7 +2258,6 @@ def _emit_select(state, op):
                 true_components,
                 false_components,
             )))
-    _propagate_selected_local_memory_roots(state, selected_operand_ids, result_id)
 
 
 def _select_vector_payload_components(
@@ -3413,8 +2385,7 @@ def _emit_reduction(state, op):
                         simd = state.dsl.SimdType(source_components[source_component].type)
                     except Exception:
                         simd = None
-                    if (registers != 1 or simd is None
-                            or str(simd.element_type) != "f32"
+                    if (registers != 1 or simd is None or str(simd.element_type) != "f32"
                             or int(simd.width) != lane_width):
                         fail(
                             "TLXW_EMIT_REDUCTION",
@@ -3503,6 +2474,10 @@ def _emit_reduction_tree(state, attrs, values, op):
 
 
 def _emit_if(state, op):
+    return _emit_if_structural_only(state, op)
+
+
+def _emit_if_structural_only(state, op):
     attrs = target_ir.attrs_dict(op)
     if len(op.operands) != 1:
         fail(
@@ -3537,59 +2512,14 @@ def _emit_if(state, op):
     outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
     outer_shared_pointer_offset_cache = dict(state.shared_pointer_offset_cache)
     outer_wave_offset_i32_cache = dict(state.wave_offset_i32_cache)
-    outer_scratch_token = state.scratch_token
-    outer_scratch_token_needs_write_barrier = state.scratch_token_needs_write_barrier
-    outer_local_memory_tokens = dict(state.local_memory_tokens)
-    outer_local_memory_pending_accesses = dict(state.local_memory_pending_accesses)
-    outer_local_memory_access_tokens = dict(state.local_memory_access_tokens)
-    outer_local_memory_read_tokens = dict(state.local_memory_read_tokens)
-    outer_pending_mma_read_boundaries = dict(state.pending_mma_read_boundaries)
-    outer_materialized_mma_read_boundaries = dict(state.materialized_mma_read_boundaries)
-    outer_local_memory_root_sets = dict(state.local_memory_root_sets)
-    outer_token_local_memory_root_sets = dict(state.token_local_memory_root_sets)
-    outer_local_memory_allocation_roots = frozenset(state.local_memory_allocations)
-    conditional_local_memory_roots = set()
-    conditional_local_memory_accesses = {}
-    for region_id in op.region_ids:
-        touched_roots, implicit_accesses = _local_memory_roots_touched_by_region(
-            state,
-            region_id,
-        )
-        conditional_local_memory_roots.update(touched_roots)
-        for root, access_kind in implicit_accesses.items():
-            conditional_local_memory_accesses[int(root)] = _merge_local_memory_pending_access(
-                conditional_local_memory_accesses.get(int(root)),
-                access_kind,
-            )
-    hidden_local_memory_roots = tuple(
-        sorted({
-            int(dependency_root)
-            for root in conditional_local_memory_roots
-            for dependency_root in _local_memory_dependency_roots(state, (root, ))
-            if int(dependency_root) in outer_local_memory_allocation_roots
-        }))
-    all_result_types = (
-        *result_types,
-        *([state.dsl.mem_token_type()] * (2 * len(hidden_local_memory_roots))),
-    )
-    with state.builder.if_(condition, all_result_types, otherwise=True) as ifop:
-        _restore_emission_state(
+    with state.builder.if_(condition, result_types, otherwise=True) as ifop:
+        _restore_structural_emission_state(
             state,
             outer_values,
             outer_uniform_pointer_bases,
             outer_shared_pointer_dword_bases,
             outer_shared_pointer_offset_cache,
             outer_wave_offset_i32_cache,
-            outer_scratch_token,
-            outer_scratch_token_needs_write_barrier,
-            outer_local_memory_tokens,
-            outer_local_memory_pending_accesses,
-            outer_local_memory_access_tokens,
-            outer_local_memory_read_tokens,
-            outer_pending_mma_read_boundaries,
-            outer_materialized_mma_read_boundaries,
-            outer_local_memory_root_sets,
-            outer_token_local_memory_root_sets,
         )
         then_yields = _emit_structured_branch(
             state,
@@ -3599,33 +2529,15 @@ def _emit_if(state, op):
             "if then",
             op,
         )
-        then_local_memory_yields = tuple(
-            _local_memory_allocation_access_dependency(state, root) for root in hidden_local_memory_roots)
-        then_local_memory_read_yields = tuple(
-            _local_memory_allocation_read_dependency(state, root) for root in hidden_local_memory_roots)
-        if (then_yields or then_local_memory_yields or then_local_memory_read_yields):
-            state.builder.yield_((
-                *then_yields,
-                *then_local_memory_yields,
-                *then_local_memory_read_yields,
-            ))
-        _restore_emission_state(
+        if then_yields:
+            state.builder.yield_(then_yields)
+        _restore_structural_emission_state(
             state,
             outer_values,
             outer_uniform_pointer_bases,
             outer_shared_pointer_dword_bases,
             outer_shared_pointer_offset_cache,
             outer_wave_offset_i32_cache,
-            outer_scratch_token,
-            outer_scratch_token_needs_write_barrier,
-            outer_local_memory_tokens,
-            outer_local_memory_pending_accesses,
-            outer_local_memory_access_tokens,
-            outer_local_memory_read_tokens,
-            outer_pending_mma_read_boundaries,
-            outer_materialized_mma_read_boundaries,
-            outer_local_memory_root_sets,
-            outer_token_local_memory_root_sets,
         )
         with ifop.otherwise():
             else_yields = _emit_structured_branch(
@@ -3636,103 +2548,29 @@ def _emit_if(state, op):
                 "if else",
                 op,
             )
-            else_local_memory_yields = tuple(
-                _local_memory_allocation_access_dependency(state, root) for root in hidden_local_memory_roots)
-            else_local_memory_read_yields = tuple(
-                _local_memory_allocation_read_dependency(state, root) for root in hidden_local_memory_roots)
-            if (else_yields or else_local_memory_yields or else_local_memory_read_yields):
-                state.builder.yield_((
-                    *else_yields,
-                    *else_local_memory_yields,
-                    *else_local_memory_read_yields,
-                ))
-    _restore_emission_state(
+            if else_yields:
+                state.builder.yield_(else_yields)
+    _restore_structural_emission_state(
         state,
         outer_values,
         outer_uniform_pointer_bases,
         outer_shared_pointer_dword_bases,
         outer_shared_pointer_offset_cache,
         outer_wave_offset_i32_cache,
-        outer_scratch_token,
-        outer_scratch_token_needs_write_barrier,
-        outer_local_memory_tokens,
-        outer_local_memory_pending_accesses,
-        outer_local_memory_access_tokens,
-        outer_local_memory_read_tokens,
-        outer_pending_mma_read_boundaries,
-        outer_materialized_mma_read_boundaries,
-        outer_local_memory_root_sets,
-        outer_token_local_memory_root_sets,
     )
-    # An allocation created in only one arm has no dominating handle at the
-    # continuation. Existing allocations are handled by the hidden token
-    # results above; keep conditionally scoped allocations alive.
-    conditionally_scoped_allocations = {
-        int(root)
-        for root in state.local_memory_allocations
-        if int(root) not in outer_local_memory_allocation_roots
-    }
-    state.local_memory_release_unsafe_roots.update(conditionally_scoped_allocations)
-
     flat_results = tuple(ifop.results)
-    if len(flat_results) != len(all_result_types):
+    if len(flat_results) != len(result_types):
         fail(
             "TLXW_EMIT_IF_RESULT_COMPONENTS",
             STAGE,
-            "if result component count must match result and hidden LDS types",
+            "if result component count must match its explicit result types",
             target_op_id=op.target_op_id,
         )
-    source_flat_results = flat_results[:len(result_types)]
-    hidden_start = len(result_types)
-    hidden_end = hidden_start + len(hidden_local_memory_roots)
-    hidden_local_memory_results = flat_results[hidden_start:hidden_end]
-    hidden_read_end = hidden_end + len(hidden_local_memory_roots)
-    hidden_local_memory_read_results = flat_results[hidden_end:hidden_read_end]
-    trailing_results = flat_results[hidden_read_end:]
-    if len(hidden_local_memory_results) != len(hidden_local_memory_roots):
-        fail(
-            "TLXW_EMIT_IF_HIDDEN_LOCAL_TOKEN_COMPONENTS",
-            STAGE,
-            "if hidden local memory result count must match carried LDS roots",
-            target_op_id=op.target_op_id,
-        )
-    if len(hidden_local_memory_read_results) != len(hidden_local_memory_roots):
-        fail(
-            "TLXW_EMIT_IF_HIDDEN_LOCAL_READ_TOKEN_COMPONENTS",
-            STAGE,
-            "if hidden local memory read result count must match carried LDS roots",
-            target_op_id=op.target_op_id,
-        )
-    if trailing_results:
-        fail(
-            "TLXW_EMIT_IF_TRAILING_COMPONENTS",
-            STAGE,
-            "if has unexpected trailing hidden token results",
-            target_op_id=op.target_op_id,
-        )
-    for root, token in zip(hidden_local_memory_roots, hidden_local_memory_results):
-        root = int(root)
-        # Each arm's yielded token includes the full incoming history plus its
-        # own accesses, so the merged token replaces the pre-if history.
-        state.local_memory_access_tokens[root] = (token, )
-        state.local_memory_tokens[root] = token
-        pending_access = _carried_local_memory_pending_access(
-            state,
-            root,
-            conditional_local_memory_accesses,
-            outer_local_memory_pending_accesses,
-        )
-        if pending_access is None:
-            state.local_memory_pending_accesses.pop(root, None)
-        else:
-            state.local_memory_pending_accesses[root] = pending_access
-    for root, token in zip(hidden_local_memory_roots, hidden_local_memory_read_results):
-        state.local_memory_read_tokens[int(root)] = (token, )
     cursor = 0
     for result_id, shape in zip(op.results, result_shapes):
         state.values[result_id] = _pack_structured_value_components(
             state,
-            source_flat_results[cursor:cursor + shape.component_count],
+            flat_results[cursor:cursor + shape.component_count],
             shape,
             "if",
             op,
@@ -3741,6 +2579,14 @@ def _emit_if(state, op):
 
 
 def _emit_for_loop(state, op):
+    return _emit_for_loop_structural_only(state, op)
+
+
+def _emit_for_loop_structural_only(state, op):
+    return _emit_for_loop_literal(state, op)
+
+
+def _emit_for_loop_literal(state, op):
     attrs = target_ir.attrs_dict(op)
     if len(op.region_ids) != 1:
         fail(
@@ -3784,146 +2630,27 @@ def _emit_for_loop(state, op):
             "result-bearing for_loop requires init args",
             target_op_id=op.target_op_id,
         )
+
     outer_values = dict(state.values)
+    outer_uniform_pointer_bases = dict(state.uniform_pointer_bases)
     outer_shared_pointer_dword_bases = dict(state.shared_pointer_dword_bases)
     outer_shared_pointer_offset_cache = dict(state.shared_pointer_offset_cache)
     outer_wave_offset_i32_cache = dict(state.wave_offset_i32_cache)
     outer_lane_mask_loop_phase = state.lane_mask_loop_phase
-    outer_scratch_token = state.scratch_token
-    outer_scratch_token_needs_write_barrier = state.scratch_token_needs_write_barrier
-    outer_local_memory_tokens = dict(state.local_memory_tokens)
-    outer_local_memory_pending_accesses = dict(state.local_memory_pending_accesses)
-    outer_local_memory_access_tokens = dict(state.local_memory_access_tokens)
-    outer_local_memory_read_tokens = dict(state.local_memory_read_tokens)
-    outer_pending_mma_read_boundaries = dict(state.pending_mma_read_boundaries)
-    outer_materialized_mma_read_boundaries = dict(state.materialized_mma_read_boundaries)
-    outer_local_memory_root_sets = dict(state.local_memory_root_sets)
-    outer_token_local_memory_root_sets = dict(state.token_local_memory_root_sets)
-    (
-        touched_local_memory_roots,
-        implicit_local_memory_accesses,
-        region_local_memory_root_sets,
-        region_local_memory_read_roots,
-    ) = _local_memory_roots_touched_by_region(
-        state,
-        region.target_region_id,
-        include_root_sets=True,
-    )
-    loop_token_block_root_sets, loop_token_result_root_sets = _loop_token_root_sets(
-        state,
-        op,
-        region,
-        region_local_memory_root_sets,
-    )
-    implicit_local_memory_roots = frozenset(implicit_local_memory_accesses)
-    hidden_local_memory_seed_roots = implicit_local_memory_roots.union(
-        root for root in touched_local_memory_roots
-        if root in outer_local_memory_tokens or any(dep_root in outer_local_memory_tokens
-                                                    for dep_root in _local_memory_dependency_roots(state, (root, ))))
-    hidden_local_memory_candidates = set()
-    for root in hidden_local_memory_seed_roots:
-        for dep_root in _local_memory_dependency_roots(state, (root, )):
-            if root in implicit_local_memory_roots or dep_root in outer_local_memory_tokens:
-                hidden_local_memory_candidates.add(dep_root)
-    # Async queue token loop carries track logical committed groups, not stable
-    # physical LDS slots.  Circular-buffer loops can consume one group's token
-    # and yield a different group's token for the same carry position, so the
-    # per-root completion state still has to be carried independently.
-    if not _loop_local_memory_state_carry_required(
-            state,
-            region,
-            hidden_local_memory_candidates,
-            implicit_local_memory_accesses,
-            outer_local_memory_pending_accesses,
-            region_local_memory_root_sets,
-            loop_token_block_root_sets,
-    ):
-        hidden_local_memory_candidates.clear()
-    hidden_local_memory_roots = tuple(sorted(hidden_local_memory_candidates))
-    hidden_local_memory_init_tokens = (_join_memory_tokens(
-        state,
-        tuple(outer_local_memory_tokens[root]
-              for root in hidden_local_memory_roots
-              if root in outer_local_memory_tokens),
-    ), ) if hidden_local_memory_roots else ()
-    # Per-slot carries drive ordering within the loop. Keep a separate
-    # allocation-wide history carry so every access token also reaches the
-    # post-loop lifetime proof, even when an access uses an alias that is later
-    # superseded by another physical-slot state token.
-    loop_local_memory_allocation_roots = tuple(
-        sorted({
-            int(dependency_root)
-            for root in touched_local_memory_roots
-            for dependency_root in _local_memory_dependency_roots(state, (root, ))
-            if int(dependency_root) in state.local_memory_allocations
-        }))
-    hidden_local_memory_access_roots = ()
-    hidden_local_memory_read_roots = tuple(root for root in loop_local_memory_allocation_roots if any(
-        int(dependency_root) in region_local_memory_read_roots
-        for dependency_root in _local_memory_dependency_roots(state, (root, ))) or any(
-            int(dependency_root) in outer_local_memory_read_tokens
-            for dependency_root in _local_memory_dependency_roots(state, (root, ))))
-    # A loop has one backedge memory frontier.  Carrying a separate cumulative
-    # history for every allocation duplicates token phis and can split one
-    # commit group's prior-read dependency into incomplete pieces.  Preserve
-    # precise per-root slot state above, while carrying allocation lifetime
-    # history as one collective token and reattaching it to every touched root
-    # inside and after the loop.
-    hidden_local_memory_access_init_tokens = (_join_memory_tokens(
-        state,
-        tuple(token for root in hidden_local_memory_access_roots
-              for token in outer_local_memory_access_tokens.get(root, ())),
-    ), ) if hidden_local_memory_access_roots else ()
-    # Overwrite ordering needs a read-only frontier.  Carry it independently
-    # from lifetime history so a refill can wait for prior LDS reads without
-    # inheriting async DMA completion state from earlier accesses.
-    hidden_local_memory_read_init_tokens = (_join_memory_tokens(
-        state,
-        tuple(token for root in hidden_local_memory_read_roots
-              for dependency_root in sorted(_local_memory_dependency_roots(state, (root, )))
-              for token in outer_local_memory_read_tokens.get(int(dependency_root), ())),
-    ), ) if hidden_local_memory_read_roots else ()
-    carry_scratch_token = _region_uses_scratch_memory(state, region.target_region_id)
-    scratch_init_tokens = (outer_scratch_token if outer_scratch_token is not None else
-                           state.builder.token(), ) if carry_scratch_token else ()
-    nonzero_trip = bool(attrs.get("nonzero_trip", False))
-    loop_init_values = (
-        *flat_init_values,
-        *hidden_local_memory_init_tokens,
-        *hidden_local_memory_access_init_tokens,
-        *hidden_local_memory_read_init_tokens,
-        *scratch_init_tokens,
-    )
+
     with state.builder.for_loop(
             lower,
             upper,
             step,
-            init_args=loop_init_values,
-            nonzero_trip=nonzero_trip,
+            init_args=flat_init_values,
+            nonzero_trip=bool(attrs.get("nonzero_trip", False)),
     ) as loop:
-        if loop_init_values:
+        if flat_init_values:
             induction_value = loop.induction_variable
-            loop_iter_values = tuple(loop.inner_iter_args)
-            flat_iter_values = loop_iter_values[:len(flat_init_values)]
-            hidden_start = len(flat_init_values)
-            hidden_end = hidden_start + len(hidden_local_memory_init_tokens)
-            hidden_local_memory_iter_tokens = loop_iter_values[hidden_start:hidden_end]
-            hidden_access_start = hidden_end
-            hidden_access_end = hidden_access_start + len(hidden_local_memory_access_init_tokens)
-            hidden_local_memory_access_iter_tokens = loop_iter_values[hidden_access_start:hidden_access_end]
-            hidden_read_start = hidden_access_end
-            hidden_read_end = hidden_read_start + len(hidden_local_memory_read_init_tokens)
-            hidden_local_memory_read_iter_tokens = loop_iter_values[hidden_read_start:hidden_read_end]
-            scratch_start = hidden_read_end
-            scratch_end = scratch_start + len(scratch_init_tokens)
-            scratch_iter_tokens = loop_iter_values[scratch_start:scratch_end]
+            flat_iter_values = tuple(loop.inner_iter_args)
         else:
             induction_value = loop
             flat_iter_values = ()
-            hidden_local_memory_iter_tokens = ()
-            hidden_local_memory_access_iter_tokens = ()
-            hidden_local_memory_read_iter_tokens = ()
-            scratch_iter_tokens = ()
         lane_mask_loop_phase = induction_value
         if str(lane_mask_loop_phase.type) != str(state.dsl.i32()):
             lane_mask_loop_phase = state.builder.cast(
@@ -3932,60 +2659,7 @@ def _emit_for_loop(state, op):
                 state.dsl.CastKind.IntConvert,
             )
         state.lane_mask_loop_phase = lane_mask_loop_phase
-        if len(hidden_local_memory_iter_tokens) != int(bool(hidden_local_memory_roots)):
-            fail(
-                "TLXW_EMIT_FOR_HIDDEN_LOCAL_TOKEN_COMPONENTS",
-                STAGE,
-                "for_loop hidden local memory token component count must match carried LDS roots",
-                target_op_id=op.target_op_id,
-            )
-        if len(hidden_local_memory_access_iter_tokens) != int(bool(hidden_local_memory_access_roots)):
-            fail(
-                "TLXW_EMIT_FOR_HIDDEN_LOCAL_ACCESS_TOKEN_COMPONENTS",
-                STAGE,
-                "for_loop must carry one collective local memory access token",
-                target_op_id=op.target_op_id,
-            )
-        if len(hidden_local_memory_read_iter_tokens) != int(bool(hidden_local_memory_read_roots)):
-            fail(
-                "TLXW_EMIT_FOR_HIDDEN_LOCAL_READ_TOKEN_COMPONENTS",
-                STAGE,
-                "for_loop must carry one collective local memory read token",
-                target_op_id=op.target_op_id,
-            )
-        if len(scratch_iter_tokens) != len(scratch_init_tokens):
-            fail(
-                "TLXW_EMIT_FOR_HIDDEN_SCRATCH_TOKEN_COMPONENTS",
-                STAGE,
-                "for_loop hidden scratch token component count must match carried scratch roots",
-                target_op_id=op.target_op_id,
-            )
-        for root in hidden_local_memory_roots:
-            root = int(root)
-            state.local_memory_tokens[root] = hidden_local_memory_iter_tokens[0]
-            pending_access = _carried_local_memory_pending_access(
-                state,
-                root,
-                implicit_local_memory_accesses,
-                outer_local_memory_pending_accesses,
-            )
-            if pending_access is None:
-                state.local_memory_pending_accesses.pop(root, None)
-            else:
-                state.local_memory_pending_accesses[root] = pending_access
-        if hidden_local_memory_access_iter_tokens:
-            history_token = hidden_local_memory_access_iter_tokens[0]
-            for root in hidden_local_memory_access_roots:
-                state.local_memory_access_tokens[int(root)] = (history_token, )
-        if hidden_local_memory_read_iter_tokens:
-            read_token = hidden_local_memory_read_iter_tokens[0]
-            for root in hidden_local_memory_read_roots:
-                _clear_local_memory_read_tokens(state, (int(root), ))
-                state.local_memory_read_tokens[int(root)] = (read_token, )
-        if scratch_iter_tokens:
-            state.scratch_token = scratch_iter_tokens[0]
-            state.scratch_token_needs_write_barrier = True
-        _bind_loop_region_args(
+        _bind_loop_region_args_structural(
             state,
             region.block_arg_ids,
             induction_value,
@@ -3994,7 +2668,6 @@ def _emit_for_loop(state, op):
             init_target_ids,
             op=op,
         )
-        state.token_local_memory_root_sets.update(loop_token_block_root_sets)
         yielded_values = _emit_region(state, op.region_ids[0])
         flat_yield_values, yield_shapes = _flatten_structured_values(
             state,
@@ -4007,52 +2680,14 @@ def _emit_for_loop(state, op):
             preserve_mma_packet_payloads=True,
         )
         if tuple(yield_shapes) != tuple(init_shapes):
-            shape_mismatches = tuple((
-                index,
-                init_target_ids[index],
-                region.yield_value_ids[index],
-                state.target_program.values[init_target_ids[index]].source_value_id,
-                state.target_program.values[region.yield_value_ids[index]].source_value_id,
-                init_shape,
-                yield_shape,
-            )
-                                     for index, (init_shape, yield_shape) in enumerate(zip(init_shapes, yield_shapes))
-                                     if init_shape != yield_shape)
             fail(
                 "TLXW_EMIT_FOR_YIELD_COMPONENTS",
                 STAGE,
-                "for_loop yielded component shape must match init args; "
-                f"mismatches={shape_mismatches!r}",
+                "for_loop yielded component shape must match init args",
                 target_op_id=op.target_op_id,
             )
-        hidden_local_memory_yield_tokens = (_join_memory_tokens(
-            state,
-            tuple(
-                state.local_memory_tokens.get(int(root), hidden_local_memory_iter_tokens[0])
-                for root in hidden_local_memory_roots),
-        ), ) if hidden_local_memory_iter_tokens else ()
-        hidden_local_memory_access_yield_tokens = (_join_memory_tokens(
-            state,
-            tuple(token for root in hidden_local_memory_access_roots
-                  for token in state.local_memory_access_tokens.get(int(root), ())),
-        ), ) if hidden_local_memory_access_iter_tokens else ()
-        hidden_local_memory_read_yield_tokens = (_join_memory_tokens(
-            state,
-            tuple(token for root in hidden_local_memory_read_roots
-                  for dependency_root in sorted(_local_memory_dependency_roots(state, (root, )))
-                  for token in state.local_memory_read_tokens.get(int(dependency_root), ())),
-        ), ) if hidden_local_memory_read_iter_tokens else ()
-        scratch_yield_tokens = (state.scratch_token if state.scratch_token is not None else
-                                scratch_iter_tokens[0], ) if scratch_iter_tokens else ()
-        scratch_yield_needs_write_barrier = state.scratch_token_needs_write_barrier
-        if loop_init_values:
-            state.builder.yield_((
-                *flat_yield_values,
-                *hidden_local_memory_yield_tokens,
-                *hidden_local_memory_access_yield_tokens,
-                *hidden_local_memory_read_yield_tokens,
-                *scratch_yield_tokens,
-            ))
+        if flat_init_values:
+            state.builder.yield_(flat_yield_values)
         elif flat_yield_values:
             fail(
                 "TLXW_EMIT_FOR_UNEXPECTED_YIELD",
@@ -4060,113 +2695,25 @@ def _emit_for_loop(state, op):
                 "for_loop without init args must not yield values",
                 target_op_id=op.target_op_id,
             )
-    inner_token_local_memory_root_sets = dict(state.token_local_memory_root_sets)
-    state.values = outer_values
-    state.shared_pointer_dword_bases = outer_shared_pointer_dword_bases
-    state.shared_pointer_offset_cache = outer_shared_pointer_offset_cache
-    state.wave_offset_i32_cache = outer_wave_offset_i32_cache
-    state.lane_mask_loop_phase = outer_lane_mask_loop_phase
-    state.scratch_token = outer_scratch_token
-    state.scratch_token_needs_write_barrier = outer_scratch_token_needs_write_barrier
-    state.local_memory_tokens = outer_local_memory_tokens
-    state.local_memory_pending_accesses = outer_local_memory_pending_accesses
-    state.local_memory_access_tokens = outer_local_memory_access_tokens
-    state.local_memory_read_tokens = outer_local_memory_read_tokens
-    state.pending_mma_read_boundaries = outer_pending_mma_read_boundaries
-    state.materialized_mma_read_boundaries = outer_materialized_mma_read_boundaries
-    state.local_memory_root_sets = outer_local_memory_root_sets
-    state.token_local_memory_root_sets = outer_token_local_memory_root_sets
 
-    flat_results = tuple(loop.results) if loop_init_values else ()
-    if len(flat_results) != len(loop_init_values):
+    _restore_structural_emission_state(
+        state,
+        outer_values,
+        outer_uniform_pointer_bases,
+        outer_shared_pointer_dword_bases,
+        outer_shared_pointer_offset_cache,
+        outer_wave_offset_i32_cache,
+    )
+    state.lane_mask_loop_phase = outer_lane_mask_loop_phase
+
+    flat_results = tuple(loop.results) if flat_init_values else ()
+    if len(flat_results) != len(flat_init_values):
         fail(
             "TLXW_EMIT_FOR_RESULT_COMPONENTS",
             STAGE,
-            "for_loop result component count must match init args and hidden local memory tokens",
+            "for_loop result component count must match explicit init args",
             target_op_id=op.target_op_id,
         )
-    source_flat_results = flat_results[:len(flat_init_values)]
-    hidden_start = len(flat_init_values)
-    hidden_end = hidden_start + len(hidden_local_memory_init_tokens)
-    hidden_local_memory_results = flat_results[hidden_start:hidden_end]
-    hidden_access_start = hidden_end
-    hidden_access_end = hidden_access_start + len(hidden_local_memory_access_init_tokens)
-    hidden_local_memory_access_results = flat_results[hidden_access_start:hidden_access_end]
-    hidden_read_start = hidden_access_end
-    hidden_read_end = hidden_read_start + len(hidden_local_memory_read_init_tokens)
-    hidden_local_memory_read_results = flat_results[hidden_read_start:hidden_read_end]
-    scratch_start = hidden_read_end
-    scratch_end = scratch_start + len(scratch_init_tokens)
-    scratch_results = flat_results[scratch_start:scratch_end]
-    trailing_results = flat_results[scratch_end:]
-    if len(hidden_local_memory_results) != int(bool(hidden_local_memory_roots)):
-        fail(
-            "TLXW_EMIT_FOR_HIDDEN_LOCAL_TOKEN_COMPONENTS",
-            STAGE,
-            "for_loop hidden local memory result count must match carried LDS roots",
-            target_op_id=op.target_op_id,
-        )
-    # Hidden LDS results are physical slot state, not async queue groups.  A
-    # wait inside the loop may have consumed a different logical group, so the
-    # post-loop successor must still preserve each carried slot's pending access.
-    for root in hidden_local_memory_roots:
-        root = int(root)
-        token = hidden_local_memory_results[0]
-        _record_local_memory_access_token(state, (root, ), token)
-        state.local_memory_tokens[root] = token
-        pending_access = _carried_local_memory_pending_access(
-            state,
-            root,
-            implicit_local_memory_accesses,
-            outer_local_memory_pending_accesses,
-        )
-        if pending_access is None:
-            state.local_memory_pending_accesses.pop(root, None)
-        else:
-            state.local_memory_pending_accesses[root] = pending_access
-    if len(hidden_local_memory_access_results) != int(bool(hidden_local_memory_access_roots)):
-        fail(
-            "TLXW_EMIT_FOR_HIDDEN_LOCAL_ACCESS_TOKEN_COMPONENTS",
-            STAGE,
-            "for_loop must return one collective local memory access token",
-            target_op_id=op.target_op_id,
-        )
-    if hidden_local_memory_access_results:
-        history_token = hidden_local_memory_access_results[0]
-        # The loop result merges the incoming history with the body history and
-        # therefore replaces every non-dominating body-local access token.
-        for root in hidden_local_memory_access_roots:
-            state.local_memory_access_tokens[int(root)] = (history_token, )
-    if len(hidden_local_memory_read_results) != int(bool(hidden_local_memory_read_roots)):
-        fail(
-            "TLXW_EMIT_FOR_HIDDEN_LOCAL_READ_TOKEN_COMPONENTS",
-            STAGE,
-            "for_loop must return one collective local memory read token",
-            target_op_id=op.target_op_id,
-        )
-    if hidden_local_memory_read_results:
-        read_token = hidden_local_memory_read_results[0]
-        for root in hidden_local_memory_read_roots:
-            _clear_local_memory_read_tokens(state, (int(root), ))
-            state.local_memory_read_tokens[int(root)] = (read_token, )
-    if len(scratch_results) != len(scratch_init_tokens):
-        fail(
-            "TLXW_EMIT_FOR_HIDDEN_SCRATCH_TOKEN_COMPONENTS",
-            STAGE,
-            "for_loop hidden scratch result count must match carried scratch roots",
-            target_op_id=op.target_op_id,
-        )
-    if scratch_results:
-        state.scratch_token = scratch_results[0]
-        state.scratch_token_needs_write_barrier = scratch_yield_needs_write_barrier
-    if trailing_results:
-        fail(
-            "TLXW_EMIT_FOR_TRAILING_COMPONENTS",
-            STAGE,
-            "for_loop has unexpected trailing hidden token results",
-            target_op_id=op.target_op_id,
-        )
-
     if len(op.results) != init_arg_count:
         fail(
             "TLXW_EMIT_FOR_RESULT_COUNT",
@@ -4174,43 +2721,34 @@ def _emit_for_loop(state, op):
             "for_loop result count must match init args",
             target_op_id=op.target_op_id,
         )
-    if op.results:
-        if len(source_flat_results) != len(flat_init_values):
-            fail(
-                "TLXW_EMIT_FOR_RESULT_COMPONENTS",
-                STAGE,
-                "for_loop result component count must match init args",
-                target_op_id=op.target_op_id,
-            )
-        cursor = 0
-        for yield_index, (result_id, shape, init_target_id) in enumerate(
-                zip(op.results, init_shapes, init_target_ids)):
-            result_components = source_flat_results[cursor:cursor + shape.component_count]
-            value = _pack_loop_value_components(
-                state,
-                result_components,
-                shape,
-                op,
-            )
-            state.values[result_id] = value
-            _propagate_local_memory_roots(state, init_target_id, result_id)
-            plan = outer_shared_pointer_dword_bases.get(int(init_target_id))
-            if plan is not None:
-                state.shared_pointer_dword_bases[int(result_id)] = (
-                    _SharedPointerDwordBase(
-                        value,
-                        allocation_base=plan.allocation_base,
-                        allocation_bytes=plan.allocation_bytes,
-                    )
-                )
-            if yield_index < len(region.yield_value_ids):
-                roots = loop_token_result_root_sets.get(int(result_id))
-                if roots is None:
-                    roots = inner_token_local_memory_root_sets.get(int(region.yield_value_ids[yield_index]))
-                if roots:
-                    state.token_local_memory_root_sets[int(result_id)] = roots
-                    _set_local_memory_roots_token(state, roots, state.values[result_id])
-            cursor += shape.component_count
+    cursor = 0
+    for result_id, shape, init_target_id in zip(
+            op.results,
+            init_shapes,
+            init_target_ids,
+    ):
+        value = _pack_loop_value_components(
+            state,
+            flat_results[cursor:cursor + shape.component_count],
+            shape,
+            op,
+        )
+        state.values[result_id] = value
+        _propagate_uniform_pointer_bases(
+            state,
+            init_target_id,
+            result_id,
+        )
+        plan = outer_shared_pointer_dword_bases.get(int(init_target_id))
+        if plan is not None:
+            state.shared_pointer_dword_bases[int(result_id)] = (_SharedPointerDwordBase(
+                value,
+                allocation_base=plan.allocation_base,
+                allocation_bytes=plan.allocation_bytes,
+            ))
+        cursor += shape.component_count
+
+
 def _emit_structured_branch(
     state,
     region_id,
@@ -4259,11 +2797,20 @@ def _structured_result_types_and_shapes(state, target_value_ids, op):
     shapes = []
     attrs = target_ir.attrs_dict(op)
     packet_registers = tuple(int(width) for width in attrs.get("result_packet_registers", ()))
+    if packet_registers and len(packet_registers) < len(target_value_ids):
+        synthetic_result_ids = target_value_ids[len(packet_registers):]
+        if all(state.target_program.values[target_value_id].type.representation == "token"
+               for target_value_id in synthetic_result_ids):
+            packet_registers = (
+                *packet_registers,
+                *((0, ) * len(synthetic_result_ids)),
+            )
     if packet_registers and len(packet_registers) != len(target_value_ids):
         fail(
             "TLXW_EMIT_IF_RESULT_TYPE",
             STAGE,
-            "if packet register widths must match the result count",
+            "if packet register widths must match the data result count and "
+            "any trailing structural token results",
             target_op_id=op.target_op_id,
         )
     for result_index, target_value_id in enumerate(target_value_ids):
@@ -4332,39 +2879,19 @@ def _structured_result_types_and_shapes(state, target_value_ids, op):
     return tuple(result_types), tuple(shapes)
 
 
-def _restore_emission_state(
+def _restore_structural_emission_state(
     state,
     values,
     uniform_pointer_bases,
     shared_pointer_dword_bases,
     shared_pointer_offset_cache,
     wave_offset_i32_cache,
-    scratch_token,
-    scratch_token_needs_write_barrier,
-    local_memory_tokens,
-    local_memory_pending_accesses,
-    local_memory_access_tokens,
-    local_memory_read_tokens,
-    pending_mma_read_boundaries,
-    materialized_mma_read_boundaries,
-    local_memory_root_sets,
-    token_local_memory_root_sets,
 ):
     state.values = dict(values)
     state.uniform_pointer_bases = dict(uniform_pointer_bases)
     state.shared_pointer_dword_bases = dict(shared_pointer_dword_bases)
     state.shared_pointer_offset_cache = dict(shared_pointer_offset_cache)
     state.wave_offset_i32_cache = dict(wave_offset_i32_cache)
-    state.scratch_token = scratch_token
-    state.scratch_token_needs_write_barrier = bool(scratch_token_needs_write_barrier)
-    state.local_memory_tokens = dict(local_memory_tokens)
-    state.local_memory_pending_accesses = dict(local_memory_pending_accesses)
-    state.local_memory_access_tokens = dict(local_memory_access_tokens)
-    state.local_memory_read_tokens = dict(local_memory_read_tokens)
-    state.pending_mma_read_boundaries = dict(pending_mma_read_boundaries)
-    state.materialized_mma_read_boundaries = dict(materialized_mma_read_boundaries)
-    state.local_memory_root_sets = dict(local_memory_root_sets)
-    state.token_local_memory_root_sets = dict(token_local_memory_root_sets)
 
 
 def _flatten_structured_values(
@@ -4589,15 +3116,15 @@ def _pack_loop_value_components(state, components, shape, op=None):
     return _pack_structured_value_components(state, components, shape, "for_loop", op)
 
 
-def _bind_loop_region_args(
-        state,
-        block_arg_ids,
-        induction_value,
-        flat_iter_values,
-        init_shapes,
-        init_target_ids,
-        *,
-        op,
+def _bind_loop_region_args_structural(
+    state,
+    block_arg_ids,
+    induction_value,
+    flat_iter_values,
+    init_shapes,
+    init_target_ids,
+    *,
+    op,
 ):
     state.values[block_arg_ids[0]] = induction_value
     cursor = 0
@@ -4614,21 +3141,18 @@ def _bind_loop_region_args(
             op,
         )
         state.values[block_arg_id] = value
-        _propagate_local_memory_roots(state, init_target_id, block_arg_id)
-        plan = state.shared_pointer_dword_bases.get(int(init_target_id))
-        if plan is not None:
-            state.shared_pointer_dword_bases[int(block_arg_id)] = (
-                _SharedPointerDwordBase(
-                    value,
-                    allocation_base=plan.allocation_base,
-                    allocation_bytes=plan.allocation_bytes,
-                )
-            )
-        _propagate_token_local_memory_roots(
+        _propagate_uniform_pointer_bases(
             state,
             init_target_id,
             block_arg_id,
         )
+        plan = state.shared_pointer_dword_bases.get(int(init_target_id))
+        if plan is not None:
+            state.shared_pointer_dword_bases[int(block_arg_id)] = (_SharedPointerDwordBase(
+                value,
+                allocation_base=plan.allocation_base,
+                allocation_bytes=plan.allocation_bytes,
+            ))
         cursor += shape.component_count
     if cursor != len(flat_iter_values):
         fail(
@@ -4654,20 +3178,12 @@ def _emit_local_alloc(state, op):
         allocation_bytes=int(attrs["allocation_bytes"]),
         allocation_dword_range=(0, 0),
     )
-    _record_local_memory_root(state, result_id)
-    state.local_memory_allocations[int(result_id)] = value
 
 
 def _emit_memdesc_index(state, op):
     attrs = target_ir.attrs_dict(op)
     base, index = _operand_values(state, op, 2)
     result_id = _single_result(op)
-    state.local_memory_root_sets[int(result_id)] = _memdesc_index_result_roots(
-        state,
-        _local_memory_roots(state, op.operands[0]),
-        attrs,
-        op.operands[1],
-    )
     static_byte_offset = attrs.get("static_byte_offset")
     if static_byte_offset is not None:
         target_type = state.target_program.values[result_id].type
@@ -4816,7 +3332,6 @@ def _emit_memdesc_view(state, op):
     base = _operand_values(state, op, 1)[0]
     result_id = _single_result(op)
     state.values[result_id] = base
-    _propagate_local_memory_roots(state, op.operands[0], result_id)
     dword_base = state.shared_pointer_dword_bases.get(op.operands[0])
     if dword_base is not None:
         state.shared_pointer_dword_bases[result_id] = dword_base
@@ -4840,31 +3355,10 @@ def _local_access_result_ids(op):
 
 
 def _finish_local_access(state, op, memdesc_target_id, token, access_kind):
-    attrs = target_ir.attrs_dict(op)
+    del memdesc_target_id, access_kind
     _data_result_ids, completion_result_ids = _local_access_result_ids(op)
     for result_id in completion_result_ids:
         state.values[result_id] = token
-        state.token_local_memory_root_sets[result_id] = _local_memory_roots(
-            state,
-            memdesc_target_id,
-        )
-    if (bool(attrs.get("protocol_tracked", False)) and bool(attrs.get("synced_via_async_wait", False))
-            and access_kind in {"read", "mma_read"}):
-        # The target SSA completion result is the sole release frontier for a
-        # wait-ready DMA consumer.  Retain only allocation-lifetime history;
-        # do not rebuild a second pending/read frontier in emitter state.
-        _record_local_memory_access_token(
-            state,
-            _local_memory_roots(state, memdesc_target_id),
-            token,
-        )
-        return
-    _set_local_memory_access_token(
-        state,
-        memdesc_target_id,
-        token,
-        access_kind,
-    )
 
 
 def _emit_local_store(state, op):
@@ -4889,12 +3383,7 @@ def _emit_local_store(state, op):
         base,
         state.dsl.ptr_type(element_type, state.dsl.shared_address_space()),
     )
-    dependency = _local_memory_access_dependency_token(
-        state,
-        memdesc_target_id,
-        "write",
-        extra_tokens=explicit_dependencies,
-    )
+    dependency = _memory_dependency_token(state, explicit_dependencies)
     if isinstance(values, _VectorPacketPayload):
         value_components = _value_components(state, values, op)
     else:
@@ -5205,20 +3694,9 @@ def _emit_local_load(state, op):
         base,
         state.dsl.ptr_type(element_type, state.dsl.shared_address_space()),
     )
-    dependency = _local_memory_access_dependency_token(
+    dependency = _memory_dependency_token(
         state,
-        memdesc_target_id,
-        "read",
-        extra_tokens=tuple(explicit_dependencies),
-        # The explicit source wait is the sole readiness proof for an async
-        # DMA write.  It does not waive an unrelated synchronous LDS hazard,
-        # such as a preceding local_store to the same allocation.
-        ignore_async_writes=bool(attrs.get("synced_via_async_wait", False)),
-        ready_async_write_roots=_local_load_ready_async_write_roots(
-            state,
-            op,
-            attrs,
-        ),
+        tuple(explicit_dependencies),
     )
     if attrs.get("result_value_mode") == "mma_packet_payload":
         offsets = _local_access_offsets(
@@ -5786,29 +4264,17 @@ def _symbolic_local_destination_bit_offset(
             f"{attrs.get('destination_offset_mode')}",
             target_op_id=op.target_op_id,
         )
-    shape = tuple(int(value)
-                  for value in attrs["destination_coordinate_shape"])
+    shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
     component_bases = tuple(
-        tuple(int(value) for value in bases)
-        for bases in attrs["destination_component_coordinate_bases"]
-    )
+        tuple(int(value) for value in bases) for bases in attrs["destination_component_coordinate_bases"])
     item_coefficients = tuple(
-        tuple(int(value) for value in coefficients)
-        for coefficients in attrs[
-            "destination_workitem_coordinate_coefficients"
-        ]
-    )
+        tuple(int(value)
+              for value in coefficients)
+        for coefficients in attrs["destination_workitem_coordinate_coefficients"])
     component_count = int(component_count)
-    if (
-        component_count <= 0
-        or component_count & (component_count - 1)
-        or len(component_bases) != component_count
-        or any(len(bases) != len(shape) for bases in component_bases)
-        or any(
-            len(coefficients) != len(shape)
-            for coefficients in item_coefficients
-        )
-    ):
+    if (component_count <= 0 or component_count & (component_count - 1) or len(component_bases) != component_count
+            or any(len(bases) != len(shape) for bases in component_bases)
+            or any(len(coefficients) != len(shape) for coefficients in item_coefficients)):
         fail(
             "TLXW_EMIT_COMPONENT_COUNT",
             STAGE,
@@ -5819,21 +4285,14 @@ def _symbolic_local_destination_bit_offset(
 
     slot_bit_count = component_count.bit_length() - 1
     slot_coefficients = tuple(
-        tuple(
-            int(component_bases[0][dim])
-            ^ int(component_bases[1 << bit][dim])
-            for dim in range(len(shape))
-        )
-        for bit in range(slot_bit_count)
-    )
+        tuple(int(component_bases[0][dim]) ^ int(component_bases[1 << bit][dim])
+              for dim in range(len(shape)))
+        for bit in range(slot_bit_count))
     for slot_index, bases in enumerate(component_bases):
         expected = list(component_bases[0])
         for bit, coefficients in enumerate(slot_coefficients):
             if slot_index & (1 << bit):
-                expected = [
-                    int(value) ^ int(coefficient)
-                    for value, coefficient in zip(expected, coefficients)
-                ]
+                expected = [int(value) ^ int(coefficient) for value, coefficient in zip(expected, coefficients)]
         if tuple(expected) != tuple(bases):
             fail(
                 "TLXW_EMIT_BAD_COORDINATES",
@@ -5872,28 +4331,16 @@ def _symbolic_local_destination_bit_offset(
             coord = state.dsl.xor(coord, value)
         logical_coords.append(coord)
 
-    physical_shape = tuple(
-        int(value) for value in attrs["destination_physical_shape"]
-    )
-    logical_origin = tuple(
-        int(value) for value in attrs["destination_logical_origin"]
-    )
-    if not (
-        len(logical_coords)
-        == len(shape)
-        == len(physical_shape)
-        == len(logical_origin)
-    ):
+    physical_shape = tuple(int(value) for value in attrs["destination_physical_shape"])
+    logical_origin = tuple(int(value) for value in attrs["destination_logical_origin"])
+    if not (len(logical_coords) == len(shape) == len(physical_shape) == len(logical_origin)):
         fail(
             "TLXW_EMIT_BAD_COORDINATES",
             STAGE,
             "local-memory symbolic destination view ranks do not match",
             target_op_id=op.target_op_id,
         )
-    physical_coords = tuple(
-        coord + int(origin)
-        for coord, origin in zip(logical_coords, logical_origin)
-    )
+    physical_coords = tuple(coord + int(origin) for coord, origin in zip(logical_coords, logical_origin))
     plan = attrs.get("destination_physical_offset_plan")
     if plan == "dense_row_major":
         element_offset = _linearize_local_fragment_coords(
@@ -5920,12 +4367,10 @@ def _symbolic_local_destination_bit_offset(
         )
         element_offset = physical
         for interval, padding in zip(
-            attrs.get("destination_physical_intervals", ()),
-            attrs.get("destination_physical_paddings", ()),
+                attrs.get("destination_physical_intervals", ()),
+                attrs.get("destination_physical_paddings", ()),
         ):
-            element_offset += (
-                state.dsl.floor(physical / int(interval)) * int(padding)
-            )
+            element_offset += (state.dsl.floor(physical / int(interval)) * int(padding))
     elif plan == "swizzled_xor":
         order = _physical_order_from_attrs(
             attrs,
@@ -5941,18 +4386,12 @@ def _symbolic_local_destination_bit_offset(
         minor = physical_coords[minor_dim]
         vec = int(attrs["destination_physical_swizzled_vec"])
         phase = state.dsl.mod(
-            state.dsl.floor(
-                major
-                / int(attrs["destination_physical_swizzled_per_phase"])
-            ),
+            state.dsl.floor(major / int(attrs["destination_physical_swizzled_per_phase"])),
             int(attrs["destination_physical_swizzled_max_phase"]),
         )
         max_phase = int(attrs["destination_physical_swizzled_max_phase"])
         if vec * max_phase <= minor_extent:
-            swizzled_minor = (
-                state.dsl.xor(state.dsl.floor(minor / vec), phase) * vec
-                + state.dsl.mod(minor, vec)
-            )
+            swizzled_minor = (state.dsl.xor(state.dsl.floor(minor / vec), phase) * vec + state.dsl.mod(minor, vec))
         else:
             phase_offset = state.dsl.mod(phase * vec, minor_extent)
             swizzled_minor = state.dsl.xor(minor, phase_offset)
@@ -6003,15 +4442,9 @@ def _emit_buffer_load_to_local(state, op):
             f"unsupported amdg.buffer_load_to_local mode {attrs.get('mode')}",
             target_op_id=op.target_op_id,
         )
-    source_issue_dependency_count = int(
-        attrs.get("issue_dependency_count", 0)
-    )
-    barrier_order_dependency_count = int(
-        attrs.get("barrier_order_dependency_count", 0)
-    )
-    issue_dependency_count = (
-        source_issue_dependency_count + barrier_order_dependency_count
-    )
+    source_issue_dependency_count = int(attrs.get("issue_dependency_count", 0))
+    barrier_order_dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
+    issue_dependency_count = (source_issue_dependency_count + barrier_order_dependency_count)
     has_mask = bool(attrs.get("has_mask", False))
     expected_operand_count = 3 + int(has_mask) + issue_dependency_count
     if len(op.operands) != expected_operand_count:
@@ -6027,16 +4460,9 @@ def _emit_buffer_load_to_local(state, op):
     source_base = _require_value(state, op.operands[1], op)
     offsets = _require_value(state, op.operands[2], op)
     operand_index = 3
-    masks = (
-        _require_value(state, op.operands[operand_index], op)
-        if has_mask
-        else None
-    )
+    masks = (_require_value(state, op.operands[operand_index], op) if has_mask else None)
     operand_index += int(has_mask)
-    issue_dependencies = tuple(
-        _require_value(state, operand_id, op)
-        for operand_id in op.operands[operand_index:]
-    )
+    issue_dependencies = tuple(_require_value(state, operand_id, op) for operand_id in op.operands[operand_index:])
     component_count = int(attrs["component_count"])
     lane_width = int(attrs["lane_width"])
     element_type = _scalar_type(state.dsl, attrs["element_type"])
@@ -6049,17 +4475,13 @@ def _emit_buffer_load_to_local(state, op):
             "match its symbolic packet",
             target_op_id=op.target_op_id,
         )
-    mask_components = (
-        None
-        if masks is None
-        else _as_mask_predicate_components(
-            state,
-            masks,
-            component_count,
-            lane_width,
-            op,
-        )
-    )
+    mask_components = (None if masks is None else _as_mask_predicate_components(
+        state,
+        masks,
+        component_count,
+        lane_width,
+        op,
+    ))
     if mask_components is not None and attrs.get("mask_mode") != "exec_where":
         fail(
             "TLXW_EMIT_UNSUPPORTED_BUFFER_ASYNC_MASK",
@@ -6091,9 +4513,7 @@ def _emit_buffer_load_to_local(state, op):
     )
     element_byte_width = int(attrs["element_byte_width"])
     cache = _direct_buffer_load_cache_attr(state, attrs, op)
-    source_offset_upper = (
-        int(attrs["range_bytes"]) - element_byte_width + 1
-    ) // element_byte_width
+    source_offset_upper = (int(attrs["range_bytes"]) - element_byte_width + 1) // element_byte_width
     source_offset_range = (0, source_offset_upper)
 
     offset_components = tuple(
@@ -6102,9 +4522,7 @@ def _emit_buffer_load_to_local(state, op):
             offset,
             source_offset_range,
             op,
-        )
-        for offset in offset_components
-    )
+        ) for offset in offset_components)
     gather = _prepare_symbolic_indexed_gather(
         state,
         offset_components,
@@ -6156,11 +4574,6 @@ def _emit_buffer_load_to_local(state, op):
 
     result_id = _single_result(op)
     state.values[result_id] = token
-    _record_token_local_memory_roots(
-        state,
-        result_id,
-        op.operands[0],
-    )
 
 
 def _shared_destination_element_offset(state, attrs, coords, shape, lane_width, op):
@@ -6345,9 +4758,6 @@ def _emit_async_commit_group(state, op):
     if op.results:
         result_id = _single_result(op)
         state.values[result_id] = token
-        roots = _local_memory_roots_for_token_values(state, op.operands)
-        if roots:
-            state.token_local_memory_root_sets[int(result_id)] = roots
 
 
 def _emit_token(state, op):
@@ -6420,50 +4830,6 @@ def _memory_dependency_token(state, tokens):
     return _join_memory_tokens(state, tokens)
 
 
-def _local_memory_value_descendants(state, root):
-    root = int(root)
-    cached = state.local_memory_descendants.get(root)
-    if cached is not None:
-        return cached
-    descendants = {root}
-    changed = True
-    while changed:
-        changed = False
-        for op in state.target_program.ops:
-            sources = set(int(operand) for operand in op.operands)
-            for region_id in op.region_ids:
-                sources.update(
-                    int(value_id) for value_id in state.target_program.regions[int(region_id)].yield_value_ids)
-            if descendants.isdisjoint(sources):
-                continue
-            for result_id in op.results:
-                result_id = int(result_id)
-                if (state.target_program.values[result_id].type.representation == "memdesc"
-                        and result_id not in descendants):
-                    descendants.add(result_id)
-                    changed = True
-    result = frozenset(descendants)
-    state.local_memory_descendants[root] = result
-    return result
-
-
-def _local_memory_allocation_has_future_use(state, root, current_op):
-    current_source_index = current_op.source_op_index
-    if current_source_index is None:
-        return True
-    descendants = _local_memory_value_descendants(state, root)
-    for candidate in state.target_program.ops:
-        candidate_source_index = candidate.source_op_index
-        if candidate_source_index is None:
-            continue
-        is_future = (int(candidate_source_index) > int(current_source_index)
-                     or (int(candidate_source_index) == int(current_source_index)
-                         and int(candidate.target_op_id) > int(current_op.target_op_id)))
-        if is_future and not descendants.isdisjoint(int(operand) for operand in candidate.operands):
-            return True
-    return False
-
-
 def _unique_tokens(tokens):
     unique = []
     seen = set()
@@ -6480,9 +4846,7 @@ def _emit_async_wait(state, op):
     attrs = target_ir.attrs_dict(op)
     completed_count = int(attrs["completed_group_dependency_count"])
     retained_issue_count = int(attrs["retained_issue_dependency_count"])
-    release_count = int(attrs["lds_release_dependency_count"])
-    if (completed_count < 0 or retained_issue_count < 0 or release_count < 0
-            or completed_count + retained_issue_count + release_count != len(op.operands)):
+    if (completed_count < 0 or retained_issue_count < 0 or completed_count + retained_issue_count != len(op.operands)):
         fail(
             "TLXW_EMIT_ASYNC_WAIT_OPERANDS",
             STAGE,
@@ -6490,39 +4854,20 @@ def _emit_async_wait(state, op):
             target_op_id=op.target_op_id,
         )
     completed_target_ids = op.operands[:completed_count]
-    issue_end = completed_count + retained_issue_count
-    retained_issue_target_ids = op.operands[completed_count:issue_end]
-    release_target_ids = op.operands[issue_end:]
+    retained_issue_target_ids = op.operands[completed_count:]
     completed_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in completed_target_ids)
     retained_issue_tokens = tuple(
         _require_value(state, target_value_id, op) for target_value_id in retained_issue_target_ids)
-    release_tokens = tuple(_require_value(state, target_value_id, op) for target_value_id in release_target_ids)
-    dependencies = (
-        *completed_tokens,
-        *retained_issue_tokens,
-        *release_tokens,
-    )
-    publication_mode = attrs["publication_mode"]
-    if publication_mode == "workgroup":
-        token = _emit_cta_barrier(state, *dependencies)
-    elif publication_mode == "wave_local":
-        token = (state.builder.after(*dependencies) if dependencies else state.builder.token())
+    # The issue projection keeps retained groups ordered without contributing
+    # their completion: Wave's token analysis stops at wave.issue_token.
+    dependencies = (*completed_tokens, *retained_issue_tokens)
+    if not dependencies:
+        token = state.builder.token()
     else:
-        fail(
-            "TLXW_EMIT_ASYNC_WAIT_MODE",
-            STAGE,
-            f"unsupported async wait publication mode {publication_mode}",
-            target_op_id=op.target_op_id,
-        )
-    roots = _local_memory_roots_for_token_values(
-        state,
-        completed_target_ids,
-    )
+        token = state.builder.after(*dependencies)
     if op.results:
         result_id = _single_result(op)
         state.values[result_id] = token
-        if roots:
-            state.token_local_memory_root_sets[int(result_id)] = roots
 
 
 def _emit_local_load_mma_payload(state, op):
@@ -6568,19 +4913,9 @@ def _emit_local_load_mma_payload(state, op):
             target_op_id=op.target_op_id,
         )
     wi = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
-    dependency = _local_memory_access_dependency_token(
+    dependency = _memory_dependency_token(
         state,
-        memdesc_target_id,
-        "read",
-        extra_tokens=tuple(explicit_dependencies),
-        # See _emit_local_load: the wait replaces only async-DMA destination
-        # inference.  Synchronous LDS hazards remain structural dependencies.
-        ignore_async_writes=bool(attrs.get("synced_via_async_wait", False)),
-        ready_async_write_roots=_local_load_ready_async_write_roots(
-            state,
-            op,
-            attrs,
-        ),
+        tuple(explicit_dependencies),
     )
     # MMA payload values carry the data dependency into MFMA.  The read token is
     # kept only as a lightweight anti-dependency for later writes that reuse the
@@ -6705,9 +5040,7 @@ def _emit_symbolic_mma_payload_load(
     slot = state.dsl.sym("slot")
     payloads = []
     load_tokens = []
-    for component, component_base in enumerate(
-        attrs["component_coordinate_bases"]
-    ):
+    for component, component_base in enumerate(attrs["component_coordinate_bases"]):
         logical_coords = _bit_linear_packet_coordinate_exprs(
             state,
             attrs,
@@ -6722,11 +5055,7 @@ def _emit_symbolic_mma_payload_load(
             logical_coords,
             op,
         )
-        bit_offset = (
-            _element_byte_width(attrs["element_type"], op)
-            * 8
-            * element_offset
-        ).simplify()
+        bit_offset = (_element_byte_width(attrs["element_type"], op) * 8 * element_offset).simplify()
         payload, token = state.builder.gather(
             [base],
             load_type,
@@ -6750,19 +5079,11 @@ def _bit_linear_packet_coordinate_exprs(
     op,
 ):
     shape = tuple(int(dim) for dim in attrs["coordinate_shape"])
-    slot_coefficients = tuple(
-        tuple(int(value) for value in basis)
-        for basis in attrs["slot_coordinate_coefficients"]
-    )
+    slot_coefficients = tuple(tuple(int(value) for value in basis) for basis in attrs["slot_coordinate_coefficients"])
     item_coefficients = tuple(
-        tuple(int(value) for value in basis)
-        for basis in attrs["workitem_coordinate_coefficients"]
-    )
-    if (
-        len(component_base) != len(shape)
-        or any(len(basis) != len(shape) for basis in slot_coefficients)
-        or any(len(basis) != len(shape) for basis in item_coefficients)
-    ):
+        tuple(int(value) for value in basis) for basis in attrs["workitem_coordinate_coefficients"])
+    if (len(component_base) != len(shape) or any(len(basis) != len(shape) for basis in slot_coefficients)
+            or any(len(basis) != len(shape) for basis in item_coefficients)):
         fail(
             "TLXW_EMIT_BAD_COORDINATES",
             STAGE,
@@ -6799,28 +5120,16 @@ def _local_physical_element_offset_from_coords_expr(
     op,
 ):
     shape = tuple(int(dim) for dim in attrs["coordinate_shape"])
-    physical_shape = tuple(
-        int(dim) for dim in attrs["memdesc_physical_shape"]
-    )
-    logical_origin = tuple(
-        int(value) for value in attrs["memdesc_logical_origin"]
-    )
-    if not (
-        len(logical_coords)
-        == len(shape)
-        == len(physical_shape)
-        == len(logical_origin)
-    ):
+    physical_shape = tuple(int(dim) for dim in attrs["memdesc_physical_shape"])
+    logical_origin = tuple(int(value) for value in attrs["memdesc_logical_origin"])
+    if not (len(logical_coords) == len(shape) == len(physical_shape) == len(logical_origin)):
         fail(
             "TLXW_EMIT_BAD_COORDINATES",
             STAGE,
             "symbolic MMA payload view ranks do not match",
             target_op_id=op.target_op_id,
         )
-    physical_coords = tuple(
-        coord + int(origin)
-        for coord, origin in zip(logical_coords, logical_origin)
-    )
+    physical_coords = tuple(coord + int(origin) for coord, origin in zip(logical_coords, logical_origin))
     logical = _linearize_local_fragment_coords(
         physical_shape,
         physical_coords,
@@ -8180,14 +6489,10 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
     if mask_payload:
         element_type = state.dsl.i32()
     elif pointer_payload:
-        address_space = (
-            state.dsl.buffer_address_space()
-            if result_type.representation in {
-                "buffer_pointer",
-                "buffer_pointer_tuple",
-            }
-            else state.dsl.global_address_space()
-        )
+        address_space = (state.dsl.buffer_address_space() if result_type.representation in {
+            "buffer_pointer",
+            "buffer_pointer_tuple",
+        } else state.dsl.global_address_space())
         element_type = state.dsl.ptr_type(
             _scalar_type(state.dsl, attrs["element_type"]),
             address_space,
@@ -8200,14 +6505,8 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
     result_count = int(attrs["result_component_count"])
     result_registers = int(attrs["result_registers_per_component"])
     result_slots = int(attrs["result_slot_count"])
-    if pointer_payload and (
-        source_count != 1
-        or source_registers != 1
-        or source_slots != 1
-        or result_count != 1
-        or result_registers != 1
-        or result_slots != 1
-    ):
+    if pointer_payload and (source_count != 1 or source_registers != 1 or source_slots != 1 or result_count != 1
+                            or result_registers != 1 or result_slots != 1):
         fail(
             "TLXW_EMIT_LAYOUT_REMAP",
             STAGE,
@@ -8305,7 +6604,7 @@ def _emit_redistribute_layout_convert(state, op, value, attrs):
         source_slot=source_slot,
     )
     if pointer_payload:
-        result_components = (redistributed,)
+        result_components = (redistributed, )
     else:
         result_chunk_type = (state.dsl.simd_type(element_type, lane_width)
                              if result_registers == 1 else state.dsl.simd_type(
@@ -8381,6 +6680,7 @@ def _emit_layout_convert(state, op):
         f"unsupported layout_convert mode {mode}",
         target_op_id=op.target_op_id,
     )
+
 
 def _layout_alias_scalar_slots(
     state,
@@ -8743,24 +7043,12 @@ def _emit_buffer_store(state, op):
     )
     redundant_register_mask = int(attrs.get("redundant_register_mask", 0))
     if redundant_register_mask:
-        canonical_components = tuple(
-            component
-            for component in range(access_component_count)
-            if (component & redundant_register_mask) == 0
-        )
-        value_components = tuple(
-            value_components[component]
-            for component in canonical_components
-        )
-        offset_components = tuple(
-            offset_components[component]
-            for component in canonical_components
-        )
+        canonical_components = tuple(component for component in range(access_component_count)
+                                     if (component & redundant_register_mask) == 0)
+        value_components = tuple(value_components[component] for component in canonical_components)
+        offset_components = tuple(offset_components[component] for component in canonical_components)
         if mask_components is not None:
-            mask_components = tuple(
-                mask_components[component]
-                for component in canonical_components
-            )
+            mask_components = tuple(mask_components[component] for component in canonical_components)
     if has_mask and attrs.get("mask_mode", "exec_where") != "exec_where":
         fail(
             "TLXW_EMIT_UNSUPPORTED_BUFFER_STORE_MASK",
@@ -8802,9 +7090,7 @@ def _emit_buffer_store(state, op):
                         owner_condition,
                         lane_width,
                         op,
-                    )
-                    for component in mask_components
-                )
+                    ) for component in mask_components)
             predicate_conditions = _symbolic_mask_conditions(
                 state,
                 mask_components,
@@ -8882,17 +7168,13 @@ def _buffer_store_owner_condition(state, attrs, lane_width, op):
             masked_wave_id,
             _simd_i32_constant(state, lane_width, 0),
         )
-        owner_condition = (
-            wave_owner
-            if owner_condition is None
-            else _mask_and_predicate(
-                state,
-                owner_condition,
-                wave_owner,
-                lane_width,
-                op,
-            )
-        )
+        owner_condition = (wave_owner if owner_condition is None else _mask_and_predicate(
+            state,
+            owner_condition,
+            wave_owner,
+            lane_width,
+            op,
+        ))
     return owner_condition
 
 
@@ -10192,10 +8474,7 @@ def _mapped_affine_component_binding_value(
                 "affine scalar operands",
                 target_op_id=op.target_op_id,
             )
-        sources = tuple(
-            int(source)
-            for source in scalar_component_sources[int(scalar_index)]
-        )
+        sources = tuple(int(source) for source in scalar_component_sources[int(scalar_index)])
         if len(sources) != int(component_count):
             fail(
                 "TLXW_EMIT_COMPONENT_COUNT",
@@ -10256,9 +8535,7 @@ def _wave_type(dsl, target_type):
     if target_type.representation == "uniform_pointer":
         return dsl.ptr_type(_scalar_type(dsl, target_type.element_type))
     if target_type.representation == "uniform_buffer_pointer":
-        return dsl.buffer_ptr_type(
-            _scalar_type(dsl, target_type.element_type)
-        )
+        return dsl.buffer_ptr_type(_scalar_type(dsl, target_type.element_type))
     if target_type.representation in {"simd", "simd_tuple"}:
         return dsl.simd_type(
             _scalar_type(dsl, target_type.element_type),
@@ -10273,8 +8550,8 @@ def _wave_type(dsl, target_type):
             int(target_type.lane_width or 64),
         )
     if target_type.representation in {
-        "buffer_pointer",
-        "buffer_pointer_tuple",
+            "buffer_pointer",
+            "buffer_pointer_tuple",
     }:
         return dsl.simd_ptr_type(
             _scalar_type(dsl, target_type.element_type),

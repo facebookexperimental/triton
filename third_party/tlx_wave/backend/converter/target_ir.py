@@ -28,10 +28,6 @@ EVENT_DOMAIN_MEMORY_COMPLETION = "memory_completion"
 EVENT_DOMAIN_MEMORY_ISSUE = "memory_issue"
 EVENT_DOMAIN_MEMORY_BARRIER = "memory_barrier"
 EVENT_DOMAIN_BARRIER_ISSUE = "barrier_issue"
-EVENT_DOMAIN_LDS_COMPLETION = "lds_completion"
-EVENT_DOMAIN_LDS_FRONTIER = "lds_frontier"
-EVENT_DOMAIN_LDS_RELEASED = "lds_released"
-EVENT_DOMAIN_WORKGROUP_READY = "workgroup_ready"
 EVENT_DOMAIN_WAVE_LOCAL_READY = "wave_local_ready"
 EVENT_DOMAIN_EMPTY = "empty"
 EVENT_DOMAINS = frozenset({
@@ -42,19 +38,15 @@ EVENT_DOMAINS = frozenset({
     EVENT_DOMAIN_MEMORY_ISSUE,
     EVENT_DOMAIN_MEMORY_BARRIER,
     EVENT_DOMAIN_BARRIER_ISSUE,
-    EVENT_DOMAIN_LDS_COMPLETION,
-    EVENT_DOMAIN_LDS_FRONTIER,
-    EVENT_DOMAIN_LDS_RELEASED,
-    EVENT_DOMAIN_WORKGROUP_READY,
     EVENT_DOMAIN_WAVE_LOCAL_READY,
     EVENT_DOMAIN_EMPTY,
 })
 
 # Target operations that issue real memory instructions and therefore
-# participate in the completion-free ordering frontier around a barrier with
-# an explicit memory-issue-ordering guarantee. High-level transforms and
-# reductions are deliberately absent even when their eventual implementation
-# may use private scratch memory.
+# participate in the explicit ordering frontier around a barrier. LDS reads
+# contribute completion; global memory, LDS writes, and direct-to-LDS DMA
+# contribute issue only. High-level transforms and reductions are deliberately
+# absent even when their eventual implementation may use private scratch memory.
 MEMORY_ISSUER_OP_KINDS = frozenset({
     "buffer_load",
     "buffer_load_to_local",
@@ -195,35 +187,32 @@ class TargetBuilder:
         self.layouts = tuple(layouts)
         self.assumptions = ()
         self.contract = contract or TargetContract()
-        # Conversion-only protocol state.  The final dependency graph is
-        # serialized as ordinary target SSA; these maps merely make that graph
-        # convenient to construct while walking structured source regions.
-        self.protocol_frontiers = {}
 
     @property
     def current_region_id(self):
         return self._region_stack[-1]
 
     def add_value(
-        self,
-        target_type,
-        *,
-        source_value_id=None,
-        debug_name=None,
-        event_domain=None,
-        layout_map_id=None,
-        resource_target_ids=(),
+            self,
+            target_type,
+            *,
+            source_value_id=None,
+            debug_name=None,
+            event_domain=None,
+            layout_map_id=None,
+            resource_target_ids=(),
     ):
         value_id = len(self.values)
-        self.values.append(TargetValue(
-            value_id,
-            target_type,
-            source_value_id,
-            debug_name,
-            event_domain,
-            None if layout_map_id is None else int(layout_map_id),
-            tuple(dict.fromkeys(int(target_id) for target_id in resource_target_ids)),
-        ))
+        self.values.append(
+            TargetValue(
+                value_id,
+                target_type,
+                source_value_id,
+                debug_name,
+                event_domain,
+                None if layout_map_id is None else int(layout_map_id),
+                tuple(dict.fromkeys(int(target_id) for target_id in resource_target_ids)),
+            ))
         if source_value_id is not None:
             self.source_value_targets.setdefault(source_value_id, tuple())
             self.source_value_targets[source_value_id] = (
@@ -260,38 +249,6 @@ class TargetBuilder:
 
     def set_assumptions(self, assumptions):
         self.assumptions = tuple(assumptions)
-
-    def snapshot_protocol_state(self):
-        return {
-            int(source_value_id): tuple(int(target_id) for target_id in target_ids)
-            for source_value_id, target_ids in self.protocol_frontiers.items()
-        }
-
-    def restore_protocol_state(self, snapshot):
-        self.protocol_frontiers = {
-            int(source_value_id): tuple(int(target_id) for target_id in target_ids)
-            for source_value_id, target_ids in snapshot.items()
-        }
-
-    def set_protocol_frontier(self, source_value_id, target_ids):
-        self.protocol_frontiers[int(source_value_id)] = tuple(dict.fromkeys(
-            int(target_id) for target_id in target_ids
-        ))
-
-    def append_protocol_frontier(self, source_value_ids, target_id):
-        target_id = int(target_id)
-        for source_value_id in source_value_ids:
-            source_value_id = int(source_value_id)
-            current = self.protocol_frontiers.get(source_value_id, ())
-            if target_id not in current:
-                self.protocol_frontiers[source_value_id] = (*current, target_id)
-
-    def protocol_frontier_target_ids(self):
-        return tuple(dict.fromkeys(
-            target_id
-            for source_value_id in sorted(self.protocol_frontiers)
-            for target_id in self.protocol_frontiers[source_value_id]
-        ))
 
     def erase_source_value(self, source_value_id, reason):
         self.erased_source_values[source_value_id] = str(reason)
@@ -411,10 +368,7 @@ def target_layout_from_converted(layout):
         None if layout.element_type is None else str(layout.element_type),
         int(layout.component_count),
         int(layout.lane_width),
-        tuple(
-            TargetAttr(str(name), _target_layout_property_value(value))
-            for name, value in layout.properties.items()
-        ),
+        tuple(TargetAttr(str(name), _target_layout_property_value(value)) for name, value in layout.properties.items()),
     )
 
 
@@ -424,29 +378,16 @@ def _target_layout_property_value(value):
     if isinstance(value, (tuple, list)):
         return tuple(_target_layout_property_value(item) for item in value)
     if isinstance(value, dict):
-        return tuple(
-            TargetAttr(str(name), _target_layout_property_value(item))
-            for name, item in value.items()
-        )
+        return tuple(TargetAttr(str(name), _target_layout_property_value(item)) for name, item in value.items())
     get_in_dim_names = getattr(value, "get_in_dim_names", None)
-    if (
-        callable(get_in_dim_names)
-        and hasattr(value, "out_dims")
-        and hasattr(value, "bases")
-    ):
+    if (callable(get_in_dim_names) and hasattr(value, "out_dims") and hasattr(value, "bases")):
         return TargetLinearLayout(
             tuple(str(name) for name in get_in_dim_names()),
             tuple((str(name), int(size)) for name, size in value.out_dims),
-            tuple(
-                (
-                    str(name),
-                    tuple(
-                        tuple(int(component) for component in basis)
-                        for basis in bases
-                    ),
-                )
-                for name, bases in value.bases
-            ),
+            tuple((
+                str(name),
+                tuple(tuple(int(component) for component in basis) for basis in bases),
+            ) for name, bases in value.bases),
         )
     fail(
         "TLXW_TARGET_LAYOUT_SCHEMA",
@@ -461,13 +402,10 @@ def target_assumptions_from_facts(fact_program, source_value_targets):
             int(fact.fact_id),
             str(fact.kind),
             str(fact.predicate),
-            tuple(
-                int(target_id)
-                for target_id in source_value_targets.get(
-                    int(fact.subject_value_id),
-                    (),
-                )
-            ),
+            tuple(int(target_id) for target_id in source_value_targets.get(
+                int(fact.subject_value_id),
+                (),
+            )),
             None if fact.lower is None else int(fact.lower),
             None if fact.upper is None else int(fact.upper),
             None if fact.width is None else int(fact.width),
@@ -476,9 +414,7 @@ def target_assumptions_from_facts(fact_program, source_value_targets):
             None if fact.mask_scope is None else int(fact.mask_scope),
             str(fact.provenance),
             None if fact.source_op_index is None else int(fact.source_op_index),
-        )
-        for fact in fact_program.facts
-    )
+        ) for fact in fact_program.facts)
 
 
 def attrs_dict(op):

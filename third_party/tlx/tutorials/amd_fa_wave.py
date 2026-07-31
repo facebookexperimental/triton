@@ -715,7 +715,6 @@ def _pipeline_phase(
     stride_vn,
     tile,
     current_k_ready,
-    publish_k_ready,
     previous_v_ready,
     PHASE: tl.constexpr,
     q_layout: tl.constexpr,
@@ -758,12 +757,12 @@ def _pipeline_phase(
         True,
     )
     _stage_end()
-    # The dominating wait above supplies V completion.  Carry the next-K issue
-    # token as an additional publication dependency, matching the standalone
-    # kernel's cohort hand-off without imposing a scheduler-side ordering rule.
+    # The wait covers both the current K group and the previous V group.  The
+    # V load consumes that exact completion token; the next-K commit remains
+    # an independent pipeline value.
     value_fragments = _load_value_fragments(
         tlx.local_view(v_buffer, previous_v_slot),
-        publish_k_ready,
+        current_ready,
         v_layout,
     )
     _stage_end()
@@ -863,7 +862,6 @@ def _pipeline(
         stride_vn,
         0,
         k_ready1,
-        k_ready2,
         v_ready0,
         0,
         q_layout,
@@ -887,7 +885,6 @@ def _pipeline(
             stride_vn,
             first_tile,
             k_ready2,
-            k_ready3,
             previous_v_ready,
             1,
             q_layout,
@@ -910,7 +907,6 @@ def _pipeline(
             stride_vn,
             first_tile + 1,
             k_ready3,
-            k_ready0,
             previous_v_ready,
             2,
             q_layout,
@@ -933,7 +929,6 @@ def _pipeline(
             stride_vn,
             first_tile + 2,
             k_ready0,
-            k_ready1,
             previous_v_ready,
             3,
             q_layout,
@@ -956,7 +951,6 @@ def _pipeline(
             stride_vn,
             first_tile + 3,
             k_ready1,
-            k_ready2,
             previous_v_ready,
             0,
             q_layout,
@@ -1000,7 +994,7 @@ def _pipeline(
     _stage_end()
     value_fragments = _load_value_fragments(
         tlx.local_view(v_buffer, tile_nm3 % LDS_STAGES),
-        k_ready3,
+        ready_nm3,
         v_layout,
     )
     _stage_end()
@@ -1044,7 +1038,7 @@ def _pipeline(
     _stage_end()
     value_fragments = _load_value_fragments(
         tlx.local_view(v_buffer, tile_nm2 % LDS_STAGES),
-        k_ready0,
+        ready_nm2,
         v_layout,
     )
     _stage_end()

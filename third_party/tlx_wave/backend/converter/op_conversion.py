@@ -60,19 +60,17 @@ _MMA_PACKET_REPRESENTATIONS = frozenset({
     "simd_packet_tuple",
 })
 
-_LAYOUT_PRESERVING_SIMPLE_OPS = frozenset(
-    (
-        *_BINARY_OPS,
-        *_FLOAT_BINARY_OPS,
-        *_FLOAT_UNARY_OPS,
-        *_FLOAT_CAST_OPS,
-        "arith.cmpi",
-        "arith.maxsi",
-        "arith.minsi",
-        "arith.select",
-        "tt.addptr",
-    )
-)
+_LAYOUT_PRESERVING_SIMPLE_OPS = frozenset((
+    *_BINARY_OPS,
+    *_FLOAT_BINARY_OPS,
+    *_FLOAT_UNARY_OPS,
+    *_FLOAT_CAST_OPS,
+    "arith.cmpi",
+    "arith.maxsi",
+    "arith.minsi",
+    "arith.select",
+    "tt.addptr",
+))
 
 _MMA_PACKET_RESULT_SOURCE_OPS = frozenset({
     "arith.constant",
@@ -156,9 +154,9 @@ class ConversionInput:
     token_groups_by_id: dict[int, object]
     loop_token_carries_by_op: dict[int, tuple[object, ...]]
     if_token_carries_by_op: dict[int, tuple[object, ...]]
-    async_protocol_dependency_value_ids_by_op: dict[int, tuple[int, ...]]
-    wait_publication_barrier_by_op: dict[int, int]
+    implicit_wait_readiness_value_ids_by_op: dict[int, tuple[int, ...]]
     async_issue_dependency_target_ids_by_op: dict[int, tuple[int, ...]]
+    async_wait_entry_dependency_target_ids_by_value_id: dict[int, tuple[int, ...]]
     static_memdesc_byte_offsets: dict[int, int]
     layout_remap_plans: dict[tuple, dict]
     fragment_local_load_plans: dict[tuple, dict]
@@ -181,10 +179,7 @@ def convert_ops(
     )
     builder = target_ir.TargetBuilder(
         conversion_input.kernel,
-        layouts=tuple(
-            target_ir.target_layout_from_converted(layout)
-            for layout in type_layout_program.layouts
-        ),
+        layouts=tuple(target_ir.target_layout_from_converted(layout) for layout in type_layout_program.layouts),
         contract=contract,
     )
     _seed_kernel_arguments(builder, conversion_input, type_layout_program)
@@ -203,12 +198,10 @@ def convert_ops(
         allow_yield=False,
     )
 
-    builder.set_assumptions(
-        target_ir.target_assumptions_from_facts(
-            fact_program,
-            builder.source_value_targets,
-        )
-    )
+    builder.set_assumptions(target_ir.target_assumptions_from_facts(
+        fact_program,
+        builder.source_value_targets,
+    ))
     return builder.build()
 
 
@@ -247,11 +240,6 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
         memdesc_index_slot_stride_bytes,
         constant_ints,
     )
-    async_protocol_dependencies = (token_program.async_protocol_dependency_value_ids_by_op)
-    wait_publication_barriers = _wait_publication_barrier_by_op(
-        source_program,
-        async_protocol_dependencies,
-    )
     kernel = target_ir.TargetKernel(
         source_program.kernel.name,
         source_program.kernel.target,
@@ -289,52 +277,14 @@ def _build_conversion_input(source_program, type_layout_program, fact_program, t
          for group in token_program.groups},
         token_program.loop_token_carries_by_op,
         token_program.if_token_carries_by_op,
-        async_protocol_dependencies,
-        wait_publication_barriers,
+        token_program.implicit_wait_readiness_value_ids_by_op,
+        {},
         {},
         static_memdesc_byte_offsets,
         {},
         {},
         {},
     )
-
-
-def _wait_publication_barrier_by_op(
-    source_program,
-    async_protocol_dependencies,
-):
-    """Find a source CTA barrier immediately following an explicit wait.
-
-    AMD membar materializes this pair as ``async_wait; ttg.barrier local``.
-    The bridge's workgroup wait-ready operation already lowers to the same
-    physical barrier, so preserving both would duplicate the rendezvous.  The
-    relation is purely structural: it does not inspect DMA destinations,
-    allocation identity, or memory aliases.
-    """
-    result = {}
-    for region in source_program.regions:
-        for wait_op_index, barrier_op_index in zip(
-                region.op_indices,
-                region.op_indices[1:],
-        ):
-            wait_op = source_program.ops[int(wait_op_index)]
-            barrier_op = source_program.ops[int(barrier_op_index)]
-            if wait_op.name != "ttg.async_wait":
-                continue
-            wait_result = None if not wait_op.results else int(wait_op.results[0])
-            has_local_consumer = (wait_result is not None
-                                  and any(wait_result in tuple(int(value_id)
-                                                               for value_id in value_ids)
-                                          for value_ids in async_protocol_dependencies.values()))
-            has_release_dependencies = bool(async_protocol_dependencies.get(int(wait_op.index), ()))
-            if (int(source_program.kernel.num_warps or 1) <= 1 or not (has_local_consumer or has_release_dependencies)):
-                continue
-            if barrier_op.name == "rocdl.s.barrier":
-                result[int(wait_op.index)] = int(barrier_op.index)
-                continue
-            if (barrier_op.name == "ttg.barrier" and int(barrier_op.attrs.get("addrSpace", -1)) == 1):
-                result[int(wait_op.index)] = int(barrier_op.index)
-    return result
 
 
 def _convert_region(
@@ -667,12 +617,12 @@ def _protocol_token_type():
 
 
 def _declare_protocol_token(
-    builder,
-    *,
-    event_domain,
-    debug_name,
-    source_value_id=None,
-    resource_target_ids=(),
+        builder,
+        *,
+        event_domain,
+        debug_name,
+        source_value_id=None,
+        resource_target_ids=(),
 ):
     target_id = builder.add_value(
         _protocol_token_type(),
@@ -682,42 +632,6 @@ def _declare_protocol_token(
         resource_target_ids=resource_target_ids,
     )
     return target_id
-
-
-def _join_protocol_tokens(
-    builder,
-    target_ids,
-    op,
-    *,
-    debug_name,
-    event_domain=target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-):
-    target_ids = tuple(dict.fromkeys(int(target_id) for target_id in target_ids))
-    result_id = _declare_protocol_token(
-        builder,
-        event_domain=(target_ir.EVENT_DOMAIN_EMPTY if not target_ids else event_domain),
-        debug_name=debug_name,
-        resource_target_ids=_resource_target_ids(builder, target_ids),
-    )
-    if target_ids:
-        builder.add_op(
-            "token_join",
-            operands=target_ids,
-            results=(result_id, ),
-            attrs={
-                "event_domain": str(event_domain),
-                "input_count": len(target_ids),
-            },
-            source_op_index=op.index,
-        )
-    else:
-        builder.add_op(
-            "token",
-            results=(result_id, ),
-            attrs={"event_domain": target_ir.EVENT_DOMAIN_EMPTY},
-            source_op_index=op.index,
-        )
-    return result_id
 
 
 def _operand_target_ids(builder, op):
@@ -746,18 +660,38 @@ def _operand_target_ids(builder, op):
 
 def _resource_target_ids(builder, target_value_ids):
     return tuple(
-        dict.fromkeys(
-            resource_target_id
-            for target_value_id in target_value_ids
-            for resource_target_id in builder.values[int(target_value_id)].resource_target_ids
-        )
-    )
+        dict.fromkeys(resource_target_id for target_value_id in target_value_ids
+                      for resource_target_id in builder.values[int(target_value_id)].resource_target_ids))
 
 
 def _set_result_resource_targets(builder, result_target_ids, operand_target_ids):
     resources = _resource_target_ids(builder, operand_target_ids)
     for result_target_id in result_target_ids:
         builder.set_value_resource_targets(result_target_id, resources)
+
+
+def _propagate_structural_event_domain(
+    builder,
+    destination_target_ids,
+    source_target_ids,
+    op,
+    description,
+):
+    domains = tuple(
+        dict.fromkeys(builder.values[int(target_id)].event_domain
+                      for target_id in source_target_ids
+                      if builder.values[int(target_id)].event_domain is not None))
+    if len(domains) > 1:
+        fail(
+            "TLXW_OP_STRUCTURAL_TOKEN_DOMAIN_MISMATCH",
+            STAGE,
+            f"{description} has incompatible explicit token domains {domains}",
+            source_op_index=op.index,
+        )
+    if not domains:
+        return
+    for target_id in destination_target_ids:
+        builder.set_value_event_domain(target_id, domains[0])
 
 
 def _converter_for_op(op_name):
@@ -1169,13 +1103,11 @@ def _convert_make_range(
         "start": _int_attr(op.attrs, "start"),
         "end": _int_attr(op.attrs, "end"),
     }
-    attrs.update(
-        _make_range_coordinate_attrs(
-            conversion_input,
-            type_layout_program,
-            op,
-        )
-    )
+    attrs.update(_make_range_coordinate_attrs(
+        conversion_input,
+        type_layout_program,
+        op,
+    ))
     builder.add_op(
         "make_range",
         results=result_target_ids,
@@ -1477,14 +1409,9 @@ def _convert_join(builder, conversion_input, type_layout_program, op):
             "tt.join requires two operands and one result",
             source_op_index=op.index,
         )
-    operands = tuple(
-        type_layout_program.values[value_id] for value_id in op.operands
-    )
+    operands = tuple(type_layout_program.values[value_id] for value_id in op.operands)
     result = type_layout_program.values[op.results[0]]
-    operand_layouts = tuple(
-        _require_layout(type_layout_program, operand.layout_map_id, op)
-        for operand in operands
-    )
+    operand_layouts = tuple(_require_layout(type_layout_program, operand.layout_map_id, op) for operand in operands)
     result_layout = _require_layout(
         type_layout_program,
         result.layout_map_id,
@@ -1522,18 +1449,13 @@ def _convert_split(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
         )
     operand = type_layout_program.values[op.operands[0]]
-    results = tuple(
-        type_layout_program.values[value_id] for value_id in op.results
-    )
+    results = tuple(type_layout_program.values[value_id] for value_id in op.results)
     operand_layout = _require_layout(
         type_layout_program,
         operand.layout_map_id,
         op,
     )
-    result_layouts = tuple(
-        _require_layout(type_layout_program, result.layout_map_id, op)
-        for result in results
-    )
+    result_layouts = tuple(_require_layout(type_layout_program, result.layout_map_id, op) for result in results)
     attrs = layout_remap.structural_split_plan(
         operand,
         results,
@@ -1924,7 +1846,6 @@ def _convert_if(
             source_op_index=op.index,
         )
     token_carries = conversion_input.if_token_carries_by_op.get(op.index, ())
-    outer_protocol_state = builder.snapshot_protocol_state()
     condition_targets = _operand_target_ids(builder, op)
     data_result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -1940,7 +1861,6 @@ def _convert_if(
     result_target_ids = (*data_result_target_ids, *token_result_target_ids)
     then_region_id = builder.add_region()
     else_region_id = builder.add_region()
-    builder.restore_protocol_state(outer_protocol_state)
     with builder.insertion_region(then_region_id):
         then_yields = _convert_region(
             builder,
@@ -1950,8 +1870,6 @@ def _convert_if(
             op.region_ids[0],
             allow_yield=True,
         )
-    then_protocol_state = builder.snapshot_protocol_state()
-    builder.restore_protocol_state(outer_protocol_state)
     with builder.insertion_region(else_region_id):
         else_yields = _convert_region(
             builder,
@@ -1961,7 +1879,6 @@ def _convert_if(
             op.region_ids[1],
             allow_yield=True,
         )
-    else_protocol_state = builder.snapshot_protocol_state()
     if (len(then_yields) != len(data_result_target_ids) or len(else_yields) != len(data_result_target_ids)):
         fail(
             "TLXW_OP_IF_YIELD_MISMATCH",
@@ -2015,47 +1932,20 @@ def _convert_if(
                           if builder.values[int(target_id)].event_domain not in {None, target_ir.EVENT_DOMAIN_EMPTY}))
         if len(branch_domains) == 1:
             builder.set_value_event_domain(result_target_id, branch_domains[0])
-    protocol_carry_specs = _if_protocol_carry_specs(
-        token_carries,
-        outer_protocol_state,
-        then_protocol_state,
-        else_protocol_state,
-    )
-    protocol_result_target_ids = tuple(
-        _declare_protocol_token(
+    then_data_target_ids = tuple(_single_source_target(builder, source_value_id, op) for source_value_id in then_yields)
+    else_data_target_ids = tuple(_single_source_target(builder, source_value_id, op) for source_value_id in else_yields)
+    for result_target_id, then_target_id, else_target_id in zip(
+            data_result_target_ids,
+            then_data_target_ids,
+            else_data_target_ids,
+    ):
+        _propagate_structural_event_domain(
             builder,
-            event_domain=target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-            debug_name=f"if_lds_frontier_result_{op.index}_{index}",
-        ) for index, (_keys, then_target_ids, else_target_ids) in enumerate(protocol_carry_specs))
-    with builder.insertion_region(then_region_id):
-        then_protocol_yields = tuple(
-            _join_protocol_tokens(
-                builder,
-                then_target_ids,
-                op,
-                debug_name=f"if_then_lds_frontier_{op.index}_{index}",
-            ) for index, (_keys, then_target_ids, _else_target_ids) in enumerate(protocol_carry_specs))
-    with builder.insertion_region(else_region_id):
-        else_protocol_yields = tuple(
-            _join_protocol_tokens(
-                builder,
-                else_target_ids,
-                op,
-                debug_name=f"if_else_lds_frontier_{op.index}_{index}",
-            ) for index, (_keys, _then_target_ids, else_target_ids) in enumerate(protocol_carry_specs))
-    then_data_target_ids = tuple(
-        _single_source_target(builder, source_value_id, op)
-        for source_value_id in then_yields
-    )
-    else_data_target_ids = tuple(
-        _single_source_target(builder, source_value_id, op)
-        for source_value_id in else_yields
-    )
-    for result_target_id, then_target_id, else_target_id in zip(
-        data_result_target_ids,
-        then_data_target_ids,
-        else_data_target_ids,
-    ):
+            (result_target_id, ),
+            (then_target_id, else_target_id),
+            op,
+            "scf.if result",
+        )
         builder.set_value_resource_targets(
             result_target_id,
             _resource_target_ids(
@@ -2064,21 +1954,9 @@ def _convert_if(
             ),
         )
     for result_target_id, then_target_id, else_target_id in zip(
-        token_result_target_ids,
-        then_token_yields,
-        else_token_yields,
-    ):
-        builder.set_value_resource_targets(
-            result_target_id,
-            _resource_target_ids(
-                builder,
-                (then_target_id, else_target_id),
-            ),
-        )
-    for result_target_id, then_target_id, else_target_id in zip(
-        protocol_result_target_ids,
-        then_protocol_yields,
-        else_protocol_yields,
+            token_result_target_ids,
+            then_token_yields,
+            else_token_yields,
     ):
         builder.set_value_resource_targets(
             result_target_id,
@@ -2089,23 +1967,18 @@ def _convert_if(
         )
     builder.set_region_yields(
         then_region_id,
-        (*then_data_target_ids, *then_token_yields, *then_protocol_yields),
+        (*then_data_target_ids, *then_token_yields),
     )
     builder.set_region_yields(
         else_region_id,
-        (*else_data_target_ids, *else_token_yields, *else_protocol_yields),
+        (*else_data_target_ids, *else_token_yields),
     )
     data_result_packet_registers = tuple(
         _mma_packet_registers(type_layout_program, type_layout_program.values[source_value_id], op)
         if type_layout_program.values[source_value_id].type.representation in _MMA_PACKET_REPRESENTATIONS else 0
         for source_value_id in op.results)
     result_packet_registers = ((*data_result_packet_registers,
-                                *((0, ) * (len(token_carries) + len(protocol_result_target_ids))))
-                               if data_result_packet_registers else ())
-    result_target_ids = (
-        *result_target_ids,
-        *protocol_result_target_ids,
-    )
+                                *((0, ) * len(token_carries))) if data_result_packet_registers else ())
     builder.add_op(
         "if",
         operands=condition_targets,
@@ -2113,16 +1986,6 @@ def _convert_if(
         attrs={
             "result_packet_registers":
             result_packet_registers,
-            "protocol_frontier_result_count":
-            len(protocol_result_target_ids),
-            "protocol_frontier_key_mappings":
-            tuple((
-                tuple(int(key) for key in keys),
-                int(result_target_id),
-            ) for (keys, _then_ids, _else_ids), result_target_id in zip(
-                protocol_carry_specs,
-                protocol_result_target_ids,
-            )),
             "token_carry_target_mappings":
             tuple((
                 -1 if carry.then_source_value_id is None else _single_source_target(
@@ -2152,74 +2015,6 @@ def _convert_if(
               for source_value_id in (carry.then_source_value_id, carry.else_source_value_id)
               if source_value_id is not None),
     )
-    builder.restore_protocol_state(outer_protocol_state)
-    for (
-            keys,
-            _then_target_ids,
-            _else_target_ids,
-    ), protocol_result_target_id in zip(
-            protocol_carry_specs,
-            protocol_result_target_ids,
-    ):
-        for key in keys:
-            builder.set_protocol_frontier(key, (protocol_result_target_id, ))
-
-
-def _if_protocol_carry_specs(
-    token_carries,
-    outer_state,
-    then_state,
-    else_state,
-):
-    keys = set(outer_state) | set(then_state) | set(else_state)
-    parent = {int(key): int(key) for key in keys}
-
-    def find(key):
-        key = int(key)
-        parent.setdefault(key, key)
-        while parent[key] != key:
-            parent[key] = parent[parent[key]]
-            key = parent[key]
-        return key
-
-    def union(lhs, rhs):
-        lhs_root = find(lhs)
-        rhs_root = find(rhs)
-        if lhs_root != rhs_root:
-            parent[max(lhs_root, rhs_root)] = min(lhs_root, rhs_root)
-
-    for carry in token_carries:
-        source_ids = tuple(
-            int(source_value_id) for source_value_id in (
-                carry.then_source_value_id,
-                carry.else_source_value_id,
-            ) if source_value_id is not None)
-        keys.update(source_ids)
-        for source_value_id in source_ids:
-            parent.setdefault(source_value_id, source_value_id)
-        if len(source_ids) == 2:
-            union(*source_ids)
-
-    key_groups = {}
-    for key in sorted(keys):
-        key_groups.setdefault(find(key), []).append(int(key))
-
-    specs = []
-    for group_keys in key_groups.values():
-        then_target_ids = tuple(
-            dict.fromkeys(target_id for key in group_keys for target_id in then_state.get(int(key), ())))
-        else_target_ids = tuple(
-            dict.fromkeys(target_id for key in group_keys for target_id in else_state.get(int(key), ())))
-        if then_target_ids == else_target_ids:
-            continue
-        if not then_target_ids and not else_target_ids:
-            continue
-        specs.append((
-            tuple(sorted(int(key) for key in group_keys)),
-            then_target_ids,
-            else_target_ids,
-        ))
-    return tuple(specs)
 
 
 def _if_token_yield_target_id(
@@ -2297,13 +2092,6 @@ def _convert_for(
     explicit_warp_pipeline_protocol = ("rocdl.sched.barrier" in source_region_op_names
                                        and "rocdl.s.setprio" in source_region_op_names)
     token_carries = conversion_input.loop_token_carries_by_op.get(op.index, ())
-    outer_protocol_state = builder.snapshot_protocol_state()
-    protocol_carry_specs = _loop_protocol_carry_specs(
-        conversion_input,
-        op,
-        token_carries,
-        outer_protocol_state,
-    )
     source_loop_operands = _operand_target_ids(builder, op)
     token_init_target_ids = tuple(
         _loop_token_init_target_id(
@@ -2312,22 +2100,9 @@ def _convert_for(
             op,
             carry,
         ) for carry in token_carries)
-    protocol_init_target_ids = tuple(
-        _join_protocol_tokens(
-            builder,
-            init_target_ids,
-            op,
-            debug_name=f"loop_lds_frontier_init_{op.index}_{index}",
-        ) for index, (
-            _keys,
-            _init_key,
-            _yield_key,
-            init_target_ids,
-        ) in enumerate(protocol_carry_specs))
     loop_operands = (
         *source_loop_operands,
         *token_init_target_ids,
-        *protocol_init_target_ids,
     )
     result_target_ids, result_layout_map_ids = _declare_results(
         builder,
@@ -2342,21 +2117,9 @@ def _convert_for(
             debug_name=f"loop_token_result_{op.index}_{index}",
             event_domain=_loop_token_carry_event_domain(builder, carry),
         ) for index, carry in enumerate(token_carries))
-    protocol_result_target_ids = tuple(
-        _declare_protocol_token(
-            builder,
-            event_domain=target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-            debug_name=f"loop_lds_frontier_result_{op.index}_{index}",
-        ) for index, (
-            _keys,
-            _init_key,
-            _yield_key,
-            init_target_ids,
-        ) in enumerate(protocol_carry_specs))
     result_target_ids = (
         *data_result_target_ids,
         *token_result_target_ids,
-        *protocol_result_target_ids,
     )
     block_arg_target_ids = tuple(
         builder.add_value(
@@ -2373,41 +2136,21 @@ def _convert_for(
             debug_name=f"loop_token_arg_{op.index}_{index}",
             event_domain=_loop_token_carry_event_domain(builder, carry),
         ) for index, carry in enumerate(token_carries))
-    protocol_block_arg_target_ids = tuple(
-        _declare_protocol_token(
-            builder,
-            event_domain=target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-            debug_name=f"loop_lds_frontier_arg_{op.index}_{index}",
-        ) for index, (
-            _keys,
-            _init_key,
-            _yield_key,
-            init_target_ids,
-        ) in enumerate(protocol_carry_specs))
     block_arg_target_ids = (
         *data_block_arg_target_ids,
         *token_block_arg_target_ids,
-        *protocol_block_arg_target_ids,
     )
     for block_arg_target_id, init_target_id in zip(
-        data_block_arg_target_ids[1:],
-        source_loop_operands[3:],
+            data_block_arg_target_ids[1:],
+            source_loop_operands[3:],
     ):
         builder.set_value_resource_targets(
             block_arg_target_id,
             builder.values[int(init_target_id)].resource_target_ids,
         )
     for block_arg_target_id, init_target_id in zip(
-        token_block_arg_target_ids,
-        token_init_target_ids,
-    ):
-        builder.set_value_resource_targets(
-            block_arg_target_id,
-            builder.values[int(init_target_id)].resource_target_ids,
-        )
-    for block_arg_target_id, init_target_id in zip(
-        protocol_block_arg_target_ids,
-        protocol_init_target_ids,
+            token_block_arg_target_ids,
+            token_init_target_ids,
     ):
         builder.set_value_resource_targets(
             block_arg_target_id,
@@ -2431,6 +2174,24 @@ def _convert_for(
             **conversion_input.async_issue_dependency_target_ids_by_op,
             **issue_dependencies,
         },
+        async_wait_entry_dependency_target_ids_by_value_id={
+            **(conversion_input.async_wait_entry_dependency_target_ids_by_value_id),
+            **{
+                int(carry.init_source_value_id):
+                tuple(
+                    dict.fromkeys((
+                        *(conversion_input.async_wait_entry_dependency_target_ids_by_value_id.get(
+                            int(carry.init_source_value_id),
+                            (),
+                        )),
+                        int(init_target_id),
+                    )))
+                for carry, init_target_id in zip(
+                    token_carries,
+                    token_init_target_ids,
+                ) if (carry.init_source_value_id is not None and not carry.readiness_carry)
+            },
+        },
     )
     saved_token_targets = _replace_source_targets(
         builder,
@@ -2439,28 +2200,6 @@ def _convert_for(
             token_block_arg_target_ids,
         ) if carry.init_source_value_id is not None),
     )
-    builder.restore_protocol_state(outer_protocol_state)
-    for (
-            keys,
-            init_key,
-            _yield_key,
-            _init_target_ids,
-    ), protocol_block_arg_target_id in zip(
-            protocol_carry_specs,
-            protocol_block_arg_target_ids,
-    ):
-        builder.set_protocol_frontier(
-            init_key,
-            (protocol_block_arg_target_id, ),
-        )
-        for key in keys:
-            if int(key) in outer_protocol_state:
-                builder.set_protocol_frontier(
-                    key,
-                    (protocol_block_arg_target_id, ),
-                )
-            elif key != init_key:
-                builder.protocol_frontiers.pop(int(key), None)
     with builder.insertion_region(target_region_id):
         try:
             if induction_fact_ids:
@@ -2481,7 +2220,6 @@ def _convert_for(
             )
         finally:
             _restore_source_targets(builder, saved_token_targets)
-    body_protocol_state = builder.snapshot_protocol_state()
     if len(yielded_source_values) != data_init_arg_count:
         fail(
             "TLXW_OP_FOR_YIELD_MISMATCH",
@@ -2506,24 +2244,19 @@ def _convert_for(
                 op,
                 carry,
             ) for carry in token_carries)
-        yielded_protocol_target_ids = tuple(
-            _join_protocol_tokens(
-                builder,
-                body_protocol_state.get(int(yield_key), ()),
-                op,
-                debug_name=f"loop_lds_frontier_yield_{op.index}_{index}",
-            ) for index, (
-                _keys,
-                _init_key,
-                yield_key,
-                _init_target_ids,
-            ) in enumerate(protocol_carry_specs))
     for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
-        data_result_target_ids,
-        data_block_arg_target_ids[1:],
-        source_loop_operands[3:],
-        yielded_target_ids,
+            data_result_target_ids,
+            data_block_arg_target_ids[1:],
+            source_loop_operands[3:],
+            yielded_target_ids,
     ):
+        _propagate_structural_event_domain(
+            builder,
+            (block_arg_target_id, result_target_id),
+            (init_target_id, yield_target_id),
+            op,
+            "scf.for iter_arg",
+        )
         resources = _resource_target_ids(
             builder,
             (init_target_id, yield_target_id),
@@ -2531,22 +2264,10 @@ def _convert_for(
         builder.set_value_resource_targets(block_arg_target_id, resources)
         builder.set_value_resource_targets(result_target_id, resources)
     for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
-        token_result_target_ids,
-        token_block_arg_target_ids,
-        token_init_target_ids,
-        yielded_token_target_ids,
-    ):
-        resources = _resource_target_ids(
-            builder,
-            (init_target_id, yield_target_id),
-        )
-        builder.set_value_resource_targets(block_arg_target_id, resources)
-        builder.set_value_resource_targets(result_target_id, resources)
-    for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
-        protocol_result_target_ids,
-        protocol_block_arg_target_ids,
-        protocol_init_target_ids,
-        yielded_protocol_target_ids,
+            token_result_target_ids,
+            token_block_arg_target_ids,
+            token_init_target_ids,
+            yielded_token_target_ids,
     ):
         resources = _resource_target_ids(
             builder,
@@ -2559,7 +2280,6 @@ def _convert_for(
         (
             *yielded_target_ids,
             *yielded_token_target_ids,
-            *yielded_protocol_target_ids,
         ),
     )
     builder.add_op(
@@ -2567,32 +2287,9 @@ def _convert_for(
         operands=loop_operands,
         results=result_target_ids,
         attrs={
-            "init_arg_count": (
-                data_init_arg_count
-                + len(token_carries)
-                + len(protocol_carry_specs)
-            ),
-            "protocol_frontier_init_arg_indices":
-            tuple(data_init_arg_count + len(token_carries) + index for index in range(len(protocol_carry_specs))),
-            "protocol_frontier_key_mappings":
-            tuple((
-                tuple(int(key) for key in keys),
-                int(block_arg_target_id),
-                int(result_target_id),
-            ) for (
-                keys,
-                _init_key,
-                _yield_key,
-                _init_target_ids,
-            ), block_arg_target_id, result_target_id in zip(
-                protocol_carry_specs,
-                protocol_block_arg_target_ids,
-                protocol_result_target_ids,
-            )),
-            "source_result_count":
-            data_init_arg_count,
-            "explicit_warp_pipeline_protocol":
-            explicit_warp_pipeline_protocol,
+            "init_arg_count": data_init_arg_count + len(token_carries),
+            "source_result_count": data_init_arg_count,
+            "explicit_warp_pipeline_protocol": explicit_warp_pipeline_protocol,
         },
         layout_map_ids=result_layout_map_ids,
         region_ids=(target_region_id, ),
@@ -2605,18 +2302,6 @@ def _convert_for(
             token_result_target_ids,
         ) if carry.yield_source_value_id is not None),
     )
-    builder.restore_protocol_state(outer_protocol_state)
-    for (
-            keys,
-            _init_key,
-            _yield_key,
-            _init_target_ids,
-    ), protocol_result_target_id in zip(
-            protocol_carry_specs,
-            protocol_result_target_ids,
-    ):
-        for key in keys:
-            builder.set_protocol_frontier(key, (protocol_result_target_id, ))
 
 
 def _loop_token_init_target_id(builder, type_layout_program, op, carry):
@@ -2673,6 +2358,8 @@ def _loop_token_carry_type_source_value_id(carry):
 
 
 def _loop_token_carry_event_domain(builder, carry):
+    if carry.readiness_carry:
+        return target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY
     for source_value_id in (
             carry.init_source_value_id,
             carry.yield_source_value_id,
@@ -2695,92 +2382,6 @@ def _loop_token_carry_issue_dependencies(token_carries, token_block_arg_target_i
     ) if carry.add_issue_dependency)
 
 
-def _loop_protocol_carry_specs(
-    conversion_input,
-    op,
-    token_carries,
-    outer_protocol_state,
-):
-    specs = []
-    covered_keys = set()
-    for carry in token_carries:
-        if not carry.readiness_carry:
-            continue
-        init_key = carry.init_source_value_id
-        yield_key = carry.yield_source_value_id
-        if init_key is None and yield_key is None:
-            continue
-        init_key = int(yield_key if init_key is None else init_key)
-        yield_key = int(init_key if yield_key is None else yield_key)
-        keys = tuple(sorted({init_key, yield_key}))
-        covered_keys.update(keys)
-        specs.append((
-            keys,
-            init_key,
-            yield_key,
-            tuple(outer_protocol_state.get(init_key, ())),
-        ))
-
-    body_dependency_keys = _region_async_protocol_dependency_keys(
-        conversion_input,
-        op.region_ids[0],
-    )
-    body_wait_keys = tuple(
-        int(result_value_id) for op_index in sorted(_region_op_indices_recursive(
-            conversion_input,
-            op.region_ids[0],
-        )) for source_op in (conversion_input.ops[int(op_index)], ) if source_op.name == "ttg.async_wait"
-        for result_value_id in source_op.results[:1] if int(result_value_id) in body_dependency_keys)
-    outer_frontier_keys = tuple(
-        int(key)
-        for key, target_ids in sorted(outer_protocol_state.items())
-        if target_ids and int(key) not in covered_keys)
-    uncovered_body_wait_keys = tuple(key for key in body_wait_keys if key not in covered_keys)
-    if outer_frontier_keys and uncovered_body_wait_keys:
-        # One collective LDS frontier is sufficient even when a staged loop
-        # rotates several logical wait epochs.  All DMA packets consume the
-        # same frontier, and the body yields the join of the epoch(s) produced
-        # on that path.
-        keys = tuple(sorted({
-            *outer_frontier_keys,
-            *uncovered_body_wait_keys,
-        }))
-        specs.append((
-            keys,
-            outer_frontier_keys[0],
-            uncovered_body_wait_keys[-1],
-            tuple(
-                dict.fromkeys(target_id for key in outer_frontier_keys
-                              for target_id in outer_protocol_state.get(key, ()))),
-        ))
-        covered_keys.update(keys)
-    for key in sorted(set(outer_protocol_state).intersection(body_dependency_keys)):
-        key = int(key)
-        if key in covered_keys:
-            continue
-        specs.append((
-            (key, ),
-            key,
-            key,
-            tuple(outer_protocol_state.get(key, ())),
-        ))
-    return tuple(specs)
-
-
-def _region_async_protocol_dependency_keys(conversion_input, region_id):
-    keys = set()
-    for op_index in conversion_input.regions[int(region_id)].op_indices:
-        keys.update(
-            int(source_value_id)
-            for source_value_id in (conversion_input.async_protocol_dependency_value_ids_by_op.get(int(op_index), ())))
-        for child_region_id in conversion_input.ops[int(op_index)].region_ids:
-            keys.update(_region_async_protocol_dependency_keys(
-                conversion_input,
-                child_region_id,
-            ))
-    return frozenset(keys)
-
-
 def _loop_async_issue_dependencies(token_carries, token_block_arg_target_ids):
     dependencies_by_op = {}
     for carry, token_block_arg_target_id in zip(token_carries, token_block_arg_target_ids):
@@ -2791,15 +2392,6 @@ def _loop_async_issue_dependencies(token_carries, token_block_arg_target_ids):
                 int(token_block_arg_target_id),
             )
     return dependencies_by_op
-
-
-def _region_op_indices_recursive(conversion_input, region_id):
-    result = []
-    for op_index in conversion_input.regions[region_id].op_indices:
-        result.append(op_index)
-        for child_region_id in conversion_input.ops[op_index].region_ids:
-            result.extend(_region_op_indices_recursive(conversion_input, child_region_id))
-    return frozenset(result)
 
 
 def _replace_source_targets(builder, replacements):
@@ -2840,7 +2432,7 @@ def _convert_local_alloc(
     for result_target_id in result_target_ids:
         builder.set_value_resource_targets(
             result_target_id,
-            (result_target_id,),
+            (result_target_id, ),
         )
     memdesc = _memdesc_info(conversion_input, op.results[0], op)
     shape = tuple(memdesc.shape or memdesc.alloc_shape)
@@ -3095,8 +2687,7 @@ def _convert_buffer_load_to_local(
     async_group_ids = tuple(
         int(group.group_id)
         for group in conversion_input.token_groups_by_id.values()
-        if token_node.value_id in group.member_token_ids
-    )
+        if token_node.value_id in group.member_token_ids)
     if len(async_group_ids) > 1:
         fail(
             "TLXW_OP_BUFFER_ASYNC_GROUP",
@@ -3125,9 +2716,7 @@ def _convert_buffer_load_to_local(
             source_value_id=fields["offset_value_id"],
         )
     component_count = int(offsets.type.component_count)
-    lane_width = int(
-        offsets.type.lane_width or conversion_input.threads_per_warp
-    )
+    lane_width = int(offsets.type.lane_width or conversion_input.threads_per_warp)
     has_mask = fields["mask_value_id"] is not None
     mask_component_count = 0
     if has_mask:
@@ -3176,13 +2765,10 @@ def _convert_buffer_load_to_local(
         )
 
     source_issue_dependency_target_ids = tuple(
-        dict.fromkeys(
-            conversion_input.async_issue_dependency_target_ids_by_op.get(
-                op.index,
-                (),
-            )
-        )
-    )
+        dict.fromkeys(conversion_input.async_issue_dependency_target_ids_by_op.get(
+            op.index,
+            (),
+        )))
     destination_target_id = _single_source_target(
         builder,
         fields["memdesc_value_id"],
@@ -3191,7 +2777,7 @@ def _convert_buffer_load_to_local(
     _set_result_resource_targets(
         builder,
         result_target_ids,
-        (destination_target_id,),
+        (destination_target_id, ),
     )
     base_target_id = _single_source_target(
         builder,
@@ -3205,13 +2791,11 @@ def _convert_buffer_load_to_local(
     )
     operands = [destination_target_id, base_target_id, offset_target_id]
     if has_mask:
-        operands.append(
-            _single_source_target(
-                builder,
-                fields["mask_value_id"],
-                op,
-            )
-        )
+        operands.append(_single_source_target(
+            builder,
+            fields["mask_value_id"],
+            op,
+        ))
     operands.extend(source_issue_dependency_target_ids)
     builder.add_op(
         "buffer_load_to_local",
@@ -3226,18 +2810,16 @@ def _convert_buffer_load_to_local(
             "element_type": memdesc.element_type,
             "has_mask": has_mask,
             "has_stride_operand": fields["stride_value_id"] is not None,
-            "issue_dependency_count":
-            len(source_issue_dependency_target_ids),
+            "issue_dependency_count": len(source_issue_dependency_target_ids),
             "lane_width": lane_width,
             "mask_component_count": mask_component_count,
             "mask_mode": "exec_where" if has_mask else "none",
             "mode": "symbolic_copy",
             "range_bytes": int(range_fact.upper),
-            "source_issue_dependency_count":
-            len(source_issue_dependency_target_ids),
+            "source_issue_dependency_count": len(source_issue_dependency_target_ids),
         },
-        fact_ids=(range_fact.fact_id,),
-        fact_target_ids=(base_target_id,),
+        fact_ids=(range_fact.fact_id, ),
+        fact_target_ids=(base_target_id, ),
         layout_map_ids=result_layout_map_ids,
         source_op_index=op.index,
     )
@@ -3250,14 +2832,12 @@ def _local_component_store_plan_attrs(destination_plan):
         "destination_coordinate_shape":
         tuple(int(dim) for dim in destination_plan["coordinate_shape"]),
         "destination_component_coordinate_bases":
-        tuple(tuple(int(value) for value in bases)
-              for bases in destination_plan["component_coordinate_bases"]),
+        tuple(tuple(int(value) for value in bases) for bases in destination_plan["component_coordinate_bases"]),
         "destination_workitem_coordinate_coefficients":
         tuple(
-            tuple(int(value) for value in coefficients)
-            for coefficients in destination_plan[
-                "workitem_coordinate_coefficients"
-            ]),
+            tuple(int(value)
+                  for value in coefficients)
+            for coefficients in destination_plan["workitem_coordinate_coefficients"]),
         **destination_plan["shared_layout_attrs"],
     }
 
@@ -4017,30 +3597,6 @@ def _convert_store(builder, conversion_input, type_layout_program, op):
     )
 
 
-def _declare_lds_completion(
-    builder,
-    op,
-    dominating_wait_value_ids,
-    resource_target_ids,
-):
-    if not dominating_wait_value_ids:
-        return ()
-    completion_target_id = _declare_protocol_token(
-        builder,
-        event_domain=target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-        debug_name=f"lds_completion_{op.index}",
-        resource_target_ids=_resource_target_ids(
-            builder,
-            resource_target_ids,
-        ),
-    )
-    builder.append_protocol_frontier(
-        dominating_wait_value_ids,
-        completion_target_id,
-    )
-    return (completion_target_id, )
-
-
 def _convert_local_load(builder, conversion_input, type_layout_program, op):
     if len(op.operands) not in {1, 2} or len(op.results) != 1:
         fail(
@@ -4063,22 +3619,18 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
             source_value_id=token_value_id,
         )
-    target_operands = [_single_source_target(builder, memdesc_value_id, op)]
-    if token_value_id is not None:
-        target_operands.append(_single_source_target(builder, token_value_id, op))
-    dominating_wait_value_ids = (conversion_input.async_protocol_dependency_value_ids_by_op.get(
-        op.index,
-        (),
-    ))
-    readiness_target_ids = tuple(
+    dependency_source_value_ids = ((token_value_id, ) if token_value_id is not None else
+                                   conversion_input.implicit_wait_readiness_value_ids_by_op.get(
+                                       op.index,
+                                       (),
+                                   ))
+    dependency_target_ids = tuple(
         dict.fromkeys(
-            _single_source_target(builder, source_value_id, op) for source_value_id in dominating_wait_value_ids))
-    target_operands.extend(readiness_target_ids)
-    target_operands = tuple(dict.fromkeys(target_operands))
-    # A dominating wait is a structural dependency for every following DS
-    # read, but it does not by itself make an ordinary local load "relaxed".
-    # Only the source load's explicit protocol marker permits the emitter to
-    # bypass synchronous LDS access state (for example a preceding local_store).
+            _single_source_target(builder, source_value_id, op) for source_value_id in dependency_source_value_ids))
+    target_operands = (
+        _single_source_target(builder, memdesc_value_id, op),
+        *dependency_target_ids,
+    )
     synced_via_async_wait = bool(token_value_id is not None or _attr_bool(op.attrs.get("ttg.amdg.syncedViaAsyncWait")))
     if result_layout is None:
         fail(
@@ -4094,12 +3646,6 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
             op,
             type_layout_program,
         )
-        completion_target_ids = _declare_lds_completion(
-            builder,
-            op,
-            dominating_wait_value_ids,
-            target_operands[:1],
-        )
         attrs = _local_tensor_access_attrs(
             conversion_input,
             type_layout_program,
@@ -4109,16 +3655,15 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
             op,
         )
         attrs["synced_via_async_wait"] = synced_via_async_wait
-        attrs["readiness_dependency_count"] = len(readiness_target_ids)
-        attrs["protocol_tracked"] = bool(completion_target_ids)
+        attrs["explicit_dependency_count"] = len(dependency_target_ids)
         attrs["data_result_count"] = len(result_target_ids)
-        attrs["completion_result_count"] = len(completion_target_ids)
+        attrs["completion_result_count"] = 0
         attrs.update(_local_load_result_value_attrs(attrs, result))
         attrs.update(_local_load_mma_packet_result_value_attrs(type_layout_program, result, op))
         builder.add_op(
             "local_load",
             operands=target_operands,
-            results=(*result_target_ids, *completion_target_ids),
+            results=result_target_ids,
             attrs=attrs,
             layout_map_ids=result_layout_map_ids,
             source_op_index=op.index,
@@ -4133,12 +3678,6 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
         op,
         type_layout_program,
     )
-    completion_target_ids = _declare_lds_completion(
-        builder,
-        op,
-        dominating_wait_value_ids,
-        target_operands[:1],
-    )
     load_plan = _fragment_local_load_plan(
         conversion_input,
         type_layout_program,
@@ -4151,7 +3690,7 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
     builder.add_op(
         "local_load_mma_payload",
         operands=target_operands,
-        results=(*result_target_ids, *completion_target_ids),
+        results=result_target_ids,
         attrs={
             "columns": int(fragment_columns),
             "component_count": int(result.type.component_count),
@@ -4161,10 +3700,9 @@ def _convert_local_load(builder, conversion_input, type_layout_program, op):
             "role": int(result_layout.properties["op_idx"]),
             "rows": int(fragment_rows),
             "synced_via_async_wait": synced_via_async_wait,
-            "readiness_dependency_count": len(readiness_target_ids),
-            "protocol_tracked": bool(completion_target_ids),
+            "explicit_dependency_count": len(dependency_target_ids),
             "data_result_count": len(result_target_ids),
-            "completion_result_count": len(completion_target_ids),
+            "completion_result_count": 0,
             **load_plan,
         },
         layout_map_ids=result_layout_map_ids,
@@ -4197,20 +3735,7 @@ def _convert_local_store(builder, conversion_input, type_layout_program, op):
             source_op_index=op.index,
             source_value_id=value_id,
         )
-    dominating_wait_value_ids = (conversion_input.async_protocol_dependency_value_ids_by_op.get(
-        op.index,
-        (),
-    ))
-    readiness_target_ids = tuple(
-        dict.fromkeys(
-            _single_source_target(builder, source_value_id, op) for source_value_id in dominating_wait_value_ids))
     memdesc_target_id = _single_source_target(builder, memdesc_value_id, op)
-    completion_target_ids = _declare_lds_completion(
-        builder,
-        op,
-        dominating_wait_value_ids,
-        (memdesc_target_id,),
-    )
     attrs = _local_tensor_access_attrs(
         conversion_input,
         type_layout_program,
@@ -4219,18 +3744,15 @@ def _convert_local_store(builder, conversion_input, type_layout_program, op):
         "ttg.local_store value",
         op,
     )
-    attrs["readiness_dependency_count"] = len(readiness_target_ids)
-    attrs["protocol_tracked"] = bool(completion_target_ids)
+    attrs["explicit_dependency_count"] = 0
     attrs["data_result_count"] = 0
-    attrs["completion_result_count"] = len(completion_target_ids)
+    attrs["completion_result_count"] = 0
     builder.add_op(
         "local_store",
         operands=(
             _single_source_target(builder, value_id, op),
             memdesc_target_id,
-            *readiness_target_ids,
         ),
-        results=completion_target_ids,
         attrs=attrs,
         source_op_index=op.index,
     )
@@ -4939,37 +4461,29 @@ def _convert_async_wait(
             source_op_index=op.index,
         )
     result_target_ids, _ = _declare_results(builder, op, type_layout_program)
-    wait_source_value_id = None if not op.results else int(op.results[0])
-    if node.input_token_ids:
-        wait_token_ids = node.input_token_ids
-    else:
-        wait_token_ids = _implicit_wait_token_ids(conversion_input, node, op)
-    group_operand_ids = tuple(
-        dict.fromkeys(_single_source_target(builder, token_value_id, op) for token_value_id in wait_token_ids))
-    release_value_ids = (conversion_input.async_protocol_dependency_value_ids_by_op.get(
-        op.index,
-        (),
-    ))
-    live_release_value_ids = tuple(
-        int(source_value_id)
-        for source_value_id, target_ids in sorted(builder.protocol_frontiers.items())
-        if target_ids)
-    release_value_ids = tuple(dict.fromkeys((
-        *release_value_ids,
-        *live_release_value_ids,
-    )))
-    release_operand_ids = tuple(
-        dict.fromkeys(target_id for source_value_id in release_value_ids
-                      for target_id in builder.protocol_frontiers.get(int(source_value_id), ())))
     retained_group_operand_ids = tuple(
         dict.fromkeys(
             _single_source_target(
                 builder,
                 conversion_input.token_groups_by_id[group_id].token_value_id,
                 op,
-            )
-            for group_id in node.retained_group_ids
-            if conversion_input.token_groups_by_id[group_id].token_value_id is not None))
+            ) for group_id in node.retained_group_ids if
+            (conversion_input.token_groups_by_id[group_id].token_value_id is not None and _implicit_group_is_reachable(
+                conversion_input,
+                conversion_input.token_groups_by_id[group_id],
+                op,
+            ))))
+    wait_token_ids = (node.input_token_ids if node.input_token_ids else _implicit_wait_token_ids(
+        conversion_input, node, op))
+    group_operand_ids = tuple(target_id for target_id in dict.fromkeys(
+        _single_source_target(builder, token_value_id, op) for token_value_id in wait_token_ids)
+                              if target_id not in retained_group_operand_ids)
+    entry_group_operand_ids = tuple(target_id for target_id in dict.fromkeys(
+        target_id for token_value_id in wait_token_ids
+        for target_id in (conversion_input.async_wait_entry_dependency_target_ids_by_value_id.get(
+            int(token_value_id),
+            (),
+        ))) if (target_id not in group_operand_ids and target_id not in retained_group_operand_ids))
     retained_issue_operand_ids = ()
     if retained_group_operand_ids:
         retained_issue_target_id = _declare_protocol_token(
@@ -4994,123 +4508,58 @@ def _convert_async_wait(
             source_op_index=op.index,
         )
         retained_issue_operand_ids = (retained_issue_target_id, )
-    publication_mode = _async_wait_publication_mode(
-        conversion_input,
-        wait_source_value_id,
-        bool(release_operand_ids),
-    )
-    coalesced_source_barrier_op_index = (int(conversion_input.wait_publication_barrier_by_op[op.index]) if
-                                         (publication_mode == "workgroup"
-                                          and op.index in conversion_input.wait_publication_barrier_by_op) else -1)
-    ready_domain = (target_ir.EVENT_DOMAIN_WORKGROUP_READY
-                    if publication_mode == "workgroup" else target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY)
     for result_target_id in result_target_ids:
-        builder.set_value_event_domain(result_target_id, ready_domain)
+        builder.set_value_event_domain(
+            result_target_id,
+            target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
+        )
         builder.set_value_resource_targets(
             result_target_id,
-            _resource_target_ids(builder, group_operand_ids),
+            _resource_target_ids(
+                builder,
+                (*group_operand_ids, *entry_group_operand_ids),
+            ),
         )
-    operands = (
-        *group_operand_ids,
-        *retained_issue_operand_ids,
-        *release_operand_ids,
-    )
     builder.add_op(
         "async_wait",
-        operands=operands,
+        operands=(
+            *group_operand_ids,
+            *entry_group_operand_ids,
+            *retained_issue_operand_ids,
+        ),
         results=result_target_ids,
         attrs={
-            "wait_group":
-            -1 if node.wait_group is None else int(node.wait_group),
-            "waited_group_ids":
-            tuple(int(group_id) for group_id in node.waited_group_ids),
-            "retained_group_ids":
-            tuple(int(group_id) for group_id in node.retained_group_ids),
-            "completed_group_dependency_count":
-            len(group_operand_ids),
-            "retained_issue_dependency_count":
-            len(retained_issue_operand_ids),
-            "lds_release_dependency_count":
-            len(release_operand_ids),
-            "publication_mode":
-            publication_mode,
-            "publication_provenance":
-            ("amd_membar_compatibility" if publication_mode == "workgroup" else "single_wave_ownership"),
-            "coalesced_source_barrier_op_index": (coalesced_source_barrier_op_index),
+            "wait_group": -1 if node.wait_group is None else int(node.wait_group),
+            "waited_group_ids": tuple(int(group_id) for group_id in node.waited_group_ids),
+            "retained_group_ids": tuple(int(group_id) for group_id in node.retained_group_ids),
+            "completed_group_dependency_count": len(group_operand_ids) + len(entry_group_operand_ids),
+            "retained_issue_dependency_count": len(retained_issue_operand_ids),
         },
         source_op_index=op.index,
     )
-    for release_value_id in release_value_ids:
-        builder.protocol_frontiers.pop(int(release_value_id), None)
-    if wait_source_value_id is not None:
-        builder.set_protocol_frontier(wait_source_value_id, ())
-
-
-def _async_wait_publication_mode(
-    conversion_input,
-    wait_source_value_id,
-    has_release_dependencies,
-):
-    wait_has_local_consumer = (wait_source_value_id is not None and any(
-        int(wait_source_value_id) in tuple(int(value_id)
-                                           for value_id in value_ids)
-        for value_ids in conversion_input.async_protocol_dependency_value_ids_by_op.values()))
-    if (conversion_input.num_warps > 1 and (wait_has_local_consumer or has_release_dependencies)):
-        return "workgroup"
-    return "wave_local"
 
 
 def _implicit_wait_token_ids(conversion_input, node, op):
-    if int(node.wait_group or 0) > 0 and _waited_tokens_cross_if_merge(
-            conversion_input,
-            node,
-    ):
-        # The source token graph is linearized across sibling regions.  A
-        # partial implicit wait needs a path-sensitive queue length to decide
-        # which branch-local groups remain live; treating neutral branch tokens
-        # as real queue entries would wait the wrong group.  Full drains are
-        # path independent and are merged structurally by _convert_if.
-        fail(
-            "TLXW_OP_UNSUPPORTED_IF_TOKENS",
-            STAGE,
-            "a partial implicit async wait after scf.if requires "
-            "path-sensitive branch queue lengths",
-            source_op_index=op.index,
-        )
     wait_token_ids = []
     for group_id in node.waited_group_ids:
         group = conversion_input.token_groups_by_id[group_id]
         if group.token_value_id is None:
             continue
-        if (_source_token_crosses_if_branch_path(
-                conversion_input,
-                group.commit_op_index,
-                op.index,
-        ) and not _source_token_has_if_merge(conversion_input, group.token_value_id)):
-            fail(
-                "TLXW_OP_UNSUPPORTED_IF_TOKENS",
-                STAGE,
-                "implicit ttg.async_wait cannot wait an async group from a "
-                "different scf.if branch path",
-                source_op_index=op.index,
-            )
+        if not _implicit_group_is_reachable(conversion_input, group, op):
+            continue
         wait_token_ids.append(group.token_value_id)
     return tuple(wait_token_ids)
 
 
-def _waited_tokens_cross_if_merge(conversion_input, node):
-    waited_token_ids = {
-        conversion_input.token_groups_by_id[group_id].token_value_id
-        for group_id in node.waited_group_ids
-    }
-    return any(source_value_id in waited_token_ids
-               for carries in conversion_input.if_token_carries_by_op.values()
-               for carry in carries
-               for source_value_id in (
-                   carry.then_source_value_id,
-                   carry.else_source_value_id,
-               )
-               if source_value_id is not None)
+def _implicit_group_is_reachable(conversion_input, group, op):
+    return (not _source_token_crosses_if_branch_path(
+        conversion_input,
+        group.commit_op_index,
+        op.index,
+    ) or _source_token_has_if_merge(
+        conversion_input,
+        group.token_value_id,
+    ))
 
 
 def _source_token_has_if_merge(conversion_input, source_value_id):
@@ -5137,8 +4586,7 @@ def _convert_reduce(builder, conversion_input, type_layout_program, op):
         )
     operand = type_layout_program.values[op.operands[0]]
     result = type_layout_program.values[op.results[0]]
-    if operand.type.representation not in (
-            _MMA_PACKET_REPRESENTATIONS | {"simd", "simd_tuple"}):
+    if operand.type.representation not in (_MMA_PACKET_REPRESENTATIONS | {"simd", "simd_tuple"}):
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
@@ -5269,8 +4717,7 @@ def _reduction_combiner(conversion_input, op):
 
 
 def _require_slice_reduction_layouts(operand_layout, result_layout, axis, op):
-    if (result_layout.kind != "slice"
-            or result_layout.properties.get("parent_kind") != operand_layout.kind):
+    if (result_layout.kind != "slice" or result_layout.properties.get("parent_kind") != operand_layout.kind):
         fail(
             "TLXW_OP_REDUCTION",
             STAGE,
@@ -5734,48 +5181,29 @@ def _convert_barrier(builder, conversion_input, op):
             f"{op.name} must not have operands or results",
             source_op_index=op.index,
         )
-    if int(op.index) in {
-            int(barrier_op_index)
-            for barrier_op_index in conversion_input.wait_publication_barrier_by_op.values()
-    }:
-        return
-    dependency_target_ids = builder.protocol_frontier_target_ids()
-    result_target_ids = ()
-    if dependency_target_ids:
-        result_target_ids = (_declare_protocol_token(
-            builder,
-            event_domain=target_ir.EVENT_DOMAIN_LDS_RELEASED,
-            debug_name=f"barrier_lds_release_{op.index}",
-            resource_target_ids=_resource_target_ids(
-                builder,
-                dependency_target_ids,
-            ),
-        ), )
+    readiness_target_ids = tuple(
+        dict.fromkeys(
+            _single_source_target(builder, source_value_id, op)
+            for source_value_id in conversion_input.implicit_wait_readiness_value_ids_by_op.get(
+                op.index,
+                (),
+            )))
     attrs = {
-        "address_space": int(op.attrs.get("addrSpace", 0)),
-        "dependency_count": len(dependency_target_ids),
-        "orders_memory_issue": bool(
-            int(op.attrs.get("addrSpace", 0)) == 31
-            or op.attrs.get("tlx.orders_memory_issue", False)
-        ),
+        "address_space":
+        int(op.attrs.get("addrSpace", 0)),
+        "dependency_count":
+        len(readiness_target_ids),
+        "orders_memory_issue":
+        bool(int(op.attrs.get("addrSpace", 0)) == 31 or op.attrs.get("tlx.orders_memory_issue", False)),
     }
     if bool(op.attrs.get("tlx.compiler_membar_barrier", False)):
         attrs["compiler_membar_barrier"] = True
     builder.add_op(
         "barrier",
-        operands=dependency_target_ids,
-        results=result_target_ids,
+        operands=readiness_target_ids,
         attrs=attrs,
         source_op_index=op.index,
     )
-    if not result_target_ids:
-        return
-    for source_value_id, target_ids in tuple(builder.protocol_frontiers.items()):
-        if target_ids:
-            builder.set_protocol_frontier(
-                source_value_id,
-                result_target_ids,
-            )
 
 
 def _convert_cond_barrier(builder, op):
@@ -6018,11 +5446,11 @@ def _memdesc_infos(source_program):
 
 
 def _compute_memdesc_view_infos(
-    source_values,
-    ops,
-    kernel_arg_ids,
-    memdescs,
-    regions=(),
+        source_values,
+        ops,
+        kernel_arg_ids,
+        memdescs,
+        regions=(),
 ):
     result = {}
     for_yield_edges = {}
@@ -6046,8 +5474,7 @@ def _compute_memdesc_view_infos(
         )
 
     def same_view_geometry(lhs, rhs):
-        return (lhs is not None and rhs is not None
-                and lhs.logical_origin == rhs.logical_origin
+        return (lhs is not None and rhs is not None and lhs.logical_origin == rhs.logical_origin
                 and lhs.physical_shape == rhs.physical_shape)
 
     def require_same_memdesc_type(lhs_id, rhs_id, op, description):
@@ -6062,10 +5489,7 @@ def _compute_memdesc_view_infos(
             "memory_space",
             "mutable",
         )
-        mismatches = tuple(
-            field for field in fields
-            if getattr(lhs, field) != getattr(rhs, field)
-        )
+        mismatches = tuple(field for field in fields if getattr(lhs, field) != getattr(rhs, field))
         if mismatches:
             fail(
                 "TLXW_OP_MEMDESC_FOR_CARRY",
@@ -6085,8 +5509,7 @@ def _compute_memdesc_view_infos(
                 source_op_index=op.index,
             )
         region = regions[int(op.region_ids[0])]
-        if (len(op.operands) < 3
-                or len(op.results) != len(op.operands) - 3
+        if (len(op.operands) < 3 or len(op.results) != len(op.operands) - 3
                 or len(region.block_arg_ids) != 1 + len(op.results)):
             fail(
                 "TLXW_OP_MEMDESC_FOR_CARRY",
@@ -6149,9 +5572,7 @@ def _compute_memdesc_view_infos(
                 init_id = int(op.operands[3 + index])
                 block_arg_id = int(region.block_arg_ids[1 + index])
                 yielded_id = int(yield_op.operands[index])
-                if (init_id not in memdescs
-                        or block_arg_id not in memdescs
-                        or yielded_id not in memdescs):
+                if (init_id not in memdescs or block_arg_id not in memdescs or yielded_id not in memdescs):
                     fail(
                         "TLXW_OP_MEMDESC_FOR_CARRY",
                         STAGE,
@@ -6715,10 +6136,7 @@ def _indexed_memdesc_parent_allocation_bytes(
                     int(child_slot_stride_bytes),
                 )
             return _align_to(
-                max(
-                    int(offset) + terminal_slot_bytes
-                    for offset in slot_offsets
-                ),
+                max(int(offset) + terminal_slot_bytes for offset in slot_offsets),
                 16,
             )
     if child_slot_stride_bytes is not None:
@@ -8257,29 +7675,26 @@ def _noncontiguous_mma_payload_gather_plan(
     )
     return {
         **attrs,
-        "component_coordinate_bases": tuple(
-            tuple(int(value) for value in base)
-            for base in plan.component_bases
-        ),
-        "coordinate_shape": tuple(int(dim) for dim in plan.shape),
-        "elements_per_lane": int(packet_width),
-        "load_mode": "symbolic_mma_payload_load",
-        "memdesc_shape": tuple(int(dim) for dim in memdesc.shape),
-        "memdesc_logical_origin": tuple(
-            int(value) for value in view.logical_origin
-        ),
-        "memdesc_physical_shape": tuple(
-            int(dim) for dim in view.physical_shape
-        ),
-        "slot_coordinate_coefficients": tuple(
-            tuple(int(value) for value in basis)
-            for basis in plan.slot_coefficients
-        ),
-        "source_shape": tuple(int(dim) for dim in plan.shape),
-        "workitem_coordinate_coefficients": tuple(
-            tuple(int(value) for value in basis)
-            for basis in plan.workitem_coefficients
-        ),
+        "component_coordinate_bases":
+        tuple(tuple(int(value) for value in base) for base in plan.component_bases),
+        "coordinate_shape":
+        tuple(int(dim) for dim in plan.shape),
+        "elements_per_lane":
+        int(packet_width),
+        "load_mode":
+        "symbolic_mma_payload_load",
+        "memdesc_shape":
+        tuple(int(dim) for dim in memdesc.shape),
+        "memdesc_logical_origin":
+        tuple(int(value) for value in view.logical_origin),
+        "memdesc_physical_shape":
+        tuple(int(dim) for dim in view.physical_shape),
+        "slot_coordinate_coefficients":
+        tuple(tuple(int(value) for value in basis) for basis in plan.slot_coefficients),
+        "source_shape":
+        tuple(int(dim) for dim in plan.shape),
+        "workitem_coordinate_coefficients":
+        tuple(tuple(int(value) for value in basis) for basis in plan.workitem_coefficients),
     }
 
 

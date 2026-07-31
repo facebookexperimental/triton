@@ -91,12 +91,8 @@ def _verify_target_layouts(target_program):
             )
         property_names = set()
         for prop in layout.properties:
-            if (
-                not isinstance(prop, target_ir.TargetAttr)
-                or not prop.name
-                or prop.name in property_names
-                or not _is_layout_schema_value(prop.value)
-            ):
+            if (not isinstance(prop, target_ir.TargetAttr) or not prop.name or prop.name in property_names
+                    or not _is_layout_schema_value(prop.value)):
                 fail(
                     "TLXW_VERIFY_LAYOUT_SCHEMA",
                     STAGE,
@@ -132,9 +128,7 @@ def _verify_target_assumptions(target_program):
                 "to a predicate and target value",
                 fact_id=assumption.assumption_id,
             )
-        if len(set(assumption.subject_target_ids)) != len(
-            assumption.subject_target_ids
-        ):
+        if len(set(assumption.subject_target_ids)) != len(assumption.subject_target_ids):
             fail(
                 "TLXW_VERIFY_ASSUMPTION_SCHEMA",
                 STAGE,
@@ -158,11 +152,8 @@ def _verify_target_assumptions(target_program):
                 f"target assumption {assumption.assumption_id} has no bounds",
                 fact_id=assumption.assumption_id,
             )
-        if (
-            assumption.lower is not None
-            and assumption.upper is not None
-            and int(assumption.lower) > int(assumption.upper)
-        ):
+        if (assumption.lower is not None and assumption.upper is not None
+                and int(assumption.lower) > int(assumption.upper)):
             fail(
                 "TLXW_VERIFY_ASSUMPTION_SCHEMA",
                 STAGE,
@@ -203,10 +194,7 @@ def _verify_target_value_ids(target_program):
 
 
 def _verify_target_value_types(target_program):
-    layouts = {
-        layout.layout_map_id: layout
-        for layout in target_program.layouts
-    }
+    layouts = {layout.layout_map_id: layout for layout in target_program.layouts}
     for value in target_program.values:
         representation = str(value.type.representation)
         resources = tuple(int(target_id) for target_id in value.resource_target_ids)
@@ -286,10 +274,7 @@ def _verify_target_value_types(target_program):
                     f"layout {value.layout_map_id}",
                     target_value_id=value.target_value_id,
                 )
-            if (
-                value.type.lane_width is not None
-                and int(value.type.lane_width) != int(layout.lane_width)
-            ):
+            if (value.type.lane_width is not None and int(value.type.lane_width) != int(layout.lane_width)):
                 fail(
                     "TLXW_VERIFY_LAYOUT_TYPE",
                     STAGE,
@@ -302,14 +287,8 @@ def _verify_target_value_types(target_program):
 def _verify_ops(target_program, source_program):
     value_count = len(target_program.values)
     op_count = len(target_program.ops)
-    facts_by_id = {
-        assumption.assumption_id: assumption
-        for assumption in target_program.assumptions
-    }
-    layout_ids = frozenset(
-        layout.layout_map_id
-        for layout in target_program.layouts
-    )
+    facts_by_id = {assumption.assumption_id: assumption for assumption in target_program.assumptions}
+    layout_ids = frozenset(layout.layout_map_id for layout in target_program.layouts)
     for expected_id, op in enumerate(target_program.ops):
         if op.target_op_id != expected_id:
             fail(
@@ -351,16 +330,15 @@ def _verify_ops(target_program, source_program):
         if op.kind in target_ir.MEMORY_ISSUER_OP_KINDS:
             _verify_memory_issue_order(op, target_program)
         if op.kind in {
-            "token",
-            "token_join",
-            "issue_token",
-            "barrier",
-            "buffer_load_to_local",
-            "async_commit_group",
-            "async_wait",
-            "local_load",
-            "local_load_mma_payload",
-            "local_store",
+                "token",
+                "issue_token",
+                "barrier",
+                "buffer_load_to_local",
+                "async_commit_group",
+                "async_wait",
+                "local_load",
+                "local_load_mma_payload",
+                "local_store",
         }:
             _verify_async_protocol_op(op, target_program, source_program)
         if op.kind == "affine_materialize":
@@ -426,9 +404,7 @@ def _verify_ops(target_program, source_program):
 
 def _verify_memory_issue_order(op, target_program):
     attrs = _attrs_dict(op)
-    dependency_count = int(
-        attrs.get("barrier_order_dependency_count", 0)
-    )
+    dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
     if dependency_count not in {0, 1} or dependency_count > len(op.operands):
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_SEGMENT",
@@ -436,15 +412,11 @@ def _verify_memory_issue_order(op, target_program):
             "memory operation has a malformed barrier-order operand segment",
             target_op_id=op.target_op_id,
         )
-    barrier_issue_operands = tuple(
-        int(operand) for operand in op.operands[-dependency_count:]
-    ) if dependency_count else ()
+    barrier_issue_operands = tuple(int(operand)
+                                   for operand in op.operands[-dependency_count:]) if dependency_count else ()
     for operand in barrier_issue_operands:
         value = target_program.values[operand]
-        if (
-            value.type.representation != "token"
-            or value.event_domain != target_ir.EVENT_DOMAIN_BARRIER_ISSUE
-        ):
+        if (value.type.representation != "token" or value.event_domain != target_ir.EVENT_DOMAIN_BARRIER_ISSUE):
             fail(
                 "TLXW_VERIFY_BARRIER_ORDER_DOMAIN",
                 STAGE,
@@ -456,16 +428,11 @@ def _verify_memory_issue_order(op, target_program):
         producer = _target_value_producer(target_program, operand)
         _require_precedes_in_same_region(target_program, producer, op)
 
-    ordinary_operands = (
-        op.operands[:-dependency_count]
-        if dependency_count else op.operands
-    )
+    ordinary_operands = (op.operands[:-dependency_count] if dependency_count else op.operands)
     hidden_barrier_operands = tuple(
         int(operand)
         for operand in ordinary_operands
-        if target_program.values[int(operand)].event_domain
-        == target_ir.EVENT_DOMAIN_BARRIER_ISSUE
-    )
+        if target_program.values[int(operand)].event_domain == target_ir.EVENT_DOMAIN_BARRIER_ISSUE)
     if hidden_barrier_operands:
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_SEGMENT",
@@ -494,10 +461,7 @@ def _verify_memory_issue_order(op, target_program):
         return
     result_id = int(op.results[-1])
     result = target_program.values[result_id]
-    if (
-        result.type.representation != "token"
-        or result.event_domain != target_ir.EVENT_DOMAIN_MEMORY_COMPLETION
-    ):
+    if (result.type.representation != "token" or result.event_domain != target_ir.EVENT_DOMAIN_MEMORY_COMPLETION):
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_RESULT",
             STAGE,
@@ -542,10 +506,7 @@ def _verify_issue_projection_structure(op, target_program, projection_domain):
             )
         producer = _target_value_producer(target_program, op.operands[0])
         attrs = _attrs_dict(producer)
-        if (
-            producer.kind != "barrier"
-            or not bool(attrs.get("orders_memory_issue", False))
-        ):
+        if (producer.kind != "barrier" or not bool(attrs.get("orders_memory_issue", False))):
             fail(
                 "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
                 STAGE,
@@ -558,10 +519,7 @@ def _verify_issue_projection_structure(op, target_program, projection_domain):
 
 
 def _target_value_producer(target_program, target_value_id):
-    producers = tuple(
-        op for op in target_program.ops
-        if int(target_value_id) in op.results
-    )
+    producers = tuple(op for op in target_program.ops if int(target_value_id) in op.results)
     if len(producers) != 1:
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
@@ -581,10 +539,7 @@ def _require_precedes_in_same_region(target_program, producer, consumer):
         target_program,
         consumer.target_op_id,
     )
-    if (
-        producer_position[0] != consumer_position[0]
-        or producer_position[1] >= consumer_position[1]
-    ):
+    if (producer_position[0] != consumer_position[0] or producer_position[1] >= consumer_position[1]):
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
             STAGE,
@@ -594,12 +549,10 @@ def _require_precedes_in_same_region(target_program, producer, consumer):
 
 
 def _target_op_region_position(target_program, target_op_id):
-    positions = tuple(
-        (int(region.target_region_id), position)
-        for region in target_program.regions
-        for position, op_id in enumerate(region.op_ids)
-        if int(op_id) == int(target_op_id)
-    )
+    positions = tuple((int(region.target_region_id), position)
+                      for region in target_program.regions
+                      for position, op_id in enumerate(region.op_ids)
+                      if int(op_id) == int(target_op_id))
     if len(positions) != 1:
         fail(
             "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
@@ -608,6 +561,118 @@ def _target_op_region_position(target_program, target_op_id):
             target_op_id=int(target_op_id),
         )
     return positions[0]
+
+
+def _require_value_dominates_op(target_program, target_value_id, consumer):
+    """Verify ordinary structured-SSA availability for a token operand."""
+    target_value_id = int(target_value_id)
+    producers = tuple(op for op in target_program.ops if target_value_id in op.results)
+    block_arg_regions = tuple(region for region in target_program.regions if target_value_id in region.block_arg_ids)
+    if len(producers) + len(block_arg_regions) != 1:
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
+            STAGE,
+            "barrier source-order token must have exactly one target "
+            "producer or block argument",
+            target_op_id=consumer.target_op_id,
+            target_value_id=target_value_id,
+        )
+
+    consumer_region_id, _ = _target_op_region_position(
+        target_program,
+        consumer.target_op_id,
+    )
+    if block_arg_regions:
+        block_arg_region_id = int(block_arg_regions[0].target_region_id)
+        if _region_is_ancestor_of(
+                target_program,
+                block_arg_region_id,
+                consumer_region_id,
+        ):
+            return
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
+            STAGE,
+            "barrier source-order block argument must belong to the "
+            "consumer region or an ancestor",
+            target_op_id=consumer.target_op_id,
+            target_value_id=target_value_id,
+        )
+
+    producer = producers[0]
+    producer_region_id, producer_position = _target_op_region_position(
+        target_program,
+        producer.target_op_id,
+    )
+    if producer_region_id == consumer_region_id:
+        _, consumer_position = _target_op_region_position(
+            target_program,
+            consumer.target_op_id,
+        )
+        if producer_position < consumer_position:
+            return
+    else:
+        containing_op = _containing_op_in_ancestor_region(
+            target_program,
+            consumer_region_id,
+            producer_region_id,
+        )
+        if containing_op is not None:
+            _, containing_position = _target_op_region_position(
+                target_program,
+                containing_op.target_op_id,
+            )
+            if producer_position < containing_position:
+                return
+    fail(
+        "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
+        STAGE,
+        "barrier source-order token must dominate its consumer",
+        target_op_id=consumer.target_op_id,
+        target_value_id=target_value_id,
+    )
+
+
+def _region_is_ancestor_of(target_program, ancestor_region_id, region_id):
+    ancestor_region_id = int(ancestor_region_id)
+    region_id = int(region_id)
+    while True:
+        if region_id == ancestor_region_id:
+            return True
+        parent = _target_region_parent(target_program, region_id)
+        if parent is None:
+            return False
+        _, region_id = parent
+
+
+def _containing_op_in_ancestor_region(
+    target_program,
+    region_id,
+    ancestor_region_id,
+):
+    region_id = int(region_id)
+    ancestor_region_id = int(ancestor_region_id)
+    while region_id != ancestor_region_id:
+        parent = _target_region_parent(target_program, region_id)
+        if parent is None:
+            return None
+        parent_op, parent_region_id = parent
+        if parent_region_id == ancestor_region_id:
+            return parent_op
+        region_id = parent_region_id
+    return None
+
+
+def _target_region_parent(target_program, region_id):
+    parents = tuple((op, parent_region_id) for op in target_program.ops if int(region_id) in op.region_ids
+                    for parent_region_id, _ in ((_target_op_region_position(target_program, op.target_op_id), )))
+    if len(parents) > 1:
+        fail(
+            "TLXW_VERIFY_BARRIER_ORDER_DOMINANCE",
+            STAGE,
+            "target region must have at most one containing operation",
+        )
+    return None if not parents else parents[0]
 
 
 def _verify_async_protocol_op(op, target_program, source_program=None):
@@ -623,10 +688,7 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 target_op_id=op.target_op_id,
                 target_value_id=int(value_id),
             )
-        if (
-            allowed_domains is not None
-            and value.event_domain not in allowed_domains
-        ):
+        if (allowed_domains is not None and value.event_domain not in allowed_domains):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN",
                 STAGE,
@@ -651,13 +713,9 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         )
         return
 
-    if op.kind in {"token_join", "issue_token"}:
+    if op.kind == "issue_token":
         input_count = int(attrs.get("input_count", -1))
-        if (
-            len(op.results) != 1
-            or input_count <= 0
-            or input_count != len(op.operands)
-        ):
+        if (len(op.results) != 1 or input_count <= 0 or input_count != len(op.operands)):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
                 STAGE,
@@ -666,107 +724,82 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             )
         for operand in op.operands:
             require_token(operand, f"{op.kind} operand")
-        expected = {target_ir.EVENT_DOMAIN_LDS_FRONTIER}
-        if op.kind == "issue_token":
-            projection_domain = attrs.get("projection_domain")
-            expected_provenance = {
-                target_ir.EVENT_DOMAIN_DMA_ISSUE:
-                "partial_wait_retained_group",
-                target_ir.EVENT_DOMAIN_MEMORY_ISSUE:
-                "memory_barrier_predecessors",
-                target_ir.EVENT_DOMAIN_BARRIER_ISSUE:
-                "memory_barrier_successors",
-            }.get(projection_domain)
-            if expected_provenance is None:
-                fail(
-                    "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN",
-                    STAGE,
-                    "issue token requires an explicit supported projection domain",
-                    target_op_id=op.target_op_id,
-                )
-            if attrs.get("projection_provenance") != expected_provenance:
-                fail(
-                    "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-                    STAGE,
-                    f"{projection_domain} projection requires provenance "
-                    f"{expected_provenance!r}",
-                    target_op_id=op.target_op_id,
-                )
-            expected = {projection_domain}
-            allowed_input_domains = {
-                target_ir.EVENT_DOMAIN_DMA_ISSUE: {
-                    target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-                    target_ir.EVENT_DOMAIN_DMA_GROUP,
-                    target_ir.EVENT_DOMAIN_EMPTY,
-                    None,
-                },
-                target_ir.EVENT_DOMAIN_MEMORY_ISSUE: {
-                    target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
-                    target_ir.EVENT_DOMAIN_DMA_COMPLETION,
-                    target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-                },
-                target_ir.EVENT_DOMAIN_BARRIER_ISSUE: {
-                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
-                },
-            }[projection_domain]
-            for operand in op.operands:
-                require_token(
-                    operand,
-                    f"{projection_domain} projection operand",
-                    allowed_input_domains,
-                )
-            _verify_issue_projection_structure(
-                op,
-                target_program,
-                projection_domain,
+        projection_domain = attrs.get("projection_domain")
+        expected_provenance = {
+            target_ir.EVENT_DOMAIN_DMA_ISSUE: "partial_wait_retained_group",
+            target_ir.EVENT_DOMAIN_MEMORY_ISSUE: "memory_barrier_predecessors",
+            target_ir.EVENT_DOMAIN_BARRIER_ISSUE: "memory_barrier_successors",
+        }.get(projection_domain)
+        if expected_provenance is None:
+            fail(
+                "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN",
+                STAGE,
+                "issue token requires an explicit supported projection domain",
+                target_op_id=op.target_op_id,
             )
-        else:
-            result_domain = attrs.get("event_domain")
-            if result_domain != target_ir.EVENT_DOMAIN_LDS_FRONTIER:
-                fail(
-                    "TLXW_VERIFY_ASYNC_PROTOCOL_DOMAIN",
-                    STAGE,
-                    "token join requires an explicit LDS-frontier domain",
-                    target_op_id=op.target_op_id,
-                )
-            for operand in op.operands:
-                require_token(
-                    operand,
-                    "LDS-frontier join operand",
-                    {
-                        target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-                        target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-                        target_ir.EVENT_DOMAIN_LDS_RELEASED,
-                        target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
-                        target_ir.EVENT_DOMAIN_EMPTY,
-                    },
-                )
-        require_token(op.results[0], f"{op.kind} result", expected)
+        if attrs.get("projection_provenance") != expected_provenance:
+            fail(
+                "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
+                STAGE,
+                f"{projection_domain} projection requires provenance "
+                f"{expected_provenance!r}",
+                target_op_id=op.target_op_id,
+            )
+        allowed_input_domains = {
+            target_ir.EVENT_DOMAIN_DMA_ISSUE: {
+                target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+                target_ir.EVENT_DOMAIN_DMA_GROUP,
+                target_ir.EVENT_DOMAIN_EMPTY,
+                None,
+            },
+            target_ir.EVENT_DOMAIN_MEMORY_ISSUE: {
+                target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
+                target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+            },
+            target_ir.EVENT_DOMAIN_BARRIER_ISSUE: {
+                target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
+            },
+        }[projection_domain]
+        for operand in op.operands:
+            require_token(
+                operand,
+                f"{projection_domain} projection operand",
+                allowed_input_domains,
+            )
+        _verify_issue_projection_structure(
+            op,
+            target_program,
+            projection_domain,
+        )
+        require_token(
+            op.results[0],
+            "issue token result",
+            {projection_domain},
+        )
         return
 
     if op.kind == "barrier":
         dependency_count = int(attrs.get("dependency_count", -1))
-        issue_dependency_count = int(
-            attrs.get("barrier_order_dependency_count", 0)
-        )
-        if (
-            dependency_count < 0
-            or issue_dependency_count not in {0, 1}
-            or dependency_count + issue_dependency_count != len(op.operands)
-        ):
+        lds_read_dependency_count = int(attrs.get("lds_read_dependency_count", 0))
+        issue_dependency_count = int(attrs.get("barrier_order_dependency_count", 0))
+        if (dependency_count not in {0, 1} or lds_read_dependency_count < 0 or issue_dependency_count not in {0, 1}
+                or dependency_count + lds_read_dependency_count + issue_dependency_count != len(op.operands)):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
                 STAGE,
-                "barrier dependency count does not match its operands",
+                "barrier source-order, LDS-read, and memory-issue segments "
+                "are malformed",
                 target_op_id=op.target_op_id,
             )
-        completion_operands = op.operands[:dependency_count]
-        issue_operands = op.operands[dependency_count:]
+        readiness_operands = op.operands[:dependency_count]
+        lds_read_begin = dependency_count
+        lds_read_end = lds_read_begin + lds_read_dependency_count
+        lds_read_operands = op.operands[lds_read_begin:lds_read_end]
+        issue_operands = op.operands[lds_read_end:]
         orders_memory_issue = bool(attrs.get("orders_memory_issue", False))
-        requires_issue_order = (
-            int(attrs.get("address_space", 0)) == 31
-            or bool(attrs.get("compiler_membar_barrier", False))
-        )
+        lds_completion_result_count = int(attrs.get("lds_completion_result_count", 0))
+        requires_issue_order = (int(attrs.get("address_space", 0)) == 31
+                                or bool(attrs.get("compiler_membar_barrier", False)))
         if requires_issue_order and not orders_memory_issue:
             fail(
                 "TLXW_VERIFY_BARRIER_ORDER_ASSUMPTION",
@@ -778,35 +811,58 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
                 STAGE,
-                "barrier may publish at most one token result",
+                "memory-issue-ordering barrier may expose at most one token",
                 target_op_id=op.target_op_id,
             )
-        if not completion_operands:
-            if op.results and not orders_memory_issue:
-                fail(
-                    "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
-                    STAGE,
-                    "dependency-free barrier must not publish an LDS result",
-                    target_op_id=op.target_op_id,
-                )
-        elif not op.results:
+        if (lds_completion_result_count not in {0, 1} or lds_completion_result_count > len(op.results)):
             fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_SHAPE",
+                "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
                 STAGE,
-                "LDS-dependent barrier requires one publication result",
+                "barrier LDS-completion result segment is malformed",
                 target_op_id=op.target_op_id,
             )
-        for operand in completion_operands:
+        for operand in readiness_operands:
             require_token(
                 operand,
-                "barrier LDS dependency",
+                "barrier source wait-order dependency",
+                {target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY},
+            )
+            _require_value_dominates_op(target_program, operand, op)
+        for operand in lds_read_operands:
+            require_token(
+                operand,
+                "barrier LDS-read completion dependency",
                 {
-                    target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-                    target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-                    target_ir.EVENT_DOMAIN_LDS_RELEASED,
+                    target_ir.EVENT_DOMAIN_MEMORY_COMPLETION,
                     target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
-                    target_ir.EVENT_DOMAIN_EMPTY,
                 },
+            )
+            producers = tuple(producer for producer in target_program.ops if int(operand) in producer.results)
+            block_arg_regions = tuple(region for region in target_program.regions
+                                      if int(operand) in region.block_arg_ids)
+            is_local_read = (len(producers) == 1 and producers[0].kind in {
+                "local_load",
+                "local_load_mma_payload",
+            })
+            is_structured_completion = (len(producers) == 1 and producers[0].kind in {
+                "barrier",
+                "for_loop",
+                "if",
+                "token_join",
+            }) or (not producers and len(block_arg_regions) == 1)
+            if not is_local_read and not is_structured_completion:
+                fail(
+                    "TLXW_VERIFY_BARRIER_ORDER_PROVENANCE",
+                    STAGE,
+                    "barrier LDS-read completion must come from a local load "
+                    "or an explicit structured SSA carry",
+                    target_op_id=op.target_op_id,
+                    target_value_id=int(operand),
+                )
+            _require_value_dominates_op(
+                target_program,
+                operand,
+                op,
             )
         for operand in issue_operands:
             require_token(
@@ -820,14 +876,14 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
             producer = _target_value_producer(target_program, operand)
             _require_precedes_in_same_region(target_program, producer, op)
         if op.results:
-            allowed_result_domains = {target_ir.EVENT_DOMAIN_LDS_RELEASED}
+            allowed_result_domains = set()
             if orders_memory_issue:
-                allowed_result_domains.add(
-                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER
-                )
+                allowed_result_domains.add(target_ir.EVENT_DOMAIN_MEMORY_BARRIER)
+            if lds_completion_result_count:
+                allowed_result_domains.add(target_ir.EVENT_DOMAIN_MEMORY_COMPLETION)
             require_token(
                 op.results[0],
-                "barrier publication result",
+                "barrier memory-order result",
                 allowed_result_domains,
             )
         return
@@ -856,24 +912,16 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
         total_issue_count = int(attrs.get("issue_dependency_count", -1))
         source_count = int(attrs.get("source_issue_dependency_count", -1))
         barrier_count = int(attrs.get("barrier_order_dependency_count", 0))
-        if (
-            min(total_issue_count, source_count) < 0
-            or source_count != total_issue_count
-            or barrier_count not in {0, 1}
-            or total_issue_count + barrier_count > len(op.operands)
-        ):
+        if (min(total_issue_count, source_count) < 0 or source_count != total_issue_count
+                or barrier_count not in {0, 1} or total_issue_count + barrier_count > len(op.operands)):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
                 STAGE,
                 "direct-to-LDS issue segments are malformed",
                 target_op_id=op.target_op_id,
             )
-        dependency_begin = (
-            len(op.operands) - total_issue_count - barrier_count
-        )
-        source_operands = op.operands[
-            dependency_begin:dependency_begin + total_issue_count
-        ]
+        dependency_begin = (len(op.operands) - total_issue_count - barrier_count)
+        source_operands = op.operands[dependency_begin:dependency_begin + total_issue_count]
         for operand in source_operands:
             require_token(
                 operand,
@@ -915,21 +963,15 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
     if op.kind == "async_wait":
         completed_count = int(attrs.get("completed_group_dependency_count", -1))
         retained_count = int(attrs.get("retained_issue_dependency_count", -1))
-        release_count = int(attrs.get("lds_release_dependency_count", -1))
-        if (
-            min(completed_count, retained_count, release_count) < 0
-            or completed_count + retained_count + release_count
-            != len(op.operands)
-        ):
+        if (min(completed_count, retained_count) < 0 or completed_count + retained_count != len(op.operands)):
             fail(
                 "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
                 STAGE,
-                "async wait requires completed, retained-issue, and "
-                "LDS-release operand segments",
+                "async wait requires exact completed and retained-issue "
+                "operand segments",
                 target_op_id=op.target_op_id,
             )
         completed_end = completed_count
-        retained_end = completed_end + retained_count
         for operand in op.operands[:completed_end]:
             require_token(
                 operand,
@@ -941,65 +983,11 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                     None,
                 },
             )
-        for operand in op.operands[completed_end:retained_end]:
+        for operand in op.operands[completed_end:]:
             require_token(
                 operand,
                 "async wait retained issue dependency",
                 {target_ir.EVENT_DOMAIN_DMA_ISSUE},
-            )
-        for operand in op.operands[retained_end:]:
-            require_token(
-                operand,
-                "async wait LDS-release dependency",
-                {
-                    target_ir.EVENT_DOMAIN_LDS_COMPLETION,
-                    target_ir.EVENT_DOMAIN_LDS_FRONTIER,
-                    target_ir.EVENT_DOMAIN_LDS_RELEASED,
-                    target_ir.EVENT_DOMAIN_MEMORY_BARRIER,
-                    target_ir.EVENT_DOMAIN_EMPTY,
-                },
-            )
-        mode = attrs.get("publication_mode")
-        result_domain = {
-            "workgroup": target_ir.EVENT_DOMAIN_WORKGROUP_READY,
-            "wave_local": target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
-        }.get(mode)
-        if result_domain is None:
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_PUBLICATION",
-                STAGE,
-                f"unsupported async wait publication mode {mode!r}",
-                target_op_id=op.target_op_id,
-            )
-        expected_provenance = {
-            "workgroup": "amd_membar_compatibility",
-            "wave_local": "single_wave_ownership",
-        }[mode]
-        if attrs.get("publication_provenance") != expected_provenance:
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-                STAGE,
-                f"async wait {mode} publication requires provenance "
-                f"{expected_provenance!r}",
-                target_op_id=op.target_op_id,
-            )
-        coalesced_barrier_op_index = int(
-            attrs.get("coalesced_source_barrier_op_index", -1)
-        )
-        if coalesced_barrier_op_index < -1:
-            fail(
-                "TLXW_VERIFY_ASYNC_PROTOCOL_PUBLICATION",
-                STAGE,
-                "coalesced source barrier index must be -1 or nonnegative",
-                target_op_id=op.target_op_id,
-            )
-        if coalesced_barrier_op_index >= 0:
-            _verify_coalesced_wait_publication_barrier(
-                op,
-                target_program,
-                source_program,
-                coalesced_barrier_op_index,
-                mode,
             )
         if len(op.results) != 1:
             fail(
@@ -1009,139 +997,53 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                 target_op_id=op.target_op_id,
             )
         for result in op.results:
-            require_token(result, "async wait ready result", {result_domain})
+            require_token(
+                result,
+                "async wait ready result",
+                {target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY},
+            )
         return
 
-    if not bool(attrs.get("protocol_tracked", False)):
+    if op.kind not in {
+            "local_load",
+            "local_load_mma_payload",
+            "local_store",
+    }:
         return
+
+    explicit_count = int(attrs.get("explicit_dependency_count", -1))
     data_count = int(attrs.get("data_result_count", -1))
     completion_count = int(attrs.get("completion_result_count", -1))
-    if (
-        data_count < 0
-        or completion_count != 1
-        or data_count + completion_count != len(op.results)
-    ):
+    barrier_count = int(attrs.get("barrier_order_dependency_count", 0))
+    base_operand_count = 2 if op.kind == "local_store" else 1
+    if (explicit_count not in {0, 1} or data_count < 0 or completion_count not in {0, 1}
+            or data_count + completion_count != len(op.results) or barrier_count not in {0, 1}
+            or base_operand_count + explicit_count + barrier_count != len(op.operands)):
         fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_LOCAL_RESULTS",
+            "TLXW_VERIFY_ASYNC_PROTOCOL_LOCAL_SEGMENTS",
             STAGE,
-            "tracked LDS access requires one explicit completion result",
+            "local access has malformed explicit dependency, barrier-order, "
+            "or result segments",
             target_op_id=op.target_op_id,
         )
-    require_token(
-        op.results[-1],
-        "tracked LDS completion result",
-        {target_ir.EVENT_DOMAIN_LDS_COMPLETION},
-    )
-    readiness_count = int(attrs.get("readiness_dependency_count", -1))
-    barrier_count = int(attrs.get("barrier_order_dependency_count", 0))
-    if (
-        readiness_count <= 0
-        or readiness_count + barrier_count > len(op.operands)
-    ):
+    if op.kind == "local_store" and explicit_count:
         fail(
             "TLXW_VERIFY_ASYNC_PROTOCOL_SEGMENTS",
             STAGE,
-            "tracked LDS access requires an explicit readiness segment",
+            "ttg.local_store has no source token operand",
             target_op_id=op.target_op_id,
         )
-    readiness_end = len(op.operands) - barrier_count
-    readiness_begin = readiness_end - readiness_count
-    for operand in op.operands[readiness_begin:readiness_end]:
+    if explicit_count:
         require_token(
-            operand,
-            "tracked LDS readiness dependency",
-            {
-                target_ir.EVENT_DOMAIN_WORKGROUP_READY,
-                target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY,
-            },
+            op.operands[base_operand_count],
+            "local-load explicit wait dependency",
+            {target_ir.EVENT_DOMAIN_WAVE_LOCAL_READY},
         )
-
-
-def _verify_coalesced_wait_publication_barrier(
-    op,
-    target_program,
-    source_program,
-    barrier_op_index,
-    publication_mode,
-):
-    if publication_mode != "workgroup":
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PUBLICATION",
-            STAGE,
-            "only a workgroup wait-ready point may coalesce a source CTA barrier",
-            target_op_id=op.target_op_id,
-        )
-    if source_program is None or op.source_op_index is None:
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-            STAGE,
-            "coalesced wait publication requires source-program provenance",
-            target_op_id=op.target_op_id,
-        )
-    wait_op_index = int(op.source_op_index)
-    if not (0 <= wait_op_index < len(source_program.ops)):
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-            STAGE,
-            f"async wait source op index {wait_op_index} is out of range",
-            target_op_id=op.target_op_id,
-        )
-    if not (0 <= barrier_op_index < len(source_program.ops)):
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-            STAGE,
-            f"coalesced barrier source op index {barrier_op_index} is out of range",
-            target_op_id=op.target_op_id,
-        )
-    wait_op = source_program.ops[wait_op_index]
-    barrier_op = source_program.ops[barrier_op_index]
-    is_cta_barrier = (
-        barrier_op.name == "rocdl.s.barrier"
-        or (
-            barrier_op.name == "ttg.barrier"
-            and int(barrier_op.attrs.get("addrSpace", -1)) == 1
-        )
-    )
-    if wait_op.name != "ttg.async_wait" or not is_cta_barrier:
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-            STAGE,
-            "coalesced publication must pair ttg.async_wait with a source CTA barrier",
-            target_op_id=op.target_op_id,
-        )
-    if wait_op.parent_region_id != barrier_op.parent_region_id:
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-            STAGE,
-            "coalesced wait and barrier must belong to the same source region",
-            target_op_id=op.target_op_id,
-        )
-    source_region = source_program.regions[int(wait_op.parent_region_id)]
-    try:
-        wait_position = source_region.op_indices.index(wait_op_index)
-    except ValueError:
-        wait_position = -1
-    if (
-        wait_position < 0
-        or wait_position + 1 >= len(source_region.op_indices)
-        or int(source_region.op_indices[wait_position + 1]) != barrier_op_index
-    ):
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PROVENANCE",
-            STAGE,
-            "coalesced source CTA barrier must immediately follow its async wait",
-            target_op_id=op.target_op_id,
-        )
-    if any(
-        candidate.kind == "barrier"
-        and candidate.source_op_index == barrier_op_index
-        for candidate in target_program.ops
-    ):
-        fail(
-            "TLXW_VERIFY_ASYNC_PROTOCOL_PUBLICATION",
-            STAGE,
-            "a coalesced source CTA barrier must not also be emitted separately",
-            target_op_id=op.target_op_id,
+    if completion_count:
+        require_token(
+            op.results[-1],
+            "local access memory-issue completion result",
+            {target_ir.EVENT_DOMAIN_MEMORY_COMPLETION},
         )
 
 
@@ -1258,19 +1160,13 @@ def _verify_provenance_only_target_ids(op, value_count):
             target_op_id=op.target_op_id,
         )
     for target_value_id in value_ids:
-        if (not isinstance(target_value_id, int)
-                or target_value_id < 0
-                or target_value_id >= value_count):
+        if (not isinstance(target_value_id, int) or target_value_id < 0 or target_value_id >= value_count):
             fail(
                 "TLXW_VERIFY_PROVENANCE_TARGETS",
                 STAGE,
                 "target op references an unknown provenance-only value",
                 target_op_id=op.target_op_id,
-                target_value_id=(
-                    target_value_id
-                    if isinstance(target_value_id, int)
-                    else None
-                ),
+                target_value_id=(target_value_id if isinstance(target_value_id, int) else None),
             )
         if int(target_value_id) in op.operands:
             fail(
@@ -1329,13 +1225,8 @@ def _verify_memory_edges(op, target_program):
             "memory operation is missing its typed offset operand",
             target_op_id=op.target_op_id,
         )
-    offset_type = target_program.values[
-        int(op.operands[offset_operand])
-    ].type
-    if (
-        offset_type.element_type not in {"i32", "index"}
-        or offset_type.representation not in {"simd", "simd_tuple"}
-    ):
+    offset_type = target_program.values[int(op.operands[offset_operand])].type
+    if (offset_type.element_type not in {"i32", "index"} or offset_type.representation not in {"simd", "simd_tuple"}):
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
@@ -1353,18 +1244,8 @@ def _verify_memory_edges(op, target_program):
         redundant_lane_mask,
         redundant_wave_mask,
     )
-    if (
-        any(
-            not isinstance(mask, int) or mask < 0
-            for mask in ownership_masks
-        )
-        or (
-            any(ownership_masks)
-            and (
-                op.kind != "buffer_store"
-            )
-        )
-    ):
+    if (any(not isinstance(mask, int) or mask < 0 for mask in ownership_masks)
+            or (any(ownership_masks) and (op.kind != "buffer_store"))):
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
@@ -1372,16 +1253,9 @@ def _verify_memory_edges(op, target_program):
             target_op_id=op.target_op_id,
         )
     wave_count = attrs.get("wave_count")
-    if (
-        redundant_wave_mask
-        and (
-            not isinstance(wave_count, int)
-            or wave_count <= 1
-            or wave_count & (wave_count - 1)
-            or redundant_wave_mask >= wave_count
-            or redundant_wave_mask & ~(wave_count - 1)
-        )
-    ):
+    if (redundant_wave_mask
+            and (not isinstance(wave_count, int) or wave_count <= 1 or wave_count &
+                 (wave_count - 1) or redundant_wave_mask >= wave_count or redundant_wave_mask & ~(wave_count - 1))):
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
@@ -1389,16 +1263,9 @@ def _verify_memory_edges(op, target_program):
             target_op_id=op.target_op_id,
         )
     lane_width = attrs.get("lane_width")
-    if (
-        redundant_lane_mask
-        and (
-            not isinstance(lane_width, int)
-            or lane_width <= 1
-            or lane_width & (lane_width - 1)
-            or redundant_lane_mask >= lane_width
-            or redundant_lane_mask & ~(lane_width - 1)
-        )
-    ):
+    if (redundant_lane_mask
+            and (not isinstance(lane_width, int) or lane_width <= 1 or lane_width &
+                 (lane_width - 1) or redundant_lane_mask >= lane_width or redundant_lane_mask & ~(lane_width - 1))):
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
@@ -1406,15 +1273,9 @@ def _verify_memory_edges(op, target_program):
             target_op_id=op.target_op_id,
         )
     access_component_count = attrs.get("access_component_count")
-    if (
-        redundant_register_mask
-        and (
-            op.kind != "buffer_store"
-            or not isinstance(access_component_count, int)
-            or access_component_count <= 1
-            or redundant_register_mask >= access_component_count
-        )
-    ):
+    if (redundant_register_mask
+            and (op.kind != "buffer_store" or not isinstance(access_component_count, int) or access_component_count <= 1
+                 or redundant_register_mask >= access_component_count)):
         fail(
             "TLXW_VERIFY_MEMORY_EDGE",
             STAGE,
@@ -1439,10 +1300,7 @@ def _verify_memory_edges(op, target_program):
             "memory mask operand mode does not match has_mask",
             target_op_id=op.target_op_id,
         )
-    forbidden = tuple(
-        name for name in attrs
-        if name.startswith("mask_predicate_") or name == "mask_scalar_count"
-    )
+    forbidden = tuple(name for name in attrs if name.startswith("mask_predicate_") or name == "mask_scalar_count")
     if forbidden:
         fail(
             "TLXW_VERIFY_MASK_EDGE",
@@ -1465,16 +1323,10 @@ def _verify_make_buffer(op, target_program):
     base_type = target_program.values[int(op.operands[0])].type
     result_type = target_program.values[int(op.results[0])].type
     range_bytes = attrs.get("range_bytes")
-    if (
-        base_type.representation != "uniform_pointer"
-        or result_type.representation != "uniform_buffer_pointer"
-        or int(result_type.component_count) != 1
-        or base_type.element_type != result_type.element_type
-        or attrs.get("element_type") != result_type.element_type
-        or not isinstance(range_bytes, int)
-        or range_bytes <= 0
-        or range_bytes > (1 << 31) - 1
-    ):
+    if (base_type.representation != "uniform_pointer" or result_type.representation != "uniform_buffer_pointer"
+            or int(result_type.component_count) != 1 or base_type.element_type != result_type.element_type
+            or attrs.get("element_type") != result_type.element_type or not isinstance(range_bytes, int)
+            or range_bytes <= 0 or range_bytes > (1 << 31) - 1):
         fail(
             "TLXW_VERIFY_MAKE_BUFFER",
             STAGE,
@@ -1493,10 +1345,7 @@ def _verify_affine_materialize(op, target_program):
             target_op_id=op.target_op_id,
         )
     result_type = target_program.values[int(op.results[0])].type
-    if (
-        result_type.element_type not in {"i32", "index"}
-        or result_type.representation not in {"simd", "simd_tuple"}
-    ):
+    if (result_type.element_type not in {"i32", "index"} or result_type.representation not in {"simd", "simd_tuple"}):
         fail(
             "TLXW_VERIFY_AFFINE_EDGE",
             STAGE,
@@ -1530,13 +1379,9 @@ def _verify_affine_materialize(op, target_program):
         )
     value_range = attrs.get("value_range")
     if result_type.element_type == "index":
-        if (
-            not isinstance(value_range, tuple)
-            or len(value_range) != 2
-            or not all(isinstance(bound, int) for bound in value_range)
-            or int(value_range[0]) < 0
-            or int(value_range[0]) > int(value_range[1])
-        ):
+        if (not isinstance(value_range, tuple) or len(value_range) != 2
+                or not all(isinstance(bound, int) for bound in value_range) or int(value_range[0]) < 0
+                or int(value_range[0]) > int(value_range[1])):
             fail(
                 "TLXW_VERIFY_AFFINE_EDGE",
                 STAGE,
@@ -1562,10 +1407,8 @@ def _verify_affine_materialize(op, target_program):
             target_op_id=op.target_op_id,
         )
     rank = len(shape)
-    if len(bases) != int(result_type.component_count) or any(
-        not isinstance(values, tuple) or len(values) != rank
-        for values in (*bases, *coefficients)
-    ):
+    if len(bases) != int(result_type.component_count) or any(not isinstance(values, tuple) or len(values) != rank
+                                                             for values in (*bases, *coefficients)):
         fail(
             "TLXW_VERIFY_AFFINE_EDGE",
             STAGE,
@@ -1597,16 +1440,9 @@ def _verify_affine_scalar_component_sources(
         )
     for operand_id, sources in zip(op.operands, scalar_sources):
         operand_type = target_program.values[int(operand_id)].type
-        if (
-            not isinstance(sources, tuple)
-            or len(sources) != component_count
-            or any(
-                not isinstance(source, int)
-                or source < 0
-                or source >= int(operand_type.component_count)
-                for source in sources
-            )
-        ):
+        if (not isinstance(sources, tuple) or len(sources) != component_count
+                or any(not isinstance(source, int) or source < 0 or source >= int(operand_type.component_count)
+                       for source in sources)):
             fail(
                 "TLXW_VERIFY_AFFINE_EDGE",
                 STAGE,
@@ -1628,11 +1464,11 @@ def _verify_type_convert(op, target_program):
         )
     mode = attrs.get("mode")
     if mode not in {
-        "bounded_i32_to_index",
-        "component_remap",
-        "index_cast",
-        "packet_to_scalar_components",
-        "scalar_components_to_packet",
+            "bounded_i32_to_index",
+            "component_remap",
+            "index_cast",
+            "packet_to_scalar_components",
+            "scalar_components_to_packet",
     }:
         fail(
             "TLXW_VERIFY_TYPE_CONVERT",
@@ -1643,14 +1479,10 @@ def _verify_type_convert(op, target_program):
     operand_type = target_program.values[int(op.operands[0])].type
     result_type = target_program.values[int(op.results[0])].type
     if mode == "index_cast":
-        if (
-            operand_type.kind != result_type.kind
-            or operand_type.representation != result_type.representation
-            or operand_type.lane_width != result_type.lane_width
-            or operand_type.component_count != result_type.component_count
-            or {operand_type.element_type, result_type.element_type}
-            not in ({"index", "i32"}, {"index", "i64"})
-        ):
+        if (operand_type.kind != result_type.kind or operand_type.representation != result_type.representation
+                or operand_type.lane_width != result_type.lane_width
+                or operand_type.component_count != result_type.component_count
+                or {operand_type.element_type, result_type.element_type} not in ({"index", "i32"}, {"index", "i64"})):
             fail(
                 "TLXW_VERIFY_TYPE_CONVERT",
                 STAGE,
@@ -1660,20 +1492,13 @@ def _verify_type_convert(op, target_program):
         return
     if mode == "bounded_i32_to_index":
         value_range = attrs.get("value_range")
-        if (
-            operand_type.element_type != "i32"
-            or result_type.element_type != "index"
-            or operand_type.kind != result_type.kind
-            or operand_type.representation != result_type.representation
-            or operand_type.representation not in {"scalar", "simd", "simd_tuple"}
-            or operand_type.lane_width != result_type.lane_width
-            or operand_type.component_count != result_type.component_count
-            or not isinstance(value_range, tuple)
-            or len(value_range) != 2
-            or not all(isinstance(bound, int) for bound in value_range)
-            or int(value_range[0]) < 0
-            or int(value_range[0]) > int(value_range[1])
-        ):
+        if (operand_type.element_type != "i32" or result_type.element_type != "index"
+                or operand_type.kind != result_type.kind or operand_type.representation != result_type.representation
+                or operand_type.representation not in {"scalar", "simd", "simd_tuple"}
+                or operand_type.lane_width != result_type.lane_width
+                or operand_type.component_count != result_type.component_count or not isinstance(value_range, tuple)
+                or len(value_range) != 2 or not all(isinstance(bound, int) for bound in value_range)
+                or int(value_range[0]) < 0 or int(value_range[0]) > int(value_range[1])):
             fail(
                 "TLXW_VERIFY_TYPE_CONVERT",
                 STAGE,
@@ -1683,20 +1508,12 @@ def _verify_type_convert(op, target_program):
         return
     if mode == "component_remap":
         component_sources = attrs.get("component_sources")
-        if (
-            not isinstance(component_sources, tuple)
-            or not component_sources
-            or len(component_sources) != int(result_type.component_count)
-            or any(
-                not isinstance(component, int)
-                or component < 0
-                or component >= int(operand_type.component_count)
-                for component in component_sources
-            )
-            or operand_type.kind != result_type.kind
-            or operand_type.element_type != result_type.element_type
-            or operand_type.lane_width != result_type.lane_width
-        ):
+        if (not isinstance(component_sources, tuple) or not component_sources
+                or len(component_sources) != int(result_type.component_count)
+                or any(not isinstance(component, int) or component < 0 or component >= int(operand_type.component_count)
+                       for component in component_sources) or operand_type.kind != result_type.kind
+                or operand_type.element_type != result_type.element_type
+                or operand_type.lane_width != result_type.lane_width):
             fail(
                 "TLXW_VERIFY_TYPE_CONVERT",
                 STAGE,
@@ -1706,12 +1523,8 @@ def _verify_type_convert(op, target_program):
         return
     packet_count = attrs.get("packet_component_count")
     packet_width = attrs.get("packet_width")
-    if (
-        not isinstance(packet_count, int)
-        or packet_count <= 0
-        or not isinstance(packet_width, int)
-        or packet_width <= 0
-    ):
+    if (not isinstance(packet_count, int) or packet_count <= 0 or not isinstance(packet_width, int)
+            or packet_width <= 0):
         fail(
             "TLXW_VERIFY_TYPE_CONVERT",
             STAGE,
@@ -1720,19 +1533,14 @@ def _verify_type_convert(op, target_program):
         )
     packet_representations = {"simd_packet", "simd_packet_tuple"}
     scalar_representations = {"simd", "simd_tuple"}
-    source_type, destination_type = (
-        (operand_type, result_type)
-        if mode == "packet_to_scalar_components"
-        else (result_type, operand_type)
-    )
-    if (
-        source_type.representation not in packet_representations
-        or destination_type.representation not in scalar_representations
-        or int(source_type.component_count) != packet_count
-        or int(destination_type.component_count) != packet_count * packet_width
-        or source_type.element_type != destination_type.element_type
-        or source_type.lane_width != destination_type.lane_width
-    ):
+    source_type, destination_type = ((operand_type, result_type) if mode == "packet_to_scalar_components" else
+                                     (result_type, operand_type))
+    if (source_type.representation not in packet_representations
+            or destination_type.representation not in scalar_representations
+            or int(source_type.component_count) != packet_count
+            or int(destination_type.component_count) != packet_count * packet_width
+            or source_type.element_type != destination_type.element_type
+            or source_type.lane_width != destination_type.lane_width):
         fail(
             "TLXW_VERIFY_TYPE_CONVERT",
             STAGE,
@@ -1750,9 +1558,7 @@ def _verify_component_join(op, target_program):
             "component_join requires two operands and one result",
             target_op_id=op.target_op_id,
         )
-    operand_types = tuple(
-        target_program.values[int(value_id)].type for value_id in op.operands
-    )
+    operand_types = tuple(target_program.values[int(value_id)].type for value_id in op.operands)
     result_type = target_program.values[int(op.results[0])].type
     source_counts = attrs.get("source_component_counts")
     source_widths = attrs.get("source_packet_widths")
@@ -1761,65 +1567,33 @@ def _verify_component_join(op, target_program):
     result_count = attrs.get("result_component_count")
     result_width = attrs.get("result_packet_width")
     result_slots = attrs.get("result_slot_count")
-    valid_source_metadata = (
-        isinstance(source_counts, tuple)
-        and isinstance(source_widths, tuple)
-        and isinstance(source_slots, tuple)
-        and len(source_counts) == len(source_widths) == len(source_slots) == 2
-        and all(isinstance(value, int) and value > 0 for value in source_counts)
-        and all(isinstance(value, int) and value > 0 for value in source_widths)
-        and all(isinstance(value, int) and value > 0 for value in source_slots)
-        and all(
-            count == int(operand_type.component_count)
-            and count * width == slots
-            for count, width, slots, operand_type in zip(
-                source_counts,
-                source_widths,
-                source_slots,
-                operand_types,
-            )
-        )
-    )
-    valid_result_metadata = (
-        isinstance(result_count, int)
-        and isinstance(result_width, int)
-        and isinstance(result_slots, int)
-        and result_count == int(result_type.component_count)
-        and result_count > 0
-        and result_width > 0
-        and result_count * result_width == result_slots
-    )
-    valid_sources = (
-        isinstance(scalar_sources, tuple)
-        and isinstance(result_slots, int)
-        and len(scalar_sources) == result_slots
-        and all(
-            isinstance(source, tuple)
-            and len(source) == 2
-            and all(isinstance(index, int) for index in source)
-            and 0 <= source[0] < len(operand_types)
-            and isinstance(source_slots, tuple)
-            and 0 <= source[1] < source_slots[source[0]]
-            for source in scalar_sources
-        )
-    )
-    valid_types = (
-        all(operand_type.kind == result_type.kind for operand_type in operand_types)
-        and all(
-            operand_type.element_type == result_type.element_type
-            for operand_type in operand_types
-        )
-        and all(
-            operand_type.lane_width == result_type.lane_width
-            for operand_type in operand_types
-        )
-    )
-    if not (
-        valid_source_metadata
-        and valid_result_metadata
-        and valid_sources
-        and valid_types
-    ):
+    valid_source_metadata = (isinstance(source_counts, tuple) and isinstance(source_widths, tuple)
+                             and isinstance(source_slots, tuple)
+                             and len(source_counts) == len(source_widths) == len(source_slots) == 2
+                             and all(isinstance(value, int) and value > 0 for value in source_counts)
+                             and all(isinstance(value, int) and value > 0 for value in source_widths)
+                             and all(isinstance(value, int) and value > 0 for value in source_slots)
+                             and all(count == int(operand_type.component_count) and count * width == slots
+                                     for count, width, slots, operand_type in zip(
+                                         source_counts,
+                                         source_widths,
+                                         source_slots,
+                                         operand_types,
+                                     )))
+    valid_result_metadata = (isinstance(result_count, int) and isinstance(result_width, int)
+                             and isinstance(result_slots, int) and result_count == int(result_type.component_count)
+                             and result_count > 0 and result_width > 0 and result_count * result_width == result_slots)
+    valid_sources = (isinstance(scalar_sources, tuple) and isinstance(result_slots, int)
+                     and len(scalar_sources) == result_slots and all(
+                         isinstance(source, tuple) and len(source) == 2 and all(
+                             isinstance(index, int)
+                             for index in source) and 0 <= source[0] < len(operand_types) and isinstance(
+                                 source_slots, tuple) and 0 <= source[1] < source_slots[source[0]]
+                         for source in scalar_sources))
+    valid_types = (all(operand_type.kind == result_type.kind for operand_type in operand_types)
+                   and all(operand_type.element_type == result_type.element_type for operand_type in operand_types)
+                   and all(operand_type.lane_width == result_type.lane_width for operand_type in operand_types))
+    if not (valid_source_metadata and valid_result_metadata and valid_sources and valid_types):
         fail(
             "TLXW_VERIFY_COMPONENT_JOIN",
             STAGE,
@@ -1838,9 +1612,7 @@ def _verify_component_split(op, target_program):
             target_op_id=op.target_op_id,
         )
     operand_type = target_program.values[int(op.operands[0])].type
-    result_types = tuple(
-        target_program.values[int(value_id)].type for value_id in op.results
-    )
+    result_types = tuple(target_program.values[int(value_id)].type for value_id in op.results)
     source_count = attrs.get("source_component_count")
     source_width = attrs.get("source_packet_width")
     source_slots = attrs.get("source_slot_count")
@@ -1848,67 +1620,32 @@ def _verify_component_split(op, target_program):
     result_widths = attrs.get("result_packet_widths")
     result_slots = attrs.get("result_slot_counts")
     scalar_sources = attrs.get("scalar_source_slots")
-    valid_source_metadata = (
-        isinstance(source_count, int)
-        and isinstance(source_width, int)
-        and isinstance(source_slots, int)
-        and source_count == int(operand_type.component_count)
-        and source_count > 0
-        and source_width > 0
-        and source_count * source_width == source_slots
-    )
-    valid_result_metadata = (
-        isinstance(result_counts, tuple)
-        and isinstance(result_widths, tuple)
-        and isinstance(result_slots, tuple)
-        and len(result_counts) == len(result_widths) == len(result_slots) == 2
-        and all(isinstance(value, int) and value > 0 for value in result_counts)
-        and all(isinstance(value, int) and value > 0 for value in result_widths)
-        and all(isinstance(value, int) and value > 0 for value in result_slots)
-        and all(
-            count == int(result_type.component_count)
-            and count * width == slots
-            for count, width, slots, result_type in zip(
-                result_counts,
-                result_widths,
-                result_slots,
-                result_types,
-            )
-        )
-    )
-    valid_sources = (
-        isinstance(scalar_sources, tuple)
-        and isinstance(result_slots, tuple)
-        and len(scalar_sources) == len(result_slots) == 2
-        and all(
-            isinstance(sources, tuple)
-            and len(sources) == slots
-            and all(
-                isinstance(source, int)
-                and isinstance(source_slots, int)
-                and 0 <= source < source_slots
-                for source in sources
-            )
-            for sources, slots in zip(scalar_sources, result_slots)
-        )
-    )
-    valid_types = (
-        all(result_type.kind == operand_type.kind for result_type in result_types)
-        and all(
-            result_type.element_type == operand_type.element_type
-            for result_type in result_types
-        )
-        and all(
-            result_type.lane_width == operand_type.lane_width
-            for result_type in result_types
-        )
-    )
-    if not (
-        valid_source_metadata
-        and valid_result_metadata
-        and valid_sources
-        and valid_types
-    ):
+    valid_source_metadata = (isinstance(source_count, int) and isinstance(source_width, int)
+                             and isinstance(source_slots, int) and source_count == int(operand_type.component_count)
+                             and source_count > 0 and source_width > 0 and source_count * source_width == source_slots)
+    valid_result_metadata = (isinstance(result_counts, tuple) and isinstance(result_widths, tuple)
+                             and isinstance(result_slots, tuple)
+                             and len(result_counts) == len(result_widths) == len(result_slots) == 2
+                             and all(isinstance(value, int) and value > 0 for value in result_counts)
+                             and all(isinstance(value, int) and value > 0 for value in result_widths)
+                             and all(isinstance(value, int) and value > 0 for value in result_slots)
+                             and all(count == int(result_type.component_count) and count * width == slots
+                                     for count, width, slots, result_type in zip(
+                                         result_counts,
+                                         result_widths,
+                                         result_slots,
+                                         result_types,
+                                     )))
+    valid_sources = (isinstance(scalar_sources, tuple) and isinstance(result_slots, tuple)
+                     and len(scalar_sources) == len(result_slots) == 2 and all(
+                         isinstance(sources, tuple) and len(sources) == slots and all(
+                             isinstance(source, int) and isinstance(source_slots, int) and 0 <= source < source_slots
+                             for source in sources)
+                         for sources, slots in zip(scalar_sources, result_slots)))
+    valid_types = (all(result_type.kind == operand_type.kind for result_type in result_types)
+                   and all(result_type.element_type == operand_type.element_type for result_type in result_types)
+                   and all(result_type.lane_width == operand_type.lane_width for result_type in result_types))
+    if not (valid_source_metadata and valid_result_metadata and valid_sources and valid_types):
         fail(
             "TLXW_VERIFY_COMPONENT_SPLIT",
             STAGE,
@@ -1927,9 +1664,7 @@ def _verify_cmpi_select(op, target_program):
             "one result",
             target_op_id=op.target_op_id,
         )
-    if (
-        set(attrs) != {"predicate", "source_width"}
-        or attrs.get("predicate") not in {
+    if (set(attrs) != {"predicate", "source_width"} or attrs.get("predicate") not in {
             "eq",
             "ne",
             "slt",
@@ -1940,37 +1675,25 @@ def _verify_cmpi_select(op, target_program):
             "ule",
             "ugt",
             "uge",
-        }
-        or attrs.get("source_width") != 32
-    ):
+    } or attrs.get("source_width") != 32):
         fail(
             "TLXW_VERIFY_CMPI_SELECT",
             STAGE,
             "cmpi_select requires a supported i32 predicate",
             target_op_id=op.target_op_id,
         )
-    lhs_type, rhs_type, true_type, false_type = (
-        target_program.values[int(operand)].type
-        for operand in op.operands
-    )
+    lhs_type, rhs_type, true_type, false_type = (target_program.values[int(operand)].type for operand in op.operands)
     result_type = target_program.values[int(op.results[0])].type
     result_components = int(result_type.component_count)
-    if (
-        lhs_type.element_type != "i32"
-        or rhs_type.element_type != "i32"
-        or lhs_type.lane_width != rhs_type.lane_width
-        or int(lhs_type.component_count) not in {1, result_components}
-        or int(rhs_type.component_count) not in {1, result_components}
-        or true_type.kind != result_type.kind
-        or false_type.kind != result_type.kind
-        or true_type.element_type != result_type.element_type
-        or false_type.element_type != result_type.element_type
-        or true_type.lane_width != result_type.lane_width
-        or false_type.lane_width != result_type.lane_width
-        or int(true_type.component_count) not in {1, result_components}
-        or int(false_type.component_count) not in {1, result_components}
-        or result_type.representation in {"mask", "mask_tuple"}
-    ):
+    if (lhs_type.element_type != "i32" or rhs_type.element_type != "i32" or lhs_type.lane_width != rhs_type.lane_width
+            or int(lhs_type.component_count) not in {1, result_components}
+            or int(rhs_type.component_count) not in {1, result_components} or true_type.kind != result_type.kind
+            or false_type.kind != result_type.kind or true_type.element_type != result_type.element_type
+            or false_type.element_type != result_type.element_type or true_type.lane_width != result_type.lane_width
+            or false_type.lane_width != result_type.lane_width
+            or int(true_type.component_count) not in {1, result_components}
+            or int(false_type.component_count) not in {1, result_components}
+            or result_type.representation in {"mask", "mask_tuple"}):
         fail(
             "TLXW_VERIFY_CMPI_SELECT",
             STAGE,
@@ -2052,23 +1775,15 @@ def _is_layout_schema_value(value):
     if isinstance(value, target_ir.TargetAttr):
         return bool(value.name) and _is_layout_schema_value(value.value)
     if isinstance(value, target_ir.TargetLinearLayout):
-        if (
-            not value.in_dims
-            or len(set(value.in_dims)) != len(value.in_dims)
-            or not value.out_dims
-            or len({name for name, _size in value.out_dims})
-            != len(value.out_dims)
-            or any(not name or int(size) <= 0 for name, size in value.out_dims)
-        ):
+        if (not value.in_dims or len(set(value.in_dims)) != len(value.in_dims) or not value.out_dims
+                or len({name
+                        for name, _size in value.out_dims}) != len(value.out_dims)
+                or any(not name or int(size) <= 0 for name, size in value.out_dims)):
             return False
         out_rank = len(value.out_dims)
         if tuple(name for name, _bases in value.bases) != value.in_dims:
             return False
-        return all(
-            len(basis) == out_rank
-            for _name, bases in value.bases
-            for basis in bases
-        )
+        return all(len(basis) == out_rank for _name, bases in value.bases for basis in bases)
     if isinstance(value, tuple):
         return all(_is_layout_schema_value(item) for item in value)
     return False
