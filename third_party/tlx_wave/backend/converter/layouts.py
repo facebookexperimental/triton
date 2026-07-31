@@ -443,35 +443,6 @@ def linear_layout_in_dim_size(linear, dim):
     return 1
 
 
-def optimal_swizzled_ldst_plan(source, result, bitwidth, target):
-    """Build the physical LDS conversion plan used by Triton's LLVM lowering."""
-    arch = str(target or "").rsplit(":", 1)[-1]
-    if arch == "gfx950":
-        num_banks = 64
-        load_lane_addr_128 = (0, 1, 3, 4)
-    elif arch == "gfx942":
-        num_banks = 32
-        load_lane_addr_128 = (0, 1, 4)
-    else:
-        raise ValueError(f"unsupported AMD LDS swizzle target {target!r}")
-
-    vector_bitwidth = int(_linear_layout.get_vec_bitwidth_ld_st(
-        source,
-        result,
-        int(bitwidth),
-    ))
-    # Match AMD TargetInfo::getSharedLdStTiles. Stores use the regular lane
-    # tile; 128-bit loads use the architecture-specific ds_read_b128 tile.
-    load_lane_addr = load_lane_addr_128 if vector_bitwidth == 128 else ()
-    return _linear_layout.optimal_swizzled_ldst_plan(
-        source,
-        result,
-        int(bitwidth),
-        num_banks=num_banks,
-        dst_lane_addr=load_lane_addr,
-    )
-
-
 def linear_layout_out_dim_size(linear, dim, *, stage=STAGE):
     for out_dim, size in linear.out_dims:
         if out_dim == dim:
