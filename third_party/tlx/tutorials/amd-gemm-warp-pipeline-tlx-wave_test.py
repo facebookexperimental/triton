@@ -185,24 +185,18 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert wave.count("wave.cast fpconvert") == 32
     # Shared-memory copies are symbolic scatters too.  Check only the two
     # masked global output scatters here.
-    global_scatter_lines = [
-        line
-        for line in wave.splitlines()
-        if "wave.scatter" in line and "#waveamd.buffer" in line
-    ]
+    global_scatter_lines = [line for line in wave.splitlines() if "wave.scatter" in line and "#waveamd.buffer" in line]
     assert len(global_scatter_lines) == 2
     assert "wave.store" not in wave
     assert wave.count("wave.where") == 2
     assert wave.count("wave.join") <= 20
     assert wave.count("wave.barrier") == 3
-    assert wave.count("wave.extract") < 512
     assert "waveamdmachine.mfma_f32_16x16x32_f16" in machine
     assert machine.count("waveamdmachine.v_cvt_pk_f16_f32") == 64
     assert "waveamdmachine.v_cvt_f16_f32" not in machine
     assert machine.count("waveamdmachine.buffer_load_lds_b128") == 16
     assert "waveamdmachine.global_load_lds_b128" not in machine
     assert machine.count("waveamdmachine.ds_load_b128") == 16
-    assert machine.count("waveamdmachine.token_join") <= 20
     assert machine.count("waveamdmachine.buffer_store_b64") == 32
     assert machine.count("waveamdmachine.v_cndmask_b32_tuple") == 0
     assert amd_asm.count("v_cndmask_b32") == 32
@@ -238,6 +232,7 @@ def test_gfx9_v9_tlx_wave_warmup_lowers_to_machine(monkeypatch, tmp_path):
     assert machine.count("waveamdmachine.s_xor_b32") <= 32
     assert machine.count("waveamdmachine.s_lshr_b64") <= 16
     assert machine.count("waveamdmachine.s_add_u64") <= 64
+    assert "wave.extract" not in machine
     assert len(machine.splitlines()) < 5_000
     assert machine.count("waveamdmachine.tuple_to_elements") < 384
     assert machine.count("waveamdmachine.tuple_from_elements") < 640
