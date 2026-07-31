@@ -1,14 +1,14 @@
 """Eight-wave gfx950 FlashAttention shaped after the standalone Wave kernel.
 
-This is a deliberately separate, bounded-input kernel rather than another mode
-of ``amd_fa_cluster``.  It keeps four physical K and V LDS slots so Wave's two
-four-wave cohorts can run as a ping-pong pipeline without reusing a slot that
-the other cohort still consumes.
+This remains separate from ``amd_fa_cluster`` because its packetized score and
+output state is arranged specifically for two four-wave cohorts.  Four physical
+K and V LDS slots let those cohorts run as a ping-pong pipeline without reusing
+a slot that the other cohort still consumes.
 
-The fixed softmax reference is valid when every Q and K element satisfies
-``abs(x) <= qk_max_abs``.  Subtracting that common reference from every score
-does not change softmax, while removing the running-max rescale from the hot
-loop.  The host wrapper makes the bound an explicit part of the API.
+The normal path uses an adaptive softmax reference.  A reference is retained
+while new row maxima remain numerically safe and the accumulators are rescaled
+only when it must advance.  Callers with a tight input bound may still request
+the fixed-reference specialization explicitly through ``qk_max_abs``.
 """
 
 import math
@@ -26,10 +26,44 @@ HEAD_DIM = tl.constexpr(128)
 LDS_STAGES = tl.constexpr(4)
 XCDS = tl.constexpr(8)
 
+# Let ``x_i`` denote a base-2-scaled attention logit.  After processing some
+# tiles, the online-softmax state represented with reference ``r`` is
+#
+#     denominator = sum_i 2 ** (x_i - r)
+#     accumulator = sum_i 2 ** (x_i - r) * v_i.
+#
+# Their ratio is the softmax result, independently of ``r``.  Conventional
+# online softmax keeps ``r`` equal to the largest logit seen so far.  For a new
+# tile with maximum ``m``, it chooses ``c = max(r, m)`` and changes reference by
+# rescaling the old state with
+#
+#                         alpha = 2 ** (r - c).
+#
+# This kernel deliberately allows ``r`` to lag behind the true maximum.  If it
+# retains ``r``, every term in both state components is larger than the state
+# represented at ``c`` by the same common factor ``2 ** (c - r)``.  The factor
+# cancels in ``accumulator / denominator``.  Therefore delaying the reference
+# change neither clips nor approximates the softmax; in exact arithmetic it
+# only selects a different common scale for its numerator and denominator.
+#
+# The reason not to retain ``r`` indefinitely is numerical range.  The largest
+# positive exponent argument introduced by the new tile is bounded by
+# ``m - r <= c - r``.  We retain ``r`` only while ``c - r <= H``, which caps
+# every positive weight at ``2 ** H``.  With H=8 that cap is 256.  Once the
+# bound is exceeded, the state is rebased to ``c`` using ``alpha`` exactly as
+# in conventional online softmax.  H controls when that exact rebase occurs;
+# it is not a score bound or an approximation tolerance.
+SOFTMAX_REFERENCE_HEADROOM_LOG2 = tl.constexpr(8.0)
+
 
 @triton.jit
 def _sum_combine(lhs, rhs):
     return lhs + rhs
+
+
+@triton.jit
+def _max_combine(lhs, rhs):
+    return tl.maximum(lhs, rhs, propagate_nan=tl.PropagateNan.ALL)
 
 
 @triton.jit
@@ -137,6 +171,36 @@ def _registers_to_score_packet(registers):
 
 
 @triton.jit
+def _pin_workitem_layout(value):
+    workitem_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[],
+        lane_bases=[
+            [1],
+            [2],
+            [4],
+            [8],
+            [16],
+            [32],
+        ],
+        warp_bases=[
+            [64],
+            [128],
+            [256],
+        ],
+        block_bases=[],
+        shape=[8 * 64],
+    ))
+    return tlx.release_layout(tlx.require_layout(value, workitem_layout))
+
+
+@triton.jit
+def _duplicate_rows_to_workitems(rows):
+    per_wave_rows = rows.reshape([8, 32])
+    per_workitem = tl.broadcast_to(per_wave_rows[:, None, :], (8, 2, 32))
+    return _pin_workitem_layout(per_workitem.reshape([8 * 64]))
+
+
+@triton.jit
 def _reduce_score_registers(registers0, registers1):
     """Match Wave's scalar component reduction before the lane-half exchange."""
     (
@@ -211,7 +275,91 @@ def _reduce_score_registers(registers0, registers1):
     # the two-element reduction axis, exactly matching Wave's xor-32 exchange.
     lane_halves = local_sum.reshape([8, 2, 32]).permute(0, 2, 1)
     lane_halves = lane_halves.reshape([BLOCK_M, 2])
-    return tl.reduce(lane_halves, 1, _sum_combine)
+    return _duplicate_rows_to_workitems(tl.reduce(lane_halves, 1, _sum_combine))
+
+
+@triton.jit
+def _reduce_max_score_registers(registers0, registers1):
+    """Compute one NaN-propagating maximum for each 64-column score row."""
+    (
+        value00,
+        value01,
+        value02,
+        value03,
+        value04,
+        value05,
+        value06,
+        value07,
+        value08,
+        value09,
+        value10,
+        value11,
+        value12,
+        value13,
+        value14,
+        value15,
+    ) = _split_last_16(registers0)
+    (
+        value16,
+        value17,
+        value18,
+        value19,
+        value20,
+        value21,
+        value22,
+        value23,
+        value24,
+        value25,
+        value26,
+        value27,
+        value28,
+        value29,
+        value30,
+        value31,
+    ) = _split_last_16(registers1)
+    local_max = tl.maximum(value00, value01, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value02, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value03, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value04, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value05, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value06, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value07, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value08, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value09, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value10, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value11, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value12, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value13, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value14, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value15, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value16, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value17, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value18, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value19, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value20, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value21, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value22, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value23, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value24, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value25, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value26, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value27, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value28, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value29, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value30, propagate_nan=tl.PropagateNan.ALL)
+    local_max = tl.maximum(local_max, value31, propagate_nan=tl.PropagateNan.ALL)
+
+    lane_halves = local_max.reshape([8, 2, 32]).permute(0, 2, 1)
+    lane_halves = lane_halves.reshape([BLOCK_M, 2])
+    return _duplicate_rows_to_workitems(tl.reduce(lane_halves, 1, _max_combine))
+
+
+@triton.jit
+def _scale_accumulator_rows(accumulator, scale):
+    """Scale an MFMA accumulator through its physical register packet."""
+    registers = _score_packet_to_registers(accumulator)
+    registers = registers * scale[:, None]
+    return _registers_to_score_packet(registers)
 
 
 @triton.jit
@@ -255,7 +403,7 @@ def _load_value_fragment(
 
 
 @aggregate
-class BoundedSoftmaxPending:
+class SoftmaxPending:
     score0: tl.tensor
     score1: tl.tensor
 
@@ -269,21 +417,27 @@ class ProbabilityFragments:
 
 
 @aggregate
-class BoundedSoftmaxState:
+class SoftmaxState:
     acc0: tl.tensor
     acc1: tl.tensor
     acc2: tl.tensor
     acc3: tl.tensor
+    row_max: tl.tensor
     row_sum: tl.tensor
 
     @triton.jit
     def create():
-        return BoundedSoftmaxState(
+        return SoftmaxState(
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
-            tl.zeros((BLOCK_M, ), tl.float32),
+            _pin_workitem_layout(
+                tl.full((8 * 64, ), -1.0e30, tl.float32),
+            ),
+            _pin_workitem_layout(
+                tl.zeros((8 * 64, ), tl.float32),
+            ),
         )
 
     @triton.jit
@@ -293,12 +447,135 @@ class BoundedSoftmaxState:
         qk_scale: tl.constexpr,
         log2_score_bound: tl.constexpr,
         mma_layout: tl.constexpr,
+        INITIAL: tl.constexpr,
+        ADAPTIVE_REFERENCE: tl.constexpr,
     ):
         score0, score1 = _split_last_2(scores)
-        score0 = score0 * qk_scale + (-log2_score_bound)
-        registers0 = tl.math.exp2(_score_packet_to_registers(score0))
-        score1 = score1 * qk_scale + (-log2_score_bound)
-        registers1 = _score_packet_to_registers(score1)
+        state = self
+        if ADAPTIVE_REFERENCE:
+            raw_registers0 = _score_packet_to_registers(score0)
+            raw_registers1 = _score_packet_to_registers(score1)
+            tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
+            if INITIAL:
+                reference = tile_max
+            else:
+                candidate = tl.maximum(
+                    self.row_max,
+                    tile_max,
+                    propagate_nan=tl.PropagateNan.ALL,
+                )
+                advance = candidate - self.row_max
+                # This is the direct logarithmic form of the derivation above:
+                # ``advance = c - r`` and monotonicity of exp2 gives
+                # ``2**advance <= 2**H`` exactly when ``advance <= H``.  This
+                # is an ordered floating-point comparison, not a test of the
+                # floating-point representation.  A NaN consequently makes
+                # the predicate false and takes the update path, where the NaN
+                # from the row maximum continues to propagate through state.
+                row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
+
+                # Why the following layout, ballot, and ``-1`` comparison are
+                # an all-row test rather than ad-hoc bit manipulation:
+                #
+                # A physical wave owns 32 output rows, while a gfx950 wave has
+                # 64 lanes.  The reductions above first combine each lane's 32
+                # register elements, then combine lanes ``j`` and ``j + 32``.
+                # Their row result is duplicated back to both lanes.  Numbering
+                # the wave by ``w``, its row by ``j`` (0 <= j < 32), and the
+                # lane half by ``h`` (0 <= h < 2), the resulting predicate
+                # ``b[w,j] = (candidate[w,j] - reference[w,j] <= H)`` lives at
+                # flat workitem index
+                #
+                #                         64*w + 32*h + j.
+                #
+                # The required layout expresses exactly that mapping.  Its
+                # lane bases are the six binary place values
+                # ``1, 2, 4, 8, 16, 32`` and its warp bases are
+                # ``64, 128, 256``.  Thus physical lanes ``j`` and ``j + 32``
+                # both receive ``b[w,j]``.  No float bits are inspected and no
+                # data-dependent shuffle is hidden in this operation.
+                #
+                # ``warp_ballot`` places lane ``l``'s boolean in bit ``l`` of
+                # an i64.  For one wave its unsigned mask is consequently
+                #
+                #       B = sum_{j=0}^{31} b[w,j] * (2**j + 2**(j+32)).
+                #
+                # Therefore B == 2**64 - 1 iff every one of the 32 row
+                # predicates is true.  The same 64-bit pattern, interpreted as
+                # a signed two's-complement i64, is ``-1``; that is all the
+                # comparison below means.
+                #
+                # If any ``b[w,j]`` is false, every row in the wave takes the
+                # uniform rebase path.  For a row that was still within
+                # headroom this merely chooses its candidate reference early:
+                # multiplying both its old denominator and accumulator by
+                # ``2**(old_reference - candidate)`` preserves their ratio.
+                # The new tile is then accumulated relative to ``candidate``.
+                # Hence the wave-wide decision is algebraically the same
+                # softmax state update for every row (up to normal floating-
+                # point rounding), while avoiding divergent per-row state and
+                # control flow.
+                ballot_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
+                    reg_bases=[],
+                    lane_bases=[
+                        [1],
+                        [2],
+                        [4],
+                        [8],
+                        [16],
+                        [32],
+                    ],
+                    warp_bases=[
+                        [64],
+                        [128],
+                        [256],
+                    ],
+                    block_bases=[],
+                    shape=[8 * 64],
+                ))
+                row_is_within_headroom = tlx.require_layout(
+                    row_is_within_headroom,
+                    ballot_layout,
+                )
+                all_rows_within_headroom = tlx.warp_ballot(row_is_within_headroom) == -1
+                if all_rows_within_headroom:
+                    reference = self.row_max
+                else:
+                    reference = candidate
+                    alpha_rows = tl.math.exp2(self.row_max - reference)
+                    state = SoftmaxState(
+                        _scale_accumulator_rows(self.acc0, alpha_rows),
+                        _scale_accumulator_rows(self.acc1, alpha_rows),
+                        _scale_accumulator_rows(self.acc2, alpha_rows),
+                        _scale_accumulator_rows(self.acc3, alpha_rows),
+                        reference,
+                        self.row_sum * alpha_rows,
+                    )
+            if INITIAL:
+                state = SoftmaxState(
+                    self.acc0,
+                    self.acc1,
+                    self.acc2,
+                    self.acc3,
+                    reference,
+                    self.row_sum,
+                )
+            # Keep the scale and translation as a multiply-add expression.
+            # The global fast-math policy permits contraction, so Wave can
+            # form the same FMA as its native FA implementation without a
+            # kernel-specific fused operation in the bridge.
+            negative_reference = (
+                tl.zeros((8 * 64, 1), tl.float32) - reference[:, None]
+            )
+            registers0 = raw_registers0 * qk_scale + negative_reference
+            registers1 = raw_registers1 * qk_scale + negative_reference
+        else:
+            score0 = score0 * qk_scale + (-log2_score_bound)
+            score1 = score1 * qk_scale + (-log2_score_bound)
+            registers0 = _score_packet_to_registers(score0)
+            registers1 = _score_packet_to_registers(score1)
+
+        registers0 = tl.math.exp2(registers0)
         lower8, tail8 = _split_last_2(registers1)
         head4, upper4 = _split_last_2(lower8)
         lower2, tail2 = _split_last_2(upper4)
@@ -307,9 +584,12 @@ class BoundedSoftmaxState:
         middle4 = _join_last_2(middle2, tail2)
         lower8 = _join_last_2(tl.math.exp2(head4), middle4)
         registers1 = _join_last_2(lower8, tail8)
-        return BoundedSoftmaxPending(
-            registers0,
-            registers1,
+        return (
+            state,
+            SoftmaxPending(
+                registers0,
+                registers1,
+            ),
         )
 
     @triton.jit
@@ -374,11 +654,12 @@ class BoundedSoftmaxState:
             p3,
         )
         return (
-            BoundedSoftmaxState(
+            SoftmaxState(
                 self.acc0,
                 self.acc1,
                 self.acc2,
                 self.acc3,
+                self.row_max,
                 row_sum,
             ),
             probabilities,
@@ -422,6 +703,7 @@ def _accumulate_prefix_body(
     mma_layout: tl.constexpr,
     qk_scale: tl.constexpr,
     log2_score_bound: tl.constexpr,
+    ADAPTIVE_REFERENCE: tl.constexpr,
 ):
     """Accumulate one PV tile using the standalone kernel's 3+13 split.
 
@@ -473,20 +755,22 @@ def _accumulate_prefix_body(
     acc1 = _pv_mfma(p3, v31, acc1, p_layout, v_layout, mma_layout)
     acc2 = _pv_mfma(p3, v32, acc2, p_layout, v_layout, mma_layout)
     acc3 = _pv_mfma(p3, v33, acc3, p_layout, v_layout, mma_layout)
-    pending = state.prepare(
-        next_scores,
-        qk_scale,
-        log2_score_bound,
-        mma_layout,
-    )
-
-    return BoundedSoftmaxState(
+    state = SoftmaxState(
         acc0,
         acc1,
         acc2,
         acc3,
+        state.row_max,
         state.row_sum,
-    ), pending
+    )
+    return state.prepare(
+        next_scores,
+        qk_scale,
+        log2_score_bound,
+        mma_layout,
+        False,
+        ADAPTIVE_REFERENCE,
+    )
 
 
 @triton.jit
@@ -536,11 +820,12 @@ def _accumulate_value_fragments(
     acc1 = _pv_mfma(p3, v31, acc1, p_layout, v_layout, mma_layout)
     acc2 = _pv_mfma(p3, v32, acc2, p_layout, v_layout, mma_layout)
     acc3 = _pv_mfma(p3, v33, acc3, p_layout, v_layout, mma_layout)
-    return BoundedSoftmaxState(
+    return SoftmaxState(
         acc0,
         acc1,
         acc2,
         acc3,
+        state.row_max,
         state.row_sum,
     )
 
@@ -569,24 +854,129 @@ def _load_query(
 
 
 @triton.jit
-def _store_output_fragment(
+def _normalize_output_fragment(
+    inverse_row_sum,
+    acc,
+    out_dtype: tl.constexpr,
+    mma_layout: tl.constexpr,
+):
+    acc = tlx.require_layout(acc, mma_layout)
+    register_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
+        reg_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+        ],
+        lane_bases=[
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+        ],
+        warp_bases=[
+            [64, 0],
+            [128, 0],
+            [256, 0],
+        ],
+        block_bases=[],
+        shape=[8 * 64, 16],
+    ))
+    binary = acc.reshape([2] * 13)
+    registers = binary.permute(
+        0,
+        1,
+        2,
+        10,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        11,
+        12,
+    ).reshape([8 * 64, 16])
+    scale = tl.broadcast_to(inverse_row_sum[:, None], (8 * 64, 16))
+    scale = tlx.require_layout(scale, register_layout)
+    registers = registers * scale
+    registers = tlx.cast_preserve_layout(registers, out_dtype)
+    binary = registers.reshape([2] * 13)
+    output = binary.permute(
+        0,
+        1,
+        2,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        3,
+        11,
+        12,
+    ).reshape([BLOCK_M, BLOCK_N // 2])
+    return tlx.release_layout(output)
+
+
+@triton.jit
+def _store_output(
     Out,
     o_base,
     pid_m,
     stride_om: tl.constexpr,
     row_sum,
-    acc,
-    FRAGMENT: tl.constexpr,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+    store_layout: tl.constexpr,
     mma_layout: tl.constexpr,
 ):
-    output = acc / row_sum[:, None]
-    output = tlx.require_layout(output, mma_layout)
+    # Each lane initially owns sixteen values from each 32-column MFMA packet.
+    # Join the four packets and redistribute them to the coalesced IO layout:
+    # lane bits 0..4 select the row, lane bit 5 selects columns 0/8, and the
+    # first three register bits select eight consecutive columns.  Each lane
+    # can then publish its output using eight 128-bit stores.
+    inverse_row_sum = 1.0 / row_sum
+    output0 = _normalize_output_fragment(
+        inverse_row_sum,
+        acc0,
+        Out.dtype.element_ty,
+        mma_layout,
+    )
+    output1 = _normalize_output_fragment(
+        inverse_row_sum,
+        acc1,
+        Out.dtype.element_ty,
+        mma_layout,
+    )
+    output2 = _normalize_output_fragment(
+        inverse_row_sum,
+        acc2,
+        Out.dtype.element_ty,
+        mma_layout,
+    )
+    output3 = _normalize_output_fragment(
+        inverse_row_sum,
+        acc3,
+        Out.dtype.element_ty,
+        mma_layout,
+    )
+    output01 = _join_last_2(output0, output1)
+    output23 = _join_last_2(output2, output3)
+    output = _join_last_2(output01, output23)
+    output = tlx.require_layout(output, store_layout)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = FRAGMENT * (HEAD_DIM // 4) + tl.arange(0, HEAD_DIM // 4)
+    offs_d = tl.arange(0, HEAD_DIM)
     offsets = offs_m[:, None] * stride_om + offs_d[None, :]
-    offsets = tlx.require_layout(offsets, mma_layout)
+    offsets = tlx.require_layout(offsets, store_layout)
     tlx.buffer_store(
-        output.to(Out.dtype.element_ty),
+        output,
         Out + o_base,
         offsets,
     )
@@ -685,6 +1075,7 @@ def _warp_pipeline_phase(
     mma_layout: tl.constexpr,
     qk_scale: tl.constexpr,
     log2_score_bound: tl.constexpr,
+    ADAPTIVE_REFERENCE: tl.constexpr,
 ):
     previous_v_slot: tl.constexpr = PHASE
     current_k_slot: tl.constexpr = (PHASE + 1) % LDS_STAGES
@@ -746,6 +1137,7 @@ def _warp_pipeline_phase(
             mma_layout,
             qk_scale,
             log2_score_bound,
+            ADAPTIVE_REFERENCE,
         )
         future_v_ready = _issue_tile(
             v_ptrs,
@@ -783,6 +1175,7 @@ def _pipeline(
     mma_layout: tl.constexpr,
     qk_scale: tl.constexpr,
     log2_score_bound: tl.constexpr,
+    ADAPTIVE_REFERENCE: tl.constexpr,
 ):
     q = tlx.require_layout(q, q_layout)
     # Prime K0, V0, and K1.  Every completion used by a local load below comes
@@ -807,11 +1200,13 @@ def _pipeline(
     scores = tl.dot(q, k0, score_acc)
     scores = tlx.release_layout(scores)
     _stage_end()
-    probabilities = state.prepare(
+    state, probabilities = state.prepare(
         scores,
         qk_scale,
         log2_score_bound,
         mma_layout,
+        True,
+        ADAPTIVE_REFERENCE,
     )
 
     # K2 has its own physical slot; unlike the legacy cluster kernel, no
@@ -860,6 +1255,7 @@ def _pipeline(
         mma_layout,
         qk_scale,
         log2_score_bound,
+        ADAPTIVE_REFERENCE,
     )
     for first_tile in tl.range(1, tile_count - 3, 4, num_stages=0):
         (
@@ -890,6 +1286,7 @@ def _pipeline(
             mma_layout,
             qk_scale,
             log2_score_bound,
+            ADAPTIVE_REFERENCE,
         )
         (
             state,
@@ -919,6 +1316,7 @@ def _pipeline(
             mma_layout,
             qk_scale,
             log2_score_bound,
+            ADAPTIVE_REFERENCE,
         )
         (
             state,
@@ -948,6 +1346,7 @@ def _pipeline(
             mma_layout,
             qk_scale,
             log2_score_bound,
+            ADAPTIVE_REFERENCE,
         )
         (
             state,
@@ -977,6 +1376,7 @@ def _pipeline(
             mma_layout,
             qk_scale,
             log2_score_bound,
+            ADAPTIVE_REFERENCE,
         )
     # Drain the final three output tiles without out-of-range DMA requests.
     tile_nm3 = tile_count - 3
@@ -1013,6 +1413,7 @@ def _pipeline(
         mma_layout,
         qk_scale,
         log2_score_bound,
+        ADAPTIVE_REFERENCE,
     )
 
     v_ready_nm1 = _issue_tile(
@@ -1052,6 +1453,7 @@ def _pipeline(
         mma_layout,
         qk_scale,
         log2_score_bound,
+        ADAPTIVE_REFERENCE,
     )
 
     state, p_dot = state.finish(
@@ -1088,6 +1490,7 @@ def _attn_fwd_wave_pipeline(
     TOTAL_HEADS: tl.constexpr,
     SM_SCALE: tl.constexpr,
     LOG2_SCORE_BOUND: tl.constexpr,
+    ADAPTIVE_REFERENCE: tl.constexpr,
 ):
     stride_m: tl.constexpr = HEAD_DIM
     stride_h: tl.constexpr = N_CTX * HEAD_DIM
@@ -1233,7 +1636,7 @@ def _attn_fwd_wave_pipeline(
         LDS_STAGES,
         layout=v_shared_layout,
     )
-    state = BoundedSoftmaxState.create()
+    state = SoftmaxState.create()
     state = _pipeline(
         state,
         q,
@@ -1251,46 +1654,20 @@ def _attn_fwd_wave_pipeline(
         mma_layout,
         SM_SCALE * 1.4426950408889634,
         LOG2_SCORE_BOUND,
+        ADAPTIVE_REFERENCE,
     )
 
-    _store_output_fragment(
+    _store_output(
         Out,
         o_base,
         pid_m,
         stride_m,
         state.row_sum,
         state.acc0,
-        0,
-        mma_layout,
-    )
-    _store_output_fragment(
-        Out,
-        o_base,
-        pid_m,
-        stride_m,
-        state.row_sum,
         state.acc1,
-        1,
-        mma_layout,
-    )
-    _store_output_fragment(
-        Out,
-        o_base,
-        pid_m,
-        stride_m,
-        state.row_sum,
         state.acc2,
-        2,
-        mma_layout,
-    )
-    _store_output_fragment(
-        Out,
-        o_base,
-        pid_m,
-        stride_m,
-        state.row_sum,
         state.acc3,
-        3,
+        q_load_layout,
         mma_layout,
     )
 
@@ -1302,12 +1679,16 @@ def attention(
     sm_scale=None,
     causal=False,
     *,
-    qk_max_abs=1.0,
+    qk_max_abs=None,
     out=None,
     warmup=False,
     **kwargs,
 ):
-    """Run the separate eight-wave bounded-input attention kernel."""
+    """Run the separate eight-wave attention kernel.
+
+    The default adaptive reference is numerically stable for unrestricted
+    inputs.  ``qk_max_abs`` explicitly selects the bounded specialization.
+    """
     assert not causal, "amd_fa_wave only implements non-causal attention"
     assert q.dtype == torch.bfloat16, "amd_fa_wave requires BF16 inputs"
     assert q.ndim == 4
@@ -1317,11 +1698,15 @@ def attention(
     assert sequence % 256 == 0
     assert sequence // 64 >= 4
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-    assert math.isfinite(qk_max_abs) and qk_max_abs > 0
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
-    log2_score_bound = (math.log2(math.e) * head_dim * float(sm_scale) * qk_max_abs * qk_max_abs)
+    adaptive_reference = qk_max_abs is None
+    if adaptive_reference:
+        log2_score_bound = 0.0
+    else:
+        assert math.isfinite(qk_max_abs) and qk_max_abs > 0
+        log2_score_bound = (math.log2(math.e) * head_dim * float(sm_scale) * qk_max_abs * qk_max_abs)
     output = torch.empty_like(q) if out is None else out
     assert output.shape == q.shape and output.dtype == q.dtype
     assert output.is_contiguous()
@@ -1333,12 +1718,13 @@ def attention(
         "TOTAL_HEADS": batch * heads,
         "SM_SCALE": float(sm_scale),
         "LOG2_SCORE_BOUND": log2_score_bound,
+        "ADAPTIVE_REFERENCE": adaptive_reference,
         "num_warps": 8,
         "waves_per_eu": 2,
         **kwargs,
     }
     if triton.runtime.driver.active.get_current_target().backend == "tlx_wave":
-        launch_options.setdefault("tlx_wave_enable_multi_wave_specialize", True)
+        launch_options.setdefault("tlx_wave_enable_multi_wave_specialize", False)
 
     args = (q, k, v, output)
     if warmup:

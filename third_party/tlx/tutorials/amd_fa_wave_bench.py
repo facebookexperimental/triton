@@ -49,9 +49,9 @@ def bounded_inputs(shape, device, *, seed):
     return q, k, v
 
 
-def check_correctness(device):
+def check_correctness(device, *, qk_max_abs):
     q, k, v = bounded_inputs(CORRECTNESS_SHAPE, device, seed=0)
-    output = amd_fa_wave.attention(q, k, v)
+    output = amd_fa_wave.attention(q, k, v, qk_max_abs=qk_max_abs)
     reference = F.scaled_dot_product_attention(
         q,
         k,
@@ -72,12 +72,12 @@ def check_correctness(device):
     return passed
 
 
-def measure_performance(device, *, warmup, rep):
+def measure_performance(device, *, warmup, rep, qk_max_abs):
     batch, heads, sequence, head_dim = PERFORMANCE_SHAPE
     q, k, v = bounded_inputs(PERFORMANCE_SHAPE, device, seed=0)
     output = torch.empty_like(q)
-    amd_fa_wave.attention(q, k, v, out=output, warmup=True)
-    launch = lambda: amd_fa_wave.attention(q, k, v, out=output)
+    amd_fa_wave.attention(q, k, v, qk_max_abs=qk_max_abs, out=output, warmup=True)
+    launch = lambda: amd_fa_wave.attention(q, k, v, qk_max_abs=qk_max_abs, out=output)
     launch()
     torch.cuda.synchronize()
     milliseconds = triton.testing.do_bench(
@@ -99,7 +99,18 @@ def parse_args():
         type=float,
         help="required performance; defaults to 1000 for TLX Wave and 0 for LLVM",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--qk-max-abs",
+        type=float,
+        help="explicit Q/K magnitude bound; generated inputs require a value >= 1",
+    )
+    args = parser.parse_args()
+    invalid_bound = args.qk_max_abs is not None and (
+        not math.isfinite(args.qk_max_abs) or args.qk_max_abs < 1.0
+    )
+    if invalid_bound:
+        parser.error("--qk-max-abs must be finite and at least 1")
+    return args
 
 
 def main():
@@ -110,12 +121,14 @@ def main():
     if minimum is None:
         minimum = WAVE_PERFORMANCE_FLOOR_TFLOPS if backend == "tlx_wave" else 0.0
 
-    print(f"Eight-wave bounded FlashAttention ({backend})")
-    correctness_ok = check_correctness(device)
+    mode = "adaptive" if args.qk_max_abs is None else f"bounded (|Q|, |K| <= {args.qk_max_abs:g})"
+    print(f"Eight-wave {mode} FlashAttention ({backend})")
+    correctness_ok = check_correctness(device, qk_max_abs=args.qk_max_abs)
     milliseconds, tflops = measure_performance(
         device,
         warmup=args.warmup,
         rep=args.rep,
+        qk_max_abs=args.qk_max_abs,
     )
     performance_ok = tflops >= minimum
     print(f"  [{'PASS' if performance_ok else 'FAIL'}] performance "

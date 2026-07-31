@@ -399,7 +399,7 @@ def build_run_specs(args, cache_root):
         for backend in ("llvm", "wave"):
             cache_dir = cache_root / f"fa-eight-wave-{backend}"
             minimum = "1000" if backend == "wave" else "0"
-            command = (python, script, *timing, "--min-tflops", minimum)
+            command = (python, script, *timing, "--qk-max-abs", "1", "--min-tflops", minimum)
             specs.append(
                 RunSpec(
                     f"fa-eight-wave-{backend}",
