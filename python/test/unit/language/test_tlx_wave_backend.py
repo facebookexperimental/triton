@@ -1546,11 +1546,11 @@ def test_tlx_wave_converter_preserves_make_range_signed_div_rem(tmp_path):
     operations = [
         converter_target_ir.attrs_dict(op)["operation"] for op in output.target_program.ops if op.kind == "binary"
     ]
-    assert "divsi" in operations
-    assert {"muli", "subi"} <= set(operations)
-    assert "remsi" not in operations
+    assert operations == ["remsi", "divsi"]
     assert "divui" not in operations
     assert "remui" not in operations
+    _run_wave_verify(output.emitted_module.text)
+    _run_waveamd_to_machine(output.emitted_module.text)
     del ctx
 
 
@@ -1579,25 +1579,16 @@ def test_tlx_wave_converter_preserves_shared_dynamic_divisor(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
-    div_ops = [
-        op for op in output.target_program.ops
-        if op.kind == "binary" and converter_target_ir.attrs_dict(op)["operation"] == "divsi"
-    ]
-    assert len(div_ops) == 1
-    (div_op, ) = div_ops
     binary_ops = [op for op in output.target_program.ops if op.kind == "binary"]
-    assert not any(converter_target_ir.attrs_dict(op)["operation"] == "remsi" for op in binary_ops)
-    remainder_product = next(
-        op for op in binary_ops
-        if converter_target_ir.attrs_dict(op)["operation"] == "muli" and op.operands == (div_op.results[0],
-                                                                                         div_op.operands[1]))
-    assert any(
-        converter_target_ir.attrs_dict(op)["operation"] == "subi" and op.operands[1] == remainder_product.results[0]
-        for op in binary_ops)
+    div_rem_ops = [op for op in binary_ops if converter_target_ir.attrs_dict(op)["operation"] in {"divsi", "remsi"}]
+    assert [converter_target_ir.attrs_dict(op)["operation"] for op in div_rem_ops] == ["remsi", "divsi"]
+    assert div_rem_ops[0].operands == div_rem_ops[1].operands
+
     producer_by_result = {result: op for op in output.target_program.ops for result in op.results}
-    divisor = producer_by_result[div_op.operands[1]]
+    divisor = producer_by_result[div_rem_ops[0].operands[1]]
     assert divisor.kind != "constant"
     _run_wave_verify(output.emitted_module.text)
+    _run_waveamd_to_machine(output.emitted_module.text)
     del ctx
 
 
@@ -3689,56 +3680,37 @@ def test_tlx_wave_converter_rejects_scalar_float_add(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_canonicalizes_div_before_rem_pair():
-    target = _target_div_rem_program(("divsi", "remsi"))
+@pytest.mark.parametrize(
+    "operations",
+    (
+        ("divsi", "remsi"),
+        ("remsi", "divsi"),
+        ("divui", "remui"),
+        ("remui", "divui"),
+    ),
+)
+def test_tlx_wave_converter_preserves_div_rem_source_order(operations):
+    target = _target_div_rem_program(operations)
 
-    canonical = converter_canonicalize.canonicalize_target_program(target)
+    ordered = converter_barrier_order.thread_barrier_issue_order(target)
+    ordered = converter_canonicalize.eliminate_dead_target_ops(ordered)
 
-    operations = [converter_target_ir.attrs_dict(op)["operation"] for op in canonical.ops if op.kind == "binary"]
-    assert operations == ["divsi", "muli", "subi"]
-    assert canonical.ops[0].results == (2, )
-    assert canonical.ops[1].operands == (2, 1)
-    assert canonical.ops[2].operands == (0, 4)
-    assert canonical.ops[2].results == (3, )
-
-
-def test_tlx_wave_converter_moves_div_before_earlier_rem_pair():
-    target = _target_div_rem_program(("remsi", "divsi"))
-
-    canonical = converter_canonicalize.canonicalize_target_program(target)
-
-    operations = [converter_target_ir.attrs_dict(op)["operation"] for op in canonical.ops if op.kind == "binary"]
-    assert operations == ["divsi", "muli", "subi"]
-    assert canonical.ops[0].results == (3, )
-    assert canonical.ops[1].operands == (3, 1)
-    assert canonical.ops[2].operands == (0, 4)
-    assert canonical.ops[2].results == (2, )
+    assert [converter_target_ir.attrs_dict(op)["operation"]
+            for op in ordered.ops
+            if op.kind == "binary"] == list(operations)
 
 
-def test_tlx_wave_converter_hoists_async_wait_before_mma_payload_load():
-    target = _target_async_wait_local_load_program("local_load_mma_payload")
+@pytest.mark.parametrize("load_kind", ("local_load_mma_payload", "local_load"))
+def test_tlx_wave_converter_preserves_async_wait_source_order(load_kind):
+    target = _target_async_wait_local_load_program(load_kind)
 
-    canonical = converter_canonicalize.canonicalize_target_program(target)
+    ordered = converter_barrier_order.thread_barrier_issue_order(target)
 
-    op_ids = canonical.regions[0].op_ids
-    assert [canonical.ops[op_id].kind for op_id in op_ids] == [
-        "async_commit_group",
-        "async_wait",
-        "memdesc_index",
-        "local_load_mma_payload",
-    ]
-
-
-def test_tlx_wave_converter_does_not_hoist_async_wait_before_regular_local_load():
-    target = _target_async_wait_local_load_program("local_load")
-
-    canonical = converter_canonicalize.canonicalize_target_program(target)
-
-    op_ids = canonical.regions[0].op_ids
-    assert [canonical.ops[op_id].kind for op_id in op_ids] == [
+    op_ids = ordered.regions[0].op_ids
+    assert [ordered.ops[op_id].kind for op_id in op_ids] == [
         "async_commit_group",
         "memdesc_index",
-        "local_load",
+        load_kind,
         "async_wait",
     ]
 
@@ -14930,14 +14902,14 @@ def test_tlx_wave_converter_pipeline_selects_mfma_fragment_payloads(tmp_path):
         ),
     ),
 )
-def test_tlx_wave_converter_fuses_distributed_compare_select_components(
+def test_tlx_wave_converter_preserves_distributed_compare_selects_for_wave(
     tmp_path,
     preamble,
     shape,
     layout,
 ):
     local_func = f"""
-  tt.func public @converter_fused_compare_select() attributes {{noinline = false}} {{
+  tt.func public @converter_structural_compare_select() attributes {{noinline = false}} {{
     %lhs = arith.constant dense<0> : tensor<{shape}xi32, {layout}>
     %rhs = arith.constant dense<1> : tensor<{shape}xi32, {layout}>
     %condition = arith.cmpi slt, %lhs, %rhs : tensor<{shape}xi32, {layout}>
@@ -14952,41 +14924,26 @@ def test_tlx_wave_converter_fuses_distributed_compare_select_components(
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     kinds = [op.kind for op in output.target_program.ops]
-    assert "cmpi" not in kinds
-    assert kinds.count("cmpi_select") == 1
-    (fused_op, ) = [op for op in output.target_program.ops if op.kind == "cmpi_select"]
-    component_count = output.target_program.values[fused_op.results[0]].type.component_count
+    assert kinds.count("cmpi") == 1
+    assert kinds.count("select") == 1
+    compare = next(op for op in output.target_program.ops if op.kind == "cmpi")
+    select = next(op for op in output.target_program.ops if op.kind == "select")
+    assert compare.target_op_id < select.target_op_id
+    assert compare.source_op_index < select.source_op_index
+    assert select.operands[0] == compare.results[0]
+
     compare_select_lines = [
         line for line in output.emitted_module.text.splitlines() if "wave.cmpi slt" in line or "wave.select" in line
     ]
     assert compare_select_lines
-    assert len(compare_select_lines) % 2 == 0
-    emitted_component_count = len(compare_select_lines) // 2
-    # Structurally equivalent components may share one emitted compare/select
-    # pair, but distinct components must still respect the mask budget.
-    assert emitted_component_count <= component_count
-    live_mask_components = 0
-    max_live_mask_components = 0
-    for line in compare_select_lines:
-        if "wave.cmpi slt" in line:
-            live_mask_components += 1
-            max_live_mask_components = max(
-                max_live_mask_components,
-                live_mask_components,
-            )
-        else:
-            live_mask_components -= 1
-            assert live_mask_components >= 0
-    assert live_mask_components == 0
-    lane_width = output.target_program.values[fused_op.results[0]].type.lane_width
-    mask_dwords = max(1, lane_width // 32)
-    mask_budget_dwords = converter_emission._COMPARE_SELECT_MASK_BUDGET_DWORDS
-    assert max_live_mask_components * mask_dwords <= mask_budget_dwords
-    assert 0 < max_live_mask_components <= min(
-        component_count,
-        mask_budget_dwords // mask_dwords,
-    )
+    first_select = next(index for index, line in enumerate(compare_select_lines) if "wave.select" in line)
+    assert all("wave.cmpi slt" in line for line in compare_select_lines[:first_select])
+    assert all("wave.select" in line for line in compare_select_lines[first_select:])
+
     _run_wave_verify(output.emitted_module.text)
+    machine = _run_waveamd_to_machine(output.emitted_module.text)
+    assert "cmp_lt_i32" in machine
+    assert "cselect_b32" in machine or "cndmask_b32" in machine
     del ctx
 
 
@@ -16793,7 +16750,6 @@ def _convert_ttgir_to_wave_keep_dead(
         fact_program,
         token_program,
     )
-    target_program = converter_canonicalize.canonicalize_target_program(target_program)
     target_program = converter_barrier_order.thread_barrier_issue_order(target_program)
     if verify:
         converter_verifier.verify_target_program(

@@ -48,7 +48,6 @@ def convert_ttgir_to_wave(
         token_program,
         contract=target_ir.TargetContract(enable_fp_fusion=bool(enable_fp_fusion), ),
     )
-    target_program = canonicalize.canonicalize_target_program(target_program)
     target_program = barrier_order.thread_barrier_issue_order(target_program)
     if verify:
         verifier.verify_target_program(

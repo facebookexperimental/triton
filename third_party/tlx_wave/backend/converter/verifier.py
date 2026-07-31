@@ -351,8 +351,6 @@ def _verify_ops(target_program, source_program):
             _verify_component_join(op, target_program)
         if op.kind == "component_split":
             _verify_component_split(op, target_program)
-        if op.kind == "cmpi_select":
-            _verify_cmpi_select(op, target_program)
         if len(op.fact_target_ids) != len(op.fact_ids):
             fail(
                 "TLXW_VERIFY_FACT_TARGET_COUNT",
@@ -1650,54 +1648,6 @@ def _verify_component_split(op, target_program):
             "TLXW_VERIFY_COMPONENT_SPLIT",
             STAGE,
             "component_split packet metadata or types are inconsistent",
-            target_op_id=op.target_op_id,
-        )
-
-
-def _verify_cmpi_select(op, target_program):
-    attrs = _attrs_dict(op)
-    if len(op.operands) != 4 or len(op.results) != 1:
-        fail(
-            "TLXW_VERIFY_CMPI_SELECT",
-            STAGE,
-            "cmpi_select requires compare lhs/rhs, true/false values, and "
-            "one result",
-            target_op_id=op.target_op_id,
-        )
-    if (set(attrs) != {"predicate", "source_width"} or attrs.get("predicate") not in {
-            "eq",
-            "ne",
-            "slt",
-            "sle",
-            "sgt",
-            "sge",
-            "ult",
-            "ule",
-            "ugt",
-            "uge",
-    } or attrs.get("source_width") != 32):
-        fail(
-            "TLXW_VERIFY_CMPI_SELECT",
-            STAGE,
-            "cmpi_select requires a supported i32 predicate",
-            target_op_id=op.target_op_id,
-        )
-    lhs_type, rhs_type, true_type, false_type = (target_program.values[int(operand)].type for operand in op.operands)
-    result_type = target_program.values[int(op.results[0])].type
-    result_components = int(result_type.component_count)
-    if (lhs_type.element_type != "i32" or rhs_type.element_type != "i32" or lhs_type.lane_width != rhs_type.lane_width
-            or int(lhs_type.component_count) not in {1, result_components}
-            or int(rhs_type.component_count) not in {1, result_components} or true_type.kind != result_type.kind
-            or false_type.kind != result_type.kind or true_type.element_type != result_type.element_type
-            or false_type.element_type != result_type.element_type or true_type.lane_width != result_type.lane_width
-            or false_type.lane_width != result_type.lane_width
-            or int(true_type.component_count) not in {1, result_components}
-            or int(false_type.component_count) not in {1, result_components}
-            or result_type.representation in {"mask", "mask_tuple"}):
-        fail(
-            "TLXW_VERIFY_CMPI_SELECT",
-            STAGE,
-            "cmpi_select operand and result types are inconsistent",
             target_op_id=op.target_op_id,
         )
 
