@@ -438,34 +438,6 @@ def _validate_plan_ranks(
         )
 
 
-def _coords_from_plan(component_base, workitem_coefficients, workitem):
-    coords = [int(value) for value in component_base]
-    for bit, coefficients in enumerate(workitem_coefficients):
-        if not (int(workitem) & (1 << bit)):
-            continue
-        for dim, coefficient in enumerate(coefficients):
-            coords[dim] ^= int(coefficient)
-    return tuple(coords)
-
-
-def _coords_from_packet_plan(
-    component_base,
-    slot_coefficients,
-    workitem_coefficients,
-    slot,
-    workitem,
-):
-    coords = list(
-        _coords_from_plan(component_base, workitem_coefficients, workitem)
-    )
-    for bit, coefficients in enumerate(slot_coefficients):
-        if not (int(slot) & (1 << bit)):
-            continue
-        for dim, coefficient in enumerate(coefficients):
-            coords[dim] ^= int(coefficient)
-    return tuple(coords)
-
-
 def _xor_masks_are_additive(bases, coefficients):
     occupied = 0
     for coefficient in coefficients:

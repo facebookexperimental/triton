@@ -52,7 +52,6 @@ def convert_ttgir_to_wave(
         verifier.verify_target_program(
             target_program,
             source_program=source_program,
-            token_program=token_program,
         )
     emitted_module = emission.emit_wave_module(
         target_program,
