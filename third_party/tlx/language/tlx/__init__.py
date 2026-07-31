@@ -143,7 +143,7 @@ from .utility import (
     warp_id,
 )
 from .mxfp8_utils import _to_mxfp8_block
-from .warp_ops import vote_ballot_sync, warp_all, warp_any, warp_redux
+from .warp_ops import vote_ballot_sync, warp_all, warp_any, warp_ballot, warp_redux
 from .warp_pipeline import warp_pipeline_stage
 
 __all__ = [
@@ -289,6 +289,7 @@ __all__ = [
     # warp_ops
     "warp_all",
     "warp_any",
+    "warp_ballot",
     "vote_ballot_sync",
     # warp_pipeline
     "warp_pipeline_stage",

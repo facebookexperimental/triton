@@ -124,6 +124,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
       triton::nvidia_gpu::VoteBallotSyncOp, triton::tlx::RequireLayoutOp,
       triton::tlx::ReleaseLayoutOp, triton::tlx::LocalAliasOp,
       triton::tlx::DumpLayoutOp, triton::gpu::WarpVoteOp,
+      triton::gpu::WarpBallotOp,
       triton::amdgpu::BufferLoadOp, triton::amdgpu::BufferStoreOp,
       triton::amdgpu::BufferLoadToLocalOp,
       triton::amdgpu::RematerializedRangeOp,

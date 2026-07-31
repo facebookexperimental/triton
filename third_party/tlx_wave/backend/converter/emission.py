@@ -677,6 +677,27 @@ def _emit_cmpi(state, op):
     state.values[result_id] = _pack_components(components)
 
 
+def _emit_cmpf(state, op):
+    attrs = target_ir.attrs_dict(op)
+    lhs, rhs = _operand_values(state, op, 2)
+    result_id = _single_result(op)
+    count = _component_count(state, result_id)
+    lhs_components, rhs_components = _broadcast_components(state, (lhs, rhs), count, op)
+    reused = []
+    components = tuple(
+        _reuse_component_result(
+            reused,
+            (lhs_component, rhs_component),
+            lambda lhs_component=lhs_component, rhs_component=rhs_component: _cmpf(
+                state,
+                attrs["predicate"],
+                lhs_component,
+                rhs_component,
+            ),
+        ) for lhs_component, rhs_component in zip(lhs_components, rhs_components))
+    state.values[result_id] = _pack_components(components)
+
+
 def _emit_type_convert(state, op):
     attrs = target_ir.attrs_dict(op)
     mode = attrs.get("mode")
@@ -1366,6 +1387,21 @@ def _emit_warp_id(state, op):
         state.dsl.BinaryKind.ShRUI,
         wave_first,
         shift,
+    )
+
+
+def _emit_ballot(state, op):
+    (predicate, ) = _operand_values(state, op, 1)
+    if isinstance(predicate, (tuple, list)):
+        fail(
+            "TLXW_EMIT_WARP_BALLOT",
+            STAGE,
+            "warp ballot predicate must contain exactly one mask component",
+            target_op_id=op.target_op_id,
+        )
+    state.values[_single_result(op)] = state.builder.ballot(
+        predicate,
+        state.dsl.i64(),
     )
 
 
@@ -5093,6 +5129,7 @@ _TARGET_EMITTERS = {
     "float_binary": _emit_float_binary,
     "float_unary": _emit_float_unary,
     "float_cast": _emit_float_cast,
+    "cmpf": _emit_cmpf,
     "cmpi": _emit_cmpi,
     "maxsi": _emit_maxsi,
     "minsi": _emit_minsi,
@@ -5107,6 +5144,7 @@ _TARGET_EMITTERS = {
     "expand_dims": _emit_expand_dims,
     "program_id": _emit_program_id,
     "warp_id": _emit_warp_id,
+    "ballot": _emit_ballot,
     "thread_id": _emit_thread_id,
     "barrier": _emit_barrier,
     "cond_barrier": _emit_cond_barrier,
@@ -5678,6 +5716,28 @@ def _cmpi(state, predicate_name, lhs, rhs):
             )
         return state.builder.cmpi(predicate, lhs, rhs)
     return state.dsl.arith.CmpIOp(predicate, lhs, rhs).result
+
+
+def _cmpf(state, predicate_name, lhs, rhs):
+    predicate = state.dsl.CmpFPredicate[predicate_name.upper()]
+    lhs_simd = _is_simd_value(state.dsl, lhs)
+    rhs_simd = _is_simd_value(state.dsl, rhs)
+    if lhs_simd or rhs_simd:
+        simd_type = state.dsl.SimdType(lhs.type if lhs_simd else rhs.type)
+        if not lhs_simd:
+            lhs = state.builder.splat(
+                lhs,
+                simd_type.element_type,
+                int(simd_type.width),
+            )
+        if not rhs_simd:
+            rhs = state.builder.splat(
+                rhs,
+                simd_type.element_type,
+                int(simd_type.width),
+            )
+        return state.builder.cmpf(predicate, lhs, rhs)
+    return state.dsl.arith.CmpFOp(predicate, lhs, rhs).result
 
 
 def _set_module_attrs(module_builder, dsl, ir, kernel):
