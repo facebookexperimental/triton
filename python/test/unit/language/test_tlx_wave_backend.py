@@ -164,15 +164,11 @@ def _target_value_producer(target_program, target_value_id, *, kind=None):
 
 
 def _packetized_local_load_attrs(output):
-    attrs = [
-        converter_target_ir.attrs_dict(op)
-        for op in output.target_program.ops
-        if op.kind == "local_load"
-    ]
+    attrs = [converter_target_ir.attrs_dict(op) for op in output.target_program.ops if op.kind == "local_load"]
     return [entry for entry in attrs if int(entry.get("packet_count", 1)) > 1]
 
 
-def _memory_affine_edge(target_program, memory_op):
+def _memory_offset_edge(target_program, memory_op):
     offset_operand_index = {
         "buffer_load": 1,
         "buffer_load_to_local": 2,
@@ -185,15 +181,10 @@ def _memory_affine_edge(target_program, memory_op):
     offset_target_id = memory_op.operands[offset_operand_index]
     edge = _target_value_producer(target_program, offset_target_id)
     edge_attrs = converter_target_ir.attrs_dict(edge)
-    if edge.kind == "type_convert" and edge_attrs.get("mode") == "component_remap":
-        edge = _target_value_producer(
-            target_program,
-            edge.operands[0],
-            kind="affine_materialize",
-        )
-    else:
-        assert edge.kind == "affine_materialize"
-    return edge, converter_target_ir.attrs_dict(edge)
+    assert edge.kind != "type_convert"
+    live_op_ids = {int(op_id) for region in target_program.regions for op_id in region.op_ids}
+    assert edge.target_op_id in live_op_ids
+    return edge, edge_attrs
 
 
 def _memory_mask_edge(target_program, memory_op):
@@ -1748,7 +1739,7 @@ def test_tlx_wave_converter_keeps_branch_assume_out_of_if_result_range(tmp_path)
     del ctx
 
 
-def test_tlx_wave_converter_fact_stage_invalidates_convert_layout_affine(tmp_path):
+def test_tlx_wave_converter_fact_stage_preserves_ranges_without_affine_graph(tmp_path):
     preamble = """
 #blocked0 = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
@@ -1769,8 +1760,7 @@ def test_tlx_wave_converter_fact_stage_invalidates_convert_layout_affine(tmp_pat
     source_value_id = convert_op.operands[0]
     result_value_id = convert_op.results[0]
     assert converted.values[source_value_id].layout_map_id != converted.values[result_value_id].layout_map_id
-    assert source_value_id in fact_program.tensor_affine
-    assert result_value_id not in fact_program.tensor_affine
+    assert not hasattr(fact_program, "tensor_affine")
     source_ranges = [
         fact for fact in converter_facts.facts_for_value(fact_program, source_value_id) if fact.kind == "range"
     ]
@@ -3076,18 +3066,15 @@ def test_tlx_wave_converter_marks_only_symbolic_address_math_nsw(tmp_path):
     assert scalar_mul_attrs
     assert all(set(attrs) == {"operation", "source_width"} for attrs in scalar_mul_attrs)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
-    affine_op, affine_attrs = _memory_affine_edge(
+    offset_edge, offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["no_signed_wrap"] is True
-    (replaced_offset, ) = affine_attrs[converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR]
-    live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
-    replaced_offset_producer = next(op for op in output.target_program.ops if replaced_offset in op.results)
-    assert replaced_offset_producer.target_op_id not in live_op_ids
+    assert offset_edge.kind == "binary"
+    assert offset_attrs["operation"] == "addi"
     assert "wave.address_arithmetic_no_overflow" in output.emitted_module.text
     assert "wave.binary" in output.emitted_module.text
+    assert "overflow<" not in output.emitted_module.text
     del ctx
 
 
@@ -3128,18 +3115,15 @@ def test_tlx_wave_converter_does_not_walk_loop_carried_address_producers(tmp_pat
     assert {attrs["operation"] for attrs in scalar_binary_attrs} >= {"muli", "addi"}
     assert all(set(attrs) == {"operation", "source_width"} for attrs in scalar_binary_attrs)
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
-    affine_op, affine_attrs = _memory_affine_edge(
+    offset_edge, offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["no_signed_wrap"] is True
-    (replaced_offset, ) = affine_attrs[converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR]
-    live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
-    replaced_offset_producer = next(op for op in output.target_program.ops if replaced_offset in op.results)
-    assert replaced_offset_producer.target_op_id not in live_op_ids
+    assert offset_edge.kind == "binary"
+    assert offset_attrs["operation"] == "addi"
     assert "wave.address_arithmetic_no_overflow" in output.emitted_module.text
     assert "wave.binary" in output.emitted_module.text
+    assert "overflow<" not in output.emitted_module.text
     del ctx
 
 
@@ -3705,8 +3689,6 @@ def test_tlx_wave_converter_preserves_div_rem_source_order(operations):
     target = _target_div_rem_program(operations)
 
     ordered = converter_barrier_order.thread_barrier_issue_order(target)
-    ordered = converter_canonicalize.eliminate_dead_target_ops(ordered)
-
     assert [converter_target_ir.attrs_dict(op)["operation"]
             for op in ordered.ops
             if op.kind == "binary"] == list(operations)
@@ -3878,78 +3860,6 @@ def test_tlx_wave_converter_elides_compiler_membar_before_wait_ready_load():
         "buffer_load_to_local",
         "async_commit_group",
         "local_load",
-    ]
-
-
-@pytest.mark.parametrize("keep_shared_range", (False, True))
-def test_tlx_wave_converter_eliminates_replaced_provenance_slices(keep_shared_range, ):
-    builder = converter_target_ir.TargetBuilder()
-    tensor_i32 = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        1,
-    )
-    scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
-    pointer = converter_target_ir.TargetType(
-        "pointer",
-        "uniform_pointer",
-        "f16",
-    )
-    tensor_f16 = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "f16",
-        64,
-        1,
-    )
-    tensor_index = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "index",
-        64,
-        1,
-    )
-    scalar = builder.add_value(scalar_i32)
-    base = builder.add_value(pointer)
-    stored = builder.add_value(tensor_f16)
-    lane = builder.add_value(tensor_i32)
-    splat = builder.add_value(tensor_i32)
-    replaced_offset = builder.add_value(tensor_i32)
-    materialized_offset = builder.add_value(tensor_index)
-    builder.add_op("make_range", results=(lane, ))
-    builder.add_op("splat", operands=(scalar, ), results=(splat, ))
-    builder.add_op(
-        "binary",
-        operands=(lane, splat),
-        results=(replaced_offset, ),
-        attrs={"operation": "addi"},
-    )
-    if keep_shared_range:
-        builder.add_op("store", operands=(lane, ))
-    builder.add_op(
-        "affine_materialize",
-        results=(materialized_offset, ),
-        attrs={
-            converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR: (replaced_offset, ),
-        },
-    )
-    builder.add_op(
-        "buffer_store",
-        operands=(stored, base, materialized_offset),
-    )
-    builder.add_op("return")
-
-    eliminated = converter_canonicalize.eliminate_dead_target_ops(builder.build(), )
-
-    live_kinds = [eliminated.ops[op_id].kind for op_id in eliminated.regions[0].op_ids]
-    expected_prefix = ["make_range", "store"] if keep_shared_range else []
-    assert live_kinds == [
-        *expected_prefix,
-        "affine_materialize",
-        "buffer_store",
-        "return",
     ]
 
 
@@ -4381,33 +4291,6 @@ def test_tlx_wave_converter_verifier_rejects_unknown_target_value():
     assert diagnostic.no_fallback is True
 
 
-def test_tlx_wave_converter_verifier_rejects_unknown_provenance_target_value():
-    target = converter_target_ir.TargetProgram(
-        (),
-        (converter_target_ir.TargetOp(
-            0,
-            "return",
-            attrs=(converter_target_ir.TargetAttr(
-                converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR,
-                (99, ),
-            ), ),
-        ), ),
-        (converter_target_ir.TargetRegion(0, (0, )), ),
-        {},
-        {},
-    )
-
-    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
-        converter_verifier.verify_target_program(target)
-
-    diagnostic = exc_info.value
-    assert diagnostic.code == "TLXW_VERIFY_PROVENANCE_TARGETS"
-    assert diagnostic.stage == "verification"
-    assert diagnostic.target_op_id == 0
-    assert diagnostic.target_value_id == 99
-    assert diagnostic.no_fallback is True
-
-
 def test_tlx_wave_converter_verifier_rejects_semantic_memory_mask_edges():
     base_type = converter_target_ir.TargetType(
         "pointer",
@@ -4469,7 +4352,7 @@ def test_tlx_wave_converter_verifier_rejects_semantic_memory_mask_edges():
     assert "unsupported memory mask operand mode" in str(exc_info.value)
 
 
-def test_tlx_wave_converter_verifier_rejects_i32_memory_offset_edges():
+def test_tlx_wave_converter_verifier_rejects_f32_memory_offset_edges():
     target = converter_target_ir.TargetProgram(
         (
             converter_target_ir.TargetValue(
@@ -5084,7 +4967,6 @@ def _build_circular_memdesc_read_refill_target(
     pointer_f32 = converter_target_ir.TargetType("pointer", "uniform_pointer", "f32")
     scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
     simd_i32 = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
-    simd_index = converter_target_ir.TargetType("tensor", "simd", "index", 64, 1)
     simd_f32 = converter_target_ir.TargetType("tensor", "simd", "f32", 64, 1)
     memdesc_f32 = converter_target_ir.TargetType("memdesc", "memdesc", "f32")
     token = converter_target_ir.TargetType("token", "token")
@@ -5098,8 +4980,7 @@ def _build_circular_memdesc_read_refill_target(
     current_slot = builder.add_value(scalar_i32)
     next_base = builder.add_value(scalar_i32)
     next_slot = builder.add_value(scalar_i32)
-    raw_offsets = builder.add_value(simd_i32)
-    offsets = builder.add_value(simd_index)
+    offsets = builder.add_value(simd_i32)
     alloc = builder.add_value(memdesc_f32)
     current_view = builder.add_value(memdesc_f32)
     next_view = builder.add_value(memdesc_f32)
@@ -5140,16 +5021,7 @@ def _build_circular_memdesc_read_refill_target(
         results=(next_slot, ),
         attrs={"operation": "remui", "source_width": 32},
     )
-    builder.add_op("splat", operands=(zero, ), results=(raw_offsets, ), attrs={"lane_width": 64})
-    builder.add_op(
-        "type_convert",
-        operands=(raw_offsets, ),
-        results=(offsets, ),
-        attrs={
-            "mode": "bounded_i32_to_index",
-            "value_range": (0, 60),
-        },
-    )
+    builder.add_op("splat", operands=(zero, ), results=(offsets, ), attrs={"lane_width": 64})
     builder.add_op(
         "local_alloc",
         results=(alloc, ),
@@ -5203,14 +5075,12 @@ def _build_independent_async_dma_wait_target():
     pointer_f32 = converter_target_ir.TargetType("pointer", "uniform_pointer", "f32")
     scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
     simd_i32 = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
-    simd_index = converter_target_ir.TargetType("tensor", "simd", "index", 64, 1)
     memdesc_f32 = converter_target_ir.TargetType("memdesc", "memdesc", "f32")
     token = converter_target_ir.TargetType("token", "token")
 
     source = builder.add_value(pointer_f32)
     zero = builder.add_value(scalar_i32)
-    raw_offsets = builder.add_value(simd_i32)
-    offsets = builder.add_value(simd_index)
+    offsets = builder.add_value(simd_i32)
     allocs = tuple(builder.add_value(memdesc_f32) for _ in range(2))
     dma_tokens = tuple(
         builder.add_value(
@@ -5229,16 +5099,7 @@ def _build_independent_async_dma_wait_target():
 
     builder.set_kernel_arg_targets((source, ))
     builder.add_op("constant", results=(zero, ), attrs={"value": 0})
-    builder.add_op("splat", operands=(zero, ), results=(raw_offsets, ), attrs={"lane_width": 64})
-    builder.add_op(
-        "type_convert",
-        operands=(raw_offsets, ),
-        results=(offsets, ),
-        attrs={
-            "mode": "bounded_i32_to_index",
-            "value_range": (0, 60),
-        },
-    )
+    builder.add_op("splat", operands=(zero, ), results=(offsets, ), attrs={"lane_width": 64})
     for alloc in allocs:
         builder.add_op(
             "local_alloc",
@@ -5477,14 +5338,12 @@ def _build_mma_read_then_dma_reuse_target(
     pointer_f16 = converter_target_ir.TargetType("pointer", "uniform_pointer", "f16")
     scalar_i32 = converter_target_ir.TargetType("scalar", "scalar", "i32")
     simd_i32 = converter_target_ir.TargetType("tensor", "simd", "i32", 64, 1)
-    simd_index = converter_target_ir.TargetType("tensor", "simd", "index", 64, 1)
     memdesc_f16 = converter_target_ir.TargetType("memdesc", "memdesc", "f16")
     fragment_f16 = converter_target_ir.TargetType("tensor", "simd_packet", "f16", 64, 1)
     token = converter_target_ir.TargetType("token", "token")
     source = builder.add_value(pointer_f16)
     zero = builder.add_value(scalar_i32)
-    raw_offset = builder.add_value(simd_i32)
-    offset = builder.add_value(simd_index)
+    offset = builder.add_value(simd_i32)
     alloc = builder.add_value(memdesc_f16)
     payload = builder.add_value(fragment_f16)
     second_alloc = builder.add_value(memdesc_f16) if second_root else None
@@ -5522,16 +5381,7 @@ def _build_mma_read_then_dma_reuse_target(
 
     builder.set_kernel_arg_targets((source, ))
     builder.add_op("constant", results=(zero, ), attrs={"value": 0})
-    builder.add_op("splat", operands=(zero, ), results=(raw_offset, ), attrs={"lane_width": 64})
-    builder.add_op(
-        "type_convert",
-        operands=(raw_offset, ),
-        results=(offset, ),
-        attrs={
-            "mode": "bounded_i32_to_index",
-            "value_range": (0, 504),
-        },
-    )
+    builder.add_op("splat", operands=(zero, ), results=(offset, ), attrs={"lane_width": 64})
     builder.add_op(
         "local_alloc",
         results=(alloc, ),
@@ -9390,7 +9240,6 @@ def test_tlx_wave_converter_dma_affine_offset_marks_layout_math_nsw(tmp_path):
     (load_to_local_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(load_to_local_op)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
-    assert all(op.kind != "affine_materialize" for op in output.target_program.ops)
     wave = output.emitted_module.text
     assert wave.count("wave.gather") == 1
     assert wave.count("wave.scatter") == 1
@@ -9961,14 +9810,14 @@ def test_tlx_wave_converter_lowers_masked_scalar_buffer_load_to_local_fallback(t
     del ctx
 
 
-def test_tlx_wave_converter_scalarized_buffer_load_to_local_uses_affine_source_offsets(tmp_path, ):
+def test_tlx_wave_converter_scalarized_buffer_load_to_local_uses_structural_source_offsets(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 #smem = #ttg.shared_memory
 """
     local_func = """
-  tt.func public @converter_scalarized_dma_affine_source_i8(
+  tt.func public @converter_scalarized_dma_structural_source_i8(
       %arg0: !tt.ptr<i8> {tt.pointer_range = 32 : i32},
       %stride: i32) attributes {noinline = false} {
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<8x8xi8, #shared, #smem, mutable>
@@ -11238,84 +11087,6 @@ def test_tlx_wave_converter_materializes_rank2_blocked_coordinates(tmp_path):
     del ctx
 
 
-def test_tlx_wave_emits_affine_tuple_operands_componentwise():
-    tuple_i32 = converter_target_ir.TargetType(
-        "tensor",
-        "simd_tuple",
-        "i32",
-        64,
-        2,
-    )
-    target = converter_target_ir.TargetProgram(
-        values=(
-            converter_target_ir.TargetValue(0, tuple_i32),
-            converter_target_ir.TargetValue(1, tuple_i32),
-        ),
-        ops=(
-            converter_target_ir.TargetOp(
-                0,
-                "constant",
-                results=(0, ),
-                attrs=(converter_target_ir.TargetAttr("value", 7), ),
-            ),
-            converter_target_ir.TargetOp(
-                1,
-                "affine_materialize",
-                operands=(0, ),
-                results=(1, ),
-                attrs=(
-                    converter_target_ir.TargetAttr(
-                        "mode",
-                        "layout_coordinates",
-                    ),
-                    converter_target_ir.TargetAttr(
-                        "coordinate_shape",
-                        (1, ),
-                    ),
-                    converter_target_ir.TargetAttr(
-                        "component_coordinate_bases",
-                        ((0, ), (0, )),
-                    ),
-                    converter_target_ir.TargetAttr(
-                        "workitem_coordinate_coefficients",
-                        (),
-                    ),
-                    converter_target_ir.TargetAttr("scalar_count", 1),
-                    converter_target_ir.TargetAttr(
-                        "scalar_component_sources",
-                        ((0, 1), ),
-                    ),
-                    converter_target_ir.TargetAttr(
-                        "terms",
-                        (("scalar", 1, 0, (0, )), ),
-                    ),
-                    converter_target_ir.TargetAttr(
-                        "no_signed_wrap",
-                        False,
-                    ),
-                ),
-            ),
-            converter_target_ir.TargetOp(2, "return"),
-        ),
-        regions=(converter_target_ir.TargetRegion(0, (0, 1, 2)), ),
-        source_value_targets={},
-        erased_source_values={},
-        kernel=converter_target_ir.TargetKernel(
-            "converter_affine_tuple_operand",
-            "hip:gfx950",
-            num_warps=1,
-            threads_per_warp=64,
-        ),
-    )
-
-    emitted = converter_emission.emit_wave_module(target)
-
-    # The two tuple components have the same affine expression, so emission
-    # may bind both components to the same structurally equivalent Wave value.
-    assert emitted.text.count("wave.binary addi") == 1
-    _run_wave_verify(emitted.text)
-
-
 @pytest.mark.parametrize(
     "is_transposed,expected_coefficients",
     [
@@ -12514,12 +12285,10 @@ def test_tlx_wave_converter_lowers_mfma_epilogue_convert_before_buffer_store(tmp
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "access_element_count" not in attrs
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["scalar_count"] == 1
     assert output.emitted_module.lds_size == 0
     assert "wave.alloc" not in output.emitted_module.text
     assert output.emitted_module.text.count("wave.scatter") == 1
@@ -12561,11 +12330,10 @@ def test_tlx_wave_converter_preserves_generic_epilogue_convert_before_buffer_sto
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "value_mode" not in attrs
     assert attrs["component_count"] == 2
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert "!wave.simd<vector<2xf16>, 64>" in wave
@@ -13094,7 +12862,10 @@ def test_tlx_wave_converter_lowers_fragment_f32_mfma_to_blocked_remap(tmp_path):
     assert attrs["source_registers_per_component"] == 4
     assert attrs["result_component_count"] == 4
     wave = output.emitted_module.text
-    assert wave.count("wave.redistribute") == 1
+    # Both source convert_layout operations remain structural conversions.
+    # The bridge does not recover producer provenance to erase the accumulator
+    # conversion merely because it feeds this dot.
+    assert wave.count("wave.redistribute") == 2
     assert "waveamd.fragment_unpack" in wave
     _run_wave_verify(wave)
     _run_waveamd_to_machine(wave)
@@ -13185,14 +12956,10 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_where(tmp_p
     assert attrs["mask_mode"] == "exec_where"
     assert "inactive_byte_offset" not in attrs
     assert "inactive_offset" not in attrs
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["value_range"] == (0, 1073741823)
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["no_signed_wrap"] is True
-    assert affine_attrs["scalar_count"] == 0
     assert output.emitted_module.text.count("wave.where") == 1
     assert output.emitted_module.text.count("wave.scatter") == 1
     assert 'bit_offset = <"16*offset">' in output.emitted_module.text
@@ -13255,12 +13022,12 @@ def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_is_affine(tmp_path):
+def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_stays_structural(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_buffer_store_affine_offset(
+  tt.func public @converter_buffer_store_structural_offset(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %stride: i32) attributes {noinline = false} {
     %zero = arith.constant 0 : i32
@@ -13279,27 +13046,24 @@ def test_tlx_wave_converter_buffer_store_dynamic_scalar_offset_is_affine(tmp_pat
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
-    affine_op, affine_attrs = _memory_affine_edge(
+    offset_edge, offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["scalar_count"] == 1
     assert len(store_op.operands) == 3
-    (replaced_offset, ) = affine_attrs[converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR]
-    assert replaced_offset not in store_op.operands
-    assert affine_attrs["value_range"] == (0, 1073741823)
-    assert "wave.index_expr" in output.emitted_module.text
+    assert offset_edge.kind == "binary"
+    assert offset_attrs["operation"] == "addi"
+    assert "wave.assume" in output.emitted_module.text
     assert output.emitted_module.text.count("wave.scatter") == 1
     del ctx
 
 
-def test_tlx_wave_converter_emits_dynamic_affine_offsets_at_store_edges(tmp_path, ):
+def test_tlx_wave_converter_keeps_dynamic_offset_ssa_at_store_edges(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_structural_affine_store_offsets(
+  tt.func public @converter_structural_store_offsets(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
       %stride: i32) attributes {noinline = false} {
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
@@ -13320,41 +13084,34 @@ def test_tlx_wave_converter_emits_dynamic_affine_offsets_at_store_edges(tmp_path
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
-    affine_op, affine_attrs = _memory_affine_edge(
+    offset_edge, offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    (replaced_offset, ) = affine_attrs[converter_target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR]
-    live_op_ids = {op_id for region in output.target_program.regions for op_id in region.op_ids}
-    replaced_offset_producer = next(op for op in output.target_program.ops if replaced_offset in op.results)
-    assert replaced_offset_producer.target_op_id not in live_op_ids
+    assert offset_edge.kind == "binary"
+    assert offset_attrs["operation"] == "muli"
 
     wave_lines = output.emitted_module.text.splitlines()
-    affine_offset_lines = [
-        index for index, line in enumerate(wave_lines)
-        if "wave.index_expr" in line and 'wave.index_expr <"x">' not in line
-    ]
-    bounded_offset_lines = [index for index, line in enumerate(wave_lines) if 'wave.index_expr <"x">' in line]
+    multiply_line = max(index for index, line in enumerate(wave_lines) if "wave.binary muli" in line)
     scatter_lines = [index for index, line in enumerate(wave_lines) if "wave.scatter " in line]
-    assert len(affine_offset_lines) == len(bounded_offset_lines) == 8
     assert len(scatter_lines) == 1
-    assert all(affine_offset + 2 == bounded_offset and "wave.assume" in wave_lines[bounded_offset - 1]
-               for affine_offset, bounded_offset in zip(
-                   affine_offset_lines,
-                   bounded_offset_lines,
-               ))
+    bounded_offset_lines = [
+        index for index, line in enumerate(wave_lines)
+        if multiply_line < index < scatter_lines[0] and "wave.assume" in line and 'as "x"' in line
+    ]
+    assert len(bounded_offset_lines) == 8
     assert bounded_offset_lines[-1] < scatter_lines[0]
+    assert "wave.binary muli" in output.emitted_module.text
     _run_waveamd_to_machine(output.emitted_module.text)
     del ctx
 
 
-def test_tlx_wave_converter_structurally_converts_nonaffine_memory_offsets(tmp_path, ):
+def test_tlx_wave_converter_preserves_remui_memory_offset_ssa(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_nonaffine_store_offset(
+  tt.func public @converter_remui_store_offset(
       %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked>
     %divisor = arith.constant dense<32> : tensor<64xi32, #blocked>
@@ -13374,22 +13131,18 @@ def test_tlx_wave_converter_structurally_converts_nonaffine_memory_offsets(tmp_p
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
-    conversion_op = _target_value_producer(
+    offset_op = _target_value_producer(
         output.target_program,
         store_op.operands[2],
     )
-    conversion_attrs = converter_target_ir.attrs_dict(conversion_op)
-    assert conversion_op.kind == "type_convert"
-    assert conversion_attrs["mode"] == "bounded_i32_to_index"
-    assert conversion_attrs["value_range"] == (0, 1073741823)
-    source_type = output.target_program.values[conversion_op.operands[0]].type
-    result_type = output.target_program.values[conversion_op.results[0]].type
-    assert source_type.element_type == "i32"
-    assert result_type.element_type == "index"
+    offset_attrs = converter_target_ir.attrs_dict(offset_op)
+    assert offset_op.kind == "binary"
+    assert offset_attrs["operation"] == "remui"
+    result_type = output.target_program.values[offset_op.results[0]].type
+    assert result_type.element_type == "i32"
     assert "offset_range" not in converter_target_ir.attrs_dict(store_op)
     wave = output.emitted_module.text
     assert "wave.binary remui" in wave
-    assert "wave.index_expr" in wave
     assert "wave.assume" in wave
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_store_b16" in machine
@@ -13425,11 +13178,10 @@ def test_tlx_wave_converter_vectorizes_mfma_vector_payload_buffer_store(tmp_path
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "access_element_count" not in attrs
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert "!wave.simd<vector<4xf16>, 64>" in wave
@@ -13471,12 +13223,10 @@ def test_tlx_wave_converter_vectorizes_mfma_vector_payload_dynamic_stride_buffer
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "access_element_count" not in attrs
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["scalar_count"] == 1
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert "!wave.simd<vector<4xf16>, 64>" in wave
@@ -13485,7 +13235,7 @@ def test_tlx_wave_converter_vectorizes_mfma_vector_payload_dynamic_stride_buffer
     del ctx
 
 
-def test_tlx_wave_converter_buffer_store_dynamic_branch_fact_is_affine(tmp_path, ):
+def test_tlx_wave_converter_buffer_store_dynamic_branch_fact_stays_structural(tmp_path, ):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -13515,12 +13265,10 @@ def test_tlx_wave_converter_buffer_store_dynamic_branch_fact_is_affine(tmp_path,
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
-    assert affine_attrs["scalar_count"] == 1
     del ctx
 
 
@@ -13583,18 +13331,17 @@ def test_tlx_wave_converter_masks_wide_buffer_store_with_where(tmp_path, ):
     assert "access_element_count" not in attrs
     assert "inactive_byte_offset" not in attrs
     assert "inactive_offset" not in attrs
-    _affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["value_range"] == (0, 1073741823)
     assert "wave.where" in output.emitted_module.text
     assert output.emitted_module.text.count("wave.scatter") == 1
     assert "wave.select" not in output.emitted_module.text
     del ctx
 
 
-def test_tlx_wave_converter_vectorizes_affine_contiguous_f16_buffer_store(tmp_path):
+def test_tlx_wave_converter_vectorizes_structural_contiguous_f16_buffer_store(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -13614,11 +13361,10 @@ def test_tlx_wave_converter_vectorizes_affine_contiguous_f16_buffer_store(tmp_pa
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
     assert "access_element_count" not in attrs
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         store_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert "!wave.simd<vector<8xf16>, 64>" in wave
@@ -13628,7 +13374,7 @@ def test_tlx_wave_converter_vectorizes_affine_contiguous_f16_buffer_store(tmp_pa
     del ctx
 
 
-def test_tlx_wave_converter_vectorizes_uniform_masked_affine_buffer_store(tmp_path):
+def test_tlx_wave_converter_vectorizes_uniform_masked_structural_buffer_store(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -13727,7 +13473,7 @@ def test_tlx_wave_converter_keeps_unaligned_masked_buffer_store_scalar(tmp_path)
     del ctx
 
 
-def test_tlx_wave_converter_keeps_noncontiguous_affine_buffer_store_scalar(tmp_path):
+def test_tlx_wave_converter_keeps_noncontiguous_structural_buffer_store_scalar(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -14110,11 +13856,10 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(tmp_pa
     assert attrs["mask_mode"] == "exec_where"
     assert "inactive_byte_offset" not in attrs
     assert "inactive_offset" not in attrs
-    _affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         load_op,
     )
-    assert affine_attrs["value_range"] == (0, 536870911)
     assert output.emitted_module.text.count("waveamd.make_buffer") == 2
     assert output.emitted_module.text.count("wave.gather") == 1
     assert output.emitted_module.text.count("wave.scatter") == 1
@@ -14187,11 +13932,10 @@ def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load
 
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
     attrs = converter_target_ir.attrs_dict(load_op)
-    affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         load_op,
     )
-    assert affine_attrs["mode"] == "layout_coordinates"
     assert "source_access_element_count" not in attrs
     assert "access_element_count" not in attrs
     wave = output.emitted_module.text
@@ -14246,12 +13990,12 @@ def test_tlx_wave_converter_preserves_direct_buffer_cache_modifiers(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_infers_affine_contiguous_i8_buffer_load(tmp_path):
+def test_tlx_wave_converter_vectorizes_contiguous_i8_buffer_load_from_structural_offsets(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
     local_func = """
-  tt.func public @converter_affine_vector_buffer_load(
+  tt.func public @converter_structural_vector_buffer_load(
       %arg0: !tt.ptr<i8> {tt.pointer_range = 32 : i32}) attributes {noinline = false} {
     %range = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32, #blocked>
     %loaded = amdg.buffer_load %arg0[%range] {contiguity = 1 : i32} : tensor<512xi8, #blocked>
@@ -14603,11 +14347,10 @@ def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
 
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
     attrs = converter_target_ir.attrs_dict(load_op)
-    _affine_op, affine_attrs = _memory_affine_edge(
+    _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         load_op,
     )
-    assert affine_attrs["value_range"] == (0, 0)
     assert attrs["mask_mode"] == "exec_where"
     assert "inactive_byte_offset" not in attrs
     assert "inactive_offset" not in attrs
@@ -14616,7 +14359,8 @@ def test_tlx_wave_converter_masks_buffer_load_offset_assumes(tmp_path):
     assert "otherwise" in wave
     gather_index = wave.index("wave.gather")
     where_index = wave.rindex("wave.where", 0, gather_index)
-    assert wave.index("wave.assume") < where_index < gather_index
+    assume_index = wave.index("wave.assume", where_index)
+    assert where_index < assume_index < gather_index
     machine = _run_waveamd_to_machine(wave)
     assert "waveamdmachine.buffer_load_b32" in machine
     assert "waveamdmachine.exec_if" in machine
@@ -15199,14 +14943,8 @@ def test_tlx_wave_converter_threads_dominating_wait_without_relaxing_ordinary_lo
     (wait_op, ) = [op for op in output.target_program.ops if op.kind == "async_wait"]
     relaxed_store, ordinary_store = [op for op in output.target_program.ops if op.kind == "local_store"]
     local_loads = [op for op in output.target_program.ops if op.kind == "local_load"]
-    (relaxed_load, ) = [
-        op for op in local_loads
-        if converter_target_ir.attrs_dict(op)["synced_via_async_wait"]
-    ]
-    (ordinary_load, ) = [
-        op for op in local_loads
-        if not converter_target_ir.attrs_dict(op)["synced_via_async_wait"]
-    ]
+    (relaxed_load, ) = [op for op in local_loads if converter_target_ir.attrs_dict(op)["synced_via_async_wait"]]
+    (ordinary_load, ) = [op for op in local_loads if not converter_target_ir.attrs_dict(op)["synced_via_async_wait"]]
     assert relaxed_load.operands[1:] == wait_op.results
     assert relaxed_store.operands[2:] == ()
     assert ordinary_store.operands[2:] == ()
@@ -15591,9 +15329,7 @@ def test_tlx_wave_converter_pipeline_keeps_mma_payload_read_tokens_out_of_barrie
             r"%[\w#]+,\s*(?P<token>%[\w#]+)\s*=\s*wave\.(?:gather|load)",
             wave,
         ))
-    assert len(read_tokens) == sum(
-        attrs["packet_count"] for attrs in _packetized_local_load_attrs(output)
-    )
+    assert len(read_tokens) == sum(attrs["packet_count"] for attrs in _packetized_local_load_attrs(output))
     token_consumers = [
         line for line in wave.splitlines() if "wave.barrier" in line if any(
             re.search(rf"(?<![\w#]){re.escape(token)}(?![\w#])", line) for token in read_tokens)
@@ -16057,8 +15793,7 @@ def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_scale_transpose_loads
     scale_load_attrs = [
         converter_target_ir.attrs_dict(op)
         for op in output.target_program.ops
-        if op.kind == "local_load"
-        and converter_target_ir.attrs_dict(op)["element_type"] == "i8"
+        if op.kind == "local_load" and converter_target_ir.attrs_dict(op)["element_type"] == "i8"
         and int(converter_target_ir.attrs_dict(op)["packet_count"]) == 1
     ]
     assert [attrs["component_count"] for attrs in scale_load_attrs] == [16, 8]
@@ -16409,9 +16144,8 @@ def test_tlx_wave_converter_pipeline_lowers_mfma32_transpose_load(tmp_path):
 
     output = converter_pipeline.convert_ttgir_to_wave(mod)
     local_load_attrs = _packetized_local_load_attrs(output)
-    assert [attrs["packet_count"] for attrs in local_load_attrs] == [
-        attrs["component_count"] for attrs in local_load_attrs
-    ]
+    assert [attrs["packet_count"]
+            for attrs in local_load_attrs] == [attrs["component_count"] for attrs in local_load_attrs]
     assert all(attrs["packet_width"] == 8 for attrs in local_load_attrs)
     assert [attrs["shared_physical_offset_plan"] for attrs in local_load_attrs] == [
         "swizzled_xor",

@@ -324,7 +324,6 @@ def _verify_ops(target_program, source_program):
                     target_op_id=op.target_op_id,
                 )
         _verify_attrs(op)
-        _verify_provenance_only_target_ids(op, value_count)
         if op.kind in {"buffer_load_to_local", "buffer_load", "buffer_store"}:
             _verify_memory_edges(op, target_program)
         if op.kind in target_ir.MEMORY_ISSUER_OP_KINDS:
@@ -340,8 +339,6 @@ def _verify_ops(target_program, source_program):
                 "local_store",
         }:
             _verify_async_protocol_op(op, target_program, source_program)
-        if op.kind == "affine_materialize":
-            _verify_affine_materialize(op, target_program)
         if op.kind == "type_convert":
             _verify_type_convert(op, target_program)
         if op.kind == "make_buffer":
@@ -1142,37 +1139,6 @@ def _verify_attrs(op):
             )
 
 
-def _verify_provenance_only_target_ids(op, value_count):
-    value_ids = _attrs_dict(op).get(
-        target_ir.PROVENANCE_ONLY_TARGET_IDS_ATTR,
-        (),
-    )
-    if not isinstance(value_ids, tuple):
-        fail(
-            "TLXW_VERIFY_PROVENANCE_TARGETS",
-            STAGE,
-            "provenance-only target IDs must be a tuple",
-            target_op_id=op.target_op_id,
-        )
-    for target_value_id in value_ids:
-        if (not isinstance(target_value_id, int) or target_value_id < 0 or target_value_id >= value_count):
-            fail(
-                "TLXW_VERIFY_PROVENANCE_TARGETS",
-                STAGE,
-                "target op references an unknown provenance-only value",
-                target_op_id=op.target_op_id,
-                target_value_id=(target_value_id if isinstance(target_value_id, int) else None),
-            )
-        if int(target_value_id) in op.operands:
-            fail(
-                "TLXW_VERIFY_PROVENANCE_TARGETS",
-                STAGE,
-                "provenance-only values must not be runtime operands",
-                target_op_id=op.target_op_id,
-                target_value_id=int(target_value_id),
-            )
-
-
 def _verify_memory_edges(op, target_program):
     attrs = _attrs_dict(op)
     semantic_edge_attrs = frozenset({
@@ -1330,124 +1296,6 @@ def _verify_make_buffer(op, target_program):
         )
 
 
-def _verify_affine_materialize(op, target_program):
-    attrs = _attrs_dict(op)
-    if len(op.results) != 1:
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "affine_materialize requires exactly one result",
-            target_op_id=op.target_op_id,
-        )
-    result_type = target_program.values[int(op.results[0])].type
-    if (result_type.element_type not in {"i32", "index"} or result_type.representation not in {"simd", "simd_tuple"}):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "affine_materialize result must be an i32 or index SIMD value",
-            target_op_id=op.target_op_id,
-            target_value_id=int(op.results[0]),
-        )
-    scalar_count = attrs.get("scalar_count")
-    if not isinstance(scalar_count, int) or scalar_count != len(op.operands):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "affine_materialize scalar count must match its operands",
-            target_op_id=op.target_op_id,
-        )
-    terms = attrs.get("terms")
-    if not isinstance(terms, tuple):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "affine_materialize requires tuple term attrs",
-            target_op_id=op.target_op_id,
-        )
-    mode = attrs.get("mode")
-    if mode != "layout_coordinates":
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            f"unsupported affine materialization mode {mode!r}",
-            target_op_id=op.target_op_id,
-        )
-    value_range = attrs.get("value_range")
-    if result_type.element_type == "index":
-        if (not isinstance(value_range, tuple) or len(value_range) != 2
-                or not all(isinstance(bound, int) for bound in value_range) or int(value_range[0]) < 0
-                or int(value_range[0]) > int(value_range[1])):
-            fail(
-                "TLXW_VERIFY_AFFINE_EDGE",
-                STAGE,
-                "index affine materialization requires a nonnegative closed range",
-                target_op_id=op.target_op_id,
-            )
-    elif value_range is not None:
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "i32 affine materialization must not carry an index value range",
-            target_op_id=op.target_op_id,
-        )
-    shape = attrs.get("coordinate_shape")
-    bases = attrs.get("component_coordinate_bases")
-    coefficients = attrs.get("workitem_coordinate_coefficients")
-    if not all(isinstance(value, tuple) for value in (shape, bases, coefficients)):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "layout-coordinate affine materialization requires tuple "
-            "coordinate attrs",
-            target_op_id=op.target_op_id,
-        )
-    rank = len(shape)
-    if len(bases) != int(result_type.component_count) or any(not isinstance(values, tuple) or len(values) != rank
-                                                             for values in (*bases, *coefficients)):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "affine_materialize coordinate ranks do not match its result",
-            target_op_id=op.target_op_id,
-        )
-    scalar_sources = attrs.get("scalar_component_sources")
-    if scalar_sources is not None:
-        _verify_affine_scalar_component_sources(
-            op,
-            target_program,
-            scalar_sources,
-            int(result_type.component_count),
-        )
-
-
-def _verify_affine_scalar_component_sources(
-    op,
-    target_program,
-    scalar_sources,
-    component_count,
-):
-    if len(scalar_sources) != len(op.operands):
-        fail(
-            "TLXW_VERIFY_AFFINE_EDGE",
-            STAGE,
-            "affine scalar maps must match its operands",
-            target_op_id=op.target_op_id,
-        )
-    for operand_id, sources in zip(op.operands, scalar_sources):
-        operand_type = target_program.values[int(operand_id)].type
-        if (not isinstance(sources, tuple) or len(sources) != component_count
-                or any(not isinstance(source, int) or source < 0 or source >= int(operand_type.component_count)
-                       for source in sources)):
-            fail(
-                "TLXW_VERIFY_AFFINE_EDGE",
-                STAGE,
-                "packet affine scalar component map is inconsistent with "
-                "its operand type",
-                target_op_id=op.target_op_id,
-                target_value_id=int(operand_id),
-            )
-
-
 def _verify_type_convert(op, target_program):
     attrs = _attrs_dict(op)
     if len(op.operands) != 1 or len(op.results) != 1:
@@ -1459,7 +1307,6 @@ def _verify_type_convert(op, target_program):
         )
     mode = attrs.get("mode")
     if mode not in {
-            "bounded_i32_to_index",
             "component_remap",
             "index_cast",
             "packet_to_scalar_components",
@@ -1482,22 +1329,6 @@ def _verify_type_convert(op, target_program):
                 "TLXW_VERIFY_TYPE_CONVERT",
                 STAGE,
                 "index cast has inconsistent types or value distribution",
-                target_op_id=op.target_op_id,
-            )
-        return
-    if mode == "bounded_i32_to_index":
-        value_range = attrs.get("value_range")
-        if (operand_type.element_type != "i32" or result_type.element_type != "index"
-                or operand_type.kind != result_type.kind or operand_type.representation != result_type.representation
-                or operand_type.representation not in {"scalar", "simd", "simd_tuple"}
-                or operand_type.lane_width != result_type.lane_width
-                or operand_type.component_count != result_type.component_count or not isinstance(value_range, tuple)
-                or len(value_range) != 2 or not all(isinstance(bound, int) for bound in value_range)
-                or int(value_range[0]) < 0 or int(value_range[0]) > int(value_range[1])):
-            fail(
-                "TLXW_VERIFY_TYPE_CONVERT",
-                STAGE,
-                "bounded i32-to-index conversion has inconsistent types or range",
                 target_op_id=op.target_op_id,
             )
         return
