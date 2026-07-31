@@ -167,6 +167,12 @@ categorizeDataPartitionOps()    ← skips already-categorized ops
 Correction runs before DataPartition so that correction ops (accumulator
 rescaling) are not stolen by the data partition categorizer.
 
+Categorized operations retain their deterministic discovery order separately
+from the pointer-keyed category lookup map. Scheduling phases process operations
+in that discovery order; iterating the lookup map directly would make shared
+producer ownership depend on pointer hash order when multiple anchor backward
+slices reach the same index or mask chain.
+
 ### Central dpId Assignment (`collectMMABackwardSlices`)
 
 `collectMMABackwardSlices` is the single source of truth for data partition ID

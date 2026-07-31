@@ -421,7 +421,8 @@ public:
   /// Get operations in a specific category.
   SmallVector<CategorizedOp> getOpsInCategory(OpCategory cat) const {
     SmallVector<CategorizedOp> result;
-    for (auto &[op, catOp] : opCategories) {
+    for (Operation *op : opCategoryOrder) {
+      const CategorizedOp &catOp = opCategories.at(op);
       if (catOp.category == cat)
         result.push_back(catOp);
     }
@@ -483,7 +484,8 @@ public:
 
     for (OpCategory cat : categoryOrder) {
       SmallVector<const CategorizedOp *> ops;
-      for (auto &[op, catOp] : opCategories) {
+      for (Operation *op : opCategoryOrder) {
+        const CategorizedOp &catOp = opCategories.at(op);
         if (catOp.category == cat)
           ops.push_back(&catOp);
       }
@@ -951,6 +953,8 @@ private:
       if (it != opToDpId.end() && it->second != SHARED_DPID)
         dataPartitionId = it->second;
     }
+    if (!opCategories.contains(op))
+      opCategoryOrder.insert(op);
     opCategories[op] = CategorizedOp{op, cat, dataPartitionId, parentMMA};
   }
 
@@ -958,6 +962,7 @@ private:
   SmallVector<LoopLikeOpInterface> loops;
   SmallVector<Operation *> mmas;
   DenseMap<Operation *, CategorizedOp> opCategories;
+  SetVector<Operation *> opCategoryOrder;
   DenseMap<Operation *, SetVector<Operation *>> mmaToSlice;
   DenseSet<Operation *> sharedOps;
   DenseMap<Operation *, unsigned> opToDpId;
