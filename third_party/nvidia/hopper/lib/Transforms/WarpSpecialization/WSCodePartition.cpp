@@ -4774,6 +4774,7 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 // allocation) prevents the autoWS compiler from creating a
 // cross-partition channel for it.
 void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
+  DominanceInfo dominance(funcOp);
   auto isConstZeroTensor = [](Value v) -> bool {
     auto constOp = v.getDefiningOp<arith::ConstantOp>();
     if (!constOp)
@@ -4864,9 +4865,14 @@ void removeRedundantTmemZeroStores(triton::FuncOp funcOp) {
           zeroStoreOp->getParentOfType<scf::ForOp>();
       if (!zeroStoreParentLoop)
         zeroStoreParentLoop = zeroStoreOp->getParentOfType<scf::WhileOp>();
-      if (zeroStoreParentLoop &&
+      bool commonOuterLoop =
+          zeroStoreParentLoop &&
           (zeroStoreParentLoop == mmaParentLoop.getOperation() ||
-           zeroStoreParentLoop->isProperAncestor(mmaParentLoop))) {
+           zeroStoreParentLoop->isProperAncestor(mmaParentLoop));
+      bool dominatesKnownNonEmptyLoop =
+          mmaParentLoop->hasAttr("tt.assume_nonempty") &&
+          dominance.properlyDominates(zeroStoreOp, mmaParentLoop);
+      if (commonOuterLoop || dominatesKnownNonEmptyLoop) {
         LLVM_DEBUG({
           LDBG("Removing redundant TMEM zero-store for operand D: "
                << "MMA useAccumulator=false already handles zeroing");
