@@ -249,9 +249,7 @@ class TestTLXTemplates(TestCase):
         code_str = "\n".join(code)
         self.assertIn("split_k_ws", code_str)
         self.assertIn("call__reduce_k_kernel_", code_str)
-        self.assertNotIn(
-            "from triton.language.extra.tlx.inductor.reduce_k import", code_str
-        )
+        self.assertNotIn("from triton.language.extra.tlx.inductor.reduce_k import", code_str)
 
     @unittest.skipIf(
         not is_gfx950(),
@@ -635,8 +633,7 @@ class TestReduceKKernel(TestCase):
 
     def test_aoti_reduce_k_emission(self):
         from triton.language.extra.tlx.inductor.reduce_k import (
-            emit_aoti_reduce_k_call,
-        )
+            emit_aoti_reduce_k_call, )
 
         wrapper = mock.MagicMock()
         wrapper.define_user_defined_triton_kernel.return_value = (

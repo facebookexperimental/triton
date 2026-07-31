@@ -1,5 +1,5 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
-//META_WS_ONLY
+// META_WS_ONLY
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"

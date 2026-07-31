@@ -106,13 +106,20 @@ def make_prod(max_targets, max_kv, batch, seed=1001):
     # Port generative_recommenders.common.generate_sparse_seq_len at
     # --seq-sparsity=0.95: U[int(0.9 * max_kv), max_kv).
     lengths_kv = torch.randint(
-        int(0.9 * max_kv), max_kv, (batch,), device=dev,
-        dtype=torch.int64, generator=gen,
+        int(0.9 * max_kv),
+        max_kv,
+        (batch, ),
+        device=dev,
+        dtype=torch.int64,
+        generator=gen,
     )
     lengths_q = torch.randint(
         1 if max_targets < 400 else max_targets // 2,
         max_targets + 1,
-        (batch,), device=dev, dtype=torch.int64, generator=gen,
+        (batch, ),
+        device=dev,
+        dtype=torch.int64,
+        generator=gen,
     )
     so_kv = torch.zeros(batch + 1, device=dev, dtype=torch.int64)
     so_q = torch.zeros(batch + 1, device=dev, dtype=torch.int64)
@@ -121,9 +128,7 @@ def make_prod(max_targets, max_kv, batch, seed=1001):
     tq, tkv = int(so_q[-1]), int(so_kv[-1])
 
     def tensor(n, heads):
-        return torch.empty(n, heads, D, device=dev, dtype=torch.bfloat16).uniform_(
-            -0.1, 0.1, generator=gen
-        )
+        return torch.empty(n, heads, D, device=dev, dtype=torch.bfloat16).uniform_(-0.1, 0.1, generator=gen)
 
     q = tensor(tq, H).requires_grad_(True)
     k = tensor(tkv, H_KV).requires_grad_(True)
@@ -264,16 +269,13 @@ def main():
     ap.add_argument("--ns", type=int, default=2, help="bwd num_stages")
     ap.add_argument("--shared-kv", action="store_true", dest="shared_kv",
                     help="use shared-KV for accuracy cases (perf always matches production)")
-    ap.add_argument("--batch", type=int, default=1024,
-                    help="performance batch size (default: Buck workload 1024)")
+    ap.add_argument("--batch", type=int, default=1024, help="performance batch size (default: Buck workload 1024)")
     ap.add_argument("--max-kv", type=int, default=4096, dest="max_kv",
                     help="performance max KV length (default: task focus 4096)")
     ap.add_argument("--max-targets", default="32,128,160,256", dest="max_targets",
                     help="comma-separated performance max query/target lengths")
-    ap.add_argument("--bm", type=int, default=BLOCK,
-                    help="pinned autoWS backward BLOCK_M")
-    ap.add_argument("--bn", type=int, default=128,
-                    help="pinned autoWS backward BLOCK_N (TLX-aligned default: 128)")
+    ap.add_argument("--bm", type=int, default=BLOCK, help="pinned autoWS backward BLOCK_M")
+    ap.add_argument("--bn", type=int, default=128, help="pinned autoWS backward BLOCK_N (TLX-aligned default: 128)")
     ap.add_argument("--ref", choices=["redq", "tlx"], default="redq",
                     help="byte-reference kernel for the dq bad-Q-block count")
     known = [n for n, _, _ in VARIANTS]
@@ -309,13 +311,11 @@ def main():
         target_lengths = [int(x) for x in args.max_targets.split(",")]
     except ValueError:
         ap.error("--max-targets must be a comma-separated list of integers")
-    perf_shapes = [(max_targets, args.max_kv, args.batch)
-                   for max_targets in target_lengths]
+    perf_shapes = [(max_targets, args.max_kv, args.batch) for max_targets in target_lengths]
     if do_acc:
         run_accuracy(acc_cfgs, ns=args.ns, ref_name=ref, variants=variants, shared=shared)
     if do_perf:
-        run_perf(perf_shapes, ns=args.ns, variants=variants, production=True,
-                 bm=args.bm, bn=args.bn)
+        run_perf(perf_shapes, ns=args.ns, variants=variants, production=True, bm=args.bm, bn=args.bn)
 
 
 if __name__ == "__main__":
