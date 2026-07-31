@@ -72,6 +72,7 @@ class HSTUAutoWSConfig:
     sp: bool = False  # bwd SEQUENCE_PARALLEL
     clc: bool = False  # bwd CLC-persistent flattened tile loop
     clc_smem_algo: int = 1  # CLC outer-loop SMEM allocation algorithm
+    mask_if: bool = False  # runtime masked/unmasked branch inside the bwd loop
     pin: bool = False  # pin autotune to one config (fast compile)
 
     @classmethod
@@ -94,6 +95,7 @@ class HSTUAutoWSConfig:
             sp=g("HSTU_SELF_AUTOWS_SP") == "1",
             clc=g("HSTU_SELF_AUTOWS_CLC") == "1",
             clc_smem_algo=int(g("HSTU_SELF_AUTOWS_CLC_SMEM_ALGO", "1")),
+            mask_if=g("HSTU_SELF_AUTOWS_MASK_IF") == "1",
             pin=g("HSTU_SELF_PIN") == "1",
         )
 
@@ -633,10 +635,23 @@ def backward_activation(qk_trans, alpha, scale, valid_mask_trans, k):
 
 
 @triton.jit
+def backward_activation_unmasked(qk_trans, alpha, scale, k):
+    qk_trans = qk_trans * alpha
+    sig_trans = fast_dividef(1.0, 1.0 + tl.exp(-qk_trans))
+    act_qk_trans = (qk_trans * sig_trans * scale).to(k.dtype)
+    return qk_trans, sig_trans, act_qk_trans
+
+
+@triton.jit
 def backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans):
     dqk_trans = dact_qk_trans * sig_trans * (1 + qk_trans * (1 - sig_trans)) * scale
     dqk_trans = tl.where(valid_mask_trans, dqk_trans, 0)
     return dqk_trans
+
+
+@triton.jit
+def backward_d_activation_unmasked(dact_qk_trans, sig_trans, qk_trans, scale):
+    return dact_qk_trans * sig_trans * (1 + qk_trans * (1 - sig_trans)) * scale
 
 
 @triton.jit
@@ -939,6 +954,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
+    MASK_IF: tl.constexpr = False,
 ):
     offs_m = offs_m + start_m
     # Keep the integer KV-index/mask chain inside the warp-specialized loop.
@@ -975,18 +991,45 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         allow_tf32=ALLOW_TF32,
         attrs=({"stage": "0", "order": "0", "channels": ["opndD,tmem,1,2"]} if DQ_REUSE else None),
     )
-    valid_mask_trans = backward_valid_mask(
-        offs_m,
-        pos_offs_n,
-        offs_n,
-        max_ids,
-        contextual_seq_len,
-        max_attn_len,
-        HAS_CONTEXTUAL_SEQ_LEN,
-        HAS_NUM_TARGETS,
-        HAS_MAX_ATTN_LEN,
-    )
-    qk_trans, sig_trans, act_qk_trans = backward_activation(qk_trans, alpha, scale, valid_mask_trans, k)
+    if MASK_IF:
+        valid_mask_trans = tl.full((BLOCK_N, BLOCK_M), True, tl.int1)
+        apply_mask = start_m < start_n + BLOCK_N
+        if HAS_MAX_ATTN_LEN:
+            apply_mask = True
+            if HAS_NUM_TARGETS:
+                apply_mask = start_m < seq_len_q - n_targets
+        if HAS_CONTEXTUAL_SEQ_LEN:
+            apply_mask = True
+        if apply_mask:
+            valid_mask_trans = backward_valid_mask(
+                offs_m,
+                pos_offs_n,
+                offs_n,
+                max_ids,
+                contextual_seq_len,
+                max_attn_len,
+                HAS_CONTEXTUAL_SEQ_LEN,
+                HAS_NUM_TARGETS,
+                HAS_MAX_ATTN_LEN,
+            )
+            qk_trans, sig_trans, act_qk_trans = backward_activation(
+                qk_trans, alpha, scale, valid_mask_trans, k
+            )
+        else:
+            qk_trans, sig_trans, act_qk_trans = backward_activation_unmasked(qk_trans, alpha, scale, k)
+    else:
+        valid_mask_trans = backward_valid_mask(
+            offs_m,
+            pos_offs_n,
+            offs_n,
+            max_ids,
+            contextual_seq_len,
+            max_attn_len,
+            HAS_CONTEXTUAL_SEQ_LEN,
+            HAS_NUM_TARGETS,
+            HAS_MAX_ATTN_LEN,
+        )
+        qk_trans, sig_trans, act_qk_trans = backward_activation(qk_trans, alpha, scale, valid_mask_trans, k)
     # compute dv
     if ENABLE_TMA:
         do = device_desc_do.load([(desc_row_q + start_m).to(tl.int32), (off_h * stride_doh).to(tl.int32)])
@@ -1014,7 +1057,13 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     )
 
     # compute dk and dq
-    dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
+    if MASK_IF:
+        if apply_mask:
+            dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
+        else:
+            dqk_trans = backward_d_activation_unmasked(dact_qk_trans, sig_trans, qk_trans, scale)
+    else:
+        dqk_trans = backward_d_activation(dact_qk_trans, sig_trans, qk_trans, scale, valid_mask_trans)
     dqk_trans = dqk_trans.to(k.dtype)
 
     # Note: the factor `alpha` is delayed until the end of the function to reduce the cost
@@ -1720,6 +1769,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     ATOMIC_ADD: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr = False,
+    MASK_IF: tl.constexpr = False,
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
@@ -1798,6 +1848,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 DQ_REDUCE=DQ_REDUCE,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
+                MASK_IF=MASK_IF,
             )
     if HAS_NUM_TARGETS:
         low = start_n
@@ -1879,6 +1930,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             DQ_REDUCE=DQ_REDUCE,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
+            MASK_IF=MASK_IF,
         )
     # write-back
     dk = dk * alpha
@@ -1970,6 +2022,7 @@ def _hstu_attn_bwd(  # noqa C901
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr = False,
+    MASK_IF: tl.constexpr = False,
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
@@ -2143,6 +2196,7 @@ def _hstu_attn_bwd(  # noqa C901
             ATOMIC_ADD=True,
             ENABLE_TMA=ENABLE_TMA,
             AUTOWS=AUTOWS,
+            MASK_IF=MASK_IF,
             DQ_REDUCE=DQ_REDUCE,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
@@ -2207,6 +2261,7 @@ def _hstu_attn_bwd(  # noqa C901
                 ATOMIC_ADD=False,
                 ENABLE_TMA=ENABLE_TMA,
                 AUTOWS=AUTOWS,
+                MASK_IF=MASK_IF,
                 DQ_REDUCE=DQ_REDUCE,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
@@ -2272,6 +2327,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
     AUTOWS: tl.constexpr,
+    MASK_IF: tl.constexpr,
     DQ_REDUCE: tl.constexpr,
     DQ_ITERS: tl.constexpr,
     DQ_REUSE: tl.constexpr,
@@ -2404,6 +2460,7 @@ def _hstu_attn_bwd_clc(  # noqa C901
                 ATOMIC_ADD=False,
                 ENABLE_TMA=True,
                 AUTOWS=False,
+                MASK_IF=MASK_IF,
                 DQ_REDUCE=DQ_REDUCE,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
@@ -2629,6 +2686,7 @@ def triton_hstu_attention_bwd(
         HAS_SORT_BY_LENGTH_INDICES=sort_by_length_indices is not None,
         ENABLE_TMA=enable_tma,
         AUTOWS=_AUTOWS_CFG.autows,
+        MASK_IF=_AUTOWS_CFG.mask_if,
         DQ_REDUCE=_AUTOWS_CFG.dq_reduce,
         DQ_ITERS=_AUTOWS_CFG.dq_iters,
         DQ_REUSE=_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse,
