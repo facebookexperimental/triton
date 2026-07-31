@@ -1,11 +1,18 @@
 import copy
 import json
+import os
+
 import pytest
 import torch
 
 import triton
 import triton.language as tl
-from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _reduce_fadd2
+from triton.language.extra.cuda.inline_ptx_lib import (
+    _fma_f32x2,
+    _mul_f32x2,
+    _reduce_fadd2,
+    _sub_f32x2,
+)
 from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -603,6 +610,17 @@ _DEFAULT_BWD_DOT_ATTRS = FrozenDotAttrs({
     "dk": {"stage": "1", "order": "1", "channels": ["opndD,tmem,1,10"]},
 })
 
+# BM128 2-CTA uses TLX's qK -> dK -> dP -> dQ -> dV dot order. dK reads
+# dS from the reused dP slot before the next dP write. dQ reuses qK's lower
+# 64 columns, while P stays live for dV in qK's upper 64 columns.
+_BWD_DOT_ATTRS_BM128_2CTA = FrozenDotAttrs({
+    "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,1,1", "opndD,tmem,1,2"]},
+    "dpT": {"stage": "0", "order": "1", "channels": ["opndA,smem,1,3", "opndB,smem,1,4", "opndD,tmem,1,5"]},
+    "dv": {"stage": "0", "order": "3", "channels": ["opndA,tmem,1,2,64", "opndD,tmem,1,7"]},
+    "dk": {"stage": "1", "order": "0", "channels": ["opndD,tmem,1,10"]},
+    "dq": {"stage": "1", "order": "2", "channels": ["opndA,smem,1,8", "opndD,tmem,1,2"]},
+})
+
 # For BM of 128: dpT share with dq, qk share with ppT, dsT share with dpT.
 _BWD_DOT_ATTRS_TMEM = FrozenDotAttrs({
     "qkT": {"stage": "0", "order": "0", "channels": ["opndA,smem,1,0", "opndB,smem,2,1", "opndD,tmem,1,2"]},
@@ -707,13 +725,17 @@ def _attn_bwd_dkdv_inner(
     LN2: tl.constexpr,
     RESCHED: tl.constexpr,
     TWO_CTAS: tl.constexpr = False,
+    TLX_DQ_LAYOUT: tl.constexpr = False,
     BWD_DOT_ATTRS: tl.constexpr = None,
 ):
-    q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
     if TWO_CTAS:
+        # Keep qT ahead of q in the load partition. With one qT slot, loading q
+        # first can wait on the late dK consumer while qK waits for the next qT.
         qt = desc_qt.load([(off_bh + curr_m).to(tl.int32), 0])
         qT = tl.trans(qt)
+        q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
     else:
+        q = desc_q.load([(off_bh + curr_m).to(tl.int32), 0])
         qT = tl.trans(q)
     offs_m_start = off_chz + curr_m
     m = desc_m.load([offs_m_start.to(tl.int32)])
@@ -721,7 +743,7 @@ def _attn_bwd_dkdv_inner(
         qkT = tl.dot(k, qT, attrs=BWD_DOT_ATTRS.get("qkT"), two_ctas=TWO_CTAS)
     else:
         qkT = tl.dot(k, qT)
-    pT = tl.math.exp2(qkT - m[None, :])
+    pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
     if MASK:
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         mask = offs_m[None, :] >= offs_n[:, None]
@@ -741,7 +763,7 @@ def _attn_bwd_dkdv_inner(
         dv += tl.dot(ppT, do)
         Di = desc_delta.load([offs_m_start.to(tl.int32)])
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
-    dsT = pT * (dpT - Di[None, :])
+    dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
     dsT = dsT.to(dtype)
     if RESCHED:
         # dk reads dsT from the reused TMEM buffer-5; dq writes the same buffer.
@@ -749,20 +771,36 @@ def _attn_bwd_dkdv_inner(
         # blackwell_fa_ws_pipelined_persistent: "dk must read dsT_tmem BEFORE
         # dq writes ... same TMEM slot"). Emit dk first.
         dk += tl.dot(dsT, q, attrs=BWD_DOT_ATTRS.get("dk"), two_ctas=TWO_CTAS)
-        dq = tl.dot(tl.trans(dsT), kt, attrs=BWD_DOT_ATTRS.get("dq"), two_ctas=TWO_CTAS)
+        if TLX_DQ_LAYOUT:
+            # Physical BM128 2-CTA dQ. The compiler peer-gather rewrite replaces
+            # this local packed view with the rank-owned M half from both CTA N
+            # domains: [64, 256] @ [256, 64] -> [64, 128].
+            dsT_dq = tl.reshape(tl.trans(dsT), (BLOCK_M1 // 2, dsT.shape[0] * 2))
+            dq = tl.dot(dsT_dq, kt, attrs=BWD_DOT_ATTRS.get("dq"), two_ctas=TWO_CTAS)
+        else:
+            dq = tl.dot(tl.trans(dsT), kt, attrs=BWD_DOT_ATTRS.get("dq"), two_ctas=TWO_CTAS)
     else:
         dk += tl.dot(dsT, tl.trans(qT))
         dq = tl.dot(tl.trans(dsT), k)
     slice_size: tl.constexpr = HEAD_DIM // DQ_SUBTILE
     if TWO_CTAS:
-        # TwoCTA_RHS distributes the accumulator's M dimension across the
-        # cluster.  Each CTA exposes its local half at the first logical half;
-        # the cluster rank selects the corresponding output rows.
         cluster_cta_rank = tl.program_id(0) % 2
-        dq_local = _take_m_half_2D(dq, cluster_cta_rank)
-        dqs = _split_n_2D(dq_local, DQ_SUBTILE)
-        dq_row = off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // 2)
-        for slice_id in tl.static_range(0, DQ_SUBTILE):
+        if TLX_DQ_LAYOUT:
+            # TwoCTA_RHS stores logical [BM/2, H] as physical [BM, H/2].
+            # Load/store that physical view directly; slicing the logical H
+            # dimension makes both halves address the same local TMEM bank.
+            dq_local = tl.reshape(dq, (BLOCK_M1, HEAD_DIM // 2))
+            dq_subtiles: tl.constexpr = DQ_SUBTILE // 2
+            dqs = _split_n_2D(dq_local, dq_subtiles)
+            dq_row = 2 * (off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // 2))
+        else:
+            # Native two-CTA dQ retains the full logical M extent; select the
+            # rank-owned half for the global update.
+            dq_local = _take_m_half_2D(dq, cluster_cta_rank)
+            dq_subtiles: tl.constexpr = DQ_SUBTILE
+            dqs = _split_n_2D(dq_local, dq_subtiles)
+            dq_row = off_bh + curr_m + cluster_cta_rank * (BLOCK_M1 // 2)
+        for slice_id in tl.static_range(0, dq_subtiles):
             dqN = dqs[slice_id] * LN2
             desc_dq.atomic_add([dq_row.to(tl.int32), slice_id * slice_size], dqN)
     else:
@@ -811,6 +849,7 @@ def _attn_bwd_dkdv(
     BWD_DOT_ATTRS: tl.constexpr = None,
     SMEM_BUDGET: tl.constexpr = 200000,
     TWO_CTAS: tl.constexpr = False,
+    TLX_DQ_LAYOUT: tl.constexpr = False,
 ):
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
@@ -825,6 +864,7 @@ def _attn_bwd_dkdv(
                 0,
                 num_steps,
                 warp_specialize=True,
+                assume_nonempty=TWO_CTAS,
                 merge_epilogue_to_computation=True,
                 tmem_alloc_algo=2,
                 smem_alloc_algo=1,
@@ -857,6 +897,7 @@ def _attn_bwd_dkdv(
                 LN2,
                 True,
                 TWO_CTAS,
+                TLX_DQ_LAYOUT,
                 BWD_DOT_ATTRS,
             )
     else:
@@ -888,6 +929,7 @@ def _attn_bwd_dkdv(
                 LN2,
                 True,
                 TWO_CTAS,
+                TLX_DQ_LAYOUT,
                 BWD_DOT_ATTRS,
             )
 
@@ -902,6 +944,14 @@ def _bwd_host_descriptor_pre_hook(nargs):
     # DQ_SUBTILE controls dq atomic_add staging only; defaults to
     # EPILOGUE_SUBTILE so existing configs continue to behave the same.
     DQ_SUBTILE = nargs.get("DQ_SUBTILE", EPILOGUE_SUBTILE)
+    NUM_CTAS = nargs.get("NUM_CTAS", 1)
+    # BM128 2-CTA assigns adjacent N tiles to the CTA pair. Keep this initial
+    # implementation to complete pairs: a CTA cannot independently skip a
+    # collective MMA when the sequence has an odd trailing N tile.
+    if NUM_CTAS == 2 and BLOCK_M1 == 128:
+        N_CTX = nargs["N_CTX"]
+        if N_CTX % (BLOCK_N1 * NUM_CTAS) != 0:
+            raise ValueError("BM128 2-CTA requires N_CTX divisible by 2 * BLOCK_N1")
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
 
@@ -916,12 +966,23 @@ def _bwd_host_descriptor_pre_hook(nargs):
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
     if "desc_dot" in nargs:
         nargs["desc_dot"].block_shape = [BLOCK_M1, HEAD_DIM]
-    dq_rows = BLOCK_M1 // nargs.get("NUM_CTAS", 1)
+    packed_dq = NUM_CTAS == 2 and BLOCK_M1 == 128
+    if packed_dq:
+        N_CTX = nargs["N_CTX"]
+        nargs["desc_dq"].shape = [2 * nargs["BATCH"] * nargs["H"] * N_CTX, HEAD_DIM // 2]
+        nargs["desc_dq"].strides = [HEAD_DIM // 2, 1]
+    else:
+        nargs["desc_dq"].shape = [nargs["BATCH"] * nargs["H"] * nargs["N_CTX"], HEAD_DIM]
+        nargs["desc_dq"].strides = [HEAD_DIM, 1]
+    dq_rows = BLOCK_M1 if packed_dq else BLOCK_M1 // NUM_CTAS
     nargs["desc_dq"].block_shape = [dq_rows, HEAD_DIM // DQ_SUBTILE]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
     if "desc_kt" in nargs:
-        nargs["desc_kt"].block_shape = [BLOCK_N1, HEAD_DIM]
+        if NUM_CTAS == 2 and BLOCK_M1 == 128:
+            nargs["desc_kt"].block_shape = [BLOCK_N1 * NUM_CTAS, HEAD_DIM]
+        else:
+            nargs["desc_kt"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_m"].block_shape = [BLOCK_M1]
@@ -1037,6 +1098,32 @@ configs_bwd_persist = [
         ctas_per_cga=(2, 1, 1),
         allowDependentTwoCTA=True,
     ),
+    triton.Config(  # BM128 2-CTA: adjacent N tiles per CTA cluster.
+        {
+            "BLOCK_M1": 128,
+            "BLOCK_N1": 128,
+            "BLOCK_M2": 128,
+            "BLOCK_N2": 128,
+            "EPILOGUE_SUBTILE": 8,
+            "DQ_SUBTILE": 8,
+            # Permit the allocated dQ reduction staging group to use two slots
+            # (224004 + 8192 = 232196 physical bytes). Fully reused dK/dV
+            # staging groups remain at one slot in the memory planner.
+            "SMEM_BUDGET": 230400,
+            "BWD_DOT_ATTRS": _BWD_DOT_ATTRS_BM128_2CTA,
+            "NUM_CTAS": 2,
+        },
+        # Match TLX: the default computation/epilogue group starts with eight
+        # warps; AutoWS specializes reduction, GEMM, load, and relay from it.
+        num_warps=8,
+        num_stages=2,
+        minRegAutoWS=88,
+        maxRegAutoWS=88,
+        pre_hook=_bwd_host_descriptor_pre_hook,
+        ctas_per_cga=(2, 1, 1),
+        allowDependentTwoCTA=True,
+        generate_subtiled_region=True,
+    ),
     triton.Config(
         {
             "BLOCK_M1": 64,
@@ -1080,6 +1167,20 @@ configs_bwd_persist = [
         pre_hook=_bwd_host_descriptor_pre_hook,
     ),
 ]
+
+# Keep register options config-owned so the autotuner passes each option once.
+# Existing configs retain the historical 24/192 bounds; the dedicated BM128
+# 2-CTA config uses the TLX-aligned 88-register budget. Environment overrides
+# remain global and are applied uniformly for debugging sweeps.
+for _config in configs_bwd_persist:
+    _is_bm128_2cta = (
+        _config.kwargs.get("NUM_CTAS", 1) == 2
+        and _config.kwargs["BLOCK_M1"] == 128
+    )
+    _config.minRegAutoWS = int(os.environ.get(
+        "AUTOWS_BWD_MIN_REG", "88" if _is_bm128_2cta else "24"))
+    _config.maxRegAutoWS = int(os.environ.get(
+        "AUTOWS_BWD_MAX_REG", "88" if _is_bm128_2cta else "192"))
 
 
 @triton.jit
@@ -1125,10 +1226,13 @@ def _attn_bwd_core(
 
     start_n = pid * BLOCK_N1
     start_m = 0
+    TLX_DQ_LAYOUT: tl.constexpr = TWO_CTAS and BLOCK_M1 == 128
+    cluster_cta_rank = tl.program_id(0) % 2 if TWO_CTAS else 0
 
     k = desc_k.load([(off_bh + start_n).to(tl.int32), 0])
     if TWO_CTAS:
-        kt = desc_kt.load([(off_bh + start_n).to(tl.int32), 0])
+        kt_start_n = start_n - cluster_cta_rank * BLOCK_N1 if TLX_DQ_LAYOUT else start_n
+        kt = desc_kt.load([(off_bh + kt_start_n).to(tl.int32), 0])
     else:
         kt = k
     v = desc_v.load([(off_bh + start_n).to(tl.int32), 0])
@@ -1167,6 +1271,7 @@ def _attn_bwd_core(
         BWD_DOT_ATTRS=BWD_DOT_ATTRS,
         SMEM_BUDGET=SMEM_BUDGET,
         TWO_CTAS=TWO_CTAS,
+        TLX_DQ_LAYOUT=TLX_DQ_LAYOUT,
     )
 
     dvs = _split_n_2D(dv, EPILOGUE_SUBTILE)
@@ -1223,6 +1328,7 @@ def _attn_bwd(
     DQ_SUBTILE: tl.constexpr,
     BWD_DOT_ATTRS: tl.constexpr = None,
     SMEM_BUDGET: tl.constexpr = 200000,
+    NUM_CTAS: tl.constexpr = 1,
 ):
     bhid = tl.program_id(2)
     pid = tl.program_id(0)
@@ -1259,6 +1365,7 @@ def _attn_bwd(
         DQ_SUBTILE,
         BWD_DOT_ATTRS,
         SMEM_BUDGET,
+        NUM_CTAS == 2,
     )
 
 
@@ -1301,9 +1408,14 @@ def _attn_bwd_persist(
     NUM_CTAS: tl.constexpr = 1,
 ):
     n_tile_num = tl.cdiv(N_CTX, BLOCK_N1)
+    cluster_rank = tl.program_id(0) % NUM_CTAS
     prog_id = tl.program_id(0) // NUM_CTAS
     num_progs = tl.num_programs(0) // NUM_CTAS
-    total_tiles = n_tile_num * BATCH * H
+    # BM64 retains its validated same-N direct protocol. BM128 matches TLX
+    # ownership: one persistent cluster tile covers two adjacent N tiles.
+    ADJACENT_N: tl.constexpr = NUM_CTAS == 2 and BLOCK_M1 == 128
+    scheduled_n_tiles = n_tile_num // NUM_CTAS if ADJACENT_N else n_tile_num
+    total_tiles = scheduled_n_tiles * BATCH * H
 
     tiles_per_sm = total_tiles // num_progs
     if prog_id < total_tiles % num_progs:
@@ -1358,7 +1470,7 @@ def _attn_bwd_persist(
         desc_kt,
         shape=[y_dim, HEAD_DIM],
         strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N1, HEAD_DIM],
+        block_shape=[BLOCK_N1 * NUM_CTAS if NUM_CTAS == 2 and BLOCK_M1 == 128 else BLOCK_N1, HEAD_DIM],
     )
     desc_dv = _maybe_make_tensor_desc(
         desc_dv,
@@ -1394,8 +1506,9 @@ def _attn_bwd_persist(
             smem_alloc_algo=1,
             smem_budget=SMEM_BUDGET,
     ):
-        pid = tile_idx % n_tile_num
-        bhid = tile_idx // n_tile_num
+        scheduled_pid = tile_idx % scheduled_n_tiles
+        bhid = tile_idx // scheduled_n_tiles
+        pid = scheduled_pid * NUM_CTAS + cluster_rank if ADJACENT_N else scheduled_pid
         _attn_bwd_core(
             desc_q,
             desc_qt,
@@ -1484,7 +1597,9 @@ class _attention_opt(torch.autograd.Function):
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
             triton.knobs.nvidia.use_meta_partition = True
-            triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.disable_wsbarrier_reorder = (
+                os.environ.get("AUTOWS_ENABLE_WSBARRIER_REORDER", "0") != "1"
+            )
             if persistent:
                 _attn_fwd_persist[grid_persist](
                     sm_scale,
@@ -1653,8 +1768,13 @@ class _attention_opt(torch.autograd.Function):
         )
 
         def grid(meta):
+            num_ctas = meta.get("NUM_CTAS", 1)
+            n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
+            if num_ctas == 2:
+                assert meta["BLOCK_M1"] == 128
+                assert n_tiles % num_ctas == 0
             return (
-                triton.cdiv(N_CTX, meta["BLOCK_N1"]),  # tiles along N (K/V)
+                n_tiles,
                 1,  # (or cdiv over M if you need)
                 BATCH * N_HEAD,
             )  # batch*heads
@@ -1664,8 +1784,15 @@ class _attention_opt(torch.autograd.Function):
 
             def grid_persist_bwd(meta):
                 num_ctas = meta.get("NUM_CTAS", 1)
-                total_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD
-                num_clusters = min(NUM_SMS // num_ctas, total_tiles)
+                n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
+                if num_ctas == 2 and meta["BLOCK_M1"] == 128:
+                    assert n_tiles % num_ctas == 0
+                    n_tiles //= num_ctas
+                total_tiles = n_tiles * BATCH * N_HEAD
+                if os.environ.get("AUTOWS_BWD_FULL_GRID", "0") == "1":
+                    num_clusters = total_tiles
+                else:
+                    num_clusters = min(NUM_SMS // num_ctas, total_tiles)
                 return (
                     num_clusters * num_ctas,
                     1,
@@ -1675,7 +1802,9 @@ class _attention_opt(torch.autograd.Function):
         with triton.knobs.nvidia.scope():
             triton.knobs.nvidia.use_meta_ws = True
             triton.knobs.nvidia.use_meta_partition = True
-            triton.knobs.nvidia.disable_wsbarrier_reorder = True
+            triton.knobs.nvidia.disable_wsbarrier_reorder = (
+                os.environ.get("AUTOWS_ENABLE_WSBARRIER_REORDER", "0") != "1"
+            )
             if ctx.persistent:
                 _attn_bwd_persist[grid_persist_bwd](
                     desc_q,
@@ -1702,7 +1831,6 @@ class _attention_opt(torch.autograd.Function):
                     HEAD_DIM=ctx.HEAD_DIM,  #
                     dtype=torch_dtype_to_triton(q.dtype),
                     warp_specialize=warp_specialize,
-                    maxRegAutoWS=192,
                 )
             else:
                 _attn_bwd[grid](
@@ -1730,7 +1858,6 @@ class _attention_opt(torch.autograd.Function):
                     HEAD_DIM=ctx.HEAD_DIM,  #
                     dtype=torch_dtype_to_triton(q.dtype),
                     warp_specialize=warp_specialize,
-                    maxRegAutoWS=192,
                 )
 
         return dq, dk, dv, None, None, None, None, None, None, None
@@ -1924,6 +2051,55 @@ def test_bwd_bm64_1cta_persistent_store_wait_drain():
         _attn_bwd_persist.cache = old_autows_cache
         tlx._attn_bwd_ws.configs = old_tlx_configs
         tlx._attn_bwd_ws.cache = old_tlx_cache
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm128_2cta_packed_dq():
+    # TwoCTA_RHS stores logical [64,128] dQ as physical [128,64]. Loading the
+    # logical H slices duplicates the local physical bank into both H halves.
+    idx = next(i for i, config in enumerate(configs_bwd_persist)
+               if config.kwargs.get("NUM_CTAS") == 2 and config.kwargs.get("BLOCK_M1") == 128)
+    test_op(
+        Z=2,
+        H=2,
+        N_CTX=256,
+        HEAD_DIM=128,
+        causal=False,
+        mode="bwd",
+        baseVariant="ws_persistent",
+        provider="triton-fp16",
+        SUBTILING=False,
+        VECT_MUL=0,
+        FADD2_REDUCE=False,
+        bwd_config_idx=idx,
+    )
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm128_2cta_nonpersistent():
+    idx = next(i for i, config in enumerate(configs_bwd_persist)
+               if config.kwargs.get("NUM_CTAS") == 2 and config.kwargs.get("BLOCK_M1") == 128)
+    config = copy.copy(configs_bwd_persist[idx])
+    config.kwargs = dict(config.kwargs)
+    config.kwargs["EPILOGUE_SUBTILE"] = 2
+    configs_bwd_persist.append(config)
+    try:
+        test_op(
+            Z=2,
+            H=2,
+            N_CTX=256,
+            HEAD_DIM=128,
+            causal=False,
+            mode="bwd",
+            baseVariant="ws",
+            provider="triton-fp16",
+            SUBTILING=False,
+            VECT_MUL=0,
+            FADD2_REDUCE=False,
+            bwd_config_idx=len(configs_bwd_persist) - 1,
+        )
+    finally:
+        configs_bwd_persist.pop()
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
