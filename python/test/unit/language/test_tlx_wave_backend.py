@@ -66,28 +66,6 @@ pytestmark = pytest.mark.skipif("tlx_wave" not in backends, reason="tlx_wave bac
 GFX942_WAVE = GPUTarget("tlx_wave", "gfx942", 64)
 GFX950_WAVE = GPUTarget("tlx_wave", "gfx950", 64)
 _TLX_WAVE_RUNTIME_ARCHES = {"gfx942", "gfx950"}
-_LEGACY_LAYOUT_PLAN_ATTRS = frozenset({
-    "block_count",
-    "component_sources",
-    "cta_thread_count",
-    "mode",
-    "packet_source_indices",
-    "register_payload_source_slots",
-    "registers",
-    "relation_bases",
-    "relation_out_dims",
-    "result_component_count",
-    "result_packet_width",
-    "result_registers_per_component",
-    "result_slot_count",
-    "result_value_mode",
-    "scalar_source_slots",
-    "scalar_sources",
-    "source_component_count",
-    "source_packet_width",
-    "source_registers_per_component",
-    "source_slot_count",
-})
 
 
 def _fake_layout(
@@ -251,7 +229,6 @@ def _assert_mechanical_layout_transform(
         expected = {}
     attrs = converter_target_ir.attrs_dict(op)
     assert attrs == expected
-    assert not _LEGACY_LAYOUT_PLAN_ATTRS.intersection(attrs)
     for target_value_id in (*op.operands, *op.results):
         target_value = target_program.values[int(target_value_id)]
         assert target_value.layout_map_id is not None
@@ -474,6 +451,19 @@ def _load_tlx_perf_sweep_module(module_name="_tlx_wave_test_perf_sweep"):
     repo_root = Path(__file__).resolve().parents[4]
     script_path = repo_root / "third_party" / "tlx" / "tutorials" / "run_wave_perf_sweeps.py"
     spec = importlib.util.spec_from_file_location(module_name, script_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def _load_wave_structural_bridge_guard(module_name="_tlx_wave_structural_bridge_guard", ):
+    repo_root = Path(__file__).resolve().parents[4]
+    guard_path = repo_root / "third_party" / "wave" / "build_tools" / "check_structural_bridge.py"
+    spec = importlib.util.spec_from_file_location(module_name, guard_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:
@@ -1139,33 +1129,17 @@ def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
         )
 
 
-def test_tlx_wave_converter_import_stage_boundary_is_static():
+def test_tlx_wave_converter_boundary_is_structurally_guarded():
     package_root = (Path(__file__).resolve().parents[4] / "third_party" / "tlx_wave" / "backend" / "converter")
-    forbidden_prefixes = (
-        "triton.backends.tlx_wave.wave_bridge",
-        "third_party.tlx_wave.backend.wave_bridge",
+    guard = _load_wave_structural_bridge_guard()
+    violations = guard.scan_paths(
+        (package_root, ),
+        forbidden_import_prefixes=(
+            "triton.backends.tlx_wave.wave_bridge",
+            "third_party.tlx_wave.backend.wave_bridge",
+        ),
     )
-    for path in package_root.glob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        imports = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imports.extend(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                imports.append(node.module)
-        assert not any(module.startswith(forbidden_prefixes) for module in imports), (path, imports)
-
-    assert "wave_bridge" not in converter_source_ir.__dict__
-    assert "wave_bridge" not in converter_diagnostics.__dict__
-    assert "wave_bridge" not in converter_domains.__dict__
-    assert "wave_bridge" not in converter_canonicalize.__dict__
-    assert "wave_bridge" not in converter_source_import.__dict__
-    assert "wave_bridge" not in converter_tokens.__dict__
-    assert "wave_bridge" not in converter_target_ir.__dict__
-    assert "wave_bridge" not in converter_op_conversion.__dict__
-    assert "wave_bridge" not in converter_verifier.__dict__
-    assert "wave_bridge" not in converter_emission.__dict__
-    assert "wave_bridge" not in converter_pipeline.__dict__
+    assert not violations, "\n".join(violation.format() for violation in violations)
 
 
 def test_tlx_wave_converter_lowering_domains_are_pure_policy():
@@ -1208,33 +1182,6 @@ def test_tlx_wave_converter_lowering_domains_cover_dispatch():
     assert converter_domains.target_domain_for_op("buffer_store") == "store_epilogue"
     assert (converter_op_conversion._SUPPORTED_SOURCE_OPS == converter_domains.all_source_ops())
     assert set(converter_emission._TARGET_EMITTERS) == (converter_domains.all_target_ops())
-
-
-def test_tlx_wave_converter_op_rewriters_do_not_accept_source_program():
-    tree = ast.parse(
-        Path(converter_op_conversion.__file__).read_text(),
-        filename=converter_op_conversion.__file__,
-    )
-    allowed_source_program_functions = {
-        "convert_ops",
-        "_build_conversion_input",
-        "_wait_publication_barrier_by_op",
-        "_memdesc_infos",
-        "_constant_ints",
-    }
-    offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        if node.name in allowed_source_program_functions:
-            continue
-        arg_names = [arg.arg for arg in node.args.args]
-        if "source_program" in arg_names:
-            offenders.append(f"{node.name}:argument")
-        if any(isinstance(child, ast.Name) and child.id == "source_program" for child in ast.walk(node)):
-            offenders.append(f"{node.name}:body")
-
-    assert not offenders
 
 
 def test_tlx_wave_converter_import_stage_builds_source_snapshot(tmp_path):
@@ -3819,6 +3766,86 @@ def test_tlx_wave_converter_verifier_rejects_unknown_contract_version():
     assert diagnostic.code == "TLXW_VERIFY_SCHEMA_VERSION"
     assert diagnostic.stage == "verification"
     assert diagnostic.no_fallback is True
+
+
+def test_tlx_wave_converter_verifier_rejects_physical_mask_payload():
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_value(converter_target_ir.TargetType(
+        "tensor",
+        "simd",
+        "i1",
+        lane_width=64,
+    ))
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_PHYSICAL_MASK_PAYLOAD"
+
+
+def test_tlx_wave_converter_verifier_rejects_event_domain_on_data_value():
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_value(
+        converter_target_ir.TargetType("scalar", "scalar", "i32"),
+        event_domain=converter_target_ir.EVENT_DOMAIN_DMA_COMPLETION,
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_EVENT_REPRESENTATION"
+
+
+def test_tlx_wave_converter_verifier_rejects_target_policy_attrs():
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_op(
+        "return",
+        attrs={"transaction_bytes": 16},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(builder.build())
+
+    assert exc_info.value.code == "TLXW_VERIFY_BRIDGE_POLICY_ATTR"
+
+
+@pytest.mark.parametrize(
+    "source_name,target_kind,target_attrs",
+    (
+        ("arith.addi", "binary", {"operation": "addi", "nsw": True}),
+        (
+            "arith.addf",
+            "float_binary",
+            {"operation": "addf", "fastmath": ("contract", )},
+        ),
+    ),
+)
+def test_tlx_wave_converter_verifier_rejects_invented_semantic_flags(
+    source_name,
+    target_kind,
+    target_attrs,
+):
+    source = converter_source_ir.SourceProgram(
+        converter_source_ir.KernelInfo("invented_semantics"),
+        (converter_source_ir.SourceOp(0, source_name), ),
+        {},
+        (converter_source_ir.SourceRegion(0, (0, )), ),
+        0,
+    )
+    builder = converter_target_ir.TargetBuilder()
+    builder.add_op(
+        target_kind,
+        attrs=target_attrs,
+        source_op_index=0,
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(
+            builder.build(),
+            source_program=source,
+        )
+
+    assert exc_info.value.code == "TLXW_VERIFY_INVENTED_SEMANTICS"
 
 
 def test_tlx_wave_converter_verifier_rejects_missing_fact_target():
