@@ -490,31 +490,6 @@ def _accumulate_prefix_body(
 
 
 @triton.jit
-def _accumulate_with_prefix_barrier(
-    state,
-    probabilities,
-    value_fragments,
-    next_scores,
-    p_layout: tl.constexpr,
-    v_layout: tl.constexpr,
-    mma_layout: tl.constexpr,
-    qk_scale: tl.constexpr,
-    log2_score_bound: tl.constexpr,
-):
-    return _accumulate_prefix_body(
-        state,
-        probabilities,
-        value_fragments,
-        next_scores,
-        p_layout,
-        v_layout,
-        mma_layout,
-        qk_scale,
-        log2_score_bound,
-    )
-
-
-@triton.jit
 def _accumulate_value_fragments(
     state,
     probabilities,
@@ -657,16 +632,11 @@ def _score_phase(
     probabilities,
     current_ready,
     q,
-    k_ptrs,
     k_buffer,
-    stride_kn,
-    tile,
     current_k_slot: tl.constexpr,
-    k_prefetch_slot: tl.constexpr,
     q_layout: tl.constexpr,
     k_layout: tl.constexpr,
     mma_layout: tl.constexpr,
-    PREFETCH: tl.constexpr,
 ):
     q = tlx.require_layout(q, q_layout)
     current_k = tlx.local_load(
@@ -680,16 +650,6 @@ def _score_phase(
         q.dtype,
     )
     _stage_end()
-    next_k_ready = current_ready
-    if PREFETCH:
-        next_k_ready = _issue_tile(
-            k_ptrs,
-            tile + 3,
-            stride_kn,
-            k_buffer,
-            k_prefetch_slot,
-            8,
-        )
     score_acc = tlx.zeros(
         (BLOCK_M, BLOCK_N),
         tl.float32,
@@ -699,87 +659,7 @@ def _score_phase(
     next_scores = tlx.release_layout(next_scores)
     q = tlx.release_layout(q)
     tlx.sched_barrier()
-    return state, p_dot, next_scores, next_k_ready
-
-
-@triton.jit
-def _pipeline_phase(
-    state,
-    probabilities,
-    q,
-    k_ptrs,
-    v_ptrs,
-    k_buffer,
-    v_buffer,
-    stride_kn,
-    stride_vn,
-    tile,
-    current_k_ready,
-    previous_v_ready,
-    PHASE: tl.constexpr,
-    q_layout: tl.constexpr,
-    k_layout: tl.constexpr,
-    p_layout: tl.constexpr,
-    v_layout: tl.constexpr,
-    mma_layout: tl.constexpr,
-    qk_scale: tl.constexpr,
-    log2_score_bound: tl.constexpr,
-):
-    previous_v_slot: tl.constexpr = PHASE
-    current_k_slot: tl.constexpr = (PHASE + 1) % LDS_STAGES
-    k_prefetch_slot: tl.constexpr = (PHASE + 3) % LDS_STAGES
-    current_v_ready = _issue_tile(
-        v_ptrs,
-        tile + 1,
-        stride_vn,
-        v_buffer,
-        current_k_slot,
-        32,
-    )
-    current_ready = _wait_stage_end(
-        2,
-        [current_k_ready, previous_v_ready],
-    )
-    state, p_dot, next_scores, next_k_ready = _score_phase(
-        state,
-        probabilities,
-        current_ready,
-        q,
-        k_ptrs,
-        k_buffer,
-        stride_kn,
-        tile,
-        current_k_slot,
-        k_prefetch_slot,
-        q_layout,
-        k_layout,
-        mma_layout,
-        True,
-    )
-    _stage_end()
-    # The wait covers both the current K group and the previous V group.  The
-    # V load consumes that exact completion token; the next-K commit remains
-    # an independent pipeline value.
-    value_fragments = _load_value_fragments(
-        tlx.local_view(v_buffer, previous_v_slot),
-        current_ready,
-        v_layout,
-    )
-    _stage_end()
-
-    state, probabilities = _accumulate_with_prefix_barrier(
-        state,
-        p_dot,
-        value_fragments,
-        next_scores,
-        p_layout,
-        v_layout,
-        mma_layout,
-        qk_scale,
-        log2_score_bound,
-    )
-
-    return state, probabilities, next_k_ready, current_v_ready
+    return state, p_dot, next_scores
 
 
 @triton.jit
@@ -856,7 +736,7 @@ def _warp_pipeline_phase(
         )
 
     with tlx.warp_pipeline_stage("pv"):
-        state, probabilities = _accumulate_with_prefix_barrier(
+        state, probabilities = _accumulate_prefix_body(
             state,
             p_dot,
             value_fragments,
@@ -937,9 +817,6 @@ def _pipeline(
     # K2 has its own physical slot; unlike the legacy cluster kernel, no
     # barrier-and-overwrite of K0 is needed here.
     k_ready2 = _issue_tile(k_ptrs, 2, stride_kn, k_buffer, 2, 8)
-    trailing_cohort = tlx.warp_id() >= 4
-    if trailing_cohort:
-        tlx.set_priority(3)
     # Tile i consumes V[i] and K[i+1], reads K[i+2], and publishes K[i+3] and
     # V[i+2].  Spell out all four ring phases so each physical slot remains
     # static in the generated Wave program.
@@ -947,7 +824,21 @@ def _pipeline(
     # addition to matching the four-slot ring, this lets Wave keep the MFMA
     # accumulator register groups intact across the loop backedge.
     q = tlx.release_layout(q)
-    state, probabilities, k_ready3, previous_v_ready = _pipeline_phase(
+    v_ready1 = _issue_tile(
+        v_ptrs,
+        1,
+        stride_vn,
+        v_buffer,
+        1,
+        32,
+    )
+    (
+        state,
+        probabilities,
+        k_ready3,
+        previous_v_ready,
+        prefetched_v_ready,
+    ) = _warp_pipeline_phase(
         state,
         probabilities,
         q,
@@ -960,6 +851,7 @@ def _pipeline(
         0,
         k_ready1,
         v_ready0,
+        v_ready1,
         0,
         q_layout,
         k_layout,
@@ -968,14 +860,6 @@ def _pipeline(
         mma_layout,
         qk_scale,
         log2_score_bound,
-    )
-    prefetched_v_ready = _issue_tile(
-        v_ptrs,
-        2,
-        stride_vn,
-        v_buffer,
-        2,
-        32,
     )
     for first_tile in tl.range(1, tile_count - 3, 4, num_stages=0):
         (
@@ -1101,21 +985,16 @@ def _pipeline(
 
     v_ready_nm2 = prefetched_v_ready
     ready_nm3 = _wait_stage_end(2, [k_ready2, previous_v_ready])
-    state, p_dot, next_scores, _ = _score_phase(
+    state, p_dot, next_scores = _score_phase(
         state,
         probabilities,
         ready_nm3,
         q,
-        k_ptrs,
         k_buffer,
-        stride_kn,
-        tile_nm3,
         tile_nm2 % LDS_STAGES,
-        0,
         q_layout,
         k_layout,
         mma_layout,
-        False,
     )
     _stage_end()
     value_fragments = _load_value_fragments(
@@ -1124,7 +1003,7 @@ def _pipeline(
         v_layout,
     )
     _stage_end()
-    state, probabilities = _accumulate_with_prefix_barrier(
+    state, probabilities = _accumulate_prefix_body(
         state,
         p_dot,
         value_fragments,
@@ -1145,21 +1024,16 @@ def _pipeline(
         32,
     )
     ready_nm2 = _wait_stage_end(1, [k_ready3, v_ready_nm2])
-    state, p_dot, next_scores, _ = _score_phase(
+    state, p_dot, next_scores = _score_phase(
         state,
         probabilities,
         ready_nm2,
         q,
-        k_ptrs,
         k_buffer,
-        stride_kn,
-        tile_nm2,
         tile_nm1 % LDS_STAGES,
-        0,
         q_layout,
         k_layout,
         mma_layout,
-        False,
     )
     _stage_end()
     value_fragments = _load_value_fragments(
@@ -1168,7 +1042,7 @@ def _pipeline(
         v_layout,
     )
     _stage_end()
-    state, probabilities = _accumulate_with_prefix_barrier(
+    state, probabilities = _accumulate_prefix_body(
         state,
         p_dot,
         value_fragments,
@@ -1199,7 +1073,6 @@ def _pipeline(
         v_layout,
         mma_layout,
     )
-    tlx.set_priority(0)
     return state
 
 
