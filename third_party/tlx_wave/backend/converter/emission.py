@@ -6994,10 +6994,6 @@ def _function_attrs(
     waves_per_eu=0,
 ):
     num_warps = _kernel_num_warps(kernel)
-    workgroup_target_waves = max(1, (num_warps + 3) // 4)
-    # Triton's waves_per_eu requests a tighter register budget. It cannot lower
-    # the minimum residency needed to place one complete workgroup.
-    target_waves = max(workgroup_target_waves, int(waves_per_eu or 0))
     attrs = {
         "tlx_wave.converter.stage": ir.StringAttr.get("structural-emission"),
         "tlx_wave.num_warps": ir.IntegerAttr.get(dsl.i32(), num_warps),
@@ -7008,10 +7004,9 @@ def _function_attrs(
         "tlx_wave.ttgir.noinline": ir.Attribute.parse("true" if kernel.noinline else "false"),
         "wave.waves_per_workgroup": dsl.i64_attr(num_warps),
         "wave.address_arithmetic_no_overflow": ir.UnitAttr.get(),
-        # gfx9/gfx950 exposes four SIMD execution units per CU. Model the
-        # requested CTA waves as the resident wave target per SIMD.
-        "waveamdmachine.target_waves": dsl.i64_attr(target_waves),
     }
+    if waves_per_eu:
+        attrs["wave.assumed_waves_per_eu"] = dsl.i64_attr(int(waves_per_eu))
     if kernel.enable_split_barriers:
         attrs["waveamdmachine.enable_split_barriers"] = ir.UnitAttr.get()
     if kernel.enable_multi_wave_specialization:

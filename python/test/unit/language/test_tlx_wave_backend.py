@@ -6064,18 +6064,18 @@ def test_tlx_wave_converter_emits_workgroup_shape_from_ttgir(tmp_path):
     assert "wave.workgroup_size = array<i32: 256, 1, 1>" in wave_artifact
     assert "gpu.known_block_size = array<i32: 256, 1, 1>" in wave_artifact
     assert "wave.waves_per_workgroup = 4 : i64" in wave_artifact
-    assert "waveamdmachine.target_waves = 1 : i64" in wave_artifact
+    assert "wave.assumed_waves_per_eu" not in wave_artifact
+    assert "waveamdmachine.target_waves" not in wave_artifact
     del ctx
 
 
 @pytest.mark.parametrize(
-    "waves_per_eu,expected_target_waves",
-    [(1, 2), (4, 4)],
+    "waves_per_eu",
+    [1, 4],
 )
-def test_tlx_wave_converter_applies_waves_per_eu_target(
+def test_tlx_wave_converter_forwards_waves_per_eu_assumption(
     tmp_path,
     waves_per_eu,
-    expected_target_waves,
 ):
     local_func = """
   tt.func public @converter_waves_per_eu() attributes {noinline = false} {
@@ -6094,7 +6094,8 @@ def test_tlx_wave_converter_applies_waves_per_eu_target(
         waves_per_eu=waves_per_eu,
     )
 
-    assert (f"waveamdmachine.target_waves = {expected_target_waves} : i64" in output.emitted_module.text)
+    assert (f"wave.assumed_waves_per_eu = {waves_per_eu} : i64" in output.emitted_module.text)
+    assert "waveamdmachine.target_waves" not in output.emitted_module.text
     del ctx
 
 
@@ -6147,7 +6148,8 @@ def test_tlx_wave_backend_wave_stage_forwards_waves_per_eu(tmp_path):
         _tlx_wave_options(waves_per_eu=4),
     )
 
-    assert "waveamdmachine.target_waves = 4 : i64" in wave_artifact
+    assert "wave.assumed_waves_per_eu = 4 : i64" in wave_artifact
+    assert "waveamdmachine.target_waves" not in wave_artifact
     _run_wave_verify(wave_artifact)
     del ctx
 
@@ -6395,7 +6397,8 @@ def test_tlx_wave_backend_compile_forwards_waves_per_eu():
     )
     wave_artifact = _asm_text(compiled, "wave")
 
-    assert "waveamdmachine.target_waves = 4 : i64" in wave_artifact
+    assert "wave.assumed_waves_per_eu = 4 : i64" in wave_artifact
+    assert "waveamdmachine.target_waves" not in wave_artifact
     assert compiled.metadata.waves_per_eu == 4
 
 
@@ -6804,8 +6807,8 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
 
     assert "tlx_wave.new_converter" in wave_artifact
     assert "gpu.kernel" in wave_artifact
-    expected_target_waves = max(1, (case["num_warps"] + 3) // 4)
-    assert (f"waveamdmachine.target_waves = {expected_target_waves} : i64" in wave_artifact)
+    assert f"wave.waves_per_workgroup = {case['num_warps']} : i64" in wave_artifact
+    assert "waveamdmachine.target_waves" not in wave_artifact
     assert isinstance(hsaco, bytes)
     assert hsaco.startswith(b"\x7fELF")
     assert compiled.kernel == hsaco
