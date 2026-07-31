@@ -1058,7 +1058,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
                 "stage": "0",
                 "order": "2",
                 "channels": [
-                    "opndA,smem,1,11" if MASK_IF else "opndA,tmem,1,2",
+                    "opndA,tmem,1,2",
                     "opndD,tmem,1,7",
                 ],
             }
