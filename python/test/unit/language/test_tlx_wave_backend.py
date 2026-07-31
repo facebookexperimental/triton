@@ -14205,6 +14205,7 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
     assert all(op.kind == "float_binary" for op in combiner_ops)
     wave = output.emitted_module.text
     assert wave.count("wave.reduce") == 4
+    assert wave.count("extent 64") == 4
     assert "wave.shuffle" not in wave
     assert "wave.fmax" in wave
     assert "wave.fadd" in wave
@@ -14251,6 +14252,7 @@ def test_tlx_wave_converter_pipeline_reduces_integer_packets(tmp_path):
     assert converter_target_ir.attrs_dict(combiner_op)["operation"] == "addi"
     wave = output.emitted_module.text
     assert "wave.reduce" in wave
+    assert "extent 64" in wave
     lowered = _run_wave_lower_redistribute(wave)
     assert "wave.reduce" not in lowered
     assert "wave.binary addi" in lowered
