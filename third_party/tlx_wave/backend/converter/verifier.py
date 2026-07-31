@@ -337,7 +337,6 @@ def _verify_ops(target_program, source_program):
                 "async_commit_group",
                 "async_wait",
                 "local_load",
-                "local_load_mma_payload",
                 "local_store",
         }:
             _verify_async_protocol_op(op, target_program, source_program)
@@ -467,7 +466,7 @@ def _verify_memory_issue_order(op, target_program):
             target_op_id=op.target_op_id,
             target_value_id=result_id,
         )
-    if op.kind in {"local_load", "local_load_mma_payload", "local_store"}:
+    if op.kind in {"local_load", "local_store"}:
         completion_count = int(attrs.get("completion_result_count", 0))
         if completion_count < result_count:
             fail(
@@ -840,7 +839,6 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
                                       if int(operand) in region.block_arg_ids)
             is_local_read = (len(producers) == 1 and producers[0].kind in {
                 "local_load",
-                "local_load_mma_payload",
             })
             is_structured_completion = (len(producers) == 1 and producers[0].kind in {
                 "barrier",
@@ -1004,7 +1002,6 @@ def _verify_async_protocol_op(op, target_program, source_program=None):
 
     if op.kind not in {
             "local_load",
-            "local_load_mma_payload",
             "local_store",
     }:
         return

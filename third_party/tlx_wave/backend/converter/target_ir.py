@@ -53,7 +53,6 @@ MEMORY_ISSUER_OP_KINDS = frozenset({
     "buffer_store",
     "load",
     "local_load",
-    "local_load_mma_payload",
     "local_store",
     "store",
 })

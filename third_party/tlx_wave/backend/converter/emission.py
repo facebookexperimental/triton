@@ -49,12 +49,6 @@ class _VectorPacketPayload:
 
 
 @dataclass(frozen=True)
-class _DeferredPacketLocalLoad:
-    loaded: object
-    element_count: int
-
-
-@dataclass(frozen=True)
 class _LoopValueShape:
     component_count: int
     packet_width: int | None = None
@@ -2992,7 +2986,6 @@ def _emit_local_store(state, op):
     memdesc_target_id = op.operands[1]
     lane_width = int(attrs["lane_width"])
     component_count = int(attrs["component_count"])
-    offsets = _local_access_offsets(state, attrs, component_count, lane_width, op)
     element_type = _scalar_type(state.dsl, attrs["element_type"])
     base = _ptr_cast(
         state,
@@ -3000,32 +2993,87 @@ def _emit_local_store(state, op):
         state.dsl.ptr_type(element_type, state.dsl.shared_address_space()),
     )
     dependency = _memory_dependency_token(state, explicit_dependencies)
-    if isinstance(values, _VectorPacketPayload):
-        value_components = _value_components(state, values, op)
+    target_type = state.target_program.values[op.operands[0]].type
+    packet_count = int(attrs["packet_count"])
+    packet_width = int(attrs["packet_width"])
+    if target_type.representation in _MMA_PACKET_REPRESENTATIONS:
+        payloads = _as_components(values)
+        if len(payloads) != packet_count or packet_count != component_count:
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "local_store packet payload does not match its relation",
+                target_op_id=op.target_op_id,
+            )
+        for payload in payloads:
+            shape = _simd_1d_vector_payload(state, payload)
+            if shape is None or int(shape[0]) != packet_width:
+                fail(
+                    "TLXW_EMIT_COMPONENT_COUNT",
+                    STAGE,
+                    "local_store packet payload has the wrong vector width",
+                    target_op_id=op.target_op_id,
+                )
     else:
+        if packet_count != 1 or packet_width != component_count:
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "local_store scalar payload does not match its packet relation",
+                target_op_id=op.target_op_id,
+            )
         value_components = _broadcast_component(state, values, component_count, op)
-    splat_cache = []
-    value_components = tuple(
-        _memory_simd_component(
-            state,
-            value_component,
-            attrs["element_type"],
-            lane_width,
-            op,
-            splat_cache,
-        ) for value_component in value_components)
-    token = _emit_symbolic_shared_scatter(
-        state,
-        value_components,
-        offsets,
-        base,
-        element_type,
-        lane_width,
-        int(attrs["element_byte_width"]),
-        dependency,
-        op,
+        splat_cache = []
+        value_components = tuple(
+            _memory_simd_component(
+                state,
+                value_component,
+                attrs["element_type"],
+                lane_width,
+                op,
+                splat_cache,
+            ) for value_component in value_components)
+        payloads = (
+            _symbolic_shared_packet(
+                state,
+                value_components,
+                element_type,
+                lane_width,
+            ),
+        )
+    packet_bases = tuple(
+        tuple(int(value) for value in packet_base)
+        for packet_base in attrs["packet_coordinate_bases"]
     )
-    _finish_local_access(state, op, memdesc_target_id, token, "write")
+    if len(packet_bases) != packet_count:
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "local_store packet bases do not match its packet count",
+            target_op_id=op.target_op_id,
+        )
+    tokens = []
+    for payload, packet_base in zip(payloads, packet_bases):
+        tokens.append(
+            state.builder.scatter(
+                payload,
+                [base],
+                bit_offset=_symbolic_local_packet_bit_offset(
+                    state,
+                    attrs,
+                    packet_base,
+                    op,
+                ),
+                after=dependency,
+            )
+        )
+    _finish_local_access(
+        state,
+        op,
+        memdesc_target_id,
+        _join_memory_tokens(state, tokens),
+        "write",
+    )
 
 
 def _symbolic_shared_packet(state, components, element_type, lane_width):
@@ -3314,462 +3362,40 @@ def _emit_local_load(state, op):
         state,
         tuple(explicit_dependencies),
     )
-    if attrs.get("result_value_mode") == "mma_packet_payload":
-        offsets = _local_access_offsets(
-            state,
-            attrs,
-            component_count,
-            lane_width,
-            op,
-        )
-        payload, token = _emit_local_load_mma_packet_payload(
-            state,
-            op,
-            attrs,
-            base,
-            offsets,
-            element_type,
-            target_type,
-            lane_width,
-            dependency,
-        )
-        state.values[result_id] = payload
-        _finish_local_access(state, op, memdesc_target_id, token, "read")
-        return
-    result_type = _wave_type(state.dsl, target_type)
-    vector_packet_indices = _local_load_vector_packet_indices(
+    payloads, token = _emit_symbolic_local_gather_packets(
         state,
-        attrs,
-        component_count,
         op,
+        attrs,
+        base,
+        element_type,
+        dependency,
     )
-    if vector_packet_indices is not None:
-        result_packet_width = int(attrs["result_packet_width"])
-        transpose_packet_width = int(attrs.get("result_transpose_packet_width", result_packet_width))
-        loaded_packets = []
-        tokens = []
-        for index in vector_packet_indices:
-            loaded, token = _emit_i8_transpose_gather(
-                state,
-                attrs,
-                index,
-                base,
-                element_type,
-                lane_width,
-                dependency,
+    if target_type.representation in _MMA_PACKET_REPRESENTATIONS:
+        if len(payloads) != component_count:
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "local_load packet relation does not match its result components",
+                target_op_id=op.target_op_id,
             )
-            loaded_packets.append(loaded)
-            tokens.append(token)
-        packets = []
-        for loaded in loaded_packets:
-            packets.extend(
-                _split_i8_transpose_packet(
-                    state,
-                    loaded,
-                    element_type,
-                    lane_width,
-                    transpose_packet_width,
-                    result_packet_width,
-                ))
-        state.values[result_id] = _VectorPacketPayload(
-            tuple(packets),
-            result_packet_width,
-            component_count,
-        )
-        if tokens:
-            _finish_local_access(
-                state,
-                op,
-                memdesc_target_id,
-                _join_memory_tokens(state, tokens),
-                "read",
+        state.values[result_id] = _pack_components(payloads)
+    else:
+        if len(payloads) != 1 or int(attrs["packet_width"]) != component_count:
+            fail(
+                "TLXW_EMIT_COMPONENT_COUNT",
+                STAGE,
+                "local_load scalar packet relation does not match its result",
+                target_op_id=op.target_op_id,
             )
-        return
-    uses_transpose_load = any(
-        _local_load_transpose_packet_elements(
-            state,
-            attrs,
-            index,
-            component_count,
-            op,
-        ) > 1 for index in range(component_count))
-    if not uses_transpose_load:
-        packet_type = state.dsl.simd_type(
-            state.dsl.vector_type(component_count, element_type),
-            width=lane_width,
-        )
-        bit_offset = _symbolic_local_destination_bit_offset(
-            state,
-            attrs,
-            component_count,
-            int(attrs["element_byte_width"]),
-            op,
-        )
-        loaded, token = state.builder.gather(
-            [base],
-            packet_type,
-            bit_offset=bit_offset,
-            after=dependency,
-        )
         components = _symbolic_shared_packet_components(
             state,
-            loaded,
+            payloads[0],
             component_count,
             element_type,
             lane_width,
         )
         state.values[result_id] = _pack_components(components)
-        _finish_local_access(state, op, memdesc_target_id, token, "read")
-        return
-    offsets = _local_access_offsets(
-        state,
-        attrs,
-        component_count,
-        lane_width,
-        op,
-    )
-    component_entries = []
-    tokens = []
-    index = 0
-    component_type = state.dsl.simd_type(element_type, lane_width)
-    while index < component_count:
-        transpose_packet = _local_load_transpose_packet_elements(
-            state,
-            attrs,
-            index,
-            component_count,
-            op,
-        )
-        if transpose_packet > 1:
-            component_type = state.dsl.simd_type(element_type, lane_width)
-            loaded, token = _emit_i8_transpose_gather(
-                state,
-                attrs,
-                index,
-                base,
-                element_type,
-                lane_width,
-                dependency,
-            )
-            component_entries.append(_DeferredPacketLocalLoad(loaded, int(transpose_packet)))
-            tokens.append(token)
-            index += int(transpose_packet)
-            continue
-        loaded_packet, token = _emit_symbolic_shared_gather(
-            state,
-            (offsets[index], ),
-            base,
-            element_type,
-            lane_width,
-            int(attrs["element_byte_width"]),
-            dependency,
-            op,
-        )
-        loaded = state.dsl.wave.ExtractOp(
-            component_type,
-            loaded_packet,
-            0,
-        ).result
-        component_entries.append(loaded)
-        tokens.append(token)
-        index += 1
-    components = []
-    for entry in component_entries:
-        if isinstance(entry, _DeferredPacketLocalLoad):
-            for element in range(int(entry.element_count)):
-                components.append(state.dsl.wave.ExtractOp(
-                    component_type,
-                    entry.loaded,
-                    int(element),
-                ).result)
-            continue
-        components.append(entry)
-    state.values[result_id] = _pack_components(tuple(components))
-    if tokens:
-        _finish_local_access(
-            state,
-            op,
-            memdesc_target_id,
-            _join_memory_tokens(state, tokens),
-            "read",
-        )
-
-
-def _emit_local_load_mma_packet_payload(
-    state,
-    op,
-    attrs,
-    base,
-    offsets,
-    element_type,
-    target_type,
-    lane_width,
-    dependency,
-):
-    if target_type.representation not in _MMA_PACKET_REPRESENTATIONS:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "MMA packet local_load requires an MMA packet result type",
-            target_op_id=op.target_op_id,
-        )
-    component_count = int(attrs["component_count"])
-    if len(offsets) != component_count:
-        fail(
-            "TLXW_EMIT_COMPONENT_COUNT",
-            STAGE,
-            "MMA packet local_load offset count does not match attrs",
-            target_op_id=op.target_op_id,
-        )
-    registers = int(attrs.get("registers", 0))
-    if registers <= 1:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "MMA packet local_load requires multiple registers",
-            target_op_id=op.target_op_id,
-        )
-    load_type = state.dsl.simd_type(
-        state.dsl.vector_type(registers, element_type),
-        width=int(lane_width),
-    )
-    expanded_offsets = tuple(offset if element == 0 else _simd_binary_const(
-        state,
-        "addi",
-        offset,
-        element,
-        lane_width,
-        nsw=_LAYOUT_MATH_NSW,
-    ) for offset in offsets for element in range(registers))
-    loaded, token = _emit_symbolic_shared_gather(
-        state,
-        expanded_offsets,
-        base,
-        element_type,
-        lane_width,
-        int(attrs["element_byte_width"]),
-        dependency,
-        op,
-    )
-    scalar_components = _symbolic_shared_packet_components(
-        state,
-        loaded,
-        component_count * registers,
-        element_type,
-        lane_width,
-    )
-    components = tuple(
-        state.dsl.wave.PackOp(
-            load_type,
-            scalar_components[index * registers:(index + 1) * registers],
-        ).result for index in range(component_count))
-    return _pack_components(components), token
-
-
-def _local_load_vector_packet_indices(state, attrs, component_count, op):
-    if attrs.get("result_value_mode") != "transpose_vector_packets":
-        return None
-    if int(attrs.get("result_packet_width", 0)) <= 1:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "transpose vector-packet local_load requires result_packet_width",
-            target_op_id=op.target_op_id,
-        )
-    if int(attrs.get("result_transpose_packet_width", 0)) <= 1:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "transpose vector-packet local_load requires result_transpose_packet_width",
-            target_op_id=op.target_op_id,
-        )
-    if int(attrs["result_transpose_packet_width"]) % int(attrs["result_packet_width"]):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "transpose vector-packet local_load packet widths are incompatible",
-            target_op_id=op.target_op_id,
-        )
-    if component_count % int(attrs["result_transpose_packet_width"]):
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "transpose vector-packet local_load requires uniform transpose packets",
-            target_op_id=op.target_op_id,
-        )
-    if attrs.get("element_type") != "i8" or int(attrs.get("element_byte_width", 0)) != 1:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "transpose vector-packet local_load currently requires i8 elements",
-            target_op_id=op.target_op_id,
-        )
-    if int(attrs["result_packet_width"]) != 4 or int(attrs["result_transpose_packet_width"]) != 8:
-        fail(
-            "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
-            STAGE,
-            "unsupported transpose vector-packet local_load packet shape",
-            target_op_id=op.target_op_id,
-        )
-        return None
-    indices = []
-    index = 0
-    while index < int(component_count):
-        transpose_packet = _local_load_transpose_packet_elements(
-            state,
-            attrs,
-            index,
-            component_count,
-            op,
-        )
-        if transpose_packet != 8:
-            return None
-        indices.append(index)
-        index += int(transpose_packet)
-    return tuple(indices)
-
-
-def _split_i8_transpose_packet(state, loaded, element_type, lane_width, transpose_packet_width, result_packet_width):
-    return tuple(
-        _extract_i8_vector_packet(
-            state,
-            loaded,
-            element_type,
-            lane_width,
-            first_element,
-            result_packet_width,
-        ) for first_element in range(0, int(transpose_packet_width), int(result_packet_width)))
-
-
-def _extract_i8_vector_packet(state, loaded, element_type, lane_width, first_element, packet_width):
-    component_type = state.dsl.simd_type(element_type, int(lane_width))
-    packet_type = state.dsl.simd_type(
-        state.dsl.vector_type(int(packet_width), element_type),
-        int(lane_width),
-    )
-    return state.dsl.wave.PackOp(
-        packet_type,
-        tuple(
-            state.dsl.wave.ExtractOp(
-                component_type,
-                loaded,
-                int(first_element) + int(element),
-            ).result for element in range(int(packet_width))),
-    ).result
-
-
-def _local_load_transpose_packet_elements(state, attrs, index, component_count, op):
-    if int(index) + 8 > int(component_count):
-        return 1
-    if attrs.get("destination_offset_mode") != "layout_coordinates":
-        return 1
-    if attrs.get("element_type") != "i8":
-        return 1
-    if int(attrs.get("element_byte_width", 0)) != 1:
-        return 1
-    if int(attrs.get("lane_width", 0)) != 64:
-        return 1
-    if attrs.get("destination_physical_offset_plan") != "swizzled_xor":
-        return 1
-    if attrs.get("destination_physical_offset_unit") != "element":
-        return 1
-    if int(attrs.get("destination_physical_element_byte_width", 0)) != 1:
-        return 1
-    if tuple(int(value) for value in attrs.get("destination_physical_order", ())) != (0, 1):
-        return 1
-    if int(attrs.get("destination_physical_swizzled_vec", 0)) != 1:
-        return 1
-    if int(attrs.get("destination_physical_swizzled_per_phase", 0)) != 1:
-        return 1
-    if int(attrs.get("destination_physical_swizzled_max_phase", 0)) != 1:
-        return 1
-    shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
-    physical_shape = tuple(int(value) for value in attrs.get("destination_physical_shape", shape))
-    logical_origin = tuple(int(value) for value in attrs.get("destination_logical_origin", (0, ) * len(shape)))
-    if physical_shape != shape or any(logical_origin):
-        return 1
-    if len(shape) != 2:
-        return 1
-    component_bases = tuple(
-        tuple(int(value) for value in bases) for bases in attrs["destination_component_coordinate_bases"])
-    if int(index) + 8 > len(component_bases):
-        return 1
-    workitem_coefficients = tuple(
-        tuple(int(value)
-              for value in coefficients)
-        for coefficients in attrs["destination_workitem_coordinate_coefficients"])
-    if any(len(coefficients) != len(shape) for coefficients in workitem_coefficients):
-        return 1
-    # CDNA4 ds_read_b64_tr_b8 loads an 8x16 byte tile from LDS. The Wave op
-    # consumes the source-lane pointer for the first logical component and
-    # returns the transposed 8-byte payload for the destination lane.
-    packet_bases = component_bases[int(index):int(index) + 8]
-    first_row, first_col = packet_bases[0]
-    if int(first_row) % 32 or int(first_col) % 4:
-        return 1
-    expected = []
-    for row_group in range(4):
-        for col_group in range(2):
-            expected.append((int(first_row) + row_group * 32, int(first_col) + col_group * 4))
-    if tuple(expected) != tuple(packet_bases):
-        return 1
-    if int(first_row) + 96 >= int(shape[0]) or int(first_col) + 4 >= int(shape[1]):
-        return 1
-    del state, op
-    return 8
-
-
-def _emit_i8_transpose_gather(
-    state,
-    attrs,
-    index,
-    base,
-    element_type,
-    lane_width,
-    dependency,
-):
-    shape = tuple(int(value) for value in attrs["destination_coordinate_shape"])
-    row_extent = int(shape[0])
-    component_bases = tuple(
-        tuple(int(value) for value in bases) for bases in attrs["destination_component_coordinate_bases"])
-    first_row, first_col = component_bases[int(index)]
-    workitem_coefficients = tuple(
-        tuple(int(value)
-              for value in coefficients)
-        for coefficients in attrs["destination_workitem_coordinate_coefficients"])
-    coefficients = [
-        8,
-        4 * row_extent,
-        32,
-        64,
-        row_extent,
-        2 * row_extent,
-    ]
-    for bit in range(6, len(workitem_coefficients)):
-        row_coeff, col_coeff = workitem_coefficients[bit]
-        coefficients.append(int(row_coeff) + int(col_coeff) * row_extent)
-
-    item = state.dsl.sym("item")
-    slot = state.dsl.sym("slot")
-    lane = state.dsl.mod(item, 64)
-    source_item = (item - lane + 16 * state.dsl.floor(lane / 16) + state.dsl.floor(state.dsl.mod(lane, 16) / 2))
-    source_offset = _bit_affine_thread_offset_expr(
-        state,
-        source_item,
-        int(first_col) * row_extent + int(first_row),
-        tuple(coefficients),
-    )
-    byte_offset = (source_offset + 4 * state.dsl.mod(lane, 2) + state.dsl.floor(slot / 2))
-    packet_type = state.dsl.simd_type(
-        state.dsl.vector_type(8, element_type),
-        width=int(lane_width),
-    )
-    return state.builder.gather(
-        [base],
-        packet_type,
-        bit_offset=8 * byte_offset,
-        after=dependency,
-    )
+    _finish_local_access(state, op, memdesc_target_id, token, "read")
 
 
 def _b16_transpose_source_item_expr(state, item, slot):
@@ -4631,7 +4257,7 @@ def _emit_local_load_mma_payload(state, op):
     )
 
 
-def _emit_symbolic_mma_payload_load(
+def _emit_symbolic_local_gather_packets(
     state,
     op,
     attrs,
@@ -4640,7 +4266,7 @@ def _emit_symbolic_mma_payload_load(
     dependency,
 ):
     lane_width = int(attrs["lane_width"])
-    packet_width = int(attrs["elements_per_lane"])
+    packet_width = int(attrs["packet_width"])
     base_type = state.dsl.ptr_type(
         element_type,
         state.dsl.shared_address_space(),
@@ -4654,34 +4280,66 @@ def _emit_symbolic_mma_payload_load(
     slot = state.dsl.sym("slot")
     payloads = []
     load_tokens = []
-    for component, component_base in enumerate(attrs["component_coordinate_bases"]):
-        logical_coords = _bit_linear_packet_coordinate_exprs(
-            state,
-            attrs,
-            tuple(int(value) for value in component_base),
-            item,
-            slot,
-            op,
+    packet_bases = tuple(
+        tuple(int(value) for value in base)
+        for base in attrs["packet_coordinate_bases"]
+    )
+    if len(packet_bases) != int(attrs["packet_count"]):
+        fail(
+            "TLXW_EMIT_COMPONENT_COUNT",
+            STAGE,
+            "local_load packet bases do not match its packet count",
+            target_op_id=op.target_op_id,
         )
-        element_offset = _local_physical_element_offset_from_coords_expr(
-            state,
-            attrs,
-            logical_coords,
-            op,
-        )
-        bit_offset = (_element_byte_width(attrs["element_type"], op) * 8 * element_offset).simplify()
+    for packet_base in packet_bases:
         payload, token = state.builder.gather(
             [base],
             load_type,
-            bit_offset=bit_offset,
+            bit_offset=_symbolic_local_packet_bit_offset(
+                state,
+                attrs,
+                packet_base,
+                op,
+                item=item,
+                slot=slot,
+            ),
             after=dependency,
         )
         payloads.append(payload)
         load_tokens.append(token)
-    return _pack_components(tuple(payloads)), _join_memory_tokens(
+    return tuple(payloads), _join_memory_tokens(state, load_tokens)
+
+
+def _symbolic_local_packet_bit_offset(
+    state,
+    attrs,
+    packet_base,
+    op,
+    *,
+    item=None,
+    slot=None,
+):
+    item = state.dsl.sym("item") if item is None else item
+    slot = state.dsl.sym("slot") if slot is None else slot
+    logical_coords = _bit_linear_packet_coordinate_exprs(
         state,
-        load_tokens,
+        attrs,
+        tuple(int(value) for value in packet_base),
+        item,
+        slot,
+        op,
     )
+    element_offset = _local_physical_element_offset_from_coords_expr(
+        state,
+        attrs,
+        logical_coords,
+        op,
+    )
+    return (
+        _element_byte_width(attrs["element_type"], op)
+        * 8
+        * element_offset
+    ).simplify()
 
 
 def _bit_linear_packet_coordinate_exprs(
@@ -4701,7 +4359,7 @@ def _bit_linear_packet_coordinate_exprs(
         fail(
             "TLXW_EMIT_BAD_COORDINATES",
             STAGE,
-            "symbolic MMA payload coordinate bases do not match the tensor rank",
+            "symbolic local-memory coordinates do not match the tensor rank",
             target_op_id=op.target_op_id,
         )
     coords = []
@@ -4740,7 +4398,7 @@ def _local_physical_element_offset_from_coords_expr(
         fail(
             "TLXW_EMIT_BAD_COORDINATES",
             STAGE,
-            "symbolic MMA payload view ranks do not match",
+            "symbolic local-memory view ranks do not match",
             target_op_id=op.target_op_id,
         )
     physical_coords = tuple(coord + int(origin) for coord, origin in zip(logical_coords, logical_origin))
@@ -4760,7 +4418,7 @@ def _local_physical_element_offset_from_coords_expr(
     fail(
         "TLXW_EMIT_UNSUPPORTED_LOCAL_LOAD",
         STAGE,
-        f"unsupported symbolic MMA payload physical offset plan {plan}",
+        f"unsupported symbolic local-memory physical offset plan {plan}",
         target_op_id=op.target_op_id,
     )
 
@@ -7006,44 +6664,49 @@ def _emit_store(state, op):
             target_op_id=op.target_op_id,
         )
     mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
+    if mask_components is not None and mask_mode != "exec_where":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_STORE_MASK",
+            STAGE,
+            f"unsupported store mask mode {mask_mode}",
+            target_op_id=op.target_op_id,
+        )
     _data_result_ids, issue_result_ids = _issue_order_result_ids(op)
     capture_token = bool(issue_result_ids)
-    tokens = []
-    for index, (ptr_component, value_component) in enumerate(zip(ptr_components, value_components)):
-        if mask_components is None:
-            tokens.append(state.builder.store(
-                value_component,
-                ptr_component,
-                after=dependency,
-            ))
-            continue
-        if mask_mode != "exec_where":
-            fail(
-                "TLXW_EMIT_UNSUPPORTED_STORE_MASK",
-                STAGE,
-                f"unsupported store mask mode {mask_mode}",
-                target_op_id=op.target_op_id,
-            )
-        emit_store = lambda value_component=value_component, ptr_component=ptr_component: state.builder.store(
-            value_component,
-            ptr_component,
+    lane_width = int(attrs["lane_width"])
+    element_type = _scalar_type(state.dsl, attrs["element_type"])
+    packet_type = state.dsl.simd_type(
+        state.dsl.vector_type(component_count, element_type),
+        width=lane_width,
+    )
+    packet = state.dsl.wave.PackOp(packet_type, value_components).result
+    slot = state.dsl.sym("slot")
+    zero = state.dsl.sym_ctx.int_(0)
+
+    def emit_store():
+        return state.builder.scatter(
+            packet,
+            ptr_components,
+            base=slot,
+            bit_offset=zero,
             after=dependency,
         )
+
+    if mask_components is None:
+        token = emit_store()
+    else:
+        condition = _symbolic_mask_conditions(state, mask_components)
         if capture_token:
-            tokens.append(
-                _emit_masked_token_region(
-                    state,
-                    mask_components[index],
-                    dependency or state.builder.token(),
-                    emit_store,
-                ))
-        else:
-            _emit_masked_effect_region(
+            token = _emit_masked_token_region(
                 state,
-                mask_components[index],
+                condition,
+                dependency or state.builder.token(),
                 emit_store,
             )
-    _finish_issue_order_result(state, op, tokens)
+        else:
+            _emit_masked_effect_region(state, condition, emit_store)
+            token = None
+    _finish_issue_order_result(state, op, () if token is None else (token, ))
 
 
 def _emit_load(state, op):
@@ -7103,52 +6766,67 @@ def _emit_load(state, op):
             target_op_id=op.target_op_id,
         )
     result_id = data_result_ids[0]
-    result_type = _wave_type(state.dsl, state.target_program.values[result_id].type)
     mask_mode = attrs.get("mask_mode", "exec_where" if attrs["has_mask"] else "none")
-    loaded_components = []
-    tokens = []
-    for index, ptr_component in enumerate(ptr_components):
-        if mask_components is None:
-            loaded, token = state.builder.load(
-                ptr_component,
-                result_type,
-                after=dependency,
-            )
-        else:
-            if mask_mode != "exec_where":
-                fail(
-                    "TLXW_EMIT_UNSUPPORTED_LOAD_MASK",
-                    STAGE,
-                    f"unsupported load mask mode {mask_mode}",
-                    target_op_id=op.target_op_id,
-                )
+    if mask_components is not None and mask_mode != "exec_where":
+        fail(
+            "TLXW_EMIT_UNSUPPORTED_LOAD_MASK",
+            STAGE,
+            f"unsupported load mask mode {mask_mode}",
+            target_op_id=op.target_op_id,
+        )
+    lane_width = int(attrs["lane_width"])
+    element_type = _scalar_type(state.dsl, attrs["element_type"])
+    component_type = state.dsl.simd_type(element_type, lane_width)
+    packet_type = state.dsl.simd_type(
+        state.dsl.vector_type(component_count, element_type),
+        width=lane_width,
+    )
+    slot = state.dsl.sym("slot")
+    zero = state.dsl.sym_ctx.int_(0)
 
-            def emit_active_load(ptr_component=ptr_component):
-                return state.builder.load(
-                    ptr_component,
-                    result_type,
-                    after=dependency,
-                )
+    def emit_active_load():
+        return state.builder.gather(
+            ptr_components,
+            packet_type,
+            base=slot,
+            bit_offset=zero,
+            after=dependency,
+        )
 
-            other_component = (None if other_components is None else other_components[index])
-            fallback = (other_component if other_component is not None else _zero_simd_value(
+    if mask_components is None:
+        packet, token = emit_active_load()
+    else:
+        if other_components is None:
+            fallback = _zero_simd_value(
                 state,
-                result_type,
+                component_type,
                 attrs["element_type"],
                 op,
-            ))
-            loaded, token = _emit_masked_memory_value_region(
-                state,
-                mask_components[index],
-                result_type,
-                fallback,
-                dependency,
-                emit_active_load,
             )
-        loaded_components.append(loaded)
-        tokens.append(token)
+            fallback_components = (fallback, ) * component_count
+        else:
+            fallback_components = other_components
+        fallback_packet = state.dsl.wave.PackOp(
+            packet_type,
+            fallback_components,
+        ).result
+        packet, token = _emit_masked_memory_value_region(
+            state,
+            _symbolic_mask_conditions(state, mask_components),
+            packet_type,
+            fallback_packet,
+            dependency,
+            emit_active_load,
+        )
+    loaded_components = _symbolic_shared_packet_components(
+        state,
+        packet,
+        component_count,
+        element_type,
+        lane_width,
+    )
     state.values[result_id] = _pack_components(tuple(loaded_components))
-    _finish_issue_order_result(state, op, tokens)
+    _finish_issue_order_result(state, op, (token, ))
 
 
 def _memory_simd_component(state, value, element_type, lane_width, op, splat_cache):
@@ -7267,7 +6945,6 @@ _TARGET_EMITTERS = {
     "local_store": _emit_local_store,
     "local_load": _emit_local_load,
     "buffer_load_to_local": _emit_buffer_load_to_local,
-    "local_load_mma_payload": _emit_local_load_mma_payload,
     "mma_packet_constant": _emit_mma_packet_constant,
     "mma": _emit_mma,
     "mma_scaled": _emit_mma_scaled,
