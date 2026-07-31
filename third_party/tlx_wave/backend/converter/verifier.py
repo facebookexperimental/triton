@@ -360,6 +360,8 @@ def _verify_ops(target_program, source_program):
                 "split",
         }:
             _verify_layout_transform(op, target_program)
+        if op.kind == "reduction":
+            _verify_reduction(op, target_program)
         if len(op.fact_target_ids) != len(op.fact_ids):
             fail(
                 "TLXW_VERIFY_FACT_TARGET_COUNT",
@@ -1451,6 +1453,80 @@ def _verify_layout_transform(op, target_program):
             "TLXW_VERIFY_LAYOUT_TRANSFORM",
             STAGE,
             f"{op.kind} has incompatible structural layout semantics",
+            target_op_id=op.target_op_id,
+        )
+
+
+def _verify_reduction(op, target_program):
+    attrs = _attrs_dict(op)
+    allowed = {"axis"}
+    leaked_attrs = tuple(sorted(set(attrs) - allowed))
+    if leaked_attrs:
+        fail(
+            "TLXW_VERIFY_REDUCTION_ATTRS",
+            STAGE,
+            f"reduction carries non-structural attrs {leaked_attrs}",
+            target_op_id=op.target_op_id,
+        )
+    if len(op.operands) != 1 or len(op.results) != 1 or len(op.region_ids) != 1:
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction requires one operand, one result, and one combiner region",
+            target_op_id=op.target_op_id,
+        )
+    operand = target_program.values[int(op.operands[0])]
+    result = target_program.values[int(op.results[0])]
+    types = (operand.type, result.type)
+    if (any(value.layout_map_id is None for value in (operand, result)) or any(type_.representation not in {
+            "simd",
+            "simd_tuple",
+            "simd_packet",
+            "simd_packet_tuple",
+    } for type_ in types) or types[0].element_type != types[1].element_type
+            or types[0].lane_width != types[1].lane_width):
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction requires layout-bearing SIMD packets with matching element types and lane widths",
+            target_op_id=op.target_op_id,
+        )
+    region_id = int(op.region_ids[0])
+    if region_id <= 0 or region_id >= len(target_program.regions):
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction references an invalid combiner region",
+            target_op_id=op.target_op_id,
+        )
+    region = target_program.regions[region_id]
+    if len(region.block_arg_ids) != 2 or len(region.yield_value_ids) != 1:
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction combiner requires two arguments and one yielded value",
+            target_op_id=op.target_op_id,
+        )
+    combiner_values = tuple(target_program.values[int(target_value_id)] for target_value_id in (
+        *region.block_arg_ids,
+        *region.yield_value_ids,
+    ))
+    if any(value.layout_map_id is not None or value.type.representation != "simd" or value.type.element_type !=
+           types[0].element_type or value.type.lane_width != types[0].lane_width or int(value.type.component_count) != 1
+           for value in combiner_values):
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction combiner values must be scalar-packet SIMD values "
+            "matching the reduced packet element type",
+            target_op_id=op.target_op_id,
+        )
+    axis = attrs.get("axis")
+    if not isinstance(axis, int):
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction axis must be an integer",
             target_op_id=op.target_op_id,
         )
 
