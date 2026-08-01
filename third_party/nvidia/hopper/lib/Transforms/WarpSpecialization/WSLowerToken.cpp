@@ -32,6 +32,41 @@ namespace {
 // In Hopper, each task is a warpgroup consisting of 4 warps.
 const int THREADS_PER_WARP = 32;
 
+// Token lowering emits one CTA barrier after initializing each token's full
+// and empty mbarriers.  Consecutive token initializers in the same block can
+// share the last barrier: no token user can execute until that barrier, and
+// delaying the earlier synchronization only extends initialization ordering.
+static void
+coalesceAdjacentTokenInitBarriers(ArrayRef<ttg::BarrierOp> initBarriers) {
+  // drop_front() asserts on an empty ArrayRef, and a kernel with no tokens
+  // reaches here with nothing to coalesce.
+  if (initBarriers.empty())
+    return;
+
+  DenseSet<Operation *> generatedBarriers;
+  for (ttg::BarrierOp barrier : initBarriers)
+    generatedBarriers.insert(barrier);
+
+  for (auto [barrier, nextBarrier] :
+       llvm::zip(initBarriers, initBarriers.drop_front())) {
+    if (barrier->getBlock() != nextBarrier->getBlock())
+      continue;
+
+    bool onlyInitScaffolding = true;
+    for (Operation *op = barrier->getNextNode(); op != nextBarrier;
+         op = op->getNextNode()) {
+      if (!op || (!generatedBarriers.contains(op) &&
+                  !isa<arith::ConstantOp, ttg::LocalAllocOp,
+                       ttg::MemDescIndexOp, ttng::InitBarrierOp>(op))) {
+        onlyInitScaffolding = false;
+        break;
+      }
+    }
+    if (onlyInitScaffolding)
+      barrier->erase();
+  }
+}
+
 Value getMBarrierPhaseBit(OpBuilder &builder, Operation *op,
                           bool emptyBarrier) {
   auto loc = op->getLoc();
@@ -112,6 +147,7 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
   SmallVector<Operation *> deprecatedTokenOps;
   DenseMap<Operation *, Value> tokenToFull;
   DenseMap<Operation *, Value> tokenToEmpty;
+  SmallVector<ttg::BarrierOp> tokenInitBarriers;
   parentOp->walk([&](ttnvws::CreateTokenOp createTokenOp) {
     ttnvws::TokenLoadType loadType = createTokenOp.getLoadType();
     MLIRContext *context = createTokenOp.getContext();
@@ -232,8 +268,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     }
 
     assert(numCTAs == 1 && "remote CTA is not supported yet");
-    mlir::triton::gpu::BarrierOp::create(builder, loc,
-                                         triton::gpu::AddrSpace::Local);
+    tokenInitBarriers.push_back(mlir::triton::gpu::BarrierOp::create(
+        builder, loc, triton::gpu::AddrSpace::Local));
 
     // Helper function for extracting one index from bufferFullArray.
     auto extractBufferFull = [&](Location loc, Value idx) -> Value {
@@ -366,6 +402,8 @@ void lowerTokenOperations(Operation *parentOp, int numCTAs,
     }
     op->erase();
   }
+
+  coalesceAdjacentTokenInitBarriers(tokenInitBarriers);
 
   assert(numCTAs == 1 && "remote CTA is not supported yet");
   LLVM_DEBUG({
