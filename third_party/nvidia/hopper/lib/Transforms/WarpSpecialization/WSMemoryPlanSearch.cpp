@@ -19,6 +19,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
+#include <optional>
 
 #define DEBUG_TYPE "nvgpu-ws-memory-planner"
 
@@ -29,14 +30,33 @@ namespace {
 
 /// Apply the CopySolver to `plan` (a grouping) and return its scored copy. Used
 /// both for beam ranking and leaf finalization so the two stay consistent.
-Plan scoreWithCopies(const BufferModel &model, const Packer &packer,
-                     const Budget &budget, const CostModel &cost,
-                     const CopySolver &copies, Plan plan) {
+std::optional<Plan> scoreWithCopies(const BufferModel &model,
+                                    const Packer &packer, const Budget &budget,
+                                    const CostModel &cost,
+                                    const CopySolver &copies,
+                                    const CopySafetyValidator &validator,
+                                    Plan plan) {
   CopyMap cm = copies.solve(model, packer, plan, budget, cost);
   for (Block &blk : plan.blocks) {
     auto it = cm.find(blk.id);
     if (it != cm.end())
       blk.copies = it->second;
+  }
+  SmallVector<CopySafetyFailure> failures;
+  if (!validator.validate(model, plan, &failures)) {
+    LLVM_DEBUG(for (const CopySafetyFailure &failure : failures) {
+      llvm::dbgs() << "[ws-plan] reject unsafe block " << failure.block
+                   << " buffer " << failure.buffer << ": proposed "
+                   << failure.proposedCopies << ", required "
+                   << failure.requiredCopies
+                   << " (missing release -> overwrite ordering)\n";
+    });
+    return std::nullopt;
+  }
+  if (!packer.feasible(plan, budget)) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[ws-plan] reject copy-solved plan over budget\n");
+    return std::nullopt;
   }
   plan.score = cost.score(plan);
   return plan;
@@ -68,8 +88,9 @@ Plan withNewBlock(Plan plan, const Packer &packer, BufferId b) {
 
 TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
                      const Packer &packer, const CostModel &cost,
-                     const CopySolver &copies, const Budget &budget, unsigned W,
-                     unsigned K) {
+                     const CopySolver &copies,
+                     const CopySafetyValidator &validator, const Budget &budget,
+                     unsigned W, unsigned K) {
   TopKPlans out;
   if (model.buffers().empty() || W == 0 || K == 0)
     return out;
@@ -110,9 +131,10 @@ TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
     SmallVector<std::pair<double, unsigned>> ranked;
     ranked.reserve(next.size());
     for (unsigned i = 0; i < next.size(); ++i) {
-      Plan scored =
-          scoreWithCopies(model, packer, budget, cost, copies, next[i]);
-      ranked.push_back({scored.score, i});
+      auto scored = scoreWithCopies(model, packer, budget, cost, copies,
+                                    validator, next[i]);
+      if (scored)
+        ranked.push_back({scored->score, i});
     }
     llvm::stable_sort(ranked, [](const std::pair<double, unsigned> &x,
                                  const std::pair<double, unsigned> &y) {
@@ -134,7 +156,9 @@ TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
   SmallVector<Plan> leaves;
   leaves.reserve(beam.size());
   for (Plan &p : beam)
-    leaves.push_back(scoreWithCopies(model, packer, budget, cost, copies, p));
+    if (auto scored =
+            scoreWithCopies(model, packer, budget, cost, copies, validator, p))
+      leaves.push_back(std::move(*scored));
   llvm::stable_sort(
       leaves, [](const Plan &x, const Plan &y) { return x.score > y.score; });
 
