@@ -180,7 +180,6 @@ FuncOp getOrCreateFunction(
   func.setVisibility(SymbolTable::Visibility::Private);
   func->setAttr(ttg::AttrNumWarpsName,
                 moduleBuilder.getI32IntegerAttr(numWarps));
-  func->setAttr("always_use_warp_shuffle", moduleBuilder.getUnitAttr());
   for (auto [i, argType] : llvm::enumerate(argTypes)) {
     if (isa<PointerType>(argType)) {
       func.setArgAttr(i, "tt.divisibility",
@@ -191,6 +190,9 @@ FuncOp getOrCreateFunction(
   OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entryBlock);
   ImplicitLocOpBuilder fb(loc, bodyBuilder);
   buildBody(fb, entryBlock);
+  func.walk([&](ttg::ConvertLayoutOp op) {
+    op.setForceWarpShuffleAttr(moduleBuilder.getUnitAttr());
+  });
   return func;
 }
 
