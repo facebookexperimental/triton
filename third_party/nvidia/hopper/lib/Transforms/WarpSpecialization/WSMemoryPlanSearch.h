@@ -119,6 +119,14 @@ using CopyMap = DenseMap<BlockId, unsigned>;
 /// The K best complete plans, best-first.
 using TopKPlans = SmallVector<Plan>;
 
+/// Why a copy-solved block failed static slot-reuse validation.
+struct CopySafetyFailure {
+  BlockId block = 0;
+  BufferId buffer = 0;
+  unsigned proposedCopies = 0;
+  unsigned requiredCopies = 1;
+};
+
 //===----------------------------------------------------------------------===//
 // Module interfaces (docs §3.2)
 //===----------------------------------------------------------------------===//
@@ -207,6 +215,19 @@ public:
                         const CostModel &) const = 0;
 };
 
+/// Validates physical-slot reuse using correctness facts from BufferModel.
+/// This is deliberately independent of CostModel and therefore of estimated
+/// pipeline II: latency estimates may rank safe plans but never admit one.
+class CopySafetyValidator {
+public:
+  virtual ~CopySafetyValidator() = default;
+  virtual bool
+  validate(const BufferModel &, const Plan &,
+           SmallVectorImpl<CopySafetyFailure> *failures = nullptr) const = 0;
+};
+
+std::unique_ptr<CopySafetyValidator> createStaticCopySafetyValidator();
+
 /// Concave-knapsack copy allocator (docs §2.3, Step 4).
 std::unique_ptr<CopySolver> createGreedyCopySolver();
 
@@ -253,8 +274,9 @@ std::unique_ptr<CostModel> createLatencyCostModel(const BufferModel &model,
 ///   K = number of top plans to return
 TopKPlans beamSearch(const BufferModel &model, const OrderingPolicy &ordering,
                      const Packer &packer, const CostModel &cost,
-                     const CopySolver &copies, const Budget &budget, unsigned W,
-                     unsigned K);
+                     const CopySolver &copies,
+                     const CopySafetyValidator &validator, const Budget &budget,
+                     unsigned W, unsigned K);
 
 } // namespace wsplan
 } // namespace mlir
