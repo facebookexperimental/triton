@@ -1805,7 +1805,7 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
     """
     import sympy
     from torch._inductor.codegen.common import OpOverrides
-    from torch._inductor.utils import sympy_dot, triton_type_to_torch
+    from torch._inductor.utils import triton_type_to_torch
 
     subgraph_name = self._get_compute_epilogue_subgraph_name(
         next(self._compute_epilogue_ctr)
@@ -1823,7 +1823,6 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
         lengths = [V.graph.sizevars.simplify(s) for s in self.output_node.get_size()]
         assert len(indices) == len(lengths)
 
-        output_layout = self.output_node.get_layout()
         self.template_out = val
 
         # Use the tma_store index setup path (same as store_output with
@@ -1864,7 +1863,6 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
         val_shape = tuple(val_shape_copy)
 
         index_symbols = epilogue_index_symbols
-        contiguous_index = sympy_dot(output_layout.stride, index_symbols)
 
         for line in intermediate_lines:
             self.body.writeline(line)
@@ -1914,6 +1912,30 @@ def _tlx_compute_epilogue(  # type: ignore[no-untyped-def]
 _tlx_compute_epilogue.__name__ = "compute_epilogue"
 TritonTemplateKernel.compute_epilogue = _tlx_compute_epilogue  # type: ignore[method-assign]
 
+
+def _tlx_compute_reduce_epilogue(self):  # type: ignore[no-untyped-def]
+    """Codegen only downstream pointwise ops; reduce-k applies addmm bias itself."""
+    subgraph_name = self._get_compute_epilogue_subgraph_name(
+        next(self._compute_epilogue_ctr)
+    )
+    with self.create_subgraph_body(subgraph_name, clear_cse=True):
+        fused = self.cse.namedvar(
+            "acc", dtype=torch.float32, shape=("BLOCK_SIZE_M", "BLOCK_SIZE_N")
+        )
+        self.template_out = "acc"
+        self.template_out_shape = ("BLOCK_SIZE_M", "BLOCK_SIZE_N")
+        self.cse.store_cache[self.output_node.get_name()] = fused
+        self.body.writeline(f"fused_result = {fused}")
+        self.store_buffer_names.add(self.output_node.get_name())
+        self._tlx_compute_epilogue_result_name = "fused_result"
+        self.codegen_body()
+    return self._register_hook(
+        subgraph_name, self._make_codegen_hook(subgraph_name, 4)
+    )
+
+
+TritonTemplateKernel.compute_reduce_epilogue = _tlx_compute_reduce_epilogue  # type: ignore[attr-defined]
+
 # -- codegen_template_body: wrap to set _final_output_name and handle
 #    COMPUTE_EPILOGUE subgraphs --
 # The epilogue-fusion codegen API below (codegen_template_body,
@@ -1937,6 +1959,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
     prologue_preserves_zero_mask_fn,
     render,
 ):
+    split_k = getattr(self, "_tlx_split_k", 1)
     # Set _final_output_name so output_ptr() resolves to the fused output.
     if epilogue_nodes:
         last_names = epilogue_nodes[-1].get_buffer_names()
@@ -1948,6 +1971,10 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
 
     def _render_with_compute_epilogue():
         result = orig_render()
+
+        reduce_epilogue_hook = None
+        if split_k > 1 and config.cpp_wrapper and epilogue_nodes:
+            reduce_epilogue_hook = self.compute_reduce_epilogue()
 
         # After render, codegen epilogue nodes into COMPUTE_EPILOGUE subgraphs,
         # redirecting their stores to variable assignments.
@@ -1974,6 +2001,12 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
                 finally:
                     self.store = orig_store  # type: ignore[method-assign]
                 self.cse.invalidate(OrderedSet())
+
+        if reduce_epilogue_hook is not None:
+            hook = self.render_hooks.pop(reduce_epilogue_hook)
+            if hook is None:
+                raise AssertionError("missing split-K reduce epilogue hook")
+            self._tlx_reduce_epilogue_code = hook()
 
         return result
 
@@ -2070,10 +2103,21 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
                 bias_node=bias_node if bias_name is not None else None,
                 M=self.call_sizes[0],
                 N=self.call_sizes[1],
+                M_kernel_expr=self.size("A", 0),
+                N_kernel_expr=self.size("B", 1),
                 split_k=split_k,
                 output_triton_dtype=output_triton_dtype,
                 stride_bias_m=stride_bias_m,
                 stride_bias_n=stride_bias_n,
+                template_kernel=self,
+                main_kernel_name=kernel_name,
+                epilogue_code=getattr(self, "_tlx_reduce_epilogue_code", None),
+                final_output_ptr=self.output_ptr(),
+                bias_kernel_ptr=(
+                    self.args.input_buffers.get(bias_name)
+                    if bias_name is not None
+                    else None
+                ),
             )
         else:
             emit_reduce_k_call(
@@ -2114,7 +2158,7 @@ def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
         from collections import defaultdict
 
         self._epilogue_nodes_by_subgraph = defaultdict(list)
-        self._unfused_epilogues = list(epilogue_nodes)
+        self._unfused_epilogues = [] if config.cpp_wrapper else list(epilogue_nodes)
         self._prologue_sources = {}
         self._scheduling_ref = scheduling
     elif _orig_compute_fusion_metadata is not None:
