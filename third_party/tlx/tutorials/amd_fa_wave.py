@@ -1720,7 +1720,6 @@ def attention(
         "LOG2_SCORE_BOUND": log2_score_bound,
         "ADAPTIVE_REFERENCE": adaptive_reference,
         "num_warps": 8,
-        "waves_per_eu": 2,
         **kwargs,
     }
     if triton.runtime.driver.active.get_current_target().backend == "tlx_wave":
