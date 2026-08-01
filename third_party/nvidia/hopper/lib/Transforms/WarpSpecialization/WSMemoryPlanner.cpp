@@ -1919,10 +1919,17 @@ findReuseCandidate(WSBuffer &candidate, SmallVector<WSBuffer> &wsBuffers,
     // Pick the target with the lowest order (earliest last consumer).
     // Tiebreak: within the same linearOrder, prefer the target whose last
     // consumer appears earlier in program order (its SMEM is free sooner).
-    bool isBetter = false;
-    if (effectiveOrder < bestOrder.linearOrder) {
+    // Seed an unknown-order search only for TMA store staging.  Its consumers
+    // are outside the pipelined inner loop and therefore intentionally have no
+    // loop.stage; the code partitioner supplies the cross-tile WAR edge needed
+    // by allocation.reuseTarget.  Ordinary buffers still require a known
+    // order: allowing them through this fallback can create unsynchronized
+    // reuse chains and make the planner under-count their physical storage.
+    bool isBetter = best == nullptr &&
+                    (effectiveOrder != INT_MAX || candidate.tmaStaging != 0);
+    if (!isBetter && effectiveOrder < bestOrder.linearOrder) {
       isBetter = true;
-    } else if (effectiveOrder == bestOrder.linearOrder &&
+    } else if (!isBetter && effectiveOrder == bestOrder.linearOrder &&
                bestOrder.linearOrder != INT_MAX && order.lastOp &&
                bestOrder.lastOp &&
                order.lastOp->getBlock() == bestOrder.lastOp->getBlock() &&
