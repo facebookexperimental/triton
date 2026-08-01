@@ -3985,6 +3985,14 @@ def _convert_reduce(
             source_op_index=op.index,
         )
     axis = _int_attr(op.attrs, "axis")
+    reduction_ordering = op.attrs.get("reduction_ordering") or "unordered"
+    if reduction_ordering not in {"inner_tree", "unordered"}:
+        fail(
+            "TLXW_OP_REDUCTION_ORDERING",
+            STAGE,
+            f"unsupported tt.reduce ordering {reduction_ordering}",
+            source_op_index=op.index,
+        )
 
     source_region = conversion_input.regions[op.region_ids[0]]
     if len(source_region.block_arg_ids) != 2:
@@ -4042,7 +4050,10 @@ def _convert_reduce(
         "reduction",
         operands=(_single_source_target(builder, operand.value_id, op), ),
         results=result_target_ids,
-        attrs={"axis": int(axis)},
+        attrs={
+            "axis": int(axis),
+            "reduction_ordering": reduction_ordering,
+        },
         layout_map_ids=result_layout_map_ids,
         region_ids=(target_region_id, ),
         source_op_index=op.index,

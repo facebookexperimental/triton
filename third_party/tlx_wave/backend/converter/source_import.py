@@ -228,6 +228,10 @@ def _collect_region(
 
 def _source_attrs(op):
     attrs = dict(op.get_attrs())
+    for name in ("reduction_ordering", ):
+        value = op.get_str_attr(name)
+        if value is not None:
+            attrs[name] = value
     for name in ("axis", "end", "num", "predicate", "start"):
         value = op.get_int_attr(name)
         if value is not None:

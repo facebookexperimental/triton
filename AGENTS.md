@@ -9,6 +9,21 @@
 - Lit tests can be run locally (no GPU required).
 - Compiler crashes sometimes print an MLIR reproducer (external_resources / mlir_reproducer). Save the full MLIR + {-# ... #-} metadata to `/tmp/<file>.mlir`, then run `triton-opt /tmp/<file>.mlir --run-reproducer` to reproduce locally.
 
+## Performance Sweep Regression Policy
+- Every kernel in the full performance sweep is a protected gate. Compiler or
+  backend changes must preserve compilation, correctness, runtime execution,
+  and performance for every listed configuration.
+- Run the full sweep after changes that can affect Wave code generation. A
+  failure inherited from a recent branch revision is still a regression: find
+  the last known-good revision and fix it. Never waive a failure by treating
+  the immediately preceding broken revision as the baseline.
+- Do not accept aggregate or flagship-kernel wins that hide another kernel's
+  regression. Report and compare every configuration against LLVM and the
+  last known-good Wave baseline.
+- Any statistically credible slowdown in any sweep configuration blocks the
+  change. Resolve noise with matched, repeated A/B measurements; never waive
+  an individual regression against gains elsewhere.
+
 ## TLX Wave async DMA
 - Direct-to-LDS async DMA completion is synchronized only by an explicit
   `wait_group`. Never infer a DMA dependency from LDS aliasing, destination
