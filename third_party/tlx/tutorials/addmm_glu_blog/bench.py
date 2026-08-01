@@ -13,8 +13,6 @@ reported in the blog).
 Run:
     python bench.py                                  # library column = rocBLAS
     TORCH_BLAS_PREFER_HIPBLASLT=1 python bench.py    # library column = hipBLASLt
-
-DO NOT MERGE - reference code accompanying the blog.
 """
 import os
 # Force the rocBLAS backend for the library-GEMM column (must be set before torch import).
