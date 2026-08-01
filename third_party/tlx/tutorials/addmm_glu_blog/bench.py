@@ -2,13 +2,9 @@
 
 Runs V1-V4 at K in {256, 512, 1024} on the blog's shape (M=1024, N=21568, fp16),
 checks each for correctness against a PyTorch reference, and prints throughput
-(TFLOP/s over the GEMM FLOPs, 2*M*N*K) plus speedups vs:
+(TFLOPS over the GEMM FLOPs, 2*M*N*K) plus speedups vs:
   * an eager PyTorch unfused path (`torch.addmm` then the gate as a separate op), and
   * a rocBLAS matmul (the projection A @ B only -- no bias, no gate).
-
-Numbers are intentionally NOT committed; run this yourself. See the README for the
-compiler caveat (the current main compiler regresses these kernels vs the numbers
-reported in the blog).
 
 Run:
     python bench.py                                  # library column = rocBLAS
