@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<!--
+  MIT License
+
+  Copyright (c) 2026 Advanced Micro Devices, Inc. All Rights Reserved.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in
+  all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+-->
+
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The LLIR Scheduler — gfx950 Design Reference</title>
+<style>
+  :root{
+    --mfma:#6366f1; --gr:#3b82f6; --lr:#10b981; --lw:#f59e0b;
+    --wait:#ef4444; --bar:#ec4899;
+    --bg:#f6f8fc; --card:#ffffff; --ink:#0f172a; --muted:#64748b;
+    --line:#e2e8f0; --code:#0b1020; --accent:#4f46e5;
+    --shadow:0 1px 2px rgba(15,23,42,.04),0 8px 24px rgba(15,23,42,.06);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  code,.mono{font-family:"SF Mono",ui-monospace,"Cascadia Code",Menlo,Consolas,monospace}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+
+  header.hero{background:radial-gradient(1200px 400px at 15% -10%,#6366f1 0%,#4338ca 45%,#312e81 100%);
+    color:#eef2ff;padding:56px 24px 64px;position:relative;overflow:hidden}
+  header.hero::after{content:"";position:absolute;inset:0;
+    background:repeating-linear-gradient(135deg,rgba(255,255,255,.04) 0 2px,transparent 2px 16px);pointer-events:none}
+  .wrap{max-width:980px;margin:0 auto;padding:0 24px}
+  .hero h1{margin:0 0 8px;font-size:clamp(28px,4vw,42px);letter-spacing:-.02em}
+  .hero p{margin:0;max-width:64ch;color:#c7d2fe;font-size:18px}
+  .hero .tag{display:inline-block;margin-bottom:18px;padding:4px 12px;border:1px solid rgba(255,255,255,.3);
+    border-radius:999px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#e0e7ff}
+
+  main{max-width:980px;margin:-32px auto 80px;padding:0 24px;position:relative;z-index:2}
+  section.card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:28px 30px;margin:22px 0;box-shadow:var(--shadow)}
+  section.card h2{margin:0 0 4px;font-size:22px;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+  section.card h2 .num{display:inline-grid;place-items:center;width:30px;height:30px;border-radius:9px;
+    background:linear-gradient(180deg,#eef2ff,#e0e7ff);color:#4338ca;font-size:14px;font-weight:700;flex:none}
+  section.card h3{margin:26px 0 8px;font-size:16px;color:#334155}
+  .lede{color:var(--muted);margin:.2em 0 1em}
+  p{margin:.7em 0}
+  .small{font-size:13.5px;color:var(--muted)}
+
+  nav.toc{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 0}
+  nav.toc a{background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 13px;font-size:13px;color:#475569}
+  nav.toc a:hover{border-color:#c7d2fe;background:#f5f7ff;text-decoration:none}
+
+  .legend{display:flex;flex-wrap:wrap;gap:10px;margin:6px 0 2px}
+  .key{display:inline-flex;align-items:center;gap:8px;font-size:13.5px;color:#334155;
+    background:#fff;border:1px solid var(--line);border-radius:10px;padding:6px 11px}
+  .dot{width:13px;height:13px;border-radius:4px;flex:none}
+  .d-mfma{background:var(--mfma)} .d-gr{background:var(--gr)} .d-lr{background:var(--lr)}
+  .d-lw{background:var(--lw)} .d-wait{background:var(--wait)} .d-bar{background:var(--bar)}
+
+  .ribbon{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:16px;border-radius:12px;
+    background:linear-gradient(180deg,#fbfcff,#f1f5fb);border:1px solid var(--line);margin:12px 0}
+  .ins{display:inline-grid;place-items:center;height:30px;border-radius:7px;color:#fff;font-weight:700;
+    font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;padding:0 4px;min-width:26px;box-shadow:0 1px 1px rgba(0,0,0,.12)}
+  .ins.m{background:var(--mfma);min-width:24px}
+  .ins.gr{background:var(--gr);padding:0 12px}
+  .ins.lr{background:var(--lr);padding:0 12px}
+  .ins.lw{background:var(--lw);padding:0 12px}
+  .ins.wait{background:var(--wait);padding:0 12px;letter-spacing:.02em}
+  .ins.bar{background:var(--bar);padding:0 12px}
+  .ins.phi{background:#475569;padding:0 10px}
+  .grp{display:inline-flex;align-items:center;gap:5px;padding:7px 9px 9px;border-radius:10px;
+    background:rgba(99,102,241,.06);border:1px dashed rgba(99,102,241,.3);position:relative;margin-top:14px}
+  .grp.g-lr{background:rgba(16,185,129,.08);border-color:rgba(16,185,129,.4)}
+  .grp .lbl{position:absolute;top:-11px;left:8px;background:#eef2ff;color:#4338ca;font-size:11px;font-weight:700;
+    padding:1px 8px;border-radius:999px;border:1px solid #c7d2fe;white-space:nowrap}
+  .grp.g-lr .lbl{background:#ecfdf5;color:#065f46;border-color:#a7f3d0}
+  .arrow{color:#94a3b8;font-weight:700;padding:0 2px}
+
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#f8fafc;color:#475569;font-weight:600;font-size:13px;letter-spacing:.02em}
+  tr:last-child td{border-bottom:none}
+  td code{background:#eef2ff;color:#3730a3;padding:1px 6px;border-radius:5px;font-size:13px}
+
+  .note,.warn,.tip{border-radius:12px;padding:14px 18px;margin:16px 0;border:1px solid;font-size:14.5px}
+  .note{background:#eff6ff;border-color:#bfdbfe;color:#1e3a8a}
+  .warn{background:#fff7ed;border-color:#fed7aa;color:#9a3412}
+  .tip{background:#ecfdf5;border-color:#a7f3d0;color:#065f46}
+
+  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:14px 0}
+  .step{background:#fff;border:1.5px solid #c7d2fe;border-radius:11px;padding:9px 14px;font-size:13.5px;font-weight:600;color:#3730a3}
+  .sub{display:inline-flex;gap:6px;background:#f5f7ff;border:1px dashed #c7d2fe;border-radius:12px;padding:8px}
+  .flow .ar{color:#a5b4fc;font-size:20px;font-weight:700}
+
+  .pill{display:inline-block;background:#eef2ff;color:#4338ca;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:700;font-family:monospace}
+  .hl{background:linear-gradient(180deg,transparent 60%,#fde68a 60%)}
+  footer{max-width:980px;margin:0 auto 50px;padding:0 24px;color:var(--muted);font-size:13px}
+  .bits{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:13px;display:flex;flex-wrap:wrap;gap:4px;margin:10px 0}
+  .bit{display:inline-grid;place-items:center;width:30px;padding:5px 0;border-radius:6px;background:#f1f5f9;border:1px solid var(--line);color:#334155;font-weight:600;font-size:12px}
+  .bit.on{background:var(--wait);color:#fff;border-color:var(--wait)}
+  .bit small{display:block;font-size:9px;color:#94a3b8;font-weight:500}
+  .bit.on small{color:#fee2e2}
+
+  /* scenario */
+  .scn{border:1px solid var(--line);border-radius:12px;margin:14px 0;overflow:hidden}
+  .scn>.h{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 14px;background:#f8fafc;border-bottom:1px solid var(--line);font-weight:700;font-size:14px}
+  .scn>.h .verdict{font-family:monospace;font-size:12px;font-weight:700;padding:2px 10px;border-radius:999px}
+  .v-ok{background:#dcfce7;color:#166534} .v-skip{background:#fee2e2;color:#991b1b} .v-bug{background:#fef9c3;color:#854d0e}
+  .scn>.b{padding:12px 14px}
+  pre.asm{margin:0;font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.7;color:#0f172a;white-space:pre-wrap}
+  .rg0{border-left:3px solid var(--mfma);padding-left:8px} .rg1{border-left:3px solid var(--lr);padding-left:8px}
+  .cmt{color:#94a3b8}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="tag">gfx950 · CDNA4 · out‑of‑tree plugin</span>
+    <h1>The LLIR Scheduler</h1>
+    <p>An LLVM‑IR pass that keeps the matrix cores busy, by one of <b>two models chosen per region</b>: interleave
+       MFMA with the LDS / global traffic that feeds it (a <b>throughput</b> ratio — §1–§7, typical of an intra‑wave
+       GEMM hot loop), or fill each MFMA's co‑execution shadow with VALU and declare it with
+       <code>sched_group_barrier</code> (<b>co‑exec</b> — §8–§9, typical of an inter‑wave Flash‑Attention DOT
+       cluster, which is register‑only and has no memory latency to pair against).</p>
+  </div>
+</header>
+
+<main>
+
+  <section class="card">
+    <p class="lede">The pass runs on LLVM IR (at the <code class="mono">OptimizerLast</code> extension point of the O3
+    pipeline, before codegen) and reorders the instructions of a GEMM hot loop so <b>MFMA compute overlaps memory
+    latency</b>. To make that ordering survive codegen it <b>pins each scheduled region with an
+    <code class="mono">llvm.amdgcn.sched.barrier</code></b> rather than turning LLVM's machine schedulers off — so
+    misched still runs everywhere else (§7). It ships as an <b>out‑of‑tree LLVM pass plugin</b>
+    (<code class="mono">libLlirSched.so</code>) and is gfx950‑only: load it with
+    <code class="mono">LLVM_PASS_PLUGIN_PATH</code>.</p>
+    <div class="note"><b>Scope.</b> gfx950 (CDNA4) MFMA kernels — GEMM and Flash‑Attention. The pass identifies its
+      eligible regions <i>structurally</i>, from what each region contains rather than from which kernel it came
+      from (§8), and leaves everything else untouched — so it is safe to enable on any kernel: it simply does
+      nothing on code that matches neither shape.</div>
+    <nav class="toc">
+      <a href="#pipeline">1 · Pipeline</a>
+      <a href="#classes">2 · Classification</a>
+      <a href="#regions">3 · Regions &amp; invariant</a>
+      <a href="#prep">4 · Pre‑processing</a>
+      <a href="#budget">5 · MFMA interleaving</a>
+      <a href="#cost">6 · Cost model</a>
+      <a href="#pinning">7 · Pinning the schedule</a>
+      <a href="#routing">8 · Region routing</a>
+      <a href="#coexec">9 · Co‑exec model</a>
+    </nav>
+  </section>
+
+  <!-- 1 PIPELINE -->
+  <section class="card" id="pipeline">
+    <h2><span class="num">1</span> Pipeline — every block, transactional bail‑out</h2>
+    <p class="lede">The same logic runs on <b>every basic block</b> of the function. There is no "find the loop"
+       heuristic; a block that doesn't match the matrix‑core hot‑loop shape simply produces no schedulable regions
+       and is left untouched.</p>
+    <div class="flow">
+      <span class="step">For <b>each basic block</b></span>
+      <span class="ar">→</span>
+      <span class="sub">
+        <span class="step">Detect regions</span><span class="ar">›</span>
+        <span class="step">Schedule regions</span>
+      </span>
+    </div>
+    <p>Each block is scheduled <b>transactionally and independently</b>: the pass snapshots the block, schedules it,
+       runs <code>verifyFunction</code>, and—if that block's result is invalid—reverts <i>only that block</i>, leaving
+       every other block's schedule intact. A failure in one block therefore does not throw away the work done on the
+       others: the pass still reports success as long as <i>at least one</i> block was scheduled. A whole‑function
+       clone‑and‑rollback wraps the entire pass as a backstop — it fires only in the rare case that the function is
+       <i>still</i> invalid after the per‑block reverts, and only then does the whole kernel fall back to the default
+       machine‑scheduled lowering.</p>
+    <div class="tip"><b>It pins only what it schedules.</b> The pass returns <code>true</code> if it scheduled at least
+      one region, but nothing downstream depends on that signal: each scheduled region carries its own
+      <code>sched.barrier</code> pins (§7). On a kernel where the pass finds nothing to do — or in a region it bails
+      on — codegen is exactly the backend default, machine‑scheduled as usual.</div>
+  </section>
+
+  <!-- 2 CLASSES -->
+  <section class="card" id="classes">
+    <h2><span class="num">2</span> Instruction classification (gfx950)</h2>
+    <p class="lede">Every instruction is sorted into a <code>SchedKind</code>. MFMAs are the compute that gets spaced
+       out; the memory kinds are the <b>anchors</b> they interleave against.</p>
+    <div class="legend">
+      <span class="key"><span class="dot d-mfma"></span><b>MFMA</b> — matrix compute</span>
+      <span class="key"><span class="dot d-gr"></span><b>GR</b> — global / buffer mem</span>
+      <span class="key"><span class="dot d-lr"></span><b>LR</b> — LDS read</span>
+      <span class="key"><span class="dot d-lw"></span><b>LW</b> — LDS write</span>
+    </div>
+    <table>
+      <tr><th>Kind</th><th>Meaning</th><th>Matched by (gfx950 intrinsic / op)</th></tr>
+      <tr><td><span class="pill" style="background:#e0e7ff;color:#3730a3">MFMA</span></td><td>matrix multiply‑accumulate</td><td>intrinsic name contains <code>mfma</code></td></tr>
+      <tr><td><span class="pill" style="background:#dbeafe;color:#1e40af">GR</span></td><td>global &amp; buffer memory</td><td><code>buffer.load</code>, <code>buffer.load.lds</code> / <code>buffer.load.async.lds</code>, <code>raw.ptr.buffer.store</code></td></tr>
+      <tr><td><span class="pill" style="background:#d1fae5;color:#065f46">LR</span></td><td>LDS read</td><td><code>ds.read</code> / <code>ds.load</code>, or a <code>load</code> from address space&nbsp;3</td></tr>
+      <tr><td><span class="pill" style="background:#fef3c7;color:#92400e">LW</span></td><td>LDS write</td><td>a <code>store</code> to address space&nbsp;3</td></tr>
+    </table>
+  </section>
+
+  <!-- 3 REGIONS -->
+  <section class="card" id="regions">
+    <h2><span class="num">3</span> Regions &amp; the dependency invariant <span style="font-size:13px;color:#ef4444;margin-left:6px">★ key logic</span></h2>
+    <p class="lede">The block is sliced into <b>regions</b>. The way a region is formed makes reordering within it
+       dependency‑safe by construction — the scheduler can freely interleave a region's MFMAs with its memory anchors
+       without consulting the def‑use graph.</p>
+
+    <h3>Rule 1 — region boundary</h3>
+    <p>Walking the block, a <b>new region opens at each MFMA that follows ≥1 memory op</b> (GR/LR/LW) since the
+       current region began. A region is therefore one run of MFMAs followed by the memory ops that trail it, up to
+       the next MFMA‑after‑memory. <b>Consequence:</b> within a region every memory op sits <i>after</i> all of that
+       region's MFMAs. Memory ops that appear <i>before</i> a region's first MFMA belong to that region's setup and do
+       not, on their own, open a new region.</p>
+
+    <h3>Rule 2 — the dependency invariant</h3>
+    <p>It follows from Rule 1 that an MFMA never consumes a load from its own region:</p>
+    <ul>
+      <li><b>(a)</b> Rule 1 ⇒ a region's loads come <i>after</i> all its MFMAs.</li>
+      <li><b>(b)</b> SSA ⇒ an MFMA's operands are defined <i>before</i> it.</li>
+    </ul>
+    <p>A load feeding an MFMA must precede that MFMA (b), which places it in an <i>earlier</i> region — never the
+       MFMA's own region (a). So a region's MFMAs only ever read values produced outside that region (a loop‑carried
+       PHI, or an earlier region's load), and the intra‑region interleaving in §5 can move MFMAs freely among that
+       region's anchors without breaking any def‑use ordering.</p>
+
+    <h3>Eligibility</h3>
+    <p>A region is scheduled only when it contains both a <b>recognized‑shape MFMA</b> (§6) and at least one
+       <b>memory anchor</b> to interleave against. Regions without an anchor, or whose MFMA shape isn't in the cost
+       model, are left untouched — and a block whose regions are all ineligible contributes no scheduling at all.</p>
+
+    <h3>Region‑assignment scenarios</h3>
+    <p class="small">Each is a minimal block; the right‑hand verdict is what the pass produces. These double as
+       unit‑test cases.</p>
+
+    <div class="scn">
+      <div class="h"><span>S1 · canonical hot loop — one region</span><span class="verdict v-ok">1 region · scheduled</span></div>
+      <div class="b"><pre class="asm"><span class="cmt">; inputs come from the previous iteration (PHI)</span>
+<span class="rg0">a = phi …            <span class="cmt">; loop-carried</span>
+b = phi …
+p = shuffle a        <span class="cmt">; MFMA input prep</span>
+mfma; mfma; mfma; mfma   <span class="cmt">; region 0  → inputs come from PHIs / earlier region</span>
+buffer_load A_next   <span class="cmt">; [GR] trailing memory</span>
+buffer_load B_next   <span class="cmt">; [GR]</span>
+ds_write LDS         <span class="cmt">; [LW]</span>
+ds_read  LDS         <span class="cmt">; [LR]  (feeds NEXT iteration)</span></span></pre></div>
+    </div>
+
+    <div class="scn">
+      <div class="h"><span>S2 · two MFMA groups split by memory — two regions</span><span class="verdict v-ok">2 regions · both scheduled</span></div>
+      <div class="b"><pre class="asm"><span class="rg0">mfma; mfma; mfma; mfma   <span class="cmt">; region 0</span>
+buffer_load; ds_read     <span class="cmt">; [GR][LR] memory</span></span>
+<span class="rg1">mfma; mfma; mfma; mfma   <span class="cmt">; region 1 ← new (MFMA after memory)</span>
+buffer_load; ds_read     <span class="cmt">; [GR][LR]</span></span></pre></div>
+    </div>
+
+    <div class="scn">
+      <div class="h"><span>S3 · a load feeding an MFMA always lands in an earlier region</span><span class="verdict v-ok">invariant holds</span></div>
+      <div class="b"><pre class="asm">ds_read  X           <span class="cmt">; [LR] before any region starts → unassigned</span>
+<span class="rg0">mfma  (op0 = X)      <span class="cmt">; first MFMA → region 0; X is NOT in region 0</span>
+ds_read  Y           <span class="cmt">; [LR] region 0 (trails the MFMA)</span></span>
+<span class="rg1">mfma  (op0 = Y)      <span class="cmt">; Y (a memory op) forced this into region 1; Y ∈ region 0 ≠ 1</span></span></pre>
+        <div class="small" style="margin-top:8px">An MFMA's input load is always in a different region than the MFMA — the dependency invariant in action.</div>
+      </div>
+    </div>
+
+    <div class="scn">
+      <div class="h"><span>S4 · no memory between MFMAs — single region</span><span class="verdict v-ok">1 region</span></div>
+      <div class="b"><pre class="asm"><span class="rg0">mfma; mfma; mfma; mfma   <span class="cmt">; nothing splits them → all region 0</span></span></pre></div>
+    </div>
+
+    <div class="scn">
+      <div class="h"><span>S5 · prologue memory before the first MFMA — still one region</span><span class="verdict v-ok">1 region</span></div>
+      <div class="b"><pre class="asm">buffer_load A        <span class="cmt">; [GR] BEFORE any MFMA — part of the region's setup</span>
+a = phi; p = shuffle a
+<span class="rg0">mfma                 <span class="cmt">; first MFMA → opens region 0</span>
+mfma                 <span class="cmt">; no memory since the region began → same region</span></span></pre>
+        <div class="small" style="margin-top:8px">When a region opens, the "seen a memory op" state is cleared, so a leading
+          load (the region's own inputs) cannot split off the following MFMA. A boundary forms only on a memory op that
+          appears <i>after</i> the region's MFMAs have begun.</div>
+      </div>
+    </div>
+
+    <div class="tip"><b>Net:</b> region formation alone makes intra‑region reordering dependency‑safe, and any block
+      that isn't a matrix‑core hot loop yields no eligible regions — so the pass needs neither a loop‑finding
+      heuristic nor a runtime prefetch check.</div>
+  </section>
+
+  <!-- 4 PREP -->
+  <section class="card" id="prep">
+    <h2><span class="num">4</span> Per‑region pre‑processing</h2>
+    <p class="lede">Two transforms prepare a region before its MFMAs are spaced out. Both exist only to keep the
+       interleaving in §5 legal — neither reorders memory ops to hide latency.</p>
+    <table>
+      <tr><th>Transform</th><th>What moves</th><th>Where / why</th></tr>
+      <tr><td><b>Hoist</b></td><td><code>shuffle</code>/<code>insertelement</code> feeding an MFMA (same block)</td><td>to the region start — <i>unless</i> it consumes a same‑region LR (that would break dominance)</td></tr>
+      <tr><td><b>Sink</b></td><td><code>extractelement</code> defined by an MFMA</td><td>to just after the region's last anchor</td></tr>
+    </table>
+    <div class="note"><b>Why the sink is required, not cosmetic.</b> Moving every MFMA‑result <code>extractelement</code>
+      past the region's last anchor clears them out of the MFMA run, so the interleaving in §5 — which only reorders
+      instructions <i>before</i> the last anchor — can never move an MFMA past one of its own result extracts.</div>
+  </section>
+
+  <!-- 5 BUDGET -->
+  <section class="card" id="budget">
+    <h2><span class="num">5</span> MFMA interleaving budget <span style="font-size:13px;color:#ef4444;margin-left:6px">★ key algorithm</span></h2>
+    <p class="lede">Anchors are processed in reverse and MFMAs are inserted after each. Every count is a
+       <b>throughput</b> estimate — how much MFMA cover each memory op's issue‑port occupancy needs — never a
+       latency‑hiding reorder. LDS accesses (reads <i>and</i> writes alike) pair at the exact cycle ratio; a global
+       load takes a fixed 64 cycles of cover; the tail drains the run.</p>
+
+    <h3>① MFMA ↔ LDS access (LR &amp; LW) — a throughput ratio</h3>
+    <p>An MFMA provides <code>mfma_cycles</code> of cover; an <b>LDS access</b> — a read (<span class="pill" style="background:#dcfce7;color:#166534">LR</span>) or a write (<span class="pill" style="background:#fef3c7;color:#92400e">LW</span>) — occupies
+       the one LDS issue port for a number of cycles proportional to its vector width (128 bits = 16 cycles). Reads and
+       writes go through the <i>same</i> port, so the scheduler treats them identically: the pairing is simply the
+       <b>ratio of those two rates</b> — <code>cycles_per_access / mfma_cycles</code> MFMAs per access. An access
+       cheaper than one MFMA's cover <i>shares</i> an MFMA with its neighbours; a <i>wide</i> one draws several. The
+       pass realizes this exactly by carrying a single running cycle balance across the region's LR <i>and</i> LW
+       anchors:</p>
+    <p class="small mono" style="background:#0b1020;color:#cbd5e1;padding:12px 14px;border-radius:10px">
+       cycles_per_access = LDS_bits / 8&nbsp;&nbsp;&nbsp;(128‑bit access = 16 cyc)<br>
+       balance&nbsp;&nbsp; += cycles_per_access&nbsp;&nbsp;&nbsp;<span style="color:#64748b">// carried across the region's LR &amp; LW</span><br>
+       emit&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= floor(balance / mfma_cycles);&nbsp;&nbsp;balance −= emit · mfma_cycles</p>
+    <p class="small">The width comes straight from the IR type — for a read the loaded vector
+       (<code>load &lt;8 x half&gt;</code> / <code>&lt;4 x float&gt;</code> = 128‑bit, <code>&lt;4 x half&gt;</code> =
+       64‑bit, <code>&lt;16 x half&gt;</code> / <code>&lt;8 x i32&gt;</code> = 256‑bit), for a write the stored
+       vector (<code>store &lt;4 x i32&gt;</code> to <code>addrspace(3)</code> = 128‑bit).</p>
+    <table>
+      <tr><th>MFMA cycles</th><th>access width</th><th>cyc / access</th><th>pairing</th></tr>
+      <tr><td><b>16</b></td><td>128‑bit</td><td>16</td><td><b>1 MFMA : 1 access</b></td></tr>
+      <tr><td><b>32</b></td><td>256‑bit</td><td>32</td><td><b>1 MFMA : 1 access</b></td></tr>
+      <tr><td><b>16</b></td><td>64‑bit</td><td>8</td><td><b>1 MFMA : 2 accesses</b> <span class="small">(= ½ cover)</span></td></tr>
+      <tr><td><b>32</b></td><td>128‑bit</td><td>16</td><td><b>1 MFMA : 2 accesses</b> <span class="small">(= ½ cover)</span></td></tr>
+      <tr><td><b>16</b></td><td>256‑bit <span class="small">(wide)</span></td><td>32</td><td><b>2 MFMA : 1 access</b></td></tr>
+    </table>
+    <div class="ribbon" style="gap:28px">
+      <span class="grp g-lr"><span class="lbl">matched (cost = cover)</span><span class="ins lr">LR</span><span class="ins m">M</span></span>
+      <span class="grp g-lr"><span class="lbl">two cheap accesses</span><span class="ins lr">LR</span><span class="ins lw">LW</span><span class="ins m">M</span></span>
+      <span class="grp g-lr"><span class="lbl">wide access</span><span class="ins lr">LR</span><span class="ins m">M</span><span class="ins m">M</span></span>
+    </div>
+    <p class="small">The pairing is the true throughput ratio over reads and writes together: two accesses each costing
+       half an MFMA's cover share a single MFMA (1 MFMA : 2 accesses), while an access wider than one MFMA's cover
+       draws more than one. The remainder of a partial pairing is carried to the next access, so no MFMA cover is lost
+       across the region.</p>
+
+    <h3>② GR &amp; tail — the same throughput basis</h3>
+    <p class="small">A global load (<span class="pill" style="background:#dbeafe;color:#1e40af">GR</span>) isn't an LDS access, but it's still costed by throughput, not latency: it
+       occupies the global‑load path for a fixed ~64 cycles, so it needs <b>64 cycles of cover</b> =
+       <code>ceil(64 / mfma_cycles)</code> MFMAs.</p>
+    <table>
+      <tr><th>Anchor</th><th>MFMAs placed</th><th>Why (throughput)</th></tr>
+      <tr><td><span class="pill" style="background:#dbeafe;color:#1e40af">GR</span></td><td><b>4</b> &nbsp;<span class="small">(<b>2</b> if the MFMA is 32‑cycle); <b>1</b> if a GR is immediately followed by an LR</span></td><td>64 cyc of global‑load occupancy → <code>ceil(64 / mfma_cycles)</code> = 64/16 or 64/32</td></tr>
+      <tr><td>tail / head</td><td><b>2 + ½·leftover</b> at end · <b>½·leftover</b> at front</td><td>2 drain the run; the surplus compute (more MFMAs than the memory ops demand cover for) is split evenly head/tail — an odd MFMA favors the head</td></tr>
+    </table>
+    <div class="ribbon" style="gap:28px">
+      <span class="grp"><span class="lbl">GR ×4 (= 64/16)</span><span class="ins gr">GR</span><span class="ins m">M</span><span class="ins m">M</span><span class="ins m">M</span><span class="ins m">M</span></span>
+      <span class="grp g-lr"><span class="lbl">LR / LW ×1</span><span class="ins lr">LR</span><span class="ins m">M</span></span>
+      <span class="grp"><span class="lbl">tail ×2</span><span class="ins m">M</span><span class="ins m">M</span></span>
+    </div>
+  </section>
+
+  <!-- 6 COST -->
+  <section class="card" id="cost">
+    <h2><span class="num">6</span> Cost model</h2>
+    <p class="lede">MFMA cycle counts drive both the per‑GR budget and the per‑LR pairing. Scaled f8f6f4 shapes read
+       <code>cbsz</code>/<code>blgp</code> to tell the input format apart.</p>
+    <table>
+      <tr><th>Intrinsic</th><th>Cycles</th></tr>
+      <tr><td><code>mfma.scale.f32.16x16x128.f8f6f4</code></td><td><b>16</b> if a sub‑byte input (f4; cbsz or blgp&gt;1) else <b>32</b> (f8)</td></tr>
+      <tr><td><code>mfma.scale.f32.32x32x64.f8f6f4</code></td><td><b>32</b> if both inputs f4 else <b>64</b> (either f8)</td></tr>
+      <tr><td><code>mfma.f32.16x16x32.f16</code> / <code>.bf16</code></td><td><b>16</b></td></tr>
+      <tr><td><code>mfma.f32.32x32x16.f16</code> / <code>.bf16</code></td><td><b>32</b></td></tr>
+      <tr><td><code>mfma.i32.16x16x64.i8</code></td><td><b>16</b></td></tr>
+      <tr><td><code>mfma.i32.32x32x32.i8</code></td><td><b>32</b></td></tr>
+      <tr><td><i>anything else</i></td><td><b>unknown</b> → the region is left unscheduled rather than guessed</td></tr>
+    </table>
+    <div class="note">A 32‑cycle MFMA provides twice the cover per op, so it pairs with <b>2× the LDS accesses per
+      MFMA</b> and gets <b>half</b> the per‑GR count (2 instead of 4). A 16‑cycle MFMA is the 4‑per‑GR /
+      1‑per‑128‑bit‑access case.</div>
+  </section>
+
+  <!-- 7 PINNING -->
+  <section class="card" id="pinning">
+    <h2><span class="num">7</span> Pinning the schedule with <code>sched.barrier</code></h2>
+    <p class="lede">For the interleave to reach assembly it has to survive LLVM's pre‑ and post‑RA machine schedulers.
+       The pass holds its ordering by pinning each region locally, so misched keeps running everywhere else.</p>
+    <p>After a region is spaced out (§5), the pass drops an <code>llvm.amdgcn.sched.barrier(0)</code> immediately after
+       <b>each memory anchor</b> in that region. A mask‑0 sched.barrier is a hard reorder barrier: misched may not move
+       any instruction across it, so the exact MFMA↔memory ordering the pass chose is frozen — while the prologue, the
+       epilogue, and any region the pass leaves unscheduled are still machine‑scheduled normally. The scheduler is never
+       disabled globally, and nothing downstream (<code>make_amdgcn</code>) has to turn it off.</p>
+    <div class="ribbon" style="gap:22px">
+      <span class="grp"><span class="lbl">each anchor is pinned</span><span class="ins gr">GR</span><span class="ins m">M</span><span class="ins m">M</span><span class="ins m">M</span><span class="ins m">M</span><span class="ins bar">sched.barrier(0)</span></span>
+      <span class="grp g-lr"><span class="lbl">…so misched can't undo it</span><span class="ins lr">LR</span><span class="ins m">M</span><span class="ins bar">sched.barrier(0)</span></span>
+    </div>
+    <div class="note"><b>Self‑contained.</b> Because it pins locally, the pass needs no companion change in the compiler
+      to hold its schedule, so it loads as a plugin via <code>LLVM_PASS_PLUGIN_PATH</code> at the
+      <code>OptimizerLast</code> extension point. (Its one compiler‑side requirement is unrelated to scheduling —
+      <code>LLVM_PASS_PLUGIN_KEEP_TARGET_MACHINE=1</code>, so the O3 run keeps its target machine when a plugin is loaded.)</div>
+  </section>
+
+  <section class="card">
+    <h2><span class="num">★</span> Cheat‑sheet (gfx950)</h2>
+    <table>
+      <tr><th>Decision</th><th>Value</th></tr>
+      <tr><td>Enable</td><td><code>LLVM_PASS_PLUGIN_PATH=…/libLlirSched.so</code> (+ <code>LLVM_PASS_PLUGIN_KEEP_TARGET_MACHINE=1</code>), gfx950 only</td></tr>
+      <tr><td>Scope</td><td>every basic block; per‑block transactional bail‑out (no loop selection)</td></tr>
+      <tr><td>Region boundary</td><td>at each MFMA that follows a memory op since the region began</td></tr>
+      <tr><td>Region eligible?</td><td>recognized‑shape MFMA + ≥1 memory anchor (dependency safety is a structural invariant, §3)</td></tr>
+      <tr><td>MFMA : LDS access (LR &amp; LW)</td><td>throughput ratio <b>cycles_per_access / mfma_cycles</b> (one carried balance over reads and writes): cheap accesses share an MFMA (e.g. 1 MFMA : 2 accesses), wide ones draw several</td></tr>
+      <tr><td>MFMA per GR</td><td><b>ceil(64 / mfma_cycles)</b> = <b>4</b> (16‑cyc) / <b>2</b> (32‑cyc); <b>1</b> if GR→LR</td></tr>
+      <tr><td>tail / head</td><td>2 drain at end; surplus compute split evenly head/tail (odd favors head)</td></tr>
+      <tr><td>Schedule pinning</td><td><code>llvm.amdgcn.sched.barrier(0)</code> after each memory anchor — misched stays enabled elsewhere</td></tr>
+      <tr><td>Unknown MFMA shape</td><td>region left unscheduled</td></tr>
+    </table>
+  </section>
+
+  <section class="card" id="routing">
+    <h2><span class="num">8</span> Region routing — which model <span style="font-size:13px;color:#ef4444;margin-left:6px">★ key logic</span></h2>
+    <p class="lede">The choice is a property of what a region <b>contains</b>, not of which kernel it came from
+       (<code>WP::classifyRegion</code>). It reuses the same <code>classifySchedInst</code> used in §2, so the two
+       models can never disagree about what counts as memory.</p>
+    <table>
+      <tr><th>Region contains</th><th>Model</th><th>What happens</th></tr>
+      <tr>
+        <td>MFMA + memory <span class="pill" style="background:#dbeafe;color:#1e40af">GR</span>
+            <span class="pill" style="background:#d1fae5;color:#065f46">LR</span>
+            <span class="pill" style="background:#fef3c7;color:#92400e">LW</span>, no VALU</td>
+        <td><b>throughput</b></td>
+        <td>§5's cycle‑paired anchor walk. The intra‑wave GEMM case.</td>
+      </tr>
+      <tr>
+        <td>MFMA + VALU, no memory</td>
+        <td><b>co‑exec</b></td>
+        <td>§9. The inter‑wave FA case — <code>TRITON_WP_DEBUG</code> confirms those DOT clusters carry
+            <i>zero</i> LDS effects, so there is no latency to pair against.</td>
+      </tr>
+      <tr>
+        <td>MFMA + VALU + memory</td>
+        <td><span class="verdict v-skip">not handled</span></td>
+        <td>Skipped with a logged reason. An intra‑wave FA kernel would land here; the two models disagree about
+            what an MFMA is <i>for</i> (covering VALU issue vs covering memory latency), so declining beats
+            guessing.</td>
+      </tr>
+      <tr>
+        <td>no MFMA</td>
+        <td>—</td>
+        <td>Nothing to schedule around. FA's <i>mem</i> stages are this case; <code>LLIRSCHED_WP_MEMNOP</code>
+            paces them separately with <code>s_nop</code> at the stage head.</td>
+      </tr>
+    </table>
+    <div class="note"><b>Inter‑wave GEMM</b> needs no scheduling at all and simply produces no qualifying region.
+      Region boundaries for the co‑exec path come pre‑made: <code>ConvertWarpPipeline</code> lowers every
+      warp‑pipeline stage boundary to <code>llvm.amdgcn.sched.barrier(i32 0)</code>, so a region is the span
+      between two of them.</div>
+  </section>
+
+  <section class="card" id="coexec">
+    <h2><span class="num">9</span> Co‑exec model — <code>sched_group_barrier</code> <span style="font-size:13px;color:#ef4444;margin-left:6px">★ key algorithm</span></h2>
+    <p class="lede">An MFMA occupies the matrix core for many cycles while the vector ALU sits idle beside it.
+       Those two units issue independently, so VALU work placed behind an MFMA <b>co‑executes</b> with it and costs
+       nothing — until the VALU exceeds what the MFMA covers, at which point the surplus is exposed and the matrix
+       core waits. The model's whole job is to decide which VALU goes behind which MFMA.</p>
+
+    <h3>The co‑execution window</h3>
+    <p>An MFMA's window is <i>shorter</i> than its matrix occupancy: a 32×32×16 (32‑cycle) MFMA exposes
+       <b>24 cycles</b> of co‑execution. That is the budget each MFMA offers, and it is derived per region rather
+       than assumed — <code>regionWindowCycles</code> reads the region's actual MFMAs via <code>getMFMACycles</code>
+       (§6) and returns <code>occupancy − 8</code>, taking the <i>shortest</i> when shapes are mixed and bailing out
+       entirely on an unmodelled one. Hardcoding 24 would over‑fill every window by 3× on an FA variant built from
+       16×16×32 MFMAs.</p>
+    <p>Not everything co‑executes. Transcendentals and packed math never issue alongside an MFMA
+       (<code>isNeverCoissue</code>), which is why TRANS carries its own IGroupLP mask and packed ops cost two slots
+       of window.</p>
+
+    <h3>Cost model per op</h3>
+    <p class="small">Cycles a co‑issued op consumes from its window. Six plain VALU fill a 24‑cycle window.</p>
+    <table>
+      <tr><th>Op</th><th>Cycles</th><th>Note</th></tr>
+      <tr><td>plain VALU</td><td>4</td><td>one co‑exec slot; a 24‑cycle window holds 6</td></tr>
+      <tr><td>packed <code>v_pk_*</code></td><td>8</td><td>two slots' worth of window, but declared as <b>one</b> instruction — <code>sched_group_barrier</code> sizes are instruction counts</td></tr>
+      <tr><td>TRANS (<code>v_exp</code>)</td><td>8</td><td>own IGroupLP mask (0x400) — <code>canAddMI</code>'s VALU branch excludes transcendentals</td></tr>
+      <tr><td><code>v_permlane</code></td><td>20</td><td>cross‑lane shuffle; one window hides a permlane plus a single 4‑cycle op</td></tr>
+      <tr><td><code>fneg</code>, <code>llvm.fabs</code></td><td><b>0</b></td><td>not instructions — they fold into the consumer as source modifiers</td></tr>
+    </table>
+
+    <h3>How the schedule is expressed</h3>
+    <p>The pass does not reorder the region; it <b>declares</b> the intended pipeline as
+       <code>[MFMA 1][VALU n]</code> / <code>[MFMA 1][TRANS n]</code> groups and lets AMDGPUIGroupLP <i>build</i> it
+       in the machine scheduler. <code>sched.barrier(0)</code> pinning (§7) is only advisory by comparison — codegen
+       still consolidated the last groups of a stage. Placement is not optional: IGroupLP forms groups scanning
+       <b>upward</b>, so the whole declaration must sit after every real op of the region.</p>
+
+    <h3>① The VALU fits the windows</h3>
+    <p>Classify into <b>dependency‑ordered blocks</b> — VALU independent of the region's TRANS, then TRANS, then the
+       VALU that consumes it — and pack each block into <code>ceil(total/window)</code> groups aimed at the average
+       of what is left. Program order is too fine (FA's PV stage emits 8 alternating <code>sub</code>/<code>exp</code>
+       runs, which do not fit 16 windows), and one flat VALU block is unsatisfiable whenever a VALU consumes a
+       TRANS — IGroupLP abandons the pipeline and leaves ISel's order. Three blocks is a topological order of the
+       class dependency, so it is always satisfiable.</p>
+    <div class="note"><b>This path imposes an order: VALU → TRANS → dependent VALU.</b> Every TRANS‑independent VALU
+      is declared <i>ahead</i> of the first TRANS, even where interleaving them would be equally legal. The order is
+      always dependency‑safe, but it is a <i>choice</i>, and an empirical one — VALU‑first measured 2.3% faster
+      than TRANS‑first on FMHA v3. A kernel whose natural order is TRANS‑first gets reordered accordingly.
+      The over‑capacity path (②) makes the opposite choice: it emits in <b>program order</b> and never reorders
+      classes, which is precisely what lets one window hold a VALU group and a TRANS group together.</div>
+
+    <h3>② The VALU does <i>not</i> fit</h3>
+    <p>fmha_v3 carries 476 and 496 cycles of VALU against 384 of capacity, so no arrangement hides it and the balanced
+       packer merges cheap pairs into 48‑cycle groups. The question changes to <b>which ops get a window and what
+       shape the rest take</b> (<code>declareRegionGroupsOverCap</code>; opt out with
+       <code>LLIRSCHED_WP_NOOVERCAP</code>):</p>
+    <table>
+      <tr><th>#</th><th>Rule</th><th>Why</th></tr>
+      <tr><td>1</td><td>Non‑splittable ops claim windows first — TRANS, the max3 reduction, <code>v_cvt_pk</code>, permlane</td><td>Packing cannot help them, so they have first call on scarce capacity</td></tr>
+      <tr><td>2</td><td>Remaining capacity buys packable ops from the <b>end</b> of the stage backwards</td><td>MFMAs inserted in reverse program order keep the uncovered remainder contiguous, where it already sits</td></tr>
+      <tr><td>3</td><td>Covered packed ops are <b>scalarized</b> by the pass; uncovered ones <b>stay packed</b></td><td>A covered op should co‑issue 4 cycles at a time; an uncovered one is hidden by nothing either way, and one <code>v_pk_mul_f32</code> retires two elements in one issue where two <code>v_mul_f32</code> need two</td></tr>
+      <tr><td>4</td><td>A window may hold groups of <b>different classes</b></td><td><code>[MFMA 1][VALU 1][TRANS 1]</code> puts a sub and an exp2 behind one MFMA. fmha_v3's PV stage ends in exactly that pair and used to spend two windows on 12 cycles of work — worth +0.6%</td></tr>
+    </table>
+    <div class="note"><b>Rule 3 means the pass does its own scalarization</b>, on exactly the ops it decided to
+      cover. A blanket split of every packed op in the region would defeat it — the uncovered ones must stay
+      packed — so this path cannot be combined with one.</div>
+    <div class="note"><b>Where it stops.</b> fmha_v3's PV cannot do better on packed coverage: 368 of its 384 cycles are
+      unpackable, so only 16 cycles (2 <code>v_pk_fma</code>) can ever be bought while rule 1 holds. The 14 that stay
+      packed are arithmetic, not a packing failure.</div>
+
+    <h3>Knobs</h3>
+    <p class="small"><b>None of these is needed for the measured configuration</b> — the two that used to be are now
+       defaults. With no <code>LLIRSCHED_*</code> set, the pass declares via
+       <code>sched_group_barrier</code> and paces mem stages with 2 <code>s_nop</code>, which builds byte‑identical
+       assembly to the old explicit recipe.</p>
+    <table>
+      <tr><th>Env var</th><th>Effect</th></tr>
+      <tr><td><code>LLIRSCHED_WP_NOSGB</code></td><td>fall back to physically reordering + pinning (§7) instead of declaring (§9) — slower, kept for A/B</td></tr>
+      <tr><td><code>LLIRSCHED_WP_MEMNOP=k</code></td><td>override the mem‑stage pacing; default <b>2</b>, <code>0</code> disables</td></tr>
+      <tr><td><code>LLIRSCHED_WP_NOOVERCAP</code></td><td>keep the fitting packer (①) even over capacity — for bisecting a regression to ②</td></tr>
+      <tr><td><code>LLIRSCHED_WP_DEBUG</code></td><td>per‑region model, counts, group sizes and the chosen window</td></tr>
+    </table>
+    <div class="note"><b>Everything else is hardwired to the measured winner.</b> The heuristics that were once
+      env‑selectable — counting the max/min reduction, the 2:1 <code>v_maximum3</code> fold, adaptive group weight,
+      pinning the physical interleave, the legacy error‑diffusion spread, pre‑reordering before a declaration — each
+      had a losing alternative, so the loser is gone rather than left as a flag.</div>
+    <div class="note"><b>Safety.</b> The whole pass is transactional — clone the function, schedule, run
+      <code>verifyFunction</code>, and roll back to the pristine body on failure — so a bad schedule can never reach
+      codegen. It earned its keep: a phi‑led region once rolled back an entire interleave, costing 8%, until the
+      region walk learned to advance past phis.</div>
+  </section>
+
+</main>
+
+<footer>
+  Design reference for the gfx950 <b>LLIR scheduler</b> — throughput model (§1–§7) and co‑exec model (§8–§9) —
+  an out‑of‑tree LLVM pass plugin
+  (<code>plugins/llir_scheduler/LlirSchedPlugin.cpp</code>, loaded via <code>LLVM_PASS_PLUGIN_PATH</code>).
+</footer>
+
+</body>
+</html>
