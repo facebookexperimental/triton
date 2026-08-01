@@ -12,8 +12,6 @@ left in the epilogue:
   * Collapse the gate to a single packed FMA: out = X + X*Y = fma(X, Y, X).
 
 The only difference from V3 is this epilogue. See the blog's "Version 4" section.
-
-DO NOT MERGE - reference code accompanying the blog, not intended for upstreaming.
 """
 import torch
 import triton
