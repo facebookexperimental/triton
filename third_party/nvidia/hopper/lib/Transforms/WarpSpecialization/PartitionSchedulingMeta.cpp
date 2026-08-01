@@ -422,7 +422,8 @@ public:
   /// Get operations in a specific category.
   SmallVector<CategorizedOp> getOpsInCategory(OpCategory cat) const {
     SmallVector<CategorizedOp> result;
-    for (auto &[op, catOp] : opCategories) {
+    for (Operation *op : opCategoryOrder) {
+      const CategorizedOp &catOp = opCategories.at(op);
       if (catOp.category == cat)
         result.push_back(catOp);
     }
@@ -484,7 +485,8 @@ public:
 
     for (OpCategory cat : categoryOrder) {
       SmallVector<const CategorizedOp *> ops;
-      for (auto &[op, catOp] : opCategories) {
+      for (Operation *op : opCategoryOrder) {
+        const CategorizedOp &catOp = opCategories.at(op);
         if (catOp.category == cat)
           ops.push_back(&catOp);
       }
@@ -952,6 +954,8 @@ private:
       if (it != opToDpId.end() && it->second != SHARED_DPID)
         dataPartitionId = it->second;
     }
+    if (!opCategories.contains(op))
+      opCategoryOrder.insert(op);
     opCategories[op] = CategorizedOp{op, cat, dataPartitionId, parentMMA};
   }
 
@@ -959,6 +963,7 @@ private:
   SmallVector<LoopLikeOpInterface> loops;
   SmallVector<Operation *> mmas;
   DenseMap<Operation *, CategorizedOp> opCategories;
+  SetVector<Operation *> opCategoryOrder;
   DenseMap<Operation *, SetVector<Operation *>> mmaToSlice;
   DenseSet<Operation *> sharedOps;
   DenseMap<Operation *, unsigned> opToDpId;
@@ -2218,6 +2223,19 @@ static bool isScalarOp(Operation *op) {
   });
 }
 
+// A primitive scalar value can be cloned into multiple async tasks without a
+// communication buffer.  Keep this deliberately narrower than isScalarOp:
+// descriptor, token, and other opaque results are not ranked tensors either,
+// but duplicating their task ownership changes synchronization semantics.
+static bool isRematerializablePrimitiveScalarOp(Operation *op) {
+  if (op->getNumResults() == 0 || op->getNumRegions() != 0)
+    return false;
+  return llvm::all_of(op->getResults(), [](Value value) {
+    Type type = value.getType();
+    return type.isIntOrIndexOrFloat() || isa<triton::PointerType>(type);
+  });
+}
+
 void propagatePartitions(LoopLikeOpInterface loop, PartitionSet &schedule,
                          bool createComputePartitions,
                          Partition *defaultPartition) {
@@ -2502,7 +2520,9 @@ static bool isRematerializableForClone(Operation *defOp) {
 /// them through a cross-partition memory channel.
 ///
 /// Cloneable: MemDescTransOp (metadata-only SMEM-layout reinterpretation),
-/// ConvertLayoutOp, BroadcastOp, ExpandDimsOp (cheap element rearrangement).
+/// cheap integer index arithmetic, and ConvertLayoutOp/BroadcastOp/
+/// ExpandDimsOp/MakeRangeOp/SplatOp (cheap element rearrangement or index
+/// construction).
 /// LocalAllocOp is NOT cloned: a shared SMEM buffer (e.g. K/V in FA) is one
 /// producer feeding N consumer partitions, so cloning would duplicate the
 /// buffer. separateLocalAllocWithSrc instead tags the local_store with the
@@ -2562,8 +2582,7 @@ void optimizeSchedule(LoopLikeOpInterface loop, PartitionSet &schedule) {
   // operands.
   getLoopBodyRegion(loop).walk<WalkOrder::PostOrder, ReverseIterator>(
       [&](Operation *op) {
-        if (!isa<MemDescTransOp, ConvertLayoutOp, BroadcastOp, ExpandDimsOp>(
-                op))
+        if (!isa<MemDescTransOp>(op) && !isRematerializableForClone(op))
           return;
 
         Partition *partition = getPartition(op);
@@ -2938,6 +2957,33 @@ void PartitionSchedulingMeta::runOnOperation() {
             }
           });
         }
+      }
+
+      // Scalar values are rematerializable and must not become cross-partition
+      // channels: WS buffer allocation only materializes ranked tensor values.
+      // This matters for persistent jagged kernels where a scalar seq-offset
+      // load is initially anchored in the load partition but its length/offset
+      // users span reduction, GEMM, load, and computation tasks. Expand scalar
+      // producers to the union of their users' partitions so specialization
+      // clones the scalar chain into each consuming task.
+      bool scalarPartitionsChanged = true;
+      while (scalarPartitionsChanged) {
+        scalarPartitionsChanged = false;
+        getLoopBodyRegion(loop).walk([&](Operation *op) {
+          if (!isRematerializablePrimitiveScalarOp(op))
+            return;
+          SetVector<int> unionIds;
+          SetVector<int> currentIds = safeGetPartitionIds(op);
+          unionIds.insert(currentIds.begin(), currentIds.end());
+          for (Operation *user : op->getUsers()) {
+            SetVector<int> userIds = safeGetPartitionIds(user);
+            unionIds.insert(userIds.begin(), userIds.end());
+          }
+          if (unionIds.empty() || unionIds.size() == currentIds.size())
+            return;
+          setPartition(op, unionIds);
+          scalarPartitionsChanged = true;
+        });
       }
 
       // Backstop: verify no two accumulator-chained MMAs were assigned to
