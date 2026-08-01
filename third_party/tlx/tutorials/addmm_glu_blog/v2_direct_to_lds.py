@@ -16,8 +16,6 @@ The hot-loop wait is a full drain (`async_load_wait_group(0)`): with only two
 buffers the tile a local read consumes was fetched one step earlier, so the wave
 must wait on every in-flight load. V3 deepens the pipeline to relax this. See the
 blog's "Version 2" section.
-
-DO NOT MERGE - reference code accompanying the blog, not intended for upstreaming.
 """
 import torch
 import triton
