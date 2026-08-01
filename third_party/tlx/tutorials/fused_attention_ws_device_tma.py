@@ -1724,6 +1724,71 @@ def test_op(
 
 
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
+def test_bwd_bm64_1cta_persistent_store_wait_drain():
+    # Regression for rotating a one-CTA dQ TMA-reduction wait across the
+    # persistent loop. At the production shape, the missing final queue drain
+    # raced the next tile and produced nondeterministic dQ. Smaller N_CTX=1024
+    # tests did not reliably expose the race.
+    import blackwell_fa_ws_pipelined_persistent as tlx
+
+    config = next(config for config in configs_bwd_persist
+                  if config.kwargs.get("BWD_DOT_ATTRS") == _BWD_DOT_ATTRS_BM64_MEMTYPE)
+    config = copy.copy(config)
+    config.kwargs = dict(config.kwargs)
+
+    tlx_configs = [
+        config for config in tlx.configs_bwd_tlx
+        if config.kwargs.get("NUM_CTAS", 1) == 1
+        and config.kwargs.get("BLOCK_M1") == 64
+        and config.kwargs.get("USE_WARP_BARRIER") is False
+    ]
+    assert len(tlx_configs) == 1
+
+    old_autows_configs = _attn_bwd_persist.configs
+    old_autows_cache = _attn_bwd_persist.cache
+    old_tlx_configs = tlx._attn_bwd_ws.configs
+    old_tlx_cache = tlx._attn_bwd_ws.cache
+    _attn_bwd_persist.configs = [config]
+    _attn_bwd_persist.cache = {}
+    tlx._attn_bwd_ws.configs = tlx_configs
+    tlx._attn_bwd_ws.cache = {}
+
+    torch.manual_seed(20)
+    shape = (4, 48, 4096, 128)
+    q = torch.empty(shape, dtype=torch.float16, device=DEVICE).normal_(0.0, 0.5)
+    k = torch.empty_like(q).normal_(0.0, 0.5)
+    v = torch.empty_like(q).normal_(0.0, 0.5)
+    dout = torch.randn_like(q)
+
+    def run(attention_fn):
+        qq = q.clone().requires_grad_()
+        kk = k.clone().requires_grad_()
+        vv = v.clone().requires_grad_()
+        out = attention_fn(qq, kk, vv).half()
+        out.backward(dout)
+        return qq.grad, kk.grad, vv.grad
+
+    try:
+        reference = run(lambda qq, kk, vv: tlx.attention(qq, kk, vv, 0.5, False))
+        first = None
+        for _ in range(10):
+            actual = run(lambda qq, kk, vv: attention(
+                qq, kk, vv, False, 0.5, "ws_persistent", False, 0, False))
+            for actual_grad, reference_grad in zip(actual, reference):
+                torch.testing.assert_close(actual_grad, reference_grad, atol=1e-2, rtol=0)
+            if first is None:
+                first = actual
+            else:
+                for actual_grad, first_grad in zip(actual, first):
+                    torch.testing.assert_close(actual_grad, first_grad, atol=1e-2, rtol=0)
+    finally:
+        _attn_bwd_persist.configs = old_autows_configs
+        _attn_bwd_persist.cache = old_autows_cache
+        tlx._attn_bwd_ws.configs = old_tlx_configs
+        tlx._attn_bwd_ws.cache = old_tlx_cache
+
+
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell (sm100) for the device-TMA bwd kernel")
 def test_bwd_tmem_dsT_reuse_3group():
     # Regression for the 3-group TMEM-reuse accuracy bug.
     #
