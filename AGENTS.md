@@ -17,3 +17,11 @@
 - Preserve the explicit wait result as a token dependency on dominated DS
   operations. If the source protocol does not provide the required wait, fix
   or reject the source protocol instead of manufacturing an implicit wait.
+
+## Wave scheduling boundary
+- Greedy scheduling only traverses legal ready candidates and fills stalls
+  reported by the Wave model. Target, occupancy, latency, resource, and filler
+  compatibility policy belongs in the model, never in the scheduler.
+- Represent new scheduling opportunities as named model stalls, such as
+  `CoexecWindow`. Do not add target-specific ranking, a second order, or a
+  post-schedule veto to the scheduler.
