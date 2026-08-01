@@ -294,9 +294,12 @@ def test_warp_specialize_tma_matmul(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_S
     triton.set_allocator(alloc_fn)
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N), )
-    kernel = matmul_tma_ws_kernel[grid](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, num_stages,
-                                        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_warps=num_warps,
-                                        USE_FP8=use_fp8, A_USE_TMA=a_use_tma, B_USE_TMA=b_use_tma)
+    with triton.knobs.nvidia.scope():
+        if is_hopper() and num_warps == 4 and num_stages > 1:
+            triton.knobs.nvidia.use_meta_ws = True
+        kernel = matmul_tma_ws_kernel[grid](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, num_stages,
+                                            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_warps=num_warps,
+                                            USE_FP8=use_fp8, A_USE_TMA=a_use_tma, B_USE_TMA=b_use_tma)
 
     ref_out = torch.empty((M, N), dtype=dtype, device=device)
     cublas.matmul(A, B, ref_out)
@@ -419,10 +422,13 @@ def test_warp_specialize_tma_matmul_persistent(M, N, K, BLOCK_SIZE_M, BLOCK_SIZE
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         ), )
 
-    kernel = matmul_tma_persistent_ws_kernel[grid](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, num_stages,
-                                                   BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, NUM_SMS,
-                                                   num_warps=num_warps, USE_FP8=use_fp8, FLATTEN=flatten
-                                                   and is_blackwell(), A_USE_TMA=a_use_tma, B_USE_TMA=b_use_tma)
+    with triton.knobs.nvidia.scope():
+        if is_hopper() and num_warps == 4:
+            triton.knobs.nvidia.use_meta_ws = True
+        kernel = matmul_tma_persistent_ws_kernel[grid](
+            A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, num_stages, BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M, NUM_SMS, num_warps=num_warps, USE_FP8=use_fp8,
+            FLATTEN=flatten and is_blackwell(), A_USE_TMA=a_use_tma, B_USE_TMA=b_use_tma)
     ttgir = kernel.asm["ttgir"]
     if is_blackwell():
         assert "ttng.tc_gen5_mma" in ttgir
