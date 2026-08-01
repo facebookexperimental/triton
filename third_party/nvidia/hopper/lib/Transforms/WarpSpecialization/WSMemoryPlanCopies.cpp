@@ -99,10 +99,36 @@ public:
   }
 };
 
+class StaticCopySafetyValidator : public CopySafetyValidator {
+public:
+  bool validate(const BufferModel &model, const Plan &plan,
+                SmallVectorImpl<CopySafetyFailure> *failures) const override {
+    bool safe = true;
+    for (const Block &blk : plan.blocks) {
+      unsigned memberEntries = 0;
+      for (BufferId b : blk.members)
+        memberEntries += model.entries(b);
+      for (BufferId b : blk.members) {
+        unsigned required = std::max({1u, memberEntries, model.stageSpan(b)});
+        if (blk.copies >= required)
+          continue;
+        safe = false;
+        if (failures)
+          failures->push_back({blk.id, b, blk.copies, required});
+      }
+    }
+    return safe;
+  }
+};
+
 } // namespace
 
 std::unique_ptr<CopySolver> createGreedyCopySolver() {
   return std::make_unique<GreedyCopySolver>();
+}
+
+std::unique_ptr<CopySafetyValidator> createStaticCopySafetyValidator() {
+  return std::make_unique<StaticCopySafetyValidator>();
 }
 
 } // namespace wsplan
