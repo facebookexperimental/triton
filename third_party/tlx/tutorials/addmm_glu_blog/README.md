@@ -32,7 +32,7 @@ python bench.py                                  # library column = rocBLAS
 TORCH_BLAS_PREFER_HIPBLASLT=1 python bench.py    # library column = hipBLASLt
 ```
 
-It prints TFLOP/s (over the GEMM FLOPs) and speedups, and verifies correctness.
+It prints TFLOPS (over the GEMM FLOPs) and speedups, and verifies correctness.
 
 ## Correctness
 
