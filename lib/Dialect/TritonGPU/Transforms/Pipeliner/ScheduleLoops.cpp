@@ -707,13 +707,10 @@ CoarseSchedule
 scheduleKeyOpsAnnotation(scf::ForOp forOp,
                          const DenseMap<Operation *, int> &opLatency,
                          int defaultNumStages) {
-  // Collect all latency ops and MMA ops with annotations.
-  SmallVector<Operation *> latOps;
+  // Collect MMA ops with annotations.
   SmallVector<std::tuple<ttng::MMAv5OpInterface, int, int>> annotatedMMAs;
 
   for (auto &op : forOp.getBody()->without_terminator()) {
-    if (opLatency.count(&op))
-      latOps.push_back(&op);
     if (auto mmaOp = dyn_cast<ttng::MMAv5OpInterface>(&op)) {
       if (auto attr = op.getAttrOfType<StringAttr>("tt.autows")) {
         auto parsed = llvm::json::parse(attr.getValue());
@@ -756,12 +753,10 @@ scheduleKeyOpsAnnotation(scf::ForOp forOp,
     schedule.insert(mma, stage, clusters[cluster]);
   }
 
-  // Schedule latency ops (loads, etc.) to stage 0, cluster 0.
-  for (auto *op : latOps) {
-    if (schedule.count(op))
-      continue;
-    schedule.insert(op, 0, clusters[0]);
-  }
+  // Leave latency ops unscheduled here. scheduleDependencies() places each
+  // load with its annotated consumer. This realizes the qT/dOt prologue and
+  // delayed-q epilogue of FA backward without speculatively prefetching a
+  // single-buffered metadata channel such as delta/Di.
 
   LDBG("scheduleKeyOpsAnnotation: scheduled "
        << annotatedMMAs.size() << " annotated MMAs with " << numStages
