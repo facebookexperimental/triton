@@ -69,6 +69,7 @@ _DQREDUCE_CFG = dict(
     dq_iters=4,
     pin=True,
 )
+_CLC_CFG = dict(_DQREDUCE_CFG, clc=True, bwd_stages=2, clc_smem_algo=2)
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
 _MANUAL_DP_CFG = dict(autows=True, manual_dp=True, dp=2, warps=4, pin=True)
@@ -78,7 +79,10 @@ _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
 # select the config (before the kernel import below) from argv.
-if "--run-dqreduce" in sys.argv:
+if "--run-clc" in sys.argv:
+    _C.set_config(**_CLC_CFG)
+    os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
+elif "--run-dqreduce" in sys.argv:
     _C.set_config(**_DQREDUCE_CFG)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
 elif "--run-fadp" in sys.argv:
@@ -235,6 +239,22 @@ def test_self_attention_bwd_autows_dqreduce(L, Z):
     assert r.returncode == 0, (f"dq-reduce autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}")
 
 
+@pytest.mark.parametrize("L,Z", [(256, 2)])
+def test_self_attention_bwd_autows_clc(L, Z):
+    """CLC-persistent AutoWS bwd matches the same torch/TLX reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    r = subprocess.run(
+        [sys.executable, __file__, "--run-clc", str(L), str(Z)],
+        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    assert r.returncode == 0, (
+        f"CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
+    )
+
+
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
 @pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_self_attention_fwd_autows_fadp(L, Z):
@@ -294,9 +314,10 @@ if __name__ == "__main__":
     # Subprocess entry point for the dq-reduce config. _DQREDUCE_CFG was applied
     # via set_config() at the top of this file (argv --run-dqreduce) before the
     # kernel import, so the dq-reduce constexprs / autotune config are baked on.
-    if len(sys.argv) >= 4 and sys.argv[1] == "--run-dqreduce":
+    if len(sys.argv) >= 4 and sys.argv[1] in ("--run-dqreduce", "--run-clc"):
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
+        assert A._AUTOWS_CFG.clc == (sys.argv[1] == "--run-clc")
         (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z)
         rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
         print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
@@ -333,5 +354,7 @@ if __name__ == "__main__":
             sys.exit(1)
         print("OK")
         sys.exit(0)
-    sys.exit("usage: test_self_attention_autows.py "
-             "--run-dqreduce|--run-fadp|--run-fwd L Z")
+    sys.exit(
+        "usage: test_self_attention_autows.py "
+        "--run-dqreduce|--run-clc|--run-fadp|--run-fwd L Z"
+    )

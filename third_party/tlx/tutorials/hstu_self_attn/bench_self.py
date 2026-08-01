@@ -203,6 +203,14 @@ _PERF_ENV = {
         "HSTU_SELF_DQ_ITERS": "4",
         "TRITON_WS_SMEM_PLAN_SEARCH": "1",
     },
+    "autows_clc": {
+        "HSTU_SELF_AUTOWS": "1", "HSTU_SELF_DQ_REDUCE": "1", "HSTU_SELF_DQ_REUSE": "1",
+        "HSTU_SELF_AUTOWS_CLC": "1", "HSTU_SELF_AUTOWS_CLC_SMEM_ALGO": "2",
+        "HSTU_SELF_DP": "1",
+        "HSTU_SELF_AUTOWS_BWD_BM": "128", "HSTU_SELF_AUTOWS_BWD_BN": "128",
+        "HSTU_SELF_AUTOWS_BWD_STAGES": "2", "HSTU_SELF_AUTOWS_WARPS": "4",
+        "HSTU_SELF_PIN": "1", "HSTU_SELF_DQ_ITERS": "4", "TRITON_WS_SMEM_PLAN_SEARCH": "1",
+    },
 }
 
 
@@ -224,24 +232,76 @@ def _bench_one(variant, L, Z, nrep):
         lo = 1 if _ts < 400 else _ts // 2
         nt = torch.randint(lo, _ts + 1, (Z, ), device=so.device, dtype=torch.int64)
         kw["num_targets"] = torch.minimum(nt, lens)
-    meta_ws = variant == "autows"
-    with triton.knobs.nvidia.scope():
-        triton.knobs.nvidia.use_meta_ws = meta_ws
-        triton.knobs.nvidia.disable_wsbarrier_reorder = True
+    meta_ws = variant in ("autows", "autows_clc")
+    warmup = int(os.environ.get("BENCH_WARMUP", "25"))
+    rep = int(os.environ.get("BENCH_REP", "100"))
+    # Each variant runs in a dedicated subprocess, so keep these knobs active
+    # through compilation and timing (a scope that exits here resets them before
+    # the first JIT compile).
+    triton.knobs.nvidia.use_meta_ws = meta_ws
+    triton.knobs.nvidia.disable_wsbarrier_reorder = True
+    if variant == "autows_clc":
+        # CLC is a backward-only experiment. Call the production backward
+        # wrapper directly so forward compilation/autotuning is excluded from
+        # both setup and timing while retaining backward-side allocations and
+        # preprocessing.
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+        def bwd():
+            A.triton_hstu_attention_bwd(
+                dout=do,
+                q=q,
+                k=k,
+                v=v,
+                dq=dq,
+                dk=dk,
+                dv=dv,
+                seq_offsets=so,
+                attn_scale=asc,
+                max_seq_len=L,
+                alpha=1.0 / D,
+                max_q_len=None,
+                seq_offsets_q=None,
+                sort_by_length_indices=None,
+                enable_tma=True,
+                num_targets=kw.get("num_targets"),
+                max_attn_len=0,
+                contextual_seq_len=0,
+            )
+
+        fwd_s = [float("nan")] * nrep
+    else:
         fwd = lambda: run(q, k, v, so, L, asc, **kw)  # noqa: E731
         out = fwd()  # warm / compile / autotune
+        if os.environ.get("BENCH_TRACE"):
+            print(f"TRACE {variant} forward-ready", flush=True)
         torch.cuda.synchronize()
-        fwd_s = [triton.testing.do_bench(fwd, warmup=25, rep=100) for _ in range(nrep)]
+        fwd_s = [triton.testing.do_bench(fwd, warmup=warmup, rep=rep) for _ in range(nrep)]
 
         def bwd():
             for t in (q, k, v):
                 t.grad = None
             out.backward(do, retain_graph=True)
 
-        bwd()  # warm
-        bwd_s = [triton.testing.do_bench(bwd, warmup=25, rep=100) for _ in range(nrep)]
+    bwd()  # warm
+    if os.environ.get("BENCH_RUN_ONCE"):
+        torch.cuda.synchronize()
+        print(f"PERF {variant} L={L} Z={Z} run_once=ok", flush=True)
+        return
+    if os.environ.get("BENCH_PROFILE"):
+        from torch.profiler import ProfilerActivity, profile
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            bwd()
+            torch.cuda.synchronize()
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+        return
+    if os.environ.get("BENCH_TRACE"):
+        print(f"TRACE {variant} backward-ready", flush=True)
+    bwd_s = [triton.testing.do_bench(bwd, warmup=warmup, rep=rep) for _ in range(nrep)]
     fm, bm = statistics.mean(fwd_s), statistics.mean(bwd_s)
-    fsd = statistics.stdev(fwd_s) if len(fwd_s) > 1 else 0.0
+    fsd = (float("nan") if variant == "autows_clc" else
+           (statistics.stdev(fwd_s) if len(fwd_s) > 1 else 0.0))
     bsd = statistics.stdev(bwd_s) if len(bwd_s) > 1 else 0.0
     print(f"PERF {variant} L={L} Z={Z} fwd={fm:.4f} fwd_sd={fsd:.4f} bwd={bm:.4f} bwd_sd={bsd:.4f}")
 
