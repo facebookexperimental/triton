@@ -485,7 +485,7 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
 
 // The straight-line epilogue loads dV and dK before staging either output.
 // dV's final drain is delayed across dK preparation to the first dK writer.
-// LOWER-NEXT: {{.*}} = ttng.tmem_load %dv
+// LOWER: {{.*}} = ttng.tmem_load %dv
 // LOWER-NEXT: {{.*}} = ttng.tmem_load %dk
 // LOWER: ttg.local_store {{.*}}, %[[DV0:desc_dv_staging[^ ]*]]
 // LOWER-NEXT: {{.*}} = ttng.async_tma_copy_local_to_global %desc_dv{{.*}} %[[DV0]]

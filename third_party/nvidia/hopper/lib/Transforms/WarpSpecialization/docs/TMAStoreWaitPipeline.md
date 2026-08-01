@@ -268,7 +268,8 @@ for one output (for example dV) may cross independent preparation for the next
 output (dK) and stop at dK's staging write. The last wait in the block remains
 the final drain.
 
-Merged epilogue loops (`tt.merge_epilogue_to_computation`) serialize the
+For annotated operations, merged epilogue loops
+(`tt.merge_epilogue_to_computation`) serialize the
 same-iteration part of the coarse schedule directly into block order: the pass
 selects the nearest matching writer before the chosen future TMA operation, so
 a two-slot dQ ring maps store 0's wait to store 2 rather than the earlier
@@ -277,6 +278,12 @@ pipeliner. Barrier-free wraparound token waits are therefore materialized as
 queue-wide `wait_group(K-1)` operations before the next iteration's staging
 writers, followed by one `wait_group(0)` drain after the loop. Ordinary
 software-pipelined loops retain their loop-carried token schedule.
+
+The merge attribute can be on an enclosing persistent loop rather than the
+loop containing the dQ stores. The pass therefore searches the loop ancestry:
+an inner reduction loop inherits the merged-epilogue realization and receives
+its final drain immediately after that inner loop. Checking only the immediate
+loop leaves loop-carried token waits in final TTGIR and loses the drain.
 
 ### Algorithm
 
