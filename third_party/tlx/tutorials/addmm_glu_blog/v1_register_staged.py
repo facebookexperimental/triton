@@ -11,8 +11,6 @@ detour on its way to the matrix cores: HBM -> registers (`tl.load`) -> LDS
 (`tlx.local_store`) -> registers (`tlx.local_load`) -> MFMA. Loads, LDS staging,
 and MFMA run essentially in sequence, so the matrix unit spends most of its time
 waiting on memory. See the blog's "Version 1" section.
-
-DO NOT MERGE - reference code accompanying the blog, not intended for upstreaming.
 """
 import torch
 import triton
