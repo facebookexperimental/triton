@@ -319,6 +319,14 @@ width `W`. Leaves are finalized (copies + score) and the top `K` returned. The
 copy dimension is solved in closed form per grouping, never branched. Callers use
 `W = max(16, topK)`, `K = topK`.
 
+Every copy-solved partial and leaf passes through
+`StaticCopySafetyValidator` before ranking or acceptance. It checks physical
+ring depth against schedule-derived stage/release floors and rotating entries,
+then the packer rechecks the copy-expanded footprint. Rejections identify the
+block, buffer, proposed and required depths, and the missing
+release-to-overwrite ordering in `LLVM_DEBUG` output. The validator does not
+read estimated II; II remains solely an optimization-ranking input.
+
 ### 9.7 Wiring & safety net
 `allocateSmemBuffersViaSearch` / `allocateTmemBuffersViaSearch` build the model,
 run `beamSearch`, then stamp `buffer.id` / `buffer.copy` (/ `buffer.offset`) from
@@ -328,6 +336,14 @@ regions, multi-store TMA staging; TMEM: scaled MMA (scale-column reservation) an
 subtiled regions. Correctness floors (cross-stage depth, per-id entry count) are
 re-applied after the search as a backstop, so a plan can never drop below the
 proven floor.
+
+SMEM search and heuristic allocation share
+`getStaticSmemCopySafetyFloor`. Besides ordinary consumer stage span, it
+recognizes TMA operands of data-partitioned MMAv5 loops with
+`tt.disallow_acc_multi_buffer`: those loops overlap all configured pipeline
+generations and require the full configured ring depth. Search records this as
+`BufferModel::stageSpan`; heuristic planning repairs `WSBuffer::minCopies` to
+the same value.
 
 ## 10. See also
 - `MemoryPlannerSearchSpace.plan.md` — N-way reuse design, dead ends, rationale.
