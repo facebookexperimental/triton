@@ -25,6 +25,7 @@ if "tlx_wave" in backends:
     from triton.backends.tlx_wave import driver as tlx_wave_driver
     from triton.backends.tlx_wave import wave_bridge_tools
     from triton.backends.tlx_wave.converter import barrier_order as converter_barrier_order
+    from triton.backends.tlx_wave.converter import boundary as converter_boundary
     from triton.backends.tlx_wave.converter import canonicalize as converter_canonicalize
     from triton.backends.tlx_wave.converter import diagnostics as converter_diagnostics
     from triton.backends.tlx_wave.converter import domains as converter_domains
@@ -45,6 +46,7 @@ else:
     tlx_wave_driver = None
     wave_bridge_tools = None
     converter_barrier_order = None
+    converter_boundary = None
     converter_canonicalize = None
     converter_diagnostics = None
     converter_domains = None
@@ -451,19 +453,6 @@ def _load_tlx_perf_sweep_module(module_name="_tlx_wave_test_perf_sweep"):
     repo_root = Path(__file__).resolve().parents[4]
     script_path = repo_root / "third_party" / "tlx" / "tutorials" / "run_wave_perf_sweeps.py"
     spec = importlib.util.spec_from_file_location(module_name, script_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.modules.pop(module_name, None)
-
-
-def _load_wave_structural_bridge_guard(module_name="_tlx_wave_structural_bridge_guard", ):
-    repo_root = Path(__file__).resolve().parents[4]
-    guard_path = repo_root / "third_party" / "wave" / "build_tools" / "check_structural_bridge.py"
-    spec = importlib.util.spec_from_file_location(module_name, guard_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     try:
@@ -1133,8 +1122,7 @@ def _compile_tlx_gfx9_gemm_kernel(tmp_path, monkeypatch, case):
 
 def test_tlx_wave_converter_boundary_is_structurally_guarded():
     package_root = (Path(__file__).resolve().parents[4] / "third_party" / "tlx_wave" / "backend" / "converter")
-    guard = _load_wave_structural_bridge_guard()
-    violations = guard.scan_paths(
+    violations = converter_boundary.scan_paths(
         (package_root, ),
         forbidden_import_prefixes=(
             "triton.backends.tlx_wave.wave_bridge",
@@ -1142,6 +1130,37 @@ def test_tlx_wave_converter_boundary_is_structurally_guarded():
         ),
     )
     assert not violations, "\n".join(violation.format() for violation in violations)
+
+
+@pytest.mark.parametrize(
+    "category,source",
+    (
+        ("def-use-walk", "def recover(value):\n    return value.users\n"),
+        ("emitted-owner-inspection", "def recover(value):\n    return value.owner.operation\n"),
+        ("physical-mask-payload", "attrs = {'vcc_payload': (1, 0)}\n"),
+        ("target-policy", "attrs = {'transaction_bytes': 16}\n"),
+        ("target-policy", "attrs = {'preferred_target_waves': 4}\n"),
+        ("hidden-memory-state", "class State:\n    pending_memory_tokens = {}\n"),
+        ("layout-policy-plan", "attrs = {'layout_repacking_plan': ()}\n"),
+    ),
+)
+def test_tlx_wave_converter_boundary_guard_rejects_policy(category, source):
+    categories = {violation.category for violation in converter_boundary.scan_text(source)}
+    assert category in categories
+
+
+def test_tlx_wave_converter_boundary_guard_rejects_policy_import():
+    violations = converter_boundary.scan_text(
+        "import forbidden.policy\n",
+        forbidden_import_prefixes=("forbidden.policy", ),
+    )
+    assert {violation.category for violation in violations} == {"forbidden-import"}
+
+
+def test_tlx_wave_converter_boundary_guard_allows_legacy_occupancy_target():
+    source = "attrs = {'waveamdmachine.target_waves': target_waves}\n"
+    assert converter_boundary.scan_text(source) == []
+    assert converter_boundary.bridge_policy_attr("waveamdmachine.target_waves") is None
 
 
 def test_tlx_wave_converter_lowering_domains_are_pure_policy():
@@ -5510,6 +5529,36 @@ def test_tlx_wave_converter_does_not_carry_implicit_lds_token_across_for(
     del ctx
 
 
+@pytest.mark.parametrize(
+    "waves_per_eu,expected_target_waves",
+    [(1, 2), (4, 4)],
+)
+def test_tlx_wave_converter_applies_waves_per_eu_target(
+    tmp_path,
+    waves_per_eu,
+    expected_target_waves,
+):
+    local_func = """
+  tt.func public @converter_waves_per_eu() attributes {noinline = false} {
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(
+        tmp_path,
+        local_func,
+        num_warps=8,
+        threads_per_warp=64,
+    )
+
+    output = converter_pipeline.convert_ttgir_to_wave(
+        mod,
+        waves_per_eu=waves_per_eu,
+    )
+
+    assert (f"waveamdmachine.target_waves = {expected_target_waves} : i64" in output.emitted_module.text)
+    del ctx
+
+
 def test_tlx_wave_converter_emits_workgroup_shape_from_ttgir(tmp_path):
     local_func = """
   tt.func public @converter_workgroup_shape() attributes {noinline = false} {
@@ -5529,38 +5578,7 @@ def test_tlx_wave_converter_emits_workgroup_shape_from_ttgir(tmp_path):
     assert "wave.workgroup_size = array<i32: 256, 1, 1>" in wave_artifact
     assert "gpu.known_block_size = array<i32: 256, 1, 1>" in wave_artifact
     assert "wave.waves_per_workgroup = 4 : i64" in wave_artifact
-    assert "wave.assumed_waves_per_eu" not in wave_artifact
-    assert "waveamdmachine.target_waves" not in wave_artifact
-    del ctx
-
-
-@pytest.mark.parametrize(
-    "waves_per_eu",
-    [1, 4],
-)
-def test_tlx_wave_converter_forwards_waves_per_eu_assumption(
-    tmp_path,
-    waves_per_eu,
-):
-    local_func = """
-  tt.func public @converter_waves_per_eu() attributes {noinline = false} {
-    tt.return
-  }
-"""
-    mod, ctx = _parse_ttgir(
-        tmp_path,
-        local_func,
-        num_warps=8,
-        threads_per_warp=64,
-    )
-
-    output = converter_pipeline.convert_ttgir_to_wave(
-        mod,
-        waves_per_eu=waves_per_eu,
-    )
-
-    assert (f"wave.assumed_waves_per_eu = {waves_per_eu} : i64" in output.emitted_module.text)
-    assert "waveamdmachine.target_waves" not in output.emitted_module.text
+    assert "waveamdmachine.target_waves = 1 : i64" in wave_artifact
     del ctx
 
 
@@ -5622,8 +5640,7 @@ def test_tlx_wave_backend_wave_stage_forwards_waves_per_eu(tmp_path):
         _tlx_wave_options(waves_per_eu=4),
     )
 
-    assert "wave.assumed_waves_per_eu = 4 : i64" in wave_artifact
-    assert "waveamdmachine.target_waves" not in wave_artifact
+    assert "waveamdmachine.target_waves = 4 : i64" in wave_artifact
     _run_wave_verify(wave_artifact)
     del ctx
 
@@ -5871,8 +5888,7 @@ def test_tlx_wave_backend_compile_forwards_waves_per_eu():
     )
     wave_artifact = _asm_text(compiled, "wave")
 
-    assert "wave.assumed_waves_per_eu = 4 : i64" in wave_artifact
-    assert "waveamdmachine.target_waves" not in wave_artifact
+    assert "waveamdmachine.target_waves = 4 : i64" in wave_artifact
     assert compiled.metadata.waves_per_eu == 4
 
 
@@ -6281,8 +6297,8 @@ def test_tlx_wave_backend_compiles_gfx9_gemm_passing_variants_to_hsaco(
 
     assert "tlx_wave.new_converter" in wave_artifact
     assert "gpu.kernel" in wave_artifact
-    assert f"wave.waves_per_workgroup = {case['num_warps']} : i64" in wave_artifact
-    assert "waveamdmachine.target_waves" not in wave_artifact
+    expected_target_waves = max(1, (case["num_warps"] + 3) // 4)
+    assert (f"waveamdmachine.target_waves = {expected_target_waves} : i64" in wave_artifact)
     assert isinstance(hsaco, bytes)
     assert hsaco.startswith(b"\x7fELF")
     assert compiled.kernel == hsaco

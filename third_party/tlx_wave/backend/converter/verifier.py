@@ -2,6 +2,7 @@
 
 import re
 
+from . import boundary
 from . import domains
 from . import target_ir
 from .diagnostics import fail
@@ -108,7 +109,7 @@ def _verify_target_layouts(target_program):
                     f"target layout {layout.layout_map_id} has malformed "
                     "symbolic properties",
                 )
-            policy = _bridge_policy_attr(prop.name)
+            policy = boundary.bridge_policy_attr(prop.name)
             if policy is not None:
                 fail(
                     "TLXW_VERIFY_BRIDGE_POLICY_ATTR",
@@ -1165,7 +1166,7 @@ def _verify_attrs(op):
                 target_op_id=op.target_op_id,
             )
         names.add(attr.name)
-        policy = _bridge_policy_attr(attr.name)
+        policy = boundary.bridge_policy_attr(attr.name)
         if policy is not None:
             fail(
                 "TLXW_VERIFY_BRIDGE_POLICY_ATTR",
@@ -1180,44 +1181,6 @@ def _verify_attrs(op):
                 f"target op {op.target_op_id} attr {attr.name} is not schema data",
                 target_op_id=op.target_op_id,
             )
-
-
-def _identifier_tokens(name):
-    split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
-    return frozenset(token for token in re.split(r"[^A-Za-z0-9]+", split_camel.lower()) if token)
-
-
-def _bridge_policy_attr(name):
-    tokens = _identifier_tokens(name)
-    if tokens & {"transaction", "transactions", "coalesce", "coalescing"}:
-        return "target memory transaction selection"
-    if tokens & {"bank", "banks"} and tokens & {"count", "num", "number"}:
-        return "target memory-bank selection"
-    if tokens & {"optimal", "preference", "selected", "strategy"} and tokens & {
-            "chunk",
-            "tile",
-            "vector",
-            "width",
-    }:
-        return "target width or tile selection"
-    if {"target", "waves"} <= tokens:
-        return "derived target occupancy"
-    if tokens & {"repack", "repacking"}:
-        return "bridge-local repacking"
-    if {"copy", "layout"} <= tokens:
-        return "bridge-local layout copy"
-    if {"scratch", "layout"} <= tokens:
-        return "bridge-local scratch layout"
-    if "shuffle" in tokens and tokens & {"mode", "plan", "steps", "strategy"}:
-        return "bridge-local shuffle plan"
-    if "plan" in tokens and "layout" in tokens and tokens & {
-            "optimal",
-            "preference",
-            "selected",
-            "strategy",
-    }:
-        return "bridge-local layout selection plan"
-    return None
 
 
 def _verify_source_semantic_attrs(target_program, op, source_program):
@@ -1246,7 +1209,7 @@ def _verify_source_semantic_attrs(target_program, op, source_program):
         )
     source_op = source_program.ops[source_op_index]
 
-    source_overflow = _identifier_tokens(source_op.attrs.get("overflowFlags", ""))
+    source_overflow = boundary.identifier_tokens(source_op.attrs.get("overflowFlags", ""))
     for flag in ("nsw", "nuw"):
         if flag not in attrs:
             continue
