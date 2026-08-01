@@ -81,7 +81,7 @@ bool tryRepairModuloSchedule(const DataDependenceGraph &ddg,
 /// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
-                    int maxBacktracks = 20);
+                    int maxBacktracks = 20, int minIIOverride = 0);
 
 /// Result of list scheduling for a non-loop region. The algorithm itself
 /// lives in `ListSchedulePass.cpp` (kept there so its debug output is

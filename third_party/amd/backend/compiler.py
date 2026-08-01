@@ -332,14 +332,14 @@ class HIPBackend(BaseBackend):
         # AMDLatencyModel and serializes a CoarseSchedule that add_pipeline then
         # consumes (multi-buffer + expansion). Needs TRITON_AMD_MODULO_SERIALIZE=1.
         if os.environ.get("TRITON_USE_MODULO_SCHEDULE"):
-            # decompose+modulo pipeline (changes #1-#4): early-lower tt.load ->
-            # single-buffer async_copy+local_load, then the ModuloDotSchedule
-            # expander (re-buffer single->multi + ring index, general expander),
-            # replacing schedule_loops + add_pipeline. async_wait counts are
-            # fixed by add_update_async_wait_count downstream.
-            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            # Modulo replaces ScheduleLoops only. The standard AMD pipeline
+            # lowers the original loads, reconstructs buffered slots, and
+            # expands the serialized two-stage schedule.
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "modulo")
-            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
+            # Fill only loops modulo could not serialize; ScheduleLoops preserves
+            # every existing deserializable modulo schedule.
+            amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
+            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
             amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
