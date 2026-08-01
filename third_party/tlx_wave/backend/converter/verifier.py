@@ -1185,7 +1185,12 @@ def _verify_attrs(op):
 
 def _verify_source_semantic_attrs(target_program, op, source_program):
     attrs = _attrs_dict(op)
-    semantic_names = {"fastmath", "nsw", "nuw"}.intersection(attrs)
+    semantic_names = {
+        "fastmath",
+        "nsw",
+        "nuw",
+        "reduction_ordering",
+    }.intersection(attrs)
     if not semantic_names:
         return
     if op.source_op_index is None:
@@ -1208,6 +1213,17 @@ def _verify_source_semantic_attrs(target_program, op, source_program):
             source_op_index=op.source_op_index,
         )
     source_op = source_program.ops[source_op_index]
+
+    if "reduction_ordering" in attrs:
+        source_ordering = source_op.attrs.get("reduction_ordering") or "unordered"
+        if attrs["reduction_ordering"] != source_ordering:
+            fail(
+                "TLXW_VERIFY_INVENTED_SEMANTICS",
+                STAGE,
+                "target reduction ordering differs from the source operation",
+                target_op_id=op.target_op_id,
+                source_op_index=op.source_op_index,
+            )
 
     source_overflow = boundary.identifier_tokens(source_op.attrs.get("overflowFlags", ""))
     for flag in ("nsw", "nuw"):
@@ -1584,7 +1600,7 @@ def _verify_layout_transform(op, target_program):
 
 def _verify_reduction(op, target_program):
     attrs = _attrs_dict(op)
-    allowed = {"axis"}
+    allowed = {"axis", "reduction_ordering"}
     leaked_attrs = tuple(sorted(set(attrs) - allowed))
     if leaked_attrs:
         fail(
@@ -1652,6 +1668,13 @@ def _verify_reduction(op, target_program):
             "TLXW_VERIFY_REDUCTION",
             STAGE,
             "reduction axis must be an integer",
+            target_op_id=op.target_op_id,
+        )
+    if attrs.get("reduction_ordering") not in {"inner_tree", "unordered"}:
+        fail(
+            "TLXW_VERIFY_REDUCTION",
+            STAGE,
+            "reduction ordering must be inner_tree or unordered",
             target_op_id=op.target_op_id,
         )
 

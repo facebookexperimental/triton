@@ -1572,12 +1572,15 @@ def _emit_reduction(state, op):
     outer_shared_pointer_offset_cache = dict(state.shared_pointer_offset_cache)
     outer_wave_offset_i32_cache = dict(state.wave_offset_i32_cache)
     try:
+        reorderable = attrs["reduction_ordering"] == "unordered"
         with state.builder.reduce_layout(
                 source_packet,
                 result_type,
                 source_layout=source_layout,
                 result_layout=result_layout,
                 axis=int(attrs["axis"]),
+                associative=reorderable,
+                commutative=reorderable,
         ) as reduction:
             _restore_structural_emission_state(
                 state,
