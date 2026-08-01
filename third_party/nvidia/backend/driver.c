@@ -2215,6 +2215,7 @@ static PyObject *register_tensor_bridge(PyObject *self, PyObject *arg) {
 #define TD_FIXED_ARGS 4          /* grid_x, grid_y, grid_z, stream */
 #define TD_MAX_TMA_DESCS 16      /* max nvTmaDesc args per kernel */
 #define TD_MAX_TENSORDESC_NDIM 5 /* max dimensionality for TensorDescriptor */
+#define TD_TMA_DESC_ALIGNMENT alignof(CUtensorMap)
 
 /* Per-TMA-slot metadata for inline expansion of TensorDescriptor objects */
 typedef struct {
@@ -2271,12 +2272,14 @@ typedef struct {
   unsigned profile_scratch_align;
   PyObject *allocator;         /* _allocation._allocator (ContextVar) */
   PyObject *profile_allocator; /* _allocation._profile_allocator (wrapper) */
-  /* TMA descriptor storage (128-byte aligned) */
+  /* TMA descriptor storage with room to align within the Python object. */
   int num_tma_descs;
   int tma_slot_for_arg[TD_MAX_KERNEL_ARGS]; /* -1 if not TMA, else tma_descs
                                                index */
   TMASlotMeta tma_meta[TD_MAX_TMA_DESCS];
-  CUtensorMap tma_descs[TD_MAX_TMA_DESCS] __attribute__((aligned(128)));
+  unsigned char tma_desc_storage[TD_MAX_TMA_DESCS * sizeof(CUtensorMap) +
+                                 TD_TMA_DESC_ALIGNMENT - 1];
+  CUtensorMap *tma_descs;
   /* Converged launch: when set, this kernel launches through the shared core
    * triton_launch_kernel() instead of the dispatcher's own cuLaunchKernelEx.
    * Enabled for the common non-TMA, non multi-dim-cluster case (see
@@ -2700,6 +2703,11 @@ static PyObject *TritonDispatcher_new(PyTypeObject *type, PyObject *args,
   TritonDispatcher *self = (TritonDispatcher *)type->tp_alloc(type, 0);
   if (!self)
     return NULL;
+
+  uintptr_t tma_storage = (uintptr_t)self->tma_desc_storage;
+  self->tma_descs = (CUtensorMap *)(
+      (tma_storage + TD_TMA_DESC_ALIGNMENT - 1) &
+      ~(uintptr_t)(TD_TMA_DESC_ALIGNMENT - 1));
 
   self->vectorcall = TritonDispatcher_vectorcall;
   self->function = (CUfunction)(uintptr_t)func_ptr;
