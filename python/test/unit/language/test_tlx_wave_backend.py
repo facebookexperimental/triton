@@ -14193,22 +14193,22 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
     local_func = """
   tt.func public @converter_reduce_mfma_fragments() attributes {noinline = false} {
     %input = arith.constant dense<1.250000e+00> : tensor<256x64xf32, #mma>
-    %maximum_propagate = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+    %maximum_propagate = "tt.reduce"(%input) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %value = arith.maximumf %lhs, %rhs : f32
       tt.reduce.return %value : f32
     }) : (tensor<256x64xf32, #mma>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mma}>>
-    %maximum_number = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+    %maximum_number = "tt.reduce"(%input) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %value = arith.maxnumf %lhs, %rhs : f32
       tt.reduce.return %value : f32
     }) : (tensor<256x64xf32, #mma>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mma}>>
-    %sum = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+    %sum = "tt.reduce"(%input) <{axis = 1 : i32, reduction_ordering = "unordered"}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %value = arith.addf %lhs, %rhs : f32
       tt.reduce.return %value : f32
     }) : (tensor<256x64xf32, #mma>) -> tensor<256xf32, #ttg.slice<{dim = 1, parent = #mma}>>
-    %difference = "tt.reduce"(%input) <{axis = 1 : i32}> ({
+    %difference = "tt.reduce"(%input) <{axis = 1 : i32, reduction_ordering = "inner_tree"}> ({
     ^bb0(%lhs: f32, %rhs: f32):
       %value = arith.subf %lhs, %rhs : f32
       tt.reduce.return %value : f32
@@ -14221,7 +14221,12 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
     output = converter_pipeline.convert_ttgir_to_wave(mod)
 
     reductions = [op for op in output.target_program.ops if op.kind == "reduction"]
-    assert all(converter_target_ir.attrs_dict(op) == {"axis": 1} for op in reductions)
+    assert [converter_target_ir.attrs_dict(op) for op in reductions] == [
+        {"axis": 1, "reduction_ordering": "unordered"},
+        {"axis": 1, "reduction_ordering": "unordered"},
+        {"axis": 1, "reduction_ordering": "unordered"},
+        {"axis": 1, "reduction_ordering": "inner_tree"},
+    ]
     combiner_regions = [output.target_program.regions[op.region_ids[0]] for op in reductions]
     assert all(len(region.block_arg_ids) == 2 and len(region.yield_value_ids) == 1 for region in combiner_regions)
     combiner_ops = [output.target_program.ops[region.op_ids[0]] for region in combiner_regions]
@@ -14235,6 +14240,7 @@ def test_tlx_wave_converter_pipeline_reduces_mfma_fragments_within_waves(tmp_pat
     wave = output.emitted_module.text
     assert wave.count("wave.reduce") == 4
     assert wave.count("extent 64") == 4
+    assert wave.count("{associative, commutative}") == 3
     assert "wave.shuffle" not in wave
     assert "wave.fmax" in wave
     assert "wave.fadd" in wave
