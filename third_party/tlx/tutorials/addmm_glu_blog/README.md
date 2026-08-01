@@ -1,9 +1,4 @@
-# addmm + GLU reference kernels (blog companion)
-
-> **DO NOT MERGE.** This directory is reference code for the AMD blog
-> *"Optimizing GEMM + Activation on CDNA4 with TLX."* It exists so readers can see
-> the kernel behind each step of the post. It is intentionally kept out of the build
-> and is not intended for upstreaming.
+# Optimizing GEMM + Activation on CDNA4 with TLX
 
 These four TLX kernels implement a fused **addmm + GLU** for gfx950 (CDNA4 / MI350):
 
@@ -12,7 +7,7 @@ X   = A @ B + bias        # the addmm / projection
 out = X + X * Y           # the gate / activation
 ```
 
-on the shape the blog targets: **M = 1024, N = 21568, fp16, K in {256, 512, 1024}**.
+on the following targeted shapes: **M = 1024, N = 21568, fp16, K in {256, 512, 1024}**.
 
 ## The four versions
 
@@ -38,16 +33,6 @@ TORCH_BLAS_PREFER_HIPBLASLT=1 python bench.py    # library column = hipBLASLt
 ```
 
 It prints TFLOP/s (over the GEMM FLOPs) and speedups, and verifies correctness.
-**No numbers are committed** — run it on your own hardware.
-
-## Caveat on absolute numbers
-
-The figures in the blog were measured on the Triton build in use at the time. A later
-upstream layout refactor changed the codegen for the padded-shared load path these
-kernels use, so on current `main` they compile ~2× slower than the blog reports. That
-is why `bench.py` computes numbers live rather than committing a table: the *shape of
-the story* (fusion wins, each version improving on the last) holds, but absolute
-throughput depends on the compiler you build against.
 
 ## Correctness
 
