@@ -15,8 +15,6 @@ V3 builds on V2 with three changes:
 
 The epilogue is still the unfused one from V2 (separate bias add and X + X*Y gate);
 V4 collapses it. See the blog's "Version 3" section.
-
-DO NOT MERGE - reference code accompanying the blog, not intended for upstreaming.
 """
 import torch
 import triton
