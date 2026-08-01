@@ -629,4 +629,40 @@ tt.func @prioritize_tmem_operand(
   tt.return %sum : tensor<128x64xf32, #blocked>
 }
 
+// A whole-allocation MMA overwrite must also acquire an EMPTY barrier from a
+// narrower temporal-reuse sibling at the same TMEM offset. The acquire uses
+// the sibling's ring phase, cloned before the overwrite.
+// CHECK-LABEL: @acquire_narrow_tmem_reuse_before_whole_overwrite
+// CHECK:      ttng.wait_barrier %[[QBAR:.*]], %[[QPHASE:.*]] {{.*}}constraints
+// CHECK-NEXT: %[[SIBLING_I1:.*]] = arith.xori %{{.*}}, %{{.*}}
+// CHECK-NEXT: %[[SIBLING_PHASE:.*]] = arith.extui %[[SIBLING_I1]]
+// CHECK-NEXT: ttng.wait_barrier %[[DBAR:.*]], %[[SIBLING_PHASE]]
+// CHECK-NEXT: ttng.arrive_barrier %[[ISSUE:.*]], 1
+// CHECK-NEXT: ttng.wait_barrier %[[ISSUE]], %[[QPHASE]]
+// CHECK-NEXT: ttng.tc_gen5_mma
+tt.func @acquire_narrow_tmem_reuse_before_whole_overwrite(
+    %a: !ttg.memdesc<128x128xf16, #shared, #smem, mutable>,
+    %b_wide: !ttg.memdesc<128x128xf16, #shared, #smem, mutable>,
+    %b_narrow: !ttg.memdesc<128x64xf16, #shared, #smem, mutable>,
+    %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>,
+    %qbar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %dbar: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %issue: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+    %ring: i1) {
+  %true = arith.constant true
+  %false = arith.constant false
+  %qphase = arith.extui %ring : i1 to i32
+  ttng.wait_barrier %qbar, %qphase {constraints = {WSBarrier = {channelGraph = array<i32: 0>, dstTask = 0 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> loc("qk")
+  ttng.arrive_barrier %issue, 1 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.wait_barrier %issue, %qphase : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+  ttng.tc_gen5_mma %a, %b_wide, %acc, %false, %true {is_async} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> loc("qk")
+
+  %narrow = ttng.tmem_subslice %acc {N = 0 : i32} : !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable> -> !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128>
+  %sibling_i1 = arith.xori %ring, %true : i1
+  %sibling_phase = arith.extui %sibling_i1 : i1 to i32
+  ttng.wait_barrier %dbar, %sibling_phase {constraints = {WSBarrier = {channelGraph = array<i32: 1>, dstTask = 1 : i32}}} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> loc("dq")
+  ttng.tc_gen5_mma %a, %b_narrow, %narrow, %false, %true {is_async} : !ttg.memdesc<128x128xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<128x64xf32, #tmem, #ttng.tensor_memory, mutable, 128x128> loc("dq")
+  tt.return
+}
+
 }
