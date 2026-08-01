@@ -8,6 +8,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/JSON.h"
 
 #define DEBUG_TYPE "triton-loop-pipeline"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -20,6 +21,30 @@ namespace ttng = mlir::triton::nvidia_gpu;
 
 namespace mlir::triton::gpu {
 namespace {
+
+// Return true when AutoWS will communicate the MMA result through an opndD
+// channel.  That channel already carries MMA completion to the consumer and
+// prevents the accumulator from being reused until the consumer releases it.
+// In that case LowerLoops does not need a second, private completion pipeline
+// for the MMA.
+bool hasAutoWSOutputChannel(Operation *op) {
+  auto attr = op->getAttrOfType<StringAttr>("tt.autows");
+  if (!attr)
+    return false;
+  auto parsed = llvm::json::parse(attr.getValue());
+  if (!parsed) {
+    llvm::consumeError(parsed.takeError());
+    return false;
+  }
+  auto *object = parsed->getAsObject();
+  auto *channels = object ? object->getArray("channels") : nullptr;
+  if (!channels)
+    return false;
+  return llvm::any_of(*channels, [](const llvm::json::Value &channel) {
+    auto value = channel.getAsString();
+    return value && value->starts_with("opndD,");
+  });
+}
 
 //===----------------------------------------------------------------------===//
 // assignLatencies
@@ -251,6 +276,15 @@ public:
             }
           }
         }
+        // An AutoWS opndD channel already synchronizes MMA completion and
+        // accumulator reuse.  Keeping self_latency=1 would make LowerLoops
+        // add a redundant completion wait one stage after the MMA.  For an
+        // MMA in the last scheduled stage that wait alone deepens the whole
+        // software pipeline and duplicates the compute prologue.  Record zero
+        // explicitly even when the generic MMA-pipelining heuristic declines
+        // the op so LowerLoops cannot infer a private completion pipeline.
+        if (useMetaWS && hasAutoWSOutputChannel(&op))
+          mmaSelfLatency[mma] = 0;
       }
     }
     serializeSelfLatencies(forOp->getParentOfType<ModuleOp>(), mmaSelfLatency);
