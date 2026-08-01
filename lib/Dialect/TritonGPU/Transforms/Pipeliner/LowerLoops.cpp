@@ -983,6 +983,18 @@ scf::ForOp lowerMMA(ttng::MMAv5OpInterface mma, scf::ForOp forOp,
     tmemUseNumStages += 1;
   }
 
+  // A scratch accumulator (useAccumulator=false) is overwritten every
+  // iteration.  When it remains inside a software-pipelined loop, different
+  // iterations can still be in flight even if its producer and consumer are
+  // assigned to the same coarse stage.  Give it one TMEM slice per pipeline
+  // stage so the next iteration cannot overwrite a pending result.
+  auto useAcc = mma.useAccumulator().getDefiningOp<arith::ConstantOp>();
+  bool fullyOverwritesAccumulator =
+      useAcc && cast<BoolAttr>(useAcc.getValueAttr()).getValue() == false;
+  if (alloc.getDefiningOp<ttng::TMEMAllocOp>() &&
+      fullyOverwritesAccumulator)
+    tmemUseNumStages = std::max(tmemUseNumStages, schedule.getNumStages());
+
   // If the accumulator needs to be double-buffered but we can't find the alloc
   // op, then bail out.
   if (tmemUseNumStages > 1 && !alloc.getDefiningOp<ttng::TMEMAllocOp>())

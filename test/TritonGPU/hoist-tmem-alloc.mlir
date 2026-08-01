@@ -101,6 +101,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @sink_alloc_to_mma_use_acc_false
+  // CHECK: %[[SCRATCH:.*]], %[[SCRATCH_TOKEN:.*]] = ttng.tmem_alloc : ()
+  // CHECK: scf.for {{.*}} iter_args(%[[LOOP_TOKEN:.*]] = %[[SCRATCH_TOKEN]])
+  // CHECK:   ttng.tc_gen5_mma {{.*}}, {{.*}}, %[[SCRATCH]][%[[LOOP_TOKEN]]]
   // POST-PIPELINE-LABEL: @sink_alloc_to_mma_use_acc_false
   // POST-PIPELINE: scf.for
   // POST-PIPELINE:   %[[ACC_TM:.*]], %[[ALLOC_TOK:.*]] = ttng.tmem_alloc : ()
