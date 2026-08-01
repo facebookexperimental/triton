@@ -10,6 +10,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/Triton/Transforms/LoopPeeling.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/PartitionLoopPeeling.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipelineExpander.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
@@ -198,6 +199,18 @@ struct PipelinePass : public impl::TritonGPUPipelineBase<PipelinePass> {
     if (dumpIntermediateSteps) {
       ::mlir::triton::tools::mlirDumpsOrDbgs()
           << "// -----// SoftwarePipeliner internal IR Dump After: LowerLoops\n"
+          << moduleOp << "\n\n\n";
+    }
+
+    // Code partitioning has already produced physical warp-specialize regions.
+    // Peel only after lowerLoops has consumed the original schedule: moving a
+    // scheduled use into a prologue earlier would invalidate its def-use stage
+    // analysis.
+    peelPartitionLoops(moduleOp);
+    if (dumpIntermediateSteps) {
+      ::mlir::triton::tools::mlirDumpsOrDbgs()
+          << "// -----// SoftwarePipeliner internal IR Dump After: "
+             "PartitionLoopPeeling\n"
           << moduleOp << "\n\n\n";
     }
 

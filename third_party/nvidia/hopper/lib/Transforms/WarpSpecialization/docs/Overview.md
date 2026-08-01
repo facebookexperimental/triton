@@ -24,6 +24,9 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doPingPongSync       (optional)
   → doTokenLowering
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
+  → SoftwarePipeliner::lowerLoops
+  → peelPartitionLoops   (first masked tile vs. unmasked remainder)
+  → SoftwarePipeliner::expandLoops
 ```
 
 On Blackwell, task assignments are expected to come from an earlier partition
@@ -89,6 +92,7 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
+| `Pipeliner/PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a partition-local first iteration when `iv < lb + step`, folding the masked prologue and unmasked remainder predicates |
 | `WSLowerMem.cpp` | — | Memory lowering: async copies between global/shared/tensor memory |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
@@ -134,6 +138,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Data Partitioning](DataPartition.md) — splitting tensor dimensions across consumer warp groups
 - [Code Partitioning](CodePartition.md) — channel discovery, buffer creation, sync insertion
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
+- [Partition Loop Peeling](PartitionLoopPeeling.md) — first-tile control-flow peeling after physical specialization
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
 - [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting

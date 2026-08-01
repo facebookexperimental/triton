@@ -211,13 +211,14 @@ Operation *mlir::triton::predicateOp(RewriterBase &rewriter, Operation *op,
   }
   // Ops without a built-in pred operand: wrap in scf.if.
   //
-  // The TMA "store" family (copy local->global, reduce, scatter) all write to
-  // global memory but have no mask/pred operand, so they cannot be masked in
-  // place. They must be predicated when the pipeliner peels prologue/epilogue
-  // iterations of a dynamic loop: executing a store/reduce/scatter for an
-  // iteration past the real trip count would corrupt the output (e.g. a
-  // spurious atomic add for a TMA reduce). Guard them with scf.if(pred).
-  if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
+  // Synchronous descriptor loads/gathers and the TMA "store" family have no
+  // mask/pred operand, so they cannot be masked in place. They must be
+  // predicated when the pipeliner peels prologue/epilogue iterations of a
+  // dynamic loop. Guard them with scf.if(pred); result-producing operations
+  // yield poison on the inactive path because their consumers are predicated
+  // by the same pipeline-stage condition.
+  if (isa<tt::DescriptorLoadOp, tt::DescriptorGatherOp,
+          ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp,
           ttng::AsyncTMAScatterOp, ttng::TMAStoreTokenWaitOp>(op)) {
     rewriter.setInsertionPoint(op);
     bool hasResults = op->getNumResults() > 0;
