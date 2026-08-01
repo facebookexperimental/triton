@@ -464,3 +464,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 64 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  tt.func public @warp_group_wait_preserves_memdesc() {
+    %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
+    // expected-remark @below {{Buffers: [0, 64]}}
+    %source = ttg.local_load %buffer : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
+    %waited = ttng.warp_group_dot_wait %buffer {pendings = 0 : i32} : !ttg.memdesc<16xi32, #shared, #smem, mutable>
+    // expected-remark @below {{Buffers: [0, 64]}}
+    %result = ttg.local_load %waited : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
+    tt.return
+  }
+
+  // expected-remark @below {{All Shared Regions: [0, 64]}}
+  tt.func private @print_all_regions() attributes {test.print_all_used_regions} {
+    tt.return
+  }
+}

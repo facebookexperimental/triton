@@ -291,6 +291,11 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     }
     return success();
   }
+  if (isa<ttng::WarpGroupDotWaitOp>(op)) {
+    for (auto [operand, result] : llvm::zip_equal(operands, results))
+      propagateIfChanged(result, result->join(operand->getValue()));
+    return success();
+  }
   verifyOpIsSupported(op);
   return success();
 }
