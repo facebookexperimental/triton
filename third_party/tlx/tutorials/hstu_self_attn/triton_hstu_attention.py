@@ -63,12 +63,15 @@ class HSTUAutoWSConfig:
     dq_reduce: bool = False  # bwd dq via TMA reduce-add (vs in-loop RMW)
     dq_reuse: bool = False  # FA-style TMEM reuse for the dq-reduce bwd
     dq_iters: int = 1  # dq TMA-reduce column subtiles
+    dkdv_subtile: int = 1  # dK/dV output-store column subtiles
     warps: int = 8  # num_warps for the autoWS config
     bn: int = 128  # fwd DP BLOCK_N
     bwd_bm: int = 64  # bwd autoWS BLOCK_M
     bwd_bn: int = 64  # bwd autoWS BLOCK_N
     bwd_stages: int = 1  # bwd autoWS num_stages
     sp: bool = False  # bwd SEQUENCE_PARALLEL
+    clc: bool = False  # bwd CLC-persistent flattened tile loop
+    clc_smem_algo: int = 1  # CLC outer-loop SMEM allocation algorithm
     pin: bool = False  # pin autotune to one config (fast compile)
 
     @classmethod
@@ -82,12 +85,15 @@ class HSTUAutoWSConfig:
             dq_reduce=g("HSTU_SELF_DQ_REDUCE") == "1",
             dq_reuse=g("HSTU_SELF_DQ_REUSE", "0") == "1",
             dq_iters=int(g("HSTU_SELF_DQ_ITERS", "1")),
+            dkdv_subtile=int(g("HSTU_SELF_BWD_DKDV_SUBTILE", "1")),
             warps=int(g("HSTU_SELF_AUTOWS_WARPS", "8")),
             bn=int(g("HSTU_SELF_AUTOWS_BN", "128")),
             bwd_bm=int(g("HSTU_SELF_AUTOWS_BWD_BM", "64")),
             bwd_bn=int(g("HSTU_SELF_AUTOWS_BWD_BN", "64")),
             bwd_stages=int(g("HSTU_SELF_AUTOWS_BWD_STAGES", "1")),
             sp=g("HSTU_SELF_AUTOWS_SP") == "1",
+            clc=g("HSTU_SELF_AUTOWS_CLC") == "1",
+            clc_smem_algo=int(g("HSTU_SELF_AUTOWS_CLC_SMEM_ALGO", "1")),
             pin=g("HSTU_SELF_PIN") == "1",
         )
 
@@ -101,6 +107,8 @@ try:
     _AUTOWS_CFG = _dc_replace(_AUTOWS_CFG, **_hstu_autows_config_hook.pop_overrides())
 except Exception:  # noqa: BLE001 -- hook is optional
     pass
+
+_CLC_SMEM_ALGO = tl.constexpr(_AUTOWS_CFG.clc_smem_algo)
 
 
 def _reload_autotune_configs() -> None:
@@ -116,6 +124,7 @@ def _reload_autotune_configs() -> None:
     for name, gen in (
         ("_hstu_attn_fwd", _get_fw_configs),
         ("_hstu_attn_bwd", _get_bw_configs),
+        ("_hstu_attn_bwd_clc", _get_bw_configs),
     ):
         kern = globals().get(name)
         if kern is None:
@@ -599,7 +608,9 @@ def _get_bw_configs() -> List[triton.Config]:
                 },
                 num_stages=_ns,
                 num_warps=_w,
+                maxRegAutoWS=192,
                 pre_hook=_bwd_pre_hook,
+                generate_subtiled_region=_AUTOWS_CFG.dkdv_subtile > 1,
             )
         ]
     # HSTU_SELF_PIN=1 shrinks the bwd autotune to one config so tritonbench
@@ -610,10 +621,38 @@ def _get_bw_configs() -> List[triton.Config]:
 
 
 @triton.jit
+def _tanh_approx_fp32(x):
+    return tl.inline_asm_elementwise(
+        "tanh.approx.f32 $0, $1;", "=r,r", [x],
+        dtype=tl.float32, is_pure=True, pack=1,
+    )
+
+
+@triton.jit
+def _fma_f32x2(a, b, c):
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 ra, rb, rc, rd;
+            mov.b64 ra, { $2, $3 };
+            mov.b64 rb, { $4, $5 };
+            mov.b64 rc, { $6, $7 };
+            fma.rn.f32x2 rd, ra, rb, rc;
+            mov.b64 { $0, $1 }, rd;
+        }
+        """,
+        "=r,=r,r,r,r,r,r,r", [a, b, c],
+        dtype=tl.float32, is_pure=True, pack=2,
+    )
+
+
+@triton.jit
 def backward_activation(qk_trans, alpha, scale, valid_mask_trans, k):
     qk_trans = qk_trans * alpha
-    sig_trans = fast_dividef(1.0, 1.0 + tl.exp(-qk_trans))
-    silu_trans = qk_trans * sig_trans * scale
+    half_qk = qk_trans * 0.5
+    one_plus_tanh = _fma_f32x2(_tanh_approx_fp32(half_qk), 1.0, 1.0)
+    sig_trans = one_plus_tanh * 0.5
+    silu_trans = half_qk * one_plus_tanh * scale
     act_qk_trans = tl.where(valid_mask_trans, silu_trans, 0)
     act_qk_trans = act_qk_trans.to(k.dtype)
     return qk_trans, sig_trans, act_qk_trans
@@ -882,7 +921,8 @@ def _hstu_attn_fwd_subtile(  # noqa: C901
 @triton.jit
 def _hstu_attn_bwd_one_block_0(  # noqa C901
     start_m,
-    offs_n,
+    start_n,
+    desc_row_q,
     offs_m,
     q_ptrs_trans,
     dq_ptrs_trans,
@@ -911,14 +951,13 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     max_attn_len,
     contextual_seq_len,
     n_targets,
-    max_ids,
-    pos_offs_n,
     HAS_NUM_TARGETS: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
     ATTN_SCALE_TYPE: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     ENABLE_TMA: tl.constexpr,
     BLOCK_D_Q: tl.constexpr,
@@ -928,6 +967,18 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     DQ_REUSE: tl.constexpr = False,
 ):
     offs_m = offs_m + start_m
+    # Keep the integer KV-index/mask chain inside the warp-specialized loop.
+    # Building it in the enclosing scope makes AutoWS transfer the 128x128 i32
+    # value through a 64 KiB shared-memory channel.
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    max_ids, pos_offs_n = backward_off_common_preprocess(
+        seq_len_q,
+        contextual_seq_len,
+        n_targets,
+        offs_n,
+        HAS_CONTEXTUAL_SEQ_LEN,
+        HAS_NUM_TARGETS,
+    )
     mask_m = offs_m < seq_len_q
     if ATTN_SCALE_TYPE == "scalar":
         scale = tl.load(attn_scale).to(tl.float32)
@@ -936,7 +987,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         scale = tl.load(attn_scale + offs_m, mask=mask_m).to(tl.float32)
     # recompute qk and silu
     if ENABLE_TMA:
-        q = device_desc_q.load([start_m, (off_h * stride_qh).to(tl.int32)])
+        q = device_desc_q.load([(desc_row_q + start_m).to(tl.int32), (off_h * stride_qh).to(tl.int32)])
         q_trans = tl.trans(q)
     else:
         q_trans = tl.load(
@@ -964,7 +1015,7 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
     qk_trans, sig_trans, act_qk_trans = backward_activation(qk_trans, alpha, scale, valid_mask_trans, k)
     # compute dv
     if ENABLE_TMA:
-        do = device_desc_do.load([start_m, (off_h * stride_doh).to(tl.int32)])
+        do = device_desc_do.load([(desc_row_q + start_m).to(tl.int32), (off_h * stride_doh).to(tl.int32)])
     else:
         do = tl.load(
             do_ptrs + start_m * stride_dom,
@@ -1028,7 +1079,8 @@ def _hstu_attn_bwd_one_block_0(  # noqa C901
         dqs = _split_n_2D(dq, DQ_ITERS)
         for _s in tl.static_range(DQ_ITERS):
             device_desc_dq.store(
-                [start_m, (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
+                [(desc_row_q + start_m).to(tl.int32),
+                 (off_h * stride_dqh + _s * dq_slice_size).to(tl.int32)],
                 dqs[_s],
                 store_reduce="add",
             )
@@ -1630,6 +1682,8 @@ def _hstu_attn_fwd(  # noqa C901
 @triton.jit
 def _hstu_attn_bwd_one_col_block(  # noqa C901
     start_n,
+    desc_row_q,
+    desc_row_kv,
     seq_len_q,
     seq_len_kv,
     Q,
@@ -1686,6 +1740,7 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
+    DKDV_SUBTILE: tl.constexpr = 1,
 ):
     offs_m = tl.arange(0, BLOCK_M)
     offs_qk_d = tl.arange(0, BLOCK_D_Q)
@@ -1698,8 +1753,8 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     if ENABLE_TMA:
         q_ptrs_trans = None
         do_ptrs = None
-        k = device_desc_k.load([start_n, (off_h * stride_kh).to(tl.int32)])
-        v = device_desc_v.load([start_n, (off_h * stride_vh).to(tl.int32)])
+        k = device_desc_k.load([(desc_row_kv + start_n).to(tl.int32), (off_h * stride_kh).to(tl.int32)])
+        v = device_desc_v.load([(desc_row_kv + start_n).to(tl.int32), (off_h * stride_vh).to(tl.int32)])
     else:
         mask_n = offs_n < seq_len_kv
         q_ptrs_trans = Q + (offs_m[None, :] * stride_qm + offs_qk_d[:, None])
@@ -1709,14 +1764,6 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
     n_targets = target_common_preprocess(off_z, num_targets, HAS_NUM_TARGETS)
-    max_ids, pos_offs_n = backward_off_common_preprocess(
-        seq_len_q,
-        contextual_seq_len,
-        n_targets,
-        offs_n,
-        HAS_CONTEXTUAL_SEQ_LEN,
-        HAS_NUM_TARGETS,
-    )
     if HAS_CONTEXTUAL_SEQ_LEN:
         low = 0
         high = contextual_seq_len
@@ -1724,7 +1771,8 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             start_m = tl.multiple_of(start_m, BLOCK_M)
             dk, dv = _hstu_attn_bwd_one_block_0(
                 start_m=start_m,
-                offs_n=offs_n,
+                start_n=start_n,
+                desc_row_q=desc_row_q,
                 offs_m=offs_m,
                 q_ptrs_trans=q_ptrs_trans,
                 dq_ptrs_trans=dq_ptrs_trans,
@@ -1753,14 +1801,13 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
                 max_attn_len=max_attn_len,
                 contextual_seq_len=contextual_seq_len,
                 n_targets=n_targets,
-                max_ids=max_ids,
-                pos_offs_n=pos_offs_n,
                 HAS_NUM_TARGETS=HAS_NUM_TARGETS,
                 HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
                 HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
                 ATTN_SCALE_TYPE=ATTN_SCALE_TYPE,
                 ALLOW_TF32=ALLOW_TF32,
                 BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
                 ATOMIC_ADD=ATOMIC_ADD,
                 ENABLE_TMA=ENABLE_TMA,
                 BLOCK_D_Q=BLOCK_D_Q,
@@ -1805,7 +1852,8 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
         start_m = tl.multiple_of(start_m, BLOCK_M)
         dk, dv = _hstu_attn_bwd_one_block_0(
             start_m=start_m,
-            offs_n=offs_n,
+            start_n=start_n,
+            desc_row_q=desc_row_q,
             offs_m=offs_m,
             q_ptrs_trans=q_ptrs_trans,
             dq_ptrs_trans=dq_ptrs_trans,
@@ -1834,14 +1882,13 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             n_targets=n_targets,
-            max_ids=max_ids,
-            pos_offs_n=pos_offs_n,
             HAS_NUM_TARGETS=HAS_NUM_TARGETS,
             HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
             HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
             ATTN_SCALE_TYPE=ATTN_SCALE_TYPE,
             ALLOW_TF32=ALLOW_TF32,
             BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
             ATOMIC_ADD=ATOMIC_ADD,
             ENABLE_TMA=ENABLE_TMA,
             BLOCK_D_Q=BLOCK_D_Q,
@@ -1853,8 +1900,22 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     # write-back
     dk = dk * alpha
     if ENABLE_TMA:
-        device_desc_dv.store([start_n, (off_h * stride_dvh).to(tl.int32)], dv.to(k.dtype))
-        device_desc_dk.store([start_n, (off_h * stride_dkh).to(tl.int32)], dk.to(k.dtype))
+        dv_slices = _split_n_2D(dv, DKDV_SUBTILE)
+        dv_slice_size: tl.constexpr = BLOCK_D_V // DKDV_SUBTILE
+        for slice_id in tl.static_range(DKDV_SUBTILE):
+            device_desc_dv.store(
+                [(desc_row_kv + start_n).to(tl.int32),
+                 (off_h * stride_dvh + slice_id * dv_slice_size).to(tl.int32)],
+                dv_slices[slice_id].to(k.dtype),
+            )
+        dk_slices = _split_n_2D(dk, DKDV_SUBTILE)
+        dk_slice_size: tl.constexpr = BLOCK_D_Q // DKDV_SUBTILE
+        for slice_id in tl.static_range(DKDV_SUBTILE):
+            device_desc_dk.store(
+                [(desc_row_kv + start_n).to(tl.int32),
+                 (off_h * stride_dkh + slice_id * dk_slice_size).to(tl.int32)],
+                dk_slices[slice_id].to(k.dtype),
+            )
     else:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_qk_d[None, :])
@@ -1884,6 +1945,7 @@ def _hstu_attn_bwd(  # noqa C901
     DQ,
     DK,
     DV,
+    TILE_IDS,
     LOCK,
     stride_qm,
     stride_qh,
@@ -1928,6 +1990,8 @@ def _hstu_attn_bwd(  # noqa C901
     DQ_REDUCE: tl.constexpr = False,
     DQ_ITERS: tl.constexpr = 1,
     DQ_REUSE: tl.constexpr = False,
+    DKDV_SUBTILE: tl.constexpr = 1,
+    NUM_SMS: tl.constexpr = 0,
 ):
     off_hz = tl.program_id(0)
     off_z = off_hz // H
@@ -2041,6 +2105,8 @@ def _hstu_attn_bwd(  # noqa C901
             return
         _hstu_attn_bwd_one_col_block(
             start_n=start_n,
+            desc_row_q=0,
+            desc_row_kv=0,
             seq_len_q=seq_len_q,
             seq_len_kv=seq_len_kv,
             Q=Q,
@@ -2097,11 +2163,14 @@ def _hstu_attn_bwd(  # noqa C901
             DQ_REDUCE=DQ_REDUCE,
             DQ_ITERS=DQ_ITERS,
             DQ_REUSE=DQ_REUSE,
+            DKDV_SUBTILE=DKDV_SUBTILE,
         )
     else:
         for start_n in range(0, seq_len_kv, BLOCK_N):
             _hstu_attn_bwd_one_col_block(
                 start_n=start_n,
+                desc_row_q=0,
+                desc_row_kv=0,
                 seq_len_q=seq_len_q,
                 seq_len_kv=seq_len_kv,
                 Q=Q,
@@ -2158,7 +2227,206 @@ def _hstu_attn_bwd(  # noqa C901
                 DQ_REDUCE=DQ_REDUCE,
                 DQ_ITERS=DQ_ITERS,
                 DQ_REUSE=DQ_REUSE,
+                DKDV_SUBTILE=DKDV_SUBTILE,
             )
+
+
+@triton_autotune(
+    configs=_get_bw_configs(),
+    key=["AUTOTUNE_Z", "H", "AUTOTUNE_MAX_SEQ_LEN", "DimQ", "DimV"],
+)
+@triton.jit
+def _hstu_attn_bwd_clc(  # noqa C901
+    Q,
+    K,
+    V,
+    sort_by_length_indices,
+    seq_offsets,
+    seq_offsets_q,
+    DOut,
+    DQ,
+    DK,
+    DV,
+    TILE_IDS,
+    LOCK,
+    stride_qm,
+    stride_qh,
+    stride_kn,
+    stride_kh,
+    stride_vn,
+    stride_vh,
+    stride_dom,
+    stride_doh,
+    stride_dqm,
+    stride_dqh,
+    stride_dkn,
+    stride_dkh,
+    stride_dvn,
+    stride_dvh,
+    alpha,
+    attn_scale,
+    Z,
+    AUTOTUNE_Z,
+    H,
+    max_q_len,
+    AUTOTUNE_MAX_SEQ_LEN,
+    DimQ,
+    DimV,
+    num_targets,
+    max_attn_len,
+    contextual_seq_len,
+    HAS_NUM_TARGETS: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    ATTN_SCALE_TYPE: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    SEQUENCE_PARALLEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    UNROLL: tl.constexpr,
+    HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
+    AUTOWS: tl.constexpr,
+    DQ_REDUCE: tl.constexpr,
+    DQ_ITERS: tl.constexpr,
+    DQ_REUSE: tl.constexpr,
+    DKDV_SUBTILE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    tl.static_assert(ENABLE_TMA)
+    tl.static_assert(DQ_REDUCE)
+    tl.static_assert(not SEQUENCE_PARALLEL)
+    tl.static_assert(not HAS_SORT_BY_LENGTH_INDICES)
+
+    total_kv = tl.load(seq_offsets + Z).to(tl.int64)
+    total_q = tl.load(seq_offsets_q + Z).to(tl.int64)
+    desc_q = tl.make_tensor_descriptor(
+        Q, shape=[total_q, H * DimQ], strides=[H * DimQ, 1], block_shape=[BLOCK_M, BLOCK_D_Q]
+    )
+    desc_k = tl.make_tensor_descriptor(
+        K, shape=[total_kv, H * DimQ], strides=[H * DimQ, 1], block_shape=[BLOCK_N, BLOCK_D_Q]
+    )
+    desc_v = tl.make_tensor_descriptor(
+        V, shape=[total_kv, H * DimV], strides=[H * DimV, 1], block_shape=[BLOCK_N, BLOCK_D_V]
+    )
+    desc_do = tl.make_tensor_descriptor(
+        DOut, shape=[total_q, H * DimV], strides=[H * DimV, 1], block_shape=[BLOCK_M, BLOCK_D_V]
+    )
+    desc_dq = tl.make_tensor_descriptor(
+        DQ,
+        shape=[total_q, H * DimQ],
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_M, BLOCK_D_Q // DQ_ITERS],
+    )
+    desc_dk = tl.make_tensor_descriptor(
+        DK,
+        shape=[total_kv, H * DimQ],
+        strides=[H * DimQ, 1],
+        block_shape=[BLOCK_N, BLOCK_D_Q // DKDV_SUBTILE],
+    )
+    desc_dv = tl.make_tensor_descriptor(
+        DV,
+        shape=[total_kv, H * DimV],
+        strides=[H * DimV, 1],
+        block_shape=[BLOCK_N, BLOCK_D_V // DKDV_SUBTILE],
+    )
+
+    num_n_tiles = tl.cdiv(max_q_len, BLOCK_N)
+    sched = tl.clc_tile_scheduler()
+    while tl.condition(
+        sched.is_valid(),
+        warp_specialize=AUTOWS,
+        merge_epilogue_to_computation=DQ_REDUCE,
+        tmem_alloc_algo=2,
+        smem_alloc_algo=_CLC_SMEM_ALGO,
+    ):
+        tile_id = tl.load(TILE_IDS + sched.tile_id[0])
+        off_hz = tile_id // num_n_tiles
+        start_n = (tile_id % num_n_tiles) * BLOCK_N
+        off_z = off_hz // H
+        off_h = (off_hz % H).to(tl.int64)
+
+        seq_start_kv = tl.load(seq_offsets + off_z).to(tl.int64)
+        seq_end_kv = tl.load(seq_offsets + off_z + 1)
+        seq_len_kv = (seq_end_kv - seq_start_kv).to(tl.int32)
+        seq_start_q = tl.load(seq_offsets_q + off_z).to(tl.int64)
+        seq_end_q = tl.load(seq_offsets_q + off_z + 1)
+        seq_len_q = (seq_end_q - seq_start_q).to(tl.int32)
+
+        q_base = Q + seq_start_q * stride_qm
+        k_base = K + seq_start_kv * stride_kn
+        v_base = V + seq_start_kv * stride_vn
+        do_base = DOut + seq_start_q * stride_dom
+        dq_base = DQ + seq_start_q * stride_dqm
+        dk_base = DK + seq_start_kv * stride_dkn
+        dv_base = DV + seq_start_kv * stride_dvn
+
+        if tl.constexpr(True):
+            _hstu_attn_bwd_one_col_block(
+                start_n=start_n,
+                desc_row_q=seq_start_q,
+                desc_row_kv=seq_start_kv,
+                seq_len_q=seq_len_q,
+                seq_len_kv=seq_len_kv,
+                Q=q_base,
+                K=k_base,
+                V=v_base,
+                DOut=do_base,
+                DQ=dq_base,
+                DK=dk_base,
+                DV=dv_base,
+                device_desc_q=desc_q,
+                device_desc_k=desc_k,
+                device_desc_v=desc_v,
+                device_desc_do=desc_do,
+                device_desc_dk=desc_dk,
+                device_desc_dv=desc_dv,
+                device_desc_dq=desc_dq,
+                LOCK=LOCK,
+                off_h=off_h,
+                off_z=off_z,
+                stride_qh=stride_qh,
+                stride_kh=stride_kh,
+                stride_vh=stride_vh,
+                stride_doh=stride_doh,
+                stride_dkh=stride_dkh,
+                stride_dvh=stride_dvh,
+                stride_qm=stride_qm,
+                stride_kn=stride_kn,
+                stride_vn=stride_vn,
+                stride_dom=stride_dom,
+                stride_dqm=stride_dqm,
+                stride_dqh=stride_dqh,
+                stride_dkn=stride_dkn,
+                stride_dvn=stride_dvn,
+                alpha=alpha,
+                attn_scale=attn_scale,
+                max_q_len=max_q_len,
+                seq_start_q=seq_start_q,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                HAS_NUM_TARGETS=HAS_NUM_TARGETS,
+                HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+                HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+                ATTN_SCALE_TYPE=ATTN_SCALE_TYPE,
+                ALLOW_TF32=ALLOW_TF32,
+                BLOCK_D_Q=BLOCK_D_Q,
+                BLOCK_D_V=BLOCK_D_V,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                UNROLL=UNROLL,
+                ATOMIC_ADD=False,
+                ENABLE_TMA=True,
+                AUTOWS=False,
+                DQ_REDUCE=DQ_REDUCE,
+                DQ_ITERS=DQ_ITERS,
+                DQ_REUSE=DQ_REUSE,
+                DKDV_SUBTILE=DKDV_SUBTILE,
+            )
+        sched = sched.advance()
 
 
 def triton_hstu_attention_fwd(
@@ -2286,10 +2554,37 @@ def triton_hstu_attention_bwd(
         attn_scale_type = "scalar"
     else:
         attn_scale_type = "dynamic"
-    grid = lambda meta: (  # noqa E731
-        Z * H,
-        (triton.cdiv(max_seq_len, meta["BLOCK_N"]) if meta["SEQUENCE_PARALLEL"] else 1),
-    )
+    num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    if _AUTOWS_CFG.clc:
+        assert enable_tma and _AUTOWS_CFG.autows and _AUTOWS_CFG.dq_reduce
+        assert sort_by_length_indices is None
+        # Compact the rectangular max-length grid to valid jagged tiles. Empty
+        # tail tiles cannot enter the partitioned body: their divergent inner
+        # loop trip counts break cross-partition barrier cadence.
+        block_n = _AUTOWS_CFG.bwd_bn
+        num_n_tiles = triton.cdiv(max_seq_len, block_n)
+        seq_lens = seq_offsets_q[1:] - seq_offsets_q[:-1]
+        blocks_per_seq = torch.div(seq_lens + block_n - 1, block_n, rounding_mode="floor")
+        counts = blocks_per_seq.repeat_interleave(H)
+        tile_count = int(counts.sum().item())
+        tile_starts = torch.cumsum(counts, dim=0) - counts
+        compact_ids = torch.arange(tile_count, device=q.device, dtype=torch.int64)
+        off_hz = torch.repeat_interleave(
+            torch.arange(Z * H, device=q.device, dtype=torch.int64), counts
+        )
+        local_n = compact_ids - torch.repeat_interleave(tile_starts, counts)
+        tile_ids = (off_hz * num_n_tiles + local_n).to(torch.int32)
+        grid = lambda meta: (  # noqa E731
+            tile_count,
+        )
+        bwd_kernel = _hstu_attn_bwd_clc
+    else:
+        grid = lambda meta: (  # noqa E731
+            Z * H,
+            (triton.cdiv(max_seq_len, meta["BLOCK_N"]) if meta["SEQUENCE_PARALLEL"] else 1),
+        )
+        bwd_kernel = _hstu_attn_bwd
+        tile_ids = None
     # The minimum size of BLOCK_M used in `_get_bw_configs`.
     # TODO (linjianma): avoid hardcoding the value.
     MIN_BLOCK_M = 16
@@ -2302,7 +2597,7 @@ def triton_hstu_attention_bwd(
     HAS_NUM_TARGETS = num_targets is not None
     HAS_MAX_ATTN_LEN = max_attn_len != 0
     HAS_CONTEXTUAL_SEQ_LEN = contextual_seq_len != 0
-    _hstu_attn_bwd[grid](
+    bwd_kernel[grid](
         Q=q,
         K=k,
         V=v,
@@ -2313,6 +2608,7 @@ def triton_hstu_attention_bwd(
         DQ=dq,
         DK=dk,
         DV=dv,
+        TILE_IDS=tile_ids,
         LOCK=lock,
         stride_qm=q.stride(0),
         stride_qh=q.stride(1),
@@ -2353,6 +2649,8 @@ def triton_hstu_attention_bwd(
         DQ_REDUCE=_AUTOWS_CFG.dq_reduce,
         DQ_ITERS=_AUTOWS_CFG.dq_iters,
         DQ_REUSE=_AUTOWS_CFG.dq_reduce and _AUTOWS_CFG.dq_reuse,
+        DKDV_SUBTILE=_AUTOWS_CFG.dkdv_subtile,
+        NUM_SMS=num_sms,
     )
 
     return dq, dk, dv
