@@ -1,7 +1,10 @@
 // RUN: triton-opt %s --nvgpu-warp-specialization | FileCheck %s
+// RUN: not triton-opt %s --nvgpu-warp-specialization="num-stages=0" 2>&1 | FileCheck %s --check-prefix=INVALID-NUM-STAGES
 //
 // Generated from python/test/unit/language/test_autows_addmm.py with MLIR_ENABLE_DUMP=1.
 // Configuration: FLATTEN=False, EPILOGUE_SUBTILE=4, M=N=K=128, BLOCK_SIZE_M=N=128, BLOCK_SIZE_K=64.
+//
+// INVALID-NUM-STAGES: error: nvgpu-warp-specialization requires num-stages >= 1; use 1 for an unpipelined kernel
 //
 // CHECK-LABEL: tt.func public @addmm_kernel_tma_persistent_ws
 // CHECK: !tt.tensordesc<128x32xf16
