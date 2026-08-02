@@ -143,10 +143,13 @@ def _reduce_k_body_source(
         bias_offs = offs_m[:, None] * {stride_bias_m} + offs_n[None, :] * {stride_bias_n}
         acc += tl.load({bias_name} + bias_offs, mask=mask, other=0.0).to(tl.float32)
         """)
-    epilogue_code = textwrap.dedent(epilogue_code)
-    if "fused_result" not in epilogue_code:
+    epilogue_lines = [
+        line.lstrip() for line in textwrap.dedent(epilogue_code).splitlines()
+    ]
+    epilogue_body = "\n".join(line for line in epilogue_lines if line)
+    if "fused_result" not in epilogue_body:
         raise AssertionError("reduce-k epilogue must define fused_result")
-    code += "\n" + epilogue_code
+    code += "\n" + epilogue_body
     code += f"\ntl.store({output_name} + base_offs, fused_result, mask=mask)\n"
     return code
 
