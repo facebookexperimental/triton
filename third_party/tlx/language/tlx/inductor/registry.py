@@ -1973,7 +1973,7 @@ def _tlx_codegen_template_body(  # type: ignore[no-untyped-def]
         result = orig_render()
 
         reduce_epilogue_hook = None
-        if split_k > 1 and config.cpp_wrapper and epilogue_nodes:
+        if split_k > 1 and epilogue_nodes:
             reduce_epilogue_hook = self.compute_reduce_epilogue()
 
         # After render, codegen epilogue nodes into COMPUTE_EPILOGUE subgraphs,
@@ -2095,7 +2095,12 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
             else:
                 bias_name = None  # unexpected rank; skip (should not happen for addmm)
 
-        if config.cpp_wrapper:
+        # Split-K is handled entirely template-side: when there is a fusible epilogue
+        # the reducer is code-generated to replay it (backend-agnostic, works for the
+        # Python/JIT wrapper and the AOTI C++ wrapper alike); otherwise the generic
+        # sum+bias reducer is used. Nothing about split-K leaks to the Inductor compiler.
+        _reduce_epilogue_code = getattr(self, "_tlx_reduce_epilogue_code", None)
+        if config.cpp_wrapper or _reduce_epilogue_code is not None:
             emit_aoti_reduce_k_call(
                 wrapper,
                 workspace_arg=self.workspace_arg,
@@ -2111,7 +2116,7 @@ def _tlx_emit_post_kernel_code(self, wrapper, kernel_name):  # type: ignore[no-u
                 stride_bias_n=stride_bias_n,
                 template_kernel=self,
                 main_kernel_name=kernel_name,
-                epilogue_code=getattr(self, "_tlx_reduce_epilogue_code", None),
+                epilogue_code=_reduce_epilogue_code,
                 final_output_ptr=self.output_ptr(),
                 bias_kernel_ptr=(
                     self.args.input_buffers.get(bias_name)
@@ -2158,7 +2163,7 @@ def _tlx_compute_fusion_metadata(  # type: ignore[no-untyped-def]
         from collections import defaultdict
 
         self._epilogue_nodes_by_subgraph = defaultdict(list)
-        self._unfused_epilogues = [] if config.cpp_wrapper else list(epilogue_nodes)
+        self._unfused_epilogues = []
         self._prologue_sources = {}
         self._scheduling_ref = scheduling
     elif _orig_compute_fusion_metadata is not None:
