@@ -376,7 +376,7 @@ def get_fwd_triton_configs() -> List[triton.Config]:
                 "TRANS": tma_trans[1],
                 "NUM_STAGES": ns,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=nw,
         )
         for bm in [32, 64, 128]
@@ -1034,7 +1034,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": ns1,
                     "IS_DYNAMIC": is_dynamic,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=nw,
             )
             for bm in [64, 128]
@@ -1061,7 +1061,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": 2,
                     "IS_DYNAMIC": True,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=4,
             ),
             triton.Config(
@@ -1076,7 +1076,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": 2,
                     "IS_DYNAMIC": True,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=4,
             ),
             triton.Config(
@@ -1091,7 +1091,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": 2,
                     "IS_DYNAMIC": True,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=4,
             ),
             triton.Config(
@@ -1106,7 +1106,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": 4,
                     "IS_DYNAMIC": True,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=2,
             ),
             triton.Config(
@@ -1121,7 +1121,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": 2,
                     "IS_DYNAMIC": True,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=4,
             ),
             triton.Config(
@@ -1136,7 +1136,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                     "NUM_STAGES1": 2,
                     "IS_DYNAMIC": True,
                 },
-                num_stages=0,
+                num_stages=1,
                 num_warps=4,
             ),
         ]
@@ -1155,7 +1155,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                         "NUM_STAGES1": 4,
                         "IS_DYNAMIC": True,
                     },
-                    num_stages=0,
+                    num_stages=1,
                     num_warps=4,
                 ),
                 triton.Config(
@@ -1170,7 +1170,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                         "NUM_STAGES1": 4,
                         "IS_DYNAMIC": False,
                     },
-                    num_stages=0,
+                    num_stages=1,
                     num_warps=4,
                 ),
                 triton.Config(
@@ -1185,7 +1185,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                         "NUM_STAGES1": 2,
                         "IS_DYNAMIC": False,
                     },
-                    num_stages=0,
+                    num_stages=1,
                     num_warps=4,
                 ),
                 triton.Config(
@@ -1200,7 +1200,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                         "NUM_STAGES1": 4,
                         "IS_DYNAMIC": False,
                     },
-                    num_stages=0,
+                    num_stages=1,
                     num_warps=8,
                 ),
                 triton.Config(
@@ -1215,7 +1215,7 @@ def get_fwd_triton_spec_configs() -> List[triton.Config]:
                         "NUM_STAGES1": 4,
                         "IS_DYNAMIC": False,
                     },
-                    num_stages=0,
+                    num_stages=1,
                     num_warps=4,
                 ),
             ]
