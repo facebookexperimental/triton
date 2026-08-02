@@ -863,6 +863,13 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
                llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
                DenseMap<Value, Value> *argSubstitutionMap = nullptr);
 
+// Print scf.while with explicit condition and loop-carried assignments.
+void printWhileOp(Operation *op, llvm::raw_ostream &os,
+                  const llvm::StringMap<StringRef> &opNameMap,
+                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                  DenseMap<Value, Value> *argSubstitutionMap = nullptr);
+
 // Print scf.for in Python range syntax
 void printForOp(Operation *op, llvm::raw_ostream &os,
                 const llvm::StringMap<StringRef> &opNameMap,
@@ -1030,6 +1037,67 @@ void printIfOp(Operation *op, llvm::raw_ostream &os,
       os << elseStr;
     }
   }
+}
+
+// Print scf.while as a Python loop while preserving both SCF regions:
+// the before region computes the condition and the after region is the body.
+void printWhileOp(Operation *op, llvm::raw_ostream &os,
+                  const llvm::StringMap<StringRef> &opNameMap,
+                  const DenseMap<Operation *, LocalAllocInfo> &allocInfoMap,
+                  llvm::DenseSet<Operation *> &skippedOps, unsigned indent,
+                  DenseMap<Value, Value> *argSubstitutionMap) {
+  auto whileOp = cast<scf::WhileOp>(op);
+  Block &before = whileOp.getBefore().front();
+  Block &after = whileOp.getAfter().front();
+  auto conditionOp = whileOp.getConditionOp();
+
+  // Initialize the values carried into the before region.
+  for (auto [arg, init] : llvm::zip(before.getArguments(), op->getOperands())) {
+    for (unsigned i = 0; i < indent; ++i)
+      os << "  ";
+    os << getValueName(arg, argSubstitutionMap) << " = "
+       << getValueName(init, argSubstitutionMap) << "\n";
+  }
+
+  for (unsigned i = 0; i < indent; ++i)
+    os << "  ";
+  os << "while True:\n";
+
+  // The before region executes at the start of every iteration. Its terminator
+  // is rendered below as the loop exit rather than as a generic operation.
+  skippedOps.insert(conditionOp);
+  printRegion(whileOp.getBefore(), os, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, argSubstitutionMap);
+
+  for (unsigned i = 0; i < indent + 1; ++i)
+    os << "  ";
+  os << "if not "
+     << getValueName(conditionOp.getCondition(), argSubstitutionMap) << ":\n";
+  for (auto [result, forwarded] :
+       llvm::zip(op->getResults(), conditionOp.getArgs())) {
+    for (unsigned i = 0; i < indent + 2; ++i)
+      os << "  ";
+    os << getValueName(result, argSubstitutionMap) << " = "
+       << getValueName(forwarded, argSubstitutionMap) << "\n";
+  }
+  for (unsigned i = 0; i < indent + 2; ++i)
+    os << "  ";
+  os << "break\n";
+
+  // scf.condition forwards values into the after-region arguments. Substitute
+  // them while printing the body instead of emitting misleading no-op
+  // assignments when MLIR gives corresponding region arguments the same name.
+  DenseMap<Value, Value> whileSubstitutions;
+  if (argSubstitutionMap)
+    whileSubstitutions = *argSubstitutionMap;
+  for (auto [arg, forwarded] :
+       llvm::zip(after.getArguments(), conditionOp.getArgs()))
+    whileSubstitutions[arg] = forwarded;
+
+  // scf.yield carries the next values back to the before-region arguments.
+  SmallVector<Value> yieldTargets(before.getArguments());
+  printRegion(whileOp.getAfter(), os, opNameMap, allocInfoMap, skippedOps,
+              indent + 1, &whileSubstitutions, yieldTargets);
 }
 
 // Helper to check if a region has meaningful operations (not just skipped ops)
@@ -1544,6 +1612,22 @@ void printSimplifiedOp(
     return;
   }
 
+  // Token waits retain their planned queue depth through scheduling. Render
+  // that depth as the equivalent TLX wait while marking the token-specific
+  // origin, which matters when auditing CLC store-wait rotation.
+  if (opName == "ttng.async_tma_store_token_wait") {
+    int pendings = 0;
+    if (auto planned = op->getAttrOfType<IntegerAttr>("planned_pending_count"))
+      pendings = planned.getInt();
+    os << "tlx.async_descriptor_store_wait(" << pendings
+       << ")  # token-specific";
+    std::string loc = getLocString(op->getLoc());
+    if (!loc.empty())
+      os << "; " << loc;
+    os << "\n";
+    return;
+  }
+
   // ttng.tc_gen5_mma: emit async_dot with named kwargs
   if (opName == "ttng.tc_gen5_mma") {
     if (op->getNumResults() > 0)
@@ -1846,6 +1930,13 @@ void printBlock(Block &block, llvm::raw_ostream &os,
     if (op.getName().getStringRef() == "scf.if") {
       printIfOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
                 argSubstitutionMap);
+      continue;
+    }
+
+    // Special handling for scf.while - preserve condition/body and carries.
+    if (op.getName().getStringRef() == "scf.while") {
+      printWhileOp(&op, os, opNameMap, allocInfoMap, skippedOps, indent,
+                   argSubstitutionMap);
       continue;
     }
 
