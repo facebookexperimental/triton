@@ -87,7 +87,10 @@ def force(ns=2, bm=BLOCK, bn=BLOCK):
 
 def make(Lq, Lkv, Z, shared=False):
     tq, tk = Z * Lq, Z * Lkv
-    g = lambda n: torch.randn(n, H, D, device="cuda", dtype=torch.bfloat16)
+
+    def g(n):
+        return torch.randn(n, H, D, device="cuda", dtype=torch.bfloat16)
+
     q = g(tq).requires_grad_(True)
     k = g(tk).requires_grad_(True)
     # shared-KV: V aliases K (same tensor), so k.grad accumulates dk + dv.
