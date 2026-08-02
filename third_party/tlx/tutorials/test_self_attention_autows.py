@@ -8,7 +8,7 @@ gradients match a torch-autograd float causal-SiLU reference.
 
 Four configs are covered:
 - The DEFAULT autoWS config (in-process): `test_self_attention_fwd_autows`.
-- The TLX-matching dq-reduce config (BM=BN=128, num_stages=2, TMEM reuse, dsT in
+- The non-CLC dq-reduce config (BM=64, BN=128, num_stages=2, TMEM reuse, dsT in
   SMEM): `test_self_attention_bwd_autows_dqreduce`. Its flags
   (HSTU_SELF_DQ_REDUCE / HSTU_SELF_DQ_REUSE / the BWD tile knobs) are baked as
   tl.constexpr / read into the autotune configs AT IMPORT, so they can't coexist
@@ -53,7 +53,7 @@ import hstu_autows_config as _C  # noqa: E402
 
 # DEFAULT autoWS config (in-process fwd+grads test).
 _DEFAULT_CFG = dict(autows=True, dp=1, pin=True)
-# TLX-matching dq-reduce config: BM=BN=128, num_stages=2 (annotation-driven SWP),
+# Non-CLC dq-reduce config: BM=64, BN=128, num_stages=2 (annotation-driven SWP),
 # FA-style TMEM reuse (id2={qk,act}, id5={dp,dq}, id7=dv, id10=dk) with dsT pinned
 # to SMEM, dq via TMA reduce-add subtiled x4 -- final ttgir matches the hand-written
 # TLX bwd and its grads match torch/TLX numerics.
@@ -62,7 +62,7 @@ _DQREDUCE_CFG = dict(
     dq_reduce=True,
     dq_reuse=True,
     dp=1,
-    bwd_bm=128,
+    bwd_bm=64,
     bwd_bn=128,
     bwd_stages=2,
     warps=4,
@@ -82,7 +82,7 @@ _COMPILER_DP2_CFG = dict(autows=True, dp=2, warps=4, pin=True)
 
 # The dq-reduce / fadp / compiler-dp2 cases re-invoke this file as a subprocess;
 # select the config (before the kernel import below) from argv.
-if "--run-clc" in sys.argv:
+if "--run-clc" in sys.argv or "--run-clc-jagged" in sys.argv:
     _C.set_config(**_CLC_CFG)
     os.environ["TRITON_WS_SMEM_PLAN_SEARCH"] = "1"
 elif "--run-dqreduce" in sys.argv:
@@ -130,14 +130,18 @@ def _rel_l2(a, b):
     return (torch.norm(a.float() - b.float()) / (torch.norm(b.float()) + 1e-12)).item()
 
 
-def _run_autows_bwd(L, Z):
+def _run_autows_bwd(L, Z, jagged=False):
     """Run the (already-imported) autoWS kernel fwd+bwd and return the grads plus
     the torch-float reference grads. Config is whatever env was baked at import."""
     torch.manual_seed(0)
-    t = Z * L
+    lens = [L] * Z
+    if jagged:
+        assert Z == 2
+        lens[-1] = L - 65
+    t = sum(lens)
     g = lambda: torch.randn(t, H, D, device="cuda", dtype=torch.bfloat16)  # noqa: E731
     q, k, v = g().requires_grad_(True), g().requires_grad_(True), g().requires_grad_(True)
-    so = torch.arange(0, t + 1, L, device="cuda", dtype=torch.int64)
+    so = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device="cuda", dtype=torch.int64)
     asc = torch.tensor(1.0 / L, device="cuda", dtype=torch.float32)
     do = g()
 
@@ -216,7 +220,7 @@ def test_self_attention_fwd_autows(L, Z):
 @pytest.mark.parametrize("L,Z", [(256, 2)])
 @pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU for TMEM reuse")
 def test_self_attention_bwd_autows_dqreduce(L, Z):
-    """TLX-matching dq-reduce config (BM=BN=128, ns=2, TMEM reuse, dsT-in-SMEM).
+    """Non-CLC dq-reduce config (BM=64, BN=128, ns=2, TMEM reuse, dsT-in-SMEM).
 
     Runs in a SUBPROCESS because its flags are constexpr-baked at import and
     cannot share an interpreter with the default config above. Asserts the bwd
@@ -255,6 +259,22 @@ def test_self_attention_bwd_autows_clc(L, Z):
     sys.stderr.write(r.stderr)
     assert r.returncode == 0, (
         f"CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
+    )
+
+
+def test_self_attention_bwd_autows_clc_jagged_production():
+    """Production shape exercises the collective jagged-tail guard."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    L, Z = 4096, 2
+    r = subprocess.run(
+        [sys.executable, __file__, "--run-clc-jagged", str(L), str(Z)],
+        env=dict(os.environ), capture_output=True, text=True, timeout=900,
+    )
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    assert r.returncode == 0, (
+        f"jagged production CLC autoWS bwd failed (L={L} Z={Z}):\n{r.stdout}\n{r.stderr}"
     )
 
 
@@ -317,14 +337,20 @@ if __name__ == "__main__":
     # Subprocess entry point for the dq-reduce config. _DQREDUCE_CFG was applied
     # via set_config() at the top of this file (argv --run-dqreduce) before the
     # kernel import, so the dq-reduce constexprs / autotune config are baked on.
-    if len(sys.argv) >= 4 and sys.argv[1] in ("--run-dqreduce", "--run-clc"):
+    bwd_modes = ("--run-dqreduce", "--run-clc", "--run-clc-jagged")
+    if len(sys.argv) >= 4 and sys.argv[1] in bwd_modes:
         _L, _Z = int(sys.argv[2]), int(sys.argv[3])
         assert bool(A._AUTOWS_CFG.dq_reduce and A._AUTOWS_CFG.dq_reuse), "dq-reduce reuse flag not baked on"
-        assert A._AUTOWS_CFG.clc == (sys.argv[1] == "--run-clc")
-        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(_L, _Z)
-        rls = {n: _rel_l2(g_, w) for n, g_, w in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
-        print(f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
-              f"(L={_L} Z={_Z})")
+        assert A._AUTOWS_CFG.clc == (sys.argv[1] in ("--run-clc", "--run-clc-jagged"))
+        (dq, dk, dv), (rq, rk, rv) = _run_autows_bwd(
+            _L, _Z, jagged=sys.argv[1] == "--run-clc-jagged"
+        )
+        rls = {n: _rel_l2(g_, w) for n, g_, w in
+               (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv))}
+        print(
+            f"REL_L2 dq/dk/dv = {rls['dq']:.2e} / {rls['dk']:.2e} / {rls['dv']:.2e} "
+            f"(L={_L} Z={_Z})"
+        )
         bad = {n: v for n, v in rls.items() if not (v < 1e-2)}
         if bad:
             print(f"FAIL: rel-L2 too high: {bad}")
@@ -359,5 +385,5 @@ if __name__ == "__main__":
         sys.exit(0)
     sys.exit(
         "usage: test_self_attention_autows.py "
-        "--run-dqreduce|--run-clc|--run-fadp|--run-fwd L Z"
+        "--run-dqreduce|--run-clc|--run-clc-jagged|--run-fadp|--run-fwd L Z"
     )

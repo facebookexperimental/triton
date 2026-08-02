@@ -190,6 +190,7 @@ def run_accuracy(shapes):
 _PERF_ENV = {
     "triton": {},
     "tlx": {},
+    "tlx_raw": {},
     "autows": {
         "HSTU_SELF_AUTOWS": "1",
         "HSTU_SELF_DQ_REDUCE": "1",
@@ -223,8 +224,8 @@ def _bench_one(variant, L, Z, nrep):
     torch.manual_seed(0)
     _sp = os.environ.get("BENCH_SPARSITY")
     q, k, v, do, so, asc = make(L, Z, sparsity=float(_sp) if _sp else None)
-    run = run_tlx if variant == "tlx" else run_triton  # triton & autows share triton_hstu_mha
-    kw = {"causal": True} if variant == "tlx" else {}
+    run = run_tlx if variant in ("tlx", "tlx_raw") else run_triton
+    kw = {"causal": True} if variant in ("tlx", "tlx_raw") else {}
     # Optional targets (BENCH_TARGET_SIZE>0): per-batch target counts like the
     # fbsource HSTU bench, clamped to each jagged seq-len. Setting this exercises
     # the num_targets/target-masking path (the autoWS compile trigger).
@@ -242,34 +243,58 @@ def _bench_one(variant, L, Z, nrep):
     # the first JIT compile).
     triton.knobs.nvidia.use_meta_ws = meta_ws
     triton.knobs.nvidia.disable_wsbarrier_reorder = True
-    if variant == "autows_clc":
-        # CLC is a backward-only experiment. Call the production backward
-        # wrapper directly so forward compilation/autotuning is excluded from
-        # both setup and timing while retaining backward-side allocations and
-        # preprocessing.
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    if variant in ("autows_clc", "tlx_raw"):
+        # Compare backward wrappers at the same boundary: prepared inputs and
+        # gradient buffers, without forward or autograd dispatch.
+        dq = torch.empty_like(q, dtype=torch.float32 if variant == "tlx_raw" else q.dtype)
+        dk, dv = torch.empty_like(k), torch.empty_like(v)
+        # SiLU TLX does not consume M/Delta, but its common wrapper requires
+        # pointer arguments. Keep stable dummy buffers outside the timed call.
+        M = torch.empty((1,), device=q.device, dtype=torch.float32)
+        Delta = torch.empty((1,), device=q.device, dtype=torch.float32)
 
         def bwd():
-            A.triton_hstu_attention_bwd(
-                dout=do,
-                q=q,
-                k=k,
-                v=v,
-                dq=dq,
-                dk=dk,
-                dv=dv,
-                seq_offsets=so,
-                attn_scale=asc,
-                max_seq_len=L,
-                alpha=1.0 / D,
-                max_q_len=None,
-                seq_offsets_q=None,
-                sort_by_length_indices=None,
-                enable_tma=True,
-                num_targets=kw.get("num_targets"),
-                max_attn_len=0,
-                contextual_seq_len=0,
-            )
+            if variant == "tlx_raw":
+                T.tlx_hstu_attention_bwd(
+                    dout=do,
+                    q=q,
+                    k=k,
+                    v=v,
+                    dq=dq,
+                    dk=dk,
+                    dv=dv,
+                    seq_offsets=so,
+                    attn_scale=asc,
+                    max_seq_len=L,
+                    alpha=1.0 / D,
+                    M=M,
+                    Delta=Delta,
+                    stride_mm=1,
+                    num_softmax_heads=0,
+                    num_targets=kw.get("num_targets"),
+                    causal=True,
+                )
+            else:
+                A.triton_hstu_attention_bwd(
+                    dout=do,
+                    q=q,
+                    k=k,
+                    v=v,
+                    dq=dq,
+                    dk=dk,
+                    dv=dv,
+                    seq_offsets=so,
+                    attn_scale=asc,
+                    max_seq_len=L,
+                    alpha=1.0 / D,
+                    max_q_len=None,
+                    seq_offsets_q=None,
+                    sort_by_length_indices=None,
+                    enable_tma=True,
+                    num_targets=kw.get("num_targets"),
+                    max_attn_len=0,
+                    contextual_seq_len=0,
+                )
 
         fwd_s = [float("nan")] * nrep
     else:
@@ -302,7 +327,7 @@ def _bench_one(variant, L, Z, nrep):
         print(f"TRACE {variant} backward-ready", flush=True)
     bwd_s = [triton.testing.do_bench(bwd, warmup=warmup, rep=rep) for _ in range(nrep)]
     fm, bm = statistics.mean(fwd_s), statistics.mean(bwd_s)
-    fsd = (float("nan") if variant == "autows_clc" else
+    fsd = (float("nan") if variant in ("autows_clc", "tlx_raw") else
            (statistics.stdev(fwd_s) if len(fwd_s) > 1 else 0.0))
     bsd = statistics.stdev(bwd_s) if len(bwd_s) > 1 else 0.0
     print(f"PERF {variant} L={L} Z={Z} fwd={fm:.4f} fwd_sd={fsd:.4f} bwd={bm:.4f} bwd_sd={bsd:.4f}")
@@ -368,8 +393,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--perf", action="store_true", help="run the fwd/bwd latency benchmark")
     ap.add_argument("--acc", action="store_true", help="run the accuracy check (default)")
-    ap.add_argument("--nrep", type=int, default=1, help="do_bench repetitions per point; >1 reports mean + std")
-    ap.add_argument("--variants", default="autows,tlx,triton", help="comma subset of autows,tlx,triton (perf)")
+    ap.add_argument("--nrep", type=int, default=1,
+                    help="do_bench repetitions per point; >1 reports mean + std")
+    ap.add_argument("--variants", default="autows,tlx,triton",
+                    help="comma subset of autows,autows_clc,tlx,tlx_raw,triton (perf)")
     ap.add_argument("--seqlens", default=None, help="comma L list, e.g. 256,512,1024,4096")
     ap.add_argument("--batch", type=int, default=None, help="batch Z (default 2)")
     ap.add_argument("--heads", type=int, default=None, help="num heads H (perf; default 2)")
