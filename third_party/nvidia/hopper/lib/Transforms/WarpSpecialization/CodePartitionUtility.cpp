@@ -13,6 +13,7 @@
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttnvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-utility"
@@ -139,7 +140,7 @@ Operation *AllocChannel::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (isa<ttg::LocalStoreOp>(user))
+    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
@@ -163,7 +164,7 @@ static void getAllConsumers(AllocChannel *ch,
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (!isa<ttg::LocalStoreOp>(user) &&
+    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user) &&
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
@@ -1772,8 +1773,8 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Load operations
-  if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp, ttg::LocalLoadOp>(
-          op))
+  if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+          ttg::LocalLoadOp>(op))
     return true;
 
   // Store operations
@@ -1878,9 +1879,10 @@ static std::string getKeyOpDescription(Operation *op) {
   }
 
   // For loads, show source and result
-  if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
+  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+    // NVWS "result" is the destination memdesc operand, not an SSA result.
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
-       << formatOutput(loadOp.getResult());
+       << formatInput(loadOp.getResult());
     return result;
   }
   if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
@@ -2101,7 +2103,7 @@ static std::string getKeyOpLabel(Operation *op) {
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
     label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
-  } else if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  } else if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
                  ttg::LocalLoadOp>(op)) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
@@ -3496,7 +3498,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
         // Alloc associated with operand D can have multiple producers.
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp>(user)) {
+      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user)) {
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
@@ -3559,9 +3561,16 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
   SmallVector<int> consumerTaskIds;
   DenseSet<int> seenTaskIds;
   for (auto *consumer : consumers) {
-    for (int id : getAsyncTaskIds(consumer)) {
-      if (seenTaskIds.insert(id).second)
-        consumerTaskIds.push_back(id);
+    SmallVector<Operation *> taskOwners = {consumer};
+    // A memdesc view can carry boundary task IDs that do not all consume the
+    // buffer. Descriptor channels synchronize with the terminal consumers.
+    if (isa<ttnvws::DescriptorLoadOp>(producerOp))
+      taskOwners = getActualConsumers(consumer);
+    for (Operation *taskOwner : taskOwners) {
+      for (int id : getAsyncTaskIds(taskOwner)) {
+        if (seenTaskIds.insert(id).second)
+          consumerTaskIds.push_back(id);
+      }
     }
   }
 
