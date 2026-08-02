@@ -1,15 +1,15 @@
 // RUN: triton-opt %s --nvgpu-test-ws-buffer-allocation | FileCheck %s
 
-// createBuffer sorts channels by producer program order before hoisting their
-// buffers. Hoisting must insert each new allocation after the previous hoisted
-// allocation; otherwise every allocation is inserted at function entry and the
-// final order is reversed.
+// Each register-consumed descriptor load is converted to an nvws.descriptor_load
+// that writes its own SMEM buffer, in producer program order. The A load's
+// buffer/load must be emitted before the B load's; otherwise the producer order
+// is reversed (e.g. every allocation hoisted to function entry in reverse).
 
 // CHECK-LABEL: @hoist_preserves_producer_order
-// CHECK: %[[A_BUF:.*]] = ttg.local_alloc : () -> !ttg.memdesc<128x64xf16
-// CHECK: %[[B_BUF:.*]] = ttg.local_alloc : () -> !ttg.memdesc<64x128xf16
-// CHECK: ttg.local_store {{.*}}, %[[A_BUF]]
-// CHECK: ttg.local_store {{.*}}, %[[B_BUF]]
+// CHECK: %[[A_BUF:.*]] = ttg.local_alloc {{.*}}: () -> !ttg.memdesc<128x64xf16
+// CHECK: nvws.descriptor_load {{.*}} %[[A_BUF]]
+// CHECK: %[[B_BUF:.*]] = ttg.local_alloc {{.*}}: () -> !ttg.memdesc<64x128xf16
+// CHECK: nvws.descriptor_load {{.*}} %[[B_BUF]]
 
 #blocked_a = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [2, 16], warpsPerCTA = [4, 1], order = [1, 0]}>
 #blocked_b = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>

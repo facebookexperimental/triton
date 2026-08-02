@@ -18,8 +18,10 @@
 // CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 3>, dstTask = 0 : i32, maxRegionId = 2 : i32, minRegionId = 2 : i32, parentId = 1 : i32}}
 // CHECK: ttng.async_tma_copy_local_to_global
 // CHECK: partition2
-// CHECK: ttng.async_tma_copy_global_to_local
-// CHECK: tt.descriptor_load
+// CHECK-COUNT-6: ttng.async_tma_copy_global_to_local
+// CHECK: ttg.local_load {{.*}} -> tensor<128x32xf16
+// CHECK-NOT: tt.descriptor_load
+// CHECK-NOT: nvws.descriptor_load
 // CHECK: constraints = {WSBarrier = {channelGraph = array<i32: 0, 1, 2>, dstTask = 0 : i32, maxRegionId = 4 : i32, minRegionId = 4 : i32, parentId = 1 : i32}}
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
