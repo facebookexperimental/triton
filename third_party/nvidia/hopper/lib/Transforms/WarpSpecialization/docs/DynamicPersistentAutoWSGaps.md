@@ -108,6 +108,25 @@ round-tripping, CLC-shaped ordered-subset carry, condition/task replication,
 warp-budget cleanup, and graceful rejection of reordered or computed
 condition forwarding.
 
+### Collective per-tile guards
+
+A CLC body may be wrapped in a zero-result bounds guard such as
+`if start_n < seq_len`. AutoWS treats this as collective control flow:
+
+- nearest-loop discovery crosses the `scf.if`, so the guarded K-loop remains
+  the persistent loop's compute loop;
+- scalar address/load chains feeding the condition are replicated into every
+  participating task, and each specialized partition clones the same `if`;
+- post-compute epilogue propagation crosses the guard, preserving accumulator
+  channels and dK/dV stores; and
+- reuse-group ordering uses the nearest enclosing `for`/`if`/`while`, so
+  guarded channels use the same accumulation counter and staging rotation.
+
+This requires a collective predicate: all partitions must compute the same
+boolean. It permits rectangular CLC scheduling for jagged inputs, where an
+invalid tail tile skips the complete partitioned body in every task without
+changing cross-partition barrier cadence.
+
 The atomic-broadcast half of the outer-while path is now also validated in
 isolation (`ws_atomic_broadcast_from_psm.mlir`): starting from an
 **unpartitioned** dynamic-persistent GEMM `scf.while` with a scalar

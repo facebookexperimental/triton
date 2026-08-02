@@ -126,16 +126,19 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
   // need to dump the task ids into the IR.
   auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
 
-  // An op is a non-anchor (allows backward propagation to flow through) only
-  // if it is a scalar arithmetic/math op. These ops compute shared addresses
-  // or indices used across tasks and need the union of consumer task IDs.
+  // An op is a non-anchor (allows backward propagation to flow through) when
+  // it is a replicable scalar computation. These ops compute shared addresses,
+  // indices, or control predicates used across tasks and need the union of
+  // consumer task IDs. Scalar loads are safe to repeat and avoid introducing
+  // an unsupported scalar communication channel for a collective predicate.
   // All other annotated ops (Triton ops, tensor ops, control flow) are anchors
   // whose task IDs define the computation partition and must not be overridden.
-  bool isScalarArithOrMath =
-      isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) &&
+  bool isScalarReplicable =
+      (isa<arith::ArithDialect, math::MathDialect>(op->getDialect()) ||
+       isa<triton::AddPtrOp, triton::LoadOp>(op)) &&
       llvm::none_of(op->getResultTypes(),
                     [](Type t) { return isa<RankedTensorType>(t); });
-  bool isAnchor = taskIdAttr && !isScalarArithOrMath;
+  bool isAnchor = taskIdAttr && !isScalarReplicable;
 
   auto propagateTaskToOperandsAndParent = [&](const TaskId &taskId) {
     for (auto operandLattice : operands) {

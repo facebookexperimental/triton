@@ -56,6 +56,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // A collective bounds guard must be evaluated by every task that has work in
+  // its body. Scalar address/load chains are replicated instead of lowered to
+  // unsupported scalar communication channels.
+  // CHECK-LABEL: @collective_if_scalar_load
+  // CHECK: tt.addptr {{.*}} {async_task_id = array<i32: 0, 1>}
+  // CHECK: tt.load {{.*}} {async_task_id = array<i32: 0, 1>}
+  // CHECK: arith.cmpi {{.*}} {async_task_id = array<i32: 0, 1>}
+  // CHECK: scf.if
+  // CHECK: } {async_task_id = array<i32: 0, 1>}
+  tt.func public @collective_if_scalar_load(%lengths: !tt.ptr<i32>, %idx: i32,
+                                            %out0: !tt.ptr<i32>, %out1: !tt.ptr<i32>) {
+    %ptr = tt.addptr %lengths, %idx {async_task_id = array<i32: 0>} : !tt.ptr<i32>, i32
+    %length = tt.load %ptr {async_task_id = array<i32: 0>} : !tt.ptr<i32>
+    %valid = arith.cmpi sgt, %length, %idx : i32
+    scf.if %valid {
+      tt.store %out0, %length {async_task_id = array<i32: 0>} : !tt.ptr<i32>
+      tt.store %out1, %length {async_task_id = array<i32: 1>} : !tt.ptr<i32>
+    }
+    tt.return
+  }
+}
+
+// -----
+
 // Test that nested for loop constant bounds get allTasks after propagation.
 // The inner loop body only contains ops with tasks 1 and 2, while task 0 ops
 // are in the outer loop epilogue. The solver's backward propagation only sees

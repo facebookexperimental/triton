@@ -1363,18 +1363,17 @@ getStaggeredAccumCnt(OpBuilderWithAsyncTaskIds &builder, Operation *op,
   if (reuseGroupIdx < 0)
     return accumCnt;
   // op is a user of the channel. accumCnt is the corresponding argument of the
-  // parentForOp.
-  // Go through chList in the parentForOp, assume ch is directly in parentForOp.
-  // FIXME: handle the case where ch is inside in IfOp.
+  // enclosing control region. Order reuse members in the nearest control
+  // region so channels directly inside a collective IfOp are not collapsed to
+  // the IfOp entry in an enclosing loop's channel list.
   SmallVector<Operation *> chList;
-  // The enclosing loop holding the reuse-group channels can be an scf.for or,
-  // for a static persistent while-loop kernel, an scf.while (the channels live
-  // directly in the while's after region). Using getParentOfType<scf::ForOp>()
-  // alone would be null for the while case and crash getReuseChannels.
-  Operation *parentLoop = op->getParentOfType<scf::ForOp>();
-  if (!parentLoop)
-    parentLoop = op->getParentOfType<scf::WhileOp>();
-  getReuseChannels(config->getGroup(reuseGroupIdx), parentLoop, chList);
+  // The enclosing region holding the reuse-group channels can be an scf.for,
+  // scf.if, or scf.while.
+  Operation *parentRegion = op->getParentOp();
+  while (parentRegion &&
+         !isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parentRegion))
+    parentRegion = parentRegion->getParentOp();
+  getReuseChannels(config->getGroup(reuseGroupIdx), parentRegion, chList);
   assert(chList.size() >= 1);
 
   // When multiple channels in the reuse group share the same getDstOp() but
