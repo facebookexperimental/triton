@@ -69,7 +69,10 @@ _DQREDUCE_CFG = dict(
     dq_iters=4,
     pin=True,
 )
-_CLC_CFG = dict(_DQREDUCE_CFG, clc=True, bwd_stages=2, clc_smem_algo=2, dkdv_subtile=2)
+_CLC_CFG = dict(
+    _DQREDUCE_CFG, clc=True, bwd_bm=64, bwd_bn=128,
+    bwd_stages=2, dkdv_subtile=2, clc_smem_algo=2,
+)
 # Manual data-partition fwd: split BLOCK_M=256 into two 128-row halves
 # sharing one K/V load, warp-specialized (load + 2 MMA groups).
 _MANUAL_DP_CFG = dict(autows=True, manual_dp=True, dp=2, warps=4, pin=True)

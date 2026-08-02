@@ -27,6 +27,34 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+// CLC epilogues are carried by scf.while rather than scf.for.
+// CHECK-LABEL: while_store_wait
+// CHECK: ttng.async_tma_store_token_wait
+// CHECK-SAME: can_rotate_by_buffer_count = 2
+// CHECK-SAME: planned_pending_count = 1
+  tt.func public @while_store_wait(
+      %desc: !tt.tensordesc<128x64xf16, #shared>,
+      %src: tensor<128x64xf16>, %i: i32) {
+    %buf = ttg.local_alloc {"buffer.copy" = 2 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %true = arith.constant true
+    %false = arith.constant false
+    scf.while (%valid = %true) : (i1) -> () {
+      scf.condition(%valid)
+    } do {
+      ttg.local_store %src, %buf : tensor<128x64xf16> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %tok = ttng.async_tma_copy_local_to_global %desc[%i, %i] %buf : !tt.tensordesc<128x64xf16, #shared>, !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> !ttg.async.token
+      ttng.async_tma_store_token_wait %tok : !ttg.async.token
+      scf.yield %false : i1
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
 // One-CTA reductions use the same two-slot rotation as TLX. The reorder pass
 // is responsible for materializing the final queue drain.
