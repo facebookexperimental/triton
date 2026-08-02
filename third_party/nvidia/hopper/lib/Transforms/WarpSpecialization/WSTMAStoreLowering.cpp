@@ -316,40 +316,69 @@ findLocalStoreWritingBuffer(scf::ForOp forOp, Value buffer, Operation *before,
   return writer;
 }
 
+// Dynamic-persistent and CLC schedulers both lower to scf.while. Only CLC may
+// rotate epilogue store waits across scheduler iterations; treating an atomic
+// dynamic scheduler as CLC races reuse of its epilogue staging buffers.
+static constexpr StringLiteral kCLCPersistentLoop = "ttg.clc_persistent";
+
+static bool isCLCPersistentLoop(scf::WhileOp whileOp) {
+  if (whileOp->hasAttr(kCLCPersistentLoop))
+    return true;
+  bool hasCLC = false;
+  whileOp.walk([&](Operation *op) -> WalkResult {
+    if (isa<ttng::CLCAdvanceOp, ttng::CLCTryCancelAsyncOp, ttng::CLCReadOp>(
+            op)) {
+      hasCLC = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return hasCLC;
+}
+
 void doAnnotateTMAStoreWaits(triton::FuncOp funcOp) {
   MLIRContext *ctx = funcOp.getContext();
-  // Use walk to find TMAStoreTokenWaitOp ops inside ForOp bodies, including
-  // those nested inside SubtiledRegionOp regions.
-  funcOp.walk([&](scf::ForOp forOp) {
-    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-      Value buffer;
-      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
-      if (!tmaOp)
-        return;
+  // Code partitioning clones the scheduler loop once per partition, but only
+  // the scheduler partition keeps the CLC operations. Mark the original loop
+  // so every clone remains distinguishable from an atomic dynamic loop.
+  funcOp.walk([&](scf::WhileOp whileOp) {
+    if (isCLCPersistentLoop(whileOp))
+      whileOp->setAttr(kCLCPersistentLoop, UnitAttr::get(ctx));
+  });
+  // Annotate waits in counted loops and CLC persistent while loops, including
+  // waits nested inside SubtiledRegionOp regions.
+  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+    auto whileOp = waitOp->getParentOfType<scf::WhileOp>();
+    if (!waitOp->getParentOfType<scf::ForOp>() &&
+        (!whileOp || !isCLCPersistentLoop(whileOp)))
+      return;
+    Value buffer;
+    auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
+    if (!tmaOp)
+      return;
 
-      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
-      if (!allocOp)
-        return;
+    auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+    if (!allocOp)
+      return;
 
-      // Only annotate buffers that have buffer.copy from the memory planner.
-      // Buffers without buffer.copy were not planned and cannot be rotated.
-      auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
-      if (!bufferCopy)
-        return;
+    // Only annotate buffers that have buffer.copy from the memory planner.
+    // Buffers without buffer.copy were not planned and cannot be rotated.
+    auto bufferCopy = allocOp->getAttrOfType<IntegerAttr>("buffer.copy");
+    if (!bufferCopy)
+      return;
 
-      int k = bufferCopy.getInt();
-      if (k <= 0)
-        return;
+    int k = bufferCopy.getInt();
+    if (k <= 0)
+      return;
 
-      waitOp->setAttr(kCanRotateByBufferCount,
-                      IntegerAttr::get(IntegerType::get(ctx, 32), k));
-      // The canonical wait_group count for a K-slot same-task staging ring is
-      // K-1. Keep it as stable lowering metadata: schedule serialization can
-      // move the token wait through pipeline clusters without leaving enough
-      // linear IR context for computePendings() to reconstruct the ring depth.
-      waitOp->setAttr(kPlannedPendingCount,
-                      IntegerAttr::get(IntegerType::get(ctx, 32), k - 1));
-    });
+    waitOp->setAttr(kCanRotateByBufferCount,
+                    IntegerAttr::get(IntegerType::get(ctx, 32), k));
+    // The canonical wait_group count for a K-slot same-task staging ring is
+    // K-1. Keep it as stable lowering metadata: schedule serialization can
+    // move the token wait through pipeline clusters without leaving enough
+    // linear IR context for computePendings() to reconstruct the ring depth.
+    waitOp->setAttr(kPlannedPendingCount,
+                    IntegerAttr::get(IntegerType::get(ctx, 32), k - 1));
   });
 }
 
@@ -375,26 +404,24 @@ static bool isInMergedEpilogueLoop(scf::ForOp forOp) {
 // ---------------------------------------------------------------------------
 
 void doValidateTMAStoreAnnotations(triton::FuncOp funcOp) {
-  funcOp.walk([&](scf::ForOp forOp) {
-    forOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-      if (!waitOp->hasAttr(kCanRotateByBufferCount))
-        return;
+  funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
+    if (!waitOp->hasAttr(kCanRotateByBufferCount))
+      return;
 
-      Value buffer;
-      auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
-      if (!tmaOp) {
-        waitOp->removeAttr(kCanRotateByBufferCount);
-        waitOp->removeAttr(kPlannedPendingCount);
-        return;
-      }
+    Value buffer;
+    auto *tmaOp = getDefiningTMAStoreOp(waitOp, buffer);
+    if (!tmaOp) {
+      waitOp->removeAttr(kCanRotateByBufferCount);
+      waitOp->removeAttr(kPlannedPendingCount);
+      return;
+    }
 
-      auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
-      if (!allocOp) {
-        waitOp->removeAttr(kCanRotateByBufferCount);
-        waitOp->removeAttr(kPlannedPendingCount);
-        return;
-      }
-    });
+    auto allocOp = buffer.getDefiningOp<ttg::LocalAllocOp>();
+    if (!allocOp) {
+      waitOp->removeAttr(kCanRotateByBufferCount);
+      waitOp->removeAttr(kPlannedPendingCount);
+      return;
+    }
   });
 }
 
@@ -454,9 +481,24 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
   // This is deliberately limited to direct tokens and staging writers in the
   // same block. The final use remains a drain.
   SmallVector<ttng::TMAStoreTokenWaitOp> straightLineWaits;
+  SmallVector<std::pair<scf::WhileOp, Attribute>> whileDrains;
   funcOp.walk([&](ttng::TMAStoreTokenWaitOp waitOp) {
-    if (!waitOp->getParentOfType<scf::ForOp>())
+    if (!waitOp->getParentOfType<scf::ForOp>()) {
+      auto whileOp = waitOp->getParentOfType<scf::WhileOp>();
+      if (whileOp && !isCLCPersistentLoop(whileOp))
+        return;
       straightLineWaits.push_back(waitOp);
+      auto planned = waitOp->getAttrOfType<IntegerAttr>(kPlannedPendingCount);
+      if (!whileOp || !planned || planned.getInt() == 0)
+        return;
+      Attribute taskIds = waitOp->getAttr("async_task_id");
+      bool alreadyTracked = std::any_of(
+          whileDrains.begin(), whileDrains.end(), [&](const auto &entry) {
+            return entry.first == whileOp && entry.second == taskIds;
+          });
+      if (!alreadyTracked)
+        whileDrains.emplace_back(whileOp, taskIds);
+    }
   });
   for (ttng::TMAStoreTokenWaitOp waitOp : straightLineWaits) {
     Operation *tmaStore = waitOp.getToken().getDefiningOp();
@@ -489,6 +531,17 @@ void doTMAStoreWaitReorder(triton::FuncOp funcOp) {
       waitOp->moveBefore(localStore);
       break;
     }
+  }
+
+  // CLC epilogues live directly in an scf.while rather than an scf.for. Their
+  // planned K-slot waits overlap stores across scheduler iterations, so drain
+  // each issuing task's queue when the persistent loop exits.
+  for (auto [whileOp, taskIds] : whileDrains) {
+    OpBuilder builder(whileOp);
+    builder.setInsertionPointAfter(whileOp);
+    auto drain = ttng::TMAStoreWaitOp::create(builder, whileOp.getLoc(), 0);
+    if (taskIds)
+      drain->setAttr("async_task_id", taskIds);
   }
 
   funcOp.walk([&](scf::ForOp forOp) {
