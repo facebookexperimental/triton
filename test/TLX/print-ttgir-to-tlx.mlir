@@ -1,4 +1,4 @@
-// RUN: triton-opt --tlx-print-ttgir-to-tlx %s | FileCheck %s
+// RUN: triton-opt --tlx-print-ttgir-to-tlx %s -split-input-file | FileCheck %s
 
 // Test TTGIR to TLX simplified output on FlashAttention persistent kernel
 // The pass outputs simplified TLX-style code:
@@ -1067,5 +1067,33 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       ttg.warp_return {async_task_id = array<i32: 5>}
     } : (i32, i32, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<3x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<3x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x128x128xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !tt.ptr<bf16>, !tt.ptr<bf16>, !tt.ptr<bf16>, !tt.ptr<bf16>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, !ttg.memdesc<1x128x128xbf16, #shared1, #smem, mutable>, f32, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>, !ttg.memdesc<1x1xi64, #shared, #smem, mutable>) -> ()
     tt.return
+  }
+}
+
+// -----
+
+module {
+  // CHECK-LABEL: def clc_while(
+  // CHECK: tlx.async_descriptor_store_wait(1)  # token-specific
+  // CHECK: arg2 = arg0
+  // CHECK: while True:
+  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 < arg1
+  // CHECK-NEXT:   if not var_{{[0-9]+}}:
+  // CHECK-NEXT:     var_{{[0-9]+}} = arg2
+  // CHECK-NEXT:     break
+  // CHECK-NEXT:   var_{{[0-9]+}} = arg2 + arg1
+  // CHECK-NEXT:   arg2 = var_{{[0-9]+}}
+  tt.func public @clc_while(%start: i32, %limit: i32) -> i32 {
+    %token = ub.poison : !ttg.async.token
+    ttng.async_tma_store_token_wait %token {planned_pending_count = 1 : i32} : !ttg.async.token
+    %result = scf.while (%iter = %start) : (i32) -> i32 {
+      %keep_going = arith.cmpi slt, %iter, %limit : i32
+      scf.condition(%keep_going) %iter : i32
+    } do {
+    ^bb0(%body_iter: i32):
+      %next = arith.addi %body_iter, %limit : i32
+      scf.yield %next : i32
+    }
+    tt.return %result : i32
   }
 }
