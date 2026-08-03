@@ -14224,6 +14224,7 @@ def test_tlx_wave_converter_pipeline_keeps_mfma_fragment_math_structural(tmp_pat
     %maximum = arith.maxnumf %lhs, %rhs : tensor<16x16xf32, #mma>
     %product = arith.mulf %maximum, %lhs : tensor<16x16xf32, #mma>
     %sum = arith.addf %maximum, %maximum : tensor<16x16xf32, #mma>
+    %difference = arith.subf %sum, %maximum : tensor<16x16xf32, #mma>
     tt.return
   }
 """
@@ -14235,7 +14236,15 @@ def test_tlx_wave_converter_pipeline_keeps_mfma_fragment_math_structural(tmp_pat
     assert not re.search(r"wave\.fmul .* -> !wave\.simd<f32, 64>", wave)
     assert re.search(r"wave\.fmul .*vector<4xf32>", wave)
     assert re.search(r"wave\.fadd .*vector<4xf32>", wave)
+    assert re.search(r"wave\.fsub .*vector<4xf32>", wave)
     _run_wave_verify(wave)
+    machine = _run_waveamd_to_machine(wave)
+    assert re.search(
+        r"waveamdmachine\.v_pk_add_f32 .*"
+        r"\{neg_hi = 2 : i64, neg_lo = 2 : i64\}",
+        machine,
+    )
+    assert "waveamdmachine.v_sub_f32" not in machine
     del ctx
 
 
