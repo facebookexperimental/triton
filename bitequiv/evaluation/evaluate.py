@@ -203,9 +203,10 @@ def evaluate_precision(spec, run_checker, config_effort, fuzzer_effort, artifact
     for config in configs:
         try:
             ck = spec.compile(config, size)
-        except Exception:  # noqa: BLE001
-            fails += 1
-            continue
+            spec.run(config, ck, 0, size)  # trial launch: a config can COMPILE yet OOM at LAUNCH
+        except Exception:  # noqa: BLE001    (tcgen05 TMEM is rejected by the driver at launch, not
+            fails += 1  # at compile), so skip compile OR launch failures instead of letting one bad
+            continue  # config abort the whole kernel's eval (Stage 4's compile loop already does this)
         compiled[config] = ck
         checker_key[config] = run_checker(ck.asm[artifact], config)
     ok = list(compiled)
