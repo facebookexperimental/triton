@@ -6742,6 +6742,92 @@ def test_tlx_wave_runtime_gfx950_fa_exact_q_output_alias_e2e(tmp_path, backend):
     torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "shape,expected_constant",
+    [
+        ((1, 65535, 256, 128), 2147450880),
+        ((2, 32768, 256, 128), 1073741824),
+    ],
+    ids=["last-safe-batch-stride", "last-safe-element-offset"],
+)
+def test_tlx_wave_compile_gfx950_fa_i32_offset_boundary(tmp_path, monkeypatch, shape, expected_constant):
+    torch = pytest.importorskip("torch")
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_i32_offset_boundary_{shape[0]}_{shape[1]}")
+    tensors = [MockTensor(torch.bfloat16, shape) for _ in range(4)]
+
+    batch_stride = math.prod(shape[1:])
+    last_element_offset = math.prod(shape) - 1
+    assert batch_stride <= tutorial.MAX_SIGNED_I32
+    assert last_element_offset <= tutorial.MAX_SIGNED_I32
+    with (
+            _tlx_wave_compile_driver(monkeypatch),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / "fa-i32-offset-boundary-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        compiled = tutorial._attn_fwd_wave_pipeline.warmup(
+            *tensors,
+            N_CTX=shape[2],
+            BATCH=shape[0],
+            HEADS=shape[1],
+            TOTAL_HEADS=shape[0] * shape[1],
+            SM_SCALE=1.0 / math.sqrt(shape[3]),
+            LOG2_SCORE_BOUND=0.0,
+            ADAPTIVE_REFERENCE=True,
+            num_warps=8,
+            tlx_wave_enable_multi_wave_specialize=False,
+            grid=(shape[2] // 256, shape[0] * shape[1], 1),
+        )
+
+    wave = _asm_text(compiled, "wave")
+    assert f"arith.constant {expected_constant} : i32" in wave
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 65536, 256, 128),
+        (3, 32768, 256, 128),
+    ],
+    ids=["first-unrepresentable-stride", "wrapped-batch-offset-reproducer"],
+)
+def test_tlx_wave_fa_rejects_i32_offset_overflow(shape):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_i32_offset_overflow_{shape[0]}_{shape[1]}")
+    elements = math.prod(shape)
+
+    class TensorContract:
+
+        dtype = torch.bfloat16
+        ndim = 4
+        device = torch.device("cuda")
+
+        def __init__(self, pointer):
+            self.shape = shape
+            self.pointer = pointer
+
+        def is_contiguous(self):
+            return True
+
+        def numel(self):
+            return elements
+
+        def element_size(self):
+            return 2
+
+        def data_ptr(self):
+            return self.pointer
+
+    q = TensorContract(0x10000000000)
+    k = TensorContract(0x20000000000)
+    v = TensorContract(0x30000000000)
+
+    with pytest.raises(ValueError, match="must not exceed the signed-i32 address limit"):
+        tutorial.attention(q, k, v)
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
