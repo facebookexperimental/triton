@@ -150,12 +150,13 @@ Value createLeaderCTAPredicate(Location loc, OpBuilder &rewriter) {
 }
 
 Value createTMAMulticastMask(Location loc, ConversionPatternRewriter &rewriter,
-                             uint16_t broadcastBits) {
+                             uint16_t broadcastBits, Value ctaId) {
   int numCTAs = triton::gpu::lookupNumCTAs(rewriter);
   auto encoding =
       triton::nvidia_gpu::getTMAMulticastMaskEncoding(numCTAs, broadcastBits);
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
+  if (!ctaId)
+    ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
   Value base = b.and_(ctaId, b.i32_val(encoding.fixedBits));
   return b.shl(b.i32_val(encoding.pattern), base);
 }
