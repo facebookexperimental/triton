@@ -1284,6 +1284,14 @@ def _fastmath_flags(value):
 
 def _verify_memory_edges(op, target_program):
     attrs = _attrs_dict(op)
+    contiguity = attrs.get("contiguity", 1)
+    if not isinstance(contiguity, int) or contiguity <= 0:
+        fail(
+            "TLXW_VERIFY_MEMORY_CONTIGUITY",
+            STAGE,
+            "memory contiguity must be a positive integer",
+            target_op_id=op.target_op_id,
+        )
     semantic_edge_attrs = frozenset({
         "offset_component_coordinate_bases",
         "offset_range",
