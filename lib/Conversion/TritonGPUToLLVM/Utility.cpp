@@ -1017,8 +1017,8 @@ lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
     addrBases.push_back({kBlock, reps.getBases().lookup(kBlock)});
   }
   LinearLayout addrLayout(addrBases, reps.getOutDims(), false);
-  auto [nAdditive, permStrides] =
-      actionAdditiveStrides(reps, addrLayout, maskSpanAffineOffset);
+  auto [nAdditive, permStrides] = actionAdditiveStrides(
+      reps, addrLayout, maskSpanAffineOffset, elemsPerVec);
   reps = permStrides.apply(reps);
 
   if (isPartitioned) {
