@@ -386,7 +386,13 @@ struct WaitBarrierOpConversion
       operands.push_back(ptxBuilder.newOperand(pred, "b"));
 
     waitLoop(operands, /*onlyAttachMLIRArgs=*/true);
-    ptxBuilder.launch(rewriter, loc, void_ty(ctx));
+    Value wait = ptxBuilder.launch(rewriter, loc, void_ty(ctx));
+    if (predicated) {
+      if (auto constraints = op.getConstraints();
+          constraints && constraints->contains("WSBarrier"))
+        wait.getDefiningOp()->setAttr("ttg.ws_predicated_mbarrier_wait",
+                                      UnitAttr::get(ctx));
+    }
     rewriter.eraseOp(op);
     return success();
   }
