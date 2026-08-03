@@ -455,11 +455,6 @@ LogicalResult ConcatOp::verify() {
                      linearLayoutDst.getBases().lookup(key)};
   };
 
-  auto srcToDstShape = LLVM::AMD::multiDimElementwise<int64_t, int64_t>(
-      dstShape, srcShape, std::divides<unsigned>());
-  std::vector<unsigned> defaultOrder(rank);
-  std::iota(defaultOrder.rbegin(), defaultOrder.rend(), 0);
-
   StringAttr kReg = StringAttr::get(ctx, "register");
   auto dstRegBases = linearLayoutDst.getBases().lookup(kReg);
   int dstRegCount = 1 << dstRegBases.size();
@@ -481,9 +476,6 @@ LogicalResult ConcatOp::verify() {
     // 3.   find, which input tile holds the dst value
     auto multiDimOperandIdx = LLVM::AMD::multiDimElementwise<int32_t, int64_t>(
         elemCoordsArray, srcShape, std::divides<unsigned>());
-    auto linearOperandIdx =
-        linearizeIndices(multiDimOperandIdx, srcToDstShape, defaultOrder);
-
     // 4.   subtract dst coordinates and start coordinates of the tile
 
     for (int dim = 0; dim < rank; ++dim)

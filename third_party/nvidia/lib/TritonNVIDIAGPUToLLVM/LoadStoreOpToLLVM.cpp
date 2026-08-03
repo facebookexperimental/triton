@@ -1344,7 +1344,6 @@ struct AsyncTMACopyGlobalToLocalOpConversion
     auto kMsg = str_attr("msg");
     auto kBlock = str_attr("block");
     const auto numCopies = msgToOffset.getInDimSize(kMsg);
-    auto zero = b.i32_val(0);
     auto ctaId = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     // We multicast if the flag is on and the block layout has broadcasting
     bool multicast = op.getMulticast();
