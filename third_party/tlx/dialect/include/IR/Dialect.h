@@ -13,6 +13,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "tlx/dialect/include/IR/Dialect.h.inc"
+#include "tlx/dialect/include/IR/TLXLayoutInterface.h.inc"
 #include "tlx/dialect/include/IR/Traits.h"
 #define GET_ATTRDEF_CLASSES
 #include "tlx/dialect/include/IR/TLXAttrDefs.h.inc"
@@ -42,6 +43,16 @@ bool tlxEnablePairedMMA(Operation *op);
 Attribute wrapNoVerifyLayout(Attribute layout);
 Attribute unwrapNoVerifyLayout(Attribute layout);
 bool hasNoVerifyLayout(Attribute layout);
+
+// Peel any TLX layout wrappers (attributes implementing TLXLayoutAttrInterface,
+// e.g. #tlx.no_verify_layout / #tlx.user_layout) to a fixed point and return
+// the concrete, non-wrapper encoding (or the argument unchanged if it is not a
+// wrapper). Use this wherever a TLX-produced encoding must be compared or
+// isa<>-tested against a concrete layout.
+Attribute getEffectiveEncoding(Attribute enc);
+
+// True iff `enc` is a TLX layout wrapper (implements TLXLayoutAttrInterface).
+bool isTLXLayoutWrapper(Attribute enc);
 
 // Wrap a concrete layout (distributed or shared) as a user-pinned layout (no-op
 // if the layout is already wrapped or is not a distributed/shared encoding).

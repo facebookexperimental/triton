@@ -86,8 +86,11 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
         cast<RankedTensorType>(dotOp.getA().getType()).getEncoding();
     Attribute bEncoding =
         cast<RankedTensorType>(dotOp.getB().getType()).getEncoding();
-    if (aEncoding && isa<triton::gpu::DotOperandEncodingAttr>(aEncoding) &&
-        bEncoding && isa<triton::gpu::DotOperandEncodingAttr>(bEncoding))
+    if (aEncoding && bEncoding &&
+        isa<triton::gpu::DotOperandEncodingAttr>(
+            triton::tlx::getEffectiveEncoding(aEncoding)) &&
+        isa<triton::gpu::DotOperandEncodingAttr>(
+            triton::tlx::getEffectiveEncoding(bEncoding)))
       return true;
     return false;
   });

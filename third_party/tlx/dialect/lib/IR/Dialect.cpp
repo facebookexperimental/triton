@@ -8,6 +8,7 @@
 // clang-format off
 #include "IR/Dialect.h"
 #include "IR/Dialect.cpp.inc"
+#include "IR/TLXLayoutInterface.cpp.inc"
 #include "IR/TLXTypesEnums.cpp.inc"
 // clang-format on
 
@@ -36,13 +37,13 @@ getInferLayoutInterfaceFor(Attribute layout) {
 // encoding, whose dialect provides the real layout-inference interface. Without
 // this a wrapped layout (a TLX-dialect attribute) would resolve its delegate
 // back to this same TLX interface and recurse forever (stack overflow).
+//
+// Migrated from a hand-rolled unwrapUserLayout(unwrapNoVerifyLayout(...)) loop
+// to the TLXLayoutAttrInterface-based getEffectiveEncoding, so any attribute
+// that advertises itself as a TLX layout wrapper is peeled automatically
+// without enumerating the concrete wrapper attrs here.
 static Attribute unwrapTlxLayoutWrappers(Attribute layout) {
-  Attribute prev;
-  do {
-    prev = layout;
-    layout = unwrapUserLayout(unwrapNoVerifyLayout(layout));
-  } while (layout != prev);
-  return layout;
+  return mlir::triton::tlx::getEffectiveEncoding(layout);
 }
 
 LogicalResult delegateInferredLayout(
@@ -127,11 +128,21 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     Attribute result;
     if (failed(infer(delegate, anchor, result)))
       return failure();
-    // Re-wrap no_verify as the outermost wrapper so a build-time verify (before
-    // ttg.num-warps is set) skips verifyTensorLayout. After resolve strips
-    // no_verify from operand and result alike, re-inference takes the plain
-    // branch and produces the same slice<parent=...>, so they stay consistent.
-    resultEncoding = deferred ? wrapNoVerifyLayout(result) : result;
+    if (!deferred) {
+      resultEncoding = result;
+      return success();
+    }
+
+    // Reduce returns a slice whose parent is the full-rank operand encoding, so
+    // keep no_verify on that parent. Expand-dims returns the parent itself.
+    if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(result)) {
+      auto parent = cast<triton::gpu::DistributedEncodingTrait>(
+          wrapNoVerifyLayout(slice.getParent()));
+      resultEncoding = triton::gpu::SliceEncodingAttr::get(
+          result.getContext(), slice.getDim(), parent);
+    } else {
+      resultEncoding = wrapNoVerifyLayout(result);
+    }
     return success();
   }
 
@@ -230,7 +241,25 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
   LogicalResult
   verifyDotOpEncodingCompatibility(Operation *op, Attribute operandEncodingA,
                                    Attribute operandEncodingB) const override {
-    return success();
+    // Peel TLX layout wrappers and delegate to the concrete result dialect's
+    // verifier, so a pinned dot operand (e.g. no_verify<user<dot_op>>) is
+    // actually checked as its concrete dot_op -- mirroring inferDotOpEncoding
+    // above -- instead of being blindly accepted. This keeps ttg core free of
+    // any TLX-unwrap logic: when the dot result is a TLX wrapper the dispatch
+    // lands here, we unwrap, and hand ttg the raw encodings it expects.
+    Attribute a = unwrapTlxLayoutWrappers(operandEncodingA);
+    Attribute b = unwrapTlxLayoutWrappers(operandEncodingB);
+    Attribute ret;
+    if (op->getNumResults() == 1)
+      if (auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
+        ret = unwrapTlxLayoutWrappers(rt.getEncoding());
+    const triton::DialectInferLayoutInterface *delegate =
+        ret ? getInferLayoutInterfaceFor(ret) : nullptr;
+    // No concrete result dialect yet (still fully wrapped) -> defer, matching
+    // the no_verify contract (verification happens after placeholder resolve).
+    if (!delegate)
+      return success();
+    return delegate->verifyDotOpEncodingCompatibility(op, a, b);
   }
 
   LogicalResult verifyCatOpEncodingCompatibility(Operation *op) const override {
@@ -330,6 +359,16 @@ Attribute mlir::triton::tlx::unwrapNoVerifyLayout(Attribute layout) {
   if (auto noVerify = dyn_cast_or_null<NoVerifyLayoutAttr>(layout))
     return noVerify.getLayout();
   return layout;
+}
+
+Attribute mlir::triton::tlx::getEffectiveEncoding(Attribute enc) {
+  while (auto wrapper = dyn_cast_or_null<TLXLayoutAttrInterface>(enc))
+    enc = wrapper.getUnderlyingLayout();
+  return enc;
+}
+
+bool mlir::triton::tlx::isTLXLayoutWrapper(Attribute enc) {
+  return enc && isa<TLXLayoutAttrInterface>(enc);
 }
 
 bool mlir::triton::tlx::hasNoVerifyLayout(Attribute layout) {
