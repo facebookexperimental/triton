@@ -76,6 +76,8 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
+    matmul as _amd_gemm_pingpong, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_gemm_tdm_pipelined,
     pack_scale as _amd_mxfp_pack_scale,
@@ -1394,6 +1396,17 @@ def test_amd_tdm_gemm_pipelined(dtype):
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_amd_gemm_warp_pipeline(dtype):
     Gemm.run_test(_amd_gemm_warp_pipeline, Gemm.CONFIGS["amd_gemm_warp_pipeline"], dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
+def test_amd_gemm_pingpong(dtype):
+    # Specialized kernel: config is baked in, so it can't go through Gemm.run_test.
+    for M, N, K in Gemm.SHAPES:
+        torch.manual_seed(0)
+        a = (torch.randn((M, K), device=DEVICE, dtype=dtype) + 1) / K
+        b = (torch.randn((K, N), device=DEVICE, dtype=dtype) + 1) / K
+        torch.testing.assert_close(_amd_gemm_pingpong(a, b), torch.matmul(a, b))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
