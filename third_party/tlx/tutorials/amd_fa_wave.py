@@ -1785,6 +1785,17 @@ def _attn_fwd_wave_pipeline(
     )
 
 
+def _storage_ranges_overlap(lhs, rhs):
+    """Return whether two contiguous tensors address any common byte."""
+    if lhs.device != rhs.device or lhs.numel() == 0 or rhs.numel() == 0:
+        return False
+    lhs_begin = lhs.data_ptr()
+    rhs_begin = rhs.data_ptr()
+    lhs_end = lhs_begin + lhs.numel() * lhs.element_size()
+    rhs_end = rhs_begin + rhs.numel() * rhs.element_size()
+    return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+
 def attention(
     q,
     k,
@@ -1801,6 +1812,8 @@ def attention(
 
     The default adaptive reference is numerically stable for unrestricted
     inputs.  ``qk_max_abs`` explicitly selects the bounded specialization.
+    ``out`` may be exactly ``q``, but it must not partially overlap ``q`` or
+    overlap any part of ``k`` or ``v``.
     """
     assert not causal, "amd_fa_wave only implements non-causal attention"
     assert q.dtype == torch.bfloat16, "amd_fa_wave requires BF16 inputs"
@@ -1831,6 +1844,12 @@ def attention(
     output = torch.empty_like(q) if out is None else out
     assert output.shape == q.shape and output.dtype == q.dtype
     assert output.is_contiguous()
+    if _storage_ranges_overlap(output, k):
+        raise ValueError("amd_fa_wave out must not overlap k")
+    if _storage_ranges_overlap(output, v):
+        raise ValueError("amd_fa_wave out must not overlap v")
+    if _storage_ranges_overlap(output, q) and not output.is_set_to(q):
+        raise ValueError("amd_fa_wave out may overlap q only when it is exactly the same tensor view")
     grid = (sequence // 256, batch * heads, 1)
     launch_options = {
         "N_CTX": sequence,
