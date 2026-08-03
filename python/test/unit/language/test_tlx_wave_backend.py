@@ -6891,7 +6891,11 @@ def test_tlx_wave_fa_forwards_compiler_options(monkeypatch):
         captured["options"] = options
         return sentinel
 
+    def unexpected_allocation(*_args, **_kwargs):
+        pytest.fail("provided out buffer must not allocate")
+
     monkeypatch.setattr(tutorial, "_attn_fwd_wave_pipeline", SimpleNamespace(warmup=warmup))
+    monkeypatch.setattr(tutorial.torch, "empty_like", unexpected_allocation)
     monkeypatch.setattr(
         tutorial.triton.runtime.driver.active,
         "get_current_target",
@@ -6928,6 +6932,116 @@ def test_tlx_wave_fa_forwards_compiler_options(monkeypatch):
         "ADAPTIVE_REFERENCE": True,
         "num_warps": 8,
     }
+
+
+def _make_fa_validation_inputs(torch, *, device="cpu"):
+    shape = (1, 1, 256, 128)
+    return [torch.empty(shape, dtype=torch.bfloat16, device=device) for _ in range(3)]
+
+
+@pytest.mark.parametrize("name", ["q", "k", "v"])
+@pytest.mark.parametrize("defect", ["rank", "dtype", "noncontiguous"])
+def test_tlx_wave_fa_rejects_invalid_input_tensor(name, defect):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_invalid_{name}_{defect}")
+    tensors = _make_fa_validation_inputs(torch)
+    index = {"q": 0, "k": 1, "v": 2}[name]
+    if defect == "rank":
+        tensors[index] = torch.empty((1, 256, 128), dtype=torch.bfloat16)
+        message = rf"{name} must be rank 4 .* got rank 3"
+    elif defect == "dtype":
+        tensors[index] = torch.empty((1, 1, 256, 128), dtype=torch.float16)
+        message = rf"{name} must have dtype torch.bfloat16, got torch.float16"
+    else:
+        tensors[index] = torch.empty((1, 1, 128, 256), dtype=torch.bfloat16).transpose(-1, -2)
+        assert tensors[index].shape == tensors[0].shape
+        message = rf"{name} must be contiguous"
+
+    with pytest.raises(ValueError, match=message):
+        tutorial.attention(*tensors)
+
+
+@pytest.mark.parametrize("name", ["k", "v"])
+def test_tlx_wave_fa_rejects_mixed_input_device(name):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_mixed_{name}_device")
+    tensors = _make_fa_validation_inputs(torch)
+    tensors[{"k": 1, "v": 2}[name]] = torch.empty((1, 1, 256, 128), dtype=torch.bfloat16, device="meta")
+
+    with pytest.raises(ValueError, match=rf"{name} must be on the same device as q"):
+        tutorial.attention(*tensors)
+
+
+@pytest.mark.parametrize("name", ["k", "v"])
+def test_tlx_wave_fa_rejects_mismatched_input_shape(name):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_mismatched_{name}_shape")
+    tensors = _make_fa_validation_inputs(torch)
+    tensors[{"k": 1, "v": 2}[name]] = torch.empty((1, 2, 256, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=rf"{name} must have shape"):
+        tutorial.attention(*tensors)
+
+
+@pytest.mark.parametrize(
+    "shape,message",
+    [
+        ((0, 1, 256, 128), "batch and head dimensions must be positive"),
+        ((1, 0, 256, 128), "batch and head dimensions must be positive"),
+        ((1, 1, 128, 128), "sequence length must be a multiple of 256 and at least 256"),
+        ((1, 1, 384, 128), "sequence length must be a multiple of 256 and at least 256"),
+        ((1, 1, 256, 64), "head dimension must be 128"),
+    ],
+)
+def test_tlx_wave_fa_rejects_unsupported_shape(shape, message):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_unsupported_shape_{shape}")
+    tensors = [torch.empty(shape, dtype=torch.bfloat16) for _ in range(3)]
+
+    with pytest.raises(ValueError, match=message):
+        tutorial.attention(*tensors)
+
+
+@pytest.mark.parametrize("warmup", [False, True], ids=["launch", "warmup"])
+@pytest.mark.parametrize("defect", ["rank", "dtype", "device", "shape", "noncontiguous"])
+def test_tlx_wave_fa_rejects_invalid_output(defect, warmup):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_invalid_output_{defect}_{warmup}")
+    q, k, v = _make_fa_validation_inputs(torch)
+    if defect == "rank":
+        output = torch.empty((1, 256, 128), dtype=torch.bfloat16)
+        message = r"out must be rank 4 .* got rank 3"
+    elif defect == "dtype":
+        output = torch.empty(q.shape, dtype=torch.float16)
+        message = r"out must have dtype torch.bfloat16, got torch.float16"
+    elif defect == "device":
+        output = torch.empty(q.shape, dtype=torch.bfloat16, device="meta")
+        message = r"out must be on the same device as q"
+    elif defect == "shape":
+        output = torch.empty((1, 2, 256, 128), dtype=torch.bfloat16)
+        message = r"out must have shape"
+    else:
+        output = torch.empty((1, 1, 128, 256), dtype=torch.bfloat16).transpose(-1, -2)
+        assert output.shape == q.shape
+        message = r"out must be contiguous"
+
+    with pytest.raises(ValueError, match=message):
+        tutorial.attention(q, k, v, out=output, warmup=warmup)
+
+
+def test_tlx_wave_fa_rejects_causal_mode():
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_causal_mode")
+    q, k, v = _make_fa_validation_inputs(torch)
+
+    with pytest.raises(ValueError, match="only implements non-causal attention"):
+        tutorial.attention(q, k, v, causal=True)
 
 
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
