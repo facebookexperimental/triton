@@ -164,7 +164,13 @@ class ShflCombine:
         return (self.child, )
 
     def sig_local(self, child_sigs):
-        return f"shfl{self.offset}.{self.kind}{''.join(self.mods)}({child_sigs[0]})"
+        # .rn is the DEFAULT rounding for add (add.f32 == add.rn.f32 bit-for-bit), so strip it here
+        # the same way FpOp / ITreeReduce do: enable_fp_fusion on/off flips implicit-vs-explicit .rn
+        # on the butterfly combine, and keeping mods verbatim spuriously split a pure-add reduction
+        # (unordered / partially-collapsed) across fp_fusion on num_warps-invariant bits. min/max
+        # carry no .rn so they are unaffected; sub/div are not reduce butterflies.
+        m = _norm("".join(self.mods)) if self.kind in ("add", "mul", "fma") else "".join(self.mods)
+        return f"shfl{self.offset}.{self.kind}{m}({child_sigs[0]})"
 
     def sig(self):
         return self.sig_local([self.child.sig()])
