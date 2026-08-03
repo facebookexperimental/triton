@@ -459,7 +459,12 @@ class SoftmaxState:
         if ADAPTIVE_REFERENCE:
             raw_registers0 = _score_packet_to_registers(score0)
             raw_registers1 = _score_packet_to_registers(score1)
-            tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
+            if qk_scale < 0.0:
+                scaled_registers0 = raw_registers0 * qk_scale
+                scaled_registers1 = raw_registers1 * qk_scale
+                tile_max = _reduce_max_score_registers(scaled_registers0, scaled_registers1)
+            else:
+                tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
             if INITIAL:
                 reference = tile_max
             else:
@@ -569,8 +574,12 @@ class SoftmaxState:
             # form the same FMA as its native FA implementation without a
             # kernel-specific fused operation in the bridge.
             negative_reference = (tl.zeros((8 * 64, 1), tl.float32) - reference[:, None])
-            registers0 = raw_registers0 * qk_scale + negative_reference
-            registers1 = raw_registers1 * qk_scale + negative_reference
+            if qk_scale < 0.0:
+                registers0 = scaled_registers0 + negative_reference
+                registers1 = scaled_registers1 + negative_reference
+            else:
+                registers0 = raw_registers0 * qk_scale + negative_reference
+                registers1 = raw_registers1 * qk_scale + negative_reference
         else:
             score0 = score0 * qk_scale + (-log2_score_bound)
             score1 = score1 * qk_scale + (-log2_score_bound)
@@ -610,7 +619,12 @@ class SoftmaxState:
         score0, score1 = _split_last_2(scores)
         raw_registers0 = _score_packet_to_registers(score0)
         raw_registers1 = _score_packet_to_registers(score1)
-        tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
+        if qk_scale < 0.0:
+            scaled_registers0 = raw_registers0 * qk_scale
+            scaled_registers1 = raw_registers1 * qk_scale
+            tile_max = _reduce_max_score_registers(scaled_registers0, scaled_registers1)
+        else:
+            tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
         candidate = tl.maximum(
             self.row_max,
             tile_max,
@@ -643,8 +657,12 @@ class SoftmaxState:
         needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
         reference = tl.where(needs_rebase, candidate, self.row_max)
         negative_reference = (tl.zeros((8 * 64, 1), tl.float32) - reference[:, None])
-        registers0 = raw_registers0 * qk_scale + negative_reference
-        registers1 = raw_registers1 * qk_scale + negative_reference
+        if qk_scale < 0.0:
+            registers0 = scaled_registers0 + negative_reference
+            registers1 = scaled_registers1 + negative_reference
+        else:
+            registers0 = raw_registers0 * qk_scale + negative_reference
+            registers1 = raw_registers1 * qk_scale + negative_reference
 
         registers0 = tl.math.exp2(registers0)
         lower8, tail8 = _split_last_2(registers1)
@@ -1796,13 +1814,16 @@ def attention(
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
+    sm_scale = float(sm_scale)
+    if not math.isfinite(sm_scale):
+        raise ValueError("sm_scale must be finite")
     adaptive_reference = qk_max_abs is None
     if adaptive_reference:
         log2_score_bound = 0.0
     else:
         if not math.isfinite(qk_max_abs) or qk_max_abs <= 0:
             raise ValueError("qk_max_abs must be finite and greater than zero")
-        log2_score_bound = (math.log2(math.e) * head_dim * float(sm_scale) * qk_max_abs * qk_max_abs)
+        log2_score_bound = (math.log2(math.e) * head_dim * abs(sm_scale) * qk_max_abs * qk_max_abs)
         log2_score_span = 2.0 * abs(log2_score_bound)
         if not math.isfinite(log2_score_span) or log2_score_span >= FIXED_REFERENCE_MAX_LOG2_SPAN:
             raise ValueError(f"fixed-reference log2 score span ({log2_score_span:g}) must be less than "
@@ -1816,7 +1837,7 @@ def attention(
         "BATCH": batch,
         "HEADS": heads,
         "TOTAL_HEADS": batch * heads,
-        "SM_SCALE": float(sm_scale),
+        "SM_SCALE": sm_scale,
         "LOG2_SCORE_BOUND": log2_score_bound,
         "ADAPTIVE_REFERENCE": adaptive_reference,
         "num_warps": 8,
