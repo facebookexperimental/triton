@@ -769,6 +769,12 @@ def test_tlx_fa_precompile_reuses_runtime_launch_configuration(monkeypatch):
     assert cluster_kwargs["BLOCK_N"] == 32
     assert cluster_kwargs["num_warps"] == 8
     assert cluster_kwargs["waves_per_eu"] == 0
+    assert cluster_kwargs["disable_vector_combine"] is False
+
+    bench.compile_kernel_config(("cluster", 1, 64, 4096, 128, False, "bf16"), num_sms=304)
+    noncausal_cluster_kwargs = calls["cluster"][1]
+    assert noncausal_cluster_kwargs["BLOCK_N"] == 64
+    assert noncausal_cluster_kwargs["disable_vector_combine"] is True
 
     perf_jobs = bench.compilation_jobs(SimpleNamespace(mode="perf_test"))
     assert len(perf_jobs) == len(bench.PERF_BASELINE_TFLOPS) == 42
