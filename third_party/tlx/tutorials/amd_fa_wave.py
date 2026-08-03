@@ -1001,18 +1001,14 @@ def _issue_tile(
 
 @triton.jit
 def _stage_end():
-    """Match standalone Wave's scheduling and CTA-convergence boundary."""
-    tlx.sched_barrier()
+    """Match standalone Wave's CTA-convergence boundary."""
     tl.debug_barrier()
-    tlx.sched_barrier()
 
 
 @triton.jit
 def _wait_stage_end(PENDING: tl.constexpr, tokens):
     """Publish an explicit async wait at a standalone stage boundary."""
-    tlx.sched_barrier()
     ready = tlx.async_load_wait_group(PENDING, tokens=tokens)
-    tlx.sched_barrier()
     return ready
 
 
@@ -1048,7 +1044,6 @@ def _score_phase(
     next_scores = tl.dot(q, current_k, score_acc)
     next_scores = tlx.release_layout(next_scores)
     q = tlx.release_layout(q)
-    tlx.sched_barrier()
     return state, p_dot, next_scores
 
 
@@ -1117,7 +1112,6 @@ def _warp_pipeline_phase(
         next_scores = tl.dot(q, current_k, score_acc)
         next_scores = tlx.release_layout(next_scores)
         q = tlx.release_layout(q)
-        tlx.sched_barrier()
 
     with tlx.warp_pipeline_stage("value"):
         value_fragments = _load_value_fragments(
