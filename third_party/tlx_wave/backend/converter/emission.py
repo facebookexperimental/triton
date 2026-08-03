@@ -572,7 +572,7 @@ def _emit_mma_packet_float_binary_component(state, operation, fastmath, lhs_comp
             target_op_id=op.target_op_id,
         )
     scalar_type = state.dsl.simd_type(lhs_element_type, int(lhs_lane_width))
-    if (operation in {"addf", "mulf"} and str(lhs_element_type) == "f32" and int(lhs_width) >= 2
+    if (operation in {"addf", "subf", "mulf"} and str(lhs_element_type) == "f32" and int(lhs_width) >= 2
             and int(lhs_width) % 2 == 0):
         return _emit_wave_float_binary_component(
             state,
