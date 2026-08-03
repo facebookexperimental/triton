@@ -388,14 +388,6 @@ unsigned ttng::TmemAllocChannel::getNumBuffers() {
   return 1;
 }
 
-// Check to see if there is no outer loop that is enclosed under ifOp.
-bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
-  auto pOp = subOp->getParentOfType<scf::ForOp>();
-  if (!pOp)
-    return true;
-  return !enclosing(ifOp, pOp.getOperation());
-}
-
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {

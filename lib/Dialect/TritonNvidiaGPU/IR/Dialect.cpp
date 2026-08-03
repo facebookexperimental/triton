@@ -49,6 +49,8 @@ namespace mlir {
 namespace triton {
 namespace nvidia_gpu {
 
+namespace {
+
 FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
   Attribute attr;
   if (parser.parseAttribute(attr).failed())
@@ -61,6 +63,8 @@ FailureOr<gpu::CGAEncodingAttr> parseCGALayoutRankTwo(AsmParser &parser) {
 void printCGALayoutRankTwo(AsmPrinter &printer, gpu::CGAEncodingAttr cgaAttr) {
   gpu::printCGAAttr(printer, cgaAttr);
 }
+
+} // namespace
 
 TensorMemoryScalesBlockRepOrder getTensorMemoryScalesBlockRepOrder(
     Operation *op, bool isA, ScaleDotElemType aType, ScaleDotElemType bType,

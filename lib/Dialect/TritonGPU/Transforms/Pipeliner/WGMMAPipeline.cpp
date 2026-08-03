@@ -246,6 +246,8 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
   wait->erase();
 }
 
+namespace {
+
 // Split the LHS of a RSWGMMADot operation into multiple
 // tensors of size MxnewK via SplitOps
 SmallVector<Value> splitLhs(OpBuilder &builder,
@@ -389,6 +391,8 @@ splitRSDots(const llvm::MapVector<Operation *, int> &dots) {
   }
   return ret;
 }
+
+} // namespace
 
 // Determines whether a given MMAv3 dot op, represented as ttng.warp_group_dot,
 // needs a wait immediately after it.
