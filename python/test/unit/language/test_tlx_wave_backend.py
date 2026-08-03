@@ -449,6 +449,26 @@ def _load_tlx_fa_wave_module(module_name="_tlx_wave_test_fa_wave"):
     return module
 
 
+def _load_tlx_fa_wave_bench_module(module_name="_tlx_wave_test_fa_wave_bench"):
+    repo_root = Path(__file__).resolve().parents[4]
+    tutorial_dir = repo_root / "third_party" / "tlx" / "tutorials"
+    bench_path = tutorial_dir / "amd_fa_wave_bench.py"
+    before_path = list(sys.path)
+    previous_kernel_module = sys.modules.get("amd_fa_wave")
+    try:
+        sys.path.insert(0, str(tutorial_dir))
+        spec = importlib.util.spec_from_file_location(module_name, bench_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = before_path
+        if previous_kernel_module is None:
+            sys.modules.pop("amd_fa_wave", None)
+        else:
+            sys.modules["amd_fa_wave"] = previous_kernel_module
+
+
 def _load_tlx_perf_sweep_module(module_name="_tlx_wave_test_perf_sweep"):
     repo_root = Path(__file__).resolve().parents[4]
     script_path = repo_root / "third_party" / "tlx" / "tutorials" / "run_wave_perf_sweeps.py"
@@ -874,12 +894,14 @@ def test_tlx_perf_sweep_forwards_compile_workers_to_fa(tmp_path):
     assert [spec.name for spec in specs] == [
         "fa-llvm",
         "fa-wave",
-        "fa-eight-wave-llvm",
-        "fa-eight-wave-wave",
+        "fa-eight-wave-bounded-llvm",
+        "fa-eight-wave-bounded-wave",
+        "fa-eight-wave-adaptive-llvm",
+        "fa-eight-wave-adaptive-wave",
     ]
-    assert [spec.backend for spec in specs] == ["llvm", "wave", "llvm", "wave"]
+    assert [spec.backend for spec in specs] == ["llvm", "wave", "llvm", "wave", "llvm", "wave"]
     assert all(spec.command[-2:] == ("--compile-workers", "3") for spec in specs[:2])
-    for spec, minimum in zip(specs[2:], ("0", "1000")):
+    for spec, minimum in zip(specs[2:4], ("0", "1000")):
         assert spec.command[-8:] == (
             "--rep",
             "1",
@@ -890,6 +912,85 @@ def test_tlx_perf_sweep_forwards_compile_workers_to_fa(tmp_path):
             "--min-tflops",
             minimum,
         )
+    for spec, minimum in zip(specs[4:], ("0", "1000")):
+        assert spec.command[-6:] == (
+            "--rep",
+            "1",
+            "--warmup",
+            "0",
+            "--min-tflops",
+            minimum,
+        )
+
+
+def test_tlx_fa_wave_bench_forces_every_adaptive_rebase():
+    pytest.importorskip("torch")
+    bench = _load_tlx_fa_wave_bench_module()
+    shape = (2, 8, 256, 128)
+
+    q, k, v, rebase_count, minimum_advance = bench.forced_rebase_inputs(shape, "cpu", seed=17)
+
+    assert q.shape == k.shape == v.shape == shape
+    assert q[..., 0].eq(1).all()
+    assert q[..., 1:].eq(0).all()
+    assert k[..., 0].reshape(-1, shape[2])[0].unique_consecutive().tolist() == [0.0, 64.0, 128.0, 192.0]
+    assert k[..., 1:].eq(0).all()
+    assert rebase_count == shape[2] // bench.KV_TILE_SIZE - 1 == 3
+    assert minimum_advance > bench.FORCED_REBASE_LOG2_HEADROOM
+    assert bench.ADVERTISED_SHAPE == (2, 64, 8192, 128)
+    batch, heads, sequence, _ = bench.ADVERTISED_SHAPE
+    program_count = batch * heads * (sequence // bench.QUERY_TILE_SIZE)
+    assert program_count == 4096
+    assert program_count % bench.XCD_COUNT == 0
+
+
+def test_tlx_fa_wave_bench_gates_adaptive_full_shape_and_forced_rebases(monkeypatch):
+    bench = _load_tlx_fa_wave_bench_module("_tlx_wave_test_fa_wave_bench_adaptive_gate")
+    correctness_cases = []
+    performance_cases = []
+    nominal = (object(), object(), object())
+    forced = (object(), object(), object())
+
+    monkeypatch.setattr(
+        bench,
+        "parse_args",
+        lambda: SimpleNamespace(warmup=7, rep=31, min_tflops=1000.0, qk_max_abs=None),
+    )
+    monkeypatch.setattr(
+        bench.triton.runtime.driver,
+        "active",
+        SimpleNamespace(
+            get_active_torch_device=lambda: "test-device",
+            get_current_target=lambda: SimpleNamespace(backend="tlx_wave"),
+        ),
+    )
+    monkeypatch.setattr(bench, "bounded_inputs", lambda shape, device, seed: nominal)
+    monkeypatch.setattr(
+        bench,
+        "forced_rebase_inputs",
+        lambda shape, device, seed: (*forced, 127, 8.161),
+    )
+
+    def check_correctness(q, k, v, *, qk_max_abs, case):
+        correctness_cases.append(((q, k, v), qk_max_abs, case))
+        return True
+
+    def measure_performance(q, k, v, *, warmup, rep, qk_max_abs):
+        performance_cases.append(((q, k, v), warmup, rep, qk_max_abs))
+        return 4.0, 1001.0
+
+    monkeypatch.setattr(bench, "check_correctness", check_correctness)
+    monkeypatch.setattr(bench, "measure_performance", measure_performance)
+
+    assert bench.main() == 0
+    assert correctness_cases == [
+        (nominal, None, "bounded-distribution"),
+        (forced, None, "forced-rebase count=127 min-log2-advance=8.161000"),
+    ]
+    assert performance_cases == [
+        (nominal, 7, 31, None),
+        (forced, 7, 31, None),
+    ]
 
 
 def test_tlx_perf_sweep_forwards_f16_input_and_timing_options(tmp_path):
@@ -6579,6 +6680,45 @@ def test_tlx_wave_fa_rejects_unsafe_fixed_reference_span():
 
     with pytest.raises(ValueError, match=r"fixed-reference log2 score span .* must be less than 126"):
         tutorial.attention(tensor, tensor, tensor, qk_max_abs=2.0)
+
+
+@pytest.mark.parametrize("backend", ["llvm", "wave"])
+def test_tlx_wave_runtime_gfx950_fa_fixed_reference_normal_boundary_e2e(tmp_path, backend):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for eight-wave FA e2e, got {arch}")
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_fixed_reference_normal_boundary_{backend}")
+
+    shape = (1, 1, 256, 128)
+    device = torch.device("cuda")
+    safe_bound = 1.9609375
+    unsafe_bound = 1.96875
+    scale = 1.0 / math.sqrt(shape[-1])
+    safe_span = 2.0 * math.log2(math.e) * shape[-1] * scale * safe_bound * safe_bound
+    unsafe_span = 2.0 * math.log2(math.e) * shape[-1] * scale * unsafe_bound * unsafe_bound
+    assert safe_span < tutorial.FIXED_REFERENCE_MAX_LOG2_SPAN < unsafe_span
+
+    q = torch.full(shape, safe_bound, dtype=torch.bfloat16, device=device)
+    k = torch.full(shape, -safe_bound, dtype=torch.bfloat16, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    v = torch.rand(shape, dtype=torch.float32, device=device,
+                   generator=generator).mul_(2.0).sub_(1.0).to(torch.bfloat16)
+    expected = v.float().mean(dim=2, keepdim=True).expand(shape).to(torch.bfloat16)
+
+    driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
+    with (
+            driver_context(),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-fixed-reference-normal-boundary-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.attention(q, k, v, qk_max_abs=safe_bound)
+        torch.cuda.synchronize()
+
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("qk_max_abs", [None, 1.0], ids=["adaptive", "bounded"])
