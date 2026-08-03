@@ -354,7 +354,7 @@ py::list getAutoTmaRecipes(ModuleOp &mod) {
         auto shp = blockTy.getShape();
         blockShape.assign(shp.begin(), shp.end());
         if (shp.size() >= 2 &&
-            isa<ttg::NVMMASharedEncodingAttr>(blockTy.getEncoding())) {
+            isa<ttg::NVMMASharedEncodingAttr>(descTy.getSharedLayout())) {
           auto sw = ttng::getTMASwizzleMode(descArg.getLoc(), descTy);
           if (succeeded(sw))
             swizzle = *sw;
