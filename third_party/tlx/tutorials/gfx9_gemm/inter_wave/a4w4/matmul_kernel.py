@@ -872,11 +872,14 @@ def _matmul_skinny(a, b, a_scales, b_scales, SPLIT_K=None):
 
 def matmul(a, b, a_scales, b_scales):
     """A @ B.T for packed MXFP4 A/B. Dispatches on the 256-tile grid fill:
-    severely occupancy-starved shapes (e.g. skinny-N) take the 128x128 + split-K
-    TLX path; everything else takes the 256x256 inter-wave path."""
+    the 256x256 inter-wave tile only fills the GPU once its grid reaches ~half the
+    CUs; below that it wastes CUs (a 256x256 tile is 1 workgroup/CU), so route those
+    occupancy-starved shapes to the 128x128 + split-K path, which spawns 4x the
+    workgroups and refills with split-K. Measured crossover on gfx950 (256 CUs):
+    skinny wins for grid_256 <= 64, the 256x256 tile wins from grid_256 >= 128."""
     M = a.shape[0]
     N = b.shape[0]
     grid_mn_256 = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    if grid_mn_256 <= NUM_CU // 32:
+    if grid_mn_256 <= NUM_CU // 4:
         return _matmul_skinny(a, b, a_scales, b_scales)
     return _matmul_256tile(a, b, a_scales, b_scales)
