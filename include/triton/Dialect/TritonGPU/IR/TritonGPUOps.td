@@ -14,8 +14,8 @@ include "triton/Dialect/Triton/IR/TritonOpInterfaces.td"
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td" // RegionBranchOpInterface
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
-include "mlir/Interfaces/InferTypeOpInterface.td"  // SameOperandsAndResultType
-include "mlir/Interfaces/SideEffectInterfaces.td"  // Pure
+include "mlir/Interfaces/InferTypeOpInterface.td" // SameOperandsAndResultType
+include "mlir/Interfaces/SideEffectInterfaces.td" // Pure
 include "mlir/Interfaces/ViewLikeInterface.td"
 
 //
@@ -24,15 +24,14 @@ include "mlir/Interfaces/ViewLikeInterface.td"
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
 def SharedMemory : Resource<"::mlir::triton::gpu::SharedMemory">;
 
-class TTG_Op<string mnemonic, list<Trait> traits = []> :
-    Op<TritonGPU_Dialect, mnemonic,
-       !listconcat(traits, [VerifyTensorLayoutsTrait, VerifyMemDescLayoutsTrait])> {
-}
+class TTG_Op<string mnemonic, list<Trait> traits = []>
+    : Op<TritonGPU_Dialect, mnemonic,
+         !listconcat(
+             traits, [VerifyTensorLayoutsTrait, VerifyMemDescLayoutsTrait])> {}
 
-def TTG_ConvertLayoutOp : TTG_Op<"convert_layout",
-                                 [SameOperandsAndResultShape,
-                                  SameOperandsAndResultElementType,
-                                  Pure]> {
+def TTG_ConvertLayoutOp
+    : TTG_Op<"convert_layout", [SameOperandsAndResultShape,
+                                SameOperandsAndResultElementType, Pure]> {
   let summary = "convert layout";
 
   let arguments = (ins TT_Tensor:$src);
@@ -69,7 +68,8 @@ def TTG_AsyncWaitOp : TTG_Op<"async_wait", [MemWaitOpTrait]> {
 }
 
 def TTG_AsyncCommitGroupOp : TTG_Op<"async_commit_group"> {
-  let summary = "Commit pending async copies into an async group that can be waited on";
+  let summary =
+      "Commit pending async copies into an async group that can be waited on";
   let description = [{
     Closes the current batch of async_copy_* operations
     and allows for them to be waited on with `ttg.async_wait`.
@@ -87,13 +87,14 @@ def TTG_AsyncCommitGroupOp : TTG_Op<"async_commit_group"> {
   }];
 }
 
-def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
-  AttrSizedOperandSegments,
-  DeclareOpInterfaceMethods<PredicatedOpInterface>,
-  OptionalTypesMatchWith<"infer mask type from src type",
-                 "src", "mask", "getI1SameShape($_self)">,
-  OptionalTypesMatchWith<"infer other type from src type",
-                 "src", "other", "getPointeeType($_self)">,
+def TTG_AsyncCopyGlobalToLocalOp
+    : TTG_Op<"async_copy_global_to_local",
+             [AttrSizedOperandSegments,
+              DeclareOpInterfaceMethods<PredicatedOpInterface>,
+              OptionalTypesMatchWith<"infer mask type from src type", "src",
+                                     "mask", "getI1SameShape($_self)">,
+              OptionalTypesMatchWith<"infer other type from src type", "src",
+                                     "other", "getPointeeType($_self)">,
 ]> {
   let summary = "Copy data from global memory to local memory asynchronously";
 
@@ -116,42 +117,41 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     pointers and mask/other type constraints apply.
   }];
 
-  let arguments = (ins
-    Arg<TT_PtrLike, "", [MemRead<GlobalMemory>]>:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
-    Optional<I1Tensor>:$mask,
-    Optional<TT_Type>:$other,
-    Optional<I32>:$bulkSize,
-    Optional<TTG_MemDescType>:$barrier,
-    DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
-    DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
-    DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
-    DefaultValuedAttr<BoolAttr, "false">:$useBulk,
-    DefaultValuedAttr<I32Attr, "1">:$contiguity
-  );
+  let arguments = (ins Arg<TT_PtrLike, "", [MemRead<GlobalMemory>]>:$src,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$result,
+      Optional<I1Tensor>:$mask, Optional<TT_Type>:$other,
+      Optional<I32>:$bulkSize, Optional<TTG_MemDescType>:$barrier,
+      DefaultValuedAttr<TT_CacheModifierAttr,
+                        "triton::CacheModifier::NONE">:$cache,
+      DefaultValuedAttr<TT_EvictionPolicyAttr,
+                        "triton::EvictionPolicy::NORMAL">:$evict,
+      DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
+      DefaultValuedAttr<BoolAttr, "false">:$useBulk,
+      DefaultValuedAttr<I32Attr, "1">:$contiguity);
 
   let results = (outs TTG_AsyncToken:$token);
 
   let builders = [
-    // Backward-compatible builder without bulkSize/barrier/useBulk/contiguity
-    OpBuilder<(ins "Value":$src, "Value":$result, "Value":$mask, "Value":$other,
-                   "triton::CacheModifier":$cache, "triton::EvictionPolicy":$evict,
-                   "bool":$isVolatile),
-              [{
+      // Backward-compatible builder without bulkSize/barrier/useBulk/contiguity
+      OpBuilder<(ins "Value":$src, "Value":$result, "Value":$mask,
+                    "Value":$other, "triton::CacheModifier":$cache,
+                    "triton::EvictionPolicy":$evict, "bool":$isVolatile),
+                [{
                 build($_builder, $_state, src, result, mask, other,
                       /*bulkSize=*/Value(), /*barrier=*/Value(), cache, evict,
                       isVolatile, /*useBulk=*/false, /*contiguity=*/1);
               }]>,
-    // Backward-compatible builder without bulkSize/barrier/useBulk but with contiguity
-    OpBuilder<(ins "Value":$src, "Value":$result, "Value":$mask, "Value":$other,
-                   "triton::CacheModifier":$cache, "triton::EvictionPolicy":$evict,
-                   "bool":$isVolatile, "int":$contiguity),
-              [{
+      // Backward-compatible builder without bulkSize/barrier/useBulk but with
+      // contiguity
+      OpBuilder<(ins "Value":$src, "Value":$result, "Value":$mask,
+                    "Value":$other, "triton::CacheModifier":$cache,
+                    "triton::EvictionPolicy":$evict, "bool":$isVolatile,
+                    "int":$contiguity),
+                [{
                 build($_builder, $_state, src, result, mask, other,
                       /*bulkSize=*/Value(), /*barrier=*/Value(), cache, evict,
                       isVolatile, /*useBulk=*/false, contiguity);
-              }]>
-  ];
+              }]>];
 
   let extraClassDeclaration = [{
     static DenseSet<unsigned> getEligibleLoadByteWidth(int computeCapability) {
@@ -179,7 +179,8 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
 }
 
 // Allocate shared memory
-def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<
+                                                 MemoryEffectsOpInterface>]> {
   let summary = "allocate tensor";
   let description = [{
     This operation allocates buffer in shared memory and return a descriptor
@@ -191,20 +192,18 @@ def TTG_LocalAllocOp : TTG_Op<"local_alloc", [DeclareOpInterfaceMethods<MemoryEf
     must have the element type as the buffer. If `src` is not specified, the
     returned buffer must be mutable.
   }];
-  let arguments = (
-    ins
-    Optional<TT_Tensor>:$src,
-    OptionalAttr<I32Attr>:$alignment
-  );
+  let arguments = (ins Optional<TT_Tensor>:$src,
+      OptionalAttr<I32Attr>:$alignment);
 
-  let builders = [
-    OpBuilder<(ins "Type":$result),
-              [{ build($_builder, $_state, result, Value(), IntegerAttr()); }]>,
-    OpBuilder<(ins "Type":$result, "Value":$src),
-              [{ build($_builder, $_state, result, src, IntegerAttr()); }]>,
-    OpBuilder<(ins "Type":$result, "Value":$src, "int32_t":$alignment),
-              [{ build($_builder, $_state, result, src, $_builder.getI32IntegerAttr(alignment)); }]>
-  ];
+  let builders =
+      [OpBuilder<
+           (ins "Type":$result),
+           [{ build($_builder, $_state, result, Value(), IntegerAttr()); }]>,
+       OpBuilder<(ins "Type":$result, "Value":$src),
+                 [{ build($_builder, $_state, result, src, IntegerAttr()); }]>,
+       OpBuilder<
+           (ins "Type":$result, "Value":$src, "int32_t":$alignment),
+           [{ build($_builder, $_state, result, src, $_builder.getI32IntegerAttr(alignment)); }]>];
 
   let extraClassDeclaration = [{
     bool isSharedMemoryAlloc() {
@@ -265,12 +264,14 @@ def TTG_MemDescIndexOp : TTG_Op<"memdesc_index", [Pure, MemDescViewTrait]> {
 
   let results = (outs TTG_MemDescType:$result);
 
-  let assemblyFormat = [{$src `[` $index `]` attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
+  let assemblyFormat =
+      [{$src `[` $index `]` attr-dict `:` qualified(type($src)) `->` qualified(type($result))}];
 
   let hasVerifier = 1;
 }
 
-def TTG_MemDescSubsliceOp : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]> {
+def TTG_MemDescSubsliceOp
+    : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]> {
   let summary = "take a subview of the descriptor.";
 
   let description = [{
@@ -301,11 +302,10 @@ def TTG_MemDescSubsliceOp : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]>
   let hasVerifier = 1;
 }
 
-def TTG_MemDescTransOp : TTG_Op<"memdesc_trans", [Pure,
-                                                  MemDescViewTrait,
-                                                  TransposeOpInterface,
-                                                  InferMemDescTypeOpWithLayoutEquivalence,
-                                                  SameOperandsAndResultElementType]> {
+def TTG_MemDescTransOp
+    : TTG_Op<"memdesc_trans", [Pure, MemDescViewTrait, TransposeOpInterface,
+                               InferMemDescTypeOpWithLayoutEquivalence,
+                               SameOperandsAndResultElementType]> {
   let summary = "transpose the descriptor";
 
   let description = [{
@@ -313,21 +313,19 @@ def TTG_MemDescTransOp : TTG_Op<"memdesc_trans", [Pure,
     representing a transposed view of the buffer.
   }];
 
-  let arguments = (
-    ins TTG_MemDescType:$src,
-    DenseI32ArrayAttr:$order
-  );
+  let arguments = (ins TTG_MemDescType:$src, DenseI32ArrayAttr:$order);
 
   let results = (outs TTG_MemDescType:$result);
 
-  let assemblyFormat = "$src attr-dict `:` qualified(type($src)) `->` qualified(type($result))";
+  let assemblyFormat =
+      "$src attr-dict `:` qualified(type($src)) `->` qualified(type($result))";
 
   let hasFolder = 1;
 }
 
-def TTG_MemDescReshapeOp : TTG_Op<"memdesc_reshape", [Pure,
-                                                      MemDescViewTrait,
-                                                      SameOperandsAndResultElementType]> {
+def TTG_MemDescReshapeOp
+    : TTG_Op<"memdesc_reshape", [Pure, MemDescViewTrait,
+                                 SameOperandsAndResultElementType]> {
   let summary = "creates a descriptor for the new shape";
 
   let description = [{
@@ -337,9 +335,7 @@ def TTG_MemDescReshapeOp : TTG_Op<"memdesc_reshape", [Pure,
 
   let arguments = (ins TTG_MemDescType:$src);
 
-  let builders = [
-    OpBuilder<(ins "Value":$src, "ArrayRef<int64_t>":$shape),
-              [{
+  let builders = [OpBuilder<(ins "Value":$src, "ArrayRef<int64_t>":$shape), [{
                 MemDescType dstTy;
                 auto srcTy = cast<MemDescType>(src.getType());
                 auto result = inferReturnTypes($_builder.getContext(),
@@ -347,8 +343,7 @@ def TTG_MemDescReshapeOp : TTG_Op<"memdesc_reshape", [Pure,
                                            srcTy, shape, dstTy);
                 assert(succeeded(result) && "failed to infer return types");
                 build($_builder, $_state, dstTy, src);
-              }]>
-  ];
+              }]>];
   let extraClassDeclaration = [{
       static LogicalResult inferReturnTypes(MLIRContext *context,
                                         std::optional<Location> loc,
@@ -359,12 +354,14 @@ def TTG_MemDescReshapeOp : TTG_Op<"memdesc_reshape", [Pure,
 
   let results = (outs TTG_MemDescType:$result);
 
-  let assemblyFormat = "$src attr-dict `:` qualified(type($src)) `->` qualified(type($result))";
+  let assemblyFormat =
+      "$src attr-dict `:` qualified(type($src)) `->` qualified(type($result))";
 
   let hasVerifier = 1;
 }
 
-def TTG_MemDescReinterpretOp : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewTrait]> {
+def TTG_MemDescReinterpretOp
+    : TTG_Op<"memdesc_reinterpret", [Pure, MemDescViewTrait]> {
   let summary = "reinterpret a memory descriptor as a different type and shape";
 
   let description = [{
@@ -396,20 +393,17 @@ def TTG_LocalLoadOp : TTG_Op<"local_load", [LocalLoadTrait]> {
   let description = [{
     Load a tensor from the local memory descriptor into a distributed tensor.
   }];
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    Optional<TTG_AsyncToken>:$token
-  );
+  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+      Optional<TTG_AsyncToken>:$token);
   let results = (outs TT_Tensor:$result);
 
-  let builders = [
-      OpBuilder<(ins "Type":$retType, "Value":$src),
-      [{
+  let builders = [OpBuilder<(ins "Type":$retType, "Value":$src), [{
       build($_builder, $_state, retType, src, /*token=*/static_cast<mlir::Value>(nullptr));
       }]>];
 
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
-  let assemblyFormat = [{$src (`token` $token^)? attr-dict `:` qualified(type($src)) `->` type($result)}];
+  let assemblyFormat =
+      [{$src (`token` $token^)? attr-dict `:` qualified(type($src)) `->` type($result)}];
   let hasVerifier = 1;
 }
 
@@ -419,10 +413,8 @@ def TTG_LocalStoreOp : TTG_Op<"local_store"> {
   let description = [{
     Store a distributed tensor into a buffer in local memory.
   }];
-  let arguments = (ins
-    TT_Tensor:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst
-  );
+  let arguments = (ins TT_Tensor:$src,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst);
 
   let hasVerifier = 1;
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
@@ -432,18 +424,16 @@ def TTG_LocalStoreOp : TTG_Op<"local_store"> {
 }
 
 def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
-  let summary = "Store a distributed tensor into a buffer in remote shared memory";
+  let summary =
+      "Store a distributed tensor into a buffer in remote shared memory";
 
   let description = [{
     Store a distributed tensor into a buffer in remote shared memory.
     `$ctaRank` refers to the unique CTA id in a cluster across all dims. e.g. For a 2x4 CTA cluster, a valid CTA rank
     will be 0~7.
   }];
-  let arguments = (ins
-    TT_Tensor:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-    I32:$ctaRank
-  );
+  let arguments = (ins TT_Tensor:$src,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst, I32:$ctaRank);
   // TODO Add a verifier
   let hasVerifier = 0;
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
@@ -453,7 +443,8 @@ def TTG_RemoteShmemStoreOp : TTG_Op<"remote_shmem_store"> {
 }
 
 def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
-  let summary = "Store a distributed tensor into remote shared memory with barrier completion";
+  let summary = "Store a distributed tensor into remote shared memory with "
+                "barrier completion";
   let description = [{
     Store a distributed tensor into a buffer in remote shared memory with barrier completion signaling.
     Uses PTX instruction: st.async.shared::cluster.mbarrier::complete_tx::bytes
@@ -462,12 +453,9 @@ def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
     will be 0~7.
     `$barrier` is a mandatory mbarrier in local shared memory that will be signaled when the remote store completes.
   }];
-  let arguments = (ins
-    TT_Tensor:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-    I32:$ctaRank,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier
-  );
+  let arguments = (ins TT_Tensor:$src,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst, I32:$ctaRank,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier);
   let hasVerifier = 0;
   let assemblyFormat = [{
     $src `,` `rank` $ctaRank `,` $dst `barrier` $barrier attr-dict `:` type($src) `->` qualified(type($dst)) `barrier_ty` qualified(type($barrier))
@@ -475,7 +463,8 @@ def TTG_AsyncRemoteShmemStoreOp : TTG_Op<"async_remote_shmem_store"> {
 }
 
 def TTG_AsyncRemoteShmemCopyOp : TTG_Op<"async_remote_shmem_copy"> {
-  let summary = "Copy a local shared memory buffer to remote shared memory with barrier completion";
+  let summary = "Copy a local shared memory buffer to remote shared memory "
+                "with barrier completion";
   let description = [{
     Copy a local shared memory buffer to a buffer in the remote shared memory of a cluster CTA,
     and notify an mbarrier in the remote CTA when the copy completes.
@@ -486,12 +475,9 @@ def TTG_AsyncRemoteShmemCopyOp : TTG_Op<"async_remote_shmem_copy"> {
     `$barrier` is an mbarrier in local shared memory whose address will be mapa'd to the remote CTA's shared memory
     to signal completion of the copy.
   }];
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-    I32:$ctaRank,
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier
-  );
+  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst, I32:$ctaRank,
+      Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$barrier);
   let hasVerifier = 0;
   let assemblyFormat = [{
     $src `,` `rank` $ctaRank `,` $dst `barrier` $barrier attr-dict `:` qualified(type($src)) `->` qualified(type($dst)) `barrier_ty` qualified(type($barrier))
@@ -512,22 +498,19 @@ def TTG_LocalGatherOp : TTG_Op<"local_gather", [LocalLoadTrait]> {
 
     This matches the behavior of tt.gather but operates on shared memory descriptors.
   }];
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
-    TT_IntTensor:$indices,
-    I32Attr:$axis,
-    Optional<TTG_AsyncToken>:$token
-  );
+  let arguments = (ins Arg<TTG_MemDescType, "", [MemRead<SharedMemory>]>:$src,
+      TT_IntTensor:$indices, I32Attr:$axis, Optional<TTG_AsyncToken>:$token);
   let results = (outs TT_Tensor:$result);
 
-  let builders = [
-      OpBuilder<(ins "Type":$retType, "Value":$src, "Value":$indices, "IntegerAttr":$axis),
-      [{
+  let builders = [OpBuilder<(ins "Type":$retType, "Value":$src,
+                                "Value":$indices, "IntegerAttr":$axis),
+                            [{
       build($_builder, $_state, retType, src, indices, axis, /*token=*/static_cast<mlir::Value>(nullptr));
       }]>];
 
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
-  let assemblyFormat = [{$src `[` $indices `]` (`token` $token^)? attr-dict `:` qualified(type($src)) `,` type($indices) `->` type($result)}];
+  let assemblyFormat =
+      [{$src `[` $indices `]` (`token` $token^)? attr-dict `:` qualified(type($src)) `,` type($indices) `->` type($result)}];
   let hasVerifier = 1;
 }
 
@@ -545,32 +528,31 @@ def TTG_LocalScatterOp : TTG_Op<"local_scatter"> {
 
     This is the inverse of local_gather and writes to shared memory at runtime-computed indices.
   }];
-  let arguments = (ins
-    Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
-    TT_Tensor:$values,
-    TT_IntTensor:$indices,
-    I32Attr:$axis,
-    Optional<TTG_AsyncToken>:$token
-  );
+  let arguments = (ins Arg<TTG_MemDescType, "", [MemWrite<SharedMemory>]>:$dst,
+      TT_Tensor:$values, TT_IntTensor:$indices, I32Attr:$axis,
+      Optional<TTG_AsyncToken>:$token);
 
-  let builders = [
-      OpBuilder<(ins "Value":$dst, "Value":$values, "Value":$indices, "IntegerAttr":$axis),
-      [{
+  let builders = [OpBuilder<(ins "Value":$dst, "Value":$values,
+                                "Value":$indices, "IntegerAttr":$axis),
+                            [{
       build($_builder, $_state, dst, values, indices, axis, /*token=*/static_cast<mlir::Value>(nullptr));
       }]>];
 
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
-  let assemblyFormat = [{$dst `[` $indices `]` `,` $values (`token` $token^)? attr-dict `:` qualified(type($dst)) `,` type($indices) `,` type($values)}];
+  let assemblyFormat =
+      [{$dst `[` $indices `]` `,` $values (`token` $token^)? attr-dict `:` qualified(type($dst)) `,` type($indices) `,` type($values)}];
   let hasVerifier = 1;
 }
 
-def TTG_LocalAtomicScatterRMWOp : TTG_Op<"local_atomic_scatter_rmw", [
-  DeclareOpInterfaceMethods<InferTypeOpInterface>,
-  TypesMatchWith<"result type matches values type", "values", "result", "$_self">,
-  OptionalTypesMatchWith<"mask type matches values type",
-                 "values", "mask", "getI1SameShape($_self)">
-]> {
-  let summary = "Atomically scatter RMW elements into shared memory along a specified axis";
+def TTG_LocalAtomicScatterRMWOp
+    : TTG_Op<"local_atomic_scatter_rmw",
+             [DeclareOpInterfaceMethods<InferTypeOpInterface>,
+              TypesMatchWith<"result type matches values type", "values",
+                             "result", "$_self">,
+              OptionalTypesMatchWith<"mask type matches values type", "values",
+                                     "mask", "getI1SameShape($_self)">]> {
+  let summary = "Atomically scatter RMW elements into shared memory along a "
+                "specified axis";
 
   let description = [{
     Atomically updates elements in a shared memory descriptor using an indices tensor
@@ -587,14 +569,11 @@ def TTG_LocalAtomicScatterRMWOp : TTG_Op<"local_atomic_scatter_rmw", [
     mask[I] is true. Masked-off positions do not update shared memory and return
     an undefined old value.
   }];
-  let arguments = (ins
-    TT_AtomicRMWAttr:$atomic_rmw_op,
-    Arg<TTG_MemDescType, "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$dst,
-    TT_Tensor:$values,
-    TT_IntTensor:$indices,
-    Optional<I1Tensor>:$mask,
-    I32Attr:$axis
-  );
+  let arguments = (ins TT_AtomicRMWAttr:$atomic_rmw_op,
+      Arg<TTG_MemDescType,
+          "", [MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$dst,
+      TT_Tensor:$values, TT_IntTensor:$indices, Optional<I1Tensor>:$mask,
+      I32Attr:$axis);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
@@ -604,31 +583,29 @@ def TTG_LocalAtomicScatterRMWOp : TTG_Op<"local_atomic_scatter_rmw", [
   let hasVerifier = 1;
 }
 
-def TTG_PredicateStageOp: TTG_Op<"predicate_stage",
-                                [Pure, AllTypesMatch<["iv", "ub", "step"]>]> {
+def TTG_PredicateStageOp
+    : TTG_Op<"predicate_stage", [Pure, AllTypesMatch<["iv", "ub", "step"]>]> {
   let summary = "pipeliner stage predicate";
   let arguments = (ins AnySignlessIntegerOrIndex:$iv,
-                       AnySignlessIntegerOrIndex:$ub,
-                       AnySignlessIntegerOrIndex:$step,
-                       I32Attr:$maxStage,
-                       I32Attr:$stage);
+      AnySignlessIntegerOrIndex:$ub, AnySignlessIntegerOrIndex:$step,
+      I32Attr:$maxStage, I32Attr:$stage);
   let results = (outs I1:$result);
-  let assemblyFormat = "$iv `,` $ub `,` $step `maxStage` $maxStage `stage` $stage attr-dict `:` type($iv) `->` type($result)";
+  let assemblyFormat = "$iv `,` $ub `,` $step `maxStage` $maxStage `stage` "
+                       "$stage attr-dict `:` type($iv) `->` type($result)";
 }
 
-def TTG_MaskOp: TTG_Op<"mask",
-                       [SingleBlock]> {
-    let summary = "mask op for pipelining";
-    let arguments = (ins I1:$pred);
-    let results = (outs Variadic<AnyType>:$result);
-    let regions = (region SizedRegion<1>:$region);
+def TTG_MaskOp : TTG_Op<"mask", [SingleBlock]> {
+  let summary = "mask op for pipelining";
+  let arguments = (ins I1:$pred);
+  let results = (outs Variadic<AnyType>:$result);
+  let regions = (region SizedRegion<1>:$region);
 }
 
-def TTG_MaskReturnOp: TTG_Op<"mask.return",
-                             [HasParent<"MaskOp">, Pure, Terminator, ReturnLike]> {
-    let summary = "terminator for mask operator";
-    let arguments = (ins Variadic<AnyType>:$result);
-    let assemblyFormat = "$result attr-dict `:` type($result)";
+def TTG_MaskReturnOp : TTG_Op<"mask.return", [HasParent<"MaskOp">, Pure,
+                                              Terminator, ReturnLike]> {
+  let summary = "terminator for mask operator";
+  let arguments = (ins Variadic<AnyType>:$result);
+  let assemblyFormat = "$result attr-dict `:` type($result)";
 }
 
 def TTG_Fp4ToFpOp : TTG_Op<"fp4_to_fp", [Pure]> {
@@ -645,9 +622,8 @@ def TTG_Fp4ToFpOp : TTG_Op<"fp4_to_fp", [Pure]> {
     The `axis` attribute specifies the axis along which the fp4 elements are packed.
   }];
 
-  let builders = [
-      OpBuilder<(ins "TypedValue<RankedTensorType>":$src, "Type":$elemType, "int32_t":$axis)>
-    ];
+  let builders = [OpBuilder<(ins "TypedValue<RankedTensorType>":$src,
+      "Type":$elemType, "int32_t":$axis)>];
 
   let arguments = (ins RankedTensorOf<[I8]>:$src, I32Attr:$axis);
   let results = (outs TT_FloatTensor:$result);
@@ -675,13 +651,9 @@ def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc"> {
     Concurrency sanitizer allocations that hold cluster-wide state can be marked
     using the optional `shared_cluster_state` unit attribute.
   }];
-  let arguments = (
-    ins
-    I32Attr:$nbytes,
-    I32Attr:$alignment,
-    OptionalAttr<UnitAttr>:$third_party_allocation,
-    OptionalAttr<UnitAttr>:$shared_cluster_state
-  );
+  let arguments = (ins I32Attr:$nbytes, I32Attr:$alignment,
+      OptionalAttr<UnitAttr>:$third_party_allocation,
+      OptionalAttr<UnitAttr>:$shared_cluster_state);
   let results = (outs Arg<TT_Ptr, "", [MemAlloc<GlobalMemory>]>:$result);
 
   let extraClassDeclaration = [{
@@ -698,10 +670,11 @@ def TTG_GlobalScratchAllocOp : TTG_Op<"global_scratch_alloc"> {
   let assemblyFormat = [{attr-dict `:` qualified(type($result))}];
 }
 
-def TTG_WarpSpecializeOp : TTG_Op<"warp_specialize", [
-  RecursiveMemoryEffects, RecursivelySpeculatable, AsyncRegions,
-  DeclareOpInterfaceMethods<RegionBranchOpInterface, ["getSuccessorInputs"]>
-]> {
+def TTG_WarpSpecializeOp
+    : TTG_Op<"warp_specialize",
+             [RecursiveMemoryEffects, RecursivelySpeculatable, AsyncRegions,
+              DeclareOpInterfaceMethods<
+                  RegionBranchOpInterface, ["getSuccessorInputs"]>]> {
   let summary = "asynchronously execute code on multiple warpgroups";
   let description = [{
     The `ttg.warp_specialize` op represents executing different code
@@ -743,13 +716,12 @@ def TTG_WarpSpecializeOp : TTG_Op<"warp_specialize", [
       OptionalAttr<DenseI32ArrayAttr>:$actualRegisters);
   let results = (outs Variadic<AnyType>:$defaultPassthrough);
 
-  let regions = (region
-    MinSizedRegion<1>:$defaultRegion,
-    SizedRegion<1>:$partitionOpHolder
-  );
+  let regions = (region MinSizedRegion<1>:$defaultRegion,
+      SizedRegion<1>:$partitionOpHolder);
 
   let extraClassDeclaration = [{
     RegionRange getPartitionRegions();
+    SmallVector<Region *> getNonEmptyPartitionRegions();
     WarpSpecializePartitionsOp getPartitionOp();
 
     // Get the size of the capture list.
@@ -793,10 +765,10 @@ def TTG_WarpSpecializePartitionsOp
   let hasCanonicalizeMethod = 1;
 }
 
-def TTG_WarpYieldOp : TTG_Op<"warp_yield", [
-  Pure, Terminator, ReturnLike, HasParent<"WarpSpecializeOp">,
-  DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>
-]> {
+def TTG_WarpYieldOp
+    : TTG_Op<"warp_yield",
+             [Pure, Terminator, ReturnLike, HasParent<"WarpSpecializeOp">,
+              DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface>]> {
   let summary = "yield from the default region of `ttg.warp_specialize`";
   let description = [{
     The `ttg.warp_yield` operation is the terminator for the "default" region of
@@ -816,9 +788,9 @@ def TTG_WarpYieldOp : TTG_Op<"warp_yield", [
   let hasVerifier = 1;
 }
 
-def TTG_WarpReturnOp : TTG_Op<"warp_return", [
-  Pure, Terminator, ReturnLike, HasParent<"WarpSpecializePartitionsOp">
-]> {
+def TTG_WarpReturnOp
+    : TTG_Op<"warp_return", [Pure, Terminator, ReturnLike,
+                             HasParent<"WarpSpecializePartitionsOp">]> {
   let summary = "implicit terminator from partition regions";
   let description = [{
     The `ttg.warp_return` operation is the implicit terminator that ends the
@@ -831,16 +803,17 @@ def TTG_WarpReturnOp : TTG_Op<"warp_return", [
   let assemblyFormat = "attr-dict";
 }
 
-def TTG_Clock64Op : TTG_Op<"clock64", [
-    MemoryEffects<[MemRead<DefaultResource>, MemWrite<DefaultResource>]>
-]> {
+def TTG_Clock64Op
+    : TTG_Op<"clock64", [MemoryEffects<[MemRead<DefaultResource>,
+                                        MemWrite<DefaultResource>]>]> {
   let summary = "read 64-bit GPU clock counter";
   let results = (outs I64:$res);
   let assemblyFormat = "attr-dict";
 }
 
 def TTG_BarrierOp : TTG_Op<"barrier"> {
-  let summary = "Synchronizes execution and reads/writes to the selected address spaces for all threads in the CTA.";
+  let summary = "Synchronizes execution and reads/writes to the selected "
+                "address spaces for all threads in the CTA.";
   let description = [{
     The `barrier` op synchronises the execution and all operations between the selected address spaces for all
     threads in the CTA. It is used to coordinate communication between threads in the CTA.
