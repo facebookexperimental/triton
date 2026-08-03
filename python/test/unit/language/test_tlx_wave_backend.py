@@ -7044,6 +7044,87 @@ def test_tlx_wave_fa_rejects_causal_mode():
         tutorial.attention(q, k, v, causal=True)
 
 
+def test_tlx_wave_fa_accepts_conservative_raw_qk_boundary(monkeypatch):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_raw_qk_boundary")
+    q, k, v = _make_fa_validation_inputs(torch)
+    output = torch.empty_like(q)
+    safe_bf16_bound = float.fromhex("0x1.6ap60")
+    assert safe_bf16_bound < tutorial.MAX_QK_ABS_FOR_FINITE_F32_DOT
+    captured = {}
+    sentinel = object()
+
+    def warmup(*_args, grid, **options):
+        captured["grid"] = grid
+        captured["options"] = options
+        return sentinel
+
+    monkeypatch.setattr(tutorial, "_attn_fwd_wave_pipeline", SimpleNamespace(warmup=warmup))
+    monkeypatch.setattr(
+        tutorial.triton.runtime.driver.active,
+        "get_current_target",
+        lambda: SimpleNamespace(backend="tlx_wave"),
+    )
+    result = tutorial.attention(
+        q,
+        k,
+        v,
+        sm_scale=1.0e-40,
+        qk_max_abs=safe_bf16_bound,
+        out=output,
+        warmup=True,
+    )
+
+    assert result is sentinel
+    assert captured["grid"] == (1, 1, 1)
+    assert captured["options"]["LOG2_SCORE_BOUND"] < 1.0
+
+
+def test_tlx_wave_fa_rejects_raw_qk_overflow_envelope():
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_raw_qk_overflow_envelope")
+    q, k, v = _make_fa_validation_inputs(torch)
+    unsafe_bound = float.fromhex("0x1.6cp60")
+    assert unsafe_bound > tutorial.MAX_QK_ABS_FOR_FINITE_F32_DOT
+
+    with pytest.raises(ValueError, match="exceeds the conservative raw FP32 QK limit"):
+        tutorial.attention(q, k, v, sm_scale=1.0e-40, qk_max_abs=unsafe_bound)
+
+
+@pytest.mark.parametrize("backend", ["llvm", "wave"])
+def test_tlx_wave_runtime_gfx950_fa_raw_qk_boundary_e2e(tmp_path, backend):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for eight-wave FA e2e, got {arch}")
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_raw_qk_boundary_{backend}")
+
+    shape = (1, 1, 256, 128)
+    device = torch.device("cuda")
+    safe_bf16_bound = float.fromhex("0x1.6ap60")
+    q = torch.full(shape, safe_bf16_bound, dtype=torch.bfloat16, device=device)
+    k = torch.full(shape, safe_bf16_bound, dtype=torch.bfloat16, device=device)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    v = torch.rand(shape, dtype=torch.float32, device=device, generator=generator).to(torch.bfloat16)
+    expected = v.float().mean(dim=2, keepdim=True).expand(shape).to(torch.bfloat16)
+
+    driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
+    with (
+            driver_context(),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-raw-qk-boundary-runtime-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.attention(q, k, v, sm_scale=1.0e-40, qk_max_abs=safe_bf16_bound)
+        torch.cuda.synchronize()
+
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
