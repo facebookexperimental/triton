@@ -31,12 +31,12 @@ under Buck in fbcode. It is target-agnostic: substitute your own
    default/stable Triton — without it, changes made here are not exercised.
 4. **Select the GPU architecture** with `-c fbcode.nvcc_arch=<arch>` and,
    where required, the **CUDA version** with
-   `-c fbcode.platform010_cuda_version=<ver>` (see *Hardware
+   `-m ovr_config//third-party/cuda/constraints:<ver>` (see *Hardware
    requirements*).
 5. **Environment variables prefix the `buck2 run`** and are forwarded to
    the launched process:
    ```bash
-   <ENV VARS> buck2 run @mode/opt -m ovr_config//triton:beta -c fbcode.nvcc_arch=<arch> [-c fbcode.platform010_cuda_version=<ver>] \
+   <ENV VARS> buck2 run @mode/opt -m ovr_config//triton:beta -c fbcode.nvcc_arch=<arch> [-m ovr_config//third-party/cuda/constraints:<ver>] \
      <buck target> -- <program args>
    ```
 6. **`buck2 build` vs `buck2 run`.** Use `buck2 build <target>` to compile
@@ -48,7 +48,7 @@ under Buck in fbcode. It is target-agnostic: substitute your own
 
 Pick the arch (and CUDA version) for the single GPU you are targeting:
 
-| Hardware | `fbcode.nvcc_arch` | `fbcode.platform010_cuda_version` |
+| Hardware | `fbcode.nvcc_arch` | `ovr_config//third-party/cuda/constraints:<version>` |
 | --- | --- | --- |
 | Hopper (H100) | `h100a` | (default) |
 | Blackwell B200 / GB200 | `b200a` | `>= 12.8` |
@@ -67,7 +67,7 @@ Notes:
 ```bash
 buck2 run @mode/opt -m ovr_config//triton:beta \
   -c fbcode.nvcc_arch=b300a \
-  -c fbcode.platform010_cuda_version=13.0 \
+  -m ovr_config//third-party/cuda/constraints:13.0 \
   <buck target> -- <program args>
 ```
 
@@ -75,7 +75,7 @@ buck2 run @mode/opt -m ovr_config//triton:beta \
 ```bash
 buck2 run @mode/opt -m ovr_config//triton:beta \
   -c fbcode.nvcc_arch=b200a \
-  -c fbcode.platform010_cuda_version=12.8 \
+  -m ovr_config//third-party/cuda/constraints:12.8 \
   <buck target> -- <program args>
 ```
 
@@ -89,13 +89,13 @@ buck2 run @mode/opt -m ovr_config//triton:beta \
 **With env vars forwarded** (e.g. enabling a feature for the run):
 ```bash
 SOME_ENV=1 buck2 run @mode/opt -m ovr_config//triton:beta -c fbcode.nvcc_arch=b300a \
-  -c fbcode.platform010_cuda_version=13.0 \
+  -m ovr_config//third-party/cuda/constraints:13.0 \
   <buck target> -- <program args>
 ```
 
 **Compile only** (surface a build/compile failure without running):
 ```bash
 buck2 build @mode/opt -m ovr_config//triton:beta -c fbcode.nvcc_arch=b300a \
-  -c fbcode.platform010_cuda_version=13.0 \
+  -m ovr_config//third-party/cuda/constraints:13.0 \
   <buck target>
 ```
