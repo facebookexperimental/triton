@@ -688,8 +688,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-// NOTE: beta intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
-// inside ttg.warp_specialize (beta's autows/TLX pipelines place them there and the
+// NOTE: Meta Triton intentionally does NOT reject ttng.cluster_arrive / ttng.cluster_wait
+// inside ttg.warp_specialize (Meta Triton's autows/TLX pipelines place them there and the
 // conversion lowers them with all-warps wrapping). Only ttng.cluster_barrier is
 // rejected. The arrive/wait warp-specialize invalid cases from upstream #9456 are
 // therefore omitted here.
@@ -705,33 +705,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
-  tt.func @cluster_barrier_in_default_region_invalid() {
-    ttg.warp_specialize()
-    default {
-      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
-      ttng.cluster_barrier
-      ttg.warp_yield
-    }
-    partition0() num_warps(4) {
-      ttg.warp_return
-    } : () -> ()
+  tt.func public @cluster_barrier_in_noinline_kernel_valid() attributes {noinline = true} {
+    ttng.cluster_barrier
     tt.return
   }
-}
 
-// -----
-
-module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
-  tt.func @cluster_barrier_in_partition_invalid() {
-    ttg.warp_specialize()
-    default {
-      ttg.warp_yield
-    }
-    partition0() num_warps(4) {
-      // expected-error @below {{cannot be used inside `ttg.warp_specialize`}}
-      ttng.cluster_barrier
-      ttg.warp_return
-    } : () -> ()
+  tt.func private @cluster_barrier_in_non_kernel_function_invalid() attributes {noinline = true} {
+    // expected-error @below {{must be inside a kernel function}}
+    ttng.cluster_barrier
     tt.return
   }
 }
@@ -1114,7 +1095,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // NOTE: the "multicast requires the shared layout to broadcast across CTAs"
 // verifier check comes from upstream #9977/#9615 (TMA gather/scatter multiCTA +
 // MultiCTA membar), which are not part of this tensordesc-migration bundle. The
-// corresponding invalid.mlir section is deferred until those land in beta.
+// corresponding invalid.mlir section is deferred until those land in Meta Triton.
 
 // Test invalid TensorDescIm2ColType: rank-3 blockType (must be rank-2)
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32} {
