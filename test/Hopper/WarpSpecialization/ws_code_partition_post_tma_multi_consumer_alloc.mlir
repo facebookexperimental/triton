@@ -1,19 +1,22 @@
 // RUN: triton-opt %s --nvgpu-test-ws-buffer-allocation '--nvgpu-test-ws-memory-planner=num-buffers=2 smem-budget=200000' '--nvgpu-test-ws-code-partition=num-buffers=2' | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-buffer-allocation '--nvgpu-test-ws-memory-planner=num-buffers=2 smem-budget=200000' '--nvgpu-test-ws-code-partition=num-buffers=2' | FileCheck %s --check-prefix=TASK1
+// RUN: triton-opt %s --nvgpu-test-ws-buffer-allocation '--nvgpu-test-ws-memory-planner=num-buffers=2 smem-budget=200000' '--nvgpu-test-ws-code-partition=num-buffers=2' | FileCheck %s --check-prefix=TASK2
 
-// Regression test for a TMA load whose SMEM tile feeds multiple consumers. The
-// buffer-allocation pre-pass should avoid materializing one local_alloc/local_store
-// chain per consumer when both chains come from the same descriptor_load value.
-// That lets code partitioning discover one SMEM buffer with two consumer tasks
-// without relying on buffer.id, which is also used for logical buffer reuse.
+// Buffer creation should reuse the descriptor load's existing SMEM allocation.
 
 // CHECK-LABEL: @post_tma_load_multi_consumer_allocs
+// CHECK-NOT: tt.descriptor_load
 // CHECK-COUNT-1: ttng.async_tma_copy_global_to_local
-// CHECK: ttng.wait_barrier {{.*}}async_task_id = array<i32: 1>
-// CHECK: ttg.local_load {{.*}}async_task_id = array<i32: 1>
-// CHECK: ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
-// CHECK: ttg.local_load {{.*}}async_task_id = array<i32: 2>
 // CHECK-NOT: tt.descriptor_load
 // CHECK: tt.return
+
+// TASK1-LABEL: @post_tma_load_multi_consumer_allocs
+// TASK1: ttng.wait_barrier {{.*}}async_task_id = array<i32: 1>
+// TASK1: ttg.local_load {{.*}}async_task_id = array<i32: 1>
+
+// TASK2-LABEL: @post_tma_load_multi_consumer_allocs
+// TASK2: ttng.wait_barrier {{.*}}async_task_id = array<i32: 2>
+// TASK2: ttg.local_load {{.*}}async_task_id = array<i32: 2>
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -26,11 +29,9 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     %ptrs1 = tt.splat %out1 {async_task_id = array<i32: 2>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
     %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
     %alloc0 = ttg.local_alloc %tile {async_task_id = array<i32: 0, 1>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
-    %alloc1 = ttg.local_alloc %tile {async_task_id = array<i32: 0, 2>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %loaded0 = ttg.local_load %alloc0 {async_task_id = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
-    %loaded1 = ttg.local_load %alloc1 {async_task_id = array<i32: 2>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
     %consumer0 = arith.addf %loaded0, %loaded0 {async_task_id = array<i32: 1>} : tensor<128x64xf16, #blocked>
-    %consumer1 = arith.subf %loaded1, %loaded1 {async_task_id = array<i32: 2>} : tensor<128x64xf16, #blocked>
+    %consumer1 = arith.subf %tile, %tile {async_task_id = array<i32: 2>} : tensor<128x64xf16, #blocked>
     tt.store %ptrs0, %consumer0 {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
     tt.store %ptrs1, %consumer1 {async_task_id = array<i32: 2>} : tensor<128x64x!tt.ptr<f16>, #blocked>
     tt.return
