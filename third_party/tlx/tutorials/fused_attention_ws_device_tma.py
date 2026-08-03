@@ -1772,7 +1772,7 @@ class _attention_opt(torch.autograd.Function):
         )
 
         def grid(meta):
-            num_ctas = meta.get("NUM_CTAS", 1)
+            num_ctas = meta.get("NUM_CTAS") or 1
             n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
             if num_ctas == 2:
                 assert meta["BLOCK_M1"] == 128
@@ -1787,7 +1787,7 @@ class _attention_opt(torch.autograd.Function):
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
             def grid_persist_bwd(meta):
-                num_ctas = meta.get("NUM_CTAS", 1)
+                num_ctas = meta.get("NUM_CTAS") or 1
                 n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
                 if num_ctas == 2 and meta["BLOCK_M1"] == 128:
                     assert n_tiles % num_ctas == 0
