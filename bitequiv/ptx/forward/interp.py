@@ -460,12 +460,13 @@ def forward_descriptor(func):
 
 def _fence_str(fence):
     """Canonical string for an :func:`bitequiv.ptx.mma._mma_fence` tuple (frozensets sorted so the
-    string is deterministic across runs). The ratio is (mma : fma : add/mul) — fma kept apart from
-    add/mul so enable_fp_fusion on/off never collide."""
+    string is deterministic across runs). The f32 epilogue rides as PRESENCE ``(has_fma, has_addmul)``
+    — fma kept apart from add/mul so enable_fp_fusion on/off never collide, but NOT counted (the count
+    is M/N-tile-scaled and would over-split equivalent re-tilings)."""
     if fence[0] == "mma":
-        _, tokens, flags, ratio = fence
+        _, tokens, flags, epi = fence
         return (f"mma|tok={'/'.join(sorted(tokens))}|fl={','.join(sorted(flags))}"
-                f"|r={ratio[0]}:{ratio[1]}:{ratio[2]}")
+                f"|epi=fma{epi[0]},addmul{epi[1]}")
     _, counts, flags, fa = fence  # mma-fp8 fallback: raw per-token counts + (fma, add/mul) (more split)
     counts_s = "/".join(f"{t}x{n}" for t, n in counts)
     return f"mma-fp8|tok={counts_s}|fl={','.join(sorted(flags))}|fma_addmul={fa[0]},{fa[1]}"
