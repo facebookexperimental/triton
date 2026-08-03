@@ -63,6 +63,13 @@ SOFTMAX_REFERENCE_HEADROOM_LOG2 = tl.constexpr(8.0)
 # envelope strictly above that boundary to prevent a zero softmax denominator.
 FIXED_REFERENCE_MAX_LOG2_SPAN = 126.0
 
+# A BF16 product is exact in FP32.  Bound the 128 subsequent accumulation
+# roundings with gamma_n = n*u/(1-n*u), u=2^-24, then keep the absolute dot sum
+# strictly below the largest finite FP32 value before applying the softmax scale.
+_FP32_UNIT_ROUNDOFF = 2.0**-24
+_QK_ACCUMULATION_ERROR = (128 * _FP32_UNIT_ROUNDOFF) / (1.0 - 128 * _FP32_UNIT_ROUNDOFF)
+MAX_QK_ABS_FOR_FINITE_F32_DOT = math.sqrt(torch.finfo(torch.float32).max / (128 * (1.0 + _QK_ACCUMULATION_ERROR)))
+
 # The current symbolic address expressions are signed i32 through the Wave
 # bridge.  Keep both the materialized tensor stride and every flattened element
 # offset representable until the kernel migrates those expressions to i64.
@@ -1881,6 +1888,9 @@ def attention(
     else:
         if not math.isfinite(qk_max_abs) or qk_max_abs <= 0:
             raise ValueError("qk_max_abs must be finite and greater than zero")
+        if qk_max_abs >= MAX_QK_ABS_FOR_FINITE_F32_DOT:
+            raise ValueError(f"qk_max_abs ({qk_max_abs:g}) exceeds the conservative raw FP32 QK limit "
+                             f"({MAX_QK_ABS_FOR_FINITE_F32_DOT:g}) for head dimension 128")
         log2_score_bound = (math.log2(math.e) * head_dim * abs(sm_scale) * qk_max_abs * qk_max_abs)
         log2_score_span = 2.0 * abs(log2_score_bound)
         if not math.isfinite(log2_score_span) or log2_score_span >= FIXED_REFERENCE_MAX_LOG2_SPAN:
