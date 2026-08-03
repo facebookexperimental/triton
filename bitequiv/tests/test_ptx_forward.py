@@ -131,6 +131,54 @@ def test_mma_entry_gets_fence_descriptor():
     assert desc.startswith("mma|tok=") and "k16" in desc and "m64" not in desc
 
 
+# -- Phase 4b: a reduction OVER the MMA output rides the reduction fingerprint (soundness) ----------
+# The tiling-invariant fence over-merges a GEMM whose epilogue REDUCES C = A @ B across configs that
+# differ only in the reduction ORDER (gemm_reduce_sum / softmax / layernorm): the reduction can lower
+# to a within-thread add fold with NO shfl.bfly, which the old shfl-only trigger missed -> the fence
+# alone -> unordered and inner_tree collapse to one descriptor -> OVER-MERGE (measured 1/kernel).
+# The MMA output is now an ``Mma`` leaf and ``_epilogue_reduces_mma`` detects the fold, so the
+# reduction fingerprint rides the descriptor and the orders split.
+
+_WGMMA4 = "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%f1, %f2, %f3, %f4}, %rd3, %rd4;\n"
+
+
+def _mma_body(body):
+    return (_HDR + ".visible .entry k(.param .u64 po)\n{\n.reg .b64 %rd<6>;\n.reg .f32 %f<16>;\n"
+            "ld.param.u64 %rd1, [po];\ncvta.to.global.u64 %rd2, %rd1;\n" + body + "ret;\n}\n")
+
+
+def test_mma_within_thread_reduction_rides_fingerprint():
+    # A within-thread add fold over the 4 MMA-output lanes (no shfl.bfly) is a reduction over the MMA
+    # output -> the descriptor carries "mma+red" (the fingerprint), not the fence alone.
+    (desc, ) = forward_module_descriptor(
+        _mma_body(_WGMMA4 + "add.f32 %f5, %f1, %f2;\nadd.f32 %f6, %f5, %f3;\n"
+                  "add.f32 %f7, %f6, %f4;\nst.global.f32 [%rd2], %f7;\n"))
+    assert desc.startswith("mma|") and "mma+red" in desc
+
+
+def test_mma_elementwise_epilogue_stays_pure_fence():
+    # An elementwise epilogue (acc + bias): the add has a non-Mma child (bias from ld.global), so it is
+    # NOT a reduction over the MMA output -> the clean tiling-invariant fence, no "mma+red" (must not
+    # over-split the pure GEMMs, e.g. gemm_bias_relu).
+    (desc, ) = forward_module_descriptor(
+        _mma_body(_WGMMA4 + "ld.global.f32 %f5, [%rd2];\nadd.f32 %f6, %f1, %f5;\n"
+                  "st.global.f32 [%rd2], %f6;\n"))
+    assert desc.startswith("mma|") and "mma+red" not in desc
+
+
+def test_mma_reduction_orders_do_not_over_merge():
+    # Two entries with the IDENTICAL MMA fence but within-thread reductions of different op count (the
+    # unordered-255 vs inner_tree-209 shape difference) must NOT share a descriptor. The old shfl-only
+    # trigger left both as the bare fence -> one class -> over-merge; riding the fingerprint splits them.
+    three = forward_module_descriptor(
+        _mma_body(_WGMMA4 + "add.f32 %f5, %f1, %f2;\nadd.f32 %f6, %f5, %f3;\n"
+                  "add.f32 %f7, %f6, %f4;\nst.global.f32 [%rd2], %f7;\n"))
+    two = forward_module_descriptor(
+        _mma_body(_WGMMA4 + "add.f32 %f6, %f1, %f2;\nadd.f32 %f7, %f6, %f3;\n"
+                  "st.global.f32 [%rd2], %f7;\n"))
+    assert three != two
+
+
 # -- Phase 5: data-dependent control flow fails closed (sound floor) -----------
 
 

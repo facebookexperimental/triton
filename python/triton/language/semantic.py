@@ -1298,6 +1298,7 @@ class TritonSemantic(Generic[TensorTy]):
         if mask is None:
             ptr, val = self.broadcast_tensors(ptr, val)
         else:
+            mask = self.to_tensor(mask)
             ptr, val, mask = self.broadcast_tensors(ptr, val, mask)
         if ptr_shape != ptr.shape:
             raise ValueError(f"Expected pointer argument to have shape {ptr.shape} but got {ptr_shape}")
@@ -1386,6 +1387,8 @@ class TritonSemantic(Generic[TensorTy]):
                 mask_ty = ptr.type.with_element_ty(tl.int1)
                 mask_ir = self.builder.create_splat(mask_ty.to_ir(self.builder), mask_ir)
             mask = self.tensor(mask_ir, mask_ty)
+        elif not mask.type.scalar.is_bool():
+            raise ValueError("Mask must have boolean scalar type")
         return ptr, val, mask
 
     def _signbit(self, x: TensorTy) -> TensorTy:

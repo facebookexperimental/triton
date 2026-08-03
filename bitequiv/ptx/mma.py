@@ -14,20 +14,21 @@ Soundness (over-split, never over-merge):
 - Each DROPPED piece is tiling-free: the m/n tile dims (retiling the SAME dot products across a
   different BLOCK_M / BLOCK_N is bit-identical) and the issue/transpose mods
   (``.mma_async`` / ``.sync`` / ``.aligned`` / ``.row`` / ``.col``).
-- The ``(mma_count, f32-fp-count)`` ratio is GCD-reduced, so proportional M/N tiling (n128 ->
-  2x n64 doubles BOTH counts) reduces to the same ratio (sound merge), while a real K split (which
-  changes the counts disproportionately) stays distinct.
-- fp8 (e4m3/e5m2/...): the ``max_num_imprecise_acc`` periodic-flush cadence is invisible to the
-  reduced ratio, so we FALL BACK to the raw per-token count map + raw fp count (strictly more
-  splitting).
-- tcgen05 M/N/K live in a runtime descriptor, not the modifiers, so tcgen05 K rides the ratio + the
-  caller's ``loops=`` (BLOCK_K) fence rather than the token — conservative.
+- The f32 epilogue fp ops ride as PRESENCE ``(has_fma, has_addmul)`` — NOT a count: the op count
+  scales with the M/N tile (elements per thread) while tcgen05's mma count does not, so a count
+  (even GCD-reduced) cannot cancel the tile scaling and over-splits equivalent re-tilings (measured:
+  num_splits 1..8 x tilings -> 20 classes for a 4-class split-K kernel). Presence keeps
+  enable_fp_fusion (fma single-rounded vs add+mul double-rounded) distinct; the bit-relevant K
+  regrouping rides the token / caller's ``loops=`` (BLOCK_K) / ``splits=`` (num_splits) instead.
+- fp8 (e4m3/e5m2/...): the ``max_num_imprecise_acc`` periodic-flush cadence is invisible even to
+  presence, so we FALL BACK to the raw per-token count map + raw fp count (strictly more splitting).
+- tcgen05 M/N/K live in a runtime descriptor, not the modifiers, so tcgen05 K rides ``loops=``
+  (BLOCK_K) + ``splits=`` (num_splits) rather than the token — conservative.
 
 This module is the single source of truth for both the forward interpreter and the backward
 ``_entry_signature`` (which currently uses the coarser ``_mma_guard``).
 """
 import re
-from math import gcd
 
 from bitequiv.ptx.linker import linearize
 
@@ -44,9 +45,9 @@ _MMA_DTYPES = frozenset({".f64", ".f32", ".tf32", ".f16", ".bf16", ".s32", ".s8"
 # The single tile+K modifier token, e.g. `.m64n128k16` (wgmma / mma.sync / wmma).
 _TILE_RE = re.compile(r"^\.m(\d+)n(\d+)k(\d+)$")
 
-# fp reduce/epilogue ops whose count scales with the MMA tile count, so the GCD-reduced
-# (mma_count, fp_count) ratio cancels proportional M/N tiling. f32 family only (the accumulate /
-# epilogue precision that matters).
+# fp reduce/epilogue ops. Their COUNT scales with the M/N tile (elements per thread), so the fence
+# records only their PRESENCE (has_fma, has_addmul), never the count. f32 family only (the accumulate
+# / epilogue precision that matters).
 _FP_EPI_OPS = frozenset({"add", "sub", "mul", "fma"})
 _FP_EPI_WIDTHS = frozenset({".f32", ".f32x2"})
 
@@ -109,8 +110,9 @@ def _fp_epi_counts(func):
     flips fma <-> mul+add in the epilogue, and the compiler can emit the SAME TOTAL count either way
     (measured on gemm_bias_relu_fp_fusion: 16 fma fused vs 16 add/mul unfused) — so a single lumped
     count collides and over-merges (fma is single-rounded, mul+add double-rounded -> different bits).
-    Keeping fma apart splits fp_fusion on/off. Both scale with the MMA tile count, so the GCD-reduced
-    ratio still cancels proportional M/N tiling."""
+    Keeping fma apart splits fp_fusion on/off. Both COUNTS scale with the M/N tile (elements per
+    thread), so the fence records only their PRESENCE, not the count (a count over-splits equivalent
+    re-tilings — see :func:`_mma_fence`)."""
     fma, addmul = 0, 0
     for inst in linearize(func):
         if not (inst.modifiers and inst.modifiers[-1] in _FP_EPI_WIDTHS):
@@ -126,9 +128,14 @@ def _mma_fence(func):
     """Tiling-invariant fence for an entry's MMA ops, or ``None`` if the entry has no MMA.
 
     Returns a hashable tuple. Two entries with equal fences differ only in a bit-IRRELEVANT tiling
-    choice; any bit-relevant difference (K split, dtype, flag, or a non-proportional op-count change)
-    yields a distinct fence. fp8 falls back to the raw per-token count map + raw fp count (strictly
-    more splitting) because its imprecise-acc flush cadence is invisible to the reduced ratio."""
+    choice; any bit-relevant difference (K split, dtype, flag, enable_fp_fusion) yields a distinct
+    fence. The f32 epilogue rides as PRESENCE ``(has_fma, has_addmul)`` — NOT a count: the op count
+    scales with the M/N tile (elements per thread) while tcgen05's mma count does not, so a count
+    (even GCD-reduced) cannot cancel the tile scaling and over-splits equivalent re-tilings. The
+    bit-relevant K regrouping (BLOCK_K, num_splits) rides the token / caller's ``loops=`` /
+    ``splits=`` instead of the op count. fp8 still falls back to the raw per-token count map + raw fp
+    count (strictly more splitting) because its imprecise-acc flush cadence is invisible even to
+    presence."""
     insts = [i for i in linearize(func) if _is_mma(i)]
     if not insts:
         return None
@@ -143,6 +150,4 @@ def _mma_fence(func):
         for t in tokens:
             counts[t] = counts.get(t, 0) + 1
         return ("mma-fp8", tuple(sorted(counts.items())), flags, (fma, addmul))
-    n = len(insts)
-    g = gcd(gcd(n, fma), addmul) or 1  # GCD over all three -> proportional M/N tiling cancels
-    return ("mma", frozenset(tokens), flags, (n // g, fma // g, addmul // g))
+    return ("mma", frozenset(tokens), flags, (int(fma > 0), int(addmul > 0)))
