@@ -432,12 +432,8 @@ class SoftmaxState:
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
             tl.zeros((BLOCK_M, HEAD_DIM // 4), tl.float32),
-            _pin_workitem_layout(
-                tl.full((8 * 64, ), -1.0e30, tl.float32),
-            ),
-            _pin_workitem_layout(
-                tl.zeros((8 * 64, ), tl.float32),
-            ),
+            _pin_workitem_layout(tl.full((8 * 64, ), -1.0e30, tl.float32), ),
+            _pin_workitem_layout(tl.zeros((8 * 64, ), tl.float32), ),
         )
 
     @triton.jit
@@ -537,10 +533,8 @@ class SoftmaxState:
                     row_is_within_headroom,
                     ballot_layout,
                 )
-                all_rows_within_headroom = tlx.warp_ballot(row_is_within_headroom) == -1
-                if all_rows_within_headroom:
-                    reference = self.row_max
-                else:
+                needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
+                if needs_rebase:
                     reference = candidate
                     alpha_rows = tl.math.exp2(self.row_max - reference)
                     state = SoftmaxState(
@@ -551,6 +545,8 @@ class SoftmaxState:
                         reference,
                         self.row_sum * alpha_rows,
                     )
+                else:
+                    reference = self.row_max
             if INITIAL:
                 state = SoftmaxState(
                     self.acc0,
@@ -564,9 +560,7 @@ class SoftmaxState:
             # The global fast-math policy permits contraction, so Wave can
             # form the same FMA as its native FA implementation without a
             # kernel-specific fused operation in the bridge.
-            negative_reference = (
-                tl.zeros((8 * 64, 1), tl.float32) - reference[:, None]
-            )
+            negative_reference = (tl.zeros((8 * 64, 1), tl.float32) - reference[:, None])
             registers0 = raw_registers0 * qk_scale + negative_reference
             registers1 = raw_registers1 * qk_scale + negative_reference
         else:
@@ -591,6 +585,95 @@ class SoftmaxState:
                 registers1,
             ),
         )
+
+    @triton.jit
+    def prepare_adaptive_pending(
+        self,
+        scores,
+        qk_scale: tl.constexpr,
+    ):
+        """Prepare the next score tile without rebasing the current PV state.
+
+        Keeping the rebase commit separate lets Wave overlap this independent
+        score work with the remaining PV MFMAs.  The reference is still chosen
+        by the same wave-uniform ballot as prepare; only the state scaling
+        is deferred until the current PV tile is fully accumulated.
+        """
+        score0, score1 = _split_last_2(scores)
+        raw_registers0 = _score_packet_to_registers(score0)
+        raw_registers1 = _score_packet_to_registers(score1)
+        tile_max = _reduce_max_score_registers(raw_registers0, raw_registers1) * qk_scale
+        candidate = tl.maximum(
+            self.row_max,
+            tile_max,
+            propagate_nan=tl.PropagateNan.ALL,
+        )
+        advance = candidate - self.row_max
+        row_is_within_headroom = advance <= SOFTMAX_REFERENCE_HEADROOM_LOG2
+        ballot_layout: tl.constexpr = (tlx.distributed_linear_layout_encoding.make(
+            reg_bases=[],
+            lane_bases=[
+                [1],
+                [2],
+                [4],
+                [8],
+                [16],
+                [32],
+            ],
+            warp_bases=[
+                [64],
+                [128],
+                [256],
+            ],
+            block_bases=[],
+            shape=[8 * 64],
+        ))
+        row_is_within_headroom = tlx.require_layout(
+            row_is_within_headroom,
+            ballot_layout,
+        )
+        needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
+        reference = tl.where(needs_rebase, candidate, self.row_max)
+        negative_reference = (tl.zeros((8 * 64, 1), tl.float32) - reference[:, None])
+        registers0 = raw_registers0 * qk_scale + negative_reference
+        registers1 = raw_registers1 * qk_scale + negative_reference
+
+        registers0 = tl.math.exp2(registers0)
+        lower8, tail8 = _split_last_2(registers1)
+        head4, upper4 = _split_last_2(lower8)
+        lower2, tail2 = _split_last_2(upper4)
+        head1, tail1 = _split_last_2(lower2)
+        middle2 = _join_last_2(tl.math.exp2(head1), tail1)
+        middle4 = _join_last_2(middle2, tail2)
+        lower8 = _join_last_2(tl.math.exp2(head4), middle4)
+        registers1 = _join_last_2(lower8, tail8)
+        return (
+            SoftmaxPending(
+                registers0,
+                registers1,
+            ),
+            reference,
+            needs_rebase,
+        )
+
+    @triton.jit
+    def commit_adaptive_reference(
+        self,
+        reference,
+        needs_rebase,
+    ):
+        state = self
+        if needs_rebase:
+            alpha_rows = tl.math.exp2(self.row_max - reference)
+            state = SoftmaxState(
+                _scale_accumulator_rows(self.acc0, alpha_rows),
+                _scale_accumulator_rows(self.acc1, alpha_rows),
+                _scale_accumulator_rows(self.acc2, alpha_rows),
+                _scale_accumulator_rows(self.acc3, alpha_rows),
+                reference,
+                self.row_sum * alpha_rows,
+            )
+        return state
 
     @triton.jit
     def finish(
@@ -747,6 +830,11 @@ def _accumulate_prefix_body(
     acc1 = _pv_mfma(p1, v11, acc1, p_layout, v_layout, mma_layout)
     acc2 = _pv_mfma(p1, v12, acc2, p_layout, v_layout, mma_layout)
     acc3 = _pv_mfma(p1, v13, acc3, p_layout, v_layout, mma_layout)
+    if ADAPTIVE_REFERENCE:
+        pending, reference, needs_rebase = state.prepare_adaptive_pending(
+            next_scores,
+            qk_scale,
+        )
     acc0 = _pv_mfma(p2, v20, acc0, p_layout, v_layout, mma_layout)
     acc1 = _pv_mfma(p2, v21, acc1, p_layout, v_layout, mma_layout)
     acc2 = _pv_mfma(p2, v22, acc2, p_layout, v_layout, mma_layout)
@@ -763,6 +851,11 @@ def _accumulate_prefix_body(
         state.row_max,
         state.row_sum,
     )
+    if ADAPTIVE_REFERENCE:
+        return (
+            state.commit_adaptive_reference(reference, needs_rebase),
+            pending,
+        )
     return state.prepare(
         next_scores,
         qk_scale,
