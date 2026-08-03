@@ -166,29 +166,70 @@ def outer_reduction_loops(insts, loops):
     return out
 
 
-def reduction_trip_signature(func):
-    """Hashable fingerprint that distinguishes the outer reduction loops' TRIP COUNTS (the split-K
-    regrouping), or ``None`` when the entry has no nested-reduction structure (a plain GEMM, whose K
-    sum is a single in-order fold that tiling never regroups).
-
-    A split-K GEMM's static instruction structure is IDENTICAL across split counts — only the outer
-    loop's runtime TRIP differs — so the checker must key on the loop-control constants. We return the
-    sorted set of ``setp`` immediate compare-constants in the entry: the outer split loop's bound
-    (= num_splits) and the inner K-loop's bound both appear here as literals and both change with the
-    split count, so different split counts get different signatures (SOUND, never over-merged). This is
-    a FAIL-CLOSED fingerprint of the trip structure — the checker cannot yet model the split regrouping
-    precisely; exact per-split recovery (nested ``LoopReduce``) is a follow-up. Returns ``None`` unless
-    an outer reduction loop exists, so a plain tiled GEMM keeps its tiling-invariant fence."""
-    insts, loops = find_loops(func)
-    if not outer_reduction_loops(insts, loops):
-        return None
-    consts = set()
+def _setp_bounds_of(insts, regs):
+    """Constants each register in ``regs`` is compared to across the entry's ``setp`` instructions."""
+    out = set()
     for inst in insts:
         if inst.opcode == "setp" and len(inst.operands) >= 3:
-            for o in inst.operands[1:]:
-                if isinstance(o, ImmediateOperand):
+            for x, y in ((inst.operands[1], inst.operands[2]), (inst.operands[2], inst.operands[1])):
+                if isinstance(x, RegisterOperand) and x.name in regs and isinstance(y, ImmediateOperand):
                     try:
-                        consts.add(int(o.text, 0))
+                        out.add(int(y.text, 0))
                     except (ValueError, TypeError):
                         continue
-    return tuple(sorted(consts))
+    return out
+
+
+def reduction_trip_signature(func):
+    """Hashable fingerprint that distinguishes the outer reduction loops' TRIP COUNTS (the split-K
+    regrouping = num_splits), or ``None`` when the entry has no nested-reduction structure (a plain
+    GEMM, whose K sum is a single in-order fold that tiling never regroups). Same num_splits across any
+    tiling -> same signature (RECOVERS num_warps / BLOCK_M / BLOCK_N); different num_splits -> different
+    signature (SOUND).
+
+    A split-K GEMM's static instruction structure is IDENTICAL across split counts — only the outer
+    loop's runtime TRIP differs — so we key on the loop-control constants, in two tiers:
+    - the ``("trip", ...)`` tier is the split loops' scalar self-increment COUNTER `(step, bound)` (a
+      LOOPED split has `s += 1` guarded by `s < num_splits`); the bound is num_splits, tiling-invariant.
+    - a small split count is peeled (no counter) at some tilings, so the ``("region", ...)`` tier falls
+      back to the split loops' in-region ``setp`` constants (the split + inner-K bounds), which are
+      likewise tiling-invariant per split count.
+    Both are keyed on num_splits and independent of the tiling axes, so they recover the tiling freedom
+    while keeping the split counts distinct. Returns ``None`` unless an outer reduction loop exists, so
+    a plain tiled GEMM keeps its tiling-invariant fence."""
+    insts, loops = find_loops(func)
+    splitloops = outer_reduction_loops(insts, loops)
+    if not splitloops:
+        return None
+    clean = set()
+    for h, latch in splitloops:
+        steps = {}
+        for k in range(h, latch + 1):
+            inst = insts[k]
+            if inst.opcode == "add" and len(inst.operands) == 3:
+                d, a, b = inst.operands
+                if (isinstance(d, RegisterOperand) and isinstance(a, RegisterOperand)
+                        and d.name == a.name and isinstance(b, ImmediateOperand)):
+                    try:
+                        steps[d.name] = int(b.text, 0)
+                    except (ValueError, TypeError):
+                        continue
+        for reg, step in steps.items():
+            for bound in _setp_bounds_of(insts, {reg}):
+                clean.add((step, bound))
+    if clean:
+        return ("trip", tuple(sorted(clean)))
+    region = []
+    for h, latch in splitloops:
+        cs = set()
+        for k in range(h, latch + 1):
+            inst = insts[k]
+            if inst.opcode == "setp" and len(inst.operands) >= 3:
+                for o in inst.operands[1:]:
+                    if isinstance(o, ImmediateOperand):
+                        try:
+                            cs.add(int(o.text, 0))
+                        except (ValueError, TypeError):
+                            continue
+        region.append(tuple(sorted(cs)))
+    return ("region", tuple(sorted(region)))

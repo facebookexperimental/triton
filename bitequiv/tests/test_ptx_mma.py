@@ -48,9 +48,9 @@ def test_non_mma_entry_has_no_fence():
     assert _mma_fence(_entry("add.f32 %f1, %f2, %f3;\n")) is None
 
 
-def test_proportional_tiling_reduces_to_same_ratio():
-    # n128 + 1 epilogue add  ==  2x n64 + 2 epilogue adds: same K/dtypes (m/n dropped) and the
-    # GCD-reduced (mma_count, fp_count) ratio is equal -> same fence (bit-irrelevant re-tiling).
+def test_proportional_tiling_reduces_to_same_fence():
+    # n128 + 1 epilogue add  ==  2x n64 + 2 epilogue adds: same K/dtypes (m/n dropped) and the f32
+    # epilogue PRESENCE (has_fma, has_addmul) is equal -> same fence (bit-irrelevant re-tiling).
     one = _mma_fence(_entry(_WGMMA + "add.f32 %f1, %f2, %f3;\n"))
     two = _mma_fence(_entry(
         "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 {%r1}, %r2, %r3;\n"
@@ -81,4 +81,18 @@ def test_fp_fusion_splits_at_equal_op_count():
     # add/mul (ratio mma:fma:addmul) splits them (fma single-rounded vs mul+add double-rounded).
     fused = _mma_fence(_entry(_WGMMA + "fma.rn.f32 %f1, %f2, %f3, %f4;\nfma.rn.f32 %f5, %f6, %f7, %f8;\n"))
     unfused = _mma_fence(_entry(_WGMMA + "add.f32 %f1, %f2, %f3;\nadd.f32 %f5, %f6, %f7;\n"))
-    assert fused != unfused  # (1 mma, 2 fma, 0 addmul) vs (1 mma, 0 fma, 2 addmul)
+    assert fused != unfused  # presence (has_fma=1, has_addmul=0) vs (has_fma=0, has_addmul=1)
+
+
+def test_epilogue_count_is_presence_not_scaled_count():
+    # The split-K / bias_relu over-split: tcgen05's mma count stays 1 while the f32 epilogue add count
+    # scales with the M/N tile (elements per thread), so a COUNT (even GCD-reduced against the constant
+    # mma count) over-splits equivalent re-tilings. The fence records only PRESENCE, so same-token
+    # entries differing ONLY in addmul COUNT (1 add vs 4 adds) merge -- the recovery this diff adds.
+    _TCG = "tcgen05.mma.cta_group::1.kind::f16 [%r1], %r2, %r3;\n"
+    one = _mma_fence(_entry(_TCG + "add.f32 %f1, %f2, %f3;\n"))
+    four = _mma_fence(_entry(_TCG + "add.f32 %f1, %f2, %f3;\nadd.f32 %f4, %f5, %f6;\n"
+                             "add.f32 %f7, %f8, %f9;\nadd.f32 %f10, %f11, %f12;\n"))
+    assert one == four                                       # presence: both (has_fma=0, has_addmul=1)
+    none = _mma_fence(_entry(_TCG))                          # no epilogue add at all
+    assert none != one                                       # (has_addmul=0) still splits from (1)
