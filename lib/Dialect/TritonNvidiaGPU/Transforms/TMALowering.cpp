@@ -193,7 +193,6 @@ public:
 
   LogicalResult matchAndRewrite(MakeTensorDescOp op,
                                 PatternRewriter &rewriter) const override {
-    MLIRContext *ctx = op.getContext();
     auto loc = op.getLoc();
 
     Value descPtr;

@@ -1003,7 +1003,6 @@ public:
     // kWidth is 16 for fp4.
     const unsigned kWidth = kBase;
     assert(kWidth == 32);
-    using basisT = std::vector<std::vector<int32_t>>;
 
     auto aShape = a.getType().getShape();
     auto bShape = b.getType().getShape();
@@ -1201,8 +1200,6 @@ public:
 
     auto order = ttg::getMatrixOrder(rank, /*rowMajor=*/true);
     auto standardOutDims = standardOutDimNames(ctx, rank);
-
-    using basisT = std::vector<std::vector<int32_t>>;
 
     RankedTensorType aType = a.getType();
     RankedTensorType bType = b.getType();
@@ -1405,9 +1402,6 @@ FailureOr<WmmaIntrinsic> chooseWmmaInstruction(Location loc, int wmmaVersion,
                                                Type cElemType, int inputKSize) {
   // number of matrix elements along k dim per one WMMA instruction
   unsigned kDim = 0;
-
-  auto resShape = cType.getShape();
-  auto rank = resShape.size();
 
   unsigned mDim = 16;
   unsigned nDim = 16;
