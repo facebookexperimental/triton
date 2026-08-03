@@ -63,6 +63,11 @@ SOFTMAX_REFERENCE_HEADROOM_LOG2 = tl.constexpr(8.0)
 # envelope strictly above that boundary to prevent a zero softmax denominator.
 FIXED_REFERENCE_MAX_LOG2_SPAN = 126.0
 
+# The current symbolic address expressions are signed i32 through the Wave
+# bridge.  Keep both the materialized tensor stride and every flattened element
+# offset representable until the kernel migrates those expressions to i64.
+MAX_SIGNED_I32 = (1 << 31) - 1
+
 
 @triton.jit
 def _sum_combine(lhs, rhs):
@@ -1824,6 +1829,12 @@ def attention(
     assert sequence % 256 == 0
     assert sequence // 64 >= 4
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    batch_stride = heads * sequence * head_dim
+    last_element_offset = batch * batch_stride - 1
+    if batch_stride > MAX_SIGNED_I32 or last_element_offset > MAX_SIGNED_I32:
+        raise ValueError(f"amd_fa_wave batch stride ({batch_stride}) and last element offset "
+                         f"({last_element_offset}) must not exceed the signed-i32 address limit "
+                         f"({MAX_SIGNED_I32})")
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
