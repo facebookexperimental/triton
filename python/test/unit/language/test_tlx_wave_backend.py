@@ -2168,6 +2168,7 @@ def test_tlx_wave_converter_token_stage_merges_conditional_group_before_loop_car
     (if_carry, ) = token_program.if_token_carries_by_op[source_if_op.index]
     assert loop_carry.init_source_value_id == warmup_group_op.results[0]
     assert loop_carry.yield_source_value_id == body_group_op.results[0]
+    assert loop_carry.cumulative_completion is True
     assert if_carry.then_source_value_id == body_group_op.results[0]
     assert if_carry.else_source_value_id is None
 
@@ -2178,7 +2179,18 @@ def test_tlx_wave_converter_token_stage_merges_conditional_group_before_loop_car
     target_wait_ops = [op for op in output.target_program.ops if op.kind == "async_wait"]
     target_for_region = output.target_program.regions[target_for_op.region_ids[0]]
     assert len(target_if_op.results) == 1
-    assert target_for_region.yield_value_ids[-1] == target_if_op.results[0]
+    (completion_join, ) = [
+        output.target_program.ops[op_id]
+        for op_id in target_for_region.op_ids
+        if output.target_program.ops[op_id].kind == "token_join"
+    ]
+    assert completion_join.operands == (
+        target_for_region.block_arg_ids[-1],
+        target_if_op.results[0],
+    )
+    assert target_for_region.yield_value_ids[-1:] == completion_join.results
+    assert output.target_program.values[completion_join.results[0]].event_domain == (
+        converter_target_ir.EVENT_DOMAIN_DMA_GROUP)
     target_commit_ops = [op for op in output.target_program.ops if op.kind == "async_commit_group"]
     assert target_wait_ops[0].operands == (
         target_for_region.block_arg_ids[-1],
@@ -3707,6 +3719,27 @@ def test_tlx_wave_converter_verifier_rejects_missing_fact():
     assert diagnostic.stage == "verification"
     assert diagnostic.target_op_id == 0
     assert diagnostic.no_fallback is True
+
+
+@pytest.mark.parametrize("kind", ("buffer_load", "buffer_store", "buffer_load_to_local"))
+def test_tlx_wave_converter_verifier_rejects_zero_memory_contiguity(kind):
+    target = converter_target_ir.TargetProgram(
+        values=(),
+        ops=(converter_target_ir.TargetOp(
+            0,
+            kind,
+            attrs=(converter_target_ir.TargetAttr("contiguity", 0), ),
+        ), ),
+        regions=(converter_target_ir.TargetRegion(0, (0, )), ),
+        source_value_targets={},
+        erased_source_values={},
+    )
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_verifier.verify_target_program(target)
+
+    assert exc_info.value.code == "TLXW_VERIFY_MEMORY_CONTIGUITY"
+    assert exc_info.value.stage == "verification"
 
 
 def test_tlx_wave_converter_verifier_rejects_unknown_value_layout():
@@ -8911,6 +8944,7 @@ def test_tlx_wave_converter_lowers_dynamic_padded_memdesc_index_packet_dma_desti
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
+    _assert_runtime_contiguity_scoped_by_where(raw_wave)
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     machine = _run_waveamd_to_machine(raw_wave)
@@ -9212,6 +9246,7 @@ def test_tlx_wave_converter_lowers_masked_narrow_padded_buffer_load_to_local_dma
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
+    _assert_runtime_contiguity_scoped_by_where(raw_wave)
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
@@ -9266,6 +9301,7 @@ def test_tlx_wave_converter_lowers_glu_like_masked_narrow_padded_buffer_load_to_
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
+    _assert_runtime_contiguity_scoped_by_where(raw_wave)
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
@@ -12371,7 +12407,8 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_store_with_where(tmp_p
     del ctx
 
 
-def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path):
+@pytest.mark.parametrize("register_mask", (1, 2))
+def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path, register_mask):
     preamble = """
 #linear = #ttg.linear<{
   register = [[1], [0]],
@@ -12390,13 +12427,13 @@ def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path):
     %mask = arith.cmpi slt, %range, %limit_splat : tensor<64xi32, #linear>
     amdg.buffer_store %value, %arg0[%range], %mask {
       amdgpu.redundant_lane_mask = 1 : i32,
-      amdgpu.redundant_register_mask = 2 : i32,
+      amdgpu.redundant_register_mask = REGISTER_MASK : i32,
       amdgpu.redundant_wave_mask = 7 : i32,
       contiguity = 2 : i32
     } : tensor<64xf16, #linear>
     tt.return
   }
-"""
+""".replace("REGISTER_MASK", str(register_mask))
     mod, ctx = _parse_ttgir(
         tmp_path,
         local_func,
@@ -12408,15 +12445,20 @@ def test_tlx_wave_converter_applies_generic_buffer_store_ownership(tmp_path):
 
     (store_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_store"]
     attrs = converter_target_ir.attrs_dict(store_op)
-    assert attrs["redundant_register_mask"] == 2
+    assert attrs["redundant_register_mask"] == register_mask
     assert attrs["redundant_lane_mask"] == 1
     assert attrs["redundant_wave_mask"] == 7
     assert attrs["wave_count"] == 8
+    assert attrs["contiguity"] == 2
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert wave.count("wave.where") == 1
     assert "wave.binary andi" in wave
     machine = _run_waveamd_to_machine(wave)
+    if register_mask == 1:
+        assert '#wave.pred<"-1 + x >= 0">, #wave.pred<"-1 + x <= 0">' not in wave
+    else:
+        _assert_runtime_contiguity_scoped_by_where(wave)
     assert machine.count("waveamdmachine.buffer_store_b16") == 2
     assert machine.count("waveamdmachine.exec_if") == 2
     del ctx
@@ -13251,6 +13293,7 @@ def test_tlx_wave_converter_pipeline_lowers_masked_buffer_load_with_other(tmp_pa
 
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
     attrs = converter_target_ir.attrs_dict(load_op)
+    assert attrs["contiguity"] == 1
     assert attrs["has_mask"] is True
     assert attrs["has_other"] is True
     assert attrs["mask_mode"] == "exec_where"
@@ -13332,6 +13375,7 @@ def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load
 
     (load_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load"]
     attrs = converter_target_ir.attrs_dict(load_op)
+    assert attrs["contiguity"] == 8
     _offset_edge, _offset_attrs = _memory_offset_edge(
         output.target_program,
         load_op,
@@ -13346,6 +13390,134 @@ def test_tlx_wave_converter_vectorizes_dynamic_stride_contiguous_f16_buffer_load
     # Wave, rather than the bridge, discovers and lowers all eight.
     assert machine.count("waveamdmachine.buffer_load_tuple_b32") == 8
     assert "waveamdmachine.buffer_load_b16" not in machine
+    del ctx
+
+
+def test_tlx_wave_converter_vectorizes_runtime_modulo_buffer_accesses(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_runtime_modulo_buffer_accesses(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %base: i32,
+      %modulus: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %base_s = tt.splat %base : i32 -> tensor<128xi32, #blocked>
+    %raw = arith.addi %base_s, %range : tensor<128xi32, #blocked>
+    %modulus_s = tt.splat %modulus : i32 -> tensor<128xi32, #blocked>
+    %offset = arith.remsi %raw, %modulus_s : tensor<128xi32, #blocked>
+    %loaded = amdg.buffer_load %arg0[%offset] {contiguity = 2 : i32} : tensor<128xf16, #blocked>
+    amdg.buffer_store %loaded, %arg1[%offset] {contiguity = 2 : i32} : tensor<128xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    load_op = next(op for op in output.target_program.ops if op.kind == "buffer_load")
+    store_op = next(op for op in output.target_program.ops if op.kind == "buffer_store")
+    assert converter_target_ir.attrs_dict(load_op)["contiguity"] == 2
+    assert converter_target_ir.attrs_dict(store_op)["contiguity"] == 2
+    raw_wave = output.emitted_module.text
+    _assert_runtime_contiguity_identity_chain(raw_wave, minimum=2)
+    machine = _run_waveamd_to_machine(raw_wave)
+    assert "load_b16" not in machine
+    assert "store_b16" not in machine
+    assert "load_b32" in machine
+    assert "store_b32" in machine
+    del ctx
+
+
+def test_tlx_wave_converter_scopes_masked_runtime_contiguity(tmp_path):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+"""
+    local_func = """
+  tt.func public @converter_masked_runtime_contiguity(
+      %arg0: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %arg1: !tt.ptr<f16> {tt.pointer_range = 32 : i32},
+      %base: i32,
+      %modulus: i32,
+      %limit: i32) attributes {noinline = false} {
+    %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %base_s = tt.splat %base : i32 -> tensor<128xi32, #blocked>
+    %raw = arith.addi %base_s, %range : tensor<128xi32, #blocked>
+    %modulus_s = tt.splat %modulus : i32 -> tensor<128xi32, #blocked>
+    %offset = arith.remsi %raw, %modulus_s : tensor<128xi32, #blocked>
+    %active = arith.cmpi slt, %base, %limit : i32
+    %mask = tt.splat %active : i1 -> tensor<128xi1, #blocked>
+    %other = arith.constant dense<0.000000e+00> : tensor<128xf16, #blocked>
+    %loaded = amdg.buffer_load %arg0[%offset], %mask, %other {contiguity = 2 : i32} : tensor<128xf16, #blocked>
+    amdg.buffer_store %loaded, %arg1[%offset], %mask {contiguity = 2 : i32} : tensor<128xf16, #blocked>
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    raw_wave = output.emitted_module.text
+    assert raw_wave.count("wave.where") == 2
+    _assert_runtime_contiguity_scoped_by_where(raw_wave, minimum=2)
+    machine = _run_waveamd_to_machine(raw_wave)
+    assert "waveamdmachine.buffer_load_b16" not in machine
+    assert "waveamdmachine.buffer_store_b16" not in machine
+    assert machine.count("waveamdmachine.buffer_load_b32") == 1
+    assert machine.count("waveamdmachine.buffer_store_b32") == 1
+    assert machine.count("waveamdmachine.exec_if") == 2
+    del ctx
+
+
+@pytest.mark.parametrize(
+    ("kind", "diagnostic_code"),
+    (
+        ("buffer_load", "TLXW_OP_BUFFER_LOAD"),
+        ("buffer_store", "TLXW_OP_BUFFER_STORE"),
+        ("buffer_load_to_local", "TLXW_OP_BUFFER_ASYNC"),
+    ),
+)
+def test_tlx_wave_converter_rejects_zero_buffer_contiguity(tmp_path, kind, diagnostic_code):
+    preamble = """
+#blocked = #ttg.blocked<{sizePerThread = [2], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+"""
+    operation = {
+        "buffer_load":
+        """
+    %loaded = amdg.buffer_load %arg0[%range] {contiguity = 0 : i32} : tensor<128xf16, #blocked>
+""",
+        "buffer_store":
+        """
+    %value = arith.constant dense<0.000000e+00> : tensor<128xf16, #blocked>
+    amdg.buffer_store %value, %arg0[%range] {contiguity = 0 : i32} : tensor<128xf16, #blocked>
+""",
+        "buffer_load_to_local":
+        """
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xf16, #shared, #smem, mutable>
+    %copy = amdg.buffer_load_to_local %arg0[%range] into %alloc {contiguity = 0 : i32} : <f16>[tensor<128xi32, #blocked>] -> <128xf16, #shared, #smem, mutable>
+    %group = ttg.async_commit_group tokens %copy
+    %wait = ttg.async_wait %group {num = 0 : i32}
+""",
+    }[kind]
+    local_func = f"""
+  tt.func public @converter_zero_buffer_contiguity(
+      %arg0: !tt.ptr<f16> {{tt.pointer_range = 32 : i32}}) attributes {{noinline = false}} {{
+    %range = tt.make_range {{end = 128 : i32, start = 0 : i32}} : tensor<128xi32, #blocked>
+{operation}
+    tt.return
+  }}
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=1, preamble=preamble)
+
+    with pytest.raises(converter_diagnostics.Diagnostic) as exc_info:
+        converter_pipeline.convert_ttgir_to_wave(mod)
+
+    assert exc_info.value.code == diagnostic_code
+    assert exc_info.value.stage == "op_conversion"
     del ctx
 
 
@@ -13839,7 +14011,7 @@ def test_tlx_wave_converter_pipeline_groups_2d_padded_dma_physical_linear_slots(
     del ctx
 
 
-def test_tlx_wave_converter_pipeline_does_not_assume_runtime_modulo_contiguity(tmp_path):
+def test_tlx_wave_converter_pipeline_preserves_runtime_modulo_contiguity(tmp_path):
     preamble = """
 #linear = #ttg.linear<{register = [[0, 1], [8, 0], [16, 0], [32, 0], [64, 0]], lane = [[0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], warp = [[1, 0], [2, 0], [4, 0]], block = []}>
 #shared = #ttg.padded_shared<[128:+4] {order = [1, 0], shape = [128, 128]}>
@@ -13884,11 +14056,15 @@ def test_tlx_wave_converter_pipeline_does_not_assume_runtime_modulo_contiguity(t
     (dma_op, ) = [op for op in output.target_program.ops if op.kind == "buffer_load_to_local"]
     attrs = converter_target_ir.attrs_dict(dma_op)
     _assert_mechanical_symbolic_copy(attrs, masked=False)
+    assert attrs["contiguity"] == 2
     raw_wave = output.emitted_module.text
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
+    assert "linear_layout" not in raw_wave
+    assert "assumed_contiguity" not in raw_wave
+    _assert_runtime_contiguity_identity_chain(raw_wave)
     wave = _run_wave_lower_symbolic_memory(raw_wave)
-    assert "waveamd.dma_load_lds" not in wave
+    assert "waveamd.dma_load_lds" in wave
     _run_waveamd_to_machine(raw_wave)
     del ctx
 
@@ -16084,6 +16260,29 @@ def _assert_mechanical_symbolic_copy(attrs, *, masked=None):
     if masked is not None:
         assert attrs["has_mask"] is masked
         assert attrs["mask_mode"] == ("exec_where" if masked else "none")
+
+
+def _assert_runtime_contiguity_identity_chain(wave_artifact, *, minimum=1):
+    value = r"%[A-Za-z0-9_.$-]+"
+    pattern = re.compile(rf"(?m)^\s*(?P<delta>{value}) = wave\.binary subi "
+                         rf"(?P<current>{value}), (?P<previous>{value})[^\n]*\n"
+                         rf"\s*(?P<unit>{value}) = wave\.assume (?P=delta) as \"x\" "
+                         r"\[#wave\.pred<\"-1 \+ x >= 0\">, #wave\.pred<\"-1 \+ x <= 0\">\][^\n]*\n"
+                         rf"\s*(?P<rebuilt>{value}) = wave\.binary addi (?P=previous), (?P=unit)")
+    matches = tuple(pattern.finditer(wave_artifact))
+    assert len(matches) >= minimum
+    assert all(match.group("current") != match.group("previous") for match in matches)
+    return matches
+
+
+def _assert_runtime_contiguity_scoped_by_where(wave_artifact, *, minimum=1):
+    matches = _assert_runtime_contiguity_identity_chain(
+        wave_artifact,
+        minimum=minimum,
+    )
+    for match in matches:
+        prefix = wave_artifact[:match.start()]
+        assert prefix.rfind("wave.where ") > prefix.rfind("} : !wave.mask")
 
 
 def _run_wave_compile_kernels(wave_artifact):

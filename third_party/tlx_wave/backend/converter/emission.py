@@ -2589,6 +2589,46 @@ def _symbolic_buffer_offset_range(attrs):
     return 0, upper
 
 
+def _assume_symbolic_element_contiguity(
+    state,
+    offsets,
+    contiguity,
+    component_indices=None,
+):
+    """Express scalar element contiguity with ordinary Wave predicates."""
+    offsets = tuple(offsets)
+    contiguity = int(contiguity)
+    if contiguity <= 1 or len(offsets) <= 1:
+        return offsets
+    if component_indices is None:
+        component_indices = range(len(offsets))
+    component_indices = tuple(int(index) for index in component_indices)
+    if len(component_indices) != len(offsets):
+        raise ValueError("symbolic contiguity indices must match offsets")
+
+    normalized = []
+    previous_index = None
+    for component_index, offset in zip(component_indices, offsets):
+        if (previous_index is None or component_index % contiguity == 0 or component_index != previous_index + 1):
+            normalized.append(offset)
+            previous_index = component_index
+            continue
+        previous = normalized[-1]
+        delta = state.builder.binary(
+            state.dsl.BinaryKind.SubI,
+            offset,
+            previous,
+        )
+        unit_delta = state.builder.assume_range(delta, 1, 1)
+        normalized.append(state.builder.binary(
+            state.dsl.BinaryKind.AddI,
+            previous,
+            unit_delta,
+        ))
+        previous_index = component_index
+    return tuple(normalized)
+
+
 def _prepare_symbolic_indexed_gather(
     state,
     offsets,
@@ -2600,6 +2640,8 @@ def _prepare_symbolic_indexed_gather(
     offset_range=None,
     op=None,
     dependency=None,
+    element_contiguity=1,
+    element_component_indices=None,
     cache=None,
 ):
     """Prepare stable operands and defer access-scoped facts with the gather."""
@@ -2613,6 +2655,12 @@ def _prepare_symbolic_indexed_gather(
 
     def emit():
         access_offsets = tuple(_assume_value_range(state, offset, offset_range, op) for offset in offset_components)
+        access_offsets = _assume_symbolic_element_contiguity(
+            state,
+            access_offsets,
+            element_contiguity,
+            element_component_indices,
+        )
         return state.builder.gather(
             [base],
             result_type,
@@ -2637,6 +2685,8 @@ def _prepare_symbolic_indexed_scatter(
     offset_range=None,
     op=None,
     dependency=None,
+    element_contiguity=1,
+    element_component_indices=None,
     cache=None,
 ):
     """Prepare stable operands and defer access-scoped facts with the scatter."""
@@ -2655,6 +2705,12 @@ def _prepare_symbolic_indexed_scatter(
 
     def emit():
         access_offsets = tuple(_assume_value_range(state, offset, offset_range, op) for offset in offset_components)
+        access_offsets = _assume_symbolic_element_contiguity(
+            state,
+            access_offsets,
+            element_contiguity,
+            element_component_indices,
+        )
         return state.builder.scatter(
             value_packet,
             [base],
@@ -2994,6 +3050,7 @@ def _emit_buffer_load_to_local(state, op):
         offset_range=_symbolic_buffer_offset_range(attrs),
         op=op,
         dependency=dependency,
+        element_contiguity=int(attrs.get("contiguity", 1)),
         cache=cache,
     )
     if mask_components is None:
@@ -4501,6 +4558,7 @@ def _emit_buffer_store(state, op):
         op,
     )
     redundant_register_mask = int(attrs.get("redundant_register_mask", 0))
+    canonical_components = tuple(range(access_component_count))
     if redundant_register_mask:
         canonical_components = tuple(component for component in range(access_component_count)
                                      if (component & redundant_register_mask) == 0)
@@ -4528,6 +4586,8 @@ def _emit_buffer_store(state, op):
         offset_range=_symbolic_buffer_offset_range(attrs),
         op=op,
         dependency=dependency,
+        element_contiguity=int(attrs.get("contiguity", 1)),
+        element_component_indices=canonical_components,
         cache=cache,
     )
 
@@ -4793,6 +4853,7 @@ def _emit_buffer_load(state, op):
         offset_range=_symbolic_buffer_offset_range(attrs),
         op=op,
         dependency=dependency,
+        element_contiguity=int(attrs.get("contiguity", 1)),
         cache=cache,
     )
 
