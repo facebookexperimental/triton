@@ -1325,7 +1325,11 @@ def _pipeline(
     v_ready0 = _issue_tile(v_ptrs, 0, stride_vn, v_buffer, 0, 32)
     k_ready1 = _issue_tile(k_ptrs, 1, stride_kn, k_buffer, 1, 8)
 
-    wait_k0 = _wait_stage_end(2, [k_ready0, k_ready1, v_ready0])
+    # Only K0 is required for the first QK.  A FIFO wait retains V0 and K1 as
+    # issue-order dependencies without also demanding their completion.  The
+    # K0 local load consumes this explicit wait result; later V0/K1 loads
+    # consume the next explicit wait result.
+    wait_k0 = tlx.async_load_wait_group(2)
     k0 = tlx.local_load(
         tlx.local_trans(tlx.local_view(k_buffer, 0)),
         token=wait_k0,
