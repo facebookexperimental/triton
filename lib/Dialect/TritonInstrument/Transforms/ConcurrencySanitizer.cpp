@@ -387,6 +387,9 @@ Value getMemEffectRecipientCTAs(ImplicitLocOpBuilder &b, Operation *op) {
       return getMulticastRecipientCTAs(b, copyOp.getResult());
     return currentCTAMask(b);
   }
+  if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op);
+      gatherOp && gatherOp.getMulticast())
+    return getMulticastRecipientCTAs(b, gatherOp.getResult());
   if (isTensorCoreOp(op))
     return getRecipientCTAsForBroadcastMasks(
         b, ttng::getCTABroadcastMasks(ttng::getModuleTwoCTAs(op), {}));
@@ -406,8 +409,12 @@ Value getBarrierRecipientCTAs(ImplicitLocOpBuilder &b, Operation *op) {
                                               copyOp.getBarrier());
     return getLeaderCTA(b, copyOp.getBarrier());
   }
-  if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op))
+  if (auto gatherOp = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+    if (gatherOp.getMulticast())
+      return getMulticastBarrierRecipientCTAs(b, gatherOp.getResult(),
+                                              gatherOp.getBarrier());
     return getLeaderCTA(b, gatherOp.getBarrier());
+  }
 
   if (isTensorCoreOp(op))
     return getRecipientCTAsForBroadcastMasks(
