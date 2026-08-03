@@ -6571,6 +6571,16 @@ def test_tlx_wave_runtime_gfx950_fa_eight_wave_e2e(tmp_path, backend, qk_max_abs
     torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_tlx_wave_fa_rejects_unsafe_fixed_reference_span():
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_unsafe_fixed_reference_span")
+    tensor = torch.empty((1, 1, 256, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=r"fixed-reference log2 score span .* must be less than 126"):
+        tutorial.attention(tensor, tensor, tensor, qk_max_abs=2.0)
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
