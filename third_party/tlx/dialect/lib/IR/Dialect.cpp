@@ -128,11 +128,21 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     Attribute result;
     if (failed(infer(delegate, anchor, result)))
       return failure();
-    // Re-wrap no_verify as the outermost wrapper so a build-time verify (before
-    // ttg.num-warps is set) skips verifyTensorLayout. After resolve strips
-    // no_verify from operand and result alike, re-inference takes the plain
-    // branch and produces the same slice<parent=...>, so they stay consistent.
-    resultEncoding = deferred ? wrapNoVerifyLayout(result) : result;
+    if (!deferred) {
+      resultEncoding = result;
+      return success();
+    }
+
+    // Reduce returns a slice whose parent is the full-rank operand encoding, so
+    // keep no_verify on that parent. Expand-dims returns the parent itself.
+    if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(result)) {
+      auto parent = cast<triton::gpu::DistributedEncodingTrait>(
+          wrapNoVerifyLayout(slice.getParent()));
+      resultEncoding = triton::gpu::SliceEncodingAttr::get(
+          result.getContext(), slice.getDim(), parent);
+    } else {
+      resultEncoding = wrapNoVerifyLayout(result);
+    }
     return success();
   }
 
