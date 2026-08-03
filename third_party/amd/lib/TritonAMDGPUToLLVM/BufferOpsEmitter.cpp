@@ -13,6 +13,7 @@
 #include <cstdint>
 
 using namespace triton::AMD;
+using mlir::triton::amdgpu::ISAFamily;
 
 namespace {
 
