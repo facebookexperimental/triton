@@ -68,6 +68,22 @@ FIXED_REFERENCE_MAX_LOG2_SPAN = 126.0
 # offset representable until the kernel migrates those expressions to i64.
 MAX_SIGNED_I32 = (1 << 31) - 1
 
+RESERVED_LAUNCH_OPTIONS = frozenset({
+    "Q",
+    "K",
+    "V",
+    "Out",
+    "grid",
+    "N_CTX",
+    "BATCH",
+    "HEADS",
+    "TOTAL_HEADS",
+    "SM_SCALE",
+    "LOG2_SCORE_BOUND",
+    "ADAPTIVE_REFERENCE",
+    "num_warps",
+})
+
 
 @triton.jit
 def _sum_combine(lhs, rhs):
@@ -1811,7 +1827,7 @@ def attention(
     qk_max_abs=None,
     out=None,
     warmup=False,
-    **kwargs,
+    **compiler_options,
 ):
     """Run the separate eight-wave attention kernel.
 
@@ -1820,6 +1836,10 @@ def attention(
     ``out`` may be exactly ``q``, but it must not partially overlap ``q`` or
     overlap any part of ``k`` or ``v``.
     """
+    reserved_options = sorted(RESERVED_LAUNCH_OPTIONS.intersection(compiler_options))
+    if reserved_options:
+        names = ", ".join(reserved_options)
+        raise TypeError(f"amd_fa_wave compiler options must not override reserved launch keys: {names}")
     assert not causal, "amd_fa_wave only implements non-causal attention"
     assert q.dtype == torch.bfloat16, "amd_fa_wave requires BF16 inputs"
     assert q.ndim == 4
@@ -1863,6 +1883,7 @@ def attention(
         raise ValueError("amd_fa_wave out may overlap q only when it is exactly the same tensor view")
     grid = (sequence // 256, batch * heads, 1)
     launch_options = {
+        **compiler_options,
         "N_CTX": sequence,
         "BATCH": batch,
         "HEADS": heads,
@@ -1871,7 +1892,6 @@ def attention(
         "LOG2_SCORE_BOUND": log2_score_bound,
         "ADAPTIVE_REFERENCE": adaptive_reference,
         "num_warps": 8,
-        **kwargs,
     }
     if triton.runtime.driver.active.get_current_target().backend == "tlx_wave":
         launch_options.setdefault("tlx_wave_enable_multi_wave_specialize", False)

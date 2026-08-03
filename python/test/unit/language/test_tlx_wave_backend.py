@@ -6828,6 +6828,108 @@ def test_tlx_wave_fa_rejects_i32_offset_overflow(shape):
         tutorial.attention(q, k, v)
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "Q",
+        "K",
+        "V",
+        "Out",
+        "grid",
+        "N_CTX",
+        "BATCH",
+        "HEADS",
+        "TOTAL_HEADS",
+        "SM_SCALE",
+        "LOG2_SCORE_BOUND",
+        "ADAPTIVE_REFERENCE",
+        "num_warps",
+    ],
+)
+def test_tlx_wave_fa_rejects_reserved_launch_option(key):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_reserved_launch_option_{key}")
+    tensor = torch.empty((1, 1, 256, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError, match=rf"reserved launch keys: {key}$"):
+        tutorial.attention(tensor, tensor.clone(), tensor.clone(), **{key: 0})
+
+
+def test_tlx_wave_fa_reserved_launch_option_order_is_deterministic():
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_reserved_launch_option_order")
+    tensor = torch.empty((1, 1, 256, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError, match=r"reserved launch keys: ADAPTIVE_REFERENCE, SM_SCALE, num_warps$"):
+        tutorial.attention(
+            tensor,
+            tensor.clone(),
+            tensor.clone(),
+            num_warps=4,
+            SM_SCALE=0.0,
+            ADAPTIVE_REFERENCE=False,
+        )
+
+
+def test_tlx_wave_fa_forwards_compiler_options(monkeypatch):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_forwards_compiler_options")
+    shape = (1, 1, 256, 128)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty(shape, dtype=torch.bfloat16)
+    v = torch.empty(shape, dtype=torch.bfloat16)
+    output = torch.empty(shape, dtype=torch.bfloat16)
+    captured = {}
+    sentinel = object()
+
+    def warmup(*args, grid, **options):
+        captured["args"] = args
+        captured["grid"] = grid
+        captured["options"] = options
+        return sentinel
+
+    monkeypatch.setattr(tutorial, "_attn_fwd_wave_pipeline", SimpleNamespace(warmup=warmup))
+    monkeypatch.setattr(
+        tutorial.triton.runtime.driver.active,
+        "get_current_target",
+        lambda: SimpleNamespace(backend="tlx_wave"),
+    )
+    result = tutorial.attention(
+        q,
+        k,
+        v,
+        out=output,
+        warmup=True,
+        waves_per_eu=2,
+        tlx_wave_enable_split_barriers=True,
+        tlx_wave_enable_multi_wave_specialize=True,
+        schedule_hint="none",
+        llvm_fn_attrs=("amdgpu-waves-per-eu=2", ),
+    )
+
+    assert result is sentinel
+    assert captured["args"] == (q, k, v, output)
+    assert captured["grid"] == (1, 1, 1)
+    assert captured["options"] == {
+        "waves_per_eu": 2,
+        "tlx_wave_enable_split_barriers": True,
+        "tlx_wave_enable_multi_wave_specialize": True,
+        "schedule_hint": "none",
+        "llvm_fn_attrs": ("amdgpu-waves-per-eu=2", ),
+        "N_CTX": 256,
+        "BATCH": 1,
+        "HEADS": 1,
+        "TOTAL_HEADS": 1,
+        "SM_SCALE": 1.0 / math.sqrt(128),
+        "LOG2_SCORE_BOUND": 0.0,
+        "ADAPTIVE_REFERENCE": True,
+        "num_warps": 8,
+    }
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
