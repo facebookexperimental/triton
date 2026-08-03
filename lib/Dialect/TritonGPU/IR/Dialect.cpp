@@ -4530,10 +4530,13 @@ getTMABlockShapeIm2Col(ArrayRef<int64_t> shapePerCTA, int elementBitWidth,
   // H, W). Supporting pixelsPerColumn > 1024 would require computing offsets
   // that depend on input tensor shape and padding, which is non-trivial.
   if (blockShape[otherDim] > otherDimMax) {
-    return emitError() << "im2col mode: pixelsPerColumn dimension "
-                       << blockShape[otherDim]
-                       << " exceeds the maximum supported value of "
-                       << otherDimMax;
+    if (emitError) {
+      emitError() << Twine("im2col mode: pixelsPerColumn dimension ") +
+                         Twine(blockShape[otherDim]) +
+                         " exceeds the maximum supported value of " +
+                         Twine(otherDimMax);
+    }
+    return failure();
   }
 
   // Clamp the contiguous dimension (channelsPerPixel) to max 256
@@ -4543,12 +4546,16 @@ getTMABlockShapeIm2Col(ArrayRef<int64_t> shapePerCTA, int elementBitWidth,
   if (swizzleBytes != 0) {
     auto contigDimSize = (8 * swizzleBytes) / elementBitWidth;
     if (blockShape[contigDim] < contigDimSize) {
-      return emitError() << "im2col mode: block shape along the contiguous "
-                            "dimension "
-                         << contigDim
-                         << " is too small for the swizzle byte size "
-                         << swizzleBytes << ", got " << blockShape[contigDim]
-                         << " but expected at least " << contigDimSize;
+      if (emitError) {
+        emitError() << Twine("im2col mode: block shape along the contiguous "
+                             "dimension ") +
+                           Twine(contigDim) +
+                           " is too small for the swizzle byte size " +
+                           Twine(swizzleBytes) + ", got " +
+                           Twine(blockShape[contigDim]) +
+                           " but expected at least " + Twine(contigDimSize);
+      }
+      return failure();
     }
     blockShape[contigDim] = contigDimSize;
   }
@@ -4579,12 +4586,16 @@ getTMABlockShapeTiled(ArrayRef<int64_t> shapePerCTA, int elementBitWidth,
   if (swizzleBytes != 0) {
     auto contigDimSize = (8 * swizzleBytes) / elementBitWidth;
     if (blockShape[contigDim] < contigDimSize) {
-      return emitError() << "block shape along the contiguous dimension "
-                         << contigDim
-                         << " is too small for the swizzle byte size "
-                         << swizzleBytes << " in an NVMMASharedLayout, got "
-                         << blockShape[contigDim] << " but expected at least "
-                         << contigDimSize;
+      if (emitError) {
+        emitError() << Twine("block shape along the contiguous dimension ") +
+                           Twine(contigDim) +
+                           " is too small for the swizzle byte size " +
+                           Twine(swizzleBytes) +
+                           " in an NVMMASharedLayout, got " +
+                           Twine(blockShape[contigDim]) +
+                           " but expected at least " + Twine(contigDimSize);
+      }
+      return failure();
     }
     blockShape[contigDim] = contigDimSize;
   }
