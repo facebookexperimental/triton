@@ -1,5 +1,7 @@
 import os
 import subprocess
+import sys
+from pathlib import Path
 
 import triton
 
@@ -32,6 +34,11 @@ def test_address_sanitizer():
     # Disable buffer ops given it has builtin support for out of bound access.
     os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
 
-    out = subprocess.Popen(["python", "address_sanitizer_helper.py"], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-    assert "Begin function __asan_report" in out.stdout.read().decode()
-    assert "heap-buffer-overflow" in out.stderr.read().decode()
+    out = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("address_sanitizer_helper.py"))],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert "Begin function __asan_report" in out.stdout
+    assert "heap-buffer-overflow" in out.stderr

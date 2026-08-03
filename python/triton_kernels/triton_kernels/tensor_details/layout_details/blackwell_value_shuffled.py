@@ -114,11 +114,6 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         Target layout: [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
         This matches the baseline TMA block shape [block_n, packed_block_k] after swapping.
         """
-        if data.ndim == 2:
-            data = data.unsqueeze(0)
-        if data.ndim != 3:
-            raise ValueError(f"Expected 2D or 3D canonical data, got {data.ndim}D")
-
         data = self._canonical_to_physical(data)
         E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed = self.storage_shape
         K_packed, N = data.shape[-2:]
@@ -151,6 +146,7 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         Input layout: [E, num_tiles_k, num_tiles_n, tile_n, tile_k_packed]
         """
         E = data.shape[0]
+        leading_shape = self.shape[:-2]
         # Recover original shape from self.shape (the logical shape passed to convert_layout)
         orig_K_packed = self.shape[-2] // 2 if self.is_fp4 else self.shape[-2]
         orig_N = self.shape[-1]
@@ -171,4 +167,6 @@ class BlackwellMX4ValueShuffledTransformation(LayoutTransformation):
         # Trim padding back to original shape
         data = data[:, :orig_K_packed, :orig_N].contiguous()
         data = self._physical_to_canonical(data)
-        return data if len(self.shape) == 3 else data.squeeze(0)
+        if not leading_shape:
+            return data.squeeze(0)
+        return data.reshape(*leading_shape, data.shape[-2], data.shape[-1])

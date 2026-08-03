@@ -2,6 +2,7 @@ import os
 import pytest
 import shutil
 import triton
+from triton._C.libtriton import get_cache_invalidating_env_vars
 from triton._internal_testing import is_hip
 
 from pathlib import Path
@@ -109,6 +110,17 @@ def test_env_updated(fresh_knobs, monkeypatch):
     fresh_knobs.cache.home_dir = "/foo/bar"
     assert os.getenv("TRITON_HOME") == "/foo/bar"
     assert os.environ["TRITON_HOME"] == "/foo/bar"
+
+
+def test_scalarize_packed_fops_invalidates_cache(monkeypatch):
+    monkeypatch.setenv("AMDGCN_SCALARIZE_PACKED_FOPS", "0")
+    disabled = get_cache_invalidating_env_vars()
+
+    monkeypatch.setenv("AMDGCN_SCALARIZE_PACKED_FOPS", "1")
+    enabled = get_cache_invalidating_env_vars()
+
+    assert disabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "false"
+    assert enabled["AMDGCN_SCALARIZE_PACKED_FOPS"] == "true"
 
 
 @pytest.mark.parametrize("truthy, falsey", [("1", "0"), ("true", "false"), ("True", "False"), ("TRUE", "FALSE"),
