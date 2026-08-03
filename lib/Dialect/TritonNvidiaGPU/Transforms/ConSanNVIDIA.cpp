@@ -38,6 +38,10 @@ public:
                ttng::AsyncTMAReduceOp, ttng::AsyncTMAScatterOp>(op);
   }
 
+  bool isCLCOp(Operation *op) const override {
+    return isa<ttng::CLCTryCancelOp>(op);
+  }
+
   std::optional<BarrierInitInfo>
   getBarrierInitInfo(Operation *op) const override {
     if (auto initOp = dyn_cast<ttng::InitBarrierOp>(op)) {
@@ -100,6 +104,11 @@ public:
         mask = getBarrierMask(gatherOp.getResult());
     if (auto storeOp = dyn_cast<ttng::TMAStoreLikeOpInterface>(op))
       mask = getBarrierMask(storeOp.getSrc());
+    if (isa<ttng::CLCTryCancelOp>(op) && ttg::lookupNumCTAs(op) > 1) {
+      Value ctaId = tti::ExperimentalClusterCTAIdOp::create(b, b.getLoc());
+      return arith::CmpIOp::create(b, arith::CmpIPredicate::eq, ctaId,
+                                   arith::ConstantIntOp::create(b, 0, 32));
+    }
 
     // In 2CTA tcgen05 and tmem_copy, only the even CTA in each (i, i^1) pair
     // issues the op.
@@ -228,7 +237,25 @@ public:
       info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
                                         copyOp.getResult());
     }
-    if (auto storeOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op)) {
+    if (auto tryCancelOp = dyn_cast<ttng::CLCTryCancelOp>(op)) {
+      info.emplace();
+      info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
+      info->barriers.push_back(
+          {tryCancelOp.getMbarrier(), nullptr, /*count=*/0,
+           MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
+           /*txCount=*/
+           -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult())),
+           /*diagonalEffectRecipientCTAs=*/true});
+      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
+                                        tryCancelOp.getResult());
+    }
+    if (auto loadResultOp = dyn_cast<ttng::CLCLoadResultOp>(op)) {
+      info.emplace();
+      info->trackingKind = MemEffectsOpInfo::TrackingKind::Barrier;
+      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Read,
+                                        loadResultOp.getSrc());
+    }
+    if (auto storeOp = dyn_cast<ttng::TMAStoreLikeOpInterface>(op)) {
       info.emplace();
       info->trackingKind = MemEffectsOpInfo::TrackingKind::CommitCount;
       info->commitKind = tti::CommitKind::TmaStore;
@@ -259,22 +286,6 @@ public:
            /*txCount=*/-txCount});
       info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
                                         gatherOp.getResult());
-    }
-    if (auto reduceOp = dyn_cast<ttng::AsyncTMAReduceOp>(op)) {
-      info.emplace();
-      info->trackingKind = MemEffectsOpInfo::TrackingKind::CommitCount;
-      info->commitKind = tti::CommitKind::TmaStore;
-      info->implicitCommit = true;
-      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Read,
-                                        reduceOp.getSrc());
-    }
-    if (auto scatterOp = dyn_cast<ttng::AsyncTMAScatterOp>(op)) {
-      info.emplace();
-      info->trackingKind = MemEffectsOpInfo::TrackingKind::CommitCount;
-      info->commitKind = tti::CommitKind::TmaStore;
-      info->implicitCommit = true;
-      info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Read,
-                                        scatterOp.getSrc());
     }
     if (auto arriveOp = dyn_cast<ttng::ArriveBarrierOp>(op)) {
       info.emplace();
