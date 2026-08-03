@@ -24,7 +24,7 @@ correctness against a PyTorch reference at all three K.
 
 ## Benchmarking
 
-`bench.py` runs all four versions and compares them to an eager **PyTorch unfused**
+`bench.py` runs all four versions and compares them to a **torch.compile**
 path and to **rocBLAS** (the matmul alone — no bias, no gate):
 
 ```bash
