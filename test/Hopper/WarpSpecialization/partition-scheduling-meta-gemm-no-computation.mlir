@@ -30,28 +30,28 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 // CHECK: ttg.memdesc_trans {{.*}}ttg.partition = array<i32: [[GEMM:[0-9]+]]>
 // CHECK: ttng.tc_gen5_mma {{.*}}ttg.partition = array<i32: [[GEMM]]>
 //
-// --- Epilogue: tmem_load, reshape, trans, split → computation partition ---
-// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[COMP:[0-9]+]]>
-// CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: tt.split {{.*}}ttg.partition = array<i32: [[COMP]]>
-// --- Epilogue: truncf, convert_layout, local_alloc → computation partition ---
-// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[COMP]]>
+// --- Epilogue: tmem_load, reshape, trans, split → logical default partition ---
+// CHECK: ttng.tmem_load {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: tt.reshape {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: tt.trans {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: tt.split {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// --- Epilogue: truncf, convert_layout, local_alloc → logical default partition ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // --- Epilogue: TMA store → epilogue partition ---
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL_STORE:[0-9]+]]>
 // CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
-// --- Second half: truncf, convert_layout, local_alloc → computation; TMA store → epilogue ---
-// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[COMP]]>
-// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[COMP]]>
+// --- Second half: truncf, convert_layout, local_alloc → default; TMA store → epilogue store ---
+// CHECK: arith.truncf {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttg.convert_layout {{.*}}ttg.partition = array<i32: [[EPIL]]>
+// CHECK: ttg.local_alloc {{.*}}ttg.partition = array<i32: [[EPIL]]>
 // CHECK: ttng.async_tma_copy_local_to_global {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
 // CHECK: ttng.async_tma_store_token_wait {{.*}}ttg.partition = array<i32: [[EPIL_STORE]]>
 //
 // --- Partition types ---
 // CHECK: tt.warp_specialize
-// CHECK-SAME: ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load", "computation"]
+// CHECK-SAME: ttg.partition.types = ["epilogue", "gemm", "epilogue_store", "load"]
 tt.func public @persistent_gemm_no_computation_partition(
   %a_desc: !tt.tensordesc<128x64xf16, #shared>,
   %b_desc: !tt.tensordesc<256x64xf16, #shared>,

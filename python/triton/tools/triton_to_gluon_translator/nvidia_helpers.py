@@ -14,8 +14,12 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     tcgen05_mma_scaled,
 )
 from triton.experimental.gluon.language.nvidia.blackwell import tma as tma_blackwell
-from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
+from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared, mbarrier, tma
 from triton.language.core import _unwrap_if_constexpr
+
+from triton.tools.triton_to_gluon_translator.common_helpers import *  # noqa: F401,F403
+
+# ---- NVIDIA MMA sync (Ampere) ----
 
 
 @gluon.constexpr_function
@@ -57,6 +61,9 @@ def tl_dot_mma_sync(a, b, acc_init=None, input_precision=None, out_dtype=ttgl.fl
         layout: ttgl.constexpr = default_blocked_layout(result.type.shape, ttgl.num_warps())
     result = ttgl.convert_layout(result, layout)
     return result
+
+
+# ---- NVIDIA Blackwell dot ----
 
 
 @gluon.constexpr_function
@@ -145,7 +152,6 @@ def tl_dot_blackwell(
     a_smem = get_shared_memory_mma_operand(a, 0, allow_transpose)
     b_smem = get_shared_memory_mma_operand(b, 1, allow_transpose)
 
-    # MMA instruction shape
     m: ttgl.constexpr = 128 if M >= 128 else 64
     n: ttgl.constexpr = 256 if N >= 256 else N
 
@@ -166,11 +172,13 @@ def tl_dot_blackwell(
     mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
 
-    # Load back from TMEM using a register layout and convert to acc layout
     out = acc_tmem.load()
     ret_layout: ttgl.constexpr = default_blocked_layout([M, N], ttgl.num_warps())
     out = ttgl.convert_layout(out, ret_layout)
     return out
+
+
+# ---- NVIDIA dot dispatch ----
 
 
 @gluon.jit
@@ -188,6 +196,9 @@ def tl_dot(
         return tl_dot_blackwell(a, b, acc, input_precision, allow_tf32, max_num_imprecise_acc, out_dtype)
     else:
         return tl_dot_mma_sync(a, b, acc, input_precision, out_dtype)
+
+
+# ---- NVIDIA dot-scaled ----
 
 
 @gluon.constexpr_function
@@ -486,7 +497,6 @@ def tl_dot_scaled_blackwell(
     tcgen05_commit(bar)
     mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
-    # Load back from TMEM using a register layout and convert to acc layout
     out = acc_tmem.load()
     ret_layout: ttgl.constexpr = default_blocked_layout([M, N], ttgl.num_warps())
     out = ttgl.convert_layout(out, ret_layout)
@@ -529,62 +539,7 @@ def default_blocked_layout(shape: ttgl.constexpr, num_warps: ttgl.constexpr) -> 
     )
 
 
-@gluon.jit
-def tl_obj_store(obj, offsets, value):
-    if isinstance(obj, ttgl.nvidia.hopper.tma.tensor_descriptor):
-        return tl_store_tensor_descriptor(obj, offsets, value)
-    else:
-        return obj.store(offsets, value)
-
-
-@gluon.jit
-def tl_obj_load(obj, offsets):
-    if isinstance(obj, ttgl.nvidia.hopper.tma.tensor_descriptor):
-        return tl_load_tensor_descriptor(obj, offsets)
-    else:
-        return obj.load(offsets)
-
-
-@gluon.jit
-def tl_obj_gather(obj, x_offsets, y_offset):
-    if isinstance(obj, ttgl.nvidia.hopper.tma.tensor_descriptor):
-        desc = obj
-        desc_shape: ttgl.constexpr = [x_offsets.shape[0], desc.block_shape[1]]
-        alloc = ttgl.allocate_shared_memory(desc.dtype, desc_shape, desc.layout)
-        bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
-        mbarrier.init(bar, count=1)
-        x_offsets_layout: ttgl.constexpr = ttgl.SliceLayout(
-            0,
-            ttgl.BlockedLayout([1, 4], [get_num_threads_per_warp(), 1], [1, ttgl.num_warps()], [1, 0]),
-        )
-        x_offsets = ttgl.convert_layout(x_offsets, x_offsets_layout)
-        mbarrier.expect(bar, x_offsets.shape[0] * obj.block_type.nbytes)
-        tma_blackwell.async_gather(desc, x_offsets, y_offset, bar, alloc)
-        mbarrier.wait(bar, phase=0)
-        mbarrier.invalidate(bar)
-        # Load from shared memory into a register tensor using a reasonable default layout
-        ret_layout: ttgl.constexpr = default_blocked_layout(desc.block_shape, ttgl.num_warps())
-        out = alloc.load(ret_layout)
-        return out
-    else:
-        return obj.gather(x_offsets, y_offset)
-
-
-@gluon.jit
-def tl_obj_scatter(obj, value, x_offsets, y_offset):
-    if isinstance(obj, ttgl.nvidia.hopper.tma.tensor_descriptor):
-        desc = obj
-        desc_shape: ttgl.constexpr = [x_offsets.shape[0], desc.block_shape[1]]
-        alloc = ttgl.allocate_shared_memory(desc.dtype, desc_shape, desc.layout, value)
-        x_offsets_layout: ttgl.constexpr = ttgl.SliceLayout(
-            0,
-            ttgl.BlockedLayout([1, 4], [get_num_threads_per_warp(), 1], [1, ttgl.num_warps()], [1, 0]),
-        )
-        x_offsets = ttgl.convert_layout(x_offsets, x_offsets_layout)
-        tma_blackwell.async_scatter(desc, x_offsets, y_offset, alloc)
-        tma.store_wait(0, read_only=False)
-    else:
-        obj.scatter(value, x_offsets, y_offset)
+# ---- NVIDIA TMA tensor descriptors ----
 
 
 @ttgl._core.builtin
@@ -606,15 +561,65 @@ def tl_load_tensor_descriptor(desc, offsets):
     smem = ttgl.allocate_shared_memory(desc.dtype, desc.block_shape, desc.layout)
     bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
     mbarrier.init(bar, count=1)
-    # Issue async copy from global (descriptor) to shared memory and wait for completion
     mbarrier.expect(bar, desc.block_type.nbytes)
     tma.async_copy_global_to_shared(desc, offsets, bar, smem)
     mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
-    # Load from shared memory into a register tensor using a reasonable default layout
     ret_layout: ttgl.constexpr = default_blocked_layout(desc.block_shape, ttgl.num_warps())
     out = smem.load(ret_layout)
     return out
+
+
+# ---- NVIDIA obj dispatch ----
+
+
+@gluon.jit
+def tl_obj_store(obj, offsets, value):
+    tl_store_tensor_descriptor(obj, offsets, value)
+
+
+@gluon.jit
+def tl_obj_load(obj, offsets):
+    return tl_load_tensor_descriptor(obj, offsets)
+
+
+@gluon.jit
+def tl_obj_gather(obj, x_offsets, y_offset):
+    desc = obj
+    desc_shape: ttgl.constexpr = [x_offsets.shape[0], desc.block_shape[1]]
+    alloc = ttgl.allocate_shared_memory(desc.dtype, desc_shape, desc.layout)
+    bar = ttgl.allocate_shared_memory(ttgl.int64, [1], mbarrier.MBarrierLayout())
+    mbarrier.init(bar, count=1)
+    x_offsets_layout: ttgl.constexpr = ttgl.SliceLayout(
+        0,
+        ttgl.BlockedLayout([1, 4], [get_num_threads_per_warp(), 1], [1, ttgl.num_warps()], [1, 0]),
+    )
+    x_offsets = ttgl.convert_layout(x_offsets, x_offsets_layout)
+    mbarrier.expect(bar, x_offsets.shape[0] * obj.block_type.nbytes)
+    tma_blackwell.async_gather(desc, x_offsets, y_offset, bar, alloc)
+    mbarrier.wait(bar, phase=0)
+    mbarrier.invalidate(bar)
+    ret_layout: ttgl.constexpr = default_blocked_layout(desc.block_shape, ttgl.num_warps())
+    out = alloc.load(ret_layout)
+    return out
+
+
+@gluon.jit
+def tl_obj_scatter(obj, value, x_offsets, y_offset):
+    desc = obj
+    desc_shape: ttgl.constexpr = [x_offsets.shape[0], desc.block_shape[1]]
+    alloc = ttgl.allocate_shared_memory(desc.dtype, desc_shape, desc.layout, value)
+    fence_async_shared()
+    x_offsets_layout: ttgl.constexpr = ttgl.SliceLayout(
+        0,
+        ttgl.BlockedLayout([1, 4], [get_num_threads_per_warp(), 1], [1, ttgl.num_warps()], [1, 0]),
+    )
+    x_offsets = ttgl.convert_layout(x_offsets, x_offsets_layout)
+    tma_blackwell.async_scatter(desc, x_offsets, y_offset, alloc)
+    tma.store_wait(0)
+
+
+# ---- NVIDIA host-side descriptor ----
 
 
 @gluon.jit

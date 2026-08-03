@@ -164,7 +164,13 @@ class ShflCombine:
         return (self.child, )
 
     def sig_local(self, child_sigs):
-        return f"shfl{self.offset}.{self.kind}{''.join(self.mods)}({child_sigs[0]})"
+        # .rn is the DEFAULT rounding for add (add.f32 == add.rn.f32 bit-for-bit), so strip it here
+        # the same way FpOp / ITreeReduce do: enable_fp_fusion on/off flips implicit-vs-explicit .rn
+        # on the butterfly combine, and keeping mods verbatim spuriously split a pure-add reduction
+        # (unordered / partially-collapsed) across fp_fusion on num_warps-invariant bits. min/max
+        # carry no .rn so they are unaffected; sub/div are not reduce butterflies.
+        m = _norm("".join(self.mods)) if self.kind in ("add", "mul", "fma") else "".join(self.mods)
+        return f"shfl{self.offset}.{self.kind}{m}({child_sigs[0]})"
 
     def sig(self):
         return self.sig_local([self.child.sig()])
@@ -187,3 +193,53 @@ class SmemExchange:
 
     def sig(self):
         return self.sig_local([self.child.sig()])
+
+
+@dataclass(frozen=True)
+class Mma:
+    """A tensor-core matmul chunk (wgmma / mma.sync / wmma / tcgen05). Its internal accumulation is
+    hardware-opaque, so it is NOT a reconstructable per-element tree — it is a tiling-invariant fence
+    ``token`` (K + operand/acc dtypes + kind, from :mod:`bitequiv.ptx.mma`) + ``flags`` (scale /
+    accumulate immediates) + its register-operand ``children`` (so a reduction OVER mma outputs
+    composes in the same DAG). NOT a layout-invariant per-element value: a reduction covering an Mma
+    must not collapse it as a uniform leaf (see :func:`bitequiv.ptx.builder._leaf_layout_invariant`)."""
+
+    token: str
+    flags: tuple = ()
+    children: tuple = ()
+
+    def sig_local(self, child_sigs):
+        f = ";fl=" + ",".join(self.flags) if self.flags else ""
+        body = "(" + ",".join(child_sigs) + ")" if child_sigs else ""
+        return f"MMA[{self.token}{f}]{body}"
+
+    def sig(self):
+        return self.sig_local([c.sig() for c in self.children])
+
+
+@dataclass(frozen=True)
+class LoopReduce:
+    """A loop-carried floating-point accumulation (a fold over chunks), summarized WITHOUT unrolling:
+    a GEMM's K-reduction, or a chunked / persistent reduction. ``chunk`` is the value-DAG of ONE
+    iteration's contribution (the accumulator input removed); ``op`` is the fold op (+ modifiers).
+    ``key`` sets the chunk sensitivity:
+
+    * chunk-BEARING ``(step, trip)`` — a different chunk size (BLOCK_K / BLOCK_N) gives a different
+      key -> split. Default; sound whenever re-chunking could change the accumulation order.
+    * chunk-INVARIANT ``()`` — chunk size dropped -> different chunk sizes MERGE. Only when the
+      accumulation is provably order-invariant (e.g. a tensor-core f32 accumulator), gated hard by
+      the empirical fuzzer."""
+
+    op: str
+    chunk: object
+    key: tuple = ()
+
+    @property
+    def children(self):
+        return (self.chunk, )
+
+    def sig_local(self, child_sigs):
+        return f"LOOP[{self.op};{child_sigs[0]};{self.key}]"
+
+    def sig(self):
+        return self.sig_local([self.chunk.sig()])

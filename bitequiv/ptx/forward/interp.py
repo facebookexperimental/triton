@@ -12,23 +12,31 @@ Modeled so far: ``ld.global`` (scalar + vector slots) -> leaves; the fp combines
 ``ShflCombine`` for any reduce op; ``mov`` pass-through; the cross-warp shared exchange
 (``st.shared`` -> ``ld.shared`` -> ``SmemExchange``, the forward SmemModel); and packed ``.f32x2``
 reductions (``mov.b64`` pack/unpack + ``.f32x2`` combine/fma decomposed per lane). ``st.global``
-values are the roots (a packed store expands to one root per f32 lane). MMA, data-dependent branches,
-and loop back-edges are later phases; anything unmodeled becomes an ``Opaque`` and, if it would strip
-a transient marker (losing a reduction ordering / packed structure), trips ``faithful=False`` — the
-sound floor that falls back to the conservative fingerprint. Integer/address ops do not touch the
-value state (their values live in the affine domain, resolved on demand for leaf coordinates).
+values are the roots (a packed store expands to one root per f32 lane). A loop-carried
+``acc = acc + chunk`` (a chunked / persistent reduction) is summarized as a ``LoopReduce`` fold over
+one iteration's chunk (via :mod:`bitequiv.ptx.forward.loops`), recovering num_warps for looped
+reductions. MMA-accumulation loops (GEMM K-fold) and data-dependent branches are later phases;
+anything unmodeled becomes an ``Opaque`` and, if it would strip a transient marker (losing a
+reduction ordering / packed structure), trips ``faithful=False`` — the sound floor that falls back to
+the conservative fingerprint. Integer/address ops do not touch the value state (their values live in
+the affine domain, resolved on demand for leaf coordinates).
 """
+
+import hashlib
 
 from pyptx.ir.nodes import RegisterOperand, VectorOperand
 
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
-from bitequiv.ptx.builder import collapse_balanced, tree_hash
+from bitequiv.ptx.builder import _postorder, collapse_balanced, output_coordfree_key, tree_hash
 from bitequiv.ptx.forward.cfg import has_unknown_control
+from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carried_accumulators,
+                                        loop_self_increments)
 from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
-from bitequiv.ptx.mma import _mma_fence
-from bitequiv.ptx.treeir import FpOp, Leaf, OpaqueLeaf, OpaqueOp, ShflCombine, SmemExchange
+from bitequiv.ptx.mma import _is_mma, _mma_fence
+from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
+                                 SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
@@ -110,6 +118,19 @@ class ForwardInterp:
         self._unknown_ctrl = has_unknown_control(func)
         self.pred = PredicateDecoder(self.ev, self.du)
         self._ddb = None  # cached _has_data_dependent_branch() result
+        # Phase 5 (loops): a loop-carried `acc = acc + chunk` is summarized as a LoopReduce fold
+        # instead of the one-iteration DAG the straight-line walk would leave. Map the accumulating
+        # instruction -> (acc register, LoopReduce key = the loop's chunk step). Only ACCUMULATING
+        # loops (a running fp total), so an output-tiling loop is untouched. `linearize` and
+        # `find_loops` walk `func.body` identically, so the accumulating `inst` objects are shared.
+        self._acc = {}
+        insts, loops = find_loops(func)
+        for lp in set(loops):
+            if not loop_accumulates(insts, lp, loops):
+                continue
+            key = (loop_self_increments(insts, lp, loops), )
+            for acc_name, inst in loop_carried_accumulators(insts, lp, loops):
+                self._acc[id(inst)] = (acc_name, key)
 
     # -- operand lookup -------------------------------------------------------
 
@@ -179,6 +200,16 @@ class ForwardInterp:
                 val = inst.operands[1]  # scalar shared store: record its value for later loads
                 if isinstance(val, RegisterOperand):
                     self.smem_stores.append((at, self._node(val, at)))
+                else:
+                    # A VECTOR st.shared writes a packed multi-element slot this phase does not model.
+                    # Skipping it silently is UNSOUND: a later scalar ld.shared would then resolve to a
+                    # STALE earlier store while faithful stays True (the tree is wrong but TRUSTED, so
+                    # two bit-different configs can collapse to one descriptor -> OVER-MERGE). Fail
+                    # closed instead. (The DCR / reviewer soundness concern on D112727538. The remaining
+                    # address-agnostic multi-buffer case among all-scalar stores -- resolving a scalar
+                    # load to a DIFFERENT scalar buffer -- needs address-matched resolution and is a
+                    # follow-up, bundled with the multi-output cross-warp recovery.)
+                    self.faithful = False
                 continue
             if op == "mov" and ".b64" in mods and len(inst.operands) == 2 and self._b64_mov(inst, at):
                 continue  # mov.b64 pack ({lo,hi}->rd) / unpack (rd->{lo,hi}) handled in place
@@ -201,6 +232,17 @@ class ForwardInterp:
         """Value produced by a non-load, non-store instruction, or ``None`` when it writes no
         value-domain register (an integer/address op)."""
         op, mods = inst.opcode, inst.modifiers
+        if _is_mma(inst) or (op == "tcgen05" and ".ld" in mods):
+            # The tensor-core output is a hardware-opaque accumulator boundary leaf: an Mma node,
+            # NOT a reconstructable per-element tree (its internal K-fold is not FP-order-recoverable).
+            # On Hopper the wgmma matmul writes its accumulator regs directly; on Blackwell the
+            # tcgen05.mma writes tensor memory (no reg def) and tcgen05.ld reads it back into regs, so
+            # BOTH are the MMA-output boundary. Modeling it lets an epilogue reduction OVER the MMA
+            # output (gemm_reduce_sum / softmax / layernorm) reconstruct with Mma leaves, which
+            # `_epilogue_reduces_mma` detects so `_mma_entry_descriptor` rides the reduction fingerprint
+            # (else those within-thread-fold reductions are invisible and over-merge across the order).
+            # Over-identifying an MMA output only ever ADDS a splitting term (sound, monotone).
+            return Mma("mma-out")
         if op == "ld" and ".shared" in mods:
             src = self._match_smem(at)
             if src is not None:
@@ -220,28 +262,18 @@ class ForwardInterp:
         if op == "fma" and _is_fp(inst) and len(inst.operands) == 4:
             return FpOp("fma", mods, tuple(self._node(o, at) for o in inst.operands[1:]), fused=True)
         if op in _FP_KINDS and _is_fp(inst) and len(inst.operands) == 3:
+            acc = self._acc.get(id(inst))
+            if acc is not None and op == "add":
+                return self._loop_reduce(inst, acc, at)  # loop-carried add-accumulation -> fold summary
             return self._combine(inst, at)
         # Any other unmodeled op (an f64 half-assembly `or.b64`, a `cvt`, ...): keep it as an
         # OpaqueOp NODE with its register operands as children + non-register operands in the token,
         # EXACTLY like the backward else-branch, so the value-DAG matches. A pure integer/address op
         # is stored too but never pulled into a value tree (value ops read value operands; addresses
-        # go through the affine domain), so this is harmless and lazy at the descriptor level.
-        # An unmodeled op that CONSUMES a transient marker (a _Shuffle butterfly partner, or a
-        # _Packed f32x2 pair — directly or via a vector operand) would have `_scalar` silently STRIP
-        # it -> the reduction ORDERING (count-up vs count-down) or the packed lane structure is lost
-        # -> OVER-MERGE. Idiom 2 RECONSTRUCTS the packed reductions above (`.f32x2` combine, `mov.b64`
-        # pack/unpack); a marker still reaching HERE is genuinely unmodeled -> fail closed, and the
-        # fingerprint's ordered shfl sequence + store widths then distinguish the configs. A benign
-        # opaque with NO marked operand (an f64 `or.b64`, a `cvt`) keeps faithful=True and recovers.
-        def _marked(o):
-            if isinstance(o, RegisterOperand):
-                return isinstance(self._val(o, at), (_Shuffle, _Packed))
-            if isinstance(o, VectorOperand):
-                return any(isinstance(e, RegisterOperand)
-                           and isinstance(self._val(e, at), (_Shuffle, _Packed)) for e in o.elements)
-            return False
-
-        if any(_marked(o) for o in inst.operands[1:]):
+        # go through the affine domain), so this is harmless and lazy at the descriptor level. If an
+        # operand still carries a transient marker HERE it is genuinely unmodeled (the packed
+        # reductions were reconstructed above) -> fail closed (see `_consumes_marker`).
+        if any(self._consumes_marker(o, at) for o in inst.operands[1:]):
             self.faithful = False
         reg_ops = [o for o in inst.operands[1:] if isinstance(o, RegisterOperand)]
         others = [o for o in inst.operands[1:] if not isinstance(o, RegisterOperand)]
@@ -249,6 +281,36 @@ class ForwardInterp:
         if others:
             tok += "{" + ",".join(canon(self.ev.of_operand(o, at)) for o in others) + "}"
         return OpaqueOp(tok, tuple(self._node(o, at) for o in reg_ops))
+
+    def _consumes_marker(self, operand, at):
+        """True if ``operand`` (a register, or a vector of registers) currently holds a transient
+        ``_Shuffle`` / ``_Packed`` marker. An unmodeled op that consumes one would have ``_scalar``
+        silently STRIP it -> the reduction ORDERING (count-up vs count-down) or the packed lane
+        structure is lost -> OVER-MERGE. The caller fails closed when this is True; the fingerprint's
+        ordered shfl sequence + store widths then distinguish the configs. A benign opaque with NO
+        marked operand (an f64 ``or.b64``, a ``cvt``) keeps ``faithful`` True and still recovers."""
+        if isinstance(operand, RegisterOperand):
+            return isinstance(self._val(operand, at), (_Shuffle, _Packed))
+        if isinstance(operand, VectorOperand):
+            return any(isinstance(e, RegisterOperand)
+                       and isinstance(self._val(e, at), (_Shuffle, _Packed)) for e in operand.elements)
+        return False
+
+    def _loop_reduce(self, inst, acc, at):
+        """A loop-carried ``acc = acc + chunk`` -> ``LoopReduce(add, chunk, key)``, summarizing the
+        whole fold instead of leaving the one-iteration ``add(seed, chunk)`` the straight-line walk
+        produces. The pre-loop SEED is dropped: when autotuning a single kernel every config shares
+        it, so it can never separate two configs (the module docstring's identical-outside-the-
+        computation assumption). This RECOVERS num_warps for a chunked / persistent reduction — the
+        chunk's within-block reduction collapses to a num_warps-invariant ITreeReduce and the key
+        (chunk step) is num_warps-invariant, so configs differing only in num_warps get one LoopReduce.
+        The key is chunk-BEARING (the step multiset), so a different BLOCK_N still splits (sound)."""
+        acc_name, key = acc
+        chunk = next((o for o in inst.operands[1:]
+                      if not (isinstance(o, RegisterOperand) and o.name == acc_name)), None)
+        if chunk is None:  # `acc = acc + acc` (not a chunk fold) -> fall back to a plain combine
+            return self._combine(inst, at)
+        return LoopReduce(inst.opcode + "".join(inst.modifiers), self._node(chunk, at), key)
 
     def _combine(self, inst, at):
         """Scalar fp binary combine — see :meth:`_combine_nodes`."""
@@ -390,48 +452,111 @@ def forward_descriptor(func):
     roots = interp.run()
     if not interp.faithful:
         return (interp.fingerprint(), )
-    # G3 guard (mirrors the backward `entry_signatures`): the layout-drop collapse is num_warps-
-    # INVARIANT only when ALL of the entry's threads reduce into ONE output. With MULTIPLE outputs
-    # (a 2-D / multi-axis tile reduced per row), num_warps RE-PARTITIONS the threads among the outputs
-    # and re-associates each output's reduction, so collapsing there OVER-MERGES — measured: sum_4d /
-    # softmax / rmsnorm inner_tree vs unordered collapsed to the same descriptor at the heavy grid.
-    # So collapse only a single-output entry; keep a multi-output entry's trees VERBATIM (sound,
-    # over-split — num_warps recovery for multi-output is later, layout-aware work).
-    collapsed = [collapse_balanced(roots[0])] if len(roots) == 1 else roots
+    if len(roots) == 1:
+        return (tree_hash(collapse_balanced(roots[0])), )
+    # MULTI-output: num_warps redistributes the entry's rows across threads, so the forward per-thread
+    # trees (and their COUNT) are num_warps-bearing -> a verbatim descriptor over-splits. When every
+    # output is a CLEAN per-element function of its own element over num_warps-invariant reductions
+    # (softmax / layernorm / rmsnorm), coord-blank each output + dedup: the SET of distinct output
+    # computations is num_warps-invariant even though the per-thread count is not. An unordered per-row
+    # reduction keeps its ShflCombine offsets in the key -> stays split (correct). If ANY output is not
+    # cleanly reconstructed (opaque leaf / unrecovered coord), fall back to the verbatim trees (sound,
+    # over-split). Replaces the old blanket multi-output G3 guard; gated on the fuzzer (0 over-merge).
+    collapsed = [collapse_balanced(r) for r in roots]
+    keys = [output_coordfree_key(t) for t in collapsed]
+    if all(k is not None for k in keys):
+        return tuple(sorted({hashlib.sha1(k.encode()).hexdigest()[:16] for k in keys}))
     return tuple(sorted(tree_hash(t) for t in collapsed))
 
 
 def _fence_str(fence):
     """Canonical string for an :func:`bitequiv.ptx.mma._mma_fence` tuple (frozensets sorted so the
-    string is deterministic across runs). The ratio is (mma : fma : add/mul) — fma kept apart from
-    add/mul so enable_fp_fusion on/off never collide."""
+    string is deterministic across runs). The f32 epilogue rides as PRESENCE ``(has_fma, has_addmul)``
+    — fma kept apart from add/mul so enable_fp_fusion on/off never collide, but NOT counted (the count
+    is M/N-tile-scaled and would over-split equivalent re-tilings)."""
     if fence[0] == "mma":
-        _, tokens, flags, ratio = fence
+        _, tokens, flags, epi = fence
         return (f"mma|tok={'/'.join(sorted(tokens))}|fl={','.join(sorted(flags))}"
-                f"|r={ratio[0]}:{ratio[1]}:{ratio[2]}")
+                f"|epi=fma{epi[0]},addmul{epi[1]}")
     _, counts, flags, fa = fence  # mma-fp8 fallback: raw per-token counts + (fma, add/mul) (more split)
     counts_s = "/".join(f"{t}x{n}" for t, n in counts)
     return f"mma-fp8|tok={counts_s}|fl={','.join(sorted(flags))}|fma_addmul={fa[0]},{fa[1]}"
 
 
+def _epilogue_reduces_mma(sinks):
+    """True iff any sink value-DAG REDUCES over the MMA output — a reduce node (a 2-ary add/min/max
+    ``FpOp`` whose BOTH children carry an ``Mma`` leaf, or a ``ShflCombine`` / ``SmemExchange`` over an
+    Mma-bearing subtree). This is the ``tl.sum`` / ``tl.max`` epilogue over ``C = A @ B``
+    (gemm_reduce_sum / softmax / layernorm), whether it lowers to a within-thread fold (no shfl), a
+    cross-lane butterfly, or a cross-warp shared exchange. It EXCLUDES an elementwise epilogue
+    (``relu(acc*alpha + bias)``: the bias add has one non-Mma child, relu's max pairs with a constant)
+    and the split-K accumulation (a 1-ary ``LoopReduce`` over an Mma chunk), so the pure GEMMs keep
+    their clean tiling-invariant fence. When it fires, :func:`_mma_entry_descriptor` rides the reduction
+    fingerprint so configs differing only in the reduction ORDER split (they otherwise share one fence
+    and the within-thread fold is invisible -> over-merge across unordered / inner_tree).
+
+    ``sinks`` is EVERY reachable value-DAG root, not just the ``st.global`` stores: a softmax /
+    layernorm output is the full tile written through ``ldmatrix`` (a transposed read the walk fails
+    closed on, so the ``st.global`` root is an opaque relocation), which buries the ``sum(e)`` reduction
+    mid-computation. Scanning the recorded shared-store values and the live registers too surfaces it.
+    The ``Mma``-bearing walk is memoized across all sinks (shared subtrees walked once)."""
+    has_mma = {}
+    for root in sinks:
+        for n in _postorder(root):
+            if id(n) in has_mma:
+                continue
+            has_mma[id(n)] = isinstance(n, Mma) or any(has_mma[id(c)] for c in n.children)
+            if isinstance(n, (ShflCombine, SmemExchange)) and has_mma[id(n)]:
+                return True
+            if (isinstance(n, FpOp) and not n.fused and n.kind in ("add", "min", "max")
+                    and len(n.children) == 2 and all(has_mma[id(c)] for c in n.children)):
+                return True
+    return False
+
+
 def _mma_entry_descriptor(func, fence):
     """Descriptor for an entry containing MMA (tensor-core) ops, via the tiling-invariant fence.
 
-    A PURE GEMM (MMA, no reduction butterfly) is the fence ALONE -> num_warps + BLOCK_M/BLOCK_N are
-    free (recovered), with ``loops=`` kept (BLOCK_K is a real, bit-relevant K split). An MMA + a
-    ``shfl.bfly`` reduction (e.g. FA softmax) is FAIL-CLOSED: the fence AND the reduction fingerprint
-    both ride, so configs differing in EITHER the MMA shape OR the reduction order split (sound, never
-    over-merged). The reduction fingerprint carries num_warps back in that case; the pure GEMM drops
-    it deliberately (num_warps is a free re-tiling of the same dot products)."""
+    A PURE GEMM (MMA, no reduction over the output) is the fence ALONE -> num_warps + BLOCK_M/BLOCK_N
+    are free (recovered), with ``loops=`` kept (BLOCK_K is a real, bit-relevant K split). An MMA + a
+    reduction OVER the MMA output (FA softmax, or gemm_reduce_sum / softmax / layernorm) is FAIL-CLOSED:
+    the fence AND the reduction fingerprint both ride, so configs differing in EITHER the MMA shape OR
+    the reduction order split (sound, never over-merged). The reduction is detected structurally
+    (:func:`_epilogue_reduces_mma`) rather than by ``shfl.bfly`` presence, so a within-thread epilogue
+    fold (no shuffle) — which the shfl-only trigger missed, over-merging unordered vs inner_tree — is
+    now caught. The reduction fingerprint carries num_warps back in that case; the pure GEMM drops it
+    deliberately (num_warps is a free re-tiling of the same dot products)."""
+    from bitequiv.ptx.forward.loops import reduction_trip_signature
     from bitequiv.ptx_reduction import _loop_steps
     parts = [_fence_str(fence)]
-    if any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func)):
-        interp = ForwardInterp(func)
-        interp.run()
+    interp = ForwardInterp(func)
+    roots = interp.run()
+    # Ride the reduction fingerprint when the entry reduces over the MMA output. Detected two ways,
+    # OR'd so the trigger is a strict SUPERSET of the old ``shfl.bfly`` one (can only ADD splitting):
+    # (1) any ``shfl.bfly`` — a cross-lane / cross-warp reduction (the reconstructed tree may fail
+    #     closed on an unmatched shared load, hiding the Mma leaves, so the structural detector alone
+    #     under-fires here); (2) ``_epilogue_reduces_mma`` — a within-thread fold (no shuffle) over the
+    #     MMA output, which (1) misses and which otherwise over-merges across the reduction order. The
+    #     detector scans every reachable value-DAG (roots + recorded shared stores + live registers),
+    #     since a softmax / layernorm reduction is buried behind the ldmatrix output relocation.
+    sinks = list(roots)
+    sinks += [v for _, v in interp.smem_stores if hasattr(v, "children")]
+    sinks += [v for v in interp.regs.values() if hasattr(v, "children")]
+    has_shfl = any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func))
+    if has_shfl or _epilogue_reduces_mma(sinks):
         parts.append("mma+red|" + interp.fingerprint())
     steps = _loop_steps(func)  # BLOCK_K split (+ the tcgen05 / fp8 K carried here, not in the token)
     if steps:
         parts.append("loops=" + ",".join(map(str, steps)))
+    sig = reduction_trip_signature(func)
+    if sig is not None:
+        # A GEMM whose K sum is regrouped by an OUTER reduction loop (split-K: partials combined) is
+        # NOT bitwise-equivalent across split counts, yet its static MMA/op structure is identical, so
+        # the tiling-invariant fence over-merges them (num_splits 1==2, 4==8). Fail closed on the
+        # loop-control fingerprint (the setp trip constants), which differs per split count -> sound.
+        # A plain single-K-loop GEMM has no such nested reduction -> sig is None -> fence unchanged.
+        # Precise per-split recovery (nested LoopReduce) is the follow-up.
+        parts.append("splits=" + hashlib.sha1(repr(sig).encode()).hexdigest()[:8])
     return "|".join(parts)
 
 

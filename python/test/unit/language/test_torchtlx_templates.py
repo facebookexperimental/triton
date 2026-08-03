@@ -223,6 +223,122 @@ class TestTLXTemplates(TestCase):
         "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_split_k_cpp_wrapper(self):
+        M, K, N = 256, 4096, 256
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "cpp_wrapper": True,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("split_k_ws", code_str)
+        # Every split-K reducer is now code-generated via define_kernel, even with no
+        # fused epilogue (identity epilogue), so the define_user_defined_triton_kernel
+        # reducer is gone from the forward.
+        self.assertIn("_reduce_k", code_str)
+        self.assertNotIn("call__reduce_k_kernel_", code_str)
+        self.assertNotIn("from triton.language.extra.tlx.inductor.reduce_k import", code_str)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    def test_tlx_addmm_warppipe_split_k_python_epilogue_fused(self):
+        """Split-K + pointwise epilogue under the Python/JIT wrapper.
+
+        The generated reducer replays the fused epilogue in both wrappers, so the
+        epilogue runs after the partials are summed and no separate pointwise kernel
+        is emitted.
+        """
+        M, K, N = 256, 4096, 256
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm_gelu(bias, a, w):
+            return torch.nn.functional.gelu(torch.addmm(bias, a, w.t()))
+
+        with config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "cpp_wrapper": False,
+        }):
+            c_actual, code = run_and_get_code(torch.compile(addmm_gelu), bias, a, w)
+
+        c_expected = torch.nn.functional.gelu(a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("_reduce_k", code_str)
+        self.assertNotIn("triton_poi_", code_str)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("epilogue", ("gelu", "mul"))
+    def test_tlx_addmm_warppipe_split_k_cpp_wrapper_fused_epilogue(self, epilogue: str):
+        M, K, N = 256, 4096, 256
+        dtype = torch.float16
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm_epilogue(bias, a, w):
+            out = torch.addmm(bias, a, w.t())
+            if epilogue == "gelu":
+                return torch.nn.functional.gelu(out)
+            return out * 0.5
+
+        with (config.patch({
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "cpp_wrapper": True,
+        }), ):
+            c_actual, code = run_and_get_code(torch.compile(addmm_epilogue), bias, a, w)
+
+        reference = a.float() @ w.t().float() + bias.float()
+        if epilogue == "gelu":
+            reference = torch.nn.functional.gelu(reference)
+        else:
+            reference = reference * 0.5
+        torch.testing.assert_close(c_actual, reference.to(dtype), atol=4e-2, rtol=4e-2)
+
+        code_str = "\n".join(code)
+        self.assertIn("split_k_ws", code_str)
+        self.assertIn("_reduce_k", code_str)
+        self.assertNotIn("triton_poi_", code_str)
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_tlx_addmm_warppipe_unaligned_k(self, dtype: torch.dtype):
         """Unaligned K (K % BLOCK_K != 0) on the TLX warp-pipe addmm (gfx950).
@@ -391,6 +507,64 @@ class TestTLXTemplates(TestCase):
         self.assertIn("USE_ASYNC", src)  # dual-path selector constexpr
         self.assertIn("tlx.async_load", src)  # aligned-K async path
         self.assertIn("a_reg = tl.load", src)  # register-path fallback load
+
+    @unittest.skipIf(
+        not is_gfx950(),
+        "Need AMD MI350X (gfx950) for the TLX persistent warp-pipe addmm template",
+    )
+    @unittest.skipIf(not has_tlx(), "TLX not available")
+    @parametrize("dtype", (torch.float16, torch.bfloat16))
+    def test_tlx_addmm_persistent_warppipe(self, dtype: torch.dtype):
+        """Persistent TLX warp-pipe addmm template (AMD MI350X / gfx950), col-major B.
+
+        De-risks the persistent tile-loop + tlx.warp_pipeline_stage nesting (the exact
+        pattern that failed to lower on beta triton 3.6). ``append_tlx`` is patched to
+        offer ONLY the persistent template, so force mode is guaranteed to select and
+        compile it (not the per-tile warp-pipe) -- proving it lowers and is numerically
+        correct. The shape has many more MN tiles than SMs, so each program's persistent
+        loop iterates over several output tiles.
+        """
+        from triton.language.extra.tlx.inductor import mm_templates as _tlx_mm
+
+        M, K, N = 4096, 2048, 512  # many MN tiles -> persistent loop iterates per program
+        a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
+        # w.t() => B is [K, N] col-major (stride_bk == 1) -- the nn.Linear weight layout.
+        w = torch.randn(N, K, device=GPU_TYPE, dtype=dtype)
+        bias = torch.randn(N, device=GPU_TYPE, dtype=dtype)
+
+        def addmm(bias, a, w):
+            return torch.addmm(bias, a, w.t())
+
+        def _only_persistent(templates, op_name="mm"):
+            # Offer only the persistent template (drop the per-tile warp-pipe) so force
+            # mode is guaranteed to select and compile the persistent kernel.
+            from torch._inductor.kernel.mm import mm_template
+
+            uids = {getattr(t, "uid", None) for t in templates}
+            if op_name == "addmm" and mm_template.uid in uids:
+                if _tlx_mm.amd_addmm_persistent_warppipe_template.uid not in uids:
+                    templates.append(_tlx_mm.amd_addmm_persistent_warppipe_template)
+            return templates
+
+        with (
+                mock.patch.object(_tlx_mm, "append_tlx", _only_persistent),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
+        ):
+            c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
+
+        c_expected = (a.float() @ w.t().float() + bias.float()).to(dtype)
+        torch.testing.assert_close(c_actual, c_expected, atol=2e-2, rtol=2e-2)
+
+        # Only the persistent template is offered, so force mode must lower addmm
+        # through it (triton_tem), never an extern/aten kernel.
+        code_str = "\n".join(code)
+        self.assertIn("triton_tem", code_str)
 
 
 class TestWarpPipeSplitKCodegen(TestCase):
@@ -596,7 +770,91 @@ class TestSplitK(TestCase):
 
 
 class TestReduceKKernel(TestCase):
-    """Direct unit test for the split-K reduction kernel."""
+    """Direct unit tests for the split-K reduction kernel."""
+
+    def test_aoti_reduce_k_emission(self):
+        from torch._inductor.virtualized import V
+        from triton.language.extra.tlx.inductor.reduce_k import (
+            emit_aoti_reduce_k_call, )
+
+        wrapper = mock.MagicMock()
+        wrapper.src_to_kernel = {}
+
+        workspace = mock.MagicMock()
+        workspace.inner_name = "split_k_ws"
+        output = mock.MagicMock()
+        output.get_device.return_value = torch.device(GPU_TYPE)
+
+        def _argdef(name):
+            arg = mock.MagicMock()
+            arg.full_name.return_value = name
+            return arg
+
+        template_kernel = mock.MagicMock()
+        template_kernel.args.python_argdefs.return_value = (
+            [_argdef("split_k_ws"), _argdef("out_ptr0")],
+            ["split_k_ws_0", "buf_out"],
+            None,
+            [torch.float32, torch.float16],
+        )
+        template_kernel.gen_common_triton_imports.return_value = "import triton"
+        template_kernel.jit_lines.return_value = "@triton.jit"
+        template_kernel.triton_meta = {"signature": {}}
+
+        graph = mock.MagicMock()
+        graph.get_current_device_or_throw.return_value = torch.device(GPU_TYPE)
+
+        with V.set_graph_handler(graph):
+            emit_aoti_reduce_k_call(
+                wrapper,
+                workspace_arg=workspace,
+                output_node=output,
+                bias_node=None,
+                M=256,
+                N=256,
+                split_k=4,
+                output_triton_dtype="tl.float16",
+                template_kernel=template_kernel,
+                main_kernel_name="triton_tem_fused_addmm_0",
+                final_output_ptr="out_ptr0",
+            )
+
+        reduce_name = "triton_tem_fused_addmm_0_reduce_k"
+        # The reducer is code-generated through define_kernel; the old
+        # define_user_defined_triton_kernel path no longer exists.
+        wrapper.define_user_defined_triton_kernel.assert_not_called()
+        wrapper.define_kernel.assert_called_once()
+        self.assertEqual(reduce_name, wrapper.define_kernel.call_args.args[0])
+
+        body = wrapper.define_kernel.call_args.args[1]
+        self.assertIn(f"def {reduce_name}(split_k_ws, out_ptr0):", body)
+        # No fused epilogue -> identity epilogue, so the reducer still does sum + store.
+        self.assertIn("acc += partial", body)
+        self.assertIn("fused_result = acc", body)
+        self.assertIn("tl.store(out_ptr0 + base_offs, fused_result", body)
+
+        wrapper.generate_kernel_call.assert_called_once()
+        call = wrapper.generate_kernel_call.call_args
+        self.assertEqual(reduce_name, call.args[0])
+        # Reuses the main template's runtime args, then the reducer grid.
+        self.assertEqual(["split_k_ws_0", "buf_out"], call.args[1][:2])
+        self.assertEqual(3, len(call.args[1]) - 2)
+        self.assertTrue(call.kwargs["triton"])
+
+    def test_fused_reduce_k_source(self):
+        from triton.language.extra.tlx.inductor.reduce_k import _reduce_k_body_source
+
+        source = _reduce_k_body_source(
+            "split_k_ws",
+            "out_ptr",
+            "M",
+            "N",
+            4,
+            "    fused_result = tl.libdevice.tanh(acc)",
+        )
+        self.assertLess(source.index("acc += partial"), source.index("fused_result"))
+        self.assertLess(source.index("fused_result"), source.index("tl.store"))
+        self.assertIn("tl.store(out_ptr + base_offs, fused_result", source)
 
     @unittest.skipIf(
         not has_datacenter_blackwell_tma_device(),

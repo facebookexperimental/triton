@@ -11,6 +11,7 @@ Q-blocks) and a torch-autograd float reference (dq/dk/dv rel-L2).
 
 Run: pytest third_party/tlx/tutorials/test_cross_attention_bwd_autows.py
 """
+
 import os
 import sys
 
@@ -26,6 +27,7 @@ os.environ.pop("TRITON_USE_META_WS", None)
 import pytest  # noqa: E402
 import torch  # noqa: E402
 import triton.language as tl  # noqa: E402
+from triton._internal_testing import is_blackwell, is_hopper  # noqa: E402
 
 import bench_bwd as bb  # noqa: E402
 import triton_bw_cross_attention as xa  # noqa: E402
@@ -71,6 +73,7 @@ _SHAPES = [(256, 64, 2), (256, 128, 2), (256, 192, 2), (256, 256, 2)]
 
 @pytest.mark.parametrize("ns", [1, 2])
 @pytest.mark.parametrize("Lq,Lkv,Z", _SHAPES)
+@pytest.mark.skipif(not is_blackwell(), reason="Hand-written TLX backward requires a Blackwell GPU")
 def test_cross_attention_bwd_autows(Lq, Lkv, Z, ns):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -96,8 +99,8 @@ def test_cross_attention_bwd_autows(Lq, Lkv, Z, ns):
 
     # No dq Q-block may diverge from the TLX reference (this is what the bug hit).
     n_bad, bad_blocks = bb.bad_qblocks(dq, ref_dq, Lq)
-    assert n_bad == 0, (f"autoWS dq diverges from TLX in Q-blocks {bad_blocks} "
-                        f"({n_bad} rows) for Lq={Lq} Lkv={Lkv} ns={ns}")
+    assert n_bad == 0, (
+        f"autoWS dq diverges from TLX in Q-blocks {bad_blocks} ({n_bad} rows) for Lq={Lq} Lkv={Lkv} ns={ns}")
 
     # And all three grads must match the float reference to bf16 precision.
     for name, got, want in (("dq", dq, rq), ("dk", dk, rk), ("dv", dv, rv)):
@@ -112,6 +115,7 @@ _SHARED_SHAPES = [(256, 256, 2), (256, 384, 2), (256, 512, 2)]
 
 @pytest.mark.parametrize("ns", [1, 2])
 @pytest.mark.parametrize("Lq,Lkv,Z", _SHARED_SHAPES)
+@pytest.mark.skipif(not is_blackwell(), reason="Hand-written TLX backward requires a Blackwell GPU")
 def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
     """TLX 2-KV-block data-partitioned reduce_dq (BwdVariant.TLX_2KV), shared-KV.
     Must match the torch-float reference and be run-to-run deterministic."""
@@ -131,12 +135,12 @@ def test_cross_attention_bwd_tlx_2kv(Lq, Lkv, Z, ns):
         bb._fwd(xa.BwdVariant.TLX_2KV, "0", q, k, v, so_kv, so_q, Lkv, Lq, asc, shared=True).backward(do)
         grads.append((q.grad.clone(), k.grad.clone()))
     assert torch.equal(grads[0][0], grads[1][0]) and torch.equal(
-        grads[0][1], grads[1][1]), f"TLX_2KV nondeterministic (Lq={Lq} Lkv={Lkv} ns={ns})"
+        grads[0][1], grads[1][1]), (f"TLX_2KV nondeterministic (Lq={Lq} Lkv={Lkv} ns={ns})")
 
     dq, dk = grads[0]
     for name, got, want in (("dq", dq, rq), ("dk", dk, rk)):
         rl2 = bb.rel_l2(got, want)
-        assert rl2 < 1e-2, (f"TLX_2KV {name} rel-L2 {rl2:.2e} too high (Lq={Lq} Lkv={Lkv} ns={ns})")
+        assert rl2 < 1e-2, f"TLX_2KV {name} rel-L2 {rl2:.2e} too high (Lq={Lq} Lkv={Lkv} ns={ns})"
 
 
 # autows_2kv-only shapes: at BLOCK_N=64 the shared 256/384/512 are all even KV
@@ -148,7 +152,12 @@ _AUTOWS_2KV_SHAPES = [(256, 256, 2), (256, 320, 2), (256, 384, 2), (256, 512, 2)
 
 @pytest.mark.parametrize("ns", [1])
 @pytest.mark.parametrize("Lq,Lkv,Z", _AUTOWS_2KV_SHAPES)
-def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
+@pytest.mark.parametrize(
+    "variant",
+    [xa.BwdVariant.TRITON_AUTOWS_2KV, xa.BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA],
+)
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
+def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, variant, monkeypatch):
     """MANUAL 2-KV-block data-partition reduce_dq (BwdVariant.TRITON_AUTOWS_2KV),
     shared-KV + compute fold, warp specialization ON (milestone 2). Two KV blocks
     are processed per step explicitly in Triton, with DISJOINT per-block
@@ -164,12 +173,21 @@ def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
     monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
     _reset_captured_globals(xa)
 
-    # BLOCK_M=64, BLOCK_N=128 (matches TLX attn_bwd_ws_2kv). TMEM budget at 128:
-    # dk0+dk1 (256) + qk0+qk1 (128, P aliased) + dq shared (64) + dp shared (64)
-    # = 512, exactly the 512-col limit. The fit hinges on dp0/dp1 REUSING one
-    # TMEM tile (b1's dpT points at b0's id 5, TLX-style) -- without that reuse the
-    # two dp tiles add 64 cols -> 576 > 512 and the kernel OOMs on tensor memory.
-    bb.force(ns, bm=64, bn=128)
+    if is_blackwell():
+        # BLOCK_M=64, BLOCK_N=128 (matches TLX attn_bwd_ws_2kv). TMEM budget at 128:
+        # dk0+dk1 (256) + qk0+qk1 (128, P aliased) + dq shared (64) + dp shared (64)
+        # = 512, exactly the 512-col limit. The fit hinges on dp0/dp1 REUSING one
+        # TMEM tile (b1's dpT points at b0's id 5, TLX-style) -- without that reuse the
+        # two dp tiles add 64 cols -> 576 > 512 and the kernel OOMs on tensor memory.
+        bm = 64
+        bn = 128
+    else:
+        # Hopper runs out of memory with the Blackwell config. Verify the kernel still
+        # works with Hopper.
+        bm = 64
+        bn = 64
+
+    bb.force(ns, bm=bm, bn=bn)
     torch.manual_seed(0)
     q, k, v, do, so_kv, so_q, asc = bb.make(Lq, Lkv, Z, shared=True)
     # shared-KV: K and V are one leaf, so the returned dk = dk + dv (dv is None).
@@ -179,8 +197,8 @@ def test_cross_attention_bwd_autows_2kv(Lq, Lkv, Z, ns, monkeypatch):
         t.grad = None
     # ws="1" -> TRITON_USE_META_WS=1 (meta warp specialization enabled), required
     # now that the kernel is dispatched with WS_ON=True.
-    bb._fwd(xa.BwdVariant.TRITON_AUTOWS_2KV, "1", q, k, v, so_kv, so_q, Lkv, Lq, asc, shared=True).backward(do)
+    bb._fwd(variant, "1", q, k, v, so_kv, so_q, Lkv, Lq, asc, shared=True).backward(do)
     dq, dk = q.grad.clone(), k.grad.clone()
     for name, got, want in (("dq", dq, rq), ("dk", dk, rk)):
         rl2 = bb.rel_l2(got, want)
-        assert rl2 < 1e-2, (f"autows_2kv {name} rel-L2 {rl2:.2e} too high (Lq={Lq} Lkv={Lkv} ns={ns})")
+        assert rl2 < 1e-2, f"autows_2kv {name} rel-L2 {rl2:.2e} too high (Lq={Lq} Lkv={Lkv} ns={ns})"

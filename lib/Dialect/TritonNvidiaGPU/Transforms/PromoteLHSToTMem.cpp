@@ -20,40 +20,38 @@ namespace nvidia_gpu {
 
 namespace {
 
+enum class OpndAMemType { Unspecified, SMem, TMem };
+
 /// Extract the memory type for opndA from a tt.autows annotation.
-/// Returns "tmem", "smem", or "" if no annotation or no opndA entry.
-static StringRef getOpndAMemType(Operation *op) {
+static OpndAMemType getOpndAMemType(Operation *op) {
   auto attr = op->getAttrOfType<StringAttr>("tt.autows");
   if (!attr)
-    return "";
+    return OpndAMemType::Unspecified;
   auto parsed = llvm::json::parse(attr.getValue());
   if (!parsed) {
     llvm::consumeError(parsed.takeError());
-    return "";
+    return OpndAMemType::Unspecified;
   }
   auto *obj = parsed->getAsObject();
   if (!obj)
-    return "";
+    return OpndAMemType::Unspecified;
   auto *channelsArr = obj->getArray("channels");
   if (!channelsArr)
-    return "";
+    return OpndAMemType::Unspecified;
   for (auto &elem : *channelsArr) {
     auto str = elem.getAsString();
     if (!str)
       continue;
-    if (str->starts_with("opndA,")) {
-      // Format: "opndA,memType[,numCopies,bufferId]". The copies/id fields are
-      // optional: a memtype-only annotation ("opndA,smem"/"opndA,tmem") marks
-      // just the memory space (the planner decides copies/id/grouping).
-      auto comma = str->find(',');
-      auto comma2 = str->find(',', comma + 1);
-      if (comma != StringRef::npos) {
-        size_t end = (comma2 != StringRef::npos) ? comma2 : str->size();
-        return str->slice(comma + 1, end);
-      }
-    }
+    StringRef channel = *str;
+    if (!channel.consume_front("opndA,"))
+      continue;
+    StringRef memType = channel.take_front(channel.find(','));
+    if (memType == "smem")
+      return OpndAMemType::SMem;
+    if (memType == "tmem")
+      return OpndAMemType::TMem;
   }
-  return "";
+  return OpndAMemType::Unspecified;
 }
 
 template <class MMAOpTy>
@@ -82,10 +80,10 @@ public:
     // If annotated as "smem", skip promotion. If "tmem", promote directly
     // (skip the transposed-shared-source heuristic). If no annotation,
     // fall through to the heuristic.
-    StringRef opndAMem = getOpndAMemType(tcGen5MMAOp);
-    if (opndAMem == "smem")
+    const OpndAMemType opndAMem = getOpndAMemType(tcGen5MMAOp);
+    if (opndAMem == OpndAMemType::SMem)
       return failure();
-    bool annotatedTmem = (opndAMem == "tmem");
+    const bool annotatedTmem = opndAMem == OpndAMemType::TMem;
 
     // If the same source value is also allocated and transposed for use as
     // operand A of another gen5 MMA, skip promotion. The transposed path

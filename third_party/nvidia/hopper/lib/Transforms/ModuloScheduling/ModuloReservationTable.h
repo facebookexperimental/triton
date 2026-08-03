@@ -55,6 +55,23 @@ struct ModuloScheduleResult {
   }
 };
 
+/// Check that every DDG node has a nonnegative cycle and every dependence
+/// satisfies dst_cycle + distance * II >= src_cycle + latency.
+bool isValidModuloSchedule(int II,
+                           const llvm::DenseMap<unsigned, int> &nodeToCycle,
+                           unsigned numNodes, llvm::ArrayRef<DDGEdge> edges);
+bool isValidModuloSchedule(const DataDependenceGraph &ddg,
+                           const ModuloScheduleResult &schedule);
+
+/// Move dependency-violating destinations forward when the move fits both the
+/// modulo reservation table and every outgoing dependence. Returns false if
+/// no local repair exists.
+bool tryRepairModuloSchedule(int II, llvm::DenseMap<unsigned, int> &nodeToCycle,
+                             llvm::ArrayRef<DDGNode> nodes,
+                             llvm::ArrayRef<DDGEdge> edges);
+bool tryRepairModuloSchedule(const DataDependenceGraph &ddg,
+                             ModuloScheduleResult &schedule);
+
 /// Run modulo scheduling on the DDG.
 /// Algorithm selected by TRITON_USE_MODULO_SCHEDULE env var value:
 ///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
@@ -64,7 +81,7 @@ struct ModuloScheduleResult {
 /// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
-                    int maxBacktracks = 20);
+                    int maxBacktracks = 20, int minIIOverride = 0);
 
 /// Result of list scheduling for a non-loop region. The algorithm itself
 /// lives in `ListSchedulePass.cpp` (kept there so its debug output is

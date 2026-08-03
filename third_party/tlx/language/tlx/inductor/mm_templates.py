@@ -85,6 +85,17 @@ amd_bmm_warppipe_template = TritonTemplate(
     source=load_tlx_template("amd_bmm_warppipe"),
 )
 
+# Persistent variant of the AMD warp-pipe addmm: same warp-pipe body, but the grid
+# is capped at NUM_SMS (_persistent_mm_grid_split_k) and the kernel loops over output
+# tiles. Competes as an additional addmm candidate so per-template selection can be
+# attributed in the merge_net gemm sweep. Requires NUM_SMS in the template kwargs
+# (supplied by ROCmAddMMPersistentWarpPipeTemplateConfigHeuristic in registry.py).
+amd_addmm_persistent_warppipe_template = TritonTemplate(
+    name="tlx_amd_addmm_persistent_warppipe",
+    grid=_persistent_mm_grid_split_k,
+    source=load_tlx_template("amd_addmm_persistent_warppipe"),
+)
+
 
 def append_tlx(templates, op_name="mm"):
     # Import registry to trigger heuristic registration via decorators
@@ -98,8 +109,15 @@ def append_tlx(templates, op_name="mm"):
         from torch._inductor.kernel.mm import mm_template
 
         uids = {getattr(t, "uid", None) for t in templates}
-        if mm_template.uid in uids and amd_addmm_warppipe_template.uid not in uids:
-            templates.append(amd_addmm_warppipe_template)
+        if mm_template.uid in uids:
+            # per-tile warp-pipe (existing candidate)
+            if amd_addmm_warppipe_template.uid not in uids:
+                templates.append(amd_addmm_warppipe_template)
+            # persistent warp-pipe (new): competes as an ADDITIONAL addmm candidate,
+            # kept a distinct template so the sweep attributes its selection count
+            # separately from the per-tile warp-pipe.
+            if amd_addmm_persistent_warppipe_template.uid not in uids:
+                templates.append(amd_addmm_persistent_warppipe_template)
     elif op_name == "bmm":
         # Compete as an additional candidate alongside the stock bmm_template + aten. Inject once,
         # gated on bmm_template already being present (the unified choice call).

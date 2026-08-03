@@ -415,20 +415,20 @@ static void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value mask;
   if (!descs.empty()) {
-    auto kBlock = StringAttr::get(rewriter.getContext(), "block");
-    for (Value desc : descs) {
-      auto descTy = cast<MemDescType>(desc.getType());
-      uint16_t broadcastBits =
-          toLinearLayout(descTy).getFreeVariableMasks().lookup(kBlock);
-      if (twoCTAs)
-        broadcastBits |= 1;
-      if (broadcastBits) {
-        Value descMask =
-            LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, broadcastBits);
-        mask = mask ? b.or_(descMask, mask) : descMask;
-      }
+    for (uint16_t broadcastBits : ttng::getCTABroadcastMasks(twoCTAs, descs)) {
+      Value descMask =
+          LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, broadcastBits);
+      mask = mask ? b.or_(descMask, mask) : descMask;
     }
   } else if (twoCTAs) {
+    // Beta encodes Blackwell 2-CTA paired MMA via the ttng.two-ctas attribute
+    // while the tensors keep a 1-CTA CGA layout, so lookupNumCTAs() == 1 here.
+    // Routing the completion-barrier mask through
+    // createTMAMulticastMask()/getTMAMulticastMaskEncoding() therefore does not
+    // expand the cluster group and collapses the multicast to the issuing CTA
+    // (0b01), leaving the peer CTA's mbarrier unsignalled -> cluster deadlock.
+    // Build the both-CTA mask (0b11, shifted to the CTA pair) directly from the
+    // paired-MMA flag, independent of lookupNumCTAs().
     auto clusterCTARank = nvgpu::ClusterCTAIdOp::create(rewriter, loc);
     Value ctaPairBase = b.and_(clusterCTARank, b.i32_val(~1));
     mask = b.shl(b.i32_val(3), ctaPairBase);
@@ -943,12 +943,12 @@ LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
                         mxfpInstKind, twoCTAs, collectorB, ptxVersion);
   };
 
-  return convertDotImpl(
-      typeConverter, rewriter, loc, op.getA(), op.getB(), adaptor.getA(),
-      adaptor.getB(), dTensorTy, adaptor.getUseD(), adaptor.getPred(),
-      adaptor.getBarriers(), adaptor.getBarrierPreds(), twoCTAs,
-      tlx::tlxEnablePairedMMA(op), commitDescs, opKindIsMXFP4,
-      targetFeatures, dot);
+  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
+                        adaptor.getA(), adaptor.getB(), dTensorTy,
+                        adaptor.getUseD(), adaptor.getPred(),
+                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
+                        twoCTAs, tlx::tlxEnablePairedMMA(op), commitDescs,
+                        opKindIsMXFP4, targetFeatures, dot);
 }
 
 //===----------------------------------------------------------------------===//

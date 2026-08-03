@@ -158,6 +158,11 @@ class HIPBackend(BaseBackend):
         return f"hip:{options.arch}"
 
     def parse_options(self, opts) -> Any:
+        # Keep device-side ConSan assertions through LLVM optimization.
+        if "consan" in opts.get("instrumentation_mode", ""):
+            opts["debug"] = True
+            opts["sanitize_overflow"] = False
+
         args = {"arch": knobs.runtime.override_arch or self.target.arch}
 
         if opts.get("num_ctas", 1) > 1 and not amd.supports_multi_cta_launch(self.target.arch):
@@ -327,14 +332,14 @@ class HIPBackend(BaseBackend):
         # AMDLatencyModel and serializes a CoarseSchedule that add_pipeline then
         # consumes (multi-buffer + expansion). Needs TRITON_AMD_MODULO_SERIALIZE=1.
         if os.environ.get("TRITON_USE_MODULO_SCHEDULE"):
-            # decompose+modulo pipeline (changes #1-#4): early-lower tt.load ->
-            # single-buffer async_copy+local_load, then the ModuloDotSchedule
-            # expander (re-buffer single->multi + ring index, general expander),
-            # replacing schedule_loops + add_pipeline. async_wait counts are
-            # fixed by add_update_async_wait_count downstream.
-            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "early-lower")
+            # Modulo replaces ScheduleLoops only. The standard AMD pipeline
+            # lowers the original loads, reconstructs buffered slots, and
+            # expands the serialized two-stage schedule.
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "modulo")
-            amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "expand")
+            # Fill only loops modulo could not serialize; ScheduleLoops preserves
+            # every existing deserializable modulo schedule.
+            amd.passes.ttgpuir.add_schedule_loops(pm, options.num_stages)
+            amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
         elif os.environ.get("TRITON_ENABLE_AMD_MODULO"):
             amd.passes.ttgpuir.add_dot_decompose_and_schedule(pm, "")
             amd.passes.ttgpuir.add_pipeline(pm, use_async_copy, use_block_pingpong)
@@ -420,6 +425,7 @@ class HIPBackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.gluon.add_canonicalizer(pm)
+        passes.ttir.add_loop_unroll(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
@@ -443,7 +449,13 @@ class HIPBackend(BaseBackend):
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
+        if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
+            amd.passes.ttgpuir.add_prepare_consan_captures(pm)
         amd.passes.ttgpuir.add_allocate_shared_memory(pm, options.arch)
+        if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
+            passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.gluon.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if HIPBackend.instrumentation:
@@ -523,20 +535,24 @@ class HIPBackend(BaseBackend):
         amd.set_bool_control_constant(llvm_mod, "__oclc_wavefrontsize64", options.warp_size == 64)
 
         # Set kernel attributes first given this may affect later optimizations.
+        # The kernel is the only non-declaration function with external linkage;
+        # instrumentation helpers (e.g. ConSan) use internal linkage.
         fns = [fn for fn in llvm_mod.get_functions() if not fn.is_declaration()]
-        # The public kernel should be kernel 0.
-        fns[0].set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
+        kernel_fn = next((fn for fn in fns if fn.is_external_linkage()), None)
+        if not kernel_fn:
+            raise RuntimeError("Could not find kernel function")
+        kernel_fn.set_calling_conv(amd.CALLING_CONV_AMDGPU_KERNEL)
         cluster_dim = metadata["num_ctas"]
-        fns[0].add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
+        kernel_fn.add_fn_attr("amdgpu-cluster-dims", f"{cluster_dim},1,1")
         # warp-specialization mutates num_warps
         total_warps_num = options.num_warps
         total_num_warps = src.get_int_attr("ttg.total-num-warps")
         if total_num_warps is not None:
             total_warps_num = total_num_warps
-        fns[0].add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
+        kernel_fn.add_fn_attr("amdgpu-flat-work-group-size", f"1,{total_warps_num*options.warp_size}")
         if "memory-bound-attention" in options.schedule_hint.split(","):
-            fns[0].add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
-        fns[0].add_fn_attr("uniform-work-group-size", "true")
+            kernel_fn.add_fn_attr("amdgpu-sched-strategy", "iterative-ilp")
+        kernel_fn.add_fn_attr("uniform-work-group-size", "true")
         # LLVM AMDGPU backend supports the attribute "amdgpu-waves-per-eu"="<min>[, <max>]".
         # This attribute may be attached to a kernel function definition and is an optimization hint.
         # <min> parameter specifies the requested minimum number of waves per EU, and optional <max> parameter
@@ -546,17 +562,17 @@ class HIPBackend(BaseBackend):
         # implies the default behavior (no limits).
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
-        fns[0].add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
+        kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
         if is_expert_sched_supported(options.arch) and options.num_warps <= 4:
             fns[0].add_fn_attr("amdgpu-sched-strategy", "coexec")
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
-        fns[0].add_fn_attr("denormal-fp-math-f32", denormal_mode)
+        kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
-            fns[0].add_fn_target_feature("+xnack")
-            fns[0].add_fn_asan_attr()
+            kernel_fn.add_fn_target_feature("+xnack")
+            kernel_fn.add_fn_asan_attr()
         for name, value in options.llvm_fn_attrs:
-            fns[0].remove_fn_attr(name)
-            fns[0].add_fn_attr(name, value)
+            kernel_fn.remove_fn_attr(name)
+            kernel_fn.add_fn_attr(name, value)
 
         # Hint the compiler that we'd like the firmware to set the kernel arguments
         # to user SGPRs so that the kernel does not need to s_load its arguments
@@ -565,7 +581,7 @@ class HIPBackend(BaseBackend):
         # TODO(tyb0807): Disabled when using MIR swap/dump because the value is
         # not serializable to/from MIR YAML
         if not (knobs.amd.swap_mir or knobs.amd.dump_mir):
-            amd.set_all_fn_arg_inreg(fns[0])
+            amd.set_all_fn_arg_inreg(kernel_fn)
 
         if knobs.compilation.enable_asan:
             default_libdir = Path(__file__).parent / "lib"
@@ -580,20 +596,21 @@ class HIPBackend(BaseBackend):
             if len(paths) > 0:
                 llvm.link_extern_libs(llvm_mod, paths)
 
+        # gfx950 requires VectorCombine for stable BF16 and FP8 code generation.
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, "", [], options.enable_fp_fusion,
-                             disable_vector_combine=True)
+                             disable_vector_combine=options.arch != "gfx950")
 
         # Architectures with architected SGPRs store the workgroup id in ttmp9 (X) and ttmp7 (Y[15:0], Z[31:16]).
         # These attributes are used to determine if Z should be masked out when loading Y. They are inferred during
         # optimize_module from calls to @llvm.amdgcn.workgroup.id.x/y/z(). We cannot rely on this because a
         # dispatch dimensions might be used even if there is no program_id() call for it.
         if amd.has_architected_sgprs(options.arch):
-            fns[0].remove_fn_attr("amdgpu-no-workgroup-id-x")
-            fns[0].remove_fn_attr("amdgpu-no-workgroup-id-y")
-            fns[0].remove_fn_attr("amdgpu-no-workgroup-id-z")
+            kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-x")
+            kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-y")
+            kernel_fn.remove_fn_attr("amdgpu-no-workgroup-id-z")
 
         if knobs.amd.scalarize_packed_fops:
-            amd.add_scalarize_packed_fops_llvm_pass(fns[0])
+            amd.add_scalarize_packed_fops_llvm_pass(kernel_fn)
 
         # Get some metadata
         metadata["num_warps"] = total_warps_num

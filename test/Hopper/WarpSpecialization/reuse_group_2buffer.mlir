@@ -1,4 +1,4 @@
-// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
 //
 // Verify that 2-buffer reuse group logic moves the late buffer's (dq)
 // producer_acquire before the early buffer's (dpT) producer.
@@ -13,6 +13,9 @@
 // shared token prevents dq's old data from being overwritten before it
 // is consumed.
 //
+// CHECK: remark: loc("dq"): reuse barrier: channel {{[0-9]+}} waits on channel {{[0-9]+}} (intra-iteration)
+// CHECK-NEXT: {{.*}}note: loc("dq"): see current operation: nvws.producer_acquire
+// CHECK-SAME: constraints = {WSBarrier = {dstTask = 3 : i32}}
 // CHECK: nvws.producer_acquire {{.*}}%dq_{{[0-9]+}}, %dq_{{[0-9]+}}
 // CHECK: nvws.producer_acquire {{.*}}%dpT_{{[0-9]+}}, %dpT_{{[0-9]+}}
 // CHECK: %dpT_{{[0-9]+}} = ttng.tc_gen5_mma

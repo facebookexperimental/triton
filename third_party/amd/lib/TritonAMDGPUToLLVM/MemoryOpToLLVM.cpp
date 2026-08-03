@@ -3,6 +3,7 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
@@ -14,6 +15,20 @@
 using ::mlir::triton::gpu::MemDescType;
 
 namespace {
+
+static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
+                                             LLVM::AtomicOrdering ordering,
+                                             StringRef synchronizeAddrSpace) {
+  auto fence =
+      LLVM::FenceOp::create(builder, loc, ordering, /*syncscope=*/"workgroup");
+  if (!synchronizeAddrSpace.empty()) {
+    Attribute mmra = builder.getAttr<LLVM::MMRATagAttr>("amdgpu-synchronize-as",
+                                                        synchronizeAddrSpace);
+    fence->setDiscardableAttr(LLVM::LLVMDialect::getMmraAttrName(), mmra);
+  }
+  return fence;
+}
+
 class TransLocalLoadOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp> {
 public:
@@ -351,7 +366,18 @@ private:
     // It's fine that we don't compute the offset in bytes as affineOffset
     // will be folded into a constant
     auto affineOffsetI8 = b.mul(affineOffset, b.i32_val(bitWidth / 8));
-    regBase = b.xor_(regBase, affineOffsetI8);
+    bool hasPadding = !paddingShifts.empty();
+    Value paddedAffineOffsetI8 = b.i32_val(0);
+    if (hasPadding && maskSpanAffineOffset != 0) {
+      // `maskSpanAffineOffset != 0` indicates the affine offsets come from
+      // MemDescSubsliceOp, whose verifier guarantees that the affine offsets
+      // are bitwise disjoint from other offset contributors. Padding can thus
+      // be applied separately. This helps LLVM reuse base pointers.
+      paddedAffineOffsetI8 =
+          applyPadding(loc, rewriter, affineOffsetI8, paddingShifts);
+    } else {
+      regBase = b.xor_(regBase, affineOffsetI8);
+    }
 
     // Elements per op
     auto elemsPerInstr = fullTile.getInDimSize(kReg);
@@ -361,7 +387,13 @@ private:
       auto regIdx = reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}})[0].second;
       auto regIdxI8 = regIdx * (bitWidth / 8);
       Value offset = b.xor_(regBase, b.i32_val(regIdxI8));
-      offset = applyPadding(loc, rewriter, offset, paddingShifts);
+
+      if (hasPadding) {
+        offset = applyPadding(loc, rewriter, offset, paddingShifts);
+        if (maskSpanAffineOffset != 0)
+          offset = b.add(offset, paddedAffineOffsetI8);
+      }
+
       for (int i2 = 0; i2 < nAdditive; i2 += elemsPerInstr) {
         // all these constants will go as immediate values to ds_read_tr
         auto regIdxAdd =
@@ -692,21 +724,27 @@ public:
                 triton::gpu::AddrSpace::TensorWrite;
     if ((op.getAddrSpace() & ~mask) != triton::gpu::AddrSpace::None)
       return failure();
-    // We can lower barrier to MemoryCounterWaitOp + s_barrier
-    // - MemoryCounterWaitOp specifies how many operations to
-    //   VMEM(Read)/VMEM(Write)/LDS can be outstanding when
-    //   the instruction completes.
-    // - s_barrier synchronizes the execution for the CTA
-    IntegerAttr zero = rewriter.getI32IntegerAttr(0);
     bool localBarrier = op.hasLocal();
     bool globalBarrier = op.hasGlobalRead() || op.hasGlobalWrite();
     if (localBarrier || globalBarrier) {
-      amdgpu::MemoryCounterWaitOp::create(
-          rewriter, op->getLoc(),
-          /* load= */ op.hasGlobalRead() ? zero : nullptr,
-          /* store= */ op.hasGlobalWrite() ? zero : nullptr,
-          /* ds= */ localBarrier ? zero : nullptr);
+      StringRef mmraAddrSpace = "";
+      if (localBarrier && !globalBarrier)
+        mmraAddrSpace = "local";
+      else if (!localBarrier && globalBarrier)
+        mmraAddrSpace = "global";
+
+      // Local/global barriers use LLVM fences so the AMDGPU memory legalizer
+      // selects target-specific waits. Mixed local+global barriers are left
+      // untagged so LLVM conservatively synchronizes every relevant space.
+      createAMDGPUMemoryFence(rewriter, op->getLoc(),
+                              LLVM::AtomicOrdering::release, mmraAddrSpace);
+      ROCDL::SBarrierOp::create(rewriter, op->getLoc());
+      createAMDGPUMemoryFence(rewriter, op->getLoc(),
+                              LLVM::AtomicOrdering::acquire, mmraAddrSpace);
+      rewriter.eraseOp(op);
+      return success();
     }
+
     rewriter.replaceOpWithNewOp<ROCDL::SBarrierOp>(op);
 
     return success();

@@ -206,16 +206,15 @@ counter independently.
 
 ## Frontend and Configuration Gaps
 
-Because the current workaround annotates the inner K loop, outer-while options
-do not have a complete end-to-end contract for dynamic persistence. This
-includes:
+The unified outer-while path now has Blackwell end-to-end coverage for
+`data_partition_factor`, `separate_epilogue_store`, generated subtiled regions,
+and broadcast depth greater than one (the 16-configuration unified matrix). The
+following remain without a complete end-to-end contract for dynamic persistence:
 
-- `data_partition_factor`;
 - `merge_epilogue`, `merge_epilogue_to_computation`, and `merge_correction`;
-- `separate_epilogue_store`;
 - SMEM/TMEM allocation options;
-- generated subtiled regions;
-- register-budget and ping-pong combinations.
+- register-budget and ping-pong combinations;
+- all of the above on Hopper (the Blackwell matrix does not run on Hopper).
 
 `num_stages` on the dynamic outer while should remain inert or produce a clear
 frontend diagnostic; stages belong on the nested K loop.
@@ -239,22 +238,46 @@ Required coverage:
    from an initially unpartitioned outer while, extended through code
    partitioning, physical specialization, depth-2 slot/phase rotation, and
    nested K-loop rescheduling. (`ws_atomic_broadcast_from_psm.mlir`.)
-4. **Unified E2E** [Blackwell done]: `DynamicPersistent1DScheduler` and
-   `ClcTileScheduler` with outer `tl.condition(..., warp_specialize=True)` and
-   an unannotated K loop. The dynamic scheduler remains pending on Hopper.
-5. **Feature E2E**: epilogue subtiles, DP=2, separate epilogue store, generated
-   subtiled regions, and broadcast depths greater than one.
-6. **Bailout E2E/lit**: scatter, strict-subset, non-carried, and unrelated
-   replicated atomics leave a compilable non-WS kernel.
+4. **Unified E2E** [Blackwell done; Hopper test added, run pending]:
+   `DynamicPersistent1DScheduler` and `ClcTileScheduler` with outer
+   `tl.condition(..., warp_specialize=True)` and an unannotated K loop, on
+   Blackwell. A dedicated `is_hopper()`-gated dynamic test
+   (`test_tutorial09_..._while_loop_warp_specialize_hopper`, 5 Hopper-capable
+   configs incl. DP=2 at BLOCK_M=128) now exists but is skipped on Blackwell and
+   awaits an SM90 run.
+5. **Feature E2E** [Blackwell done]: epilogue subtiles, DP=2, separate epilogue
+   store, generated subtiled regions, and broadcast depths greater than one are
+   all exercised by the 16-configuration unified matrix
+   (`test_tutorial09_matmul_tma_unified_persistent_while_loop_warp_specialize`),
+   including `dynamic-generated-subtile-4`,
+   `dynamic-generated-separate-subtile-4`,
+   `dynamic-dp2-generated-separate-subtile-2`, and `dynamic-broadcast-depth-2`,
+   all passing on Blackwell. Hopper feature-combination runtime remains pending.
+6. **Bailout E2E/lit** [done]: unsupported replicated atomics/CLC fetches leave a
+   compilable non-WS kernel. Coverage: (a) **E2E** — a scatter-atomic
+   dynamic-persistent outer-while GEMM
+   (`test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize_bailout`)
+   asserts `ttg.warp_specialize`/`async_task_id` absent **and** numerical
+   correctness on Blackwell; (b) **classify-branch lit** —
+   `ws_atomic_broadcast_reject_classify.mlir` pins strict-subset, non-carried,
+   and CLC (not-in-while, subset) rejects via `not triton-opt
+   --nvgpu-test-ws-atomic-broadcast` (the test pass `signalPassFailure`s on
+   reject); (c) **full-pass teardown** — the scatter case in
+   `ws_atomic_broadcast_reject.mlir` proves the shared, category-independent
+   `bailOut`/`removeWarpSpecMetadata` teardown. ("non-carried" and
+   "unrelated-replicated" are the same `getLoopCarryingWhile==null` check.)
 7. **Hopper and Blackwell**: CLC sibling correctness is covered on Blackwell;
-   unified dynamic atomic correctness remains to be run on Hopper.
+   unified dynamic atomic correctness on Hopper now has a dedicated gated test
+   (see #4) but has not yet been executed on SM90 hardware.
 8. **Performance**: compare static persistent, dynamic inner-loop AutoWS,
    dynamic outer-loop AutoWS at depth 1, and tuned broadcast depth.
 
 ## Recommended Implementation Order
 
 1. Complete unified dynamic E2E coverage on Hopper.
-2. Add feature combinations.
+2. Add feature combinations. [Blackwell done — the unified matrix covers epilogue
+   subtiles, DP=2, separate epilogue store, generated subtiled regions, and
+   broadcast depth 2; Hopper still pending.]
 3. Address dynamic 2-CTA as a separate cluster-level design.
 
 ## Definition of Done

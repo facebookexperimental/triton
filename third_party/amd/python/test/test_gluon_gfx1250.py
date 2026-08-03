@@ -393,7 +393,8 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
                                 stride_bk, stride_bn,  #
                                 stride_cm, stride_cn,  #
                                 BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, BLOCK_K: ttgl.constexpr,  #
-                                NUM_BUFFERS: ttgl.constexpr, USE_TDM: ttgl.constexpr, IS_B_K_CONTIG: ttgl.constexpr):
+                                NUM_BUFFERS: ttgl.constexpr, USE_TDM: ttgl.constexpr, IS_B_K_CONTIG: ttgl.constexpr,
+                                RESOLVE_PARTITION_CONFLICTS: ttgl.constexpr):
     a_dtype: ttgl.constexpr = a_ptr.type.element_ty
     b_dtype: ttgl.constexpr = b_ptr.type.element_ty
     ttgl.static_assert(a_dtype.is_fp16() or a_dtype.is_bf16(), "Only fp16/bf16 supported for A")
@@ -401,19 +402,24 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
     ttgl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
 
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+
+    padded_a: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0])
     if IS_B_K_CONTIG:
-        BLOCKED_LAYOUT_B: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+        padded_b: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0])
     else:
-        BLOCKED_LAYOUT_B: ttgl.constexpr = ttgl.BlockedLayout([8, 1], [8, 4], [1, 4], [0, 1])
-    WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, [[0, 1], [1, 0]], [], [16, 16, 32])
-    SHARED_LAYOUT_A: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K],
-                                                                                [1, 0])
-    if IS_B_K_CONTIG:
-        SHARED_LAYOUT_B: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 8]], [BLOCK_K, BLOCK_N],
-                                                                                    [1, 0])
+        padded_b: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 8]], [BLOCK_K, BLOCK_N], [1, 0])
+
+    if RESOLVE_PARTITION_CONFLICTS:
+        # The padded layouts above are reinterpreted as per-piece sublayouts here.
+        _DOT_LAYOUTS: ttgl.constexpr = ttgl.amd.gfx1250.make_partitioned_dot_layouts(
+            BLOCK_M, BLOCK_N, padded_a, padded_b, 4, [16, 16, 32], a_transposed=False, b_transposed=IS_B_K_CONTIG)
     else:
-        SHARED_LAYOUT_B: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_K, BLOCK_N],
-                                                                                    [0, 1])
+        _DOT_LAYOUTS: ttgl.constexpr = (padded_a, padded_b,
+                                        ttgl.amd.AMDWMMALayout(3, True, [[0, 1], [1, 0]], [], [16, 16, 32]))
+    SHARED_LAYOUT_A: ttgl.constexpr = _DOT_LAYOUTS[0]
+    SHARED_LAYOUT_B: ttgl.constexpr = _DOT_LAYOUTS[1]
+    WMMA_LAYOUT: ttgl.constexpr = _DOT_LAYOUTS[2]
+
     OPERAND_LAYOUT_A: ttgl.constexpr = ttgl.DotOperandLayout(0, WMMA_LAYOUT, 8)
     OPERAND_LAYOUT_B: ttgl.constexpr = ttgl.DotOperandLayout(1, WMMA_LAYOUT, 8)
 
@@ -429,21 +435,38 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         strides=(stride_am, stride_ak),  #
         block_shape=(BLOCK_M, BLOCK_K),  #
         layout=SHARED_LAYOUT_A)
-    b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(  #
-        base=b_ptr + pid_n * BLOCK_N * stride_bn,  #
-        shape=(K, N),  #
-        strides=(stride_bk, stride_bn),  #
-        block_shape=(BLOCK_K, BLOCK_N),  #
-        layout=SHARED_LAYOUT_B)
+    if IS_B_K_CONTIG:
+        # TDM always needs the most-minor dimension to be contiguous, so for K-contiguous B we
+        # describe the tile as (BLOCK_N, BLOCK_K) and permute it before the dot.
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(  #
+            base=b_ptr + pid_n * BLOCK_N * stride_bn,  #
+            shape=(N, K),  #
+            strides=(stride_bn, stride_bk),  #
+            block_shape=(BLOCK_N, BLOCK_K),  #
+            layout=SHARED_LAYOUT_B)
+    else:
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(  #
+            base=b_ptr + pid_n * BLOCK_N * stride_bn,  #
+            shape=(K, N),  #
+            strides=(stride_bk, stride_bn),  #
+            block_shape=(BLOCK_K, BLOCK_N),  #
+            layout=SHARED_LAYOUT_B)
 
     # Pointers for AsyncCopy
     offs_ak = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
     offs_am = (pid_m * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))) % M
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
 
-    offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_B))
-    offs_bn = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_B))) % N
-    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    if IS_B_K_CONTIG:
+        # Tile is [BLOCK_N, BLOCK_K]: N along rows, K along cols (contiguous).
+        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
+        offs_bn = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))) % N
+        b_ptrs = b_ptr + offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk
+    else:
+        # Tile is [BLOCK_K, BLOCK_N]: K along rows, N along cols (contiguous).
+        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))
+        offs_bn = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))) % N
+        b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
     a_buffer = ttgl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = ttgl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
@@ -456,14 +479,21 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         if USE_TDM:
             ttgl.amd.gfx1250.tdm.async_load(a_desc, [0, load_idx * BLOCK_K],  #
                                             a_buffer.index(load_idx % NUM_BUFFERS))
-            ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
-                                            b_buffer.index(load_idx % NUM_BUFFERS))
+            if IS_B_K_CONTIG:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [0, load_idx * BLOCK_K],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
+            else:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
         else:
             mask_a = offs_ak[None, :] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(a_buffer.index(load_idx % NUM_BUFFERS), a_ptrs, mask_a,
                                                          other=0.0)
 
-            mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
+            if IS_B_K_CONTIG:
+                mask_b = offs_bk[None, :] < K - load_idx * BLOCK_K
+            else:
+                mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(b_buffer.index(load_idx % NUM_BUFFERS), b_ptrs, mask_b,
                                                          other=0.0)
             ttgl.amd.gfx1250.async_copy.commit_group()
@@ -476,14 +506,21 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         if USE_TDM:
             ttgl.amd.gfx1250.tdm.async_load(a_desc, [0, load_idx * BLOCK_K],  #
                                             a_buffer.index(load_idx % NUM_BUFFERS))
-            ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
-                                            b_buffer.index(load_idx % NUM_BUFFERS))
+            if IS_B_K_CONTIG:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [0, load_idx * BLOCK_K],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
+            else:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
         else:
             mask_a = offs_ak[None, :] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(a_buffer.index(load_idx % NUM_BUFFERS), a_ptrs, mask_a,
                                                          other=0.0)
 
-            mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
+            if IS_B_K_CONTIG:
+                mask_b = offs_bk[None, :] < K - load_idx * BLOCK_K
+            else:
+                mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(b_buffer.index(load_idx % NUM_BUFFERS), b_ptrs, mask_b,
                                                          other=0.0)
             ttgl.amd.gfx1250.async_copy.commit_group()
@@ -498,7 +535,10 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
             ttgl.amd.gfx1250.async_copy.wait_group((NUM_BUFFERS - 1))
 
         a = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
-        b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
+        if IS_B_K_CONTIG:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+        else:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
         accumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)
         wmma_idx += 1
 
@@ -509,7 +549,10 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
             ttgl.amd.gfx1250.async_copy.wait_group((NUM_BUFFERS - 2 - i))
 
         a = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
-        b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
+        if IS_B_K_CONTIG:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+        else:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
         accumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)
         wmma_idx += 1
 
@@ -523,26 +566,42 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 @pytest.mark.parametrize("BLOCK_M,BLOCK_N,BLOCK_K", [(m, n, k) for (m, n) in [(32, 32), (64, 64)] \
                                                                for k in [32, 64]])
 @pytest.mark.parametrize("NUM_BUFFERS", [2, 4])
-@pytest.mark.parametrize("IS_B_K_CONTIG", [True, False])
 @pytest.mark.parametrize("ASYNC_LOAD_TYPE", ["ASYNC_COPY", "TDM"])
-def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS_B_K_CONTIG, ASYNC_LOAD_TYPE):
+@pytest.mark.parametrize("B_K_CONTIG", [True, False])
+@pytest.mark.parametrize("RESOLVE_PARTITION_CONFLICTS", [True, False])
+def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, ASYNC_LOAD_TYPE, B_K_CONTIG,
+                                      RESOLVE_PARTITION_CONFLICTS):
+    if RESOLVE_PARTITION_CONFLICTS:
+        if ASYNC_LOAD_TYPE == "ASYNC_COPY":
+            pytest.skip("AsyncCopy is not supported with partition shared layouts")
+        # The kernel uses num_warps=4 and instr_shape=[16, 16, 32], which gives
+        # WARP_TILES_M=4 and WARP_TILES_N=2 (see make_partitioned_dot_layouts).
+        # The minimum partitionable tile size is WARP_TILES_{M,N} * instr_shape[{0,1}].
+        min_block_m = 4 * 16
+        min_block_n = 2 * 16
+        if BLOCK_M < min_block_m or BLOCK_N < min_block_n:
+            pytest.skip(
+                f"Minimal block shape for partition conflicts resolution is ({min_block_m}, {min_block_n}) along (M, N)"
+            )
+
     # Inner strides need to be constexpr (1) to get contiguity. Note the compiler frontend does the same for normal dispatches
     signature = {
         "a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32",  #
         "M": "i32", "N": "i32", "K": "i32",  #
         "stride_am": "i32", "stride_ak": "constexpr",  #
-        "stride_bk": "constexpr", "stride_bn": "constexpr",  #
+        "stride_bk": "constexpr" if B_K_CONTIG else "i32", "stride_bn": "i32" if B_K_CONTIG else "constexpr",  #
         "stride_cm": "i32", "stride_cn": "constexpr",  #
         "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr",  #
-        "NUM_BUFFERS": "constexpr", "USE_TDM": "constexpr", "IS_B_K_CONTIG": "constexpr"
+        "NUM_BUFFERS": "constexpr", "USE_TDM": "constexpr", "IS_B_K_CONTIG": "constexpr", "RESOLVE_PARTITION_CONFLICTS":
+        "constexpr"
     }
 
     constexprs = {
-        "stride_ak": 1, "stride_cn": 1, "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K, "NUM_BUFFERS":
-        NUM_BUFFERS, "USE_TDM": ASYNC_LOAD_TYPE == "TDM", "IS_B_K_CONTIG": IS_B_K_CONTIG
+        "stride_ak": 1, ("stride_bk" if B_K_CONTIG else "stride_bn"): 1, "stride_cn": 1,  #
+        "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K, "NUM_BUFFERS": NUM_BUFFERS,  #
+        "USE_TDM": ASYNC_LOAD_TYPE == "TDM", "IS_B_K_CONTIG": B_K_CONTIG,  #
+        "RESOLVE_PARTITION_CONFLICTS": RESOLVE_PARTITION_CONFLICTS
     }
-    constexprs["stride_bn"] = BLOCK_N if not IS_B_K_CONTIG else 1
-    constexprs["stride_bk"] = BLOCK_K if IS_B_K_CONTIG else 1
 
     fn = gemm_async_pipelined_kernel
 
@@ -563,7 +622,8 @@ def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS
         assert len(re.findall("tensor_load_to_lds", amdgcn)) == NUM_BUFFERS * 2
     else:
         copy_instr_for_A = BLOCK_M // 4 // 4
-        copy_isntr_for_B = (BLOCK_K if IS_B_K_CONTIG else BLOCK_N) // 4 // 4
+        b_rows = BLOCK_N if B_K_CONTIG else BLOCK_K
+        copy_isntr_for_B = b_rows // 4 // 4
         copy_instr_per_iter = copy_instr_for_A + copy_isntr_for_B
         for cnt in range(NUM_BUFFERS - 1, -1, -1):
             assert re.search(f"s_wait_asynccnt 0x{(cnt * copy_instr_per_iter):x}", amdgcn)
@@ -575,23 +635,42 @@ def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS
                                                                for k in [32, 64]])
 @pytest.mark.parametrize("NUM_BUFFERS", [2, 4])
 @pytest.mark.parametrize("M,N,K", [(256, 256, 512), (240, 240, 496), (250, 250, 510)])
-@pytest.mark.parametrize("IS_B_K_CONTIG", [True, False])
 @pytest.mark.parametrize("ASYNC_LOAD_TYPE", ["ASYNC_COPY", "TDM"])
-def test_runtime_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, M, N, K, IS_B_K_CONTIG, ASYNC_LOAD_TYPE):
+@pytest.mark.parametrize("B_K_CONTIG", [True, False])
+@pytest.mark.parametrize("RESOLVE_PARTITION_CONFLICTS", [True, False])
+def test_runtime_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, M, N, K, ASYNC_LOAD_TYPE, B_K_CONTIG,
+                                      RESOLVE_PARTITION_CONFLICTS):
     if triton.cdiv(K, BLOCK_K) < NUM_BUFFERS:
         pytest.skip("Skip tests where K/BLOCK_K < NUM_BUFFERS")
 
     if ASYNC_LOAD_TYPE == "ASYNC_COPY" and any([x % 16 != 0 for x in [M, N, K]]):
         pytest.skip("AsyncCopy tests need divisibility==16 to get vectorization information")
 
+    if RESOLVE_PARTITION_CONFLICTS:
+        if ASYNC_LOAD_TYPE == "ASYNC_COPY":
+            pytest.skip("AsyncCopy is not supported with partition shared layouts")
+        # The kernel uses num_warps=4 and instr_shape=[16, 16, 32], which gives
+        # WARP_TILES_M=4 and WARP_TILES_N=2 (see make_partitioned_dot_layouts).
+        # The minimum partitionable tile size is WARP_TILES_{M,N} * instr_shape[{0,1}].
+        min_block_m = 4 * 16
+        min_block_n = 2 * 16
+        if BLOCK_M < min_block_m or BLOCK_N < min_block_n:
+            pytest.skip(
+                f"Minimal block shape for partition conflicts resolution is ({min_block_m}, {min_block_n}) along (M, N)"
+            )
+
     torch.manual_seed(42)
 
     a = torch.randn((M, K), dtype=torch.float16)
-    b = torch.randn((K, N), dtype=torch.float16)
+    if B_K_CONTIG:
+        # Allocate as (N, K) and transpose so that the K dimension is the contiguous one.
+        b = torch.randn((N, K), dtype=torch.float16).t()
+    else:
+        b = torch.randn((K, N), dtype=torch.float16)
     c = torch.zeros((M, N), dtype=torch.float32)
 
     a_device = a.cuda()
-    b_device = b.cuda() if IS_B_K_CONTIG else b.data.T.contiguous().T.cuda()
+    b_device = b.cuda() if B_K_CONTIG else b.data.T.contiguous().T.cuda()
     c_device = c.cuda()
 
     stride_am, stride_ak = a_device.stride(0), a_device.stride(1)
@@ -606,7 +685,8 @@ def test_runtime_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, M,
         stride_bk, stride_bn,  #
         stride_cm, stride_cn,  #
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,  #
-        NUM_BUFFERS=NUM_BUFFERS, USE_TDM=ASYNC_LOAD_TYPE == "TDM", IS_B_K_CONTIG=IS_B_K_CONTIG)
+        NUM_BUFFERS=NUM_BUFFERS, USE_TDM=ASYNC_LOAD_TYPE == "TDM", IS_B_K_CONTIG=B_K_CONTIG,
+        RESOLVE_PARTITION_CONFLICTS=RESOLVE_PARTITION_CONFLICTS)
 
     c_triton = c_device.cpu()
     c_torch = a.to(torch.float32) @ b.to(torch.float32)
@@ -2941,6 +3021,15 @@ def test_ws_store_wait_load(XBLOCK):
     arange pattern.
     """
 
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
+
     @gluon.jit
     def ws_consumer(smem, ready_bar, done_bar, layout: ttgl.constexpr):
         ttgl.amd.gfx1250.mbarrier.wait(ready_bar, phase=0)
@@ -3002,6 +3091,15 @@ def test_ws_store_wait_load_loop(XBLOCK, NUM_ITERS):
     (executed by default warps) waits for done_bar, loads the accumulated result, and stores it to global memory.
     The test verifies that the output equals the expected arange pattern.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_consumer(smem, ready_bar, done_bar, empty_bar, XBLOCK: ttgl.constexpr, NUM_ITERS: ttgl.constexpr,
@@ -3082,6 +3180,15 @@ def test_runtime_ws_tensor_async_load_store_mbarrier(M, N, BLOCK_M, BLOCK_N, NUM
 
     The test verifies that the output matches the input, confirming that async load/store operations are correctly coordinated by mbarriers.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_producer(a_desc, a_buffer, bars, pid_n, idx_m, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):
@@ -3165,6 +3272,15 @@ def test_runtime_ws_tensor_copy_mbarrier(M, N, BLOCK_M, BLOCK_N, NUM_BUFFERS, NU
 
     The test verifies that the output matches the input, confirming correct synchronization.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_producer(a_desc, a_buffer, bars, pid_n, idx_m, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):

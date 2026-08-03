@@ -389,15 +389,26 @@ void updateWaitCount(WaitType waitOp,
     // Replace ttg.async_wait which counts outstanding commit groups with
     // amdg.async_wait which counts the number of outstanding intrinsics
     auto tokens = waitOp.getAsyncToken();
+    auto origNum = waitOp.getNum();
     rewriter.setInsertionPointAfter(waitOp);
-    rewriter.replaceOpWithNewOp<amdgpu::AsyncWaitOp>(waitOp, tokens, waitCnt);
+    auto newOp = rewriter.replaceOpWithNewOp<amdgpu::AsyncWaitOp>(
+        waitOp, tokens, waitCnt);
+    // Preserve the original commit-group count so downstream passes
+    // (e.g. ConcurrencySanitizer) that reason about commit groups can
+    // still access it after this lowering.
+    newOp->setAttr("ttg.num_commit_groups",
+                   rewriter.getI32IntegerAttr(origNum));
   } else if (std::is_same_v<WaitType, triton::amdgpu::AsyncTDMWait>) {
     // Replace amdg.async_tdm_wait (counts TDM operations) with
     // amdg.async_tdm_intrinsic_wait (counts TDM intrinsics)
     auto tokens = waitOp.getAsyncToken();
+    auto origNum = waitOp.getNum();
     rewriter.setInsertionPointAfter(waitOp);
-    rewriter.replaceOpWithNewOp<amdgpu::AsyncTDMIntrinsicWait>(waitOp, tokens,
-                                                               waitCnt);
+    auto newOp = rewriter.replaceOpWithNewOp<amdgpu::AsyncTDMIntrinsicWait>(
+        waitOp, tokens, waitCnt);
+    // Preserve the original TDM operation count so downstream passes
+    // (e.g. ConcurrencySanitizer) can still access it after this lowering.
+    newOp->setAttr("ttg.num_tdm_ops", rewriter.getI32IntegerAttr(origNum));
   } else {
     assert(false && "Unsupported wait type");
   }
@@ -479,15 +490,10 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
                   smemTy.getShape(), numWarps, smemTy.getEncoding());
           return numInstr;
         } else if (isa<AsyncTDMScatterOp, AsyncTDMGatherOp>(op)) {
-          // For scatter and gather we need to get the count of TDM intrinsics
-          // based on the row indices tensor type
           auto rowIndicesType =
               cast<RankedTensorType>(op->getOperandTypes()[1]);
-          bool use32BitIndices =
-              rowIndicesType.getElementType().getIntOrFloatBitWidth() == 32;
-          size_t numIndices = rowIndicesType.getNumElements();
           return mlir::LLVM::AMD::getTDMGatherScatterInstrinsicCount(
-              numIndices, use32BitIndices);
+              rowIndicesType);
         } else {
           return 0;
         }

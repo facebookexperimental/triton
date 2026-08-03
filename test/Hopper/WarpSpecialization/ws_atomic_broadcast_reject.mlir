@@ -5,6 +5,14 @@
 // cannot broadcast a data-dependent scatter, so it must bail out of warp
 // specialization and leave a plain, compilable (non-WS) kernel: no
 // ttg.warp_specialize op and no leftover partition ids / async_task_ids.
+//
+// This is the representative full-pass graceful-teardown proof. The teardown
+// (bailOut -> removeWarpSpecMetadata) is one shared, category-independent path,
+// so the OTHER classifyAtomic/classifyCLC reject branches (strict-subset,
+// non-carried, and the CLC rejects) are pinned deterministically via the
+// test pass in ws_atomic_broadcast_reject_classify.mlir, and the E2E scatter
+// bail-out (non-WS + correctness) lives in
+// test_tutorial09_matmul_tma_dynamic_persistent_while_loop_warp_specialize_bailout.
 
 // CHECK-LABEL: @reject_scatter_atomic
 // CHECK-NOT: ttg.warp_specialize

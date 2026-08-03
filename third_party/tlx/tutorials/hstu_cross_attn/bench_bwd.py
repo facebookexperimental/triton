@@ -34,6 +34,7 @@ import triton_bw_cross_attention as xa
 
 D = 128
 H = 2
+H_KV = 1
 BLOCK = 64  # BLOCK_M == BLOCK_N used by the redq/autows benchmark configs
 
 VARIANTS = [
@@ -44,9 +45,10 @@ VARIANTS = [
     # Manual 2-KV data-partition + compute-fold + shared-KV. WS dispatch ("1");
     # under TRITON_USE_LIST_SCHEDULE=1 its inner loop's schedule is autotuned.
     ("autows_2kv", xa.BwdVariant.TRITON_AUTOWS_2KV, "1"),
+    ("autows_2kv_host_tma", xa.BwdVariant.TRITON_AUTOWS_2KV_HOST_TMA, "1"),
 ]
 # Variants that require shared-KV (V aliases K); only run under --shared-kv.
-SHARED_KV_ONLY = {"tlx_2kv", "autows_2kv"}
+SHARED_KV_ONLY = {"tlx_2kv", "autows_2kv", "autows_2kv_host_tma"}
 
 
 def force(ns=2, bm=BLOCK, bn=BLOCK):
@@ -85,7 +87,10 @@ def force(ns=2, bm=BLOCK, bn=BLOCK):
 
 def make(Lq, Lkv, Z, shared=False):
     tq, tk = Z * Lq, Z * Lkv
-    g = lambda n: torch.randn(n, H, D, device="cuda", dtype=torch.bfloat16)
+
+    def g(n):
+        return torch.randn(n, H, D, device="cuda", dtype=torch.bfloat16)
+
     q = g(tq).requires_grad_(True)
     k = g(tk).requires_grad_(True)
     # shared-KV: V aliases K (same tensor), so k.grad accumulates dk + dv.
@@ -94,6 +99,45 @@ def make(Lq, Lkv, Z, shared=False):
     so_q = torch.arange(0, tq + 1, Lq, device="cuda", dtype=torch.int64)
     asc = torch.tensor(1.0 / Lkv, device="cuda", dtype=torch.float32)
     do = g(tq)
+    return q, k, v, do, so_kv, so_q, asc
+
+
+def make_prod(max_targets, max_kv, batch, seed=1001):
+    """Build the jagged GQA/shared-KV shape used by T281143734's Buck bench."""
+    dev = "cuda"
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    # Port generative_recommenders.common.generate_sparse_seq_len at
+    # --seq-sparsity=0.95: U[int(0.9 * max_kv), max_kv).
+    lengths_kv = torch.randint(
+        int(0.9 * max_kv),
+        max_kv,
+        (batch, ),
+        device=dev,
+        dtype=torch.int64,
+        generator=gen,
+    )
+    lengths_q = torch.randint(
+        1 if max_targets < 400 else max_targets // 2,
+        max_targets + 1,
+        (batch, ),
+        device=dev,
+        dtype=torch.int64,
+        generator=gen,
+    )
+    so_kv = torch.zeros(batch + 1, device=dev, dtype=torch.int64)
+    so_q = torch.zeros(batch + 1, device=dev, dtype=torch.int64)
+    torch.cumsum(lengths_kv, 0, out=so_kv[1:])
+    torch.cumsum(lengths_q, 0, out=so_q[1:])
+    tq, tkv = int(so_q[-1]), int(so_kv[-1])
+
+    def tensor(n, heads):
+        return torch.empty(n, heads, D, device=dev, dtype=torch.bfloat16).uniform_(-0.1, 0.1, generator=gen)
+
+    q = tensor(tq, H).requires_grad_(True)
+    k = tensor(tkv, H_KV).requires_grad_(True)
+    v = k  # The production benchmark passes --share-kv True.
+    do = tensor(tq, H)
+    asc = torch.tensor(1.0 / (max_kv + max_targets), device=dev)
     return q, k, v, do, so_kv, so_q, asc
 
 
@@ -143,7 +187,7 @@ def _fwd(var, ws, q, k, v, so_kv, so_q, Lkv, Lq, asc, shared=False):
         attn_scale=asc,
         max_q_len=Lq,
         seq_offsets_q=so_q,
-        num_softmax_heads=H,
+        num_softmax_heads=q.shape[1],
         shared_kv=shared,
         enable_tma=True,
     )
@@ -184,16 +228,22 @@ def run_accuracy(configs, ns=2, ref_name="redq", variants=None, shared=False):
                 print(f"  {name:<8} ERROR {type(e).__name__}: {str(e)[:50]}")
 
 
-def run_perf(shapes, ns=2, variants=None, shared=False):
+def run_perf(shapes, ns=2, variants=None, production=False, bm=BLOCK, bn=BLOCK):
     sel = VARIANTS if variants is None else [x for x in VARIANTS if x[0] in variants]
-    mode = "shared-KV" if shared else "separate-KV"
+    mode = "shared-KV, jagged GQA" if production else "dense"
     print(f"\n=== Perf ({mode}): backward latency per variant "
           f"(autograd bwd on prebuilt fwd graph) ===")
     for Lq, Lkv, Z in shapes:
-        force(ns)
+        force(ns, bm=bm, bn=bn)
         torch.manual_seed(0)
-        q, k, v, do, so_kv, so_q, asc = make(Lq, Lkv, Z, shared=shared)
-        print(f"\n  Lq={Lq} Lkv={Lkv}({Lkv // BLOCK}blk) Z={Z} H={H} D={D} ns={ns}")
+        if production:
+            q, k, v, do, so_kv, so_q, asc = make_prod(Lq, Lkv, Z)
+        else:
+            q, k, v, do, so_kv, so_q, asc = make(Lq, Lkv, Z)
+        shared = production
+        q_tokens, kv_tokens = int(so_q[-1]), int(so_kv[-1])
+        print(f"\n  maxLq={Lq} maxLkv={Lkv} Z={Z} Hq={q.shape[1]} "
+              f"Hkv={k.shape[1]} D={D} q_tok={q_tokens} kv_tok={kv_tokens} ns={ns}")
         print(f"  {'variant':<8}{'bwd ms':>10}{'vs redq':>10}")
         base = None
         for name, var, ws in sel:
@@ -206,7 +256,7 @@ def run_perf(shapes, ns=2, variants=None, shared=False):
                     out.backward(do, retain_graph=True)
 
                 fn()  # warm / compile / autotune
-                ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+                ms = triton.testing.do_bench(fn, warmup=25, rep=1000)
                 if name == "redq":
                     base = ms
                 spd = f"{base / ms:.2f}x" if base else "-"
@@ -221,7 +271,14 @@ def main():
     ap.add_argument("--perf", action="store_true", help="perf only")
     ap.add_argument("--ns", type=int, default=2, help="bwd num_stages")
     ap.add_argument("--shared-kv", action="store_true", dest="shared_kv",
-                    help="run shared-KV (V aliases K); required for tlx_2kv")
+                    help="use shared-KV for accuracy cases (perf always matches production)")
+    ap.add_argument("--batch", type=int, default=1024, help="performance batch size (default: Buck workload 1024)")
+    ap.add_argument("--max-kv", type=int, default=4096, dest="max_kv",
+                    help="performance max KV length (default: task focus 4096)")
+    ap.add_argument("--max-targets", default="32,128,160,256", dest="max_targets",
+                    help="comma-separated performance max query/target lengths")
+    ap.add_argument("--bm", type=int, default=BLOCK, help="pinned autoWS backward BLOCK_M")
+    ap.add_argument("--bn", type=int, default=128, help="pinned autoWS backward BLOCK_N (TLX-aligned default: 128)")
     ap.add_argument("--ref", choices=["redq", "tlx"], default="redq",
                     help="byte-reference kernel for the dq bad-Q-block count")
     known = [n for n, _, _ in VARIANTS]
@@ -251,14 +308,17 @@ def main():
         # 2kv uses BLOCK_N=128 (2*BLOCK_N=256 per pair); use Lkv multiples of 128,
         # incl. an odd number of KV blocks (384) to exercise the partial tail pair.
         acc_cfgs = [(256, 256, 2), (256, 384, 2), (256, 512, 2)]
-        perf_shapes = [(256, 256, 4), (256, 512, 4), (256, 1024, 4)]
     else:
         acc_cfgs = [(256, 64, 2), (256, 128, 2), (256, 192, 2)]
-        perf_shapes = [(256, 256, 4), (256, 1024, 4)]
+    try:
+        target_lengths = [int(x) for x in args.max_targets.split(",")]
+    except ValueError:
+        ap.error("--max-targets must be a comma-separated list of integers")
+    perf_shapes = [(max_targets, args.max_kv, args.batch) for max_targets in target_lengths]
     if do_acc:
         run_accuracy(acc_cfgs, ns=args.ns, ref_name=ref, variants=variants, shared=shared)
     if do_perf:
-        run_perf(perf_shapes, ns=args.ns, variants=variants, shared=shared)
+        run_perf(perf_shapes, ns=args.ns, variants=variants, production=True, bm=args.bm, bn=args.bn)
 
 
 if __name__ == "__main__":

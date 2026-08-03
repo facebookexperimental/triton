@@ -154,7 +154,9 @@ struct ConvertLayoutOpConversion
       assert(srcLayout.getOutDimSize(dim) == dstLayout.getOutDimSize(dim) &&
              "source and destination logical dimensions must have equal size");
 
-    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+    auto laneAndWarpId = getLaneAndWarpId(rewriter, loc);
+    Value laneId = laneAndWarpId.first;
+    Value warpId = laneAndWarpId.second;
     auto elemPtrTy = ptr_ty(ctx, targetInfo.getSharedAddressSpace());
     smemBase = b.bitcast(smemBase, elemPtrTy);
 

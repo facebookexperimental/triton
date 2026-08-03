@@ -132,6 +132,12 @@
 - **Regression**: WarpSpecialization lit suite 119 pass / 10 xfail / 0 unexpected.
 - **Key insight**: a `ttg.partition` attribute is a *set*, not a scalar. `PartitionSchedulingMeta` can legitimately assign an op to more than one partition (documented for the no-MMA scalar offset; also possible via the `TMAStoreTokenWaitOp` copy path). Any consumer of `ttg.partition` must handle size ≥ 1, not size == 1.
 
+### 17. Hopper data-partitioned TMA stores share staging slot 0 (2026-07-30, fixed)
+- **Symptom**: the Hopper tutorial09 data-partitioned GEMM writes incorrect output when two epilogue tasks TMA-store different C tiles through the same descriptor. Both stores use slot 0 of one fused staging allocation.
+- **Root cause** (`WSMemoryPlanner.cpp`, `fuseEpilogueWSBuffers`): Phase 3.5 keyed TMA staging fusion on `(descriptor, originalLoad)`. Hopper register accumulators do not trace to a `ttng.tmem_load`, so both `originalLoad` values were null and the key collapsed to the descriptor alone. `doCodePartition` then merged the two task-local allocations even though each task independently indexed its staging channel at slot 0.
+- **Fix**: when `originalLoad` is unavailable, include the channel's producer task in the staging-fusion key. Same-task subtiles still fuse, but concurrent data partitions targeting the same descriptor receive distinct `buffer.id`s.
+- **Tests**: `ws_memory_planner_tma_store_staging_cap.mlir` checks distinct IDs for two null-origin producer tasks. `test_hopper_matmul_tma_warp_specialize[False-True-2-True-False-4-3-64-128-128-8192-8192-1024]` passes and its final TTGIR contains two one-copy staging allocations instead of one two-copy reuse group.
+
 ## Debugging Workflow
 - `t.dump` captures IR after each WarpSpec pass (doTaskIdPropagate → doBufferAllocation → doMemoryPlanner → doCodePartition → ...)
 - IR after PartitionSchedulingMeta uses `ttg.partition = array<i32: N>` attributes (not `async_task_id`)

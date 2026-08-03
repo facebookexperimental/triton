@@ -4,6 +4,10 @@
 // RUN: TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
 // RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule 2>/dev/null \
 // RUN:   | triton-opt -tritonamdgpu-pipeline | FileCheck %s --check-prefix=EXPAND
+// RUN: TRITON_ENABLE_AMD_MODULO=1 TRITON_AMD_MODULO_SERIALIZE=1 triton-opt %s \
+// RUN:   -split-input-file -tritonamdgpu-dot-decompose-and-schedule 2>/dev/null \
+// RUN:   | triton-opt -tritonamdgpu-schedule-loops="num_stages=2" \
+// RUN:   | FileCheck %s --check-prefix=PRESERVE
 //
 // Phase E3: the AMD modulo scaffold emits a serialized tt::CoarseSchedule
 // (modulo stage → loop.stage; slot = order%II → loop.cluster) so the EXISTING
@@ -17,6 +21,9 @@
 // CHECK-DAG: ttg.local_load {{.*}}loop.cluster = {{[0-9]+}} : i32{{.*}}loop.stage = {{[0-9]+}} : i32
 // CHECK-DAG: tt.dot {{.*}}loop.cluster = {{[0-9]+}} : i32{{.*}}loop.stage = {{[0-9]+}} : i32
 // CHECK: tt.scheduled_max_stage = {{[0-9]+}} : i32
+// PRESERVE-DAG: ttg.local_load {{.*}}loop.cluster = {{[0-9]+}} : i32{{.*}}loop.stage = {{[0-9]+}} : i32
+// PRESERVE-DAG: tt.dot {{.*}}loop.cluster = {{[0-9]+}} : i32{{.*}}loop.stage = {{[0-9]+}} : i32
+// PRESERVE: tt.scheduled_max_stage = {{[0-9]+}} : i32
 
 // (2) The existing expander consumes the modulo schedule without error and the
 //     kernel survives expansion.
