@@ -16,7 +16,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.runtime.fbcode_gating import is_fbcode_dependant
 
 if is_fbcode_dependant():
-    from python.test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
+    try:
+        from python.test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
+    except ModuleNotFoundError as error:
+        if error.name != "python.test":
+            raise
+        from conftest import _generate_test_params, _swizzle_scale_to_5d
 else:
     from conftest import _generate_test_params, _swizzle_scale_to_5d
 

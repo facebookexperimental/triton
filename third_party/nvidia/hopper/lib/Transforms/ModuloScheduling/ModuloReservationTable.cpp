@@ -403,12 +403,15 @@ static FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
 
 FailureOr<ModuloScheduleResult>
 runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
-                    int maxBacktracks) {
-  const int minII = ddg.computeMinII();
-  if (minII <= 0)
+                    int maxBacktracks, int minIIOverride) {
+  const int computedMinII = ddg.computeMinII();
+  if (computedMinII <= 0)
     return failure();
+  const int minII = std::max(computedMinII, minIIOverride);
   if (maxII <= 0)
     maxII = 2 * minII;
+  else if (maxII < minII)
+    return failure();
 
   // Cap maxII to avoid spending too long on large DDGs. The slack window
   // scales with minII: GPU inner-loop IIs are hundreds of cycles with
@@ -447,12 +450,14 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
 
   if (algo == "exhaustive") {
     LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");
-    return validateResult(runExhaustiveSearch(ddg, maxII));
+    return validateResult(runExhaustiveSearch(ddg, maxII, /*smemBudget=*/232448,
+                               /*tmemColLimit=*/512, minII));
   }
 
   if (algo == "random") {
     LLVM_DEBUG(DBGS() << "Using random sampling search\n");
-    return validateResult(runRandomSearch(ddg, maxII));
+    return validateResult(runRandomSearch(ddg, maxII, /*smemBudget=*/232448,
+                           /*tmemColLimit=*/512, /*numSamples=*/1000, minII));
   }
 
   if (algo == "contracted") {

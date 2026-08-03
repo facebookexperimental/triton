@@ -1912,9 +1912,7 @@ def tensor_descriptor_load_store_nd_kernel_host_tdm(out_desc, inp_desc):
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
-def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT, ROW_MAJOR):
-    if not ROW_MAJOR and TDM_TYPE == "HOST_TDM":
-        pytest.skip("NYI: Host TDM does not support non-row major layouts")
+def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT):
     """Utility function to run TDM load/store tests with a given shared layout."""
     alloc_shape = [1, 1, 3, 7, INNER_BLOCK][-ndim:]
 
@@ -1922,10 +1920,6 @@ def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYP
     inp = to_triton(numpy_random(alloc_shape, dtype_str), device="cpu", dst_type=dtype_str)
     inp.data = inp.data[..., :INNER_BLOCK - 3]
     out = inp.new_empty(BLOCK_SHAPE)
-
-    if ndim > 1 and not ROW_MAJOR:
-        out = out.data.transpose(-2, -1).contiguous().transpose(-2, -1)
-        inp = inp.data.transpose(-2, -1).contiguous().transpose(-2, -1)
 
     inp = inp.cuda()
     out = out.cuda()
@@ -1961,23 +1955,19 @@ def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYP
 @pytest.mark.parametrize("INNER_BLOCK", [4, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("dtype_str", sorted(set(float_dtypes + int_dtypes)))
 @pytest.mark.parametrize("TDM_TYPE", ["DEVICE_TDM", "HOST_TDM"])
-@pytest.mark.parametrize("ROW_MAJOR", [False, True])
-def test_tensor_descriptor_load_store_nd(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, ROW_MAJOR):
+def test_tensor_descriptor_load_store_nd(dtype_str, ndim, INNER_BLOCK, TDM_TYPE):
     """Test TDM load/store with swizzled shared layout."""
 
     order = [ndim - 1 - i for i in range(ndim)]
-    if ndim > 1 and not ROW_MAJOR:
-        order[0], order[1] = order[1], order[0]
     SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=order)
 
-    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT, ROW_MAJOR)
+    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT)
 
 
 @pytest.mark.parametrize("ndim", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("INNER_BLOCK", [16, 64])
 @pytest.mark.parametrize("dtype_str", ["float16", "int32"])
-@pytest.mark.parametrize("ROW_MAJOR", [False, True])
-def test_tensor_descriptor_load_store_nd_with_padding(dtype_str, ndim, INNER_BLOCK, ROW_MAJOR):
+def test_tensor_descriptor_load_store_nd_with_padding(dtype_str, ndim, INNER_BLOCK):
     """Test TDM load/store with padded shared memory layout.
     TDM store only supports padding when:
     1. There is a single padding interval
@@ -1987,12 +1977,9 @@ def test_tensor_descriptor_load_store_nd_with_padding(dtype_str, ndim, INNER_BLO
     BLOCK_SHAPE = (2, 2, 4, 8, INNER_BLOCK)[-ndim:]
     order = [ndim - 1 - i for i in range(ndim)]
     padding = [INNER_BLOCK, 8]
-    if ndim > 1 and not ROW_MAJOR:
-        order[0], order[1] = order[1], order[0]
-        padding = [8, INNER_BLOCK]
     PADDED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([padding], BLOCK_SHAPE, order)
 
-    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, "DEVICE_TDM", PADDED_LAYOUT, ROW_MAJOR)
+    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, "DEVICE_TDM", PADDED_LAYOUT)
 
 
 def test_tensor_descriptor_load_store_invalid_blocksize():
@@ -3021,6 +3008,15 @@ def test_ws_store_wait_load(XBLOCK):
     arange pattern.
     """
 
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
+
     @gluon.jit
     def ws_consumer(smem, ready_bar, done_bar, layout: ttgl.constexpr):
         ttgl.amd.gfx1250.mbarrier.wait(ready_bar, phase=0)
@@ -3082,6 +3078,15 @@ def test_ws_store_wait_load_loop(XBLOCK, NUM_ITERS):
     (executed by default warps) waits for done_bar, loads the accumulated result, and stores it to global memory.
     The test verifies that the output equals the expected arange pattern.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_consumer(smem, ready_bar, done_bar, empty_bar, XBLOCK: ttgl.constexpr, NUM_ITERS: ttgl.constexpr,
@@ -3162,6 +3167,15 @@ def test_runtime_ws_tensor_async_load_store_mbarrier(M, N, BLOCK_M, BLOCK_N, NUM
 
     The test verifies that the output matches the input, confirming that async load/store operations are correctly coordinated by mbarriers.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_producer(a_desc, a_buffer, bars, pid_n, idx_m, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):
@@ -3245,6 +3259,15 @@ def test_runtime_ws_tensor_copy_mbarrier(M, N, BLOCK_M, BLOCK_N, NUM_BUFFERS, NU
 
     The test verifies that the output matches the input, confirming correct synchronization.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_producer(a_desc, a_buffer, bars, pid_n, idx_m, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):

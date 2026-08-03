@@ -599,6 +599,22 @@ def test_tuple_constexpr():
     run_parser(foo, args=(test, ))
 
 
+@triton.jit
+def tuple_arg_identity(xs):
+    return xs
+
+
+def test_jit_call_tuple_of_tensors_plus_tuple_of_int():
+
+    @triton.jit
+    def kernel():
+        x0 = tl.program_id(0)
+        x1 = tl.program_id(1)
+        tuple_arg_identity((x0, x1)[:-1] + (1, ))
+
+    run_parser(kernel)
+
+
 @triton.aggregate
 class AggregateWithConstexprFunction:
     val: tl.constexpr
@@ -717,6 +733,43 @@ def test_constexpr_return():
         tl.static_assert(x == 42)
 
     run_parser(test)
+
+
+@filecheck_test
+@triton.jit
+def test_atomic_scalar_masks():
+    # CHECK-LABEL: test_atomic_scalar_masks
+    BLOCK: tl.constexpr = 128
+    ptr = tl.full((BLOCK, ), 0, tl.int64).to(tl.pointer_type(tl.int32), bitcast=True)
+    offs = tl.arange(0, BLOCK)
+    ptrs = ptr + offs
+    val = tl.full((BLOCK, ), 1, tl.int32)
+    mask = offs >= 0
+    scalar_mask = True
+    constexpr_value: tl.constexpr = 1
+    constexpr_mask: tl.constexpr = True
+
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, val, mask=mask)
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, constexpr_value, mask=constexpr_mask)
+    # CHECK: {{.*}} = tt.atomic_rmw add, acq_rel, gpu
+    tl.atomic_add(ptrs, val, mask=scalar_mask)
+
+    # CHECK: {{.*}} = tt.atomic_rmw exch, acq_rel, gpu
+    tl.atomic_xchg(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw max, acq_rel, gpu
+    tl.atomic_max(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw min, acq_rel, gpu
+    tl.atomic_min(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw and, acq_rel, gpu
+    tl.atomic_and(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw or, acq_rel, gpu
+    tl.atomic_or(ptrs, 1, mask=True)
+    # CHECK: {{.*}} = tt.atomic_rmw xor, acq_rel, gpu
+    tl.atomic_xor(ptrs, 1, mask=True)
 
 
 @pytest.mark.interpreter

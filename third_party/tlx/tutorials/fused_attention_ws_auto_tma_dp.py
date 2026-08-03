@@ -984,17 +984,11 @@ def attention(q, k, v, causal, sm_scale, baseVariant="ws_persistent", config=Non
     return o
 
 
-def _bw_only():
-    import torch as _t
-    return _t.cuda.is_available() and _t.cuda.get_device_capability()[0] >= 9
-
-
 @pytest.mark.parametrize("baseVariant",
                          ["ws"])  # ws_persistent: pre-existing GROUP_SIZE_N issue in this untested tutorial
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_op(HEAD_DIM, baseVariant):
-    if not _bw_only():
-        pytest.skip("sm90+ only")
     Z, H, N_CTX = 2, 8, 1024
     sm_scale = 0.5
     torch.manual_seed(0)
@@ -1010,9 +1004,8 @@ def test_op(HEAD_DIM, baseVariant):
     torch.testing.assert_close(tri, ref, atol=1e-2, rtol=0)
 
 
+@pytest.mark.skipif(not (is_hopper() or is_blackwell()), reason="Requires Hopper or Blackwell GPU")
 def test_bench():
-    if not _bw_only():
-        pytest.skip("sm90+ only")
     Z, H, N, D = 4, 32, 4096, 128
     q = torch.randn((Z, H, N, D), dtype=torch.float16, device="cuda")
     k = torch.randn((Z, H, N, D), dtype=torch.float16, device="cuda")

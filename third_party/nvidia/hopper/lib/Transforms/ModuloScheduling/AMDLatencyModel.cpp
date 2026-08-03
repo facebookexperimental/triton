@@ -85,14 +85,14 @@ OpLatencyInfo AMDLatencyModel::getLatency(Operation *op) const {
     //   dependent v_mfma_f32_16x16x32_f16: 18.25 ticks ~= 18 cycles
     //   four independent streams:          16.62 ticks/MFMA ~= 17 cycles
     // s_memtime measured at 2.183 GHz while the gfx950 shader clock reached
-    // 2.2 GHz (1.008 cycles/tick). Scale the block-level dot by its per-wave
-    // hardware MFMA count and keep dependency latency distinct from occupancy.
+    // 2.2 GHz (1.008 cycles/tick). A block-level tt.dot is one scheduling
+    // node: its result latency and reservation duration are those of one MFMA
+    // dependency/issue step, while its total MFMA work contributes to ResMII
+    // through occupancy.
     int64_t intMax = std::numeric_limits<int>::max();
-    int latency = (int)std::min<int64_t>(nMfma, intMax / 18) * 18;
-    int occupancy = (int)std::min<int64_t>(nMfma, intMax / 17) * 17;
-    return OpLatencyInfo{pipe, /*latency=*/latency,
-                         /*selfLatency=*/occupancy, /*minWarps=*/1,
-                         /*occupancy=*/occupancy};
+    int occupancy = (int)std::min<int64_t>(nMfma, intMax / 4) * 4;
+    return OpLatencyInfo{pipe, /*latency=*/18, /*selfLatency=*/17,
+                         /*minWarps=*/1, /*occupancy=*/occupancy};
   }
   case HWPipeline::LDS:
     // gfx950 pure LDS read measurement using tlx.local_gather over a

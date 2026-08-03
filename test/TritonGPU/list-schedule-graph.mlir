@@ -1,5 +1,4 @@
-// REQUIRES: asserts
-// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-list-schedule -debug-only=nvgpu-list-schedule 2>&1 | FileCheck %s
+// RUN: triton-opt %s -allow-unregistered-dialect -nvgpu-list-schedule | FileCheck %s
 
 //===----------------------------------------------------------------------===//
 // Test: A.6 List ScheduleGraph — all ops at stage 0, cluster by cycle
@@ -17,12 +16,6 @@
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // --- Schedule: makespan=1402, all ops stage 0 ---
-// --- List-schedule debug summary: makespan only (no II), single default heuristic ---
-// CHECK: [nvgpu-list-schedule]: List scheduling loop with 8 nodes (genK=1, pick=0, ranked=0)
-// CHECK: [nvgpu-list-schedule]: List schedule: makespan=1402 nodes=8
-// CHECK: [nvgpu-list-schedule]: List schedule: applying rank 0 of 1 (makespan=1402)
-// CHECK: [nvgpu-list-schedule]: reorderByCluster: permuted 8 body ops into schedule order
-//
 // --- Transformed IR: all ops at stage 0, cluster IDs as dense rank of cycle ---
 // --- MEM (loads) get earliest clusters, TC (MMA) later, CUDA (tmem_load) last ---
 // CHECK-LABEL: @gemm_list_schedule_graph

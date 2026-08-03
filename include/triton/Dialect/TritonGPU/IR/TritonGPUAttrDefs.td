@@ -90,34 +90,28 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
 
   // swizzle info: vec, perPhase, maxPhase
   // order: the fastest-changing axis first
-  let parameters = (
-    ins
-    "unsigned":$vec,
-    "unsigned":$perPhase,
-    "unsigned":$maxPhase,
-    ArrayRefParameter<"unsigned">:$order,
-    "CGAEncodingAttr":$CGALayout
-  );
+  let parameters = (ins "unsigned":$vec, "unsigned":$perPhase,
+      "unsigned":$maxPhase, ArrayRefParameter<"unsigned">:$order,
+      "CGAEncodingAttr":$CGALayout);
 
-  let builders = [
-    AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
-                     "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$order,
-                     "CGAEncodingAttr":$CGALayout,
-                     "unsigned":$typeWidthInBit), [{
+  let builders =
+      [AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
+                       "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout,
+                       "unsigned":$typeWidthInBit),
+                   [{
         bool needTrans = false; // default value
         return get(context, dotOpEnc, shape, order, CGALayout, typeWidthInBit, needTrans);
     }]>,
 
-    // TODO(jlebar): This should not be an overload of
-    // SwizzledSharedEncodingAttr::get().  It's misleading, because it does a bunch of
-    // nontrivial work based on the given dotOpEnc.
-    AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
-                     "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$order,
-                     "CGAEncodingAttr":$CGALayout,
-                     "unsigned":$typeWidthInBit,
-                     "bool":$needTrans), [{
+       // TODO(jlebar): This should not be an overload of
+       // SwizzledSharedEncodingAttr::get().  It's misleading, because it does a
+       // bunch of nontrivial work based on the given dotOpEnc.
+       AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
+                       "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "unsigned":$typeWidthInBit,
+                       "bool":$needTrans),
+                   [{
 
         // ---- begin MFMA ----
         if (auto mfmaEnc = mlir::dyn_cast<AMDMfmaEncodingAttr>(dotOpEnc.getParent())) {
@@ -148,15 +142,13 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         llvm_unreachable("unsupported swizzling for provided MMA version");
     }]>,
 
-    // NVIDIA constructor!
-    // TODO(lezcano): We should totally get rid of all these constructors...
-    AttrBuilder<(ins "int":$opIdx,
-                     "unsigned":$kWidth,
-                     "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$order,
-                     "CGAEncodingAttr":$CGALayout,
-                     "unsigned":$bitwidth,
-                     "bool":$needTrans), [{
+       // NVIDIA constructor!
+       // TODO(lezcano): We should totally get rid of all these constructors...
+       AttrBuilder<(ins "int":$opIdx, "unsigned":$kWidth,
+                       "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "unsigned":$bitwidth,
+                       "bool":$needTrans),
+                   [{
         int K =  getShapePerCTA(CGALayout.getCTASplitNum(), shape)[order[0]];
         // Elems necessary to cover all the banks divided by the inner dimension
         // This packs a few rows together for small K
@@ -181,21 +173,19 @@ When vec=2, elements are swizzled in pairs of 2.  In other words, the element at
         return get(context, vec, perPhase, maxPhase, order, CGALayout);
     }]>,
 
-    AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
-                     "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$order,
-                     "CGAEncodingAttr":$CGALayout,
-                     "Type":$eltTy), [{
+       AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
+                       "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "Type":$eltTy),
+                   [{
       unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
       return get(context, dotOpEnc, shape, order, CGALayout, bitwidth);
     }]>,
 
-    AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
-                     "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$order,
-                     "CGAEncodingAttr":$CGALayout,
-                     "Type":$eltTy,
-                     "bool":$needTrans), [{
+       AttrBuilder<(ins "DotOperandEncodingAttr":$dotOpEnc,
+                       "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+                       "CGAEncodingAttr":$CGALayout, "Type":$eltTy,
+                       "bool":$needTrans),
+                   [{
       unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
       return get(context, dotOpEnc, shape, order, CGALayout, bitwidth, needTrans);
     }]>,
@@ -285,25 +275,23 @@ For identity mappings a short form based on order and shape is used to increase 
 
   }];
 
-  let parameters = (ins
-      ArrayRefParameter<"unsigned">:$intervals,
+  let parameters = (ins ArrayRefParameter<"unsigned">:$intervals,
       ArrayRefParameter<"unsigned">:$paddings,
-      LinearLayoutParam:$linearComponent
-  );
+      LinearLayoutParam:$linearComponent);
 
-  let builders = [
-      AttrBuilder<(ins "ArrayRef<std::pair<unsigned, unsigned>>":$intervalPads,
-                       "LinearLayout":$linearComponent)>,
+  let builders =
+      [AttrBuilder<(ins "ArrayRef<std::pair<unsigned, unsigned>>":$intervalPads,
+           "LinearLayout":$linearComponent)>,
 
-      // Builder to create an identity mapping as the linear component
-      AttrBuilder<(ins "ArrayRef<std::pair<unsigned, unsigned>>":$intervalPads,
-                       "ArrayRef<unsigned>":$order, "ArrayRef<int64_t>":$shape,
-                       "CGAEncodingAttr":$cgaLayout)>,
+       // Builder to create an identity mapping as the linear component
+       AttrBuilder<(ins "ArrayRef<std::pair<unsigned, unsigned>>":$intervalPads,
+           "ArrayRef<unsigned>":$order, "ArrayRef<int64_t>":$shape,
+           "CGAEncodingAttr":$cgaLayout)>,
   ];
 
-  let extraClassDeclaration = extraBaseClassDeclaration # [{
+  let extraClassDeclaration = extraBaseClassDeclaration#[{
     // Returns the order of the dimensions `dimName` of the layout.
-    // If more than dimension is of size one, it uses defaultOrder to determine
+    // If more than one dimension is of size one, it uses defaultOrder to determine
     // the order of the dimensions of size one.
     SmallVector<unsigned> orderPerDim(StringAttr dimName,
                                       ArrayRef<unsigned> defaultOrder) const;
@@ -326,10 +314,10 @@ For identity mappings a short form based on order and shape is used to increase 
   let genVerifyDecl = 1;
 }
 
-
 def PartitionedSharedEncodingAttr
     : TritonGPU_Attr<"PartitionedSharedEncoding", "partitioned_shared_encoding",
-                     [SharedEncodingTrait, DeclareLayoutEncodingMethods,  LayoutEncodingTrait]> {
+                     [SharedEncodingTrait, DeclareLayoutEncodingMethods,
+                      LayoutEncodingTrait]> {
   let mnemonic = "partitioned_shared";
 
   let description = [{
@@ -374,12 +362,8 @@ def PartitionedSharedEncodingAttr
     in distinct physical shared memory partitions.
   }];
 
-  let parameters = (ins
-      "unsigned":$numPartitions,
-      "unsigned":$numGroups,
-      "unsigned":$partitionDim,
-      "SharedEncodingTrait":$partitionLayout
-  );
+  let parameters = (ins "unsigned":$numPartitions, "unsigned":$numGroups,
+      "unsigned":$partitionDim, "SharedEncodingTrait":$partitionLayout);
 
   let extraClassDeclaration = [{
     /// Returns the total number of logical pieces.
@@ -404,7 +388,8 @@ def SharedLinearEncodingAttr
     offsets (and optionally blocks) map to logical tensor indices.
   }];
 
-  let parameters = (ins LinearLayoutParam:$linearLayout, "unsigned":$layoutAlignment);
+  let parameters = (ins LinearLayoutParam:$linearLayout,
+      "unsigned":$layoutAlignment);
 
   let extraClassDeclaration = [{
     SmallVector<unsigned> basesPerDim(StringAttr dimName,
@@ -425,7 +410,8 @@ def SharedLinearEncodingAttr
   let hasCustomAssemblyFormat = 1;
 }
 
-def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_shared_encoding",
+def NVMMASharedEncodingAttr
+    : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_shared_encoding",
                      [DeclareSharedEncodingMethods, LayoutEncodingTrait,
                       DeclareLayoutEncodingMethods]> {
   let mnemonic = "nvmma_shared";
@@ -444,24 +430,18 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
     in the MMA instruction descriptors. https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-shared-memory-layout-swizzling
   }];
 
+  // fp4Padded: Indicates that this encoding represents a mixed-precision fp4
+  // operand in MMAv5 scaled dot, which needs to be in the special padded layout
+  // as described in
+  // https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
+  let parameters = (ins "unsigned":$swizzlingByteWidth, "bool":$transposed,
+      "unsigned":$elementBitWidth, "bool":$fp4Padded,
+      "CGAEncodingAttr":$CGALayout);
 
-  // fp4Padded: Indicates that this encoding represents a mixed-precision fp4 operand in MMAv5 scaled dot, which needs
-  // to be in the special padded layout as described in https://docs.nvidia.com/cuda/parallel-thread-execution/#packing-format-used-for-matrix-a-and-b-by-kind-mxf8f6f4-in-shared-memory
-  let parameters = (
-    ins
-    "unsigned":$swizzlingByteWidth,
-    "bool":$transposed,
-    "unsigned":$elementBitWidth,
-    "bool":$fp4Padded,
-    "CGAEncodingAttr":$CGALayout
-  );
-
-  let builders = [
-    AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$order,
-                     "CGAEncodingAttr":$CGALayout,
-                     "Type":$eltTy,
-                     "bool": $fp4Padded), [{
+  let builders = [AttrBuilder<
+      (ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$order,
+          "CGAEncodingAttr":$CGALayout, "Type":$eltTy, "bool":$fp4Padded),
+      [{
         auto shapePerCTA = getShapePerCTA(CGALayout.getCTASplitNum(), shape);
         int32_t swizzlingByteWidth = 0;
         unsigned eleBitWidth = eltTy.getIntOrFloatBitWidth();
@@ -488,10 +468,9 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
         }
         bool transposed = order.size() > 1 && order[0] == 0;
         return $_get(context, swizzlingByteWidth, transposed, eleBitWidth, fp4Padded, CGALayout);
-    }]>
-  ];
+    }]>];
 
-  let extraClassDeclaration = extraBaseClassDeclaration # [{
+  let extraClassDeclaration = extraBaseClassDeclaration#[{
     int getPerPhase() const;
     int getMaxPhase() const;
     int getVec() const;
@@ -500,10 +479,11 @@ def NVMMASharedEncodingAttr : TritonGPU_Attr<"NVMMASharedEncoding", "nvmma_share
   let genVerifyDecl = 1;
 }
 
-def AMDRotatingSharedEncodingAttr :
-  TritonGPU_Attr<"AMDRotatingSharedEncoding", "amd_rotating_shared_encoding",
-                 [SharedEncodingTrait, LayoutEncodingTrait,
-                  DeclareLayoutEncodingMethods]> {
+def AMDRotatingSharedEncodingAttr
+    : TritonGPU_Attr<"AMDRotatingSharedEncoding",
+                     "amd_rotating_shared_encoding",
+                     [SharedEncodingTrait, LayoutEncodingTrait,
+                      DeclareLayoutEncodingMethods]> {
   let mnemonic = "amd_rotating_shared";
 
   let description = [{
@@ -586,24 +566,19 @@ Swizzling examples (matrix is filled with numbers 0, 1, 2, .. columns*rows-1):
     7  [30, 31, 28, 29]   // phase = 3 blockNo = 1 (xor with 2)
   }];
 
-  let parameters = (
-    ins
-    "unsigned":$vec,
-    "unsigned":$perPhase,
-    "unsigned":$maxPhase,
-    ArrayRefParameter<"unsigned">:$order,
-    "CGAEncodingAttr":$CGALayout
-  );
+  let parameters = (ins "unsigned":$vec, "unsigned":$perPhase,
+      "unsigned":$maxPhase, ArrayRefParameter<"unsigned">:$order,
+      "CGAEncodingAttr":$CGALayout);
 
   let hasCustomAssemblyFormat = 1;
 }
 
-
-class DistributedEncoding<string name, string attrMnemonic, list<Trait> traits = []>
-  : TritonGPU_Attr<name, attrMnemonic,
-                   !listconcat([DistributedEncodingTrait, LayoutEncodingTrait,
-                                DeclareLayoutEncodingMethods],
-                               traits)> {
+class DistributedEncoding<string name, string attrMnemonic,
+                          list<Trait> traits = []>
+    : TritonGPU_Attr<name, attrMnemonic,
+                     !listconcat([DistributedEncodingTrait, LayoutEncodingTrait,
+                                  DeclareLayoutEncodingMethods],
+                                 traits)> {
 
   let description = [{
 Distributed encodings have a layout function L that is entirely characterized
@@ -638,7 +613,7 @@ L(T) = [ {0,8} , {1,9} , {2,10}, {3,11}, {0,8} , {1, 9} , {2, 10}, {3, 11},
          {4,12}, {5,13}, {6,14}, {7,15}, {4,12}, {5, 13}, {6, 14}, {7, 15} ]
   }];
 
-  code extraDistributedDeclaration  = extraBaseClassDeclaration # [{
+  code extraDistributedDeclaration = extraBaseClassDeclaration#[{
     // Implemented in subclasses
     SmallVector<unsigned> getRepOrder() const;
 
@@ -647,50 +622,55 @@ L(T) = [ {0,8} , {1,9} , {2,10}, {3,11}, {0,8} , {1, 9} , {2, 10}, {3, 11},
 }
 
 //===----------------------------------------------------------------------===//
-// Linear Layout Encoding
+// Linear Layout Encodings (common base class)
 //===----------------------------------------------------------------------===//
 
-def LinearEncodingAttr : DistributedEncoding<"LinearEncoding", "linear_encoding"> {
-  let mnemonic = "linear";
-
-  let description = [{
-    See the docs in LinearLayout.h for the definition of linear layouts.
-  }];
+class LinearDistributedEncoding<string name, string attrMnemonic,
+                                list<Trait> traits = []>
+    : DistributedEncoding<name, attrMnemonic,
+                          !listconcat([LinearEncodingTrait,
+                                       DeclareLinearEncodingMethods],
+                                      traits)> {
 
   let parameters = (ins LinearLayoutParam:$linearLayout);
 
-  let extraClassDeclaration = extraDistributedDeclaration # [{
-    // Generic distributed encoding methods
-    unsigned getTotalElemsPerThread(ArrayRef<int64_t> shape) const;
-    SmallVector<unsigned> getElemsPerThread(ArrayRef<int64_t> shape) const;
-
-    SmallVector<unsigned int> getContig(const char *, SmallVector<unsigned int>) const;
-    SmallVector<unsigned> getContigPerThread() const;
-    SmallVector<unsigned> getContigPerWarp() const;
-    SmallVector<unsigned> getOrder() const;
-    SmallVector<unsigned> getWarpOrder() const;
-    SmallVector<unsigned> getThreadOrder() const;
-
-
-    // Generalizes get{Warp,Thread,CTA}Order to linear layouts.
-    // Returns the order of the dimensions `dimName` of the layout.
-    // If more than dimension is of size one, it uses defaultOrder to determine
-    // the order of the dimensions of size one.
-    SmallVector<unsigned> orderPerDim(StringAttr dimName,
-                                      ArrayRef<unsigned> defaultOrder) const;
-
-    // Generalizes getThreadsPerWarp, getWarpsPerCTA, getCTAsPerCGA to linear layouts.
-    // Returns the bases of the dimensions `dimName` of the layout.
-    // If skipBroadcast is false, we count a base zero
-    SmallVector<unsigned> basesPerDim(StringAttr dimName,
-                                      bool skipBroadcast = true) const;
-    SmallVector<unsigned> getThreadsPerWarp() const;
-    SmallVector<unsigned> getWarpsPerCTA() const;
-
+  code extraLinearDistributedDeclaration = [{
     unsigned getRank() const { return getLinearLayout().getNumOutDims(); }
+  }];
+}
 
-    // [FIXME LL] Supports legacy behaviour. We should remove these functions
-    SmallVector<unsigned> getSizePerThread() const;
+//===----------------------------------------------------------------------===//
+// Linear Layout Encoding
+//===----------------------------------------------------------------------===//
+
+def LinearEncodingAttr
+    : LinearDistributedEncoding<"LinearEncoding", "linear_encoding"> {
+  let mnemonic = "linear";
+
+  let description = [{
+    An encoding backed by a LinearLayout with input dims
+    {register, lane, warp, block} and output dims {dim0, dim1, ...}. See the
+    docs in LinearLayout.h for the general definition of linear layouts;
+    this attribute is a strictly more restricted form of that abstraction.
+
+    Compared to GenericLinearEncodingAttr, this is more constrained
+    LinearLayout-based encoding:
+    - Every basis vector (register, lane, warp, and block) must be
+      non-swizzled, i.e. have at most one non-zero output component (the
+      basis either moves along a single output dim, or is a broadcast/zero
+      basis).
+    - After removing broadcast bases the layout must be bijective.
+
+    GenericLinearEncodingAttr relaxes the above in two ways:
+    - Warp bases MAY be swizzled (non-zero in multiple output dims).
+      Register, lane, and block bases must still be non-swizzled.
+    - The layout is only required to be surjective (not bijective) after
+      removing broadcast bases.
+  }];
+
+  let extraClassDeclaration = extraLinearDistributedDeclaration#[{
+    SmallVector<unsigned> getWarpsPerCTA() const;
+    SmallVector<unsigned> getWarpOrder() const;
   }];
 
   let genVerifyDecl = 1;
@@ -702,12 +682,42 @@ def LinearEncodingAttr : DistributedEncoding<"LinearEncoding", "linear_encoding"
   let hasCustomAssemblyFormat = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// Generic Linear Layout Encoding
+//===----------------------------------------------------------------------===//
+
+def GenericLinearEncodingAttr
+    : LinearDistributedEncoding<"GenericLinearEncoding",
+                                "generic_linear_encoding"> {
+  let mnemonic = "generic_linear";
+
+  let description = [{
+    A linear layout encoding with relaxed constraints compared to LinearEncoding.
+    Like LinearEncoding, it wraps a LinearLayout with input dims
+    {register, lane, warp, block} and output dims {dim0, dim1, ...}.
+
+    Unlike LinearEncoding:
+    - Warp bases MAY be swizzled (non-zero in multiple output dims).
+    - The layout is NOT required to be bijective after removing broadcast bases,
+      but it's still required to be surjective.
+
+    Register, lane, and block bases must still be non-swizzled (at most one
+    non-zero output component per basis vector), which preserves existing
+    within-thread, within-warp, and CGA lowering paths.
+  }];
+
+  let extraClassDeclaration = extraLinearDistributedDeclaration;
+
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
+}
 
 //===----------------------------------------------------------------------===//
 // Blocked Layout Encoding
 //===----------------------------------------------------------------------===//
 
-def BlockedEncodingAttr : DistributedEncoding<"BlockedEncoding", "blocked_encoding"> {
+def BlockedEncodingAttr
+    : DistributedEncoding<"BlockedEncoding", "blocked_encoding"> {
   let mnemonic = "blocked";
 
   let description = [{
@@ -787,26 +797,22 @@ for
 }>
 }];
 
-  let parameters = (
-    ins
-    ArrayRefParameter<"unsigned">:$sizePerThread,
-    ArrayRefParameter<"unsigned">:$threadsPerWarp,
-    ArrayRefParameter<"unsigned">:$warpsPerCTA,
-    ArrayRefParameter<"unsigned">:$order, // the fastest-changing axis first
+  let parameters = (ins ArrayRefParameter<"unsigned">:$sizePerThread,
+      ArrayRefParameter<"unsigned">:$threadsPerWarp,
+      ArrayRefParameter<"unsigned">:$warpsPerCTA,
+      ArrayRefParameter<"unsigned">:$order, // the fastest-changing axis first
 
-    // CGALayout is optional in the textual IR.  If omitted, we infer it to be a
-    // CGA with a single CTA (i.e. the trivial map onto dim0..dimn-1)
-    "CGAEncodingAttr":$CGALayout
-  );
+      // CGALayout is optional in the textual IR.  If omitted, we infer it to be
+      // a CGA with a single CTA (i.e. the trivial map onto dim0..dimn-1)
+      "CGAEncodingAttr":$CGALayout);
   let genVerifyDecl = 1;
 
-  let builders = [
-    AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$sizePerThread,
-                     "ArrayRef<unsigned>":$order,
-                     "unsigned":$numWarps,
-                     "unsigned":$numThreadsPerWarp,
-                     "CGAEncodingAttr":$CGALayout), [{
+  let builders =
+      [AttrBuilder<
+           (ins "ArrayRef<int64_t>":$shape, "ArrayRef<unsigned>":$sizePerThread,
+               "ArrayRef<unsigned>":$order, "unsigned":$numWarps,
+               "unsigned":$numThreadsPerWarp, "CGAEncodingAttr":$CGALayout),
+           [{
       unsigned rank = sizePerThread.size();
       SmallVector<unsigned, 4> threadsPerWarp(rank);
       SmallVector<unsigned, 4> warpsPerCTA(rank);
@@ -850,12 +856,11 @@ for
       return $_get(context, sizePerThread, threadsPerWarp, warpsPerCTA, order, CGALayout);
     }]>,
 
-    AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
-                     "ArrayRef<unsigned>":$sizePerThread,
-                     "ArrayRef<unsigned>":$order,
-                     "unsigned":$numWarps,
-                     "unsigned":$numThreadsPerWarp,
-                     "unsigned":$numCTAs), [{
+       AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
+                       "ArrayRef<unsigned>":$sizePerThread,
+                       "ArrayRef<unsigned>":$order, "unsigned":$numWarps,
+                       "unsigned":$numThreadsPerWarp, "unsigned":$numCTAs),
+                   [{
       unsigned rank = sizePerThread.size();
       SmallVector<unsigned, 4> CTAsPerCGA(rank);
       SmallVector<unsigned, 4> CTASplitNum(rank);
@@ -875,15 +880,16 @@ for
 
       CGAEncodingAttr CGALayout = CGAEncodingAttr::fromSplitParams(context, CTAsPerCGA, CTASplitNum, CTAOrder);
       return get(context, shape, sizePerThread, order, numWarps, numThreadsPerWarp, CGALayout);
-    }]>
-  ];
+    }]>];
 
   let extraClassDeclaration = extraDistributedDeclaration;
 
   let hasCustomAssemblyFormat = 1;
 }
 
-def AMDMfmaEncodingAttr : DistributedEncoding<"AMDMfmaEncoding", "amd_mfma_encoding", [MmaEncodingTrait]> {
+def AMDMfmaEncodingAttr
+    : DistributedEncoding<"AMDMfmaEncoding",
+                          "amd_mfma_encoding", [MmaEncodingTrait]> {
   let mnemonic = "amd_mfma";
 
   let description = [{
@@ -1007,35 +1013,27 @@ w2 w2 w3 w3
 w2 w2 w3 w3
 }];
 
-  let parameters = (
-    ins
-    "unsigned": $version,
-    ArrayRefParameter<"unsigned">:$warpsPerCTA,
-    ArrayRefParameter<"unsigned">:$instrShape,
-    "bool":$isTransposed,
-    "CGAEncodingAttr":$CGALayout,
-    ArrayRefParameter<"unsigned">:$tilesPerWarp,
-    "unsigned":$elementBitWidth
-  );
+  let parameters = (ins "unsigned":$version,
+      ArrayRefParameter<"unsigned">:$warpsPerCTA,
+      ArrayRefParameter<"unsigned">:$instrShape, "bool":$isTransposed,
+      "CGAEncodingAttr":$CGALayout, ArrayRefParameter<"unsigned">:$tilesPerWarp,
+      "unsigned":$elementBitWidth);
 
-  let builders = [
-    AttrBuilder<(ins "unsigned":$version,
-                     "ArrayRef<unsigned>":$warpsPerCTA,
-                     "ArrayRef<unsigned>":$instrShape,
-                     "bool":$isTransposed,
-                     "CGAEncodingAttr":$CGALayout,
-                     CArg<"ArrayRef<unsigned>", "{}">:$tpw,
-                     CArg<"unsigned", "0">:$elementBitWidth), [{
+  let builders = [AttrBuilder<
+      (ins "unsigned":$version, "ArrayRef<unsigned>":$warpsPerCTA,
+          "ArrayRef<unsigned>":$instrShape, "bool":$isTransposed,
+          "CGAEncodingAttr":$CGALayout, CArg<"ArrayRef<unsigned>", "{}">:$tpw,
+          CArg<"unsigned", "0">:$elementBitWidth),
+      [{
       SmallVector<unsigned> tilesPerWarp(tpw);
       if (tilesPerWarp.empty())
         tilesPerWarp = SmallVector<unsigned>(warpsPerCTA.size(), 1);
       if (elementBitWidth == 0)
         elementBitWidth = 32;
       return $_get($_ctxt, version, warpsPerCTA, instrShape, isTransposed, CGALayout, tilesPerWarp, elementBitWidth);
-    }]>
-  ];
+    }]>];
 
-  let extraClassDeclaration = extraDistributedDeclaration # [{
+  let extraClassDeclaration = extraDistributedDeclaration#[{
     SmallVector<int64_t> getInstrShapeForOperand(int kWidth, int opIdx) const;
     SmallVector<int64_t> getRepForOperand(ArrayRef<int64_t> operandShape, int kWidth, int opIdx) const;
     SmallVector<unsigned> getRepOrderForOperand(int opIdx) const;
@@ -1056,7 +1054,9 @@ w2 w2 w3 w3
   let skipDefaultBuilders = 1;
 }
 
-def AMDWmmaEncodingAttr : DistributedEncoding<"AMDWmmaEncoding", "amd_wmma_encoding", [MmaEncodingTrait]> {
+def AMDWmmaEncodingAttr
+    : DistributedEncoding<"AMDWmmaEncoding",
+                          "amd_wmma_encoding", [MmaEncodingTrait]> {
   let mnemonic = "amd_wmma";
 
   let description = [{
@@ -1217,19 +1217,14 @@ wmmaLayout = tileLayout * ctaLayout
 This simplifies both WMMA and dotOperand layouts lowering to linear layout.
   }];
 
-  let parameters = (
-    ins
-    "unsigned": $version,
-    LinearLayoutParam:$ctaLayout,
-    "bool":$isTransposed,
-    "CGAEncodingAttr":$CGALayout,
-    ArrayRefParameter<"unsigned">:$instrShape
-  );
+  let parameters = (ins "unsigned":$version, LinearLayoutParam:$ctaLayout,
+      "bool":$isTransposed, "CGAEncodingAttr":$CGALayout,
+      ArrayRefParameter<"unsigned">:$instrShape);
 
   let genVerifyDecl = 1;
   let hasCustomAssemblyFormat = 1;
 
-  let extraClassDeclaration = extraDistributedDeclaration # [{
+  let extraClassDeclaration = extraDistributedDeclaration#[{
     SmallVector<unsigned> getRepOrderForOperand(int opIdx) const;
     LinearLayout getTileLayout(unsigned rank) const;
     static SmallVector<unsigned, 3> getDefaultInstrShape() {
@@ -1253,7 +1248,9 @@ This simplifies both WMMA and dotOperand layouts lowering to linear layout.
   }];
 }
 
-def NvidiaMmaEncodingAttr : DistributedEncoding<"NvidiaMmaEncoding", "nvidia_mma_encoding", [MmaEncodingTrait]> {
+def NvidiaMmaEncodingAttr
+    : DistributedEncoding<"NvidiaMmaEncoding",
+                          "nvidia_mma_encoding", [MmaEncodingTrait]> {
   let mnemonic = "nvidia_mma";
 
   let description = [{
@@ -1337,17 +1334,11 @@ For example, the matrix L corresponding to blockTileSize=[32,16] is:
 
 }];
 
-  let parameters = (
-    ins
-    "unsigned":$versionMajor,
-    "unsigned":$versionMinor,
-    ArrayRefParameter<"unsigned">:$warpsPerCTA,
-    "CGAEncodingAttr":$CGALayout,
-    ArrayRefParameter<"unsigned">:$instrShape
-  );
+  let parameters = (ins "unsigned":$versionMajor, "unsigned":$versionMinor,
+      ArrayRefParameter<"unsigned">:$warpsPerCTA, "CGAEncodingAttr":$CGALayout,
+      ArrayRefParameter<"unsigned">:$instrShape);
 
-
-  let extraClassDeclaration = extraDistributedDeclaration # [{
+  let extraClassDeclaration = extraDistributedDeclaration#[{
     bool isVolta() const;
     bool isTuring() const;
     bool isAmpere() const;
@@ -1393,13 +1384,9 @@ def SliceEncodingAttr : DistributedEncoding<"SliceEncoding", "slice_encoding"> {
     during some optimization passes.
   }];
 
-  let parameters = (
-    ins
-    "unsigned":$dim,
-    "DistributedEncodingTrait":$parent
-  );
+  let parameters = (ins "unsigned":$dim, "DistributedEncodingTrait":$parent);
 
-  let extraClassDeclaration = extraDistributedDeclaration # [{
+  let extraClassDeclaration = extraDistributedDeclaration#[{
     template<class T>
     SmallVector<T> paddedShape(ArrayRef<T> shape) const;
 
@@ -1412,7 +1399,8 @@ def SliceEncodingAttr : DistributedEncoding<"SliceEncoding", "slice_encoding"> {
   let genVerifyDecl = 1;
 }
 
-def DotOperandEncodingAttr : DistributedEncoding<"DotOperandEncoding", "dot_operand_encoding"> {
+def DotOperandEncodingAttr
+    : DistributedEncoding<"DotOperandEncoding", "dot_operand_encoding"> {
   let mnemonic = "dot_op";
 
   let description = [{
@@ -1451,17 +1439,11 @@ quadM (m-index of the "quad" in the core matrix)
 vecIdx (index of the element in the quad; this is always along the k-dim)
   }];
 
-  let parameters = (
-    ins
-    "unsigned":$opIdx,
-    "Attribute":$parent,
-    DefaultValuedParameter<"unsigned", "0">:$kWidth
-  );
+  let parameters = (ins "unsigned":$opIdx, "Attribute":$parent,
+      DefaultValuedParameter<"unsigned", "0">:$kWidth);
 
-  let builders = [
-    AttrBuilder<(ins "unsigned":$opIdx,
-                     "Attribute":$parent,
-                     "Type":$eltTy), [{
+  let builders = [AttrBuilder<
+      (ins "unsigned":$opIdx, "Attribute":$parent, "Type":$eltTy), [{
       NvidiaMmaEncodingAttr parentAttr = mlir::dyn_cast<NvidiaMmaEncodingAttr>(parent);
       if (!parentAttr || (!parentAttr.isAmpere() && !parentAttr.isHopper()))
         return $_get(context, opIdx, parent, 0);
@@ -1469,8 +1451,7 @@ vecIdx (index of the element in the quad; this is always along the k-dim)
       unsigned bitwidth = eltTy.getIntOrFloatBitWidth();
       unsigned kWidth = std::max(32 / bitwidth, 1u);
       return $_get(context, opIdx, parent, kWidth);
-    }]>
-  ];
+    }]>];
 
   let assemblyFormat = "`<` `{` struct(params) `}` `>`";
   let genVerifyDecl = 1;

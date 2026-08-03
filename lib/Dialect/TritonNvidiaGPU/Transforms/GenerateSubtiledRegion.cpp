@@ -1,5 +1,5 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
-//META_WS_ONLY
+// META_WS_ONLY
 #include "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionAttrs.h"
 #include "mlir/IR/IRMapping.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
