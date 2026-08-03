@@ -23,14 +23,9 @@ There are two synchronization mechanisms:
 
 ## Key Decision: `useGen5Barrier`
 
-```cpp
-bool useGen5Barrier = isa<ttng::TCGen5MMAOp>(consumerOp) &&
-                      producerOp->getBlock() == consumerOp->getBlock();
-```
-
-This is `true` when:
-1. The **consumer** op is a `TCGen5MMAOp`, **AND**
-2. Producer and consumer are in the **same basic block**.
+`useGen5Barrier` is true when every actual consumer in the current consumer
+task implements `MMAv5OpInterface`. The decision is made independently for
+each consumer task.
 
 When true → `consumerBarriers` is populated (an inline barrier alloc is
 created).
@@ -39,14 +34,16 @@ When false → only a **token** (`nvws.create_token`) is created.
 Separately, a **`producerBarrier`** is allocated when the producer is a TMA
 load (`DescriptorLoadOp`) or gen5 MMA (`ProducerIsGen5`).
 
-## Path 1: Token-Based (Consumer is NOT gen5)
+## Path 1: Token-Based (Consumer Task is NOT gen5-only)
 
-Applies when `commChannel.consumerBarriers` is empty.
+Applies to each token whose consumer task has no entry in
+`commChannel.consumerBarriers`. A channel may use an inline barrier for one
+consumer task and token synchronization for another.
 
 ### `ProducerAcquireOp`
 
 ```cpp
-if (commChannel.consumerBarriers.empty()) {
+if (!commChannel.consumerBarriers.count(token.first)) {
     auto producerAcquirePoint =
         getSameLevelOp(headConsumer, tmaHeadProducer);
     if (producerAcquireForChannelLoop) {
@@ -66,7 +63,7 @@ if (commChannel.consumerBarriers.empty()) {
 ### `ConsumerReleaseOp`
 
 ```cpp
-if (commChannel.consumerBarriers.empty()) {
+if (!commChannel.consumerBarriers.count(token.first)) {
     auto consumerReleasePoint =
         consumerReleaseHeuristic(tailProducer, tailConsumer, consumerTaskId);
     builder.setInsertionPointAfter(consumerReleasePoint);
@@ -94,9 +91,10 @@ Only when there is **no `producerBarrier`**:
 
 - Inserted **before** `headConsumer`.
 
-## Path 2: Gen5 Inline Barrier (Consumer IS gen5)
+## Path 2: Gen5 Inline Barrier (Consumer Task is gen5-only)
 
-Applies when `commChannel.consumerBarriers` is populated.
+Applies to each consumer task with an entry in
+`commChannel.consumerBarriers`.
 
 ### Producer Acquire → `WaitBarrierOp` with Inverted Phase
 
@@ -141,12 +139,12 @@ When the **producer** is gen5, `desyncTCGen5MMAOp()` is called with
 
 ## Summary Table
 
-| Scenario | `consumerBarriers` | Producer Acquire | Producer Commit | Consumer Wait | Consumer Release |
+| Consumer task | `consumerBarriers` entry | Producer Acquire | Producer Commit | Consumer Wait | Consumer Release |
 |---|---|---|---|---|---|
-| Consumer is gen5 (same block) | populated | `WaitBarrierOp` (inverted phase) before producer | Implicit via gen5 inline barrier | Implicit via gen5 inline barrier | Implicit via gen5 inline barrier |
-| Consumer is NOT gen5, producer is NOT gen5/TMA | empty | `ProducerAcquireOp` before head producer | `ProducerCommitOp` after tail producer | `ConsumerWaitOp` before head consumer | `ConsumerReleaseOp` after last actual consumer |
-| Consumer is NOT gen5, producer IS gen5 | empty | `ProducerAcquireOp` before head producer | Implicit via gen5 inline barrier + `WaitBarrierOp` before consumer | `WaitBarrierOp` before head consumer | `ConsumerReleaseOp` after last actual consumer |
-| Consumer is NOT gen5, producer IS TMA | empty | `ProducerAcquireOp` before head producer | TMA barrier expect (via `optimizeTMALoads`) | `WaitBarrierOp` on TMA barrier before consumer | `ConsumerReleaseOp` after last actual consumer |
+| Gen5-only | Present | `WaitBarrierOp` (inverted phase) before producer | Implicit via gen5 inline barrier | Implicit via gen5 inline barrier | Implicit via gen5 inline barrier |
+| Not gen5-only; producer is not gen5/TMA | Absent | `ProducerAcquireOp` before head producer | `ProducerCommitOp` after tail producer | `ConsumerWaitOp` before head consumer | `ConsumerReleaseOp` after last actual consumer |
+| Not gen5-only; producer is gen5 | Absent | `ProducerAcquireOp` before head producer | Implicit via gen5 inline barrier + `WaitBarrierOp` before consumer | `WaitBarrierOp` before head consumer | `ConsumerReleaseOp` after last actual consumer |
+| Not gen5-only; producer is TMA | Absent | `ProducerAcquireOp` before head producer | TMA barrier expect (via `optimizeTMALoads`) | `WaitBarrierOp` on TMA barrier before consumer | `ConsumerReleaseOp` after last actual consumer |
 
 ## Examples: FA BWD Channels
 
@@ -170,7 +168,7 @@ When the **producer** is gen5, `desyncTCGen5MMAOp()` is called with
 - **Consumer**: `tc_gen5_mma` for dk and dq (task 1, gemm) reads `dsT` as
   an operand.
 - **`producerBarrier`** is not set (producer is `local_store`, not TMA/gen5).
-- **`useGen5Barrier = true`** (consumer is gen5, same block) →
+- **`useGen5Barrier = true`** (all consumers in task 1 are gen5) →
   `consumerBarriers` populated.
 - Result:
   - `WaitBarrierOp` with inverted phase before `local_store` (acts as

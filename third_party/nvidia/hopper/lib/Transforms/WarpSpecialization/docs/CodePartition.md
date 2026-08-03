@@ -46,12 +46,12 @@ Step 10: replaceBufferReuse        — rewrite non-representative allocs
 Step 11: specializeRegion          — clone ops into WarpSpecializeOp regions
 ```
 
-Before channel discovery, `doBufferAllocation` deduplicates local allocations
-that have the same source SSA value and the same `MemDescType`. This represents
-one TMA-loaded SMEM tile with multiple consumers, for example an A tile consumed
-by both scalar normalization math and a gen5 MMA. Deduplicating before
-`local_alloc(src)` is split into `local_alloc + local_store` avoids using
-physical `buffer.id` metadata as proof that two logical buffers are the same.
+`doBufferAllocation` forms one TMA-loaded SMEM tile with multiple consumers in
+two places. It deduplicates compatible read-only `local_alloc(src)` ops that
+already exist. During buffer creation it also reuses a compatible read-only
+allocation initialized from the same descriptor result, adding only the
+missing consumer load. Physical `buffer.id` metadata is not used as proof that
+logical buffers are identical.
 
 ## `doBufferAllocation` — Pre-pass
 
