@@ -277,20 +277,16 @@ class TestTLXTemplates(TestCase):
             return torch.nn.functional.gelu(torch.addmm(bias, a, w.t()))
 
         with config.patch({
-            "triton.tlx_mode": "force",
-            "force_disable_caches": True,
-            "max_autotune": True,
-            "max_autotune_gemm_backends": "TRITON",
-            "enable_caching_generated_triton_templates": False,
-            "cpp_wrapper": False,
+                "triton.tlx_mode": "force",
+                "force_disable_caches": True,
+                "max_autotune": True,
+                "max_autotune_gemm_backends": "TRITON",
+                "enable_caching_generated_triton_templates": False,
+                "cpp_wrapper": False,
         }):
-            c_actual, code = run_and_get_code(
-                torch.compile(addmm_gelu), bias, a, w
-            )
+            c_actual, code = run_and_get_code(torch.compile(addmm_gelu), bias, a, w)
 
-        c_expected = torch.nn.functional.gelu(
-            a.float() @ w.t().float() + bias.float()
-        ).to(dtype)
+        c_expected = torch.nn.functional.gelu(a.float() @ w.t().float() + bias.float()).to(dtype)
         torch.testing.assert_close(c_actual, c_expected, atol=3e-2, rtol=3e-2)
 
         code_str = "\n".join(code)
@@ -303,9 +299,7 @@ class TestTLXTemplates(TestCase):
     )
     @unittest.skipIf(not has_tlx(), "TLX not available")
     @parametrize("epilogue", ("gelu", "mul"))
-    def test_tlx_addmm_warppipe_split_k_cpp_wrapper_fused_epilogue(
-        self, epilogue: str
-    ):
+    def test_tlx_addmm_warppipe_split_k_cpp_wrapper_fused_epilogue(self, epilogue: str):
         M, K, N = 256, 4096, 256
         dtype = torch.float16
         a = torch.randn(M, K, device=GPU_TYPE, dtype=dtype)
@@ -326,18 +320,14 @@ class TestTLXTemplates(TestCase):
                 "enable_caching_generated_triton_templates": False,
                 "cpp_wrapper": True,
         }), ):
-            c_actual, code = run_and_get_code(
-                torch.compile(addmm_epilogue), bias, a, w
-            )
+            c_actual, code = run_and_get_code(torch.compile(addmm_epilogue), bias, a, w)
 
         reference = a.float() @ w.t().float() + bias.float()
         if epilogue == "gelu":
             reference = torch.nn.functional.gelu(reference)
         else:
             reference = reference * 0.5
-        torch.testing.assert_close(
-            c_actual, reference.to(dtype), atol=4e-2, rtol=4e-2
-        )
+        torch.testing.assert_close(c_actual, reference.to(dtype), atol=4e-2, rtol=4e-2)
 
         code_str = "\n".join(code)
         self.assertIn("split_k_ws", code_str)
@@ -557,14 +547,14 @@ class TestTLXTemplates(TestCase):
             return templates
 
         with (
-            mock.patch.object(_tlx_mm, "append_tlx", _only_persistent),
-            config.patch({
-                "triton.tlx_mode": "force",
-                "force_disable_caches": True,
-                "max_autotune": True,
-                "max_autotune_gemm_backends": "TRITON",
-                "enable_caching_generated_triton_templates": False,
-            }),
+                mock.patch.object(_tlx_mm, "append_tlx", _only_persistent),
+                config.patch({
+                    "triton.tlx_mode": "force",
+                    "force_disable_caches": True,
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON",
+                    "enable_caching_generated_triton_templates": False,
+                }),
         ):
             c_actual, code = run_and_get_code(torch.compile(addmm), bias, a, w)
 
