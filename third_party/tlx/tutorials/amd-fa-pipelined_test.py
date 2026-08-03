@@ -1188,6 +1188,10 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, *, out=None, wa
     BLOCK_M = kw.pop("BLOCK_M", 256)
     BLOCK_N = kw.pop("BLOCK_N", _cluster_default_block_n(causal))
     num_warps = kw.pop("num_warps", min(8, max(1, BLOCK_M // MFMA_M)))
+    # LLVM VectorCombine creates a long AGPR<->VGPR transfer chain in the
+    # non-causal hot loop. Opt out only for that specialization; other gfx950
+    # kernels retain the packed rewrites that improve BF16/FP8 code generation.
+    disable_vector_combine = kw.pop("disable_vector_combine", not causal)
     # Leave occupancy unconstrained by default. Callers may still request an
     # explicit target for controlled experiments.
     waves_per_eu = kw.pop("waves_per_eu", 0)
@@ -1221,6 +1225,7 @@ def flash_attn_cluster_pipeline(q, k, v, sm_scale, causal=False, *, out=None, wa
         "IS_CAUSAL": causal,
         "num_warps": num_warps,
         "waves_per_eu": waves_per_eu,
+        "disable_vector_combine": disable_vector_combine,
         **kw,
     }
     _launch_kernel(
