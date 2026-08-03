@@ -51,7 +51,9 @@ Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                                              viewDescType, alloc, idx);
 }
 
-static int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
+namespace {
+
+int getTMALoadSize(tt::DescriptorLoadOp &tmaLoad) {
   auto tensorTy = cast<RankedTensorType>(tmaLoad->getResult(0).getType());
   int loadSize = product(tensorTy.getShape());
   return loadSize * tensorTy.getElementType().getIntOrFloatBitWidth() / 8;
@@ -85,6 +87,8 @@ Value getBufferForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
       buffer.getLoc(), subviewTy, buffer, bufferIdx);
   return desc;
 }
+
+} // namespace
 
 Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
                             SmallVector<tt::DescriptorLoadOp> &tmaLoads,
