@@ -396,19 +396,20 @@ def build_run_specs(args, cache_root):
             specs.append(RunSpec(f"fa-{backend}", f"FA: {backend.upper()}", backend, command, cache_dir))
 
         script = str(SCRIPT_DIR / "amd_fa_wave_bench.py")
-        for backend in ("llvm", "wave"):
-            cache_dir = cache_root / f"fa-eight-wave-{backend}"
-            minimum = "1000" if backend == "wave" else "0"
-            command = (python, script, *timing, "--qk-max-abs", "1", "--min-tflops", minimum)
-            specs.append(
-                RunSpec(
-                    f"fa-eight-wave-{backend}",
-                    f"FA eight-wave bounded: {backend.upper()}",
-                    backend,
-                    command,
-                    cache_dir,
+        for mode, bound_args in (("bounded", ("--qk-max-abs", "1")), ("adaptive", ())):
+            for backend in ("llvm", "wave"):
+                cache_dir = cache_root / f"fa-eight-wave-{mode}-{backend}"
+                minimum = "1000" if backend == "wave" else "0"
+                command = (python, script, *timing, *bound_args, "--min-tflops", minimum)
+                specs.append(
+                    RunSpec(
+                        f"fa-eight-wave-{mode}-{backend}",
+                        f"FA eight-wave {mode}: {backend.upper()}",
+                        backend,
+                        command,
+                        cache_dir,
+                    )
                 )
-            )
 
     return specs
 
