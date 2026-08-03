@@ -142,6 +142,20 @@ bool tt::encodingContainsTlxPlaceholder(Attribute attr) {
   return found;
 }
 
+bool tt::encodingContainsTlxNoVerifyLayout(Attribute attr) {
+  if (!attr)
+    return false;
+  if (attr.getAbstractAttribute().getName() == "tlx.no_verify_layout")
+    return true;
+  bool found = false;
+  attr.walkImmediateSubElements(
+      [&](Attribute sub) {
+        found |= tt::encodingContainsTlxNoVerifyLayout(sub);
+      },
+      [](Type) {});
+  return found;
+}
+
 Attribute tt::unwrapTlxWrappers(Attribute attr) {
   while (attr && attr.getDialect().getNamespace() == "tlx") {
     Attribute inner;

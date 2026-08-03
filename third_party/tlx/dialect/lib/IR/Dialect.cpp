@@ -100,14 +100,10 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
   // structurally stable across resolve-placeholder-layouts (which strips
   // no_verify) and matches the op's own inference on both sides.
   //
-  // When the operand carries the deferred no_verify pin, additionally keep
-  // no_verify as the *outermost* wrapper of the result (peel only the outer
-  // no_verify, run the standard inference on the user_layout<L> anchor, then
-  // re-wrap): a build-time reduce_op.verify() runs before ttg.num-warps is set,
-  // and a top-level no_verify makes it skip verifyTensorLayout. After resolve
-  // strips no_verify from both operand and result, re-inference falls into the
-  // plain branch and produces the same slice<parent=...> -- so they stay
-  // consistent.
+  // When the operand carries a deferred no_verify pin, keep it on the slice
+  // parent so repeated inference produces the same canonical encoding. The
+  // tensor-layout verifier recursively detects the nested placeholder and
+  // defers verification until resolve-placeholder-layouts.
   template <typename InferFn>
   LogicalResult inferSliceLike(Attribute operandEncoding,
                                Attribute &resultEncoding, InferFn infer) const {
@@ -138,12 +134,8 @@ struct TLXInferLayoutInterface : public triton::DialectInferLayoutInterface {
     if (auto slice = dyn_cast<triton::gpu::SliceEncodingAttr>(result)) {
       auto parent = cast<triton::gpu::DistributedEncodingTrait>(
           wrapNoVerifyLayout(slice.getParent()));
-      auto deferredSlice = triton::gpu::SliceEncodingAttr::get(
+      resultEncoding = triton::gpu::SliceEncodingAttr::get(
           result.getContext(), slice.getDim(), parent);
-      // Keep the slice parent deferred for canonical slice inference, and also
-      // defer verification of the whole result while frontend TTIR has no
-      // ttg.num-warps context yet.
-      resultEncoding = wrapNoVerifyLayout(deferredSlice);
     } else {
       resultEncoding = wrapNoVerifyLayout(result);
     }
