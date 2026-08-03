@@ -6581,6 +6581,61 @@ def test_tlx_wave_fa_rejects_unsafe_fixed_reference_span():
         tutorial.attention(tensor, tensor, tensor, qk_max_abs=2.0)
 
 
+@pytest.mark.parametrize("qk_max_abs", [None, 1.0], ids=["adaptive", "bounded"])
+@pytest.mark.parametrize("sm_scale", [math.nan, math.inf, -math.inf], ids=["nan", "positive-inf", "negative-inf"])
+def test_tlx_wave_fa_rejects_nonfinite_scale(qk_max_abs, sm_scale):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_nonfinite_scale_{qk_max_abs}_{sm_scale}")
+    tensor = torch.empty((1, 1, 256, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="sm_scale must be finite"):
+        tutorial.attention(tensor, tensor, tensor, sm_scale=sm_scale, qk_max_abs=qk_max_abs)
+
+
+@pytest.mark.parametrize("backend", ["llvm", "wave"])
+@pytest.mark.parametrize(
+    "mode,sm_scale,qk_max_abs",
+    [
+        ("adaptive-negative", -1.0 / math.sqrt(128), None),
+        ("bounded-negative", -0.3357431655837235, 1.0),
+        ("adaptive-zero", 0.0, None),
+        ("bounded-negative-zero", -0.0, 1.0),
+    ],
+)
+def test_tlx_wave_runtime_gfx950_fa_signed_scale_e2e(tmp_path, backend, mode, sm_scale, qk_max_abs):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for eight-wave FA e2e, got {arch}")
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_signed_scale_{backend}_{mode}")
+
+    shape = (1, 1, 256, 128)
+    device = torch.device("cuda")
+    magnitude = 2.0 if mode == "adaptive-negative" else 1.0
+    q = torch.full(shape, magnitude, dtype=torch.bfloat16, device=device)
+    token_sign = torch.where(
+        torch.arange(shape[2], device=device) % 64 < 32,
+        magnitude,
+        -magnitude,
+    )
+    k = token_sign[None, None, :, None].expand(shape).contiguous().to(torch.bfloat16)
+    v = torch.where(token_sign > 0, -1.0, 1.0)[None, None, :, None].expand(shape).contiguous().to(torch.bfloat16)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=sm_scale)
+
+    driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
+    with (
+            driver_context(),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-eight-wave-{mode}-runtime-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.attention(q, k, v, sm_scale=sm_scale, qk_max_abs=qk_max_abs)
+        torch.cuda.synchronize()
+
+    torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
