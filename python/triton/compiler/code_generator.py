@@ -1520,9 +1520,17 @@ class CodeGenerator(ast.NodeVisitor):
         bound_args.apply_defaults()
         args = bound_args.arguments
         args = [args[name] for name in fn.arg_names]
+
+        def normalize_arg(arg):
+            if isinstance(arg, language.tuple):
+                return _apply_to_tuple_values(arg, normalize_arg)
+            if not isinstance(arg, base_value) or isinstance(arg, JITCallable):
+                return language.core.constexpr(arg)
+            return arg
+
         for i, arg in enumerate(args):
-            if isinstance(arg, (language.dtype, float, int, bool, JITFunction)):
-                args[i] = language.core.constexpr(arg)
+            args[i] = normalize_arg(arg)
+
         args_cst = find_paths_if(args, lambda _, x: _is_constexpr(x))
         args_cst = {path: get_iterable_path(args, path) for path in args_cst}
         args_path = find_paths_if(args, lambda _, x: not _is_constexpr(x))
