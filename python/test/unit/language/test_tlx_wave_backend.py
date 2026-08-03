@@ -6784,6 +6784,78 @@ def test_tlx_wave_compile_gfx950_fa_i32_offset_boundary(tmp_path, monkeypatch, s
     assert f"arith.constant {expected_constant} : i32" in wave
 
 
+def test_tlx_wave_compile_gfx950_fa_prologue_partial_wait(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_prologue_partial_wait")
+    shape = (2, 64, 8192, 128)
+    tensors = [MockTensor(torch.bfloat16, shape) for _ in range(4)]
+
+    with (
+            _tlx_wave_compile_driver(monkeypatch),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / "fa-prologue-partial-wait-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        compiled = tutorial._attn_fwd_wave_pipeline.warmup(
+            *tensors,
+            N_CTX=shape[2],
+            BATCH=shape[0],
+            HEADS=shape[1],
+            TOTAL_HEADS=shape[0] * shape[1],
+            SM_SCALE=1.0 / math.sqrt(shape[3]),
+            LOG2_SCORE_BOUND=0.0,
+            ADAPTIVE_REFERENCE=True,
+            num_warps=8,
+            tlx_wave_enable_multi_wave_specialize=False,
+            grid=(shape[2] // 256, shape[0] * shape[1], 1),
+        )
+
+    wait_pattern = r"%wait_k0 = ttg\.async_wait \{num = 2 : i32\}"
+    ttir = _asm_text(compiled, "ttir")
+    ttgir = _asm_text(compiled, "ttgir")
+    assert re.search(wait_pattern, ttir)
+    assert re.search(wait_pattern, ttgir)
+    assert re.search(r"ttg\.local_load %k0 token %wait_k0 .*syncedViaAsyncWait", ttgir)
+
+    wave = _asm_text(compiled, "wave")
+    retained_issue = re.search(
+        r"(?m)^\s*(%\w+) = wave\.issue_token %\w+, %\w+ : !wave\.mem\.token, !wave\.mem\.token "
+        r"-> !wave\.mem\.token$",
+        wave,
+    )
+    assert retained_issue is not None
+    assert re.search(rf"wave\.after %\w+, {re.escape(retained_issue.group(1))}", wave)
+
+    hsaco_path = tmp_path / "fa-prologue-partial-wait.hsaco"
+    hsaco_path.write_bytes(compiled.asm["hsaco"])
+    objdump_candidates = (
+        Path(sys.prefix) / "bin" / "llvm-objdump",
+        Path("/opt/rocm/llvm/bin/llvm-objdump"),
+    )
+    disassembly = None
+    for objdump in objdump_candidates:
+        if not objdump.is_file():
+            continue
+        result = subprocess.run(
+            [str(objdump), "-d", "--mcpu=gfx950", str(hsaco_path)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            disassembly = result.stdout
+            break
+    if disassembly is None:
+        pytest.fail("a gfx950-capable ROCm llvm-objdump is required")
+
+    first_wait = disassembly.index("s_waitcnt vmcnt")
+    first_ds_read = disassembly.index("ds_read", first_wait)
+    assert len(re.findall(r"buffer_load_dwordx4 .* lds", disassembly[:first_wait])) == 6
+    assert "s_waitcnt vmcnt(4)" in disassembly[first_wait:first_ds_read]
+    assert "s_waitcnt vmcnt(0)" not in disassembly[first_wait:first_ds_read]
+    assert "s_barrier" in disassembly[first_wait:first_ds_read]
+
+
 @pytest.mark.parametrize(
     "shape",
     [
