@@ -56,9 +56,15 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
   int64_t srcBits = getMemDescStorageBits(srcTy);
   int64_t dstBits = getMemDescStorageBits(dstTy);
 
-  if (dstBits <= srcBits)
-    return ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base)
-        .getResult();
+  if (dstBits <= srcBits) {
+    auto view = ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base);
+    // Explicit storage aliases may intentionally expose the same allocation
+    // through a different padded address mapping.
+    if (isa<ttg::PaddedSharedEncodingAttr>(srcTy.getEncoding()) ||
+        isa<ttg::PaddedSharedEncodingAttr>(dstTy.getEncoding()))
+      view->setAttr("tlx.storage_alias_view", builder.getUnitAttr());
+    return view.getResult();
+  }
 
   return errorOp->emitError()
          << "TLXRewriteLocalAlias cannot view a " << srcBits
@@ -128,7 +134,9 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
     return success();
   }
 
-  // Compute the max shape of an alias class
+  // Select the type with the largest physical storage span in each alias
+  // class. Logical element count is insufficient for padded layouts: a view
+  // with the same or fewer logical elements may still require more storage.
   DenseMap<Operation *, ttg::MemDescType> allocToMaxStorageType;
   for (auto &kv : aliasClasses) {
     auto allocOp = kv.first;
@@ -136,12 +144,10 @@ LogicalResult rewriteLocalAlias(ModuleOp m) {
     auto allocType =
         dyn_cast<ttg::MemDescType>(allocOp->getResult(0).getType());
     auto maxStorageType = allocType;
-    auto maxStorageSize =
-        allocType.getNumElements() * allocType.getElementTypeBitWidth();
+    auto maxStorageSize = getMemDescStorageBits(allocType);
     for (tlx::LocalAliasOp alias : aliases) {
       auto aliasType = dyn_cast<ttg::MemDescType>(alias.getResult().getType());
-      auto aliasStorageSize =
-          aliasType.getNumElements() * aliasType.getElementTypeBitWidth();
+      auto aliasStorageSize = getMemDescStorageBits(aliasType);
       if (aliasStorageSize > maxStorageSize) {
         maxStorageType = aliasType;
         maxStorageSize = aliasStorageSize;

@@ -7,6 +7,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace {
 
@@ -219,8 +220,24 @@ public:
       cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
     }
 
+    std::optional<std::pair<Value, Value>> distributedCoordinates;
+    if (auto group = op->getAttrOfType<IntegerAttr>(
+            "tlx.rematerialize_coordinates_group")) {
+      auto kLane = str_attr("lane");
+      auto kWarp = str_attr("warp");
+      auto outDims = to_vector(cvt.getOutDimNames());
+      bool rematerializeLane =
+          cvt.hasInDim(kLane) && !cvt.sublayoutIsZero({kLane}, outDims);
+      bool rematerializeWarp =
+          cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims);
+      distributedCoordinates = getGroupedCoordinates(
+          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter);
+    }
+
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
-                                  smemObj, rewriter, targetInfo, op);
+                                  smemObj, rewriter, targetInfo, op,
+                                  /*ctaRank=*/{}, /*barrierPtr=*/{},
+                                  distributedCoordinates);
 
     Value result = packLLElements(loc, typeConverter, outVals, rewriter, regTy);
     rewriter.replaceOp(op, result);
@@ -229,6 +246,54 @@ public:
   }
 
 private:
+  struct CoordinateGroup {
+    Value lane;
+    Value warp;
+    bool laneRematerialized = false;
+    bool warpRematerialized = false;
+  };
+
+  std::pair<Value, Value>
+  getGroupedCoordinates(LocalLoadOp op, int64_t group, bool rematerializeLane,
+                        bool rematerializeWarp,
+                        ConversionPatternRewriter &rewriter) const {
+    Block *block = op->getBlock();
+    auto &entry = coordinateGroups[block][group];
+    if (!entry.lane || !entry.warp ||
+        (rematerializeLane && !entry.laneRematerialized) ||
+        (rematerializeWarp && !entry.warpRematerialized)) {
+      Operation *anchor = op.getOperation();
+      for (Operation &candidate : *block) {
+        auto candidateGroup = candidate.getAttrOfType<IntegerAttr>(
+            "tlx.rematerialize_coordinates_group");
+        if (candidateGroup && candidateGroup.getInt() == group) {
+          anchor = &candidate;
+          break;
+        }
+      }
+      RewriterBase::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(anchor);
+      auto [lane, warp] = getLaneAndWarpId(rewriter, anchor->getLoc());
+      if (!entry.lane)
+        entry.lane = lane;
+      if (!entry.warp)
+        entry.warp = warp;
+      if (rematerializeLane && !entry.laneRematerialized) {
+        entry.lane = targetInfo.rematerializeDistributedCoordinate(
+            rewriter, anchor->getLoc(), lane);
+        entry.laneRematerialized = true;
+      }
+      if (rematerializeWarp && !entry.warpRematerialized) {
+        entry.warp = targetInfo.rematerializeDistributedCoordinate(
+            rewriter, anchor->getLoc(), warp);
+        entry.warpRematerialized = true;
+      }
+    }
+    return {entry.lane, entry.warp};
+  }
+
+  mutable llvm::DenseMap<Block *, llvm::DenseMap<int64_t, CoordinateGroup>>
+      coordinateGroups;
   const TargetInfoBase &targetInfo;
 };
 

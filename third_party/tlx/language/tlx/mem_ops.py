@@ -26,7 +26,15 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
 
 
 @tl.builtin
-def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
+def buffer_load(
+    ptr,
+    offsets,
+    mask=None,
+    other=None,
+    cache=None,
+    contiguity=1,
+    _semantic=None,
+):
     """
     AMD buffer load from global memory via a scalar base pointer and a tensor
     of i32 element offsets. Loads data directly into registers.
@@ -40,8 +48,15 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache: Optional cache modifier string.
+        contiguity: Trusted positive power-of-two lower bound on contiguous
+            elements available for vectorization. It must divide the number
+            of elements owned by each thread.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
 
     mask = tl._unwrap_if_constexpr(mask)
     if mask is not None:
@@ -60,7 +75,16 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
-    handle = _semantic.builder.create_buffer_load(ptr.handle, offsets.handle, mask_handle, other_handle, cache_modifier)
+    handle = _semantic.builder.create_buffer_load(
+        ptr.handle,
+        offsets.handle,
+        mask_handle,
+        other_handle,
+        cache_modifier,
+        contiguity,
+    )
+    if contiguity > 1:
+        handle.set_attr("tlx.preserve_layout", _semantic.builder.get_unit_attr())
     return tl.tensor(handle, ret_ty)
 
 
@@ -97,6 +121,64 @@ def buffer_store(stored_value, ptr, offsets, mask=None, cache=None, _semantic=No
     cache_modifier = _semantic._str_to_store_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     _semantic.builder.create_buffer_store(stored_value.handle, ptr.handle, offsets.handle, mask_handle, cache_modifier)
+
+
+@tl.builtin
+def buffer_atomic_add(
+    ptr,
+    offsets,
+    value,
+    mask=None,
+    sem=None,
+    scope=None,
+    contiguity=1,
+    _semantic=None,
+):
+    """
+    AMD buffer atomic add from a scalar global pointer and i32 tensor offsets.
+
+    Unlike a generic tensor-of-pointers atomic, this directly preserves the
+    scalar resource descriptor. ``contiguity`` is a trusted per-thread
+    adjacency width used to select packed atomics; values greater than one
+    also anchor the selected layout so later optimization cannot invalidate
+    that promise. FP16 and BF16 atomics require width two, including a mask
+    that is uniform across each adjacent pair.
+    """
+    _verify_buffer_ops(ptr, offsets, mask)
+
+    contiguity = tl._unwrap_if_constexpr(contiguity)
+    assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
+            and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
+
+    value = _semantic.to_tensor(tl._unwrap_if_constexpr(value))
+    value = _semantic.cast(value, ptr.type.scalar.element_ty)
+    offsets, value = _semantic.broadcast_impl_value(offsets, value)
+
+    mask = tl._unwrap_if_constexpr(mask)
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        mask = _semantic.cast(mask, tl.int1)
+        offsets, mask = _semantic.broadcast_impl_value(offsets, mask)
+
+    atomic_op = ir.ATOMIC_OP.FADD if value.dtype.is_floating() else ir.ATOMIC_OP.ADD
+    semantic = _semantic._str_to_sem(sem)
+    sync_scope = _semantic._str_to_scope(scope)
+    handle = _semantic.builder.create_buffer_atomic_rmw(
+        atomic_op,
+        ptr.handle,
+        offsets.handle,
+        value.handle,
+        semantic,
+        sync_scope,
+        mask.handle if mask is not None else None,
+        contiguity,
+    )
+    if contiguity > 1:
+        # Lowering trusts this width as a per-thread adjacency guarantee.
+        # Keep layout optimization from retagging the operation after that
+        # guarantee was established.
+        handle.set_attr("tlx.preserve_layout", _semantic.builder.get_unit_attr())
+    return tl.tensor(handle, value.type)
 
 
 @tl.builtin
@@ -873,6 +955,8 @@ def local_load(
     token: tlx.async_token = None,
     layout=None,
     relaxed: bool = False,
+    rematerialize_coordinates: tl.constexpr = False,
+    rematerialize_coordinates_group: tl.constexpr = None,
     _semantic=None,
 ) -> tl.tensor:
     """
@@ -881,10 +965,30 @@ def local_load(
     ``layout`` (optional) pins the register layout of the loaded value, written
     as a ``tlx.layout(...)`` (Shape:Stride). It is mapped to a ``#linear``
     encoding so the compiler propagates it back and avoids ``convert_layout``.
+
+    ``rematerialize_coordinates=True`` starts fresh lane/warp address live
+    ranges at this load. This can avoid keeping a cheap LDS address live
+    through a register-heavy region.
+
+    ``rematerialize_coordinates_group=N`` shares one fresh coordinate anchor
+    among local loads with the same integer group in a basic block. Use it for
+    adjacent independent loads that should reuse address arithmetic without
+    extending the coordinate lifetime outside that region.
     """
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
     layout = tl._unwrap_if_constexpr(layout)
+    rematerialize_coordinates = tl._unwrap_if_constexpr(rematerialize_coordinates)
+    rematerialize_coordinates_group = tl._unwrap_if_constexpr(rematerialize_coordinates_group)
+    assert isinstance(rematerialize_coordinates, bool), ("rematerialize_coordinates must be a constexpr bool, got "
+                                                         f"{type(rematerialize_coordinates).__name__}")
+    assert (rematerialize_coordinates_group is None
+            or (isinstance(rematerialize_coordinates_group, int)
+                and not isinstance(rematerialize_coordinates_group, bool) and rematerialize_coordinates_group
+                >= 0)), "rematerialize_coordinates_group must be a non-negative constexpr int or None"
+    assert not (rematerialize_coordinates and rematerialize_coordinates_group is not None), (
+        "rematerialize_coordinates and rematerialize_coordinates_group "
+        "are mutually exclusive")
     if storage == tlx.storage_kind.tmem:
         _assert_blackwell_for_tmem(_semantic.builder.options.arch)
         if layout is not None:
@@ -914,6 +1018,13 @@ def local_load(
         result = tl.tensor(output, block_type)
         if (token is not None or relaxed) and _semantic.builder.options.backend_name == "hip":
             result.handle.set_attr("ttg.amdg.syncedViaAsyncWait", _semantic.builder.get_bool_attr(True))
+        if rematerialize_coordinates and _semantic.builder.options.backend_name == "hip":
+            result.handle.set_attr("tlx.rematerialize_coordinates", _semantic.builder.get_unit_attr())
+        if rematerialize_coordinates_group is not None and _semantic.builder.options.backend_name == "hip":
+            result.handle.set_attr(
+                "tlx.rematerialize_coordinates_group",
+                _semantic.builder.get_int32_attr(rematerialize_coordinates_group),
+            )
         return result
 
 
@@ -1165,6 +1276,14 @@ def local_reinterpret(
         assert isinstance(src, tlx.buffered_tensor) and src.type.storage == tlx.storage_kind.smem, (
             "TLX local_reinterpret with an explicit layout only supports SMEM")
         encoding = layout.to_ir(_semantic.builder)
+        # Match local_alloc's explicit-layout contract.  Leaving the result
+        # unwrapped lets layout propagation treat a user-specified
+        # reinterpret view as inferred, and padded sources then fail the
+        # MemDescReinterpret verifier before placeholder layouts are
+        # finalized (user-wrapped padded source versus raw padded result).
+        if not getattr(layout, "_tlx_default", False):
+            layout._tlx_user_pinned = True
+            encoding = _semantic.builder.make_user_layout_attr(encoding)
     reinterpreted_value_handle = _semantic.builder.create_memdesc_reinterpret(src.handle,
                                                                               dtype.to_ir(_semantic.builder), shape,
                                                                               encoding)

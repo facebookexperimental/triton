@@ -380,9 +380,14 @@ struct CanonicalizeConvertFromConvert
       // We insert at the point of the original op as there could be ops with
       // memory side-effects between the LocalLoad op and the ConvertLayout op
       rewriter.setInsertionPoint(arg);
-      rewriter.replaceOpWithNewOp<LocalLoadOp>(op, op->getResult(0).getType(),
-                                               sharedLoad.getSrc(),
-                                               sharedLoad.getToken());
+      auto replacement = rewriter.replaceOpWithNewOp<LocalLoadOp>(
+          op, op->getResult(0).getType(), sharedLoad.getSrc(),
+          sharedLoad.getToken());
+      // Preserve backend optimization metadata such as
+      // ttg.amdg.syncedViaAsyncWait. Dropping it here makes the replacement
+      // load conservatively wait for unrelated async LDS writes.
+      for (auto attr : sharedLoad->getDiscardableAttrs())
+        replacement->setDiscardableAttr(attr.getName(), attr.getValue());
 
       return success();
     }
@@ -399,8 +404,17 @@ struct CanonicalizeConvertFromConvert
 
     // cvt(cvt(x, type1), type2) -> cvt(x, type2)
     if (auto cvt = dyn_cast<ConvertLayoutOp>(arg)) {
-      rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
-          op, op->getResultTypes().front(), cvt.getSrc());
+      auto replacement =
+          rewriter.replaceOpWithNewOp<triton::gpu::ConvertLayoutOp>(
+              op, op->getResultTypes().front(), cvt.getSrc());
+      // A conversion chain carrying a coordinate-rematerialization request
+      // still represents one shared-memory-backed transfer after folding.
+      // Preserve the request on the replacement rather than silently
+      // reverting to the entry-time lane/warp coordinates.
+      if (op->hasAttr("tlx.rematerialize_coordinates") ||
+          cvt->hasAttr("tlx.rematerialize_coordinates"))
+        replacement->setAttr("tlx.rematerialize_coordinates",
+                             rewriter.getUnitAttr());
       return success();
     }
 
@@ -695,11 +709,16 @@ LogicalResult MemDescReinterpretOp::verify() {
   // the destination layouts must be equal.
   auto srcEnc = oldType.getEncoding();
   auto dstEnc = newType.getEncoding();
-  if (isPaddedEncoding(srcEnc) != isPaddedEncoding(dstEnc))
+  // Storage-alias lowering deliberately creates another view over the same
+  // physical allocation. Its bounds are checked by the storage-size verifier
+  // below, so the view may use a different padded address mapping.
+  bool isStorageAliasView = (*this)->hasAttr("tlx.storage_alias_view");
+  if (!isStorageAliasView &&
+      isPaddedEncoding(srcEnc) != isPaddedEncoding(dstEnc))
     return emitError(
         "cannot reinterpret between padded and non-padded layouts");
 
-  if (isPaddedEncoding(srcEnc)) {
+  if (!isStorageAliasView && isPaddedEncoding(srcEnc)) {
     auto getPadPattern = [](MemDescType ty) {
       auto enc = getPaddedEncoding(ty.getEncoding());
       auto elmtSize = ty.getElementType().getIntOrFloatBitWidth() / 8;
@@ -1266,15 +1285,22 @@ LogicalResult MemDescSubsliceOp::verify() {
   }
 
   auto ctx = getContext();
+  // TLX keeps explicit shared-memory layouts wrapped in
+  // #tlx.user_layout until layout propagation has used the pin.  A subslice
+  // is verified earlier, during TTIR construction, so inspect the concrete
+  // shared encoding here instead of passing the wrapper to toLinearLayout
+  // (which only accepts concrete TritonGPU encodings).
+  Attribute concreteSrcEnc = triton::unwrapTlxWrappers(srcEnc);
+  auto allocShape = srcTy.getAllocShape().take_back(srcTy.getRank());
   LinearLayout ll;
-  if (auto paddedEncoding = triton::gpu::getPaddedEncoding(srcEnc)) {
+  if (auto paddedEncoding = triton::gpu::getPaddedEncoding(concreteSrcEnc)) {
     if (paddedEncoding.getRank() < srcTy.getRank()) {
       return emitError("SubSlice of low rank PaddedSharedEncoding from higher "
                        "rank tensors is not supported yet");
     }
-    ll = triton::gpu::paddedLinearLayout(srcTy);
+    ll = triton::gpu::paddedLinearLayout(allocShape, concreteSrcEnc);
   } else {
-    ll = triton::gpu::toLinearLayout(srcTy);
+    ll = triton::gpu::toLinearLayout(allocShape, concreteSrcEnc);
   }
 
   auto llInv = ll.pseudoinvert();

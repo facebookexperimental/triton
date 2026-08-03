@@ -118,6 +118,322 @@ static bool retypeWithEncoding(Value v, Attribute enc) {
   return true;
 }
 
+// Give one call site a private copy of a shared @triton.jit helper before its
+// tensor ABI is specialized.  Both concrete and deferred layout propagation
+// use this path; keeping the cloning mechanics in one place also guarantees
+// that their generated symbols cannot collide.
+static void privatizeHelperForCall(::mlir::triton::CallOp call,
+                                   ::mlir::triton::FuncOp callee,
+                                   StringRef suffix) {
+  OpBuilder b(callee);
+  auto clone = cast<::mlir::triton::FuncOp>(b.clone(*callee.getOperation()));
+  std::string base = (callee.getSymName() + suffix).str();
+  std::string name = base;
+  unsigned n = 0;
+  while (SymbolTable::lookupNearestSymbolFrom(
+      call, StringAttr::get(callee.getContext(), name)))
+    name = base + "_" + std::to_string(n++);
+  clone.setSymName(name);
+  SymbolTable::setSymbolVisibility(clone, SymbolTable::Visibility::Private);
+  call.setCalleeAttr(FlatSymbolRefAttr::get(callee.getContext(), name));
+}
+
+// Triton's Python frontend monomorphizes @triton.jit helpers with
+// encoding-free tensor argument and result types. TLX primitives can
+// nevertheless pass or produce concrete distributed values at a helper
+// boundary (for example dot operands loaded from LDS or AMD MFMA
+// accumulators). Repair that temporary ABI before the module verifier runs:
+// infer helper inputs from concrete call operands, infer results from concrete
+// return operands, update unreachable poison returns, mirror the repaired
+// types on calls, and keep any scf.for ABI crossed by those values concrete.
+static LogicalResult synchronizeConcreteHelperABI(ModuleOp mod) {
+  auto isConcreteDistributed = [](Type ty) {
+    auto tensorTy = dyn_cast<RankedTensorType>(ty);
+    Attribute enc = tensorTy ? tensorTy.getEncoding() : Attribute();
+    return enc && !hasNoVerifyLayout(enc) &&
+           isa<ttg::DistributedEncodingTrait>(enc);
+  };
+
+  bool changed = true;
+  unsigned iteration = 0;
+  constexpr unsigned kMaxIterations = 64;
+  while (changed) {
+    changed = false;
+    if (++iteration > kMaxIterations)
+      return mod.emitError(
+          "TLX concrete helper-ABI synchronization did not converge");
+
+    // A frontend-monomorphized helper can be shared by call sites carrying
+    // different concrete layouts.  Privatize every concrete call while the
+    // original ABI is still encoding-free; otherwise the first call would
+    // specialize the shared function and make a later, equally valid layout
+    // look like a conflict.  Encoding-free callers retain the original.
+    SmallVector<std::pair<::mlir::triton::CallOp, ::mlir::triton::FuncOp>>
+        concreteClones;
+    mod.walk([&](::mlir::triton::CallOp call) {
+      if (!llvm::any_of(call.getOperandTypes(), isConcreteDistributed))
+        return;
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee || callee.getBody().empty())
+        return;
+      auto uses = SymbolTable::getSymbolUses(callee, mod);
+      if (!uses)
+        return;
+      unsigned useCount = 0;
+      for (const auto &use : *uses) {
+        (void)use;
+        ++useCount;
+      }
+      if (useCount > 1)
+        concreteClones.emplace_back(call, callee);
+    });
+    for (auto [call, callee] : concreteClones) {
+      privatizeHelperForCall(call, callee, "_tlxabi");
+      changed = true;
+    }
+
+    bool inputConflict = false;
+    mod.walk([&](::mlir::triton::CallOp call) {
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee || callee.getBody().empty())
+        return;
+
+      SmallVector<Type> inputTypes(callee.getFunctionType().getInputs().begin(),
+                                   callee.getFunctionType().getInputs().end());
+      Block &entry = callee.getBody().front();
+      bool signatureChanged = false;
+      for (unsigned i = 0; i < call.getNumOperands() && i < inputTypes.size() &&
+                           i < entry.getNumArguments();
+           ++i) {
+        Type actual = call.getOperand(i).getType();
+        Type expected = inputTypes[i];
+        Type target =
+            isConcreteDistributed(actual)
+                ? actual
+                : (isConcreteDistributed(expected) ? expected : Type());
+        if (!target)
+          continue;
+
+        auto targetTy = cast<RankedTensorType>(target);
+        auto actualTy = dyn_cast<RankedTensorType>(actual);
+        auto expectedTy = dyn_cast<RankedTensorType>(expected);
+        if (!actualTy || !expectedTy ||
+            actualTy.getShape() != targetTy.getShape() ||
+            actualTy.getElementType() != targetTy.getElementType() ||
+            expectedTy.getShape() != targetTy.getShape() ||
+            expectedTy.getElementType() != targetTy.getElementType()) {
+          call.emitError() << "helper argument " << i
+                           << " has inconsistent tensor payload type";
+          inputConflict = true;
+          return;
+        }
+        if ((isConcreteDistributed(actual) && actual != target) ||
+            (isConcreteDistributed(expected) && expected != target)) {
+          call.emitError() << "conflicting concrete layouts for helper "
+                              "argument "
+                           << i;
+          inputConflict = true;
+          return;
+        }
+
+        // A second call may still carry an encoding-free value after another
+        // call specialized the shared callee. Bridge only this use instead of
+        // changing the producer's type out from under its other users.
+        if (actual != target) {
+          OpBuilder b(call);
+          Value converted = RequireLayoutOp::create(b, call.getLoc(), target,
+                                                    call.getOperand(i));
+          call.setOperand(i, converted);
+          changed = true;
+        }
+        if (entry.getArgument(i).getType() != target) {
+          entry.getArgument(i).setType(target);
+          changed = true;
+        }
+        if (inputTypes[i] != target) {
+          inputTypes[i] = target;
+          signatureChanged = true;
+        }
+      }
+      if (signatureChanged) {
+        callee.setType(
+            FunctionType::get(callee.getContext(), inputTypes,
+                              callee.getFunctionType().getResults()));
+        changed = true;
+      }
+    });
+    if (inputConflict)
+      return failure();
+
+    SmallVector<::mlir::triton::FuncOp> funcs;
+    mod.walk([&](::mlir::triton::FuncOp func) { funcs.push_back(func); });
+    for (auto func : funcs) {
+      SmallVector<::mlir::triton::ReturnOp> returns;
+      func.walk([&](::mlir::triton::ReturnOp ret) { returns.push_back(ret); });
+      if (returns.empty() || func.getFunctionType().getNumResults() == 0)
+        continue;
+
+      SmallVector<Type> resultTypes(func.getFunctionType().getResults().begin(),
+                                    func.getFunctionType().getResults().end());
+      for (unsigned i = 0; i < resultTypes.size(); ++i) {
+        Type target =
+            isConcreteDistributed(resultTypes[i]) ? resultTypes[i] : Type();
+        for (auto ret : returns) {
+          if (i >= ret.getNumOperands())
+            continue;
+          Type candidate = ret.getOperand(i).getType();
+          if (!isConcreteDistributed(candidate))
+            continue;
+          if (target && target != candidate)
+            return ret.emitError()
+                   << "conflicting concrete layouts for helper result " << i;
+          target = candidate;
+        }
+        if (!target)
+          continue;
+
+        if (resultTypes[i] != target) {
+          resultTypes[i] = target;
+          changed = true;
+        }
+        auto targetTy = cast<RankedTensorType>(target);
+        for (auto ret : returns) {
+          if (i >= ret.getNumOperands())
+            continue;
+          Value operand = ret.getOperand(i);
+          auto operandTy = dyn_cast<RankedTensorType>(operand.getType());
+          if (!operandTy)
+            continue;
+          if (operandTy.getShape() != targetTy.getShape() ||
+              operandTy.getElementType() != targetTy.getElementType())
+            return ret.emitError() << "helper result " << i
+                                   << " has inconsistent shape or element type";
+          if (isConcreteDistributed(operandTy) && operandTy != targetTy)
+            return ret.emitError()
+                   << "conflicting concrete layouts for helper result " << i;
+          if (operandTy != targetTy) {
+            // Specialize this return edge without retyping its producer.  A
+            // value may also feed another result that intentionally remains
+            // encoding-free (or deferred), so mutating the SSA value here can
+            // silently change an unrelated result's ABI.
+            OpBuilder b(ret);
+            Value converted =
+                RequireLayoutOp::create(b, ret.getLoc(), targetTy, operand);
+            ret.setOperand(i, converted);
+            changed = true;
+          }
+        }
+      }
+
+      if (func.getFunctionType().getResults() != ArrayRef<Type>(resultTypes)) {
+        func.setType(FunctionType::get(func.getContext(),
+                                       func.getFunctionType().getInputs(),
+                                       resultTypes));
+        changed = true;
+      }
+    }
+
+    mod.walk([&](::mlir::triton::CallOp call) {
+      auto callee =
+          SymbolTable::lookupNearestSymbolFrom<::mlir::triton::FuncOp>(
+              call, call.getCalleeAttr());
+      if (!callee)
+        return;
+      auto calleeResults = callee.getFunctionType().getResults();
+      if (calleeResults.size() != call.getNumResults())
+        return;
+      for (unsigned i = 0; i < calleeResults.size(); ++i) {
+        if (call.getResult(i).getType() != calleeResults[i]) {
+          call.getResult(i).setType(calleeResults[i]);
+          changed = true;
+        }
+      }
+    });
+
+    // A helper argument can acquire its concrete layout above after the
+    // Python frontend has already built a loop with encoding-free region
+    // iter-arguments/results. Likewise, specializing a helper return can
+    // retype an scf.for result through the enclosing tt.return without
+    // updating the loop body. Repair all four pieces of each loop-carried
+    // value together: init, iter-arg, yield, and result.
+    bool loopConflict = false;
+    SmallVector<scf::ForOp> loops;
+    mod.walk([&](scf::ForOp forOp) { loops.push_back(forOp); });
+    for (scf::ForOp forOp : loops) {
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      for (unsigned i = 0; i < forOp.getNumRegionIterArgs(); ++i) {
+        SmallVector<Value> linked{
+            forOp.getInitArgs()[i],
+            forOp.getRegionIterArg(i),
+            yield.getOperand(i),
+            forOp.getResult(i),
+        };
+        Type target;
+        for (Value value : linked) {
+          Type candidate = value.getType();
+          if (!isConcreteDistributed(candidate))
+            continue;
+          if (target && target != candidate) {
+            forOp.emitError()
+                << "conflicting concrete layouts for loop-carried value " << i;
+            loopConflict = true;
+            break;
+          }
+          target = candidate;
+        }
+        if (loopConflict || !target)
+          continue;
+
+        auto targetTy = cast<RankedTensorType>(target);
+        for (Value value : linked) {
+          auto valueTy = dyn_cast<RankedTensorType>(value.getType());
+          if (!valueTy || valueTy.getShape() != targetTy.getShape() ||
+              valueTy.getElementType() != targetTy.getElementType()) {
+            forOp.emitError() << "loop-carried value " << i
+                              << " has inconsistent tensor payload type";
+            loopConflict = true;
+            break;
+          }
+        }
+        if (loopConflict)
+          continue;
+
+        Value init = forOp.getInitArgs()[i];
+        if (init.getType() != target) {
+          OpBuilder b(forOp);
+          Value converted =
+              RequireLayoutOp::create(b, forOp.getLoc(), target, init);
+          forOp.setOperand(forOp.getNumControlOperands() + i, converted);
+          changed = true;
+        }
+        if (forOp.getRegionIterArg(i).getType() != target) {
+          forOp.getRegionIterArg(i).setType(target);
+          changed = true;
+        }
+        Value yielded = yield.getOperand(i);
+        if (yielded.getType() != target) {
+          OpBuilder b(yield);
+          Value converted =
+              RequireLayoutOp::create(b, yield.getLoc(), target, yielded);
+          yield.setOperand(i, converted);
+          changed = true;
+        }
+        if (forOp.getResult(i).getType() != target) {
+          forOp.getResult(i).setType(target);
+          changed = true;
+        }
+      }
+    }
+    if (loopConflict)
+      return failure();
+  }
+  return success();
+}
+
 static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
   bool conflict = false;
   // Find a placeholder encoding among a set of linked values (values an op
@@ -429,11 +745,18 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
             newResults[i] = target;
             sigChanged = true;
           }
-          for (auto r : rets)
+          for (auto r : rets) {
             if (i < r.getNumOperands() && r.getOperand(i).getType() != target) {
-              r.getOperand(i).setType(target);
+              // Specialize only this return edge. The returned value may also
+              // feed another result or an unrelated use, and constants cannot
+              // be retyped without rebuilding their value attribute.
+              OpBuilder b(r);
+              Value converted = RequireLayoutOp::create(b, r.getLoc(), target,
+                                                        r.getOperand(i));
+              r.setOperand(i, converted);
               changed = true;
             }
+          }
         }
         if (sigChanged) {
           callee.setType(
@@ -452,19 +775,7 @@ static LogicalResult propagatePlaceholderLayouts(ModuleOp mod) {
               callOp, callOp.getCalleeAttr());
       if (!callee)
         continue;
-      OpBuilder b(callee);
-      auto cloneOp =
-          cast<::mlir::triton::FuncOp>(b.clone(*callee.getOperation()));
-      std::string base = (callee.getSymName() + "_tlxpin").str();
-      std::string name = base;
-      unsigned n = 0;
-      while (SymbolTable::lookupNearestSymbolFrom(
-          callOp, StringAttr::get(callee.getContext(), name)))
-        name = base + "_" + std::to_string(n++);
-      cloneOp.setSymName(name);
-      SymbolTable::setSymbolVisibility(cloneOp,
-                                       SymbolTable::Visibility::Private);
-      callOp.setCalleeAttr(FlatSymbolRefAttr::get(callee.getContext(), name));
+      privatizeHelperForCall(callOp, callee, "_tlxpin");
       changed = true;
     }
     if (conflict)
@@ -673,6 +984,8 @@ public:
     // accepts the module. Runs after the ttg.num-warps metadata above is set,
     // since validating the pinned #linear layout needs it. Concrete layouts are
     // resolved later in make_ttgir.
+    if (failed(synchronizeConcreteHelperABI(mod)))
+      return signalPassFailure();
     if (failed(propagatePlaceholderLayouts(mod)))
       return signalPassFailure();
   }

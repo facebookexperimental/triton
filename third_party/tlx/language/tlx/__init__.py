@@ -28,6 +28,7 @@ from .mem_ops import (
     async_amd_descriptor_wait,
     async_store,
     async_descriptor_load,
+    buffer_atomic_add,
     buffer_load,
     buffer_load_to_local,
     zeros,
@@ -63,7 +64,20 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, require_layout, tcgen05_commit
+from .mma_ops import (
+    amd_extract_slice,
+    amd_mfma,
+    amd_mfma_commit,
+    amd_rematerialized_range,
+    amd_register_resident,
+    amd_sched_barrier,
+    amd_scheduled_mfma,
+    async_dot,
+    async_dot_scaled,
+    async_dot_wait,
+    require_layout,
+    tcgen05_commit,
+)
 from .types import (
     async_token,
     buffered_tensor,
@@ -128,6 +142,13 @@ __all__ = [
     "nv_mma_shared_layout_encoding",
     "storage_kind",
     "layout",
+    "amd_extract_slice",
+    "amd_mfma",
+    "amd_mfma_commit",
+    "amd_rematerialized_range",
+    "amd_register_resident",
+    "amd_sched_barrier",
+    "amd_scheduled_mfma",
     "buffered_tensor",
     "buffered_tensor_type",
     "storage_alias_spec",
@@ -145,6 +166,7 @@ __all__ = [
     "tensor_descriptor_ptr_type",
     # mem_ops
     "async_store",
+    "buffer_atomic_add",
     "buffer_load",
     "buffer_load_to_local",
     "zeros",

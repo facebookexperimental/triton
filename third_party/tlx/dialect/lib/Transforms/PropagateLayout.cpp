@@ -43,8 +43,12 @@ public:
       rewriter.replaceOp(requireLayoutOp, requireLayoutOp.getSrc());
       return success();
     }
-    rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(
-        requireLayoutOp, requireLayoutOp.getType(), requireLayoutOp.getSrc());
+    auto convert = ttg::ConvertLayoutOp::create(
+        rewriter, requireLayoutOp.getLoc(), requireLayoutOp.getType(),
+        requireLayoutOp.getSrc());
+    if (requireLayoutOp->hasAttr("tlx.rematerialize_coordinates"))
+      convert->setAttr("tlx.rematerialize_coordinates", rewriter.getUnitAttr());
+    rewriter.replaceOp(requireLayoutOp, convert);
     return success();
   }
 };

@@ -669,7 +669,8 @@ SmallVector<Value> lowerLdStShared(
     uint64_t maskSpanAffineOffset, RewriterBase &rewriter,
     const TargetInfoBase &targetInfo, std::optional<int> maybeMaxVecElems = {},
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {},
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
 
 // Lower an ld/st-like operation given a layout and a callback that creates the
 // PTX instruction Lowers to st when valArrays is empty, and to ld when it is
@@ -699,13 +700,36 @@ SmallVector<Value> lowerLocalLdSt(
     Type llvmElemTy, triton::gpu::MemDescType srcTy, SharedMemoryObject smemObj,
     RewriterBase &rewriter, const TargetInfoBase &targetInfo,
     Operation *localLoadOp = nullptr, std::optional<Value> ctaRank = {},
-    std::optional<Value> barrierPtr = {});
+    std::optional<Value> barrierPtr = {},
+    std::optional<std::pair<Value, Value>> distributedCoordinates = {});
 
 SmallVector<Value> unpackLLElements(Location loc, Value llvmStruct,
                                     RewriterBase &rewriter);
 
+SmallVector<Value> unpackUniqueTensorElements(Location loc, Value llvmStruct,
+                                              RewriterBase &rewriter);
+
+/// Unpack the values in \p llvmStruct into a vector using the layout from
+/// \p originalType. Preserve a full-register ABI; if a target-specific ABI
+/// stores only unique registers, restore its broadcast dimensions.
+SmallVector<Value> unpackTensorElements(Location loc, Value llvmStruct,
+                                        RewriterBase &rewriter,
+                                        Type originalType);
+
 Value packLLElements(Location loc, const LLVMTypeConverter *typeConverter,
                      ValueRange resultVals, RewriterBase &rewriter, Type type);
+
+Value packUniqueTensorElements(Location loc,
+                               const LLVMTypeConverter *typeConverter,
+                               ValueRange resultVals, RewriterBase &rewriter,
+                               Type type);
+
+/// Pack values using the tensor layout from \p type. Preserve broadcast
+/// registers when the converted ABI materializes the full register tuple, and
+/// remove them only for an ABI that stores unique registers.
+Value packTensorElements(Location loc, const LLVMTypeConverter *typeConverter,
+                         ValueRange resultVals, RewriterBase &rewriter,
+                         Type type);
 
 SmallVector<Value> unpackLLVector(Location loc, Value llvmVec,
                                   RewriterBase &rewriter);

@@ -81,6 +81,28 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
+#remat_blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [4], order = [0]}>
+#remat_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#remat_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: local_load_rematerialized_coordinates
+  tt.func @local_load_rematerialized_coordinates(%arg0: tensor<256xf32, #remat_blocked>, %arg1: tensor<256x!tt.ptr<f32>, #remat_blocked>, %arg2: tensor<256xf32, #remat_blocked>, %arg3: tensor<256x!tt.ptr<f32>, #remat_blocked>) {
+    %0 = ttg.local_alloc %arg0 : (tensor<256xf32, #remat_blocked>) -> !ttg.memdesc<256xf32, #remat_shared, #remat_smem>
+    // One lane and one warp anchor are shared by both loads in group 7.
+    // COMMON-COUNT-2: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // COMMON-NOT: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // COMMON: llvm.load
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xf32, #remat_shared, #remat_smem> -> tensor<256xf32, #remat_blocked>
+    tt.store %arg1, %1 : tensor<256x!tt.ptr<f32>, #remat_blocked>
+    %2 = ttg.local_alloc %arg2 : (tensor<256xf32, #remat_blocked>) -> !ttg.memdesc<256xf32, #remat_shared, #remat_smem>
+    %3 = ttg.local_load %2 {tlx.rematerialize_coordinates_group = 7 : i32} : !ttg.memdesc<256xf32, #remat_shared, #remat_smem> -> tensor<256xf32, #remat_blocked>
+    tt.store %arg3, %3 : tensor<256x!tt.ptr<f32>, #remat_blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // Smoke test to check that mfma 32 and dot operand layouts can work with small tensors, for example with shape 16x16
 #mfma = #ttg.amd_mfma<{version = 2, warpsPerCTA = [2, 2], instrShape = [32, 32, 8], isTransposed = true}>
 #dotop0 = #ttg.dot_op<{opIdx = 0, parent = #mfma, kWidth=4}>
@@ -93,9 +115,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK-NOT: ttg.convert_layout
     %0 = ttg.local_alloc %arg0 : (tensor<16x16xf16, #mfma>) -> !ttg.memdesc<16x16xf16, #shared, #smem>
     // CHECK-4: store {{.*}} vector<4xf16>
-    %1 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
+    %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
     // CHECK-2: load {{.*}} vector<4xf16>
-    %2 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
+    // GFX950: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    %2 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
     // CHECK-8: load {{.*}} vector<1xf16>
     %3 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #mfma>
     // CHECK-4: load {{.*}} vector<4xf16>
