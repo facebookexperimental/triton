@@ -1,4 +1,3 @@
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
@@ -6,6 +5,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "third_party/amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -27,7 +27,8 @@ using ::mlir::LLVM::AMD::isChainDotTail;
 namespace mlir {
 
 namespace {
-using triton::AMD::ISAFamily;
+using triton::amdgpu::ISAFamily;
+using triton::amdgpu::TargetFeatures;
 
 constexpr char AttrDecomposedDotScaledSource[] =
     "amdg.decomposed_dot_scaled_source";
@@ -48,13 +49,17 @@ int getMfmaVersion(ISAFamily isaFamily) {
   return 0;
 }
 
-int getWmmaVersion(StringRef archGen) {
-  if (archGen.starts_with("gfx11"))
+int getWmmaVersion(ISAFamily isaFamily) {
+  switch (isaFamily) {
+  case ISAFamily::RDNA3:
     return 1;
-  if (archGen.starts_with("gfx12") && !archGen.ends_with("50"))
+  case ISAFamily::RDNA4:
     return 2;
-  if (archGen == "gfx1250")
+  case ISAFamily::GFX1250:
     return 3;
+  default:
+    break;
+  }
 
   return 0;
 }
@@ -805,9 +810,10 @@ public:
 class DecomposeAMDScaledBlocked final : public ttg::DecomposeScaledBlocked {
 public:
   DecomposeAMDScaledBlocked(MLIRContext *context,
-                            const AMD::TargetInfo &targetInfo,
+                            const TargetFeatures &targetFeatures,
                             PatternBenefit benefit = 1)
-      : ttg::DecomposeScaledBlocked(context, benefit), targetInfo(targetInfo) {}
+      : ttg::DecomposeScaledBlocked(context, benefit),
+        targetFeatures(targetFeatures) {}
   using TensorValue = TypedValue<RankedTensorType>;
 
   LogicalResult matchAndRewrite(tt::DotScaledOp dotOp,
@@ -862,7 +868,7 @@ public:
                                    BoolAttr::get(rewriter.getContext(), true));
 
     Value reshapeScale;
-    if (targetInfo.supportsCvtPkScalePk8()) {
+    if (targetFeatures.supportsCvtPkScalePk8()) {
       // On architectures with CvtPkScalePk8 (e.g., GFX1250), the scale type
       // is int8, required by hardware instruction so type should not be
       // converted.
@@ -899,7 +905,7 @@ public:
   }
 
 private:
-  const AMD::TargetInfo &targetInfo;
+  const TargetFeatures &targetFeatures;
 };
 
 class ScaledBlockedToScaledMFMAF8F6F4 final
@@ -1559,12 +1565,12 @@ public:
 };
 
 class AccelerateBlocked : public OpRewritePattern<DotOp> {
-  StringRef arch;
+  TargetFeatures targetFeatures;
 
 public:
-  AccelerateBlocked(MLIRContext *context, StringRef arch,
+  AccelerateBlocked(MLIRContext *context, const TargetFeatures &targetFeatures,
                     PatternBenefit benefit = 1)
-      : OpRewritePattern(context, benefit), arch(arch) {}
+      : OpRewritePattern(context, benefit), targetFeatures(targetFeatures) {}
 
   bool isFloat(Type t) const { return t.isIntOrFloat() && !t.isIntOrIndex(); }
 
@@ -1602,39 +1608,37 @@ public:
   };
 
   bool isLegalFMAForm(DotOp dotOp, const DotElTypes &dotTypes) const {
-    if (AMD::supportsVDot(arch)) {
-      auto aOpType = dotOp.getA().getType();
-      int rank = aOpType.getRank();
-      int k = aOpType.getShape()[rank - 1];
-      // Try Fp16 x Fp16 -> Fp32 v_dot
-      // if k % 2 != 0: can not use fp V_DOT instruction
-      if (dotTypes.a.isF16() && dotTypes.b.isF16() && dotTypes.c.isF32() &&
-          dotTypes.d.isF32() && k % 2 == 0) {
-        return true;
-      }
+    auto aOpType = dotOp.getA().getType();
+    int rank = aOpType.getRank();
+    int k = aOpType.getShape()[rank - 1];
+    // Try Fp16 x Fp16 -> Fp32 v_dot
+    // if k % 2 != 0: can not use fp V_DOT instruction
+    if (dotTypes.a.isF16() && dotTypes.b.isF16() && dotTypes.c.isF32() &&
+        dotTypes.d.isF32() && k % 2 == 0) {
+      return true;
+    }
 
-      // CDNA4 has Bf16 v_dot2
-      if (AMD::deduceISAFamily(arch) == ISAFamily::CDNA4 &&
-          dotTypes.a.isBF16() && dotTypes.b.isBF16() && dotTypes.c.isF32() &&
-          dotTypes.d.isF32() && k % 2 == 0) {
-        return true;
-      }
+    // CDNA4 has Bf16 v_dot2
+    if (targetFeatures.isCDNA4() && dotTypes.a.isBF16() &&
+        dotTypes.b.isBF16() && dotTypes.c.isF32() && dotTypes.d.isF32() &&
+        k % 2 == 0) {
+      return true;
+    }
 
-      // TODO: enable this condition, when fp32 -> fp16 cast works correctly
-      // Consider this case as non legal, despite this case is covered by fp16
-      // FMA. Because v_dot expected to give both better performance and
-      // computational precision.
-      if (false && dotTypes.a.isF16() && dotTypes.b.isF16() &&
-          dotTypes.c.isF16() && dotTypes.d.isF16() && k % 2 == 0) {
-        return false;
-      }
+    // TODO: enable this condition, when fp32 -> fp16 cast works correctly
+    // Consider this case as non legal, despite this case is covered by fp16
+    // FMA. Because v_dot expected to give both better performance and
+    // computational precision.
+    if (false && dotTypes.a.isF16() && dotTypes.b.isF16() &&
+        dotTypes.c.isF16() && dotTypes.d.isF16() && k % 2 == 0) {
+      return false;
+    }
 
-      // Try I8 x I8 -> I32 v_dot
-      // if k % 4 != 0: can not use integer V_DOT instruction
-      if (dotTypes.a.isInteger(8) && dotTypes.b.isInteger(8) &&
-          dotTypes.c.isInteger(32) && dotTypes.d.isInteger(32) && k % 4 == 0) {
-        return true;
-      }
+    // Try I8 x I8 -> I32 v_dot
+    // if k % 4 != 0: can not use integer V_DOT instruction
+    if (dotTypes.a.isInteger(8) && dotTypes.b.isInteger(8) &&
+        dotTypes.c.isInteger(32) && dotTypes.d.isInteger(32) && k % 4 == 0) {
+      return true;
     }
 
     auto expectedElTy = dotTypes.a;
@@ -1651,10 +1655,6 @@ public:
 
   LogicalResult tryAccelerateF16WithVDot(DotOp dotOp, PatternRewriter &rewriter,
                                          const DotElTypes &dotTypes) const {
-    if (!AMD::supportsVDot(arch))
-      return rewriter.notifyMatchFailure(
-          dotOp, "Target architecture does not support V_DOT instruction.");
-
     // If this is fp16 x fp16 ->fp16 case prioritize using v_dot.
     auto aOpType = dotOp.getA().getType();
     int rank = aOpType.getRank();
@@ -1757,13 +1757,14 @@ struct TritonAMDGPUAccelerateMatmulPass
     ModuleOp m = getOperation();
 
     RewritePatternSet mfmaPatterns(context);
-    AMD::TargetInfo ti = AMD::TargetInfo(gfxArch);
-    unsigned wmmaVersion = getWmmaVersion(gfxArch);
-    switch (auto isaFamily = triton::AMD::deduceISAFamily(gfxArch)) {
+    TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
+    auto isaFamily = targetFeatures.getISAFamily();
+    unsigned wmmaVersion = getWmmaVersion(isaFamily);
+    switch (isaFamily) {
     case ISAFamily::GFX1250:
       mfmaPatterns.add<ScaledBlockedToScaledWMMAF8F6F4>(context, wmmaVersion,
                                                         /*benefit=*/4);
-      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, ti,
+      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
                                                     /*benefit=*/3);
       mfmaPatterns.add<BlockedToWMMA>(context, wmmaVersion, 16, /*benefit=*/2);
       break;
@@ -1775,7 +1776,8 @@ struct TritonAMDGPUAccelerateMatmulPass
     case ISAFamily::CDNA3:
     case ISAFamily::CDNA2:
     case ISAFamily::CDNA1:
-      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, ti, /*benefit=*/3);
+      mfmaPatterns.add<::DecomposeAMDScaledBlocked>(context, targetFeatures,
+                                                    /*benefit=*/3);
       mfmaPatterns.add<::BlockedToMFMA>(context, getMfmaVersion(isaFamily),
                                         matrixInstructionSize, kPack,
                                         /*benefit=*/2);
@@ -1784,7 +1786,7 @@ struct TritonAMDGPUAccelerateMatmulPass
     case ISAFamily::RDNA4:
       ttg::populateDecomposeScaledBlockedPatterns(mfmaPatterns,
                                                   /*benefit=*/3);
-      mfmaPatterns.add<::BlockedToWMMA>(context, getWmmaVersion(gfxArch),
+      mfmaPatterns.add<::BlockedToWMMA>(context, wmmaVersion,
                                         matrixInstructionSize,
                                         /*benefit=*/2);
       break;
@@ -1795,7 +1797,7 @@ struct TritonAMDGPUAccelerateMatmulPass
       signalPassFailure();
 
     RewritePatternSet patterns(context);
-    patterns.add<AccelerateBlocked>(context, gfxArch, /*benefit=*/1);
+    patterns.add<AccelerateBlocked>(context, targetFeatures, /*benefit=*/1);
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();
     decomposeMixedModeDotOp(m);

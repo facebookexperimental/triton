@@ -25,7 +25,6 @@ add_triton_library(TritonAMDGPUToLLVM
     BuiltinFuncToLLVM.cpp
     Utility.cpp
     TargetInfo.cpp
-    TargetUtils.cpp
     SPMDOpToLLVM.cpp
     SchedInstructions.cpp
     Fp4ToFpOpToLLVM.cpp

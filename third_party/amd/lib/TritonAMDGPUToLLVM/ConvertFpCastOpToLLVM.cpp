@@ -29,7 +29,7 @@
 using namespace mlir;
 
 using mlir::getElementTypeOrSelf;
-using mlir::triton::AMD::ISAFamily;
+using mlir::triton::amdgpu::ISAFamily;
 using mlir::triton::gpu::ElementwiseOpConversionBase;
 using mlir::triton::gpu::MultipleOperandsRange;
 

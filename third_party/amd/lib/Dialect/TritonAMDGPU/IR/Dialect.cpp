@@ -38,6 +38,7 @@
 // clang-format off
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.cpp.inc"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 // clang-format on
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
@@ -508,15 +509,8 @@ LogicalResult BufferLoadToLocalOp::verify() {
   auto mod = getOperation()->getParentOfType<ModuleOp>();
   if (!mod)
     return success();
-
-  auto arch = mlir::getAMDArch(mod);
-  // buffer_load_to_local is supported only on CDNA3 (gfx942) and CDNA4
-  // (gfx950) -- i.e. AMD::TargetInfo::supportsBufferLoadToLocal() returns
-  // isaFamily in {CDNA3, CDNA4}. We check the arch string directly here rather
-  // than constructing AMD::TargetInfo (or calling deduceISAFamily): both live
-  // in the TritonAMDGPUToLLVM lowering library, which this IR dialect library
-  // (TritonAMDGPUIR) must not depend on.
-  if (!arch || *arch == "gfx942" || *arch == "gfx950")
+  TargetFeatures features = TargetFeatures::fromModuleOp(mod);
+  if (features.getArch().empty() || features.supportsBufferLoadToLocal())
     return success();
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
