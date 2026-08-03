@@ -1840,15 +1840,29 @@ def attention(
     if reserved_options:
         names = ", ".join(reserved_options)
         raise TypeError(f"amd_fa_wave compiler options must not override reserved launch keys: {names}")
-    assert not causal, "amd_fa_wave only implements non-causal attention"
-    assert q.dtype == torch.bfloat16, "amd_fa_wave requires BF16 inputs"
-    assert q.ndim == 4
+    if causal:
+        raise ValueError("amd_fa_wave only implements non-causal attention")
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.ndim != 4:
+            raise ValueError(f"{name} must be rank 4 (B, H, N, D), got rank {tensor.ndim}")
+        if tensor.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must have dtype torch.bfloat16, got {tensor.dtype}")
+    for name, tensor in (("k", k), ("v", v)):
+        if tensor.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q (q={q.device}, {name}={tensor.device})")
+        if tensor.shape != q.shape:
+            raise ValueError(f"{name} must have shape {tuple(q.shape)}, got {tuple(tensor.shape)}")
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
     batch, heads, sequence, head_dim = q.shape
-    assert k.shape == q.shape and v.shape == q.shape
-    assert head_dim == 128
-    assert sequence % 256 == 0
-    assert sequence // 64 >= 4
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    if batch <= 0 or heads <= 0:
+        raise ValueError(f"q batch and head dimensions must be positive, got B={batch}, H={heads}")
+    if sequence < 256 or sequence % 256 != 0:
+        raise ValueError(f"q sequence length must be a multiple of 256 and at least 256, got N={sequence}")
+    if head_dim != 128:
+        raise ValueError(f"q head dimension must be 128, got D={head_dim}")
     batch_stride = heads * sequence * head_dim
     last_element_offset = batch * batch_stride - 1
     if batch_stride > MAX_SIGNED_I32 or last_element_offset > MAX_SIGNED_I32:
@@ -1872,9 +1886,20 @@ def attention(
         if not math.isfinite(log2_score_span) or log2_score_span >= FIXED_REFERENCE_MAX_LOG2_SPAN:
             raise ValueError(f"fixed-reference log2 score span ({log2_score_span:g}) must be less than "
                              f"{FIXED_REFERENCE_MAX_LOG2_SPAN:g}; use qk_max_abs=None for adaptive softmax")
-    output = torch.empty_like(q) if out is None else out
-    assert output.shape == q.shape and output.dtype == q.dtype
-    assert output.is_contiguous()
+    if out is None:
+        output = torch.empty_like(q)
+    else:
+        output = out
+        if output.ndim != 4:
+            raise ValueError(f"out must be rank 4 (B, H, N, D), got rank {output.ndim}")
+        if output.dtype != torch.bfloat16:
+            raise ValueError(f"out must have dtype torch.bfloat16, got {output.dtype}")
+        if output.device != q.device:
+            raise ValueError(f"out must be on the same device as q (q={q.device}, out={output.device})")
+        if output.shape != q.shape:
+            raise ValueError(f"out must have shape {tuple(q.shape)}, got {tuple(output.shape)}")
+        if not output.is_contiguous():
+            raise ValueError("out must be contiguous")
     if _storage_ranges_overlap(output, k):
         raise ValueError("amd_fa_wave out must not overlap k")
     if _storage_ranges_overlap(output, v):
