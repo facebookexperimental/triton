@@ -1117,17 +1117,18 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version, "consan" in options.instrumentation_mode)
+        nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
-        # FB/beta divergence: upstream #9535 ("Re-order WS lowering and NVGPU
-        # lowering") is fully reverted for beta. #9535 moved warp-id
+        # Meta Triton divergence: upstream #9535 ("Re-order WS lowering and NVGPU
+        # lowering") is fully reverted for Meta Triton. #9535 moved warp-id
         # relativization out of NVGPUToLLVM into the WS pass and ran WS-to-llvm
-        # before nvgpu-to-llvm. On beta's diverged NVGPU/WS lowering that (a)
+        # before nvgpu-to-llvm. On Meta Triton's diverged NVGPU/WS lowering that (a)
         # crashes ConvertNVGPUToLLVM with "operand #0 does not dominate this use"
         # on every Blackwell warp-specialized/TLX/autows kernel, and (b) leaves
         # the NVGPU WarpIdOp lowering using an absolute (non-relative) tid inside
         # warp-specialize regions, which silently miscompiles warpgroup reductions
-        # (e.g. test_warpgroup_reduction returns 0). Beta keeps the pre-#9535
+        # (e.g. test_warpgroup_reduction returns 0). Meta Triton keeps the pre-#9535
         # behavior: NVGPUToLLVM relativizes the warp-group tid and runs before WS
         # lowering.
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)

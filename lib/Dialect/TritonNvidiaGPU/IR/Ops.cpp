@@ -268,11 +268,12 @@ LogicalResult ClusterArriveOp::verify() {
   // FB: verifier intentionally relaxed. The numCTAs > 1 check is omitted
   // because the TLX frontend emits this op in frontend/ttir before the cluster
   // dim is known. The upstream #9456 "cannot be inside ttg.warp_specialize"
-  // restriction is also NOT enforced here: beta's automatic-warp-specialization
-  // and TLX Blackwell pipelines legitimately place ttng.cluster_arrive inside a
-  // ttg.warp_specialize region, and beta's ClusterArriveOpConversion lowers it
-  // there (all-warps wrapping). Enforcing the restriction made PassManager::run
-  // fail across the Blackwell autows/TLX targets.
+  // restriction is also NOT enforced here: Meta Triton's
+  // automatic-warp-specialization and TLX Blackwell pipelines legitimately
+  // place ttng.cluster_arrive inside a ttg.warp_specialize region, and Meta
+  // Triton's ClusterArriveOpConversion lowers it there (all-warps wrapping).
+  // Enforcing the restriction made PassManager::run fail across the Blackwell
+  // autows/TLX targets.
   return success();
 }
 
@@ -282,17 +283,30 @@ LogicalResult ClusterWaitOp::verify() {
   return success();
 }
 
+static LogicalResult verifyClusterIsMultiCTA(Operation *op) {
+  int numCTAs = triton::gpu::lookupNumCTAs(op);
+  if (numCTAs <= 1)
+    return op->emitOpError("requires ttg.num-ctas > 1");
+  return success();
+}
+
 // -- ClusterBarrierOp --
 LogicalResult ClusterBarrierOp::verify() {
-  // ClusterBarrierOp is backend-inserted (not emitted by beta lowering, which
-  // has no TargetInfo::clusterBarrier creator), so the full upstream check
-  // applies; it never runs on real beta IR.
-  int numCTAs = triton::gpu::lookupNumCTAs(getOperation());
-  if (numCTAs <= 1)
-    return emitOpError("requires ttg.num-ctas > 1");
-  if (getOperation()->getParentOfType<mlir::triton::gpu::WarpSpecializeOp>())
-    return emitOpError("cannot be used inside `ttg.warp_specialize`");
-  return success();
+  if (failed(verifyClusterIsMultiCTA(getOperation())))
+    return failure();
+  auto func = getOperation()->getParentOfType<FunctionOpInterface>();
+  if (!func)
+    return emitOpError("must be inside a kernel function");
+  if (triton::isKernel(func))
+    return success();
+  // Inlineable Triton helpers are verified before the inliner moves their
+  // bodies into the kernel.
+  if (auto tritonFunc = dyn_cast<triton::FuncOp>(func.getOperation())) {
+    auto noinline = tritonFunc->getAttrOfType<BoolAttr>("noinline");
+    if (!noinline || !noinline.getValue())
+      return success();
+  }
+  return emitOpError("must be inside a kernel function");
 }
 
 TypedValue<MemDescType> InvalBarrierOp::getBarrier() { return getAlloc(); }
@@ -322,10 +336,10 @@ LogicalResult WaitBarrierOp::verify() {
   return success();
 }
 
-// Forward declaration. The single (beta-adapted) definition lives below near
-// verifyTMABarrierLayout; beta deliberately tolerates an unset CGA layout, so
-// we keep that version rather than the upstream hard-failing one this
-// cherry-pick carried.
+// Forward declaration. The single Meta Triton-adapted definition lives below
+// near verifyTMABarrierLayout; Meta Triton deliberately tolerates an unset CGA
+// layout, so we keep that version rather than the upstream hard-failing one
+// this cherry-pick carried.
 static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
                                             CGAEncodingAttr expectedCGALayout,
                                             StringRef barrierName);
@@ -451,10 +465,10 @@ static LogicalResult verifyBarrierCGALayout(Operation *op, Value barrier,
                                             StringRef barrierName) {
   auto barrierTy = cast<MemDescType>(barrier.getType());
   auto actualCGALayout = getCGALayout(barrierTy.getEncoding());
-  // beta divergence: beta's TMA kernels commonly leave the barrier CGA layout
-  // unset (empty block bases = the default single-CTA layout) rather than
-  // spelling out the explicit form upstream emits. Treat an unset layout as
-  // satisfying the expectation instead of hard-failing (mirrors
+  // Meta Triton divergence: Meta Triton's TMA kernels commonly leave the
+  // barrier CGA layout unset (empty block bases = the default single-CTA
+  // layout) rather than spelling out the explicit form upstream emits. Treat an
+  // unset layout as satisfying the expectation instead of hard-failing (mirrors
   // verifyTMAEncoding's skip-when-no-encoding behavior below). This keeps the
   // check meaningful for barriers that DO carry an explicit CGA layout.
   auto kBlock = StringAttr::get(op->getContext(), "block");
@@ -950,11 +964,12 @@ LogicalResult TCGen5MMAOp::verify() {
   }
   for (auto barrier : getBarriers()) {
     auto barrierTy = cast<MemDescType>(barrier.getType());
-    // FB/beta divergence: beta's TLX / warp-spec paths emit multi-dimensional
-    // tc_gen5_mma barriers (e.g. 1x1xi64), which verifyBarrierType (which
-    // models only the rank-1 `Nxi64` mbarrier form introduced upstream by
-    // #9474) does not understand. Only verify the rank-1 form; leave beta's
-    // higher-rank barriers unchecked here as they were before #9474.
+    // Meta Triton divergence: Meta Triton's TLX / warp-spec paths emit
+    // multi-dimensional tc_gen5_mma barriers (e.g. 1x1xi64), which
+    // verifyBarrierType (which models only the rank-1 `Nxi64` mbarrier form
+    // introduced upstream by #9474) does not understand. Only verify the rank-1
+    // form; leave Meta Triton's higher-rank barriers unchecked here as they
+    // were before #9474.
     if (barrierTy.getRank() == 1) {
       if (failed(verifyBarrierType(*this, barrierTy)) ||
           failed(verifyCompletionBarrierLayout(getOperation(), barrier)))
@@ -1679,23 +1694,23 @@ LogicalResult TMEMCopyOp::verify() {
     return emitOpError("Source must have at least 16-byte alignment to be "
                        "representable in a matrix descriptor.");
   }
-  // FB/beta divergence: beta's TMEMCopy supports flexible multi-dimensional
-  // SMEM source shapes (e.g. 5D TMA scale loads) into a DummyTMEMLayoutAttr
-  // destination whose deferred layout is resolved later. Such swizzled
-  // multi-dim sources have no representable linear layout yet (toLinearLayout
-  // would report_fatal_error "Illegal shared layout"), so skip the upstream
-  // cga-layout equality check entirely when the destination layout is still a
-  // placeholder.
+  // Meta Triton divergence: Meta Triton's TMEMCopy supports flexible
+  // multi-dimensional SMEM source shapes (e.g. 5D TMA scale loads) into a
+  // DummyTMEMLayoutAttr destination whose deferred layout is resolved later.
+  // Such swizzled multi-dim sources have no representable linear layout yet
+  // (toLinearLayout would report_fatal_error "Illegal shared layout"), so skip
+  // the upstream cga-layout equality check entirely when the destination layout
+  // is still a placeholder.
   if (!isa<triton::tlx::DummyTMEMLayoutAttr>(dstTy.getEncoding())) {
     auto shmemLl = toLinearLayout(srcTy);
     auto tmemLl = toLinearLayout(dstTy);
 
     // The upstream cga-layout equality check uses invertAndCompose, which
     // requires matching out-dim names AND tmem out-dim sizes >= shmem out-dim
-    // sizes (its internal assertion). beta's flexible multi-dimensional scale
-    // SMEM sources can be larger than the tmem destination, which would trip
-    // that assertion, so only run the check when the out-dims are compatible
-    // (the rank-equal case upstream assumes).
+    // sizes (its internal assertion). Meta Triton's flexible multi-dimensional
+    // scale SMEM sources can be larger than the tmem destination, which would
+    // trip that assertion, so only run the check when the out-dims are
+    // compatible (the rank-equal case upstream assumes).
     bool compatibleOutDims =
         llvm::equal(shmemLl.getOutDimNames(), tmemLl.getOutDimNames());
     if (compatibleOutDims) {
@@ -1764,8 +1779,8 @@ LogicalResult TMEMSubSliceOp::verify() {
 
   if (!isa<triton::nvidia_gpu::TensorMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("The source must be a tensor memory buffer.");
-  // Beta divergence: TMEM subslices may be higher-rank (multibuffered) and may
-  // reduce blockN (packed/reuse), so we do not enforce upstream #7777's
+  // Meta Triton divergence: TMEM subslices may be higher-rank (multibuffered)
+  // and may reduce blockN (packed/reuse), so we do not enforce upstream #7777's
   // rank==2 / same-encoding / same-allocShape restrictions. We require equal
   // rank and innermost-dimension slicing instead.
   if (srcTy.getRank() != dstTy.getRank())
@@ -1822,7 +1837,7 @@ LogicalResult TMEMSubSliceOp::verify() {
     return emitOpError(
         "The destination must use the same TMEM encoding kind as the source.");
   }
-  // Checks adopted from upstream #7777 that are compatible with beta's
+  // Checks adopted from upstream #7777 that are compatible with Meta Triton's
   // higher-rank / reduced-blockN subslices.
   if (srcTy.getElementType() != dstTy.getElementType())
     return emitOpError(
