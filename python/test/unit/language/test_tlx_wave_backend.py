@@ -6636,6 +6636,112 @@ def test_tlx_wave_runtime_gfx950_fa_signed_scale_e2e(tmp_path, backend, mode, sm
     torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_tlx_wave_fa_storage_range_overlap():
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_storage_range_overlap")
+    backing = torch.empty(3 * 256, dtype=torch.bfloat16)
+    first = backing[:256]
+    adjacent = backing[256:512]
+    shifted = backing[128:384]
+
+    assert tutorial._storage_ranges_overlap(first, first)
+    assert tutorial._storage_ranges_overlap(first, shifted)
+    assert not tutorial._storage_ranges_overlap(first, adjacent)
+    assert not tutorial._storage_ranges_overlap(first, first.clone())
+    assert not tutorial._storage_ranges_overlap(first[:0], first)
+
+
+@pytest.mark.parametrize("alias", ["k", "v"])
+@pytest.mark.parametrize("warmup", [False, True], ids=["launch", "warmup"])
+def test_tlx_wave_fa_rejects_skewed_kv_output_alias(alias, warmup):
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_skewed_{alias}_output_alias_{warmup}")
+    shape = (1, 16, 8192, 128)
+    elements = math.prod(shape)
+
+    class TensorContract:
+
+        dtype = torch.bfloat16
+        ndim = 4
+        device = torch.device("cuda")
+
+        def __init__(self, pointer):
+            self.shape = shape
+            self.pointer = pointer
+
+        def is_contiguous(self):
+            return True
+
+        def numel(self):
+            return elements
+
+        def element_size(self):
+            return 2
+
+        def data_ptr(self):
+            return self.pointer
+
+        def is_set_to(self, other):
+            return self is other
+
+    q = TensorContract(0x10000000000)
+    k = TensorContract(0x20000000000)
+    v = TensorContract(0x30000000000)
+    output = k if alias == "k" else v
+
+    assert shape[0] * shape[1] * (shape[2] // 256) == 512
+    with pytest.raises(ValueError, match=rf"amd_fa_wave out must not overlap {alias}"):
+        tutorial.attention(q, k, v, out=output, warmup=warmup)
+
+
+def test_tlx_wave_fa_rejects_shifted_q_output_alias():
+    import torch
+
+    tutorial = _load_tlx_fa_wave_module("_tlx_wave_fa_shifted_q_output_alias")
+    shape = (1, 1, 256, 128)
+    backing = torch.empty(math.prod(shape) + 1, dtype=torch.bfloat16)
+    q = backing[:-1].view(shape)
+    output = backing[1:].view(shape)
+    k = torch.empty(shape, dtype=torch.bfloat16)
+    v = torch.empty(shape, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="out may overlap q only when it is exactly the same tensor view"):
+        tutorial.attention(q, k, v, out=output)
+
+
+@pytest.mark.parametrize("backend", ["llvm", "wave"])
+def test_tlx_wave_runtime_gfx950_fa_exact_q_output_alias_e2e(tmp_path, backend):
+    torch, arch = _require_tlx_wave_runtime_target()
+    if arch != "gfx950":
+        pytest.skip(f"requires physical gfx950 hardware for eight-wave FA e2e, got {arch}")
+    tutorial = _load_tlx_fa_wave_module(f"_tlx_wave_fa_exact_q_output_alias_{backend}")
+
+    shape = (1, 1, 512, 128)
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    q = torch.rand(shape, dtype=torch.float32, device=device, generator=generator).to(torch.bfloat16)
+    k = torch.rand(shape, dtype=torch.float32, device=device, generator=generator).to(torch.bfloat16)
+    v = torch.rand(shape, dtype=torch.float32, device=device, generator=generator).to(torch.bfloat16)
+    expected = torch.nn.functional.scaled_dot_product_attention(q.clone(), k, v)
+
+    driver_context = _active_amd_driver if backend == "llvm" else _active_tlx_wave_driver
+    with (
+            driver_context(),
+            triton.knobs.cache.scope(),
+            triton.knobs.runtime.scope(),
+    ):
+        triton.knobs.cache.dir = str(tmp_path / f"{backend}-fa-eight-wave-exact-q-output-alias-runtime-cache")
+        triton.knobs.runtime.override_arch = "gfx950"
+        got = tutorial.attention(q, k, v, out=q)
+        torch.cuda.synchronize()
+
+    assert got.is_set_to(q)
+    torch.testing.assert_close(got, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_tlx_wave_runtime_gfx950_v9_group_swizzle_multi_n_e2e(tmp_path):
     torch, arch = _require_tlx_wave_runtime_target()
     if arch != "gfx950":
