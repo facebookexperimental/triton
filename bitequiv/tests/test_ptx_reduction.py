@@ -117,7 +117,7 @@ _GOLDEN = {
     "sum_nw4": "c6fda1d478b8",
     "sum_nw8": "dca122a2b82e",
     "dot_fuse_on": "80acbd23018a",
-    "dot_fuse_off": "32aa7e471b9a",
+    "dot_fuse_off": "1cae08676ab8",  # butterfly add.rn.f32 -> add.f32 (ShflCombine .rn normalized; still != fuse_on)
 }
 
 
