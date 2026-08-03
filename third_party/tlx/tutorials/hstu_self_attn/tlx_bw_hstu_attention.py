@@ -85,7 +85,7 @@ def get_fwd_persistent_configs() -> List[triton.Config]:
                 "MOVE_QK_WAIT": qk_wait,
                 "SLICE_MASK": slice_mask,
             },
-            num_stages=0,
+            num_stages=1,
             num_warps=4,
             pre_hook=_host_descriptor_pre_hook,
         )
