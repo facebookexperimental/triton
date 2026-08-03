@@ -8,7 +8,9 @@ a slot that the other cohort still consumes.
 The normal path uses an adaptive softmax reference.  A reference is retained
 while new row maxima remain numerically safe and the accumulators are rescaled
 only when it must advance.  Callers with a tight input bound may still request
-the fixed-reference specialization explicitly through ``qk_max_abs``.
+the fixed-reference specialization explicitly through ``qk_max_abs``.  Bounds
+whose full score span can leave the normal exponent range are rejected; those
+inputs must use the adaptive path.
 """
 
 import math
@@ -54,6 +56,12 @@ XCDS = tl.constexpr(8)
 # in conventional online softmax.  H controls when that exact rebase occurs;
 # it is not a score bound or an approximation tolerance.
 SOFTMAX_REFERENCE_HEADROOM_LOG2 = tl.constexpr(8.0)
+
+# The bounded specialization fixes its reference at the positive score bound,
+# so its smallest exponent argument can be twice that bound below zero.  The
+# gfx950 exp2 path flushes values below the f32 normal range; keep every accepted
+# envelope strictly above that boundary to prevent a zero softmax denominator.
+FIXED_REFERENCE_MAX_LOG2_SPAN = 126.0
 
 
 @triton.jit
@@ -1792,8 +1800,13 @@ def attention(
     if adaptive_reference:
         log2_score_bound = 0.0
     else:
-        assert math.isfinite(qk_max_abs) and qk_max_abs > 0
+        if not math.isfinite(qk_max_abs) or qk_max_abs <= 0:
+            raise ValueError("qk_max_abs must be finite and greater than zero")
         log2_score_bound = (math.log2(math.e) * head_dim * float(sm_scale) * qk_max_abs * qk_max_abs)
+        log2_score_span = 2.0 * abs(log2_score_bound)
+        if not math.isfinite(log2_score_span) or log2_score_span >= FIXED_REFERENCE_MAX_LOG2_SPAN:
+            raise ValueError(f"fixed-reference log2 score span ({log2_score_span:g}) must be less than "
+                             f"{FIXED_REFERENCE_MAX_LOG2_SPAN:g}; use qk_max_abs=None for adaptive softmax")
     output = torch.empty_like(q) if out is None else out
     assert output.shape == q.shape and output.dtype == q.dtype
     assert output.is_contiguous()
