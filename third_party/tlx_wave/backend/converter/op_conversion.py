@@ -1828,7 +1828,11 @@ def _convert_for(
                 type_layout_program,
                 op,
                 carry,
-            ) for carry in token_carries)
+                token_block_arg_target_id,
+            ) for carry, token_block_arg_target_id in zip(
+                token_carries,
+                token_block_arg_target_ids,
+            ))
     for result_target_id, block_arg_target_id, init_target_id, yield_target_id in zip(
             data_result_target_ids,
             data_block_arg_target_ids[1:],
@@ -1908,10 +1912,43 @@ def _loop_token_init_target_id(builder, type_layout_program, op, carry):
     return token_target_id
 
 
-def _loop_token_yield_target_id(builder, type_layout_program, op, carry):
+def _loop_token_yield_target_id(
+    builder,
+    type_layout_program,
+    op,
+    carry,
+    token_block_arg_target_id,
+):
     yield_source_value_id = carry.yield_source_value_id
     if yield_source_value_id is not None:
-        return _single_source_target(builder, yield_source_value_id, op)
+        yield_target_id = _single_source_target(
+            builder,
+            yield_source_value_id,
+            op,
+        )
+        if not carry.cumulative_completion:
+            return yield_target_id
+        event_domain = _loop_token_carry_event_domain(builder, carry)
+        cumulative_target_id = _declare_protocol_token(
+            builder,
+            event_domain=event_domain,
+            debug_name=f"loop_completion_yield_{op.index}",
+            resource_target_ids=_resource_target_ids(
+                builder,
+                (token_block_arg_target_id, yield_target_id),
+            ),
+        )
+        builder.add_op(
+            "token_join",
+            operands=(token_block_arg_target_id, yield_target_id),
+            results=(cumulative_target_id, ),
+            attrs={
+                "event_domain": event_domain,
+                "input_count": 2,
+            },
+            source_op_index=op.index,
+        )
+        return cumulative_target_id
     init_source_value_id = carry.init_source_value_id
     if init_source_value_id is None:
         fail(
@@ -2302,6 +2339,14 @@ def _convert_buffer_load_to_local(
         )
     component_count = int(offsets.type.component_count)
     lane_width = int(offsets.type.lane_width or conversion_input.threads_per_warp)
+    contiguity = int(fields["contiguity"])
+    if contiguity <= 0:
+        fail(
+            "TLXW_OP_BUFFER_ASYNC",
+            STAGE,
+            "amdg.buffer_load_to_local contiguity must be positive",
+            source_op_index=op.index,
+        )
     has_mask = fields["mask_value_id"] is not None
     mask_component_count = 0
     if has_mask:
@@ -2390,6 +2435,7 @@ def _convert_buffer_load_to_local(
             "async_group_id": int(async_group_id),
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": component_count,
+            "contiguity": contiguity,
             **_local_component_store_plan_attrs(destination_plan),
             "element_byte_width": int(memdesc.element_byte_width),
             "element_type": memdesc.element_type,
@@ -2649,7 +2695,8 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             source_op_index=op.index,
             source_value_id=op.results[0],
         )
-    if int(fields["contiguity"] or 1) <= 0:
+    contiguity = int(fields["contiguity"])
+    if contiguity <= 0:
         fail(
             "TLXW_OP_BUFFER_LOAD",
             STAGE,
@@ -2688,6 +2735,7 @@ def _convert_buffer_load(builder, conversion_input, type_layout_program, fact_pr
             "access_component_count": access_component_count,
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": int(loaded.type.component_count),
+            "contiguity": contiguity,
             "element_byte_width": int(element_byte_width),
             "element_type": loaded.type.element_type,
             "has_mask": has_mask,
@@ -2766,7 +2814,8 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             source_op_index=op.index,
             source_value_id=fields["value_value_id"],
         )
-    if int(fields["contiguity"] or 1) <= 0:
+    contiguity = int(fields["contiguity"])
+    if contiguity <= 0:
         fail(
             "TLXW_OP_BUFFER_STORE",
             STAGE,
@@ -2815,6 +2864,7 @@ def _convert_buffer_store(builder, conversion_input, type_layout_program, fact_p
             "access_component_count": access_component_count,
             "cache_modifier": int(fields["cache"] or 1),
             "component_count": int(store_component_count),
+            "contiguity": contiguity,
             "element_byte_width": int(element_byte_width),
             "element_type": value.type.element_type,
             "has_boundary_check_operand": fields["boundary_check_value_id"] is not None,
@@ -5496,6 +5546,7 @@ def _buffer_load_to_local_fields(op):
         "other_value_id": op.operands[other_index] if int(segments[4]) else None,
         "stride_value_id": op.operands[stride_index] if int(segments[5]) else None,
         "cache": _int_attr_or_default(op.attrs, "cache", 1),
+        "contiguity": _int_attr_or_default(op.attrs, "contiguity", 1),
     }
 
 

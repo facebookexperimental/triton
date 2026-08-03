@@ -46,6 +46,7 @@ class LoopTokenCarry:
     add_issue_dependency: bool
     issue_dependency_op_indices: tuple[int, ...] = ()
     readiness_carry: bool = False
+    cumulative_completion: bool = False
 
 
 @dataclass(frozen=True)
@@ -510,6 +511,7 @@ def _loop_token_carries_for_body(
             body_token,
             False,
             (),
+            cumulative_completion=True,
         ))
     return (*queue_carries, *final_body_carries)
 
@@ -602,6 +604,10 @@ def _loop_async_queue_carries(
                 yield_source_value_id=yield_token_id,
                 add_issue_dependency=False,
                 issue_dependency_op_indices=(),
+                # A replaced queue slot was explicitly completed in the loop.
+                # Preserve that completed history in the raw group carry so a
+                # later source wait can close the complete loop DMA epoch.
+                cumulative_completion=(yield_token_id is not None and yield_token_id != init_token_id),
             ))
     return tuple(carries)
 
