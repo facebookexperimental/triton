@@ -480,6 +480,7 @@ def _mma_entry_descriptor(func, fence):
     both ride, so configs differing in EITHER the MMA shape OR the reduction order split (sound, never
     over-merged). The reduction fingerprint carries num_warps back in that case; the pure GEMM drops
     it deliberately (num_warps is a free re-tiling of the same dot products)."""
+    from bitequiv.ptx.forward.loops import reduction_trip_signature
     from bitequiv.ptx_reduction import _loop_steps
     parts = [_fence_str(fence)]
     if any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func)):
@@ -489,6 +490,15 @@ def _mma_entry_descriptor(func, fence):
     steps = _loop_steps(func)  # BLOCK_K split (+ the tcgen05 / fp8 K carried here, not in the token)
     if steps:
         parts.append("loops=" + ",".join(map(str, steps)))
+    sig = reduction_trip_signature(func)
+    if sig is not None:
+        # A GEMM whose K sum is regrouped by an OUTER reduction loop (split-K: partials combined) is
+        # NOT bitwise-equivalent across split counts, yet its static MMA/op structure is identical, so
+        # the tiling-invariant fence over-merges them (num_splits 1==2, 4==8). Fail closed on the
+        # loop-control fingerprint (the setp trip constants), which differs per split count -> sound.
+        # A plain single-K-loop GEMM has no such nested reduction -> sig is None -> fence unchanged.
+        # Precise per-split recovery (nested LoopReduce) is the follow-up.
+        parts.append("splits=" + hashlib.sha1(repr(sig).encode()).hexdigest()[:8])
     return "|".join(parts)
 
 
