@@ -87,6 +87,24 @@ public:
   }
 };
 
+static void removeRedundantBarrierAfterPredicatedWSWait(ModuleOp mod) {
+  SmallVector<NVVM::BarrierOp> redundant;
+  SmallVector<LLVM::InlineAsmOp> markedWaits;
+  mod.walk([&](LLVM::InlineAsmOp wait) {
+    if (wait->hasAttr("ttg.ws_predicated_mbarrier_wait"))
+      markedWaits.push_back(wait);
+  });
+  mod.walk([&](NVVM::BarrierOp barrier) {
+    auto wait = dyn_cast_or_null<LLVM::InlineAsmOp>(barrier->getPrevNode());
+    if (wait && wait->hasAttr("ttg.ws_predicated_mbarrier_wait"))
+      redundant.push_back(barrier);
+  });
+  for (NVVM::BarrierOp barrier : redundant)
+    barrier.erase();
+  for (LLVM::InlineAsmOp wait : markedWaits)
+    wait->removeAttr("ttg.ws_predicated_mbarrier_wait");
+}
+
 struct ConvertTritonGPUToLLVM
     : public triton::impl::ConvertTritonGPUToLLVMBase<ConvertTritonGPUToLLVM> {
   using ConvertTritonGPUToLLVMBase::ConvertTritonGPUToLLVMBase;
@@ -224,6 +242,8 @@ struct ConvertTritonGPUToLLVM
     TritonLLVMConversionTarget convTarget(*context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
+
+    removeRedundantBarrierAfterPredicatedWSWait(mod);
 
     // Lower CF ops separately to avoid breaking analysis.
     TritonLLVMFunctionConversionTarget cfTarget(*context);

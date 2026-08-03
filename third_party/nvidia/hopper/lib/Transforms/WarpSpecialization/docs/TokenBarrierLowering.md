@@ -188,6 +188,20 @@ capture becomes two captures (the ready and empty barrier arrays).
 barriers for the TMA store's SMEM buffer. This ensures the SMEM buffer is
 not reused before the TMA store finishes reading from it.
 
+### Predicated Wait Lowering
+
+Predicated waits produced from AutoWS tokens retain their `WSBarrier`
+constraint through NVIDIA lowering. The lowered wait is partition-uniform: the
+predicate selects whether the whole participating partition waits, while the
+mbarrier protocol supplies cross-partition synchronization. Therefore, if
+generic membar analysis placed a CTA barrier immediately after that wait, late
+NVIDIA lowering removes it as redundant. Keeping both synchronization points
+creates a separate PTX reconvergence region around every polling wait.
+
+This elision is intentionally limited to predicated waits carrying
+`WSBarrier`. Explicit TLX waits and arbitrary predicated mbarrier waits retain
+their following CTA barrier.
+
 ## Relationship to Barrier Fusion
 
 Token lowering happens **after** barrier fusion. By the time tokens are

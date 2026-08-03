@@ -35,6 +35,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32} {
 
 // -----
 
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
+  // A predicated AutoWS wait is partition-uniform. Its mbarrier protocol
+  // already synchronizes the participating partition, so retaining Membar's
+  // immediately following barrier only creates a second reconvergence region.
+  // CHECK-LABEL: @predicated_ws_wait
+  // CHECK: llvm.inline_asm {{.*}}mbarrier.try_wait.parity.shared::cta
+  // CHECK-NOT: nvvm.barrier
+  // CHECK: llvm.return
+  tt.func @predicated_ws_wait(
+      %barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %phase: i32, %pred: i1) {
+    ttng.wait_barrier %barrier, %phase, %pred
+        {constraints = {WSBarrier = {dstTask = 1 : i32}}} :
+        !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+    ttg.barrier local
+    tt.return
+  }
+
+  // An arbitrary predicated wait still needs the post-wait CTA barrier.
+  // CHECK-LABEL: @predicated_wait
+  // CHECK: llvm.inline_asm {{.*}}mbarrier.try_wait.parity.shared::cta
+  // CHECK-NEXT: nvvm.barrier
+  // CHECK: llvm.return
+  tt.func @predicated_wait(
+      %barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>,
+      %phase: i32, %pred: i1) {
+    ttng.wait_barrier %barrier, %phase, %pred :
+        !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
+    ttg.barrier local
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
   // CHECK-LABEL: @fp32_to_fp8_stochastic_rounding
