@@ -450,7 +450,7 @@ class HIPBackend(BaseBackend):
         passes.gluon.add_inliner(pm)
         passes.convert.add_index_to_llvmir(pm)
         if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
-            amd.passes.ttgpuir.add_prepare_consan_captures(pm)
+            passes.ttgpuir.add_prepare_consan_captures(pm, "amd")
         amd.passes.ttgpuir.add_allocate_shared_memory(pm, options.arch)
         if "consan" in options.instrumentation_mode and is_consan_supported(options.arch):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
