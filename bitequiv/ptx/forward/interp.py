@@ -200,6 +200,16 @@ class ForwardInterp:
                 val = inst.operands[1]  # scalar shared store: record its value for later loads
                 if isinstance(val, RegisterOperand):
                     self.smem_stores.append((at, self._node(val, at)))
+                else:
+                    # A VECTOR st.shared writes a packed multi-element slot this phase does not model.
+                    # Skipping it silently is UNSOUND: a later scalar ld.shared would then resolve to a
+                    # STALE earlier store while faithful stays True (the tree is wrong but TRUSTED, so
+                    # two bit-different configs can collapse to one descriptor -> OVER-MERGE). Fail
+                    # closed instead. (The DCR / reviewer soundness concern on D112727538. The remaining
+                    # address-agnostic multi-buffer case among all-scalar stores -- resolving a scalar
+                    # load to a DIFFERENT scalar buffer -- needs address-matched resolution and is a
+                    # follow-up, bundled with the multi-output cross-warp recovery.)
+                    self.faithful = False
                 continue
             if op == "mov" and ".b64" in mods and len(inst.operands) == 2 and self._b64_mov(inst, at):
                 continue  # mov.b64 pack ({lo,hi}->rd) / unpack (rd->{lo,hi}) handled in place
@@ -249,23 +259,10 @@ class ForwardInterp:
         # OpaqueOp NODE with its register operands as children + non-register operands in the token,
         # EXACTLY like the backward else-branch, so the value-DAG matches. A pure integer/address op
         # is stored too but never pulled into a value tree (value ops read value operands; addresses
-        # go through the affine domain), so this is harmless and lazy at the descriptor level.
-        # An unmodeled op that CONSUMES a transient marker (a _Shuffle butterfly partner, or a
-        # _Packed f32x2 pair — directly or via a vector operand) would have `_scalar` silently STRIP
-        # it -> the reduction ORDERING (count-up vs count-down) or the packed lane structure is lost
-        # -> OVER-MERGE. Idiom 2 RECONSTRUCTS the packed reductions above (`.f32x2` combine, `mov.b64`
-        # pack/unpack); a marker still reaching HERE is genuinely unmodeled -> fail closed, and the
-        # fingerprint's ordered shfl sequence + store widths then distinguish the configs. A benign
-        # opaque with NO marked operand (an f64 `or.b64`, a `cvt`) keeps faithful=True and recovers.
-        def _marked(o):
-            if isinstance(o, RegisterOperand):
-                return isinstance(self._val(o, at), (_Shuffle, _Packed))
-            if isinstance(o, VectorOperand):
-                return any(isinstance(e, RegisterOperand)
-                           and isinstance(self._val(e, at), (_Shuffle, _Packed)) for e in o.elements)
-            return False
-
-        if any(_marked(o) for o in inst.operands[1:]):
+        # go through the affine domain), so this is harmless and lazy at the descriptor level. If an
+        # operand still carries a transient marker HERE it is genuinely unmodeled (the packed
+        # reductions were reconstructed above) -> fail closed (see `_consumes_marker`).
+        if any(self._consumes_marker(o, at) for o in inst.operands[1:]):
             self.faithful = False
         reg_ops = [o for o in inst.operands[1:] if isinstance(o, RegisterOperand)]
         others = [o for o in inst.operands[1:] if not isinstance(o, RegisterOperand)]
@@ -273,6 +270,20 @@ class ForwardInterp:
         if others:
             tok += "{" + ",".join(canon(self.ev.of_operand(o, at)) for o in others) + "}"
         return OpaqueOp(tok, tuple(self._node(o, at) for o in reg_ops))
+
+    def _consumes_marker(self, operand, at):
+        """True if ``operand`` (a register, or a vector of registers) currently holds a transient
+        ``_Shuffle`` / ``_Packed`` marker. An unmodeled op that consumes one would have ``_scalar``
+        silently STRIP it -> the reduction ORDERING (count-up vs count-down) or the packed lane
+        structure is lost -> OVER-MERGE. The caller fails closed when this is True; the fingerprint's
+        ordered shfl sequence + store widths then distinguish the configs. A benign opaque with NO
+        marked operand (an f64 ``or.b64``, a ``cvt``) keeps ``faithful`` True and still recovers."""
+        if isinstance(operand, RegisterOperand):
+            return isinstance(self._val(operand, at), (_Shuffle, _Packed))
+        if isinstance(operand, VectorOperand):
+            return any(isinstance(e, RegisterOperand)
+                       and isinstance(self._val(e, at), (_Shuffle, _Packed)) for e in operand.elements)
+        return False
 
     def _loop_reduce(self, inst, acc, at):
         """A loop-carried ``acc = acc + chunk`` -> ``LoopReduce(add, chunk, key)``, summarizing the
