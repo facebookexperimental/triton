@@ -99,7 +99,9 @@ static ttng::SubtiledRegionOp getEnclosingSubtiledRegionTile(Operation *op) {
   return nullptr;
 }
 
-static unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
+namespace {
+
+unsigned getNumBuffersOrDefault(scf::ForOp forOp, unsigned numBuffers) {
   // Use the attribute attached to the loop if it exists otherwise use the
   // global control.
   if (!forOp->hasAttr(mlir::triton::kNumStagesAttrName))
@@ -195,9 +197,9 @@ void getTransitiveUsers(Value root,
 
 // When traversing MMAv5, producerOp can be either the defining op of operand
 // A or the accumulator.
-static void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
-                          SmallVector<std::unique_ptr<Channel>> &channels,
-                          bool opndAOfGen5, unsigned producerNumBuffers) {
+void createChannel(Operation *producerOp, mlir::DominanceInfo &dom,
+                   SmallVector<std::unique_ptr<Channel>> &channels,
+                   bool opndAOfGen5, unsigned producerNumBuffers) {
   // For TMEM channels, op is MMAv5 op, producerOp can be either A operand
   // or accumulator.
   auto producerTaskIds = getAsyncTaskIds(producerOp);
@@ -335,13 +337,12 @@ void collectAsyncChannels(SmallVector<std::unique_ptr<Channel>> &channels,
   });
 }
 
-static Operation *getUniqueActualConsumer(Operation *consumerOp) {
+Operation *getUniqueActualConsumer(Operation *consumerOp) {
   auto consumers = getActualConsumers(consumerOp);
   return consumers.size() == 1 ? consumers[0] : consumerOp;
 }
 
-static Operation *getUniqueActualConsumer(Operation *consumerOp,
-                                          AsyncTaskId taskId) {
+Operation *getUniqueActualConsumer(Operation *consumerOp, AsyncTaskId taskId) {
   auto consumers = getActualConsumers(consumerOp);
   if (consumers.size() == 1)
     return consumers[0];
@@ -655,6 +656,8 @@ void reorderEpilogOps(const SmallVector<Channel *> &channels,
   });
 }
 
+} // namespace
+
 // Find top-level ops which contain at least one channel. If a channel's
 // getSrcOp() and getDstOp() belong to the inner loop, the outer loop will be
 // part of asyncTaskOps.
@@ -701,9 +704,10 @@ getTaskTopRegion(triton::FuncOp funcOp,
 }
 
 // Create an allocation to hold the mbarriers.
-static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
-                                StringRef srcName = "",
-                                unsigned arriveCount = 1) {
+namespace {
+
+Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance,
+                         StringRef srcName = "", unsigned arriveCount = 1) {
   OpBuilder builder(funcOp);
   builder.setInsertionPointToStart(&(funcOp.getBody().front()));
   Attribute sharedMemorySpace =
@@ -1495,10 +1499,9 @@ static ttg::LocalAllocOp hoistLocalAllocMultiBuffer(OpBuilder &builder,
   return ttg::LocalAllocOp::create(builder, oldAlloc.getLoc(), memdescType);
 }
 
-static ttng::TMEMAllocOp
-createTMemAllocMultiBuffer(OpBuilder &builder, ttng::TMEMAllocOp oldTMemAllocOp,
-                           int numBuffers) {
-  Location loc = oldTMemAllocOp.getLoc();
+ttng::TMEMAllocOp createTMemAllocMultiBuffer(OpBuilder &builder,
+                                             ttng::TMEMAllocOp oldTMemAllocOp,
+                                             int numBuffers) {
   auto oldRetType = oldTMemAllocOp.getType();
   SmallVector<int64_t> shape = {oldRetType.getShape().begin(),
                                 oldRetType.getShape().end()};
@@ -4747,6 +4750,8 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
   }
 }
 
+} // namespace
+
 // Remove redundant TMEM zeroing stores.
 // When a TMEMAllocOp is used as operand D of an MMAv5 op with
 // useAccumulator=false (on the first iteration), any preceding
@@ -4902,6 +4907,8 @@ void doBufferAllocation(triton::FuncOp funcOp) {
   // local_alloc + local_store for downstream channel detection.
   separateLocalAllocWithSrc(funcOp);
 }
+
+namespace {
 
 // ── mergeStagingReuseIntoHost ───────────────────────────────────────────
 // Realize the planner's `allocation.reuseTarget` annotation by replacing
@@ -5180,6 +5187,8 @@ static void lowerMultiTaskSubtiledRegions(triton::FuncOp funcOp) {
   for (auto op : multiTaskOps)
     ttng::lowerSubtiledRegion(op);
 }
+
+} // namespace
 
 void doCodePartition(triton::FuncOp funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.

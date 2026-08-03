@@ -23,9 +23,6 @@ int getNumElementsPerThreads(Type type,
   return numElemsPerThread;
 }
 
-} // namespace
-
-namespace {
 struct AddPtrOpConversion : public ConvertOpToLLVMPattern<AddPtrOp> {
   using ConvertOpToLLVMPattern<AddPtrOp>::ConvertOpToLLVMPattern;
 
