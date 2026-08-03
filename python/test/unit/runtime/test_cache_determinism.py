@@ -71,6 +71,9 @@ def stress_parent():
 
 def _subprocess_key(mode, seed, order="forward"):
     env = os.environ.copy()
+    # A Buck par's sys.executable does not reconstruct the parent test
+    # runner's link-tree paths when it launches a script directly.
+    env["PYTHONPATH"] = os.pathsep.join(sys.path)
     env["PYTHONHASHSEED"] = str(seed)
     env["TRITON_CACHE_KEY_TEST_ORDER"] = order
     env["TRITON_CACHE_KEY_TEST_SEED"] = str(seed)
