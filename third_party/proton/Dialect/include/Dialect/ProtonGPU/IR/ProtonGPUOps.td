@@ -40,21 +40,26 @@ def PTG_CircularStoreOp : PTG_Op<"circular_store", [
 
   let description = [{
     Store a metric `counter` into a circular buffer backed by the internal memory `segment`.
-    automatically updated. Older metric counters are dropped if the `segment` buffer is full.
+    `scopeId` contains a compile-time scope identifier, while `dynamicScopeId`
+    contains a runtime scope identifier. Exactly one must be present. Older
+    metric counters are dropped if the `segment` buffer is full. When
+    `predicate` is false, neither a record nor an index update occurs.
   }];
 
   let arguments = (ins
     PTG_SegmentType:$segment,
     AnyTypeOf<[I32, I64]>:$counter,
+    Optional<I32>:$dynamicScopeId,
     UnitAttr:$isStart,
-    I32Attr:$scopeId,
+    OptionalAttr<I32Attr>:$scopeId,
     Optional<I1>:$predicate
   );
 
   let builders = [
     OpBuilder<(ins "Value":$segment, "Value":$counter, "bool":$isStart,
                    "int32_t":$scopeId), [{
-      build($_builder, $_state, segment, counter, isStart, scopeId,
+      build($_builder, $_state, segment, counter, mlir::Value(), isStart,
+            $_builder.getI32IntegerAttr(scopeId),
             /*predicate=*/static_cast<mlir::Value>(nullptr));
     }]>
   ];
@@ -62,7 +67,9 @@ def PTG_CircularStoreOp : PTG_Op<"circular_store", [
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    (`start` $isStart^):(`end`)? $segment `,` $counter (`if` $predicate^)? attr-dict `:`
+    (`start` $isStart^):(`end`)? $segment `,` $counter
+    (`,` $dynamicScopeId^)?
+    (`if` $predicate^)? attr-dict `:`
     qualified(type($segment)) `,` type($counter)
   }];
 }
