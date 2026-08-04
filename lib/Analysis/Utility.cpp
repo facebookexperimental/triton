@@ -1497,17 +1497,13 @@ bool isCvtDimSync(const triton::LinearLayout &srcLayout,
   assert((dim == kWarp || dim == kBlock) && "expected dim to be warp or block");
   assert(srcLayout.hasInDim(dim) && dstLayout.hasInDim(dim) &&
          "expected dim to be present in both layouts");
-  auto parentTrivial = true;
   if (dim == kWarp) {
-    parentTrivial = isCvtDimSync(srcLayout, dstLayout, kBlock);
+    auto comp = dstLayout.invertAndCompose(srcLayout);
+    return comp.isTrivialOver({kBlock, kWarp}) &&
+           srcLayout.getFreeVariableMasks()[dim] == 0 &&
+           dstLayout.getFreeVariableMasks()[dim] == 0;
   }
-  auto comp = dstLayout.invertAndCompose(srcLayout);
-  if (!parentTrivial || !comp.isTrivialOver(dim))
-    return false;
-
-  // Broadcasting across warps requires CTA-wide synchronization. A broadcast
-  // block basis does not move values between CTAs, so it remains CTA-local.
-  return dim == kBlock || (srcLayout.getFreeVariableMasks()[dim] == 0 &&
-                           dstLayout.getFreeVariableMasks()[dim] == 0);
+  return invertAndComposeBlockLocal(srcLayout, dstLayout)
+      .isIdentityOnOutDim(kBlock);
 }
 } // namespace mlir

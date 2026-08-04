@@ -33,20 +33,23 @@ getPhysicalLayouts(LinearLayout regLayout, MemDescType memDescTy) {
 // Helper for LocalGather/ScatterOpConversion.
 // For gather: storeVals is empty, returns loaded values.
 // For scatter: storeVals contains values to store, returns empty.
-SmallVector<Value>
-lowerLocalScGt(Location loc, MLIRContext *ctx, MemDescType memDescTy,
-               SharedMemoryObject smemObj, Type llvmElemTy,
-               ArrayRef<Value> idxValues, ArrayRef<SmallVector<Value>> coords,
-               unsigned axis, ArrayRef<Value> storeVals, RewriterBase &rewriter,
-               const TargetInfoBase &targetInfo) {
+SmallVector<Value> lowerLocalScGt(Location loc, MemDescType memDescTy,
+                                  SharedMemoryObject smemObj, Type llvmElemTy,
+                                  const LinearLayout &regLayout,
+                                  ArrayRef<Value> idxValues, unsigned axis,
+                                  ArrayRef<Value> storeVals,
+                                  RewriterBase &rewriter,
+                                  const TargetInfoBase &targetInfo) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   bool isScatter = !storeVals.empty();
-  SmallVector<LocalSharedMemoryAddress> addrs = computeLocalAddrs(
-      loc, memDescTy, smemObj, llvmElemTy, idxValues, coords, axis, rewriter);
+  auto offsetAndBlock = computeBlockLocalOffsets(
+      loc, memDescTy, regLayout, idxValues, axis, rewriter, targetInfo);
+  SmallVector<LocalSharedMemoryAddress> addrs = materializeLocalAddrs(
+      loc, memDescTy, smemObj, llvmElemTy, offsetAndBlock, rewriter);
 
   SmallVector<Value> results;
   if (!isScatter)
-    results.resize(coords.size());
+    results.resize(idxValues.size());
 
   for (auto [i, addr] : llvm::enumerate(addrs)) {
     if (isScatter) {
@@ -73,26 +76,15 @@ LogicalResult lowerLocalStore(Location loc, MLIRContext *ctx, Value regVal,
   auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
 
   auto regLayout = toLinearLayout(regTy);
-  auto kReg = str_attr("register");
-  auto kLane = str_attr("lane");
-  auto kWarp = str_attr("warp");
-  auto kOffset = str_attr("offset");
   LinearLayout cvt = LinearLayout::empty();
   if (isPaddedEncoding(memDescTy.getEncoding())) {
-    cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
+    cvt = invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
   } else {
     auto [physicalRegLayout, sharedLayout] =
         getPhysicalLayouts(regLayout, memDescTy);
     regLayout = std::move(physicalRegLayout);
-    cvt = regLayout.invertAndCompose(sharedLayout);
+    cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
   }
-  // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
-  // can select the per-partition base pointer; lowerLdSt strips it afterwards.
-  SmallVector<StringAttr> ldStOutDims = {kOffset};
-  auto kPartition = str_attr("partition");
-  if (cvt.hasOutDim(kPartition))
-    ldStOutDims.push_back(kPartition);
-  cvt = cvt.sublayout({kReg, kLane, kWarp}, ldStOutDims);
   lowerLocalLdSt(loc, ctx, cvt, inVals, llvmElemTy, memDescTy, smemObj,
                  rewriter, targetInfo, nullptr, clusterCTARank, barrierPtr);
 
@@ -216,32 +208,16 @@ public:
                                                          llvmElemTy, rewriter);
 
     auto regLayout = toLinearLayout(regTy);
-    auto kReg = str_attr("register");
-    auto kLane = str_attr("lane");
-    auto kWarp = str_attr("warp");
-    auto kOffset = str_attr("offset");
     LinearLayout cvt = LinearLayout::empty();
     if (isPaddedEncoding(memDescTy.getEncoding())) {
-      cvt = regLayout.invertAndCompose(paddedLinearLayout(memDescTy));
+      cvt =
+          invertAndComposeBlockLocal(paddedLinearLayout(memDescTy), regLayout);
     } else {
       auto [physicalRegLayout, sharedLayout] =
           getPhysicalLayouts(regLayout, memDescTy);
       regLayout = std::move(physicalRegLayout);
-      cvt = regLayout.invertAndCompose(sharedLayout);
+      cvt = invertAndComposeBlockLocal(sharedLayout, regLayout);
     }
-    auto kBlock = str_attr("block");
-    // We could support it by removing this check if we ever want to
-    if (!cvt.isTrivialOver({kBlock})) {
-      return failure();
-    }
-    // Keep the "partition" output dim (PartitionedSharedEncoding) so lowerLdSt
-    // can select the per-partition base pointer; lowerLdSt strips it
-    // afterwards.
-    SmallVector<StringAttr> ldStOutDims = {kOffset};
-    auto kPartition = str_attr("partition");
-    if (cvt.hasOutDim(kPartition))
-      ldStOutDims.push_back(kPartition);
-    cvt = cvt.sublayout({kReg, kLane, kWarp}, ldStOutDims);
 
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
                                   smemObj, rewriter, targetInfo, op);
@@ -365,7 +341,6 @@ public:
   matchAndRewrite(LocalGatherOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getSrc().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
@@ -383,12 +358,10 @@ public:
 
     SmallVector<Value> idxValues =
         unpackLLElements(loc, adaptor.getIndices(), rewriter);
-    SmallVector<SmallVector<Value>> dstIndices =
-        emitIndices(loc, rewriter, targetInfo, regTy.getEncoding(), regTy,
-                    /*withCTAOffset=*/true);
+    auto regLayout = toLinearLayout(regTy);
 
-    auto results = lowerLocalScGt(loc, ctx, memDescTy, smemObj, llvmElemTy,
-                                  idxValues, dstIndices, op.getAxis(),
+    auto results = lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy,
+                                  regLayout, idxValues, op.getAxis(),
                                   /*storeVals=*/{}, rewriter, targetInfo);
 
     Value result = packLLElements(loc, typeConverter, results, rewriter, regTy);
@@ -465,7 +438,6 @@ public:
   matchAndRewrite(LocalScatterOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto *ctx = op.getContext();
     auto memDescTy = cast<MemDescType>(op.getDst().getType());
     // TODO: PartitionedSharedEncoding lowering will be enabled in subsequent
     // PRs.
@@ -485,12 +457,10 @@ public:
         unpackLLElements(loc, adaptor.getValues(), rewriter);
     SmallVector<Value> idxValues =
         unpackLLElements(loc, adaptor.getIndices(), rewriter);
-    SmallVector<SmallVector<Value>> srcIndices =
-        emitIndices(loc, rewriter, targetInfo, valuesTy.getEncoding(), valuesTy,
-                    /*withCTAOffset=*/true);
+    auto regLayout = toLinearLayout(valuesTy);
 
-    lowerLocalScGt(loc, ctx, memDescTy, smemObj, llvmElemTy, idxValues,
-                   srcIndices, op.getAxis(), values, rewriter, targetInfo);
+    lowerLocalScGt(loc, memDescTy, smemObj, llvmElemTy, regLayout, idxValues,
+                   op.getAxis(), values, rewriter, targetInfo);
 
     rewriter.eraseOp(op);
     return success();
