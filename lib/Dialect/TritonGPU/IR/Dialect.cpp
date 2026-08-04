@@ -479,12 +479,22 @@ SmallVector<int64_t> getShapePerCTA(Attribute layout, ArrayRef<int64_t> shape) {
 SmallVector<int64_t> getAllocationShapePerCTA(Attribute layout,
                                               ArrayRef<int64_t> shapeLogical) {
   SmallVector<int64_t> shape(shapeLogical);
+  std::optional<int64_t> packedAxis;
   auto sharedMMALayout = dyn_cast<NVMMASharedEncodingAttr>(layout);
+  if (sharedMMALayout) {
+    if (sharedMMALayout.getFp4Padded())
+      packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
+  } else if (auto tmemLayout =
+                 dyn_cast<nvidia_gpu::TensorMemoryEncodingAttr>(layout)) {
+    // An fp4Padded TMEM descriptor keeps the packed Mx(K/2)xi8 shape. Allocate
+    // two physical columns per packed K coordinate so each logical FP4 element
+    // occupies one byte in TMEM.
+    if (tmemLayout.getFp4Padded())
+      packedAxis = 1;
+  }
+  if (packedAxis)
+    shape[*packedAxis] *= 2;
   if (sharedMMALayout || isa<SwizzledSharedEncodingAttr>(layout)) {
-    if (sharedMMALayout && sharedMMALayout.getFp4Padded()) {
-      auto packedAxis = getOrder(sharedMMALayout, shapeLogical)[0];
-      shape[packedAxis] *= 2;
-    }
     // Pad only the trailing dimensions covered by the swizzle.
     unsigned tileRank = getCGALayout(layout).getRank();
     size_t firstTileDim = shape.size() > tileRank ? shape.size() - tileRank : 0;

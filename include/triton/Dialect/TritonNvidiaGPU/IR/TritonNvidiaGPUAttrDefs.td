@@ -12,18 +12,23 @@ include "mlir/IR/EnumAttr.td"
 // TensorMemoryCTAMode enum
 //===----------------------------------------------------------------------===//
 
-def TTNG_TensorMemoryCTAMode_Default    : I32EnumAttrCase<"DEFAULT",    0, "default">;
-def TTNG_TensorMemoryCTAMode_TwoCTA_LHS : I32EnumAttrCase<"TwoCTA_LHS", 1, "twocta_lhs">;
-def TTNG_TensorMemoryCTAMode_TwoCTA_RHS : I32EnumAttrCase<"TwoCTA_RHS", 2, "twocta_rhs">;
+def TTNG_TensorMemoryCTAMode_Default : I32EnumAttrCase<"DEFAULT", 0, "default">;
+def TTNG_TensorMemoryCTAMode_TwoCTA_LHS
+    : I32EnumAttrCase<"TwoCTA_LHS", 1, "twocta_lhs">;
+def TTNG_TensorMemoryCTAMode_TwoCTA_RHS
+    : I32EnumAttrCase<"TwoCTA_RHS", 2, "twocta_rhs">;
 
-def TTNG_TensorMemoryCTAMode : I32EnumAttr<"TensorMemoryCTAMode",
-    "Tensor memory CTA mode for LinearLayout conversion",
-    [TTNG_TensorMemoryCTAMode_Default, TTNG_TensorMemoryCTAMode_TwoCTA_LHS,
-     TTNG_TensorMemoryCTAMode_TwoCTA_RHS]> {
+def TTNG_TensorMemoryCTAMode
+    : I32EnumAttr<"TensorMemoryCTAMode",
+                  "Tensor memory CTA mode for LinearLayout conversion",
+                  [TTNG_TensorMemoryCTAMode_Default,
+                   TTNG_TensorMemoryCTAMode_TwoCTA_LHS,
+                   TTNG_TensorMemoryCTAMode_TwoCTA_RHS]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
 
-def TTG_SharedClusterMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "SharedClusterMemorySpace"> {
+def TTG_SharedClusterMemorySpace
+    : AttrDef<TritonNvidiaGPU_Dialect, "SharedClusterMemorySpace"> {
   let mnemonic = "shared_cluster_memory";
   let description = [{
     Attribute to indicate that the memory descriptor points to shared memory. The shared memory could reside in
@@ -31,7 +36,8 @@ def TTG_SharedClusterMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "SharedClust
   }];
 }
 
-def TTG_TensorMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"> {
+def TTG_TensorMemorySpace
+    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"> {
   let mnemonic = "tensor_memory";
   let description = [{
     Attribute to indicate that the memory descriptor points to tensor memory.
@@ -57,27 +63,27 @@ def TTG_TensorMemorySpace : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemorySpace"
   }];
 }
 
-def TTNG_TMEMLoadReduceModifierAttr : I32EnumAttr<
-    "TMEMLoadReduceModifier", "",
-    [
-        I32EnumAttrCase<"MIN", 1, "min">,
-        I32EnumAttrCase<"MAX", 2, "max">,
-    ]> {
-    let cppNamespace = "::mlir::triton::nvidia_gpu";
-    let genSpecializedAttr = 0;
+def TTNG_TMEMLoadReduceModifierAttr
+    : I32EnumAttr<"TMEMLoadReduceModifier", "",
+                  [I32EnumAttrCase<"MIN", 1, "min">,
+                   I32EnumAttrCase<"MAX", 2, "max">,
+]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+  let genSpecializedAttr = 0;
 }
-def TTNG_TMEMLoadReduceModifierEnum : EnumAttr<TritonNvidiaGPU_Dialect, TTNG_TMEMLoadReduceModifierAttr, "redOp"> {
+def TTNG_TMEMLoadReduceModifierEnum
+    : EnumAttr<TritonNvidiaGPU_Dialect, TTNG_TMEMLoadReduceModifierAttr,
+               "redOp"> {
   let assemblyFormat = "`<` $value `>`";
 }
 
-def TTNG_TensorMemoryScalesBlockRepOrderAttr : I32EnumAttr<
-    "TensorMemoryScalesBlockRepOrder", "",
-    [
-        I32EnumAttrCase<"MN_THEN_K", 0, "mnThenK">,
-        I32EnumAttrCase<"K_THEN_MN", 1, "kThenMn">,
-    ]> {
-    let cppNamespace = "::mlir::triton::nvidia_gpu";
-    let genSpecializedAttr = 0;
+def TTNG_TensorMemoryScalesBlockRepOrderAttr
+    : I32EnumAttr<"TensorMemoryScalesBlockRepOrder", "",
+                  [I32EnumAttrCase<"MN_THEN_K", 0, "mnThenK">,
+                   I32EnumAttrCase<"K_THEN_MN", 1, "kThenMn">,
+]> {
+  let cppNamespace = "::mlir::triton::nvidia_gpu";
+  let genSpecializedAttr = 0;
 }
 def TTNG_TensorMemoryScalesBlockRepOrderEnum
     : EnumAttr<TritonNvidiaGPU_Dialect,
@@ -101,8 +107,8 @@ def TTNG_CGALayoutRankTwoParam
 }
 
 def TTG_TensorMemoryEncodingAttr
-    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryEncoding",
-              [LayoutEncodingTrait]> {
+    : AttrDef<TritonNvidiaGPU_Dialect,
+              "TensorMemoryEncoding", [LayoutEncodingTrait]> {
   let mnemonic = "tensor_memory_encoding";
   let attrName = "triton.gpu.tensor_memory_encoding";
   let description = [{
@@ -114,22 +120,27 @@ def TTG_TensorMemoryEncodingAttr
     `twoCTAs` indicates that the tensor memory is laid out for twoCTA mode,
     i.e., `cta_group::2`.
   }];
-  let parameters = (
-    ins
-    "unsigned":$blockM,
-    "unsigned":$blockN,
-    "unsigned":$colStride,
-    TTNG_CGALayoutRankTwoParam:$CGALayout,
-    DefaultValuedParameter<"bool", "false">:$twoCTAs,
-    DefaultValuedParameter<"TensorMemoryCTAMode", "TensorMemoryCTAMode::DEFAULT">:$ctaMode
-  );
+  let parameters = (ins "unsigned":$blockM, "unsigned":$blockN,
+      "unsigned":$colStride, TTNG_CGALayoutRankTwoParam:$CGALayout,
+      DefaultValuedParameter<"bool", "false">:$twoCTAs,
+      DefaultValuedParameter<"TensorMemoryCTAMode",
+                             "TensorMemoryCTAMode::DEFAULT">:$ctaMode,
+      DefaultValuedParameter<"bool", "false">:$fp4Padded);
+  let builders = [AttrBuilder<
+      (ins "unsigned":$blockM, "unsigned":$blockN, "unsigned":$colStride,
+          "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout, "bool":$twoCTAs,
+          "TensorMemoryCTAMode":$ctaMode),
+      [{
+      return $_get($_ctxt, blockM, blockN, colStride, CGALayout, twoCTAs,
+                   ctaMode, false);
+    }]>];
   let genVerifyDecl = 1;
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
 def TTG_TensorMemoryScalesEncodingAttr
-    : AttrDef<TritonNvidiaGPU_Dialect, "TensorMemoryScalesEncoding",
-              [LayoutEncodingTrait]> {
+    : AttrDef<TritonNvidiaGPU_Dialect,
+              "TensorMemoryScalesEncoding", [LayoutEncodingTrait]> {
   let mnemonic = "tensor_memory_scales_encoding";
   let attrName = "triton.gpu.tensor_memory_scales_encoding";
   let description = [{
@@ -145,19 +156,17 @@ def TTG_TensorMemoryScalesEncodingAttr
     does not matter. Otherwise, it must match the hardware instruction layout. For example, Rubin NVFP4 A scales
     with `BLOCK_M = 256` require `kThenMn`, while B scales keep the default `mnThenK`.
   }];
-  let parameters = (
-    ins
-    TTNG_CGALayoutRankTwoParam:$CGALayout,
-    DefaultValuedParameter<
-        "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder",
-        "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K">:$blockRepOrder
-  );
-  let builders = [
-    AttrBuilder<(ins "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout), [{
+  let parameters =
+      (ins TTNG_CGALayoutRankTwoParam:$CGALayout,
+          DefaultValuedParameter<
+              "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder",
+              "::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_"
+              "THEN_K">:$blockRepOrder);
+  let builders = [AttrBuilder<
+      (ins "::mlir::triton::gpu::CGAEncodingAttr":$CGALayout), [{
       return get(context, CGALayout,
                  ::mlir::triton::nvidia_gpu::TensorMemoryScalesBlockRepOrder::MN_THEN_K);
-    }]>
-  ];
+    }]>];
   let genVerifyDecl = 1;
   let assemblyFormat = "`<` struct(params) `>`";
 }
@@ -167,11 +176,11 @@ def TTG_TensorMemoryScalesEncodingAttr
 //===----------------------------------------------------------------------===//
 
 def TTNG_BarrierPlacementBefore : I32EnumAttrCase<"BEFORE", 0, "before">;
-def TTNG_BarrierPlacementAfter  : I32EnumAttrCase<"AFTER",  1, "after">;
+def TTNG_BarrierPlacementAfter : I32EnumAttrCase<"AFTER", 1, "after">;
 
-def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
-    "Barrier placement relative to target op",
-    [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
+def TTNG_BarrierPlacement
+    : I32EnumAttr<"BarrierPlacement", "Barrier placement relative to target op",
+                  [TTNG_BarrierPlacementBefore, TTNG_BarrierPlacementAfter]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
 
@@ -179,14 +188,15 @@ def TTNG_BarrierPlacement : I32EnumAttr<"BarrierPlacement",
 // BarrierRegion enum
 //===----------------------------------------------------------------------===//
 
-def TTNG_BarrierRegionTile     : I32EnumAttrCase<"TILE",     0, "tile">;
-def TTNG_BarrierRegionSetup    : I32EnumAttrCase<"SETUP",    1, "setup">;
+def TTNG_BarrierRegionTile : I32EnumAttrCase<"TILE", 0, "tile">;
+def TTNG_BarrierRegionSetup : I32EnumAttrCase<"SETUP", 1, "setup">;
 def TTNG_BarrierRegionTeardown : I32EnumAttrCase<"TEARDOWN", 2, "teardown">;
 
-def TTNG_BarrierRegion : I32EnumAttr<"BarrierRegion",
-    "Which region of a subtiled_region the barrier targets",
-    [TTNG_BarrierRegionTile, TTNG_BarrierRegionSetup,
-     TTNG_BarrierRegionTeardown]> {
+def TTNG_BarrierRegion
+    : I32EnumAttr<"BarrierRegion",
+                  "Which region of a subtiled_region the barrier targets",
+                  [TTNG_BarrierRegionTile, TTNG_BarrierRegionSetup,
+                   TTNG_BarrierRegionTeardown]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
 }
 
@@ -194,7 +204,8 @@ def TTNG_BarrierRegion : I32EnumAttr<"BarrierRegion",
 // BarrierAnnotation attribute
 //===----------------------------------------------------------------------===//
 
-def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnotation"> {
+def TTNG_BarrierAnnotationAttr
+    : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnotation"> {
   let mnemonic = "barrier_annotation";
   let description = [{
     Describes where to insert a barrier operation during subtiled region lowering.
@@ -221,17 +232,12 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
       only emitted for tiles where the mask is true. Empty mask means emit
       on all tiles. Only used for TILE region annotations.
   }];
-  let parameters = (
-    ins
-    "unsigned":$barrierIdx,
-    "BarrierPlacement":$placement,
-    "unsigned":$targetOpIdx,
-    "StringAttr":$barrierOpKind,
-    DefaultValuedParameter<"unsigned", "1">:$count,
-    DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
-    DefaultValuedParameter<"unsigned", "1">:$numBuffers,
-    OptionalParameter<"DenseI32ArrayAttr">:$tileMask
-  );
+  let parameters = (ins "unsigned":$barrierIdx, "BarrierPlacement":$placement,
+      "unsigned":$targetOpIdx, "StringAttr":$barrierOpKind,
+      DefaultValuedParameter<"unsigned", "1">:$count,
+      DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region,
+      DefaultValuedParameter<"unsigned", "1">:$numBuffers,
+      OptionalParameter<"DenseI32ArrayAttr">:$tileMask);
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
@@ -239,7 +245,8 @@ def TTNG_BarrierAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "BarrierAnnota
 // TokenAnnotation attribute
 //===----------------------------------------------------------------------===//
 
-def TTNG_TokenAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "TokenAnnotation"> {
+def TTNG_TokenAnnotationAttr
+    : AttrDef<TritonNvidiaGPU_Dialect, "TokenAnnotation"> {
   let mnemonic = "token_annotation";
   let description = [{
     Describes where to insert a token-based synchronization operation during
@@ -259,26 +266,17 @@ def TTNG_TokenAnnotationAttr : AttrDef<TritonNvidiaGPU_Dialect, "TokenAnnotation
     - `tokenOpKind`: "consumer_wait" or "consumer_release".
     - `region`: which region the token op targets (default TILE).
   }];
-  let parameters = (
-    ins
-    "unsigned":$tokenIdx,
-    "unsigned":$bufferIdxIdx,
-    "int":$phaseIdx,
-    "BarrierPlacement":$placement,
-    "unsigned":$targetOpIdx,
-    "StringAttr":$tokenOpKind,
-    DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region
-  );
+  let parameters = (ins "unsigned":$tokenIdx, "unsigned":$bufferIdxIdx,
+      "int":$phaseIdx, "BarrierPlacement":$placement, "unsigned":$targetOpIdx,
+      "StringAttr":$tokenOpKind,
+      DefaultValuedParameter<"BarrierRegion", "BarrierRegion::TILE">:$region);
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-
-def TTNG_TensorModeAttr : I32EnumAttr<
-    "TensorMode", "",
-    [
-        I32EnumAttrCase<"TILED", 0, "tiled">,
-        I32EnumAttrCase<"IM2COL", 1, "im2col">
-    ]> {
+def TTNG_TensorModeAttr
+    : I32EnumAttr<"TensorMode", "",
+                  [I32EnumAttrCase<"TILED", 0, "tiled">,
+                   I32EnumAttrCase<"IM2COL", 1, "im2col">]> {
   let cppNamespace = "::mlir::triton::nvidia_gpu";
   let description = [{
     Enum attribute for TMA tensor mode.
@@ -291,6 +289,5 @@ def TTNG_TensorModeAttr : I32EnumAttr<
     - https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-im2col-mode
   }];
 }
-
 
 #endif

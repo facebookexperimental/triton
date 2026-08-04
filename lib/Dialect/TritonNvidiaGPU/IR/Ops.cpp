@@ -1001,11 +1001,16 @@ LogicalResult TCGen5MMAOp::verify() {
   auto retEnc = dyn_cast<TensorMemoryEncodingAttr>(retType.getEncoding());
   if (!retEnc)
     return emitOpError("Return operand must have a TensorMemory encoding");
+  if (retEnc.getFp4Padded())
+    return emitOpError("Accumulator must not be fp4_padded");
 
   // Check colStride of TMEM operands
   if (auto tmem = dyn_cast<TensorMemoryEncodingAttr>(aEnc)) {
     if (tmem.getColStride() != 1)
       return emitOpError("The col stride of the LHS operand must be 1");
+    if (tmem.getFp4Padded())
+      return emitOpError(
+          "fp4_padded tensor memory LHS is only supported by scaled MMA");
   }
   if (retEnc.getColStride() != 32 / retType.getElementTypeBitWidth())
     return emitOpError("The col stride of the return operand must be 32 / ")
@@ -1275,6 +1280,37 @@ verifyScaleBlockRepOrder(TCGen5MMAScaledOp op,
   return success();
 }
 
+static LogicalResult verifyScaledLHSOperand(Operation *op, Type elementType,
+                                            TensorMemoryEncodingAttr encoding,
+                                            ScaleDotElemType aType,
+                                            ScaleDotElemType bType) {
+  if (aType == ScaleDotElemType::E2M1) {
+    if (!elementType.isInteger(8))
+      return op->emitOpError("expected e2m1 LHS operand to have i8 storage");
+    if (encoding.getFp4Padded() &&
+        !llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                            bType))
+      return op->emitOpError("can only use fp4_padded LHS when RHS is float8");
+    if (llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                           bType) &&
+        !encoding.getFp4Padded())
+      return op->emitOpError(
+          "expected e2m1 LHS operand to be fp4_padded when RHS is float8");
+    return success();
+  }
+
+  if (isa<Float8E4M3FNType, Float8E5M2Type>(elementType)) {
+    if (!llvm::is_contained({ScaleDotElemType::E4M3, ScaleDotElemType::E5M2},
+                            aType)) {
+      return op->emitOpError(
+          "expected float8 LHS operand to have e4m3 or e5m2 format");
+    }
+    return success();
+  }
+
+  return op->emitOpError("unsupported LHS operand type for scaled MMA");
+}
+
 LogicalResult TCGen5MMAScaledOp::verify() {
   if (!getIsAsync() && !getBarriers().empty()) {
     return emitOpError("The op is synchronous but a barrier is present.");
@@ -1299,8 +1335,17 @@ LogicalResult TCGen5MMAScaledOp::verify() {
     return emitOpError(
         "expected accumulator layout to be a TensorMemoryLayout");
   }
+  if (enc.getFp4Padded())
+    return emitOpError("accumulator layout must not be fp4_padded");
   if (enc.getBlockM() != 128)
     return emitOpError("only supports instruction shape blockM=128");
+  if (auto lhsEnc =
+          dyn_cast<TensorMemoryEncodingAttr>(getA().getType().getEncoding())) {
+    if (failed(verifyScaledLHSOperand(getOperation(),
+                                      getA().getType().getElementType(), lhsEnc,
+                                      getAType(), getBType())))
+      return failure();
+  }
   auto aScaleType = cast<MemDescType>(getAScale().getType());
   auto bScaleType = cast<MemDescType>(getBScale().getType());
   auto isScaleBlockRepOrderRelevant = [](MemDescType scaleType) {
@@ -1864,7 +1909,7 @@ void TMEMSubSliceOp::build(OpBuilder &builder, OperationState &state,
     newEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         builder.getContext(), encoding.getBlockM(), newBlockN,
         encoding.getColStride(), encoding.getCGALayout(), encoding.getTwoCTAs(),
-        encoding.getCtaMode());
+        encoding.getCtaMode(), encoding.getFp4Padded());
   }
   auto subsliceType = gpu::MemDescType::get(
       shape, allocTy.getElementType(), newEncoding, allocTy.getMemorySpace(),

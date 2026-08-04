@@ -1141,14 +1141,20 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
   assert(blockM == 64 || blockM == 128);
   LinearLayout tile =
       LinearLayout::zeros1D(encoding.getColStride(), kCol, dims[1]);
+  LinearLayout colLayout;
+  if (encoding.getFp4Padded()) {
+    // The physical low column bit selects the real/padded half, so the logical
+    // column bits start one bit later than they do for dense TMEM layouts.
+    colLayout *= LinearLayout::zeros1D(2, kCol, dims[1]);
+  }
+  colLayout *= LinearLayout::identity1D(blockN, kCol, dims[1]);
   if (encoding.getCtaMode() ==
       triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_LHS) {
     // BlockM=64(per CTA) in 2cta mode has special layouts for both LHS (A) and
     // RHS (D)
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-data-path-layout-b
     // This applies to all TMEM encoding in 2cta_m64 except accumulator of MMA
-    tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
-            LinearLayout::identity1D(blockN, kCol, dims[1]);
+    tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) * colLayout;
     tile *= LinearLayout::zeros1D(2, kRow, dims[0]);
   } else if (encoding.getCtaMode() ==
              triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS) {
@@ -1158,8 +1164,7 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
     // row 64~127 stores the right half of the logical tensor (D[0:64, N/2:N])
     tile *= LinearLayout::identity1D(2, kRow, dims[1]);
   } else if (blockM == 64 && !encoding.getTwoCTAs()) {
-    tile *= LinearLayout::identity1D(16, kRow, dims[0]) *
-            LinearLayout::identity1D(blockN, kCol, dims[1]);
+    tile *= LinearLayout::identity1D(16, kRow, dims[0]) * colLayout;
     auto bases = tile.getBases();
     if (shapePerCTA[0] > blockM) {
       bases[kRow].push_back({64, 0});
@@ -1173,8 +1178,7 @@ LinearLayout tensorMemoryToLinearLayout(ArrayRef<int64_t> shape,
     bases[kRow].push_back({32, 0});
     tile = LinearLayout(std::move(bases), dims);
   } else {
-    tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) *
-            LinearLayout::identity1D(blockN, kCol, dims[1]);
+    tile *= LinearLayout::identity1D(blockM, kRow, dims[0]) * colLayout;
     if (isM64TwoCTA) {
       auto bases = tile.getBases();
       bases[kRow].push_back(bases[kCol].back());
