@@ -863,7 +863,7 @@ public:
     unsigned colStride = 32 / bitwidth;
     Attribute accEncoding = triton::nvidia_gpu::TensorMemoryEncodingAttr::get(
         context, m, n, colStride, CGALayout, false,
-        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT);
+        triton::nvidia_gpu::TensorMemoryCTAMode::DEFAULT, false);
     Attribute tensorMemorySpace =
         triton::nvidia_gpu::TensorMemorySpaceAttr::get(context);
     MemDescType accMemDescType =
