@@ -480,6 +480,7 @@ class HIPBackend(BaseBackend):
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, options.arch, __HIP_FTZ)
+        passes.convert.add_reconcile_unrealized_casts(pm)
         pm.run(mod, "make_llir")
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
