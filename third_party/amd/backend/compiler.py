@@ -33,8 +33,16 @@ def is_async_copy_enabled(arch):
     return ((arch in ["gfx950", "gfx1250"]) if knobs.amd.use_async_copy is None else knobs.amd.use_async_copy)
 
 
-def is_expert_sched_supported(arch):
+def is_coexec_scheduler_supported(arch):
     return arch in ["gfx1250"]
+
+
+def is_expert_scheduling_enabled(arch):
+    if arch not in ["gfx1250"]:
+        return False
+    if knobs.amd.use_expert_scheduling is None:
+        return True
+    return knobs.amd.use_expert_scheduling
 
 
 def is_fpsan_supported(arch):
@@ -538,8 +546,9 @@ class HIPBackend(BaseBackend):
         # Specifying N, N forces LLVM to focus on a single register count, simplifies some heuristics
         # and may improve scheduling.
         kernel_fn.add_fn_attr("amdgpu-waves-per-eu", f"{options.waves_per_eu}, {options.waves_per_eu}")
-        if is_expert_sched_supported(options.arch) and options.num_warps <= 4:
-            fns[0].add_fn_attr("amdgpu-sched-strategy", "coexec")
+        if is_coexec_scheduler_supported(options.arch) and options.num_warps <= 4:
+            kernel_fn.add_fn_attr("amdgpu-sched-strategy", "coexec")
+
         denormal_mode = "preserve-sign" if options.allow_flush_denorm else "ieee"
         kernel_fn.add_fn_attr("denormal-fp-math-f32", denormal_mode)
         if knobs.compilation.enable_asan:
@@ -611,7 +620,7 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
-        if is_expert_sched_supported(options.arch):
+        if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
         features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
