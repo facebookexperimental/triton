@@ -25,7 +25,10 @@ There are two synchronization mechanisms:
 
 `useGen5Barrier` is true when every actual consumer in the current consumer
 task implements `MMAv5OpInterface`. The decision is made independently for
-each consumer task.
+each consumer task. Channels that reuse the same physical slot must agree on
+the mode, so the check covers every channel in the reuse group: one scalar
+consumer makes that task token-based for the entire group. Multi-buffer groups
+share tokens; single-copy groups retain separate tokens.
 
 When true → `consumerBarriers` is populated (an inline barrier alloc is
 created).

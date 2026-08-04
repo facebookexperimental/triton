@@ -126,7 +126,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 // CHECK-LABEL: @descriptor_allocs_with_different_attrs
-// CHECK-COUNT-2: ttg.local_alloc
+// CHECK-DAG: ttg.local_alloc {{.*}}alignment = 16 : i32
+// CHECK-DAG: ttg.local_alloc {{.*}}alignment = 32 : i32
+// CHECK-NOT: ttg.local_alloc
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
