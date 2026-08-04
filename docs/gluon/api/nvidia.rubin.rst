@@ -18,9 +18,19 @@ NVIDIA Rubin
     :toctree: generated
     :nosignatures:
 
+    add2
+    add4
     allocate_tensor_memory
     fence_async_shared
+    fma2
+    fma4
+    max2
+    min2
     mma_v2
+    mul2
+    mul4
+    sub2
+    sub4
     tensor_memory_descriptor
     tensor_memory_descriptor_type
     tcgen05_commit
