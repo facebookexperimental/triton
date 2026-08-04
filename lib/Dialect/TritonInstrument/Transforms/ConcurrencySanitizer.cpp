@@ -14,24 +14,15 @@
 
 // clang-format off
 // Concurrency Sanitizer data structures:
-// ConSan keeps auxilary data requied for tracking memory accesses in tensors.
+// ConSan keeps auxiliary data required for tracking memory accesses in tensors.
 // These tensors are stored as a distributed tensor or in global scratch memory.
 // C = CTAs, B = buffers, K = mbarriers, T = logical ConSan thread bit slots,
-// P = max number of warp-specialize partitions tracked by ConSan (16 for now).
+// P = base-thread commit columns.
 //
-// Name                   | Storage | Rank/Type          | Description
-// -----------------------|---------|--------------------|------------
-// buffers                | tensor  | <C x B x i64>      | Base pointers of all (sub)buffers
-// barriers               | tensor  | <C x K x i64>      | Pointers to all individual mbarriers
-// barrierStates          | scratch | <C x K x i64>      | Packed barrier phase (bit 0), arrival counts (bits[1..20] init, [21..40] current), and signed tx-count (bits[41..61]); zero means invalid/uninitialized
-// barrierWriteRecipients | scratch | <C x K x i32>      | CTA bitsets of EffectWrites rows published by each barrier
-// waiting                | scratch | <C x K x i32>      | Two bits per thread: waiting flag bit (LSB), stored phase bit (bit 1)
-// writeVisibility        | scratch | <C x B x i64>      | Per-buffer thread-visibility bitmask (bit i => thread i visible)
-// readVisibility         | scratch | <C x B x T x i64>  | Per-buffer, per-thread visibility lanes (row-updated; values are bitmasks)
-// writeTracking          | scratch | <C x B x K x i8>   | Map buffers -> barriers that track writes
-// readTracking           | scratch | <C x B x K x i64>  | Map buffers -> barriers that track reads
-// outstandingCommits
-//   (async/wgmma)        | scratch | <C x B x P x i8>   | Number of outstanding commits per buffer/base partition-thread (2D replaces prior 1D)
+// Descriptors are CTA-agnostic: buffers are <B x i64> and barriers are
+// <K x i64>. Scratch state has explicit CTA axes for buffer rows, barrier rows,
+// logical threads, and visibility masks. See TritonInstrument.md for the full
+// logical shapes.
 // clang-format on
 
 namespace mlir {
@@ -110,36 +101,49 @@ std::optional<int> maybeGetPartitionIdx(Operation *op) {
   return std::nullopt;
 }
 
-int getCurrentThread(Operation *op, const ConSanTargetHooks *hooks) {
+int getCurrentThread(Operation *op, const ConSanTargetHooks *hooks,
+                     const AuxDataMap::ThreadLayout &threadLayout) {
   // Default partition is 0, other partitions are idx + 1
   int thread = maybeGetPartitionIdx(op).value_or(-1) + 1;
   if (hooks->isTMAOp(op)) {
-    thread += TMA_THREAD_OFFSET;
+    assert(threadLayout.hasTMAThreads() &&
+           "TMA thread class must exist when instrumenting a TMA op");
+    thread += threadLayout.tmaThreadOffset;
     return thread;
   }
   if (isTensorCoreOp(op)) {
-    thread += TC_THREAD_OFFSET;
+    assert(threadLayout.hasTCThreads() &&
+           "TC thread class must exist when instrumenting a tensor-core op");
+    thread += threadLayout.tcThreadOffset;
     return thread;
   }
   if (hooks->isCLCOp(op)) {
-    thread += CLC_THREAD_OFFSET;
+    assert(threadLayout.hasCLCThreads() &&
+           "CLC thread class must exist when instrumenting a CLC op");
+    thread += threadLayout.clcThreadOffset;
     return thread;
   }
   return thread;
 }
 
-int getBaseThread(int thread) { return thread % NUM_THREADS; }
+int getBaseThread(int thread, const AuxDataMap::ThreadLayout &threadLayout) {
+  return thread % threadLayout.numBaseThreads;
+}
 
 // Peer threads are the equivalent threads in the TMA, TC, CLC and normal
 // thread classes.
 // If a thread is a base thread, return the mask with the peers, otherwise
 // return the mask with the thread itself.
-uint64_t getThreadPeersMask(int thread) {
+uint64_t getThreadPeersMask(int thread,
+                            const AuxDataMap::ThreadLayout &threadLayout) {
   uint64_t mask = 1ULL << thread;
-  if (thread < NUM_THREADS) {
-    mask |= 1ULL << (thread + TMA_THREAD_OFFSET);
-    mask |= 1ULL << (thread + TC_THREAD_OFFSET);
-    mask |= 1ULL << (thread + CLC_THREAD_OFFSET);
+  if (thread < threadLayout.numBaseThreads) {
+    if (threadLayout.hasTMAThreads())
+      mask |= 1ULL << (thread + threadLayout.tmaThreadOffset);
+    if (threadLayout.hasTCThreads())
+      mask |= 1ULL << (thread + threadLayout.tcThreadOffset);
+    if (threadLayout.hasCLCThreads())
+      mask |= 1ULL << (thread + threadLayout.clcThreadOffset);
   }
   return mask;
 }
@@ -382,9 +386,11 @@ SmallVector<uint16_t> getTensorCoreBarrierBroadcastMasks(Operation *op) {
   return ttng::getCTABroadcastMasks(twoCTAs, commitDescs);
 }
 
-Value getBarrierRecipientCTAs(ImplicitLocOpBuilder &b, Operation *op);
-
-Value getMemEffectRecipientCTAs(ImplicitLocOpBuilder &b, Operation *op) {
+Value getMemEffectCTAs(ImplicitLocOpBuilder &b, Operation *op) {
+  if (auto tmaLoad = dyn_cast<ttng::TMALoadLikeOpInterface>(op)) {
+    if (tmaLoad.getMulticast())
+      return getMulticastRecipientCTAs(b, tmaLoad.getResult());
+  }
   if (auto copyOp = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
     if (copyOp.getMulticast())
       return getMulticastRecipientCTAs(b, copyOp.getResult());
@@ -395,7 +401,7 @@ Value getMemEffectRecipientCTAs(ImplicitLocOpBuilder &b, Operation *op) {
     return getMulticastRecipientCTAs(b, gatherOp.getResult());
   if (isa<ttng::CLCTryCancelOp>(op))
     return allCTAsMask(b);
-  if (isTensorCoreOp(op))
+  if (isa<ttng::MMAv5OpInterface, ttng::TMEMCopyOp>(op))
     return getRecipientCTAsForBroadcastMasks(
         b, ttng::getCTABroadcastMasks(ttng::getModuleTwoCTAs(op), {}));
   return currentCTAMask(b);
@@ -481,8 +487,8 @@ private:
       CriticalSectionListener listener;
       b.setListener(&listener);
 
-      int thread = getCurrentThread(op, hooks);
-      int baseThread = getBaseThread(thread);
+      int thread = getCurrentThread(op, hooks, auxData.threadLayout);
+      int baseThread = getBaseThread(thread, auxData.threadLayout);
       b.setLoc(op->getLoc());
       b.setInsertionPoint(op);
       if (isa<ttg::LocalAllocOp, ttng::TMEMAllocOp>(op)) {
@@ -511,7 +517,8 @@ private:
         if (!partitionRegions.empty()) {
           uint64_t destMask = 0;
           for (Region *region : partitionRegions)
-            destMask |= getThreadPeersMask(region->getRegionNumber() + 1);
+            destMask |= getThreadPeersMask(region->getRegionNumber() + 1,
+                                           auxData.threadLayout);
           if (destMask) {
             for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
               funcBuilder.createCopyWriteVisibilityCall(b, thread, destMask,
@@ -549,28 +556,40 @@ private:
       }
       if (auto asyncWaitOp = dyn_cast<ttg::AsyncWaitOp>(op)) {
         funcBuilder.createClearOutstandingCommitsTransferWritesCall(
-            b, baseThread, getThreadPeersMask(thread), asyncWaitOp.getNum(),
-            nullptr, CommitKind::AsyncCp, MemType::SHARED_MEM, op);
+            b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+            asyncWaitOp.getNum(), nullptr, CommitKind::AsyncCp,
+            MemType::SHARED_MEM, op);
       }
       if (auto wgmmaWaitOp = dyn_cast<ttng::WarpGroupDotWaitOp>(op)) {
         funcBuilder.createClearOutstandingCommitsTransferReadsCall(
-            b, baseThread, getThreadPeersMask(thread),
+            b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
             wgmmaWaitOp.getPendings(), nullptr, CommitKind::Wgmma,
             MemType::SHARED_MEM, op);
       }
       if (auto info = hooks->getWaitOpInfo(op)) {
         if (info->transferWrites && info->transferReads) {
           funcBuilder.createClearOutstandingCommitsTransferBothCall(
-              b, baseThread, getThreadPeersMask(thread), info->pendingCount,
-              nullptr, info->commitKind, MemType::SHARED_MEM, op);
+              b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+              info->pendingCount, nullptr, info->commitKind,
+              MemType::SHARED_MEM, op);
         } else if (info->transferWrites) {
           funcBuilder.createClearOutstandingCommitsTransferWritesCall(
-              b, baseThread, getThreadPeersMask(thread), info->pendingCount,
-              nullptr, info->commitKind, MemType::SHARED_MEM, op);
+              b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+              info->pendingCount, nullptr, info->commitKind,
+              MemType::SHARED_MEM, op);
         } else if (info->transferReads) {
           funcBuilder.createClearOutstandingCommitsTransferReadsCall(
-              b, baseThread, getThreadPeersMask(thread), info->pendingCount,
-              nullptr, info->commitKind, MemType::SHARED_MEM, op);
+              b, baseThread, getThreadPeersMask(thread, auxData.threadLayout),
+              info->pendingCount, nullptr, info->commitKind,
+              MemType::SHARED_MEM, op);
+        }
+      }
+      if (auto clusterBarrier = dyn_cast<ttng::ClusterBarrierOp>(op)) {
+        if (!clusterBarrier.getRelaxed()) {
+          b.setInsertionPointAfter(op);
+          for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM})
+            funcBuilder.createPublishClusterVisibilityCall(b, nullptr, memType,
+                                                           op);
         }
       }
 
@@ -619,9 +638,11 @@ private:
     tti::ExperimentalLockAcquireOp::create(wb, lock, pred);
     for (MemType memType : {MemType::SHARED_MEM, MemType::TENSOR_MEM}) {
       funcBuilder.createTransferVisibleWritesCall(
-          wb, alloc, getThreadPeersMask(thread), pred, memType, op);
+          wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
+          memType, op);
       funcBuilder.createTransferVisibleReadsCall(
-          wb, alloc, getThreadPeersMask(thread), pred, memType, op);
+          wb, alloc, getThreadPeersMask(thread, auxData.threadLayout), pred,
+          memType, op);
     }
     funcBuilder.createClearWaitingCall(wb, alloc, baseThread, pred, op);
     tti::ExperimentalLockReleaseOp::create(wb, lock, pred);
@@ -629,7 +650,7 @@ private:
 
   void instrumentMemEffects(ImplicitLocOpBuilder &b, Operation *op, int thread,
                             tti::FunctionBuilder &funcBuilder) {
-    int baseThread = getBaseThread(thread);
+    int baseThread = getBaseThread(thread, auxData.threadLayout);
     std::optional<MemEffectsOpInfo> opInfo = hooks->getMemEffectsOpInfo(op);
     if (!opInfo) {
       return;
@@ -637,7 +658,7 @@ private:
     Value pred = opInfo->pred;
     Value issuerCTAPred = hooks->getIssuerCTAPred(b, op);
     pred = tti::maybeAnd(b, pred, issuerCTAPred);
-    Value effectRecipientCTAs = getMemEffectRecipientCTAs(b, op);
+    Value effectCTAs = getMemEffectCTAs(b, op);
     for (auto effect : opInfo->operandEffects) {
       Value buf = effect.buf;
       auto bufType = cast<ttg::MemDescType>(buf.getType());
@@ -649,12 +670,13 @@ private:
         // For op that is reading, we only need to check if anything else
         // is writing to the same buffer.
         addWriteChecks(b, funcBuilder, op, buf, effect.length, pred, memType,
-                       thread, effect.operandName, effectRecipientCTAs,
-                       opInfo->commitKind);
+                       thread, effect.operandName, effectCTAs,
+                       /*allowNoWrite=*/false, opInfo->commitKind);
         if (opInfo->trackingKind == MemEffectsOpInfo::TrackingKind::Barrier) {
           funcBuilder.createSetReadVisibilityCall(
-              b, buf, effect.length, getThreadPeersMask(thread), pred, memType,
-              op, effectRecipientCTAs);
+              b, buf, effect.length,
+              getThreadPeersMask(thread, auxData.threadLayout), pred, memType,
+              op, effectCTAs);
         }
         if (opInfo->trackingKind ==
             MemEffectsOpInfo::TrackingKind::CommitCount) {
@@ -668,21 +690,22 @@ private:
         // Op is writing to the buffer, we need to check if anything else
         // is reading or writing to the same buffer.
         addWriteChecks(b, funcBuilder, op, buf, effect.length, pred, memType,
-                       thread, effect.operandName, effectRecipientCTAs,
-                       opInfo->commitKind);
+                       thread, effect.operandName, effectCTAs,
+                       /*allowNoWrite=*/true, opInfo->commitKind);
         addReadChecks(b, funcBuilder, op, buf, effect.length, pred, memType,
-                      thread, effect.operandName, effectRecipientCTAs,
+                      thread, effect.operandName, effectCTAs,
                       opInfo->commitKind);
         if (opInfo->trackingKind == MemEffectsOpInfo::TrackingKind::Barrier) {
           funcBuilder.createSetWriteVisibilityCall(
-              b, buf, effect.length, getThreadPeersMask(thread), pred, memType,
-              op, effectRecipientCTAs);
-          funcBuilder.createClearWriteTrackingCall(
-              b, buf, effect.length, pred, memType, op, effectRecipientCTAs);
-          funcBuilder.createClearReadVisibilityCall(
-              b, buf, effect.length, pred, memType, op, effectRecipientCTAs);
-          funcBuilder.createClearReadTrackingCall(
-              b, buf, effect.length, pred, memType, op, effectRecipientCTAs);
+              b, buf, effect.length,
+              getThreadPeersMask(thread, auxData.threadLayout), pred, memType,
+              op, effectCTAs);
+          funcBuilder.createClearWriteTrackingCall(b, buf, effect.length, pred,
+                                                   memType, op, effectCTAs);
+          funcBuilder.createClearReadVisibilityCall(b, buf, effect.length, pred,
+                                                    memType, op, effectCTAs);
+          funcBuilder.createClearReadTrackingCall(b, buf, effect.length, pred,
+                                                  memType, op, effectCTAs);
         }
         if (opInfo->trackingKind ==
             MemEffectsOpInfo::TrackingKind::CommitCount) {
@@ -720,8 +743,7 @@ private:
             memType = MemType::SHARED_MEM;
           funcBuilder.createTrackBarrierWriteForBufferCall(
               b, barrier, effect.buf, effect.length, combinedPred, memType, op,
-              recipientCTAs, effectRecipientCTAs,
-              barrierInfo.diagonalEffectRecipientCTAs);
+              recipientCTAs, effectCTAs);
         }
       }
       if (barrierInfo.count > 0 || barrierInfo.txCount != 0) {
@@ -745,10 +767,11 @@ private:
                       tti::FunctionBuilder &funcBuilder, Operation *op,
                       Value buf, uint32_t length, Value pred, MemType memType,
                       int thread, const std::string &operandName,
-                      Value recipientCTAs,
+                      Value effectCTAs, bool allowNoWrite,
                       CommitKind::Kind opCommitKind = CommitKind::None) {
-    funcBuilder.createVerifyWriteVisibilityCall(
-        b, buf, length, thread, operandName, pred, memType, op, recipientCTAs);
+    funcBuilder.createVerifyWriteVisibilityCall(b, buf, length, thread,
+                                                operandName, pred, memType, op,
+                                                effectCTAs, allowNoWrite);
     // commit-num-based synchronization is only supported for shared memory
     if (memType == MemType::SHARED_MEM) {
       for (const auto &commitKindDesc :
@@ -756,8 +779,9 @@ private:
         bool excludeSelf = (opCommitKind == commitKindDesc.kind &&
                             hooks->isOrderedCommitKind(opCommitKind));
         funcBuilder.createCheckOutstandingCommitsCall(
-            b, buf, length, getBaseThread(thread), commitKindDesc.operationDesc,
-            pred, memType, commitKindDesc.kind, op, recipientCTAs, excludeSelf);
+            b, buf, length, getBaseThread(thread, auxData.threadLayout),
+            commitKindDesc.operationDesc, pred, memType, commitKindDesc.kind,
+            op, effectCTAs, excludeSelf);
       }
     }
   }
@@ -765,10 +789,10 @@ private:
   void addReadChecks(ImplicitLocOpBuilder &b, tti::FunctionBuilder &funcBuilder,
                      Operation *op, Value buf, uint32_t length, Value pred,
                      MemType memType, int thread,
-                     const std::string &operandName, Value recipientCTAs,
+                     const std::string &operandName, Value effectCTAs,
                      CommitKind::Kind opCommitKind = CommitKind::None) {
     funcBuilder.createVerifyReadVisibilityCall(
-        b, buf, length, thread, operandName, pred, memType, op, recipientCTAs);
+        b, buf, length, thread, operandName, pred, memType, op, effectCTAs);
     // commit-num-based synchronization is only supported for shared memory
     if (memType == MemType::SHARED_MEM) {
       for (const auto &commitKindDesc :
@@ -776,8 +800,9 @@ private:
         bool excludeSelf = (opCommitKind == commitKindDesc.kind &&
                             hooks->isOrderedCommitKind(opCommitKind));
         funcBuilder.createCheckOutstandingCommitsCall(
-            b, buf, length, getBaseThread(thread), commitKindDesc.operationDesc,
-            pred, memType, commitKindDesc.kind, op, recipientCTAs, excludeSelf);
+            b, buf, length, getBaseThread(thread, auxData.threadLayout),
+            commitKindDesc.operationDesc, pred, memType, commitKindDesc.kind,
+            op, effectCTAs, excludeSelf);
       }
     }
   }

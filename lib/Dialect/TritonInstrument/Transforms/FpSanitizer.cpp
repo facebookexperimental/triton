@@ -459,8 +459,6 @@ Value createScratchAndStore(PatternRewriter &rewriter, Location loc, Value val,
   auto ptrTy = triton::getPointerType(storageTy.getElementType());
   auto allocOp = createThirdPartyScratchAlloc(rewriter, loc, ptrTy, sizeInBytes,
                                               alignment);
-  allocOp->setDiscardableAttr("tt.divisibility",
-                              rewriter.getI64IntegerAttr(alignment));
   if (!storeFpSanScratchMemory(rewriter, loc, allocOp.getResult(), val,
                                tensorTy))
     return Value();

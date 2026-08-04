@@ -239,8 +239,7 @@ public:
           {tryCancelOp.getMbarrier(), nullptr, /*count=*/0,
            MemEffectsOpInfo::BarrierTrackingMode::EffectWrites,
            /*txCount=*/
-           -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult())),
-           /*diagonalEffectRecipientCTAs=*/true});
+           -static_cast<int>(tti::getMemDescLength(tryCancelOp.getResult()))});
       info->operandEffects.emplace_back(MemEffectsOpInfo::Effects::Write,
                                         tryCancelOp.getResult());
     }
