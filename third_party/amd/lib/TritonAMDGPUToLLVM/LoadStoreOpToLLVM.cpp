@@ -1523,8 +1523,8 @@ struct AsyncTDMScatterOpConversion
     Value pred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
     mlir::LLVM::AMD::emitTDMGatherScatter(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, padInterval,
-        padAmount, srcPtr, pred, elementType, barrierPtr, cgaLayout, ctaId,
-        dstRowIndices, dstColOffset,
+        padAmount, srcPtr, pred, /*multicastMask=*/{}, elementType, barrierPtr,
+        cgaLayout, ctaId, dstRowIndices, dstColOffset,
         /*isGather=*/false, numWarps, dstRowIndicesType);
 
     rewriter.eraseOp(op);
@@ -1549,11 +1549,6 @@ struct AsyncTDMGatherOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-
-    // Multi-CTA not supported for gather
-    if (lookupNumCTAs(op) > 1) {
-      return op.emitError("TDM gather does not support multi-CTA");
-    }
 
     auto tensorDescTy = op.getDesc().getType();
     auto smemTy = op.getDst().getType();
@@ -1616,10 +1611,18 @@ struct AsyncTDMGatherOpConversion
         {kBlock}, to_vector(sharedLayout.getOutDimNames()));
     auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
 
+    Value multicastMask;
+    if (targetInfo.supportsMultiCTALaunch()) {
+      // Use the sharedLayout to compute the multicast mask because the index
+      // layout only describes rows and misses information about columns.
+      multicastMask =
+          LLVM::AMD::emitCtaMulticastMask(rewriter, loc, ctaId, sharedLayout);
+    }
+
     mlir::LLVM::AMD::emitTDMGatherScatter(
         rewriter, loc, getTypeConverter(), desc, shapePerCTA, padInterval,
-        padAmount, dstPtr, op.getPred(), elementType, barrierPtr, cgaLayout,
-        ctaId, srcRowIndices, srcColOffset,
+        padAmount, dstPtr, op.getPred(), multicastMask, elementType, barrierPtr,
+        cgaLayout, ctaId, srcRowIndices, srcColOffset,
         /*isGather=*/true, numWarps, srcRowIndicesType);
 
     rewriter.eraseOp(op);
