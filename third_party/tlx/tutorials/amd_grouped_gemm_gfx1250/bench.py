@@ -86,7 +86,7 @@ def _parse_case(value: str) -> BenchCase:
 
 def _child_env() -> dict[str, str]:
     env = os.environ.copy()
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[4]
     local_paths = [str(repo_root / "python"), str(repo_root)]
     if env.get("PYTHONPATH"):
         local_paths.append(env["PYTHONPATH"])
