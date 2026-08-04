@@ -1811,10 +1811,13 @@ void replaceUsesAndPropagateType(
                                            trans.getOrder());
     } else if (auto reshape = dyn_cast<ttg::MemDescReshapeOp>(user)) {
       ttg::MemDescType oldType = reshape.getType();
-      bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
+      ttg::MemDescType srcType = cast<ttg::MemDescType>(val.getType());
+      SmallVector<int64_t> allocShape = to_vector(
+          srcType.getAllocShape().drop_back(srcType.getShape().size()));
+      llvm::append_range(allocShape, oldType.getShape());
       auto newDstType = ttg::MemDescType::get(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
-          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
+          oldType.getMemorySpace(), srcType.getMutableMemory(), allocShape);
       newVal = ttg::MemDescReshapeOp::create(builder, reshape.getLoc(),
                                              newDstType, val);
     }
@@ -1857,7 +1860,15 @@ replaceUsesWithLocalLoad(OpBuilder &builder, OpResult old,
   SmallVector<ttg::LocalAllocOp> allocsToErase;
   for (Operation *user : old.getUsers()) {
     if (auto userAlloc = dyn_cast<ttg::LocalAllocOp>(user)) {
-      if (allocTy.getEncoding() == userAlloc.getType().getEncoding()) {
+      auto userAllocTy = userAlloc.getType();
+
+      auto allocEnc = dyn_cast<ttg::LayoutEncodingTrait>(allocTy.getEncoding());
+      auto userAllocEnc =
+          dyn_cast<ttg::LayoutEncodingTrait>(userAllocTy.getEncoding());
+      if ((allocTy.getEncoding() == userAllocTy.getEncoding()) ||
+          (allocEnc && userAllocEnc &&
+           ttg::areLayoutsEquivalent(allocTy.getShape(), allocEnc,
+                                     userAllocEnc))) {
         replaceUsesAndPropagateType(builder, userAlloc, alloc);
         allocsToErase.push_back(userAlloc);
       }
