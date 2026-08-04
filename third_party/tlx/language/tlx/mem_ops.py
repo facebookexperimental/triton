@@ -1279,6 +1279,17 @@ def _layouts_match(actual, expected):
     return False
 
 
+def _handle_i32_pred(pred, _semantic):
+    pred = tl._unwrap_if_constexpr(pred)
+    if isinstance(pred, bool):
+        pred = int(pred)
+    pred = _semantic.to_tensor(pred)
+    if pred.type.is_int1():
+        pred = _semantic.cast(pred, tl.int32)
+    assert pred.type.is_int32(), f"Expected pred to be an int32 or int1 value, but got {pred.type}"
+    return pred
+
+
 @tl.builtin
 def async_amd_descriptor_load(
     desc: tl.tensor_descriptor_base,
@@ -1314,15 +1325,15 @@ def async_amd_descriptor_load(
             )
 
     offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
-    if pred is None:
-        pred_handle = _semantic.builder.get_int1(True)
-    else:
-        pred_handle = pred.handle
+    # The copy op is now pure: position the descriptor (tile offsets + predicate,
+    # with clamped OOB bounds) first, then issue the copy from it.
+    pred32 = _handle_i32_pred(True if pred is None else pred, _semantic)
+    positioned_desc = _semantic.builder.create_update_tensor_descriptor(desc.handle, offsets_handles, [], pred32.handle,
+                                                                        True,  # clamp_bounds
+                                                                        )
     token_handle = _semantic.builder.create_async_tdm_copy_global_to_local(
-        desc.handle,
-        offsets_handles,
+        positioned_desc,
         result.handle,
-        pred_handle,
         None,
     )
     return tlx.async_token(token_handle)
@@ -1362,9 +1373,13 @@ def async_amd_descriptor_store(
             )
 
     offsets_handles = _semantic._convert_to_ir_values(offsets, require_i64=False)
+    # Position the descriptor (tile offsets + clamped OOB bounds); stores take no
+    # predicate. The copy op is now pure and reads from the positioned descriptor.
+    positioned_desc = _semantic.builder.create_update_tensor_descriptor(desc.handle, offsets_handles, [], None,
+                                                                        True,  # clamp_bounds
+                                                                        )
     _semantic.builder.create_async_tdm_copy_local_to_global(
-        desc.handle,
-        offsets_handles,
+        positioned_desc,
         source.handle,
         None,
     )
