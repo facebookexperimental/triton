@@ -2855,7 +2855,7 @@ def test_tlx_wave_converter_preserves_wrapping_layout_integer_math(tmp_path):
     del ctx
 
 
-def test_tlx_wave_converter_marks_only_symbolic_address_math_nsw(tmp_path):
+def test_tlx_wave_converter_keeps_source_address_math_unflagged(tmp_path):
     preamble = """
 #blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 """
@@ -2891,7 +2891,7 @@ def test_tlx_wave_converter_marks_only_symbolic_address_math_nsw(tmp_path):
     )
     assert offset_edge.kind == "binary"
     assert offset_attrs["operation"] == "addi"
-    assert "wave.address_arithmetic_no_overflow" in output.emitted_module.text
+    assert "wave.address_arithmetic_no_overflow" not in output.emitted_module.text
     assert "wave.binary" in output.emitted_module.text
     assert "overflow<" not in output.emitted_module.text
     del ctx
@@ -2940,7 +2940,7 @@ def test_tlx_wave_converter_does_not_walk_loop_carried_address_producers(tmp_pat
     )
     assert offset_edge.kind == "binary"
     assert offset_attrs["operation"] == "addi"
-    assert "wave.address_arithmetic_no_overflow" in output.emitted_module.text
+    assert "wave.address_arithmetic_no_overflow" not in output.emitted_module.text
     assert "wave.binary" in output.emitted_module.text
     assert "overflow<" not in output.emitted_module.text
     del ctx
@@ -17224,7 +17224,8 @@ def _assert_runtime_contiguity_identity_chain(wave_artifact, *, minimum=1):
                          rf"(?P<current>{value}), (?P<previous>{value})[^\n]*\n"
                          rf"\s*(?P<unit>{value}) = wave\.assume (?P=delta) as \"x\" "
                          r"\[#wave\.pred<\"-1 \+ x >= 0\">, #wave\.pred<\"-1 \+ x <= 0\">\][^\n]*\n"
-                         rf"\s*(?P<rebuilt>{value}) = wave\.binary addi (?P=previous), (?P=unit)")
+                         rf"\s*(?P<rebuilt>{value}) = wave\.binary addi (?P=previous), (?P=unit) "
+                         r"overflow<nsw>")
     matches = tuple(pattern.finditer(wave_artifact))
     assert len(matches) >= minimum
     assert all(match.group("current") != match.group("previous") for match in matches)

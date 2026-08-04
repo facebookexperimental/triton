@@ -11,13 +11,8 @@ from . import target_ir
 
 STAGE = "emission"
 
-# TLX Wave target programs are only defined for executions where synthesized
-# layout-address arithmetic fits signed i32: indexes, strides, coordinates,
-# LDS offsets, and pointer offsets must not overflow.  This module-level flag
-# encodes that target IR contract in emitted Wave ops; it is not a per-op proof
-# computed in emission.  Keep it restricted to backend-synthesized layout math.
-# Generic source arithmetic still flows through _emit_binary and only receives
-# overflow flags that were present on the source arith op.
+# Carry the signed-i32 layout contract on each synthesized arithmetic op.
+# Source arithmetic keeps only its source overflow flags.
 _LAYOUT_MATH_NSW = True
 _MMA_PACKET_REPRESENTATIONS = frozenset({
     "simd_packet",
@@ -2713,6 +2708,7 @@ def _assume_symbolic_element_contiguity(
             state.dsl.BinaryKind.AddI,
             previous,
             unit_delta,
+            nsw=_LAYOUT_MATH_NSW,
         ))
         previous_index = component_index
     return tuple(normalized)
@@ -5984,7 +5980,6 @@ def _function_attrs(
         ),
         "tlx_wave.ttgir.noinline": ir.Attribute.parse("true" if kernel.noinline else "false"),
         "wave.waves_per_workgroup": dsl.i64_attr(num_warps),
-        "wave.address_arithmetic_no_overflow": ir.UnitAttr.get(),
         # gfx9/gfx950 exposes four SIMD execution units per CU. Model the
         # requested CTA waves as the resident wave target per SIMD.
         "waveamdmachine.target_waves": dsl.i64_attr(target_waves),
