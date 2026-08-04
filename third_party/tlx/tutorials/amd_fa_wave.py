@@ -601,13 +601,12 @@ class SoftmaxState:
             # The global fast-math policy permits contraction, so Wave can
             # form the same FMA as its native FA implementation without a
             # kernel-specific fused operation in the bridge.
-            negative_reference = (tl.zeros((8 * 64, 1), tl.float32) - reference[:, None])
             if qk_scale < 0.0:
-                registers0 = scaled_registers0 + negative_reference
-                registers1 = scaled_registers1 + negative_reference
+                registers0 = scaled_registers0 - reference[:, None]
+                registers1 = scaled_registers1 - reference[:, None]
             else:
-                registers0 = raw_registers0 * qk_scale + negative_reference
-                registers1 = raw_registers1 * qk_scale + negative_reference
+                registers0 = raw_registers0 * qk_scale - reference[:, None]
+                registers1 = raw_registers1 * qk_scale - reference[:, None]
         else:
             score0 = score0 * qk_scale + (-log2_score_bound)
             score1 = score1 * qk_scale + (-log2_score_bound)
@@ -684,13 +683,12 @@ class SoftmaxState:
         )
         needs_rebase = tlx.warp_ballot(row_is_within_headroom) != -1
         reference = tl.where(needs_rebase, candidate, self.row_max)
-        negative_reference = (tl.zeros((8 * 64, 1), tl.float32) - reference[:, None])
         if qk_scale < 0.0:
-            registers0 = scaled_registers0 + negative_reference
-            registers1 = scaled_registers1 + negative_reference
+            registers0 = scaled_registers0 - reference[:, None]
+            registers1 = scaled_registers1 - reference[:, None]
         else:
-            registers0 = raw_registers0 * qk_scale + negative_reference
-            registers1 = raw_registers1 * qk_scale + negative_reference
+            registers0 = raw_registers0 * qk_scale - reference[:, None]
+            registers1 = raw_registers1 * qk_scale - reference[:, None]
 
         registers0 = tl.math.exp2(registers0)
         lower8, tail8 = _split_last_2(registers1)
