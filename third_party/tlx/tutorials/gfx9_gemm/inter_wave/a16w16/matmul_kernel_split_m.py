@@ -170,11 +170,13 @@ def matmul_kernel_pingpong(
         cur = j % 2
         oth = 1 - cur
         with tlx.warp_pipeline_stage("mem", priority=1):
+            b_cur = tlx.local_load(tlx.local_view(smemB, cur))
+            tlx.amd_sched_barrier()
             tlx.async_load(ab_ptrs, tlx.local_view(smemA_bot, oth))
             tlx.async_load_commit_group()
-            ab_ptrs += BLOCK_K * stride_ak
+            tlx.amd_sched_barrier()
             at_cur = tlx.local_load(tlx.local_view(smemA_top, cur))
-            b_cur = tlx.local_load(tlx.local_view(smemB, cur))
+            ab_ptrs += BLOCK_K * stride_ak
 
         tlx.async_load_wait_group(3)
         with tlx.warp_pipeline_stage("mfma", priority=0):
@@ -183,11 +185,13 @@ def matmul_kernel_pingpong(
         with tlx.warp_pipeline_stage("mem", priority=1):
             tlx.async_load(b_ptrs, tlx.local_view(smemB, cur))
             tlx.async_load_commit_group()
+            tlx.amd_sched_barrier()
+            ab_cur = tlx.local_load(tlx.local_view(smemA_bot, cur))
+            tlx.amd_sched_barrier()
             tlx.async_load(at_ptrs, tlx.local_view(smemA_top, cur))
             tlx.async_load_commit_group()
             b_ptrs += BLOCK_K * stride_bk
             at_ptrs += BLOCK_K * stride_ak
-            ab_cur = tlx.local_load(tlx.local_view(smemA_bot, cur))
 
         tlx.async_load_wait_group(3)
         with tlx.warp_pipeline_stage("mfma", priority=0):

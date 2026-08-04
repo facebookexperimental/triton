@@ -590,6 +590,12 @@ Binary wheels are available for CPython 3.10-3.14.
 
     Perform the arrive operation on an mbarrier. If `remote_cta_rank` is provided, signals the barrier in the specified remote CTA's shared memory (useful for multi-CTA synchronization).
 
+- `tlx.amd_sched_barrier(mask=0)`  **[AMD]**
+
+    Prevents selected AMD machine-instruction classes from crossing a source
+    boundary. It is a scheduling marker, not a workgroup barrier or memory
+    fence.
+
 ### Memory Fences
 
 - `tlx.fence(scope)` **[Hopper+]** issues a memory fence. The `scope` argument is required:
