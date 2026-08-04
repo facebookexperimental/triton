@@ -1039,7 +1039,8 @@ def _verify_scale_tmem_copy_shape(src: tlx.buffered_tensor, dst: tlx.buffered_te
     error_msg = ("scale tmem_copy requires an explicit packed i8 SMEM shape matching the rank-2 TMEM scale shape; "
                  "accepted source shapes are [rows / 128, cols / 4, 32, 16], "
                  "[rows / 128, cols / 4, 32, 4, 4], [1, rows / 128, cols / 4, 2, 256], "
-                 "or [rows / 128, (cols / 4) * 512]")
+                 "[rows / 128, (cols / 4) * 512], or [32 * num_blocks, 16] for a "
+                 "[128, 16 * num_blocks] destination")
 
     assert src.type.scalar in (tl.int8, tl.uint8) and dst.type.scalar in (tl.int8, tl.uint8), error_msg
     assert len(dst_shape) == 2, error_msg
@@ -1055,6 +1056,8 @@ def _verify_scale_tmem_copy_shape(src: tlx.buffered_tensor, dst: tlx.buffered_te
         [1, rep_rows, rep_cols, 2, 256],
         [rep_rows, rep_cols * 512],
     ]
+    if rows == 128 and cols % 16 == 0:
+        accepted_shapes.append([32 * (cols // 16), 16])
     assert src_shape in accepted_shapes, error_msg
 
 

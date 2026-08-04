@@ -447,6 +447,11 @@ public:
         if (isRetaggableLocalAllocLoadFallback(allocOp))
           return WalkResult::interrupt();
       }
+      if (auto copyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {
+        auto dstType = cast<ttg::MemDescType>(copyOp.getDst().getType());
+        if (isa_and_nonnull<DummyTMEMLayoutAttr>(dstType.getEncoding()))
+          return WalkResult::interrupt();
+      }
       return WalkResult::advance();
     });
     if (!walkResult.wasInterrupted())
