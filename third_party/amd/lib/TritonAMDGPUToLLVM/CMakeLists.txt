@@ -3,7 +3,6 @@ add_triton_library(TritonAMDGPUToLLVM
     AtomicRMWOpsEmitter.cpp
     AllocateSharedMemory.cpp
     BarrierOpConversion.cpp
-    PrepareConSanCaptures.cpp
     BufferOpsEmitter.cpp
     OffsetUniformitySplit.cpp
     UniformityAnalysis.cpp
