@@ -209,7 +209,7 @@ static std::string getConstraintForBitwidth(unsigned bitwidth) {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val, Value pred,
+                              Value ctaId, Value val, Value pred,
                               std::optional<Value> barrierPtr) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
@@ -299,22 +299,22 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   assert(vec * elemBitwidth <= 128);
 
   // Get pointer to remote shared memory if needed.
-  if (ctaId.has_value()) {
-    ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
+  if (ctaId) {
+    ptr = mapa(rewriter, loc, ptr, ctaId, pred);
   }
 
   // Map barrier to remote address space if needed
   Value mappedBarrier;
   if (barrierPtr.has_value()) {
-    assert(ctaId.has_value() && "barrier without ctaId");
-    mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), *ctaId, pred);
+    assert(ctaId && "barrier without ctaId");
+    mappedBarrier = mapa(rewriter, loc, barrierPtr.value(), ctaId, pred);
   }
 
   PTXBuilder builder;
   auto st = builder.create<>("st")
                 ->o("async", barrierPtr.has_value())
-                .o("shared::cluster", ctaId.has_value())
-                .o("shared", !ctaId.has_value())
+                .o("shared::cluster", static_cast<bool>(ctaId))
+                .o("shared", !ctaId)
                 .o("mbarrier::complete_tx::bytes", barrierPtr.has_value());
 
   st.v(vec, /*predicate=*/vec > 1).b(elemBitwidth);
@@ -371,8 +371,8 @@ void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Type loadTy,
-                              Value pred, Operation *localLoadOp) const {
+                              Value ctaId, Type loadTy, Value pred,
+                              Operation *localLoadOp) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   MLIRContext *ctx = rewriter.getContext();
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
@@ -457,14 +457,14 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   assert(vec * elemBitwidth <= 128);
 
   // Get pointer to remote shared memory if needed.
-  if (ctaId.has_value()) {
-    ptr = mapa(rewriter, loc, ptr, *ctaId, pred);
+  if (ctaId) {
+    ptr = mapa(rewriter, loc, ptr, ctaId, pred);
   }
 
   PTXBuilder builder;
   auto ld = builder.create("ld")
-                ->o("shared::cluster", ctaId.has_value())
-                .o("shared", !ctaId.has_value())
+                ->o("shared::cluster", static_cast<bool>(ctaId))
+                .o("shared", !ctaId)
                 .v(vec, /*predicate=*/vec > 1)
                 .b(elemBitwidth);
 
