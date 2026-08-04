@@ -1423,8 +1423,12 @@ struct AsyncTMACopyGlobalToLocalOpConversion
       // otherwise it is CTA-local. The barrier component keys on the barrier
       // layout (not the SMEM layout), matching #9510.
       auto multicastMask = op.getMulticastTargets();
-      bool clusterScope = crossCTABarrier || multicast ||
-                          multicastMask != nullptr || op.getTwoCta();
+      // The current Hopper toolchain emits PTX < 8.6, where shared::cta TMA
+      // loads are not accepted. Conservatively use cluster scope on Hopper;
+      // keep CTA scope on Blackwell.
+      bool clusterScope = computeCapability < 100 || crossCTABarrier ||
+                          multicast || multicastMask != nullptr ||
+                          op.getTwoCta();
       std::string tmaInst = "@$0 cp.async.bulk.tensor." + std::to_string(rank) +
                             "d.shared::" + (clusterScope ? "cluster" : "cta") +
                             ".global.mbarrier::complete_tx::bytes";
