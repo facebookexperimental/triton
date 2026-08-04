@@ -1771,6 +1771,7 @@ def _emit_for_loop_literal(state, op):
         "for_loop",
         op,
         preserve_mma_packet_payloads=True,
+        pack_four_f32_simd_tuples=True,
     )
     region = state.target_program.regions[op.region_ids[0]]
     if len(region.block_arg_ids) != 1 + init_arg_count:
@@ -1825,6 +1826,7 @@ def _emit_for_loop_literal(state, op):
             op,
             expected_shapes=init_shapes,
             preserve_mma_packet_payloads=True,
+            pack_four_f32_simd_tuples=True,
         )
         if tuple(yield_shapes) != tuple(init_shapes):
             fail(
@@ -2041,6 +2043,7 @@ def _flatten_structured_values(
     *,
     expected_shapes=None,
     preserve_mma_packet_payloads=False,
+    pack_four_f32_simd_tuples=False,
 ):
     if len(values) != len(target_value_ids):
         fail(
@@ -2081,7 +2084,15 @@ def _flatten_structured_values(
         else:
             components = _value_components(state, value, op)
             shape = None
-            if (preserve_mma_packet_payloads and target_type.representation in _MMA_PACKET_REPRESENTATIONS):
+            if (pack_four_f32_simd_tuples and _is_four_f32_simd_tuple(target_type)):
+                components, shape = _pack_four_f32_loop_components(
+                    state,
+                    components,
+                    target_value_id,
+                    context,
+                    op,
+                )
+            elif (preserve_mma_packet_payloads and target_type.representation in _MMA_PACKET_REPRESENTATIONS):
                 components, shape = _preserve_loop_vector_payload_components(
                     state,
                     components,
@@ -2094,6 +2105,52 @@ def _flatten_structured_values(
             shapes.append(shape)
         flat_values.extend(components)
     return tuple(flat_values), tuple(shapes)
+
+
+def _is_four_f32_simd_tuple(target_type):
+    return (target_type.representation == "simd_tuple" and target_type.element_type == "f32"
+            and int(target_type.component_count) == 4 and int(target_type.lane_width or 0) == 64)
+
+
+def _pack_four_f32_loop_components(
+    state,
+    components,
+    target_value_id,
+    context,
+    op,
+):
+    components = tuple(components)
+    target_type = state.target_program.values[target_value_id].type
+    if len(components) != 4:
+        fail(
+            "TLXW_EMIT_FOR_SIMD_PACKET",
+            STAGE,
+            f"{context} four-f32 loop packet must contain four components",
+            target_op_id=op.target_op_id,
+            target_value_id=target_value_id,
+        )
+    scalar_type = _wave_type(state.dsl, target_type)
+    if any(str(component.type) != str(scalar_type) for component in components):
+        fail(
+            "TLXW_EMIT_FOR_SIMD_PACKET",
+            STAGE,
+            f"{context} four-f32 loop packet components must have matching scalar SIMD types",
+            target_op_id=op.target_op_id,
+            target_value_id=target_value_id,
+        )
+    packet_type = state.dsl.simd_type(
+        state.dsl.vector_type(4, _scalar_type(state.dsl, "f32")),
+        64,
+    )
+    packet = state.dsl.wave.PackOp(packet_type, components).result
+    return (
+        (packet, ),
+        _LoopValueShape(
+            1,
+            packet_width=4,
+            logical_component_count=4,
+        ),
+    )
 
 
 def _preserve_loop_vector_payload_components(
