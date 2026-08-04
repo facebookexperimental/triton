@@ -8,6 +8,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonInstrument/IR/ConSanConstants.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
@@ -93,6 +94,15 @@ getNvidiaAllocationAnalysisScratchSizeFn(TargetInfoBase &targetInfo) {
     }
     if (isa<triton::nvidia_gpu::TCGen5GlobalAllocOp>(op))
       return 4;
+    if (auto ws = dyn_cast<triton::gpu::WarpSpecializeOp>(op)) {
+      unsigned captureSize = defaultAllocationAnalysisScratchSizeFn(op);
+      // ConSan adds captures after allocation; reserve space pre-computed by
+      // the common TritonInstrumentPrepareConSanCaptures pass.
+      if (auto extra = ws->getAttrOfType<IntegerAttr>(
+              mlir::triton::instrument::kConSanExtraCaptureBytesAttr))
+        captureSize += extra.getInt();
+      return captureSize;
+    }
     return defaultAllocationAnalysisScratchSizeFn(op);
   };
   return allocation;
