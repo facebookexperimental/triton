@@ -3358,6 +3358,16 @@ def test_tlx_wave_full_barrier_orders_generic_and_buffer_memory_siblings(tmp_pat
     assert wave.count("wave.issue_token") == 3
     assert "wave.sched_barrier" not in wave
     assert wave.count("wave.barrier") == 2
+    buffer_access_lines = [
+        line for line in wave.splitlines()
+        if ("wave.gather" in line or "wave.scatter" in line) and "#waveamd.buffer" in line
+    ]
+    assert len(buffer_access_lines) == 2
+    _assert_exact_execution_item_binding(
+        wave,
+        buffer_access_lines,
+        upper_bound=63,
+    )
     _run_wave_verify(wave)
     machine = _run_waveamd_to_machine(wave)
     assert machine.count("waveamdmachine.issue_token") == 3
@@ -5245,6 +5255,20 @@ def _build_mma_read_then_dma_reuse_target(
 
 def _ssa_result_name(line):
     return line.strip().split("=", 1)[0].strip()
+
+
+def _assert_exact_execution_item_binding(
+    wave_artifact,
+    access_lines,
+    *,
+    upper_bound,
+):
+    (execution_item_line, ) = [line for line in wave_artifact.splitlines() if "wave.workitem_id 0" in line]
+    assert f"{{upper_bound = {upper_bound} : i64}}" in execution_item_line
+    execution_item = _ssa_result_name(execution_item_line)
+    assert access_lines
+    assert all(f'bindings ["item"]({execution_item})' in line for line in access_lines)
+    return execution_item
 
 
 def _ssa_second_result_name(line):
@@ -9136,6 +9160,11 @@ def test_tlx_wave_converter_applies_memdesc_subslice_to_local_load_store(tmp_pat
 """
     local_func = """
   tt.func public @converter_memdesc_subslice_local_access() attributes {noinline = false} {
+    %tid_y = gpu.thread_id y
+    %tid_y_i32 = arith.index_cast %tid_y : index to i32
+    %c0 = arith.constant 0 : i32
+    %tid_y_zero = arith.cmpi eq, %tid_y_i32, %c0 : i32
+    llvm.intr.assume %tid_y_zero : i1
     %alloc = ttg.local_alloc : () -> !ttg.memdesc<128xf32, #shared, #smem, mutable>
     %view = ttg.memdesc_subslice %alloc[64] : !ttg.memdesc<128xf32, #shared, #smem, mutable> -> !ttg.memdesc<64xf32, #shared, #smem, mutable, 128>
     %value = arith.constant dense<1.000000e+00> : tensor<64xf32, #blocked>
@@ -9159,6 +9188,18 @@ def test_tlx_wave_converter_applies_memdesc_subslice_to_local_load_store(tmp_pat
     wave = output.emitted_module.text
     assert wave.count("wave.scatter") == 1
     assert wave.count("wave.gather") == 1
+    local_access_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    execution_item = _assert_exact_execution_item_binding(
+        wave,
+        local_access_lines,
+        upper_bound=63,
+    )
+    (sibling_item_line, ) = [line for line in wave.splitlines() if "wave.workitem_id 1" in line]
+    sibling_item = _ssa_result_name(sibling_item_line)
+    assert "{upper_bound = 0 : i64}" in sibling_item_line
+    assert sibling_item != execution_item
+    assert all(f'bindings ["item"]({sibling_item})' not in line for line in local_access_lines)
+    assert "wave.assume" in wave
     _run_wave_verify(wave)
     del ctx
 
@@ -9464,16 +9505,24 @@ def test_tlx_wave_converter_pipeline_lowers_buffer_load_to_local_dma(tmp_path):
     assert attrs["mode"] == "symbolic_copy"
     assert attrs["component_count"] == 8
     assert attrs["destination_offset_mode"] == "layout_coordinates"
-    assert "waveamd.make_buffer" in output.emitted_module.text
-    assert "wave.gather" in output.emitted_module.text
-    assert "wave.scatter" in output.emitted_module.text
-    assert "wave.load" not in output.emitted_module.text
-    assert "wave.store" not in output.emitted_module.text
-    assert "waveamd.dma_load_lds" not in output.emitted_module.text
-    assert "wave.wait" not in output.emitted_module.text
-    assert "wave.after" in output.emitted_module.text
-    assert "wave.barrier" not in output.emitted_module.text
-    lowered = _run_wave_lower_symbolic_memory(output.emitted_module.text)
+    wave = output.emitted_module.text
+    assert "waveamd.make_buffer" in wave
+    assert "wave.gather" in wave
+    assert "wave.scatter" in wave
+    assert "wave.load" not in wave
+    assert "wave.store" not in wave
+    assert "waveamd.dma_load_lds" not in wave
+    assert "wave.wait" not in wave
+    assert "wave.after" in wave
+    assert "wave.barrier" not in wave
+    dma_access_lines = [line for line in wave.splitlines() if "wave.gather" in line or "wave.scatter" in line]
+    assert len(dma_access_lines) == 2
+    _assert_exact_execution_item_binding(
+        wave,
+        dma_access_lines,
+        upper_bound=63,
+    )
+    lowered = _run_wave_lower_symbolic_memory(wave)
     assert lowered.count("waveamd.dma_load_lds") == 1
     assert "wave.gather" not in lowered
     assert "wave.scatter" not in lowered
@@ -10018,7 +10067,30 @@ def test_tlx_wave_converter_lowers_masked_narrow_padded_buffer_load_to_local_dma
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
-    _assert_runtime_contiguity_scoped_by_where(raw_wave)
+    where_index = raw_wave.index("wave.where")
+    otherwise_index = raw_wave.index("} otherwise", where_index)
+    before_where = raw_wave[:where_index]
+    where_body = raw_wave[where_index:otherwise_index]
+    value = r"%[A-Za-z0-9_.$-]+"
+    selected_range = re.compile(
+        rf"(?m)^\s*(?P<selected>{value}) = wave\.select (?P<mask>{value}), "
+        rf"(?P<raw>{value}), (?P<zero>{value})[^\n]*\n"
+        rf"\s*(?P<bounded>{value}) = wave\.assume (?P=selected) as \"x\" "
+        r"\[#wave\.pred<\"x >= 0\">, #wave\.pred<\"[^\"]*x <= 0\">\]", )
+    selected_ranges = tuple(selected_range.finditer(before_where))
+    assert len(selected_ranges) == int(attrs["component_count"])
+    where_header = raw_wave[where_index:raw_wave.index("{", where_index)]
+    where_masks = set(re.findall(value, where_header.split("wave.where", maxsplit=1)[1]))
+    assert {match.group("mask") for match in selected_ranges} == where_masks
+    (zero_offset, ) = {match.group("zero") for match in selected_ranges}
+    zero_splat = re.search(rf"{re.escape(zero_offset)} = wave\.splat (?P<scalar>{value})", before_where)
+    assert zero_splat is not None
+    assert f'{zero_splat.group("scalar")} = arith.constant 0 : i32' in before_where
+    assert '#wave.pred<"x >= 0">' not in where_body
+    _assert_masked_dma_packet_bindings_follow_ranges(
+        raw_wave,
+        selected_ranges,
+    )
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
@@ -10073,7 +10145,30 @@ def test_tlx_wave_converter_lowers_glu_like_masked_narrow_padded_buffer_load_to_
     assert raw_wave.count("wave.where") == 1
     assert raw_wave.count("wave.gather") == 1
     assert raw_wave.count("wave.scatter") == 1
-    _assert_runtime_contiguity_scoped_by_where(raw_wave)
+    where_index = raw_wave.index("wave.where")
+    otherwise_index = raw_wave.index("} otherwise", where_index)
+    before_where = raw_wave[:where_index]
+    where_body = raw_wave[where_index:otherwise_index]
+    value = r"%[A-Za-z0-9_.$-]+"
+    selected_range = re.compile(
+        rf"(?m)^\s*(?P<selected>{value}) = wave\.select (?P<mask>{value}), "
+        rf"(?P<raw>{value}), (?P<zero>{value})[^\n]*\n"
+        rf"\s*(?P<bounded>{value}) = wave\.assume (?P=selected) as \"x\" "
+        r"\[#wave\.pred<\"x >= 0\">, #wave\.pred<\"[^\"]*x <= 0\">\]", )
+    selected_ranges = tuple(selected_range.finditer(before_where))
+    assert len(selected_ranges) == int(attrs["component_count"])
+    where_header = raw_wave[where_index:raw_wave.index("{", where_index)]
+    where_masks = set(re.findall(value, where_header.split("wave.where", maxsplit=1)[1]))
+    assert {match.group("mask") for match in selected_ranges} == where_masks
+    (zero_offset, ) = {match.group("zero") for match in selected_ranges}
+    zero_splat = re.search(rf"{re.escape(zero_offset)} = wave\.splat (?P<scalar>{value})", before_where)
+    assert zero_splat is not None
+    assert f'{zero_splat.group("scalar")} = arith.constant 0 : i32' in before_where
+    assert '#wave.pred<"x >= 0">' not in where_body
+    _assert_masked_dma_packet_bindings_follow_ranges(
+        raw_wave,
+        selected_ranges,
+    )
     wave = _run_wave_lower_symbolic_memory(raw_wave)
     assert "waveamd.dma_load_lds" in wave
     assert "#waveamd.buffer, f16" in wave
@@ -17144,6 +17239,33 @@ def _assert_runtime_contiguity_scoped_by_where(wave_artifact, *, minimum=1):
     for match in matches:
         prefix = wave_artifact[:match.start()]
         assert prefix.rfind("wave.where ") > prefix.rfind("} : !wave.mask")
+    return matches
+
+
+def _assert_masked_dma_packet_bindings_follow_ranges(
+    wave_artifact,
+    selected_ranges,
+):
+    bounded = tuple(match.group("bounded") for match in selected_ranges)
+    matches = _assert_runtime_contiguity_scoped_by_where(wave_artifact)
+    relevant = tuple(match for match in matches if match.group("current") in bounded)
+    assert relevant
+
+    known = set(bounded)
+    rebuilt_by_current = {}
+    for match in relevant:
+        assert match.group("previous") in known
+        rebuilt_by_current[match.group("current")] = match.group("rebuilt")
+        known.add(match.group("rebuilt"))
+
+    (gather_line, ) = [line for line in wave_artifact.splitlines() if "wave.gather" in line]
+    packet_bindings = re.search(
+        r"packet_bindings \[[^]]*\]\((?P<operands>[^)]*)\)",
+        gather_line,
+    )
+    assert packet_bindings is not None
+    packet_operands = tuple(re.findall(r"%[A-Za-z0-9_.$-]+", packet_bindings.group("operands")))
+    assert packet_operands == tuple(rebuilt_by_current.get(value, value) for value in bounded)
 
 
 def _run_wave_compile_kernels(wave_artifact):
