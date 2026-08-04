@@ -444,6 +444,19 @@ def wrap_handle_tensordesc(launcher, signature, tensordesc_meta):
     return wrap_handle_tensordesc_impl(launcher, signature, tensordesc_meta, make_tensordesc_arg)
 
 
+def wrap_handle_gsan(launcher):
+
+    def inner(*args):
+        import triton.experimental.gsan._allocator as gsan_allocator
+
+        device = triton.runtime.driver.active.get_current_device()
+        device_rank = gsan_allocator.get_device_rank(device)
+        gsan_state_ptr = gsan_allocator.get_global_state_pointer() + device_rank * GSAN_PER_DEVICE_STATE_STRIDE
+        return launcher(*args[:-1], (*args[-1], gsan_state_ptr))
+
+    return inner
+
+
 class CudaLauncher(object):
 
     def __init__(self, src, metadata):
@@ -467,9 +480,14 @@ class CudaLauncher(object):
         # the old schema path (asserted by
         # test_launch_metadata.py::test_schema_derived_signature_matches_legacy).
         expanded_signature = expand_signature(signature.values(), tensordesc_meta)
+        gsan_enabled = "gsan" in metadata.instrumentation_mode
+        if gsan_enabled:
+            expanded_signature.append("*i8")
         self.kernel_signature = make_kernel_signature(expanded_signature)
         self.arg_annotations = annotate_arguments(expanded_signature)
 
+        if gsan_enabled:
+            launcher = wrap_handle_gsan(launcher)
         self.launch = wrap_handle_tensordesc(launcher, signature, tensordesc_meta)
         # Compiler-synthesized auto-TMA descriptors (PromoteLoadToTMA): the
         # launcher builds each CUtensorMap host-side from existing scalar args
