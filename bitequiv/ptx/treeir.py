@@ -78,9 +78,18 @@ class ITreeReduce:
     #                       count-down pair lanes differently -> different bits). num_warps-
     #                       invariant (within-warp butterfly is the same for any num_warps), so
     #                       it distinguishes inner_tree from unordered without blocking recovery.
+    cols: object = None  # EXTENT-FREE key (a canonical column-image-union string) used ONLY for a
+    #                      SHAPE-invariant op (min/max, which never round): the result is bit-
+    #                      identical for ANY tree shape/order over one element SET, so height +
+    #                      shfl_seq (both layout/shape facts) are DROPPED and the collapse keys on
+    #                      the reduced column SET instead. This is what recovers a min/max LEFT-FOLD
+    #                      across num_warps (col_max). None for the balanced add collapse, whose
+    #                      shape DOES matter -> it keeps height + shfl_seq (sig byte-unchanged).
     children = ()
 
     def sig_local(self, child_sigs):
+        if self.cols is not None:  # shape-invariant (min/max): key on the reduced column SET only
+            return f"ITREE[{_norm(self.op)};{self.leaf_sig};c{self.cols}]"
         return f"ITREE[{_norm(self.op)};{self.leaf_sig};h{self.height};s{self.shfl_seq}]"
 
     def sig(self):
