@@ -886,8 +886,26 @@ struct FastCache {
     return nullptr;
   }
 
-  void insert(const FCCacheKey &key, PyObject *kernel, PyObject *dispatcher,
-              PyObject *const *args, int n_args) {
+  FCEntry *insert(const FCCacheKey &key, PyObject *kernel, PyObject *dispatcher,
+                  PyObject *const *args, int n_args) {
+    // Autotuner seeding can insert the same specialization more than once.
+    // Keep a single entry so dispatcher metadata cannot diverge across
+    // duplicates or be reordered by a table resize.
+    if (table) {
+      if (FCEntry *entry = lookup(key, args)) {
+        Py_INCREF(kernel);
+        Py_XINCREF(dispatcher);
+        Py_DECREF(entry->kernel);
+        Py_XDECREF(entry->dispatcher);
+        entry->kernel = kernel;
+        entry->dispatcher = dispatcher;
+        free(entry->dispatch_arg_indices);
+        entry->dispatch_arg_indices = nullptr;
+        entry->n_dispatch_args = 0;
+        return entry;
+      }
+    }
+
     if (!table)
       init_table(16);
     if (count * 4 >= capacity * 3)
@@ -906,7 +924,7 @@ struct FastCache {
     if (n_ce && (!positions || !vals)) {
       free(positions);
       free(vals);
-      return; // OOM — skip insertion
+      return nullptr; // OOM — skip insertion
     }
     int ci = 0;
     for (int i = 0; i < n_args && i < n_params; i++) {
@@ -939,7 +957,7 @@ struct FastCache {
               Py_DECREF(vals[k]);
             free(vals);
             free(positions);
-            return;
+            return nullptr;
           }
           vals[ci] = cmp_key; // new ref from PyTuple_Pack
         } else {
@@ -950,7 +968,7 @@ struct FastCache {
             Py_DECREF(vals[k]);
           free(vals);
           free(positions);
-          return;
+          return nullptr;
         }
         ci++;
       }
@@ -973,11 +991,13 @@ struct FastCache {
     table[idx].n_dispatch_args = 0;
     table[idx].occupied = true;
     count++;
+    return &table[idx];
   }
 
-  void set_dispatch_indices(size_t idx, int *indices, int n) {
-    table[idx].dispatch_arg_indices = indices;
-    table[idx].n_dispatch_args = n;
+  void set_dispatch_indices(FCEntry *entry, int *indices, int n) {
+    free(entry->dispatch_arg_indices);
+    entry->dispatch_arg_indices = indices;
+    entry->n_dispatch_args = n;
   }
 };
 
@@ -1525,7 +1545,7 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
     Py_RETURN_NONE;
 
   PyObject *disp = (dispatcher == Py_None) ? nullptr : dispatcher;
-  cache->insert(key, kernel, disp, ca, (int)n);
+  FCEntry *entry = cache->insert(key, kernel, disp, ca, (int)n);
 
   // Store dispatch_arg_indices if provided
   if (dispatch_indices != Py_None && PyTuple_Check(dispatch_indices)) {
@@ -1537,21 +1557,8 @@ PyObject *native_fast_dispatch_insert(PyObject *self, PyObject *const *args,
           indices[i] =
               (int)PyLong_AsLong(PyTuple_GET_ITEM(dispatch_indices, i));
         }
-        if (!PyErr_Occurred() && cache->table) {
-          // Find the just-inserted entry
-          FCCacheKeyHash hasher;
-          size_t idx = hasher(key) % cache->capacity;
-          bool found = false;
-          while (cache->table[idx].occupied) {
-            if (cache->table[idx].key == key) {
-              cache->set_dispatch_indices(idx, indices, (int)n_indices);
-              found = true;
-              break;
-            }
-            idx = (idx + 1) % cache->capacity;
-          }
-          if (!found)
-            free(indices);
+        if (!PyErr_Occurred() && entry) {
+          cache->set_dispatch_indices(entry, indices, (int)n_indices);
         } else {
           PyErr_Clear();
           free(indices);
