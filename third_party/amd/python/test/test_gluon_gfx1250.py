@@ -3644,7 +3644,9 @@ def tdm_scatter_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M_out, N_out, stri
     dst_row_indices = ttgl.load(dst_row_indices_ptr + idx_offs)
 
     # Scatter the data to non-contiguous rows starting at DST_COL_OFFSET
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, DST_COL_OFFSET, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, DST_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -3889,7 +3891,8 @@ def tdm_scatter_multi_col_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M, N, st
     dst_row_indices = ttgl.load(dst_row_indices_ptr + pid_m * BLOCK_M + idx_offs, mask=idx_mask, other=M)
 
     col_offset = pid_n * BLOCK_N
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, col_offset, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, col_offset], clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -3949,7 +3952,9 @@ def _tdm_scatter_padded_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M_out, N_o
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     dst_row_indices = ttgl.load(dst_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, DST_COL_OFFSET, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, DST_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -4023,8 +4028,9 @@ def tdm_gather_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_inp, strid
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     src_row_indices = ttgl.load(src_row_indices_ptr + idx_offs)
 
-    # Gather data from non-contiguous rows starting at SRC_COL_OFFSET
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, SRC_COL_OFFSET, smem)
+    inp_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(inp_desc, add_offsets=[0, SRC_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     # Store gathered data to output using TDM
@@ -4047,7 +4053,7 @@ def tdm_gather_multi_cta_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_
     idx_offs = ttgl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
     src_row_indices = ttgl.load(src_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, SRC_COL_OFFSET, smem)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     gathered = smem.load(layout=BLOCK_LAYOUT)
@@ -4392,7 +4398,8 @@ def tdm_gather_multi_col_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M, N, str
     src_row_indices = ttgl.load(src_row_indices_ptr + pid_m * BLOCK_M + idx_offs, mask=idx_mask, other=M)
 
     col_offset = pid_n * BLOCK_N
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, col_offset, smem)
+    inp_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(inp_desc, add_offsets=[0, col_offset], clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     out_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=out_ptr, shape=(M, N), strides=(stride_m, 1),
@@ -4421,7 +4428,9 @@ def _tdm_gather_layout_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_in
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     src_row_indices = ttgl.load(src_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, SRC_COL_OFFSET, smem)
+    inp_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(inp_desc, add_offsets=[0, SRC_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     out_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=out_ptr, shape=(BLOCK_M, BLOCK_N), strides=(BLOCK_N, 1),
@@ -4543,7 +4552,9 @@ def _tdm_scatter_layout_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M_out, N_o
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     dst_row_indices = ttgl.load(dst_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, DST_COL_OFFSET, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, DST_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
