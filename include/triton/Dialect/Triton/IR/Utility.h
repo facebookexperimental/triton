@@ -206,6 +206,11 @@ unsigned getBitwidth(RankedTensorType ty);
 // TLX dialect for typed isa<> checks.
 bool encodingContainsTlxPlaceholder(Attribute attr);
 
+// True if `attr` is, or nests anywhere, a #tlx.no_verify_layout wrapper.
+// Detected by registered attribute name because Triton core cannot depend on
+// the TLX dialect for typed isa<> checks.
+bool encodingContainsTlxNoVerifyLayout(Attribute attr);
+
 // Peel any TLX placeholder wrapper(s) (#tlx.user_layout /
 // #tlx.no_verify_layout, which live in the "tlx" dialect and wrap a single
 // inner layout) off the top of `attr`, returning the underlying concrete

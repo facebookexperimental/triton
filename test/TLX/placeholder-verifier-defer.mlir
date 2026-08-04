@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file %s | FileCheck %s
+// RUN: triton-opt -split-input-file %s --verify-diagnostics | FileCheck %s
 
 // Verifier relaxation for TLX placeholder (deferred) layouts. A user-pinned
 // layout is wrapped as #tlx.no_verify_layout<#tlx.user_layout<...>> at the load
@@ -55,5 +55,38 @@ module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32,
     // CHECK: tt.elementwise_inline_asm
     %r = tt.elementwise_inline_asm "mov.b32 $0, $1;" {constraints = "=r,r", packed_element = 1 : i32, pure = true} %a : tensor<128x128xf32, #ph> -> tensor<128x128xf32, #linear>
     tt.return %r : tensor<128x128xf32, #linear>
+  }
+}
+
+// -----
+
+#linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0]], block = []}>
+#ph = #tlx.no_verify_layout<#tlx.user_layout<#linear>>
+#slice = #ttg.slice<{dim = 1, parent = #ph}>
+module {
+  // The slice must remain the outer encoding so repeated reduction inference
+  // is structurally stable. Its nested placeholder defers layout verification
+  // while frontend IR has no ttg.num-warps context.
+  // CHECK-LABEL: @nested_placeholder_slice
+  tt.func @nested_placeholder_slice(%x: tensor<128x128xf32, #ph>) -> tensor<128xf32, #slice> {
+    // CHECK: "tt.reduce"
+    %m = "tt.reduce"(%x) <{axis = 1 : i32}> ({
+    ^bb0(%lhs: f32, %rhs: f32):
+      %max = arith.maxnumf %lhs, %rhs : f32
+      tt.reduce.return %max : f32
+    }) : (tensor<128x128xf32, #ph>) -> tensor<128xf32, #slice>
+    tt.return %m : tensor<128xf32, #slice>
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#user = #tlx.user_layout<#shared>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.num-ctas" = 1 : i32} {
+  tt.func @user_layout_does_not_defer_verification(%ptr: !tt.ptr<f32>) {
+    // expected-error @+1 {{Non-distributed layout is not allowed in tensor type}}
+    %tensor = tt.splat %ptr : !tt.ptr<f32> -> tensor<16x16x!tt.ptr<f32>, #user>
+    tt.return
   }
 }

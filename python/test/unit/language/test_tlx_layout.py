@@ -1114,3 +1114,141 @@ def test_require_layout_pins_epilogue_store_amd():
     amdgcn = compiled.asm["amdgcn"]
     assert "buffer_store_dwordx4" in amdgcn
     assert "buffer_store_dwordx2" not in amdgcn
+
+
+# Explicit MFMA-layout plumbing through the AMD make_ttgir pipeline: a pinned
+# MFMA/dot-operand layout must survive online-softmax (blocked-init scalars
+# meeting an mfma-derived reduce), an scf.for loop, and a loop-carried dot
+# operand -- the scenarios enabled by add_tlx_resolve_placeholder_layouts +
+# ConvertLayoutOp source materialization + TLX-side dot verifier unwrap (the
+# TLXLayoutAttrInterface delegate keeps ttg core layout verifiers unchanged).
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_pinned_online_softmax_amd():
+    """A pinned mfma `tl.dot` result feeds a blocked-init online-softmax
+    (max/sub/exp2) and lowers correctly on AMD: the blocked m_i meets the
+    mfma-derived reduce without an unresolved blocked->no_verify materialization,
+    and the result stores directly (tl.store converts the pinned mfma layout)."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    dot0 = tlx.dot_operand_layout(0, mma, 8)
+    dot1 = tlx.dot_operand_layout(1, mma, 8)
+
+    @triton.jit
+    def kernel(A, B, Out, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, MMA: tl.constexpr, DOT0: tl.constexpr,
+               DOT1: tl.constexpr):
+        a = tlx.require_layout(tl.load(A + tl.arange(0, M)[:, None] * K + tl.arange(0, K)[None, :]), DOT0)
+        b = tlx.require_layout(tl.load(B + tl.arange(0, K)[:, None] * N + tl.arange(0, N)[None, :]), DOT1)
+        acc = tlx.require_layout(tlx.zeros([M, N], tl.float32, layout=MMA), MMA)
+        qk = tl.dot(a, b, acc=acc, out_dtype=tl.float32)
+        m_i = tl.zeros([M], tl.float32) - float("inf")  # blocked init
+        m_new = tl.maximum(m_i, tl.max(qk, 1))  # blocked vs slice<mfma>
+        p = tl.exp2(qk - m_new[:, None])  # mfma vs expand(slice<mfma>)
+        tl.store(Out + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], p)
+
+    M, N, K = 256, 64, 64
+    a = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(K, N, device=DEVICE, dtype=torch.bfloat16)
+    out = torch.empty(M, N, device=DEVICE, dtype=torch.float32)
+    compiled = kernel[(1, )](a, b, out, M, N, K, mma, dot0, dot1, num_warps=8)
+    torch.cuda.synchronize()
+    qk = a.float() @ b.float()
+    ref = torch.exp2(qk - qk.max(1, keepdim=True).values)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+    assert "#ttg.amd_mfma" in compiled.asm["ttir"]
+    _assert_no_layout_residue(compiled.asm["ttgir"])
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_pinned_softmax_scf_loop_amd():
+    """A full online-softmax body with loop-carried acc/m_i inside an scf.for
+    (mirrors tier5, no warp_pipeline). The ConvertLayoutOp source materialization
+    keeps the pinned acc/m_i live across the loop back-edge instead of leaving an
+    unresolvable blocked->no_verify materialization."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    dot0 = tlx.dot_operand_layout(0, mma, 8)
+    dot1 = tlx.dot_operand_layout(1, mma, 8)
+
+    @triton.jit
+    def kernel(A, B, Out, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, NBLK: tl.constexpr, MMA: tl.constexpr,
+               DOT0: tl.constexpr, DOT1: tl.constexpr):
+        a = tlx.require_layout(tl.load(A + tl.arange(0, M)[:, None] * K + tl.arange(0, K)[None, :]), DOT0)
+        b = tlx.require_layout(tl.load(B + tl.arange(0, K)[:, None] * N + tl.arange(0, N)[None, :]), DOT1)
+        acc = tlx.require_layout(tlx.zeros([M, N], tl.float32, layout=MMA), MMA)
+        m_i = tl.zeros([M], tl.float32) - float("inf")
+        for _ in range(NBLK):
+            qk = tl.dot(a, b, acc=tlx.require_layout(tlx.zeros([M, N], tl.float32, layout=MMA), MMA),
+                        out_dtype=tl.float32)
+            m_new = tl.maximum(m_i, tl.max(qk, 1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            p = tl.exp2(qk - m_safe[:, None])
+            alpha = tl.exp2(m_i - m_safe)
+            acc = acc * alpha[:, None]
+            acc = tl.dot(tlx.require_layout(p.to(tl.bfloat16), DOT0), b, acc=acc, out_dtype=tl.float32)
+            m_i = m_new
+        tl.store(Out + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], acc)
+
+    M, N, K, NBLK = 256, 64, 64, 4
+    a = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(K, N, device=DEVICE, dtype=torch.bfloat16)
+    out = torch.empty(M, N, device=DEVICE, dtype=torch.float32)
+    compiled = kernel[(1, )](a, b, out, M, N, K, NBLK, mma, dot0, dot1, num_warps=8)
+    torch.cuda.synchronize()
+    # Every block is identical, so m stabilizes after iter 0 (alpha==1) and acc
+    # accumulates NBLK copies of p@b (p = exp2(qk - rowmax(qk))).
+    qk = a.float() @ b.float()
+    p = torch.exp2(qk - qk.max(1, keepdim=True).values).to(torch.bfloat16).float()
+    ref = NBLK * (p @ b.float())
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=ref.abs().max().item() * 3e-2, rtol=3e-2)
+    ttgir = compiled.asm["ttgir"]
+    assert "#ttg.amd_mfma" in ttgir
+    assert "scf.for" in ttgir
+    _assert_no_layout_residue(ttgir)
+    assert compiled.asm.get("amdgcn")
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Need gfx950 (CDNA4)")
+def test_pinned_loop_carried_dot_operand_amd():
+    """A dot operand (b) is loop-carried and re-pinned each iteration (mirrors
+    tier5's prefetched kt). The pinned dot_operand<mfma> must survive as a
+    loop-carried value across the scf.for back-edge."""
+    mma = tlx.amd_mfma_layout(4, [32, 32, 16], True, [8, 1])
+    dot0 = tlx.dot_operand_layout(0, mma, 8)
+    dot1 = tlx.dot_operand_layout(1, mma, 8)
+
+    @triton.jit
+    def kernel(A, B, Out, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, NBLK: tl.constexpr, MMA: tl.constexpr,
+               DOT0: tl.constexpr, DOT1: tl.constexpr):
+        a = tlx.require_layout(tl.load(A + tl.arange(0, M)[:, None] * K + tl.arange(0, K)[None, :]), DOT0)
+        b = tlx.require_layout(tl.load(B + tl.arange(0, K)[:, None] * N + tl.arange(0, N)[None, :]), DOT1)
+        acc = tlx.require_layout(tlx.zeros([M, N], tl.float32, layout=MMA), MMA)
+        m_i = tl.zeros([M], tl.float32) - float("inf")
+        for _ in range(NBLK):
+            qk = tl.dot(a, b, acc=tlx.require_layout(tlx.zeros([M, N], tl.float32, layout=MMA), MMA),
+                        out_dtype=tl.float32)
+            m_new = tl.maximum(m_i, tl.max(qk, 1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            p = tl.exp2(qk - m_safe[:, None])
+            alpha = tl.exp2(m_i - m_safe)
+            acc = acc * alpha[:, None]
+            acc = tl.dot(tlx.require_layout(p.to(tl.bfloat16), DOT0), b, acc=acc, out_dtype=tl.float32)
+            m_i = m_new
+            # re-pin b -> b is a loop-carried dot_operand<mfma>
+            b = tlx.require_layout(tl.load(B + tl.arange(0, K)[:, None] * N + tl.arange(0, N)[None, :]), DOT1)
+        tl.store(Out + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], acc)
+
+    M, N, K, NBLK = 256, 64, 64, 4
+    a = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(K, N, device=DEVICE, dtype=torch.bfloat16)
+    out = torch.empty(M, N, device=DEVICE, dtype=torch.float32)
+    compiled = kernel[(1, )](a, b, out, M, N, K, NBLK, mma, dot0, dot1, num_warps=8)
+    torch.cuda.synchronize()
+    qk = a.float() @ b.float()
+    p = torch.exp2(qk - qk.max(1, keepdim=True).values).to(torch.bfloat16).float()
+    ref = NBLK * (p @ b.float())
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=ref.abs().max().item() * 3e-2, rtol=3e-2)
+    ttgir = compiled.asm["ttgir"]
+    assert "#ttg.amd_mfma" in ttgir
+    _assert_no_layout_residue(ttgir)
+    assert compiled.asm.get("amdgcn")
