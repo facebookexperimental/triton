@@ -125,7 +125,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 // -----
 
 // CHECK-LABEL: @descriptor_allocs_with_different_attrs
-// CHECK-COUNT-2: ttg.local_alloc
+// CHECK-DAG: ttg.local_alloc {{.*}}alignment = 16 : i32
+// CHECK-DAG: ttg.local_alloc {{.*}}alignment = 32 : i32
+// CHECK-NOT: ttg.local_alloc
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
@@ -137,6 +139,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
     %alloc0 = ttg.local_alloc %tile {alignment = 16 : i32, async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     %alloc1 = ttg.local_alloc %tile {alignment = 32 : i32, async_task_id = array<i32: 0>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: @descriptor_allocs_merge_task_ids
+// CHECK: ttg.local_store {{.*}} {async_task_id = array<i32: 1, 3>}
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @descriptor_allocs_merge_task_ids(%desc: !tt.tensordesc<128x64xf16, #shared>) attributes {noinline = false} {
+    %c0 = arith.constant {async_task_id = array<i32: 0, 2>} 0 : i32
+    %tile = tt.descriptor_load %desc[%c0, %c0] {async_task_id = array<i32: 0, 2>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+    %alloc0 = ttg.local_alloc %tile {async_task_id = array<i32: 3>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %alloc1 = ttg.local_alloc %tile {async_task_id = array<i32: 1>} : (tensor<128x64xf16, #blocked>) -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }

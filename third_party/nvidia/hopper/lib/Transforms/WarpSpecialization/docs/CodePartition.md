@@ -46,13 +46,6 @@ Step 10: replaceBufferReuse        — rewrite non-representative allocs
 Step 11: specializeRegion          — clone ops into WarpSpecializeOp regions
 ```
 
-`doBufferAllocation` forms one TMA-loaded SMEM tile with multiple consumers in
-two places. It deduplicates compatible read-only `local_alloc(src)` ops that
-already exist. During buffer creation it also reuses a compatible read-only
-allocation initialized from the same descriptor result, adding only the
-missing consumer load. Physical `buffer.id` metadata is not used as proof that
-logical buffers are identical.
-
 ## `doBufferAllocation` — Pre-pass
 
 **Function**: `doBufferAllocation(funcOp)`
@@ -163,6 +156,12 @@ their inline completion barrier while non-gen5 consumers still get token-based
 producer acquire and consumer release operations. Synchronization insertion must
 therefore check `consumerBarriers` per consumer task ID rather than treating the
 whole channel as all-gen5 or all-token-based.
+
+Channels in a reuse group classify synchronization mode collectively by
+consumer task ID because they reuse the same physical slot. An inline barrier
+is used for a task only when every consumer in that task across the group is
+MMAv5; otherwise the whole task uses token synchronization. Multi-buffer groups
+share tokens, while single-copy groups retain separate tokens.
 
 ## Synchronization Insertion
 

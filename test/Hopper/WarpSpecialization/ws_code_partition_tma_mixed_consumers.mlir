@@ -1,4 +1,5 @@
-// RUN: triton-opt %s '--nvgpu-test-ws-code-partition=num-buffers=1' | FileCheck %s
+// RUN: triton-opt %s -split-input-file '--nvgpu-test-ws-code-partition=num-buffers=1' | FileCheck %s
+// RUN: triton-opt %s -split-input-file '--nvgpu-test-ws-code-partition=num-buffers=1' | FileCheck %s --check-prefix=GROUP
 
 // A TMA buffer shared by gen5 and scalar tasks needs both synchronization paths.
 
@@ -32,6 +33,49 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
       tt.store %ptrs, %loaded {async_task_id = array<i32: 2>} : tensor<128x64x!tt.ptr<f16>, #blocked>
       scf.yield {async_task_id = array<i32: 1>} %mma_tok : !ttg.async.token
     } {async_task_id = array<i32: 0, 1, 2>}
+    tt.return
+  }
+}
+
+// -----
+
+// Reuse-group synchronization is keyed by task ID. If any channel has a
+// scalar consumer in a task, every channel in that task must use tokens.
+
+// CHECK-LABEL: @reuse_group_same_task_mixed_consumers
+// CHECK: nvws.producer_acquire {{.*}}dstTask = 1
+// CHECK-COUNT-2: ttng.async_tma_copy_global_to_local
+// CHECK-COUNT-2: nvws.consumer_release {{.*}}async_task_id = array<i32: 1>
+
+// GROUP-LABEL: @reuse_group_same_task_mixed_consumers
+// GROUP-NOT: direction = "backward"
+// GROUP-NOT: is_async
+// GROUP: tt.return
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 128, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @reuse_group_same_task_mixed_consumers(%mma_desc: !tt.tensordesc<128x64xf16, #shared>, %scalar_desc: !tt.tensordesc<128x64xf16, #shared>, %b: !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>, %acc: !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>, %acc_tok: !ttg.async.token, %out: !tt.ptr<f16>, %lb: i32, %ub: i32, %step: i32) attributes {noinline = false} {
+    %mma_buffer = ttg.local_alloc {async_task_id = array<i32: 0, 1>, buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %scalar_buffer = ttg.local_alloc {async_task_id = array<i32: 0, 1>, buffer.copy = 1 : i32, buffer.id = 0 : i32} : () -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+    %c0 = arith.constant {async_task_id = array<i32: 0, 1>} 0 : i32
+    %false = arith.constant {async_task_id = array<i32: 1>} false
+    %true = arith.constant {async_task_id = array<i32: 1>} true
+    %ptrs = tt.splat %out {async_task_id = array<i32: 1>} : !tt.ptr<f16> -> tensor<128x64x!tt.ptr<f16>, #blocked>
+    scf.for %iv = %lb to %ub step %step iter_args(%tok = %acc_tok) -> (!ttg.async.token) : i32 {
+      %mma_tile = tt.descriptor_load %mma_desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %mma_tile, %mma_buffer {async_task_id = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %scalar_tile = tt.descriptor_load %scalar_desc[%c0, %c0] {async_task_id = array<i32: 0>} : !tt.tensordesc<128x64xf16, #shared> -> tensor<128x64xf16, #blocked>
+      ttg.local_store %scalar_tile, %scalar_buffer {async_task_id = array<i32: 0>} : tensor<128x64xf16, #blocked> -> !ttg.memdesc<128x64xf16, #shared, #smem, mutable>
+      %mma_tok = ttng.tc_gen5_mma %mma_buffer, %b, %acc[%tok], %false, %true {async_task_id = array<i32: 1>, tt.self_latency = 1 : i32} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x128xf16, #shared1, #smem, mutable>, !ttg.memdesc<128x128xf32, #tmem, #ttng.tensor_memory, mutable>
+      %loaded = ttg.local_load %scalar_buffer {async_task_id = array<i32: 1>} : !ttg.memdesc<128x64xf16, #shared, #smem, mutable> -> tensor<128x64xf16, #blocked>
+      tt.store %ptrs, %loaded {async_task_id = array<i32: 1>} : tensor<128x64x!tt.ptr<f16>, #blocked>
+      scf.yield {async_task_id = array<i32: 1>} %mma_tok : !ttg.async.token
+    } {async_task_id = array<i32: 0, 1>}
     tt.return
   }
 }
