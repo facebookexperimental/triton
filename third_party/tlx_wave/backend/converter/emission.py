@@ -129,6 +129,7 @@ class _EmissionState:
     builder: object
     target_program: target_ir.TargetProgram
     values: dict[int, object]
+    execution_item: object
     uniform_pointer_bases: dict[int, tuple[object, ...]] = field(default_factory=dict)
     shared_pointer_dword_bases: dict[int, _SharedPointerDwordBase] = field(default_factory=dict)
     shared_pointer_offset_cache: dict[tuple[object, ...], object] = field(default_factory=dict)
@@ -162,12 +163,19 @@ def emit_wave_module(
                     ),
             ) as builder:
                 builder = _PerTargetOpBuilder(ir, builder)
+                execution_item = builder.workitem_id(
+                    0,
+                    dsl.i32(),
+                    _kernel_threads_per_warp(kernel),
+                    upper_bound=_kernel_workgroup_size(kernel)[0] - 1,
+                )
                 state = _EmissionState(
                     dsl,
                     ir,
                     builder,
                     target_program,
                     {},
+                    execution_item,
                 )
                 for target_value_id, arg in zip(kernel.arg_target_ids, builder.args):
                     state.values[target_value_id] = arg
@@ -880,7 +888,7 @@ def _emit_make_range(state, op):
     target_type = state.target_program.values[result_id].type
     width = int(target_type.lane_width or 64)
     element_type = _scalar_type(state.dsl, target_type.element_type)
-    workitem = state.builder.workitem_id(0, element_type, width)
+    workitem = _bounded_workitem_id(state, 0, element_type, width)
     start = int(attrs["start"])
     components = []
     if attrs.get("coordinate_mode") == "affine_workitem":
@@ -1366,6 +1374,21 @@ def _emit_program_id(state, op):
     state.values[_single_result(op)] = state.builder.workgroup_id(int(attrs["axis"]))
 
 
+def _bounded_workitem_id(state, axis, element_type, lane_width):
+    axis = int(axis)
+    lane_width = int(lane_width)
+    if (axis == 0 and lane_width == _kernel_threads_per_warp(state.target_program.kernel)
+            and str(element_type) == str(state.dsl.i32())):
+        return state.execution_item
+    extent = _kernel_workgroup_size(state.target_program.kernel)[axis]
+    return state.builder.workitem_id(
+        axis,
+        element_type,
+        lane_width,
+        upper_bound=extent - 1,
+    )
+
+
 def _emit_warp_id(state, op):
     result_id = _single_result(op)
     target_type = state.target_program.values[result_id].type
@@ -1377,7 +1400,12 @@ def _emit_warp_id(state, op):
             f"ttg.warp_id requires a power-of-two wave width, got {lane_width}",
             target_op_id=op.target_op_id,
         )
-    workitem = state.builder.workitem_id(0, state.dsl.i32(), lane_width)
+    workitem = _bounded_workitem_id(
+        state,
+        0,
+        state.dsl.i32(),
+        lane_width,
+    )
     wave_first = state.builder.read_first(workitem)
     shift = state.builder.constant(
         state.dsl.i32(),
@@ -1409,7 +1437,8 @@ def _emit_thread_id(state, op):
     attrs = target_ir.attrs_dict(op)
     result_id = _single_result(op)
     target_type = state.target_program.values[result_id].type
-    state.values[result_id] = state.builder.workitem_id(
+    state.values[result_id] = _bounded_workitem_id(
+        state,
         int(attrs["axis"]),
         # Wave models hardware workitem IDs as i32 SIMD values.  Triton's GPU
         # dialect spells the source result as index and immediately inserts
@@ -2582,6 +2611,7 @@ def _emit_local_store(state, op):
             target_op_id=op.target_op_id,
         )
     tokens = []
+    item = state.dsl.sym("item")
     for payload, packet_base in zip(payloads, packet_bases):
         tokens.append(
             state.builder.scatter(
@@ -2592,7 +2622,9 @@ def _emit_local_store(state, op):
                     attrs,
                     packet_base,
                     op,
+                    item=item,
                 ),
+                bindings={item: state.execution_item},
                 after=dependency,
             ))
     _finish_local_access(
@@ -2700,6 +2732,7 @@ def _prepare_symbolic_indexed_gather(
     element_contiguity=1,
     element_component_indices=None,
     cache=None,
+    bindings=None,
 ):
     """Prepare stable operands and defer access-scoped facts with the gather."""
     offsets = tuple(offsets)
@@ -2722,6 +2755,7 @@ def _prepare_symbolic_indexed_gather(
             [base],
             result_type,
             bit_offset=bit_offset,
+            bindings=bindings,
             packet_bindings={offset_symbol: access_offsets},
             packet_conditions=packet_conditions,
             after=dependency,
@@ -2746,6 +2780,7 @@ def _prepare_symbolic_indexed_scatter(
     element_contiguity=1,
     element_component_indices=None,
     cache=None,
+    bindings=None,
 ):
     """Prepare stable operands and defer access-scoped facts with the scatter."""
     values = tuple(values)
@@ -2773,6 +2808,7 @@ def _prepare_symbolic_indexed_scatter(
             value_packet,
             [base],
             bit_offset=bit_offset,
+            bindings=bindings,
             packet_bindings={offset_symbol: access_offsets},
             packet_conditions=packet_conditions,
             after=dependency,
@@ -2862,6 +2898,8 @@ def _symbolic_local_destination_bit_offset(
     component_count,
     element_byte_width,
     op,
+    *,
+    item,
 ):
     """Translate the destination layout into one Wave memory relation."""
     if attrs.get("destination_offset_mode") != "layout_coordinates":
@@ -2910,7 +2948,6 @@ def _symbolic_local_destination_bit_offset(
                 target_op_id=op.target_op_id,
             )
 
-    item = state.dsl.sym("item")
     slot = state.dsl.sym("slot")
     logical_coords = []
     for dim, base in enumerate(component_bases[0]):
@@ -3099,6 +3136,21 @@ def _emit_buffer_load_to_local(state, op):
     )
     element_byte_width = int(attrs["element_byte_width"])
     cache = _direct_buffer_load_cache_attr(state, attrs, op)
+    source_offset_range = _symbolic_buffer_offset_range(attrs)
+    if mask_components is not None:
+        zero_offset = _simd_i32_constant(state, lane_width, 0)
+        offset_components = tuple(
+            _assume_value_range(
+                state,
+                state.builder.select(
+                    mask,
+                    _simd_offset_value(state, offset, lane_width),
+                    zero_offset,
+                ),
+                source_offset_range,
+                op,
+            ) for offset, mask in zip(offset_components, mask_components))
+        source_offset_range = None
     gather = _prepare_symbolic_indexed_gather(
         state,
         offset_components,
@@ -3106,11 +3158,12 @@ def _emit_buffer_load_to_local(state, op):
         element_type,
         lane_width,
         element_byte_width,
-        offset_range=_symbolic_buffer_offset_range(attrs),
+        offset_range=source_offset_range,
         op=op,
         dependency=dependency,
         element_contiguity=int(attrs.get("contiguity", 1)),
         cache=cache,
+        bindings={state.dsl.sym("item"): state.execution_item},
     )
     if mask_components is None:
         packet, load_token = gather()
@@ -3137,17 +3190,20 @@ def _emit_buffer_load_to_local(state, op):
             dependency,
             gather,
         )
+    item = state.dsl.sym("item")
     destination_bit_offset = _symbolic_local_destination_bit_offset(
         state,
         attrs,
         component_count,
         element_byte_width,
         op,
+        item=item,
     )
     token = state.builder.scatter(
         packet,
         [dest_base],
         bit_offset=destination_bit_offset,
+        bindings={item: state.execution_item},
         after=load_token,
     )
 
@@ -3319,6 +3375,7 @@ def _emit_symbolic_local_gather_packets(
                 item=item,
                 slot=slot,
             ),
+            bindings={item: state.execution_item},
             after=dependency,
         )
         payloads.append(payload)
@@ -4648,6 +4705,7 @@ def _emit_buffer_store(state, op):
         element_contiguity=int(attrs.get("contiguity", 1)),
         element_component_indices=canonical_components,
         cache=cache,
+        bindings={state.dsl.sym("item"): state.execution_item},
     )
 
     owner_condition = _buffer_store_owner_condition(
@@ -4700,7 +4758,8 @@ def _buffer_store_owner_condition(state, attrs, lane_width, op):
     wave_mask = int(attrs.get("redundant_wave_mask", 0))
     if not lane_mask and not wave_mask:
         return None
-    workitem = state.builder.workitem_id(
+    workitem = _bounded_workitem_id(
+        state,
         0,
         state.dsl.i32(),
         lane_width,
@@ -4914,6 +4973,7 @@ def _emit_buffer_load(state, op):
         dependency=dependency,
         element_contiguity=int(attrs.get("contiguity", 1)),
         cache=cache,
+        bindings={state.dsl.sym("item"): state.execution_item},
     )
 
     if mask_components is None:
