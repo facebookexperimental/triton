@@ -1,6 +1,6 @@
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "amd/lib/TritonAMDGPUToLLVM/AsyncUtility.h"
+#include "amd/lib/TritonAMDGPUToLLVM/TargetInfo.h"
 #include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -16,6 +16,7 @@
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace ttg = triton::gpu;
+using mlir::triton::amdgpu::ISAFamily;
 
 namespace mlir {
 
@@ -290,7 +291,7 @@ public:
 
     mlir::RewritePatternSet patterns(context);
 
-    if (!llvm::is_contained({AMD::ISAFamily::CDNA3, AMD::ISAFamily::CDNA4},
+    if (!llvm::is_contained({ISAFamily::CDNA3, ISAFamily::CDNA4},
                             targetInfo.getISAFamily()))
       return; // This pass is CDNA3 and CDNA4 specific.
 
