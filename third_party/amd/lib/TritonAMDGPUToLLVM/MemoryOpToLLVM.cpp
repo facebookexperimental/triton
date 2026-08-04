@@ -2,7 +2,6 @@
 #include "AtomicRMWOpsEmitter.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -12,6 +11,7 @@
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
+using mlir::triton::amdgpu::ISAFamily;
 using ::mlir::triton::gpu::MemDescType;
 
 namespace {
@@ -188,7 +188,7 @@ private:
     const unsigned missingLanes =
         targetInfo.getWarpSize() / tile.getInDimSize(kLane);
     unsigned otherLanes = 1;
-    if (isaFamily == AMD::ISAFamily::CDNA4) {
+    if (isaFamily == ISAFamily::CDNA4) {
       otherLanes = (bitWidth == 8) ? 2 : 4;
     } else if (ldsParams.tileKind ==
                AMD::TargetInfo::TileKind::DoubleContiguity) {
@@ -454,7 +454,7 @@ private:
   static Value createDsReadTr(triton::gpu::LocalLoadOp op,
                               RewriterBase &rewriter, Location loc,
                               Value vecAddr, VectorType vTy,
-                              AMD::ISAFamily isaFamily, unsigned bitWidth) {
+                              ISAFamily isaFamily, unsigned bitWidth) {
     // tr16 instructions return vectors of bf16/f16 while "tr8" instructions
     // return vectors of i32. Generate the corresponding i32 vector type.
     const auto numElemsI32 = (vTy.getNumElements() * bitWidth / 32);
@@ -469,11 +469,11 @@ private:
     };
 
     switch (isaFamily) {
-    case AMD::ISAFamily::GFX1250:
+    case ISAFamily::GFX1250:
       if (bitWidth == 16)
         return callIntrinsic("llvm.amdgcn.ds.load.tr16.b128", vTy);
       return callIntrinsic("llvm.amdgcn.ds.load.tr8.b64", vTyI32);
-    case AMD::ISAFamily::CDNA4: {
+    case ISAFamily::CDNA4: {
       Value dsReadTr;
       if (bitWidth == 16)
         dsReadTr = ROCDL::ds_read_tr16_b64::create(rewriter, loc, vTy, vecAddr);
@@ -521,7 +521,7 @@ public:
       return failure();
     }
     // FP4 packed along M/N are not supported yet on GFX1250
-    if (targetInfo.getISAFamily() == AMD::ISAFamily::GFX1250) {
+    if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
       return failure();
     }
 

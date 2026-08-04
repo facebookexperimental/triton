@@ -1,6 +1,6 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TargetInfo.h"
-#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "Utility.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -17,7 +17,7 @@
 using namespace mlir;
 
 using mlir::getElementTypeOrSelf;
-using mlir::triton::AMD::ISAFamily;
+using mlir::triton::amdgpu::ISAFamily;
 using mlir::triton::gpu::appendOrGetExternFuncOp;
 using mlir::triton::gpu::ElementwiseOpConversion;
 using mlir::triton::gpu::ElementwiseOpConversionBase;
@@ -82,7 +82,7 @@ struct FMulOpConversion
 
   explicit FMulOpConversion(LLVMTypeConverter &typeConverter,
                             ModuleAxisInfoAnalysis &axisAnalysisPass,
-                            AMD::ISAFamily isaFamily,
+                            ISAFamily isaFamily,
                             PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
         isaFamily(isaFamily) {}
@@ -117,7 +117,7 @@ struct FMulOpConversion
   }
 
 private:
-  AMD::ISAFamily isaFamily;
+  ISAFamily isaFamily;
 };
 
 struct FAddOpConversion
@@ -240,7 +240,7 @@ struct TruncFOpConversion
 
   explicit TruncFOpConversion(LLVMTypeConverter &typeConverter,
                               ModuleAxisInfoAnalysis &axisAnalysisPass,
-                              AMD::ISAFamily isaFamily,
+                              ISAFamily isaFamily,
                               PatternBenefit benefit = patternBenefitDefault)
       : ElementwiseOpConversionBase(typeConverter, axisAnalysisPass, benefit),
         isaFamily(isaFamily) {}
@@ -259,7 +259,7 @@ struct TruncFOpConversion
   }
 
 private:
-  AMD::ISAFamily isaFamily;
+  ISAFamily isaFamily;
 };
 
 struct ExpOpConversionApprox
@@ -484,7 +484,7 @@ void populateElementwiseOpToLLVMPatterns(
   patterns.add<ElementwiseOpConversion<triton::PreciseSqrtOp, LLVM::SqrtOp>>(
       typeConverter, axisInfoAnalysis, benefit);
 
-  if (targetInfo.getISAFamily() == AMD::ISAFamily::GFX1250) {
+  if (targetInfo.getISAFamily() == ISAFamily::GFX1250) {
     auto gfx1250Benefit = benefit.getBenefit() + 1;
     patterns.add<PackedArithOpConversion<arith::SubFOp, LLVM::FSubOp>>(
         typeConverter, axisInfoAnalysis, gfx1250Benefit);
