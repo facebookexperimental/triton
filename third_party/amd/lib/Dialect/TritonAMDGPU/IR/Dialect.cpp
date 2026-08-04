@@ -782,15 +782,6 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   auto paddedEnc =
       llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(smemTy.getEncoding());
   if (paddedEnc) {
-    // Check if descriptor has a compatible padded encoding
-    auto descPaddedEnc = llvm::dyn_cast_or_null<gpu::PaddedSharedEncodingAttr>(
-        tensorDescTy.getSharedLayout());
-    if (descPaddedEnc &&
-        descPaddedEnc.getIntervals() != paddedEnc.getIntervals() &&
-        descPaddedEnc.getPaddings() != paddedEnc.getPaddings()) {
-      return emitOpError(
-          "Interval/Padding mismatch between descriptor and allocation");
-    }
     // Check if we can apply the padding workaround, see the lowering to LLVM
     // for more details.
     auto intervals = paddedEnc.getIntervals();
