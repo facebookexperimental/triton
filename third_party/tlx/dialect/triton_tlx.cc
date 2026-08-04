@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
@@ -654,6 +655,14 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierArriveOp>(barrier, numThreads);
            })
+      .def("create_sched_barrier",
+           [](TritonOpBuilder &self, int mask) -> void {
+             // AMD scheduling-only fence (no memory/exec barrier). mask selects
+             // which instruction classes may cross (0 = none). Also used to
+             // carry the reserved sentinel masks that mark an LLIR-scheduler
+             // region (see tlx.sched_region_begin/end + LlirSchedule.cpp).
+             self.create<ROCDL::SchedBarrier>(mask);
+           })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,
               Value pred) -> void {
@@ -1225,15 +1234,23 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_buffer_load",
            [](TritonOpBuilder &self, Value ptr, Value offsets,
               std::optional<Value> mask, std::optional<Value> other,
-              tt::CacheModifier cache) -> Value {
+              tt::CacheModifier cache, int32_t contiguity) -> Value {
              auto offsetsType = cast<RankedTensorType>(offsets.getType());
              auto ptrType = cast<tt::PointerType>(ptr.getType());
              auto resultType = RankedTensorType::get(offsetsType.getShape(),
                                                      ptrType.getPointeeType(),
                                                      offsetsType.getEncoding());
+             // `contiguity` is the AMD BufferLoadOp vectorization hint: the
+             // lowering takes max(inferred, hint). AxisInfo can only express
+             // contiguity along a logical tensor axis, so it cannot see a load
+             // whose per-lane addresses are consecutive in (lane, register)
+             // space -- e.g. a pre-shuffled scale tile, where within a row the
+             // offsets read {0,256,512,768,1,257,513,769}. Such a load
+             // scalarizes to one instruction per element unless the caller
+             // asserts the width here.
              return self.create<ttag::BufferLoadOp>(
                  resultType, ptr, offsets, Value() /*stride*/, cache,
-                 mask.value_or(Value()), other.value_or(Value()));
+                 mask.value_or(Value()), other.value_or(Value()), contiguity);
            })
       .def("create_buffer_store",
            [](TritonOpBuilder &self, Value storedValue, Value ptr,

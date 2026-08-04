@@ -1,11 +1,23 @@
-"""TLX MXFP4 GEMM for gfx950.
+"""TLX MXFP4 GEMM for gfx950 -- 128x256 tile.
 
-Inputs use the same ABI as the Gluon a4w4 tutorial:
-  * A: packed e2m1, shape (M, K // 2), K-contiguous
-  * B: packed e2m1, shape (N, K // 2), K-contiguous; computes A @ B.T
-  * scales: e8m0 uint8, shapes (M, K // 32) and (N, K // 32),
-    contiguous along M/N so scale tiles are coalesced
-  * C: bfloat16, shape (M, N)
+Exists for 2048x4096x8192, where it is the only tile that fills the machine:
+  128x256 -> (2048/128) x (4096/256) = 16 x 16 = 256 workgroups = the CU count
+  128x128 -> 16 x 32 = 512 (two per CU, half the arithmetic intensity each)
+  256x256 ->  8 x 16 = 128 (half the machine idle)
+AITER selects its own 128x256 kernel here for the same reason.
+
+Derived from matmul_kernel.py (256x256) with BLOCK_M halved. Only the
+M-dependent pieces change -- accumulator M-repeat 8->4, store M-repeat 16->8,
+scale_a_layout M-repeat 8->4 (so 8 e8m0 per lane, not 16, hence contiguity=8
+and halved A-scale offset strides), shared_layout_a drops the [128, 0] base,
+and the host shuffle tiles by 128 rows. Everything on the B/HALF_N side is
+independent of BLOCK_M and carries over verbatim.
+
+Inherit the parent's config: LLIR sched + force-AGPR TOGETHER, i.e.
+  TRITON_ENABLE_LLIR_SCHED=1 TRITON_LLVM_OPTS=amdgpu-mfma-vgpr-form=false
+Note the flag has NO leading dash -- the dash form is silently ignored.
+Verify against plain once measured; this tile may sit below the 510/512 VGPR
+ceiling that makes the pairing mandatory on the 256x256 parent.
 """
 
 import torch
@@ -15,7 +27,7 @@ import triton.language.extra.tlx as tlx
 
 
 @triton.jit
-def _a4w4_kernel(
+def _a4w4_kernel_128x256(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -75,7 +87,6 @@ def _a4w4_kernel(
             [2, 0],
             [4, 0],
             [8, 0],
-            [128, 0],
         ],
         [BLOCK_M, BLOCK_K_PACKED],
     )
@@ -101,7 +112,7 @@ def _a4w4_kernel(
     )
     shared_scales: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
     scale_a_layout: tl.constexpr = tlx.layout(
-        shape=((16, 4, 2, 2), (2, 8)),
+        shape=((16, 4, 2, 2), (2, 4)),
         stride=((8, 1, 0, 128), (4, 256)),
     )
     scale_b_layout: tl.constexpr = tlx.layout(
@@ -109,13 +120,13 @@ def _a4w4_kernel(
         stride=((8, 1, 128, 0), (4, 256)),
     )
     store_layout_c: tl.constexpr = tlx.layout(
-        shape=((64, 4), (8, 16)),
+        shape=((64, 4), (8, 8)),
         stride=((8, 512), (1, 2048)),
     )
     # Generalized Shape:Stride form of the gfx950 16x16x128 MFMA
     # accumulator layout for one [BLOCK_M, HALF_N] result tile.
     accumulator_layout: tl.constexpr = tlx.layout(
-        shape=((16, 4, 2, 2), (4, 4, 8)),
+        shape=((16, 4, 2, 2), (4, 4, 4)),
         stride=((128, 4, 16, 2048), (1, 32, 4096)),
     )
 
@@ -149,14 +160,6 @@ def _a4w4_kernel(
     smem_a = tlx.local_alloc((BLOCK_M, BLOCK_K_PACKED), tlx.dtype_of(a_ptr), 2, layout=shared_layout_a)
     smem_b_left = tlx.local_alloc((HALF_N, BLOCK_K_PACKED), tlx.dtype_of(b_ptr), 2, layout=shared_layout_b)
     smem_b_right = tlx.local_alloc((HALF_N, BLOCK_K_PACKED), tlx.dtype_of(b_ptr), 2, layout=shared_layout_b)
-    # A scales never touch LDS: they arrive pre-shuffled (see shuffle_a_scale) so
-    # each lane's 16 e8m0 are contiguous and one buffer_load lands them straight in
-    # the MFMA operand layout. AITER does the same -- its 4 buffer_load_dword ->VGPR
-    # per iteration are exactly this, bought by the host-side shuffle_scale.
-    # B scales reach LDS by direct-to-LDS copy, so they are not a
-    # 1-deep store/load scratchpad: the copy is async, so each (left|right) x
-    # (stage) slot needs its own buffer, exactly like smem_b_left / smem_b_right.
-    # 1024 B per buffer, so this costs 3 KB more LDS than the single scratchpad.
     smem_bs_left = tlx.local_alloc((HALF_N, BLOCK_K_SCALE), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales)
     smem_bs_right = tlx.local_alloc((HALF_N, BLOCK_K_SCALE), tlx.dtype_of(b_scales_ptr), 2, layout=shared_scales)
 
@@ -190,8 +193,8 @@ def _a4w4_kernel(
     TILE_AS: tl.constexpr = BLOCK_M * BLOCK_K_SCALE
     offs_asm = tl.arange(0, BLOCK_M)
     offs_sk_a = tl.arange(0, BLOCK_K_SCALE)
-    a_scale_m_offsets = (offs_asm % 16) * 16 + ((offs_asm // 16) % 2) * 1024 + (offs_asm // 32) * 2
-    a_scale_k_offsets = (offs_sk_a % 4) * 256 + (offs_sk_a // 4)
+    a_scale_m_offsets = (offs_asm % 16) * 8 + ((offs_asm // 16) % 2) * 512 + (offs_asm // 32) * 2
+    a_scale_k_offsets = (offs_sk_a % 4) * 128 + (offs_sk_a // 4)
     a_scale_offsets = tl.add(a_scale_m_offsets[:, None], a_scale_k_offsets[None, :], sanitize_overflow=False)
     a_scale_offsets = tlx.require_layout(a_scale_offsets, scale_a_layout)
     a_scale_offsets_next = tl.add(a_scale_offsets, TILE_AS, sanitize_overflow=False)
@@ -218,7 +221,7 @@ def _a4w4_kernel(
 
     tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
     tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-    a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets, contiguity=16), scale_a_layout)
+    a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets, contiguity=8), scale_a_layout)
     tlx.buffer_load_to_local(smem_bs_left[0], b_scales_base, b_scale_left_offsets)
     tlx.async_load_commit_group()
 
@@ -228,7 +231,7 @@ def _a4w4_kernel(
 
     tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
     tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-    a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next, contiguity=16), scale_a_layout)
+    a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next, contiguity=8), scale_a_layout)
     tlx.buffer_load_to_local(smem_bs_left[1], b_scales_base, b_scale_left_offsets_next)
     tlx.async_load_commit_group()
 
@@ -247,14 +250,31 @@ def _a4w4_kernel(
     a_sc_reg_buf0 = a_sc_buf1
     b_sc_left_reg_buf0 = tlx.local_load(smem_bs_left[0], layout=scale_b_layout)
 
-    for _ in tl.range(0, iter_max - 2, 2, num_stages=1):
+    # K = 1024 per loop body, matching AITER's 128x256 kernel (256 MFMA / 8
+    # s_barrier / 48 buffer_load_dwordx4 per body, against our 128 / 4 / 24).
+    #
+    # Done by unrolling the 4-quarter block twice, NOT by doubling BLOCK_K the way
+    # the 64x128 kernel does it. BLOCK_K=512 here would want A 64 KB + B 128 KB +
+    # scales 8 KB = 205 KB against a 160 KB CU, so it does not fit. Unrolling keeps
+    # LDS byte-identical and buys loop-overhead amortisation plus a 2x bigger
+    # scheduling window -- it does NOT halve barrier density the way the 64x128
+    # change did, because the buffer count is unchanged so barriers scale with the
+    # body. AITER sits at that same 8 barriers per 1024 K.
+    #
+    # The loop covers iter_max - 4 iterations in steps of 4 (so K % 1024 == 0) and
+    # one 4-quarter block is peeled AFTER it, not before: the loop's live-in state
+    # has to come from the prologue. Peeling ahead of the loop instead makes layout
+    # inference resolve the accumulators to #blocked and the A scales to a second,
+    # narrower linear layout, and the kernel fails to compile with
+    #   size mismatch when packing elements for LLVM struct expected 4 but got 8
+    for _ in tl.range(0, iter_max - 4, 4, num_stages=1):
         acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
         tlx.async_load_wait_group(2)
         b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
         b_sc_right_reg_buf0 = tlx.local_load(smem_bs_right[0], layout=scale_b_layout)
         tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
         tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
-        a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets, contiguity=16), scale_a_layout)
+        a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets, contiguity=8), scale_a_layout)
         tlx.buffer_load_to_local(smem_bs_left[0], b_scales_base, b_scale_left_offsets)
         tlx.async_load_commit_group()
 
@@ -274,7 +294,7 @@ def _a4w4_kernel(
         b_sc_right_reg_buf2 = tlx.local_load(smem_bs_right[1], layout=scale_b_layout)
         tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
         tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
-        a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next, contiguity=16),
+        a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next, contiguity=8),
                                        scale_a_layout)
         tlx.buffer_load_to_local(smem_bs_left[1], b_scales_base, b_scale_left_offsets_next)
         tlx.async_load_commit_group()
@@ -293,6 +313,99 @@ def _a4w4_kernel(
         b_base += BLOCK_K_PACKED * stride_bk * 2
         a_scales_base += TILE_AS * 2
         b_scales_base += BLOCK_K_SCALE * stride_bsk * 2
+
+        acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
+        tlx.async_load_wait_group(2)
+        b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
+        b_sc_right_reg_buf0 = tlx.local_load(smem_bs_right[0], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
+        tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
+        a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets, contiguity=8), scale_a_layout)
+        tlx.buffer_load_to_local(smem_bs_left[0], b_scales_base, b_scale_left_offsets)
+        tlx.async_load_commit_group()
+
+        acc_right = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
+        tlx.async_load_wait_group(2)
+        a_next = tlx.local_load(smem_a[1], relaxed=True)
+        b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
+        a_sc_reg_buf2 = a_sc_buf3
+        b_sc_left_reg_buf2 = tlx.local_load(smem_bs_left[1], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
+        tlx.buffer_load_to_local(smem_bs_right[0], b_scales_base, b_scale_right_offsets)
+        tlx.async_load_commit_group()
+
+        acc_left = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
+        tlx.async_load_wait_group(2)
+        b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
+        b_sc_right_reg_buf2 = tlx.local_load(smem_bs_right[1], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
+        tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
+        a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next, contiguity=8),
+                                       scale_a_layout)
+        tlx.buffer_load_to_local(smem_bs_left[1], b_scales_base, b_scale_left_offsets_next)
+        tlx.async_load_commit_group()
+
+        acc_right = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
+        tlx.async_load_wait_group(2)
+        a = tlx.local_load(smem_a[0], relaxed=True)
+        b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+        a_sc_reg_buf0 = a_sc_buf1
+        b_sc_left_reg_buf0 = tlx.local_load(smem_bs_left[0], layout=scale_b_layout)
+        tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
+        tlx.buffer_load_to_local(smem_bs_right[1], b_scales_base, b_scale_right_offsets_next)
+        tlx.async_load_commit_group()
+
+        a_base += BLOCK_K_PACKED * stride_ak * 2
+        b_base += BLOCK_K_PACKED * stride_bk * 2
+        a_scales_base += TILE_AS * 2
+        b_scales_base += BLOCK_K_SCALE * stride_bsk * 2
+
+    # Peeled 4-quarter block: the loop leaves 2 iterations beyond the 2 the
+    # epilogue drains.
+    acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
+    tlx.async_load_wait_group(2)
+    b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
+    b_sc_right_reg_buf0 = tlx.local_load(smem_bs_right[0], layout=scale_b_layout)
+    tlx.buffer_load_to_local(smem_a[0], a_base, a_offsets)
+    tlx.buffer_load_to_local(smem_b_left[0], b_base, b_left_offsets)
+    a_sc_buf1 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets, contiguity=8), scale_a_layout)
+    tlx.buffer_load_to_local(smem_bs_left[0], b_scales_base, b_scale_left_offsets)
+    tlx.async_load_commit_group()
+
+    acc_right = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_right, b_sc_right_reg_buf0, "e2m1", acc_right)
+    tlx.async_load_wait_group(2)
+    a_next = tlx.local_load(smem_a[1], relaxed=True)
+    b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
+    a_sc_reg_buf2 = a_sc_buf3
+    b_sc_left_reg_buf2 = tlx.local_load(smem_bs_left[1], layout=scale_b_layout)
+    tlx.buffer_load_to_local(smem_b_right[0], b_base, b_right_offsets)
+    tlx.buffer_load_to_local(smem_bs_right[0], b_scales_base, b_scale_right_offsets)
+    tlx.async_load_commit_group()
+
+    acc_left = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_left, b_sc_left_reg_buf2, "e2m1", acc_left)
+    tlx.async_load_wait_group(2)
+    b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
+    b_sc_right_reg_buf2 = tlx.local_load(smem_bs_right[1], layout=scale_b_layout)
+    tlx.buffer_load_to_local(smem_a[1], a_base, a_offsets_next)
+    tlx.buffer_load_to_local(smem_b_left[1], b_base, b_left_offsets_next)
+    a_sc_buf3 = tlx.require_layout(tlx.buffer_load(a_scales_base, a_scale_offsets_next, contiguity=8), scale_a_layout)
+    tlx.buffer_load_to_local(smem_bs_left[1], b_scales_base, b_scale_left_offsets_next)
+    tlx.async_load_commit_group()
+
+    acc_right = tl.dot_scaled(a_next, a_sc_reg_buf2, "e2m1", b_right, b_sc_right_reg_buf2, "e2m1", acc_right)
+    tlx.async_load_wait_group(2)
+    a = tlx.local_load(smem_a[0], relaxed=True)
+    b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+    a_sc_reg_buf0 = a_sc_buf1
+    b_sc_left_reg_buf0 = tlx.local_load(smem_bs_left[0], layout=scale_b_layout)
+    tlx.buffer_load_to_local(smem_b_right[1], b_base, b_right_offsets_next)
+    tlx.buffer_load_to_local(smem_bs_right[1], b_scales_base, b_scale_right_offsets_next)
+    tlx.async_load_commit_group()
+
+    a_base += BLOCK_K_PACKED * stride_ak * 2
+    b_base += BLOCK_K_PACKED * stride_bk * 2
+    a_scales_base += TILE_AS * 2
+    b_scales_base += BLOCK_K_SCALE * stride_bsk * 2
 
     acc_left = tl.dot_scaled(a, a_sc_reg_buf0, "e2m1", b_left, b_sc_left_reg_buf0, "e2m1", acc_left)
     tlx.async_load_wait_group(2)
@@ -346,17 +459,22 @@ def shuffle_a_scale(a_scales):
     scattered (strides of 32 and 4*M) -- the kernel used to pay a
     ``ds_write`` + ``ds_read_b64_tr_b8`` LDS round-trip purely to transpose them.
     Reordering to (m_tile, k_tile) tiles of BLOCK_M*BLOCK_K_SCALE bytes, with
-    (m, k) at ``(m%16)*16 + (k%4)*256 + ((m//16)%2)*1024 + (k//4) + (m//32)*2``,
-    makes each lane's 16 bytes contiguous -> one buffer_load, no LDS.
+    (m, k) at ``(m%16)*8 + (k%4)*128 + ((m//16)%2)*512 + (k//4) + (m//32)*2``,
+    makes each lane's 8 bytes contiguous -> one buffer_load, no LDS. (Halved
+    from the 256x256 parent: BLOCK_M=128 gives 8 e8m0 per lane, not 16.)
 
     Shape and dtype are preserved; this is a pure permutation.
     """
-    M, nk = a_scales.shape
-    assert M % 256 == 0 and nk % 8 == 0, "A scales must tile by 256 x 8"
-    t = a_scales.contiguous().reshape(M // 256, 8, 2, 16, nk // 8, 2, 4)
-    #            (m_tile, m//32, (m//16)%2, m%16, k_tile, k//4, k%4)
-    # ->         (m_tile, k_tile, (m//16)%2, k%4, m%16, m//32, k//4)
-    return t.permute(0, 4, 2, 6, 3, 1, 5).contiguous().reshape(M, nk)
+    return _shuffle_scale_128(a_scales)
+
+
+def _shuffle_scale_128(scales):
+    rows, nk = scales.shape
+    assert rows % 128 == 0 and nk % 8 == 0, "scales must tile by 128 x 8"
+    t = scales.contiguous().reshape(rows // 128, 4, 2, 16, nk // 8, 2, 4)
+    #            (tile, r//32, (r//16)%2, r%16, k_tile, k//4, k%4)
+    # ->         (tile, k_tile, (r//16)%2, k%4, r%16, r//32, k//4)
+    return t.permute(0, 4, 2, 6, 3, 1, 5).contiguous().reshape(rows, nk)
 
 
 def matmul(a, b, a_scales, b_scales):
@@ -374,21 +492,21 @@ def matmul(a, b, a_scales, b_scales):
     assert b.shape[1] == K_packed, "B must have shape (N, K // 2)"
     assert a_scales.shape == (M, K // 32), "A scales must have shape (M, K // 32)"
     assert b_scales.shape == (N, K // 32), "B scales must have shape (N, K // 32)"
-    # A scales must be pre-shuffled by shuffle_a_scale() -- a one-off host-side
-    # permutation, the same deal AITER gets from aiter.ops.shuffle.shuffle_scale.
-    # That is what lets the kernel read them straight into MFMA operand layout
-    # instead of routing them through LDS to transpose.
+    # Both scale operands must be pre-shuffled by shuffle_a_scale() /
+    # shuffle_b_scale() -- one-off host-side permutations, the same deal AITER gets
+    # from aiter.ops.shuffle.shuffle_scale. That is what lets the kernel read them
+    # straight into MFMA operand layout instead of routing them through LDS.
     assert a_scales.is_contiguous(), "A scales must be pre-shuffled (see shuffle_a_scale)"
     assert b_scales.stride(0) == 1, "B scales must be contiguous along N"
 
-    BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 256
-    assert M % BLOCK_M == 0, "M must be a multiple of 256"
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 256, 256
+    assert M % BLOCK_M == 0, "M must be a multiple of 128"
     assert N % BLOCK_N == 0, "N must be a multiple of 256"
-    assert K >= 4 * BLOCK_K and K % (2 * BLOCK_K) == 0, "K must be at least 1024 and a multiple of 512"
+    assert K >= 4 * BLOCK_K and K % (4 * BLOCK_K) == 0, "K must be at least 1024 and a multiple of 1024"
 
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
     grid_mn = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    _a4w4_kernel[(grid_mn, )](
+    _a4w4_kernel_128x256[(grid_mn, )](
         a,
         b,
         c,

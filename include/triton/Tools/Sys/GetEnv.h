@@ -38,6 +38,39 @@ inline const std::set<std::string> CACHE_INVALIDATING_ENV_VARS = {
     "TRITON_DISABLE_POST_MISCHED",
     "TRITON_DUMP_MIR",
     "TRITON_ENABLE_LLVM_DEBUG",
+    "TRITON_ENABLE_LLIR_SCHED",
+    "TRITON_LLVM_OPTS",
+    // Tuning knobs for the LLIR scheduler (python/src/LlirSchedule.cpp). They
+    // are read there with plain std::getenv, so without listing them here they
+    // do NOT participate in the cache key: sweeping one of them against a warm
+    // cache silently re-measures the first-compiled binary. That produced a
+    // whole sweep of identical numbers that read as "this knob does nothing".
+    // LLIRSCHED_DEBUG is included for the same reason -- on a cache hit there
+    // is no compilation, so the debug log would simply not appear.
+    "LLIRSCHED_ACC_ROTATE_WIDTH",
+    "LLIRSCHED_DEBUG",
+    "LLIRSCHED_DUMP_IR",
+    "LLIRSCHED_GR_ONLY",
+    "LLIRSCHED_GR_STEAL",
+    "LLIRSCHED_LR_FAIR",
+    "LLIRSCHED_LW_BEFORE",
+    "LLIRSCHED_LW_FIRST",
+    "LLIRSCHED_LW_LAST",
+    "LLIRSCHED_LW_TAIL_STEAL",
+    "LLIRSCHED_MFMA_PER_GR",
+    "LLIRSCHED_MFMA_PER_GRV",
+    "LLIRSCHED_MFMA_PER_LDS",
+    "LLIRSCHED_MFMA_PER_LW_BARRIER",
+    "LLIRSCHED_NO_ACC_ROTATE",
+    "LLIRSCHED_NO_HEAD_PIN",
+    "LLIRSCHED_PIN_OUTSIDE",
+    "LLIRSCHED_WP_DEBUG",
+    "LLIRSCHED_WP_MEMNOP",
+    "LLIRSCHED_WP_NOMAX",
+    "LLIRSCHED_WP_NOOVERCAP",
+    "LLIRSCHED_WP_NOSGB",
+    "LLIRSCHED_WP_PIN",
+    "LLIRSCHED_WP_SGB",
     "TRITON_ENABLE_TTGIR_SCHED",
     "TRITON_TTGIR_SCHED_APPLY",
     "TRITON_TTGIR_SCHED_BARRIER_STRIDE",

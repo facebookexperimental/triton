@@ -26,7 +26,7 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
 
 
 @tl.builtin
-def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
+def buffer_load(ptr, offsets, mask=None, other=None, cache=None, contiguity=1, _semantic=None):
     """
     AMD buffer load from global memory via a scalar base pointer and a tensor
     of i32 element offsets. Loads data directly into registers.
@@ -40,6 +40,19 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         mask: Optional bool tensor for predicated loads.
         other: Optional tensor/scalar providing default values for masked elements.
         cache: Optional cache modifier string.
+        contiguity: Vectorization hint -- assert that each lane's `contiguity`
+            consecutive registers hold consecutive addresses, so the load is
+            emitted as one vector instruction of that width. The lowering takes
+            max(inferred, hint), so the default 1 changes nothing.
+
+            Needed when the addresses are contiguous per lane but NOT along any
+            logical tensor axis, which AxisInfo is the only thing able to infer.
+            A pre-shuffled scale tile is the motivating case: within a row the
+            offsets run {0,256,512,768,1,257,513,769}, so inference yields 1 and
+            the load scalarizes to one instruction per element.
+
+            UNCHECKED. If the addresses are not actually consecutive the load
+            reads the wrong memory.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
 
@@ -60,7 +73,8 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache else ir.CACHE_MODIFIER.NONE
 
     ret_ty = tl.block_type(ptr.type.scalar.element_ty, offsets.type.get_block_shapes())
-    handle = _semantic.builder.create_buffer_load(ptr.handle, offsets.handle, mask_handle, other_handle, cache_modifier)
+    handle = _semantic.builder.create_buffer_load(ptr.handle, offsets.handle, mask_handle, other_handle, cache_modifier,
+                                                  tl._unwrap_if_constexpr(contiguity))
     return tl.tensor(handle, ret_ty)
 
 
