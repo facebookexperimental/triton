@@ -86,15 +86,20 @@ ensureLayoutNotLargerThan(const LinearLayout &layout,
     // From the largest basis to the smallest.
     llvm::sort(sortedBases,
                [](auto a, auto b) { return std::get<2>(a) > std::get<2>(b); });
-    for (auto [inDimName, basisIdx, outValue] : sortedBases) {
-      if (span <= shrinkTarget) {
-        break;
-      }
-      if (!broadcastRegisters && inDimName == kRegister) {
-        broadcastedDims.insert(basisIdx);
-      } else {
-        bases[inDimName][basisIdx][outDim.index()] = 0;
-      }
+    for (size_t i = 0; i < sortedBases.size() && span > shrinkTarget;) {
+      int outValue = std::get<2>(sortedBases[i]);
+      do {
+        auto inDimName = std::get<0>(sortedBases[i]);
+        auto basisIdx = std::get<1>(sortedBases[i++]);
+        if (!broadcastRegisters && inDimName == kRegister) {
+          broadcastedDims.insert(basisIdx);
+        } else {
+          bases[inDimName][basisIdx][outDim.index()] = 0;
+        }
+      } while (i < sortedBases.size() &&
+               std::get<2>(sortedBases[i]) == outValue);
+      // Duplicate bases encode the same output bit and shrink the span only
+      // after every copy has been removed.
       span >>= 1;
     }
   }
