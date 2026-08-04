@@ -2710,7 +2710,7 @@ def _prepare_symbolic_indexed_gather(
     offset_components = tuple(_simd_offset_value(state, offset, lane_width) for offset in offsets)
     offset_symbol, bit_offset = _symbolic_buffer_mapping(state, element_byte_width)
 
-    def emit():
+    def emit(packet_conditions=()):
         access_offsets = tuple(_assume_value_range(state, offset, offset_range, op) for offset in offset_components)
         access_offsets = _assume_symbolic_element_contiguity(
             state,
@@ -2723,6 +2723,7 @@ def _prepare_symbolic_indexed_gather(
             result_type,
             bit_offset=bit_offset,
             packet_bindings={offset_symbol: access_offsets},
+            packet_conditions=packet_conditions,
             after=dependency,
             cache=cache,
         )
@@ -2760,7 +2761,7 @@ def _prepare_symbolic_indexed_scatter(
     offset_components = tuple(_simd_offset_value(state, offset, lane_width) for offset in offsets)
     offset_symbol, bit_offset = _symbolic_buffer_mapping(state, element_byte_width)
 
-    def emit():
+    def emit(packet_conditions=()):
         access_offsets = tuple(_assume_value_range(state, offset, offset_range, op) for offset in offset_components)
         access_offsets = _assume_symbolic_element_contiguity(
             state,
@@ -2773,6 +2774,7 @@ def _prepare_symbolic_indexed_scatter(
             [base],
             bit_offset=bit_offset,
             packet_bindings={offset_symbol: access_offsets},
+            packet_conditions=packet_conditions,
             after=dependency,
             cache=cache,
         )
@@ -5018,12 +5020,13 @@ def _emit_store(state, op):
     slot = state.dsl.sym("slot")
     zero = state.dsl.sym_ctx.int_(0)
 
-    def emit_store():
+    def emit_store(packet_conditions=()):
         return state.builder.scatter(
             packet,
             ptr_components,
             base=slot,
             bit_offset=zero,
+            packet_conditions=packet_conditions,
             after=dependency,
         )
 
@@ -5119,12 +5122,13 @@ def _emit_load(state, op):
     slot = state.dsl.sym("slot")
     zero = state.dsl.sym_ctx.int_(0)
 
-    def emit_active_load():
+    def emit_active_load(packet_conditions=()):
         return state.builder.gather(
             ptr_components,
             packet_type,
             base=slot,
             bit_offset=zero,
+            packet_conditions=packet_conditions,
             after=dependency,
         )
 
@@ -5182,13 +5186,20 @@ def _memory_simd_component(state, value, element_type, lane_width, op, splat_cac
     )
 
 
+def _explicit_packet_conditions(condition):
+    if isinstance(condition, (tuple, list)) and len(condition) > 1:
+        return tuple(condition)
+    return ()
+
+
 def _emit_masked_effect_region(state, condition, emit_body):
     if not isinstance(condition, (tuple, list)) and _is_scalar_i1_value(state, condition):
         with state.builder.if_(condition):
             emit_body()
         return
+    packet_conditions = _explicit_packet_conditions(condition)
     with state.builder.where(condition):
-        emit_body()
+        emit_body(packet_conditions)
 
 
 def _emit_masked_token_region(state, condition, inactive_token, emit_body):
@@ -5199,8 +5210,9 @@ def _emit_masked_token_region(state, condition, inactive_token, emit_body):
             with ifop.otherwise():
                 state.builder.yield_([inactive_token])
         return ifop.results[0]
+    packet_conditions = _explicit_packet_conditions(condition)
     with state.builder.where(condition, [result_type]) as where:
-        state.builder.yield_([emit_body()])
+        state.builder.yield_([emit_body(packet_conditions)])
     with where.otherwise():
         state.builder.yield_([inactive_token])
     return where.results[0]
@@ -5224,8 +5236,9 @@ def _emit_masked_memory_value_region(
             with ifop.otherwise():
                 state.builder.yield_([inactive_value, inactive_token])
         return tuple(ifop.results)
+    packet_conditions = _explicit_packet_conditions(condition)
     with state.builder.where(condition, result_types) as where:
-        value, token = emit_body()
+        value, token = emit_body(packet_conditions)
         state.builder.yield_([value, token])
     with where.otherwise():
         state.builder.yield_([inactive_value, inactive_token])

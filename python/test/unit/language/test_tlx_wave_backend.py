@@ -14233,6 +14233,7 @@ def test_tlx_wave_converter_scopes_masked_runtime_contiguity(tmp_path):
 
     raw_wave = output.emitted_module.text
     assert raw_wave.count("wave.where") == 2
+    assert raw_wave.count("packet_conditions(") == 2
     _assert_runtime_contiguity_scoped_by_where(raw_wave, minimum=2)
     machine = _run_waveamd_to_machine(raw_wave)
     assert "waveamdmachine.buffer_load_b16" not in machine
