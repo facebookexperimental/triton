@@ -1735,10 +1735,6 @@ def test_bwd_bm64_1cta_persistent_store_wait_drain():
                   if config.kwargs.get("BWD_DOT_ATTRS") == _BWD_DOT_ATTRS_BM64_MEMTYPE)
     config = copy.copy(config)
     config.kwargs = dict(config.kwargs)
-    # Make the legacy one-CTA default explicit: the persistent grid consumes
-    # NUM_CTAS before Triton's config defaults are applied.
-    config.kwargs["NUM_CTAS"] = 1
-
     tlx_configs = [
         config for config in tlx.configs_bwd_tlx
         if config.kwargs.get("NUM_CTAS", 1) == 1
