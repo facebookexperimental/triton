@@ -279,11 +279,25 @@ LogicalResult LayoutBackwardPropagation::visitOperation(
   // Handle TMEMCopyOp: when destination has TensorMemoryScalesEncodingAttr,
   // the source shared memory must be unswizzled. Propagate this constraint.
   if (auto tmemCopyOp = dyn_cast<ttng::TMEMCopyOp>(op)) {
+    auto srcType = cast<ttg::MemDescType>(tmemCopyOp.getSrc().getType());
+    auto dstType = cast<ttg::MemDescType>(tmemCopyOp.getDst().getType());
+    auto dstLattice = operands[1];
+    if (isa<DummyTMEMLayoutAttr>(dstType.getEncoding()) &&
+        dstType.getRank() == 2 && srcType.getElementType().isInteger(8) &&
+        dstType.getElementType().isInteger(8)) {
+      auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(op->getContext(), 2);
+      auto scalesEncoding = ttng::TensorMemoryScalesEncodingAttr::get(
+          op->getContext(), cgaLayout);
+      const auto scalesLayoutEncoding = LayoutEncoding(scalesEncoding);
+      ChangeResult changed = dstLattice->meet(scalesLayoutEncoding);
+      propagateIfChanged(dstLattice, changed);
+      visitWarpSpecRegionArgs(op, tmemCopyOp.getDst(), scalesLayoutEncoding);
+    }
+
     // Check the lattice encoding for the destination. The lattice may have
     // TensorMemoryScalesEncodingAttr propagated from downstream operations
     // (e.g., RequireLayoutOp). If the IR already has the encoding, the source
     // should already be correctly set up.
-    auto dstLattice = operands[1];
     auto dstLatticeEncoding = dstLattice->getValue();
     if (!dstLatticeEncoding.isUninitialized() &&
         isa<ttng::TensorMemoryScalesEncodingAttr>(

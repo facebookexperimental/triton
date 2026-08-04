@@ -1,4 +1,4 @@
-// RUN: triton-opt -split-input-file --tlx-propagate-layout %s| FileCheck %s
+// RUN: triton-opt -split-input-file --tlx-propagate-layout %s | FileCheck %s
 
 // -----
 
@@ -33,6 +33,37 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     // Require scales layout for use - this propagates TensorMemoryScalesEncodingAttr to the lattice
     %scale_req = tlx.require_layout %scale_tmem_indexed : !ttg.memdesc<128x8xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x8xi8, #scales_encoding, #tmem, mutable>
 
+    tt.return
+  }
+}
+
+// -----
+
+// Test that a standalone packed i8 TMEM copy resolves its dummy destination
+// to the scales layout without a downstream require_layout or MMA consumer.
+
+#shared_unswizzled = #ttg.nvmma_shared<{swizzlingByteWidth = 0, transposed = false, elementBitWidth = 8}>
+// CHECK-DAG: #[[$STANDALONE_SHARED:.*]] = #ttg.nvmma_shared<{swizzlingByteWidth = 0,
+// CHECK-DAG: #[[$STANDALONE_SCALES:.*]] = #ttng.tensor_memory_scales_encoding<>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory
+#dummy_tmem_layout = #tlx.dummy_tmem_layout<>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @standalone_tmem_copy_resolves_scales_layout
+  tt.func public @standalone_tmem_copy_resolves_scales_layout() {
+    %c0_i32 = arith.constant 0 : i32
+
+    // CHECK: %[[SMEM:.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x32x16xi8, #[[$STANDALONE_SHARED]], #smem, mutable>
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<1x32x16xi8, #shared_unswizzled, #smem, mutable>
+    // CHECK: %[[TMEM:.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x16xi8, #[[$STANDALONE_SCALES]], #ttng.tensor_memory, mutable>
+    %tmem = ttng.tmem_alloc : () -> !ttg.memdesc<1x128x16xi8, #dummy_tmem_layout, #tmem, mutable>
+    // CHECK: %[[SMEM_VIEW:.*]] = ttg.memdesc_index %[[SMEM]]{{.*}} -> !ttg.memdesc<32x16xi8, #[[$STANDALONE_SHARED]], #smem, mutable>
+    %smem_view = ttg.memdesc_index %smem[%c0_i32] : !ttg.memdesc<1x32x16xi8, #shared_unswizzled, #smem, mutable> -> !ttg.memdesc<32x16xi8, #shared_unswizzled, #smem, mutable>
+    // CHECK: %[[TMEM_VIEW:.*]] = ttg.memdesc_index %[[TMEM]]{{.*}} -> !ttg.memdesc<128x16xi8, #[[$STANDALONE_SCALES]], #ttng.tensor_memory, mutable>
+    %tmem_view = ttg.memdesc_index %tmem[%c0_i32] : !ttg.memdesc<1x128x16xi8, #dummy_tmem_layout, #tmem, mutable> -> !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable>
+    // CHECK: ttng.tmem_copy %[[SMEM_VIEW]], %[[TMEM_VIEW]]
+    ttng.tmem_copy %smem_view, %tmem_view : !ttg.memdesc<32x16xi8, #shared_unswizzled, #smem, mutable>, !ttg.memdesc<128x16xi8, #dummy_tmem_layout, #tmem, mutable>
     tt.return
   }
 }
