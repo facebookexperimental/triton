@@ -958,7 +958,7 @@ def tlx_addmm_glu_kernel_baseline(
 
     bias = tl.load(bias_ptr + offs_n).to(tl.float32)
     acc = bias[None, :] + tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in tl.range(NUM_STAGES - 1, k_iters, num_stages=0):
+    for k in tl.range(NUM_STAGES - 1, k_iters, num_stages=1):
         a_smem = tlx.local_view(buffers_a, k % (NUM_STAGES - 1))
         b_smem = tlx.local_view(buffers_b, k % (NUM_STAGES - 1))
         a_reg = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)

@@ -166,7 +166,7 @@ def matmul_kernel_pingpong(
     at_ptrs += BLOCK_K * stride_ak
 
     tlx.async_load_wait_group(3)
-    for j in tl.range(0, num_k_tiles - 2, num_stages=0):
+    for j in tl.range(0, num_k_tiles - 2, num_stages=1):
         cur = j % 2
         oth = 1 - cur
         with tlx.warp_pipeline_stage("mem", priority=1):
