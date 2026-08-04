@@ -72,6 +72,33 @@ def test_dispatcher_core_add_numerics():
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+def test_dispatcher_core_uses_default_profile_allocator(fresh_knobs):
+    from triton.runtime import _allocation
+
+    N = 256
+    x = torch.randn(N, device="cuda")
+    y = torch.randn(N, device="cuda")
+    out = torch.empty(N, device="cuda")
+    previous_profile_allocator = _allocation._profile_allocator.get()
+
+    try:
+        _allocation.set_profile_allocator(None)
+        fresh_knobs.compilation.instrumentation_mode = "consan"
+        with force_dispatcher():
+            compiled = _disp_add.warmup(x, y, out, N, BLOCK=256, grid=(1, ))
+            compiled._init_handles()
+            assert compiled.metadata.global_scratch_size == 0
+            assert compiled.metadata.profile_scratch_size > 0
+            assert compiled._dispatcher is not None
+            stream = triton.runtime.driver.active.get_current_stream(0)
+            compiled._dispatcher(1, 1, 1, stream, x, y, out, N)
+    finally:
+        _allocation.set_profile_allocator(previous_profile_allocator)
+
+    torch.testing.assert_close(out, x + y)
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
 def test_dispatcher_core_mixed_scalar_args():
     N = 2048
     x = torch.randn(N, device="cuda")
