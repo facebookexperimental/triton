@@ -7,6 +7,7 @@
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/NVPTXAddrSpace.h"
 
@@ -154,9 +155,10 @@ void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
   b.barrier(targets);
 }
 
-void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
-  triton::nvidia_gpu::ClusterArriveOp::create(rewriter, loc, /*relaxed=*/false);
-  triton::nvidia_gpu::ClusterWaitOp::create(rewriter, loc);
+void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
+                                Operation *sourceOp) const {
+  auto barrier = triton::nvidia_gpu::ClusterBarrierOp::create(rewriter, loc);
+  triton::nvidia_gpu::copyClusterBarrierMbarOffset(sourceOp, barrier);
 }
 
 void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
