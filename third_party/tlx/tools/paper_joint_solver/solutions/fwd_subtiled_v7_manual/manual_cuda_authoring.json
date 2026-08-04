@@ -1,0 +1,78 @@
+{
+  "authoring_mode": "agent-assisted-manual-cuda",
+  "clean_room": {
+    "declaration_reviewed_by": null,
+    "fa4_fa3_use": "black-box-baselines-only",
+    "prohibited_reuse": [
+      "warp_roles",
+      "mma_order",
+      "barrier_protocol"
+    ],
+    "reviewed_leaf_wrappers": []
+  },
+  "handoff": {
+    "schema_version": "twill-manual-cuda-handoff-v1",
+    "sha256": "d1bd417bb7ace6ff71e9ee75daec4555dc6a3cd184d0d5d41045bce6abe1c20c"
+  },
+  "human_reviews": [],
+  "manifests": {
+    "mapping": {
+      "path": "mapping_manifest.json",
+      "sha256": "92b9a3d07aecf9ccba9109cc8d6ef0e5762e7839206ffacc56d9b050bf852310"
+    },
+    "memory": {
+      "path": "memory_plan.json",
+      "sha256": "8713c90b623c3befd884eec54a2f45eafced1cf8a652723d10e68cb48a0d4d28"
+    },
+    "synchronization": {
+      "path": "sync_manifest.json",
+      "sha256": "a0eb2a59ac82074fec9bd2a820d0d7a58b72037a6243cb2613b4ee41a295c776"
+    }
+  },
+  "pipelined_ir": {
+    "schema_version": "twill-pipelined-warp-ir-v2",
+    "sha256": "fb2718496d24e6cb891ae0d69569750f7f50996b93a0a3c0b9a04a2c07d9fdba"
+  },
+  "schema_version": "twill-agent-assisted-manual-cuda-v1",
+  "solution_sha256": "6abd597cd8f8cc142c3ce596eba3394038796b11301bbb177207718d6fa4bf57",
+  "solver_provenance": {
+    "baseline_graph_sha256": "b556c6a72f8bae5129ad8ccc7ac1067250369789d4a9aa69afb1ebb49b7c2e1d",
+    "ddg_sha256": "4874fb0869dbb12b67dcb36a6e0b3df0c5bf06f953b460629201801c13af38b5",
+    "machine": {
+      "barrier_pair_bytes": 16,
+      "capacities": {
+        "CUDA": 1,
+        "SFU": 1,
+        "TC": 1,
+        "TMA": 1,
+        "TMEM": 1
+      },
+      "group_widths": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "num_warpgroups": 32,
+      "num_warps": 32,
+      "regs_fixed_overhead": 0,
+      "regs_per_sm": 65536,
+      "regs_per_warp": 8160,
+      "smem_bytes": 232448,
+      "smem_fixed_overhead": 0,
+      "spill_cost": 30,
+      "tmem_cols": 512,
+      "tmem_column_bytes": 512,
+      "tmem_fixed_cols": 0,
+      "warp_fixed_overhead": 4
+    },
+    "normalization_u": 300,
+    "solver_sources_sha256": "42f28efe2e94f97c13fc4c8a7e0326aaf5fe2955d21c8a0793b24b7cf93ef237"
+  },
+  "source_program_sha256": "b556c6a72f8bae5129ad8ccc7ac1067250369789d4a9aa69afb1ebb49b7c2e1d",
+  "status": "manual_completion_required",
+  "target": {
+    "cuda_arch": "sm_100a",
+    "gpu": "B200"
+  }
+}

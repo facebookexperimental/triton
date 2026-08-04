@@ -1,0 +1,15 @@
+working_directory=/data/users/haowumark14/fbsource/third-party/triton/beta/triton/third_party/tlx/tools/paper_joint_solver
+python_requested=/usr/local/fbcode/platform010-aarch64/bin/python3.12
+python_executable=/usr/local/fbcode/platform010-aarch64/bin/python3.12
+python_version=3.12.13+meta (3.12:3bb231a, Mar 03 2026, 12:38:32) [Clang 19.1.2 (ssh://git.vip.facebook.com/data/gitrepos/osmeta/external/llvm-pro
+SOLVER_LIB_PATH=/usr/local/fbcode/platform010-aarch64/lib:/home/haowumark14/fbsource/fbcode/third-party-buck/platform010-aarch64/build/gmp/lib:/home/haowumark14/fbsource/buck-out/v2/art/fbsource/8bba1f95dbfc94ea/third-party/yices2/__yices__
+effective_LD_LIBRARY_PATH=/usr/local/fbcode/platform010-aarch64/lib:/home/haowumark14/fbsource/fbcode/third-party-buck/platform010-aarch64/build/gmp/lib:/home/haowumark14/fbsource/buck-out/v2/art/fbsource/8bba1f95dbfc94ea/third-party/yices2/__yices__
+PYTHONPATH=/home/haowumark14/fbsource/third-party/pypi/yices/1.1.6/sources
+PYTHONUSERBASE=/tmp/pjs-userbase
+module_pyscipopt_file=/tmp/pjs-userbase/lib/python3.12/site-packages/pyscipopt/__init__.py
+module_pyscipopt_version=5.6.0
+module_yices_file=/home/haowumark14/fbsource/third-party/pypi/yices/1.1.6/sources/yices/__init__.py
+module_yices_version=<unset>
+module_paper_joint_solver_file=/data/users/haowumark14/fbsource/third-party/triton/beta/triton/third_party/tlx/tools/paper_joint_solver/paper_joint_solver/__init__.py
+module_paper_joint_solver_version=<unset>
+libyices_version=2.7.0

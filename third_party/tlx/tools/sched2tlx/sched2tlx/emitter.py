@@ -317,7 +317,7 @@ def _render_operand(ref: OperandRef, rctx: RenderCtx) -> str:
                 specs = _loop_iter_args(rctx.graph, target)
                 for idx, init, _yld in specs:
                     if idx == ref.result_idx:
-                        return _iter_arg_python_name(target.loop_id, idx, init)
+                        return _iter_arg_python_name(target.loop_id, idx, init, specs)
         # Already-named op → use its var. Otherwise inline-render.
         if ref.op_id in rctx.op_var:
             return rctx.op_var[ref.op_id]
@@ -964,6 +964,32 @@ def _bar_empty(buffer_var: str) -> str:
     return f"{buffer_var}_empty"
 
 
+def _buf_ring_slot(buf: "Buffer", rctx: "RenderCtx") -> str:
+    """Ring-slot expression for a data buffer accessed in a WG body.
+
+    The WG-level `buf` counter is `_it % rep_depth` (rep_depth = the WG's
+    max touched ring depth). A buffer whose own ring depth differs — solver-
+    rewritten graphs can mix depths inside one WG — must index with its own
+    modulo: using the WG counter would overrun a shallower ring and desync
+    from the buffer's SemIR barrier slots (`_it % count`)."""
+    if buf.count == 1:
+        return "0"
+    rd = getattr(rctx, "_wg_rep_depth", None)
+    if rd is not None and rd != buf.count:
+        return f"(_it % {buf.count})"
+    return "buf"
+
+
+def _buf_ring_phase(buf: "Buffer", rctx: "RenderCtx") -> str:
+    """Phase expression matching `_buf_ring_slot` (flips every `count` iters)."""
+    if buf.count == 1:
+        return "(_it & 1)"
+    rd = getattr(rctx, "_wg_rep_depth", None)
+    if rd is not None and rd != buf.count:
+        return f"((_it // {buf.count}) & 1)"
+    return "phase"
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # SemIR barrier-emission helpers (used by in-loop emitters when the flag is on)
 # ──────────────────────────────────────────────────────────────────────────
@@ -1254,8 +1280,8 @@ def _semir_mma_operand_waits_and_mbarriers(
         buf_var = rctx.buffer_var.get((loop.loop_id, buf.id))
         if buf_var is None:
             continue
-        idx = "0" if buf.count == 1 else "buf"
-        ph = "(_it & 1)" if buf.count == 1 else "phase"
+        idx = _buf_ring_slot(buf, rctx)
+        ph = _buf_ring_phase(buf, rctx)
         # Multi-consumer dedup: when several MMAs in this WG read the same
         # single-buffered operand (e.g. FA-bwd dO feeds both dpT and dV), its
         # `_full` completes ONCE per load — wait it only on the FIRST consumer
@@ -1505,7 +1531,6 @@ def _signal_only_buffer_ids(loop: Loop) -> set[int]:
     for it is pure waste — a 128x128 fp32 phantom is 64 KB. A buffer paired by any
     FORWARD barrier, or produced/consumed by a node, carries real data and is
     kept (e.g. the sa channel, whose store/load the channel path emits)."""
-    cyc = {n.id: n.schedule_cycle for n in loop.schedule.nodes}
     data_used: set[int] = set()
     for n in loop.schedule.nodes:
         if n.produces_buffer is not None:
@@ -1516,8 +1541,7 @@ def _signal_only_buffer_ids(loop: Loop) -> set[int]:
     for cb in loop.schedule.cross_wg_barriers:
         if cb.paired_buffer_id is None:
             continue
-        pc, cc = cyc.get(cb.producer_node), cyc.get(cb.consumer_node)
-        if pc is not None and cc is not None and pc > cc:
+        if _cross_barrier_is_loop_carried(cb, loop):
             bwd_paired.add(cb.paired_buffer_id)
         else:
             fwd_paired.add(cb.paired_buffer_id)
@@ -1674,7 +1698,9 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
     # TMEM interval-coloring: disjoint-lifetime accumulators share a
     # storage_alias_spec (FA-bwd: qkT and dQ → one slot), so the function-scope
     # accs fit the 512-col TMEM budget. {alloc_op_id: color} for aliased accs.
-    tmem_alias = _tmem_alias_groups(g)
+    # rctx carries the skew plan: a serially-emitted WG's accs are colored by
+    # emitted program order (see _tmem_alias_groups).
+    tmem_alias = _tmem_alias_groups(g, rctx)
     tmem_spec_var: dict[int, str] = {}  # color → emitted spec var name
 
     def _tmem_size(op):
@@ -1760,7 +1786,11 @@ def _emit_buffers(loop: Loop, g: ScheduleGraph, rctx: RenderCtx, lines: _Lines) 
                 rctx.skew_ring[name] = ring
             # If this acc is in an aliased color group, route it through a
             # shared storage_alias_spec (no set_buffer_overlap → all members
-            # overlap at offset 0, size=max; safe since lifetimes are disjoint).
+            # overlap at offset 0, size=max; safe since lifetimes are disjoint:
+            # the aliased pair lives in ONE serially-emitted warp group, where
+            # program order — last tmem_load of the dead tile completes before
+            # the aliasing MMA is even issued — is the synchronization; no new
+            # barrier is required).
             color = tmem_alias.get(op.op_id)
             if color is not None:
                 spec = tmem_spec_var.get(color)
@@ -1897,6 +1927,7 @@ class Channel:
     producer_wg: int
     consumer_wg: int
     kind: str = "smem"  # "smem" | "tmem"
+    distance: int | None = None
     # The alloc op id (TMEM channels only) — used by emitters to detect when
     # an op writes to / reads from this channel and inject the right barriers.
     alloc_op_id: str | None = None
@@ -1915,6 +1946,24 @@ class Channel:
     # barrier's arrive_count must equal this so the producer waits for ALL
     # consumers to release the slot before recycling it.
     num_consumers: int = 1
+
+
+def _cross_barrier_is_loop_carried(cb: Any, loop: Loop) -> bool:
+    if cb.distance is not None:
+        return cb.distance > 0
+    cycles = {node.id: node.schedule_cycle for node in loop.schedule.nodes}
+    producer = cycles.get(cb.producer_node)
+    consumer = cycles.get(cb.consumer_node)
+    return producer is not None and consumer is not None and producer > consumer
+
+
+def _channel_is_loop_carried(channel: Channel, loop: Loop) -> bool:
+    if channel.distance is not None:
+        return channel.distance > 0
+    cycles = {node.id: node.schedule_cycle for node in loop.schedule.nodes}
+    producer = cycles.get(channel.producer_node)
+    consumer = cycles.get(channel.consumer_node)
+    return producer is not None and consumer is not None and producer > consumer
 
 
 def _result_feeds_descriptor_store(
@@ -2072,7 +2121,7 @@ def _derive_crossloop_result_channels(
             # Resolve type / shape from the init.
             shape, dt = _parse_tensor_shape(init.type)
             dtype = _dtype_str_to_tl(dt)
-            var_name = _iter_arg_python_name(loop.loop_id, idx, init)
+            var_name = _iter_arg_python_name(loop.loop_id, idx, init, specs)
             out.append(
                 {
                     "bufname": f"epi_{var_name}_smem",
@@ -2125,14 +2174,11 @@ def _alias_predecessors(
     # Their `_empty` barrier never gets signaled (we skip the empty arrive
     # for backward channels), so any alias-predecessor wait on them would
     # deadlock.
-    cycle_of = {n.id: n.schedule_cycle for n in target_loop.schedule.nodes}
     signal_only_buf_ids: set[int] = set()
     for cb in target_loop.schedule.cross_wg_barriers:
         if cb.paired_buffer_id is None:
             continue
-        pc = cycle_of.get(cb.producer_node)
-        cc = cycle_of.get(cb.consumer_node)
-        if pc is not None and cc is not None and pc > cc:
+        if _cross_barrier_is_loop_carried(cb, target_loop):
             signal_only_buf_ids.add(cb.paired_buffer_id)
     preds: list[str] = []
     for b2 in target_loop.schedule.buffers:
@@ -2405,6 +2451,7 @@ def _derive_channels(loop: Loop, rctx: RenderCtx) -> list[Channel]:
                 depth=buf.count,
                 producer_wg=cb.producer_wg,
                 consumer_wg=cb.consumer_wg,
+                distance=cb.distance,
                 buffer_id=buf_id,
                 num_consumers=len(consumers_by_buf.get(buf_id, {cb.consumer_wg})),
             )
@@ -2631,20 +2678,30 @@ def _tmem_lifetimes_conflict(
     return any(s1 < e2 and s2 < e1 for (s1, e1) in oa for (s2, e2) in ob)
 
 
-def _tmem_alias_groups(g: ScheduleGraph) -> dict[str, int]:
+def _tmem_alias_groups(
+    g: ScheduleGraph, rctx: RenderCtx | None = None
+) -> dict[str, int]:
     """Interval-color the function-scope TMEM accumulators so disjoint-lifetime
     accs share storage (FA-bwd: qkT and dQ never overlap → one slot). Returns
     {tmem_alloc_op_id: color_id}; only colors with ≥2 members get aliased.
 
-    Lifetime of each acc, modulo the loop II:
-      - accumulator (read only in the post-loop epilogue, i.e. dV/dK) → live the
-        whole loop, conflicts with everything;
-      - per-iter (in-loop consumer) → [producer_cycle .. last_consumer_cycle],
-        which may wrap past II.
-    Two per-iter lifetimes conflict iff their cyclic projections intersect.
-    Cross-WG/iteration ordering is already enforced by the schedule's dataflow
-    barriers (same guarantee the hand-written kernel's qk_p/dp_dq reuse relies
-    on), so sharing a slot needs no new barrier."""
+    Lifetime of each acc:
+      - accumulator (read only in the post-loop epilogue, i.e. dV/dK) → live
+        the whole loop, conflicts with everything;
+      - per-iter acc whose producers AND consumers all sit in ONE warp group
+        that is emitted SERIALLY (no accepted skew plan, no TMEM ring — pass
+        `rctx` to enable this model): the real lifetime follows the emitted
+        program order, not the modulo schedule's skewed cycles —
+        [first MMA issue .. last tmem_load] under the WG's
+        (stage, cluster, id) emission sort. Two disjoint windows can share
+        columns with NO new barrier: within a serial WG the tmem_load
+        completes (tcgen05 wait::ld precedes the value's register use) before
+        any later-issued MMA starts writing, and that program order repeats
+        unchanged every iteration;
+      - otherwise → [producer_cycle .. last_consumer_cycle] modulo the loop
+        II; two lifetimes conflict iff their cyclic projections intersect
+        (skew rings preserve the schedule's cross-iteration overlap, so the
+        schedule-time model is the safe one there)."""
     loops = [L for L in g.loops if not L.is_outer] or g.loops
     if not loops:
         return {}
@@ -2684,55 +2741,97 @@ def _tmem_alias_groups(g: ScheduleGraph) -> dict[str, int]:
             if isinstance(op.operands[0], OpRef):
                 epi_read.add(op.operands[0].op_id)
 
-    # Per-alloc producer + in-loop consumer cycles.
+    # Per-alloc producer/consumer NODES, plus any reference outside the two
+    # recognized patterns (MMA accumulator operand / tmem_load source) — e.g.
+    # an acc read back as an MMA A/B operand. Those escape both lifetime
+    # models below, so such an alloc must never be aliased.
     accs: dict[str, dict] = {}
+    unsafe: set[str] = set()
     for n in loop.schedule.nodes:
         if not n.op_ref:
             continue
         op = g.ops.get(n.op_ref)
         if op is None:
             continue
-        # Absolute issue time = stage*II + within-II cycle. Using absolute time
-        # (not the raw within-II cycle) is what keeps a lifetime's hi >= lo when
-        # a consumer reads a value produced in an EARLIER iteration (multi-stage
-        # / skewed schedules) — otherwise max(cons_cycle) < min(prod_cycle)
-        # inverts the interval and the cyclic-overlap test silently misses real
-        # conflicts, mis-coloring overlapping accumulators onto one slot.
-        abs_t = n.schedule_stage * II + n.schedule_cycle
-        if _is_mma(n) and len(op.operands) >= 3 and isinstance(op.operands[2], OpRef):
-            aid = op.operands[2].op_id
-            if g.ops.get(aid) and g.ops[aid].kind == "ttng.tmem_alloc":
-                accs.setdefault(aid, {"prod": [], "cons": []})["prod"].append(abs_t)
-        if (
-            op.kind == "ttng.tmem_load"
-            and op.operands
-            and isinstance(op.operands[0], OpRef)
-        ):
-            aid = op.operands[0].op_id
-            if g.ops.get(aid) and g.ops[aid].kind == "ttng.tmem_alloc":
-                accs.setdefault(aid, {"prod": [], "cons": []})["cons"].append(abs_t)
+        for i, o in enumerate(op.operands):
+            if not isinstance(o, OpRef):
+                continue
+            tgt = g.ops.get(o.op_id)
+            if tgt is None or tgt.kind != "ttng.tmem_alloc" or tgt.scope != "function":
+                continue  # only function-scope accs go through the reuse= path
+            d = accs.setdefault(o.op_id, {"prod": [], "cons": []})
+            if _is_mma(n) and i == 2:
+                d["prod"].append(n)
+            elif op.kind == "ttng.tmem_load" and i == 0:
+                d["cons"].append(n)
+            else:
+                unsafe.add(o.op_id)
+
+    # Absolute issue time = stage*II + within-II cycle. Using absolute time
+    # (not the raw within-II cycle) is what keeps a lifetime's hi >= lo when
+    # a consumer reads a value produced in an EARLIER iteration (multi-stage
+    # / skewed schedules) — otherwise max(cons_cycle) < min(prod_cycle)
+    # inverts the interval and the cyclic-overlap test silently misses real
+    # conflicts, mis-coloring overlapping accumulators onto one slot. Graphs
+    # whose schedule_cycle is ALREADY absolute (stage folded in) only get a
+    # stretched interval out of this; stretching is conservative for the
+    # cyclic test (mod-II residues are translation-invariant), so both cycle
+    # conventions stay safe.
+    def _abs_t(n: Node) -> int:
+        return n.schedule_stage * II + n.schedule_cycle
+
+    # Emission sort key of the serial per-WG emitter (_nodes_in_warp_group).
+    def _emit_key(n: Node) -> tuple[int, int, int]:
+        return (n.schedule_stage, n.schedule_cluster, n.id)
 
     # Build lifetimes. whole=None means whole-loop (conflicts all).
     life: dict[str, tuple | None] = {}
+    prog: dict[str, tuple] = {}  # program-order window (emission sort keys)
+    prog_wg: dict[str, int] = {}  # the single WG hosting all prod+cons nodes
     for aid, d in accs.items():
         if not d["prod"]:
             continue
-        if aid in epi_read or not d["cons"]:
+        if aid in epi_read or aid in unsafe or not d["cons"]:
             life[aid] = None  # accumulator → whole loop
-        else:
-            life[aid] = (min(d["prod"]), max(d["cons"]))
+            continue
+        life[aid] = (
+            min(_abs_t(n) for n in d["prod"]),
+            max(_abs_t(n) for n in d["cons"]),
+        )
+        wgs = {n.warp_group for n in d["prod"] + d["cons"]}
+        if len(wgs) == 1:
+            prog[aid] = (
+                min(_emit_key(n) for n in d["prod"]),
+                max(_emit_key(n) for n in d["cons"]),
+            )
+            prog_wg[aid] = next(iter(wgs))
 
-    # Greedy coloring (largest-first for stable packing). Conflict = cyclic
-    # lifetime overlap; see _tmem_lifetimes_conflict / _tmem_cyclic_occupies.
+    def _serial_wg(aid: str) -> bool:
+        # Program-order lifetimes are only meaningful when the hosting WG is
+        # emitted serially: an accepted skew plan re-groups emission across
+        # iterations, and a TMEM ring re-indexes the alloc per iteration.
+        if rctx is None or aid not in prog:
+            return False
+        if aid in rctx.skew_ring_by_op:
+            return False
+        return (loop.loop_id, prog_wg[aid]) not in rctx.skew_plan
+
+    def _conflict(a: str, b: str) -> bool:
+        if _serial_wg(a) and _serial_wg(b) and prog_wg[a] == prog_wg[b]:
+            (ba, da), (bb, db) = prog[a], prog[b]
+            return ba <= db and bb <= da
+        return _tmem_lifetimes_conflict(life[a], life[b], II)
+
+    # Greedy coloring (whole-loop accs first for stable packing). Conflict =
+    # program-order overlap (serial same-WG accs) or cyclic lifetime overlap;
+    # see _conflict / _tmem_lifetimes_conflict / _tmem_cyclic_occupies.
     order = sorted(life.keys(), key=lambda a: (life[a] is not None, a))
     color: dict[str, int] = {}
     colors: list[list[str]] = []
     for aid in order:
         placed = False
         for ci, members in enumerate(colors):
-            if all(
-                not _tmem_lifetimes_conflict(life[aid], life[m], II) for m in members
-            ):
+            if all(not _conflict(aid, m) for m in members):
                 members.append(aid)
                 color[aid] = ci
                 placed = True
@@ -3310,6 +3409,10 @@ def _emit_warp_group(
         if b.id in touched_buf_ids and b.kind in ("smem", "tmem") and b.count > 1
     ]
     rep_depth = max(depths) if depths else 1
+    # The WG-level `buf`/`phase` counters are sized for rep_depth; the slot
+    # helpers (_buf_ring_slot/_buf_ring_phase) need it to detect buffers
+    # whose own ring depth differs.
+    rctx._wg_rep_depth = rep_depth
     iv = loop.schedule.induction_var_name
     # Preserve the IV's MLIR semantic value (= byte offset into K), so the
     # in-loop offsets that reference iv don't need a `* step` multiplier.
@@ -3444,7 +3547,7 @@ def _emit_warp_group(
             if isinstance(o, IterArgRef) and o.loop_id == loop.loop_id:
                 used_idxs.add(o.idx)
     kept = [
-        (idx, init, yld, _iter_arg_python_name(loop.loop_id, idx, init))
+        (idx, init, yld, _iter_arg_python_name(loop.loop_id, idx, init, iter_specs))
         for (idx, init, yld) in iter_specs
         if idx in used_idxs
     ]
@@ -3755,30 +3858,7 @@ def _emit_in_loop_node(
                 )
                 if already_tmem:
                     continue
-                # Detect backward-edge / loop-carry channels (producer_cycle >
-                # consumer_cycle within an iter): these are release SIGNALS
-                # not data transfers — emit barrier-only, no load/store.
-                prod_cyc = next(
-                    (
-                        nn.schedule_cycle
-                        for nn in loop.schedule.nodes
-                        if nn.id == c.producer_node
-                    ),
-                    None,
-                )
-                cons_cyc = next(
-                    (
-                        nn.schedule_cycle
-                        for nn in loop.schedule.nodes
-                        if nn.id == c.consumer_node
-                    ),
-                    None,
-                )
-                is_loop_carry = (
-                    prod_cyc is not None
-                    and cons_cyc is not None
-                    and prod_cyc > cons_cyc
-                )
+                is_loop_carry = _channel_is_loop_carried(c, loop)
                 if c.kind == "named" or is_loop_carry:
                     # Signal-only: just wait for producer signal. No buffer
                     # load (the synthesized buffer for loop-carry channels is
@@ -3837,15 +3917,15 @@ def _emit_in_loop_node(
             for e in _semir_producer_expect_bytes(loop.loop_id, n.id, rctx):
                 lines += e
             bar_arg = _semir_producer_barrier_for_tma(loop.loop_id, n.id, rctx)
-            data_slot = "buf" if buf is not None and buf.count > 1 else "0"
+            data_slot = _buf_ring_slot(buf, rctx) if buf is not None else "0"
             lines += f"# load → {buf_var}"
             if bar_arg is None:
                 # No cross-WG semaphore for this TMA (producer + consumer in
                 # the same WG). The intra-WG `<buf>_full` barrier was
                 # allocated in the `extra` carve-out — use it: wait empty,
                 # expect bytes, load with full as the mbarrier arg.
-                ph = "(_it & 1)" if buf.count == 1 else "phase"
-                idx = "0" if buf.count == 1 else "buf"
+                ph = _buf_ring_phase(buf, rctx)
+                idx = _buf_ring_slot(buf, rctx)
                 nbytes = (
                     (
                         buf.shape[0]
@@ -3877,12 +3957,8 @@ def _emit_in_loop_node(
         # Without this, the consumer-signaled empty barrier appears never to
         # release on subsequent iters → producer wait blocks → kernel hang
         # OR illegal barrier op if the state goes inconsistent.
-        if buf.count == 1:
-            idx = "0"
-            ph = "(_it & 1)"
-        else:
-            idx = "buf"
-            ph = "phase"
+        idx = _buf_ring_slot(buf, rctx)
+        ph = _buf_ring_phase(buf, rctx)
         nbytes = (
             (buf.shape[0] * buf.shape[1] * _bytes_per_elem_bits(buf.element_bits))
             if len(buf.shape) >= 2
@@ -3929,9 +4005,9 @@ def _emit_in_loop_node(
         def _ring_idx_phase(buf, lp):
             if lp is not loop:
                 return "0", "0"
-            if buf is not None and buf.count == 1:
-                return "0", "(_it & 1)"
-            return "buf", "phase"
+            if buf is None:
+                return "buf", "phase"
+            return _buf_ring_slot(buf, rctx), _buf_ring_phase(buf, rctx)
 
         a_idx, a_ph = _ring_idx_phase(a_buf, a_loop)
         b_idx, b_ph = _ring_idx_phase(b_buf, b_loop)
@@ -4033,6 +4109,28 @@ def _emit_in_loop_node(
                             if _seen_fw_br is not None:
                                 _seen_fw_br.add(fw)
                         tmem_chan_for_recycle.append(f"{_bar_empty(c.name)}[0]")
+                        # The bridge handshake is depth-1: the producer always
+                        # stores slot [0] and its full/empty pair has a single
+                        # slot (see the bridge store emission). Force the
+                        # operand read onto slot [0] too — the loop-wide `buf`
+                        # ring index belongs to this WG's max-depth SMEM ring
+                        # and can overrun a shallower bridge alloc (sub-tiled
+                        # FA: `L0_acc_tmem_3[buf]` with count=2 while
+                        # buf=_it%3 → OOB TMEM read of a never-written slot).
+                        if src_idx == 0:
+                            _base0 = f"{a_var}[0]"
+                            a_expr_pre = (
+                                f"tlx.local_trans({_base0})"
+                                if a_via_trans
+                                else _base0
+                            )
+                        else:
+                            _base0 = f"{b_var}[0]"
+                            b_expr_pre = (
+                                f"tlx.local_trans({_base0})"
+                                if b_via_trans
+                                else _base0
+                            )
             for w in _semir_consumer_waits(loop.loop_id, n.id, rctx):
                 if _seen_fw is not None and "_full[" in w and "barrier_wait" in w:
                     if w in _seen_fw:
@@ -4310,7 +4408,7 @@ def _emit_in_loop_node(
             buf_var = rctx.buffer_var.get(
                 (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
             )
-            slot = "buf" if buf.count > 1 else "0"
+            slot = _buf_ring_slot(buf, rctx)
         else:
             buf_var, slot = "c_smem", "0"
         if getattr(rctx, "defer_inloop_store", False):
@@ -4355,7 +4453,7 @@ def _emit_in_loop_node(
             buf_var = rctx.buffer_var.get(
                 (loop.loop_id, buf.id), f"L{loop.loop_id}_{_buffer_var_name(buf)}"
             )
-            slot = "buf" if buf.count > 1 else "0"
+            slot = _buf_ring_slot(buf, rctx)
         else:
             buf_var, slot = "dq_smem", "0"
         lines += f"tlx.local_store({buf_var}[{slot}], {value_expr})"
@@ -4435,28 +4533,7 @@ def _emit_in_loop_node(
                 )
                 if already_tmem:
                     continue
-                # Loop-carry detection: same as consumer side. Signal-only.
-                prod_cyc = next(
-                    (
-                        nn.schedule_cycle
-                        for nn in loop.schedule.nodes
-                        if nn.id == c.producer_node
-                    ),
-                    None,
-                )
-                cons_cyc = next(
-                    (
-                        nn.schedule_cycle
-                        for nn in loop.schedule.nodes
-                        if nn.id == c.consumer_node
-                    ),
-                    None,
-                )
-                is_loop_carry = (
-                    prod_cyc is not None
-                    and cons_cyc is not None
-                    and prod_cyc > cons_cyc
-                )
+                is_loop_carry = _channel_is_loop_carried(c, loop)
                 if c.kind == "named" or is_loop_carry:
                     kind_note = (
                         "named-channel" if c.kind == "named" else "loop-carry release"
@@ -5207,16 +5284,48 @@ def _iter_args_used_by_inner_uwg(
     return sorted(used)
 
 
-def _iter_arg_python_name(loop_id: int, idx: int, init: OperandRef) -> str:
-    """Stable per-loop iter_arg name. Use semantic hints from the init when
-    the pattern is unmistakable (FA softmax: -inf → m_i, 1.0 → l_i); fall
-    back to `i{loop}_{idx}` otherwise."""
+def _iter_arg_hint(loop_id: int, init: OperandRef) -> str | None:
+    """Semantic-hint base name for an iter_arg init (FA softmax: -inf → m_i,
+    1.0 → l_i); None when the pattern is not unmistakable."""
     if isinstance(init, ConstRef):
         if init.value == "-inf":
             return f"m_i_{loop_id}"
         if init.value == 1 and "tensor" in (init.type or ""):
             return f"l_i_{loop_id}"
-    return f"i{loop_id}_{idx}"
+    return None
+
+
+def _iter_arg_python_name(
+    loop_id: int,
+    idx: int,
+    init: OperandRef,
+    specs: list[tuple[int, OperandRef, OperandRef]] | None = None,
+) -> str:
+    """Stable per-loop iter_arg name. Use semantic hints from the init when
+    the pattern is unmistakable (FA softmax: -inf → m_i, 1.0 → l_i); fall
+    back to `i{loop}_{idx}` otherwise.
+
+    Sub-tiled (multi-instance) graphs carry SEVERAL iter_args with the SAME
+    hint (two duplicated m_i/l_i softmax chains). A bare hint name would be
+    shared by every instance: the Python locals shadow each other and the
+    name-keyed epilogue channels collapse onto ONE physical buffer + barrier
+    pair, which then gets one arrive per instance — over-advancing the
+    mbarrier phase past the consumer's parity-0 wait (observed deadlock on
+    case3_FA_fp16_subtiled). Pass the loop's `_loop_iter_args` specs so only
+    the FIRST occurrence of a hint keeps the bare name; later occurrences
+    append their iter_arg index to stay unique AND deterministic across all
+    call sites."""
+    hint = _iter_arg_hint(loop_id, init)
+    if hint is None:
+        return f"i{loop_id}_{idx}"
+    if specs:
+        first = next(
+            (i2 for (i2, init2, _y) in specs if _iter_arg_hint(loop_id, init2) == hint),
+            None,
+        )
+        if first is not None and first != idx:
+            return f"{hint}_{idx}"
+    return hint
 
 
 def _has_smem_ring_buffer_inner(
@@ -5345,7 +5454,7 @@ def _emit_inner_loop_in_outer(
     iter_specs = _loop_iter_args(g, inner)
     used_idxs = _iter_args_used_by_inner_uwg(g, inner, uwg)
     kept = [
-        (idx, init, yld, _iter_arg_python_name(inner.loop_id, idx, init))
+        (idx, init, yld, _iter_arg_python_name(inner.loop_id, idx, init, iter_specs))
         for (idx, init, yld) in iter_specs
         if idx in used_idxs
     ]
@@ -5358,6 +5467,8 @@ def _emit_inner_loop_in_outer(
         f"# Inner K-loop (loop {inner.loop_id}, II={inner.schedule.II}). "
         f"SMEM ring depth={depth}; smem_accum persists across outer tiles."
     )
+    # `buf`/`phase` below are sized for `depth` — see _buf_ring_slot.
+    rctx._wg_rep_depth = depth
     with lines.block(f"for {iv} in range({lo}, {hi}, {step}):"):
         if persistent:
             # accum_cnt persists across tiles
@@ -5963,9 +6074,8 @@ def _emit_uwg_body_impl(
 
     # OUTER-loop cross-WG semaphores (multi-WG outer bodies): their lowered
     # phase expressions are `_it`-based, so a task touching them needs an
-    # outer iteration counter. Inner K-loop bodies rebind `_it` inside their
-    # own loop, so a task owning BOTH an inner loop and outer channels would
-    # clobber it — refuse loudly rather than emit racy phases.
+    # outer iteration counter. Inner K-loop bodies also use `_it`; outer
+    # handshakes rebind it from `_oit` immediately before use below.
     has_outer_sems = False
     if rctx.sem_set is not None:
         for n in outer_nodes:
@@ -5976,13 +6086,6 @@ def _emit_uwg_body_impl(
             ) or rctx.sem_set.by_producer.get((outer.loop_id, n.id)):
                 has_outer_sems = True
                 break
-    if has_outer_sems and uwg.inner_wg is not None:
-        raise RuntimeError(
-            "sched2tlx: outer-loop cross-WG channel in a task that also owns "
-            f"an inner loop (task {uwg.name}) — the outer iteration counter "
-            "would collide with the inner `_it`; this partition shape is not "
-            "lowerable yet."
-        )
     if has_outer_sems:
         lines += "_oit = 0"
 
@@ -6205,6 +6308,11 @@ def _emit_uwg_body_impl(
             # the channel buffer via _store_from_channel), producer
             # wait-empty/store/arrive-full after the value is materialized.
             if has_outer_sems:
+                sem_key = (outer.loop_id, n.id)
+                if rctx.sem_set.by_consumer.get(
+                    sem_key
+                ) or rctx.sem_set.by_producer.get(sem_key):
+                    lines += "_it = _oit"
                 _semir_emit_consumer_block(n, g, outer, rctx, lines)
             _emit_outer_op(n, g, rctx, lines)
             if has_outer_sems and n.op_ref:
@@ -6558,6 +6666,7 @@ def emit(graph: ScheduleGraph) -> str:
                         producer_wg=cb.producer_wg,
                         consumer_wg=cb.consumer_wg,
                         kind="named",  # signal-only, no buffer
+                        distance=cb.distance,
                         producer_node=cb.producer_node,
                         consumer_node=cb.consumer_node,
                         buffer_id=None,
@@ -6575,6 +6684,7 @@ def emit(graph: ScheduleGraph) -> str:
                     producer_wg=cb.producer_wg,
                     consumer_wg=cb.consumer_wg,
                     kind="smem",  # all schedule-synthesized are SMEM-staged
+                    distance=cb.distance,
                     producer_node=cb.producer_node,
                     consumer_node=cb.consumer_node,
                     buffer_id=cb.paired_buffer_id,

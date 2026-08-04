@@ -1,0 +1,30 @@
+case=no_subtiling
+expected_rc=0
+command=env -u LD_LIBRARY_PATH LD_LIBRARY_PATH=/usr/local/fbcode/platform010-aarch64/lib:/home/haowumark14/fbsource/fbcode/third-party-buck/platform010-aarch64/build/gmp/lib:/home/haowumark14/fbsource/buck-out/v2/art/fbsource/8bba1f95dbfc94ea/third-party/yices2/__yices__ /usr/local/fbcode/platform010-aarch64/bin/python3.12 -m paper_joint_solver ../sched2tlx/examples/case3_FA_fp16/ddg.json --baseline-graph ../sched2tlx/examples/case3_FA_fp16/schedule_graph.json -o ablations_v7/no_subtiling.json --warp-fixed-overhead 4 --ilp-seconds 240 --smt-seconds 300 --max-wall-s 3600 
+[attempt] {'ii': 28, 'L': 63, 'stage': 'joint', 'result': 'unsat', 'seconds': 7.3}
+[attempt] {'ii': 28, 'L': 64, 'stage': 'joint', 'result': 'unsat', 'seconds': 7.0}
+[attempt] {'ii': 28, 'L': 65, 'stage': 'joint', 'result': 'unsat', 'seconds': 11.2}
+[attempt] {'ii': 28, 'L': 66, 'stage': 'joint', 'result': 'unsat', 'seconds': 14.0}
+[attempt] {'ii': 28, 'L': 67, 'stage': 'joint', 'result': 'unsat', 'seconds': 17.5}
+[attempt] {'ii': 28, 'L': 68, 'stage': 'joint', 'result': 'unsat', 'seconds': 9.2}
+[attempt] {'ii': 28, 'L': 69, 'stage': 'joint', 'result': 'unsat', 'seconds': 36.6}
+[attempt] {'ii': 28, 'L': 70, 'stage': 'joint', 'result': 'unsat', 'seconds': 13.6}
+[attempt] {'ii': 28, 'L': 71, 'stage': 'joint', 'result': 'unsat', 'seconds': 20.4}
+[attempt] {'ii': 28, 'L': 72, 'stage': 'joint', 'result': 'unsat', 'seconds': 16.9}
+[attempt] {'ii': 28, 'L': 73, 'stage': 'joint', 'result': 'unsat', 'seconds': 13.4}
+[attempt] {'ii': 28, 'L': 74, 'stage': 'joint', 'result': 'unsat', 'seconds': 27.5}
+[attempt] {'ii': 28, 'L': 75, 'stage': 'joint', 'result': 'unsat', 'seconds': 12.5}
+[attempt] {'ii': 28, 'L': 76, 'stage': 'joint', 'result': 'unsat', 'seconds': 27.0}
+[attempt] {'ii': 28, 'L': 77, 'stage': 'joint', 'result': 'unsat', 'seconds': 19.6}
+[attempt] {'ii': 28, 'L': 78, 'stage': 'joint', 'result': 'unsat', 'seconds': 13.4}
+[attempt] {'ii': 28, 'L': 79, 'stage': 'joint', 'result': 'unsat', 'seconds': 19.4}
+[attempt] {'ii': 28, 'L': 80, 'stage': 'joint', 'result': 'unsat', 'seconds': 31.1}
+[attempt] {'ii': 28, 'L': 81, 'stage': 'joint', 'result': 'unsat', 'seconds': 27.0}
+[attempt] {'ii': 28, 'L': 82, 'stage': 'joint', 'result': 'unsat', 'seconds': 32.7}
+[attempt] {'ii': 28, 'L': 83, 'stage': 'joint', 'result': 'unsat', 'seconds': 30.5}
+[attempt] {'ii': 28, 'L': 84, 'stage': 'joint', 'result': 'unsat', 'seconds': 12.3}
+[attempt] {'ii': 29, 'L': 63, 'stage': 'joint', 'result': 'unsat', 'seconds': 12.6}
+[attempt] {'ii': 29, 'L': 64, 'stage': 'joint', 'result': 'sat', 'seconds': 22.7}
+[paper_joint_solver] sat after 458.4s -> ablations_v7/no_subtiling.json
+
+actual_rc=0

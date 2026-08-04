@@ -1,0 +1,10 @@
+case=warps_minus_one
+expected_rc=0
+command=env -u LD_LIBRARY_PATH LD_LIBRARY_PATH=/usr/local/fbcode/platform010-aarch64/lib:/home/haowumark14/fbsource/fbcode/third-party-buck/platform010-aarch64/build/gmp/lib:/home/haowumark14/fbsource/buck-out/v2/art/fbsource/8bba1f95dbfc94ea/third-party/yices2/__yices__ /usr/local/fbcode/platform010-aarch64/bin/python3.12 -m paper_joint_solver ../sched2tlx/examples/case3_FA_fp16_subtiled/ddg.json --baseline-graph ../sched2tlx/examples/case3_FA_fp16_subtiled/schedule_graph.json --num-warps 31 -o ablations_v7/warps_minus_one.json --warp-fixed-overhead 4 --ilp-seconds 240 --smt-seconds 300 --max-wall-s 3600 
+[attempt] {'ii': 2, 'L': 5, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.9}
+[attempt] {'ii': 2, 'L': 6, 'stage': 'joint', 'result': 'unsat', 'seconds': 2.3}
+[attempt] {'ii': 3, 'L': 5, 'stage': 'joint', 'result': 'unsat', 'seconds': 3.7}
+[attempt] {'ii': 3, 'L': 6, 'stage': 'joint', 'result': 'sat', 'seconds': 7.3}
+[paper_joint_solver] sat after 16.2s -> ablations_v7/warps_minus_one.json
+
+actual_rc=0
