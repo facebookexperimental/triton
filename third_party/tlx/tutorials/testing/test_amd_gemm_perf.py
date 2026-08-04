@@ -1,4 +1,6 @@
 import argparse
+import statistics
+import time
 
 import torch
 
@@ -8,6 +10,10 @@ from triton.language.extra.tlx.tutorials.amd_gemm_warp_pipeline import (
     matmul as _amd_gemm_warp_pipeline, )
 from triton.language.extra.tlx.tutorials.amd_gemm_pipelined import (
     matmul as _amd_gemm_pipelined, )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel import (
+    matmul as _amd_gemm_interwave, )
+from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a16w16.matmul_kernel_split_m import (
+    matmul as _amd_gemm_pingpong, )
 
 from triton._internal_testing import is_hip
 
@@ -28,6 +34,8 @@ _WARP_PIPELINE_CONFIG = {
 MATMUL_METHODS = {
     "warp_pipeline": lambda a, b: _amd_gemm_warp_pipeline(a, b, config=_WARP_PIPELINE_CONFIG),
     "pipelined": lambda a, b: _amd_gemm_pipelined(a, b),
+    "interwave": lambda a, b: _amd_gemm_interwave(a, b),
+    "pingpong": lambda a, b: _amd_gemm_pingpong(a, b),
 }
 
 ref_lib = "rocBLAS"
@@ -39,7 +47,17 @@ Facebook: If you are developing in fbsource, use tritonbench instead to collect 
 """
 
 
-def create_benchmark(versions, dtype=torch.float16):
+def measure(fn):
+    """Measure in bursts to avoid throttling."""
+    _ = triton.testing.do_bench(fn, warmup=0, rep=10)
+    times = []
+    for _ in range(10):
+        time.sleep(1)
+        times.append(triton.testing.do_bench(fn, rep=10))
+    return statistics.median(times)
+
+
+def create_benchmark(versions, col_major_b: bool, dtype=torch.float16):
     line_vals = [ref_lib.lower()] + versions
     line_names = [ref_lib] + versions
     dtype_name = {torch.float16: "fp16", torch.bfloat16: "bf16"}[dtype]
@@ -58,18 +76,18 @@ def create_benchmark(versions, dtype=torch.float16):
     def benchmark(M, N, K, provider):
         a = torch.randn((M, K), device=DEVICE, dtype=dtype)
         b = torch.randn((K, N), device=DEVICE, dtype=dtype)
-        quantiles = [0.5, 0.2, 0.8]
+        if col_major_b:
+            b = b.T.contiguous().T
         if provider == ref_lib.lower():
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles, warmup=500,
-                                                         rep=500)
+            ms = measure(lambda: torch.matmul(a, b))
         elif provider in MATMUL_METHODS:
             matmul = MATMUL_METHODS[provider]
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles, warmup=500, rep=500)
+            ms = measure(lambda: matmul(a, b))
 
         def tflops(ms):
             return 2 * M * N * K * 1e-12 / (ms * 1e-3)
 
-        return tflops(ms), tflops(max_ms), tflops(min_ms)
+        return tflops(ms)
 
     return benchmark
 
@@ -90,6 +108,10 @@ if __name__ == "__main__":
         choices=["fp16", "bf16"],
         help="Data type for the benchmark (default: fp16)",
     )
+    parser.add_argument(
+        "--col-major-b",
+        action="store_true",
+    )
     args = parser.parse_args()
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
@@ -97,7 +119,7 @@ if __name__ == "__main__":
     if is_hip():
         versions = args.version if args.version else list(MATMUL_METHODS.keys())
         print(f"Running benchmarks for: {versions} (dtype={args.dtype})")
-        benchmark = create_benchmark(versions, dtype=dtype)
+        benchmark = create_benchmark(versions, args.col_major_b, dtype=dtype)
         benchmark.run(print_data=True)
     else:
         print("Skipping benchmarks, no AMD GPU found.")
