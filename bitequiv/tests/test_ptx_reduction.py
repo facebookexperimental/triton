@@ -117,7 +117,8 @@ _GOLDEN = {
     "sum_nw4": "c6fda1d478b8",
     "sum_nw8": "dca122a2b82e",
     "dot_fuse_on": "80acbd23018a",
-    "dot_fuse_off": "1cae08676ab8",  # butterfly add.rn.f32 -> add.f32 (ShflCombine .rn normalized; still != fuse_on)
+    "dot_fuse_off": "a06e27500cde",  # multi-element leaf mul(a_i,b_i) now collapses its balanced bottom
+    #                                  region (dot num_warps recovery; pairing is config-invariant); still != fuse_on
 }
 
 

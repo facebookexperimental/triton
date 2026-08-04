@@ -32,6 +32,35 @@ _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
 # reductions are rare + carry an fma-contraction ambiguity).
 _REDUCE_FP = frozenset({"add", "min", "max"})
 
+# Reduce ops whose result is bit-identical for ANY tree shape / association order — they select an
+# input verbatim and NEVER round (unlike add/mul). So a min/max reduction over one element SET is
+# bit-identical regardless of layout (num_warps) or a balanced-vs-left-fold shape. This is what lets
+# the EXTENT-FREE collapse merge a min/max LEFT-FOLD across num_warps (col_max), keyed on the reduced
+# column SET alone. (NaN rides as "missing" in PTX min/max -> the reduction is the min/max of the
+# non-NaN inputs, still order-invariant; the empirical fuzzer is the backstop.)
+_ORDER_INVARIANT_OPS = frozenset({"min", "max"})
+
+# Canonical, num_warps-INVARIANT extent key for a COMPLETE cross-thread min/max reduction (see the
+# min/max branch of `collapse_balanced`). A cross-warp min/max read resolves to one representative
+# partial, so the reconstructed column SET covers only one warp's slice -> num_warps-VARYING even
+# though the TRUE reduced multiset is config-invariant. min/max is order- AND shape-invariant, so its
+# result is fixed by that multiset alone, and every autotuner knob preserves it -> a complete
+# cross-thread min/max reduction is bit-identical across all of a kernel's configs. Keying such a
+# region on this constant (dropping the varying residual) recovers the num_warps freedom soundly.
+_ORDER_INVARIANT_COLS = "oi"
+
+
+def _reduce_op(node):
+    """Reduce-op token (kind + modifiers) of a reduce node — an ``FpOp`` or a ``ShflCombine`` — or
+    ``None`` for a ``SmemExchange`` (a phase marker with no op of its own; its op comes from its
+    child). Unlike the old FpOp-only detection this also reads a ``ShflCombine``'s op, so a PURE
+    cross-thread butterfly (1 element/thread, no within-thread fold) has a recoverable reduce op."""
+    if isinstance(node, FpOp):
+        return node.kind + "".join(node.mods)
+    if isinstance(node, ShflCombine):
+        return node.kind + "".join(node.mods)
+    return None
+
 
 def _is_fp(inst):
     return bool(inst.modifiers) and inst.modifiers[-1] in _FP_WIDTHS
@@ -278,13 +307,16 @@ def _balance_pass(root):
         if _is_reduce_node(n):
             kids = list(n.children)
             ops = {optok[id(c)] for c in kids if optok[id(c)] is not None}
-            if isinstance(n, FpOp):
-                ops.add(n.kind + "".join(n.mods))
+            self_op = _reduce_op(n)  # FpOp OR ShflCombine op (None for SmemExchange)
+            if self_op is not None:
+                ops.add(self_op)
             op = next(iter(ops)) if len(ops) == 1 else None  # single consistent op, else None (never empty-iter)
             kids_bal = all(bal[id(c)] for c in kids)
-            if isinstance(n, FpOp):
+            if isinstance(n, FpOp) and n.kind not in _ORDER_INVARIANT_OPS:
+                # add (etc): the SHAPE matters (rounding) -> require the AVL balance property, so an
+                # unordered left-fold stays uncollapsed (num_warps-bearing).
                 bal[id(n)] = kids_bal and op is not None and abs(ht[id(kids[0])] - ht[id(kids[1])]) <= 1
-            else:  # shfl / smem: 1-ary cross-thread step; balance carried from its child
+            else:  # min/max FpOp (shape-invariant), or a 1-ary shfl/smem step: no AVL check needed
                 bal[id(n)] = kids_bal and op is not None
             ht[id(n)] = max((ht[id(c)] for c in kids), default=0) + 1
             optok[id(n)] = op
@@ -348,32 +380,32 @@ def _shfl_dir(node, ht):
     return tuple(sorted({off for h, off in shfls if h == lo}))
 
 
-def _single_element(node):
-    """True iff every ``Leaf`` under a boundary subtree reads the SAME element (identical coord) —
-    i.e. the boundary is a per-element function ``f(x_i)`` (``exp(L)``, ``mul(L,L)`` of one element,
-    a bare ``L``). Then the multiset ``{f(x_i)}`` is layout-invariant, so a balanced reduction over
-    it is bit-identical at any layout and MAY collapse. A boundary combining DISTINCT elements
-    (``mul(L_i, L_j)``, i != j) is layout-invariant only if the PAIRING is data-fixed, which the
-    coord-blanking ``_coordfree_sig`` cannot prove — so refuse it (sound; stays over-split)."""
-    coords = {n.coord for n in _postorder(node) if isinstance(n, Leaf)}
-    return len(coords) == 1
-
-
 def _collapse_info(node):
-    """(reduce_op_token, uniform_coord_free_leaf_sig) for a balanced reduction, or None if it
-    cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of reduce nodes
-    (NOT every non-reduce postorder node — collecting the latter double-counts a boundary's own
-    internal nodes, e.g. it sees both ``cvt(L)`` and its child ``L`` -> two coord-free sigs -> a
-    spurious bail; that is why the baseline never collapsed cvt/exp/mul-fed reductions). Guards: a
-    single consistent reduce op; >= 2 boundary leaves; every boundary is layout-invariant
-    (pure-elt) AND single-element AND has the SAME coord-free computation (dropping coords is then
-    safe); and the column image is recoverable for every leaf (addressing understood)."""
+    """(reduce_op_token, uniform_coord_free_leaf_sig, reduced_column_SET) for a collapsible reduction,
+    or None if it cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of
+    reduce nodes (NOT every non-reduce postorder node — collecting the latter double-counts a
+    boundary's own internal nodes, e.g. it sees both ``cvt(L)`` and its child ``L`` -> two coord-free
+    sigs -> a spurious bail; that is why the baseline never collapsed cvt/exp/mul-fed reductions).
+
+    Guards: a single consistent reduce op (read from FpOp AND ShflCombine, so a pure cross-thread
+    butterfly counts); >= 1 boundary leaf; every boundary is layout-invariant (pure-elt); the SAME
+    coord-free computation across boundaries (dropping coords is then safe); the column image is
+    recoverable for every leaf (addressing understood, so the config-invariant reduced element SET is
+    known — the extent key for the order-invariant collapse).
+
+    A MULTI-element boundary (``mul(a_i, b_i)``, a dot's product of two distinct arrays) is now
+    admitted: within one kernel the PAIRING (which A element multiplies which B element) is fixed by
+    the source and never changes with num_warps / num_stages / ordering / fp_fusion, so the multiset
+    of leaf values — hence a balanced reduction over it — is config-invariant. Every leaf's column
+    image being recoverable is the config-invariance proof. (The old ``_single_element`` guard refused
+    this because coord-blanking cannot prove the pairing; but the pairing is a source fact, not a
+    layout fact, so it is invariant across the configs actually compared.)"""
     op, leaves = None, []
     for n in _postorder(node):
         if not _is_reduce_node(n):
             continue
-        if isinstance(n, FpOp) and not n.fused and len(n.children) == 2:
-            tok = n.kind + "".join(n.mods)
+        tok = _reduce_op(n)  # FpOp OR ShflCombine (a pure cross-thread butterfly carries its op here)
+        if tok is not None:
             if op is None:
                 op = tok
             elif op != tok:
@@ -381,18 +413,25 @@ def _collapse_info(node):
         for c in n.children:  # a boundary leaf is a non-reduce child of a reduce node
             if not _is_reduce_node(c):
                 leaves.append(c)
-    if op is None or len(leaves) < 2:
+    if op is None or not leaves:
+        return None
+    # Leaf-count guard depends on the op's shape-sensitivity. A SHAPE-INVARIANT op (min/max) keys on
+    # the reduced element SET (cols) below, so a lone coord-blanked leaf is fine — a pure cross-thread
+    # min/max butterfly (1 leaf/thread) is a real reduction and MAY collapse. A SHAPE-DEPENDENT op
+    # (add) keys on height + shfl_dir, NOT the element set, so a lone coord-blanked leaf would merge
+    # reductions over DIFFERENT element sets that share the height/direction (they differ in bits) ->
+    # keep the >= 2 guard for add (a within-thread fold pins the layout enough for the eval's
+    # same-element-set configs; a 1-leaf pure cross-thread add stays over-split, sound).
+    if op.split(".")[0] not in _ORDER_INVARIANT_OPS and len(leaves) < 2:
         return None
     if not all(_leaf_layout_invariant(l) for l in leaves):
         return None  # a layout-dependent / lost-provenance leaf -> do not collapse
-    if not all(_single_element(l) for l in leaves):
-        return None  # a boundary over DISTINCT elements: pairing may be layout-dependent
     if len({_coordfree_sig(l) for l in leaves}) != 1:
         return None  # non-uniform leaf computations -> conservative
-    for l in leaves:  # require addressing understood for every leaf (column image recoverable)
-        if _leaf_cols_union(l) is None:
-            return None
-    return (op, _coordfree_sig(leaves[0]))
+    unions = [_leaf_cols_union(l) for l in leaves]  # config-invariant column image of every leaf
+    if any(u is None for u in unions):
+        return None  # addressing not understood for some leaf -> cannot prove the extent -> conservative
+    return (op, _coordfree_sig(leaves[0]), frozenset().union(*unions))
 
 
 def output_coordfree_key(node):
@@ -448,12 +487,20 @@ def _rebuild(n, kids):
 
 
 def collapse_balanced(root):
-    """Replace each MAXIMAL balanced reduction with a layout-invariant ITreeReduce node.
+    """Replace each MAXIMAL collapsible reduction with a layout-invariant ITreeReduce node.
 
-    Sound: only balanced reductions collapse (inner_tree; unordered's left-fold stays intact),
-    and only when the column image + a uniform leaf computation are fully recovered. Different
-    chunk sizes (BLOCK_N) -> different column image -> distinct; fp_fusion -> different leaf/fold
-    structure -> distinct. Iterative (no recursion on deep folds)."""
+    Two collapse modes, by op shape-sensitivity:
+    * SHAPE-DEPENDENT (add): only a BALANCED tree collapses (inner_tree; unordered's left-fold stays
+      intact), keyed on height (= log2 total elems, num_warps-invariant) + butterfly direction. A
+      different chunk size (BLOCK_N) -> different height -> distinct; fp_fusion -> different leaf/fold
+      structure -> distinct.
+    * SHAPE-INVARIANT (min/max, which never round): ANY shape collapses (a left-fold too), keyed on the
+      reduced column SET (extent-safe) with height/direction dropped. Recovers a min/max left-fold
+      across num_warps WHEN the reconstructed column set is num_warps-invariant; when it is not (a
+      cross-warp reduction resolved to a representative), the set varies -> distinct -> stays
+      over-split (sound, no recovery).
+
+    Iterative (no recursion on deep folds)."""
     bal, ht, optok = _balance_pass(root)
     # Collapse every MAXIMAL balanced reduction region, including per-chunk reductions nested
     # under a persistent kernel's cross-chunk loop. The ITreeReduce token keeps the reduction
@@ -470,11 +517,39 @@ def collapse_balanced(root):
         region_root = collapsible[id(n)] and not has_coll_parent.get(id(n), False)
         info = _collapse_info(n) if region_root else None
         if info is not None:
-            op, leaf_sig = info
-            new[id(n)] = ITreeReduce(op, leaf_sig, ht[id(n)], _shfl_dir(n, ht))
+            op, leaf_sig, cols = info
+            if op.split(".")[0] in _ORDER_INVARIANT_OPS:
+                # min/max: SHAPE-invariant (never rounds). The physical height + butterfly direction
+                # are bit-irrelevant, so DROP them and key on the reduced element SET — this collapses
+                # even a LEFT-FOLD / cross-warp min/max across num_warps, while a different reduced set
+                # (different extent) still yields a distinct key. BUT for a genuine CROSS-THREAD
+                # reduction (a butterfly / cross-warp exchange present) the reconstructed column set is
+                # itself num_warps-VARYING: a cross-warp read resolves to one representative partial, so
+                # the union covers only one warp's slice (col_max: nw1=62, nw2=30, nw4=14 cols) even
+                # though the TRUE reduced multiset is config-invariant. Since min/max is order- AND
+                # shape-invariant its result is fixed by that multiset alone, and every autotuner knob
+                # preserves the multiset (layout/order/tiling only), so drop the varying residual too
+                # and key on (op, leaf_sig) via `_ORDER_INVARIANT_COLS` — recovering col_max soundly. A
+                # pure within-thread min/max (no cross-thread op — a partial / elementwise max) keeps
+                # its column key (conservative: it is not a complete reduction over the tile).
+                cross_thread = any(isinstance(x, (ShflCombine, SmemExchange)) for x in _postorder(n))
+                key = _ORDER_INVARIANT_COLS if cross_thread else _cols_key(cols)
+                new[id(n)] = ITreeReduce(op, leaf_sig, 0, (), cols=key)
+            else:
+                # add (etc): the SHAPE matters. Keep height (= log2 of the total fan-in, which is
+                # num_warps-invariant for a balanced tree — a 1-leaf pure cross-thread butterfly
+                # included) + the butterfly direction, so unordered stays split and inner_tree merges.
+                new[id(n)] = ITreeReduce(op, leaf_sig, ht[id(n)], _shfl_dir(n, ht))
         else:
             new[id(n)] = _rebuild(n, [new[id(c)] for c in n.children])
     return new[id(root)]
+
+
+def _cols_key(cols):
+    """Compact canonical key for a reduced column-image SET — the extent key of the order-invariant
+    (min/max) collapse. Same reduced set across configs -> same key (merge); a different set (a
+    different reduce extent) -> a different key (split)."""
+    return hashlib.sha1(repr(tuple(sorted(cols))).encode()).hexdigest()[:16]
 
 
 def entry_signatures(func):
