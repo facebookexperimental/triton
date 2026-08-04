@@ -15909,6 +15909,72 @@ def test_tlx_wave_converter_pipeline_preserves_mma_packet_vectors_across_for(tmp
     del ctx
 
 
+def test_tlx_wave_converter_pipeline_packs_four_f32_components_across_for(tmp_path):
+    preamble = """
+#linear = #ttg.linear<{
+  register = [[0, 1], [0, 2]],
+  lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+  warp = [[64, 0], [128, 0], [256, 0]],
+  block = []
+}>
+"""
+    local_func = """
+  tt.func public @converter_four_f32_loop_packet() attributes {noinline = false} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %init = arith.constant dense<4.000000e+00> : tensor<512x4xf32, #linear>
+    %rhs = arith.constant dense<1.000000e+00> : tensor<512x4xf32, #linear>
+    %carried = scf.for %i = %c0 to %c2 step %c1 iter_args(%iter = %init) -> (tensor<512x4xf32, #linear>) {
+      %difference = arith.subf %iter, %rhs : tensor<512x4xf32, #linear>
+      %narrow = arith.truncf %difference : tensor<512x4xf32, #linear> to tensor<512x4xbf16, #linear>
+      %wide = arith.extf %narrow : tensor<512x4xbf16, #linear> to tensor<512x4xf32, #linear>
+      scf.yield %wide : tensor<512x4xf32, #linear>
+    }
+    tt.return
+  }
+"""
+    mod, ctx = _parse_ttgir(tmp_path, local_func, num_warps=8, preamble=preamble)
+
+    output = converter_pipeline.convert_ttgir_to_wave(mod)
+
+    wave = output.emitted_module.text
+    (loop_line, ) = [line for line in wave.splitlines() if "scf.for" in line and "iter_args" in line]
+    assert loop_line.count("!wave.simd<vector<4xf32>, 64>") == 1
+    assert "!wave.simd<f32, 64>" not in loop_line
+    packet_lines = [line for line in wave.splitlines() if "wave.pack" in line]
+    assert len(packet_lines) == 2
+    assert all("!wave.simd<vector<4xf32>, 64>" in line for line in packet_lines)
+    loop_body = wave.split(loop_line, maxsplit=1)[1].split("scf.yield", maxsplit=1)[0]
+    assert loop_body.count("wave.extract") == 4
+    assert "wave.fsub" in loop_body
+    assert loop_body.count("wave.cast fpconvert") == 8
+    yield_line = next(line for line in wave.splitlines() if "scf.yield" in line)
+    assert "!wave.simd<vector<4xf32>, 64>" in yield_line
+    _run_wave_verify(wave)
+    packed_wave = _run_wave_form_packed_math(wave)
+    packed_fsubs = [line for line in packed_wave.splitlines() if "wave.fsub" in line]
+    assert len(packed_fsubs) == 2
+    assert all("!wave.simd<vector<2xf32>, 64>" in line for line in packed_fsubs)
+    packed_narrow_casts = [
+        line for line in packed_wave.splitlines()
+        if ("wave.cast fpconvert" in line and "!wave.simd<vector<2xf32>, 64>" in line
+            and "!wave.simd<vector<2xbf16>, 64>" in line)
+    ]
+    assert len(packed_narrow_casts) == 2
+    machine = _run_waveamd_to_machine(packed_wave)
+    assert machine.count("waveamdmachine.v_pk_add_f32") == 2
+    assert machine.count("waveamdmachine.v_cvt_pk_bf16_f32") == 2
+    assert "waveamdmachine.v_sub_f32" not in machine
+    machine_loop_header = next(line for line in machine.splitlines() if "waveamdmachine.uniform_loop carries" in line)
+    machine_loop_continue = next(line for line in machine.splitlines()
+                                 if "waveamdmachine.continue_if" in line and "carries" in line)
+    for boundary in (machine_loop_header, machine_loop_continue):
+        assert boundary.count("!waveamdmachine.reg<vgpr, 4>") == 1
+        assert "!waveamdmachine.reg<vgpr, 2>" not in boundary
+    del ctx
+
+
 def test_tlx_wave_converter_pipeline_lowers_scaled_mfma_i8_local_loads(tmp_path):
     preamble = """
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [2, 2], instrShape = [16, 16, 128], isTransposed = true}>
@@ -16953,6 +17019,19 @@ def _run_waveamd_to_machine(wave_artifact):
             "--waveamd-dma-zero-fill",
             "--waveamd-to-machine",
         ],
+        input=wave_artifact,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return result.stdout
+
+
+def _run_wave_form_packed_math(wave_artifact):
+    result = subprocess.run(
+        [wave_bridge_tools._wave_opt(), "-", "--wave-form-packed-math"],
         input=wave_artifact,
         text=True,
         stdout=subprocess.PIPE,
