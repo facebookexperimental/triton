@@ -789,24 +789,30 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<ttg::AsyncWaitOp>(asyncTokens, pendings);
            })
       .def("create_async_tdm_copy_global_to_local",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
-              Value result, Value pred,
+           [](TritonOpBuilder &self, Value desc, Value result,
               std::optional<Value> barrier) -> mlir::Value {
-             Value pred32 = pred;
-             if (auto intTy = dyn_cast<IntegerType>(pred.getType())) {
-               if (intTy.getWidth() == 1) {
-                 pred32 = self.create<arith::ExtUIOp>(
-                     self.getBuilder().getI32Type(), pred);
-               }
-             }
+             // The op is now pure: tile offsets and predicate are applied to
+             // the descriptor beforehand via create_update_tensor_descriptor.
              return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
-                 desc, indices, result, pred32, barrier.value_or(Value()));
+                 desc, result, barrier.value_or(Value()));
            })
       .def("create_async_tdm_copy_local_to_global",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
-              Value src, std::optional<Value> barrier) {
+           [](TritonOpBuilder &self, Value desc, Value src,
+              std::optional<Value> barrier) {
              self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
-                 desc, indices, src, barrier.value_or(Value()));
+                 desc, src, barrier.value_or(Value()));
+           })
+      .def("create_update_tensor_descriptor",
+           [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
+              std::vector<Value> setBounds, std::optional<Value> pred,
+              bool clampBounds) -> Value {
+             Value res = self.create<amdgpu::UpdateTensorDescriptorOp>(
+                 desc.getType(), desc, ValueRange(addOffsets),
+                 ValueRange(setBounds), pred.value_or(Value()));
+             if (clampBounds)
+               res.getDefiningOp()->setAttr("clamp_bounds",
+                                            self.getBuilder().getUnitAttr());
+             return res;
            })
       .def("create_tdm_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
