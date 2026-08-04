@@ -576,6 +576,48 @@ class ForwardInterp:
                 f"|fp={fp}|fma={fma}|cf={cond},dd{dd}")
 
 
+# Element-type modifiers a global load may carry (the vector-width `.vN` rides separately).
+_LDG_TYPE_MODS = frozenset({".b8", ".b16", ".b32", ".b64", ".b128", ".f16", ".f32", ".f64"})
+
+
+def _reduces_without_leaf(roots):
+    """True iff some RAW (uncollapsed) root reduces over a CROSS-THREAD structure (a
+    ``ShflCombine`` butterfly / ``SmemExchange``) yet reaches NO loaded ``Leaf`` anywhere.
+
+    Such a tree reduces only over a constant SEED + cross-warp shuffles — the reduced input
+    data (the within-thread / chunk fold that feeds the accumulator) was NOT captured by the
+    forward walk. Its collapsed hash is then blind to the chunk grouping: an unrolled
+    loop-carried fold (a chunked / persistent reduction whose loop the compiler fully
+    unrolled, so ``_loop_steps`` finds no back-edge and emits no ``loops=`` fence) over-merges
+    across different chunkings (r0_block), which produce different FP accumulation orders and
+    thus different bits. The RAW roots are checked ON PURPOSE: ``collapse_balanced`` absorbs a
+    recovered reduction's leaves into a leafless ``ITreeReduce``, so the collapsed tree of a
+    NORMAL reduction has no ``Leaf`` either — only the raw tree distinguishes a faithful
+    leaf-bearing reduction from this data-losing one."""
+    has_leaf = has_cross_thread = False
+    for r in roots:
+        for n in _postorder(r):
+            if isinstance(n, Leaf):
+                has_leaf = True
+            elif isinstance(n, (ShflCombine, SmemExchange)):
+                has_cross_thread = True
+    return has_cross_thread and not has_leaf
+
+
+def _global_load_shape(func):
+    """Multiset (canonical string) of ``ld.global`` vector-width x element-type over the entry —
+    a chunk-BEARING residual for the fail-closed floor. A fully-unrolled loop-carried fold's
+    chunk count changes the load vectorization/count (r0_block=512 -> ``.v2.b32``x32 vs
+    r0_block=1024 -> ``.v4.b32``x16), so two chunkings get different keys. Appended ONLY in the
+    fail-closed no-leaf path, so it only ever ADDS splitting (monotone-sound)."""
+    m = {}
+    for inst in linearize(func):
+        if inst.opcode == "ld" and ".global" in inst.modifiers:
+            w = "".join(x for x in inst.modifiers if x.startswith(".v") or x in _LDG_TYPE_MODS)
+            m[w] = m.get(w, 0) + 1
+    return ",".join(f"{k}x{n}" for k, n in sorted(m.items()))
+
+
 def forward_descriptor(func):
     """Per-entry forward descriptor: the collapsed + Merkle-hashed output trees (reusing the backward
     ``collapse_balanced`` + ``tree_hash`` so it is directly comparable to
@@ -585,6 +627,13 @@ def forward_descriptor(func):
     roots = interp.run()
     if not interp.faithful:
         return (interp.fingerprint(), )
+    if _reduces_without_leaf(roots):
+        # Faithful walk, but the reduction lost its input leaves (a fully-unrolled loop-carried
+        # fold reduced only over the seed + cross-warp shuffles). The hash cannot see the chunk
+        # grouping -> fail closed with the conservative fingerprint + the global-load shape (a
+        # chunk-bearing residual), so different r0_block chunkings split. Monotone: this only
+        # converts an over-merging hash into a MORE-split fingerprint, never the reverse.
+        return (interp.fingerprint() + "|ldg=" + _global_load_shape(func), )
     if len(roots) == 1:
         return (tree_hash(collapse_balanced(roots[0])), )
     # MULTI-output: num_warps redistributes the entry's rows across threads, so the forward per-thread
