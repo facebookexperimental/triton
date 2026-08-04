@@ -37,10 +37,9 @@ struct ScaledDotOpConversion
     : public ConvertOpToLLVMPattern<triton::DotScaledOp> {
   using ConvertOpToLLVMPattern<triton::DotScaledOp>::ConvertOpToLLVMPattern;
 
-  ScaledDotOpConversion(LLVMTypeConverter &converter, int computeCapability,
+  ScaledDotOpConversion(LLVMTypeConverter &converter, int,
                         PatternBenefit benefit)
-      : ConvertOpToLLVMPattern<triton::DotScaledOp>(converter, benefit),
-        computeCapability(computeCapability) {}
+      : ConvertOpToLLVMPattern<triton::DotScaledOp>(converter, benefit) {}
 
   LogicalResult
   matchAndRewrite(triton::DotScaledOp op, triton::DotScaledOp::Adaptor adaptor,
@@ -53,24 +52,18 @@ struct ScaledDotOpConversion
               "linear layout");
     return convertMMADotScaled(op, adaptor, getTypeConverter(), rewriter);
   }
-
-private:
-  int computeCapability;
 };
 
 struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
   using ConvertOpToLLVMPattern<triton::DotOp>::ConvertOpToLLVMPattern;
 
-  DotOpConversion(LLVMTypeConverter &converter, int computeCapability,
-                  PatternBenefit benefit)
-      : ConvertOpToLLVMPattern<triton::DotOp>(converter, benefit),
-        computeCapability(computeCapability) {}
+  DotOpConversion(LLVMTypeConverter &converter, int, PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::DotOp>(converter, benefit) {}
 
   LogicalResult
   matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // D = A * B + C
-    Value D = op.getResult();
     auto dType = op.getResult().getType();
     auto dEncoding = dType.getEncoding();
 
@@ -97,9 +90,6 @@ struct DotOpConversion : public ConvertOpToLLVMPattern<triton::DotOp> {
     llvm::report_fatal_error(
         "Unsupported DotOp found when converting TritonGPU to LLVM.");
   }
-
-private:
-  int computeCapability;
 };
 
 struct DotI8OpConversion

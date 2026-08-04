@@ -420,7 +420,7 @@ void FunctionBuilder::createSetWaitingCall(ImplicitLocOpBuilder &b, Value mbar,
   createCallToCachedFunction(
       b, "set_waiting", args,
       /*assertInfo=*/std::nullopt, {barriersType, waitingType},
-      [barriersType, waitingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [waitingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value baseThread = entryBlock->getArgument(2);
@@ -521,7 +521,7 @@ void FunctionBuilder::createClearWaitingCall(ImplicitLocOpBuilder &b,
   createCallToCachedFunction(
       b, "clear_waiting", args,
       /*assertInfo=*/std::nullopt, {barriersType, waitingType},
-      [barriersType, waitingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [waitingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value baseThread = entryBlock->getArgument(2);
@@ -769,8 +769,7 @@ void FunctionBuilder::createVerifyBarrierCanInitCall(ImplicitLocOpBuilder &b,
   createCallToCachedFunction(
       b, "verify_barrier_can_init", args, assertInfo,
       {barriersType, barrierStatesType},
-      [barriersType, barrierStatesType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [barrierStatesType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -825,8 +824,7 @@ void FunctionBuilder::createVerifyBarrierInitializedCall(
   createCallToCachedFunction(
       b, "verify_barrier_initialized", args, assertInfo,
       {barriersType, barrierStatesType},
-      [barriersType, barrierStatesType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [barrierStatesType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -883,8 +881,7 @@ void FunctionBuilder::createInitBarrierStateCall(ImplicitLocOpBuilder &b,
   createCallToCachedFunction(
       b, "init_barrier_state", args,
       /*assertInfo=*/std::nullopt, {barriersType, barrierStatesType},
-      [barriersType, barrierStatesType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [barrierStatesType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value count = entryBlock->getArgument(2);
@@ -959,8 +956,8 @@ void FunctionBuilder::createInvalidateBarrierStateCall(ImplicitLocOpBuilder &b,
       b, "invalidate_barrier_state", args,
       /*assertInfo=*/std::nullopt,
       {barriersType, barrierStatesType, waitingType},
-      [barriersType, barrierStatesType, waitingType](ImplicitLocOpBuilder &fb,
-                                                     Block *entryBlock) {
+      [barrierStatesType, waitingType](ImplicitLocOpBuilder &fb,
+                                       Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1042,8 +1039,7 @@ void FunctionBuilder::createVerifyBarrierArriveCall(
   createCallToCachedFunction(
       b, "verify_barrier_arrive", args, assertInfo,
       {barriersType, barrierStatesType},
-      [barriersType, barrierStatesType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [barrierStatesType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value count = entryBlock->getArgument(2);
@@ -1160,8 +1156,7 @@ void FunctionBuilder::createUpdateBarrierStateCall(
   createCallToCachedFunction(
       b, "update_barrier_state", args,
       /*assertInfo=*/std::nullopt, {barriersType, barrierStatesType},
-      [barriersType, barrierStatesType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [barrierStatesType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value count = entryBlock->getArgument(2);
@@ -1291,8 +1286,7 @@ void FunctionBuilder::createSetWriteVisibilityCall(
       b, "set_write_visibility", args,
       /*assertInfo=*/std::nullopt,
       {buffersType, writeVisibilityType, (uint64_t)memType},
-      [buffersType, writeVisibilityType](ImplicitLocOpBuilder &fb,
-                                         Block *entryBlock) {
+      [writeVisibilityType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value bufOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1352,8 +1346,7 @@ void FunctionBuilder::createSetReadVisibilityCall(
       b, "set_read_visibility", args,
       /*assertInfo=*/std::nullopt,
       {buffersType, readVisibilityType, (uint64_t)memType},
-      [buffersType, readVisibilityType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [readVisibilityType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value bufOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1418,8 +1411,7 @@ void FunctionBuilder::createClearWriteTrackingCall(ImplicitLocOpBuilder &b,
       b, "clear_write_tracking", args,
       /*assertInfo=*/std::nullopt,
       {buffersType, writeTrackingType, (uint64_t)memType},
-      [buffersType, writeTrackingType](ImplicitLocOpBuilder &fb,
-                                       Block *entryBlock) {
+      [writeTrackingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value bufOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1475,8 +1467,7 @@ void FunctionBuilder::createClearReadVisibilityCall(ImplicitLocOpBuilder &b,
       b, "clear_read_visibility", args,
       /*assertInfo=*/std::nullopt,
       {buffersType, readVisibilityType, (uint64_t)memType},
-      [buffersType, readVisibilityType](ImplicitLocOpBuilder &fb,
-                                        Block *entryBlock) {
+      [readVisibilityType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value bufOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1533,8 +1524,7 @@ void FunctionBuilder::createClearReadTrackingCall(ImplicitLocOpBuilder &b,
       b, "clear_read_tracking", args,
       /*assertInfo=*/std::nullopt,
       {buffersType, readTrackingType, (uint64_t)memType},
-      [buffersType, readTrackingType](ImplicitLocOpBuilder &fb,
-                                      Block *entryBlock) {
+      [readTrackingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value bufOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1598,8 +1588,8 @@ void FunctionBuilder::createTrackVisibleWritesCall(ImplicitLocOpBuilder &b,
       b, "track_visible_writes", args,
       /*assertInfo=*/std::nullopt,
       {barriersType, writeVisibilityType, writeTrackingType, (uint64_t)memType},
-      [barriersType, writeVisibilityType,
-       writeTrackingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [writeVisibilityType, writeTrackingType](ImplicitLocOpBuilder &fb,
+                                               Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1683,8 +1673,8 @@ void FunctionBuilder::createTrackVisibleReadsCall(ImplicitLocOpBuilder &b,
       b, "track_visible_reads", args,
       /*assertInfo=*/std::nullopt,
       {barriersType, readVisibilityType, readTrackingType, (uint64_t)memType},
-      [barriersType, readVisibilityType,
-       readTrackingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [readVisibilityType, readTrackingType](ImplicitLocOpBuilder &fb,
+                                             Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1775,7 +1765,7 @@ void FunctionBuilder::createTrackBarrierWriteForBufferCall(
       /*assertInfo=*/std::nullopt,
       {barriersType, buffersType, writeTrackingType, barrierWriteRecipientsType,
        (uint64_t)memType, (uint64_t)diagonalEffectRecipientCTAs},
-      [barriersType, buffersType, writeTrackingType, barrierWriteRecipientsType,
+      [writeTrackingType, barrierWriteRecipientsType,
        diagonalEffectRecipientCTAs](ImplicitLocOpBuilder &fb,
                                     Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
@@ -1889,8 +1879,8 @@ void FunctionBuilder::createClearBarrierWriteTrackingCall(
       /*assertInfo=*/std::nullopt,
       {barriersType, writeTrackingType, barrierWriteRecipientsType,
        (uint64_t)memType},
-      [barriersType, writeTrackingType, barrierWriteRecipientsType](
-          ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [writeTrackingType, barrierWriteRecipientsType](ImplicitLocOpBuilder &fb,
+                                                      Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -1969,8 +1959,7 @@ void FunctionBuilder::createClearBarrierReadTrackingCall(
       b, "clear_barrier_read_tracking", args,
       /*assertInfo=*/std::nullopt,
       {barriersType, readTrackingType, (uint64_t)memType},
-      [barriersType, readTrackingType](ImplicitLocOpBuilder &fb,
-                                       Block *entryBlock) {
+      [readTrackingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -2043,9 +2032,8 @@ void FunctionBuilder::createTransferVisibleWritesCall(
       /*assertInfo=*/std::nullopt,
       {barriersType, writeVisibilityType, writeTrackingType,
        barrierWriteRecipientsType, (uint64_t)memType},
-      [barriersType, writeVisibilityType, writeTrackingType,
-       barrierWriteRecipientsType](ImplicitLocOpBuilder &fb,
-                                   Block *entryBlock) {
+      [writeVisibilityType, writeTrackingType, barrierWriteRecipientsType](
+          ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -2150,8 +2138,8 @@ void FunctionBuilder::createTransferVisibleReadsCall(
       b, "transfer_visible_reads", args,
       /*assertInfo=*/std::nullopt,
       {barriersType, readVisibilityType, readTrackingType, (uint64_t)memType},
-      [barriersType, readVisibilityType,
-       readTrackingType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [readVisibilityType, readTrackingType](ImplicitLocOpBuilder &fb,
+                                             Block *entryBlock) {
         Value mbarOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
@@ -2565,7 +2553,7 @@ void FunctionBuilder::createStageAccessForCommitCall(
   createCallToCachedFunction(
       b, "stage_access_for_commit", args,
       /*assertInfo=*/std::nullopt, {buffersType, commitsType},
-      [buffersType, commitsType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
+      [commitsType](ImplicitLocOpBuilder &fb, Block *entryBlock) {
         Value bufOffset = entryBlock->getArgument(0);
         Value lengthVal = entryBlock->getArgument(1);
         Value pred = entryBlock->getArgument(2);
