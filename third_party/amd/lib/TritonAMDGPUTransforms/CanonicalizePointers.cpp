@@ -347,8 +347,6 @@ createDecomposeOffsetFromAdd(RewriterBase &rewriter, Location loc, Value expr,
       createAddOffsetsOfSameKind(rewriter, loc, uniformOffsetL, uniformOffsetR);
   Value nonUniformAdd = createAddOffsetsOfSameKind(
       rewriter, loc, nonUniformOffsetL, nonUniformOffsetR);
-  Value maybeDeadValue[] = {nonUniformOffsetL, nonUniformOffsetR,
-                            uniformOffsetL, uniformOffsetR};
   return {uniformAdd, nonUniformAdd};
 }
 
@@ -461,16 +459,6 @@ struct FatPointers {
     FatPtrAttrs &operator=(const FatPtrAttrs &other) = default;
     // for map default insert
     FatPtrAttrs() = default;
-
-    friend bool operator==(const FatPtrAttrs &lhs, const FatPtrAttrs &rhs) {
-      return lhs.canNarrow == rhs.canNarrow &&
-             lhs.isSmallTensor == rhs.isSmallTensor &&
-             lhs.attributes.getArrayRef() == rhs.attributes.getArrayRef();
-    }
-
-    friend bool operator!=(const FatPtrAttrs &lhs, const FatPtrAttrs &rhs) {
-      return !(lhs == rhs);
-    }
 
     static FatPtrAttrs intersect(const FatPtrAttrs &lhs,
                                  const FatPtrAttrs &rhs) {

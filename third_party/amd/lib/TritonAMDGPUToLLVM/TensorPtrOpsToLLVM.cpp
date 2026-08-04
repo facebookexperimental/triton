@@ -121,7 +121,6 @@ struct UpdateTensorDescriptorOpConversion
       return rewriter.notifyMatchFailure(
           op, "UpdateTensorDescriptorOp lowering currently supports 2D only");
     }
-
     // Unpack the input descriptor into vector groups (group0: <4 x i32>,
     // group1: <8 x i32> for 2D).
     SmallVector<Value> groups =

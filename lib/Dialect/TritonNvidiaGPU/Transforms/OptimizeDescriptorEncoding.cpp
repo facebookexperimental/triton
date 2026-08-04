@@ -680,7 +680,6 @@ public:
   using BaseT::BaseT;
 
   void runOnOperation() override {
-    MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
     if (failed(assignMemoryLayouts(m)))
       signalPassFailure();
