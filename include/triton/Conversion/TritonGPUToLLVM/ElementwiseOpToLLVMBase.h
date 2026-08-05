@@ -97,7 +97,7 @@ public:
         continue; // Log2_64(0) is UB; nothing to dedup
       int64_t pow2C = c & (-c);
       for (int i = 0; i < llvm::Log2_64(pow2C); i++) {
-        bases_inv[d][i] = {0};
+        bases_inv[d][i][0] = 0;
       }
     }
     auto invBroadcast = LinearLayout(std::move(bases_inv), invReg.getOutDims(),
