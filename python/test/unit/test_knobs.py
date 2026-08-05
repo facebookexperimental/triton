@@ -2,7 +2,7 @@ import os
 import pytest
 import shutil
 import triton
-from triton._C.libtriton import get_cache_invalidating_env_vars
+from triton._C.libtriton import get_cache_invalidating_env_vars  # type: ignore[attr-defined]
 from triton._internal_testing import is_hip
 
 from pathlib import Path
