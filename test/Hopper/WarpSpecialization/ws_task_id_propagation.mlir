@@ -56,6 +56,42 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
+// A data-partitioned inner loop can introduce a structural task that does not
+// otherwise consume the outer while's tile id. Physical while specialization
+// still preserves the complete loop signature in that task, so the condition
+// and loop-carried atomic claim must be available to the full task union.
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:90", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @while_with_nested_structural_task
+  // CHECK:       arith.cmpi {{.*}} {async_task_id = array<i32: 0, 1, 2>}
+  // CHECK:       scf.condition{{.*}} {async_task_id = array<i32: 0, 1, 2>}
+  // CHECK:       tt.atomic_rmw {{.*}} {async_task_id = array<i32: 0, 1, 2>}
+  // CHECK:       scf.yield {async_task_id = array<i32: 0, 1, 2>} %{{.*}} : i32
+  tt.func public @while_with_nested_structural_task(
+      %counter: !tt.ptr<i32>, %out0: !tt.ptr<i32>, %out1: !tt.ptr<i32>,
+      %bound: i32) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %true = arith.constant true
+    %result = scf.while (%tile = %c0) : (i32) -> i32 {
+      %valid = arith.cmpi slt, %tile, %bound : i32
+      scf.condition(%valid) %tile : i32
+    } do {
+    ^bb0(%tile: i32):
+      scf.for %i = %c0 to %c1 step %c1 : i32 {
+        scf.yield {"ttg.partition" = array<i32: 2>}
+      }
+      tt.store %out0, %tile {"ttg.partition" = array<i32: 0>} : !tt.ptr<i32>
+      tt.store %out1, %tile {"ttg.partition" = array<i32: 1>} : !tt.ptr<i32>
+      %next = tt.atomic_rmw add, acq_rel, gpu, %counter, %c1, %true : (!tt.ptr<i32>, i32, i1) -> i32
+      scf.yield %next : i32
+    }
+    tt.return
+  }
+}
+
+// -----
+
 // Test that nested for loop constant bounds get allTasks after propagation.
 // The inner loop body only contains ops with tasks 1 and 2, while task 0 ops
 // are in the outer loop epilogue. The solver's backward propagation only sees
