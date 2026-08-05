@@ -36,6 +36,11 @@ static const int THREADS_PER_WARP = 32;
 // delaying the earlier synchronization only extends initialization ordering.
 static void
 coalesceAdjacentTokenInitBarriers(ArrayRef<ttg::BarrierOp> initBarriers) {
+  // drop_front() asserts on an empty ArrayRef, and a kernel with no tokens
+  // reaches here with nothing to coalesce.
+  if (initBarriers.empty())
+    return;
+
   DenseSet<Operation *> generatedBarriers;
   for (ttg::BarrierOp barrier : initBarriers)
     generatedBarriers.insert(barrier);
