@@ -378,13 +378,17 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
           }
         }
       }
-      // If this op may signal other threads asynchronously, make sure all
-      // shared-memory transactions in this partition are complete first.
+      // A non-perThread arrive signals another partition that data is ready.
+      // Fence prior SMEM writes so they are visible before the signal, but
+      // don't leave a lasting "all SMEM" dependency that would force a
+      // barrier after the arrive for subsequent, unrelated SMEM operations.
       if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
-        Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
-        auto allMemorySlice = AllocationSlice(allIntervals);
-        curBlockInfo.syncWriteSlices[allMemorySlice].insert(op);
-        curBlockInfo.syncReadSlices[allMemorySlice].insert(op);
+        if (!blockInfo->syncWriteSlices.empty() ||
+            !blockInfo->syncReadSlices.empty()) {
+          builder->setInsertionPoint(op);
+          insertBarrier(op, builder);
+          blockInfo->sync();
+        }
       }
     }
     scratchBufferId = allocation->getBufferId(op);
