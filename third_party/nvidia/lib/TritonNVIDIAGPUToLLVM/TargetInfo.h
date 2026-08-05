@@ -105,6 +105,8 @@ public:
   bool isCuda() const override { return true; }
 
 private:
+  bool useExplicitSharedStore() const;
+
   triton::nvidia_gpu::TargetFeatures targetFeatures;
   int ptxVersion;
 };
