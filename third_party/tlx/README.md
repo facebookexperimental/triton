@@ -88,6 +88,12 @@ def kernel(src_ptr, dst_ptr, BLOCK_SIZE: tl.constexpr):
 
 For the async global-to-shared variant, see the warp-pipeline GEMM example (`third_party/amd/python/examples/gluon/f16_gemm_warp_pipeline_gfx1250.py`).
 
+## AMD Scheduler Barrier
+
+`tlx.amd_sched_barrier(mask=0)` prevents selected AMD machine-instruction
+classes from crossing a source boundary. It is a compiler scheduling marker,
+not a workgroup barrier or memory fence.
+
 ## Memory Fences
 
 `tlx.fence(scope)` issues a memory fence. The `scope` argument is required:

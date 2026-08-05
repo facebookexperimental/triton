@@ -290,8 +290,8 @@ def _tdm_load_subtile(
     SUBTILE_LEN: tl.constexpr,
 ):
     slot = consumer % NUM_BUFFERS
-    a_view = tlx.local_slice(tlx.local_view(a_buf, slot), [0, start], [BLOCK_M, SUBTILE_LEN])
-    b_view = tlx.local_slice(tlx.local_view(b_buf, slot), [0, start], [BLOCK_N, SUBTILE_LEN])
+    a_view = tlx.local_slice(a_buf[slot], [0, start], [BLOCK_M, SUBTILE_LEN])
+    b_view = tlx.local_slice(b_buf[slot], [0, start], [BLOCK_N, SUBTILE_LEN])
     return tlx.local_load(a_view), tlx.local_load(tlx.local_trans(b_view))
 
 
@@ -311,7 +311,7 @@ def _tdm_issue_loads(
     slot = producer % NUM_BUFFERS
     tlx.async_amd_descriptor_load_group(
         [a_desc, b_desc],
-        [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+        [a_buf[slot], b_buf[slot]],
         [[off_m, producer * BLOCK_K], [off_n, producer * BLOCK_K]],
         [0b0011, 0b1100],
         preds=[pred, pred],
@@ -334,7 +334,7 @@ def _tdm_issue_loads_unpredicated(
     slot = producer % NUM_BUFFERS
     tlx.async_amd_descriptor_load_group(
         [a_desc, b_desc],
-        [tlx.local_view(a_buf, slot), tlx.local_view(b_buf, slot)],
+        [a_buf[slot], b_buf[slot]],
         [[off_m, producer * BLOCK_K], [off_n, producer * BLOCK_K]],
         [0b0011, 0b1100],
     )
@@ -487,6 +487,7 @@ def grouped_gemm_tdm_kernel(
     NUM_SUBTILES: tl.constexpr = 4
     SUBTILE_LEN: tl.constexpr = BLOCK_K // NUM_SUBTILES
     K_ITERS: tl.constexpr = K // BLOCK_K
+    USE_FULL_C_TILE: tl.constexpr = (NUM_BUFFERS * BLOCK_K) % BLOCK_N == 0
     tl.static_assert(K % BLOCK_K == 0, "K must be divisible by BLOCK_K")
     tl.static_assert(K_ITERS >= NUM_BUFFERS, "K must cover the TDM pipeline")
     tl.static_assert(SUBTILE_LEN == 32, "BLOCK_K must be 128 for the first TDM schedule")
@@ -505,10 +506,9 @@ def grouped_gemm_tdm_kernel(
     # for asymmetric tiles, but B's TDM-load/dot-transpose layout constraints
     # conflict with C's TDM-store layout constraints.
     if C_STAGING_MODE == 1:
-        tl.static_assert((NUM_BUFFERS * BLOCK_K) % BLOCK_N == 0,
-                         "dedicated C staging currently requires a full C buffer")
+        tl.static_assert(USE_FULL_C_TILE, "dedicated C staging currently requires a full C buffer")
         c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_packed), 1)
-    elif (NUM_BUFFERS * BLOCK_K) % BLOCK_N == 0:
+    elif USE_FULL_C_TILE:
         c_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tlx.dtype_of(c_packed), 1, reuse=a_buf)
     else:
         tl.static_assert(BLOCK_N == 2 * BLOCK_K, "split C store currently supports BLOCK_N == 2 * BLOCK_K")
@@ -539,7 +539,7 @@ def grouped_gemm_tdm_kernel(
             strides=[stride_bn, tl.constexpr(1)],
             block_shape=[BLOCK_N, BLOCK_K],
         )
-        if (NUM_BUFFERS * BLOCK_K) % BLOCK_N == 0:
+        if USE_FULL_C_TILE:
             c_desc_base = tl.make_tensor_descriptor(
                 c_packed + group_base_c,
                 shape=[gm, N],
@@ -551,6 +551,9 @@ def grouped_gemm_tdm_kernel(
                 c_packed + group_base_c,
                 shape=[gm, N],
                 strides=[stride_cm, tl.constexpr(1)],
+                # Match the BLOCK_K-wide LDS alias above: when a full C tile
+                # cannot legally alias the A ring, store its two halves. This
+                # is an aliasing constraint, not a store-efficiency choice.
                 block_shape=[BLOCK_M, BLOCK_K],
             )
 
@@ -719,16 +722,16 @@ def grouped_gemm_tdm_kernel(
                     acc, a0, b0 = _tdm_wait_and_finish_k_block(acc, a3, b3, a_buf, b_buf, consumer, NUM_BUFFERS,
                                                                BLOCK_M, BLOCK_N, SUBTILE_LEN)
 
-            c_view = tlx.local_view(c_buf, 0)
+            c_view = c_buf[0]
             c = acc.to(tlx.dtype_of(c_packed))
             # The descriptor update is pure, so LICM otherwise hoists it into
             # the tile preheader and lengthens its live range through the K
             # loop. Keep it in the epilogue to avoid an extra gfx1250 VGPR-MSB
             # mode transition in the steady body.
-            tlx.sched_barrier()
+            tlx.amd_sched_barrier()
             c_desc = tlx.update_tensor_descriptor(c_desc_base, add_offsets=[off_m, off_n])
-            tlx.sched_barrier()
-            if (NUM_BUFFERS * BLOCK_K) % BLOCK_N == 0:
+            tlx.amd_sched_barrier()
+            if USE_FULL_C_TILE:
                 tlx.local_store(c_view, c)
                 tlx.async_amd_descriptor_store(c_desc, c_view, [0, 0])
             else:

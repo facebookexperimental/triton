@@ -1329,14 +1329,14 @@ def test_update_tensor_descriptor_store_compiles_gfx1250(device):
 
 
 @triton.jit
-def _sched_barrier_kernel(output_ptr):
-    tlx.sched_barrier(0)
+def _amd_sched_barrier_kernel(output_ptr):
+    tlx.amd_sched_barrier(0)
     tl.store(output_ptr, tl.full((), 1, tl.int32))
 
 
-def test_sched_barrier_compiles_gfx1250(device):
+def test_amd_sched_barrier_compiles_gfx1250(device):
     compiled = compile_for_gfx1250(
-        _sched_barrier_kernel,
+        _amd_sched_barrier_kernel,
         signature={"output_ptr": "*i32"},
         constexprs={},
     )

@@ -448,7 +448,7 @@ void init_triton_tlx_ir(py::module_ &m) {
              self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
              self.create<triton::nvidia_gpu::ClusterWaitOp>();
            })
-      .def("create_sched_barrier",
+      .def("create_amd_sched_barrier",
            [](TritonOpBuilder &self, unsigned mask) -> void {
              self.create<ROCDL::SchedBarrier>(mask);
            })

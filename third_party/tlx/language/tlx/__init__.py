@@ -3,6 +3,7 @@ from .async_task_utils import async_task, async_tasks
 from .barrier import (
     alloc_barriers,
     alloc_warp_barrier,
+    amd_sched_barrier,
     barrier_arrive,
     barrier_expect_bytes,
     barrier_wait,
@@ -91,7 +92,6 @@ from .utility import (
     cluster_size_1d,
     dtype_of,
     get_fp8_format_name,
-    sched_barrier,
     size_of,
     stoch_round,
     thread_id,
@@ -174,6 +174,7 @@ __all__ = [
     "barrier_arrive",
     "named_barrier_wait",
     "named_barrier_arrive",
+    "amd_sched_barrier",
     # mma_ops
     "dot_scaled",
     "require_amd_wmma_layout",
@@ -190,7 +191,6 @@ __all__ = [
     "get_fp8_format_name",
     "size_of",
     "clock64",
-    "sched_barrier",
     "stoch_round",
     # dynamic launcher ops
     "_alloc_clc_responses",
