@@ -255,3 +255,47 @@ module attributes {"ttg.cluster-dim-x" = 1 : i32, "ttg.cluster-dim-y" = 1 : i32,
     tt.return
   }
 }
+
+// -----
+
+// Test: halving the B block along the contiguous dimension must shrink the
+// swizzle byte width to one that is legal for the halved shape. A 64-element
+// fp16 contiguous dimension supports a 128B swizzle, but its 32-element half
+// only supports 64B; carrying the 128B swizzle over produces an invalid
+// NVMMASharedLayout ("block shape along the contiguous dimension 1 is too
+// small for the swizzle byte size 128").
+// CHECK-LABEL: @matmul_2cta_shrink_swizzle
+// CHECK-SAME: !tt.tensordesc<64x32xf16, #[[SW64:[a-z0-9_]+]]>
+// CHECK: tt.descriptor_load %{{.*}} : !tt.tensordesc<64x32xf16, #[[SW64]]>
+// CHECK: ttg.local_alloc %{{.*}} -> !ttg.memdesc<64x32xf16, #[[SW64]]
+// CHECK: ttng.tc_gen5_mma {{.*}} {two_ctas}
+
+#blocked_s = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked1_s = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#blocked3_s = #ttg.blocked<{sizePerThread = [1, 128], threadsPerWarp = [32, 1], warpsPerCTA = [4, 1], order = [0, 1]}>
+#shared_s = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#smem_s = #ttg.shared_memory
+#tmem_s = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @matmul_2cta_shrink_swizzle(
+      %a_desc: !tt.tensordesc<128x64xf16, #shared_s>,
+      %b_desc: !tt.tensordesc<64x64xf16, #shared_s>) attributes {noinline = false} {
+    %true = arith.constant true
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x64xf32, #blocked_s>
+
+    %a = tt.descriptor_load %a_desc[%c0_i32, %c0_i32] : !tt.tensordesc<128x64xf16, #shared_s> -> tensor<128x64xf16, #blocked1_s>
+    %a_smem = ttg.local_alloc %a : (tensor<128x64xf16, #blocked1_s>) -> !ttg.memdesc<128x64xf16, #shared_s, #smem_s>
+
+    %b = tt.descriptor_load %b_desc[%c0_i32, %c0_i32] : !tt.tensordesc<64x64xf16, #shared_s> -> tensor<64x64xf16, #blocked1_s>
+    %b_smem = ttg.local_alloc %b : (tensor<64x64xf16, #blocked1_s>) -> !ttg.memdesc<64x64xf16, #shared_s, #smem_s>
+
+    %acc_layout = ttg.convert_layout %cst : tensor<128x64xf32, #blocked_s> -> tensor<128x64xf32, #blocked3_s>
+    %acc_tmem, %token = ttng.tmem_alloc %acc_layout : (tensor<128x64xf32, #blocked3_s>) -> (!ttg.memdesc<128x64xf32, #tmem_s, #ttng.tensor_memory, mutable>, !ttg.async.token)
+
+    %mma_token = ttng.tc_gen5_mma %a_smem, %b_smem, %acc_tmem[%token], %true, %true {two_ctas} : !ttg.memdesc<128x64xf16, #shared_s, #smem_s>, !ttg.memdesc<64x64xf16, #shared_s, #smem_s>, !ttg.memdesc<128x64xf32, #tmem_s, #ttng.tensor_memory, mutable>
+
+    tt.return
+  }
+}

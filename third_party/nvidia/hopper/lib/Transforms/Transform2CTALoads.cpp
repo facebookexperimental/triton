@@ -89,6 +89,37 @@ getCompatibleEncoding(ttg::BlockedEncodingAttr origEncoding,
   return ttg::BlockedEncodingAttr::get(ctx, spt, tpw, wpc, order, ctaLayout);
 }
 
+// Halving the block along the contiguous dimension can leave the original
+// swizzle byte width illegal: an NVMMASharedLayout requires the contiguous
+// dimension to hold at least 8 * swizzleByteWidth / elementBitWidth elements.
+// A 128-byte-swizzled fp16 B tile that is 64 elements wide (HEAD_DIM=64) is
+// legal, but its 32-element half is not. Recompute the widest swizzle that is
+// legal for the halved shape instead of carrying the original one over.
+static Attribute shrinkSwizzleForShape(Attribute layout,
+                                       ArrayRef<int64_t> newBlockShape) {
+  auto nvmma = dyn_cast_if_present<ttg::NVMMASharedEncodingAttr>(layout);
+  if (!nvmma || nvmma.getSwizzlingByteWidth() == 0 || newBlockShape.size() < 2)
+    return layout;
+
+  unsigned contigDim = nvmma.getTransposed() ? 0 : newBlockShape.size() - 1;
+  unsigned eltBitWidth = nvmma.getElementBitWidth();
+  int64_t packingFactor = nvmma.getFp4Padded() ? 2 : 1;
+  int64_t contigBytes =
+      newBlockShape[contigDim] * packingFactor * eltBitWidth / 8;
+
+  unsigned swizzle = nvmma.getSwizzlingByteWidth();
+  while (swizzle >= 32 && contigBytes < static_cast<int64_t>(swizzle))
+    swizzle /= 2;
+  if (swizzle < 32)
+    swizzle = 0;
+  if (swizzle == nvmma.getSwizzlingByteWidth())
+    return layout;
+
+  return ttg::NVMMASharedEncodingAttr::get(
+      layout.getContext(), swizzle, nvmma.getTransposed(), eltBitWidth,
+      nvmma.getFp4Padded(), nvmma.getCGALayout());
+}
+
 struct BLoadTrace {
   tt::DescriptorLoadOp descLoad;
   ttg::LocalAllocOp localAlloc;
@@ -225,7 +256,8 @@ struct Transform2CTALoads
 
     MLIRContext *ctx = mma.getContext();
     auto elemType = descType.getElementType();
-    auto sharedLayout = descType.getSharedLayout();
+    auto sharedLayout =
+        shrinkSwizzleForShape(descType.getSharedLayout(), newBlockShape);
     auto newDescType =
         tt::TensorDescType::get(newBlockShape, elemType, sharedLayout);
 
@@ -304,8 +336,10 @@ struct Transform2CTALoads
 
     auto origMemDescType = cast<ttg::MemDescType>(localAlloc.getType());
     auto allocSrcType = cast<RankedTensorType>(allocSrc.getType());
+    auto newMemDescEncoding = shrinkSwizzleForShape(
+        origMemDescType.getEncoding(), allocSrcType.getShape());
     auto newMemDescType = ttg::MemDescType::get(
-        allocSrcType.getShape(), elemType, origMemDescType.getEncoding(),
+        allocSrcType.getShape(), elemType, newMemDescEncoding,
         origMemDescType.getMemorySpace(), origMemDescType.getMutableMemory());
 
     builder.setInsertionPoint(localAlloc);
