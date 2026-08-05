@@ -5,7 +5,7 @@ import torch
 
 import triton
 
-from triton._internal_testing import is_hip
+from triton._internal_testing import is_hip_cdna4
 from triton.language.extra.tlx.tutorials import amd_hstu_attn as _hstu
 
 
@@ -235,8 +235,8 @@ def parse_args():
 
 
 def main():
-    if not is_hip():
-        print("Skipping benchmarks, no AMD GPU found.")
+    if not is_hip_cdna4():
+        print("Skipping benchmarks, requires gfx950 hardware (CDNA4).")
         return
     args = parse_args()
     run_benchmark(args)
