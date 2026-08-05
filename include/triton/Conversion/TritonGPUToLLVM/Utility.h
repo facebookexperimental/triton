@@ -13,6 +13,7 @@
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/StrUtil.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -49,6 +50,28 @@ createLLVMIntrinsicCallOp(OpBuilder &builder, Location loc, StringRef intrinsic,
 } // namespace mlir::LLVM
 
 namespace mlir::triton {
+
+// Shared by backend-specific and generic local-load conversion patterns so a
+// named group produces one lane/warp rematerialization point even when its
+// loads take different lowering paths.
+class DistributedCoordinateGroups {
+public:
+  std::pair<Value, Value> getOrCreate(Operation *op, int64_t group,
+                                      bool rematerializeLane,
+                                      bool rematerializeWarp,
+                                      RewriterBase &rewriter,
+                                      const TargetInfoBase &targetInfo);
+
+private:
+  struct Entry {
+    Value lane;
+    Value warp;
+    bool laneRematerialized = false;
+    bool warpRematerialized = false;
+  };
+
+  llvm::DenseMap<Block *, llvm::DenseMap<int64_t, Entry>> groups;
+};
 
 struct TritonLLVMOpBuilder {
   TritonLLVMOpBuilder(Location loc, OpBuilder &builder)

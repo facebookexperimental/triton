@@ -622,9 +622,31 @@ LogicalResult BufferLoadOp::verify() {
 }
 
 LogicalResult BufferAtomicRMWOp::verify() {
-  return verifyBufferContiguity(getOperation(),
-                                cast<RankedTensorType>(getOffsets().getType()),
-                                getContiguity());
+  if (failed(verifyBufferContiguity(
+          getOperation(), cast<RankedTensorType>(getOffsets().getType()),
+          getContiguity())))
+    return failure();
+
+  Type elementType = getElementTypeOrSelf(getValue());
+  bool isSupportedType = elementType.isF16() || elementType.isBF16() ||
+                         elementType.isF32() || elementType.isF64() ||
+                         elementType.isInteger(32) || elementType.isInteger(64);
+  if (!isSupportedType)
+    return emitOpError(
+        "supports only f16, bf16, f32, f64, i32, and i64 values");
+
+  auto mod = getOperation()->getParentOfType<ModuleOp>();
+  if (!mod)
+    return success();
+  TargetFeatures features = TargetFeatures::fromModuleOp(mod);
+  if (features.getArch().empty())
+    return success();
+  if (!features.supportsBufferAtomicRMW())
+    return emitOpError("is unsupported on the target architecture");
+  if (getAtomicRmwOp() == RMWOp::FADD &&
+      !features.supportsBufferAtomicFadd(elementType))
+    return emitOpError("fadd is unsupported for this type on the target");
+  return success();
 }
 
 LogicalResult LocalLoadPackedTransposedOp::verify() {
@@ -703,7 +725,10 @@ LogicalResult RegisterResidentOp::verify() {
   auto tensorTy = getInput().getType();
   if (!isa<ttg::DistributedEncodingTrait>(tensorTy.getEncoding()))
     return emitOpError("requires a distributed tensor encoding");
-  unsigned bitWidth = tensorTy.getElementType().getIntOrFloatBitWidth();
+  Type elementType = tensorTy.getElementType();
+  if (!elementType.isIntOrFloat())
+    return emitOpError("requires an integer or floating-point element type");
+  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
   if (bitWidth != 16 && bitWidth != 32)
     return emitOpError("supports only 16-bit and 32-bit element types");
   if (getRegisterClass() != "agpr" && getRegisterClass() != "vgpr")

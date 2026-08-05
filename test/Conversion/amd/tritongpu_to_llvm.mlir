@@ -117,7 +117,10 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK-4: store {{.*}} vector<4xf16>
     %1 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop0>
     // CHECK-2: load {{.*}} vector<4xf16>
-    // GFX950: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // The two loads take the AMD ds_read_tr and generic local-load paths, but
+    // their named coordinate group must still share one rematerialization.
+    // GFX950-COUNT-1: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
+    // GFX950-NOT: llvm.inline_asm has_side_effects asm_dialect = att operand_attrs = [] "", "=v,0"
     %2 = ttg.local_load %0 {tlx.rematerialize_coordinates_group = 8 : i32} : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #dotop1>
     // CHECK-8: load {{.*}} vector<1xf16>
     %3 = ttg.local_load %0 : !ttg.memdesc<16x16xf16, #shared, #smem> -> tensor<16x16xf16, #mfma>

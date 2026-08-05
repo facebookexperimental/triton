@@ -321,6 +321,22 @@ def test_masked_buffer_atomic_rejects_scalar_bf16_gfx950(capfd):
     assert ("16-bit buffer atomics require two contiguous elements" in capfd.readouterr().err)
 
 
+@triton.jit
+def _unsupported_i16_buffer_atomic_kernel(atomic_ptr):
+    offsets = tl.arange(0, 64).to(tl.int32)
+    values = tl.zeros((64, ), tl.int16)
+    tlx.buffer_atomic_add(atomic_ptr, offsets, values)
+
+
+def test_buffer_atomic_rejects_unsupported_i16_gfx950():
+    with pytest.raises(CompilationError, match="buffer_atomic_add supports only"):
+        compile_for_gfx950(
+            _unsupported_i16_buffer_atomic_kernel,
+            signature={"atomic_ptr": "*i16"},
+            constexprs={},
+        )
+
+
 def test_pinned_buffer_load_layout_survives_optimization_gfx950():
     from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
         _attn_bwd_dq_native_convert_kernel, )
@@ -337,6 +353,57 @@ def test_pinned_buffer_load_layout_survives_optimization_gfx950():
     assert "ttg.convert_layout" in ttgir
     assert amdgcn.count("buffer_load_dwordx2") == 16
     assert amdgcn.count("v_permlane16_swap_b32") == 16
+
+
+def test_gqa_oversized_batches_rebase_buffer_offsets_gfx950():
+    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+        _attn_bwd_dkdv_dq_d128_gqa_kernel, )
+
+    # At N=16384 and D=128, 512 BF16 heads exactly fill the signed 32-bit
+    # byte-offset range; 520 exercises the per-tile 64-bit pointer rebasing
+    # path without allocating multi-gigabyte test tensors.
+    compiled = compile_for_gfx950(
+        _attn_bwd_dkdv_dq_d128_gqa_kernel,
+        signature={
+            "Q": "*bf16",
+            "K": "*bf16",
+            "V": "*bf16",
+            "DO": "*bf16",
+            "LSE": "*fp32",
+            "Delta": "*fp32",
+            "DQ_ACC": "*bf16",
+            "DK": "*bf16",
+            "DV": "*bf16",
+        },
+        constexprs={
+            "SM_SCALE": 0.125,
+            "HQ": 520,
+            "HK": 520,
+            "N": 16384,
+            "D": 128,
+            "BLOCK_M": 16,
+            "BLOCK_N": 256,
+        },
+    )
+
+    assert "amdgcn" in compiled.asm
+
+
+def test_gqa_oversized_head_rebases_native_conversion_gfx950():
+    from triton.language.extra.tlx.tutorials.amd_fa_bwd import (
+        _attn_bwd_dq_native_convert_kernel, )
+
+    compiled = compile_for_gfx950(
+        _attn_bwd_dq_native_convert_kernel,
+        signature={"DQ_ACC": "*bf16", "DQ": "*bf16"},
+        constexprs={
+            "N": (1 << 23) + 256,
+            "D": 128,
+            "BLOCK_M": 128,
+        },
+    )
+
+    assert "amdgcn" in compiled.asm
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")

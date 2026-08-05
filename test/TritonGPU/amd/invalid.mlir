@@ -244,6 +244,33 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 
 // -----
 
+#distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @register_resident_rejects_pointer_elements(
+      %arg0: tensor<64x!tt.ptr<f32>, #distributed>) {
+    // expected-error @+1 {{requires an integer or floating-point element type}}
+    %0 = amdg.register_resident %arg0 class "agpr" groups 1
+        : tensor<64x!tt.ptr<f32>, #distributed>
+    tt.return
+  }
+}
+
+// -----
+
+#distributed = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @buffer_atomic_rmw_rejects_i16(
+      %ptr: !tt.ptr<i16>, %offsets: tensor<64xi32, #distributed>,
+      %values: tensor<64xi16, #distributed>) {
+    // expected-error @+1 {{supports only f16, bf16, f32, f64, i32, and i64 values}}
+    %0 = amdg.buffer_atomic_rmw add, relaxed, gpu, %values, %ptr[%offsets]
+        : tensor<64xi16, #distributed>
+    tt.return
+  }
+}
+
+// -----
+
 #nondistributed = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   tt.func @extract_slice_requires_distributed_encoding(

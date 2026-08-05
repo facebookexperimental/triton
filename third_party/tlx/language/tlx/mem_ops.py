@@ -150,8 +150,13 @@ def buffer_atomic_add(
     assert (isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0
             and (contiguity & (contiguity - 1)) == 0), f"contiguity must be a positive power of two, got {contiguity!r}"
 
+    element_ty = ptr.type.scalar.element_ty
+    supported_type = (element_ty.is_standard_floating()
+                      or (element_ty.is_int() and element_ty.primitive_bitwidth in (32, 64)))
+    assert supported_type, "buffer_atomic_add supports only f16, bf16, f32, f64, i32, and i64 values"
+
     value = _semantic.to_tensor(tl._unwrap_if_constexpr(value))
-    value = _semantic.cast(value, ptr.type.scalar.element_ty)
+    value = _semantic.cast(value, element_ty)
     offsets, value = _semantic.broadcast_impl_value(offsets, value)
 
     mask = tl._unwrap_if_constexpr(mask)

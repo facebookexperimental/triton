@@ -11,7 +11,6 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
-#include "llvm/ADT/DenseMap.h"
 
 using mlir::triton::amdgpu::ISAFamily;
 using ::mlir::triton::gpu::MemDescType;
@@ -34,11 +33,12 @@ static LLVM::FenceOp createAMDGPUMemoryFence(OpBuilder &builder, Location loc,
 class TransLocalLoadOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp> {
 public:
-  TransLocalLoadOpConversion(const LLVMTypeConverter &converter,
-                             const AMD::TargetInfo &targetInfo,
-                             PatternBenefit benefit = 2)
+  TransLocalLoadOpConversion(
+      const LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
+      PatternBenefit benefit,
+      std::shared_ptr<DistributedCoordinateGroups> coordinateGroups)
       : ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp>(converter, benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), coordinateGroups(std::move(coordinateGroups)) {}
   using OpAdaptor = typename triton::gpu::LocalLoadOp::Adaptor;
 
   LogicalResult
@@ -360,8 +360,9 @@ private:
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     if (auto group = op->getAttrOfType<IntegerAttr>(
             "tlx.rematerialize_coordinates_group")) {
-      std::tie(laneId, warpId) = getGroupedCoordinates(
-          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter);
+      std::tie(laneId, warpId) = coordinateGroups->getOrCreate(
+          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter,
+          targetInfo);
     } else if (op->hasAttr("tlx.rematerialize_coordinates")) {
       if (rematerializeLane)
         laneId = targetInfo.rematerializeDistributedCoordinate(rewriter, loc,
@@ -501,55 +502,8 @@ private:
   }
 
 private:
-  struct CoordinateGroup {
-    Value lane;
-    Value warp;
-    bool laneRematerialized = false;
-    bool warpRematerialized = false;
-  };
-
-  std::pair<Value, Value>
-  getGroupedCoordinates(triton::gpu::LocalLoadOp op, int64_t group,
-                        bool rematerializeLane, bool rematerializeWarp,
-                        ConversionPatternRewriter &rewriter) const {
-    Block *block = op->getBlock();
-    auto &entry = coordinateGroups[block][group];
-    if (!entry.lane || !entry.warp ||
-        (rematerializeLane && !entry.laneRematerialized) ||
-        (rematerializeWarp && !entry.warpRematerialized)) {
-      Operation *anchor = op.getOperation();
-      for (Operation &candidate : *block) {
-        auto candidateGroup = candidate.getAttrOfType<IntegerAttr>(
-            "tlx.rematerialize_coordinates_group");
-        if (candidateGroup && candidateGroup.getInt() == group) {
-          anchor = &candidate;
-          break;
-        }
-      }
-      RewriterBase::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(anchor);
-      auto [lane, warp] = getLaneAndWarpId(rewriter, anchor->getLoc());
-      if (!entry.lane)
-        entry.lane = lane;
-      if (!entry.warp)
-        entry.warp = warp;
-      if (rematerializeLane && !entry.laneRematerialized) {
-        entry.lane = targetInfo.rematerializeDistributedCoordinate(
-            rewriter, anchor->getLoc(), lane);
-        entry.laneRematerialized = true;
-      }
-      if (rematerializeWarp && !entry.warpRematerialized) {
-        entry.warp = targetInfo.rematerializeDistributedCoordinate(
-            rewriter, anchor->getLoc(), warp);
-        entry.warpRematerialized = true;
-      }
-    }
-    return {entry.lane, entry.warp};
-  }
-
-  mutable llvm::DenseMap<Block *, llvm::DenseMap<int64_t, CoordinateGroup>>
-      coordinateGroups;
   const AMD::TargetInfo &targetInfo;
+  std::shared_ptr<DistributedCoordinateGroups> coordinateGroups;
 };
 
 class LocalLoadPackedTransposedOpConversion
@@ -1520,12 +1474,13 @@ private:
 
 void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    const TargetInfo &targetInfo, PatternBenefit benefit) {
+    const TargetInfo &targetInfo, PatternBenefit benefit,
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
   PatternBenefit transBenefit = PatternBenefit(benefit.getBenefit() + 1);
   PatternBenefit barrierBenefit = PatternBenefit(benefit.getBenefit() + 1);
 
   patterns.add<TransLocalLoadOpConversion>(typeConverter, targetInfo,
-                                           transBenefit);
+                                           transBenefit, coordinateGroups);
   patterns.add<LocalLoadPackedTransposedOpConversion>(typeConverter, targetInfo,
                                                       benefit);
   patterns.add<LocalAtomicScatterRMWOpConversion>(typeConverter, targetInfo,

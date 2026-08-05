@@ -187,11 +187,15 @@ struct LocalDeallocOpConversion
 
 struct LocalLoadOpConversion : public ConvertOpToLLVMPattern<LocalLoadOp> {
 public:
-  LocalLoadOpConversion(LLVMTypeConverter &typeConverter,
-                        const TargetInfoBase &targetInfo,
-                        PatternBenefit benefit = 1)
-      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo) {
-  }
+  LocalLoadOpConversion(
+      LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
+      PatternBenefit benefit = 1,
+      std::shared_ptr<DistributedCoordinateGroups> coordinateGroups = nullptr)
+      : ConvertOpToLLVMPattern(typeConverter, benefit), targetInfo(targetInfo),
+        coordinateGroups(
+            coordinateGroups
+                ? std::move(coordinateGroups)
+                : std::make_shared<DistributedCoordinateGroups>()) {}
 
   LogicalResult
   matchAndRewrite(LocalLoadOp op, OpAdaptor adaptor,
@@ -230,8 +234,9 @@ public:
           cvt.hasInDim(kLane) && !cvt.sublayoutIsZero({kLane}, outDims);
       bool rematerializeWarp =
           cvt.hasInDim(kWarp) && !cvt.sublayoutIsZero({kWarp}, outDims);
-      distributedCoordinates = getGroupedCoordinates(
-          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter);
+      distributedCoordinates = coordinateGroups->getOrCreate(
+          op, group.getInt(), rematerializeLane, rematerializeWarp, rewriter,
+          targetInfo);
     }
 
     auto outVals = lowerLocalLdSt(loc, ctx, cvt, {}, llvmElemTy, memDescTy,
@@ -246,55 +251,8 @@ public:
   }
 
 private:
-  struct CoordinateGroup {
-    Value lane;
-    Value warp;
-    bool laneRematerialized = false;
-    bool warpRematerialized = false;
-  };
-
-  std::pair<Value, Value>
-  getGroupedCoordinates(LocalLoadOp op, int64_t group, bool rematerializeLane,
-                        bool rematerializeWarp,
-                        ConversionPatternRewriter &rewriter) const {
-    Block *block = op->getBlock();
-    auto &entry = coordinateGroups[block][group];
-    if (!entry.lane || !entry.warp ||
-        (rematerializeLane && !entry.laneRematerialized) ||
-        (rematerializeWarp && !entry.warpRematerialized)) {
-      Operation *anchor = op.getOperation();
-      for (Operation &candidate : *block) {
-        auto candidateGroup = candidate.getAttrOfType<IntegerAttr>(
-            "tlx.rematerialize_coordinates_group");
-        if (candidateGroup && candidateGroup.getInt() == group) {
-          anchor = &candidate;
-          break;
-        }
-      }
-      RewriterBase::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(anchor);
-      auto [lane, warp] = getLaneAndWarpId(rewriter, anchor->getLoc());
-      if (!entry.lane)
-        entry.lane = lane;
-      if (!entry.warp)
-        entry.warp = warp;
-      if (rematerializeLane && !entry.laneRematerialized) {
-        entry.lane = targetInfo.rematerializeDistributedCoordinate(
-            rewriter, anchor->getLoc(), lane);
-        entry.laneRematerialized = true;
-      }
-      if (rematerializeWarp && !entry.warpRematerialized) {
-        entry.warp = targetInfo.rematerializeDistributedCoordinate(
-            rewriter, anchor->getLoc(), warp);
-        entry.warpRematerialized = true;
-      }
-    }
-    return {entry.lane, entry.warp};
-  }
-
-  mutable llvm::DenseMap<Block *, llvm::DenseMap<int64_t, CoordinateGroup>>
-      coordinateGroups;
   const TargetInfoBase &targetInfo;
+  std::shared_ptr<DistributedCoordinateGroups> coordinateGroups;
 };
 
 struct LocalStoreOpConversion
@@ -598,12 +556,14 @@ private:
 
 void mlir::triton::populateMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit) {
+    RewritePatternSet &patterns, PatternBenefit benefit,
+    std::shared_ptr<DistributedCoordinateGroups> coordinateGroups) {
   patterns.add<GlobalScratchAllocOpConversion>(typeConverter, targetInfo,
                                                benefit);
   patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalDeallocOpConversion>(typeConverter, benefit);
-  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit);
+  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit,
+                                      std::move(coordinateGroups));
   patterns.add<LocalGatherOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalScatterOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);

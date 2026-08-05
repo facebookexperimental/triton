@@ -580,6 +580,47 @@ std::pair<Value, Value> getLaneAndWarpId(OpBuilder &rewriter, Location loc) {
   return {laneId, warpId};
 }
 
+std::pair<Value, Value> DistributedCoordinateGroups::getOrCreate(
+    Operation *op, int64_t group, bool rematerializeLane,
+    bool rematerializeWarp, RewriterBase &rewriter,
+    const TargetInfoBase &targetInfo) {
+  Block *block = op->getBlock();
+  auto &entry = groups[block][group];
+  if (entry.lane && entry.warp &&
+      (!rematerializeLane || entry.laneRematerialized) &&
+      (!rematerializeWarp || entry.warpRematerialized))
+    return {entry.lane, entry.warp};
+
+  Operation *anchor = op;
+  for (Operation &candidate : *block) {
+    auto candidateGroup = candidate.getAttrOfType<IntegerAttr>(
+        "tlx.rematerialize_coordinates_group");
+    if (candidateGroup && candidateGroup.getInt() == group) {
+      anchor = &candidate;
+      break;
+    }
+  }
+
+  RewriterBase::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(anchor);
+  auto [lane, warp] = getLaneAndWarpId(rewriter, anchor->getLoc());
+  if (!entry.lane)
+    entry.lane = lane;
+  if (!entry.warp)
+    entry.warp = warp;
+  if (rematerializeLane && !entry.laneRematerialized) {
+    entry.lane = targetInfo.rematerializeDistributedCoordinate(
+        rewriter, anchor->getLoc(), lane);
+    entry.laneRematerialized = true;
+  }
+  if (rematerializeWarp && !entry.warpRematerialized) {
+    entry.warp = targetInfo.rematerializeDistributedCoordinate(
+        rewriter, anchor->getLoc(), warp);
+    entry.warpRematerialized = true;
+  }
+  return {entry.lane, entry.warp};
+}
+
 Value getLaneId(OpBuilder &rewriter, Location loc) {
   return getLaneAndWarpId(rewriter, loc).first;
 }
