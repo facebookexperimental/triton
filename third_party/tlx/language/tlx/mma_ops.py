@@ -5,13 +5,13 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
-def amd_extract_slice(source, shape, offsets, _semantic=None):
+def extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
     The result preserves ``source``'s distributed layout and selects the
-    statically shaped region beginning at ``offsets``. AMD's verifier requires
-    the source and result to have identical lane/warp ownership at CTA-tile
-    granularity; unsupported or misaligned slices fail during compilation.
+    statically shaped region beginning at ``offsets``. The source and result
+    must have identical lane/warp ownership at CTA-tile granularity;
+    unsupported or misaligned slices fail during compilation.
     """
     assert isinstance(source, tl.tensor), f"source must be a tensor, got {type(source).__name__}"
     shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
@@ -31,7 +31,7 @@ def amd_extract_slice(source, shape, offsets, _semantic=None):
 
 
 @tl.builtin
-def amd_rematerialized_range(
+def rematerialized_range(
     start,
     end,
     anchor,
@@ -97,30 +97,39 @@ def amd_scheduled_mfma(
     a,
     b,
     acc,
+    accumulator_role: tl.constexpr,
     resident_operand: tl.constexpr = None,
-    accumulator: tl.constexpr = "persistent",
     accumulator_register_class: tl.constexpr = None,
     initialize: tl.constexpr = False,
     _semantic=None,
 ):
     """Update native CDNA4 MFMA fragments with source-controlled scheduling.
 
-    Each output fragment remains an independent accumulator chain. The
-    resident-operand and accumulator arguments describe semantic lifetimes.
-    Target lowering derives native tuple widths and, by default, register
-    classes from the distributed layouts and lifetime role. An explicit
-    ``accumulator_register_class`` can place complementary persistent
-    accumulator sets in the AGPR and VGPR files.
+    Unlike ``tl.dot``, which represents one logical matrix product and carries
+    no accumulator-lifetime or register-class contract, this operation exposes
+    independent native fragment chains in source order. A ``tl.dot`` result can
+    still remain live across phases through ordinary SSA uses; its backend
+    lowering infers that lifetime instead of receiving an explicit role.
+
+    ``accumulator_role`` controls the lowering contract, not the numerical
+    operation. ``"transient"`` describes a phase-local chain: ``auto`` storage
+    selects VGPRs and lowering uses ROCDL MFMA intrinsics so LLVM can model
+    instruction latency and hazards. ``"persistent"`` describes a chain
+    carried across phases: ``auto`` storage selects AGPRs and lowering uses
+    register-constrained inline assembly. An explicit
+    ``accumulator_register_class`` overrides that default, allowing two
+    persistent accumulator sets to occupy complementary register files.
     """
     resident_operand = tl._unwrap_if_constexpr(resident_operand)
-    accumulator = tl._unwrap_if_constexpr(accumulator)
+    accumulator_role = tl._unwrap_if_constexpr(accumulator_role)
     accumulator_register_class = tl._unwrap_if_constexpr(accumulator_register_class)
     initialize = tl._unwrap_if_constexpr(initialize)
     assert isinstance(a, tl.tensor) and isinstance(b, tl.tensor), ("a and b must be distributed tensors")
     assert isinstance(acc, tl.tensor), "acc must be a distributed tensor"
     assert resident_operand is None or (isinstance(resident_operand, int) and not isinstance(resident_operand, bool)
                                         and resident_operand in (0, 1)), "resident_operand must be None, 0, or 1"
-    assert accumulator in ("transient", "persistent"), ('accumulator must be either "transient" or "persistent"')
+    assert accumulator_role in ("transient",
+                                "persistent"), ('accumulator_role must be either "transient" or "persistent"')
     assert accumulator_register_class in (None, "agpr",
                                           "vgpr"), ("accumulator_register_class must be None, \"agpr\", or \"vgpr\"")
     assert isinstance(initialize, bool), "initialize must be a constexpr bool"
@@ -131,7 +140,7 @@ def amd_scheduled_mfma(
         b.handle,
         acc.handle,
         resident_role,
-        accumulator,
+        accumulator_role,
         accumulator_class,
         initialize,
     )

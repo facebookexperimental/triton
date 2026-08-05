@@ -1224,9 +1224,9 @@ For the async global-to-shared variant, see the warp-pipeline GEMM example (`thi
 
 - `tl.dot(a, b, acc)` preserves a TLX-pinned accumulator layout, so whole dots
   need no AMD-specific wrapper.
-- `tlx.amd_extract_slice(source, shape, offsets)` selects an aligned register
+- `tlx.extract_slice(source, shape, offsets)` selects an aligned register
   fragment without cross-thread movement.
-- `tlx.amd_rematerialized_range(start, end, anchor, placement=None)` recreates
+- `tlx.rematerialized_range(start, end, anchor, placement=None)` recreates
   inexpensive distributed coordinates near a use instead of carrying them
   through a long software pipeline.
 - `tlx.amd_register_resident(value, register_class="agpr", registers_per_group=1)`
@@ -1242,6 +1242,11 @@ For the async global-to-shared variant, see the warp-pipeline GEMM example (`thi
 These primitives describe fragments, lifetimes, and ordering without assigning
 physical registers. Their verifiers reject unsupported targets, layouts,
 element types, and native fragment widths before lowering.
+
+Unlike `tl.dot`, `amd_scheduled_mfma` carries an explicit `accumulator_role`.
+`transient` selects the latency-aware intrinsic path for phase-local work;
+`persistent` selects register-constrained lowering for a chain carried across
+phases. Neither role changes the numerical matrix operation.
 
 ## AMD TDM Descriptor Loads
 

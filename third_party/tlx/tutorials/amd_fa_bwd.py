@@ -1088,8 +1088,8 @@ def _attn_bwd_gqa_issue_qdo_async(
     off_h_q = off_h_kv * group_size + group_idx
 
     outer_slice = tl.arange(0, OUTER_M // BLOCK_M)
-    inner_m = tlx.amd_rematerialized_range(0, BLOCK_M, 10, placement=step)
-    offs_d = tlx.amd_rematerialized_range(0, D, 11, placement=step)
+    inner_m = tlx.rematerialized_range(0, BLOCK_M, 10, placement=step)
+    offs_d = tlx.rematerialized_range(0, D, 11, placement=step)
     offs_m = (outer_block * OUTER_M + outer_slice[:, None] * BLOCK_M + inner_m[None, :])
     q_base = (off_z * HQ + off_h_q) * N * D
     qdo_offsets = (q_base + offs_m[:, :, None] * D + offs_d[None, None, :]).to(tl.int32)
@@ -1135,49 +1135,49 @@ def _attn_bwd_gqa_dv_fragmented_half(
     dv_lhs = tlx.require_layout(dv_lhs, P_ND_LAYOUT, pin=False)
     dv_rhs = tlx.require_layout(dv_rhs, Q_OUT_LAYOUT, pin=False)
     dv = tlx.require_layout(dv, MMA_ND, pin=False)
-    lhs0 = tlx.amd_extract_slice(dv_lhs, [128, 16], [0, 0])
-    lhs1 = tlx.amd_extract_slice(dv_lhs, [128, 16], [128, 0])
-    rhs0 = tlx.amd_extract_slice(dv_rhs, [16, 32], [0, 0])
-    rhs1 = tlx.amd_extract_slice(dv_rhs, [16, 32], [0, 32])
-    rhs2 = tlx.amd_extract_slice(dv_rhs, [16, 32], [0, 64])
-    rhs3 = tlx.amd_extract_slice(dv_rhs, [16, 32], [0, 96])
+    lhs0 = tlx.extract_slice(dv_lhs, [128, 16], [0, 0])
+    lhs1 = tlx.extract_slice(dv_lhs, [128, 16], [128, 0])
+    rhs0 = tlx.extract_slice(dv_rhs, [16, 32], [0, 0])
+    rhs1 = tlx.extract_slice(dv_rhs, [16, 32], [0, 32])
+    rhs2 = tlx.extract_slice(dv_rhs, [16, 32], [0, 64])
+    rhs3 = tlx.extract_slice(dv_rhs, [16, 32], [0, 96])
 
-    c00 = tlx.amd_extract_slice(dv, [128, 32], [0, 0])
-    c10 = tlx.amd_extract_slice(dv, [128, 32], [128, 0])
-    c01 = tlx.amd_extract_slice(dv, [128, 32], [0, 32])
-    c11 = tlx.amd_extract_slice(dv, [128, 32], [128, 32])
-    c02 = tlx.amd_extract_slice(dv, [128, 32], [0, 64])
-    c12 = tlx.amd_extract_slice(dv, [128, 32], [128, 64])
-    c03 = tlx.amd_extract_slice(dv, [128, 32], [0, 96])
-    c13 = tlx.amd_extract_slice(dv, [128, 32], [128, 96])
+    c00 = tlx.extract_slice(dv, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(dv, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(dv, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(dv, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(dv, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(dv, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(dv, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(dv, [128, 32], [128, 96])
 
     if FIRST_HALF:
         c00 = tlx.amd_scheduled_mfma(
             lhs0,
             rhs0,
             c00,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
         c10 = tlx.amd_scheduled_mfma(
             lhs1,
             rhs0,
             c10,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
         c01 = tlx.amd_scheduled_mfma(
             lhs0,
             rhs1,
             c01,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
         c11 = tlx.amd_scheduled_mfma(
             lhs1,
             rhs1,
             c11,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
     else:
@@ -1185,28 +1185,28 @@ def _attn_bwd_gqa_dv_fragmented_half(
             lhs0,
             rhs2,
             c02,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
         c12 = tlx.amd_scheduled_mfma(
             lhs1,
             rhs2,
             c12,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
         c03 = tlx.amd_scheduled_mfma(
             lhs0,
             rhs3,
             c03,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
         c13 = tlx.amd_scheduled_mfma(
             lhs1,
             rhs3,
             c13,
-            accumulator="persistent",
+            accumulator_role="persistent",
             accumulator_register_class="vgpr",
         )
 
@@ -1297,6 +1297,8 @@ def _attn_bwd_gqa_front(
         is_pure=True,
         pack=1,
     )
+    # These are soft requirements. Layout propagation does not yet infer the
+    # score MFMA layout for broadcast/full operands from elementwise users.
     lse_full = tlx.require_layout(
         tl.broadcast_to(lse_log2[None, :], (BLOCK_N, BLOCK_M)),
         MMA_NM,
@@ -1372,8 +1374,8 @@ def _attn_bwd_gqa_store_dq_native(
         pin=False,
     )
     dq = dq * dq_scale
-    local_m = tlx.amd_rematerialized_range(0, BLOCK_M, 14, placement=step)
-    offs_d = tlx.amd_rematerialized_range(0, D, 13, placement=step)
+    local_m = tlx.rematerialized_range(0, BLOCK_M, 14, placement=step)
+    offs_d = tlx.rematerialized_range(0, D, 13, placement=step)
     d_swizzled = ((offs_d & 1)
                   | ((offs_d & 2) << 6)
                   | ((offs_d & 12) << 3)
@@ -1427,16 +1429,16 @@ def _attn_bwd_gqa_dq_prefetched(
         layout=K_MD_LAYOUT,
         relaxed=True,
     )
-    k00 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [0, 0])
-    k01 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [0, 64])
-    k10 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [32, 0])
-    k11 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [32, 64])
+    k00 = tlx.extract_slice(k_resident_lo, [32, 64], [0, 0])
+    k01 = tlx.extract_slice(k_resident_lo, [32, 64], [0, 64])
+    k10 = tlx.extract_slice(k_resident_lo, [32, 64], [32, 0])
+    k11 = tlx.extract_slice(k_resident_lo, [32, 64], [32, 64])
     dq0 = tlx.amd_scheduled_mfma(
         ds0,
         k00,
         dq0,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
         initialize=True,
     )
     dq1 = tlx.amd_scheduled_mfma(
@@ -1444,7 +1446,7 @@ def _attn_bwd_gqa_dq_prefetched(
         k01,
         dq1,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
         initialize=True,
     )
 
@@ -1453,56 +1455,56 @@ def _attn_bwd_gqa_dq_prefetched(
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    dq0 = tlx.amd_scheduled_mfma(ds1, k10, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds1, k11, dq1, resident_operand=1, accumulator="transient")
-    k20 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [64, 0])
-    k21 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [64, 64])
-    dq0 = tlx.amd_scheduled_mfma(ds2, k20, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds2, k21, dq1, resident_operand=1, accumulator="transient")
+    dq0 = tlx.amd_scheduled_mfma(ds1, k10, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds1, k11, dq1, resident_operand=1, accumulator_role="transient")
+    k20 = tlx.extract_slice(k_resident_lo, [32, 64], [64, 0])
+    k21 = tlx.extract_slice(k_resident_lo, [32, 64], [64, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds2, k20, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds2, k21, dq1, resident_operand=1, accumulator_role="transient")
 
     ds4 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 128], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    k30 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [96, 0])
-    k31 = tlx.amd_extract_slice(k_resident_lo, [32, 64], [96, 64])
-    dq0 = tlx.amd_scheduled_mfma(ds3, k30, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds3, k31, dq1, resident_operand=1, accumulator="transient")
+    k30 = tlx.extract_slice(k_resident_lo, [32, 64], [96, 0])
+    k31 = tlx.extract_slice(k_resident_lo, [32, 64], [96, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds3, k30, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds3, k31, dq1, resident_operand=1, accumulator_role="transient")
 
     ds5 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 160], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    k40 = tlx.amd_extract_slice(k_resident_mid, [32, 64], [0, 0])
-    k41 = tlx.amd_extract_slice(k_resident_mid, [32, 64], [0, 64])
-    dq0 = tlx.amd_scheduled_mfma(ds4, k40, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds4, k41, dq1, resident_operand=1, accumulator="transient")
+    k40 = tlx.extract_slice(k_resident_mid, [32, 64], [0, 0])
+    k41 = tlx.extract_slice(k_resident_mid, [32, 64], [0, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds4, k40, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds4, k41, dq1, resident_operand=1, accumulator_role="transient")
 
     ds6 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 192], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    k50 = tlx.amd_extract_slice(k_resident_mid, [32, 64], [32, 0])
-    k51 = tlx.amd_extract_slice(k_resident_mid, [32, 64], [32, 64])
-    dq0 = tlx.amd_scheduled_mfma(ds5, k50, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds5, k51, dq1, resident_operand=1, accumulator="transient")
+    k50 = tlx.extract_slice(k_resident_mid, [32, 64], [32, 0])
+    k51 = tlx.extract_slice(k_resident_mid, [32, 64], [32, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds5, k50, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds5, k51, dq1, resident_operand=1, accumulator_role="transient")
 
     ds7 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 224], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    k60 = tlx.amd_extract_slice(k_resident_band6, [32, 64], [0, 0])
-    k61 = tlx.amd_extract_slice(k_resident_band6, [32, 64], [0, 64])
-    dq0 = tlx.amd_scheduled_mfma(ds6, k60, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds6, k61, dq1, resident_operand=1, accumulator="transient")
-    k70 = tlx.amd_extract_slice(k7, [32, 64], [0, 0])
-    k71 = tlx.amd_extract_slice(k7, [32, 64], [0, 64])
-    dq0 = tlx.amd_scheduled_mfma(ds7, k70, dq0, resident_operand=1, accumulator="transient")
-    dq1 = tlx.amd_scheduled_mfma(ds7, k71, dq1, resident_operand=1, accumulator="transient")
+    k60 = tlx.extract_slice(k_resident_band6, [32, 64], [0, 0])
+    k61 = tlx.extract_slice(k_resident_band6, [32, 64], [0, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds6, k60, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds6, k61, dq1, resident_operand=1, accumulator_role="transient")
+    k70 = tlx.extract_slice(k7, [32, 64], [0, 0])
+    k71 = tlx.extract_slice(k7, [32, 64], [0, 64])
+    dq0 = tlx.amd_scheduled_mfma(ds7, k70, dq0, resident_operand=1, accumulator_role="transient")
+    dq1 = tlx.amd_scheduled_mfma(ds7, k71, dq1, resident_operand=1, accumulator_role="transient")
     dq0, dq1, v_resident = tlx.amd_mfma_commit((dq0, dq1), v_resident)
     dq = tl.join(dq0, dq1)
     dq = tl.permute(dq, (0, 2, 1))
@@ -1566,40 +1568,40 @@ def _attn_bwd_gqa_dk_fragmented_prefetch(
     dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
     dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
     dk = tlx.require_layout(dk, MMA_ND, pin=False)
-    lhs0 = tlx.amd_extract_slice(dk_lhs, [128, 16], [0, 0])
-    lhs1 = tlx.amd_extract_slice(dk_lhs, [128, 16], [128, 0])
-    rhs0 = tlx.amd_extract_slice(dk_rhs, [16, 32], [0, 0])
-    rhs1 = tlx.amd_extract_slice(dk_rhs, [16, 32], [0, 32])
-    rhs2 = tlx.amd_extract_slice(dk_rhs, [16, 32], [0, 64])
-    rhs3 = tlx.amd_extract_slice(dk_rhs, [16, 32], [0, 96])
+    lhs0 = tlx.extract_slice(dk_lhs, [128, 16], [0, 0])
+    lhs1 = tlx.extract_slice(dk_lhs, [128, 16], [128, 0])
+    rhs0 = tlx.extract_slice(dk_rhs, [16, 32], [0, 0])
+    rhs1 = tlx.extract_slice(dk_rhs, [16, 32], [0, 32])
+    rhs2 = tlx.extract_slice(dk_rhs, [16, 32], [0, 64])
+    rhs3 = tlx.extract_slice(dk_rhs, [16, 32], [0, 96])
 
-    c00 = tlx.amd_extract_slice(dk, [128, 32], [0, 0])
-    c10 = tlx.amd_extract_slice(dk, [128, 32], [128, 0])
-    c01 = tlx.amd_extract_slice(dk, [128, 32], [0, 32])
-    c11 = tlx.amd_extract_slice(dk, [128, 32], [128, 32])
-    c02 = tlx.amd_extract_slice(dk, [128, 32], [0, 64])
-    c12 = tlx.amd_extract_slice(dk, [128, 32], [128, 64])
-    c03 = tlx.amd_extract_slice(dk, [128, 32], [0, 96])
-    c13 = tlx.amd_extract_slice(dk, [128, 32], [128, 96])
+    c00 = tlx.extract_slice(dk, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(dk, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(dk, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(dk, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(dk, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(dk, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(dk, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(dk, [128, 32], [128, 96])
 
-    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator="persistent")
-    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator="persistent")
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
     ds0 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 0], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator="persistent")
-    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator="persistent")
-    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator="persistent")
-    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator="persistent")
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
     ds1 = tlx.local_load(
         tlx.local_slice(prev_ds, [0, 32], [16, 32]),
         layout=DS_MD_LAYOUT,
         relaxed=True,
     )
-    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator="persistent")
-    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator="persistent")
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent")
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent")
 
     row0 = tl.cat(
         tl.cat(c00, c01, dim=1),
@@ -1715,15 +1717,20 @@ def _attn_bwd_gqa_phase(
         do_tiles,
         phase,
     )
+    # Re-anchor lane/warp coordinates at the adjacent statistics loads and
+    # share the copy. The group number is only a local equivalence tag, not a
+    # tuning parameter. Entry coordinates otherwise cross the register-heavy
+    # phase; rematerializing each load independently duplicates the anchors.
+    stats_coordinate_group: tl.constexpr = 20
     lse_values = tlx.local_load(
         tlx.local_view(lse_tiles, phase),
         relaxed=True,
-        rematerialize_coordinates_group=20,
+        rematerialize_coordinates_group=stats_coordinate_group,
     )
     delta_values = tlx.local_load(
         tlx.local_view(delta_tiles, phase),
         relaxed=True,
-        rematerialize_coordinates_group=20,
+        rematerialize_coordinates_group=stats_coordinate_group,
     )
     dv, dk_lhs, dk_rhs, dv_lhs, dv_rhs = _attn_bwd_gqa_front(
         dv,
@@ -2386,8 +2393,8 @@ def _attn_bwd_dkdv_dq_d128_gqa_kernel(
     dk = tl.reshape(dk, (BLOCK_N, D))
     dk = tlx.require_layout(dk, kv_native_layout, pin=False)
     dk = dk * SM_SCALE
-    store_n = pid_n * BLOCK_N + tlx.amd_rematerialized_range(0, BLOCK_N, 30)
-    store_d = tlx.amd_rematerialized_range(0, D, 31)
+    store_n = pid_n * BLOCK_N + tlx.rematerialized_range(0, BLOCK_N, 30)
+    store_d = tlx.rematerialized_range(0, D, 31)
     key_offsets = kv_base + store_n[:, None] * D + store_d[None, :]
     key_offsets = tlx.require_layout(key_offsets.to(tl.int32), kv_native_layout, pin=False)
     tlx.buffer_store(dk.to(tl.bfloat16), DK, key_offsets)
@@ -2446,14 +2453,17 @@ def _attn_bwd_dq_native_convert_kernel(
                   | ((native_d & 64) << 2))
     native_offsets = (tile_m[:, None] * D + (local_m[:, None] << 1) + d_swizzled[None, :]).to(tl.int32)
     native_offsets = tl.max_contiguous(native_offsets, [1, 4])
-    native_offsets = tlx.require_layout(native_offsets, native_layout)
+    # Reading the swizzled accumulator needs native MFMA ownership, but this
+    # requirement may remain soft and be absorbed by layout propagation.
+    native_offsets = tlx.require_layout(native_offsets, native_layout, pin=False)
     values = tlx.buffer_load(DQ_ACC, native_offsets, contiguity=4)
-    values = tlx.require_layout(values, store_layout)
+    # Keep this one hard: softening the native-to-store conversion makes the
+    # current compiler materialize the transpose through 32 KiB of LDS.
+    values = tlx.require_layout(values, store_layout, pin=True)
 
     store_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     store_d = tl.arange(0, D)
-    store_offsets = store_m[:, None] * D + store_d[None, :]
-    store_offsets = tlx.require_layout(store_offsets.to(tl.int32), store_layout, pin=False)
+    store_offsets = (store_m[:, None] * D + store_d[None, :]).to(tl.int32)
     tl.store(DQ + store_offsets, values)
 
 
@@ -2919,10 +2929,10 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
             do_t = tlx.local_load(tlx.local_trans(do_view), token=qdo_wait, layout=dot_op1_nm)
             q_nd = tlx.local_load(q_view, token=qdo_wait, layout=q_op1_nd)
             do_nd = tlx.local_load(do_view, token=qdo_wait, layout=do_op1_nd)
-            q_nd_0 = tlx.amd_extract_slice(q_nd, [BLOCK_M, 32], [0, 0])
-            q_nd_1 = tlx.amd_extract_slice(q_nd, [BLOCK_M, 32], [0, 32])
-            q_nd_2 = tlx.amd_extract_slice(q_nd, [BLOCK_M, 32], [0, 64])
-            q_nd_3 = tlx.amd_extract_slice(q_nd, [BLOCK_M, 32], [0, 96])
+            q_nd_0 = tlx.extract_slice(q_nd, [BLOCK_M, 32], [0, 0])
+            q_nd_1 = tlx.extract_slice(q_nd, [BLOCK_M, 32], [0, 32])
+            q_nd_2 = tlx.extract_slice(q_nd, [BLOCK_M, 32], [0, 64])
+            q_nd_3 = tlx.extract_slice(q_nd, [BLOCK_M, 32], [0, 96])
 
             offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
             lse = tl.load(LSE + batch_head * N + offs_m, mask=offs_m < N, other=0.0)
@@ -2974,12 +2984,12 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
             ds_nd = tl.reshape(ds_nd, (BLOCK_N, BLOCK_M))
             ds_nd = tlx.require_layout(ds_nd, dst_op0_nd, pin=False)
             if SCHEDULED_MFMA:
-                ds_nd_lo = tlx.amd_extract_slice(
+                ds_nd_lo = tlx.extract_slice(
                     ds_nd,
                     [BLOCK_N // 2, BLOCK_M],
                     [0, 0],
                 )
-                ds_nd_hi = tlx.amd_extract_slice(
+                ds_nd_hi = tlx.extract_slice(
                     ds_nd,
                     [BLOCK_N // 2, BLOCK_M],
                     [BLOCK_N // 2, 0],
@@ -2997,7 +3007,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     layout=ds_op0_md,
                     relaxed=True,
                 )
-                previous_ds_0 = tlx.amd_extract_slice(
+                previous_ds_0 = tlx.extract_slice(
                     previous_ds_full,
                     [BLOCK_M, 32],
                     [0, 0],
@@ -3035,21 +3045,21 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     ds_nd_lo,
                     q_nd_0,
                     dk_0_lo,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
                 dk_0_hi = tlx.amd_scheduled_mfma(
                     ds_nd_hi,
                     q_nd_0,
                     dk_0_hi,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
             else:
                 dk_0 = tl.dot(ds_nd, q_nd_0, acc=dk_0, out_dtype=dk_0.dtype)
 
             if bridge_phase == 1:
-                previous_ds_1 = tlx.amd_extract_slice(
+                previous_ds_1 = tlx.extract_slice(
                     previous_ds_full,
                     [BLOCK_M, 32],
                     [0, 32],
@@ -3066,7 +3076,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                         k_a_0,
                         dq_a,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                         initialize=True,
                     )
                     dq_b = tlx.amd_scheduled_mfma(
@@ -3074,7 +3084,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                         k_b_0,
                         dq_b,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                         initialize=True,
                     )
                 else:
@@ -3087,7 +3097,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     layout=k_op1_md,
                     relaxed=True,
                 )
-                previous_ds_2 = tlx.amd_extract_slice(
+                previous_ds_2 = tlx.extract_slice(
                     previous_ds_full,
                     [BLOCK_M, 32],
                     [0, 64],
@@ -3103,14 +3113,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     ds_nd_lo,
                     q_nd_1,
                     dk_1_lo,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
                 dk_1_hi = tlx.amd_scheduled_mfma(
                     ds_nd_hi,
                     q_nd_1,
                     dk_1_hi,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
             else:
@@ -3123,14 +3133,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                         k_a_1,
                         dq_a,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                     dq_b = tlx.amd_scheduled_mfma(
                         previous_ds_1,
                         k_b_1,
                         dq_b,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                 else:
                     tlx.amd_sched_barrier(MFMA_BRAID_BARRIER_MASK)
@@ -3142,7 +3152,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     layout=k_op1_md,
                     relaxed=True,
                 )
-                previous_ds_3 = tlx.amd_extract_slice(
+                previous_ds_3 = tlx.extract_slice(
                     previous_ds_full,
                     [BLOCK_M, 32],
                     [0, 96],
@@ -3158,14 +3168,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     ds_nd_lo,
                     q_nd_2,
                     dk_2_lo,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
                 dk_2_hi = tlx.amd_scheduled_mfma(
                     ds_nd_hi,
                     q_nd_2,
                     dk_2_hi,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
             else:
@@ -3178,14 +3188,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                         k_a_2,
                         dq_a,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                     dq_b = tlx.amd_scheduled_mfma(
                         previous_ds_2,
                         k_b_2,
                         dq_b,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                 else:
                     tlx.amd_sched_barrier(MFMA_BRAID_BARRIER_MASK)
@@ -3197,7 +3207,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     layout=k_op1_md,
                     relaxed=True,
                 )
-                previous_ds_4 = tlx.amd_extract_slice(
+                previous_ds_4 = tlx.extract_slice(
                     previous_ds_full,
                     [BLOCK_M, 32],
                     [0, 128],
@@ -3213,14 +3223,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                     ds_nd_lo,
                     q_nd_3,
                     dk_3_lo,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
                 dk_3_hi = tlx.amd_scheduled_mfma(
                     ds_nd_hi,
                     q_nd_3,
                     dk_3_hi,
-                    accumulator="persistent",
+                    accumulator_role="persistent",
                     initialize=bridge_phase == 0,
                 )
             else:
@@ -3233,14 +3243,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                         k_a_3,
                         dq_a,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                     dq_b = tlx.amd_scheduled_mfma(
                         previous_ds_3,
                         k_b_3,
                         dq_b,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                 else:
                     tlx.amd_sched_barrier(MFMA_BRAID_BARRIER_MASK)
@@ -3258,20 +3268,20 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                         k_a_4,
                         dq_a,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                     dq_b = tlx.amd_scheduled_mfma(
                         previous_ds_4,
                         k_b_4,
                         dq_b,
                         resident_operand=1,
-                        accumulator="transient",
+                        accumulator_role="transient",
                     )
                 else:
                     dq_a = tl.dot(previous_ds_4, k_a_4, acc=dq_a, out_dtype=dq_a.dtype)
                     dq_b = tl.dot(previous_ds_4, k_b_4, acc=dq_b, out_dtype=dq_b.dtype)
                 for dq_band in tl.static_range(5, num_dq_bands):
-                    previous_ds_band = tlx.amd_extract_slice(
+                    previous_ds_band = tlx.extract_slice(
                         previous_ds_full,
                         [BLOCK_M, 32],
                         [0, dq_band * 32],
@@ -3302,14 +3312,14 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
                             k_a_band,
                             dq_a,
                             resident_operand=1,
-                            accumulator="transient",
+                            accumulator_role="transient",
                         )
                         dq_b = tlx.amd_scheduled_mfma(
                             previous_ds_band,
                             k_b_band,
                             dq_b,
                             resident_operand=1,
-                            accumulator="transient",
+                            accumulator_role="transient",
                         )
                     else:
                         dq_a = tl.dot(previous_ds_band, k_a_band, acc=dq_a, out_dtype=dq_a.dtype)
@@ -3358,7 +3368,7 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     last_dq_a = tlx.zeros((BLOCK_M, D // 2), tl.float32, layout=mma_md)
     last_dq_b = tlx.zeros((BLOCK_M, D // 2), tl.float32, layout=mma_md)
     for dq_band in tl.static_range(0, num_dq_bands):
-        last_ds_band = tlx.amd_extract_slice(
+        last_ds_band = tlx.extract_slice(
             last_ds_full,
             [BLOCK_M, 32],
             [0, dq_band * 32],
@@ -3436,8 +3446,8 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
         # Rebuilding each epilogue address gives LLVM/RA short, independent
         # live ranges instead of carrying fourteen VGPR address leaves through
         # the register-heavy dK/dQ bridge.
-        dk_offs_n = tlx.amd_rematerialized_range(0, BLOCK_N, 0)
-        dk_offs_d = tlx.amd_rematerialized_range(0, D, 1)
+        dk_offs_n = tlx.rematerialized_range(0, BLOCK_N, 0)
+        dk_offs_d = tlx.rematerialized_range(0, D, 1)
         dk_key_ptrs = (tensor_base + dk_offs_n[:, None] * D + dk_offs_d[None, :])
         dk_key_mask = dk_offs_n[:, None] < N
     else:
@@ -3451,8 +3461,8 @@ def _attn_bwd_dkdv_dq_d128_exact_impl(
     dv_bf16 = dv_mma.to(tl.bfloat16)
     dv_vec = tlx.require_layout(dv_bf16, kv_async_layout)
     if IS_CAUSAL:
-        dv_offs_n = tlx.amd_rematerialized_range(0, BLOCK_N, 2)
-        dv_offs_d = tlx.amd_rematerialized_range(0, D, 3)
+        dv_offs_n = tlx.rematerialized_range(0, BLOCK_N, 2)
+        dv_offs_d = tlx.rematerialized_range(0, D, 3)
         dv_key_ptrs = (tensor_base + dv_offs_n[:, None] * D + dv_offs_d[None, :])
         dv_key_mask = dv_offs_n[:, None] < N
     else:

@@ -466,7 +466,7 @@ def test_async_load_correctness(device):
 
 
 @triton.jit
-def _amd_extract_slice_kernel(x_ptr, y_ptr):
+def _extract_slice_kernel(x_ptr, y_ptr):
     mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[16, 16, 32],
@@ -478,16 +478,16 @@ def _amd_extract_slice_kernel(x_ptr, y_ptr):
     cols = tl.arange(0, 256)
     values = tl.load(x_ptr + rows[:, None] * 256 + cols[None, :])
     values = tlx.require_layout(values, dot0, pin=False)
-    band = tlx.amd_extract_slice(values, [16, 32], [0, 64])
+    band = tlx.extract_slice(values, [16, 32], [0, 64])
     band_cols = tl.arange(0, 32)
     out_ptrs = y_ptr + rows[:, None] * 32 + band_cols[None, :]
     out_ptrs = tlx.require_layout(out_ptrs, dot0, pin=False)
     tl.store(out_ptrs, band)
 
 
-def test_amd_extract_slice_compiles_gfx950():
+def test_extract_slice_compiles_gfx950():
     compiled = compile_for_gfx950(
-        _amd_extract_slice_kernel,
+        _extract_slice_kernel,
         signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
         constexprs={},
     )
@@ -496,7 +496,7 @@ def test_amd_extract_slice_compiles_gfx950():
 
 
 @triton.jit
-def _amd_extract_slice_dot1_kernel(
+def _extract_slice_dot1_kernel(
     x_ptr,
     y_ptr,
     ROW_OFFSET: tl.constexpr,
@@ -513,7 +513,7 @@ def _amd_extract_slice_dot1_kernel(
     cols = tl.arange(0, 128)
     values = tl.load(x_ptr + rows[:, None] * 128 + cols[None, :])
     values = tlx.require_layout(values, dot1, pin=False)
-    band = tlx.amd_extract_slice(values, [32, 64], [ROW_OFFSET, COL_OFFSET])
+    band = tlx.extract_slice(values, [32, 64], [ROW_OFFSET, COL_OFFSET])
     band_rows = tl.arange(0, 32)
     band_cols = tl.arange(0, 64)
     out_ptrs = y_ptr + band_rows[:, None] * 64 + band_cols[None, :]
@@ -522,12 +522,12 @@ def _amd_extract_slice_dot1_kernel(
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_extract_slice_dot1_correct_gfx950():
+def test_extract_slice_dot1_correct_gfx950():
     x = torch.arange(256 * 128, device="cuda", dtype=torch.float32).reshape(256, 128).to(torch.bfloat16)
     actual = torch.empty((32, 64), device="cuda", dtype=torch.bfloat16)
     for row in range(0, 256, 32):
         for col in (0, 64):
-            _amd_extract_slice_dot1_kernel[(1, )](
+            _extract_slice_dot1_kernel[(1, )](
                 x,
                 actual,
                 ROW_OFFSET=row,
@@ -539,7 +539,7 @@ def test_amd_extract_slice_dot1_correct_gfx950():
 
 
 @triton.jit
-def _amd_extract_slice_mfma_kernel(
+def _extract_slice_mfma_kernel(
     a_ptr,
     b_ptr,
     output_ptr,
@@ -560,8 +560,8 @@ def _amd_extract_slice_mfma_kernel(
     b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
     a = tlx.require_layout(a, dot0, pin=False)
     b = tlx.require_layout(b, dot1, pin=False)
-    a_band = tlx.amd_extract_slice(a, [16, 32], [0, BAND * 32])
-    b_band = tlx.amd_extract_slice(b, [32, 64], [BAND * 32, 0])
+    a_band = tlx.extract_slice(a, [16, 32], [0, BAND * 32])
+    b_band = tlx.extract_slice(b, [32, 64], [BAND * 32, 0])
     acc = tlx.zeros((16, 64), tl.float32, layout=mma)
     result = tl.dot(a_band, b_band, acc)
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
@@ -570,13 +570,13 @@ def _amd_extract_slice_mfma_kernel(
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
-def test_amd_extract_slice_mfma_correct_gfx950():
+def test_extract_slice_mfma_correct_gfx950():
     torch.manual_seed(0)
     a = torch.randn((16, 256), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((256, 64), device="cuda", dtype=torch.bfloat16)
     actual = torch.empty((16, 64), device="cuda", dtype=torch.float32)
     for band in range(8):
-        _amd_extract_slice_mfma_kernel[(1, )](
+        _extract_slice_mfma_kernel[(1, )](
             a,
             b,
             actual,
@@ -589,19 +589,19 @@ def test_amd_extract_slice_mfma_correct_gfx950():
 
 
 @triton.jit
-def _amd_rematerialized_range_kernel(x_ptr, y_ptr):
-    load_rows = tlx.amd_rematerialized_range(0, 64, 0)
-    load_cols = tlx.amd_rematerialized_range(0, 64, 1)
+def _rematerialized_range_kernel(x_ptr, y_ptr):
+    load_rows = tlx.rematerialized_range(0, 64, 0)
+    load_cols = tlx.rematerialized_range(0, 64, 1)
     values = tl.load(x_ptr + load_rows[:, None] * 64 + load_cols[None, :])
 
-    store_rows = tlx.amd_rematerialized_range(0, 64, 2)
-    store_cols = tlx.amd_rematerialized_range(0, 64, 3)
+    store_rows = tlx.rematerialized_range(0, 64, 2)
+    store_cols = tlx.rematerialized_range(0, 64, 3)
     tl.store(y_ptr + store_rows[:, None] * 64 + store_cols[None, :], values)
 
 
-def test_amd_rematerialized_range_compiles_gfx950():
+def test_rematerialized_range_compiles_gfx950():
     compiled = compile_for_gfx950(
-        _amd_rematerialized_range_kernel,
+        _rematerialized_range_kernel,
         signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
         constexprs={},
     )
@@ -695,7 +695,7 @@ def _amd_scheduled_mfma_kernel(a_ptr, b_ptr, output_ptr):
         b,
         acc,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
         initialize=True,
     )
     result, _ = tlx.amd_mfma_commit(result, b)
@@ -716,6 +716,7 @@ def test_amd_scheduled_mfma_compiles_gfx950():
     assert "amdg.mfma_commit" in compiled.asm["ttir"]
     assert "=a,0" in compiled.asm["llir"]
     assert "@llvm.amdgcn.mfma.f32.16x16x32.bf16" in compiled.asm["llir"]
+    assert 'asm sideeffect "v_mfma' not in compiled.asm["llir"]
     assert "v_mfma_f32_16x16x32_bf16" in compiled.asm["amdgcn"]
     assert "s_nop 5" in compiled.asm["llir"]
 
@@ -771,14 +772,14 @@ def _amd_scheduled_mfma_chain_kernel(a_ptr, b_ptr, output_ptr, BANDS: tl.constex
     acc = tlx.zeros((16, 64), tl.float32, layout=mma)
 
     for band in tl.static_range(BANDS):
-        a_band = tlx.amd_extract_slice(a, [16, 32], [0, band * 32])
-        b_band = tlx.amd_extract_slice(b, [32, 64], [band * 32, 0])
+        a_band = tlx.extract_slice(a, [16, 32], [0, band * 32])
+        b_band = tlx.extract_slice(b, [32, 64], [band * 32, 0])
         acc = tlx.amd_scheduled_mfma(
             a_band,
             b_band,
             acc,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
             initialize=band == 0,
         )
     acc, _ = tlx.amd_mfma_commit(acc, b_band)
@@ -827,29 +828,46 @@ def _amd_scheduled_mfma_persistent_acc_kernel(
     b = tl.load(b_ptr + reduction[:, None] * 64 + cols[None, :])
     a = tlx.require_layout(a, dot0, pin=False)
     b = tlx.require_layout(b, dot1, pin=False)
-    a0 = tlx.amd_extract_slice(a, [16, 32], [0, 0])
-    b0 = tlx.amd_extract_slice(b, [32, 64], [0, 0])
+    a0 = tlx.extract_slice(a, [16, 32], [0, 0])
+    b0 = tlx.extract_slice(b, [32, 64], [0, 0])
     acc = tlx.zeros((16, 64), tl.float32, layout=mma)
     acc = tlx.amd_scheduled_mfma(
         a0,
         b0,
         acc,
-        accumulator="persistent",
+        accumulator_role="persistent",
         accumulator_register_class="vgpr" if USE_VGPR else None,
         initialize=True,
     )
-    a1 = tlx.amd_extract_slice(a, [16, 32], [0, 32])
-    b1 = tlx.amd_extract_slice(b, [32, 64], [32, 0])
+    a1 = tlx.extract_slice(a, [16, 32], [0, 32])
+    b1 = tlx.extract_slice(b, [32, 64], [32, 0])
     acc = tlx.amd_scheduled_mfma(
         a1,
         b1,
         acc,
-        accumulator="persistent",
+        accumulator_role="persistent",
         accumulator_register_class="vgpr" if USE_VGPR else None,
     )
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, acc)
+
+
+def test_amd_scheduled_mfma_persistent_acc_lowering_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_scheduled_mfma_persistent_acc_kernel,
+        signature={
+            "a_ptr": "*bf16",
+            "b_ptr": "*bf16",
+            "output_ptr": "*fp32",
+            "USE_VGPR": "constexpr",
+        },
+        constexprs={"USE_VGPR": False},
+    )
+    llir = compiled.asm["llir"]
+    assert 'asm sideeffect "v_mfma_f32_16x16x32_bf16' in llir
+    assert '"=a,v,v"' in llir
+    assert "@llvm.amdgcn.mfma.f32.16x16x32.bf16" not in llir
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
@@ -899,7 +917,7 @@ def _amd_scheduled_mfma_32x32_kernel(a_ptr, b_ptr, output_ptr):
         a,
         b,
         acc,
-        accumulator="transient",
+        accumulator_role="transient",
         initialize=True,
     )
     result, _ = tlx.amd_mfma_commit(result, b)
@@ -945,31 +963,31 @@ def _amd_scheduled_mfma_fragmented_nd_kernel(a_ptr, b_ptr, output_ptr):
     a = tlx.require_layout(a, dot0, pin=False)
     b = tlx.require_layout(b, dot1, pin=False)
 
-    a_lo = tlx.amd_extract_slice(a, [128, 16], [0, 0])
-    a_hi = tlx.amd_extract_slice(a, [128, 16], [128, 0])
-    b0 = tlx.amd_extract_slice(b, [16, 32], [0, 0])
-    b1 = tlx.amd_extract_slice(b, [16, 32], [0, 32])
-    b2 = tlx.amd_extract_slice(b, [16, 32], [0, 64])
-    b3 = tlx.amd_extract_slice(b, [16, 32], [0, 96])
+    a_lo = tlx.extract_slice(a, [128, 16], [0, 0])
+    a_hi = tlx.extract_slice(a, [128, 16], [128, 0])
+    b0 = tlx.extract_slice(b, [16, 32], [0, 0])
+    b1 = tlx.extract_slice(b, [16, 32], [0, 32])
+    b2 = tlx.extract_slice(b, [16, 32], [0, 64])
+    b3 = tlx.extract_slice(b, [16, 32], [0, 96])
     acc = tlx.zeros((256, 128), tl.float32, layout=mma)
-    c00 = tlx.amd_extract_slice(acc, [128, 32], [0, 0])
-    c10 = tlx.amd_extract_slice(acc, [128, 32], [128, 0])
-    c01 = tlx.amd_extract_slice(acc, [128, 32], [0, 32])
-    c11 = tlx.amd_extract_slice(acc, [128, 32], [128, 32])
-    c02 = tlx.amd_extract_slice(acc, [128, 32], [0, 64])
-    c12 = tlx.amd_extract_slice(acc, [128, 32], [128, 64])
-    c03 = tlx.amd_extract_slice(acc, [128, 32], [0, 96])
-    c13 = tlx.amd_extract_slice(acc, [128, 32], [128, 96])
+    c00 = tlx.extract_slice(acc, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(acc, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(acc, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(acc, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(acc, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(acc, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(acc, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(acc, [128, 32], [128, 96])
 
     tl.debug_barrier()
-    c00 = tlx.amd_scheduled_mfma(a_lo, b0, c00, accumulator="transient", initialize=True)
-    c10 = tlx.amd_scheduled_mfma(a_hi, b0, c10, accumulator="transient", initialize=True)
-    c01 = tlx.amd_scheduled_mfma(a_lo, b1, c01, accumulator="transient", initialize=True)
-    c11 = tlx.amd_scheduled_mfma(a_hi, b1, c11, accumulator="transient", initialize=True)
-    c02 = tlx.amd_scheduled_mfma(a_lo, b2, c02, accumulator="transient", initialize=True)
-    c12 = tlx.amd_scheduled_mfma(a_hi, b2, c12, accumulator="transient", initialize=True)
-    c03 = tlx.amd_scheduled_mfma(a_lo, b3, c03, accumulator="transient", initialize=True)
-    c13 = tlx.amd_scheduled_mfma(a_hi, b3, c13, accumulator="transient", initialize=True)
+    c00 = tlx.amd_scheduled_mfma(a_lo, b0, c00, accumulator_role="transient", initialize=True)
+    c10 = tlx.amd_scheduled_mfma(a_hi, b0, c10, accumulator_role="transient", initialize=True)
+    c01 = tlx.amd_scheduled_mfma(a_lo, b1, c01, accumulator_role="transient", initialize=True)
+    c11 = tlx.amd_scheduled_mfma(a_hi, b1, c11, accumulator_role="transient", initialize=True)
+    c02 = tlx.amd_scheduled_mfma(a_lo, b2, c02, accumulator_role="transient", initialize=True)
+    c12 = tlx.amd_scheduled_mfma(a_hi, b2, c12, accumulator_role="transient", initialize=True)
+    c03 = tlx.amd_scheduled_mfma(a_lo, b3, c03, accumulator_role="transient", initialize=True)
+    c13 = tlx.amd_scheduled_mfma(a_hi, b3, c13, accumulator_role="transient", initialize=True)
     c00, _ = tlx.amd_mfma_commit(c00, b3)
     c10, _ = tlx.amd_mfma_commit(c10, b3)
     c01, _ = tlx.amd_mfma_commit(c01, b3)
@@ -1062,29 +1080,29 @@ def _amd_scheduled_mfma_fragmented_nd_update_kernel(
     acc = tl.dot(a0, b0, acc)
     tl.debug_barrier()
 
-    lhs0 = tlx.amd_extract_slice(a1, [128, 16], [0, 0])
-    lhs1 = tlx.amd_extract_slice(a1, [128, 16], [128, 0])
-    rhs0 = tlx.amd_extract_slice(b1, [16, 32], [0, 0])
-    rhs1 = tlx.amd_extract_slice(b1, [16, 32], [0, 32])
-    rhs2 = tlx.amd_extract_slice(b1, [16, 32], [0, 64])
-    rhs3 = tlx.amd_extract_slice(b1, [16, 32], [0, 96])
-    c00 = tlx.amd_extract_slice(acc, [128, 32], [0, 0])
-    c10 = tlx.amd_extract_slice(acc, [128, 32], [128, 0])
-    c01 = tlx.amd_extract_slice(acc, [128, 32], [0, 32])
-    c11 = tlx.amd_extract_slice(acc, [128, 32], [128, 32])
-    c02 = tlx.amd_extract_slice(acc, [128, 32], [0, 64])
-    c12 = tlx.amd_extract_slice(acc, [128, 32], [128, 64])
-    c03 = tlx.amd_extract_slice(acc, [128, 32], [0, 96])
-    c13 = tlx.amd_extract_slice(acc, [128, 32], [128, 96])
+    lhs0 = tlx.extract_slice(a1, [128, 16], [0, 0])
+    lhs1 = tlx.extract_slice(a1, [128, 16], [128, 0])
+    rhs0 = tlx.extract_slice(b1, [16, 32], [0, 0])
+    rhs1 = tlx.extract_slice(b1, [16, 32], [0, 32])
+    rhs2 = tlx.extract_slice(b1, [16, 32], [0, 64])
+    rhs3 = tlx.extract_slice(b1, [16, 32], [0, 96])
+    c00 = tlx.extract_slice(acc, [128, 32], [0, 0])
+    c10 = tlx.extract_slice(acc, [128, 32], [128, 0])
+    c01 = tlx.extract_slice(acc, [128, 32], [0, 32])
+    c11 = tlx.extract_slice(acc, [128, 32], [128, 32])
+    c02 = tlx.extract_slice(acc, [128, 32], [0, 64])
+    c12 = tlx.extract_slice(acc, [128, 32], [128, 64])
+    c03 = tlx.extract_slice(acc, [128, 32], [0, 96])
+    c13 = tlx.extract_slice(acc, [128, 32], [128, 96])
 
-    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator="persistent")
-    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator="persistent")
-    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator="persistent")
-    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator="persistent")
-    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator="persistent")
-    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator="persistent")
-    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator="persistent")
-    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator="persistent")
+    c00 = tlx.amd_scheduled_mfma(lhs0, rhs0, c00, accumulator_role="persistent")
+    c10 = tlx.amd_scheduled_mfma(lhs1, rhs0, c10, accumulator_role="persistent")
+    c01 = tlx.amd_scheduled_mfma(lhs0, rhs1, c01, accumulator_role="persistent")
+    c11 = tlx.amd_scheduled_mfma(lhs1, rhs1, c11, accumulator_role="persistent")
+    c02 = tlx.amd_scheduled_mfma(lhs0, rhs2, c02, accumulator_role="persistent")
+    c12 = tlx.amd_scheduled_mfma(lhs1, rhs2, c12, accumulator_role="persistent")
+    c03 = tlx.amd_scheduled_mfma(lhs0, rhs3, c03, accumulator_role="persistent")
+    c13 = tlx.amd_scheduled_mfma(lhs1, rhs3, c13, accumulator_role="persistent")
 
     if DIRECT_STORE:
         fragment_rows = tl.arange(0, 128)
@@ -1170,15 +1188,15 @@ def _amd_scheduled_mfma_interleaved_chains_kernel(a_ptr, b_ptr, output_ptr, BAND
     acc1 = tlx.zeros((16, 64), tl.float32, layout=mma)
 
     for band in tl.static_range(BANDS):
-        a_band = tlx.amd_extract_slice(a, [16, 32], [0, band * 32])
-        b0 = tlx.amd_extract_slice(b, [32, 64], [band * 32, 0])
-        b1 = tlx.amd_extract_slice(b, [32, 64], [band * 32, 64])
+        a_band = tlx.extract_slice(a, [16, 32], [0, band * 32])
+        b0 = tlx.extract_slice(b, [32, 64], [band * 32, 0])
+        b1 = tlx.extract_slice(b, [32, 64], [band * 32, 64])
         acc0 = tlx.amd_scheduled_mfma(
             a_band,
             b0,
             acc0,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
             initialize=band == 0,
         )
         acc1 = tlx.amd_scheduled_mfma(
@@ -1186,7 +1204,7 @@ def _amd_scheduled_mfma_interleaved_chains_kernel(a_ptr, b_ptr, output_ptr, BAND
             b1,
             acc1,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
             initialize=band == 0,
         )
     acc0, acc1, b1 = tlx.amd_mfma_commit((acc0, acc1), b1)
@@ -1309,23 +1327,23 @@ def _amd_scheduled_mfma_split_resident_chains_kernel(
         )
     else:
         b = tlx.require_layout(b, dot1, pin=False)
-        b_lo = tlx.amd_extract_slice(b, [128, 128], [0, 0])
-        b_mid = tlx.amd_extract_slice(b, [64, 128], [128, 0])
-        b6 = tlx.amd_extract_slice(b, [32, 128], [192, 0])
-        b7 = tlx.amd_extract_slice(b, [32, 128], [224, 0])
+        b_lo = tlx.extract_slice(b, [128, 128], [0, 0])
+        b_mid = tlx.extract_slice(b, [64, 128], [128, 0])
+        b6 = tlx.extract_slice(b, [32, 128], [192, 0])
+        b7 = tlx.extract_slice(b, [32, 128], [224, 0])
 
     acc0 = tlx.zeros((16, 64), tl.float32, layout=mma)
     acc1 = tlx.zeros((16, 64), tl.float32, layout=mma)
     for band in tl.static_range(4):
-        a_band = tlx.amd_extract_slice(a, [16, 32], [0, band * 32])
-        b0 = tlx.amd_extract_slice(b_lo, [32, 64], [band * 32, 0])
-        b1 = tlx.amd_extract_slice(b_lo, [32, 64], [band * 32, 64])
+        a_band = tlx.extract_slice(a, [16, 32], [0, band * 32])
+        b0 = tlx.extract_slice(b_lo, [32, 64], [band * 32, 0])
+        b1 = tlx.extract_slice(b_lo, [32, 64], [band * 32, 64])
         acc0 = tlx.amd_scheduled_mfma(
             a_band,
             b0,
             acc0,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
             initialize=band == 0,
         )
         acc1 = tlx.amd_scheduled_mfma(
@@ -1333,60 +1351,60 @@ def _amd_scheduled_mfma_split_resident_chains_kernel(
             b1,
             acc1,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
             initialize=band == 0,
         )
     for band in tl.static_range(2):
-        a_band = tlx.amd_extract_slice(a, [16, 32], [0, (band + 4) * 32])
-        b0 = tlx.amd_extract_slice(b_mid, [32, 64], [band * 32, 0])
-        b1 = tlx.amd_extract_slice(b_mid, [32, 64], [band * 32, 64])
+        a_band = tlx.extract_slice(a, [16, 32], [0, (band + 4) * 32])
+        b0 = tlx.extract_slice(b_mid, [32, 64], [band * 32, 0])
+        b1 = tlx.extract_slice(b_mid, [32, 64], [band * 32, 64])
         acc0 = tlx.amd_scheduled_mfma(
             a_band,
             b0,
             acc0,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
         )
         acc1 = tlx.amd_scheduled_mfma(
             a_band,
             b1,
             acc1,
             resident_operand=1,
-            accumulator="transient",
+            accumulator_role="transient",
         )
-    a_band6 = tlx.amd_extract_slice(a, [16, 32], [0, 192])
-    b60 = tlx.amd_extract_slice(b6, [32, 64], [0, 0])
-    b61 = tlx.amd_extract_slice(b6, [32, 64], [0, 64])
+    a_band6 = tlx.extract_slice(a, [16, 32], [0, 192])
+    b60 = tlx.extract_slice(b6, [32, 64], [0, 0])
+    b61 = tlx.extract_slice(b6, [32, 64], [0, 64])
     acc0 = tlx.amd_scheduled_mfma(
         a_band6,
         b60,
         acc0,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
     )
     acc1 = tlx.amd_scheduled_mfma(
         a_band6,
         b61,
         acc1,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
     )
-    a_band7 = tlx.amd_extract_slice(a, [16, 32], [0, 224])
-    b70 = tlx.amd_extract_slice(b7, [32, 64], [0, 0])
-    b71 = tlx.amd_extract_slice(b7, [32, 64], [0, 64])
+    a_band7 = tlx.extract_slice(a, [16, 32], [0, 224])
+    b70 = tlx.extract_slice(b7, [32, 64], [0, 0])
+    b71 = tlx.extract_slice(b7, [32, 64], [0, 64])
     acc0 = tlx.amd_scheduled_mfma(
         a_band7,
         b70,
         acc0,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
     )
     acc1 = tlx.amd_scheduled_mfma(
         a_band7,
         b71,
         acc1,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
     )
     if FULL_COMMIT:
         v_resident = tlx.require_layout(
@@ -1852,7 +1870,7 @@ def _padded_local_slice_transposed_load_kernel(x_ptr, rhs_ptr, output_ptr):
         rhs,
         accumulator,
         resident_operand=1,
-        accumulator="transient",
+        accumulator_role="transient",
         initialize=True,
     )
     output_offsets = rows[:, None] * 64 + output_cols[None, :]
