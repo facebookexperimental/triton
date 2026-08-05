@@ -501,18 +501,19 @@ static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
 }
 
 static PyObject *PyCUtensorMap_alloc(PyTypeObject *type, Py_ssize_t n_items) {
-  PyCUtensorMapObject *self = NULL;
+  PyObject *self = NULL;
   void *mem = NULL;
   size_t size = type->tp_basicsize;
 
-  if (posix_memalign(&mem, 128, size) != 0) {
+  if (posix_memalign(&mem, alignof(CUtensorMap), size) != 0) {
     PyErr_NoMemory();
     return NULL;
   }
 
-  self = (PyCUtensorMapObject *)mem;
+  memset(mem, 0, size);
+  self = (PyObject *)mem;
   PyObject_INIT(self, type);
-  return (PyObject *)self;
+  return self;
 }
 
 static void PyCUtensorMap_dealloc(PyObject *self) {
@@ -2271,12 +2272,13 @@ typedef struct {
   unsigned profile_scratch_align;
   PyObject *allocator;         /* _allocation._allocator (ContextVar) */
   PyObject *profile_allocator; /* _allocation._profile_allocator (wrapper) */
-  /* TMA descriptor storage (128-byte aligned) */
+  /* TMA descriptor storage */
   int num_tma_descs;
   int tma_slot_for_arg[TD_MAX_KERNEL_ARGS]; /* -1 if not TMA, else tma_descs
                                                index */
   TMASlotMeta tma_meta[TD_MAX_TMA_DESCS];
-  CUtensorMap tma_descs[TD_MAX_TMA_DESCS] __attribute__((aligned(128)));
+  /* TritonDispatcherType.tp_alloc must honor this member's alignment. */
+  _Alignas(alignof(CUtensorMap)) CUtensorMap tma_descs[TD_MAX_TMA_DESCS];
   /* Converged launch: when set, this kernel launches through the shared core
    * triton_launch_kernel() instead of the dispatcher's own cuLaunchKernelEx.
    * Enabled for the common non-TMA, non multi-dim-cluster case (see
@@ -3069,6 +3071,8 @@ static PyTypeObject TritonDispatcherType = {
     .tp_call = PyVectorcall_Call,
     .tp_new = TritonDispatcher_new,
     .tp_dealloc = TritonDispatcher_dealloc,
+    .tp_alloc = PyCUtensorMap_alloc,
+    .tp_free = PyCUtensorMap_free,
     .tp_doc = "Full C dispatcher for Triton JIT kernel launch (vectorcall).",
 };
 
