@@ -80,8 +80,8 @@ def matmul_kernel_pipelined_hopper(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, stri
 
     # main K loop
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # Disable auto-pipelining with num_stages=0
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=0):
+    # Disable auto-pipelining with num_stages=1
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=1):
         # Select the buffer for the current iteration.
         buf = k % NUM_STAGES
         a_k = tlx.local_view(buffers_A, buf)

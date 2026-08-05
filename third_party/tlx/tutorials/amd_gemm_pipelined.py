@@ -186,8 +186,8 @@ def matmul_kernel_pipelined_mi300(a_ptr, b_ptr, c_ptr, M, N, K, stride_am, strid
     # Pipeline Kernel Main Loop.
     # BLOCK_SIZE_K - (NUM_STAGES - 1) iterations
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    # Disable auto-pipelining with num_stages=0
-    for k in tl.range(NUM_STAGES - 1, K_ITERS, num_stages=0):
+    # Disable auto-pipelining with num_stages=1
+    for k in tl.range(NUM_STAGES - 1, K_ITERS, num_stages=1):
         # prefetch data for k into regs, this is NUM_STAGES - 1 ahead of the k in the following tl.dot
         a_k_smem_view = tlx.local_view(buffers_A, k % NUM_BUFFERS)
         b_k_smem_view = tlx.local_view(buffers_B, k % NUM_BUFFERS)

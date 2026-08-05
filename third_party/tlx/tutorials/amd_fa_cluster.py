@@ -241,7 +241,7 @@ def _attn_inner_pipelined(
         tok_v1 = tlx.async_load(v_ptrs + n1 * stride_vn, tlx.local_view(v_buf, 1))
     tlx.async_load_commit_group([tok_v1])
 
-    for block_n in tl.range(block_start, block_end - 3, num_stages=0):
+    for block_n in tl.range(block_start, block_end - 3, num_stages=1):
         cur_slot = (block_n - block_start) % BUF_DEPTH
         nxt_slot = (block_n + 1 - block_start) % BUF_DEPTH
         ack_n = (block_n + 3) * BLOCK_N
@@ -388,7 +388,7 @@ def _attn_inner_short(
 
     num_blocks = block_end - block_start
     if USE_DIRECT_LOAD:
-        for block_offset in tl.range(0, num_blocks, num_stages=0):
+        for block_offset in tl.range(0, num_blocks, num_stages=1):
             start_n = (block_start + block_offset) * BLOCK_N
             mask = (start_n + offs_n)[:, None] < N_CTX
             k = tl.load(k_ptrs + start_n * stride_kn, mask=mask, other=0.0)
@@ -409,7 +409,7 @@ def _attn_inner_short(
             acc = tl.dot(p_dot, v, state.acc)
             state = SoftmaxState(acc, state.l_i, state.m_i)
     else:
-        for chunk_start in tl.range(0, num_blocks, BUF_DEPTH, num_stages=0):
+        for chunk_start in tl.range(0, num_blocks, BUF_DEPTH, num_stages=1):
             for slot in tl.static_range(BUF_DEPTH):
                 block_offset = chunk_start + slot
                 if block_offset < num_blocks:
@@ -815,7 +815,7 @@ def _attn_fwd_cluster_persistent_pipeline(
     hz_per_xcd = (Z * H + NUM_XCDS - 1) // NUM_XCDS
     units = hz_per_xcd * units_per_hz
 
-    for unit in tl.range(local, units, NUM_LOCAL, num_stages=0):
+    for unit in tl.range(local, units, NUM_LOCAL, num_stages=1):
         local_hz = unit // units_per_hz
         bundle = unit % units_per_hz
         pid_hz = xcd + local_hz * NUM_XCDS
@@ -831,7 +831,7 @@ def _attn_fwd_cluster_persistent_pipeline(
                     else:
                         pid_m = idx
                     # Safe to reuse the LDS slots across units: the outer loop
-                    # has num_stages=0 and _attn_cluster_tile drains all async
+                    # has num_stages=1 and _attn_cluster_tile drains all async
                     # load groups before it returns.
                     _attn_cluster_tile(
                         pid_m,

@@ -500,7 +500,7 @@ def _token_in_loop_kernel(
     acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
 
     # tok is in scope here -- that's what we're testing.
-    for i in tl.range(0, NUM_ITERS, num_stages=0):
+    for i in tl.range(0, NUM_ITERS, num_stages=1):
         tlx.async_load_wait_group(0)
         x = tlx.local_load(buf0)
         acc += x
@@ -555,7 +555,7 @@ def _loop_carried_dot_layout_kernel(
     b_reg = tlx.local_load(b_buf)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k in tl.range(0, K_ITERS - 1, num_stages=0):
+    for k in tl.range(0, K_ITERS - 1, num_stages=1):
         acc = tl.dot(a_reg, b_reg, acc)
         next_slot = (k + 1) % 2
         next_a = tlx.local_view(a_buffers, next_slot)

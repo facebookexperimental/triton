@@ -111,7 +111,7 @@ def _attn_fwd_async_simple(
     k_base = K + k_off + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
     v_base = V + v_off + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
 
-    for start_n in tl.range(0, hi, BLOCK_N, num_stages=0):
+    for start_n in tl.range(0, hi, BLOCK_N, num_stages=1):
         kn = start_n + offs_n
         k_mask = kn[:, None] < N_CTX
         v_mask = kn[:, None] < N_CTX
@@ -253,7 +253,7 @@ def _attn_fwd_async_prefetch(
     [LR_KV]
     [QK, SM0, SM1, PV]  [GLDS_KV],
     """
-    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=0):
+    for block_id in tl.range(0, n_main * BLOCK_N, BLOCK_N, num_stages=1):
         next_off = block_id + BLOCK_N
         kn = block_id + offs_n
         next_mask = (next_off + offs_n[:, None]) < N_CTX
