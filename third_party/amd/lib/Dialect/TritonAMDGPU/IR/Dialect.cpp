@@ -177,10 +177,10 @@ LogicalResult verifyBufferContiguity(Operation *op, RankedTensorType tensorTy,
     return op->emitError("contiguity must be a positive power-of-two integer");
 
   Attribute encoding = tensorTy.getEncoding();
-  // Encoding-free tensors are valid before TTGIR layout assignment. Once an
-  // encoding is present, buffer vectorization relies on distributed
-  // per-thread ownership and must reject unrelated encoding kinds.
-  if (!encoding)
+  // Encoding-free tensors and frontend placeholder encodings are valid before
+  // TTGIR layout assignment. Validate per-thread ownership once the encoding
+  // has resolved to a concrete TritonGPU layout.
+  if (!encoding || !isa<triton::gpu::LayoutEncodingTrait>(encoding))
     return success();
   if (!isa<triton::gpu::DistributedEncodingTrait>(encoding))
     return op->emitError("requires a distributed tensor encoding");

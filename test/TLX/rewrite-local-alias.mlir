@@ -4,6 +4,7 @@
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 32, transposed = false, elementBitWidth = 16}>
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 64, transposed = false, elementBitWidth = 16}>
+#bar_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 #tmem = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
 #tmem1 = #ttng.tensor_memory_encoding<blockM = 64, blockN = 32, colStride = 1>
@@ -18,6 +19,9 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     // CHECK: %[[$LOCAL_ALLOC:.*]] = ttg.local_alloc : () -> !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable>
     %0 = ttg.local_alloc : () -> !ttg.memdesc<1x64x16xf16, #shared, #smem, mutable>
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1x16x32xf16, #shared1, #smem, mutable>
+    // Unrelated NPOT allocations, such as barrier arrays, must not be sized by
+    // storage-alias lowering merely because another allocation has aliases.
+    %barriers = ttg.local_alloc : () -> !ttg.memdesc<3xi64, #bar_shared, #smem, mutable>
 
     // CHECK-NOT: tlx.local_alias
     // CHECK: ttg.memdesc_reinterpret %[[$LOCAL_ALLOC]] : !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #[[$SHARED1]], #smem, mutable>
