@@ -1328,6 +1328,25 @@ def test_update_tensor_descriptor_store_compiles_gfx1250(device):
         "expected amdg.async_tdm_copy_local_to_global in TTGIR, got:\n" + ttgir)
 
 
+@triton.jit
+def _amd_sched_barrier_kernel(output_ptr):
+    tlx.amd_sched_barrier(0)
+    tl.store(output_ptr, tl.full((), 1, tl.int32))
+
+
+def test_amd_sched_barrier_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _amd_sched_barrier_kernel,
+        signature={"output_ptr": "*i32"},
+        constexprs={},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "rocdl.sched.barrier" in ttgir, ("expected rocdl.sched.barrier in TTGIR, got:\n" + ttgir)
+    amdgcn = compiled.asm["amdgcn"]
+    assert "s_sched_barrier" in amdgcn or "sched_barrier" in amdgcn, ("expected scheduler barrier in AMDGCN, got:\n" +
+                                                                      amdgcn)
+
+
 def test_async_amd_desc_store_correctness_gfx1250(device, fresh_triton_cache):
     """End-to-end: TDM load + TDM store round-trips A -> output on gfx1250 hw."""
     if not is_gfx1250_available():

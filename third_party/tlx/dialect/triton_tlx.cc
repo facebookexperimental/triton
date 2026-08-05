@@ -11,6 +11,7 @@ namespace ir {
 nanobind::class_<TritonOpBuilder> *getBuilderClass();
 } // namespace ir
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
 #include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -446,6 +447,10 @@ void init_triton_tlx_ir(py::module_ &m) {
            [](TritonOpBuilder &self) -> void {
              self.create<triton::nvidia_gpu::ClusterArriveOp>(false);
              self.create<triton::nvidia_gpu::ClusterWaitOp>();
+           })
+      .def("create_amd_sched_barrier",
+           [](TritonOpBuilder &self, unsigned mask) -> void {
+             self.create<ROCDL::SchedBarrier>(mask);
            })
       .def("create_tmem_alloc",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,

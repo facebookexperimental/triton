@@ -297,3 +297,38 @@ tt.func public @tdm_local_descriptor_aligns_to_alloc(%ptr: !tt.ptr<f16>, %sz0: i
   tt.return
 }
 }
+
+// -----
+// =============================================================================
+// alignTDMDescriptorEncodings: loop-carried descriptor values must be updated on
+// every RegionBranchOpInterface edge. This covers scf.while init, condition,
+// body argument, yield, and result types for destructively updated descriptors.
+// =============================================================================
+
+#shared = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-DAG: #[[$PADDED_TDM:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 32]}>
+// CHECK-LABEL: @tdm_while_carried_descriptor_aligns_to_alloc
+// CHECK-SAME: %[[DESC:.*]]: !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+tt.func public @tdm_while_carried_descriptor_aligns_to_alloc(%desc: !tt.tensordesc<128x32xf16>, %m: i32, %k: i32, %cond: i1) {
+  %c0 = arith.constant 0 : i32
+  %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable>
+  %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+  // CHECK: scf.while (%[[CARRIED:.*]] = %[[DESC]]) : (!tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>) -> !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+  %res = scf.while (%carried = %desc) : (!tt.tensordesc<128x32xf16>) -> (!tt.tensordesc<128x32xf16>) {
+    // CHECK: scf.condition({{.*}}) {{.*}} : !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+    scf.condition(%cond) %carried : !tt.tensordesc<128x32xf16>
+  } do {
+  // CHECK: ^bb0(%[[BODY:.*]]: !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>):
+  ^bb0(%body_desc: !tt.tensordesc<128x32xf16>):
+    // CHECK: amdg.update_tensor_descriptor %[[BODY]]
+    %updated = amdg.update_tensor_descriptor %body_desc add_offsets = [%m, %k] : !tt.tensordesc<128x32xf16>
+    // CHECK: amdg.async_tdm_copy_global_to_local {{.*}} : !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+    %tok = amdg.async_tdm_copy_global_to_local %updated into %buf : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    // CHECK: scf.yield {{.*}} : !tt.tensordesc<128x32xf16, #[[$PADDED_TDM]]>
+    scf.yield %updated : !tt.tensordesc<128x32xf16>
+  }
+  tt.return
+}
+}

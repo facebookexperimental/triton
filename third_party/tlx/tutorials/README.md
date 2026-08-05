@@ -70,3 +70,9 @@ python3 third_party/tlx/tutorials/amd-tdm-gemm-pipelined_test.py \
 
 Pass `--benchmark_mode none --check` to run once and print a max absolute
 difference against `torch.matmul` instead of timing.
+
+## f16 gfx1250 Grouped GEMM
+
+The packed ragged-M grouped GEMM kernel, correctness tests, configuration
+notes, and benchmark sweep live in
+[`amd_grouped_gemm_gfx1250/`](amd_grouped_gemm_gfx1250/README.md).

@@ -3,6 +3,7 @@ from .async_task_utils import async_task, async_tasks
 from .barrier import (
     alloc_barriers,
     alloc_warp_barrier,
+    amd_sched_barrier,
     barrier_arrive,
     barrier_expect_bytes,
     barrier_wait,
@@ -173,6 +174,7 @@ __all__ = [
     "barrier_arrive",
     "named_barrier_wait",
     "named_barrier_arrive",
+    "amd_sched_barrier",
     # mma_ops
     "dot_scaled",
     "require_amd_wmma_layout",
