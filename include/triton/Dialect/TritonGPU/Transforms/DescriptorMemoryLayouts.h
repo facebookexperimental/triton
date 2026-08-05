@@ -47,8 +47,8 @@ private:
                                       unsigned numCTAs);
 
 protected:
-  virtual Attribute getDesiredDescriptorEncoding(
-      TypedValue<triton::TensorDescType> descriptor) {
+  virtual Attribute
+  getDesiredDescriptorEncoding(TypedValue<triton::TensorDescType> descriptor) {
     return {};
   }
 
