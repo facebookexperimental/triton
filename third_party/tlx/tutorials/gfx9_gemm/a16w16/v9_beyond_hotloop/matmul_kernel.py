@@ -143,9 +143,8 @@ def v9_beyond_hotloop(
             b_left = tlx.local_load(smem_b_left[1], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[0], b_ptr, br_off + b_k)
             tlx.async_load_commit_group()
-
-        a_k += BLOCK_K * stride_ak
-        b_k += BLOCK_K * stride_bk
+            a_k += BLOCK_K * stride_ak
+            b_k += BLOCK_K * stride_bk
 
         # ──── Region 2 ────
         with tlx.warp_pipeline_stage("mfma", priority=0):
@@ -166,9 +165,17 @@ def v9_beyond_hotloop(
             b_left = tlx.local_load(smem_b_left[0], relaxed=True)
             tlx.buffer_load_to_local(smem_b_right[1], b_ptr, br_off + b_k)
             tlx.async_load_commit_group()
-
-        a_k += BLOCK_K * stride_ak
-        b_k += BLOCK_K * stride_bk
+            # Bump the K offsets INSIDE the final stage. Left trailing after it,
+            # these two adds are the only ops following the last
+            # warp_pipeline_stage border, and WarpPipeliner::createPipeline
+            # sweeps whatever is left over into an extra "last_cluster" stage
+            # (priority -1) containing nothing but two arith.addi -- a whole
+            # pipeline turn where one wave group does two scalar adds while the
+            # other waits. sinkPureScalarsIntoNextStage cannot rescue them
+            # because there is no next stage to sink into. The identical pair in
+            # the middle of the body IS rescued, which is why only this one hurt.
+            a_k += BLOCK_K * stride_ak
+            b_k += BLOCK_K * stride_bk
 
     # ── Epilogue: drain the last two K iterations ──
     acc_left = tl.dot(a, b_left, acc_left)
