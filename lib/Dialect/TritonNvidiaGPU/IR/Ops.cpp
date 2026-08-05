@@ -1955,16 +1955,16 @@ LogicalResult TMEMCopyOp::verify() {
     auto tmemLl = toLinearLayout(dstTy);
 
     // The upstream cga-layout equality check uses invertAndCompose, which
-    // requires matching out-dim names AND tmem out-dim sizes >= shmem out-dim
+    // requires matching out-dim names AND shmem out-dim sizes >= tmem out-dim
     // sizes (its internal assertion). Meta Triton's flexible multi-dimensional
-    // scale SMEM sources can be larger than the tmem destination, which would
-    // trip that assertion, so only run the check when the out-dims are
-    // compatible (the rank-equal case upstream assumes).
+    // scale SMEM sources can have incompatible per-dimension shapes, so only
+    // run the check when the out-dims are compatible (the rank-equal case
+    // upstream assumes).
     bool compatibleOutDims =
         llvm::equal(shmemLl.getOutDimNames(), tmemLl.getOutDimNames());
     if (compatibleOutDims) {
       for (auto dim : tmemLl.getOutDimNames()) {
-        if (tmemLl.getOutDimSize(dim) < shmemLl.getOutDimSize(dim)) {
+        if (shmemLl.getOutDimSize(dim) < tmemLl.getOutDimSize(dim)) {
           compatibleOutDims = false;
           break;
         }

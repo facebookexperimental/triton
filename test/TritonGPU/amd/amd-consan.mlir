@@ -1153,16 +1153,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   // CHECK-LABEL: @tdm_gather_scatter_track_commits
   tt.func public @tdm_gather_scatter_track_commits(%desc: !tt.tensordesc<64x128xf16>, %rows: tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>) {
     %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
-    %c0_i32 = arith.constant 0 : i32
-    %true_i32 = arith.constant 1 : i32
     // CHECK: tt.call @__triton_consan_stage_access_for_commit
     // CHECK: tt.call @__triton_consan_commit_accesses
     // CHECK: amdg.async_tdm_gather
-    %gather = amdg.async_tdm_gather %desc[%rows, %c0_i32] to %buffer, pred = %true_i32 : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    %gather = amdg.async_tdm_gather %desc[%rows] to %buffer : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     // CHECK: tt.call @__triton_consan_stage_access_for_commit
     // CHECK: tt.call @__triton_consan_commit_accesses
     // CHECK: amdg.async_tdm_scatter
-    %scatter = amdg.async_tdm_scatter %desc[%rows, %c0_i32] from %buffer : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    %scatter = amdg.async_tdm_scatter %desc[%rows] from %buffer : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     // CHECK: tt.call @__triton_consan_clear_outstanding_commits_transfer_both
     // CHECK: amdg.async_tdm_wait
     %wait = amdg.async_tdm_wait %scatter {num = 0 : i32}
@@ -1184,19 +1182,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
   tt.func public @tdm_gather_scatter_track_barrier(%desc: !tt.tensordesc<64x128xf16>, %rows: tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>) {
     %buffer = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<256x128xf16, #shared, #smem, mutable>
     %barrier = ttg.local_alloc {allocation.offset = 65536 : i32} : () -> !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
-    %c0_i32 = arith.constant 0 : i32
-    %true_i32 = arith.constant 1 : i32
     amdg.init_barrier %barrier, 8 : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
     // CHECK: tt.call @__triton_consan_verify_barrier_arrive
     // CHECK: tt.call @__triton_consan_update_barrier_state
     // CHECK-NOT: tt.call @__triton_consan_commit_accesses
     // CHECK: amdg.async_tdm_gather
-    %gather = amdg.async_tdm_gather %desc[%rows, %c0_i32] to %buffer, pred = %true_i32, barrier = %barrier : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    %gather = amdg.async_tdm_gather %desc[%rows] to %buffer, barrier = %barrier : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     // CHECK: tt.call @__triton_consan_verify_barrier_arrive
     // CHECK: tt.call @__triton_consan_update_barrier_state
     // CHECK-NOT: tt.call @__triton_consan_commit_accesses
     // CHECK: amdg.async_tdm_scatter
-    %scatter = amdg.async_tdm_scatter %desc[%rows, %c0_i32] from %buffer, barrier = %barrier : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
+    %scatter = amdg.async_tdm_scatter %desc[%rows] from %buffer, barrier = %barrier : tensor<64xi32, #ttg.slice<{dim = 0, parent = #idx_parent}>>, !ttg.memdesc<256x128xf16, #shared, #smem, mutable>, !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable> -> !tt.tensordesc<64x128xf16>
     tt.return
   }
 }
