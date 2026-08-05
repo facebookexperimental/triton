@@ -321,7 +321,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 
   auto *ptrOpr = builder.newAddrOperand(ptr, "r");
 
-  if (isConstantTruePred(pred) && !barrierPtr) {
+  if (isConstantTruePred(pred) && !barrierPtr && !useExplicitSharedStore()) {
     b.store(val, ptr, /*align=*/vec * elemBitwidth / 8);
   } else {
     PTXBuilder::Operand *valOpr;
@@ -335,15 +335,25 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
     } else {
       valOpr = builder.newOperand(val, constraint);
     }
-    // Build the store instruction with optional barrier operand
+
+    // Build the explicit store, adding barrier and predicate operands when
+    // needed.
     if (barrierPtr.has_value()) {
       auto *barrierOpr = builder.newAddrOperand(mappedBarrier, "r");
       st(ptrOpr, valOpr, barrierOpr).predicate(pred, "b");
-    } else {
+    } else if (!isConstantTruePred(pred)) {
       st(ptrOpr, valOpr).predicate(pred, "b");
+    } else {
+      st(ptrOpr, valOpr);
     }
     builder.launch(rewriter, loc, void_ty(ctx));
   }
+}
+
+bool TargetInfo::useExplicitSharedStore() const {
+  // Use explicit shared stores for PTX 8.5-8.9 to avoid a ptxas
+  // miscompilation; other PTX versions keep the LLVM store path.
+  return ptxVersion >= 85 && ptxVersion < 90;
 }
 
 void TargetInfo::copyBulkSharedToRemoteShared(RewriterBase &rewriter,

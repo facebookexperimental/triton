@@ -1,6 +1,7 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=87' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=87' -reconcile-unrealized-casts | FileCheck %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=84' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=84' -reconcile-unrealized-casts | FileCheck %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=85' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=85' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX85 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=86' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=86' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX86 %s
+// RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=90 ptx-version=88' --initialize-ws-cluster-barriers='compute-capability=90 ptx-version=88' -reconcile-unrealized-casts | FileCheck --check-prefix=PTX88 %s
 // RUN: triton-opt %s -split-input-file --nvgpu-tma-store-token-wait-lowering --convert-triton-gpu-to-llvm='compute-capability=107 ptx-version=94' --initialize-ws-cluster-barriers='compute-capability=107 ptx-version=94' -reconcile-unrealized-casts | FileCheck --check-prefix=RUBIN %s
 
 #shared0 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
@@ -932,6 +933,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.tot
 
 module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   // CHECK-LABEL: @local_gather_scatter_same_ownership
+  // PTX88-LABEL: @local_gather_scatter_same_ownership
+  // PTX88: llvm.inline_asm {{.*}} "st.shared.b32
   // CHECK-NOT: nvvm.mapa
   // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> i32
   // CHECK: nvvm.barrier
@@ -952,6 +955,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   }
 
   // CHECK-LABEL: @local_gather_scatter_broadcast
+  // PTX88-LABEL: @local_gather_scatter_broadcast
+  // PTX88: llvm.inline_asm {{.*}} "st.shared.b32
   // CHECK: nvg.cluster_id
   // CHECK-NOT: nvvm.mapa
   // CHECK: llvm.load {{.*}} : !llvm.ptr<3> -> i32
@@ -973,6 +978,8 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   }
 
   // CHECK-LABEL: @local_gather_scatter_cross_cta
+  // PTX88-LABEL: @local_gather_scatter_cross_cta
+  // PTX88: llvm.inline_asm {{.*}} "st.shared::cluster.b32
   // CHECK: nvvm.mapa
   // CHECK: llvm.load {{.*}} : !llvm.ptr<7> -> i32
   // CHECK: nvvm.barrier
