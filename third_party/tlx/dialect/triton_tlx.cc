@@ -2,6 +2,7 @@
 #include "Transforms/Passes.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "ir.h" // TritonOpBuilder
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Pass/PassManager.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #include "passes.h"
@@ -653,6 +654,10 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_named_barrier_arrive",
            [](TritonOpBuilder &self, Value barrier, Value numThreads) -> void {
              self.create<ttng::NamedBarrierArriveOp>(barrier, numThreads);
+           })
+      .def("create_amd_sched_barrier",
+           [](TritonOpBuilder &self, int32_t mask) {
+             self.create<ROCDL::SchedBarrier>(mask);
            })
       .def("create_barrier_expect",
            [](TritonOpBuilder &self, Value mbarrerLoc, int expectBytes,

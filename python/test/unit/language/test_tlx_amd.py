@@ -1288,3 +1288,20 @@ def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
     actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
+
+
+@triton.jit
+def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(x_ptr + offsets)
+    tlx.amd_sched_barrier()
+    tl.store(y_ptr + offsets, values)
+
+
+def test_amd_sched_barrier_compiles_gfx950():
+    compiled = compile_for_gfx950(
+        _amd_sched_barrier_kernel,
+        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "BLOCK": "constexpr"},
+        constexprs={"BLOCK": 64},
+    )
+    assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
