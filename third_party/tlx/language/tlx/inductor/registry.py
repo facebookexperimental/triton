@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import os
 from typing import Any, Generator
 
 log = logging.getLogger(__name__)
@@ -1239,7 +1240,17 @@ class ROCmAddMMWarpPipeTemplateConfigHeuristic(
         # to that case -- unit-scalar addmm and plain mm both qualify. sympy Symbol == 1
         # returns a plain False, so this stays safe for symbolic scalars.
         scalars = getattr(kernel_inputs, "_scalars", None) or {}
-        allow_split_k = scalars.get("alpha", 1) == 1 and scalars.get("beta", 1) == 1
+        # Split-K is opt-in via TORCHINDUCTOR_TLX_SPLIT_K=1 (default off). Autotune scores
+        # each addmm candidate on the GEMM kernel's own time only and excludes the separate
+        # reduce_k kernel's latency, so a split-K TLX addmm can beat rocBLAS on the GEMM yet
+        # be net-slower e2e once the reducer is added (observed on HIM). Flip on to A/B; make
+        # it default once autotune costs the reducer during lowering. Correctness also
+        # requires alpha == beta == 1.
+        allow_split_k = (
+            scalars.get("alpha", 1) == 1
+            and scalars.get("beta", 1) == 1
+            and os.environ.get("TORCHINDUCTOR_TLX_SPLIT_K", "0") == "1"
+        )
         m_hint = sizevars.optimization_hint(m, fallback=NUM_SMS)
         n_hint = sizevars.optimization_hint(n, fallback=NUM_SMS)
         for (
