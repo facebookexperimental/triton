@@ -563,7 +563,7 @@ def _amd_extract_slice_mfma_kernel(
     a_band = tlx.amd_extract_slice(a, [16, 32], [0, BAND * 32])
     b_band = tlx.amd_extract_slice(b, [32, 64], [BAND * 32, 0])
     acc = tlx.zeros((16, 64), tl.float32, layout=mma)
-    result = tlx.amd_mfma(a_band, b_band, acc)
+    result = tl.dot(a_band, b_band, acc)
     output_offsets = output_ptr + rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(output_offsets, mma, pin=False)
     tl.store(output_offsets, result)
@@ -643,7 +643,7 @@ def _amd_rematerialized_layout_coordinates_kernel(x_ptr, y_ptr):
         src_dot1,
         pin=False,
     )
-    values = tlx.amd_mfma(
+    values = tl.dot(
         a,
         b,
         tlx.zeros((64, 64), tl.float32, layout=src_mma),
@@ -668,23 +668,6 @@ def test_amd_rematerialized_layout_coordinates_compiles_gfx950():
     assert "tlx.rematerialize_coordinates" in compiled.asm["ttgir"]
     assert compiled.asm["llir"].count('asm sideeffect "", "=v,0"') >= 2
     assert "amdgcn" in compiled.asm
-
-
-@triton.jit
-def _amd_sched_barrier_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
-    offsets = tl.arange(0, BLOCK)
-    values = tl.load(x_ptr + offsets)
-    tlx.amd_sched_barrier()
-    tl.store(y_ptr + offsets, values)
-
-
-def test_amd_sched_barrier_compiles_gfx950():
-    compiled = compile_for_gfx950(
-        _amd_sched_barrier_kernel,
-        signature={"x_ptr": "*bf16", "y_ptr": "*bf16", "BLOCK": "constexpr"},
-        constexprs={"BLOCK": 64},
-    )
-    assert "llvm.amdgcn.sched.barrier" in compiled.asm["llir"]
 
 
 @triton.jit
@@ -1076,7 +1059,7 @@ def _amd_scheduled_mfma_fragmented_nd_update_kernel(
     )
 
     acc = tlx.zeros((256, 128), tl.float32, layout=mma)
-    acc = tlx.amd_mfma(a0, b0, acc)
+    acc = tl.dot(a0, b0, acc)
     tl.debug_barrier()
 
     lhs0 = tlx.amd_extract_slice(a1, [128, 16], [0, 0])

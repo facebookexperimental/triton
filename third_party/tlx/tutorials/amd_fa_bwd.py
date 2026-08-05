@@ -1265,7 +1265,7 @@ def _attn_bwd_gqa_front(
         layout=QT_LAYOUT,
         relaxed=True,
     )
-    scores = tlx.amd_mfma(
+    scores = tl.dot(
         k_nm,
         q_t,
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
@@ -1276,7 +1276,7 @@ def _attn_bwd_gqa_front(
         layout=QT_LAYOUT,
         relaxed=True,
     )
-    dp = tlx.amd_mfma(
+    dp = tl.dot(
         v_operand,
         do_t,
         tlx.zeros((BLOCK_N, BLOCK_M), tl.float32, layout=MMA_NM),
@@ -1765,7 +1765,7 @@ def _attn_bwd_gqa_phase(
         dk_lhs = tlx.require_layout(dk_lhs, P_ND_LAYOUT, pin=False)
         dk_rhs = tlx.require_layout(dk_rhs, Q_OUT_LAYOUT, pin=False)
         dk = tlx.require_layout(dk, MMA_ND, pin=False)
-        dk = tlx.amd_mfma(dk_lhs, dk_rhs, dk)
+        dk = tl.dot(dk_lhs, dk_rhs, dk)
         dk = tlx.require_layout(dk, MMA_ND, pin=False)
     else:
         prev_stage = 1 - cur_stage

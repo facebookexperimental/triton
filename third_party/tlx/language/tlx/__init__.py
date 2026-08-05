@@ -66,11 +66,9 @@ from .mem_ops import (
 )
 from .mma_ops import (
     amd_extract_slice,
-    amd_mfma,
     amd_mfma_commit,
     amd_rematerialized_range,
     amd_register_resident,
-    amd_sched_barrier,
     amd_scheduled_mfma,
     async_dot,
     async_dot_scaled,
@@ -143,11 +141,9 @@ __all__ = [
     "storage_kind",
     "layout",
     "amd_extract_slice",
-    "amd_mfma",
     "amd_mfma_commit",
     "amd_rematerialized_range",
     "amd_register_resident",
-    "amd_sched_barrier",
     "amd_scheduled_mfma",
     "buffered_tensor",
     "buffered_tensor_type",

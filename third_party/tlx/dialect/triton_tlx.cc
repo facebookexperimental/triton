@@ -146,10 +146,6 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<amdgpu::RematerializedRangeOp>(
                  resultType, placement, startAttr, endAttr, anchorAttr);
            })
-      .def("create_amd_sched_barrier",
-           [](TritonOpBuilder &self, int32_t mask) {
-             self.create<ROCDL::SchedBarrier>(mask);
-           })
       .def("create_amd_register_resident",
            [](TritonOpBuilder &self, Value input,
               const std::string &registerClass,

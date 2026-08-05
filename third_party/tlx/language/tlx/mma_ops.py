@@ -5,24 +5,6 @@ from .utility import cuda_parse_arch
 
 
 @tl.builtin
-def amd_mfma(a, b, acc, _semantic=None):
-    """Compute an AMD MFMA while preserving the accumulator layout."""
-    assert acc is not None, "acc is required"
-    acc = tl._unwrap_if_constexpr(acc)
-    a = tl._unwrap_if_constexpr(a)
-    b = tl._unwrap_if_constexpr(b)
-    result = _semantic.dot(
-        a,
-        b,
-        acc,
-        input_precision=None,
-        max_num_imprecise_acc=None,
-        out_dtype=acc.dtype,
-    )
-    return tl.tensor(result.handle, acc.type)
-
-
-@tl.builtin
 def amd_extract_slice(source, shape, offsets, _semantic=None):
     """Extract an aligned register slice without cross-thread movement.
 
@@ -86,20 +68,6 @@ def amd_rematerialized_range(
         placement.handle,
     )
     return tl.tensor(handle, tl.block_type(tl.int32, shape))
-
-
-@tl.builtin
-def amd_sched_barrier(mask: tl.constexpr = 0, _semantic=None):
-    """Prevent AMD machine instructions from crossing this source boundary.
-
-    This is a compiler scheduling marker, not a workgroup barrier or a memory
-    fence. It adds no synchronization between waves. ``mask=0`` blocks every
-    instruction class from crossing the boundary in either direction.
-    """
-    mask = tl._unwrap_if_constexpr(mask)
-    assert isinstance(mask, int), f"mask must be a constexpr integer, got {type(mask).__name__}"
-    assert 0 <= mask <= 0xFFF, f"mask must use only AMD scheduling-class bits 0..11, got {mask:#x}"
-    _semantic.builder.create_amd_sched_barrier(mask)
 
 
 @tl.builtin

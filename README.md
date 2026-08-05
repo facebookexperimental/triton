@@ -1222,7 +1222,8 @@ For the async global-to-shared variant, see the warp-pipeline GEMM example (`thi
 > **[MI350]** — the source-scheduled operations are restricted to CDNA4
 > (`gfx950`) native BF16 MFMA layouts.
 
-- `tlx.amd_mfma(a, b, acc)` performs a layout-preserving AMD dot.
+- `tl.dot(a, b, acc)` preserves a TLX-pinned accumulator layout, so whole dots
+  need no AMD-specific wrapper.
 - `tlx.amd_extract_slice(source, shape, offsets)` selects an aligned register
   fragment without cross-thread movement.
 - `tlx.amd_rematerialized_range(start, end, anchor, placement=None)` recreates
