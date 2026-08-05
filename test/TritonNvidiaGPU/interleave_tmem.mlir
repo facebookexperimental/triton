@@ -1,5 +1,5 @@
-// RUN: triton-opt %s --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s
-// RUN: env TRITON_DISABLE_WSBARRIER_REORDER=1 triton-opt %s --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s --check-prefix=TARGETED
+// RUN: triton-opt %s -split-input-file --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s
+// RUN: env TRITON_DISABLE_WSBARRIER_REORDER=1 triton-opt %s -split-input-file --triton-nvidia-interleave-tmem --allow-unregistered-dialect | FileCheck %s --check-prefix=TARGETED
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [4, 2], order = [1, 0]}>
 #linear64 = #ttg.linear<{register = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0]], warp = [[32, 0], [64, 0], [0, 32]], block = []}>
@@ -628,6 +628,20 @@ tt.func @prioritize_tmem_operand(
   %sum = arith.addf %tmem_blocked, %local_f32 : tensor<128x64xf32, #blocked>
   tt.return %sum : tensor<128x64xf32, #blocked>
 }
+
+}
+
+// -----
+
+// The temporal-reuse EMPTY-acquire repair is 2-CTA only: the acquire is placed
+// relative to the hardware 2-CTA issue handshake, so this module carries the
+// cluster dimensions that select that path.
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#barrier_shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+#tmem = #ttng.tensor_memory_encoding<blockM = 128, blockN = 64, colStride = 1>
+
+module attributes {"ttg.cluster-dim-x" = 2 : i32, "ttg.cluster-dim-y" = 1 : i32, "ttg.cluster-dim-z" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.target = "cuda:100"} {
 
 // A whole-allocation MMA overwrite must also acquire an EMPTY barrier from a
 // narrower temporal-reuse sibling at the same TMEM offset. The acquire uses

@@ -1082,7 +1082,13 @@ struct TritonNvidiaGPUInterleaveTMemPass
     });
     for (auto &info : blocksToProcess)
       processBlock(info);
-    m.walk([](Block *block) { repairWholeOverwriteReuseWaitPhases(*block); });
+    // The temporal-reuse EMPTY acquire this repair clones is placed relative
+    // to the hardware 2-CTA issue handshake, and the packed qkT/dQ TMEM reuse
+    // it targets only arises in the 2-CTA backward. On a 1-CTA kernel the
+    // extra acquire waits on a barrier no partition arrives on, which
+    // deadlocks the kernel, so restrict the repair to 2-CTA modules.
+    if (is2CTA(m))
+      m.walk([](Block *block) { repairWholeOverwriteReuseWaitPhases(*block); });
   }
 };
 
