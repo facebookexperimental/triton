@@ -323,6 +323,19 @@ class FlashAttention:
             "USE_WARP_BARRIER": False,
             "NUM_CTAS": 2,
         },
+        "blackwell_fa_ws_pipelined_persistent_2cta_q2": {
+            "BLOCK_M": 256,
+            "BLOCK_N": 128,
+            "NUM_BUFFERS_Q": 1,
+            "NUM_BUFFERS_KV": 5,
+            "NUM_BUFFERS_QK": 1,
+            "NUM_MMA_GROUPS": 2,
+            "NUM_MMA_SLICES": 2,
+            "GROUP_SIZE_N": 1,
+            "USE_WARP_BARRIER": False,
+            "NUM_CTAS": 2,
+            "Q_STAGE": 2,
+        },
         "blackwell_fa_clc": {
             "BLOCK_M": 256,
             "BLOCK_N": 128,
@@ -613,6 +626,23 @@ def test_blackwell_fa_ws_pipelined_persistent(causal, RESCALE_OPT, USE_WHERE, BL
 def test_blackwell_fa_ws_pipelined_persistent_2cta(RESCALE_OPT, USE_WHERE):
     # 2-CTA (M-split) forward: HEAD_DIM=128, non-causal (v1 scope).
     config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_2cta"].copy()
+    config["RESCALE_OPT"] = RESCALE_OPT
+    config["USE_WHERE"] = USE_WHERE
+    causal = False
+    sm_scale = 0.5
+    for Z, H, N_CTX, HEAD_DIM in FlashAttention.SHAPES:
+        if HEAD_DIM != 128:
+            continue
+        q, k, v = FlashAttention.create_inputs(Z, H, N_CTX, HEAD_DIM)
+        ref_out = FlashAttention.get_reference(q, k, v, sm_scale, causal)
+        tri_out = _blackwell_fa_ws_pipelined_persistent(q, k, v, sm_scale, causal, config=config)
+        torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("RESCALE_OPT,USE_WHERE", [(False, False)])
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell GPU")
+def test_blackwell_fa_ws_pipelined_persistent_2cta_q2(RESCALE_OPT, USE_WHERE):
+    config = FlashAttention.CONFIGS["blackwell_fa_ws_pipelined_persistent_2cta_q2"].copy()
     config["RESCALE_OPT"] = RESCALE_OPT
     config["USE_WHERE"] = USE_WHERE
     causal = False
