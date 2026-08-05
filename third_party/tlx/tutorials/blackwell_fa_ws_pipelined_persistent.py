@@ -4,7 +4,7 @@ import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.language.extra.tlx.warp_spec import get_bufidx_phase
 from triton.language.extra.cuda.inline_ptx_lib import _mul_f32x2, _fma_f32x2, _sub_f32x2
-from triton.language.extra.subtile_ops import _join_n_2D, _split_n_2D
+from triton.language.extra.subtile_ops import _split_n_2D
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -298,6 +298,8 @@ def _softmax_inner_loop(
         tlx.barrier_wait(tlx.local_view(alpha_empties, cid), alpha_phase ^ 1)
         tlx.local_store(tlx.local_view(alpha_tiles, cid), tl.join(alpha, alpha) if SCALAR_N == 2 else alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
+        # Shorten alpha's lifetime: consume immediately, add l_ij later
+        l_i *= alpha
 
         # scale_subtract_rowmax:
         # -> row_max_scaled = row_max_new * scale
@@ -313,7 +315,7 @@ def _softmax_inner_loop(
         # elements 12 to 15 use emulation, elements 16 to 27 use SFU, elements 28 to 31 use emulation
         # the loop is unrolled twice likely for vectorization
         qks = _split_n_2D(qk, NUM_MMA_SLICES)
-        ps = ()
+        l_ij = tl.zeros_like(l_i)
         for slice_id in tl.static_range(0, NUM_MMA_SLICES):
             # prepare p for the v dot
             p_bufIdx = qk_buf * NUM_MMA_SLICES + slice_id
@@ -323,11 +325,9 @@ def _softmax_inner_loop(
                 tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx), 1, remote_cta_rank=0)
             else:
                 tlx.barrier_arrive(tlx.local_view(p_fulls, p_bufIdx))
-            ps = ps + (p_i, )
+            l_ij += tl.sum(p_i, 1)
 
-        p = _join_n_2D(ps)
-        l_ij = tl.sum(p, 1)
-        l_i = l_i * alpha + l_ij
+        l_i += l_ij
         m_i = m_ij
         accum_cnt_qk += 1
 
