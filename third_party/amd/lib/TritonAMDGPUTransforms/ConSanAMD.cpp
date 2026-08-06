@@ -19,7 +19,8 @@ namespace mlir {
 class AMDConSanHooks : public tti::ConSanTargetHooks {
 public:
   bool isTMAOp(Operation *op) const override {
-    return isa<ttag::TDMOpInterface>(op);
+    return isa<ttag::TDMOpInterface, ttag::AsyncTDMFusedCopyGlobalToLocalOp>(
+        op);
   }
 
   // TDM ops from the same warp complete in issue order. ConSan's thread model

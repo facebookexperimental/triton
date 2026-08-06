@@ -834,7 +834,7 @@ static void runEarlyLowerLoads(ModuleOp module) {
 // existing tritonamdgpu-update-async-wait-count pass downstream (e2e) — not in
 // this pass.
 //===----------------------------------------------------------------------===//
-static void runModuloExpand(ModuleOp module) {
+static LogicalResult runModuloExpand(ModuleOp module) {
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp f) { loops.push_back(f); });
   for (scf::ForOp forOp : loops) {
@@ -955,7 +955,7 @@ static void runModuloExpand(ModuleOp module) {
     cs.serialize(forOp, /*keepExistingMaxStage=*/false);
   }
   // Run the general expander on every serialized loop (change #4 (b)).
-  expandLoops(module);
+  return expandLoops(module);
 }
 
 // Phase E0: AMD modulo scaffold. For each inner loop, build the backend-neutral
@@ -1203,7 +1203,8 @@ struct TritonAMDGPUDotDecomposeAndSchedulePass
       return;
     }
     if (m == "expand") {
-      runModuloExpand(getOperation());
+      if (failed(runModuloExpand(getOperation())))
+        signalPassFailure();
       return;
     }
     bool modeDecompose = (m == "decompose");

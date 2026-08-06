@@ -1313,14 +1313,20 @@ def update_tensor_descriptor(
     set_bounds: Optional[list[tl.tensor]] = None,
     pred: tl.tensor = None,
     clamp_bounds: tl.constexpr = False,
+    _fused_tdm_explicit_offset: tl.constexpr = False,
     _semantic=None,
 ) -> tl.tensor_descriptor_base:
-    """Update the position, bounds, or predicate of an AMD TDM descriptor."""
+    """Update the position, bounds, or predicate of an AMD TDM descriptor.
+
+    ``_fused_tdm_explicit_offset`` is an internal migration hook that retains
+    the legacy direct-offset lowering for byte-stable gfx1250 kernels.
+    """
     assert isinstance(desc, tl.tensor_descriptor_base)
     if add_offsets is None and set_bounds is None and pred is None:
         raise ValueError("tlx.update_tensor_descriptor requires at least one of add_offsets, set_bounds, pred")
 
     clamp_bounds = bool(tl._unwrap_if_constexpr(clamp_bounds))
+    fused_tdm_explicit_offset = bool(tl._unwrap_if_constexpr(_fused_tdm_explicit_offset))
     if clamp_bounds:
         if add_offsets is None:
             raise ValueError("tlx.update_tensor_descriptor: clamp_bounds requires add_offsets")
@@ -1348,6 +1354,7 @@ def update_tensor_descriptor(
         set_bounds_handles,
         pred_handle,
         clamp_bounds,
+        fused_tdm_explicit_offset,
     )
     return _updated_tensor_descriptor(desc, handle)
 
@@ -1403,6 +1410,104 @@ def async_amd_descriptor_load(
         None,
     )
     return tlx.async_token(token_handle)
+
+
+@tl.builtin
+def async_amd_descriptor_load_fused(
+    members,
+    cache_modifier: str = "",
+    _semantic=None,
+) -> tlx.async_token:
+    """Emit one fused AMD TDM load for two to four members.
+
+    Each member is ``(positioned_desc, destination, warp_used_hint)``. The
+    descriptor must already carry its tile offsets, predicate, and bounds; use
+    :func:`update_tensor_descriptor` before this operation when needed.
+    Member hints must be legal, pairwise-disjoint bitmasks. All members share
+    one cache modifier.
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_load_fused is only available on AMD TDM-capable targets, got arch={arch}")
+    members = tl._unwrap_if_constexpr(members)
+    if not 2 <= len(members) <= 4:
+        raise ValueError(f"async_amd_descriptor_load_fused requires 2 to 4 members, got {len(members)}")
+
+    desc_handles = []
+    dest_handles = []
+    warp_used_hints = []
+    rank = None
+    for index, member in enumerate(members):
+        member = tl._unwrap_if_constexpr(member)
+        if len(member) != 3:
+            raise ValueError("fused TDM members must be (descriptor, destination, warp_used_hint) tuples")
+        desc, dest, warp_used_hint = member
+        if not isinstance(desc, tl.tensor_descriptor_base):
+            raise TypeError(f"fused TDM member {index}: expected a tensor descriptor")
+        if not isinstance(dest, tlx.buffered_tensor):
+            raise TypeError(f"fused TDM member {index}: expected a buffered tensor destination")
+        if rank is None:
+            rank = len(desc.block_shape)
+        if len(desc.block_shape) != rank:
+            raise ValueError("fused TDM requires all descriptors to have the same rank")
+        warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+        if warp_used_hint is None:
+            raise ValueError(f"fused TDM member {index}: warp_used_hint is required")
+        desc_handles.append(desc.handle)
+        dest_handles.append(dest.handle)
+        warp_used_hints.append(int(warp_used_hint))
+
+    cache = _semantic._str_to_load_cache_modifier(cache_modifier)
+    token_handle = _semantic.builder.create_async_tdm_fused_copy_global_to_local(
+        desc_handles,
+        dest_handles,
+        warp_used_hints,
+        cache,
+    )
+    return tlx.async_token(token_handle)
+
+
+@tl.builtin
+def async_amd_descriptor_load_group(
+    descs: list[tl.tensor_descriptor_base],
+    results: list[tlx.buffered_tensor],
+    offsets: list[list[tl.tensor]],
+    warp_masks: list[tl.constexpr],
+    preds=None,
+    _semantic=None,
+) -> tlx.async_token:
+    """Compatibility wrapper for legacy one-to-four-member grouped loads.
+
+    One member lowers to the ordinary all-warp load; two to four members
+    delegate to :func:`async_amd_descriptor_load_fused`.
+    """
+    if preds is None:
+        preds = [True] * len(descs)
+    if not (len(descs) == len(results) == len(offsets) == len(warp_masks) == len(preds)):
+        raise ValueError("grouped TDM argument lists must have equal length")
+    if len(descs) == 1:
+        # The old verifier required the sole mask to cover every warp, making
+        # this equivalent to an ordinary all-warp descriptor load.
+        return async_amd_descriptor_load(
+            descs[0],
+            results[0],
+            offsets[0],
+            pred=preds[0],
+            clamp_bounds=True,
+            _semantic=_semantic,
+        )
+    members = []
+    for desc, dest, member_offsets, hint, pred in zip(descs, results, offsets, warp_masks, preds):
+        positioned = update_tensor_descriptor(
+            desc,
+            add_offsets=member_offsets,
+            pred=pred,
+            clamp_bounds=True,
+            _fused_tdm_explicit_offset=True,
+            _semantic=_semantic,
+        )
+        members.append((positioned, dest, hint))
+    return async_amd_descriptor_load_fused(members, _semantic=_semantic)
 
 
 @tl.builtin

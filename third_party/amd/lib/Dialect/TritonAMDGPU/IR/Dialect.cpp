@@ -672,8 +672,8 @@ namespace {
 // Validate `warp_used_hint` against the axis-aligned hint rule (see
 // TritonAMDGPUOps.td).  Encoding-specific rules (e.g.
 // PartitionedSharedEncoding) live in verify() since they need the result type.
-LogicalResult validateWarpUsedHint(AsyncTDMCopyGlobalToLocalOp op,
-                                   uint32_t hint, int64_t numWarps) {
+template <typename OpT>
+LogicalResult validateWarpUsedHint(OpT op, uint32_t hint, int64_t numWarps) {
   if (!llvm::isPowerOf2_64(numWarps))
     return op.emitOpError("num_warps must be a power of two when using "
                           "warp_used_hint, got ")
@@ -722,6 +722,19 @@ LogicalResult validateWarpUsedHint(AsyncTDMCopyGlobalToLocalOp op,
 
   return success();
 }
+
+LogicalResult verifySingleTDMPaddingPair(
+    Operation *op, gpu::PaddedSharedEncodingAttr paddedEnc, StringRef subject) {
+  if (!paddedEnc)
+    return success();
+
+  if (paddedEnc.getIntervals().size() == 1 &&
+      paddedEnc.getPaddings().size() == 1)
+    return success();
+
+  return op->emitOpError() << subject
+                           << " only supports single interval-padding pairs";
+}
 } // namespace
 
 LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
@@ -755,6 +768,10 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   if (!paddedEnc && !swizzledEnc && !partitionedEnc)
     return emitOpError("Invalid shared memory layout for TDM");
 
+  if (failed(verifySingleTDMPaddingPair(
+          getOperation(), gpu::getPaddedEncoding(enc), "TDM load")))
+    return failure();
+
   Type elementType = smemTy.getElementType();
   auto elementBitWidth = elementType.getIntOrFloatBitWidth();
   if (paddedEnc) {
@@ -783,8 +800,9 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
     if (partitionedEnc) {
       unsigned partitionDim = partitionedEnc.getPartitionDim();
       unsigned numLogicalPieces = partitionedEnc.getNumLogicalPieces();
-      assert(numLogicalPieces > 0 &&
-             "PartitionedSharedEncoding must have numLogicalPieces >= 1");
+      if (numLogicalPieces == 0)
+        return emitOpError(
+            "PartitionedSharedEncoding must have numLogicalPieces >= 1");
       unsigned K = llvm::popcount(hint);
       if (K % numLogicalPieces != 0)
         return emitOpError(
@@ -797,6 +815,188 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   }
 
   return verifyTDMLayoutConsistency(getOperation(), tensorDescTy, smemTy);
+}
+
+LogicalResult AsyncTDMFusedCopyGlobalToLocalOp::verify() {
+  size_t numMembers = getDescs().size();
+  if (numMembers < 2 || numMembers > 4)
+    return emitOpError("requires 2 to 4 members");
+  if (getDests().size() != numMembers)
+    return emitOpError(
+        "requires the same number of descriptors and destinations");
+  if (getWarpUsedHints().size() != numMembers)
+    return emitOpError("requires one warp_used_hint per member");
+
+  auto firstDescTy = cast<triton::TensorDescType>(getDescs().front().getType());
+  unsigned rank = firstDescTy.getShape().size();
+  uint32_t hintUnion = 0;
+  std::optional<int> maybeNumWarps = gpu::maybeLookupNumWarps(getOperation());
+  if (maybeNumWarps && gpu::lookupNumCTAs(getOperation()) != 1)
+    return emitOpError(
+        "fused TDM multi-CTA lowering is not available on this branch");
+
+  for (auto [memberIdx, member] :
+       llvm::enumerate(llvm::zip(getDescs(), getDests(), getWarpUsedHints()))) {
+    auto [desc, dest, hint] = member;
+    auto descTy = cast<triton::TensorDescType>(desc.getType());
+    auto destTy = cast<gpu::MemDescType>(dest.getType());
+    if (descTy.getShape().size() != rank)
+      return emitOpError(
+          "requires all member descriptors to have the same rank");
+    if (descTy.getElementType().getIntOrFloatBitWidth() !=
+        destTy.getElementTypeBitWidth())
+      return emitOpError("requires each descriptor and its destination to "
+                         "have the same element bitwidth");
+    if (failed(verifyTDMBlockSize(getOperation(), descTy.getShape())) ||
+        failed(verifyTDMLayoutConsistency(getOperation(), descTy, destTy)))
+      return failure();
+
+    Attribute encoding = unwrapPinnedTDMLayout(destTy.getEncoding());
+    auto swizzled = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(encoding);
+    auto padded = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(encoding);
+    auto partitioned =
+        llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(encoding);
+    if (!padded && !swizzled && !partitioned)
+      return emitOpError("Invalid shared memory layout for TDM");
+    if (swizzled && swizzled.getMaxPhase() != 1)
+      return emitOpError("TDM does not support swizzling");
+    auto effectivePadded = gpu::getPaddedEncoding(encoding);
+    if (failed(verifySingleTDMPaddingPair(getOperation(), effectivePadded,
+                                          "fused TDM")))
+      return failure();
+    if (effectivePadded) {
+      unsigned elementBits = destTy.getElementTypeBitWidth();
+      unsigned intervalDwords =
+          effectivePadded.getIntervals()[0] * elementBits / 32;
+      unsigned paddingDwords =
+          effectivePadded.getPaddings()[0] * elementBits / 32;
+      if (intervalDwords < 2)
+        return emitOpError("TDM padding interval must be at least 2 dwords");
+      if (paddingDwords < 1)
+        return emitOpError("TDM padding amount must be at least 1 dword");
+    }
+
+    uint32_t hintValue = static_cast<uint32_t>(hint);
+    if (maybeNumWarps &&
+        failed(validateWarpUsedHint(*this, hintValue, *maybeNumWarps)))
+      return failure();
+    if (hintUnion & hintValue)
+      return emitOpError("requires pairwise-disjoint warp_used_hint values");
+    hintUnion |= hintValue;
+
+    if (partitioned) {
+      auto inner = partitioned.getPartitionLayout();
+      auto innerSwizzled =
+          llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(inner);
+      auto innerPadded = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(inner);
+      if ((innerSwizzled && innerSwizzled.getMaxPhase() != 1) ||
+          (!innerSwizzled && !innerPadded))
+        return emitOpError(
+            "Invalid inner layout for partitioned shared memory in TDM");
+      unsigned pieces = partitioned.getNumLogicalPieces();
+      if (pieces == 0)
+        return emitOpError(
+            "PartitionedSharedEncoding must have numLogicalPieces >= 1");
+      if (maybeNumWarps && llvm::popcount(hintValue) % pieces != 0)
+        return emitOpError(
+                   "warp_used_hint with a partitioned shared encoding must "
+                   "select K active warps such that numLogicalPieces divides "
+                   "K (member ")
+               << memberIdx << ")";
+    }
+  }
+  return success();
+}
+
+LogicalResult AsyncTDMFusedCopyGlobalToLocalInternalOp::verify() {
+  size_t numMembers = getDescs().size();
+  if (numMembers < 2 || numMembers > 4)
+    return emitOpError("requires 2 to 4 members");
+  if (getDests().size() != numMembers || getPreds().size() != numMembers ||
+      getWarpUsedHints().size() != numMembers)
+    return emitOpError(
+        "requires one destination, predicate, and warp hint per descriptor");
+
+  int64_t rank = getRank();
+  if (rank < 1 || rank > 5)
+    return emitOpError("rank must be in [1, 5]");
+  if (getIndices().size() != numMembers * static_cast<size_t>(rank))
+    return emitOpError("requires rank offsets per descriptor");
+
+  std::optional<int> maybeNumWarps = gpu::maybeLookupNumWarps(getOperation());
+  if (maybeNumWarps && gpu::lookupNumCTAs(getOperation()) != 1)
+    return emitOpError(
+        "fused TDM multi-CTA lowering is not available on this branch");
+  uint32_t hintUnion = 0;
+  for (auto [memberIdx, member] :
+       llvm::enumerate(llvm::zip(getDescs(), getDests(), getWarpUsedHints()))) {
+    auto [desc, dest, hint] = member;
+    auto descTy = cast<triton::TensorDescType>(desc.getType());
+    auto destTy = cast<gpu::MemDescType>(dest.getType());
+    if (descTy.getShape().size() != static_cast<size_t>(rank))
+      return emitOpError("descriptor rank does not match rank attribute");
+    if (descTy.getElementType().getIntOrFloatBitWidth() !=
+        destTy.getElementTypeBitWidth())
+      return emitOpError("requires each descriptor and its destination to "
+                         "have the same element bitwidth");
+    if (failed(verifyTDMBlockSize(getOperation(), descTy.getShape())) ||
+        failed(verifyTDMLayoutConsistency(getOperation(), descTy, destTy)))
+      return failure();
+
+    Attribute encoding = unwrapPinnedTDMLayout(destTy.getEncoding());
+    auto swizzled = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(encoding);
+    auto padded = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(encoding);
+    auto partitioned =
+        llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(encoding);
+    if (!padded && !swizzled && !partitioned)
+      return emitOpError("Invalid shared memory layout for TDM");
+    if (swizzled && swizzled.getMaxPhase() != 1)
+      return emitOpError("TDM does not support swizzling");
+    auto effectivePadded = gpu::getPaddedEncoding(encoding);
+    if (failed(verifySingleTDMPaddingPair(getOperation(), effectivePadded,
+                                          "fused TDM")))
+      return failure();
+    if (effectivePadded) {
+      unsigned elementBits = destTy.getElementTypeBitWidth();
+      unsigned intervalDwords =
+          effectivePadded.getIntervals()[0] * elementBits / 32;
+      unsigned paddingDwords =
+          effectivePadded.getPaddings()[0] * elementBits / 32;
+      if (intervalDwords < 2)
+        return emitOpError("TDM padding interval must be at least 2 dwords");
+      if (paddingDwords < 1)
+        return emitOpError("TDM padding amount must be at least 1 dword");
+    }
+    uint32_t hintValue = static_cast<uint32_t>(hint);
+    if (maybeNumWarps &&
+        failed(validateWarpUsedHint(*this, hintValue, *maybeNumWarps)))
+      return failure();
+    if (hintUnion & hintValue)
+      return emitOpError("requires pairwise-disjoint warp_used_hint values");
+    hintUnion |= hintValue;
+
+    if (partitioned) {
+      auto inner = partitioned.getPartitionLayout();
+      auto innerSwizzled =
+          llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(inner);
+      auto innerPadded = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(inner);
+      if ((innerSwizzled && innerSwizzled.getMaxPhase() != 1) ||
+          (!innerSwizzled && !innerPadded))
+        return emitOpError(
+            "Invalid inner layout for partitioned shared memory in TDM");
+      unsigned pieces = partitioned.getNumLogicalPieces();
+      if (pieces == 0)
+        return emitOpError(
+            "PartitionedSharedEncoding must have numLogicalPieces >= 1");
+      if (maybeNumWarps && llvm::popcount(hintValue) % pieces != 0)
+        return emitOpError(
+                   "warp_used_hint with a partitioned shared encoding must "
+                   "select K active warps such that numLogicalPieces divides "
+                   "K (member ")
+               << memberIdx << ")";
+    }
+  }
+  return success();
 }
 
 // -- AsyncCopyLocalToGlobalOp --

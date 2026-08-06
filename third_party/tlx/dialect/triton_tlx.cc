@@ -840,24 +840,43 @@ void init_triton_tlx_ir(py::module &&m) {
              return self.create<amdgpu::AsyncTDMCopyGlobalToLocalOp>(
                  desc, result, barrier.value_or(Value()));
            })
+      .def(
+          "create_async_tdm_fused_copy_global_to_local",
+          [](TritonOpBuilder &self, std::vector<Value> descs,
+             std::vector<Value> dests, std::vector<int32_t> warpUsedHints,
+             tt::CacheModifier cacheModifier) -> mlir::Value {
+            auto tokenType = self.getBuilder().getType<ttg::AsyncTokenType>();
+            auto hints = self.getBuilder().getDenseI32ArrayAttr(warpUsedHints);
+            return self.create<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(
+                tokenType, descs, dests, hints, cacheModifier);
+          },
+          py::arg("descs"), py::arg("dests"), py::arg("warpUsedHints"),
+          py::arg("cacheModifier") = tt::CacheModifier::NONE)
       .def("create_async_tdm_copy_local_to_global",
            [](TritonOpBuilder &self, Value desc, Value src,
               std::optional<Value> barrier) {
              self.create<amdgpu::AsyncTDMCopyLocalToGlobalOp>(
                  desc, src, barrier.value_or(Value()));
            })
-      .def("create_update_tensor_descriptor",
-           [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
-              std::vector<Value> setBounds, std::optional<Value> pred,
-              bool clampBounds) -> Value {
-             Value res = self.create<amdgpu::UpdateTensorDescriptorOp>(
-                 desc.getType(), desc, ValueRange(addOffsets),
-                 ValueRange(setBounds), pred.value_or(Value()));
-             if (clampBounds)
-               res.getDefiningOp()->setAttr("clamp_bounds",
-                                            self.getBuilder().getUnitAttr());
-             return res;
-           })
+      .def(
+          "create_update_tensor_descriptor",
+          [](TritonOpBuilder &self, Value desc, std::vector<Value> addOffsets,
+             std::vector<Value> setBounds, std::optional<Value> pred,
+             bool clampBounds, bool fusedExplicitOffset) -> Value {
+            Value res = self.create<amdgpu::UpdateTensorDescriptorOp>(
+                desc.getType(), desc, ValueRange(addOffsets),
+                ValueRange(setBounds), pred.value_or(Value()));
+            if (clampBounds)
+              res.getDefiningOp()->setAttr("clamp_bounds",
+                                           self.getBuilder().getUnitAttr());
+            if (fusedExplicitOffset)
+              res.getDefiningOp()->setAttr("amdg.fused_tdm_explicit_offset",
+                                           self.getBuilder().getUnitAttr());
+            return res;
+          },
+          py::arg("desc"), py::arg("addOffsets"), py::arg("setBounds"),
+          (py::arg("pred").none() = py::none()), py::arg("clampBounds"),
+          py::arg("fusedExplicitOffset") = false)
       .def("create_tdm_prefetch",
            [](TritonOpBuilder &self, Value desc, std::vector<Value> indices,
               Value pred, bool speculative) {

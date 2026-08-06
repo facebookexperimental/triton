@@ -454,6 +454,7 @@ static bool isFedByAnyMemDescUser(Value memdesc) {
 // padded-shared encoding, which the dot-path anchor would clobber.
 static bool isFedByTDM(Value memdesc) {
   return isFedByAnyMemDescUser<amdgpu::AsyncTDMCopyGlobalToLocalOp,
+                               amdgpu::AsyncTDMFusedCopyGlobalToLocalOp,
                                amdgpu::AsyncTDMCopyLocalToGlobalOp>(memdesc);
 }
 
@@ -972,6 +973,30 @@ static LogicalResult materializeTDMConstraints(ModuleOp m, OpBuilder &builder,
               load, load.getResult(), load.getResultMutable(),
               /*allowDotAware=*/true, builder, solver)))
         return WalkResult::interrupt();
+    } else if (auto groupLoad =
+                   dyn_cast<amdgpu::AsyncTDMFusedCopyGlobalToLocalOp>(op)) {
+      for (size_t i = 0; i < groupLoad.getDescs().size(); ++i) {
+        Value desc = groupLoad.getDescs()[i];
+        Value dst = groupLoad.getDests()[i];
+        if (dst.getDefiningOp<tlx::RequireLayoutOp>())
+          continue;
+        auto bufType = dyn_cast<ttg::MemDescType>(dst.getType());
+        if (!bufType)
+          continue;
+        auto descTy = cast<tt::TensorDescType>(desc.getType());
+        Attribute encoding = chooseTDMBufEncoding(
+            groupLoad, dst, bufType, descTy, /*allowDotAware=*/true, solver);
+        if (!encoding)
+          return WalkResult::interrupt();
+        builder.setInsertionPoint(groupLoad);
+        auto newType = ttg::MemDescType::get(
+            bufType.getShape(), bufType.getElementType(), encoding,
+            bufType.getMemorySpace(), bufType.getMutableMemory(),
+            bufType.getAllocShape());
+        auto requireOp = tlx::RequireLayoutOp::create(
+            builder, groupLoad.getLoc(), newType, dst);
+        groupLoad.getDestsMutable()[i].assign(requireOp.getResult());
+      }
     } else if (auto store = dyn_cast<amdgpu::AsyncTDMCopyLocalToGlobalOp>(op)) {
       if (failed(anchorTDMRequireLayout(
               store, store.getSrc(), store.getSrcMutable(),

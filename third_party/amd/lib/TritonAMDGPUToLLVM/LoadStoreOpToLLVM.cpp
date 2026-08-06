@@ -18,6 +18,7 @@
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/ADT/SetVector.h"
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
@@ -1262,8 +1263,9 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     unsigned padInterval = 0;
     unsigned padAmount = 0;
     if (auto padEnc = getPaddedEncoding(encoding)) {
-      assert(padEnc.getIntervals().size() == 1 &&
-             padEnc.getPaddings().size() == 1);
+      if (padEnc.getIntervals().size() != 1 || padEnc.getPaddings().size() != 1)
+        return op.emitOpError(
+            "TDM load only supports single interval-padding pairs");
       padInterval = padEnc.getIntervals()[0];
       padAmount = padEnc.getPaddings()[0];
     }
@@ -1320,6 +1322,214 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
         padInterval, padAmount, offset, dstPtrs, pred, multicastMask,
         elementType, barrierPtr, /*isLoad=*/true, sharedLayout, encoding, ctaId,
         auxBits, warpUsedHint, /*isPureForm=*/true);
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+template <typename OpT, bool hasExplicitLoweringOperands>
+struct AsyncTDMFusedCopyGlobalToLocalOpConversion
+    : public ConvertOpToLLVMPattern<OpT>,
+      public LoadStoreConversionBase {
+  using Base = ConvertOpToLLVMPattern<OpT>;
+  using OpAdaptor = typename Base::OpAdaptor;
+
+  AsyncTDMFusedCopyGlobalToLocalOpConversion(
+      LLVMTypeConverter &converter, const AMD::TargetInfo &targetInfo,
+      ModuleAxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
+      : Base(converter, benefit),
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(OpT op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    int numWarps = triton::gpu::lookupNumWarps(op);
+    int rank;
+    if constexpr (hasExplicitLoweringOperands)
+      rank = op.getRank();
+    else
+      rank = cast<triton::TensorDescType>(op.getDescs().front().getType())
+                 .getShape()
+                 .size();
+    auto ctaId = targetInfo.getClusterCTAId(rewriter, loc);
+
+    // Lower a fused TDM load to one hardware TDM instruction. Each member
+    // first builds the same descriptor groups a standalone TDM load would use,
+    // including its destination LDS pointer and warp-hint predicate. The
+    // selected descriptor is then assembled one scalar lane at a time based on
+    // the current warp id.  Doing the mux at descriptor-lane granularity keeps
+    // common fields (for example tensor shape/stride slots) shared in SSA form,
+    // so canonicalization and LLVM do not have to scalarize whole-vector
+    // selects for fields that are identical across arms.
+    auto v4i32Ty = VectorType::get(4, rewriter.getI32Type());
+    auto v8i32Ty = VectorType::get(8, rewriter.getI32Type());
+    SmallVector<SmallVector<Value>> selectedGroupElems;
+    Value mergedPred = b.i32_val(0);
+
+    Value warpId = getLaneAndWarpId(rewriter, loc).second;
+    Value one = b.i32_val(1);
+
+    constexpr int kNumTDMDescriptorInputGroups = 4;
+    constexpr int kTDMDescriptorGroup0Size = 4;
+    constexpr int kTDMDescriptorGroup1Size = 8;
+    constexpr int kTDMDescriptorPredicateGroup = 0;
+    constexpr int kTDMDescriptorPredicateElement = 0;
+    // The descriptor builder returns groups 0..3.  The hardware intrinsic
+    // also takes a reserved group 4, which is zero-filled at emission time.
+    auto getGroupSize = [](int groupIdx) {
+      return groupIdx == 1 ? kTDMDescriptorGroup1Size
+                           : kTDMDescriptorGroup0Size;
+    };
+    auto isPredicateLane = [](int groupIdx, int elemIdx) {
+      return groupIdx == kTDMDescriptorPredicateGroup &&
+             elemIdx == kTDMDescriptorPredicateElement;
+    };
+    auto extractGroupElems = [&](ArrayRef<Value> groups) {
+      SmallVector<SmallVector<Value>> elems;
+      elems.reserve(kNumTDMDescriptorInputGroups);
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
+        SmallVector<Value> groupElems;
+        int groupSize = getGroupSize(groupIdx);
+        groupElems.reserve(groupSize);
+        for (int elemIdx = 0; elemIdx < groupSize; ++elemIdx) {
+          groupElems.push_back(
+              b.extract_element(i32_ty, groups[groupIdx], b.i32_val(elemIdx)));
+        }
+        elems.push_back(std::move(groupElems));
+      }
+      return elems;
+    };
+    auto packGroupElems = [&](ArrayRef<SmallVector<Value>> elems) {
+      SmallVector<Value> groups;
+      groups.reserve(kNumTDMDescriptorInputGroups);
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
+        Type vecTy = groupIdx == 1 ? Type(v8i32Ty) : Type(v4i32Ty);
+        Value group = b.undef(vecTy);
+        for (auto [elemIdx, elem] : llvm::enumerate(elems[groupIdx]))
+          group = b.insert_element(vecTy, group, elem, b.i32_val(elemIdx));
+        groups.push_back(group);
+      }
+      return groups;
+    };
+
+    for (auto armIdx : llvm::seq<size_t>(0, op.getDescs().size())) {
+      auto tensorDescTy =
+          cast<triton::TensorDescType>(op.getDescs()[armIdx].getType());
+      auto encoding = tensorDescTy.getSharedLayout();
+      Type elementType =
+          this->getTypeConverter()->convertType(tensorDescTy.getElementType());
+
+      triton::LinearLayout sharedLayout =
+          isPaddedEncoding(encoding)
+              ? paddedLinearLayout(tensorDescTy.getShape(), encoding)
+              : toLinearLayout(tensorDescTy.getShape(), encoding);
+
+      unsigned padInterval = 0;
+      unsigned padAmount = 0;
+      if (auto padEnc = getPaddedEncoding(encoding)) {
+        if (padEnc.getIntervals().size() != 1 ||
+            padEnc.getPaddings().size() != 1)
+          return op.emitOpError(
+              "fused TDM only supports single interval-padding pairs");
+        padInterval = padEnc.getIntervals()[0];
+        padAmount = padEnc.getPaddings()[0];
+      }
+
+      SmallVector<Value> desc = mlir::LLVM::AMD::unpackTDMDescriptor(
+          rewriter, loc, adaptor.getDescs()[armIdx]);
+
+      auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
+          loc, adaptor.getDests()[armIdx], elementType, rewriter);
+      SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
+
+      SmallVector<Value> offset;
+      if constexpr (hasExplicitLoweringOperands) {
+        auto indices = adaptor.getIndices();
+        offset.reserve(rank);
+        for (int i = 0; i < rank; ++i)
+          offset.push_back(indices[armIdx * rank + i]);
+      } else {
+        offset.assign(rank, b.i32_val(0));
+      }
+
+      uint32_t warpMask = static_cast<uint32_t>(op.getWarpUsedHints()[armIdx]);
+      int effectiveWarps = llvm::popcount(warpMask);
+      auto shapePerCTA =
+          triton::gpu::getShapePerCTA(encoding, tensorDescTy.getShape());
+      auto [warpsPerCTA, numTDMInstructions] =
+          mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+              shapePerCTA, effectiveWarps, encoding);
+      if (numTDMInstructions != 1)
+        return op.emitOpError("fused TDM member ")
+               << armIdx << " would lower to multiple intrinsics";
+
+      Value pred;
+      if constexpr (hasExplicitLoweringOperands)
+        pred = adaptor.getPreds()[armIdx];
+      mlir::LLVM::AMD::fillTDMDescriptor(
+          rewriter, loc, this->getTypeConverter(), elementType, shapePerCTA,
+          numWarps, padInterval, padAmount, desc, offset, dstPtrs, pred,
+          /*multicastMask=*/Value(), /*barrierPtr=*/Value(), sharedLayout,
+          ctaId,
+          /*isStore=*/false, warpsPerCTA, warpMask,
+          /*isPureForm=*/false);
+
+      while (desc.size() < kNumTDMDescriptorInputGroups)
+        desc.push_back(LLVM::ZeroOp::create(rewriter, loc, v4i32Ty));
+
+      auto descElems = extractGroupElems(desc);
+      // For regular TDM loads group0[0] is the predicate.  fillTDMDescriptor
+      // already ANDs that predicate with the member warp hint, and the fused
+      // verifier requires masks to be disjoint.  Therefore ORing all arm
+      // predicates is equivalent to selecting the predicate for the active arm,
+      // and saves one descriptor-lane select per grouped instruction.
+      mergedPred = b.or_(mergedPred, descElems[kTDMDescriptorPredicateGroup]
+                                              [kTDMDescriptorPredicateElement]);
+      if (selectedGroupElems.empty()) {
+        selectedGroupElems = std::move(descElems);
+        selectedGroupElems[kTDMDescriptorPredicateGroup]
+                          [kTDMDescriptorPredicateElement] = mergedPred;
+        continue;
+      }
+
+      Value active = b.icmp_ne(b.and_(b.shl(one, warpId), b.i32_val(warpMask)),
+                               b.i32_val(0));
+      for (int groupIdx = 0; groupIdx < kNumTDMDescriptorInputGroups;
+           ++groupIdx) {
+        for (int elemIdx = 0; elemIdx < getGroupSize(groupIdx); ++elemIdx) {
+          if (isPredicateLane(groupIdx, elemIdx)) {
+            selectedGroupElems[kTDMDescriptorPredicateGroup]
+                              [kTDMDescriptorPredicateElement] = mergedPred;
+            continue;
+          }
+          // Non-predicate lanes are descriptor fields: base pointers, offsets,
+          // tensor dimensions, strides, and padding controls.  Select each lane
+          // independently so identical SSA values do not grow scalar setup.
+          Value armElem = descElems[groupIdx][elemIdx];
+          Value &selectedElem = selectedGroupElems[groupIdx][elemIdx];
+          if (armElem == selectedElem)
+            continue;
+          selectedElem = b.select(active, armElem, selectedElem);
+        }
+      }
+    }
+
+    if (selectedGroupElems.empty())
+      return op.emitOpError("requires at least one TDM load arm");
+
+    SmallVector<Value> selectedGroups = packGroupElems(selectedGroupElems);
+    selectedGroups.push_back(
+        LLVM::ZeroOp::create(rewriter, loc, v8i32Ty)); // group4
+    auto auxBits = mlir::LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        op.getCache(), /*isLoad=*/true, targetInfo);
+    selectedGroups.push_back(b.i32_val(auxBits));
+    LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, "llvm.amdgcn.tensor.load.to.lds", {}, selectedGroups);
 
     rewriter.eraseOp(op);
     return success();
@@ -2605,20 +2815,185 @@ private:
 } // namespace
 
 namespace mlir::triton::AMD {
+void materializeFusedTDMLoweringOperands(ModuleOp mod) {
+  SmallVector<triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp> fusedOps;
+  mod.walk([&](triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp op) {
+    fusedOps.push_back(op);
+  });
+
+  IRRewriter rewriter(mod.getContext());
+  for (auto op : fusedOps) {
+    rewriter.setInsertionPoint(op);
+    Location loc = op.getLoc();
+    unsigned rank =
+        cast<triton::TensorDescType>(op.getDescs().front().getType())
+            .getShape()
+            .size();
+
+    Value truePred;
+    auto recoverEffectivePredicate = [&](Value desc) -> Value {
+      // update_tensor_descriptor predicates replace, rather than combine with,
+      // the inherited predicate. Walking from the consumer therefore finds
+      // the effective value at the first pred-bearing update.
+      while (
+          auto update =
+              desc.getDefiningOp<triton::amdgpu::UpdateTensorDescriptorOp>()) {
+        if (Value pred = update.getPred())
+          return pred;
+        desc = update.getDesc();
+      }
+      if (!desc.getDefiningOp<triton::MakeTensorDescOp>())
+        return {};
+      if (!truePred)
+        truePred = arith::ConstantIntOp::create(rewriter, loc, 1, 32);
+      return truePred;
+    };
+
+    auto cloneWithoutEffectivePredicate = [&](Value desc) -> Value {
+      SmallVector<triton::amdgpu::UpdateTensorDescriptorOp> outerUpdates;
+      Value cursor = desc;
+      triton::amdgpu::UpdateTensorDescriptorOp predUpdate;
+      while (
+          auto update =
+              cursor
+                  .getDefiningOp<triton::amdgpu::UpdateTensorDescriptorOp>()) {
+        if (update.getPred()) {
+          predUpdate = update;
+          break;
+        }
+        outerUpdates.push_back(update);
+        cursor = update.getDesc();
+      }
+      if (!predUpdate)
+        return desc;
+
+      auto cloneMutation = [&](triton::amdgpu::UpdateTensorDescriptorOp update,
+                               Value base) -> Value {
+        if (update.getAddOffsets().empty() && update.getSetBounds().empty())
+          return base;
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPoint(update);
+        auto clone = triton::amdgpu::UpdateTensorDescriptorOp::create(
+            rewriter, update.getLoc(), update.getType(), base,
+            update.getAddOffsets(), update.getSetBounds(),
+            /*pred=*/Value());
+        if (update.getClampBounds())
+          clone->setAttr("clamp_bounds", rewriter.getUnitAttr());
+        if (update->hasAttr("amdg.fused_tdm_explicit_offset"))
+          clone->setAttr("amdg.fused_tdm_explicit_offset",
+                         rewriter.getUnitAttr());
+        return clone;
+      };
+
+      Value rebuilt = cloneMutation(predUpdate, predUpdate.getDesc());
+      for (auto update : llvm::reverse(outerUpdates))
+        rebuilt = cloneMutation(update, rebuilt);
+      return rebuilt;
+    };
+
+    SmallVector<Value> descs;
+    SmallVector<Value> indices;
+    SmallVector<Value> preds;
+    descs.reserve(op.getDescs().size());
+    indices.reserve(op.getDescs().size() * rank);
+    preds.reserve(op.getDescs().size());
+    bool canMaterialize = true;
+    Value zero;
+    llvm::SmallSetVector<Operation *, 16> updateCandidates;
+    auto recordUpdateChain = [&](Value desc) {
+      while (
+          auto update =
+              desc.getDefiningOp<triton::amdgpu::UpdateTensorDescriptorOp>()) {
+        updateCandidates.insert(update);
+        desc = update.getDesc();
+      }
+    };
+
+    for (Value desc : op.getDescs()) {
+      Value pred = recoverEffectivePredicate(desc);
+      if (!pred) {
+        canMaterialize = false;
+        break;
+      }
+      preds.push_back(pred);
+    }
+
+    // Opaque descriptors retain the canonical pure-descriptor lowering.
+    if (!canMaterialize) {
+      if (truePred && truePred.use_empty())
+        rewriter.eraseOp(truePred.getDefiningOp());
+      continue;
+    }
+
+    for (Value desc : op.getDescs()) {
+      recordUpdateChain(desc);
+      Value positionedDesc = cloneWithoutEffectivePredicate(desc);
+      recordUpdateChain(positionedDesc);
+      auto update =
+          positionedDesc
+              .getDefiningOp<triton::amdgpu::UpdateTensorDescriptorOp>();
+      bool sinkClamp = update && update.getClampBounds() &&
+                       update->hasAttr("amdg.fused_tdm_explicit_offset");
+      if (sinkClamp) {
+        // This private marker requests the legacy direct-offset semantics used
+        // by the pre-port grouped API. Sink the update so common descriptor
+        // lanes remain shared and the scalar mux remains byte-stable.
+        descs.push_back(update.getDesc());
+        llvm::append_range(indices, update.getAddOffsets());
+      } else {
+        // Canonical descriptor positioning and non-clamping updates carry
+        // persistent descriptor state. Keep them intact and overwrite only
+        // the predicate lane in the explicit lowering form.
+        descs.push_back(positionedDesc);
+        if (!zero)
+          zero = arith::ConstantIntOp::create(rewriter, loc, 0, 32);
+        indices.append(rank, zero);
+      }
+    }
+
+    auto internal =
+        triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalInternalOp::create(
+            rewriter, loc, op.getToken().getType(), descs, indices,
+            op.getDests(), preds, static_cast<uint32_t>(rank),
+            op.getWarpUsedHints(), op.getCache());
+    rewriter.replaceOp(op, internal.getToken());
+
+    // Do not let dead positioned descriptors perturb instruction ordering in
+    // the LLVM conversion. Erase only pure update chains made dead by the
+    // materialization; shared bases and retained updates stop the walk.
+    bool erasedAny;
+    do {
+      SmallVector<Operation *> deadUpdates;
+      for (Operation *candidate : updateCandidates)
+        if (candidate->use_empty())
+          deadUpdates.push_back(candidate);
+      erasedAny = !deadUpdates.empty();
+      for (Operation *candidate : deadUpdates) {
+        updateCandidates.remove(candidate);
+        rewriter.eraseOp(candidate);
+      }
+    } while (erasedAny);
+  }
+}
+
 void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        const TargetInfo &targetInfo,
                                        RewritePatternSet &patterns,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit) {
-  patterns.add<AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
-               StoreOpConversion, BufferLoadOpConversion,
-               BufferLoadToLocalOpConversion, BufferStoreOpConversion,
-               BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
-               AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
-               AsyncTDMCopyGlobalToLocalOpConversion,
-               AsyncTDMCopyLocalToGlobalOpConversion,
-               AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
-      typeConverter, targetInfo, axisInfoAnalysis, benefit);
+  patterns.add<
+      AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
+      StoreOpConversion, BufferLoadOpConversion, BufferLoadToLocalOpConversion,
+      BufferStoreOpConversion, BufferAtomicRMWOpConversion,
+      AsyncCopyGlobalToLocalOpConversion, AsyncCopyLocalToGlobalOpConversion,
+      BufferAtomicCASOpConversion, AsyncTDMCopyGlobalToLocalOpConversion,
+      AsyncTDMFusedCopyGlobalToLocalOpConversion<
+          triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalOp, false>,
+      AsyncTDMFusedCopyGlobalToLocalOpConversion<
+          triton::amdgpu::AsyncTDMFusedCopyGlobalToLocalInternalOp, true>,
+      AsyncTDMCopyLocalToGlobalOpConversion, AsyncTDMScatterOpConversion,
+      AsyncTDMGatherOpConversion>(typeConverter, targetInfo, axisInfoAnalysis,
+                                  benefit);
   patterns.add<TTGAsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<TDMPrefetchConversion>(typeConverter, targetInfo, benefit);
