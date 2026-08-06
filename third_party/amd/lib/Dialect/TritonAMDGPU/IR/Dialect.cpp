@@ -110,6 +110,14 @@ LogicalResult verifyTDMBlockSize(Operation *op, ArrayRef<int64_t> blockShape) {
   return success();
 }
 
+// TLX pins explicit shared layouts with a generic PinnedEncodingTrait wrapper.
+// TDM validation is concerned with the physical shared layout underneath it.
+Attribute unwrapPinnedTDMLayout(Attribute layout) {
+  while (auto pinned = llvm::dyn_cast<gpu::PinnedEncodingTrait>(layout))
+    layout = pinned.getPinnedLayout();
+  return layout;
+}
+
 // Verify the descriptor and allocation carry a consistent TDM shared layout
 LogicalResult verifyTDMLayoutConsistency(Operation *op,
                                          triton::TensorDescType descTy,
@@ -117,7 +125,7 @@ LogicalResult verifyTDMLayoutConsistency(Operation *op,
   Attribute descLayout = descTy.getSharedLayout();
   if (!descLayout)
     return success();
-  Attribute allocLayout = smemTy.getEncoding();
+  Attribute allocLayout = unwrapPinnedTDMLayout(smemTy.getEncoding());
   auto descPartitioned =
       llvm::dyn_cast<gpu::PartitionedSharedEncodingAttr>(descLayout);
   auto allocPartitioned =
@@ -163,8 +171,8 @@ LogicalResult verifyTDMCommonLayout(Operation *op,
   if (failed(verifyTDMBlockSize(op, descTy.getShape())))
     return failure();
 
-  auto swizzledEnc =
-      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  auto swizzledEnc = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(
+      unwrapPinnedTDMLayout(smemTy.getEncoding()));
   if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
     return op->emitOpError("TDM does not support swizzling");
 
@@ -723,7 +731,7 @@ LogicalResult AsyncTDMCopyGlobalToLocalOp::verify() {
   if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
     return failure();
 
-  auto enc = smemTy.getEncoding();
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
   auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
   auto swizzledEnc = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(enc);
 
@@ -808,7 +816,7 @@ LogicalResult AsyncTDMCopyLocalToGlobalOp::verify() {
   if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
     return failure();
 
-  auto enc = smemTy.getEncoding();
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
   auto paddedEnc = llvm::dyn_cast<gpu::PaddedSharedEncodingAttr>(enc);
   if (!paddedEnc && !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
     return emitOpError("Invalid shared memory layout for TDM");
@@ -846,7 +854,7 @@ LogicalResult AsyncTDMScatterOp::verify() {
   if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
     return failure();
 
-  auto enc = smemTy.getEncoding();
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
   if (!llvm::isa<gpu::PaddedSharedEncodingAttr>(enc) &&
       !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
     return emitOpError("Invalid shared memory layout for TDM");
@@ -897,7 +905,7 @@ LogicalResult AsyncTDMGatherOp::verify() {
   if (failed(verifyTDMCommonLayout(getOperation(), tensorDescTy, smemTy)))
     return failure();
 
-  auto enc = smemTy.getEncoding();
+  auto enc = unwrapPinnedTDMLayout(smemTy.getEncoding());
   if (!llvm::isa<gpu::PaddedSharedEncodingAttr>(enc) &&
       !llvm::isa<gpu::SwizzledSharedEncodingAttr>(enc))
     return emitOpError("Invalid shared memory layout for TDM");
