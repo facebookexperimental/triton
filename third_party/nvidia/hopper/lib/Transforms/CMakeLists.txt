@@ -10,6 +10,7 @@ add_triton_library(TritonGPUModuloCore
   ModuloScheduling/ModuloReservationTable.cpp
   ModuloScheduling/SwingScheduler.cpp
   ModuloScheduling/ExhaustiveScheduler.cpp
+  ModuloScheduling/Z3ConstraintEncoder.cpp
   ModuloScheduling/ModuloScheduleGraph.cpp
 
   LINK_LIBS PUBLIC
@@ -17,6 +18,14 @@ add_triton_library(TritonGPUModuloCore
   TritonGPUIR
   MLIRTransformUtils
 )
+
+if(TRITON_ENABLE_Z3_JOINT_SOLVER)
+  target_compile_definitions(TritonGPUModuloCore
+    PRIVATE TRITON_ENABLE_Z3_JOINT_SOLVER=1
+  )
+  target_include_directories(TritonGPUModuloCore PRIVATE ${Z3_INCLUDE_DIR})
+  target_link_libraries(TritonGPUModuloCore PUBLIC ${Z3_LIBRARIES})
+endif()
 
 add_triton_library(NVHopperTransforms
   MultiCTAReduction.cpp
