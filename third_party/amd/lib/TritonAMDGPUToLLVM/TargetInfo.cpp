@@ -376,26 +376,10 @@ static bool warpReduceSwap16or32(RewriterBase &rewriter, Location loc,
   return true;
 }
 
-bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
-                            SmallVector<Value> &acc, triton::ReduceOp op,
-                            unsigned numLaneToReduce,
-                            unsigned interleave) const {
+void TargetInfo::emitDppWarpReduce(RewriterBase &rewriter, Location loc,
+                                   SmallVector<Value> &acc, Operation *reduxOp,
+                                   ArrayRef<int> rowShrSteps) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-
-  if (getISAFamily() == ISAFamily::CDNA4 &&
-      warpReduceSwap16or32(rewriter, loc, acc, op, numLaneToReduce, interleave))
-    return true;
-  if (numLaneToReduce != getWarpSize())
-    return false;
-  // DPP warp reduce requires gfx90a+ (CDNA2+) or gfx11+ (RDNA3+).
-  // Pre-CDNA2 GFX9 (gfx906/gfx908) and GFX10 (RDNA1/2) are excluded.
-  auto v = getIsaVersion();
-  if (!((v.Major == 9 && (v.Minor > 0 || v.Stepping >= 0xa)) || v.Major >= 11))
-    return false;
-
-  Operation *reduxOp = op.getSingleCombiner();
-  if (!reduxOp)
-    return false;
 
   auto createDppReduxOpWithBoundCtrl = [&](Type valType, Value &src,
                                            uint32_t dppCtrl, int rowMask,
@@ -474,21 +458,15 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
 
     const uint32_t dppCtrlRowShr = static_cast<uint32_t>(DppCtrl::ROW_SHR0);
 
-    // row_shr:8
-    buf = createDppReduxOpWithBoundCtrl(valType, acc[i], 8 + dppCtrlRowShr,
-                                        allRows, allBanks);
-
-    // row_shr:4
-    buf = createDppReduxOpWithBoundCtrl(valType, buf, 4 + dppCtrlRowShr,
-                                        allRows, allBanks);
-
-    // row_shr:2
-    buf = createDppReduxOpWithBoundCtrl(valType, buf, 2 + dppCtrlRowShr,
-                                        allRows, allBanks);
-
-    // row_shr:1
-    buf = createDppReduxOpWithBoundCtrl(valType, buf, 1 + dppCtrlRowShr,
-                                        allRows, allBanks);
+    // Within-row lane reduction via row_shr, applied in the order given by
+    // `rowShrSteps` (count-down 8,4,2,1 for the default reduction; count-up
+    // 1,2,4,8 for an ordered inner_tree reduction -- see warpReduceInnerTree).
+    // The cross-row row_bcast steps below are grouping-preserving and identical
+    // for both orders.
+    buf = acc[i];
+    for (int step : rowShrSteps)
+      buf = createDppReduxOpWithBoundCtrl(valType, buf, step + dppCtrlRowShr,
+                                          allRows, allBanks);
 
     if (supportDppBroadcast()) {
       // row_bcast:15 row_mask:0xa
@@ -528,7 +506,66 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
 
     acc[i] = result;
   }
+}
 
+bool TargetInfo::warpReduceInnerTree(RewriterBase &rewriter, Location loc,
+                                     SmallVector<Value> &acc,
+                                     triton::ReduceOp op,
+                                     unsigned numLaneToReduce) const {
+  // The count-up DPP tree assumes the wave64 (4 rows x 16 lanes) layout and a
+  // full-warp, single-combiner reduction. When any of those does not hold, bail
+  // (return false) so the shared count-up shuffle tree performs the ordered
+  // reduction instead. This also covers non-wave64 targets (e.g. GFX1250
+  // wave32) and the permlane-swap fast paths, which do not implement the
+  // count-up order.
+  if (numLaneToReduce != getWarpSize() || getWarpSize() != 64)
+    return false;
+  // DPP warp reduce requires gfx90a+ (CDNA2+) or gfx11+ (RDNA3+).
+  auto v = getIsaVersion();
+  if (!((v.Major == 9 && (v.Minor > 0 || v.Stepping >= 0xa)) || v.Major >= 11))
+    return false;
+  Operation *reduxOp = op.getSingleCombiner();
+  if (!reduxOp)
+    return false;
+
+  // Count-up order (1,2,4,8): adjacent lanes combine first, building the same
+  // balanced, adjacency-defined tree as the shared count-up shuffle path, so
+  // the result is bitwise-identical no matter how num_warps / BLOCK_SIZE split
+  // the reduction axis. (fp add/mul is commutative, so operand order within a
+  // node does not change the bits; only the grouping does.)
+  emitDppWarpReduce(rewriter, loc, acc, reduxOp, {1, 2, 4, 8});
+  return true;
+}
+
+bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
+                            SmallVector<Value> &acc, triton::ReduceOp op,
+                            unsigned numLaneToReduce,
+                            unsigned interleave) const {
+  // A defined reduction ordering (currently only "inner_tree") requires a
+  // fixed, layout-invariant reduction tree so the result is bitwise-identical
+  // across num_warps / BLOCK_SIZE. Emit it via the dedicated count-up path; the
+  // permlane-swap fast path below does not implement that order and is only
+  // used for the default (unordered) reduction.
+  if (op.hasDefinedOrdering())
+    return warpReduceInnerTree(rewriter, loc, acc, op, numLaneToReduce);
+
+  if (getISAFamily() == ISAFamily::CDNA4 &&
+      warpReduceSwap16or32(rewriter, loc, acc, op, numLaneToReduce, interleave))
+    return true;
+  if (numLaneToReduce != getWarpSize())
+    return false;
+  // DPP warp reduce requires gfx90a+ (CDNA2+) or gfx11+ (RDNA3+).
+  // Pre-CDNA2 GFX9 (gfx906/gfx908) and GFX10 (RDNA1/2) are excluded.
+  auto v = getIsaVersion();
+  if (!((v.Major == 9 && (v.Minor > 0 || v.Stepping >= 0xa)) || v.Major >= 11))
+    return false;
+
+  Operation *reduxOp = op.getSingleCombiner();
+  if (!reduxOp)
+    return false;
+
+  // Default (unordered) within-warp reduction: count-down DPP order 8,4,2,1.
+  emitDppWarpReduce(rewriter, loc, acc, reduxOp, {8, 4, 2, 1});
   return true;
 }
 
