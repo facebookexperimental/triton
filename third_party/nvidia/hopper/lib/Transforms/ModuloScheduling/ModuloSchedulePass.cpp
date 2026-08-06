@@ -4869,6 +4869,18 @@ scheduleOneLoop(scf::ForOp loop, const ttg::LatencyModel &model,
     }
   });
 
+  // Opt-in M2 evidence: compare the joint solver against the in-tree
+  // schedulers on this DDG. Runs every backend, so it is gated behind
+  // TRITON_MODULO_BASELINE_REPORT and never fires on a compile path. Emitted
+  // on stderr so it does not interleave with triton-opt's IR on stdout.
+  if (ttg::baselineReportRequested()) {
+    llvm::StringRef fixture = label;
+    if (auto func = loop->getParentOfType<tt::FuncOp>())
+      fixture = func.getName();
+    ttg::printBaselineComparison(llvm::errs(),
+                                 ttg::compareAgainstBaselines(ddg, fixture));
+  }
+
   auto schedResult = ttg::runModuloScheduling(ddg);
   if (failed(schedResult)) {
     LDBG(label << " scheduling FAILED");
@@ -5539,9 +5551,17 @@ static bool partitionJointSolver(ttg::ScheduleLoop &loop,
   auto status = obj->getString("status");
   auto *wgMap = obj->getObject("wg");
   auto *loweringPlanObj = obj->getObject("lowering_plan");
-  if (!responseVersion || *responseVersion != "joint-solver-0.2" || !status ||
-      *status != "ok" || !wgMap || !loweringPlanObj)
+  if (!status || *status != "ok") {
+    LLVM_DEBUG(DBGS() << "[Phase4-JOINT] solver non-ok response: " << *rawOut
+                      << "\n");
     return false;
+  }
+  if (!responseVersion || *responseVersion != "joint-solver-0.2" || !wgMap ||
+      !loweringPlanObj) {
+    LLVM_DEBUG(DBGS() << "[Phase4-JOINT] malformed ok response: " << *rawOut
+                      << "\n");
+    return false;
+  }
 
   auto checkedInt = [](std::optional<int64_t> value, int &result) {
     if (!value || *value < std::numeric_limits<int>::min() ||

@@ -33,7 +33,37 @@ runJointSolverSchedule(const DataDependenceGraph &ddg, int minII,
 /// joint-partition mode (ModuloSchedulePass's partitionJointSolver).
 /// Proven results are cached by canonical request JSON in a bounded,
 /// thread-safe LRU.
+/// Inconclusive responses are retried with a fresh backend and a bounded,
+/// increasing timeout.
 FailureOr<std::string> runJointSolverBackend(llvm::StringRef problemJson);
+
+/// Minimum II feasible under a relaxation of the joint model that keeps only
+/// the resource-exclusivity constraints, i.e. `relaxed_lower_bound`.
+///
+/// A relaxation's feasible set is a superset of the full model's, so its
+/// optimum can never exceed the full model's:
+///
+///     relaxed_lower_bound <= II_full     (always, by construction)
+///
+/// That direction is the useful one. A violation is not a performance
+/// regression, it is a *soundness* failure: the full model found a schedule
+/// the relaxed model calls impossible, which can only happen if a constraint
+/// is mis-encoded or a "relaxation" is not actually a relaxation. Reporting
+/// `II_full - relaxed_lower_bound` as an improvement would be backwards; the
+/// gap is informational only, and a large gap can equally mean the dropped
+/// constraints are necessary.
+///
+/// Named `relaxed_` rather than `resource_` deliberately: not every
+/// constraint is assumption-gated, so this is not a pure resource-only bound.
+/// The cycle-domain bounds and the canonical-root pin remain hard assertions
+/// (the SMEM/TMEM ceilings also survive but go vacuous once their gated
+/// contributors are dropped). The bound is therefore tighter than a textbook
+/// resource-only relaxation — still a valid lower bound, and a stronger
+/// soundness test, but not comparable to a published one.
+FailureOr<int> runJointSolverRelaxedLowerBound(const DataDependenceGraph &ddg,
+                                               int minII,
+                                               int smemBudget = 232448,
+                                               int tmemColLimit = 512);
 
 } // namespace mlir::triton::gpu
 

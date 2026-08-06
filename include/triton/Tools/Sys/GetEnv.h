@@ -115,6 +115,7 @@ inline const std::set<std::string> CACHE_NEUTRAL_ENV_VARS = {
     "TRITON_REPRODUCER_PATH",
     "TRITON_ENABLE_PYTHON_STACKTRACE",
     "TRITON_TLX_DUMP_DIR",
+    "TRITON_MODULO_BASELINE_REPORT",
     // clang-format on
 };
 
