@@ -1,6 +1,6 @@
 """8-wave inter-wave warp-pipelined MXFP4 (a4w4) GEMM for gfx950 (CDNA4).
 
-This is the 8-wave (WARPS_M=2, WARPS_N=4), 32x32x64-MFMA sibling of the
+This is the 8-wave (WARPS_M=2, WARPS_N=4), 16x16x128-MFMA sibling of the
 4-wave a4w4 kernel in `../../intra_wave/a4w4` -- the extra warps make the inter-wave
 software pipeline (`tlx.warp_pipeline_stage`) actually active (two co-resident
 wave groups run a full stage apart), which the 4-wave kernel cannot do.
@@ -25,8 +25,35 @@ Inputs use the same ABI as the 4-wave a4w4 kernel:
   * C: bfloat16, shape (M, N)
 
 The Shape:Stride register/blocked/accumulator layouts below encode the gfx950
-32x32x64 scaled-MFMA / dot-operand / scale distributions, and are
+16x16x128 scaled-MFMA / dot-operand / scale distributions, and are
 round-trip-verified against the compiler's resolved linear layouts.
+
+Why 16x16x128 rather than the 32x32x64 this file used before: at the same tile and
+MACs the two issue byte-identical memory traffic -- 54 ds_read, zero ds_write, 22
+direct-to-LDS loads, 16 s_barrier. Only MFMA density changes: 64 MFMAs per body
+become 128, halving memory ops per MFMA from 6.44 to 3.80, which is what gives the
+scheduler enough compute to hide that traffic behind.
+
+THE THREE CHANGES THAT GOT IT HERE
+  D114296896 harness, ratio = AITER/ours, >1.0 beats AITER:
+
+                                     2048x8192x4096   2048x8192x8192
+    32x32x64 (this file, previous rev)        0.862            0.864
+    -> 16x16x128, five layouts pinned         0.961            0.852
+    -> + sched_barrier fences                 1.008            0.946
+    -> + LDS pad 16 -> 32                     1.033            0.954
+
+  1. 16x16x128 MFMA. Neutral alone; it exists to make change 2 pay.
+  2. tlx.amd_sched_barrier(0) per warp-pipeline mem stage, pinning the ds_reads ahead
+     of the global-load cluster. +4% on the 32x32x64 predecessor, but +10-15% here.
+  3. LDS pad 16 -> 32; bank conflicts 98.1% -> 9.3%. Swept, not derived: pad 8 drives
+     conflicts to 0.6% and is 3x SLOWER, because 8 bytes breaks the 16-byte alignment
+     ds_read_b128 needs. The pad must be a power of two and >= 16.
+
+STRUCTURAL CEILING: 16 s_barrier per body, 8 carrying a mandatory full lgkmcnt(0) LDS
+drain. The barrier is what forces the drain, not operand granularity, so the only way
+down is to take an operand out of LDS entirely -- which also means chunked local_load
+will not help here.
 """
 
 import os
@@ -113,9 +140,9 @@ def _a4w4_8wave_kernel(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
         stride=((32, 64, 128, 256, 512, 1024, 1, 2, 4), (8, 16)),
     )
-    # ---- padded shared tile layout ([128,128] fp4, pad 16 @ 1024) ----
+    # ---- padded shared tile layout ([128,128] fp4, pad 32 @ 1024) ----
     shared_tile: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-        [[1024, 16]],
+        [[1024, 32]],
         [
             [0, 1],
             [0, 2],
@@ -136,27 +163,27 @@ def _a4w4_8wave_kernel(
     )
     shared_scales: tl.constexpr = tlx.swizzled_layout(0, 0, 0, order=[0, 1])
     # ---- MFMA scale register layouts (get_mfma_scale_layout) ----
-    scale_a_layout: tl.constexpr = tlx.layout(  # #linear1, [128,8]
+    scale_a_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
-        stride=((8, 16, 32, 64, 128, 1, 0, 0, 256), (2, 4, 512)),
+        stride=((8, 16, 32, 64, 1, 2, 0, 0, 128), (4, 256, 512)),
     )
-    scale_b_layout: tl.constexpr = tlx.layout(  # #linear5, per-quadrant [128,8]
+    scale_b_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2)),
-        stride=((8, 16, 32, 64, 128, 1, 256, 512, 0), (2, 4)),
+        stride=((8, 16, 32, 64, 1, 2, 128, 256, 0), (4, 512)),
     )
-    scale_b_comb_layout: tl.constexpr = tlx.layout(  # #linear2, combined [256,8]
+    scale_b_comb_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2)),
-        stride=((8, 16, 32, 64, 128, 1, 256, 512, 0), (2, 4, 1024)),
+        stride=((8, 16, 32, 64, 1, 2, 128, 256, 0), (4, 512, 1024)),
     )
-    # ---- MFMA accumulator layout (#mma 32x32x64 [2,4], one [128,128] quadrant) ----
+    # ---- MFMA accumulator layout (#mma 16x16x128 [2,4], one [128,128] quadrant) ----
     accumulator_layout: tl.constexpr = tlx.layout(
         shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
-        stride=((128, 256, 512, 1024, 2048, 4, 32, 64, 4096), (1, 2, 8, 16, 8192)),
+        stride=((128, 256, 512, 1024, 4, 8, 16, 32, 2048), (1, 2, 64, 4096, 8192)),
     )
     # ---- store layout (#blocked2, [128,128] bf16 quadrant) ----
     store_layout_c: tl.constexpr = tlx.layout(
-        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2, 2, 2)),
-        stride=((8, 16, 32, 64, 512, 1024, 0, 0, 2048), (1, 2, 4, 128, 256, 4096, 8192)),
+        shape=((2, 2, 2, 2, 2, 2, 2, 2, 2), (2, 2, 2, 2, 2)),
+        stride=((8, 16, 32, 64, 128, 256, 512, 1024, 2048), (1, 2, 4, 4096, 8192)),
     )
 
     # Grid is GRID_MN * SPLIT_K; peel the split id, keep the MN pid for the
@@ -297,6 +324,7 @@ def _a4w4_8wave_kernel(
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[0], relaxed=True)
             a_sc_bot = tlx.local_load(smem_a_sc_b[0], layout=scale_a_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[0], b_base, b_tile_offsets)
             tlx.buffer_load_to_local(smem_b_sc[0], b_scales_ptr, b_sc_offsets)
             tlx.async_load_commit_group()
@@ -306,6 +334,7 @@ def _a4w4_8wave_kernel(
             acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[0]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[0], a_base, a_tile_offsets)
             tlx.buffer_load_to_local(smem_a_sc_t[0], a_scales_ptr, a_sc_offsets)
             tlx.async_load_commit_group()
@@ -315,6 +344,7 @@ def _a4w4_8wave_kernel(
             acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[1]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[0], a_base + a_half_m, a_tile_offsets)
             tlx.buffer_load_to_local(smem_a_sc_b[0], a_scales_ptr + a_sc_half_m, a_sc_offsets)
             tlx.async_load_commit_group()
@@ -329,6 +359,7 @@ def _a4w4_8wave_kernel(
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_right[0], b_base + b_half_n, b_tile_offsets)
             tlx.async_load_commit_group()
 
@@ -339,6 +370,7 @@ def _a4w4_8wave_kernel(
         with tlx.warp_pipeline_stage("mem", priority=1):
             a_bot = tlx.local_load(smem_a_bot[1], relaxed=True)
             a_sc_bot = tlx.local_load(smem_a_sc_b[1], layout=scale_a_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_left[1], b_base + b_k2, b_tile_offsets)
             tlx.buffer_load_to_local(smem_b_sc[1], b_scales_ptr + b_sc_k, b_sc_offsets)
             tlx.async_load_commit_group()
@@ -348,6 +380,7 @@ def _a4w4_8wave_kernel(
             acc_bl = tl.dot_scaled(a_bot, a_sc_bot, "e2m1", b_left, b_sc_left, "e2m1", acc_bl)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_right = tlx.local_load(tlx.local_trans(smem_b_right[1]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_top[1], a_base + a_k2, a_tile_offsets)
             tlx.buffer_load_to_local(smem_a_sc_t[1], a_scales_ptr + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
@@ -357,6 +390,7 @@ def _a4w4_8wave_kernel(
             acc_tr = tl.dot_scaled(a_top, a_sc_top, "e2m1", b_right, b_sc_right, "e2m1", acc_tr)
         with tlx.warp_pipeline_stage("mem", priority=1):
             b_left = tlx.local_load(tlx.local_trans(smem_b_left[0]), relaxed=True)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_a_bot[1], a_base + a_half_m + a_k2, a_tile_offsets)
             tlx.buffer_load_to_local(smem_a_sc_b[1], a_scales_ptr + a_sc_half_m + a_sc_k, a_sc_offsets)
             tlx.async_load_commit_group()
@@ -371,6 +405,7 @@ def _a4w4_8wave_kernel(
             b_sc_l, b_sc_r = tl.split(tl.trans(tl.reshape(b_sc_comb, 2, HALF_N, NG), 1, 2, 0))
             b_sc_left = tlx.require_layout(b_sc_l, scale_b_layout)
             b_sc_right = tlx.require_layout(b_sc_r, scale_b_layout)
+            tlx.amd_sched_barrier(0)  # keep ds_read(local_load) ahead of the global loads
             tlx.buffer_load_to_local(smem_b_right[1], b_base + b_half_n + b_k2, b_tile_offsets)
             tlx.async_load_commit_group()
             a_base += a_k2 * 2
@@ -571,7 +606,7 @@ def _matmul_256tile(a, b, a_scales, b_scales, SPLIT_K=None):
         SPLIT_K=SPLIT_K,
         num_warps=NUM_WARPS,
         num_stages=1,
-        matrix_instr_nonkdim=32,
+        matrix_instr_nonkdim=16,
         # Forbid AGPRs: f32 accumulators write VGPRs directly (packs tighter, no spills).
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"), ),
     )
