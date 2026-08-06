@@ -320,15 +320,27 @@ def _is_reduce_node(n):
 
 
 def _balance_pass(order):
-    """Per node: (balanced, height, optok). A subtree is a balanced reduction iff every reduce
+    """Per node: (balanced, height, level, optok). A subtree is a balanced reduction iff every reduce
     node has children that are balanced reductions of one consistent op AND (for the 2-ary fp
     combine) their heights differ by <= 1 — the AVL property that separates inner_tree's balanced
     tree from unordered's left-fold. Boundary leaves are trivial arity-1 balanced reductions.
 
+    ``height`` is the REDUCTION height — log2 of the number of elements folded into the node — so a
+    ``SmemExchange`` is transparent: staging a partial through shared memory does not combine
+    anything, and counting it inflated the height by the number of exchanges, which is exactly a
+    num_warps artifact (num_warps=1 needs no exchange at all, so the same total reduction came out
+    two levels shorter and never matched the multi-warp configs). Dropping the artifact also removes
+    accidental MERGES it caused, where one config's extra exchange made up for a genuinely shorter
+    reduction.
+
+    ``level`` is the raw node depth (every reduce node counts, exchanges included). It is what the
+    butterfly-direction readers (:func:`_is_count_up`, :func:`_shfl_dir`) group shuffle steps by, so
+    that the within-warp run stays separated from the cross-warp run by the exchange between them.
+
     ``order`` is a post-order node list (one tree's or a whole forest's). Every value is a pure
     function of the node's own subtree, so a forest-wide pass gives each node exactly the values a
     per-tree pass would."""
-    bal, ht, optok = {}, {}, {}
+    bal, ht, lvl, optok = {}, {}, {}, {}
     for n in order:
         if _is_reduce_node(n):
             kids = list(n.children)
@@ -344,11 +356,15 @@ def _balance_pass(order):
                 bal[id(n)] = kids_bal and op is not None and abs(ht[id(kids[0])] - ht[id(kids[1])]) <= 1
             else:  # min/max FpOp (shape-invariant), or a 1-ary shfl/smem step: no AVL check needed
                 bal[id(n)] = kids_bal and op is not None
-            ht[id(n)] = max((ht[id(c)] for c in kids), default=0) + 1
+            # A shared exchange RELOCATES a partial between threads; it combines nothing, so it
+            # multiplies the reduced element count by one and adds no reduction height.
+            grow = 0 if isinstance(n, SmemExchange) else 1
+            ht[id(n)] = max((ht[id(c)] for c in kids), default=0) + grow
+            lvl[id(n)] = max((lvl[id(c)] for c in kids), default=0) + 1
             optok[id(n)] = op
         else:
-            bal[id(n)], ht[id(n)], optok[id(n)] = True, 0, None
-    return bal, ht, optok
+            bal[id(n)], ht[id(n)], lvl[id(n)], optok[id(n)] = True, 0, 0, None
+    return bal, ht, lvl, optok
 
 
 def _has_opaque(node):
@@ -368,7 +384,7 @@ def _addr_resolved(node):
     return True
 
 
-def _is_count_up(node, ht):
+def _is_count_up(node, lvl):
     """True iff the butterfly shuffles reduce COUNT-UP — the offset DOUBLES leaf->root (1, 2, 4, 8, ...).
     That is the ``inner_tree`` signature: a count-up balanced tree fixes the reduction to the layout-
     invariant canonical order, so it is bit-identical across ``num_warps``. ``unordered`` is count-DOWN
@@ -377,22 +393,24 @@ def _is_count_up(node, ht):
     num_warps-invariant order from the layout-dependent one, so the single-leaf collapse MUST gate on it
     or it over-merges ``unordered`` across num_warps.
 
-    Examine EVERY maximal run of shuffles at consecutive heights — the within-warp butterfly AND the
+    Examine EVERY maximal run of shuffles at consecutive LEVELS — the within-warp butterfly AND the
     cross-warp run (which sits higher, separated by a shared-memory exchange). Both carry the same
     direction. inner_tree makes every run increasing; unordered makes every run decreasing. Return True
     iff at least one run of >= 2 steps is strictly increasing AND no run is non-increasing. Reading only
     the TOP run (old behavior) missed the direction at low num_warps, where the cross-warp run is a
     single (direction-less) step and only the within-warp butterfly proves count-up — so nw=2 stayed
-    over-split. A count-DOWN run (unordered), a non-monotone run, a dynamic offset, or a height carrying
-    two offsets -> False (cannot prove inner_tree -> do not collapse -> sound over-split)."""
+    over-split. A count-DOWN run (unordered), a non-monotone run, a dynamic offset, or a level carrying
+    two offsets -> False (cannot prove inner_tree -> do not collapse -> sound over-split). Runs are cut
+    at LEVEL (not reduction height) gaps on purpose: the exchange between the within-warp and the
+    cross-warp butterfly is what separates their two runs, and it carries no reduction height."""
     by_ht = {}
-    for n in _postorder(node):
+    for n in _region_nodes(node):
         if isinstance(n, ShflCombine):
             try:
                 off = int(n.offset)
             except (TypeError, ValueError):
                 return False  # dynamic / unresolved offset
-            by_ht.setdefault(ht[id(n)], set()).add(off)
+            by_ht.setdefault(lvl[id(n)], set()).add(off)
     if not by_ht or any(len(offs) != 1 for offs in by_ht.values()):
         return False  # no shuffles, or a height carrying two different offsets -> ambiguous
     flat = {h: next(iter(offs)) for h, offs in by_ht.items()}
@@ -432,17 +450,30 @@ def _tok_is_pure(token):
     return any(token == p or token.startswith(p + ".") for p in _PURE_ELT)
 
 
+def _is_const_token(token):
+    """True iff an ``OpaqueLeaf``'s token is a compile-time CONSTANT — a literal immediate the
+    affine evaluator could not parse as an integer (``opq(imm(0f3FB8AA3B))``, a float literal) or one
+    it could (a bare decimal). A constant is the same value in every thread and in every config, so
+    unlike a lost-provenance value it cannot hide a layout dependence."""
+    return "imm(" in token or token.lstrip("-").isdigit()
+
+
 def _leaf_layout_invariant(node):
     """A reduction boundary-leaf subtree is layout-invariant (safe to collapse over) iff it has
-    NO cross-thread op (Shfl/Smem), NO lost-provenance OpaqueLeaf, no fused-fma ACC-chain (a
-    layout-dependent accumulation, not a per-element value), and every OpaqueOp is a pure
-    per-element op (cvt/mov/abs/neg) kept verbatim. This admits the bf16 promote (cvt.f32.bf16)
-    and a single product mul(L,L) / fma(L,L;const) while refusing anything whose value could
-    depend on the thread/lane layout."""
+    NO cross-thread op (Shfl/Smem), NO lost-provenance OpaqueLeaf (a literal CONSTANT is fine — see
+    :func:`_is_const_token`), no fused-fma ACC-chain (a layout-dependent accumulation, not a
+    per-element value), and every OpaqueOp is a pure per-element op (cvt/mov/abs/neg) kept verbatim.
+    This admits the bf16 promote (cvt.f32.bf16) and a single product mul(L,L) / fma(L,L;const) while
+    refusing anything whose value could depend on the thread/lane layout.
+
+    An ``ITreeReduce`` is accepted: it is a NESTED reduction this same pass already certified as
+    layout-invariant, and its token rides verbatim into the outer ``leaf_sig``, so an outer reduction
+    over inner reductions (softmax's ``sum(exp(x - max(x)))``) collapses without losing the inner
+    key. Callers pass the already-COLLAPSED leaf, so this is the only place such a node appears."""
     for n in _postorder(node):
         if isinstance(n, (ShflCombine, SmemExchange, Mma, LoopReduce)):
             return False  # cross-thread / opaque-chunk / loop-fold node: not a per-element leaf
-        if isinstance(n, OpaqueLeaf):
+        if isinstance(n, OpaqueLeaf) and not _is_const_token(n.token):
             return False
         if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
             return False
@@ -452,27 +483,76 @@ def _leaf_layout_invariant(node):
     return True
 
 
-def _shfl_dir(node, ht):
-    """The butterfly DIRECTION: the distinct offsets of the FIRST (min-height, nearest-leaves)
+def _shfl_dir(node, lvl):
+    """The butterfly DIRECTION: the distinct offsets of the FIRST (min-level, nearest-leaves)
     shuffle step. count-up (inner_tree) starts at offset 1; count-down (unordered) starts at 16.
     They pair lanes differently -> different bits, so this must be in the token. It is
     num_warps-INVARIANT (the within-warp butterfly's first step is offset 1 for inner_tree at any
-    num_warps; cross-warp shuffles sit at higher height), so it distinguishes the orderings
+    num_warps; cross-warp shuffles sit at a higher level), so it distinguishes the orderings
     WITHOUT blocking num_warps recovery (the full offset sequence would, since cross-warp shuffle
-    count scales with num_warps)."""
-    shfls = [(ht[id(n)], str(n.offset)) for n in _postorder(node) if isinstance(n, ShflCombine)]
+    count scales with num_warps). Scoped to THIS region (:func:`_region_nodes`): a butterfly inside a
+    boundary leaf belongs to that nested reduction, and letting it leak in made the direction key
+    depend on which hardware form the nested reduce took (col_max's `redux.sync` at num_warps=32 vs a
+    shuffle butterfly below), splitting an outer sum whose own direction is identical."""
+    shfls = [(lvl[id(n)], str(n.offset)) for n in _region_nodes(node) if isinstance(n, ShflCombine)]
     if not shfls:
         return ()
     lo = min(h for h, _ in shfls)
     return tuple(sorted({off for h, off in shfls if h == lo}))
 
 
-def _collapse_info(node, ht=None):
+def _region_nodes(node):
+    """Every reduce node of the reduction REGION rooted at ``node`` — the walk descends only through
+    reduce nodes, so a nested reduction hiding inside a BOUNDARY leaf is not part of this region."""
+    out, stack, seen = [], [node], set()
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        out.append(n)
+        for c in n.children:
+            if _is_reduce_node(c):
+                stack.append(c)
+    return out
+
+
+def _region_walk(node):
+    """``(reduce op token, boundary leaves)`` of the reduction REGION rooted at ``node``, or
+    ``(None, ...)`` when the region mixes two reduce ops.
+
+    The walk descends ONLY through reduce nodes, exactly like the op propagation in
+    :func:`_balance_pass`: a non-reduce child ends the region and is a boundary leaf, and whatever
+    lives INSIDE that leaf is the leaf's business. Scanning the whole post-order instead (the old
+    behaviour) reached back into the leaves and saw their own reduce nodes, so any reduction fed by a
+    DIFFERENT-op or different-width sub-reduction — softmax's ``sum(exp(x - max(x)))``, col_max's
+    within-thread ``max.f16`` fold under a cross-warp ``max.f32`` — looked like a two-op region and
+    never collapsed, which is precisely where the num_warps split lived."""
+    op, leaves = None, []
+    for n in _region_nodes(node):
+        tok = _reduce_op(n)  # FpOp OR ShflCombine (a pure cross-thread butterfly carries its op here)
+        if tok is not None:
+            if op is None:
+                op = tok
+            elif op != tok:
+                return None, leaves
+        for c in n.children:  # a boundary leaf is a non-reduce child of a reduce node
+            if not _is_reduce_node(c):
+                leaves.append(c)
+    return op, leaves
+
+
+def _collapse_info(node, lvl=None, collapsed=None):
     """(reduce_op_token, uniform_coord_free_leaf_sig, reduced_column_SET) for a collapsible reduction,
-    or None if it cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of
-    reduce nodes (NOT every non-reduce postorder node — collecting the latter double-counts a
-    boundary's own internal nodes, e.g. it sees both ``cvt(L)`` and its child ``L`` -> two coord-free
-    sigs -> a spurious bail; that is why the baseline never collapsed cvt/exp/mul-fed reductions).
+    or None if it cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of the
+    region's reduce nodes (:func:`_region_walk`).
+
+    ``collapsed`` maps a node id to its ALREADY-COLLAPSED form (the post-order output map of
+    :func:`_collapse_regions`). The boundary-leaf signature is taken from there, so a leaf that is
+    itself a nested reduction contributes its layout-invariant ``ITreeReduce`` token instead of its
+    physical fold — which is what makes an outer reduction over it num_warps-invariant too. The
+    column image and the address-resolution gate still read the RAW leaf (more leaves visible ->
+    strictly more conservative).
 
     Guards: a single consistent reduce op (read from FpOp AND ShflCombine, so a pure cross-thread
     butterfly counts); >= 1 boundary leaf; every boundary is layout-invariant (pure-elt); the SAME
@@ -487,21 +567,10 @@ def _collapse_info(node, ht=None):
     image being recoverable is the config-invariance proof. (The old ``_single_element`` guard refused
     this because coord-blanking cannot prove the pairing; but the pairing is a source fact, not a
     layout fact, so it is invariant across the configs actually compared.)"""
-    op, leaves = None, []
-    for n in _postorder(node):
-        if not _is_reduce_node(n):
-            continue
-        tok = _reduce_op(n)  # FpOp OR ShflCombine (a pure cross-thread butterfly carries its op here)
-        if tok is not None:
-            if op is None:
-                op = tok
-            elif op != tok:
-                return None
-        for c in n.children:  # a boundary leaf is a non-reduce child of a reduce node
-            if not _is_reduce_node(c):
-                leaves.append(c)
-    if op is None or not leaves:
+    op, raw = _region_walk(node)
+    if op is None or not raw:
         return None
+    leaves = [collapsed[id(l)] for l in raw] if collapsed is not None else raw
     # Leaf-count guard depends on the op's shape-sensitivity. A SHAPE-INVARIANT op (min/max) keys on
     # the reduced element SET (cols) below, so a lone coord-blanked leaf is fine — a pure cross-thread
     # min/max butterfly (1 leaf/thread) is a real reduction and MAY collapse. A SHAPE-DEPENDENT op
@@ -515,15 +584,15 @@ def _collapse_info(node, ht=None):
     # recovers num_warps. Count-DOWN (unordered) or an UNRESOLVED (opaque/swizzled) address keeps the
     # old >= 2 fail-close (over-split, sound) — count-up vs count-down is the ONLY signal separating the
     # num_warps-invariant order from the layout-dependent one when there is no within-thread fold. This
-    # is the affine linchpin. (ht is None on the pre-collapse `_reduces_without_leaf` scan -> stay strict.)
-    if (op.split(".")[0] not in _ORDER_INVARIANT_OPS and len(leaves) < 2
-            and not (_addr_resolved(leaves[0]) and ht is not None and _is_count_up(node, ht))):
+    # is the affine linchpin. (lvl is None on the pre-collapse `_reduces_without_leaf` scan -> stay strict.)
+    if (op.split(".")[0] not in _ORDER_INVARIANT_OPS and len(raw) < 2
+            and not (_addr_resolved(raw[0]) and lvl is not None and _is_count_up(node, lvl))):
         return None
     if not all(_leaf_layout_invariant(l) for l in leaves):
         return None  # a layout-dependent / lost-provenance leaf -> do not collapse
     if len({_coordfree_sig(l) for l in leaves}) != 1:
         return None  # non-uniform leaf computations -> conservative
-    unions = [_leaf_cols_union(l) for l in leaves]  # config-invariant column image of every leaf
+    unions = [_leaf_cols_union(l) for l in raw]  # config-invariant column image of every leaf
     if any(u is None for u in unions):
         return None  # addressing not understood for some leaf -> cannot prove the extent -> conservative
     return (op, _coordfree_sig(leaves[0]), frozenset().union(*unions))
@@ -557,7 +626,7 @@ def output_coordfree_key(node):
 
 def _coordfree_blankable(n):
     """Is THIS node (ignoring its children) safe to coord-blank? See :func:`output_coordfree_key`."""
-    if isinstance(n, OpaqueLeaf) and "imm(" not in n.token:
+    if isinstance(n, OpaqueLeaf) and not _is_const_token(n.token):
         return False  # a lost-provenance (non-constant) value -> unsafe to coord-blank
     if isinstance(n, OpaqueOp) and not _tok_is_pure(n.token):
         return False  # an unmodeled value op -> unsafe
@@ -618,22 +687,22 @@ def collapse_balanced(root):
     Iterative (no recursion on deep folds). Use :func:`collapse_balanced_forest` for a multi-output
     entry — calling this per output rebuilds every shared subtree once per output."""
     order = _postorder(root)
-    ht, collapsible = _collapse_prep(order)
+    ht, lvl, collapsible = _collapse_prep(order)
     marks = {}
     for n in order:
         if collapsible[id(n)]:
             for c in n.children:
                 marks[id(c)] = True
-    return _collapse_regions(order, [root], ht, collapsible, marks)[0]
+    return _collapse_regions(order, [root], ht, lvl, collapsible, marks)[0]
 
 
 def _collapse_prep(order):
-    """(height, collapsible) per node of a post-order list. Collapse every MAXIMAL balanced
+    """(height, level, collapsible) per node of a post-order list. Collapse every MAXIMAL balanced
     reduction region, including per-chunk reductions nested under a persistent kernel's cross-chunk
     loop. The ITreeReduce token keeps the reduction height (= log2(BLOCK_N)+const,
     num_warps-invariant, BLOCK_N-monotone), so different chunk sizes stay in distinct classes."""
-    bal, ht, optok = _balance_pass(order)
-    return ht, {id(n): (_is_reduce_node(n) and bal[id(n)] and optok[id(n)] is not None) for n in order}
+    bal, ht, lvl, optok = _balance_pass(order)
+    return ht, lvl, {id(n): (_is_reduce_node(n) and bal[id(n)] and optok[id(n)] is not None) for n in order}
 
 
 def collapse_balanced_forest(roots):
@@ -649,11 +718,11 @@ def collapse_balanced_forest(roots):
     resolved by :func:`_shared_region_marks`, which falls back to the exact per-root pass when the
     roots disagree."""
     order = _forest_postorder(roots)
-    ht, collapsible = _collapse_prep(order)
+    ht, lvl, collapsible = _collapse_prep(order)
     marks = _shared_region_marks(order, roots, collapsible)
     if marks is None:
         return [collapse_balanced(r) for r in roots]
-    return _collapse_regions(order, roots, ht, collapsible, marks)
+    return _collapse_regions(order, roots, ht, lvl, collapsible, marks)
 
 
 # Cap on the root x node bitmasks :func:`_shared_region_marks` builds (bits, ~8 MB). Beyond it the
@@ -705,12 +774,12 @@ def _shared_region_marks(order, roots, collapsible):
     return out
 
 
-def _collapse_regions(order, roots, ht, collapsible, has_coll_parent):
+def _collapse_regions(order, roots, ht, lvl, collapsible, has_coll_parent):
     """Collapsed tree of each root, sharing one output map over ``order`` (see the two callers)."""
     new = {}
     for n in order:
         region_root = collapsible[id(n)] and not has_coll_parent.get(id(n), False)
-        info = _collapse_info(n, ht) if region_root else None
+        info = _collapse_info(n, lvl, new) if region_root else None
         if info is not None:
             op, leaf_sig, cols = info
             if op.split(".")[0] in _ORDER_INVARIANT_OPS:
@@ -734,7 +803,7 @@ def _collapse_regions(order, roots, ht, collapsible, has_coll_parent):
                 # add (etc): the SHAPE matters. Keep height (= log2 of the total fan-in, which is
                 # num_warps-invariant for a balanced tree — a 1-leaf pure cross-thread butterfly
                 # included) + the butterfly direction, so unordered stays split and inner_tree merges.
-                new[id(n)] = ITreeReduce(op, leaf_sig, ht[id(n)], _shfl_dir(n, ht))
+                new[id(n)] = ITreeReduce(op, leaf_sig, ht[id(n)], _shfl_dir(n, lvl))
         else:
             new[id(n)] = _rebuild(n, [new[id(c)] for c in n.children])
     return [new[id(r)] for r in roots]
