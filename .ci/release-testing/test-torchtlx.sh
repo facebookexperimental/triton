@@ -2,7 +2,7 @@
 # Release testing: torchTLX (TLX as an Inductor backend) template + fusion tests.
 #
 # Usage:
-#   test-torchtlx.sh <hardware>
+#   test-torchtlx.sh
 #
 # Mirrors torchtlx.yml. torchTLX plugs into the newest Inductor internals
 # (config.triton.tlx_mode, template/fusion hooks), so unlike every other suite
@@ -18,9 +18,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "${SCRIPT_DIR}/common.sh"
 
-HARDWARE="${1:-}"
-validate_hardware "${HARDWARE}"
-
 activate_env
 
 # Unlike the other suites, do NOT force TORCHINDUCTOR_TLX_MODE off here: this is
@@ -29,7 +26,8 @@ activate_env
 REFRESH_TORCH="${RELEASE_TESTING_TORCHTLX_REFRESH_TORCH:-1}"
 
 if [ "${REFRESH_TORCH}" = "1" ]; then
-  if [ "${HARDWARE}" = "mi350" ]; then
+  # Detect the ROCm build before the reprovisioning below replaces torch.
+  if is_amd; then
     # Omitting --install-torch-wheel makes setup-env.sh fall back to the latest
     # (floating) rocm nightly torch rather than the pinned wheel the other AMD
     # jobs use; --custom-triton then installs the fork Triton on top.

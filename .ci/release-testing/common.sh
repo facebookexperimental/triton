@@ -1,10 +1,11 @@
 #!/bin/bash
 # Shared helpers for the release-testing scripts in this directory.
 #
-# Sourced (not executed) by run.sh and by each test-*.sh. Every test script is
-# also runnable standalone, e.g.:
+# Sourced (not executed) by run.sh and by each test-*.sh. Only run.sh takes a
+# <hardware> argument; the test scripts detect what they need from the
+# environment, so each is runnable standalone as:
 #
-#   bash .ci/release-testing/test-tlx.sh b200
+#   bash .ci/release-testing/test-tlx.sh
 #
 # Environment consumed:
 #   SETUP_SCRIPT            Runner env activation script (e.g. /workspace/setup_instance.sh).
@@ -44,6 +45,13 @@ validate_hardware() {
   done
   echo "ERROR: unknown hardware '${hardware}'. Expected one of: ${RELEASE_TESTING_HARDWARES[*]}" >&2
   return 1
+}
+
+# is_amd
+# True when the installed torch is a ROCm build, i.e. we are on the AMD runner.
+# The test scripts branch on this instead of taking a <hardware> argument.
+is_amd() {
+  python -c "import sys, torch; sys.exit(0 if torch.version.hip else 1)" 2>/dev/null
 }
 
 # activate_env

@@ -2,7 +2,7 @@
 # Release testing: TLX unit tests + TLX tutorial correctness tests.
 #
 # Usage:
-#   test-tlx.sh <hardware>
+#   test-tlx.sh
 #
 # Mirrors the "-tlx-test" jobs of h100.yml / b200.yml / mi350.yml. Both pytest
 # invocations always run; the script exits non-zero if either failed, so a
@@ -13,9 +13,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "${SCRIPT_DIR}/common.sh"
 
-HARDWARE="${1:-}"
-validate_hardware "${HARDWARE}" || exit 1
-
 activate_env
 disable_torchtlx
 
@@ -25,7 +22,7 @@ pip_install pytest
 # torchao supplies the MX-format reference implementations used by the
 # mxfp TLX tests. AMD installs the rocm nightly wheel; NVIDIA builds from
 # source because there is no matching prebuilt nightly.
-if [ "${HARDWARE}" = "mi350" ]; then
+if is_amd; then
   pip_install --pre torchao --index-url https://download.pytorch.org/whl/nightly/rocm7.2
 else
   pip_install --no-build-isolation --no-deps "git+https://github.com/pytorch/ao.git"

@@ -4,7 +4,9 @@
 # Usage:
 #   run.sh <hardware>
 #
-# <hardware> is one of: h100, b200, mi350.
+# <hardware> is one of: h100, b200, mi350. It only selects which suites to run;
+# the suite scripts themselves take no arguments and detect what they need
+# (e.g. NVIDIA vs ROCm) from the environment.
 #
 # Every selected suite runs even if an earlier one fails, so a single release
 # run reports the complete picture instead of stopping at the first red suite.
@@ -74,7 +76,7 @@ for suite in "${SUITES[@]}"; do
   echo "=================================================================="
   # Each suite runs in a subshell so that env mutations (conda activation,
   # exported knobs) do not leak between suites.
-  if bash "${suite_script}" "${HARDWARE}"; then
+  if bash "${suite_script}"; then
     PASSED_SUITES+=("${suite}")
   else
     echo "==> ${suite} FAILED (exit $?)" >&2
