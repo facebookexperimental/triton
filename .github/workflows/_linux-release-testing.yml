@@ -26,7 +26,8 @@ on:
         required: True
         type: string
         description: |
-          Benchmark suite name
+          Benchmark suite name, or "release-testing" to run the correctness
+          gate in .ci/release-testing instead of a benchmark.
       side_a_triton:
         type: string
         required: False
@@ -96,6 +97,19 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      # The "release-testing" suite runs pytest suites out of the Triton source
+      # tree, so it needs a checkout even for periodic runs (which otherwise
+      # only install a prebuilt side A). Repo/ref are pinned to match what the
+      # periodic branch of the install step below builds.
+      - name: Checkout Triton (release testing source)
+        if: ${{ inputs.suite == 'release-testing' && inputs.test_type == 'periodic' }}
+        uses: actions/checkout@v3
+        with:
+          repository: facebookexperimental/triton
+          ref: main
+          path: triton-main
+          submodules: recursive
+
       - name: Tune Nvidia GPU
         if: ${{ inputs.runner == 'h100' || inputs.runner == 'b200' }}
         run: |
@@ -153,12 +167,38 @@ jobs:
           cat "${SETUP_SCRIPT}"
 
       - name: Setup uploader dependencies
+        if: ${{ inputs.suite != 'release-testing' }}
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
           uv pip install --group ci
 
+      # The release-testing suite is a correctness gate, not a benchmark: it
+      # dispatches the per-hardware pytest suites and emits junit XML instead of
+      # benchmark json, so it bypasses the run-benchmark.sh / upload steps below.
+      - name: Release Testing (Side A)
+        if: ${{ inputs.suite == 'release-testing' }}
+        run: |
+          set -eux
+          if [ "${{ inputs.test_type }}" = "periodic" ]; then
+            TRITON_SRC_DIR="${GITHUB_WORKSPACE}/triton-main"
+          else
+            TRITON_SRC_DIR="${GITHUB_WORKSPACE}/triton-side-a"
+          fi
+          export TRITON_SRC_DIR
+          export RELEASE_TESTING_OUTPUT="${GITHUB_WORKSPACE}/release-testing-output"
+          bash "${TRITON_SRC_DIR}/.ci/release-testing/run.sh" "${{ inputs.runner }}"
+
+      - name: Upload release testing results
+        if: ${{ always() && inputs.suite == 'release-testing' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.JOB_NAME }}
+          path: release-testing-output/
+          if-no-files-found: warn
+
       - name: Triton Testing (Side A)
+        if: ${{ inputs.suite != 'release-testing' }}
         run: |
           set -eux
           bash ${TRITONBENCH_ROOT}/.ci/tritonbench/run-benchmark.sh ${{ inputs.suite }} --conda-env "${TRITON_SIDE_A_ENV}"
@@ -167,7 +207,7 @@ jobs:
           sudo rm -rf "${TRITONBENCH_ROOT}/.benchmarks" || true
 
       - name: Compile Triton side B
-        if: ${{ inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
+        if: ${{ inputs.suite != 'release-testing' && inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
         run: |
           set -eux
           bash ${TRITONBENCH_ROOT}/.ci/triton/install.sh \
@@ -178,7 +218,7 @@ jobs:
           echo 'TRITON_SIDE_B_ENV=triton-side-b' >> "${GITHUB_ENV}"
 
       - name: Triton Testing (Side B)
-        if: ${{ inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
+        if: ${{ inputs.suite != 'release-testing' && inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
         run: |
           set -eux
           bash ${TRITONBENCH_ROOT}/.ci/tritonbench/run-benchmark.sh ${{ inputs.suite }} --conda-env "${TRITON_SIDE_B_ENV}"
@@ -187,6 +227,7 @@ jobs:
           sudo rm -rf "${TRITONBENCH_ROOT}/.benchmarks" || true
 
       - name: Upload result to GH Actions Artifact
+        if: ${{ inputs.suite != 'release-testing' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.JOB_NAME }}
@@ -223,6 +264,7 @@ jobs:
           fi
 
       - name: Upload result to ClickHouse
+        if: ${{ inputs.suite != 'release-testing' }}
         uses: pytorch/test-infra/.github/actions/upload-benchmark-results@main
         with:
           benchmark-results-dir: benchmark-output/clickhouse-results
