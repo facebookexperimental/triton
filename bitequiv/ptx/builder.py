@@ -63,7 +63,7 @@ def _reduce_op(node):
 
 
 def _is_fp(inst):
-    return bool(inst.modifiers) and inst.modifiers[-1] in _FP_WIDTHS
+    return bool(inst.modifiers) and any(m in _FP_WIDTHS for m in inst.modifiers)
 
 
 def _offset(operand):

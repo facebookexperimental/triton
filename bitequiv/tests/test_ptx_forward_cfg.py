@@ -5,8 +5,9 @@ from bitequiv.ptx.affine import AffineEval, reqntid_of
 from bitequiv.ptx.forward.cfg import has_unknown_control, predicated_insts
 from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.linker import DefUse, linearize
+from bitequiv.ptx_reduction import ptx_header
 
-_HDR = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+_HDR = ptx_header()
 
 
 def _entry(body):

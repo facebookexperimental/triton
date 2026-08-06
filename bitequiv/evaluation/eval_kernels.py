@@ -1514,7 +1514,11 @@ def gemm_splitk_partial_kernel(a_ptr, b_ptr, ws_ptr, M, N, K, stride_am, stride_
                                BLOCK_K: tl.constexpr, NUM_SPLITS: tl.constexpr):
     """Stage 1 of the two-kernel split-K: a 3-D grid (m, n, split) writes each split's
     K-slice partial to workspace[split, m_tile, n_tile] via a plain st.global (no
-    combine yet). The cross-split combine is a SEPARATE kernel (below)."""
+    combine yet). The cross-split combine is a SEPARATE kernel (below).
+
+    This is DETERMINISTIC split-K: traditional split-K accumulates partials across CTAs with
+    atomic adds (a non-reproducible add order); here each split owns its own workspace slot and
+    the separate combine kernel sums them in a fixed order, so the output is bit-reproducible."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_s = tl.program_id(2)

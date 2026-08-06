@@ -14,8 +14,9 @@ from pyptx.parser import parse
 from bitequiv.ptx.builder import _postorder, collapse_balanced
 from bitequiv.ptx.forward.interp import ForwardInterp, forward_module_descriptor
 from bitequiv.ptx.treeir import FpOp, ITreeReduce, Leaf, OpaqueOp, ShflCombine
+from bitequiv.ptx_reduction import ptx_header
 
-_HDR = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+_HDR = ptx_header()
 
 _FIX = os.path.join(os.path.dirname(__file__), "fixtures", "ptx")
 

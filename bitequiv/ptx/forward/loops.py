@@ -74,7 +74,7 @@ def own_body(insts, loop, loops):
 
 
 def _is_fp_combine(inst):
-    return inst.opcode in _FP_COMBINE and inst.modifiers and inst.modifiers[-1] in _FP_WIDTHS
+    return inst.opcode in _FP_COMBINE and inst.modifiers and any(m in _FP_WIDTHS for m in inst.modifiers)
 
 
 def _self_accumulate(inst):
@@ -108,6 +108,11 @@ def loop_self_increments(insts, loop, loops):
             d, a, b = inst.operands
             if (isinstance(d, RegisterOperand) and isinstance(a, RegisterOperand) and d.name == a.name
                     and isinstance(b, ImmediateOperand)):
+                # A non-literal increment immediate (symbolic / unparseable) is not a fixed chunk size,
+                # so we skip it rather than guess. Sound: chunk keys are only ever literal constants
+                # (BLOCK_K / BLOCK_N); dropping a symbolic step just keys the loop on its remaining literal
+                # steps (or none -> the conservative empty key), never merges two distinct chunkings, and
+                # the empirical fuzzer backstops. We do NOT fall back to 0 (0 would be dropped anyway).
                 try:
                     v = int(b.text, 0)
                 except (ValueError, TypeError):

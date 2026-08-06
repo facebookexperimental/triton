@@ -115,7 +115,7 @@ def _fp_epi_counts(func):
     re-tilings — see :func:`_mma_fence`)."""
     fma, addmul = 0, 0
     for inst in linearize(func):
-        if not (inst.modifiers and inst.modifiers[-1] in _FP_EPI_WIDTHS):
+        if not (inst.modifiers and any(m in _FP_EPI_WIDTHS for m in inst.modifiers)):
             continue
         if inst.opcode == "fma":
             fma += 1
