@@ -28,7 +28,6 @@ import torch
 
 from bitequiv import cublas_equiv_gemm as _G
 from bitequiv.cublas_equiv_gemm import (
-    CublasNeedRuntimeMatch,
     CublasUnsupportedPlatform,
     CublasUnsupportedShape,
     cublas_equivalent_gemm,
@@ -48,11 +47,12 @@ def random_shape(rng, dtypes, mode, max_dim, max_mn, max_k, fp8_round16):
     version had (those made ~98% of draws aligned, when only 1.6% of random shapes are, and
     hid every hard family).
 
-      random  -- M, N, K independent uniform draws. This is the "any shape at all" case.
+      random  -- M, N, K independent uniform draws, up to a ceiling that reaches the sizes real
+                 LLM GEMMs use. This is the "any shape at all" case.
       extreme -- M, N small and K large: the skinny+deep corner where cuBLAS reaches for
                  split-K, and where its SIMT gemv fallbacks live. Uniform sampling barely
-                 visits it (only ~1.2% of random draws have a dim under 100), so it needs its
-                 own mode to be measured at all.
+                 visits it (under 1% of random draws at the default ceiling have a dim below
+                 100), so it needs its own mode to be measured at all.
 
     `max_dim` / `max_mn` / `max_k` bound memory and run time; they are not restrictions on the
     shape class. fp8 is the one place a rounding is justified: cuBLAS itself refuses fp8 unless
@@ -116,10 +116,10 @@ def fp8_scales(rng):
     return 10**rng.uniform(-4, 2) * rng.choice([1.0, 1.3, 7.77]), 10**rng.uniform(-4, 2) * rng.choice([1.0, 0.3, 1.1])
 
 
-def our_api(a, b, dtype, out_dtype, enable_rt, scales=(1.0, 1.0)):
+def our_api(a, b, dtype, out_dtype, scales=(1.0, 1.0)):
     if dtype == "fp8":
-        return cublas_equivalent_gemm(a, b, out_dtype, scales[0], scales[1], enable_runtime_match=enable_rt)
-    return cublas_equivalent_gemm(a, b, out_dtype, enable_runtime_match=enable_rt)
+        return cublas_equivalent_gemm(a, b, out_dtype, scales[0], scales[1])
+    return cublas_equivalent_gemm(a, b, out_dtype)
 
 
 def load_done(path):
@@ -140,7 +140,7 @@ def load_done(path):
     return done
 
 
-def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn, max_k, fp8_round16, max_bytes,
+def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp8_round16, max_bytes,
         shape_log):
     rng = random.Random(seed)
     mm_path = f"/tmp/cublas_equiv_mismatches_{os.getpid()}.jsonl"
@@ -150,9 +150,9 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
 
     st = {"drawn": 0, "cmp": 0, "match": 0, "mismatch": 0, "no_ref": 0, "nonfinite": 0, "error": 0,
           "too_big": 0, "oom": 0, "dup": 0}
-    # distinct shapes by outcome: static (heuristic only) / runtime (byte-compare) / need-rt
-    # (skipped in static-only mode) / unsupported (no reconstruction even with a runtime match)
-    seen_static, seen_pseudo, seen_runtime, seen_needrt, seen_unsup = set(), set(), set(), set(), set()
+    # distinct shapes by outcome: reconstructed from the heuristic, or declined because its
+    # config falls outside the measured tables
+    seen_static, seen_unsup = set(), set()
     t0 = time.time()
     last = t0
 
@@ -163,7 +163,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
         return
     print(f"device: {torch.cuda.get_device_name()} | platform: {prof.name} | cuBLASLt "
           f"{'.'.join(map(str, _G._cublaslt_version()))} from {_G._load_lt()._name} | dtypes={dtypes} R={R} "
-          f"timeout={timeout}s enable_runtime_match={enable_rt}")
+          f"timeout={timeout}s")
     if mode == "extreme":
         print(f"EXTREME shapes: M,N ~ uniform[1,{max_mn}], K ~ uniform[1,{max_k}] -- the skinny+deep "
               f"split-K corner")
@@ -179,13 +179,13 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
         el = time.time() - t0
         scmp = st["match"] + st["mismatch"]
         rate = (100.0 * st["match"] / scmp) if scmp else 100.0
-        recon = len(seen_static) + len(seen_pseudo) + len(seen_runtime)
-        classified = recon + len(seen_needrt) + len(seen_unsup)
+        recon = len(seen_static)
+        classified = recon + len(seen_unsup)
         cov = (100.0 * recon / classified) if classified else 0.0
         print(f"[{tag} {el:6.0f}s] drawn={st['drawn']} classified={classified} "
               f"RECONSTRUCTABLE={cov:5.1f}% ({recon}/{classified}) | "
-              f"static={len(seen_static)} pseudo={len(seen_pseudo)} runtime={len(seen_runtime)} "
-              f"needRT={len(seen_needrt)} unsup={len(seen_unsup)} | bit-consistent={rate:6.2f}% ({st['match']}/{scmp}) "
+              f"static={len(seen_static)} "
+              f"unsup={len(seen_unsup)} | bit-consistent={rate:6.2f}% ({st['match']}/{scmp}) "
               f"mismatch={st['mismatch']} | no_ref={st['no_ref']} too_big={st['too_big']} "
               f"oom={st['oom']} nonfinite={st['nonfinite']} err={st['error']}", flush=True)
 
@@ -236,24 +236,11 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                     st["nonfinite"] += 1  # overflow -> byte-compare is meaningless, skip this input
                     continue
                 try:
-                    if use_rt is None:  # first comparable input: let the API pick a tier
-                        try:
-                            out = our_api(a, b, dtype, out_dtype, False, scales)
-                            use_rt = False
-                        except CublasNeedRuntimeMatch:
-                            if not enable_rt:
-                                seen_needrt.add(key)
-                                outcome = "needrt"
-                                break  # static-only mode: count it, do not compare
-                            out = our_api(a, b, dtype, out_dtype, True, scales)
-                            use_rt = True
-                        # which tier actually resolved it is recorded in the plan cache
-                        origin = _G.plan_origin(M, N, K, dtype_kind(dtype), out_dtype)
-                        outcome = origin
-                        {"static": seen_static, "pseudo-static": seen_pseudo,
-                         "runtime": seen_runtime}.get(origin, seen_runtime).add(key)
-                    else:
-                        out = our_api(a, b, dtype, out_dtype, use_rt, scales)
+                    out = our_api(a, b, dtype, out_dtype, scales)
+                    if use_rt is None:  # first comparable input for this shape
+                        use_rt = False
+                        outcome = _G.plan_origin(M, N, K, dtype_kind(dtype), out_dtype)
+                        seen_static.add(key)
                 except CublasUnsupportedShape:
                     seen_unsup.add(key)
                     outcome = "unsupported"
@@ -296,16 +283,13 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
         sf.close()
     print()
     report("DONE")
-    recon = len(seen_static) + len(seen_pseudo) + len(seen_runtime)
-    classified = recon + len(seen_needrt) + len(seen_unsup)
+    recon = len(seen_static)
+    classified = recon + len(seen_unsup)
     scmp = st["match"] + st["mismatch"]
     print(f"\nRECONSTRUCTABLE (a bit-identical Triton GEMM exists and we found it): "
           f"{recon}/{classified} = {(100.0 * recon / classified) if classified else 0.0:.2f}% "
           f"of the random shapes cuBLAS can run")
-    print(f"  static        (heuristic alone, nothing executed):    {len(seen_static)}")
-    print(f"  pseudo-static (recipe read off the launched kernel):  {len(seen_pseudo)}")
-    print(f"  runtime       (recipe found by byte-compare search):  {len(seen_runtime)}")
-    print(f"  need-runtime  (skipped in static-only mode):          {len(seen_needrt)}")
+    print(f"  reconstructed from the heuristic alone:              {len(seen_static)}")
     print(f"  DECLINED      (no reconstruction found):              {len(seen_unsup)}")
     print(f"bit-consistent on the reconstructed ones: {st['match']}/{scmp} = "
           f"{(100.0 * st['match'] / scmp) if scmp else 100.0:.3f}%")
@@ -322,25 +306,33 @@ def main():
     ap.add_argument("--R", type=int, default=5, help="random input tensors per shape")
     ap.add_argument("--dtypes", type=str, default="fp16,fp8", help="comma list: fp16,fp8,bf16")
     ap.add_argument("--seed", type=int, default=0, help="shape RNG seed (reproducible)")
-    ap.add_argument("--enable-runtime-match", action="store_true",
-                    help="also byte-compare the need-runtime shapes (default: static only -> they are "
-                         "counted as need-runtime and skipped)")
     ap.add_argument("--shape-mode", choices=("random", "extreme"), default="random",
                     help="random: M,N,K independent uniform draws. extreme: M,N small and K large, the "
                          "skinny+deep corner where cuBLAS uses split-K and its gemv fallbacks")
-    ap.add_argument("--max-dim", type=int, default=8192,
-                    help="bound on M and N in random mode. Bounds memory and run time only -- there is "
-                         "no rounding or alignment restriction on the shape")
+    ap.add_argument("--max-dim", type=int, default=32768,
+                    help="bound on M and N in random mode (and on K, unless --max-k is given). 32768 "
+                         "reaches the sizes real LLM GEMMs use -- token counts, hidden 4096-18432, most "
+                         "FFN sizes -- and is about as high as is useful: the cost of a shape grows like "
+                         "dim^2.7, so 60s of fp16 draws yields 899 shapes at 16384, 141 at 32768 and 15 "
+                         "at 65536. Bounds memory and run time only -- there is no rounding or alignment "
+                         "restriction on the shape")
     ap.add_argument("--max-mn", type=int, default=256, help="bound on M and N in extreme mode")
     ap.add_argument("--max-k", type=int, default=0,
                     help="bound on K; 0 means max-dim in random mode and 400000 in extreme mode")
     ap.add_argument("--no-fp8-round16", action="store_true",
                     help="do NOT round fp8 draws to multiples of 16. cuBLAS refuses fp8 otherwise, so "
                          "nearly every draw becomes no_ref; useful only to measure that rate")
-    ap.add_argument("--max-gib", type=float, default=6.0,
-                    help="skip a shape whose operands+output exceed this many GiB (resource skip)")
+    ap.add_argument("--max-gib", type=float, default=8.0,
+                    help="skip a shape whose operands+output exceed this many GiB (resource skip). 8.0 "
+                         "clears the largest shape --max-dim 32768 can draw (6.0 GiB of fp16 operands), so "
+                         "nothing is skipped at the default ceiling; raise it with --max-dim. The inputs "
+                         "are built in fp32 and then cast, so device peak is about 3x this")
     ap.add_argument("--cublaslt", type=str, default="",
                     help="path to the libcublasLt to match (default: auto-detect the newest installed)")
+    ap.add_argument("--workspace-bytes", type=int, default=-1,
+                    help="workspace allowance to give cuBLAS, in bytes; cuBLAS reads it when it "
+                         "picks an algorithm, so it is part of what we match (default: the "
+                         "module default, 32 MiB)")
     ap.add_argument("--shape-log", type=str, default="",
                     help="append one jsonl row per distinct shape here; also used to resume")
     args = ap.parse_args()
@@ -351,7 +343,9 @@ def main():
     max_k = args.max_k or (400000 if args.shape_mode == "extreme" else args.max_dim)
     if args.cublaslt:
         _G.set_cublaslt(args.cublaslt)
-    run(args.timeout, args.report_every, args.R, dtypes, args.seed, args.enable_runtime_match, args.shape_mode,
+    if args.workspace_bytes >= 0:   # 0 is a real allowance: it forbids split-K entirely
+        _G.set_workspace_bytes(args.workspace_bytes)
+    run(args.timeout, args.report_every, args.R, dtypes, args.seed, args.shape_mode,
         args.max_dim, args.max_mn, max_k, not args.no_fp8_round16, int(args.max_gib * 2**30), args.shape_log)
 
 

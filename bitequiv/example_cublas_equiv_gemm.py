@@ -5,15 +5,13 @@ Run:  python -m bitequiv.example_cublas_equiv_gemm
 Shows the fp16 and fp8 entry points, that the result is bit-identical to cuBLAS,
 and how to handle a shape that has no Triton reconstruction.
 
-`enable_runtime_match` is written explicitly at every call below. The default is
-`False` (static: reconstruct from the cuBLAS heuristic alone, no GEMM run); pass
-`True` to allow a one-time runtime byte-compare against cuBLAS for shapes that are
-not statically guaranteed.
+Every plan here comes from the cuBLAS heuristic alone: no GEMM is run to decide it
+and no bytes are compared. A shape the heuristic does not describe raises
+`CublasUnsupportedShape` and the caller falls back to cuBLAS.
 """
 import torch
 
 from bitequiv.cublas_equiv_gemm import (
-    CublasNeedRuntimeMatch,
     CublasUnsupportedShape,
     cublas_equivalent_gemm,
     cublas_matmul,
@@ -33,31 +31,22 @@ def example_fp16_plain():
     a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
     b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
 
-    out = cublas_equivalent_gemm(a, b, enable_runtime_match=False)  # static (default): heuristic only, no GEMM run
+    out = cublas_equivalent_gemm(a, b)  # static (default): heuristic only, no GEMM run
     ref = cublas_matmul(a, b)                                       # cuBLAS's own output (the reference)
     print(f"fp16 plain    {M}x{N}x{K}: bit-identical to cuBLAS = {_bit_equal(out, ref)}")
 
 
 def example_fp16_split_k():
-    """fp16 GEMM on a skinny+deep shape -> cuBLAS runs split-K. Split-K is NOT statically
-    guaranteed for either dtype (about 1% of split-K shapes are not reproducible at any
-    partition, and nothing in the heuristic flags them), so it needs the runtime byte-compare.
-    The split count and the cut both come from the heuristic; the runtime step only gates that
-    residual, and the verified plan is cached, so later calls are pure Triton."""
+    """fp16 GEMM on a skinny+deep shape -> cuBLAS runs split-K. The split count comes from
+    `SPLITK_NUM` and the k-slice grain from `STAGES_ID`, so this is still decided without
+    running anything."""
     M, N, K = 64, 64, 32768
     a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
     b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
 
-    try:                                          # static mode (default): split-K declines
-        cublas_equivalent_gemm(a, b, enable_runtime_match=False)
-        print(f"fp16 split-K  {M}x{N}x{K}: statically reconstructed")
-    except CublasNeedRuntimeMatch:
-        print(f"fp16 split-K  {M}x{N}x{K}: needs a runtime match (static mode declined)")
-
-    out = cublas_equivalent_gemm(a, b, enable_runtime_match=True)
+    out = cublas_equivalent_gemm(a, b)
     ref = cublas_matmul(a, b)
-    print(f"fp16 split-K  {M}x{N}x{K}: with enable_runtime_match=True -> "
-          f"bit-identical to cuBLAS = {_bit_equal(out, ref)}")
+    print(f"fp16 split-K  {M}x{N}x{K}: bit-identical to cuBLAS = {_bit_equal(out, ref)}")
 
 
 def example_fp8_plain():
@@ -67,33 +56,23 @@ def example_fp8_plain():
     a = (torch.randn(M, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
     b = (torch.randn(N, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn).t()   # [K,N] column-major
 
-    out = cublas_equivalent_gemm(a, b, scale_a=1.0, scale_b=1.0, out_dtype=torch.float16,
-                                      enable_runtime_match=False)  # static (default): large-output fp8 plain is exact
+    out = cublas_equivalent_gemm(a, b, scale_a=1.0, scale_b=1.0, out_dtype=torch.float16)
     ref = cublas_matmul(a, b, out_dtype=torch.float16)
     print(f"fp8  plain    {M}x{N}x{K}: bit-identical to cuBLAS = {_bit_equal(out, ref)}")
 
 
-def example_fp8_split_k_runtime():
-    """fp8 split-K is NOT statically guaranteed (the vertical/cluster kernel is not
-    bit-reproducible). By default the API returns need-runtime-match; pass
-    enable_runtime_match=True to let it byte-compare against cuBLAS and reconstruct (or raise
-    CublasUnsupportedShape for the vertical family)."""
+def example_fp8_split_k():
+    """fp8 split-K. Same story as fp16: the partition is read off the heuristic, at the fp8
+    grain of 128 rather than 64."""
     M, N, K = 64, 64, 65536
     a = (torch.randn(M, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
     b = (torch.randn(N, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn).t()
 
-    try:                                          # static mode (default): heuristic only, no cuBLAS GEMM run
-        cublas_equivalent_gemm(a, b, enable_runtime_match=False)
-        print(f"fp8  split-K  {M}x{N}x{K}: statically reconstructed")
-    except CublasNeedRuntimeMatch:
-        print(f"fp8  split-K  {M}x{N}x{K}: needs a runtime match (static mode declined)")
-
-    try:                                          # runtime mode: allow a one-time byte-compare against cuBLAS
-        out = cublas_equivalent_gemm(a, b, enable_runtime_match=True)
-        print(f"fp8  split-K  {M}x{N}x{K}: with enable_runtime_match=True -> "
-              f"bit-identical = {_bit_equal(out, cublas_matmul(a, b))}")
+    try:
+        out = cublas_equivalent_gemm(a, b)
+        print(f"fp8  split-K  {M}x{N}x{K}: bit-identical = {_bit_equal(out, cublas_matmul(a, b))}")
     except CublasUnsupportedShape:
-        out = cublas_matmul(a, b)                 # vertical split-K: fall back to cuBLAS
+        cublas_matmul(a, b)
         print(f"fp8  split-K  {M}x{N}x{K}: UNSUPPORTED -> fell back to cuBLAS")
 
 
@@ -159,12 +138,10 @@ def example_cannot_match():
         a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
         b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
         try:
-            cublas_equivalent_gemm(a, b, enable_runtime_match=True)
+            cublas_equivalent_gemm(a, b)
             print(f"  fp16 {M}x{N}x{K}: reconstructed (unexpected)")
-        except CublasUnsupportedShape:
-            print(f"  fp16 {M}x{N}x{K}: declined -> fall back to cublas_matmul")
-        except CublasNeedRuntimeMatch:
-            print(f"  fp16 {M}x{N}x{K}: needs a runtime match")
+        except CublasUnsupportedShape as e:
+            print(f"  fp16 {M}x{N}x{K}: declined ({str(e).split(': ')[-1]}) -> fall back to cublas_matmul")
         del a, b
 
 def main():
@@ -175,7 +152,7 @@ def main():
     example_fp16_plain()
     example_fp16_split_k()
     example_fp8_plain()
-    example_fp8_split_k_runtime()
+    example_fp8_split_k()
     print()
     example_one_api_two_dtypes()
     print()
