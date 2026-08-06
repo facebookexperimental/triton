@@ -30,6 +30,10 @@ from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_single_warp_per_simd_schedule as _amd_tdm_single_warp_matmul,
     matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel as _amd_tdm_single_warp_kernel,
 )
+from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import (
+    attention as _amd_fa_tdm_attention,
+    attn_fwd_tdm_pipelined_kernel as _amd_fa_tdm_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     matmul as _amd_mxfp_matmul,
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel,
@@ -1036,6 +1040,61 @@ def test_amd_tdm_gemm_single_warp_correctness_gfx1250(device, TRANSPOSE_B):
     actual = _amd_tdm_single_warp_matmul(a, b_input, TRANSPOSE_B=TRANSPOSE_B)
     expected = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.bfloat16)
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_amd_fa_tdm_pipelined_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _amd_fa_tdm_kernel,
+        signature={
+            "q_ptr": "*bf16",
+            "k_ptr": "*bf16",
+            "v_ptr": "*bf16",
+            "o_ptr": "*fp32",
+            "stride_qz": "i64",
+            "stride_qh": "i64",
+            "stride_qm": "i64",
+            "stride_qk": "i64",
+            "stride_kz": "i64",
+            "stride_kh": "i64",
+            "stride_kn": "i64",
+            "stride_kk": "i64",
+            "stride_vz": "i64",
+            "stride_vh": "i64",
+            "stride_vn": "i64",
+            "stride_vk": "i64",
+            "stride_oz": "i64",
+            "stride_oh": "i64",
+            "stride_om": "i64",
+            "stride_on": "i64",
+        },
+        constexprs={
+            "SM_SCALE": 1.0 / (128**0.5),
+            "SEQLEN_Q": 1024,
+            "SEQLEN_K": 1024,
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "HEAD_SZ": 128,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("SEQLEN", [640, 896])
+def test_amd_fa_tdm_pipelined_correctness_gfx1250(device, SEQLEN):
+    torch.manual_seed(0)
+    q = torch.randn((1, 1, SEQLEN, 128), device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    actual = _amd_fa_tdm_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
 
 @triton.jit
