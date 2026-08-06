@@ -739,6 +739,45 @@ def test_async_amd_desc_store_compiles_gfx1250(device):
     assert "async_tdm_copy_local_to_global" in ttgir
 
 
+@triton.jit
+def _update_tensor_descriptor_store_kernel(
+    x_ptr,
+    y_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    desc_in = tl.make_tensor_descriptor(x_ptr, [M, N], [N, 1], [M, N])
+    desc_out = tl.make_tensor_descriptor(y_ptr, [M, N], [N, 1], [M, N])
+    load_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    store_buf = tlx.local_alloc((M, N), tl.float16, 1)
+    load_view = tlx.local_view(load_buf, 0)
+    store_view = tlx.local_view(store_buf, 0)
+
+    tlx.async_amd_descriptor_load(desc_in, load_view, [0, 0])
+    tlx.async_amd_descriptor_wait(0)
+    tlx.local_store(store_view, tlx.local_load(load_view))
+
+    desc_out = tlx.update_tensor_descriptor(desc_out, add_offsets=[0, 0], clamp_bounds=True)
+    tlx.async_amd_descriptor_store(desc_out, store_view)
+    tlx.async_amd_descriptor_wait(0)
+
+
+@pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
+def test_update_tensor_descriptor_store_compiles_gfx1250(device):
+    compiled = compile_for_gfx1250(
+        _update_tensor_descriptor_store_kernel,
+        signature={"x_ptr": "*fp16", "y_ptr": "*fp16"},
+        constexprs={"M": 32, "N": 32},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.update_tensor_descriptor" in ttgir
+    assert "clamp_bounds" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    # The input convenience load and the explicit output update are the only
+    # descriptor updates; the pre-positioned store must not add a no-op update.
+    assert ttgir.count("amdg.update_tensor_descriptor") == 2
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
 @pytest.mark.parametrize("M, N", [(32, 32), (64, 128)])
 def test_async_amd_desc_store_correctness_gfx1250(device, M, N):
