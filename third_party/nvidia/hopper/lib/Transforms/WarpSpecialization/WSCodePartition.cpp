@@ -12,6 +12,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -941,6 +942,37 @@ static bool checkConsumersInLoops(Channel *channel) {
   return false;
 }
 
+/// Return true when every consumer in `consumerTaskId` can use an MMAv5 inline
+/// completion barrier. Channels that reuse a physical slot must agree on the
+/// mode, so one scalar consumer makes the whole task token-based even when
+/// single-copy channels retain separate tokens.
+static bool taskUsesOnlyGen5Consumers(ArrayRef<Channel *> channels,
+                                      AsyncTaskId consumerTaskId) {
+  bool foundConsumer = false;
+  for (Channel *channel : channels) {
+    if (!llvm::is_contained(channel->relation.second, consumerTaskId))
+      continue;
+
+    SmallVector<Operation *> dstOps;
+    if (channel->channelKind == DataChannelKind::SMEMAlloc)
+      static_cast<AllocChannel *>(channel)->getDstOps(dstOps);
+    else
+      dstOps.push_back(channel->getDstOp());
+
+    for (Operation *dst : dstOps) {
+      for (Operation *consumer : getActualConsumers(dst)) {
+        if (!llvm::is_contained(getAsyncTaskIds(consumer), consumerTaskId))
+          continue;
+        foundConsumer = true;
+        if (!isa<ttng::MMAv5OpInterface>(consumer))
+          return false;
+      }
+    }
+  }
+  assert(foundConsumer && "expected a consumer for the channel task");
+  return true;
+}
+
 void createToken(
     const DenseMap<Channel *, SmallVector<Channel *>>
         &channelsGroupedByConsumers,
@@ -1002,9 +1034,6 @@ void createToken(
     // For each reuse group, choose a representative channel.
     int reuseGrp = channelInReuseGroup(channel, config);
     if (reuseGrp >= 0) {
-      // FIXME: check that the other channels in the reuse group have the same
-      // choice about producerBarrier, and consumerBarriers. If not, we should
-      // not set producerBarrier, and consumerBarriers.
       auto *repChannel = config->getGroup(reuseGrp)->channels[0];
       if (channel != repChannel) {
         // This channel is in a reuse group but is not the representative.
@@ -1013,74 +1042,8 @@ void createToken(
         auto repIt = tokenMap.find(repChannel);
         assert(repIt != tokenMap.end() &&
                "Representative channel should have been processed first");
-        // Copy the representative's CommChannel (producerBarrier +
-        // its own consumerBarriers).
-        CommChannel commChannel = repIt->second;
-
-        // Fix 1 (BwdTmemDotAttrsDeadlock.md): the representative's
-        // consumerBarriers only covers the representative's own
-        // consumer task. For non-representative channels whose
-        // consumer lives in a DIFFERENT task (e.g. FA-bwd
-        // `_BWD_DOT_ATTRS_TMEM` 3-channel reuse group {dpT, dq,
-        // dsT_0}: dpT's consumer is in computation task 3 but
-        // dsT_0's consumer dk MMA is in gemm task 1), allocate a
-        // dedicated gen5 consumer barrier for each missing
-        // consumer task. Without this the dsT_0 channel's
-        // consumer-release path silently drops at line 3522
-        // (`if (commChannel.consumerBarriers.count(consumerTaskId))`
-        // is false), so dk MMA never gets its TMEM-A
-        // completion-barrier attachment and the next iteration's
-        // computation-partition tmem_store deadlocks waiting on
-        // dsT_0's empty mbarrier.
-        auto dstOp = it->second.front()->getDstOp();
-        for (auto consumerAsyncTaskId : channel->relation.second) {
-          if (commChannel.consumerBarriers.count(consumerAsyncTaskId))
-            continue;
-          // Recompute useGen5Barrier for THIS channel's consumer task,
-          // mirroring the logic used for the representative below
-          // (lines 1416-1455).
-          DenseSet<Operation *> actualConsumers;
-          SmallVector<Operation *> dstOps;
-          if (channel->channelKind == DataChannelKind::SMEMAlloc) {
-            auto *cAlloc = static_cast<AllocChannel *>(channel);
-            cAlloc->getDstOps(dstOps);
-          } else {
-            dstOps.push_back(dstOp);
-          }
-          bool useGen5Barrier = true;
-          for (auto *dst : dstOps) {
-            auto consumers = getActualConsumers(dst);
-            for (auto *t : consumers) {
-              SmallVector<AsyncTaskId> asyncTasks = getAsyncTaskIds(t);
-              if (asyncTasks.empty())
-                continue;
-              if (std::find(asyncTasks.begin(), asyncTasks.end(),
-                            consumerAsyncTaskId) != asyncTasks.end()) {
-                actualConsumers.insert(t);
-                if (!isa<ttng::TCGen5MMAOp>(t))
-                  useGen5Barrier = false;
-              }
-            }
-          }
-          if (actualConsumers.empty() || !useGen5Barrier)
-            continue;
-          Value v = createBarrierAlloc(funcOp, channel->getNumBuffers(),
-                                       channel->srcName);
-          commChannel.consumerBarriers[consumerAsyncTaskId] = v;
-          LDBG("createToken Fix1: non-rep channel "
-               << channel->uniqID
-               << " allocated gen5 consumer barrier for task "
-               << consumerAsyncTaskId << " (rep channel " << repChannel->uniqID
-               << " did not cover this task)");
-        }
-
-        // Share the (possibly extended) CommChannel.
-        tokenMap[channel] = commChannel;
-        LDBG("createToken: channel "
-             << channel->uniqID
-             << " shares CommChannel from representative channel "
-             << repChannel->uniqID << " ("
-             << commChannel.consumerBarriers.size() << " consumer barriers)");
+        // The representative classified every channel in the reuse group.
+        tokenMap[channel] = repIt->second;
         continue;
       }
     }
@@ -1127,6 +1090,15 @@ void createToken(
     } else {
       channelsForComm.push_back(channel);
     }
+    SmallVector<Channel *> channelsForClassification = channelsForComm;
+    int physicalReuseGrp =
+        channelInReuseGroup(channel, config, /*reuseBarrier=*/false);
+    if (reuseGrp < 0 && physicalReuseGrp >= 0) {
+      channelsForClassification.clear();
+      auto *group = config->getGroup(physicalReuseGrp);
+      channelsForClassification.append(group->channels.begin(),
+                                       group->channels.end());
+    }
 
     // Check if the channel group needs token-based synchronization.
     // Reuse groups share one CommChannel, so this must consider every channel
@@ -1141,6 +1113,9 @@ void createToken(
             commChannel.consumerBarriers.count(consumerAsyncTaskId))
           continue;
 
+        bool useGen5Barrier = taskUsesOnlyGen5Consumers(
+            channelsForClassification, consumerAsyncTaskId);
+
         // It is possible that this channel has two consumer taskIds.
         // We can have multiple consumer ops for AllocChannel, or one consumer
         // op has multiple actual consumers. Here we collect all consumer ops.
@@ -1152,9 +1127,6 @@ void createToken(
         } else {
           dstOps.push_back(sourceDstOp);
         }
-        // If all actual consumers are MMAv5 ops, we can use their inline
-        // completion barriers for consumer release.
-        bool useGen5Barrier = true;
         for (auto *dst : dstOps) {
           auto consumers = getActualConsumers(dst);
           for (auto *t : consumers) {
@@ -1174,14 +1146,6 @@ void createToken(
             if (std::find(asyncTasks.begin(), asyncTasks.end(),
                           consumerAsyncTaskId) != asyncTasks.end()) {
               actualConsumers.insert(t);
-              // XXX: Op can have multiple async tasks
-
-              // If consumer and producer are not in the same block, but
-              // as long as all consumers are MMAv5 ops, we can use their
-              // inline completion barrier path. Remove
-              // producerOp->getBlock() != t->getBlock()
-              if (!isa<ttng::MMAv5OpInterface>(t))
-                useGen5Barrier = false;
             }
           }
         }
@@ -1346,11 +1310,62 @@ static Value hoistLocalAlloc(
   return newBuf;
 }
 
+/// Return true unless every transitive use of `root` is known to preserve the
+/// allocation and its contents. Reusing a source-bearing allocation aliases
+/// its storage, so a write or free through any memdesc view would change the
+/// new consumer's value or lifetime. Region-bearing and region-branching users
+/// are rejected conservatively because this analysis does not follow their
+/// control-flow aliases.
+static bool hasTransitiveInvalidatingEffect(Value root);
+
+/// Return whether an existing descriptor-backed allocation has the physical
+/// SMEM representation required by a channel. Mutability is intentionally not
+/// compared: a fresh allocation is mutable because it needs a `local_store`,
+/// while a reused source-bearing allocation is initialized by its descriptor
+/// result and remains read-only. Shape, element type, and allocation shape are
+/// guaranteed by LocalAllocOp verification because both allocations use the
+/// same descriptor result. This predicate does not establish logical buffer
+/// identity; the shared descriptor SSA result does that.
+static bool hasCompatibleDescriptorStorageType(ttg::MemDescType candidate,
+                                               ttg::MemDescType required) {
+  return candidate.getEncoding() == required.getEncoding() &&
+         candidate.getMemorySpace() == required.getMemorySpace();
+}
+
+/// Find the closest existing SMEM allocation that can also serve `dstOp`.
+/// Candidates are users of the same descriptor result, so they contain the
+/// same TMA-loaded data. Reuse is safe only when the allocation dominates the
+/// new load, has the channel's physical storage type, and remains read-only.
+static ttg::LocalAllocOp
+findReusableDescriptorLoadAlloc(Value descriptorResult, Operation *dstOp,
+                                ttg::MemDescType requiredType,
+                                DominanceInfo &dom) {
+  ttg::LocalAllocOp reusable;
+  for (Operation *user : descriptorResult.getUsers()) {
+    auto candidate = dyn_cast<ttg::LocalAllocOp>(user);
+    if (!candidate)
+      continue;
+    if (!dom.properlyDominates(candidate.getOperation(), dstOp))
+      continue;
+    // Reuse aliases this storage; an overwrite or free would make the
+    // descriptor result unavailable to the new consumer.
+    if (!hasCompatibleDescriptorStorageType(candidate.getType(),
+                                            requiredType) ||
+        hasTransitiveInvalidatingEffect(candidate.getResult()))
+      continue;
+
+    if (!reusable || dom.properlyDominates(reusable.getOperation(),
+                                           candidate.getOperation()))
+      reusable = candidate;
+  }
+  return reusable;
+}
+
 // Create a local buffer for register channels. Return the allocated buffer and
 // the new producer (reloaded value).
 static std::pair<Value, Value>
 createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
-                 bool useTMEM) {
+                 bool useTMEM, DominanceInfo &dom) {
   auto srcResult = channel->getSrcOperand();
   auto srcOp = channel->getSrcOp();
   auto dstOp = channel->getDstOp();
@@ -1458,14 +1473,20 @@ createLocalAlloc(OpBuilderWithAsyncTaskIds &builder, Channel *channel,
         channel->srcName.empty()
             ? srcOp->getLoc()
             : replaceOutermostNameLoc(srcOp->getLoc(), channel->srcName);
-    auto allocOp = ttg::LocalAllocOp::create(builder, allocLoc, memdescType);
+    ttg::LocalAllocOp allocOp;
+    if (isa<tt::DescriptorLoadOp>(srcOp))
+      allocOp = findReusableDescriptorLoadAlloc(
+          srcResult, dstOp, cast<ttg::MemDescType>(memdescType), dom);
+    if (!allocOp)
+      allocOp = ttg::LocalAllocOp::create(builder, allocLoc, memdescType);
     buffer = allocOp->getResult(0);
 
-    // Generate the local store
-    builder.setLoopScheduleInfoFromOp(srcOp);
-    auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
-        srcOp->getLoc(), srcResult, allocOp);
-    storeOp->moveAfter(srcOp);
+    if (!allocOp.getSrc()) {
+      builder.setLoopScheduleInfoFromOp(srcOp);
+      auto storeOp = builder.createWithAsyncTaskIds<ttg::LocalStoreOp>(
+          srcOp->getLoc(), srcResult, allocOp);
+      storeOp->moveAfter(srcOp);
+    }
 
     // local load
     builder.setAsyncTaskIdsFromOp(dstOp);
@@ -1738,7 +1759,7 @@ DenseMap<Channel *, Value> createBuffer(const SmallVector<Channel *> &channels,
       bool useTMEM = cc >= 100 && tensorType.getShape().size() == 1 &&
                      tensorType.getElementType().isIntOrFloat() &&
                      !isa<tt::DescriptorLoadOp>(srcOp);
-      auto res = createLocalAlloc(builder, channel, useTMEM);
+      auto res = createLocalAlloc(builder, channel, useTMEM, dom);
       buffer = res.first;
       newProducer = res.second;
     } else {
@@ -3862,7 +3883,7 @@ void insertAsyncComm(
                  .second;
       }
       // Use token for producer acquire and consumer release.
-      if (commChannel.consumerBarriers.empty()) {
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Insert ProducerAcquireOp before the producer.
         auto producerAcquirePoint =
             getSameLevelOp(headConsumer, tmaHeadProducer);
@@ -4281,8 +4302,10 @@ void insertAsyncComm(
       }
 
       // Insert ConsumerReleaseOp, if consumer is not an MMAv5 op. For MMAv5,
-      // MMA lowering will handle the ConsumerReleaseOp.
-      if (commChannel.consumerBarriers.empty()) {
+      // MMA lowering will handle the ConsumerReleaseOp. A channel can mix MMAv5
+      // and non-MMAv5 consumers, so check the barrier per consumer task rather
+      // than treating the whole channel as all-MMAv5 or all-token-based.
+      if (!commChannel.consumerBarriers.count(token.first)) {
         // Route the release off this token's OWN tail consumer, mirroring the
         // per-token tokenHeadConsumer the ConsumerWait uses. The group-wide
         // `tailConsumer` is the last consumer op regardless of task, which for
@@ -4545,8 +4568,13 @@ static void separateLocalAllocWithSrc(triton::FuncOp &funcOp) {
         allocDescType.getMemorySpace(), /*mutableMemory*/ true);
 
     builder.setInsertionPoint(allocOp);
-    auto newAlloc =
-        ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
+    ttg::LocalAllocOp newAlloc;
+    if (auto alignment = allocOp.getAlignment())
+      newAlloc = ttg::LocalAllocOp::create(builder, allocOp.getLoc(),
+                                           memdescType, Value(), *alignment);
+    else
+      newAlloc =
+          ttg::LocalAllocOp::create(builder, allocOp.getLoc(), memdescType);
 
     auto originTaskIds = builder.getAsyncTaskIds();
     auto originLoopScheduleInfo = builder.getLoopScheduleInfo();
@@ -4663,43 +4691,75 @@ static void swapTransposedLocalAllocs(triton::FuncOp &funcOp) {
   }
 }
 
-// Merge duplicate local_alloc ops that have:
-// 1. Same source value
-// 2. Same SMEM layout (MemDescType)
-// 3. No modification to the source value between the allocs
-//
-// This optimization is enabled after swapTransposedLocalAllocs, which
-// normalizes transposed allocs to use non-transposed layout so they can
-// share the same buffer.
-//
-// Before:
-//   %val = descriptor_load ...
-//   %a = local_alloc %val -> memdesc<#shared>
-//   ... (no modification to %val) ...
-//   %b = local_alloc %val -> memdesc<#shared>  // same src, same layout
-//
-// After:
-//   %val = descriptor_load ...
-//   %a = local_alloc %val -> memdesc<#shared>
-//   ... (no modification to %val) ...
-//   // %b is replaced with %a
+static bool hasTransitiveInvalidatingEffect(Value root) {
+  SmallVector<Value> worklist = {root};
+  DenseSet<Value> visited;
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (Operation *user : value.getUsers()) {
+      if (user->getNumRegions() != 0 ||
+          isa<scf::YieldOp, scf::ConditionOp>(user))
+        return true;
+      if (auto effects = dyn_cast<MemoryEffectOpInterface>(user)) {
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        for (const auto &instance : instances) {
+          if (!isa<MemoryEffects::Write, MemoryEffects::Free>(
+                  instance.getEffect()))
+            continue;
+          if (!instance.getValue() || instance.getValue() == value)
+            return true;
+        }
+      } else if (!isMemoryEffectFree(user)) {
+        return true;
+      }
+      for (Value result : user->getResults()) {
+        if (isa<ttg::MemDescType>(result.getType()))
+          worklist.push_back(result);
+      }
+    }
+  }
+  return false;
+}
+
+/// Return whether two allocations differ only in task ownership. Other
+/// attributes may encode allocation requirements, so they must match before
+/// one allocation can replace the other. Task IDs are merged separately.
+static bool haveCompatibleAllocAttrs(ttg::LocalAllocOp lhs,
+                                     ttg::LocalAllocOp rhs) {
+  auto attrsMatch = [](Operation *a, Operation *b) {
+    for (NamedAttribute attr : a->getAttrs()) {
+      if (attr.getName() == kAsyncTaskIdAttrName)
+        continue;
+      if (b->getAttr(attr.getName()) != attr.getValue())
+        return false;
+    }
+    return true;
+  };
+  return attrsMatch(lhs, rhs) && attrsMatch(rhs, lhs);
+}
+
+/// Coalesce redundant read-only allocations of one descriptor result. The
+/// canonical allocation must dominate the replacement and have the same
+/// MemDescType and allocation attributes. Its task IDs are extended to retain
+/// the ownership recorded on every replaced allocation.
 static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
-  // Map from (src, memDescType) to the first alloc op with that signature.
-  // We use a vector of pairs since we need to process allocs in program order.
   SmallVector<ttg::LocalAllocOp> allocs;
   funcOp.walk([&](ttg::LocalAllocOp allocOp) {
-    if (allocOp.getSrc())
+    if (allocOp.getSrc() &&
+        allocOp.getSrc().getDefiningOp<tt::DescriptorLoadOp>())
       allocs.push_back(allocOp);
   });
 
-  // Group allocs by source value and MemDescType.
-  // For each group, check if they can be merged.
   DenseMap<Value, SmallVector<ttg::LocalAllocOp>> allocsBySrc;
   for (auto allocOp : allocs) {
     allocsBySrc[allocOp.getSrc()].push_back(allocOp);
   }
 
   SmallVector<ttg::LocalAllocOp> toErase;
+  DominanceInfo dom(funcOp);
 
   for (auto &[src, allocGroup] : allocsBySrc) {
     if (allocGroup.size() < 2)
@@ -4715,21 +4775,16 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
       if (typeGroup.size() < 2)
         continue;
 
-      // Sort by program order (using operation order in the IR).
-      // The first alloc in the group is the "canonical" one.
-      // We check if subsequent allocs can be merged into the first.
-      // For now, we do a simple check: if the source value is not modified
-      // between allocs (i.e., src is defined once and not reassigned).
-      // Since SSA values are immutable, if two allocs have the same src,
-      // the source cannot have been modified between them.
-
       ttg::LocalAllocOp firstAlloc = typeGroup[0];
+      if (hasTransitiveInvalidatingEffect(firstAlloc.getResult()))
+        continue;
       for (size_t i = 1; i < typeGroup.size(); ++i) {
         ttg::LocalAllocOp laterAlloc = typeGroup[i];
-
-        // Check dominance: firstAlloc must dominate laterAlloc.
-        // Since we walk in program order, firstAlloc comes before laterAlloc.
-        // We can simply replace laterAlloc's uses with firstAlloc's result.
+        if (!dom.properlyDominates(firstAlloc.getOperation(),
+                                   laterAlloc.getOperation()) ||
+            !haveCompatibleAllocAttrs(firstAlloc, laterAlloc) ||
+            hasTransitiveInvalidatingEffect(laterAlloc.getResult()))
+          continue;
 
         LLVM_DEBUG({
           LDBG("mergeDuplicateLocalAllocs: merging alloc at "
@@ -4739,6 +4794,13 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
           LDBG("  type: " << type);
         });
 
+        SmallVector<AsyncTaskId> taskIds = getAsyncTaskIds(firstAlloc);
+        for (AsyncTaskId taskId : getAsyncTaskIds(laterAlloc)) {
+          if (!llvm::is_contained(taskIds, taskId))
+            taskIds.push_back(taskId);
+        }
+        firstAlloc->setAttr(kAsyncTaskIdAttrName,
+                            OpBuilder(firstAlloc).getI32ArrayAttr(taskIds));
         laterAlloc.getResult().replaceAllUsesWith(firstAlloc.getResult());
         toErase.push_back(laterAlloc);
       }
@@ -4747,6 +4809,38 @@ static void mergeDuplicateLocalAllocs(triton::FuncOp &funcOp) {
 
   for (auto allocOp : toErase) {
     allocOp.erase();
+  }
+}
+
+/// Assign source-bearing allocations to their descriptor load's producer task
+/// when the same loaded tensor also has a direct consumer. Task propagation may
+/// otherwise leave such an allocation tagged with both producer and consumer
+/// tasks. The allocation initializes the shared buffer in the producer task;
+/// downstream local loads carry the consumer task IDs. Descriptor results used
+/// only through allocations retain their propagated task IDs because those
+/// identify the ordinary allocation consumers. Single-task allocations are
+/// already unambiguous and do not need rewriting.
+static void setDescriptorLoadAllocProducerTaskIds(triton::FuncOp &funcOp) {
+  SmallVector<tt::DescriptorLoadOp> loads;
+  funcOp.walk([&](tt::DescriptorLoadOp load) { loads.push_back(load); });
+
+  for (tt::DescriptorLoadOp load : loads) {
+    auto producerTaskIds = getAsyncTaskIds(load);
+    if (producerTaskIds.size() != 1)
+      continue;
+    bool hasDirectConsumer =
+        llvm::any_of(load.getResult().getUsers(), [](Operation *user) {
+          return !isa<ttg::LocalAllocOp>(user);
+        });
+    if (!hasDirectConsumer)
+      continue;
+    for (Operation *user : load.getResult().getUsers()) {
+      auto alloc = dyn_cast<ttg::LocalAllocOp>(user);
+      if (!alloc || getAsyncTaskIds(alloc).size() <= 1)
+        continue;
+      alloc->setAttr(kAsyncTaskIdAttrName,
+                     OpBuilder(alloc).getI32ArrayAttr(producerTaskIds));
+    }
   }
 }
 
@@ -4887,6 +4981,8 @@ void doBufferAllocation(triton::FuncOp funcOp) {
   // Step 0.5: Merge duplicate local_allocs with same src and layout.
   // This must be done after swapTransposedLocalAllocs which normalizes layouts.
   mergeDuplicateLocalAllocs(funcOp);
+
+  setDescriptorLoadAllocProducerTaskIds(funcOp);
 
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
