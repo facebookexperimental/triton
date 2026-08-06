@@ -138,17 +138,8 @@ mlir::ChainedDotSchedule::checkPreconditions(scf::ForOp forOp, int numStages,
   if (numStages != 4)
     return failure();
 
-  auto dotOps = llvm::to_vector(forOp.getBody()->getOps<tt::DotOp>());
-
-  if (dotOps.size() != 2)
+  if (collectDotLikeOps(forOp).size() != 2)
     return failure();
-
-  // Check that the first dot feeds into the second
-  SetVector<Operation *> slice;
-  getForwardSlice(dotOps[0]->getResult(0), &slice);
-  if (!slice.contains(dotOps[1])) {
-    return failure();
-  }
 
   // Reject loops with indirect loads
   // TODO support indirect loads
@@ -158,6 +149,16 @@ mlir::ChainedDotSchedule::checkPreconditions(scf::ForOp forOp, int numStages,
   }
 
   return success();
+}
+
+SmallVector<tt::DotOpInterface>
+mlir::ChainedDotSchedule::collectDotLikeOps(scf::ForOp forOp) {
+  SmallVector<tt::DotOpInterface> dotOps;
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (auto dotOp = dyn_cast<tt::DotOpInterface>(op))
+      dotOps.push_back(dotOp);
+  }
+  return dotOps;
 }
 
 namespace {
@@ -417,27 +418,30 @@ buildSchedule(scf::ForOp &forOp, int numStages, const LoadToInfoMap &loadToInfo,
 
 // Builds a schedule for loops containing chained dots. This schedule aims to
 // better interleave mma with alu ops which can be co-executed on GFX9. It
-// works for loops which have 2 dots where the result of the first is
-// transformed and used by the second dot. The dot ops will be scheduled with a
-// distance of one and the ops in between will be spit into 2 parts. The first
-// part will be scheduled to the same stage as the fist dot so it can interleave
-// with the second dot. Whereas the second part will be scheduled to the stage
-// of the second dot so it can be interleaved with the first dot. Loads will be
-// double buffered and placed in between the dot/compute clusters. This
-// pipeliner is meant to be used in combination with pingpong
+// works for loops which have 2 independent or chained dot-like operations. For
+// chained dots, the result of the first is transformed and used by the second.
+// For independent dots, scheduleOpsBetweenDots has no work; the schedule still
+// places the dots one stage apart and double-buffers their respective loads for
+// pingpong.
+// The dot ops will be scheduled with a distance of one and the ops in between
+// will be split into 2 parts. The first part will be scheduled to the same stage
+// as the first dot so it can interleave with the second dot. The second part
+// will be scheduled to the stage of the second dot so it can be interleaved
+// with the first dot. Loads will be double buffered and placed in between the
+// dot/compute clusters. This pipeliner is meant to be used with pingpong.
 namespace ChainedDotSchedule {
 using namespace mlir::ChainedDotSchedule;
 // We schedule loads one stage in front of their dots
 LogicalResult
-scheduleLoads(std::array<tt::DotOp, 2> dotOps,
+scheduleLoads(std::array<tt::DotOpInterface, 2> dotOps,
               const llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
               const ChainedDotClusters &clusters,
               tt::CoarseSchedule &schedule) {
   for (auto [loadOp, info] : loadToInfo) {
-    if (info.use == dotOps[0]) {
+    if (info.use == dotOps[0].getOperation()) {
       schedule.insert(loadOp, STAGE_GLOBAL_LOAD_1,
                       clusters[CLUSTER_GLOBAL_LOAD_1]);
-    } else if (info.use == dotOps[1]) {
+    } else if (info.use == dotOps[1].getOperation()) {
       schedule.insert(loadOp, STAGE_GLOBAL_LOAD_2,
                       clusters[CLUSTER_GLOBAL_LOAD_2]);
     } else {
@@ -448,11 +452,11 @@ scheduleLoads(std::array<tt::DotOp, 2> dotOps,
 }
 
 LogicalResult scheduleOpsBetweenDots(scf::ForOp forOp,
-                                     std::array<tt::DotOp, 2> dotOps,
+                                     std::array<tt::DotOpInterface, 2> dotOps,
                                      tt::CoarseSchedule &schedule,
                                      const ChainedDotClusters &clusters) {
   SetVector<Operation *> dot0Slice;
-  getForwardSlice(Value(dotOps[0]), &dot0Slice);
+  getForwardSlice(dotOps[0]->getResult(0), &dot0Slice);
 
   // For each operand of the second dot coming from the first dot we want to
   // split the ops in between into 2 parts.
@@ -522,12 +526,14 @@ buildSchedule(scf::ForOp &forOp, int numStages, const LoadToInfoMap &loadToInfo,
                 [&]() { return schedule.clusters.newAtBack(); });
 
   // Schedule dots
-  auto dotOpsVec = llvm::to_vector(forOp.getBody()->getOps<tt::DotOp>());
+  auto dotOpsVec = collectDotLikeOps(forOp);
   assert(dotOpsVec.size() == 2); // Ensure precondition
-  std::array<tt::DotOp, 2> dotOps = {dotOpsVec[0], dotOpsVec[1]};
+  std::array<tt::DotOpInterface, 2> dotOps = {dotOpsVec[0], dotOpsVec[1]};
 
-  schedule.insert(dotOps[0], STAGE_DOT_1, clusters[CLUSTER_DOT_1]);
-  schedule.insert(dotOps[1], STAGE_DOT_2, clusters[CLUSTER_DOT_2]);
+  schedule.insert(dotOps[0].getOperation(), STAGE_DOT_1,
+                  clusters[CLUSTER_DOT_1]);
+  schedule.insert(dotOps[1].getOperation(), STAGE_DOT_2,
+                  clusters[CLUSTER_DOT_2]);
 
   if (failed(scheduleLoads(dotOps, loadToInfo, clusters, schedule)))
     return {};

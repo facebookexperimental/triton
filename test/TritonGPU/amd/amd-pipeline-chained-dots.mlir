@@ -1,4 +1,6 @@
-// RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1" -canonicalize | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=1" -canonicalize | FileCheck %s
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=1" -canonicalize --tritonamdgpu-block-pingpong="num-stages=4" | FileCheck %s --check-prefix=PINGPONG
+// RUN: triton-opt %s -split-input-file -tritonamdgpu-schedule-loops="num_stages=4" -tritonamdgpu-pipeline="use_async_copy=1 use_pingpong=0" -canonicalize --tritonamdgpu-block-pingpong="num-stages=4" | FileCheck %s --check-prefix=NO-PINGPONG
 
 #blocked = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [0, 1]}>
 #mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
@@ -14,6 +16,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttg.async_wait
   // CHECK: ttg.local_load
   // CHECK: scf.yield
+  // CHECK: } {amdg.two_dot_schedule}
   // CHECK: ttg.async_wait
   // CHECK: ttg.local_load
 
@@ -34,6 +37,55 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
       scf.yield %10 : tensor<128x16xf32, #mma>
     }
     tt.return %6 : tensor<128x16xf32, #mma>
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [8, 8], warpsPerCTA = [1, 4], order = [0, 1]}>
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [4, 1], instrShape = [32, 32, 16], isTransposed = true}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: tt.func @independent_scaled_dots
+  // CHECK: scf.for
+  // CHECK-COUNT-2: tt.dot_scaled
+  // CHECK: } {amdg.two_dot_schedule}
+  // CHECK: tt.return
+
+  // PINGPONG-LABEL: tt.func @independent_scaled_dots
+  // PINGPONG: scf.for
+  // PINGPONG: rocdl.s.barrier
+  // PINGPONG: tt.dot_scaled
+  // PINGPONG: rocdl.s.setprio
+  // PINGPONG: tt.dot_scaled
+  // PINGPONG-NOT: amdg.two_dot_schedule
+  // PINGPONG: tt.return
+
+  // NO-PINGPONG-LABEL: tt.func @independent_scaled_dots
+  // NO-PINGPONG-NOT: rocdl.s.barrier
+  // NO-PINGPONG-NOT: rocdl.s.setprio
+  // NO-PINGPONG-NOT: amdg.two_dot_schedule
+  // NO-PINGPONG: tt.return
+
+  tt.func @independent_scaled_dots(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg2: tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>>, %arg3: i32, %arg4: i32) -> tensor<128x16xf32, #mma> {
+    %c0_i32 = arith.constant 0 : i32
+    %cst = arith.constant dense<0.000000e+00> : tensor<128x16xf32, #mma>
+    %0 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<1x16x!tt.ptr<f16>, #blocked>
+    %1 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %2 = tt.expand_dims %1 {axis = 1 : i32} : tensor<64xi32, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<64x1xi32, #blocked>
+    %3 = tt.broadcast %0 : tensor<1x16x!tt.ptr<f16>, #blocked> -> tensor<64x16x!tt.ptr<f16>, #blocked>
+    %4 = tt.broadcast %2 : tensor<64x1xi32, #blocked> -> tensor<64x16xi32, #blocked>
+    %5 = tt.addptr %3, %4 : tensor<64x16x!tt.ptr<f16>, #blocked>, tensor<64x16xi32, #blocked>
+    %6:2 = scf.for %arg7 = %c0_i32 to %arg3 step %arg4 iter_args(%arg5 = %cst, %arg6 = %cst) -> (tensor<128x16xf32, #mma>, tensor<128x16xf32, #mma>)  : i32 {
+      %7 = tt.load %5 : tensor<64x16x!tt.ptr<f16>, #blocked>
+      %8 = ttg.convert_layout %7 : tensor<64x16xf16, #blocked> -> tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
+      %9 = tt.load %5 : tensor<64x16x!tt.ptr<f16>, #blocked>
+      %10 = ttg.convert_layout %9 : tensor<64x16xf16, #blocked> -> tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>>
+      %11 = tt.dot_scaled %arg2, %8, %arg5 lhs = fp16 rhs = fp16 {fastMath = false} : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x16xf32, #mma>
+      %12 = tt.dot_scaled %arg2, %10, %arg6 lhs = fp16 rhs = fp16 {fastMath = false} : tensor<128x64xf16, #ttg.dot_op<{opIdx = 0, parent = #mma, kWidth = 2}>> * tensor<64x16xf16, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 2}>> -> tensor<128x16xf32, #mma>
+      scf.yield %11, %12 : tensor<128x16xf32, #mma>, tensor<128x16xf32, #mma>
+    }
+    %13 = arith.addf %6#0, %6#1 : tensor<128x16xf32, #mma>
+    tt.return %13 : tensor<128x16xf32, #mma>
   }
 }
 
