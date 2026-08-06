@@ -124,7 +124,7 @@ LogicalResult TaskIdBackwardPropagation::visitOperation(
     ArrayRef<const TaskIdLattice *> results) {
   // TODO(Arda): Replace the following with getAsyncTaskIds when we no longer
   // need to dump the task ids into the IR.
-  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>("async_task_id");
+  auto taskIdAttr = op->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName);
 
   // An op is a non-anchor (allows backward propagation to flow through) only
   // if it is a scalar arithmetic/math op. These ops compute shared addresses
@@ -211,17 +211,25 @@ void TaskIdBackwardPropagation::visitBranchOperand(OpOperand &operand) {
   auto defOp = operand.getOwner();
   if (auto condOp = dyn_cast<scf::ConditionOp>(defOp)) {
     auto whileOp = cast<scf::WhileOp>(condOp->getParentOp());
+    auto whileTaskIds = TaskId::getUninitialized();
+    if (auto attr =
+            whileOp->getAttrOfType<DenseI32ArrayAttr>(kAsyncTaskIdAttrName))
+      whileTaskIds = TaskId(attr);
     for (auto [idx, forwarded] : llvm::enumerate(condOp.getArgs())) {
       if (forwarded != operand.get())
         continue;
       auto resultLattice = getLatticeElement(whileOp.getResult(idx));
-      if (resultLattice->getValue().isUninitialized())
-        return;
       auto forwardedLattice = getLatticeElement(forwarded);
-      ChangeResult changed = forwardedLattice->meet(resultLattice->getValue());
+      auto taskIds = TaskId::meet(resultLattice->getValue(), whileTaskIds);
+      if (taskIds.isUninitialized())
+        return;
+      ChangeResult changed = forwardedLattice->meet(taskIds);
       propagateIfChanged(forwardedLattice, changed);
       return;
     }
+    auto conditionLattice = getLatticeElement(operand.get());
+    ChangeResult changed = conditionLattice->meet(whileTaskIds);
+    propagateIfChanged(conditionLattice, changed);
     return;
   }
 
