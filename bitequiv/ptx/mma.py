@@ -205,3 +205,21 @@ def _mma_fence(func):
             counts[t] = counts.get(t, 0) + 1
         return ("mma-fp8", tuple(sorted(counts.items())), flags, (fma, addmul))
     return ("mma", frozenset(tokens), flags, (int(fma > 0), int(addmul > 0)))
+
+
+def mma_token_counts(func):
+    """Sorted ``(token, count)`` of the entry's tensor-core matmuls — how many hardware accumulate
+    passes each :func:`_mma_token` contributes.
+
+    :func:`_mma_fence` deliberately DROPS this count for the non-fp8 families, because for a
+    PROVEN-pure tensor-core fold a re-tiling issues a different number of MMA instructions over the
+    same dot products (bit-free). That licence does not exist when the fold is NOT proven pure: there
+    the count is the only PTX witness of how many products reach an accumulator, i.e. of the matmul's
+    REDUCTION EXTENT (attention's head dim, a GEMM's K). Callers on the fail-closed side use this;
+    the fence itself must not, or it would over-split every equivalent re-tiling."""
+    counts = {}
+    for inst in linearize(func):
+        if _is_mma(inst):
+            t = _mma_token(inst.opcode, inst.modifiers)
+            counts[t] = counts.get(t, 0) + 1
+    return tuple(sorted(counts.items()))
