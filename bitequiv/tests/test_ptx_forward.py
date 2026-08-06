@@ -185,12 +185,12 @@ def test_squared_and_distinct_element_products_both_collapse():
 
 
 def test_mma_entry_gets_fence_descriptor():
-    # A wgmma entry -> the tiling-invariant fence (K + dtypes kept, m/n dropped), not a tree hash or
-    # the old coarse unanalyzed-mma guard.
+    # A wgmma entry -> the tiling-invariant, form-invariant fence (dtype FAMILY kept; form / m-n-k tile
+    # dropped), not a tree hash or the old coarse unanalyzed-mma guard.
     ptx = (_HDR + ".visible .entry k()\n{\n.reg .b32 %r<8>;\n"
            "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%r1}, %r2, %r3;\nret;\n}\n")
     (desc, ) = forward_module_descriptor(ptx)
-    assert desc.startswith("mma|tok=") and "k16" in desc and "m64" not in desc
+    assert desc.startswith("mma|tok=matmul|f16|") and "m64" not in desc and "k16" not in desc
 
 
 # -- Phase 4b: a reduction OVER the MMA output rides the reduction fingerprint (soundness) ----------

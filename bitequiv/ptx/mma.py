@@ -75,19 +75,68 @@ def _k_of(mods):
     return None
 
 
-def _mma_token(opcode, mods):
-    """Tiling-INVARIANT fence token: keep the bit-relevant facts, drop the free ones.
+# Operand dtype -> accumulation FAMILY (narrowest operand wins; the accumulator is the wider f32).
+# f16 and bf16 map to ONE family "f16": on Blackwell both lower through tcgen05 `.kind::f16` and the
+# same F=25-bit fixed-point accumulate, and a native tcgen05 GEMM does not even encode f16-vs-bf16 in
+# the PTX (see `_mma_token`). tf32/f32 -> "tf32" (a tensor-core f32 input is first rounded to tf32).
+# fp8 kinds are handled separately in `_mma_token` (kept conservative — fp8 is the one v2 != v5 case).
+_FAMILY_PRIORITY = (({".f16", ".bf16"}, "f16"), ({".tf32"}, "tf32"), ({".f64"}, "f64"),
+                    ({".s8", ".u8"}, "s8"), ({".s4", ".u4"}, "s4"), ({".b1"}, "b1"), ({".f32"}, "tf32"))
 
-    tcgen05: M/N/K live in a runtime descriptor (not the modifiers), so they ride the ratio +
-    ``loops=`` instead; keep ``.kind::`` (dtype family -> rounding) and ``.cta_group::`` (2-CTA
-    changes the accumulation). wgmma / mma.sync / wmma: keep K and the operand/accumulator dtypes;
-    drop the m/n tile dims and the issue/transpose mods."""
+
+def _dtype_family(dtypes):
+    """The accumulation family for a set of MMA operand dtypes. Narrowest operand wins because the
+    accumulator is always the wider f32; e.g. ``{.f32, .bf16}`` (acc f32, operands bf16) -> "f16"."""
+    for group, fam in _FAMILY_PRIORITY:
+        if any(d in dtypes for d in group):
+            return fam
+    return "?"
+
+
+def _fence_all_matmul(fence):
+    """True iff every token in an :func:`_mma_fence` is the canonical non-fp8 ``matmul|`` form — i.e. a
+    pure f16/bf16/tf32 tensor-core GEMM. The forward descriptor uses this to drop the bit-free
+    ``loops=`` (BLOCK_K) for such GEMMs, while keeping it for fp8 (``max_num_imprecise_acc`` cadence)
+    and the native-form cases."""
+    return fence is not None and fence[0] == "mma" and all(t.startswith("matmul|") for t in fence[1])
+
+
+def _mma_token(opcode, mods):
+    """Form-agnostic, tiling-invariant matmul token. The v2 warp-level MMA (``mma.sync``) and the v5
+    Blackwell MMA (``tcgen05.mma``) that compute the SAME matmul get the SAME token, so the autotuner
+    can move freely between them. Keeps only the bit-relevant facts — the accumulation dtype FAMILY and
+    the CTA group (2-CTA changes the accumulation) — and drops the FORM (mma vs tcgen05), the native
+    m/n/k tile, and the issue/transpose mods (all bit-free re-tilings of the same dot products).
+
+    Why v2 == v5 is sound for f16/bf16/tf32 (INFERRED, not an NVIDIA guarantee): for these types each
+    product ``A*B`` is exact in f32 (f16/tf32 give <=22 product significand bits, bf16 <=16, f32 holds
+    24 -> no rounding on the multiply), and both forms on the same Blackwell chip add the exact products
+    in the same wide fixed-point accumulator (F=25 fractional bits) with a single normalize -> same
+    bits. NVIDIA documents none of this; it is corroborated by two reverse-engineered bit-accurate
+    tensor-core models (arXiv 2511.10909 map both HMMA and UTCHMMA to FDA(F=25); arXiv 2512.07004 find
+    B200 == H100/H200 behavior, tensor cores NOT IEEE-754) and by our GB300 corpus (v2 and v5 land in
+    one bit class for f16/bf16/tf32). fp8 is the EXCEPTION and is kept conservative below: fp8
+    accumulation runs in limited precision with a periodic promote-to-f32 (Triton `max_num_imprecise_acc`
+    + a fp8-specific block ordering) that need not match across the two lowerings, so fp8 v2 != v5.
+
+    Note (dtype-relative): a native tcgen05 GEMM does not encode the specific operand dtype (``.kind::f16``
+    covers f16 AND bf16; the inputs are untyped ``.b16``), so the family cannot tell f16 from bf16 for
+    v5. The token is therefore dtype-RELATIVE: f16 and bf16 share the "f16" family. This is sound for
+    how the checker is used (the autotuner compares configs of ONE kernel = one fixed dtype), but two
+    DIFFERENT-dtype GEMMs would share a token."""
     if opcode == "tcgen05":
-        keep = sorted(m for m in mods if m.startswith(".kind::") or m.startswith(".cta_group::"))
-        return "tcgen05|" + ",".join(keep)
-    k = _k_of(mods)
+        kind = next((m[len(".kind::"):] for m in mods if m.startswith(".kind::")), "?")
+        if kind == "f8f6f4":  # fp8: v2 != v5 -> keep the native tcgen05 form so it never merges into matmul|
+            keep = sorted(m for m in mods if m.startswith(".kind::") or m.startswith(".cta_group::"))
+            return "tcgen05|" + ",".join(keep)
+        cta = next((m[len(".cta_group::"):] for m in mods if m.startswith(".cta_group::")), "1")
+        return f"matmul|{kind}|cta{cta}"
     dtypes = [m for m in mods if m in _MMA_DTYPES]
-    return f"{opcode}|k{k}|{','.join(dtypes)}"
+    if any(d in _FP8_DTYPES for d in dtypes):  # native fp8 (wgmma / mma.sync): keep the conservative form
+        k = _k_of(mods)
+        return f"{opcode}|k{k}|{','.join(dtypes)}"
+    cta = next((m[len(".cta_group::"):] for m in mods if m.startswith(".cta_group::")), "1")
+    return f"matmul|{_dtype_family(dtypes)}|cta{cta}"
 
 
 def _imm(operand):
