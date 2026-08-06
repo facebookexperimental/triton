@@ -191,14 +191,15 @@ struct PipelinePass : impl::TritonAMDGPUPipelineBase<PipelinePass> {
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
-    if (moduleOp->hasAttr(tt::kSkipGenericPipelineAttrName))
+    auto targetFeatures = tt::amdgpu::TargetFeatures::fromModuleOp(moduleOp);
+    if (moduleOp->hasAttr(tt::kSkipGenericPipelineAttrName) &&
+        !targetFeatures.isGFX1250())
       return;
 
     lowerLoops(moduleOp, useAsyncCopy, usePingpong);
     expandLoops(moduleOp);
 
     if (useAsyncCopy) {
-      auto targetFeatures = tt::amdgpu::TargetFeatures::fromModuleOp(moduleOp);
       // Only asyncmark targets (CDNA3/CDNA4) need updateWaits here: their
       // lowering reads ttg.async_wait's `num` directly into wait.asyncmark(N),
       // and PR #9883 made UpdateAsyncWaitCount a no-op on those archs, so
