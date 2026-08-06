@@ -2726,34 +2726,42 @@ static unsigned allocateSmemBuffers(
                               << " tmaStaging=" << buf.tmaStaging);
   }
 
-  // ── Phase 6: Hoist in-loop TMA store/reduce allocs to before the loop ─
-  // Early TMA store/reduce lowering creates local_alloc ops inside the loop.
-  // These must be hoisted so the pipeliner can rotate them by buffer.copy.
-  // Note: the hoist is only safe when all of `local_alloc`'s operands are
-  // defined outside the target loop. If an operand is defined inside the
-  // loop (e.g. an in-loop convert_layout), hoisting would create an SSA
-  // violation, so we skip it.
+  // Hoist TMA store, reduce, and descriptor-load staging allocations so
+  // pipelining can rotate them. Their operands must be loop invariant.
   for (auto &buf : wsBuffers) {
     auto allocOp = buf.allocOp;
     if (auto forOp = allocOp->getParentOfType<scf::ForOp>()) {
       bool feedsTMA = false;
-      for (auto user : allocOp->getUsers()) {
-        if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
-                user)) {
-          feedsTMA = true;
-          break;
+      SmallVector<Value> worklist = {allocOp->getResult(0)};
+      DenseSet<Value> visited;
+      while (!worklist.empty() && !feedsTMA) {
+        Value value = worklist.pop_back_val();
+        if (!visited.insert(value).second)
+          continue;
+        for (Operation *user : value.getUsers()) {
+          if (auto store = dyn_cast<ttg::LocalStoreOp>(user)) {
+            if (isa_and_nonnull<tt::DescriptorLoadOp>(
+                    store.getSrc().getDefiningOp())) {
+              feedsTMA = true;
+              break;
+            }
+          }
+          if (isa<ttng::AsyncTMACopyLocalToGlobalOp, ttng::AsyncTMAReduceOp>(
+                  user)) {
+            feedsTMA = true;
+            break;
+          }
+          if (user->hasTrait<OpTrait::MemDescViewTrait>())
+            for (Value result : user->getResults())
+              if (isa<triton::gpu::MemDescType>(result.getType()))
+                worklist.push_back(result);
         }
       }
       if (feedsTMA) {
-        // Walk to the outermost enclosing loop.
         auto outermost = forOp;
         while (auto parent = outermost->getParentOfType<scf::ForOp>())
           outermost = parent;
-        // Verify the operand chain doesn't depend on values defined inside
-        // `outermost`'s body. If any operand is defined inside the loop, the
-        // hoist would break SSA. Skip the hoist in that case — the alloc
-        // stays in place and the pipeliner will not be able to rotate it,
-        // but the IR remains well-formed.
+        // Hoist only when every operand is loop invariant.
         bool operandsAreLoopInvariant = true;
         for (Value operand : allocOp->getOperands()) {
           if (outermost.getBodyRegion().isAncestor(operand.getParentRegion())) {
@@ -5244,6 +5252,57 @@ static bool allocateTmemBuffersViaSearch(triton::FuncOp funcOp,
   return true;
 }
 
+// Reserve a conservative allowance for barriers, captures, and tensor-map
+// scratch created after SMEM planning.
+static unsigned estimateAuxiliarySmemBytes(
+    triton::FuncOp funcOp,
+    const SmallVectorImpl<std::unique_ptr<Channel>> &channels,
+    unsigned numBuffers) {
+  constexpr uint64_t barrierBytesPerSlot = 8;
+  // Each barrier array is captured as rank-2 memdesc metadata.
+  constexpr uint64_t barrierCaptureBytesPerArray = 16;
+  constexpr uint64_t tensorMapBytesPerOp = 128;
+  // Allow one optional staging-reuse full/empty token pair.
+  uint64_t numBarrierSlots = 2;
+  uint64_t numBarrierArrays = 2;
+  uint64_t captureBytes = 0;
+  auto addCaptureBytes = [&](Type type) {
+    if (isa<IntegerType, FloatType, tt::PointerType, tt::TensorDescInterface,
+            ttg::MemDescType, RankedTensorType>(type))
+      captureBytes += ttg::getSharedMemorySize(type);
+  };
+  DenseSet<Operation *> seenAllocs;
+  for (const auto &channel : channels) {
+    uint64_t barrierDepth = std::max(numBuffers, channel->getNumBuffers());
+    // A channel can have one producer barrier. Each consumer can require a
+    // full/empty token pair and an inline completion barrier.
+    uint64_t channelArrays = 1 + 3 * channel->relation.second.size();
+    // Operand-D TMEM hazards can require an additional guard token pair.
+    if (channel->channelKind == DataChannelKind::TMEMAlloc)
+      channelArrays += 2;
+    numBarrierSlots += channelArrays * barrierDepth;
+    numBarrierArrays += channelArrays;
+
+    Operation *alloc = channel->getAllocOp();
+    if (alloc && alloc->getNumResults() == 1 && seenAllocs.insert(alloc).second)
+      addCaptureBytes(alloc->getResult(0).getType());
+  }
+  for (BlockArgument arg : funcOp.getArguments())
+    addCaptureBytes(arg.getType());
+
+  uint64_t tensorMapScratchBytes = 0;
+  funcOp->walk([&](ttng::TensormapCreateOp) {
+    tensorMapScratchBytes += tensorMapBytesPerOp;
+  });
+
+  uint64_t totalBytes = numBarrierSlots * barrierBytesPerSlot *
+                            triton::gpu::lookupNumCTAs(funcOp) +
+                        numBarrierArrays * barrierCaptureBytesPerArray +
+                        captureBytes + tensorMapScratchBytes;
+  return static_cast<unsigned>(
+      std::min<uint64_t>(totalBytes, std::numeric_limits<unsigned>::max()));
+}
+
 // The default argument for `options` is declared in
 // WarpSpecializationPipeline.h (the single declaration site); it must not be
 // repeated on the definition.
@@ -5336,12 +5395,24 @@ LogicalResult doMemoryPlanner(triton::FuncOp funcOp, unsigned numBuffers,
 
   unsigned bufferId;
   if (effectiveSmemAllocAlgo == 1) {
+    unsigned auxiliarySmemBytes =
+        options.reserveAuxiliarySmem
+            ? estimateAuxiliarySmemBytes(funcOp, channelsOrigin, numBuffers)
+            : 0;
+    if (effectiveSmemBudget <= auxiliarySmemBytes) {
+      funcOp.emitError() << "estimated auxiliary shared-memory allocation ("
+                         << auxiliarySmemBytes
+                         << " bytes) exhausts the shared-memory budget ("
+                         << effectiveSmemBudget << " bytes)";
+      return failure();
+    }
+    effectiveSmemBudget -= auxiliarySmemBytes;
     // New WSBuffer-based SMEM allocation (Phases 1-5).
     LDBG("using SMEM allocation algorithm 1 (WSBuffer-based)"
          << (hasSmemAllocAlgoAttr ? "" : "; default when not specified")
          << " smemBudget=" << effectiveSmemBudget
+         << " auxiliarySmemBytes=" << auxiliarySmemBytes
          << " smemCircularReuse=" << effectiveSmemCircularReuse);
-    assert(effectiveSmemBudget != 0 && "smem budget is not set");
     // Parse channel annotations from MMA ops for SMEM pre-assignment.
     auto mmaAnnotations = parseChannelAnnotations(funcOp);
     DenseMap<Operation *, ChannelAnnotation> smemAllocAnnotations;
@@ -5441,6 +5512,7 @@ public:
       options.smemAllocAlgo = smemAllocAlgo;
       options.smemCircularReuse = smemCircularReuse;
       options.smemPlanSearch = smemPlanSearch;
+      options.reserveAuxiliarySmem = reserveAuxiliarySmem;
       if (failed(doMemoryPlanner(funcOp, numBuffers, smemBudget, options)))
         signalPassFailure();
     }
