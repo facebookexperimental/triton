@@ -1,7 +1,9 @@
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=1 --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=FLOOR
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-circular-reuse=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=CIRCULAR
-// RUN: triton-opt %s --nvgpu-test-ws-memory-planner=num-buffers=2 --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=OPERANDD
+// These checks pin raw planner budgets; auxiliary reservation is covered by
+// ws_memory_planner_load_order.mlir.
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=1 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=FLOOR
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-circular-reuse=1 reserve-auxiliary-smem=0" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=CIRCULAR
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 reserve-auxiliary-smem=0" --nvgpu-test-ws-code-partition="num-buffers=1" --mlir-print-debuginfo --mlir-use-nameloc-as-prefix 2>&1 | FileCheck %s --check-prefix=OPERANDD
 
 // Test case: FA BWD pattern with SMEM allocation (algo=1).
 // Both do and q are cross-stage TMA buffers, so each gets its strict
