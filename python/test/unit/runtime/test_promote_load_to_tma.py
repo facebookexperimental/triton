@@ -350,7 +350,7 @@ def _ws_load_only_scale(x_ptr, o_ptr, M, N, stride_m, BLOCK_M: tl.constexpr, BLO
 
 @pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_autows_load_over_256():
-    # autows (tl.range warp_specialize=True) + host-recipe auto-TMA LOAD, BLOCK_N=512.
+    # Exercise a host-recipe TMA load inside AutoWS with BLOCK_N > 256.
     M, N = 128, 512
     BLOCK_M, BLOCK_N = 32, 512
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -359,15 +359,15 @@ def test_auto_tma_autows_load_over_256():
     grid = (min(NUM_SMS, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)), )
     k = _ws_load_only_scale[grid](x, o, M, N, x.stride(0), BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, NUM_SMS=NUM_SMS,
                                   num_warps=4)
+    ref = x * 2.0
+    ref[:, 0] = 0.0
+    torch.testing.assert_close(o, ref, atol=1e-2, rtol=1e-2)
     assert "tt.descriptor_load" in k.asm["ttir"], "expected the BLOCK_N=512 load to promote"
 
 
 @pytest.mark.skipif(not _has_hopper(), reason="auto-TMA requires Hopper+ (sm_90)")
 def test_auto_tma_metaws_store_over_256():
-    # meta-WS (triton.knobs.nvidia.use_meta_ws) + auto-TMA store, BLOCK_N=512 > 256.
-    # Companion to the upstream-autows case above: a promoted store>256 compiles and
-    # computes correctly on the meta-WS path too. Confirms box>256 store encode is
-    # correct on both warp-specialization paths.
+    # Exercise a promoted store through meta-WS with BLOCK_N > 256.
     M, N = 128, 512
     BLOCK_M, BLOCK_N = 32, 512
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
