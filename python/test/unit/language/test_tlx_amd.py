@@ -143,6 +143,46 @@ def test_async_load_correctness(device):
 
 
 # ---------------------------------------------------------------------------
+# Reproducer: restructuring a loaded value must not release its pinned offsets.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _load_then_restructure(base, offsets):
+    value = tlx.buffer_load(base, offsets)
+    value = tl.reshape(value, [4, 4, 16, 2, 2])
+    value = tl.trans(value, (0, 4, 2, 3, 1))
+    return tl.reshape(value, [128, 8])
+
+
+@triton.jit
+def _pinned_load_helper_kernel(src, dst, PHYSICAL: tl.constexpr):
+    row = tl.arange(0, 4)[:, None]
+    col = tl.arange(0, 256)[None, :]
+    offsets = tlx.require_layout(row * 256 + col, PHYSICAL)
+    value = _load_then_restructure(src, offsets)
+    out_row = tl.arange(0, 128)[:, None]
+    out_col = tl.arange(0, 8)[None, :]
+    tl.store(dst + out_row * 8 + out_col, value)
+
+
+def test_load_helper_preserves_pinned_offset_layout_gfx950():
+    physical = tlx.layout(
+        shape=((16, 4, 4), (2, 2, 4)),
+        stride=((4, 64, 0), (1, 2, 256)),
+    )
+    compiled = compile_for_gfx950(
+        _pinned_load_helper_kernel,
+        signature={"src": "*fp8e4nv", "dst": "*fp8e4nv"},
+        constexprs={"PHYSICAL": physical},
+    )
+
+    # The helper restructures the loaded value, not the offset argument. The
+    # current fixup pass incorrectly releases every pinned helper argument.
+    assert "tlx.release_layout" not in compiled.asm["ttir"]
+
+
+# ---------------------------------------------------------------------------
 # Test: warp-pipelined batched matmul (bmm) with a partial-K tail on gfx950.
 #
 # Models the production "compression bmm" (batch, M, prime K=2309, N).
