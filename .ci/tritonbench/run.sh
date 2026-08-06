@@ -1,15 +1,21 @@
 #!/bin/bash
-# Release testing entry point for the benchmark suites, mirroring
-# .ci/release-testing/run.sh for the correctness suites.
+# Release testing entry point for the TritonBench benchmark suite, mirroring
+# .ci/release-testing/run.sh so that both gates share one interface.
 #
 # Usage:
-#   run.sh <suite> <conda-env>
+#   run.sh <hardware> <conda-env>
+#
+# <hardware> (h100, b200, mi350) is accepted for that shared interface but is
+# not used here: the same benchmark suite runs on every runner.
+#
+# <conda-env> is the env to benchmark. Results are staged under that name so
+# that an A/B run keeps its two sides apart.
 #
 # Thin wrapper over TritonBench's own run-benchmark.sh (which lives in
-# TRITONBENCH_ROOT, not in this repo): it runs <suite> under <conda-env> and
-# stages the results as BENCHMARK_OUTPUT/<conda-env>, the layout the upload
-# steps expect. TritonBench's .benchmarks scratch dir is cleared afterwards so
-# that an A/B run does not pick up the previous side's results.
+# TRITONBENCH_ROOT, not in this repo): it runs the nightly suite and stages the
+# results as BENCHMARK_OUTPUT/<conda-env>, the layout the upload steps expect.
+# TritonBench's .benchmarks scratch dir is cleared afterwards so that an A/B run
+# does not pick up the previous side's results.
 #
 # Environment consumed:
 #   TRITONBENCH_ROOT  TritonBench checkout. Defaults to /workspace/tritonbench.
@@ -17,10 +23,12 @@
 #                     benchmark-output under GITHUB_WORKSPACE (cwd if unset).
 set -euo pipefail
 
-SUITE="${1:-}"
+# The only TritonBench suite the release gate runs.
+SUITE="nightly"
+
 BENCHMARK_CONDA_ENV="${2:-}"
-if [ -z "${SUITE}" ] || [ -z "${BENCHMARK_CONDA_ENV}" ]; then
-  echo "Usage: $0 <suite> <conda-env>" >&2
+if [ -z "${1:-}" ] || [ -z "${BENCHMARK_CONDA_ENV}" ]; then
+  echo "Usage: $0 <hardware> <conda-env>" >&2
   exit 1
 fi
 
