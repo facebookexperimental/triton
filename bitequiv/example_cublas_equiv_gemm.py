@@ -18,6 +18,7 @@ from bitequiv.cublas_equiv_gemm import (
     cublas_equivalent_gemm,
     cublas_equivalent_scaled_mm,
     cublas_matmul,
+    set_cublaslt,
 )
 
 DEVICE = "cuda"
@@ -97,6 +98,28 @@ def example_fp8_split_k_runtime():
         print(f"fp8  split-K  {M}x{N}x{K}: UNSUPPORTED -> fell back to cuBLAS")
 
 
+def example_choose_cublas_version():
+    """Which cuBLAS we are bit-identical to is a choice, not whatever loaded first.
+
+    A box usually carries several: here CUDA 13.0 (13.1.1) and CUDA 12.8 (12.8.5, the one torch
+    is built against). Pass a version prefix or a full path; libraries are cached, so switching
+    back and forth costs nothing after the first use of each."""
+    print("-- choosing which cuBLAS to match --")
+    M, N, K = 2048, 2048, 4096
+    a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
+
+    for spec in ("12.8", "13.1"):
+        out = cublas_equivalent_gemm(a, b, cublaslt=spec)          # per call
+        ref = cublas_matmul(a, b, cublaslt=spec)
+        print(f"  cuBLAS {spec}: {'BIT-IDENTICAL' if _bit_equal(out, ref) else 'MISMATCH'}")
+
+    set_cublaslt("12.8")                                           # or for the whole process
+    out = cublas_equivalent_gemm(a, b)
+    print(f"  set_cublaslt(\"12.8\"): {'BIT-IDENTICAL' if _bit_equal(out, cublas_matmul(a, b)) else 'MISMATCH'}")
+    set_cublaslt()                                                 # back to the newest installed
+
+
 def example_cannot_match():
     """Shapes where the cuBLAS heuristic's algo has NO bit-identical Triton reconstruction,
     even with enable_runtime_match=True -> CublasUnsupportedShape (never a wrong result).
@@ -145,6 +168,8 @@ def main():
     example_fp16_split_k()
     example_fp8_plain()
     example_fp8_split_k_runtime()
+    print()
+    example_choose_cublas_version()
     print()
     example_cannot_match()
 

@@ -29,6 +29,7 @@ import torch
 from bitequiv import cublas_equiv_gemm as _G
 from bitequiv.cublas_equiv_gemm import (
     CublasNeedRuntimeMatch,
+    CublasUnsupportedPlatform,
     CublasUnsupportedShape,
     cublas_equivalent_gemm,
     cublas_equivalent_scaled_mm,
@@ -148,8 +149,14 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
     t0 = time.time()
     last = t0
 
-    print(f"device: {torch.cuda.get_device_name()} | dtypes={dtypes} R={R} timeout={timeout}s "
-          f"enable_runtime_match={enable_rt}")
+    try:
+        prof = _G._platform()
+    except CublasUnsupportedPlatform as e:
+        print(f"cannot run here: {e}")
+        return
+    print(f"device: {torch.cuda.get_device_name()} | platform: {prof.name} | cuBLASLt "
+          f"{'.'.join(map(str, _G._cublaslt_version()))} from {_G._load_lt()._name} | dtypes={dtypes} R={R} "
+          f"timeout={timeout}s enable_runtime_match={enable_rt}")
     if mode == "extreme":
         print(f"EXTREME shapes: M,N ~ uniform[1,{max_mn}], K ~ uniform[1,{max_k}] -- the skinny+deep "
               f"split-K corner")
@@ -233,7 +240,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                             out = our_api(a, b, dtype, out_dtype, True)
                             use_rt = True
                         # which tier actually resolved it is recorded in the plan cache
-                        origin = _G._PLAN.get((M, N, K, dtype_kind(dtype), out_dtype), ("?", None))[0]
+                        origin = _G.plan_origin(M, N, K, dtype_kind(dtype), out_dtype)
                         outcome = origin
                         {"static": seen_static, "pseudo-static": seen_pseudo,
                          "runtime": seen_runtime}.get(origin, seen_runtime).add(key)
@@ -324,6 +331,8 @@ def main():
                          "nearly every draw becomes no_ref; useful only to measure that rate")
     ap.add_argument("--max-gib", type=float, default=6.0,
                     help="skip a shape whose operands+output exceed this many GiB (resource skip)")
+    ap.add_argument("--cublaslt", type=str, default="",
+                    help="path to the libcublasLt to match (default: auto-detect the newest installed)")
     ap.add_argument("--shape-log", type=str, default="",
                     help="append one jsonl row per distinct shape here; also used to resume")
     args = ap.parse_args()
@@ -332,6 +341,8 @@ def main():
         return
     dtypes = [d.strip() for d in args.dtypes.split(",") if d.strip()]
     max_k = args.max_k or (400000 if args.shape_mode == "extreme" else args.max_dim)
+    if args.cublaslt:
+        _G.set_cublaslt(args.cublaslt)
     run(args.timeout, args.report_every, args.R, dtypes, args.seed, args.enable_runtime_match, args.shape_mode,
         args.max_dim, args.max_mn, max_k, not args.no_fp8_round16, int(args.max_gib * 2**30), args.shape_log)
 
