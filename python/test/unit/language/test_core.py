@@ -3776,6 +3776,63 @@ def test_reduction_ordering_sum_masked_multi_reg_group(num_warps, N, BLOCK_N, de
                                    f"num_warps={num_warps}")
 
 
+@pytest.mark.skipif(not is_hip(), reason="AMD-only: DPP warp-reduce count-up order for inner_tree (D113540598)")
+def test_reduction_ordering_sum_num_warps_bitwise_hip(device):
+    """AMD regression (D113540598): on gfx942/CDNA (wave64) a float `sum` with
+    INNER_TREE ordering must be bitwise-identical across num_warps.  The within-
+    warp stage lowers to a DPP butterfly; before the fix AMD always emitted the
+    count-down row_shr order (8,4,2,1) and ignored reduction_ordering, so the add
+    grouping -- and thus the result bits -- changed when num_warps / BLOCK_SIZE
+    reshaped the reduce axis (sizePerThread).  The fix emits the count-up order
+    (1,2,4,8) for inner_tree, matching the shared count-up shuffle tree.
+
+    N=1024 with a single reduced row places all warps on the reduce axis, so
+    sizePerThread on that axis shifts as num_warps grows -- the layout change
+    that used to move the result bits."""
+    BLOCK_N = 1024
+    TOTAL_ROWS = 32
+
+    @triton.jit
+    def sum_kernel_1row(X, Z, stride_row, stride_col, BLOCK_N: tl.constexpr, ORDERING: tl.constexpr):
+        pid = tl.program_id(0)
+        offs_n = tl.arange(0, BLOCK_N)
+        x = tl.load(X + pid * stride_row + offs_n * stride_col)
+        z = tl.sum(x, axis=0, reduction_ordering=ORDERING)
+        tl.store(Z + pid, z)
+
+    torch.manual_seed(42)
+    x = torch.randn((TOTAL_ROWS, BLOCK_N), device=device, dtype=torch.float32)
+    grid = (TOTAL_ROWS, )
+
+    def run(ordering, num_warps):
+        out = torch.empty(TOTAL_ROWS, device=device, dtype=torch.float32)
+        sum_kernel_1row[grid](
+            x,
+            out,
+            x.stride(0),
+            x.stride(1),
+            BLOCK_N=BLOCK_N,
+            ORDERING=ordering,
+            num_warps=num_warps,
+        )
+        return out
+
+    # INNER_TREE must be bitwise num_warps-invariant.  Compare raw bits (integer
+    # view) against the num_warps=1 reference so +0/-0 and NaN patterns count as
+    # different, not just the numeric value.
+    ref_bits = run(tl.ReductionOrdering.INNER_TREE, 1).view(torch.int32)
+    for num_warps in [1, 2, 4, 8]:
+        out_bits = run(tl.ReductionOrdering.INNER_TREE, num_warps).view(torch.int32)
+        assert torch.equal(out_bits,
+                           ref_bits), (f"INNER_TREE sum not bitwise num_warps-invariant on AMD: num_warps={num_warps}")
+
+    # Control: the UNORDERED path is deliberately NOT asserted.  It is allowed to
+    # vary across num_warps (that freedom is exactly what inner_tree removes), so
+    # requiring it to match would be wrong.  We still run it once to confirm it
+    # compiles and executes on this path.
+    run(tl.ReductionOrdering.UNORDERED, 4)
+
+
 # ---------------
 # test permute
 # ---------------
