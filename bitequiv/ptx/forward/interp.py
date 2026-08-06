@@ -36,7 +36,7 @@ from bitequiv.ptx.forward.loops import (find_loops, loop_accumulates, loop_carri
 from bitequiv.ptx.forward.predicate import PredicateDecoder
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import DefUse, _def_regs, linearize
-from bitequiv.ptx.mma import _is_mma, _mma_fence
+from bitequiv.ptx.mma import _fence_all_matmul, _is_mma, _mma_fence
 from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
                                  SmemExchange)
 
@@ -709,8 +709,11 @@ def _epilogue_reduces_mma(sinks):
 def _mma_entry_descriptor(func, fence):
     """Descriptor for an entry containing MMA (tensor-core) ops, via the tiling-invariant fence.
 
-    A PURE GEMM (MMA, no reduction over the output) is the fence ALONE -> num_warps + BLOCK_M/BLOCK_N
-    are free (recovered), with ``loops=`` kept (BLOCK_K is a real, bit-relevant K split). An MMA + a
+    A PURE f16/bf16/tf32 GEMM (MMA, no reduction over the output) is the fence ALONE -> num_warps +
+    BLOCK_M/BLOCK_N + BLOCK_K are all free (recovered) and v2 (``mma.sync``) merges with v5
+    (``tcgen05``): the fence token is form- and tiling-invariant and ``loops=`` (BLOCK_K) is dropped
+    because BLOCK_K only re-batches the same in-order k-fold (native-k fixed, exact F=25 accumulate).
+    fp8 keeps ``loops=`` (imprecise-acc cadence). An MMA + a
     reduction OVER the MMA output (FA softmax, or gemm_reduce_sum / softmax / layernorm) is FAIL-CLOSED:
     the fence AND the reduction fingerprint both ride, so configs differing in EITHER the MMA shape OR
     the reduction order split (sound, never over-merged). The reduction is detected structurally
@@ -735,10 +738,16 @@ def _mma_entry_descriptor(func, fence):
     sinks += [v for _, v in interp.smem_stores if hasattr(v, "children")]
     sinks += [v for v in interp.regs.values() if hasattr(v, "children")]
     has_shfl = any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func))
-    if has_shfl or _epilogue_reduces_mma(sinks):
+    reduces = has_shfl or _epilogue_reduces_mma(sinks)
+    if reduces:
         parts.append("mma+red|" + interp.fingerprint())
-    steps = _loop_steps(func)  # BLOCK_K split (+ the tcgen05 / fp8 K carried here, not in the token)
-    if steps:
+    steps = _loop_steps(func)
+    # BLOCK_K is bit-neutral for a PURE f16/bf16/tf32 tensor-core GEMM: native-k is fixed and each MMA's
+    # F=25 accumulate is exact, so BLOCK_K only re-batches the same in-order k-fold. Drop loops= there ->
+    # recovers BLOCK_K AND lets v2 (mma.sync, emits loops=) match v5 (tcgen05, emits none). Keep loops=
+    # for fp8 (the max_num_imprecise_acc cadence can shift with BLOCK_K) and when the entry reduces over
+    # the MMA output (a chunked reduction step may be bit-relevant; its order otherwise rides mma+red).
+    if steps and (reduces or not _fence_all_matmul(fence)):
         parts.append("loops=" + ",".join(map(str, steps)))
     sig = reduction_trip_signature(func)
     if sig is not None:
