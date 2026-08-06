@@ -135,16 +135,16 @@ void init_triton_tlx_ir(py::module &&m) {
                                                         offsetsAttr);
            })
       .def("create_amd_rematerialized_range",
-           [](TritonOpBuilder &self, int32_t start, int32_t end, int32_t anchor,
-              Value placement) -> Value {
+           [](TritonOpBuilder &self, int32_t start, int32_t end,
+              int32_t identity, Value placement) -> Value {
              auto resultType =
                  RankedTensorType::get({static_cast<int64_t>(end) - start},
                                        self.getBuilder().getI32Type());
              auto startAttr = self.getBuilder().getI32IntegerAttr(start);
              auto endAttr = self.getBuilder().getI32IntegerAttr(end);
-             auto anchorAttr = self.getBuilder().getI32IntegerAttr(anchor);
+             auto identityAttr = self.getBuilder().getI32IntegerAttr(identity);
              return self.create<amdgpu::RematerializedRangeOp>(
-                 resultType, placement, startAttr, endAttr, anchorAttr);
+                 resultType, placement, startAttr, endAttr, identityAttr);
            })
       .def("create_amd_register_resident",
            [](TritonOpBuilder &self, Value input,
@@ -185,7 +185,7 @@ void init_triton_tlx_ir(py::module &&m) {
       .def(
           "create_require_layout",
           [](TritonOpBuilder &self, Value &v, Attribute &encoding, bool pin,
-             bool rematerializeCoordinates) -> Value {
+             bool lateAddressCompute) -> Value {
             Type newType;
             if (auto type = dyn_cast<ttg::MemDescType>(v.getType())) {
               // consider allocation type for subslice
@@ -197,7 +197,7 @@ void init_triton_tlx_ir(py::module &&m) {
                   type.getShape(), type.getElementType(), encoding,
                   type.getMemorySpace(), type.getMutableMemory(), allocShape);
               auto op = self.create<tlx::RequireLayoutOp>(newType, v);
-              if (rematerializeCoordinates)
+              if (lateAddressCompute)
                 op->setAttr("tlx.rematerialize_coordinates",
                             self.getBuilder().getUnitAttr());
               return op;
@@ -218,7 +218,7 @@ void init_triton_tlx_ir(py::module &&m) {
               newType = RankedTensorType::get(
                   type.getShape(), type.getElementType(), tensorEncoding);
               auto op = self.create<tlx::RequireLayoutOp>(newType, v);
-              if (rematerializeCoordinates)
+              if (lateAddressCompute)
                 op->setAttr("tlx.rematerialize_coordinates",
                             self.getBuilder().getUnitAttr());
               return op;
@@ -227,7 +227,7 @@ void init_triton_tlx_ir(py::module &&m) {
             }
           },
           py::arg("v"), py::arg("encoding"), py::arg("pin") = false,
-          py::arg("rematerialize_coordinates") = false)
+          py::arg("late_address_compute") = false)
       .def(
           "create_splat_with_layout",
           [](TritonOpBuilder &self, std::vector<int64_t> shape,

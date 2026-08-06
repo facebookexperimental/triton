@@ -1040,7 +1040,7 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     tlx.dump_layout(v)                  # -> // cute: _64:_1
     ```
 
-- `x = tlx.require_layout(x, layout, pin=True, rematerialize_coordinates=False)` **[Hopper+, MI300+]**
+- `x = tlx.require_layout(x, layout, pin=True, late_address_compute=False)` **[Hopper+, MI300+]**
 
     Require a register tensor `x` to use `layout`, expressed as a
     `tlx.layout(...)` (Shape:Stride). With the default `pin=True`, the `#linear`
@@ -1059,9 +1059,10 @@ TLX uses **CUDA-native cluster semantics** which differs from Triton's approach:
     later layout passes to propagate the requirement or materialize a layout
     conversion. The default remains `pin=True` for existing callers.
 
-    On AMD, `rematerialize_coordinates=True` asks shared-memory-backed layout
-    conversions to recompute inexpensive lane/warp coordinates at this use,
-    shortening their live ranges across register-heavy regions.
+    On AMD, `late_address_compute=True` asks shared-memory-backed layout
+    conversions to compute their addresses at this use. The backend does this
+    by rematerializing inexpensive lane/warp coordinates, shortening their live
+    ranges across register-heavy regions.
 
     Pair with `tlx.assert_same_layout(x, layout)` (below) to statically verify the
     pin survived to the final TTGIR.

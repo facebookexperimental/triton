@@ -817,9 +817,9 @@ public:
     TritonLLVMOpBuilder b(loc, rewriter);
 
     // Start a fresh machine live range for the thread coordinates at each
-    // source anchor. The empty tied inline asm emits no instruction, but its
+    // source location. The empty tied inline asm emits no instruction, but its
     // side effect prevents LLVM from CSEing the derived range arithmetic back
-    // into an earlier anchor and recreating the lifetime this op is meant to
+    // into an earlier location and recreating the lifetime this op is meant to
     // split.
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     LinearLayout layout = triton::gpu::toLinearLayout(tensorTy);

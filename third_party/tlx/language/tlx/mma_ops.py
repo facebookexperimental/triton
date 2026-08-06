@@ -34,25 +34,27 @@ def extract_slice(source, shape, offsets, _semantic=None):
 def rematerialized_range(
     start,
     end,
-    anchor,
+    identity,
     placement=None,
     _semantic=None,
 ):
     """Materialize a distributed integer range at this source location.
 
     This has the same numerical values as ``tl.arange(start, end)``. Unlike a
-    pure range, instances with distinct ``anchor`` values are kept as separate
-    placement anchors so cheap lane/warp coordinate arithmetic can be
-    recomputed near each use instead of remaining live through a
-    register-intensive software pipeline.
+    pure range, instances with distinct ``identity`` values are kept separate
+    under common-subexpression elimination, so cheap lane/warp coordinate
+    arithmetic can be recomputed near each use instead of remaining live
+    through a register-intensive software pipeline. ``placement`` supplies an
+    optional scheduling dependency that keeps the range near that source
+    location.
     """
     start = tl._unwrap_if_constexpr(start)
     end = tl._unwrap_if_constexpr(end)
-    anchor = tl._unwrap_if_constexpr(anchor)
+    identity = tl._unwrap_if_constexpr(identity)
     assert isinstance(start, int) and not isinstance(start, bool), ("start must be a constexpr integer")
     assert isinstance(
         end, int) and not isinstance(end, bool) and end > start, ("end must be a constexpr integer greater than start")
-    assert isinstance(anchor, int) and not isinstance(anchor, bool), ("anchor must be a constexpr integer")
+    assert isinstance(identity, int) and not isinstance(identity, bool), ("identity must be a constexpr integer")
     placement = tl._unwrap_if_constexpr(placement)
     if placement is None:
         placement = 0
@@ -64,7 +66,7 @@ def rematerialized_range(
     handle = _semantic.builder.create_amd_rematerialized_range(
         start,
         end,
-        anchor,
+        identity,
         placement.handle,
     )
     return tl.tensor(handle, tl.block_type(tl.int32, shape))
@@ -174,7 +176,7 @@ def require_layout(
     x,
     layout,
     pin: tl.constexpr = True,
-    rematerialize_coordinates: tl.constexpr = False,
+    late_address_compute: tl.constexpr = False,
     _semantic=None,
 ):
     """Require a register tensor layout, optionally as a hard user anchor.
@@ -184,23 +186,23 @@ def require_layout(
     treat it as fixed. With ``pin=False``, the requirement remains
     optimizer-flexible and may be propagated or materialized as a conversion.
 
-    ``rematerialize_coordinates=True`` asks shared-memory-backed layout
-    conversions to derive fresh lane/warp coordinates at this conversion.
-    This is useful for a late epilogue conversion whose otherwise-cheap
-    address expressions would remain live through a register-heavy loop.
+    ``late_address_compute=True`` asks shared-memory-backed layout conversions
+    to derive their addresses at this conversion. This is useful for a late
+    epilogue conversion whose otherwise-cheap address expressions would remain
+    live through a register-heavy loop.
     """
     layout = tl._unwrap_if_constexpr(layout)
     pin = tl._unwrap_if_constexpr(pin)
-    rematerialize_coordinates = tl._unwrap_if_constexpr(rematerialize_coordinates)
+    late_address_compute = tl._unwrap_if_constexpr(late_address_compute)
     assert isinstance(pin, bool), f"pin must be a constexpr bool, got {type(pin).__name__}"
-    assert isinstance(rematerialize_coordinates, bool), ("rematerialize_coordinates must be a constexpr bool, got "
-                                                         f"{type(rematerialize_coordinates).__name__}")
+    assert isinstance(late_address_compute, bool), ("late_address_compute must be a constexpr bool, got "
+                                                    f"{type(late_address_compute).__name__}")
     enc = layout.to_ir(_semantic.builder, x.shape, x.dtype)
     handle = _semantic.builder.create_require_layout(
         x.handle,
         enc,
         pin=pin,
-        rematerialize_coordinates=rematerialize_coordinates,
+        late_address_compute=late_address_compute,
     )
     return tl.tensor(handle, x.type)
 

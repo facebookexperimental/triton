@@ -718,21 +718,21 @@ def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range", [
     preferable to carrying them through a long software pipeline.
 
     Each source instance has an explicit identity attribute. This keeps
-    intentionally separate placement anchors distinct under CSE while `Pure`
+    intentionally separate source instances distinct under CSE while `Pure`
     allows layout propagation's unused clones to be deleted. The scalar
     `placement` operand is a non-numerical scheduling dependency: tying it to
     a loop induction value keeps the range at that loop-local source point.
     Target lowering then starts fresh coordinate live ranges at the surviving
-    anchor. The operation neither names physical registers nor changes
+    source location. The operation neither names physical registers nor changes
     numerical results.
   }];
 
   let arguments = (ins I32:$placement, I32Attr:$start, I32Attr:$end,
-      I32Attr:$anchor);
+      I32Attr:$identity);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
-    $start `to` $end `anchor` $anchor `at` $placement
+    $start `to` $end `identity` $identity `at` $placement
     attr-dict `:` type($result)
   }];
 

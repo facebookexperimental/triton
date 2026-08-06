@@ -657,12 +657,12 @@ def test_extract_slice_mfma_correct_gfx950():
 
 @triton.jit
 def _rematerialized_range_kernel(x_ptr, y_ptr):
-    load_rows = tlx.rematerialized_range(0, 64, 0)
-    load_cols = tlx.rematerialized_range(0, 64, 1)
+    load_rows = tlx.rematerialized_range(0, 64, identity=0)
+    load_cols = tlx.rematerialized_range(0, 64, identity=1)
     values = tl.load(x_ptr + load_rows[:, None] * 64 + load_cols[None, :])
 
-    store_rows = tlx.rematerialized_range(0, 64, 2)
-    store_cols = tlx.rematerialized_range(0, 64, 3)
+    store_rows = tlx.rematerialized_range(0, 64, identity=2)
+    store_cols = tlx.rematerialized_range(0, 64, identity=3)
     tl.store(y_ptr + store_rows[:, None] * 64 + store_cols[None, :], values)
 
 
@@ -682,7 +682,7 @@ def test_rematerialized_range_compiles_gfx950():
 
 
 @triton.jit
-def _amd_rematerialized_layout_coordinates_kernel(x_ptr, y_ptr):
+def _amd_late_address_compute_kernel(x_ptr, y_ptr):
     src_mma: tl.constexpr = tlx.amd_mfma_layout(
         version=4,
         instr_shape=[16, 16, 32],
@@ -718,16 +718,16 @@ def _amd_rematerialized_layout_coordinates_kernel(x_ptr, y_ptr):
     values = tlx.require_layout(
         values,
         dst_mma,
-        rematerialize_coordinates=True,
+        late_address_compute=True,
     )
     offsets = rows[:, None] * 64 + cols[None, :]
     output_offsets = tlx.require_layout(y_ptr + offsets, dst_mma, pin=False)
     tl.store(output_offsets, values)
 
 
-def test_amd_rematerialized_layout_coordinates_compiles_gfx950():
+def test_amd_late_address_compute_compiles_gfx950():
     compiled = compile_for_gfx950(
-        _amd_rematerialized_layout_coordinates_kernel,
+        _amd_late_address_compute_kernel,
         signature={"x_ptr": "*bf16", "y_ptr": "*bf16"},
         constexprs={},
     )
