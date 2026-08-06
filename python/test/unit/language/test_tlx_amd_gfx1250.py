@@ -5,6 +5,11 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton._internal_testing import is_hip_gfx1250
+from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
+    matmul as _amd_mxfp_matmul,
+    pack_scale as _amd_mxfp_pack_scale,
+)
+from triton.tools.mxfp import MXScaleTensor
 
 
 @triton.jit
@@ -233,3 +238,48 @@ def test_wait_arrive_non_ws_gfx1250(BLOCK_SIZE, device):
     ttgir = kernel.asm["ttgir"]
     assert ((ttgir.count("amdgpu.init_barrier") == 1) and (ttgir.count("amdgpu.read_barrier_phase") == 3)
             and (ttgir.count("amdgpu.arrive_barrier") == 3)), f"TTGIR {ttgir}"
+
+
+def _mxfp_e8m0_to_float32(scale):
+    bits = scale.view(torch.uint8).to(torch.int32) << 23
+    return bits.view(torch.float32)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("tdm_fusion", ["none", "partial"])
+def test_mxgemm_tdm_split_correctness_gfx1250(device, tdm_fusion):
+    torch.manual_seed(0)
+    M = N = 128
+    K = 1536
+    scale_block = 32
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
+
+    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
+    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
+    expected = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+    actual = _amd_mxfp_matmul(
+        a.contiguous().to(device),
+        b.T.contiguous().to(device),
+        _amd_mxfp_pack_scale(a_scale).to(device),
+        _amd_mxfp_pack_scale(b_scale).to(device),
+        config={
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 256,
+            "SCALE_BLOCK": 32,
+            "NUM_BUFFERS": 3,
+            "DTYPE_A": "e4m3",
+            "DTYPE_B": "e4m3",
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": tdm_fusion,
+            "TDM_SPLIT": True,
+            "TRANSPOSE_B": True,
+            "num_warps": 4,
+            "waves_per_eu": 1,
+        },
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=2e-2)
