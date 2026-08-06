@@ -2,7 +2,7 @@
 # Release testing: TritonBench GPU tests.
 #
 # Usage:
-#   test-tritonbench.sh <hardware> [extra unittest args...]
+#   test-tritonbench.sh [extra unittest args...]
 #
 # Mirrors the "Run TritonBench tests" step of h100.yml / b200.yml / mi350.yml:
 # it delegates to .ci/tritonbench/test-gpu.sh with the fork's skip list applied.
@@ -11,10 +11,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "${SCRIPT_DIR}/common.sh"
-
-HARDWARE="${1:-}"
-validate_hardware "${HARDWARE}"
-shift
 
 activate_env
 disable_torchtlx

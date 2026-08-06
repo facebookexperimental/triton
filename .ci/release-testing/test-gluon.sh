@@ -2,7 +2,7 @@
 # Release testing: Gluon unit tests.
 #
 # Usage:
-#   test-gluon.sh <hardware>
+#   test-gluon.sh
 #
 # Mirrors the "-gluon-test" jobs of b200.yml / mi350.yml.
 set -euo pipefail
@@ -10,9 +10,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 . "${SCRIPT_DIR}/common.sh"
-
-HARDWARE="${1:-}"
-validate_hardware "${HARDWARE}"
 
 activate_env
 disable_torchtlx
