@@ -390,13 +390,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
             tlx.storage_kind.tmem,
             reuse=qk_storage_alias,
         )
-        alpha_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, 1),
-            tl.float32,
-            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
-        )
         l_tiles = tlx.local_alloc(
             (BLOCK_M_SPLIT, 1),
             tl.float32,
@@ -450,9 +443,8 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
         # QK and P have sequential lifetimes (QK consumed by softmax before P produced),
         # so they share the same TMEM region. P in FP8 (32 cols) fits within QK's FP32 space (128 cols).
         # QK[0] : |                              BLK_M/2 * BLOCK_N * fp32                                       |
-        # Alpha[0]: |BLK_M/2*1*fp32|
-        # L[0]:                    |BLK_M/2*1*fp32|
-        # M[0]:                                   |BLK_M/2*1*fp32|
+        # L[0]: |BLK_M/2*1*fp32|
+        # M[0]:                    |BLK_M/2*1*fp32|
         # Q_SCALES[1]:                                           |512*uint8|
         # K_SCALES[1]:                                                     |512*uint8|
         # V_SCALES[0]:                                                               |512*uint8|
@@ -462,7 +454,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
             tlx.reuse_group(
                 qk_tiles,
                 tlx.reuse_group(
-                    alpha_tiles,
                     l_tiles,
                     m_tiles,
                     q_scale_tmem,
@@ -478,12 +469,6 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
     else:
         # We have enough TMEM space to isolate every buffer.
         qk_tiles = tlx.local_alloc((BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
-        alpha_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, 1),
-            tl.float32,
-            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-            tlx.storage_kind.tmem,
-        )
         l_tiles = tlx.local_alloc(
             (BLOCK_M_SPLIT, 1),
             tl.float32,
@@ -527,6 +512,7 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
             tlx.storage_kind.tmem,
         )
 
+    alpha_tiles = tlx.local_alloc((BLOCK_M_SPLIT, 1), tl.float32, NUM_MMA_GROUPS)
     acc_tiles = tlx.local_alloc((BLOCK_M_SPLIT, HEAD_DIM), tl.float32, NUM_MMA_GROUPS, tlx.storage_kind.tmem)
 
     qk_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
@@ -536,8 +522,8 @@ def _attn_fwd_mxf8_ws(sm_scale, desc_m,  #
     acc_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     acc_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
-    alpha_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
-    alpha_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
+    alpha_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
+    alpha_empties = tlx.alloc_warp_barrier(num_barriers=NUM_MMA_GROUPS, num_warps=4)
     l_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
     l_empties = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS)
 
