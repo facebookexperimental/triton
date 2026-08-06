@@ -77,16 +77,28 @@ bool tryRepairModuloSchedule(int II, llvm::DenseMap<unsigned, int> &nodeToCycle,
 bool tryRepairModuloSchedule(const DataDependenceGraph &ddg,
                              ModuloScheduleResult &schedule);
 
-/// Run modulo scheduling on the DDG.
-/// Algorithm selected by TRITON_USE_MODULO_SCHEDULE env var value:
+/// Run modulo scheduling on the DDG with the backend named by `algo`:
+///   "joint_solver" → native in-process Z3 solver; falls back to Rau on
+///                    failure
 ///   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
 ///   "exhaustive" → Exhaustive search with joint memory feasibility
 ///   "random"     → Random sampling with greedy placement
-///   "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+///   "contracted" → Two-stage GEMM search on a contracted compute graph
+///   "rau", "1" or other → Rau's Iterative Modulo Scheduling (Rau, 1994)
+/// Empty resolves from TRITON_USE_MODULO_SCHEDULE (see getActiveScheduleAlgo).
+/// The backend is an argument rather than process state so two modules
+/// compiled concurrently in one process cannot observe each other's choice.
 /// maxII defaults to 2 * MinII. maxBacktracks limits ejection in Rau's IMS.
 FailureOr<ModuloScheduleResult>
-runModuloScheduling(const DataDependenceGraph &ddg, int maxII = 0,
-                    int maxBacktracks = 20, int minIIOverride = 0);
+runModuloScheduling(const DataDependenceGraph &ddg, llvm::StringRef algo,
+                    int maxII = 0, int maxBacktracks = 20,
+                    int minIIOverride = 0);
+
+/// Resolve the scheduling backend: `forced` if non-empty, else
+/// TRITON_USE_MODULO_SCHEDULE, else "rau". A pure function of its argument and
+/// the environment. A pass resolves it once and threads the result into both
+/// runModuloScheduling and its dump/diagnostic labels.
+std::string getActiveScheduleAlgo(llvm::StringRef forced = {});
 
 /// Rau's Iterative Modulo Scheduling (Rau, 1994) — Triton's default backend,
 /// and the fallback the joint solver drops to. Exposed so the baseline

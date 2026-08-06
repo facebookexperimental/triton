@@ -324,6 +324,11 @@ private:
   std::unordered_map<std::string, EntryList::iterator> entries;
 };
 
+// The one process-global on the scheduling path, and deliberately so: it is a
+// memo keyed by the canonicalized problem, not configuration. Two modules
+// compiled concurrently (each pass pipeline runs with the GIL released) can
+// only ever hand each other the answer to an identical problem, and the
+// entries are mutex-guarded.
 static JointSolverCache &jointSolverCache() {
   static JointSolverCache cache;
   return cache;

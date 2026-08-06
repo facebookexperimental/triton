@@ -11,6 +11,7 @@
 #include <climits>
 #include <cstdint>
 #include <numeric>
+#include <string>
 
 #define DEBUG_TYPE "modulo-scheduling-rau"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -402,18 +403,25 @@ FailureOr<ModuloScheduleResult> runRauIMS(const DataDependenceGraph &ddg,
 
 // ── Public entry point ──────────────────────────────────────────────────────
 
+std::string getActiveScheduleAlgo(llvm::StringRef forced) {
+  if (!forced.empty())
+    return forced.str();
+  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+  return algo.empty() ? "rau" : algo;
+}
+
 FailureOr<ModuloScheduleResult>
-runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
-                    int maxBacktracks, int minIIOverride) {
+runModuloScheduling(const DataDependenceGraph &ddg, llvm::StringRef algo,
+                    int maxII, int maxBacktracks, int minIIOverride) {
   const int computedMinII = ddg.computeMinII();
   if (computedMinII <= 0)
     return failure();
   const int minII = std::max(computedMinII, minIIOverride);
-  auto algo = mlir::triton::tools::getStrEnv("TRITON_USE_MODULO_SCHEDULE");
+  const std::string resolvedAlgo = getActiveScheduleAlgo(algo);
 
   // The complete solver computes its own true feasibility bound. Dispatch it
   // before the heuristic maxII window, which can discard feasible schedules.
-  if (algo == "joint_solver") {
+  if (resolvedAlgo == "joint_solver") {
     LLVM_DEBUG(DBGS() << "Using native Z3 joint solver\n");
     auto result = runJointSolverSchedule(
         ddg, minII, /*smemBudget=*/232448, /*tmemColLimit=*/512);
@@ -436,8 +444,8 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
   // multi-hundred-cycle op durations, so a fixed +10 window (classic CPU
   // modulo-scheduling folklore) is too narrow to absorb reservation-table
   // fragmentation when one pipeline is saturated (ResMII-bound with zero
-  // slack, e.g. layernorm's CUDA pipe). A complete (ILP-style) search has
-  // no such fragmentation failure mode and needs no window at all.
+  // slack, e.g. layernorm's CUDA pipe). Applies to the heuristic paths
+  // below only — the joint_solver path above needs no window (guard 2).
   maxII = std::min(maxII, minII + std::max(10, minII / 8));
 
   LLVM_DEBUG({
@@ -447,7 +455,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
            << " RecMII=" << ddg.computeRecMII() << "\n";
   });
 
-  // TRITON_USE_MODULO_SCHEDULE selects the scheduling algorithm:
+  // `algo` selects the scheduling algorithm:
   //   "joint_solver" → Native Z3 joint schedule and buffer-depth solver
   //   "sms"        → Swing Modulo Scheduling (Llosa et al., PACT 1996)
   //   "exhaustive" → Exhaustive search with joint memory feasibility
@@ -466,19 +474,19 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
     return std::move(result);
   };
 
-  if (algo == "exhaustive") {
+  if (resolvedAlgo == "exhaustive") {
     LLVM_DEBUG(DBGS() << "Using exhaustive search with memory feasibility\n");
     return validateResult(runExhaustiveSearch(ddg, maxII, /*smemBudget=*/232448,
                                /*tmemColLimit=*/512, minII));
   }
 
-  if (algo == "random") {
+  if (resolvedAlgo == "random") {
     LLVM_DEBUG(DBGS() << "Using random sampling search\n");
     return validateResult(runRandomSearch(ddg, maxII, /*smemBudget=*/232448,
                            /*tmemColLimit=*/512, /*numSamples=*/1000, minII));
   }
 
-  if (algo == "contracted") {
+  if (resolvedAlgo == "contracted") {
     LLVM_DEBUG(DBGS() << "Using contracted-graph two-stage search\n");
     // Contracted mode assigns cycles with a reduced (contracted) latency model
     // and validates its own dependences (see ContractedGraphScheduler.md). The
@@ -487,7 +495,7 @@ runModuloScheduling(const DataDependenceGraph &ddg, int maxII,
     return runContractedSearch(ddg, maxII);
   }
 
-  if (algo == "sms") {
+  if (resolvedAlgo == "sms") {
     LLVM_DEBUG(DBGS() << "Using Swing Modulo Scheduling (SMS)\n");
     return validateResult(runSMS(ddg, minII, maxII));
   }
