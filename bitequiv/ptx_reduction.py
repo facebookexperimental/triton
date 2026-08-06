@@ -100,7 +100,14 @@ _MMA_OPCODES = frozenset({"wgmma", "mma", "wmma", "tcgen05"})
 # bare-entry fragments (unit-test snippets) do not, so synthesize a minimal header when
 # absent. The synthetic version/target only label the module; they do not affect the
 # extracted reduction tree.
-_SYNTH_HEADER = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+def ptx_header(target="sm_90a", version="8.5", address_size=64):
+    """A minimal pyptx-parseable module header. Parameterized so a target / PTX-ISA-version upgrade is a
+    one-line change here rather than a hardcoded string duplicated across call sites and the unit tests
+    (reviewer nit, D112765110)."""
+    return f".version {version}\n.target {target}\n.address_size {address_size}\n"
+
+
+_SYNTH_HEADER = ptx_header()
 
 
 class _Unparseable:

@@ -8,9 +8,9 @@ from pyptx.parser import parse
 
 from bitequiv.ptx.forward import loops
 from bitequiv.ptx.forward.interp import forward_module_descriptor as CHECK
-from bitequiv.ptx_reduction import _ensure_header
+from bitequiv.ptx_reduction import _ensure_header, ptx_header
 
-_HDR = ".version 8.5\n.target sm_90a\n.address_size 64\n"
+_HDR = ptx_header()
 _MMA = "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%r3}, %r4, %r5;\n"
 
 
