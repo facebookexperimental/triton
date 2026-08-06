@@ -42,6 +42,11 @@ from bitequiv.ptx.treeir import (FpOp, Leaf, LoopReduce, Mma, OpaqueLeaf, Opaque
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
+# The f16-in-a-32-bit-reg within-warp butterfly wraps its `shfl.bfly.b32` in a `cvt.u32.u16` (widen the
+# 16-bit fp payload so a `.b32` shuffle can move it) + a `cvt.u16.u32` (narrow it back). Both are pure
+# bit-repacks of the SAME 16-bit payload, so the forward walk carries the register value THROUGH them
+# (see `_transfer`) to keep the `_Shuffle` butterfly marker alive for the downstream `add.f16`.
+_U16_U32_REPACK = frozenset({".u16", ".u32"})
 # A packed op decomposes into independent per-lane SCALAR ops (`.f32x2` = two `.f32`, bit-identical),
 # so a decomposed lane node carries the SCALAR width. Keeping the packed width on a lane node would
 # make its reduce-op token (`add.f32x2`) differ from the surrounding scalar `.f32` combines and break
@@ -317,6 +322,25 @@ class ForwardInterp:
             if acc is not None and op == "add":
                 return self._loop_reduce(inst, acc, at)  # loop-carried add-accumulation -> fold summary
             return self._combine(inst, at)
+        if op == "cvt" and len(inst.operands) == 2 and set(mods) == _U16_U32_REPACK:
+            # f16 within-warp butterfly:  cvt.u32.u16 (widen) -> shfl.bfly.b32 -> cvt.u16.u32 (narrow)
+            # -> add.f16.  The 16-bit fp payload rides in a 32-bit register only so the `.b32` shuffle
+            # can move it; both cvts are pure bit-repacks of that SAME payload (widen zero-extends the
+            # irrelevant high 16 bits, narrow truncates them back off), i.e. identity on the fp value.
+            # So carry the register value THROUGH the cvt (keeping any `_Shuffle` marker) instead of
+            # burying it in an OpaqueOp: the following `add.f16` then still sees `add(p, shfl.bfly(p,
+            # off))` and rebuilds a `ShflCombine` WITH its offset. Without this the marker is stripped
+            # at the narrow cvt (the OpaqueOp branch below), so inner_tree (count-up) and unordered
+            # (count-down) f16 reductions both reconstruct as the SAME offset-free `add.f16` fold and
+            # OVER-MERGE across the order. bf16/f32 reduce in f32 (shuffle the value directly, no u16
+            # repack) so they are unaffected.
+            v = self._val(inst.operands[1], at)
+            if mods[0] == ".u32":
+                return v  # widen (u16->u32, zero-extend): payload-preserving -> pass value/marker through
+            if isinstance(v, _Shuffle):
+                return v  # narrow (u32->u16) of a shuffled payload: pass the butterfly marker through
+            # A narrow cvt whose source is NOT a shuffled payload could drop meaningful high bits (not
+            # provably value-preserving) -> leave it opaque / fail-closed below (sound, never over-merge).
         # Any other unmodeled op (an f64 half-assembly `or.b64`, a `cvt`, ...): keep it as an
         # OpaqueOp NODE with its register operands as children + non-register operands in the token,
         # EXACTLY like the backward else-branch, so the value-DAG matches. A pure integer/address op
