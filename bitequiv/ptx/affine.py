@@ -68,6 +68,10 @@ def _ctz(n):
     return z
 
 
+def _is_pow2(n):
+    return n is not None and n > 0 and (n & (n - 1)) == 0
+
+
 def _is_special(name):
     return any(name.startswith(p) for p in _SPECIAL_PREFIXES)
 
@@ -277,6 +281,8 @@ class AffineEval:
             return self._and(ev(srcs[0]), ev(srcs[1]))
         if op in ("or", "xor") and len(srcs) == 2:
             return self._or_xor(ev(srcs[0]), ev(srcs[1]))
+        if op == "bfe" and len(srcs) == 3:  # bit-field extract: bits [pos, pos+len) of a
+            return self._bfe(ev(srcs[0]), ev(srcs[1]), ev(srcs[2]))
 
         return self._opaque_def(d)
 
@@ -316,7 +322,62 @@ class AffineEval:
                 terms = frozenset((sym, c >> s) for sym, c in a.terms)
                 return Affine(a.const >> s, terms, rng=_rng_scale(a.rng, 1) if a.rng is None else
                               (a.rng[0] >> s, ((a.rng[1] - 1) >> s) + 1))
+            # tid bit-slice: decompose to the bit basis, drop bits < s, shift the rest down.
+            exp = self._tid_bit_expand(a)
+            pos = self._bit_positions(exp) if exp is not None else None
+            if pos is not None and s >= 0:
+                kept = frozenset((sym, 1 << (p - s)) for p, sym in pos.items() if p >= s)
+                hi = sum(1 << (p - s) for p in pos if p >= s) + 1
+                return Affine(0, kept, rng=(0, hi))
         return self._opaque_pair(a, "shr", b)
+
+    def _tid_bit_expand(self, aff):
+        """Rewrite an integer affine into the ``%tid`` BIT basis: each ``%tid.<dim>`` term is
+        replaced by ``sum_i (coeff * 2**i) * %tid.<dim>.bit<i>`` over ``i`` in ``[0, log2(N))``
+        where ``N = reqntid[dim]`` (a bit symbol has range ``[0, 2)`` — see :func:`leaf_columns`).
+
+        This is the tid->(warp, lane, tile) basis change: because ``N`` is a power of two, bits
+        ``[0, log2 N)`` cover ``[0, N)`` EXACTLY, so the rewrite is bit-for-bit the same integer —
+        the sound precondition for turning ``and`` / ``shr`` / ``bfe`` on ``tid`` (opaque today)
+        into an exact affine. Returns ``None`` (caller stays opaque) when a term is not so
+        decomposable: a non-power-of-two / unknown ``ntid`` (bits would over-cover ``[0, N)``), or a
+        NON-tid varying symbol (``%ctaid`` / ``param:`` / ``%laneid`` / opaque) whose bits are
+        unknown, or a non-zero constant (its bits could carry into the slice — kept out of scope)."""
+        if not isinstance(aff, Affine) or aff.const != 0:
+            return None
+        terms = {}
+        for sym, coeff in aff.terms:
+            parts = sym.split(".")
+            is_bit = len(parts) == 3 and parts[0] == "%tid" and parts[2].startswith("bit")
+            is_plain = len(parts) == 2 and parts[0] == "%tid"
+            if is_bit:  # already a bit symbol — carry through
+                terms[sym] = terms.get(sym, 0) + coeff
+                continue
+            if not is_plain:
+                return None  # a non-tid varying symbol -> not bit-decomposable
+            n = self.reqntid.get(parts[1])
+            if not _is_pow2(n):
+                return None
+            for i in range(n.bit_length() - 1):  # log2(N) bits
+                bit = f"{sym}.bit{i}"
+                terms[bit] = terms.get(bit, 0) + coeff * (1 << i)
+        frozen = frozenset((s, c) for s, c in terms.items() if c != 0)
+        return Affine(0, frozen, rng=aff.rng)
+
+    @staticmethod
+    def _bit_positions(exp):
+        """The bit position of every term of a pure bit-basis affine (const 0, each coeff a single
+        power of two), or ``None`` if any coeff is not a single set bit or two terms collide on one
+        position (so a bitwise mask/shift would not distribute over the sum)."""
+        pos = {}
+        for sym, coeff in exp.terms:
+            if coeff <= 0 or (coeff & (coeff - 1)) != 0:
+                return None  # not a single power of two
+            p = coeff.bit_length() - 1
+            if p in pos:
+                return None  # two bits collide on one position
+            pos[p] = sym
+        return pos
 
     def _and(self, a, b):
         # x & mask == x  when mask covers every bit x can possibly set (no-op mask).
@@ -325,19 +386,37 @@ class AffineEval:
             bits = _set_bits_mask(a)
             if bits is not None and (mask & bits) == bits:
                 return a
-        if isinstance(b, Affine) and not b.terms and isinstance(a, Affine):
-            # symmetric (mask & x)
-            pass
+            # tid bit-slice: decompose to the bit basis and keep only bits fully inside the mask.
+            exp = self._tid_bit_expand(a)
+            pos = self._bit_positions(exp) if exp is not None else None
+            if pos is not None and mask >= 0:
+                kept = frozenset((sym, 1 << p) for p, sym in pos.items() if (mask >> p) & 1)
+                hi = sum(1 << p for p in pos if (mask >> p) & 1) + 1
+                return Affine(0, kept, rng=(0, hi))
         return self._opaque_pair(a, "and", b)
 
     def _or_xor(self, a, b):
-        # x | imm == x ^ imm == x + imm  when imm is disjoint from x's possible set bits.
-        if isinstance(a, Affine) and isinstance(b, Affine) and not b.terms:
-            imm = b.const
-            bits = _set_bits_mask(a)
-            if bits is not None and (imm & bits) == 0 and imm >= 0:
+        # x | imm == x ^ imm == x + imm  when imm is disjoint from x's possible set bits (no carry),
+        # or (a | b) == (a ^ b) == (a + b) when a, b set DISJOINT bits — both add with no carry.
+        if isinstance(a, Affine) and isinstance(b, Affine):
+            ba, bb = _set_bits_mask(a), _set_bits_mask(b)
+            if ba is not None and bb is not None and (ba & bb) == 0 and (a.const & bb) == 0 and (b.const & ba) == 0:
                 return self._binop_add(a, b, 1)
         return self._opaque_pair(a, "orxor", b)
+
+    def _bfe(self, a, pos, length):
+        """``bfe`` (bit-field extract): bits ``[p, p+len)`` of ``a`` shifted down to bit 0. Exact on
+        the tid bit basis (``= shr(and(a, ((1<<len)-1)<<p), p)``); opaque otherwise."""
+        if not (isinstance(pos, Affine) and not pos.terms and isinstance(length, Affine) and not length.terms):
+            return self._opaque_pair(a, "bfe", pos)
+        p, ln = pos.const, length.const
+        exp = self._tid_bit_expand(a)
+        bpos = self._bit_positions(exp) if exp is not None else None
+        if bpos is not None and p >= 0 and ln > 0:
+            kept = frozenset((sym, 1 << (bp - p)) for bp, sym in bpos.items() if p <= bp < p + ln)
+            hi = sum(1 << (bp - p) for bp in bpos if p <= bp < p + ln) + 1
+            return Affine(0, kept, rng=(0, hi))
+        return self._opaque_pair(a, "bfe", pos)
 
     # -- opaque construction (structural, register-name independent) -----------
 

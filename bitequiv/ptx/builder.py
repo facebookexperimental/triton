@@ -18,8 +18,8 @@ from pyptx.ir.nodes import RegisterOperand, VectorOperand
 from bitequiv.ptx.affine import AffineEval, canon, reqntid_of
 from bitequiv.ptx.leaves import leaf_coord, leaf_columns
 from bitequiv.ptx.linker import Def, DefUse
-from bitequiv.ptx.treeir import (FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp,
-                                 ShflCombine, SmemExchange)
+from bitequiv.ptx.treeir import (FpOp, ITreeReduce, Leaf, LoopReduce, Mma, OpaqueLeaf, OpaqueOp, ShflCombine,
+                                 SmemExchange)
 
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f64", ".bf16", ".bf16x2"})
 _FP_KINDS = frozenset({"add", "sub", "mul", "div", "min", "max"})
@@ -329,13 +329,74 @@ def _has_opaque(node):
     return any(isinstance(n, (OpaqueLeaf, OpaqueOp)) for n in _postorder(node))
 
 
+def _addr_resolved(node):
+    """True iff every ``Leaf`` in ``node`` has a FULLY-affine address (no ``opq(`` token in its
+    coord) — i.e. the affine engine, with its ``%tid`` bit-basis (:func:`bitequiv.ptx.affine`),
+    pinned the exact element each thread loads. This is the "affine linchpin" gate for the
+    single-leaf add collapse below: only when the addressing is fully resolved is the reduced
+    element identity known, so a lone cross-thread add leaf may soundly collapse; an unresolved
+    (opaque / swizzled) address keeps the conservative >= 2 guard (fail-closed, over-split)."""
+    for n in _postorder(node):
+        if isinstance(n, Leaf) and (n.coord is None or "opq(" in n.coord):
+            return False
+    return True
+
+
+def _is_count_up(node, ht):
+    """True iff the butterfly shuffles reduce COUNT-UP — the offset DOUBLES leaf->root (1, 2, 4, 8, ...).
+    That is the ``inner_tree`` signature: a count-up balanced tree fixes the reduction to the layout-
+    invariant canonical order, so it is bit-identical across ``num_warps``. ``unordered`` is count-DOWN
+    (16, 8, ..., 1 leaf->root). For a PURE cross-thread reduction (one boundary leaf, no within-thread
+    fold to reveal the left-fold) the butterfly direction is the ONLY signal that separates the
+    num_warps-invariant order from the layout-dependent one, so the single-leaf collapse MUST gate on it
+    or it over-merges ``unordered`` across num_warps.
+
+    Examine EVERY maximal run of shuffles at consecutive heights — the within-warp butterfly AND the
+    cross-warp run (which sits higher, separated by a shared-memory exchange). Both carry the same
+    direction. inner_tree makes every run increasing; unordered makes every run decreasing. Return True
+    iff at least one run of >= 2 steps is strictly increasing AND no run is non-increasing. Reading only
+    the TOP run (old behavior) missed the direction at low num_warps, where the cross-warp run is a
+    single (direction-less) step and only the within-warp butterfly proves count-up — so nw=2 stayed
+    over-split. A count-DOWN run (unordered), a non-monotone run, a dynamic offset, or a height carrying
+    two offsets -> False (cannot prove inner_tree -> do not collapse -> sound over-split)."""
+    by_ht = {}
+    for n in _postorder(node):
+        if isinstance(n, ShflCombine):
+            try:
+                off = int(n.offset)
+            except (TypeError, ValueError):
+                return False  # dynamic / unresolved offset
+            by_ht.setdefault(ht[id(n)], set()).add(off)
+    if not by_ht or any(len(offs) != 1 for offs in by_ht.values()):
+        return False  # no shuffles, or a height carrying two different offsets -> ambiguous
+    flat = {h: next(iter(offs)) for h, offs in by_ht.items()}
+    heights = sorted(flat)
+    runs, cur = [], [heights[0]]  # maximal runs of CONSECUTIVE heights (ascending height = leaf->root)
+    for h in heights[1:]:
+        if h == cur[-1] + 1:
+            cur.append(h)
+        else:
+            runs.append(cur)
+            cur = [h]
+    runs.append(cur)
+    saw_up = False
+    for run in runs:
+        offs = [flat[h] for h in run]  # leaf->root
+        if len(offs) < 2:
+            continue  # a single (cross-warp) step: direction-less on its own -> no evidence, skip
+        if all(0 < offs[i] < offs[i + 1] for i in range(len(offs) - 1)):
+            saw_up = True
+        else:
+            return False  # count-DOWN (unordered) or non-monotone -> not provably inner_tree
+    return saw_up
+
+
 # Pure per-element ops that are safe to keep VERBATIM inside a collapsed reduction's leaf: each is
 # a deterministic function of ONE element (cast/copy/abs/neg + the transcendentals a softmax /
 # rmsnorm / layernorm applies before the reduce), hence layout-invariant. Its token rides verbatim
 # into leaf_sig (compared, never dropped), so equal leaf_sig => same op; a config WITHOUT the op
 # gets a different leaf_sig and never merges.
-_PURE_ELT = ("cvt", "mov", "abs", "neg", "ex2", "lg2", "exp", "log",
-             "sqrt", "rsqrt", "rcp", "sin", "cos", "tanh")
+_PURE_ELT = ("cvt", "mov", "abs", "neg", "ex2", "lg2", "exp", "log", "sqrt", "rsqrt", "rcp", "sin", "cos", "tanh")
 
 
 def _tok_is_pure(token):
@@ -380,7 +441,7 @@ def _shfl_dir(node, ht):
     return tuple(sorted({off for h, off in shfls if h == lo}))
 
 
-def _collapse_info(node):
+def _collapse_info(node, ht=None):
     """(reduce_op_token, uniform_coord_free_leaf_sig, reduced_column_SET) for a collapsible reduction,
     or None if it cannot be SOUNDLY collapsed. The BOUNDARY leaves are the non-reduce CHILDREN of
     reduce nodes (NOT every non-reduce postorder node — collecting the latter double-counts a
@@ -420,9 +481,17 @@ def _collapse_info(node):
     # min/max butterfly (1 leaf/thread) is a real reduction and MAY collapse. A SHAPE-DEPENDENT op
     # (add) keys on height + shfl_dir, NOT the element set, so a lone coord-blanked leaf would merge
     # reductions over DIFFERENT element sets that share the height/direction (they differ in bits) ->
-    # keep the >= 2 guard for add (a within-thread fold pins the layout enough for the eval's
-    # same-element-set configs; a 1-leaf pure cross-thread add stays over-split, sound).
-    if op.split(".")[0] not in _ORDER_INVARIANT_OPS and len(leaves) < 2:
+    # keep the >= 2 guard for add UNLESS the sole leaf's address is FULLY resolved to affine
+    # (`_addr_resolved`) AND the tree reduces COUNT-UP (`_is_count_up`): with the `%tid` bit-basis the
+    # exact reduced element set is then pinned by the coord, and count-up is the inner_tree canonical
+    # order (bit-identical across num_warps), so a pure cross-thread add for an axis-0 / outer-axis
+    # reduction (sum_2d_axis0 etc., whose whole reduction is cross-thread -> one boundary leaf) soundly
+    # recovers num_warps. Count-DOWN (unordered) or an UNRESOLVED (opaque/swizzled) address keeps the
+    # old >= 2 fail-close (over-split, sound) — count-up vs count-down is the ONLY signal separating the
+    # num_warps-invariant order from the layout-dependent one when there is no within-thread fold. This
+    # is the affine linchpin. (ht is None on the pre-collapse `_reduces_without_leaf` scan -> stay strict.)
+    if (op.split(".")[0] not in _ORDER_INVARIANT_OPS and len(leaves) < 2
+            and not (_addr_resolved(leaves[0]) and ht is not None and _is_count_up(node, ht))):
         return None
     if not all(_leaf_layout_invariant(l) for l in leaves):
         return None  # a layout-dependent / lost-provenance leaf -> do not collapse
@@ -515,7 +584,7 @@ def collapse_balanced(root):
     new = {}
     for n in _postorder(root):
         region_root = collapsible[id(n)] and not has_coll_parent.get(id(n), False)
-        info = _collapse_info(n) if region_root else None
+        info = _collapse_info(n, ht) if region_root else None
         if info is not None:
             op, leaf_sig, cols = info
             if op.split(".")[0] in _ORDER_INVARIANT_OPS:

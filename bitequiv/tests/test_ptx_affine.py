@@ -28,10 +28,14 @@ def test_and_lowbit_mask_is_noop_within_range():
     assert canon(v) == "4*%tid.x"
 
 
-def test_and_partial_mask_is_opaque():
-    # mask 12 (bits 2,3) does NOT cover all bits 4*tid can set -> not provably no-op.
+def test_and_partial_mask_on_tid_is_bit_basis():
+    # A partial mask on tid is EXACT via the %tid bit-basis: reqntid 128 makes tid < 128, so bits
+    # [0,7) cover the value exactly, and 4*tid & 12 keeps bits 2,3 = (tid & 3)*4 = 4*bit0 + 8*bit1.
     v = _eval("mov.u32 %r1, %tid.x;\nshl.b32 %r2, %r1, 2;\nand.b32 %r3, %r2, 12;", "%r3")
-    assert isinstance(v, Opaque)
+    assert isinstance(v, Affine) and canon(v) == "4*%tid.x.bit0+8*%tid.x.bit1"
+    # A partial mask on a NON-tid value (unknown bits) is not bit-decomposable -> stays Opaque.
+    p = _eval("ld.param.b32 %r1, [k_param_1];\nand.b32 %r2, %r1, 12;", "%r2")
+    assert isinstance(p, Opaque)
 
 
 def test_disjoint_or_is_add():
@@ -56,8 +60,12 @@ def test_mad_wide_is_affine_times_const_plus_base():
 def test_shr_exact_when_multiple_else_opaque():
     exact = _eval("mov.u32 %r1, %tid.x;\nshl.b32 %r2, %r1, 2;\nshr.u32 %r3, %r2, 1;", "%r3")
     assert canon(exact) == "2*%tid.x"
-    inexact = _eval("mov.u32 %r1, %tid.x;\nshr.u32 %r2, %r1, 5;", "%r2")  # tid has tz 0
-    assert isinstance(inexact, Opaque)
+    # tid >> 5 (the warp index) is EXACT via the %tid bit-basis when reqntid pins tid < 128 (bits 5,6).
+    warp = _eval("mov.u32 %r1, %tid.x;\nshr.u32 %r2, %r1, 5;", "%r2")
+    assert isinstance(warp, Affine) and canon(warp) == "1*%tid.x.bit5+2*%tid.x.bit6"
+    # ...but Opaque WITHOUT a reqntid bound: cannot prove the shifted-out low bits are all tid has.
+    unbounded = _eval("mov.u32 %r1, %tid.x;\nshr.u32 %r2, %r1, 5;", "%r2", reqntid=False)
+    assert isinstance(unbounded, Opaque)
 
 
 def test_mul_reg_reg_is_opaque_and_structural():
