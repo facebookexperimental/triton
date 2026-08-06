@@ -1713,6 +1713,7 @@ struct BufferAtomicRMWOpConversion
 
     // Determine the vectorization size
     Type valueTy = data.getType();
+    auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
     Type valueElemTy =
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
     Type ptrType = getPointerTypeWithShape(ptr, offset);
@@ -1750,6 +1751,9 @@ struct BufferAtomicRMWOpConversion
                valueElemTy.isInteger(32) || valueElemTy.isInteger(64)) {
       vec = 1u;
     }
+    if (tensorTy && toLinearLayout(tensorTy).isModular() && vec != 1)
+      return rewriter.notifyMatchFailure(
+          op, "vectorized modular buffer atomics are not supported");
 
     // Get the offsets and value
     SmallVector<Value> offsetElems = unpackLLElements(loc, llOffset, rewriter);
@@ -1784,14 +1788,28 @@ struct BufferAtomicRMWOpConversion
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
+    SmallVector<Value> canonicalPredicates;
+    if (tensorTy) {
+      auto predicates = emitCanonicalIndexPredicates(loc, rewriter, targetInfo,
+                                                     tensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
       if (!isCanonicalIndex(vecStart, regMask)) {
         // Don't emit store ops for redundant elements within a thread
         continue;
       }
 
-      Value pred =
-          llMask ? b.and_(threadPred, maskElems[vecStart]) : threadPred;
+      Value pred = !canonicalPredicates.empty() ? canonicalPredicates[vecStart]
+                                                : threadPred;
+      if (llMask)
+        pred = b.and_(pred, maskElems[vecStart]);
 
       Type vecTy = LLVM::getVectorType(valueElemTy, vec);
       Value falseVal = createZeroVector(rewriter, loc, cast<VectorType>(vecTy));
@@ -1896,10 +1914,23 @@ struct BufferAtomicCASOpConversion
     auto freeVarMasks = getFreeVariableMasks(valueTy);
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
+    SmallVector<Value> canonicalPredicates;
+    if (auto tensorTy = dyn_cast<RankedTensorType>(valueTy)) {
+      auto predicates = emitCanonicalIndexPredicates(loc, rewriter, targetInfo,
+                                                     tensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
 
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
       Type vecTy = LLVM::getVectorType(valueElemTy, vec);
-      Value pred = threadPred;
+      Value pred = !canonicalPredicates.empty() ? canonicalPredicates[vecStart]
+                                                : threadPred;
       // Create the store val
       Value casStoreVal = packElementRangeIntoVector(
           rewriter, this->getTypeConverter(), loc, cast<VectorType>(vecTy),
@@ -2073,6 +2104,19 @@ struct AtomicCASOpConversion
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
     uint32_t regMask = freeVarMasks[str_attr("reg")];
+    SmallVector<Value> canonicalPredicates;
+    if (tensorTy) {
+      auto predicates = emitCanonicalIndexPredicates(
+          loc, rewriter, targetInfo,
+          cast<RankedTensorType>(op.getPtr().getType()), threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
 
     // atomic ops
     for (size_t i = 0; i < elemsPerThread; i += 1) {
@@ -2084,6 +2128,8 @@ struct AtomicCASOpConversion
       Value casVal = valElements[i];
       Value casCmp = cmpElements[i];
       Value casPtr = ptrElements[i];
+      Value pred =
+          !canonicalPredicates.empty() ? canonicalPredicates[i] : threadPred;
       if (valueElemIntTy) {
         casVal = LLVM::BitcastOp::create(rewriter, loc, valueElemIntTy, casVal);
         casCmp = LLVM::BitcastOp::create(rewriter, loc, valueElemIntTy, casCmp);
@@ -2098,7 +2144,7 @@ struct AtomicCASOpConversion
         endBlock->addArgument({valueElemTy}, {loc});
 
         rewriter.setInsertionPointToEnd(curBlock);
-        LLVM::CondBrOp::create(rewriter, loc, threadPred, atomicBlock, endBlock,
+        LLVM::CondBrOp::create(rewriter, loc, pred, atomicBlock, endBlock,
                                undefVal);
 
         rewriter.setInsertionPointToEnd(atomicBlock);
@@ -2239,6 +2285,7 @@ struct AtomicRMWOpConversion
       maskElements = unpackLLElements(loc, llMask, rewriter);
 
     auto tensorTy = dyn_cast<RankedTensorType>(opResult.getType());
+    auto ptrTensorTy = dyn_cast<RankedTensorType>(ptr.getType());
     Type valueElemTy =
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
                  : opResult.getType();
@@ -2294,13 +2341,24 @@ struct AtomicRMWOpConversion
           axisAnalysisPass.getAxisInfo(ptr)->getContiguity(threadOrder.front());
       enableIntraWaveReduce &= contigWithinLanes == 1;
     }
-
     auto vecTy = vec_ty(valueElemTy, vec);
     auto elemsPerThread = getTotalElemsPerThread(val.getType());
 
     auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
     Value threadPred = emitRedundantThreadPredicateNonNull(
         freeVarMasks, rewriter, loc, targetInfo);
+    SmallVector<Value> canonicalPredicates;
+    if (ptrTensorTy) {
+      auto predicates = emitCanonicalIndexPredicates(loc, rewriter, targetInfo,
+                                                     ptrTensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
     auto tid = getThreadId(rewriter, loc);
 
     bool needLdsStaging = !tensorTy && !opResult.use_empty();
@@ -2359,7 +2417,10 @@ struct AtomicRMWOpConversion
     for (size_t i = 0; i < elemsPerThread; i += vec) {
       // TODO: in case llMask is zero we can create only one branch for all
       // elemsPerThread.
-      Value rmwMask = llMask ? b.and_(threadPred, maskElements[i]) : threadPred;
+      Value rmwMask =
+          !canonicalPredicates.empty() ? canonicalPredicates[i] : threadPred;
+      if (llMask)
+        rmwMask = b.and_(rmwMask, maskElements[i]);
       if (applyPackingF16) {
         resultVals[i] = emitter.emitPairedAtomicForEvenTID(
             rewriter, ptrElements[i], valElements[i], rmwMask);

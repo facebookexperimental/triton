@@ -339,6 +339,163 @@ Value emitRedundantThreadPredicate(
   return pred;
 }
 
+struct CanonicalOwnerBasis {
+  StringAttr inDim;
+  int bit;
+  int32_t value;
+};
+
+struct CanonicalOwnerBound {
+  SmallVector<CanonicalOwnerBasis> bases;
+  int32_t upperBound;
+};
+
+static FailureOr<SmallVector<CanonicalOwnerBound>>
+getCanonicalOwnerBounds(const LinearLayout &layout) {
+  SmallVector<CanonicalOwnerBound> bounds;
+
+  // Distributed layouts decompose into binary coordinates, optionally joined
+  // by mixed-radix stages. For example, a 48-element dimension split across
+  // two CTAs has bases [1, 2, 4, 8, 16] for a 24-element CTA-local coordinate
+  // and basis [24] for the block coordinate. Each NPOT stage needs its own
+  // pre-modulo bound.
+  for (StringAttr outDim : layout.getOutDimNames()) {
+    SmallVector<CanonicalOwnerBasis> nonzeroBases;
+    for (StringAttr inDim : layout.getInDimNames()) {
+      for (int bit = 0; bit < layout.getInDimSizeLog2(inDim); ++bit) {
+        int32_t basis = layout.getBasis(inDim, bit, outDim);
+        if (basis != 0)
+          nonzeroBases.push_back({inDim, bit, basis});
+      }
+    }
+    llvm::sort(nonzeroBases, [](const CanonicalOwnerBasis &lhs,
+                                const CanonicalOwnerBasis &rhs) {
+      return lhs.value < rhs.value;
+    });
+
+    int64_t stride = 1;
+    int basisStart = 0;
+    while (basisStart < nonzeroBases.size()) {
+      int basisCount = 0;
+      while (basisStart + basisCount < nonzeroBases.size() &&
+             nonzeroBases[basisStart + basisCount].value ==
+                 stride * (int64_t{1} << basisCount)) {
+        ++basisCount;
+      }
+      if (basisCount == 0)
+        return failure();
+
+      int64_t stageExtent;
+      if (basisStart + basisCount < nonzeroBases.size()) {
+        int64_t nextStride = nonzeroBases[basisStart + basisCount].value;
+        if (nextStride % stride != 0)
+          return failure();
+        stageExtent = nextStride / stride;
+      } else {
+        int64_t outDimSize = layout.getOutDimSize(outDim);
+        if (outDimSize % stride != 0)
+          return failure();
+        stageExtent = outDimSize / stride;
+      }
+      if (stageExtent <= 0 || llvm::Log2_64_Ceil(stageExtent) != basisCount)
+        return failure();
+
+      if (!llvm::isPowerOf2_64(stageExtent)) {
+        CanonicalOwnerBound &bound = bounds.emplace_back();
+        bound.upperBound = stageExtent;
+        for (int i = 0; i < basisCount; ++i) {
+          CanonicalOwnerBasis basis = nonzeroBases[basisStart + i];
+          basis.value /= stride;
+          bound.bases.push_back(basis);
+        }
+      }
+
+      stride *= stageExtent;
+      basisStart += basisCount;
+    }
+    if (stride != layout.getOutDimSize(outDim))
+      return failure();
+  }
+  return bounds;
+}
+
+FailureOr<SmallVector<Value>> emitCanonicalIndexPredicates(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    RankedTensorType tensorTy, Value redundantThreadPredicate) {
+  LinearLayout layout = toLinearLayout(tensorTy);
+  if (!layout.isModular())
+    return SmallVector<Value>{};
+
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  MLIRContext *ctx = rewriter.getContext();
+  auto kRegister = str_attr("register");
+  auto kLane = str_attr("lane");
+  auto kWarp = str_attr("warp");
+  auto kBlock = str_attr("block");
+  SmallVector<StringAttr> expectedInDims = {kRegister, kLane, kWarp, kBlock};
+  if (!llvm::equal(layout.getInDimNames(), expectedInDims))
+    return failure();
+  for (const auto &basis : llvm::make_second_range(layout.getBases())) {
+    for (const auto &values : basis) {
+      if (llvm::count_if(values, [](int32_t value) { return value != 0; }) > 1)
+        return failure();
+    }
+  }
+  FailureOr<SmallVector<CanonicalOwnerBound>> ownerBounds =
+      getCanonicalOwnerBounds(layout);
+  if (failed(ownerBounds))
+    return failure();
+
+  Value zero = b.i32_val(0);
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  Value blockId = layout.getInDimSize(kBlock) == 1
+                      ? zero
+                      : targetInfo.getClusterCTAId(rewriter, loc);
+
+  SmallVector<Value> predicates(layout.getInDimSize(kRegister),
+                                redundantThreadPredicate);
+  auto inputValue = [&](StringAttr inDim) {
+    if (inDim == kLane)
+      return laneId;
+    if (inDim == kWarp)
+      return warpId;
+    assert(inDim == kBlock);
+    return blockId;
+  };
+
+  for (const CanonicalOwnerBound &bound : *ownerBounds) {
+    Value dynamicCoordinate = zero;
+    for (const CanonicalOwnerBasis &basis : bound.bases) {
+      if (basis.inDim == kRegister)
+        continue;
+      Value bit =
+          b.and_(inputValue(basis.inDim), b.i32_val(uint32_t{1} << basis.bit));
+      int sourceBit = basis.bit;
+      int targetBit = llvm::Log2_32(basis.value);
+      if (targetBit > sourceBit)
+        bit = b.shl(bit, b.i32_val(targetBit - sourceBit));
+      else if (targetBit < sourceBit)
+        bit = b.lshr(bit, b.i32_val(sourceBit - targetBit));
+      dynamicCoordinate = b.or_(dynamicCoordinate, bit, /*disjoint=*/true);
+    }
+    for (int reg = 0; reg < layout.getInDimSize(kRegister); ++reg) {
+      int32_t registerCoordinate = 0;
+      for (const CanonicalOwnerBasis &basis : bound.bases) {
+        if (basis.inDim == kRegister &&
+            (static_cast<uint64_t>(reg) & (uint64_t{1} << basis.bit)))
+          registerCoordinate |= basis.value;
+      }
+      Value coordinate = dynamicCoordinate;
+      if (registerCoordinate != 0)
+        coordinate = b.or_(coordinate, b.i32_val(registerCoordinate),
+                           /*disjoint=*/true);
+      Value inBounds = b.icmp_ult(coordinate, b.i32_val(bound.upperBound));
+      predicates[reg] = maybeAnd(rewriter, loc, predicates[reg], inBounds);
+    }
+  }
+  return predicates;
+}
+
 } // namespace triton::gpu
 
 // Cheap modulo for inputs provably < 2N: compare-and-subtract (2 ops vs

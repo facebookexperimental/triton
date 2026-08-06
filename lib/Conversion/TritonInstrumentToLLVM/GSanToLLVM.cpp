@@ -571,6 +571,19 @@ public:
     Value threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
                                                          loc, *targetInfo);
     uint32_t regMask = freeVarMasks.lookup(str_attr("reg"));
+    auto ptrTensorTy = dyn_cast<RankedTensorType>(op.getPtr().getType());
+    SmallVector<Value> canonicalPredicates;
+    if (ptrTensorTy) {
+      auto predicates = ttg::emitCanonicalIndexPredicates(
+          loc, rewriter, *targetInfo, ptrTensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
     Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
@@ -587,8 +600,9 @@ public:
       }
 
       Value pred =
-          llMask ? ttg::maybeAnd(rewriter, loc, threadPred, maskElements[i])
-                 : threadPred;
+          !canonicalPredicates.empty() ? canonicalPredicates[i] : threadPred;
+      if (llMask)
+        pred = ttg::maybeAnd(rewriter, loc, pred, maskElements[i]);
       Value rmwPtr = ptrElements[i];
       Value rmwVal = valElements[i];
 
@@ -673,6 +687,19 @@ public:
     Value threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
                                                          loc, *targetInfo);
     uint32_t regMask = freeVarMasks.lookup(str_attr("reg"));
+    auto ptrTensorTy = dyn_cast<RankedTensorType>(op.getPtr().getType());
+    SmallVector<Value> canonicalPredicates;
+    if (ptrTensorTy) {
+      auto predicates = ttg::emitCanonicalIndexPredicates(
+          loc, rewriter, *targetInfo, ptrTensorTy, threadPred);
+      if (failed(predicates))
+        return rewriter.notifyMatchFailure(
+            op, "modular layout has no supported canonical atomic owner");
+      canonicalPredicates = std::move(*predicates);
+      if (!canonicalPredicates.empty() && !op.getResult().use_empty())
+        return rewriter.notifyMatchFailure(
+            op, "results of modular atomics require alias redistribution");
+    }
     auto sourceLoc = materializeSourceLocation(rewriter, loc);
     auto eventStateTy = getGSanAtomicEventStateType(rewriter);
     Value eventState = LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx),
@@ -688,7 +715,8 @@ public:
         continue;
       }
 
-      Value pred = threadPred;
+      Value pred =
+          !canonicalPredicates.empty() ? canonicalPredicates[i] : threadPred;
       Value casPtr = ptrElements[i];
       Value casCmp = cmpElements[i];
       Value casVal = valElements[i];

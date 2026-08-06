@@ -380,6 +380,14 @@ Value emitRedundantThreadPredicate(
     ConversionPatternRewriter &rewriter, Location loc,
     const TargetInfoBase &targetInfo);
 
+// For a modular tensor layout, return one predicate per register that selects
+// exactly one physical representative of each logical tensor element. The
+// predicates include redundantThreadPredicate. Returns an empty vector for
+// non-modular layouts and failure for unsupported modular layouts.
+FailureOr<SmallVector<Value>> emitCanonicalIndexPredicates(
+    Location loc, RewriterBase &rewriter, const TargetInfoBase &targetInfo,
+    RankedTensorType tensorTy, Value redundantThreadPredicate);
+
 // Takes two values that may be boolean, or null to represent constant True.
 Value maybeAnd(OpBuilder &builder, Location loc, Value a, Value b);
 
