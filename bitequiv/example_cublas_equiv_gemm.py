@@ -39,16 +39,25 @@ def example_fp16_plain():
 
 
 def example_fp16_split_k():
-    """fp16 GEMM on a skinny+deep shape -> cuBLAS runs split-K; our Triton split-K matches.
-    The split count comes from the cuBLAS heuristic; the reconstruction is verified once
-    and cached, so calling it again for the same shape is pure Triton."""
+    """fp16 GEMM on a skinny+deep shape -> cuBLAS runs split-K. Split-K is NOT statically
+    guaranteed for either dtype (about 1% of split-K shapes are not reproducible at any
+    partition, and nothing in the heuristic flags them), so it needs the runtime byte-compare.
+    The split count and the cut both come from the heuristic; the runtime step only gates that
+    residual, and the verified plan is cached, so later calls are pure Triton."""
     M, N, K = 64, 64, 32768
     a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
     b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
 
-    out = cublas_equivalent_gemm(a, b, enable_runtime_match=False)  # static (default): aligned fp16 split-K is exact
+    try:                                          # static mode (default): split-K declines
+        cublas_equivalent_gemm(a, b, enable_runtime_match=False)
+        print(f"fp16 split-K  {M}x{N}x{K}: statically reconstructed")
+    except CublasNeedRuntimeMatch:
+        print(f"fp16 split-K  {M}x{N}x{K}: needs a runtime match (static mode declined)")
+
+    out = cublas_equivalent_gemm(a, b, enable_runtime_match=True)
     ref = cublas_matmul(a, b)
-    print(f"fp16 split-K  {M}x{N}x{K}: bit-identical to cuBLAS = {_bit_equal(out, ref)}")
+    print(f"fp16 split-K  {M}x{N}x{K}: with enable_runtime_match=True -> "
+          f"bit-identical to cuBLAS = {_bit_equal(out, ref)}")
 
 
 def example_fp8_plain():
@@ -92,20 +101,22 @@ def example_cannot_match():
     """Shapes where the cuBLAS heuristic's algo has NO bit-identical Triton reconstruction,
     even with enable_runtime_match=True -> CublasUnsupportedShape (never a wrong result).
 
-    Two families cover essentially all of them:
+    Two families cover them:
       1. fp16 non-aligned (odd N or odd K): cuBLAS switches to a CUTLASS kernel that either
          uses an MMA with K=8 (`s1688`) or an odd-K reduction tail. Triton's `tl.dot` emits
-         K=16, so the base MMA groups/rounds the products differently -- unreproducible.
-      2. fp8 vertical / cluster split-K: cuBLAS reduces K across the cluster's CTAs in a
-         multi-level fp32 order; a tile-level two-pass split-K in Triton cannot emit that
-         order (differs by ~1 fp16 ulp in a few elements)."""
-    fp16_bad = [(64, 64, 257), (16, 65, 8192), (64, 129, 8192), (512, 513, 4096), (64, 64, 4097),
-                (128, 127, 16384), (33, 33, 15000)]
-    fp8_bad = [(16, 64, 65536), (16, 128, 65536), (32, 256, 65536), (32, 256, 131072), (32, 32, 16384)]
+         K=16, so the base MMA groups/rounds the products differently.
+      2. a split-K residual (~1.1% of aligned fp16 split-K, ~0.4% of fp8) where K is not a
+         whole number of k-tiles, so the last slice is a partial one: no K partition
+         reproduces these -- a wide sweep of thousands of alternative partitions per shape
+         found none. Strongly associated with K%64 != 0, but not decided by it, so it can
+         only be caught by the runtime byte-compare."""
+    fp16_nonaligned = [(64, 64, 257), (16, 65, 8192), (64, 129, 8192), (512, 513, 4096), (64, 64, 4097),
+                       (128, 127, 16384), (33, 33, 15000)]
+    fp16_partial_last_slice = [(96, 48, 175248), (64, 64, 116864), (64, 24, 116864), (64, 64, 219648)]
 
     print("cannot-match (heuristic gives an algo, but no Triton reconstruction is bit-identical):")
     print("  -- fp16 non-aligned -> CUTLASS s1688 (MMA K=8) / odd-K tail --")
-    for (M, N, K) in fp16_bad:
+    for (M, N, K) in fp16_nonaligned:
         a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
         b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
         try:
@@ -114,15 +125,15 @@ def example_cannot_match():
         except CublasUnsupportedShape:
             print(f"  fp16 {M}x{N}x{K}: UNSUPPORTED -> caller falls back to cuBLAS")
 
-    print("  -- fp8 vertical / cluster split-K -> cross-CTA K reduction --")
-    for (M, N, K) in fp8_bad:
-        a = (torch.randn(M, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
-        b = (torch.randn(N, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn).t()
+    print("  -- aligned fp16 split-K, partial last k-slice -> no partition reproduces it --")
+    for (M, N, K) in fp16_partial_last_slice:
+        a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
         try:
-            cublas_equivalent_scaled_mm(a, b, enable_runtime_match=True)
-            print(f"  fp8  {M}x{N}x{K}: reconstructed (unexpected)")
+            cublas_equivalent_gemm(a, b, enable_runtime_match=True)
+            print(f"  fp16 {M}x{N}x{K}: reconstructed (unexpected)")
         except CublasUnsupportedShape:
-            print(f"  fp8  {M}x{N}x{K}: UNSUPPORTED -> caller falls back to cuBLAS")
+            print(f"  fp16 {M}x{N}x{K}: UNSUPPORTED -> caller falls back to cuBLAS")
 
 
 def main():
