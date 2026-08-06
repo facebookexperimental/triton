@@ -28,7 +28,9 @@ from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     _validate_split_pipeline_depth as _validate_amd_mxfp_split_pipeline_depth,
     mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
-    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
+    matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule_kernel as _amd_tdm_single_warp_kernel,
+)
 from triton.language.extra.tlx.tutorials.amd_fa_cluster import (
     _validate_cluster_inputs as _validate_amd_fa_cluster_inputs,
     _validate_cluster_tiles as _validate_amd_fa_cluster_tiles,
@@ -4115,10 +4117,12 @@ def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
     )
     ttgir = compiled.asm["ttgir"]
     assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
     assert "amdg.tdm_prefetch" in ttgir
     assert "ttg.padded_shared" in ttgir, "expected propagated padded encoding"
     amdgcn = compiled.asm["amdgcn"]
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "tensor_store_from_lds" in amdgcn or "tensor.store.from.lds" in amdgcn
 
 
 def test_assume_uniform_compiles_gfx950(device):
@@ -4167,3 +4171,43 @@ def test_assume_uniform_rejects_narrow_type_gfx950(device):
             signature={"in_ptr": "*i8", "out_ptr": "*fp32"},
             constexprs={"BLOCK": 64},
         )
+
+
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_compiles_gfx1250(TRANSPOSE_B):
+    compiled = compile_for_gfx1250(
+        _amd_tdm_single_warp_kernel,
+        signature={
+            "a_ptr": "*fp16",
+            "b_ptr": "*fp16",
+            "c_ptr": "*bf16",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+        },
+        constexprs={
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "BLOCK_K": 128,
+            "NUM_BUFFERS": 2,
+            "TRANSPOSE_B": TRANSPOSE_B,
+            "L2_PREFETCH_DISTANCE": 2,
+        },
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
+    assert "tt.dot" in ttgir
+
+    amdgcn = compiled.asm["amdgcn"]
+    tensor_loads = amdgcn.count("tensor_load_to_lds") + amdgcn.count("tensor.load.to.lds")
+    tensor_stores = amdgcn.count("tensor_store_from_lds") + amdgcn.count("tensor.store.from.lds")
+    assert tensor_loads == 3
+    assert tensor_stores == 1

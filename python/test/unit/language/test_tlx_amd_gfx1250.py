@@ -10,6 +10,10 @@ from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     pack_scale as _amd_mxfp_pack_scale,
 )
 from triton.tools.mxfp import MXScaleTensor
+from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
+    matmul as _amd_tdm_matmul,
+    matmul_tdm_pipelined_single_warp_per_simd_schedule as _amd_tdm_single_warp_matmul,
+)
 
 
 @triton.jit
@@ -283,3 +287,27 @@ def test_mxgemm_tdm_split_correctness_gfx1250(device, tdm_fusion):
         },
     )
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_amd_tdm_gemm_pipelined_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a = torch.randn((128, 64), device=device, dtype=torch.float16)
+    b = torch.randn((64, 128), device=device, dtype=torch.float16)
+    actual = _amd_tdm_matmul(a, b)
+    expected = torch.matmul(a, b)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("TRANSPOSE_B", [False, True])
+def test_amd_tdm_gemm_single_warp_correctness_gfx1250(device, TRANSPOSE_B):
+    torch.manual_seed(0)
+    M = N = 256
+    K = 512
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float16)
+    b_input = b.T.contiguous() if TRANSPOSE_B else b
+    actual = _amd_tdm_single_warp_matmul(a, b_input, TRANSPOSE_B=TRANSPOSE_B)
+    expected = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
