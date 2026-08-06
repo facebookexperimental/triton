@@ -32,7 +32,6 @@ from bitequiv.cublas_equiv_gemm import (
     CublasUnsupportedPlatform,
     CublasUnsupportedShape,
     cublas_equivalent_gemm,
-    cublas_equivalent_scaled_mm,
     cublas_matmul,
 )
 
@@ -109,9 +108,17 @@ def dtype_kind(dtype):
     return "fp8" if dtype == "fp8" else ("bf16" if dtype == "bf16" else "fp16")
 
 
-def our_api(a, b, dtype, out_dtype, enable_rt):
+def fp8_scales(rng):
+    """A random (scale_a, scale_b) for fp8. Mostly awkward values on purpose: a power of two
+    is exact on both sides and so proves nothing about where the multiply happens."""
+    if rng.random() < 0.2:
+        return 1.0, 1.0
+    return 10**rng.uniform(-4, 2) * rng.choice([1.0, 1.3, 7.77]), 10**rng.uniform(-4, 2) * rng.choice([1.0, 0.3, 1.1])
+
+
+def our_api(a, b, dtype, out_dtype, enable_rt, scales=(1.0, 1.0)):
     if dtype == "fp8":
-        return cublas_equivalent_scaled_mm(a, b, 1.0, 1.0, out_dtype, enable_runtime_match=enable_rt)
+        return cublas_equivalent_gemm(a, b, out_dtype, scales[0], scales[1], enable_runtime_match=enable_rt)
     return cublas_equivalent_gemm(a, b, out_dtype, enable_runtime_match=enable_rt)
 
 
@@ -208,6 +215,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
             for r in range(R):
                 s = 100003 + st["drawn"] * 131 + r  # disjoint from the API's calibration seeds
                 imode = "order" if (r % 2 == 0) else "plain"
+                scales = fp8_scales(rng) if dtype == "fp8" else (1.0, 1.0)
                 try:
                     a, b = make_inputs(M, N, K, dtype, s, imode)
                 except Exception as e:
@@ -217,7 +225,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                     outcome = "error"
                     break
                 try:
-                    ref = cublas_matmul(a, b, out_dtype)
+                    ref = cublas_matmul(a, b, out_dtype, scales[0], scales[1])
                 except Exception as e:
                     if _is_oom(e):
                         raise
@@ -230,14 +238,14 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                 try:
                     if use_rt is None:  # first comparable input: let the API pick a tier
                         try:
-                            out = our_api(a, b, dtype, out_dtype, False)
+                            out = our_api(a, b, dtype, out_dtype, False, scales)
                             use_rt = False
                         except CublasNeedRuntimeMatch:
                             if not enable_rt:
                                 seen_needrt.add(key)
                                 outcome = "needrt"
                                 break  # static-only mode: count it, do not compare
-                            out = our_api(a, b, dtype, out_dtype, True)
+                            out = our_api(a, b, dtype, out_dtype, True, scales)
                             use_rt = True
                         # which tier actually resolved it is recorded in the plan cache
                         origin = _G.plan_origin(M, N, K, dtype_kind(dtype), out_dtype)
@@ -245,7 +253,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                         {"static": seen_static, "pseudo-static": seen_pseudo,
                          "runtime": seen_runtime}.get(origin, seen_runtime).add(key)
                     else:
-                        out = our_api(a, b, dtype, out_dtype, use_rt)
+                        out = our_api(a, b, dtype, out_dtype, use_rt, scales)
                 except CublasUnsupportedShape:
                     seen_unsup.add(key)
                     outcome = "unsupported"
@@ -255,7 +263,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                         raise
                     st["error"] += 1
                     outcome = "error"
-                    mm_file.write(json.dumps({"M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode,
+                    mm_file.write(json.dumps({"M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode, "scales": scales,
                                               "error": f"{type(e).__name__}: {str(e)[:120]}"}) + "\n")
                     mm_file.flush()
                     break
@@ -268,7 +276,7 @@ def run(timeout, report_every, R, dtypes, seed, enable_rt, mode, max_dim, max_mn
                     bit_ok = False
                     diff = (out.float() - ref.float()).abs()
                     mm_file.write(json.dumps({
-                        "M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode,
+                        "M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode, "scales": scales,
                         "class": outcome, "max_abs_diff": float(diff.max()),
                         "n_diff": int((diff > 0).sum()), "out_dtype": str(out_dtype)}) + "\n")
                     mm_file.flush()
