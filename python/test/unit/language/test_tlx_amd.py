@@ -28,15 +28,18 @@ from triton.backends.compiler import GPUTarget
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul_tdm_pipelined_kernel as _amd_tdm_gemm_kernel, )
 from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
-    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel, )
+    _validate_split_pipeline_depth as _validate_amd_mxfp_split_pipeline_depth,
+    matmul as _amd_mxfp_matmul,
+    mxgemm_tdm_pipelined_kernel as _amd_mxfp_gemm_kernel,
+    pack_scale as _amd_mxfp_pack_scale,
+)
 from triton.language.extra.tlx.tutorials.gfx9_gemm.intra_wave.a4w4.bench import (
     compile_shape as _compile_a4w4_shape,
     generate_mxfp4_inputs as _generate_a4w4_inputs,
     launch_matmul as _launch_a4w4,
     torch_reference as _a4w4_reference,
 )
-from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
-    matmul as _a4w4_inter_wave_matmul, )
+from triton.tools.mxfp import MXScaleTensor
 
 # Skip the entire module if no HIP runtime is available.
 pytestmark = pytest.mark.skipif(not is_hip(), reason="Requires HIP runtime")
@@ -2920,7 +2923,8 @@ def test_require_amd_wmma_layout_compiles_gfx1250():
     assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
 
 
-def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
+@pytest.mark.parametrize("TDM_FUSION", ["none", "2way", "4way", "partial"])
+def test_mxgemm_tdm_pipelined_compiles_gfx1250(TDM_FUSION):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(
         _amd_mxfp_gemm_kernel,
@@ -2951,14 +2955,147 @@ def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
             "GROUP_SIZE_M": 8,
             "TRANSPOSE_B": True,
             "NUM_BUFFERS": 2,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "baseline",
+            "TDM_FUSION": TDM_FUSION,
+            "L2_PREFETCH_DISTANCE": 2,
+            "TDM_SPLIT": False,
         },
     )
     ttgir = compiled.asm["ttgir"]
     amdgcn = compiled.asm["amdgcn"]
-    assert "amdg.async_tdm_copy_global_to_local" in ttgir
+    if TDM_FUSION == "none":
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    else:
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_copy_global_to_local" not in ttgir
+    if TDM_FUSION == "2way":
+        assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    elif TDM_FUSION == "4way":
+        assert "warp_used_hints = array<i32: 1, 2, 4, 8>" in ttgir
+    elif TDM_FUSION == "partial":
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    assert "amdg.tdm_prefetch" in ttgir
     assert "tt.dot_scaled" in ttgir
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
     assert "wmma" in amdgcn
+
+
+@pytest.mark.parametrize(
+    "block_mn,dtype_a,dtype_b,a_ptr_type,b_ptr_type,tdm_fusion",
+    [
+        pytest.param(128, "e4m3", "e4m3", "*fp8e4nv", "*fp8e4nv", "none", id="m16-scale-64x4"),
+        pytest.param(256, "e4m3", "e2m1", "*fp8e4nv", "*u8", "partial", id="m16-scale-128x4"),
+        pytest.param(256, "e2m1", "e2m1", "*u8", "*u8", "partial", id="m32-scale-128x4"),
+    ],
+)
+def test_mxgemm_tdm_split_compiles_gfx1250(block_mn, dtype_a, dtype_b, a_ptr_type, b_ptr_type, tdm_fusion):
+    src = ASTSource(
+        fn=_amd_mxfp_gemm_kernel,
+        signature={
+            "a_ptr": a_ptr_type,
+            "b_ptr": b_ptr_type,
+            "c_ptr": "*fp32",
+            "a_scale": "*i8",
+            "b_scale": "*i8",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i64",
+            "stride_ak": "i64",
+            "stride_bk": "i64",
+            "stride_bn": "i64",
+            "stride_cm": "i64",
+            "stride_cn": "i64",
+            "stride_scale": "i64",
+        },
+        constexprs={
+            "DTYPE_A": dtype_a,
+            "DTYPE_B": dtype_b,
+            "SCALE_BLOCK": 32,
+            "BLOCK_M": block_mn,
+            "BLOCK_N": block_mn,
+            "BLOCK_K": 256,
+            "GROUP_SIZE_M": 8,
+            "TRANSPOSE_B": True,
+            "NUM_BUFFERS": 3,
+            "SCALE_PRESHUFFLE": True,
+            "WITH_A_SCALE": True,
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": tdm_fusion,
+            "L2_PREFETCH_DISTANCE": -1,
+            "TDM_SPLIT": True,
+        },
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    ttgir = compiled.asm["ttgir"]
+    amdgcn = compiled.asm["amdgcn"]
+    if tdm_fusion == "partial":
+        assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+        assert "warp_used_hints = array<i32: 5, 10>" in ttgir
+    else:
+        assert "amdg.async_tdm_copy_global_to_local" in ttgir
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in ttgir
+    assert "amdg.async_tdm_copy_local_to_global" in ttgir
+    assert "tt.dot_scaled" in ttgir
+    assert "ttg.convert_layout" not in ttgir
+    assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
+    assert "wmma" in amdgcn
+
+
+def _mxfp_e8m0_to_float32(scale):
+    bits = scale.view(torch.uint8).to(torch.int32) << 23
+    return bits.view(torch.float32)
+
+
+def test_mxgemm_tdm_split_pipeline_depth_validation_gfx1250():
+    with pytest.raises(ValueError, match="NUM_BUFFERS must be at least 2"):
+        _validate_amd_mxfp_split_pipeline_depth(K=512, block_k=256, num_buffers=1)
+    with pytest.raises(ValueError, match="does not provide the 3 pipeline tiles required"):
+        _validate_amd_mxfp_split_pipeline_depth(K=512, block_k=256, num_buffers=3)
+    _validate_amd_mxfp_split_pipeline_depth(K=768, block_k=256, num_buffers=3)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("tdm_fusion", ["none", "partial"])
+def test_mxgemm_tdm_split_correctness_gfx1250(device, tdm_fusion):
+    torch.manual_seed(0)
+    M = N = 128
+    K = 1536
+    scale_block = 32
+    a = torch.randint(20, 40, (M, K), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    b = torch.randint(20, 40, (K, N), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    a_scale = MXScaleTensor(size=(M, triton.cdiv(K, scale_block))).random(high=32.0).data
+    b_scale = MXScaleTensor(size=(N, triton.cdiv(K, scale_block))).random(high=32.0).data
+
+    a_scale_f32 = _mxfp_e8m0_to_float32(a_scale).repeat_interleave(scale_block, dim=1)[:M, :K]
+    b_scale_f32 = _mxfp_e8m0_to_float32(b_scale).repeat_interleave(scale_block, dim=1).T.contiguous()[:K, :N]
+    expected = torch.matmul(a.to(torch.float32) * a_scale_f32, b.to(torch.float32) * b_scale_f32)
+
+    actual = _amd_mxfp_matmul(
+        a.contiguous().to(device),
+        b.T.contiguous().to(device),
+        _amd_mxfp_pack_scale(a_scale).to(device),
+        _amd_mxfp_pack_scale(b_scale).to(device),
+        config={
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 256,
+            "SCALE_BLOCK": 32,
+            "NUM_BUFFERS": 3,
+            "DTYPE_A": "e4m3",
+            "DTYPE_B": "e4m3",
+            "SCHEDULE": "sliceMNK",
+            "TDM_FUSION": tdm_fusion,
+            "TDM_SPLIT": True,
+            "TRANSPOSE_B": True,
+            "num_warps": 4,
+            "waves_per_eu": 1,
+        },
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=2e-2)
 
 
 def test_tlx_gfx9_gemm_bench_parses_shapes_and_defaults():
@@ -3204,25 +3341,31 @@ def test_a4w4_shape_stride_layouts_correctness_gfx950(device):
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_256tile_correctness_gfx950(device):
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
+        matmul as a4w4_inter_wave_matmul, )
+
     # 768x768x1536 -> 256-tile grid = 3*3 = 9 > NUM_CU/32, so the dispatcher takes
     # the 8-wave 256x256 inter-wave path (K=1536 -> loop runs >= 2 trips).
     m = n = 768
     k = 1536
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
-    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    actual = a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
 
 @pytest.mark.skipif(not is_hip_cdna4(), reason="Requires gfx950 hardware")
 def test_a4w4_inter_wave_skinny_correctness_gfx950(device):
+    from triton.language.extra.tlx.tutorials.gfx9_gemm.inter_wave.a4w4.matmul_kernel import (
+        matmul as a4w4_inter_wave_matmul, )
+
     # 512x256x1536 -> 256-tile grid = 2*1 = 2 <= NUM_CU/32, so the dispatcher takes
     # the occupancy-starved 128x128 + split-K TLX path (and its fp32 reduce).
     m = 512
     n = 256
     k = 1536
     a, b, a_scales, b_scales = _generate_a4w4_inputs(m, n, k)
-    actual = _a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
+    actual = a4w4_inter_wave_matmul(a, b, a_scales, b_scales)
     expected = _a4w4_reference(a, b, a_scales, b_scales)
     torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.0)
 
