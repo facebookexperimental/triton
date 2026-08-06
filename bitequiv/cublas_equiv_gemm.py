@@ -52,9 +52,14 @@ library (always present with a CUDA runtime).  Measured on GB200 / sm_100.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import dataclasses
 import glob
+import os
 import re
+import threading
+import warnings
 
 import torch
 import triton
@@ -72,10 +77,147 @@ class CublasUnsupportedShape(Exception):
     byte-compare (e.g. fp8 vertical/cluster split-K, fp16 non-aligned s1688 K=8 / odd-K)."""
 
 
+class CublasUnsupportedPlatform(CublasUnsupportedShape):
+    """No measured strategy for this GPU architecture.
+
+    Every reconstruction rule in this file is architecture-specific and was measured, not
+    derived, so it must not be extrapolated: the sm_103 rules did not carry over to sm_100 when
+    that move was tried. Subclasses `CublasUnsupportedShape` on purpose, so a caller that
+    already writes `except CublasUnsupportedShape: <fall back to cuBLAS>` keeps working
+    unchanged on a machine we have not measured."""
+
+
 class CublasNeedRuntimeMatch(Exception):
     """The shape cannot be reconstructed from the heuristic STATICALLY with confidence; a
     runtime byte-compare against cuBLAS is needed to confirm (or reject) it. Raised only in
     static mode (`enable_runtime_match=False`). Re-call with `enable_runtime_match=True`."""
+
+
+# --------------------------------------------------------------------------- #
+# Per-platform strategy
+#
+# PORTING GUIDE. Everything cuBLAS-specific in this file lives in an ArchProfile below, so
+# adding a GPU is filling in one dataclass -- no dispatch code changes. Nothing here may be
+# guessed from another architecture: when the sm_103 rules were carried over to sm_100 they
+# were wrong, and the same is expected in reverse. Each field says how to measure it.
+#
+# The gate is (compute capability, cuBLASLt version). The cuBLASLt library we call through
+# ctypes is what decides the kernels -- its name literally carries the arch, e.g.
+# `nvjet_sm100_...` -- so it, not the CUDA toolkit torch was built against, is what we pin.
+# --------------------------------------------------------------------------- #
+# What a profile that does not name its own versions -- every placeholder, until someone
+# measures it -- is assumed to hold for. The newest version the rules have been measured on.
+_DEFAULT_CUBLASLT = (13, 1)
+
+@dataclasses.dataclass(frozen=True)
+class ArchProfile:
+    """The measured cuBLAS behaviour of one GPU architecture.
+
+    `measured=False` means the entry is a placeholder: the dispatch knows the architecture
+    exists but has no rules for it, and the API raises `CublasUnsupportedPlatform`."""
+
+    name: str                        # human-readable, e.g. "sm_100 (NVIDIA GB200 / B200)"
+    measured: bool = False
+    # (major, minor) cuBLASLt versions these rules were measured against. A patch bump inside a
+    # listed (major, minor) is silent; any other version warns and runs anyway, because a version
+    # change *can* move which kernel a shape lands on but usually does not. A placeholder profile
+    # inherits `_DEFAULT_CUBLASLT` until whoever fills it in measures which versions it holds for.
+    cublaslt_versions: tuple = (_DEFAULT_CUBLASLT, )
+    measured_cublaslt: str = ""      # exact version, for the record
+
+    # -- alignment gate -------------------------------------------------------------------
+    # Which contiguous dims must be aligned for cuBLAS to stay on its own (nvjet) kernels.
+    # Measure: sweep shapes, profile the launched kernel name, find where it flips to CUTLASS.
+    align_elems: tuple = ()          # sm_100: (("fp16", 8), ("fp8", 16)) -- see `_aligned`
+
+    # -- nvjet split-K --------------------------------------------------------------------
+    # k-slice grain of cuBLAS's own split-K, per dtype. Measure: byte-compare
+    # `chunk = ceil(ceil(K/G)/SPLITK_NUM)*G` for candidate G against cuBLAS-direct.
+    nvjet_grain: tuple = ()          # sm_100: (("fp16", 64), ("fp8", 128))
+
+    # -- Triton-side constraint -----------------------------------------------------------
+    # Minimum BM below which Triton stops using the native fp8 tensor-core path. Measure: dump
+    # PTX over a (BM, BN, BK, num_warps) grid and look for the MMA instruction changing.
+    fp8_min_bm: int = 64
+
+    # -- CUTLASS fallback (only reached when the shape is not aligned) ---------------------
+    # Real k-elements per `tl.dot`, i.e. the MMA's K. Measure: read the `s<MMA>gemm` token.
+    k_per_dot_choices: tuple = ()    # sm_100: (16, 8)
+    # Threadblock k-tiles CUTLASS uses here; decides where the partial group sits. Measure:
+    # read the `<tbK>x<stages>` token from the launched name over many shapes.
+    ktile_choices: tuple = ()        # sm_100: (32, 64, 128)
+    # Default k-tile when the name omits that field (two-stage sm_75 instances do).
+    ktile_default: int = 32
+    # Partition grains to try for CUTLASS split-K. Measure: byte-compare, and cross-check
+    # against `kAlignK` in `cutlass/.../params_universal_base.h`.
+    splitk_grains: tuple = ()        # sm_100: (8, 64)
+    # CUBLASLT_REDUCTION_SCHEME -> our merge scheme. Measure: cross-tabulate attr 3 against the
+    # merge scheme that byte-matches. sm_100: NONE -> serial fp16, COMPUTE_TYPE -> fp32 forward
+    # sum, OUTPUT_TYPE -> fp16 partials.
+    reduction_to_cmode: tuple = ()   # sm_100: ((0, 3), (2, 0), (4, 2))
+
+
+_SM100 = ArchProfile(
+    name="sm_100 (NVIDIA GB200 / B200)",
+    measured=True,
+    cublaslt_versions=((13, 1), (12, 8)),
+    measured_cublaslt="13.1.1 and 12.8.5",
+    align_elems=(("fp16", 8), ("bf16", 8), ("fp8", 16)),
+    nvjet_grain=(("fp16", 64), ("bf16", 64), ("fp8", 128)),
+    fp8_min_bm=64,
+    k_per_dot_choices=(16, 8),
+    ktile_choices=(32, 64, 128),
+    ktile_default=32,
+    splitk_grains=(8, 64),
+    reduction_to_cmode=((0, 3), (2, 0), (4, 2)),
+)
+
+# Placeholders. Fill in the fields above on the machine in question and flip `measured=True`;
+# the dispatch, the kernels and the eval need no changes. Re-measure every field -- the values
+# in `_SM100` are not a starting point, they are a different architecture's answer.
+_SM103 = ArchProfile(name="sm_103 (NVIDIA GB300)")
+_SM90 = ArchProfile(name="sm_90 (NVIDIA H100)")
+
+_PROFILES = {(10, 0): _SM100, (10, 3): _SM103, (9, 0): _SM90}
+
+
+def _cublaslt_version():
+    """(major, minor, patch) of the cuBLASLt we actually call."""
+    return _lt_version_of(_load_lt())
+
+
+def _platform():
+    """The ArchProfile for the current device, or raise CublasUnsupportedPlatform."""
+    cap = torch.cuda.get_device_capability()
+    major, minor, patch = _cublaslt_version()
+    if (cap, major, minor) in _PLATFORM_CACHE:
+        return _PLATFORM_CACHE[(cap, major, minor)]
+    prof = _PROFILES.get(cap)
+    dev = torch.cuda.get_device_name()
+    if prof is None or not prof.measured:
+        known = ", ".join(p.name for p in _PROFILES.values() if p.measured)
+        raise CublasUnsupportedPlatform(
+            f"unsupported on sm_{cap[0]}{cap[1]} ({dev}): no cuBLAS-equivalence strategy has been "
+            f"measured for this GPU. Supported: {known}. The reconstruction rules are "
+            f"architecture-specific and must be re-measured, not extrapolated -- see ArchProfile.")
+    if (major, minor) not in prof.cublaslt_versions:
+        want = ", ".join(f"{a}.{b}.x" for a, b in prof.cublaslt_versions)
+        exact = f" (exactly {prof.measured_cublaslt})" if prof.measured_cublaslt else ""
+        # Warn, do not refuse. A cuBLASLt update can move which kernel a shape lands on, but in
+        # practice most shapes are unaffected, and every reconstruction is still either checked
+        # against cuBLAS (runtime tier) or read off the kernel cuBLAS actually launched
+        # (pseudo-static tier). Only the static tier trusts the rules blind. Warn once per
+        # architecture: the cache below is filled exactly once, so a fuzzer loop stays quiet.
+        warnings.warn(
+            f"cuBLASLt {major}.{minor}.{patch} on {prof.name} was not measured: the rules come from "
+            f"{want}{exact}. Results should still be bit-identical to cuBLAS, but a version bump can "
+            f"change which kernel a shape lands on. Re-measure and add {major}.{minor} to "
+            f"ArchProfile.cublaslt_versions to silence this.", RuntimeWarning, stacklevel=2)
+    _PLATFORM_CACHE[(cap, major, minor)] = prof
+    return prof
+
+
+_PLATFORM_CACHE: dict = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -292,7 +434,7 @@ def _tile(M: int, N: int, dtype=None) -> tuple[int, int]:
     BM = 16 if M <= 16 else 32 if M <= 32 else 64 if M <= 64 else 128
     BN = 16 if N <= 16 else 32 if N <= 32 else 64 if N <= 64 else 128
     if dtype == torch.float8_e4m3fn:
-        BM = max(BM, 64)
+        BM = max(BM, _platform().fp8_min_bm)
     return BM, BN
 
 
@@ -335,9 +477,10 @@ def _k_per_dot_candidates(K):
     and parity gets `k_per_dot` wrong for the WMMA kernels -- so try all six. Measured over
     1,806 non-aligned single-pass fp16 shapes at 32 seeds: exactly one of the six byte-matches
     every shape, with no exceptions, taking that family from 33.4% to 100%."""
+    prof = _platform()
     out, seen = [], set()
-    for k_per_dot in (16, 8):
-        for ktile in (32, 64, 128):
+    for k_per_dot in prof.k_per_dot_choices:
+        for ktile in prof.ktile_choices:
             cand = (k_per_dot, K % ktile)
             if cand not in seen:
                 seen.add(cand)
@@ -383,15 +526,16 @@ def _splitk_group_candidates(K, nsplit):
     Using them would cut the list from 36 candidates to 3. The k-tile is the one knob no
     heuristic field pins -- config groups identical in every readable field still differ in it --
     so a byte-compare is still needed, which is why these shapes are `runtime`, not `static`."""
+    prof = _platform()
     chunks = []
-    for g in (8, 64):
+    for g in prof.splitk_grains:
         chunk = _chunk_from_ns(K, nsplit, g)
         if g <= chunk <= K and chunk not in chunks:
             chunks.append(chunk)
     out = []
     for cmode in (3, 2, 0):        # serial-fp16 70%, fp16-partials 17%, fp32-forward 12%
-        for k_per_dot in (8, 16):  # 8 is 80%
-            for ktile in (32, 64, 128):  # 32 is 86%
+        for k_per_dot in reversed(prof.k_per_dot_choices):  # 8 is 80%
+            for ktile in prof.ktile_choices:  # 32 is 86%
                 for chunk in chunks:
                     out.append((chunk, k_per_dot, ktile, cmode))
     return out
@@ -428,10 +572,11 @@ _DESC_A_SCALE_PTR, _DESC_B_SCALE_PTR = 17, 18
 _PREF_MAX_WS = 1
 _LAYOUT_ORDER, _ORDER_ROW = 1, 1
 _CFG_ID, _CFG_SPLITK, _CFG_REDUCTION = 0, 2, 3
-# CUBLASLT_REDUCTION_SCHEME -> which split-K merge scheme the kernel uses. Measured against the
-# scheme that actually byte-matches: 119 non-aligned split-K shapes, no mixing.
-_REDUCTION_TO_CMODE = {0: 3, 2: 0, 4: 2}  # NONE -> serial fp16, COMPUTE_TYPE -> fp32, OUTPUT_TYPE -> fp16 partials
-_LT = None
+_LT_SPEC = None   # process-wide choice from set_cublaslt(); None = newest installed
+_TLS = threading.local()   # per-CALL overrides live here, never in a global -- see _using_cublaslt
+_UNSET = object()
+_LT_LIBS: dict = {}   # resolved path -> loaded library, so switching back and forth is free
+_LT_PATHS: dict = {}  # spec -> resolved path
 _ONES = None  # device fp32 [1.0] for fp8 scale pointers
 _WS = None    # device scratch for the reference execute
 
@@ -441,21 +586,97 @@ class _HeurResult(ctypes.Structure):
                 ("wavesCount", ctypes.c_float), ("reserved", ctypes.c_int * 4)]
 
 
-def _load_lt():
-    global _LT, _ONES, _WS
-    if _LT is not None:
-        return _LT
-    cands = (["/usr/local/cuda-13.0/lib64/libcublasLt.so.13"] + glob.glob("/usr/local/cuda*/lib64/libcublasLt.so*") +
-             glob.glob("/usr/local/cuda*/targets/*/lib/libcublasLt.so*") + ["libcublasLt.so.13", "libcublasLt.so"])
-    lib = None
+def set_cublaslt(spec=None):
+    """Choose which cuBLAS to be bit-identical to, for the rest of the process.
+
+    This is process-wide, as the name says. A single call overrides it with `cublaslt=`, and
+    that override is thread-local, so one thread cannot retarget a call in flight on another.
+
+    `spec` is a version prefix ("12.8", "13.1.1") or a full path to a libcublasLt; `None`
+    restores auto-detection, which takes the newest installed. Which cuBLAS is the target is
+    part of the claim and not an implementation detail -- a box can carry several, and torch's
+    bundled one is usually not the newest. A single call can override this with `cublaslt=`."""
+    global _LT_SPEC
+    _LT_SPEC = spec
+
+
+def _lt_spec():
+    """Which cuBLAS the call on THIS thread is targeting: its own override if it set one,
+    otherwise the process-wide choice."""
+    v = getattr(_TLS, "lt_spec", _UNSET)
+    return _LT_SPEC if v is _UNSET else v
+
+
+@contextlib.contextmanager
+def _using_cublaslt(spec):
+    """Select `spec` for one call. Held in thread-local state rather than a global: two threads
+    can be matching two different cuBLAS at the same time, and a global would let one of them
+    retarget the other mid-flight. Libraries are cached per path, so switching is cheap, and the
+    plan cache keys on the version, so a plan made against one is never reused for another."""
+    if spec is None:
+        yield
+        return
+    prev = getattr(_TLS, "lt_spec", _UNSET)
+    _TLS.lt_spec = spec
+    try:
+        yield
+    finally:
+        if prev is _UNSET:
+            del _TLS.lt_spec
+        else:
+            _TLS.lt_spec = prev
+
+
+def _lt_candidates():
+    """Installed libcublasLt paths, newest first. The version comes from the file name, so
+    picking one does not mean loading all of them."""
+    seen, out = set(), []
+    for p in (glob.glob("/usr/local/cuda*/lib64/libcublasLt.so*") +
+              glob.glob("/usr/local/cuda*/targets/*/lib/libcublasLt.so*")):
+        rp = os.path.realpath(p)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        m = re.search(r"\.so\.([\d.]+)$", rp)
+        out.append((tuple(int(x) for x in m.group(1).split(".")) if m else (), rp))
+    out.sort(reverse=True)
+    return [p for _, p in out] + ["libcublasLt.so"]
+
+
+def _lt_version_of(lib):
+    lib.cublasLtGetVersion.restype = ctypes.c_size_t
+    v = int(lib.cublasLtGetVersion())
+    return v // 10000, (v // 100) % 100, v % 100
+
+
+def _resolve_lt(spec):
+    """`spec` (path, version prefix, or None) -> the path to load."""
+    if spec in _LT_PATHS:
+        return _LT_PATHS[spec]
+    if spec and ("/" in spec or spec.endswith(".so")):
+        cands, want = [spec], None
+    else:
+        cands = _lt_candidates()
+        want = tuple(int(x) for x in spec.split(".")) if spec else None
     for c in cands:
         try:
             lib = ctypes.CDLL(c)
-            break
         except OSError:
             continue
-    if lib is None:
-        raise OSError("libcublasLt not found")
+        if want is not None and _lt_version_of(lib)[:len(want)] != want:
+            continue
+        _LT_PATHS[spec] = os.path.realpath(c)
+        return _LT_PATHS[spec]
+    raise OSError(f"no libcublasLt matching {spec!r}; tried {cands[:4]}")
+
+
+def _load_lt():
+    global _ONES, _WS
+    path = _resolve_lt(_lt_spec())
+    lib = _LT_LIBS.get(path)
+    if lib is not None:
+        return lib
+    lib = ctypes.CDLL(path)
     P, PP = ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
     ci, cu64, ci64, csz = ctypes.c_int, ctypes.c_uint64, ctypes.c_int64, ctypes.c_size_t
     lib.cublasLtCreate.argtypes = [PP]
@@ -473,9 +694,10 @@ def _load_lt():
     lib.cublasLtMatmulAlgoConfigGetAttribute.argtypes = [P, ci, P, csz, ctypes.POINTER(csz)]
     lib.cublasLtMatmul.restype = ci
     lib.cublasLtMatmul.argtypes = [P] * 14 + [csz, P]  # 14 ptrs, workspaceSize, stream
-    _ONES = torch.ones(1, dtype=torch.float32, device=DEVICE)
-    _WS = torch.empty(_WS_BYTES, dtype=torch.uint8, device=DEVICE)
-    _LT = lib
+    if _ONES is None:
+        _ONES = torch.ones(1, dtype=torch.float32, device=DEVICE)
+        _WS = torch.empty(_WS_BYTES, dtype=torch.uint8, device=DEVICE)
+    _LT_LIBS[path] = lib
     return lib
 
 
@@ -583,19 +805,23 @@ def _cublas_direct(a, b, kind, out_dtype, execute=True):
                 pass
 
 
-def cublas_matmul(a, b, out_dtype=None):
+def cublas_matmul(a, b, out_dtype=None, cublaslt=None):
     """cuBLAS's OWN output (run directly via cublasLtMatmul), the reference our
-    reconstruction must match. fp16/bf16: `b` is [K,N]. fp8: `b` is [K,N] column-major."""
+    reconstruction must match. fp16/bf16: `b` is [K,N]. fp8: `b` is [K,N] column-major.
+    `cublaslt` picks which cuBLAS, as in `cublas_equivalent_gemm`."""
     kind = _kind_of(a)
     out_dtype = out_dtype or (torch.float16 if kind == "fp8" else a.dtype)
-    return _cublas_direct(a, b, kind, out_dtype)[0]
+    with _using_cublaslt(cublaslt):
+        return _cublas_direct(a, b, kind, out_dtype)[0]
 
 
 # --------------------------------------------------------------------------- #
 # Reconstruction planning (verify-then-use) + per-shape cache
 # --------------------------------------------------------------------------- #
-# (M,N,K,kind,out_dtype) -> (origin, plan): origin "static"|"runtime"|"unsupported"; plan
-# ("plain",None) | ("split",chunk) | None. Decided once; a "runtime" plan is withheld in static mode.
+# (capability,cublaslt,M,N,K,kind,out_dtype) -> (origin, plan). The capability and the cuBLASLt
+# version keep a process that switched either one from reusing the old recipe. origin is
+# "static" | "pseudo-static" | "runtime" | "unsupported"; a "runtime" plan is withheld in
+# static mode.
 _PLAN: dict[tuple, tuple] = {}
 
 
@@ -613,10 +839,8 @@ def _chunk_from_ns(K, ns, G):
 
 
 def _grain(kind):
-    """k-slice granularity for the split-K partition: fp16/bf16 = 64, fp8 = 128
-    (measured; fp8 G=128 at the heuristic nsplit dominates G=64 for every kernel family,
-    including 2-CTA/horizontal/vertical -- the earlier "vertical->64" was a 3-seed artifact)."""
-    return 128 if kind == "fp8" else 64
+    """k-slice granularity of cuBLAS's own (nvjet) split-K, from the platform profile."""
+    return dict(_platform().nvjet_grain)[kind]
 
 
 def _static_chunk(K, nsplit, kind):
@@ -678,9 +902,8 @@ def _bits_eq(x, y):
 def _aligned(M, N, K, kind):
     """Contiguous-dim alignment cuBLAS needs to stay on its reconstructable nvjet path.
     fp16/bf16: K%8==0 and N%8==0 (M free). fp8: all dims %16."""
-    if kind == "fp8":
-        return M % 16 == 0 and N % 16 == 0 and K % 16 == 0
-    return K % 8 == 0 and N % 8 == 0
+    n = dict(_platform().align_elems)[kind]
+    return (M % n == 0 and N % n == 0 and K % n == 0) if kind == "fp8" else (K % n == 0 and N % n == 0)
 
 
 def _is_static_exact(kind, nsplit, aligned):
@@ -757,7 +980,7 @@ def _parse_launched(names):
     k_per_dot = 8 if m.group(1) == "1688" else 16  # s1688 is m16n8k8, the rest here are k16 MMAs
     # cutlass_<arch>_<op>_[<dt>_]s<MMA>gemm_<dt>_<tbMxtbN>[_<tbKxstages>]_<layout>_align<n>.
     # Two-stage sm_75 instances omit the k-tile field; those were measured to use 32 (1264/1264).
-    block_k = int(tiles[1].split("x")[0]) if len(tiles) >= 2 else 32
+    block_k = int(tiles[1].split("x")[0]) if len(tiles) >= 2 else _platform().ktile_default
     return {"family": "cutlass", "k_per_dot": k_per_dot, "block_k": block_k}
 
 
@@ -783,12 +1006,13 @@ def _plan_from_launched(a, b, kind, out_dtype, nsplit, reduction):
     k_per_dot, block_k = info["k_per_dot"], info["block_k"]
     if nsplit <= 1:
         return ("k_per_dot", (k_per_dot, K % block_k))
-    cmode = _REDUCTION_TO_CMODE.get(reduction)
+    cmode = dict(_platform().reduction_to_cmode).get(reduction)
     if cmode is None:  # e.g. an atomic (INPLACE) reduction, which is not deterministic for us
         return None
     # CUTLASS's split-K partition grain: `params_universal_base.h:52-59` takes kAlignK = 64 when
     # K divides evenly by it and falls back to 128 bits / 16 bits = 8 otherwise.
-    grain = 64 if K % 64 == 0 else 8
+    big, small = max(_platform().splitk_grains), min(_platform().splitk_grains)
+    grain = big if K % big == 0 else small
     chunk = _chunk_from_ns(K, nsplit, grain)
     return ("splitk_groups", (chunk, k_per_dot, block_k, cmode)) if grain <= chunk <= K else None
 
@@ -861,6 +1085,13 @@ def _calibrate(M, N, K, kind, out_dtype):
                                  f"{len(survivors)} candidates passed the first seed)")
 
 
+def plan_origin(M, N, K, kind, out_dtype=torch.float16):
+    """Which tier settled this shape: "static" | "pseudo-static" | "runtime" | "unsupported",
+    or "?" if it has not been resolved yet."""
+    return _PLAN.get((torch.cuda.get_device_capability(), _cublaslt_version(), M, N, K, kind, out_dtype),
+                     ("?", None))[0]
+
+
 def _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static=True):
     """Reconstruction plan for this shape, cached after the first call. Three tiers, tried in
     order, each stricter about what it costs and weaker about what it proves:
@@ -878,7 +1109,7 @@ def _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static=T
     """
     M, K = a.shape
     N = b.shape[1]
-    key = (M, N, K, kind, out_dtype)
+    key = (torch.cuda.get_device_capability(), _cublaslt_version(), M, N, K, kind, out_dtype)
     if key in _PLAN:
         origin, plan = _PLAN[key]  # "static" | "pseudo-static" | "runtime" | "unsupported"
         if origin == "unsupported":
@@ -915,34 +1146,46 @@ def _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static=T
 # Public API
 # --------------------------------------------------------------------------- #
 def cublas_equivalent_gemm(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype | None = None,
-                           enable_runtime_match: bool = False, enable_pseudo_static: bool = True) -> torch.Tensor:
+                           enable_runtime_match: bool = False, enable_pseudo_static: bool = True,
+                           cublaslt: str | None = None) -> torch.Tensor:
     """fp16/bf16 GEMM, bit-identical to cuBLAS. `a` is [M,K], `b` is [K,N].
 
     Static by default: the reconstruction is planned from the cuBLAS heuristic alone (no GEMM
     run). Aligned fp16/bf16 is static-exact. A shape that is not statically guaranteed
     (non-aligned) raises CublasNeedRuntimeMatch -- unless `enable_runtime_match=True`, which
     byte-compares candidates against cuBLAS and returns the match or raises
-    CublasUnsupportedShape."""
+    CublasUnsupportedShape.
+
+    `cublaslt` picks which cuBLAS to match for this call -- a version prefix ("12.8") or a
+    path -- overriding `set_cublaslt`. Default is the process-wide choice.
+    """
     kind = _kind_of(a)
     if kind == "fp8":
         raise ValueError("use cublas_equivalent_scaled_mm for fp8")
     out_dtype = out_dtype or a.dtype
-    plan = _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static)
-    return _reconstruct(a, b, out_dtype, plan)
+    with _using_cublaslt(cublaslt):
+        plan = _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static)
+        return _reconstruct(a, b, out_dtype, plan)
 
 
 def cublas_equivalent_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: float = 1.0, scale_b: float = 1.0,
                                 out_dtype: torch.dtype = torch.float16, enable_runtime_match: bool = False,
-                                enable_pseudo_static: bool = True) -> torch.Tensor:
+                                enable_pseudo_static: bool = True,
+                                cublaslt: str | None = None) -> torch.Tensor:
     """fp8 (e4m3) GEMM, bit-identical to cuBLAS. `a` is [M,K], `b` is [K,N] column-major
     (i.e. from `w.t()`); scales are scalars.
 
     fp8 plain is static-exact. fp8 split-K is NOT statically guaranteed (the vertical/cluster
     kernel is not bit-reproducible) -> raises CublasNeedRuntimeMatch unless
     `enable_runtime_match=True`, which byte-compares against cuBLAS and returns the match or
-    raises CublasUnsupportedShape (vertical split-K)."""
-    plan = _resolve(a, b, "fp8", out_dtype, enable_runtime_match, enable_pseudo_static)
-    return _reconstruct(a, b, out_dtype, plan, sa=scale_a, sb=scale_b)
+    raises CublasUnsupportedShape (vertical split-K).
+
+    `cublaslt` picks which cuBLAS to match for this call -- a version prefix ("12.8") or a
+    path -- overriding `set_cublaslt`. Default is the process-wide choice.
+    """
+    with _using_cublaslt(cublaslt):
+        plan = _resolve(a, b, "fp8", out_dtype, enable_runtime_match, enable_pseudo_static)
+        return _reconstruct(a, b, out_dtype, plan, sa=scale_a, sb=scale_b)
 
 
 # --------------------------------------------------------------------------- #
@@ -962,7 +1205,7 @@ def _check_one(kind, M, N, K):
             out = call(True)
     except CublasUnsupportedShape:
         return "unsupported", None
-    tier = _PLAN.get((M, N, K, kind, torch.float16), ("?", None))[0]
+    tier = plan_origin(M, N, K, kind)
     return tier, _bits_eq(out, ref)
 
 
