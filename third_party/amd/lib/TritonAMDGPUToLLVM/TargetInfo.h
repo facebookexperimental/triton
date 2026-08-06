@@ -159,6 +159,24 @@ public:
   getSharedLdStTiles(int32_t vecBitwidth) const override;
 
 private:
+  // Emit the wave64 DPP butterfly warp-reduce into `acc` (in place) using the
+  // given within-row row_shr step order (count-down 8,4,2,1 for the default
+  // reduction; count-up 1,2,4,8 for an ordered inner_tree reduction). `reduxOp`
+  // is the reduction's single combiner op.
+  void emitDppWarpReduce(RewriterBase &rewriter, Location loc,
+                         SmallVector<Value> &acc, Operation *reduxOp,
+                         ArrayRef<int> rowShrSteps) const;
+
+  // Warp-reduce for a reduction with a defined ("inner_tree") ordering,
+  // emitting the fixed count-up DPP tree so the result is bitwise-identical
+  // across num_warps. Returns false when the count-up DPP tree is not
+  // applicable (partial warp, non-wave64, unsupported arch, or
+  // non-single-combiner reduce) so the shared count-up shuffle tree runs
+  // instead.
+  bool warpReduceInnerTree(RewriterBase &rewriter, Location loc,
+                           SmallVector<Value> &acc, triton::ReduceOp op,
+                           unsigned numLaneToReduce) const;
+
   void printfImpl(Value formatStrStart, int formatStrByteCount, ValueRange args,
                   ArrayRef<bool> isSigned, RewriterBase &rewriter,
                   bool useStdErr) const;
