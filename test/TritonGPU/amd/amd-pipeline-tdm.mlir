@@ -225,6 +225,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.targ
 
 // -----
 
+// Fused TDM epilogue predication preserves each positioned descriptor's
+// member predicate instead of replacing it with the pipeline predicate.
+#fused_shared = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#fused_smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tt.func @fused_tdm_pipeline_predicate(
+  // CHECK-SAME: {{.*}}%[[MEMBER:arg[0-9]+]]: i32)
+  // CHECK: %[[NARROW:.*]] = arith.andi %[[MEMBER]], {{.*}} : i32
+  // CHECK: amdg.update_tensor_descriptor {{.*}} pred = %[[NARROW]]
+  // CHECK: amdg.async_tdm_fused_copy_global_to_local
+  tt.func @fused_tdm_pipeline_predicate(
+      %a_ptr: !tt.ptr<f16>, %b_ptr: !tt.ptr<f16>, %end: index,
+      %member_pred: i32) {
+    %c0 = arith.constant 0 : i32
+    %c0_index = arith.constant 0 : index
+    %c1_index = arith.constant 1 : index
+    %c64 = arith.constant 64 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c64_i64 = arith.constant 64 : i64
+    %desc0 = tt.make_tensor_descriptor %a_ptr, [%c64, %c64], [%c64_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #fused_shared>
+    %desc1 = tt.make_tensor_descriptor %b_ptr, [%c64, %c64], [%c64_i64, %c1_i64] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #fused_shared>
+    %dst0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #fused_shared, #fused_smem, mutable>
+    %dst1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #fused_shared, #fused_smem, mutable>
+    scf.for %iv = %c0_index to %end step %c1_index {
+      %iv_i32 = arith.index_cast %iv : index to i32
+      %positioned0 = amdg.update_tensor_descriptor %desc0 add_offsets = [%iv_i32, %c0] pred = %member_pred : !tt.tensordesc<64x64xf16, #fused_shared>
+      %positioned1 = amdg.update_tensor_descriptor %desc1 add_offsets = [%iv_i32, %c0] pred = %member_pred : !tt.tensordesc<64x64xf16, #fused_shared>
+      %token = amdg.async_tdm_fused_copy_global_to_local %positioned0, %positioned1 into %dst0, %dst1 {loop.cluster = 1 : i32, loop.stage = 0 : i32, warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #fused_shared>, !tt.tensordesc<64x64xf16, #fused_shared> -> !ttg.memdesc<64x64xf16, #fused_shared, #fused_smem, mutable>, !ttg.memdesc<64x64xf16, #fused_shared, #fused_smem, mutable>
+      %wait = amdg.async_tdm_wait %token {loop.cluster = 0 : i32, loop.stage = 1 : i32, num = 0 : i32}
+      scf.yield
+    } {tt.num_stages = 2 : i32, tt.scheduled_max_stage = 1 : i32}
+    tt.return
+  }
+}
+
+// -----
+
 // A/B descriptor loads are converted to TDM copies, but a descriptor load used
 // as the dot accumulator operand remains a raw tt.descriptor_load. Dynamic loop
 // predication must guard that raw load directly.

@@ -256,7 +256,13 @@ static bool hasConvertToMMATransisitiveUse(Operation *op, Attribute encoding) {
       bool isMMAV3 =
           isa<NvidiaMmaEncodingAttr>(encoding) &&
           cast<NvidiaMmaEncodingAttr>(encoding).getVersionMajor() == 3;
-      if (isMMAV3 && (isa<LocalAllocOp>(op) || isa<LocalStoreOp>(op)))
+      bool isAMDMMA = isa<AMDMfmaEncodingAttr, AMDWmmaEncodingAttr>(encoding);
+      // A terminal local store accepts any register layout. Keep AMD MMA
+      // producers anchored as well, avoiding a needless conversion before an
+      // elementwise epilogue and LDS store.
+      if ((isMMAV3 || isAMDMMA) && isa<LocalStoreOp>(op))
+        return true;
+      if (isMMAV3 && isa<LocalAllocOp>(op))
         return true;
       auto yield = dyn_cast<scf::YieldOp>(op);
       if (!yield)
@@ -897,8 +903,13 @@ void LayoutPropagation::rewriteOp(Operation *op) {
 bool canBeRemat(Operation *op) {
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
-  if (isa<triton::gpu::LocalLoadOp>(op))
-    return !isExpensiveLocalLoad(op);
+  if (auto localLoad = dyn_cast<triton::gpu::LocalLoadOp>(op)) {
+    // A single-use synchronous load is replaced, not duplicated, when its
+    // layout is rematerialized. Allow that even when the load is large; this
+    // is especially important for loop-carried dot-scaled scale tensors.
+    return (!localLoad.getToken() && localLoad.getResult().hasOneUse()) ||
+           !isExpensiveLocalLoad(op);
+  }
   if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op) ||
       op->getName().getStringRef() == "tti.dot_i8")
     return false;

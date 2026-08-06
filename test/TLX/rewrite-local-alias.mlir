@@ -20,14 +20,14 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
     %1 = ttg.local_alloc : () -> !ttg.memdesc<1x16x32xf16, #shared1, #smem, mutable>
 
     // CHECK-NOT: tlx.local_alias
-    // CHECK: ttg.memdesc_reinterpret %[[$LOCAL_ALLOC]] : !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #[[$SHARED1]], #smem, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[$LOCAL_ALLOC]] {tlx.allow_different_padding_pattern} : !ttg.memdesc<1x64x16xf16, #[[$SHARED]], #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #[[$SHARED1]], #smem, mutable>
     %2 = tlx.local_alias %0 : !ttg.memdesc<1x64x16xf16, #shared, #smem, mutable> -> !ttg.memdesc<1x32x32xf16, #shared1, #smem, mutable>
 
     // CHECK: %[[$TMEM_ALLOC:.*]] = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable>
     %result = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable>
 
     // CHECK-NOT: tlx.local_alias
-    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
+    // CHECK: ttg.memdesc_reinterpret %[[$TMEM_ALLOC]] {tlx.allow_different_padding_pattern} : !ttg.memdesc<1x64x32xf32, #[[$TMEM]], #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf16, #[[$TMEM]], #ttng.tensor_memory, mutable>
     %result_0 = tlx.local_alias %result : !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable> -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     %result_1 = ttng.tmem_alloc : () -> !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>
     ttg.warp_specialize(%0, %result_0, %1, %2, %result_1, %result)
@@ -60,6 +60,27 @@ module attributes {tlx.has_explicit_local_mem_access = true, tlx.has_tlx_ops = t
       ttng.tmem_store %7, %6, %true : tensor<64x32xf16, #blocked> -> !ttg.memdesc<64x32xf16, #tmem1, #ttng.tensor_memory, mutable>
       ttg.warp_return
     } : (!ttg.memdesc<1x64x16xf16, #shared, #smem, mutable>, !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x16x32xf16, #shared1, #smem, mutable>, !ttg.memdesc<1x32x32xf16, #shared1, #smem, mutable>, !ttg.memdesc<1x64x32xf32, #tmem, #ttng.tensor_memory, mutable>, !ttg.memdesc<1x64x32xf16, #tmem1, #ttng.tensor_memory, mutable>) -> ()
+    tt.return
+  }
+}
+
+// -----
+
+// local_alias is a raw-storage overlay, so it may use a different padded
+// addressing pattern as long as the destination footprint fits in the source.
+
+#padded_a = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [32, 128]}>
+#padded_c = #ttg.padded_shared<[32:+8] {order = [1, 0], shape = [32, 32]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @padded_shared_overlay
+  tt.func @padded_shared_overlay() {
+    // CHECK: %[[ALLOC:.*]] = ttg.local_alloc
+    %a = ttg.local_alloc : () -> !ttg.memdesc<2x32x128xf16, #padded_a, #smem, mutable>
+    // CHECK-NOT: tlx.local_alias
+    // CHECK: ttg.memdesc_reinterpret %[[ALLOC]] {tlx.allow_different_padding_pattern}
+    %c = tlx.local_alias %a : !ttg.memdesc<2x32x128xf16, #padded_a, #smem, mutable> -> !ttg.memdesc<1x32x32xbf16, #padded_c, #smem, mutable>
     tt.return
   }
 }

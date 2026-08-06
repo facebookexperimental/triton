@@ -256,13 +256,18 @@ class HIPBackend(BaseBackend):
         if not amd.supports_tdm(options.arch):
             passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)
-        passes.ttir.add_simplify_single_trip_while(pm)
+        # Keep gfx1250's hand-scheduled TDM loops in their source form. The
+        # legacy lowering consumes their carried values and schedule markers
+        # after async-wait accounting in make_llir.
+        if options.arch != "gfx1250":
+            passes.ttir.add_simplify_single_trip_while(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.ttir.add_triton_licm(pm)
-        passes.ttir.add_uplift_while_to_for(pm)
-        passes.common.add_canonicalizer(pm)
+        if options.arch != "gfx1250":
+            passes.ttir.add_uplift_while_to_for(pm)
+            passes.common.add_canonicalizer(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod, "make_ttir")
@@ -385,13 +390,12 @@ class HIPBackend(BaseBackend):
         tlx.tlx_passes.add_tlx_propagate_layout(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier with
-        # triton.warp_pipeline.border / .priority attrs) for the TLX / triton.jit
-        # path. The gluon path runs this in gluon_to_ttgir; make_llir runs the
-        # conversion. Placed at the TTGIR stage (so it does not double-run for gluon
-        # kernels) and as the last pass before pm.run so the cleanup passes above do
-        # not strip the priority markers before the pipeliner consumes them.
-        amd.passes.ttgpuir.add_warp_pipeline(pm)
+        # Consume tlx.warp_pipeline_stage border markers (rocdl.sched.barrier
+        # with triton.warp_pipeline.border / .priority attrs) for the TLX /
+        # triton.jit path. gfx1250 deliberately delays this until make_llir;
+        # other targets run it last here so cleanup cannot strip the markers.
+        if options.arch != "gfx1250":
+            amd.passes.ttgpuir.add_warp_pipeline(pm)
         if options.instrumentation_mode == "fpsan":
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
@@ -433,6 +437,10 @@ class HIPBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
+        # Preserve gfx1250's established ordering: wait accounting first, then
+        # consume explicit warp-pipeline markers immediately before conversion.
+        if options.arch == "gfx1250":
+            amd.passes.ttgpuir.add_warp_pipeline(pm)
         amd.passes.ttgpuir.add_warp_pipeline_conversion(pm, options.arch)
         passes.convert.add_scf_to_cf(pm)
         passes.gluon.add_inliner(pm)

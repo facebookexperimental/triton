@@ -25,6 +25,15 @@ namespace tlx {
 
 namespace {
 
+static ttg::MemDescReinterpretOp createAliasReinterpret(OpBuilder &builder,
+                                                        Location loc,
+                                                        ttg::MemDescType type,
+                                                        Value source) {
+  auto op = ttg::MemDescReinterpretOp::create(builder, loc, type, source);
+  op->setAttr("tlx.allow_different_padding_pattern", builder.getUnitAttr());
+  return op;
+}
+
 // Keep this calculation in sync with MemDescReinterpretOp::verify. The
 // physical allocation is described by the layout-ranked suffix; leading
 // dimensions represent repeated pipeline copies of that layout.
@@ -57,8 +66,7 @@ FailureOr<Value> emitAliasView(OpBuilder &builder, Operation *errorOp,
   int64_t dstBits = getMemDescStorageBits(dstTy);
 
   if (dstBits <= srcBits)
-    return ttg::MemDescReinterpretOp::create(builder, loc, dstTy, base)
-        .getResult();
+    return createAliasReinterpret(builder, loc, dstTy, base).getResult();
 
   return errorOp->emitError()
          << "TLXRewriteLocalAlias cannot view a " << srcBits

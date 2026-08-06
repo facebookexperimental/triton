@@ -24,6 +24,8 @@ from .mem_ops import (
     allocate_tensor_descriptor,
     amd_descriptor_prefetch_tensor,
     async_amd_descriptor_load,
+    async_amd_descriptor_load_fused,
+    async_amd_descriptor_load_group,
     async_amd_descriptor_store,
     async_amd_descriptor_wait,
     async_store,
@@ -62,8 +64,17 @@ from .mem_ops import (
     storage_alias_spec,
     subslice,
     tmem_copy,
+    update_tensor_descriptor,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, require_layout, tcgen05_commit
+from .mma_ops import (
+    async_dot,
+    async_dot_scaled,
+    async_dot_wait,
+    dot_scaled,
+    require_amd_wmma_layout,
+    require_layout,
+    tcgen05_commit,
+)
 from .types import (
     async_token,
     buffered_tensor,
@@ -167,7 +178,10 @@ __all__ = [
     "local_reinterpret",
     "local_reshape",
     "allocate_tensor_descriptor",
+    "update_tensor_descriptor",
     "async_amd_descriptor_load",
+    "async_amd_descriptor_load_fused",
+    "async_amd_descriptor_load_group",
     "async_amd_descriptor_store",
     "async_amd_descriptor_wait",
     "amd_descriptor_prefetch_tensor",
@@ -195,6 +209,8 @@ __all__ = [
     "named_barrier_arrive",
     "amd_sched_barrier",
     # mma_ops
+    "dot_scaled",
+    "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",

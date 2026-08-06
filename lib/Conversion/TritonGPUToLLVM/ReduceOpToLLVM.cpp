@@ -19,6 +19,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -46,14 +47,15 @@ public:
       return rewriteInnerTree(op, adaptor, rewriter);
 
     ReduceOpHelper helper(op);
+    bool useLegacyAMDWMMA = isLegacyAMDWMMA(helper);
     auto regLl =
         ReduceOpHelper::reducedRegLaneLayout(helper.getSrcTy(), op.getAxis());
     auto kAxis = *(regLl.getOutDimNames().begin() + op.getAxis());
-    if (regLl.getOutDimSize(kAxis) != 1) {
+    if (regLl.getOutDimSize(kAxis) != 1 && !useLegacyAMDWMMA) {
       return rewriteInnerTree(op, adaptor, rewriter);
     }
 
-    return rewriteDefault(op, adaptor, rewriter);
+    return rewriteDefault(op, adaptor, rewriter, useLegacyAMDWMMA);
   }
 
 private:
@@ -64,8 +66,15 @@ private:
     return attr && attr.getValue() == "inner_tree";
   }
 
+  bool isLegacyAMDWMMA(ReduceOpHelper &helper) const {
+    auto encoding = helper.getSrcTy().getEncoding();
+    auto wmma = dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(encoding);
+    return wmma && wmma.getVersion() == 3 && helper.isWarpSynchronous();
+  }
+
   LogicalResult rewriteDefault(triton::ReduceOp op, OpAdaptor adaptor,
-                               ConversionPatternRewriter &rewriter) const {
+                               ConversionPatternRewriter &rewriter,
+                               bool useLegacyAMDWMMA) const {
     ReduceOpHelper helper(op);
     Location loc = op->getLoc();
     auto accs = unpackInputsByOperand(loc, op, adaptor, rewriter);
@@ -85,11 +94,15 @@ private:
 
     std::tie(regLl, accs) =
         reduceWithinWarps(op, std::move(regLl), std::move(accs), rewriter);
+    if (useLegacyAMDWMMA)
+      std::tie(regLl, accs) = reduceWithinLanesLegacy(
+          op, std::move(regLl), std::move(accs), rewriter);
 
     // reducedRegLaneLayout is used in the AllocationAnalysis to get the size
     // of the scratch space.
-    assert(regLl ==
-           ReduceOpHelper::reducedRegLaneLayout(helper.getSrcTy(), axis));
+    if (!useLegacyAMDWMMA)
+      assert(regLl ==
+             ReduceOpHelper::reducedRegLaneLayout(helper.getSrcTy(), axis));
 
     // If we still need to reduce along warps / blocks:
     // Create temporary layout for reduction within warps.
@@ -765,6 +778,59 @@ private:
 
     layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, axis, kReg);
     layout = actionRemoveBroadcastedRegs(layout).apply(layout);
+    return {std::move(layout), std::move(accs)};
+  }
+
+  // Legacy unordered AMD WMMA reduction across lane bases. This is the
+  // no-scratch path used by gfx1250 before the generic map-based fallback was
+  // introduced; keep it for warp-synchronous WMMA v3 layouts.
+  std::pair<LinearLayout, SmallVector<SmallVector<Value>>>
+  reduceWithinLanesLegacy(triton::ReduceOp op, LinearLayout layout,
+                          SmallVector<SmallVector<Value>> accs,
+                          ConversionPatternRewriter &rewriter) const {
+    auto *ctx = op.getContext();
+    auto kLane = str_attr("lane");
+    const auto &laneBases = layout.getBases().lookup(kLane);
+    unsigned reduceLaneIdMask = 0;
+    for (unsigned bit = 0; bit < laneBases.size(); ++bit) {
+      if (laneBases[bit][op.getAxis()] != 0)
+        reduceLaneIdMask |= 1u << bit;
+    }
+    if (reduceLaneIdMask == 0)
+      return {std::move(layout), std::move(accs)};
+
+    unsigned firstBit = llvm::countr_zero(reduceLaneIdMask);
+    unsigned numBits = llvm::popcount(reduceLaneIdMask);
+    unsigned contiguousMask = ((1u << numBits) - 1) << firstBit;
+    bool isContiguous = reduceLaneIdMask == contiguousMask;
+
+    for (unsigned reg = 0; reg < accs.front().size(); ++reg) {
+      SmallVector<Value> acc(op.getNumOperands());
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        acc[i] = accs[i][reg];
+
+      if (isContiguous) {
+        warpReduce(rewriter, op.getLoc(), acc, op, 1u << numBits,
+                   1u << firstBit);
+      } else {
+        for (int bit = laneBases.size() - 1; bit >= 0; --bit) {
+          unsigned mask = 1u << bit;
+          if ((reduceLaneIdMask & mask) == 0)
+            continue;
+          SmallVector<Value> shuffled(op.getNumOperands());
+          for (unsigned i = 0; i < op.getNumOperands(); ++i)
+            shuffled[i] =
+                targetInfo.shuffleXor(rewriter, op.getLoc(), acc[i], mask);
+          accumulate(op.getLoc(), rewriter, op.getCombineOp(), acc, shuffled);
+        }
+      }
+
+      for (unsigned i = 0; i < op.getNumOperands(); ++i)
+        accs[i][reg] = acc[i];
+    }
+
+    layout = ReduceOpHelper::zeroBasesAlongDimAndReorder(layout, op.getAxis(),
+                                                         kLane);
     return {std::move(layout), std::move(accs)};
   }
 

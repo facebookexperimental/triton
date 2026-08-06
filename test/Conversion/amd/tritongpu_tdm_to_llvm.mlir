@@ -1,3 +1,4 @@
+// RUN: triton-opt %s --split-input-file | FileCheck %s --check-prefix=TTG
 // RUN: triton-opt %s --split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250 --convert-builtin-func-to-llvm | FileCheck %s
 
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
@@ -26,6 +27,117 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     // CHECK: llvm.call_intrinsic "llvm.amdgcn.s.wait.tensorcnt"
     %3 = amdg.async_tdm_intrinsic_wait  {count = 0 : i32}
     %4 = ttg.local_load %1 : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#shared_a = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#shared_b = #ttg.padded_shared<[64:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // TTG-LABEL: tdm_fused_load
+  // CHECK-LABEL: tdm_fused_load
+  tt.func public @tdm_fused_load(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c_shape = arith.constant 128 : i32
+    %c_stride0 = arith.constant 128 : i64
+    %c_stride1 = arith.constant 1 : i64
+    %c_offset = arith.constant 0 : i32
+    %c_pred = arith.constant 1 : i32
+    %desc_a = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared_a>
+    %desc_b = tt.make_tensor_descriptor %arg1, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared_b>
+    %load_a = amdg.update_tensor_descriptor %desc_a add_offsets = [%c_offset, %c_offset] pred = %c_pred {amdg.fused_tdm_explicit_offset, clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_a>
+    %load_b = amdg.update_tensor_descriptor %desc_b add_offsets = [%c_offset, %c_offset] pred = %c_pred {amdg.fused_tdm_explicit_offset, clamp_bounds} : !tt.tensordesc<64x64xf16, #shared_b>
+    %buf_a = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared_a, #smem, mutable>
+    %buf_b = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared_b, #smem, mutable>
+    // TTG: amdg.async_tdm_fused_copy_global_to_local
+    // TTG-SAME: cache = 7 : i32
+    // TTG-SAME: warp_used_hints = array<i32: 3, 12>
+    // The shared cache modifier is propagated to the single fused intrinsic.
+    // CHECK: %[[CACHE:.+]] = llvm.mlir.constant(27 : i32) : i32
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"({{.+}}, %[[CACHE]]) : (vector<4xi32>, vector<8xi32>, vector<4xi32>, vector<4xi32>, vector<8xi32>, i32) -> ()
+    // CHECK-NOT: "llvm.amdgcn.tensor.load.to.lds"
+    %tok = amdg.async_tdm_fused_copy_global_to_local %load_a, %load_b into %buf_a, %buf_b {cache = 7 : i32, warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared_a>, !tt.tensordesc<64x64xf16, #shared_b> -> !ttg.memdesc<64x64xf16, #shared_a, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared_b, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Unmarked descriptor positioning retains canonical signed-offset semantics.
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_fused_dynamic_position
+  tt.func public @tdm_fused_dynamic_position(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %offset: i32) attributes {noinline = false} {
+    %c_shape = arith.constant 128 : i32
+    %c_stride0 = arith.constant 128 : i64
+    %c_stride1 = arith.constant 1 : i64
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %desc0 = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
+    %desc1 = tt.make_tensor_descriptor %arg1, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
+    %positioned0 = amdg.update_tensor_descriptor %desc0 add_offsets = [%offset, %c0] pred = %c1 {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared>
+    %positioned1 = amdg.update_tensor_descriptor %desc1 add_offsets = [%offset, %c0] pred = %c1 {clamp_bounds} : !tt.tensordesc<64x64xf16, #shared>
+    %dst0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %dst1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // The address update sign-extends the dynamic offset before the fused op.
+    // CHECK: llvm.sext {{.*}} : i32 to i64
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %token = amdg.async_tdm_fused_copy_global_to_local %positioned0, %positioned1 into %dst0, %dst1 {warp_used_hints = array<i32: 1, 2>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+// Opaque descriptor operands bypass the internal explicit-offset bridge.
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_fused_opaque_descriptors
+  tt.func public @tdm_fused_opaque_descriptors(
+      %desc0: !tt.tensordesc<64x64xf16, #shared>,
+      %desc1: !tt.tensordesc<64x64xf16, #shared>,
+      %dst0: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>,
+      %dst1: !ttg.memdesc<64x64xf16, #shared, #smem, mutable>) attributes {noinline = false} {
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    // CHECK-NOT: "llvm.amdgcn.tensor.load.to.lds"
+    %token = amdg.async_tdm_fused_copy_global_to_local %desc0, %desc1 into %dst0, %dst1 {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [64, 64]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: tdm_fused_reuse_membar
+  tt.func public @tdm_fused_reuse_membar(%arg0: !tt.ptr<f16> {tt.divisibility = 16 : i32}) attributes {noinline = false} {
+    %c_shape = arith.constant 128 : i32
+    %c_stride0 = arith.constant 128 : i64
+    %c_stride1 = arith.constant 1 : i64
+    %c0 = arith.constant 0 : i32
+    %c64 = arith.constant 64 : i32
+    %c_pred = arith.constant 1 : i32
+    %desc = tt.make_tensor_descriptor %arg0, [%c_shape, %c_shape], [%c_stride0, %c_stride1] : !tt.ptr<f16>, !tt.tensordesc<64x64xf16, #shared>
+    %desc0 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] pred = %c_pred : !tt.tensordesc<64x64xf16, #shared>
+    %desc64 = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c64] pred = %c_pred : !tt.tensordesc<64x64xf16, #shared>
+    %buf0 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %buf1 = ttg.local_alloc : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %tok0 = amdg.async_tdm_fused_copy_global_to_local %desc0, %desc64 into %buf0, %buf1 {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %wait0 = amdg.async_tdm_wait %tok0 {num = 0 : i32}
+    %data = ttg.local_load %buf0 : !ttg.memdesc<64x64xf16, #shared, #smem, mutable> -> tensor<64x64xf16, #blocked>
+    // The wait-count pass runs later in the full pipeline; at this conversion
+    // stage the token wait remains, followed by the shared-memory reuse barrier.
+    // CHECK: amdg.async_tdm_wait
+    // CHECK: rocdl.s.barrier
+    // CHECK: "llvm.amdgcn.tensor.load.to.lds"
+    %tok1 = amdg.async_tdm_fused_copy_global_to_local %desc0, %desc64 into %buf0, %buf1 {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     tt.return
   }
 }
