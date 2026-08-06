@@ -104,6 +104,25 @@ void init_triton_tlx_ir(py::module &&m) {
               std::vector<int32_t> offsets,
               std::vector<int64_t> newShape) -> mlir::Value {
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
+             Attribute encoding = localAllocType.getEncoding();
+             Attribute concrete = encoding;
+             while (true) {
+               Attribute next =
+                   tlx::unwrapNoVerifyLayout(tlx::unwrapUserLayout(concrete));
+               if (next == concrete)
+                 break;
+               concrete = next;
+             }
+             if (concrete != encoding) {
+               auto concreteType = ttg::MemDescType::get(
+                   localAllocType.getShape(), localAllocType.getElementType(),
+                   concrete, localAllocType.getMemorySpace(),
+                   localAllocType.getMutableMemory(),
+                   localAllocType.getAllocShape());
+               localAlloc =
+                   self.create<tlx::RequireLayoutOp>(concreteType, localAlloc);
+               localAllocType = concreteType;
+             }
              auto localAllocShape = localAllocType.getShape();
              assert(localAllocShape.size() == offsets.size() &&
                     "shape mismatch");
@@ -938,7 +957,26 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_memdesc_reshape",
            [](TritonOpBuilder &self, Value &src,
               std::vector<int64_t> shape) -> mlir::Value {
-             return self.create<ttg::MemDescReshapeOp>(src, shape);
+             Value reshapeSrc = src;
+             auto srcType = cast<ttg::MemDescType>(src.getType());
+             Attribute encoding = srcType.getEncoding();
+             Attribute concrete = encoding;
+             while (true) {
+               Attribute next =
+                   tlx::unwrapNoVerifyLayout(tlx::unwrapUserLayout(concrete));
+               if (next == concrete)
+                 break;
+               concrete = next;
+             }
+             if (concrete != encoding) {
+               auto concreteType = ttg::MemDescType::get(
+                   srcType.getShape(), srcType.getElementType(), concrete,
+                   srcType.getMemorySpace(), srcType.getMutableMemory(),
+                   srcType.getAllocShape());
+               reshapeSrc =
+                   self.create<tlx::RequireLayoutOp>(concreteType, src);
+             }
+             return self.create<ttg::MemDescReshapeOp>(reshapeSrc, shape);
            })
       .def(
           "create_memdesc_reinterpret",
