@@ -161,29 +161,25 @@ jobs:
           cat "${SETUP_SCRIPT}"
 
       - name: Setup uploader dependencies
-        if: ${{ inputs.suite != 'release-testing' }}
         run: |
           set -eux
           . "${SETUP_SCRIPT}"
           uv pip install --group ci
 
-      # "release-testing" is a correctness gate rather than a benchmark: it
-      # dispatches the per-hardware pytest suites and emits junit XML instead of
-      # benchmark json. Both paths stage their results under BENCHMARK_OUTPUT so
-      # the artifact upload below is common; only the json consumers (Scribe,
+      # Every suite is driven by .ci/<suite>/run.sh <hardware> <conda-env> and
+      # stages its results under BENCHMARK_OUTPUT, so the artifact upload below
+      # is common. "release-testing" is a correctness gate rather than a
+      # benchmark: it runs the per-hardware pytest suites and emits junit XML
+      # instead of benchmark json, so only the json consumers (Scribe,
       # ClickHouse) stay benchmark-only.
       - name: Triton Testing (Side A)
         run: |
           set -eux
-          if [ "${{ inputs.suite }}" = "release-testing" ]; then
-            RELEASE_TESTING_OUTPUT="${BENCHMARK_OUTPUT}/release-testing" \
-              bash "${TRITON_SRC_DIR}/.ci/release-testing/run.sh" "${{ inputs.runner }}"
-          else
-            bash "${TRITON_SRC_DIR}/.ci/tritonbench/run.sh" "${{ inputs.suite }}" "${TRITON_SIDE_A_ENV}"
-          fi
+          RELEASE_TESTING_OUTPUT="${BENCHMARK_OUTPUT}/${{ inputs.suite }}" \
+            bash "${TRITON_SRC_DIR}/.ci/${{ inputs.suite }}/run.sh" "${{ inputs.runner }}" "${TRITON_SIDE_A_ENV}"
 
-      - name: Compile and test Triton (Side B)
-        if: ${{ inputs.suite != 'release-testing' && inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
+      - name: Compile Triton side B
+        if: ${{ inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
         run: |
           set -eux
           bash ${TRITONBENCH_ROOT}/.ci/triton/install.sh \
@@ -191,7 +187,14 @@ jobs:
             --side b \
             --install-dir "${GITHUB_WORKSPACE}/triton-side-b" \
             --no-checkout
-          bash "${TRITON_SRC_DIR}/.ci/tritonbench/run.sh" "${{ inputs.suite }}" "${TRITON_SIDE_B_ENV}"
+          echo 'TRITON_SIDE_B_ENV=triton-side-b' >> "${GITHUB_ENV}"
+
+      - name: Triton Testing (Side B)
+        if: ${{ inputs.test_type == 'abtest' && inputs.side_b_triton && inputs.side_b_commit }}
+        run: |
+          set -eux
+          RELEASE_TESTING_OUTPUT="${BENCHMARK_OUTPUT}/${{ inputs.suite }}-side-b" \
+            bash "${TRITON_SRC_DIR}/.ci/${{ inputs.suite }}/run.sh" "${{ inputs.runner }}" "${TRITON_SIDE_B_ENV}"
 
       - name: Upload result to GH Actions Artifact
         uses: actions/upload-artifact@v4
