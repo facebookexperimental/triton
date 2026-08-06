@@ -186,3 +186,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %result#0 : tensor<128x128xf32, #mma_a>
   }
 }
+
+// -----
+
+// A terminal local_store is layout-flexible, so keep an AMD MMA producer in
+// its native layout through an elementwise epilogue instead of round-tripping
+// through shared memory for a convert_layout.
+
+// CHECK-LABEL: @keep_amd_mma_for_local_store
+// CHECK: %[[DOT:.*]] = tt.dot
+// CHECK-NOT: ttg.convert_layout
+// CHECK: %[[TRUNC:.*]] = arith.truncf %[[DOT]] : tensor<128x128xf32, #[[$MMA:.*]]> to tensor<128x128xf16, #[[$MMA]]>
+// CHECK-NEXT: ttg.local_store %[[TRUNC]], {{.*}} : tensor<128x128xf16, #[[$MMA]]>
+
+#blocked_out = #ttg.blocked<{sizePerThread = [4, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1], order = [1, 0]}>
+#mma_out = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#dot_lhs = #ttg.dot_op<{opIdx = 0, parent = #mma_out, kWidth = 8}>
+#dot_rhs = #ttg.dot_op<{opIdx = 1, parent = #mma_out, kWidth = 8}>
+#shared_out = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 128]}>
+#smem_out = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @keep_amd_mma_for_local_store(
+      %a: tensor<128x32xf16, #dot_lhs>,
+      %b: tensor<32x128xf16, #dot_rhs>,
+      %acc: tensor<128x128xf32, #mma_out>,
+      %dst: !ttg.memdesc<128x128xf16, #shared_out, #smem_out, mutable>) {
+    %dot = tt.dot %a, %b, %acc : tensor<128x32xf16, #dot_lhs> * tensor<32x128xf16, #dot_rhs> -> tensor<128x128xf32, #mma_out>
+    %converted = ttg.convert_layout %dot : tensor<128x128xf32, #mma_out> -> tensor<128x128xf32, #blocked_out>
+    %truncated = arith.truncf %converted : tensor<128x128xf32, #blocked_out> to tensor<128x128xf16, #blocked_out>
+    ttg.local_store %truncated, %dst : tensor<128x128xf16, #blocked_out> -> !ttg.memdesc<128x128xf16, #shared_out, #smem_out, mutable>
+    tt.return
+  }
+}
