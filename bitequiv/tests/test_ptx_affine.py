@@ -1,7 +1,8 @@
 """Hermetic unit tests for the conservative PTX affine evaluator (no GPU)."""
 from pyptx.parser import parse
 
-from bitequiv.ptx.affine import Affine, AffineEval, Opaque, canon, reqntid_of
+from bitequiv.core.affine_algebra import Affine, Opaque, canon
+from bitequiv.ptx.affine import AffineEval, reqntid_of
 from bitequiv.ptx.linker import DefUse
 from bitequiv.ptx_reduction import ptx_header
 

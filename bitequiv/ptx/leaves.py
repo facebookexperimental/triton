@@ -9,7 +9,7 @@ different ``sizePerThread`` / ``num_warps`` / transpose produces a different one
 the PTX counterpart of TTGIR's ``sublayout({register,lane,warp,block},{dim<axis>})``.
 """
 
-from bitequiv.ptx.affine import Affine, canon
+from bitequiv.core.affine_algebra import Affine, canon
 
 # Byte widths for the load-result types we may see on a reduction's leaf loads.
 _WIDTH = {

@@ -19,7 +19,7 @@ it provably cannot change the bits; an unsafe one would let the checker wrongly 
 
 Each node exposes ``children`` (sub-nodes) and ``sig_local(child_sigs)`` (this node's
 canonical string given its children's strings). ``sig()`` composes them recursively for
-convenience; deep trees are serialized iteratively in :func:`bitequiv.ptx.builder.tree_sig`
+convenience; deep trees are serialized iteratively in :func:`bitequiv.core.canonicalize.tree_sig`
 to avoid Python's recursion limit on long within-thread folds.
 """
 
@@ -46,7 +46,7 @@ class Leaf:
     coord: str  # canonical element-coordinate string (see bitequiv.ptx.leaves)
     # Layout-invariant element-index image (frozenset[int]) of this load across the thread
     # grid, or None if not recoverable. Excluded from identity/sig; used only by the
-    # balanced-reduction collapse pass (bitequiv.ptx.builder.collapse_balanced).
+    # balanced-reduction collapse pass (bitequiv.core.canonicalize.collapse_balanced).
     cols: object = field(default=None, compare=False, repr=False)
     children = ()
 
@@ -194,7 +194,7 @@ class SmemExchange:
 
     An exchange RELOCATES one value from one thread to another — an ``ld.shared`` reads a single slot,
     so its fan-in is exactly one and it combines nothing. That is why it carries no reduction height
-    (see :func:`bitequiv.ptx.builder._balance_pass`)."""
+    (see :func:`bitequiv.core.canonicalize._balance_pass`)."""
 
     child: object
 
@@ -216,7 +216,7 @@ class Mma:
     ``token`` (K + operand/acc dtypes + kind, from :mod:`bitequiv.ptx.mma`) + ``flags`` (scale /
     accumulate immediates) + its register-operand ``children`` (so a reduction OVER mma outputs
     composes in the same DAG). NOT a layout-invariant per-element value: a reduction covering an Mma
-    must not collapse it as a uniform leaf (see :func:`bitequiv.ptx.builder._leaf_layout_invariant`)."""
+    must not collapse it as a uniform leaf (see :func:`bitequiv.core.canonicalize._leaf_layout_invariant`)."""
 
     token: str
     flags: tuple = ()
