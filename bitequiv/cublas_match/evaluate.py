@@ -15,8 +15,8 @@ IMPORTANT: the fuzz inputs use seeds disjoint from the ones the API calibrates o
 so this tests inputs the reconstruction was NOT tuned for.
 
 Run:
-  python -m bitequiv.eval_cublas_equiv_gemm --timeout 300
-  python -m bitequiv.eval_cublas_equiv_gemm --timeout 3600 --dtypes fp16,fp8 --R 5
+  python -m bitequiv.cublas_match.evaluate --timeout 300
+  python -m bitequiv.cublas_match.evaluate --timeout 3600 --dtypes fp16,fp8 --R 5
 """
 import argparse
 import json
@@ -26,13 +26,15 @@ import time
 
 import torch
 
-from bitequiv import cublas_equiv_gemm as _G
-from bitequiv.cublas_equiv_gemm import (
+from bitequiv import cublas_match as _G
+from bitequiv.cublas_match import (
     CublasUnsupportedPlatform,
     CublasUnsupportedShape,
     cublas_equivalent_gemm,
     cublas_matmul,
 )
+from bitequiv.cublas_match.arch import platform as _platform
+from bitequiv.cublas_match.ltapi import _load_lt
 
 DEVICE = "cuda"
 _F8 = torch.float8_e4m3fn
@@ -140,16 +142,17 @@ def load_done(path):
     return done
 
 
-def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp8_round16, max_bytes,
-        shape_log):
+def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp8_round16, max_bytes, shape_log):
     rng = random.Random(seed)
     mm_path = f"/tmp/cublas_equiv_mismatches_{os.getpid()}.jsonl"
     mm_file = open(mm_path, "a")
     done = load_done(shape_log)
     sf = open(shape_log, "a") if shape_log else None
 
-    st = {"drawn": 0, "cmp": 0, "match": 0, "mismatch": 0, "no_ref": 0, "nonfinite": 0, "error": 0,
-          "too_big": 0, "oom": 0, "dup": 0}
+    st = {
+        "drawn": 0, "cmp": 0, "match": 0, "mismatch": 0, "no_ref": 0, "nonfinite": 0, "error": 0, "too_big": 0, "oom":
+        0, "dup": 0
+    }
     # distinct shapes by outcome: reconstructed from the heuristic, or declined because its
     # config falls outside the measured tables
     seen_static, seen_unsup = set(), set()
@@ -157,12 +160,12 @@ def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp
     last = t0
 
     try:
-        prof = _G._platform()
+        prof = _platform()
     except CublasUnsupportedPlatform as e:
         print(f"cannot run here: {e}")
         return
     print(f"device: {torch.cuda.get_device_name()} | platform: {prof.name} | cuBLASLt "
-          f"{'.'.join(map(str, _G._cublaslt_version()))} from {_G._load_lt()._name} | dtypes={dtypes} R={R} "
+          f"{'.'.join(map(str, _G.cublaslt_version()))} from {_load_lt()._name} | dtypes={dtypes} R={R} "
           f"timeout={timeout}s")
     if mode == "extreme":
         print(f"EXTREME shapes: M,N ~ uniform[1,{max_mn}], K ~ uniform[1,{max_k}] -- the skinny+deep "
@@ -182,18 +185,20 @@ def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp
         recon = len(seen_static)
         classified = recon + len(seen_unsup)
         cov = (100.0 * recon / classified) if classified else 0.0
-        print(f"[{tag} {el:6.0f}s] drawn={st['drawn']} classified={classified} "
-              f"RECONSTRUCTABLE={cov:5.1f}% ({recon}/{classified}) | "
-              f"static={len(seen_static)} "
-              f"unsup={len(seen_unsup)} | bit-consistent={rate:6.2f}% ({st['match']}/{scmp}) "
-              f"mismatch={st['mismatch']} | no_ref={st['no_ref']} too_big={st['too_big']} "
-              f"oom={st['oom']} nonfinite={st['nonfinite']} err={st['error']}", flush=True)
+        print(
+            f"[{tag} {el:6.0f}s] drawn={st['drawn']} classified={classified} "
+            f"RECONSTRUCTABLE={cov:5.1f}% ({recon}/{classified}) | "
+            f"static={len(seen_static)} "
+            f"unsup={len(seen_unsup)} | bit-consistent={rate:6.2f}% ({st['match']}/{scmp}) "
+            f"mismatch={st['mismatch']} | no_ref={st['no_ref']} too_big={st['too_big']} "
+            f"oom={st['oom']} nonfinite={st['nonfinite']} err={st['error']}", flush=True)
 
     def log_shape(M, N, K, dtype, outcome, bit_ok, nsplit=None):
         if sf is None:
             return
-        sf.write(json.dumps({"M": M, "N": N, "K": K, "dtype": dtype, "outcome": outcome,
-                             "bit_ok": bit_ok, "nsplit": nsplit}) + "\n")
+        sf.write(
+            json.dumps({"M": M, "N": N, "K": K, "dtype": dtype, "outcome": outcome, "bit_ok": bit_ok, "nsplit": nsplit})
+            + "\n")
         sf.flush()
         os.fsync(sf.fileno())
 
@@ -250,8 +255,11 @@ def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp
                         raise
                     st["error"] += 1
                     outcome = "error"
-                    mm_file.write(json.dumps({"M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode, "scales": scales,
-                                              "error": f"{type(e).__name__}: {str(e)[:120]}"}) + "\n")
+                    mm_file.write(
+                        json.dumps({
+                            "M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode, "scales": scales, "error":
+                            f"{type(e).__name__}: {str(e)[:120]}"
+                        }) + "\n")
                     mm_file.flush()
                     break
                 st["cmp"] += 1
@@ -262,10 +270,12 @@ def run(timeout, report_every, R, dtypes, seed, mode, max_dim, max_mn, max_k, fp
                     st["mismatch"] += 1
                     bit_ok = False
                     diff = (out.float() - ref.float()).abs()
-                    mm_file.write(json.dumps({
-                        "M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode, "scales": scales,
-                        "class": outcome, "max_abs_diff": float(diff.max()),
-                        "n_diff": int((diff > 0).sum()), "out_dtype": str(out_dtype)}) + "\n")
+                    mm_file.write(
+                        json.dumps({
+                            "M": M, "N": N, "K": K, "dtype": dtype, "seed": s, "mode": imode, "scales": scales, "class":
+                            outcome, "max_abs_diff": float(diff.max()), "n_diff": int(
+                                (diff > 0).sum()), "out_dtype": str(out_dtype)
+                        }) + "\n")
                     mm_file.flush()
         except Exception as e:  # OOM anywhere in the shape: drop it and keep the sweep alive
             if not _is_oom(e):
@@ -306,33 +316,38 @@ def main():
     ap.add_argument("--R", type=int, default=5, help="random input tensors per shape")
     ap.add_argument("--dtypes", type=str, default="fp16,fp8", help="comma list: fp16,fp8,bf16")
     ap.add_argument("--seed", type=int, default=0, help="shape RNG seed (reproducible)")
-    ap.add_argument("--shape-mode", choices=("random", "extreme"), default="random",
-                    help="random: M,N,K independent uniform draws. extreme: M,N small and K large, the "
-                         "skinny+deep corner where cuBLAS uses split-K and its gemv fallbacks")
-    ap.add_argument("--max-dim", type=int, default=32768,
-                    help="bound on M and N in random mode (and on K, unless --max-k is given). 32768 "
-                         "reaches the sizes real LLM GEMMs use -- token counts, hidden 4096-18432, most "
-                         "FFN sizes -- and is about as high as is useful: the cost of a shape grows like "
-                         "dim^2.7, so 60s of fp16 draws yields 899 shapes at 16384, 141 at 32768 and 15 "
-                         "at 65536. Bounds memory and run time only -- there is no rounding or alignment "
-                         "restriction on the shape")
+    ap.add_argument(
+        "--shape-mode", choices=("random", "extreme"), default="random",
+        help="random: M,N,K independent uniform draws. extreme: M,N small and K large, the "
+        "skinny+deep corner where cuBLAS uses split-K and its gemv fallbacks")
+    ap.add_argument(
+        "--max-dim", type=int, default=32768,
+        help="bound on M and N in random mode (and on K, unless --max-k is given). 32768 "
+        "reaches the sizes real LLM GEMMs use -- token counts, hidden 4096-18432, most "
+        "FFN sizes -- and is about as high as is useful: the cost of a shape grows like "
+        "dim^2.7, so 60s of fp16 draws yields 899 shapes at 16384, 141 at 32768 and 15 "
+        "at 65536. Bounds memory and run time only -- there is no rounding or alignment "
+        "restriction on the shape")
     ap.add_argument("--max-mn", type=int, default=256, help="bound on M and N in extreme mode")
     ap.add_argument("--max-k", type=int, default=0,
                     help="bound on K; 0 means max-dim in random mode and 400000 in extreme mode")
-    ap.add_argument("--no-fp8-round16", action="store_true",
-                    help="do NOT round fp8 draws to multiples of 16. cuBLAS refuses fp8 otherwise, so "
-                         "nearly every draw becomes no_ref; useful only to measure that rate")
-    ap.add_argument("--max-gib", type=float, default=8.0,
-                    help="skip a shape whose operands+output exceed this many GiB (resource skip). 8.0 "
-                         "clears the largest shape --max-dim 32768 can draw (6.0 GiB of fp16 operands), so "
-                         "nothing is skipped at the default ceiling; raise it with --max-dim. The inputs "
-                         "are built in fp32 and then cast, so device peak is about 3x this")
+    ap.add_argument(
+        "--no-fp8-round16", action="store_true",
+        help="do NOT round fp8 draws to multiples of 16. cuBLAS refuses fp8 otherwise, so "
+        "nearly every draw becomes no_ref; useful only to measure that rate")
+    ap.add_argument(
+        "--max-gib", type=float, default=8.0,
+        help="skip a shape whose operands+output exceed this many GiB (resource skip). 8.0 "
+        "clears the largest shape --max-dim 32768 can draw (6.0 GiB of fp16 operands), so "
+        "nothing is skipped at the default ceiling; raise it with --max-dim. The inputs "
+        "are built in fp32 and then cast, so device peak is about 3x this")
     ap.add_argument("--cublaslt", type=str, default="",
                     help="path to the libcublasLt to match (default: auto-detect the newest installed)")
-    ap.add_argument("--workspace-bytes", type=int, default=-1,
-                    help="workspace allowance to give cuBLAS, in bytes; cuBLAS reads it when it "
-                         "picks an algorithm, so it is part of what we match (default: the "
-                         "module default, 32 MiB)")
+    ap.add_argument(
+        "--workspace-bytes", type=int, default=-1,
+        help="workspace allowance to give cuBLAS, in bytes; cuBLAS reads it when it "
+        "picks an algorithm, so it is part of what we match (default: the "
+        "module default, 32 MiB)")
     ap.add_argument("--shape-log", type=str, default="",
                     help="append one jsonl row per distinct shape here; also used to resume")
     args = ap.parse_args()
@@ -343,10 +358,10 @@ def main():
     max_k = args.max_k or (400000 if args.shape_mode == "extreme" else args.max_dim)
     if args.cublaslt:
         _G.set_cublaslt(args.cublaslt)
-    if args.workspace_bytes >= 0:   # 0 is a real allowance: it forbids split-K entirely
+    if args.workspace_bytes >= 0:  # 0 is a real allowance: it forbids split-K entirely
         _G.set_workspace_bytes(args.workspace_bytes)
-    run(args.timeout, args.report_every, args.R, dtypes, args.seed, args.shape_mode,
-        args.max_dim, args.max_mn, max_k, not args.no_fp8_round16, int(args.max_gib * 2**30), args.shape_log)
+    run(args.timeout, args.report_every, args.R, dtypes, args.seed, args.shape_mode, args.max_dim, args.max_mn, max_k,
+        not args.no_fp8_round16, int(args.max_gib * 2**30), args.shape_log)
 
 
 if __name__ == "__main__":

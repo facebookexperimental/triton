@@ -1,6 +1,6 @@
 """Example: how to use the cuBLAS-equivalent Triton GEMM API.
 
-Run:  python -m bitequiv.example_cublas_equiv_gemm
+Run:  python -m bitequiv.cublas_match.example
 
 Shows the fp16 and fp8 entry points, that the result is bit-identical to cuBLAS,
 and how to handle a shape that has no Triton reconstruction.
@@ -11,7 +11,7 @@ and no bytes are compared. A shape the heuristic does not describe raises
 """
 import torch
 
-from bitequiv.cublas_equiv_gemm import (
+from bitequiv.cublas_match import (
     CublasUnsupportedShape,
     cublas_equivalent_gemm,
     cublas_matmul,
@@ -32,7 +32,7 @@ def example_fp16_plain():
     b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
 
     out = cublas_equivalent_gemm(a, b)  # static (default): heuristic only, no GEMM run
-    ref = cublas_matmul(a, b)                                       # cuBLAS's own output (the reference)
+    ref = cublas_matmul(a, b)  # cuBLAS's own output (the reference)
     print(f"fp16 plain    {M}x{N}x{K}: bit-identical to cuBLAS = {_bit_equal(out, ref)}")
 
 
@@ -54,7 +54,7 @@ def example_fp8_plain():
     `w.t()`); scales are scalars, output defaults to fp16. fp8 plain is static-exact."""
     M, N, K = 8192, 8192, 8192
     a = (torch.randn(M, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn)
-    b = (torch.randn(N, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn).t()   # [K,N] column-major
+    b = (torch.randn(N, K, device=DEVICE) * 0.2).to(torch.float8_e4m3fn).t()  # [K,N] column-major
 
     out = cublas_equivalent_gemm(a, b, scale_a=1.0, scale_b=1.0, out_dtype=torch.float16)
     ref = cublas_matmul(a, b, out_dtype=torch.float16)
@@ -81,13 +81,13 @@ def example_one_api_two_dtypes():
     print("-- one API, fp16 and fp8 --")
     M, N, K = 1024, 1024, 2048
 
-    a16 = torch.randn(M, K, device=DEVICE, dtype=torch.float16)     # [M,K] row-major
-    b16 = torch.randn(K, N, device=DEVICE, dtype=torch.float16)     # [K,N] row-major
+    a16 = torch.randn(M, K, device=DEVICE, dtype=torch.float16)  # [M,K] row-major
+    b16 = torch.randn(K, N, device=DEVICE, dtype=torch.float16)  # [K,N] row-major
     out = cublas_equivalent_gemm(a16, b16)
     print(f"  fp16 {M}x{N}x{K}: {'BIT-IDENTICAL' if _bit_equal(out, cublas_matmul(a16, b16)) else 'MISMATCH'}")
 
-    a8 = (torch.randn(M, K, device=DEVICE) / 4).to(torch.float8_e4m3fn)              # [M,K] row-major
-    b8 = (torch.randn(N, K, device=DEVICE) / 4).to(torch.float8_e4m3fn).t()          # [K,N] column-major
+    a8 = (torch.randn(M, K, device=DEVICE) / 4).to(torch.float8_e4m3fn)  # [M,K] row-major
+    b8 = (torch.randn(N, K, device=DEVICE) / 4).to(torch.float8_e4m3fn).t()  # [K,N] column-major
     # Awkward scales on purpose: a power of two is exact either way and proves nothing.
     for sa, sb in ((1.0, 1.0), (1.3, 0.017)):
         out = cublas_equivalent_gemm(a8, b8, scale_a=sa, scale_b=sb)
@@ -115,14 +115,14 @@ def example_choose_cublas_version():
     b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
 
     for spec in ("12.8", "13.1"):
-        out = cublas_equivalent_gemm(a, b, cublaslt=spec)          # per call
+        out = cublas_equivalent_gemm(a, b, cublaslt=spec)  # per call
         ref = cublas_matmul(a, b, cublaslt=spec)
         print(f"  cuBLAS {spec}: {'BIT-IDENTICAL' if _bit_equal(out, ref) else 'MISMATCH'}")
 
-    set_cublaslt("12.8")                                           # or for the whole process
+    set_cublaslt("12.8")  # or for the whole process
     out = cublas_equivalent_gemm(a, b)
     print(f"  set_cublaslt(\"12.8\"): {'BIT-IDENTICAL' if _bit_equal(out, cublas_matmul(a, b)) else 'MISMATCH'}")
-    set_cublaslt()                                                 # back to the newest installed
+    set_cublaslt()  # back to the newest installed
 
 
 def example_cannot_match():
@@ -133,8 +133,8 @@ def example_cannot_match():
     `reduce_1Block_kernel` -- which is CUDA-core FFMA with a shuffle reduction, an accumulation
     order none of the reconstructions here has. The caller gets an exception, not wrong bits."""
     print("cannot-match (cuBLAS runs a SIMT gemv, not a tensor-core kernel):")
-    for M, N, K in [(1, 246, 342349), (94, 1, 175811), (170, 1, 170157), (251, 1, 38346),
-                    (21, 1, 65878), (1, 23, 32259), (1, 104, 151171), (161, 1, 391706)]:
+    for M, N, K in [(1, 246, 342349), (94, 1, 175811), (170, 1, 170157), (251, 1, 38346), (21, 1, 65878),
+                    (1, 23, 32259), (1, 104, 151171), (161, 1, 391706)]:
         a = torch.randn(M, K, device=DEVICE, dtype=torch.float16)
         b = torch.randn(K, N, device=DEVICE, dtype=torch.float16)
         try:
@@ -143,6 +143,7 @@ def example_cannot_match():
         except CublasUnsupportedShape as e:
             print(f"  fp16 {M}x{N}x{K}: declined ({str(e).split(': ')[-1]}) -> fall back to cublas_matmul")
         del a, b
+
 
 def main():
     if not torch.cuda.is_available():
