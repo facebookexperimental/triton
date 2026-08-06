@@ -33,6 +33,7 @@ Keep shapes modest but representative so the whole suite runs quickly.
 """
 
 import argparse
+import contextlib
 import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -41,6 +42,7 @@ import torch
 
 import triton
 import triton.language as tl
+from triton.runtime.jit import JITFunction
 
 # libdevice (erf/tanh/rsqrt/... ) — import robustly across Triton versions; kernels that use
 # it fail gracefully (caught per-kernel by the runner) if it is unavailable.
@@ -58,19 +60,51 @@ DEVICE = "cuda"
 # --------------------------------------------------------------------------- #
 # Input helpers (seeded, reproducible)
 # --------------------------------------------------------------------------- #
+# Per-trial base seed the equivalence sweep varies so a kernel gets fresh inputs on each fuzzer
+# seed WITHOUT every make_inputs needing a seed argument. 0 in the normal perf/correctness run,
+# so those are unchanged. Set only at runtime via ``set_input_seed`` (never at import time).
+_INPUT_SEED = 0
+
+
+def set_input_seed(seed):
+    """Set the additive seed the input helpers fold in (fuzzer input variance; 0 for perf runs)."""
+    global _INPUT_SEED
+    _INPUT_SEED = seed
+
+
 def randn(*shape, dtype=torch.float32, seed=0):
-    g = torch.Generator(device="cpu").manual_seed(seed)
+    g = torch.Generator(device="cpu").manual_seed(seed + _INPUT_SEED)
     return torch.randn(*shape, generator=g, dtype=torch.float32).to(DEVICE, dtype)
 
 
 def rand(*shape, dtype=torch.float32, seed=0):
-    g = torch.Generator(device="cpu").manual_seed(seed)
+    g = torch.Generator(device="cpu").manual_seed(seed + _INPUT_SEED)
     return torch.rand(*shape, generator=g, dtype=torch.float32).to(DEVICE, dtype)
 
 
 def randint(high, shape, seed=0, dtype=torch.int32):
-    g = torch.Generator(device="cpu").manual_seed(seed)
+    g = torch.Generator(device="cpu").manual_seed(seed + _INPUT_SEED)
     return torch.randint(0, high, shape, generator=g, dtype=torch.int64).to(DEVICE, dtype)
+
+
+def adv(*shape, dtype=torch.float32, seed=0, lo=-6.0, hi=6.0):
+    """Order-sensitive input: wide dynamic range (logspace magnitudes) x alternating signs.
+
+    Reduction / softmax / norm / scan / attention kernels are bit-STABLE under plain unit-scale
+    ``randn`` -- every summand has ~the same magnitude, so the association order barely moves the
+    rounding and the sweep can't tell configs apart. Spreading magnitudes across ``[10**lo, 10**hi]``
+    and alternating the sign makes the FP reduction ORDER decide the output bits, which is what the
+    equivalence sweep needs. Narrow ``lo``/``hi`` for exp-based kernels (softmax/attention) so
+    ``exp`` stays finite. A drop-in for ``randn`` (same ``*shape, dtype, seed`` signature).
+    """
+    numel = 1
+    for s in shape:
+        numel *= s
+    g = torch.Generator(device="cpu").manual_seed(seed + _INPUT_SEED)
+    base = torch.randn(numel, generator=g, dtype=torch.float32)
+    scale = torch.logspace(lo, hi, numel, dtype=torch.float32)
+    signs = torch.where(torch.arange(numel) % 2 == 0, torch.tensor(1.0), torch.tensor(-1.0))
+    return (base * scale * signs).reshape(*shape).to(DEVICE, dtype)
 
 
 def ones(*shape, dtype=torch.float32):
@@ -93,6 +127,8 @@ class Bench:
     shape_note: str = ""
     runnable: bool = True  # False => SKIP (e.g. needs Blackwell sm100 / a HW path not in portable Triton)
     note: str = ""  # reason shown when skipped, or any caveat
+    nondeterministic: bool = False  # output not bit-reproducible (e.g. cross-CTA FP atomic_add) -> a bitwise-equivalence checker eval must SKIP it (bit-equivalence is undefined for it); the standalone perf run still uses it
+    configs: Optional[list] = None  # equivalence-sweep config axis: list of launch-override dicts (e.g. [{"num_warps": 4}, {"num_warps": 8}]); None => the sweep's default num_warps list. num_warps/num_stages are forced generically; a block-size constexpr is baked in each run() body so it is not swept here
 
 
 BENCHMARKS: list = []
@@ -116,12 +152,145 @@ def _allclose(out, exp, rtol, atol):
     return torch.allclose(out.float(), exp.float(), rtol=rtol, atol=atol)
 
 
+# --------------------------------------------------------------------------- #
+# Equivalence-checker soundness sweep (opt-in: `python benchmark_kernels.py --sweep`)
+# --------------------------------------------------------------------------- #
+@contextlib.contextmanager
+def _sweep_launch(num_warps=None, num_stages=None):
+    """Force a launch config on every kernel launched in the block AND collect each CompiledKernel.
+
+    The equivalence sweep needs (a) a config axis (num_warps / num_stages) so a kernel has >1
+    config and (b) the PTX of each launched kernel for the static checker. Rather than thread both
+    through all ~90 run() bodies, we intercept JITFunction.run for the duration of one launch and
+    restore it on exit -- SCOPED, so no global state is left patched (unlike a module monkeypatch).
+    A block-size constexpr has a kernel-specific name, so it is baked in each run() and not forced.
+    """
+    captured = []
+    orig = JITFunction.run
+
+    def run(self, *a, **k):
+        if num_warps is not None:
+            k.setdefault("num_warps", num_warps)
+        if num_stages is not None:
+            k.setdefault("num_stages", num_stages)
+        try:
+            ck = orig(self, *a, **k)
+        except TypeError:  # autotuned / fixed-config kernel rejects the override: retry unforced
+            k.pop("num_warps", None)
+            k.pop("num_stages", None)
+            ck = orig(self, *a, **k)
+        captured.append(ck)
+        return ck
+
+    JITFunction.run = run
+    try:
+        yield captured
+    finally:
+        JITFunction.run = orig
+
+
+def _to_bytes(t):
+    """Exact output bits (the fuzzer's equality unit); flattens tuple/list outputs."""
+    if isinstance(t, (tuple, list)):
+        return b"".join(_to_bytes(x) for x in t)
+    return t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def _cfg_axis(bench, warps):
+    """The config axis for a kernel: its own ``Bench.configs``, else one dict per swept num_warps.
+
+    Returns ``[(hashable_key, launch_dict), ...]`` -- a dict is unhashable so the sweep keys configs
+    by ``tuple(sorted(cfg.items()))`` (the fuzzer needs hashable configs) and launches the dict.
+    """
+    cfgs = bench.configs or [{"num_warps": nw} for nw in warps]
+    return [(tuple(sorted(c.items())), c) for c in cfgs]
+
+
+def _eval_bench(bench, warps, repeats, checker, fz):
+    """Compile each config -> checker key, fuzz -> empirical key, classify soundness (see _run_sweep)."""
+    launch = dict(_cfg_axis(bench, warps))
+
+    def launch_bytes(key, seed):
+        set_input_seed(seed)
+        with _sweep_launch(**launch[key]) as captured:
+            out = bench.run(bench.make_inputs())
+        torch.cuda.synchronize()
+        cks = [c for c in captured if getattr(c, "asm", None) and "ptx" in c.asm]
+        return tuple(checker(c.asm["ptx"]) for c in cks), _to_bytes(out)
+
+    ck_key, ok, fails = {}, [], 0
+    for key in launch:
+        try:
+            ck_key[key], _ = launch_bytes(key, 0)  # PTX is seed-independent: one compile per config
+            ok.append(key)
+        except Exception:  # noqa: BLE001 - a broken config is dropped, not fatal to the sweep
+            fails += 1
+    if not ok:
+        return dict(name=bench.name, ok=0, fails=fails, classification="error-all-configs-failed")
+    no_ptx = any(len(ck_key[k]) == 0 for k in ok)
+    nondet = bench.nondeterministic
+    if not (nondet or no_ptx):
+        nondet = any(launch_bytes(k, 0)[1] != launch_bytes(k, 0)[1] for k in ok)
+    skip = nondet or no_ptx
+    emp = fz.empirical_keys(lambda key, seed: launch_bytes(key, seed)[1], ok, repeats)
+    ck_sets, emp_sets = fz.partition(ok, ck_key), fz.partition(ok, emp)
+    over_m = None if skip else fz.over_merges(ok, ck_key, emp)
+    over_s = None if skip else fz.over_merges(ok, emp, ck_key)
+    if nondet:
+        cls = "d-nondeterministic"
+    elif no_ptx:
+        cls = "e-no-ptx (checker n/a)"
+    elif len(emp_sets) == 1:
+        cls = "c-bit-stable"
+    elif over_m > 0:
+        cls = "b-DISCRIMINATING-OVER-MERGE"
+    else:
+        cls = "a-discriminating-sound"
+    return dict(name=bench.name, category=bench.category, ok=len(ok), fails=fails,
+                checker_sets=len(ck_sets), empirical_sets=len(emp_sets), over_merges=over_m,
+                over_splits=over_s, classification=cls)
+
+
+def _run_sweep(benches, warps, repeats):
+    """Measure the FORWARD PTX checker against the empirical fuzzer over every runnable kernel.
+
+    For each kernel: over the num_warps config axis (same input+math, different reduction/layout),
+    compare the checker's partition against the fuzzer's bit-identical-on-every-seed partition and
+    report the over-merge count (checker classes that straddle an empirical boundary -- a soundness
+    violation, must be 0). nondeterministic (cross-CTA FP atomic_add) kernels are out of contract,
+    so their over-merges are NOT counted. Reuses bitequiv.ptx.forward.interp + equivalence_fuzzer.
+    """
+    # Lazy so the zoo stays torch+triton-only (drop-in) for its list / perf use.
+    from bitequiv.evaluation import equivalence_fuzzer as fz
+    from bitequiv.ptx.forward.interp import forward_module_descriptor
+
+    print(f"device: {torch.cuda.get_device_name()}  checker: forward_module_descriptor  "
+          f"kernels: {len(benches)}  warps: {warps}  repeats: {repeats}")
+    print(f"{'category':16s} {'kernel':30s} {'ok':>3s} {'chk':>4s} {'emp':>4s} "
+          f"{'over_m':>7s} {'over_s':>7s} class")
+    for b in benches:
+        if not b.runnable:
+            continue
+        try:
+            res = _eval_bench(b, warps, repeats, forward_module_descriptor, fz)
+        except Exception as e:  # noqa: BLE001 - one bad kernel must not abort the sweep
+            print(f"{b.category:16s} {b.name:30s}  ERROR {type(e).__name__}: {str(e).splitlines()[0][:50]}")
+            continue
+        print(f"{b.category:16s} {b.name:30s} {res.get('ok', 0):>3} {str(res.get('checker_sets')):>4} "
+              f"{str(res.get('empirical_sets')):>4} {str(res.get('over_merges')):>7} "
+              f"{str(res.get('over_splits')):>7} {res.get('classification')}")
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description="Standalone Triton kernel benchmark zoo.")
     ap.add_argument("--filter", default=None, help="substring match on kernel name OR category")
     ap.add_argument("--only", default=None, help="exact kernel name")
     ap.add_argument("--list", action="store_true", help="list kernels and exit")
     ap.add_argument("--no-check", action="store_true", help="skip correctness, time only")
+    ap.add_argument("--sweep", action="store_true",
+                    help="run the checker+fuzzer equivalence sweep instead of timing")
+    ap.add_argument("--warps", default="2,4,8", help="num_warps config axis for --sweep")
+    ap.add_argument("--repeats", type=int, default=12, help="fuzzer seeds per config for --sweep")
     args = ap.parse_args(argv)
 
     benches = BENCHMARKS
@@ -138,6 +307,10 @@ def main(argv):
 
     if not torch.cuda.is_available():
         raise SystemExit("benchmark_kernels needs a CUDA device.")
+
+    if args.sweep:
+        _run_sweep(benches, [int(x) for x in args.warps.split(",")], args.repeats)
+        return
 
     print(f"device: {torch.cuda.get_device_name()}")
     print(f"{'category':20s} {'kernel':34s} {'shape':24s} {'ms':>10s} {'correct':>8s}")
@@ -691,7 +864,7 @@ def _run_softmax(inp):
 
 register(name="softmax_row", category="softmax",
          source="https://github.com/triton-lang/triton/blob/main/python/tutorials/02-fused-softmax.py",
-         make_inputs=lambda: (randn(1024, 4096, seed=24), ),
+         make_inputs=lambda: (adv(1024, 4096, seed=24, lo=-1.0, hi=1.0), ),
          run=_run_softmax, ref=lambda inp: torch.softmax(inp[0], dim=1),
          rtol=2e-3, atol=2e-3, shape_note="1024x4096")
 
@@ -717,7 +890,7 @@ def _run_log_softmax(inp):
 
 register(name="log_softmax_row", category="softmax",
          source="https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops/log_softmax.py",
-         make_inputs=lambda: (randn(1024, 4096, seed=25), ),
+         make_inputs=lambda: (adv(1024, 4096, seed=25, lo=-1.0, hi=1.0), ),
          run=_run_log_softmax, ref=lambda inp: torch.log_softmax(inp[0], dim=1),
          rtol=2e-3, atol=2e-3, shape_note="1024x4096")
 
@@ -748,7 +921,8 @@ def _ref_softmax_bwd(inp):
 
 register(name="softmax_bwd", category="softmax",
          source="https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/utils/softmax.py",
-         make_inputs=lambda: (torch.softmax(randn(1024, 4096, seed=26), 1), randn(1024, 4096, seed=27)),
+         make_inputs=lambda: (torch.softmax(adv(1024, 4096, seed=26, lo=-1.0, hi=1.0), 1),
+                              adv(1024, 4096, seed=27, lo=-2.0, hi=2.0)),
          run=_run_softmax_bwd, ref=_ref_softmax_bwd, rtol=2e-3, atol=2e-3, shape_note="1024x4096")
 
 
@@ -782,7 +956,7 @@ def _run_layernorm(inp):
 
 register(name="layernorm_fwd", category="norm",
          source="https://github.com/triton-lang/triton/blob/main/python/tutorials/05-layer-norm.py",
-         make_inputs=lambda: (randn(2048, 2048, seed=28), randn(2048, seed=29), randn(2048, seed=30)),
+         make_inputs=lambda: (adv(2048, 2048, seed=28, lo=-2.0, hi=2.0), randn(2048, seed=29), randn(2048, seed=30)),
          run=_run_layernorm,
          ref=lambda inp: torch.nn.functional.layer_norm(inp[0], (inp[0].shape[1], ), inp[1], inp[2], 1e-5),
          rtol=2e-3, atol=2e-3, shape_note="2048x2048")
@@ -814,7 +988,7 @@ def _ref_rmsnorm(inp):
 
 register(name="rmsnorm_fwd", category="norm",
          source="https://github.com/pytorch-labs/tritonbench/blob/main/tritonbench/operators/rms_norm/fused_triton.py",
-         make_inputs=lambda: (randn(2048, 2048, seed=31), randn(2048, seed=32)),
+         make_inputs=lambda: (adv(2048, 2048, seed=31, lo=-2.0, hi=2.0), randn(2048, seed=32)),
          run=_run_rmsnorm, ref=_ref_rmsnorm, rtol=2e-3, atol=2e-3, shape_note="2048x2048")
 
 
@@ -838,7 +1012,7 @@ def _run_l2norm(inp):
 
 register(name="l2norm_row", category="norm",
          source="https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/l2norm.py",
-         make_inputs=lambda: (randn(2048, 2048, seed=33), ),
+         make_inputs=lambda: (adv(2048, 2048, seed=33, lo=-2.0, hi=2.0), ),
          run=_run_l2norm, ref=lambda inp: torch.nn.functional.normalize(inp[0], dim=1),
          rtol=2e-3, atol=2e-3, shape_note="2048x2048")
 
@@ -873,7 +1047,7 @@ def _run_groupnorm(inp):
 
 register(name="groupnorm_fwd", category="norm",
          source="https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops/groupnorm.py",
-         make_inputs=lambda: (randn(16, 64, 128, seed=34), randn(64, seed=35), randn(64, seed=36)),
+         make_inputs=lambda: (adv(16, 64, 128, seed=34, lo=-2.0, hi=2.0), randn(64, seed=35), randn(64, seed=36)),
          run=_run_groupnorm,
          ref=lambda inp: torch.nn.functional.group_norm(inp[0], 8, inp[1], inp[2], 1e-5),
          rtol=2e-3, atol=2e-3, shape_note="16x64x128 G=8")
@@ -930,10 +1104,10 @@ def _mk_rowreduce(kind):
 
 _REDUCE_SRC = "https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops"
 register(name="reduce_sum", category="reduction", source=_REDUCE_SRC + "/sum.py",
-         make_inputs=lambda: (randn(2048, 4096, seed=37), ), run=_mk_rowreduce(0),
+         make_inputs=lambda: (adv(2048, 4096, seed=37, lo=-2.0, hi=2.0), ), run=_mk_rowreduce(0),
          ref=lambda inp: inp[0].sum(1), rtol=2e-3, atol=2e-3, shape_note="2048x4096")
 register(name="reduce_mean", category="reduction", source=_REDUCE_SRC + "/mean.py",
-         make_inputs=lambda: (randn(2048, 4096, seed=38), ), run=_mk_rowreduce(1),
+         make_inputs=lambda: (adv(2048, 4096, seed=38, lo=-2.0, hi=2.0), ), run=_mk_rowreduce(1),
          ref=lambda inp: inp[0].mean(1), rtol=2e-3, atol=2e-3, shape_note="2048x4096")
 register(name="reduce_max", category="reduction", source=_REDUCE_SRC + "/max.py",
          make_inputs=lambda: (randn(2048, 4096, seed=39), ), run=_mk_rowreduce(2),
@@ -942,10 +1116,10 @@ register(name="reduce_min", category="reduction", source=_REDUCE_SRC + "/min.py"
          make_inputs=lambda: (randn(2048, 4096, seed=40), ), run=_mk_rowreduce(3),
          ref=lambda inp: inp[0].min(1).values, shape_note="2048x4096")
 register(name="reduce_var", category="reduction", source=_REDUCE_SRC + "/var_mean.py",
-         make_inputs=lambda: (randn(2048, 4096, seed=41), ), run=_mk_rowreduce(4),
+         make_inputs=lambda: (adv(2048, 4096, seed=41, lo=-2.0, hi=2.0), ), run=_mk_rowreduce(4),
          ref=lambda inp: inp[0].var(1, unbiased=False), rtol=2e-3, atol=2e-3, shape_note="2048x4096")
 register(name="reduce_logsumexp", category="reduction", source=_REDUCE_SRC + "/logsumexp.py",
-         make_inputs=lambda: (randn(2048, 4096, seed=42), ), run=_mk_rowreduce(5),
+         make_inputs=lambda: (adv(2048, 4096, seed=42, lo=-1.0, hi=1.0), ), run=_mk_rowreduce(5),
          ref=lambda inp: torch.logsumexp(inp[0], 1), rtol=2e-3, atol=2e-3, shape_note="2048x4096")
 
 
@@ -1045,7 +1219,7 @@ def _run_welford(inp):
 
 register(name="welford_mean_var", category="reduction",
          source="https://github.com/pytorch-labs/tritonbench/blob/main/tritonbench/operators/welford/triton_welford.py",
-         make_inputs=lambda: (randn(2048, 4096, seed=47), ), run=_run_welford,
+         make_inputs=lambda: (adv(2048, 4096, seed=47, lo=-2.0, hi=2.0), ), run=_run_welford,
          ref=lambda inp: (inp[0].mean(1), inp[0].var(1, unbiased=False)), rtol=2e-3, atol=2e-3,
          shape_note="2048x4096")
 
@@ -1077,7 +1251,7 @@ def _run_cumsum(inp):
 
 
 register(name="cumsum_row", category="scan", source=_REDUCE_SRC + "/cumsum.py",
-         make_inputs=lambda: (randn(4096, 512, seed=48), ),
+         make_inputs=lambda: (adv(4096, 512, seed=48, lo=-2.0, hi=2.0), ),
          run=_run_cumsum, ref=lambda inp: torch.cumsum(inp[0], 1), rtol=2e-3, atol=2e-3, shape_note="4096x512")
 
 
@@ -1350,15 +1524,15 @@ def _mk_attn_ref(causal):
 
 register(name="flash_attention_fwd", category="attention",
          source="https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py",
-         make_inputs=lambda: (randn(4, 8, 1024, 64, dtype=torch.float16, seed=62),
-                              randn(4, 8, 1024, 64, dtype=torch.float16, seed=63),
-                              randn(4, 8, 1024, 64, dtype=torch.float16, seed=64)),
+         make_inputs=lambda: (adv(4, 8, 1024, 64, dtype=torch.float16, seed=62, lo=-1.0, hi=1.0),
+                              adv(4, 8, 1024, 64, dtype=torch.float16, seed=63, lo=-1.0, hi=1.0),
+                              adv(4, 8, 1024, 64, dtype=torch.float16, seed=64, lo=-1.0, hi=1.0)),
          run=_mk_attn(False), ref=_mk_attn_ref(False), rtol=1e-2, atol=2e-2, shape_note="4x8x1024x64")
 register(name="flash_attention_causal", category="attention",
          source="https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py",
-         make_inputs=lambda: (randn(4, 8, 1024, 64, dtype=torch.float16, seed=65),
-                              randn(4, 8, 1024, 64, dtype=torch.float16, seed=66),
-                              randn(4, 8, 1024, 64, dtype=torch.float16, seed=67)),
+         make_inputs=lambda: (adv(4, 8, 1024, 64, dtype=torch.float16, seed=65, lo=-1.0, hi=1.0),
+                              adv(4, 8, 1024, 64, dtype=torch.float16, seed=66, lo=-1.0, hi=1.0),
+                              adv(4, 8, 1024, 64, dtype=torch.float16, seed=67, lo=-1.0, hi=1.0)),
          run=_mk_attn(True), ref=_mk_attn_ref(True), rtol=1e-2, atol=2e-2, shape_note="4x8x1024x64 causal")
 
 
@@ -1390,7 +1564,7 @@ def _run_cross_entropy(inp):
 
 register(name="cross_entropy", category="loss",
          source="https://github.com/pytorch-labs/tritonbench/blob/main/tritonbench/operators/cross_entropy",
-         make_inputs=lambda: (randn(4096, 4096, seed=68), randint(4096, (4096, ), seed=69)),
+         make_inputs=lambda: (adv(4096, 4096, seed=68, lo=-1.0, hi=1.0), randint(4096, (4096, ), seed=69)),
          run=_run_cross_entropy,
          ref=lambda inp: torch.nn.functional.cross_entropy(inp[0], inp[1].long(), reduction="none"),
          rtol=2e-3, atol=2e-3, shape_note="4096x4096")
@@ -1417,8 +1591,8 @@ def _run_kl_div(inp):
 
 register(name="kl_div", category="loss",
          source="https://github.com/pytorch-labs/tritonbench/blob/main/tritonbench/operators/kl_div",
-         make_inputs=lambda: (torch.log_softmax(randn(4096, 2048, seed=70), 1),
-                              torch.softmax(randn(4096, 2048, seed=71), 1)),
+         make_inputs=lambda: (torch.log_softmax(adv(4096, 2048, seed=70, lo=-1.0, hi=1.0), 1),
+                              torch.softmax(adv(4096, 2048, seed=71, lo=-1.0, hi=1.0), 1)),
          run=_run_kl_div,
          ref=lambda inp: torch.nn.functional.kl_div(inp[0], inp[1], reduction="none").sum(1),
          rtol=2e-3, atol=2e-3, shape_note="4096x2048")
@@ -1558,7 +1732,7 @@ def _ref_index_add(inp):
     return torch.zeros(v, device=DEVICE, dtype=torch.float32).index_add_(0, idx.long(), src)
 
 
-register(name="scatter_index_add", category="embedding",
+register(name="scatter_index_add", category="embedding", nondeterministic=True,
          source="https://github.com/FlagOpen/FlagGems/blob/master/src/flag_gems/ops/scatter.py",
          make_inputs=lambda: (randint(4096, (1 << 20, ), seed=81), randn(1 << 20, seed=82), 4096),
          run=_run_index_add, ref=_ref_index_add, rtol=1e-2, atol=1e-2, shape_note="2^20 -> 4096 (atomic)")
@@ -1820,7 +1994,7 @@ def _run_gemm_splitk(inp):
     return c
 
 
-register(name="gemm_splitk", category="gemm-structural",
+register(name="gemm_splitk", category="gemm-structural", nondeterministic=True,
          source="https://github.com/triton-lang/triton/blob/main/python/tutorials/12-split-k-matmul.py",
          make_inputs=lambda: (randn(512, 512, dtype=torch.float16, seed=91),
                               randn(512, 512, dtype=torch.float16, seed=92)),
@@ -2055,7 +2229,7 @@ def _run_coop_global_sum(inp):
     return acc
 
 
-register(name="cooperative_global_sum", category="cooperative",
+register(name="cooperative_global_sum", category="cooperative", nondeterministic=True,
          source="https://github.com/triton-lang/triton/blob/main/python/tutorials/15-multi-cta-layer-norm.py",
          make_inputs=lambda: (randn(1 << 20, seed=102), ),
          run=_run_coop_global_sum, ref=lambda inp: inp[0].sum().reshape(1), rtol=1e-2, atol=1e-1,
