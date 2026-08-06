@@ -898,10 +898,11 @@ void fillTDMDescriptor(RewriterBase &rewriter, Location loc,
   // Update group0 with addresses
   Value ldsAddr = b.ptrtoint(i32_ty, dstPtr);
 
-  // Pure form inherits pred from the descriptor (group0[0]); the per-warp
-  // active mask below still applies.
+  // Pure form inherits pred from the descriptor (group0[0]); a null explicit
+  // predicate requests the same inheritance without preserving descriptor
+  // fields (notably the barrier bit) that belong to op-level operands.
   bool predIsInherited = false;
-  if (isPureForm) {
+  if (isPureForm || !pred) {
     pred = vecGet(b, groups[0], 0);
     predIsInherited = true; // equals group0[0] unless the mask below changes it
   }

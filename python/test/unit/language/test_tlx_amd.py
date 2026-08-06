@@ -2572,6 +2572,197 @@ def test_amd_tdm_gemm_pipelined_compiles_gfx1250(device):
     assert "tensor_load_to_lds" in amdgcn or "tensor.load.to.lds" in amdgcn
 
 
+@triton.jit
+def _async_amd_desc_load_fused_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CACHE: tl.constexpr,
+    COMPAT_MEMBERS: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    b_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    a_smem = tlx.local_view(a_buf, 0)
+    b_smem = tlx.local_view(b_buf, 0)
+
+    if COMPAT_MEMBERS == 1:
+        tok = tlx.async_amd_descriptor_load_group(
+            [a_desc],
+            [a_smem],
+            [[0, 0]],
+            [0b1111],
+        )
+    elif COMPAT_MEMBERS == 2:
+        tok = tlx.async_amd_descriptor_load_group(
+            [a_desc, b_desc],
+            [a_smem, b_smem],
+            [[0, 0], [0, 0]],
+            [0b0011, 0b1100],
+        )
+    else:
+        a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+        b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=True, clamp_bounds=True)
+        tok = tlx.async_amd_descriptor_load_fused(
+            [(a_desc, a_smem, 0b0011), (b_desc, b_smem, 0b1100)],
+            cache_modifier=CACHE,
+        )
+    tlx.async_amd_descriptor_wait(0, [tok])
+
+    data = tlx.local_load(a_smem) + tlx.local_load(b_smem)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    out_ptrs = output_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(out_ptrs, data)
+
+
+def test_async_amd_desc_load_fused_compiles_gfx1250(device):
+    """Fused AMD descriptor loads lower to one static TDM instruction."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32, "CACHE": "", "COMPAT_MEMBERS": 0},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "warp_used_hints = array<i32: 3, 12>" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    n_tdm = len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", amdgcn))
+    assert n_tdm == 1, f"expected one tensor_load_to_lds, got {n_tdm}\n{amdgcn}"
+    tdm_calls = re.findall(r"(?:tail )?call void @llvm\.amdgcn\.tensor\.load\.to\.lds[^\n]+", compiled.asm["llir"])
+    assert len(tdm_calls) == 1
+    assert re.search(r", i32 0\)(?:, .*)?$", tdm_calls[0])
+
+
+@pytest.mark.parametrize("compat_members", [1, 2])
+def test_async_amd_desc_load_group_compat_compiles_gfx1250(device, compat_members):
+    """The legacy grouped helper delegates to the canonical fused operation."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={
+            "M": 16,
+            "N": 32,
+            "BLOCK_M": 16,
+            "BLOCK_N": 32,
+            "CACHE": "",
+            "COMPAT_MEMBERS": compat_members,
+        },
+    )
+    if compat_members == 1:
+        assert "amdg.async_tdm_copy_global_to_local" in compiled.asm["ttgir"]
+        assert "amdg.async_tdm_fused_copy_global_to_local" not in compiled.asm["ttgir"]
+    else:
+        assert "amdg.async_tdm_fused_copy_global_to_local" in compiled.asm["ttgir"]
+    assert len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", compiled.asm["amdgcn"])) == 1
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_async_amd_desc_load_fused_correctness_gfx1250(device):
+    """Canonical unmarked positioned descriptors load both fused members."""
+    rows, cols = 16, 32
+    a = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    b = torch.randn((rows, cols), device=device, dtype=torch.float16)
+    output = torch.empty_like(a)
+    _async_amd_desc_load_fused_kernel[(1, )](
+        a,
+        b,
+        output,
+        M=rows,
+        N=cols,
+        BLOCK_M=rows,
+        BLOCK_N=cols,
+        CACHE="",
+        COMPAT_MEMBERS=0,
+    )
+    torch.testing.assert_close(output, a + b)
+
+
+def test_async_amd_desc_load_fused_cache_modifier_gfx1250(device):
+    """The cache modifier shared by fused members reaches the TDM intrinsic."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32, "CACHE": ".cg", "COMPAT_MEMBERS": 0},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert "cache = 3 : i32" in ttgir
+
+    # On gfx1250, .cg maps to DEV scope / regular cache behavior (aux = 16).
+    tdm_calls = re.findall(
+        r"(?:tail )?call void @llvm\.amdgcn\.tensor\.load\.to\.lds[^\n]+",
+        compiled.asm["llir"],
+    )
+    assert len(tdm_calls) == 1
+    assert re.search(r", i32 16\)(?:, .*)?$", tdm_calls[0])
+
+
+@triton.jit
+def _async_amd_desc_load_fused_pred_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    DO_LOAD: tl.constexpr,
+):
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        shape=[M, N],
+        strides=[N, tl.constexpr(1)],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+    a_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    b_buf = tlx.local_alloc((BLOCK_M, BLOCK_N), tl.float16, 1)
+    pred = tl.full([], DO_LOAD, dtype=tl.int1)
+    a_desc = tlx.update_tensor_descriptor(a_desc, add_offsets=[0, 0], pred=pred, clamp_bounds=True)
+    b_desc = tlx.update_tensor_descriptor(b_desc, add_offsets=[0, 0], pred=pred, clamp_bounds=True)
+    tok = tlx.async_amd_descriptor_load_fused([
+        (a_desc, tlx.local_view(a_buf, 0), 0b0011),
+        (b_desc, tlx.local_view(b_buf, 0), 0b1100),
+    ])
+    tlx.async_amd_descriptor_wait(0, [tok])
+
+
+def test_async_amd_desc_load_fused_pred_compiles_gfx1250(device):
+    """Fused AMD descriptor loads inherit explicit i1 descriptor predicates."""
+    compiled = compile_for_gfx1250(
+        _async_amd_desc_load_fused_pred_kernel,
+        signature={"a_ptr": "*fp16", "b_ptr": "*fp16", "output_ptr": "*fp16"},
+        constexprs={"M": 16, "N": 32, "BLOCK_M": 16, "BLOCK_N": 32, "DO_LOAD": 1},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "amdg.async_tdm_fused_copy_global_to_local" in ttgir
+    assert ("arith.extui" in ttgir and "i1 to i32" in ttgir) or "arith.constant 1 : i32" in ttgir
+    amdgcn = compiled.asm["amdgcn"]
+    n_tdm = len(re.findall(r"tensor_load_to_lds|tensor\.load\.to\.lds", amdgcn))
+    assert n_tdm == 1, f"expected one tensor_load_to_lds, got {n_tdm}\n{amdgcn}"
+
+
 # ---------------------------------------------------------------------------
 # Test: tlx.local_reshape reinterprets a flat LDS buffer as a 2D tile.
 # ---------------------------------------------------------------------------

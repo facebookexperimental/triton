@@ -983,6 +983,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+// A fused TDM load must track every physical destination independently.
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 16384 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32} {
+  // CHECK-LABEL: @fused_tdm_tracks_all_destinations
+  // CHECK: arith.constant dense<[true, false]> : tensor<2xi1
+  // CHECK: tt.call @__triton_consan_verify_write_visibility
+  // CHECK: tt.call @__triton_consan_verify_read_visibility
+  // CHECK: tt.call @__triton_consan_stage_access_for_commit
+  // CHECK: arith.constant dense<[false, true]> : tensor<2xi1
+  // CHECK: tt.call @__triton_consan_verify_write_visibility
+  // CHECK: tt.call @__triton_consan_verify_read_visibility
+  // CHECK: tt.call @__triton_consan_stage_access_for_commit
+  // CHECK: tt.call @__triton_consan_commit_accesses
+  // CHECK: amdg.async_tdm_fused_copy_global_to_local
+  tt.func public @fused_tdm_tracks_all_destinations(%desc0: !tt.tensordesc<64x64xf16, #shared>, %desc1: !tt.tensordesc<64x64xf16, #shared>) {
+    %first = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %second = ttg.local_alloc {allocation.offset = 8192 : i32} : () -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    %token = amdg.async_tdm_fused_copy_global_to_local %desc0, %desc1 into %first, %second {warp_used_hints = array<i32: 3, 12>} : !tt.tensordesc<64x64xf16, #shared>, !tt.tensordesc<64x64xf16, #shared> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>, !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 // Partitioned padded allocations have several simultaneous physical bases.
 #blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [8, 4], warpsPerCTA = [2, 1], order = [1, 0]}>
 #inner_padded = #ttg.padded_shared<[128:+4] {order = [1, 0], shape = [16, 16]}>
