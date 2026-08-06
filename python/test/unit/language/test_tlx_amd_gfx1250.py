@@ -10,6 +10,7 @@ from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     pack_scale as _amd_mxfp_pack_scale,
 )
 from triton.tools.mxfp import MXScaleTensor
+from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import attention as _amd_fa_tdm_attention
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_matmul,
     matmul_tdm_pipelined_single_warp_per_simd_schedule as _amd_tdm_single_warp_matmul,
@@ -311,3 +312,15 @@ def test_amd_tdm_gemm_single_warp_correctness_gfx1250(device, TRANSPOSE_B):
     actual = _amd_tdm_single_warp_matmul(a, b_input, TRANSPOSE_B=TRANSPOSE_B)
     expected = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.bfloat16)
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("SEQLEN", [640, 896])
+def test_amd_fa_tdm_pipelined_correctness_gfx1250(device, SEQLEN):
+    torch.manual_seed(0)
+    q = torch.randn((1, 1, SEQLEN, 128), device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    actual = _amd_fa_tdm_attention(q, k, v)
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
