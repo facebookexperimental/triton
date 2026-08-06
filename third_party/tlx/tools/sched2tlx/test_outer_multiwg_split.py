@@ -39,6 +39,13 @@ def test_outer_multiwg_split_lowers():
     assert "tlx.async_descriptor_store(c_desc, L1_smem_3[0]," in src
     assert "tlx.barrier_arrive(sem2_b3_empty[0], 1)" in src
 
+    # The default task's inner K-loop reuses `_it`. Restore the outer-tile
+    # counter before the post-inner producer handshake.
+    producer_wait = src.index("tlx.barrier_wait(sem2_b3_empty[0]")
+    inner_loop = src.rfind("for k in range", 0, producer_wait)
+    outer_rebind = src.rfind("_it = _oit", 0, producer_wait)
+    assert inner_loop < outer_rebind < producer_wait
+
     # Outer-iteration counter drives the phases in both tasks.
     assert src.count("_oit = 0") == 2
     assert src.count("_oit += 1") == 2
