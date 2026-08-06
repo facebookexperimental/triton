@@ -438,6 +438,7 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     full_shape = [unwrapped_num] + unwrapped_shape
     dtype = tl._unwrap_if_constexpr(dtype)
     elem_type = dtype.to_ir(_semantic.builder)
+    legacy_explicit_padded = False
     if layout is None:
         if storage == tlx.storage_kind.smem:
             if len(shape) == 1:
@@ -503,8 +504,11 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
         # respects it (does not retag the buffer to satisfy a consumer). The
         # wrapper is unwrapped back to `layout_handle` by tlx-resolve-placeholder-layouts.
         if not getattr(layout, "_tlx_default", False):
-            layout._tlx_user_pinned = True
-            layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
+            legacy_explicit_padded = (_semantic.builder.options.arch == "gfx1250"
+                                      and isinstance(layout, tlx.padded_shared_layout_encoding))
+            if not legacy_explicit_padded:
+                layout._tlx_user_pinned = True
+                layout_handle = _semantic.builder.make_user_layout_attr(layout_handle)
 
     alias_handle = None
     shared_buffer_handle = None
@@ -530,6 +534,9 @@ To bypass, rewrite it to `local_alloc(..., num=tl.constexpr(2))` or `local_alloc
     else:
         tensor_handle = _semantic.builder.create_tmem_alloc(full_shape, elem_type, layout_handle, alias_handle,
                                                             shared_buffer_handle)
+
+    if legacy_explicit_padded:
+        tensor_handle.set_attr("tlx.layout_is_explicit", _semantic.builder.get_unit_attr())
 
     return tlx.buffered_tensor(tensor_handle, dtype, unwrapped_shape, unwrapped_num, storage, layout)
 
@@ -1537,7 +1544,7 @@ def async_amd_descriptor_load(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = result.type.layout
-    if not getattr(layout, "_tlx_default", False):
+    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
@@ -1605,7 +1612,7 @@ def async_amd_descriptor_store(
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
     layout = source.type.layout
-    if not getattr(layout, "_tlx_default", False):
+    if (not getattr(layout, "_tlx_default", False) and not isinstance(layout, tlx.padded_shared_layout_encoding)):
         expected_layout = _amd_tdm_descriptor_layout(desc)
         if not _layouts_match(layout, expected_layout):
             warnings.warn(
