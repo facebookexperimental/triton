@@ -10,6 +10,10 @@ from triton.language.extra.tlx.tutorials.amd_mxfp_gemm_tdm_pipelined import (
     pack_scale as _amd_mxfp_pack_scale,
 )
 from triton.tools.mxfp import MXScaleTensor
+from triton.language.extra.tlx.tutorials.amd_grouped_gemm_gfx1250.grouped_gemm import (
+    grouped_gemm_phase0,
+    grouped_gemm_tdm,
+)
 from triton.language.extra.tlx.tutorials.amd_fa_tdm_pipelined import attention as _amd_fa_tdm_attention
 from triton.language.extra.tlx.tutorials.amd_tdm_gemm_pipelined import (
     matmul as _amd_tdm_matmul,
@@ -324,3 +328,95 @@ def test_amd_fa_tdm_pipelined_correctness_gfx1250(device, SEQLEN):
     actual = _amd_fa_tdm_attention(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v).to(torch.float32)
     torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+def _make_grouped_packed_inputs(m_list, n, k, device):
+    groups = [torch.randn((m, k), device=device, dtype=torch.float16) for m in m_list]
+    b_t = torch.randn((len(m_list), n, k), device=device, dtype=torch.float16)
+    offsets = [0]
+    for m in m_list:
+        offsets.append(offsets[-1] + m)
+    return (
+        torch.cat(groups, dim=0).contiguous(),
+        b_t,
+        torch.tensor(offsets, device=device, dtype=torch.int32),
+        groups,
+    )
+
+
+def _check_grouped_packed_result(actual, groups, b_t):
+    start = 0
+    for i, a in enumerate(groups):
+        end = start + a.shape[0]
+        torch.testing.assert_close(actual[start:end], a @ b_t[i].T, atol=1e-2, rtol=1e-2)
+        start = end
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_phase0_ragged_gfx1250(device):
+    torch.manual_seed(0)
+    shapes = [(17, 33, 31), (64, 70, 64), (95, 128, 96), (128, 65, 129)]
+    group_a = [torch.randn((m, k), device=device, dtype=torch.float16) for m, _, k in shapes]
+    group_b = [torch.randn((k, n), device=device, dtype=torch.float16) for _, n, k in shapes]
+    actual = grouped_gemm_phase0(group_a, group_b, block_m=32, block_n=32, block_k=32)
+    for out, a, b in zip(actual, group_a, group_b):
+        torch.testing.assert_close(out, a @ b, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("depth", [2, 3, 4])
+def test_grouped_gemm_tdm_packed_correctness_gfx1250(device, depth):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([128, 256, 384], 256, 512, device)
+    actual = grouped_gemm_tdm(a, b_t, offsets, tdm_pipeline_depth=depth)
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_tdm_asymmetric_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([128, 256], 512, 384, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        tdm_pipeline_depth=3,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+def test_grouped_gemm_tdm_cross_prefetch_correctness_gfx1250(device):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([256, 128], 512, 512, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        num_programs=2,
+        c_staging_mode=1,
+        cross_tile_prefetch=True,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250 hardware")
+@pytest.mark.parametrize("mode", ["balanced", "chunked"])
+def test_grouped_gemm_tdm_xcd_remap_correctness_gfx1250(device, mode):
+    torch.manual_seed(0)
+    a, b_t, offsets, groups = _make_grouped_packed_inputs([1024], 512, 512, device)
+    actual = grouped_gemm_tdm(
+        a,
+        b_t,
+        offsets,
+        block_m=128,
+        block_n=256,
+        num_programs=16,
+        c_staging_mode=1,
+        xcd_remap_mode=mode,
+    )
+    _check_grouped_packed_result(actual, groups, b_t)
