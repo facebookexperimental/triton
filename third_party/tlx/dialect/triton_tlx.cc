@@ -75,6 +75,22 @@ makeCGALayoutFromBases(mlir::MLIRContext *ctx,
                                    tt::LinearLayout(std::move(bases), outDims));
 }
 
+// Memdesc view ops must infer their result from the concrete shared layout,
+// not from a TLX wrapper carrying the user pin. Bridge the source to that
+// concrete encoding while retaining the pin on the allocation itself.
+static Value materializeConcreteMemDesc(TritonOpBuilder &builder, Value value) {
+  auto type = cast<ttg::MemDescType>(value.getType());
+  Attribute encoding = type.getEncoding();
+  Attribute concrete = tlx::getEffectiveEncoding(encoding);
+  if (concrete == encoding)
+    return value;
+
+  auto concreteType = ttg::MemDescType::get(
+      type.getShape(), type.getElementType(), concrete, type.getMemorySpace(),
+      type.getMutableMemory(), type.getAllocShape());
+  return builder.create<tlx::RequireLayoutOp>(concreteType, value);
+}
+
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -103,6 +119,7 @@ void init_triton_tlx_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value localAlloc,
               std::vector<int32_t> offsets,
               std::vector<int64_t> newShape) -> mlir::Value {
+             localAlloc = materializeConcreteMemDesc(self, localAlloc);
              auto localAllocType = cast<ttg::MemDescType>(localAlloc.getType());
              auto localAllocShape = localAllocType.getShape();
              assert(localAllocShape.size() == offsets.size() &&
@@ -938,7 +955,8 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_memdesc_reshape",
            [](TritonOpBuilder &self, Value &src,
               std::vector<int64_t> shape) -> mlir::Value {
-             return self.create<ttg::MemDescReshapeOp>(src, shape);
+             Value reshapeSrc = materializeConcreteMemDesc(self, src);
+             return self.create<ttg::MemDescReshapeOp>(reshapeSrc, shape);
            })
       .def(
           "create_memdesc_reinterpret",
