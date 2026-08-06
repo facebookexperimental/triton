@@ -1,10 +1,14 @@
-// RUN: triton-opt -split-input-file --tlx-insert-require-layout %s | FileCheck %s
+// RUN: split-file %s %t
+// RUN: triton-opt -split-input-file --tlx-insert-require-layout %t/valid.mlir | FileCheck %s
+// RUN: not triton-opt --tlx-insert-require-layout %t/invalid.mlir 2>&1 | FileCheck %s --check-prefix=ERROR
 //
 // Tests for the AMD TDM extension of TLXInsertRequireLayout.
 //
 // The pass anchors a `tlx.require_layout` on every TDM op's buffer operand
 // so `tlx-propagate-layout` can rewrite the source `local_alloc` to a
 // descriptor-compatible padded encoding from `buildDefaultTDMDescriptorEncoding`.
+
+//--- valid.mlir
 
 // =============================================================================
 // 1. TDM copy with no consumer. Default fallback fires.
@@ -26,6 +30,55 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x32xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
     %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x32xf16>
     %tok = amdg.async_tdm_copy_global_to_local %positioned into %buf : !tt.tensordesc<128x32xf16> -> !ttg.memdesc<128x32xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+// =============================================================================
+// Explicit pinned padding is preserved instead of being replaced by the
+// descriptor-default TDM layout.
+// =============================================================================
+
+#padded_explicit = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 128]}>
+#pinned_explicit = #tlx.user_layout<#padded_explicit>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-DAG: #[[$EXPLICIT:.*]] = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 128]}>
+  // CHECK-LABEL: @tdm_preserves_pinned_padding
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x128xf16, #[[$EXPLICIT]], #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
+  tt.func public @tdm_preserves_pinned_padding(%desc: !tt.tensordesc<128x128xf16>, %m: i32, %k: i32, %p: i32) {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<2x128x128xf16, #pinned_explicit, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x128xf16, #pinned_explicit, #smem, mutable> -> !ttg.memdesc<128x128xf16, #pinned_explicit, #smem, mutable>
+    %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x128xf16>
+    %tok = amdg.async_tdm_copy_global_to_local %positioned into %buf : !tt.tensordesc<128x128xf16> -> !ttg.memdesc<128x128xf16, #pinned_explicit, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+// =============================================================================
+// The legacy gfx1250 explicit-layout marker preserves the raw padded encoding
+// without wrapping the memdesc type in #tlx.user_layout.
+// =============================================================================
+
+#padded_explicit = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 128]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-DAG: #[[$LEGACY_EXPLICIT:.*]] = #ttg.padded_shared<[256:+16] {order = [1, 0], shape = [128, 128]}>
+  // CHECK-LABEL: @tdm_preserves_legacy_explicit_padding
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x128xf16, #[[$LEGACY_EXPLICIT]], #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_global_to_local
+  tt.func public @tdm_preserves_legacy_explicit_padding(%desc: !tt.tensordesc<128x128xf16>, %m: i32, %k: i32, %p: i32) {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc {tlx.layout_is_explicit} : () -> !ttg.memdesc<2x128x128xf16, #padded_explicit, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<2x128x128xf16, #padded_explicit, #smem, mutable> -> !ttg.memdesc<128x128xf16, #padded_explicit, #smem, mutable>
+    %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%m, %k] pred = %p : !tt.tensordesc<128x128xf16>
+    %tok = amdg.async_tdm_copy_global_to_local %positioned into %buf : !tt.tensordesc<128x128xf16> -> !ttg.memdesc<128x128xf16, #padded_explicit, #smem, mutable>
     tt.return
   }
 }
@@ -181,7 +234,7 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
 // 8. TDM store: default encoding is anchored on the source memdesc.
 // =============================================================================
 
-// Store path uses swizzled (not padded) until alignTDMDescriptorEncodings is ported.
+// A pre-encoded store descriptor keeps its existing shared layout.
 // CHECK-DAG: #[[$SWIZZLED_STORE:.*]] = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
@@ -197,6 +250,30 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
     %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%m, %n] : !tt.tensordesc<128x128xf16, #shared>
     amdg.async_tdm_copy_local_to_global %positioned from %buf : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x128xf16, #shared>
+    tt.return
+  }
+}
+
+// -----
+// =============================================================================
+// A store descriptor without a shared layout receives the padded TDM default.
+// =============================================================================
+
+// CHECK-DAG: #[[$PADDED_STORE:.*]] = #ttg.padded_shared<[128:+8] {order = [1, 0], shape = [128, 128]}>
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @tdm_store_assigns_padded_default
+  // CHECK: tlx.require_layout {{.*}} -> !ttg.memdesc<128x128xf16, #[[$PADDED_STORE]], #smem, mutable>
+  // CHECK-NEXT: amdg.async_tdm_copy_local_to_global
+  tt.func public @tdm_store_assigns_padded_default(%desc: !tt.tensordesc<128x128xf16>, %m: i32, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x128xf16, #shared, #smem, mutable> -> !ttg.memdesc<128x128xf16, #shared, #smem, mutable>
+    %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%m, %n] : !tt.tensordesc<128x128xf16>
+    amdg.async_tdm_copy_local_to_global %positioned from %buf : !ttg.memdesc<128x128xf16, #shared, #smem, mutable> -> !tt.tensordesc<128x128xf16>
     tt.return
   }
 }
@@ -326,5 +403,23 @@ module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 
     %reshape = ttg.memdesc_reshape %buf : !ttg.memdesc<128x32xf16, #shared_r, #smem_r, mutable> -> !ttg.memdesc<32x128xf16, #shared_r, #smem_r, mutable>
     %t = ttg.local_load %reshape : !ttg.memdesc<32x128xf16, #shared_r, #smem_r, mutable> -> tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_r, kWidth = 8}>>
     tt.return %t : tensor<32x128xf16, #ttg.dot_op<{opIdx = 0, parent = #mma_r, kWidth = 8}>>
+  }
+}
+
+//--- invalid.mlir
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#pinned = #tlx.user_layout<#shared>
+#smem = #ttg.shared_memory
+
+module attributes {tlx.has_explicit_local_mem_access = true, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // ERROR: TDM operand requires a padded shared encoding
+  tt.func public @tdm_rejects_explicit_swizzled(%desc: !tt.tensordesc<128x128xf16>) {
+    %c0 = arith.constant 0 : i32
+    %alloc = ttg.local_alloc : () -> !ttg.memdesc<1x128x128xf16, #pinned, #smem, mutable>
+    %buf = ttg.memdesc_index %alloc[%c0] : !ttg.memdesc<1x128x128xf16, #pinned, #smem, mutable> -> !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>
+    %positioned = amdg.update_tensor_descriptor %desc add_offsets = [%c0, %c0] : !tt.tensordesc<128x128xf16>
+    %tok = amdg.async_tdm_copy_global_to_local %positioned into %buf : !tt.tensordesc<128x128xf16> -> !ttg.memdesc<128x128xf16, #pinned, #smem, mutable>
+    tt.return
   }
 }
