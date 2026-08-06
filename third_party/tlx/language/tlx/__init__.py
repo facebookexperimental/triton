@@ -63,7 +63,15 @@ from .mem_ops import (
     subslice,
     tmem_copy,
 )
-from .mma_ops import async_dot, async_dot_scaled, async_dot_wait, require_layout, tcgen05_commit
+from .mma_ops import (
+    async_dot,
+    async_dot_scaled,
+    async_dot_wait,
+    dot_scaled,
+    require_amd_wmma_layout,
+    require_layout,
+    tcgen05_commit,
+)
 from .types import (
     async_token,
     buffered_tensor,
@@ -195,6 +203,8 @@ __all__ = [
     "named_barrier_arrive",
     "amd_sched_barrier",
     # mma_ops
+    "dot_scaled",
+    "require_amd_wmma_layout",
     "async_dot",
     "async_dot_scaled",
     "async_dot_wait",

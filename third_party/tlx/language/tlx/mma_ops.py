@@ -83,6 +83,73 @@ def require_tmem_scales_layout(src: tlx.buffered_tensor, _builder=None):
     return _builder.create_require_layout(src.handle, layout_handle)
 
 
+@tl.builtin
+def require_amd_wmma_layout(
+        src,
+        version: tl.constexpr = 3,
+        transposed: tl.constexpr = True,
+        warp_bases: tl.constexpr = ((0, 2), (2, 0)),
+        reg_bases: tl.constexpr = ((0, 1), (1, 0)),
+        instr_shape: tl.constexpr = (16, 16, 128),
+        _semantic=None,
+):
+    """Pin a tensor to an explicit AMD WMMA register layout."""
+    warp_bases = [list(row) for row in tl._unwrap_if_constexpr(warp_bases)]
+    reg_bases = [list(row) for row in tl._unwrap_if_constexpr(reg_bases)]
+    instr_shape = list(tl._unwrap_if_constexpr(instr_shape))
+    rank = len(src.shape)
+    layout_handle = _semantic.builder.make_amd_wmma_encoding_attr(
+        version,
+        transposed,
+        warp_bases,
+        reg_bases,
+        instr_shape,
+        rank,
+    )
+    handle = _semantic.builder.create_require_layout(src.handle, layout_handle, pin=True)
+    return tl.tensor(handle, src.type)
+
+
+@tl.builtin
+def dot_scaled(
+    lhs,
+    lhs_scale,
+    lhs_format,
+    rhs,
+    rhs_scale,
+    rhs_format,
+    acc=None,
+    fast_math=False,
+    lhs_k_pack=True,
+    rhs_k_pack=True,
+    out_dtype=tl.float32,
+    tiles_per_warp: tl.constexpr = None,
+    _semantic=None,
+):
+    """Call ``tl.dot_scaled`` with an optional AMD WMMA tile schedule."""
+    result = tl.dot_scaled(
+        lhs,
+        lhs_scale,
+        lhs_format,
+        rhs,
+        rhs_scale,
+        rhs_format,
+        acc,
+        fast_math,
+        lhs_k_pack,
+        rhs_k_pack,
+        out_dtype,
+        _semantic=_semantic,
+    )
+    tiles_per_warp = tl._unwrap_if_constexpr(tiles_per_warp)
+    if tiles_per_warp is not None and any(tile != 1 for tile in tiles_per_warp):
+        result.handle.set_attr(
+            "amdg.wmma_tiles_per_warp",
+            _semantic.builder.make_i32_array_attr([int(tile) for tile in tiles_per_warp]),
+        )
+    return result
+
+
 def _get_use_acc_handle(use_acc: tl.constexpr | tl.tensor | None, _builder):
     if use_acc is None:
         return None

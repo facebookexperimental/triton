@@ -983,6 +983,70 @@ def test_local_reshape_correctness_gfx1250(device):
 # ---------------------------------------------------------------------------
 
 
+@triton.jit
+def _dot_scaled_tiles_per_warp_kernel(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    c_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+):
+    block_k_scale: tl.constexpr = BLOCK_K // SCALE_BLOCK
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_ks = tl.arange(0, block_k_scale)
+
+    a = tl.load(a_ptr + offs_m[:, None] * BLOCK_K + offs_k[None, :])
+    b = tl.load(b_ptr + offs_k[:, None] * BLOCK_N + offs_n[None, :])
+    a_scale = tl.load(a_scale_ptr + offs_m[:, None] * block_k_scale + offs_ks[None, :])
+    b_scale = tl.load(b_scale_ptr + offs_n[:, None] * block_k_scale + offs_ks[None, :])
+
+    acc = tlx.dot_scaled(a, a_scale, "e5m2", b, b_scale, "e5m2", tiles_per_warp=[2, 2])
+    tl.store(c_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], acc)
+
+
+def test_dot_scaled_tiles_per_warp_attr_gfx1250():
+    src = ASTSource(
+        fn=_dot_scaled_tiles_per_warp_kernel,
+        signature={
+            "a_ptr": "*fp8e5",
+            "b_ptr": "*fp8e5",
+            "a_scale_ptr": "*i8",
+            "b_scale_ptr": "*i8",
+            "c_ptr": "*fp32",
+        },
+        constexprs={"BLOCK_M": 256, "BLOCK_N": 256, "BLOCK_K": 128, "SCALE_BLOCK": 32},
+    )
+    compiled = triton_compile(src, target=GPUTarget("hip", "gfx1250", 32))
+    assert "amdg.wmma_tiles_per_warp = array<i32: 2, 2>" in compiled.asm["ttir"]
+    assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
+
+
+@triton.jit
+def _require_amd_wmma_layout_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+    offs_m = tl.arange(0, BLOCK)
+    offs_n = tl.arange(0, BLOCK)
+    offsets = offs_m[:, None] * BLOCK + offs_n[None, :]
+    values = tl.load(x_ptr + offsets)
+    values = tlx.require_amd_wmma_layout(values)
+    offsets = tlx.require_amd_wmma_layout(offsets)
+    tl.store(y_ptr + offsets, values)
+
+
+def test_require_amd_wmma_layout_compiles_gfx1250():
+    compiled = compile_for_gfx1250(
+        _require_amd_wmma_layout_kernel,
+        signature={"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        constexprs={"BLOCK": 256},
+    )
+    assert "#ttg.amd_wmma" in compiled.asm["ttgir"]
+
+
 def test_mxgemm_tdm_pipelined_compiles_gfx1250(device):
     """The mxfp GEMM tutorial kernel should lower to TDM + dot_scaled + WMMA."""
     compiled = compile_for_gfx1250(

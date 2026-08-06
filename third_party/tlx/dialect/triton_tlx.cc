@@ -466,6 +466,26 @@ void init_triton_tlx_ir(py::module &&m) {
                                                  versionMinor, warpsPerCTA,
                                                  CTALayout, instrShape)));
            })
+      .def("make_amd_wmma_encoding_attr",
+           [](TritonOpBuilder &self, unsigned version, bool transposed,
+              std::vector<std::vector<int32_t>> &warpBases,
+              std::vector<std::vector<int32_t>> &regBases,
+              std::vector<unsigned> &instrShape, unsigned rank) -> Attribute {
+             auto ctx = self.getBuilder().getContext();
+             auto kReg = mlir::StringAttr::get(ctx, "register");
+             auto kWarp = mlir::StringAttr::get(ctx, "warp");
+             auto ctaLayout =
+                 tt::LinearLayout({{kReg, regBases}, {kWarp, warpBases}},
+                                  tt::standardOutDimNames(ctx, rank));
+             auto cgaLayout = ttg::CGAEncodingAttr::get1CTALayout(ctx, rank);
+             return mlir::cast<Attribute>(ttg::AMDWmmaEncodingAttr::get(
+                 ctx, version, ctaLayout, transposed, cgaLayout, instrShape));
+           })
+      .def(
+          "make_i32_array_attr",
+          [](TritonOpBuilder &self, std::vector<int32_t> &values) -> Attribute {
+            return self.getBuilder().getDenseI32ArrayAttr(values);
+          })
       .def("make_dot_operand_encoding_attr",
            [](TritonOpBuilder &self, Value opnd, unsigned opIdx,
               Attribute parentEnc) -> Attribute {
