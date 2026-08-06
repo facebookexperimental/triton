@@ -1,15 +1,25 @@
-// RUN: triton-opt %s -split-input-file --nvgpu-test-ws-memory-planner="num-buffers=2 smem-alloc-algo=1 smem-budget=196608" | FileCheck %s
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-alloc-algo=1 smem-budget=196608" | FileCheck %s --check-prefix=RESERVED
+// RUN: triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-alloc-algo=1 smem-budget=196608 reserve-auxiliary-smem=0" | FileCheck %s --check-prefix=UNRESERVED
+// RUN: not triton-opt %s --nvgpu-test-ws-memory-planner="num-buffers=2 smem-alloc-algo=1 smem-budget=1" 2>&1 | FileCheck %s --check-prefix=EXHAUSTED
+
+// EXHAUSTED: error: estimated auxiliary shared-memory allocation ({{[0-9]+}} bytes) exhausts the shared-memory budget (1 bytes)
 
 // Test: Phase 4 chooses equal-priority multi-buffer candidates in producer
 // usage order, not local_alloc order. W is allocated first, but X's TMA load is
 // issued first. With only enough SMEM for one extra 128x256xf16 copy, X should
 // get buffer.copy = 2 and W should stay at buffer.copy = 1.
 
-// CHECK-LABEL: @load_order_breaks_multibuffer_tie
-// CHECK: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
-// CHECK-SAME: !ttg.memdesc<128x256xf16
-// CHECK: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32}
-// CHECK-SAME: !ttg.memdesc<128x256xf16
+// UNRESERVED-LABEL: @load_order_breaks_multibuffer_tie
+// UNRESERVED: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
+// UNRESERVED-SAME: !ttg.memdesc<128x256xf16
+// UNRESERVED: ttg.local_alloc {buffer.copy = 2 : i32, buffer.id = {{[0-9]+}} : i32}
+// UNRESERVED-SAME: !ttg.memdesc<128x256xf16
+
+// RESERVED-LABEL: @load_order_breaks_multibuffer_tie
+// RESERVED: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
+// RESERVED-SAME: !ttg.memdesc<128x256xf16
+// RESERVED: ttg.local_alloc {buffer.copy = 1 : i32, buffer.id = {{[0-9]+}} : i32}
+// RESERVED-SAME: !ttg.memdesc<128x256xf16
 
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
