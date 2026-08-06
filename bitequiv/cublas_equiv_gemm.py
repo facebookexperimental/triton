@@ -2,9 +2,9 @@
 
 Top-level API (a cuBLAS-like matmul):
 
-    from bitequiv.cublas_equiv_gemm import cublas_equivalent_gemm, cublas_equivalent_scaled_mm
-    c = cublas_equivalent_gemm(a_fp16, b_fp16)               # == cuBLAS fp16/bf16 GEMM, bit-for-bit
-    c = cublas_equivalent_scaled_mm(a_fp8, b_fp8_col, sa, sb) # == cuBLAS fp8 GEMM, bit-for-bit
+    from bitequiv.cublas_equiv_gemm import cublas_equivalent_gemm
+    c = cublas_equivalent_gemm(a_fp16, b_fp16)                            # == cuBLAS fp16/bf16, bit-for-bit
+    c = cublas_equivalent_gemm(a_fp8, b_fp8_col, scale_a=sa, scale_b=sb)  # == cuBLAS fp8, bit-for-bit
 
 How it works
 ------------
@@ -58,6 +58,7 @@ import dataclasses
 import glob
 import os
 import re
+import struct
 import threading
 import warnings
 
@@ -224,7 +225,7 @@ _PLATFORM_CACHE: dict = {}
 # Triton kernels (scale-capable, single FP32 accumulator)
 # --------------------------------------------------------------------------- #
 @triton.jit
-def _plain_gemm(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, sa, sb, BM: tl.constexpr, BN: tl.constexpr,
+def _plain_gemm(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, s, BM: tl.constexpr, BN: tl.constexpr,
                 BK: tl.constexpr):
     pid = tl.program_id(0)
     npn = tl.cdiv(N, BN)
@@ -243,7 +244,7 @@ def _plain_gemm(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, sa, sb, BM: tl.constex
                      tl.load(bp, mask=ok[:, None] < K - k * BK, other=0.0), acc)
         ap += BK * ak
         bp += BK * bk
-    acc = acc * sa * sb
+    acc = acc * s
     ocm = (pm * BM + tl.arange(0, BM)).to(tl.int64)
     ocn = (pn * BN + tl.arange(0, BN)).to(tl.int64)
     tl.store(C + cm * ocm[:, None] + cn * ocn[None, :], acc.to(C.dtype.element_ty),
@@ -251,7 +252,7 @@ def _plain_gemm(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, sa, sb, BM: tl.constex
 
 
 @triton.jit
-def _plain_gemm_k_per_dot(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, sa, sb, KPD, RES, BM: tl.constexpr,
+def _plain_gemm_k_per_dot(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, s, KPD, RES, BM: tl.constexpr,
                           BN: tl.constexpr, BK: tl.constexpr):
     """Plain GEMM that rounds its accumulator exactly where cuBLAS's CUTLASS kernel does.
 
@@ -293,7 +294,7 @@ def _plain_gemm_k_per_dot(A, B, C, M, N, K, am, ak, bk, bn, cm, cn, sa, sb, KPD,
         a = tl.load(A + om[:, None] * am + (k0 + ok)[None, :] * ak, mask=real[None, :], other=0.0)
         b = tl.load(B + (k0 + ok)[:, None] * bk + on[None, :] * bn, mask=real[:, None], other=0.0)
         acc = tl.dot(a, b, acc)
-    acc = acc * sa * sb
+    acc = acc * s
     ocm = (pm * BM + tl.arange(0, BM)).to(tl.int64)
     ocn = (pn * BN + tl.arange(0, BN)).to(tl.int64)
     tl.store(C + cm * ocm[:, None] + cn * ocn[None, :], acc.to(C.dtype.element_ty),
@@ -330,7 +331,7 @@ def _splitk_partial(A, B, W, M, N, K, am, ak, bk, bn, ws, wm, wn, CHUNK, BM: tl.
 
 
 @triton.jit
-def _splitk_combine(W, C, M, N, ws, wm, wn, cm, cn, S, sa, sb, BM: tl.constexpr, BN: tl.constexpr):
+def _splitk_combine(W, C, M, N, ws, wm, wn, cm, cn, S, s, BM: tl.constexpr, BN: tl.constexpr):
     """Pass 2: sum the S FP32 partials in FORWARD order (slice 0..S-1), scale, cast. The sum
     starts at partial 0 rather than a zero accumulator, which matters only for signed zero:
     `(+0.0) + (-0.0) = +0.0` would drop the sign a cuBLAS epilogue with beta=0 keeps."""
@@ -345,7 +346,7 @@ def _splitk_combine(W, C, M, N, ws, wm, wn, cm, cn, S, sa, sb, BM: tl.constexpr,
     for i in range(0, S):
         p = tl.load(W + i.to(tl.int64) * ws + om[:, None] * wm + on[None, :] * wn, mask=m2, other=0.0)
         acc = tl.where(i == 0, p, acc + p)
-    acc = acc * sa * sb
+    acc = acc * s
     tl.store(C + cm * om[:, None] + cn * on[None, :], acc.to(C.dtype.element_ty), mask=m2)
 
 
@@ -389,7 +390,7 @@ def _splitk_partial_k_per_dot(A, B, W, M, N, K, am, ak, bk, bn, ws, wm, wn, CHUN
 
 
 @triton.jit
-def _splitk_combine_modes(W, C, M, N, ws, wm, wn, cm, cn, S, sa, sb, CMODE: tl.constexpr, BM: tl.constexpr,
+def _splitk_combine_modes(W, C, M, N, ws, wm, wn, cm, cn, S, s, CMODE: tl.constexpr, BM: tl.constexpr,
                           BN: tl.constexpr):
     """Pass 2 with the three merge schemes cuBLAS actually uses, which `SPLITK_NUM` does not
     distinguish -- only the launched kernel names do:
@@ -420,7 +421,7 @@ def _splitk_combine_modes(W, C, M, N, ws, wm, wn, cm, cn, S, sa, sb, CMODE: tl.c
         acc = tl.where(i == 0, p, acc + p)
         if CMODE == 3:  # the running total lives in fp16 between slices
             acc = acc.to(tl.float16).to(tl.float32)
-    acc = acc * sa * sb
+    acc = acc * s
     tl.store(C + cm * om[:, None] + cn * on[None, :], acc.to(C.dtype.element_ty), mask=m2)
 
 
@@ -442,18 +443,18 @@ def _kcontig(b):
     return b if b.stride(1) == 1 else b.contiguous()
 
 
-def _triton_plain(a, b, out_dtype, sa=1.0, sb=1.0, BM=128, BN=128, BK=64):
+def _triton_plain(a, b, out_dtype, scale=1.0, BM=128, BN=128, BK=64):
     b = _kcontig(b)
     M, K = a.shape
     N = b.shape[1]
     c = torch.empty(M, N, device=DEVICE, dtype=out_dtype)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), )
     _plain_gemm[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
-                      sa, sb, BM=BM, BN=BN, BK=BK, num_warps=8)
+                      scale, BM=BM, BN=BN, BK=BK, num_warps=8)
     return c
 
 
-def _triton_plain_k_per_dot(a, b, out_dtype, k_per_dot, res, sa=1.0, sb=1.0, BM=128, BN=128, BK=16):
+def _triton_plain_k_per_dot(a, b, out_dtype, k_per_dot, res, scale=1.0, BM=128, BN=128, BK=16):
     """Plain GEMM accumulating `k_per_dot` real k-elements per dot, with the partial group
     ending at `res`, so the accumulator rounds where cuBLAS's CUTLASS kernel rounds. The tile
     and the MMA Triton picks are bit-neutral here (measured 2000/2000 both ways), so BM, BN,
@@ -464,7 +465,7 @@ def _triton_plain_k_per_dot(a, b, out_dtype, k_per_dot, res, sa=1.0, sb=1.0, BM=
     c = torch.empty(M, N, device=DEVICE, dtype=out_dtype)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), )
     _plain_gemm_k_per_dot[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
-                                c.stride(1), sa, sb, k_per_dot, res, BM=BM, BN=BN, BK=BK, num_warps=8)
+                                c.stride(1), scale, k_per_dot, res, BM=BM, BN=BN, BK=BK, num_warps=8)
     return c
 
 
@@ -488,7 +489,7 @@ def _k_per_dot_candidates(K):
     return out
 
 
-def _triton_splitk_groups(a, b, chunk, k_per_dot, ktile, cmode, out_dtype, sa=1.0, sb=1.0, BK=16):
+def _triton_splitk_groups(a, b, chunk, k_per_dot, ktile, cmode, out_dtype, scale=1.0, BK=16):
     """Two-pass split-K for the CUTLASS path: `chunk`-element slices, each accumulated in
     groups of `k_per_dot` real k with a per-slice residue tile of `ktile`, merged by `cmode`."""
     b = _kcontig(b)
@@ -505,7 +506,7 @@ def _triton_splitk_groups(a, b, chunk, k_per_dot, ktile, cmode, out_dtype, sa=1.
                                                BN=BN, BK=BK, num_warps=4)
     c = torch.empty(M, N, device=DEVICE, dtype=out_dtype)
     _splitk_combine_modes[(ntile, )](w, c, M, N, w.stride(0), w.stride(1), w.stride(2), c.stride(0), c.stride(1),
-                                     nsplit, sa, sb, CMODE=cmode, BM=BM, BN=BN, num_warps=4)
+                                     nsplit, scale, CMODE=cmode, BM=BM, BN=BN, num_warps=4)
     return c
 
 
@@ -541,7 +542,7 @@ def _splitk_group_candidates(K, nsplit):
     return out
 
 
-def _triton_splitk(a, b, chunk, out_dtype, sa=1.0, sb=1.0, BK=64):
+def _triton_splitk(a, b, chunk, out_dtype, scale=1.0, BK=64):
     """Deterministic two-pass split-K at `chunk`-element early slices (uneven tail),
     forward FP32 combine. Returns None if the chunk does not yield a real split (nsplit<2)."""
     b = _kcontig(b)
@@ -556,8 +557,8 @@ def _triton_splitk(a, b, chunk, out_dtype, sa=1.0, sb=1.0, BK=64):
     _splitk_partial[(ntile, nsplit)](a, b, w, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), w.stride(0),
                                      w.stride(1), w.stride(2), chunk, BM=BM, BN=BN, BK=BK, num_warps=4)
     c = torch.empty(M, N, device=DEVICE, dtype=out_dtype)
-    _splitk_combine[(ntile, )](w, c, M, N, w.stride(0), w.stride(1), w.stride(2), c.stride(0), c.stride(1), nsplit, sa,
-                               sb, BM=BM, BN=BN, num_warps=4)
+    _splitk_combine[(ntile, )](w, c, M, N, w.stride(0), w.stride(1), w.stride(2), c.stride(0), c.stride(1), nsplit,
+                               scale, BM=BM, BN=BN, num_warps=4)
     return c
 
 
@@ -577,7 +578,8 @@ _TLS = threading.local()   # per-CALL overrides live here, never in a global -- 
 _UNSET = object()
 _LT_LIBS: dict = {}   # resolved path -> loaded library, so switching back and forth is free
 _LT_PATHS: dict = {}  # spec -> resolved path
-_ONES = None  # device fp32 [1.0] for fp8 scale pointers
+_SCALE_A = None  # device fp32 [1] holding the A scale cuBLAS is given (fp8 only)
+_SCALE_B = None  # same for B
 _WS = None    # device scratch for the reference execute
 
 
@@ -671,7 +673,7 @@ def _resolve_lt(spec):
 
 
 def _load_lt():
-    global _ONES, _WS
+    global _SCALE_A, _SCALE_B, _WS
     path = _resolve_lt(_lt_spec())
     lib = _LT_LIBS.get(path)
     if lib is not None:
@@ -694,8 +696,9 @@ def _load_lt():
     lib.cublasLtMatmulAlgoConfigGetAttribute.argtypes = [P, ci, P, csz, ctypes.POINTER(csz)]
     lib.cublasLtMatmul.restype = ci
     lib.cublasLtMatmul.argtypes = [P] * 14 + [csz, P]  # 14 ptrs, workspaceSize, stream
-    if _ONES is None:
-        _ONES = torch.ones(1, dtype=torch.float32, device=DEVICE)
+    if _SCALE_A is None:
+        _SCALE_A = torch.ones(1, dtype=torch.float32, device=DEVICE)
+        _SCALE_B = torch.ones(1, dtype=torch.float32, device=DEVICE)
         _WS = torch.empty(_WS_BYTES, dtype=torch.uint8, device=DEVICE)
     _LT_LIBS[path] = lib
     return lib
@@ -728,7 +731,7 @@ def _set_row(lib, layout):
     _ck("layout-order", lib.cublasLtMatrixLayoutSetAttribute(layout, _LAYOUT_ORDER, ctypes.byref(v), 4))
 
 
-def _make_layouts(lib, desc, M, N, K, kind, out_dtype):
+def _make_layouts(lib, desc, M, N, K, kind, out_dtype, sa=1.0, sb=1.0):
     """Row-major layouts matching a standard torch GEMM dispatch; set transa/transb
     (+ fp8 scale pointers). Returns (A, B, C, D) layout handles."""
     ab, cd, transa, transb = _lt_dtypes(kind, out_dtype)
@@ -744,9 +747,11 @@ def _make_layouts(lib, desc, M, N, K, kind, out_dtype):
     else:  # fp8 e4m3 TN: operands K-contiguous (col-major), output row-major
         _ck("LA", lib.cublasLtMatrixLayoutCreate(ctypes.byref(A), ab, K, M, K))
         _ck("LB", lib.cublasLtMatrixLayoutCreate(ctypes.byref(B), ab, K, N, K))
-        sp = ctypes.c_void_p(_ONES.data_ptr())
-        _ck("Ascale", lib.cublasLtMatmulDescSetAttribute(desc, _DESC_A_SCALE_PTR, ctypes.byref(sp), 8))
-        _ck("Bscale", lib.cublasLtMatmulDescSetAttribute(desc, _DESC_B_SCALE_PTR, ctypes.byref(sp), 8))
+        _SCALE_A.fill_(sa)
+        _SCALE_B.fill_(sb)
+        for attr, t in ((_DESC_A_SCALE_PTR, _SCALE_A), (_DESC_B_SCALE_PTR, _SCALE_B)):
+            sp = ctypes.c_void_p(t.data_ptr())
+            _ck("scale", lib.cublasLtMatmulDescSetAttribute(desc, attr, ctypes.byref(sp), 8))
     _ck("LC", lib.cublasLtMatrixLayoutCreate(ctypes.byref(C), cd, M, N, N))
     _set_row(lib, C)
     _ck("LD", lib.cublasLtMatrixLayoutCreate(ctypes.byref(D), cd, M, N, N))
@@ -754,7 +759,7 @@ def _make_layouts(lib, desc, M, N, K, kind, out_dtype):
     return A, B, C, D
 
 
-def _cublas_direct(a, b, kind, out_dtype, execute=True):
+def _cublas_direct(a, b, kind, out_dtype, execute=True, sa=1.0, sb=1.0):
     """Query cuBLAS's top-heuristic algo and (if execute) run it DIRECTLY via ctypes
     cublasLtMatmul. Returns (D, nsplit): with execute, D is cuBLAS's exact output; without,
     D is None and only the heuristic's SPLITK_NUM is read (pure-static, no GEMM run). No torch."""
@@ -766,7 +771,7 @@ def _cublas_direct(a, b, kind, out_dtype, execute=True):
     try:
         _ck("create", lib.cublasLtCreate(ctypes.byref(handle)))
         _ck("desc", lib.cublasLtMatmulDescCreate(ctypes.byref(desc), _CUBLAS_COMPUTE_32F, _CUDA_R_32F))
-        A, B, C, D = _make_layouts(lib, desc, M, N, K, kind, out_dtype)
+        A, B, C, D = _make_layouts(lib, desc, M, N, K, kind, out_dtype, sa, sb)
         _ck("pref", lib.cublasLtMatmulPreferenceCreate(ctypes.byref(pref)))
         ws = ctypes.c_size_t(_WS_BYTES)
         _ck("pref-set", lib.cublasLtMatmulPreferenceSetAttribute(pref, _PREF_MAX_WS, ctypes.byref(ws), 8))
@@ -805,14 +810,15 @@ def _cublas_direct(a, b, kind, out_dtype, execute=True):
                 pass
 
 
-def cublas_matmul(a, b, out_dtype=None, cublaslt=None):
+def cublas_matmul(a, b, out_dtype=None, scale_a=None, scale_b=None, cublaslt=None):
     """cuBLAS's OWN output (run directly via cublasLtMatmul), the reference our
     reconstruction must match. fp16/bf16: `b` is [K,N]. fp8: `b` is [K,N] column-major.
     `cublaslt` picks which cuBLAS, as in `cublas_equivalent_gemm`."""
     kind = _kind_of(a)
     out_dtype = out_dtype or (torch.float16 if kind == "fp8" else a.dtype)
     with _using_cublaslt(cublaslt):
-        return _cublas_direct(a, b, kind, out_dtype)[0]
+        return _cublas_direct(a, b, kind, out_dtype, sa=scale_a if scale_a is not None else 1.0,
+                              sb=scale_b if scale_b is not None else 1.0)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -922,15 +928,30 @@ def _is_static_exact(kind, nsplit, aligned):
     return aligned and nsplit <= 1
 
 
-def _reconstruct(a, b, out_dtype, plan, sa=1.0, sb=1.0):
+def _f32(x):
+    """Round a Python float to fp32, the width cuBLAS keeps its scales in."""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def _fold_scales(scale_a, scale_b):
+    """The single fp32 factor cuBLAS applies to the accumulator for an fp8 GEMM.
+
+    cuBLAS multiplies the two operand scales together in fp32 and does ONE multiply on the fp32
+    accumulator, before the cast to the output dtype. Applying them as two multiplies rounds
+    twice and differs in the last bits whenever neither is a power of two: measured over 10
+    scale pairs on 3 shapes, two multiplies matched cuBLAS 15/30 and this folding 30/30."""
+    return _f32(_f32(1.0 if scale_a is None else scale_a) * _f32(1.0 if scale_b is None else scale_b))
+
+
+def _reconstruct(a, b, out_dtype, plan, scale=1.0):
     mode, arg = plan
     if mode == "plain":
-        return _triton_plain(a, b, out_dtype, sa=sa, sb=sb)
+        return _triton_plain(a, b, out_dtype, scale=scale)
     if mode == "k_per_dot":
-        return _triton_plain_k_per_dot(a, b, out_dtype, arg[0], arg[1], sa=sa, sb=sb)
+        return _triton_plain_k_per_dot(a, b, out_dtype, arg[0], arg[1], scale=scale)
     if mode == "splitk_groups":
-        return _triton_splitk_groups(a, b, arg[0], arg[1], arg[2], arg[3], out_dtype, sa=sa, sb=sb)
-    return _triton_splitk(a, b, arg, out_dtype, sa=sa, sb=sb)
+        return _triton_splitk_groups(a, b, arg[0], arg[1], arg[2], arg[3], out_dtype, scale=scale)
+    return _triton_splitk(a, b, arg, out_dtype, scale=scale)
 
 
 def _launched_kernel_names(a, b, out_dtype):
@@ -1145,14 +1166,53 @@ def _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static=T
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+def _canonical_layout(t, want):
+    """Is `t` laid out the way `_make_layouts` tells cuBLAS it is? A size-1 dim has no say."""
+    r, c = t.shape
+    s0, s1 = t.stride()
+    e0, e1 = (c, 1) if want == "row-major" else (1, r)
+    return (r == 1 or s0 == e0) and (c == 1 or s1 == e1)
+
+
+def _check_operands(a, b, kind):
+    """cuBLAS is told one fixed layout per dtype (see `_make_layouts`), not the tensor's actual
+    strides. An operand laid out any other way therefore makes the reference read the same bytes
+    as a different matrix -- and cuBLAS does not complain, it returns a different product, while
+    the Triton side reads the real strides and returns the right one. That looks like "Triton
+    does not match cuBLAS" when it is really a wrong call. Refuse it up front instead."""
+    if a.dim() != 2 or b.dim() != 2:
+        raise ValueError(f"expected 2-D operands, got {tuple(a.shape)} and {tuple(b.shape)}")
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(f"shapes do not match: a is {tuple(a.shape)}, b is {tuple(b.shape)}")
+    if a.dtype != b.dtype:
+        raise ValueError(f"operands must share a dtype, got {a.dtype} and {b.dtype}")
+    want_b = "column-major" if kind == "fp8" else "row-major"
+    for name, t, want in (("a", a, "row-major"), ("b", b, want_b)):
+        if _canonical_layout(t, want):
+            continue
+        hint = " -- pass `w.t()` for a [N,K] weight" if (name == "b" and kind == "fp8") else ""
+        raise ValueError(f"{kind} needs {name} {list(t.shape)} {want}, got strides {t.stride()}{hint}. "
+                         f"cuBLAS is told this layout, so any other one makes the reference compute a "
+                         f"different product and the comparison meaningless.")
+
+
 def cublas_equivalent_gemm(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype | None = None,
+                           scale_a: float | None = None, scale_b: float | None = None,
                            enable_runtime_match: bool = False, enable_pseudo_static: bool = True,
                            cublaslt: str | None = None) -> torch.Tensor:
-    """fp16/bf16 GEMM, bit-identical to cuBLAS. `a` is [M,K], `b` is [K,N].
+    """A GEMM bit-identical to cuBLAS, for fp16, bf16 and fp8 (e4m3). `a` is [M,K] row-major.
 
-    Static by default: the reconstruction is planned from the cuBLAS heuristic alone (no GEMM
-    run). Aligned fp16/bf16 is static-exact. A shape that is not statically guaranteed
-    (non-aligned) raises CublasNeedRuntimeMatch -- unless `enable_runtime_match=True`, which
+    `b` is [K,N], row-major for fp16/bf16 and column-major for fp8 (i.e. `w.t()` of an [N,K]
+    weight) -- that is cuBLAS's own requirement for e4m3, not a choice here, and passing the
+    other layout raises rather than silently returning something that does not match.
+
+    `scale_a` and `scale_b` are the fp8 operand scales and may only be given for fp8. They are
+    folded into one fp32 factor before the accumulator is scaled, which is what cuBLAS does --
+    see `_fold_scales`. `out_dtype` defaults to the input dtype, or fp16 for fp8 input.
+
+    Static by default: the reconstruction is planned from the cuBLAS heuristic alone, with no
+    GEMM run. Aligned fp16/bf16 and plain fp8 are static-exact. A shape that is not statically
+    guaranteed raises CublasNeedRuntimeMatch -- unless `enable_runtime_match=True`, which
     byte-compares candidates against cuBLAS and returns the match or raises
     CublasUnsupportedShape.
 
@@ -1160,32 +1220,22 @@ def cublas_equivalent_gemm(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dt
     path -- overriding `set_cublaslt`. Default is the process-wide choice.
     """
     kind = _kind_of(a)
-    if kind == "fp8":
-        raise ValueError("use cublas_equivalent_scaled_mm for fp8")
-    out_dtype = out_dtype or a.dtype
+    if kind != "fp8" and (scale_a is not None or scale_b is not None):
+        raise ValueError(f"scale_a/scale_b are fp8-only, but the input is {a.dtype}")
+    _check_operands(a, b, kind)
+    out_dtype = out_dtype or (torch.float16 if kind == "fp8" else a.dtype)
     with _using_cublaslt(cublaslt):
         plan = _resolve(a, b, kind, out_dtype, enable_runtime_match, enable_pseudo_static)
-        return _reconstruct(a, b, out_dtype, plan)
+        return _reconstruct(a, b, out_dtype, plan, scale=_fold_scales(scale_a, scale_b))
 
 
 def cublas_equivalent_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: float = 1.0, scale_b: float = 1.0,
                                 out_dtype: torch.dtype = torch.float16, enable_runtime_match: bool = False,
                                 enable_pseudo_static: bool = True,
                                 cublaslt: str | None = None) -> torch.Tensor:
-    """fp8 (e4m3) GEMM, bit-identical to cuBLAS. `a` is [M,K], `b` is [K,N] column-major
-    (i.e. from `w.t()`); scales are scalars.
-
-    fp8 plain is static-exact. fp8 split-K is NOT statically guaranteed (the vertical/cluster
-    kernel is not bit-reproducible) -> raises CublasNeedRuntimeMatch unless
-    `enable_runtime_match=True`, which byte-compares against cuBLAS and returns the match or
-    raises CublasUnsupportedShape (vertical split-K).
-
-    `cublaslt` picks which cuBLAS to match for this call -- a version prefix ("12.8") or a
-    path -- overriding `set_cublaslt`. Default is the process-wide choice.
-    """
-    with _using_cublaslt(cublaslt):
-        plan = _resolve(a, b, "fp8", out_dtype, enable_runtime_match, enable_pseudo_static)
-        return _reconstruct(a, b, out_dtype, plan, sa=scale_a, sb=scale_b)
+    """`cublas_equivalent_gemm` under the name torch uses for the scaled fp8 path."""
+    return cublas_equivalent_gemm(a, b, out_dtype, scale_a, scale_b, enable_runtime_match,
+                                  enable_pseudo_static, cublaslt)
 
 
 # --------------------------------------------------------------------------- #
@@ -1196,8 +1246,7 @@ def _check_one(kind, M, N, K):
     guessed from which call succeeded. Returns (tier, bit_ok)."""
     a, b = _make_inputs(M, N, K, kind, 7)
     ref = cublas_matmul(a, b, torch.float16 if kind == "fp8" else None)
-    call = (lambda rt: cublas_equivalent_scaled_mm(a, b, 1.0, 1.0, torch.float16, enable_runtime_match=rt)) \
-        if kind == "fp8" else (lambda rt: cublas_equivalent_gemm(a, b, enable_runtime_match=rt))
+    call = lambda rt: cublas_equivalent_gemm(a, b, enable_runtime_match=rt)  # noqa: E731
     try:
         try:
             out = call(False)
