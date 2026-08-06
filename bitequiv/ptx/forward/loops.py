@@ -6,15 +6,30 @@ branch (``bra`` to a label at/before it) is a loop back-edge. On top of that we 
 carrying a floating-point ACCUMULATION (a running total across iterations) — the thing that makes its
 chunk size bit-relevant — and expose the loop-carried accumulator register(s) + the accumulating
 instruction, which the forward interpreter uses to emit a ``LoopReduce`` (fold summary) instead of
-unrolling.
+unrolling. :func:`is_pure_mma_fold` is the matching POSITIVE recognizer for the tensor-core case: it
+proves an entry's fp accumulation is carried by MMA instructions alone, which is what lets the MMA
+descriptor drop its chunk (BLOCK_K) fence.
 """
-from pyptx.ir.nodes import Block, ImmediateOperand, Label, RegisterOperand
+from pyptx.ir.nodes import Block, ImmediateOperand, Label, RegisterOperand, VectorOperand
 
 from bitequiv.ptx.mma import _is_mma
 
 # fp combine ops + widths, used to detect a loop-carried floating-point accumulation.
 _FP_WIDTHS = frozenset({".f16", ".f16x2", ".f32", ".f32x2", ".f64", ".bf16", ".bf16x2"})
 _FP_COMBINE = frozenset({"add", "sub", "mul", "div", "min", "max", "fma"})
+
+# fp opcodes that COMPUTE a value — arithmetic, transcendentals, comparisons, selects. Any of these
+# inside a tensor-core fold means the loop does more than sum MMA products, so re-chunking it can
+# regroup that arithmetic (see :func:`is_pure_mma_fold`). Format conversion (``cvt``) and the memory /
+# movement ops are deliberately NOT here: they are per-element and cannot regroup a fold, and an fp8
+# GEMM upcasts its operands with ``cvt`` inside the K loop yet is still a pure fold. A ``cvt`` (or any
+# other op) applied to the ACCUMULATOR is caught by the accumulator-read rule instead.
+_FP_VALUE_OPS = frozenset({"add", "sub", "mul", "div", "fma", "mad", "min", "max", "rcp", "sqrt",
+                           "rsqrt", "sin", "cos", "lg2", "ex2", "tanh", "abs", "neg", "selp", "setp",
+                           "redux", "testp", "copysign", "atom", "red"})
+# `.tf32` is normally an MMA operand dtype rather than a scalar-op width; it is listed so that an
+# arithmetic op carrying only that width still counts as floating point.
+_FP_VALUE_WIDTHS = _FP_WIDTHS | frozenset({".tf32"})
 
 
 def instrs_and_labels(func):
@@ -139,6 +154,84 @@ def loop_carried_accumulators(insts, loop, loops):
             if acc is not None:
                 out.append((acc, inst))
     return out
+
+
+def _operand_regs(operand):
+    """Register name(s) an operand mentions (a scalar register, or every element of a vector)."""
+    if isinstance(operand, RegisterOperand):
+        return {operand.name}
+    if isinstance(operand, VectorOperand):
+        return {e.name for e in operand.elements if isinstance(e, RegisterOperand)}
+    return set()
+
+
+def _mma_accumulator_regs(inst):
+    """Register(s) an MMA writes its accumulator into, or an empty set when it has none in registers.
+    ``tcgen05.mma`` accumulates in TENSOR MEMORY — its first operand is an ADDRESS, not a value — so
+    there is no accumulator register to track; reading that accumulator back needs a ``tcgen05.ld``,
+    which :func:`is_pure_mma_fold` rejects separately."""
+    if inst.opcode == "tcgen05" or not inst.operands:
+        return set()
+    return _operand_regs(inst.operands[0])
+
+
+def _is_fp_value_op(inst):
+    """True iff ``inst`` COMPUTES a floating-point value (see ``_FP_VALUE_OPS``)."""
+    return (inst.opcode in _FP_VALUE_OPS and inst.modifiers
+            and any(m in _FP_VALUE_WIDTHS for m in inst.modifiers))
+
+
+def _is_tmem_load(inst):
+    """True iff ``inst`` reads the tensor-memory MMA accumulator back into registers."""
+    return inst.opcode == "tcgen05" and ".ld" in inst.modifiers
+
+
+def is_pure_mma_fold(func):
+    """True iff every tensor-core fold in ``func`` accumulates by MMA instructions ALONE — the
+    positive recognizer that lets an MMA descriptor drop its chunk (BLOCK_K) fence.
+
+    A tensor-core K-loop is re-chunkable without changing a bit only when one iteration contributes
+    exactly one batch of MMA products to an accumulator that nothing else touches: any chunking then
+    issues the SAME dot products, in the same order, into the same accumulator. The folds are the
+    loops that ISSUE the MMAs (an MMA in their own body); for each, over its whole range:
+
+    1. no non-MMA instruction COMPUTES an fp value (:func:`_is_fp_value_op`) — nothing else joins the
+       fold. This is what rejects ``input_precision=tf32x3``, whose 3-pass f32 emulation sums its
+       compensation products INSIDE the K loop, so its chunking IS bit-relevant;
+    2. no non-MMA instruction reads an MMA accumulator register, and no ``tcgen05.ld`` reads the
+       tensor-memory accumulator — the accumulator is consumed only AFTER the fold. This is what
+       rejects Flash Attention, which rescales the running MMA accumulator every iteration.
+
+    Each fold is scanned over its FULL range, nested loops included, since arithmetic hidden in a
+    nested loop is still part of one iteration's contribution. An OUTER loop that combines whole MMA
+    partials (split-K: ``acc += partial``, no MMA of its own) is deliberately NOT a fold here — its
+    regrouping is num_splits, which :func:`reduction_trip_signature` fences separately.
+
+    Returns False — fail closed — for anything it cannot prove, including an entry with no recovered
+    MMA loop (a fully unrolled or unrecognized fold). Asking for a POSITIVE match is the point: the
+    fence check this backs up (:func:`bitequiv.ptx.mma._fence_all_matmul`) only rules out an inexact
+    MMA dtype, so on its own it lets through every tensor-core kernel that is not a plain GEMM
+    (precision emulation, attention, implicit-GEMM convolution, a tensor-core scan). A positive
+    recognizer puts those on the conservative side without needing a case for each."""
+    insts, loops = find_loops(func)
+    folds = [lp for lp in set(loops) if any(_is_mma(insts[k]) for k in own_body(insts, lp, loops))]
+    if not folds:
+        return False
+    for header, latch in folds:
+        body = range(header, latch + 1)
+        acc_regs = set()
+        for k in body:
+            if _is_mma(insts[k]):
+                acc_regs |= _mma_accumulator_regs(insts[k])
+        for k in body:
+            inst = insts[k]
+            if _is_mma(inst):
+                continue
+            if _is_fp_value_op(inst) or _is_tmem_load(inst):
+                return False
+            if acc_regs and any(acc_regs & _operand_regs(o) for o in inst.operands):
+                return False
+    return True
 
 
 def outer_reduction_loops(insts, loops):

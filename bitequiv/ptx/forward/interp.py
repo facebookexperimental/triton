@@ -733,19 +733,23 @@ def _epilogue_reduces_mma(sinks):
 def _mma_entry_descriptor(func, fence):
     """Descriptor for an entry containing MMA (tensor-core) ops, via the tiling-invariant fence.
 
-    A PURE f16/bf16/tf32 GEMM (MMA, no reduction over the output) is the fence ALONE -> num_warps +
-    BLOCK_M/BLOCK_N + BLOCK_K are all free (recovered) and v2 (``mma.sync``) merges with v5
-    (``tcgen05``): the fence token is form- and tiling-invariant and ``loops=`` (BLOCK_K) is dropped
-    because BLOCK_K only re-batches the same in-order k-fold (native-k fixed, exact F=25 accumulate).
-    fp8 keeps ``loops=`` (imprecise-acc cadence). An MMA + a
-    reduction OVER the MMA output (FA softmax, or gemm_reduce_sum / softmax / layernorm) is FAIL-CLOSED:
-    the fence AND the reduction fingerprint both ride, so configs differing in EITHER the MMA shape OR
-    the reduction order split (sound, never over-merged). The reduction is detected structurally
-    (:func:`_epilogue_reduces_mma`) rather than by ``shfl.bfly`` presence, so a within-thread epilogue
-    fold (no shuffle) — which the shfl-only trigger missed, over-merging unordered vs inner_tree — is
-    now caught. The reduction fingerprint carries num_warps back in that case; the pure GEMM drops it
-    deliberately (num_warps is a free re-tiling of the same dot products)."""
-    from bitequiv.ptx.forward.loops import reduction_trip_signature
+    A PROVEN-PURE tensor-core fold (:func:`bitequiv.ptx.forward.loops.is_pure_mma_fold`: the loop's
+    accumulator is written only by MMA and read by nothing else) in an exactly-accumulating MMA family
+    (:func:`_fence_all_matmul`: f16/bf16/tf32), with no reduction over the output, is the fence ALONE
+    -> num_warps + BLOCK_M/BLOCK_N + BLOCK_K are all free (recovered) and v2 (``mma.sync``) merges with
+    v5 (``tcgen05``): the fence token is form- and tiling-invariant and ``loops=`` (BLOCK_K) is dropped
+    because BLOCK_K then only re-batches the same in-order k-fold (native-k fixed, exact F=25
+    accumulate). fp8 keeps ``loops=`` (imprecise-acc cadence).
+
+    Anything the fold recognizer cannot prove is FAIL-CLOSED on the conservative per-config
+    fingerprint: an MMA + a reduction OVER the output (FA softmax, or gemm_reduce_sum / softmax /
+    layernorm, detected structurally by :func:`_epilogue_reduces_mma` rather than by ``shfl.bfly``
+    presence, so a within-thread epilogue fold is caught too), and equally any tensor-core loop that
+    runs extra fp arithmetic inside the fold (``input_precision=tf32x3``, whose compensation sums are
+    grouped per K chunk, so its BLOCK_K IS bit-relevant). The fingerprint — not ``loops=`` alone — is
+    the fallback ON PURPOSE: a tcgen05 fold increments no pointer, so ``_loop_steps`` is empty there
+    and ``loops=`` would leave the descriptor chunk-blind exactly where the proof failed."""
+    from bitequiv.ptx.forward.loops import is_pure_mma_fold, reduction_trip_signature
     from bitequiv.ptx_reduction import _loop_steps
     parts = [_fence_str(fence)]
     interp = ForwardInterp(func)
@@ -763,15 +767,23 @@ def _mma_entry_descriptor(func, fence):
     sinks += [v for v in interp.regs.values() if hasattr(v, "children")]
     has_shfl = any(inst.opcode == "shfl" and ".bfly" in inst.modifiers for inst in linearize(func))
     reduces = has_shfl or _epilogue_reduces_mma(sinks)
-    if reduces:
-        parts.append("mma+red|" + interp.fingerprint())
+    # Positive proof that one loop iteration contributes nothing but MMA products to an accumulator
+    # nothing else touches. Without it we know only that the entry HAS tensor-core ops, which says
+    # nothing about whether re-chunking the fold is bit-free.
+    pure_fold = is_pure_mma_fold(func)
+    if reduces or not pure_fold:
+        # The fence alone does not describe this entry's fp behaviour: something outside the MMAs
+        # (an epilogue / in-fold reduction, or extra in-fold arithmetic) also decides the bits. Fail
+        # closed on the conservative per-config fingerprint, which carries num_warps, the ordered
+        # shuffle sequence and the op counts, so any of those differing splits.
+        parts.append("mma+fp|" + interp.fingerprint())
     steps = _loop_steps(func)
-    # BLOCK_K is bit-neutral for a PURE f16/bf16/tf32 tensor-core GEMM: native-k is fixed and each MMA's
-    # F=25 accumulate is exact, so BLOCK_K only re-batches the same in-order k-fold. Drop loops= there ->
-    # recovers BLOCK_K AND lets v2 (mma.sync, emits loops=) match v5 (tcgen05, emits none). Keep loops=
-    # for fp8 (the max_num_imprecise_acc cadence can shift with BLOCK_K) and when the entry reduces over
-    # the MMA output (a chunked reduction step may be bit-relevant; its order otherwise rides mma+red).
-    if steps and (reduces or not _fence_all_matmul(fence)):
+    # BLOCK_K is bit-neutral only for a PROVEN-pure f16/bf16/tf32 tensor-core fold: native-k is fixed
+    # and each MMA's F=25 accumulate is exact, so BLOCK_K then only re-batches the same in-order
+    # k-fold. Drop loops= there -> recovers BLOCK_K AND lets v2 (mma.sync, emits loops=) match v5
+    # (tcgen05, emits none). Keep loops= for fp8 (the max_num_imprecise_acc cadence can shift with
+    # BLOCK_K), when the entry reduces over the MMA output, and whenever the fold is not proven pure.
+    if steps and (reduces or not pure_fold or not _fence_all_matmul(fence)):
         parts.append("loops=" + ",".join(map(str, steps)))
     sig = reduction_trip_signature(func)
     if sig is not None:
